@@ -209,21 +209,21 @@ mod tests {
         let (tools, routes) = merge(vec![
             (
                 0,
-                vec![json!({"name": "zend_task"}), json!({"name": "shared"})],
+                vec![json!({"name": "task_start"}), json!({"name": "shared"})],
             ),
             (
                 1,
                 vec![
-                    json!({"name": "npc_list"}),
+                    json!({"name": "bot_list"}),
                     json!({"name": "shared"}),
                     json!({}),
                 ],
             ),
         ]);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["zend_task", "shared", "npc_list"]);
+        assert_eq!(names, ["task_start", "shared", "bot_list"]);
         assert_eq!(routes["shared"], 0);
-        assert_eq!(routes["npc_list"], 1);
+        assert_eq!(routes["bot_list"], 1);
         assert_eq!(routes.len(), 3);
     }
 
@@ -232,18 +232,18 @@ mod tests {
     #[test]
     fn a_backend_that_did_not_answer_keeps_its_routes() {
         let old = HashMap::from([
-            ("zend_task".to_string(), 0),
-            ("npc_list".to_string(), 1),
-            ("zend_gone".to_string(), 0),
+            ("task_start".to_string(), 0),
+            ("bot_list".to_string(), 1),
+            ("task_gone".to_string(), 0),
         ]);
-        let learned = HashMap::from([("zend_task".to_string(), 0), ("zend_new".to_string(), 0)]);
+        let learned = HashMap::from([("task_start".to_string(), 0), ("task_new".to_string(), 0)]);
         let routes = relearn(&old, learned, &[1]);
         assert_eq!(
             routes,
             HashMap::from([
-                ("zend_task".to_string(), 0),
-                ("zend_new".to_string(), 0),
-                ("npc_list".to_string(), 1),
+                ("task_start".to_string(), 0),
+                ("task_new".to_string(), 0),
+                ("bot_list".to_string(), 1),
             ])
         );
     }

@@ -1,7 +1,7 @@
 //! `cluster_audit`: who ran which command, and how it ended
 //! (`docs/claude_zend_gateway.md` §8.1) — the gateway's coordination log, which
 //! records every command a member ran and who sent it, kept in the gateway's
-//! memory for a day. An Admin's.
+//! memory for a day. Admins only.
 
 use std::time::Duration;
 
@@ -21,9 +21,10 @@ const MAX_ENTRIES: u64 = 500;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read the gateway's coordination log, newest first: each command a member ran, its \
-            arguments, who sent it, and how it ended, with membership changes beside them. An Admin's. \
-            Use it to see what was done to the cluster, and by whom, before doing more.",
+        "description": "Read what was done to the cluster, newest first, from the gateway's log of it: each \
+            maintenance command a member ran, its arguments, who sent it, and how it ended, with members \
+            joining and leaving beside them. Use it before doing more, to see what has already been done and \
+            by whom. Kept for a day. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {

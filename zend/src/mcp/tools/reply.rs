@@ -1,5 +1,5 @@
-//! `zend_answer {worker, answer, wait_s?}`: answer a worker that asked or is
-//! stuck; the answer is its next turn (`docs/claude_zend_gateway.md` §6.2).
+//! `task_reply {worker, answer, wait_s?}`: reply to a worker that asked or is
+//! stuck; the reply is its next turn (`docs/claude_zend_gateway.md` §6.2).
 
 use serde_json::{json, Value};
 
@@ -8,21 +8,22 @@ use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::names::Path;
 use crate::mcp::workers;
 
-pub const NAME: &str = "zend_answer";
+pub const NAME: &str = "task_reply";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Answer a zend worker that asked you a question or is stuck, by its path. The answer \
-            becomes its next message and it carries on from there, so make it the decision itself — pick one \
-            of its options, or say what to do instead — and check its pointers first when the question rests \
-            on them. Answering grants nothing: it cannot approve a merge, a deploy or anything else the user \
-            must approve. Answers as `zend_task` does: `done`, `running`, or a further question.",
+        "description": "Reply to a worker — the conversation a task runs on — that asked you a question, is \
+            stuck, or was stopped. Your reply becomes its next message and it carries on from there, so make it \
+            the decision itself: pick one of its options, or say what to do instead, and check its pointers \
+            first when the question rests on them. A reply grants nothing: it cannot approve a merge, a deploy \
+            or anything else the user must approve. Answers as `task_start` does: `done`, `running`, or a \
+            further question.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "worker": {"type": "string", "description": "The worker's path, `T:<thread>/<name>`."},
-                "answer": {"type": "string", "description": "The decision, or what to do instead."},
+                "answer": {"type": "string", "description": "Your reply: the decision, or what to do instead."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (45 by default)."}
             },
             "required": ["worker", "answer"],

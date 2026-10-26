@@ -143,17 +143,17 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 
 | Tool | Does | Returns |
 |---|---|---|
-| `zend_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
-| `zend_task {thread, name, prompt, priority?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
-| `zend_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
-| `zend_answer {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `zend_task` |
-| `zend_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
-| `zend_stop {worker, reason?, wait_s?}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `zend_answer` to redirect (§6.2) | As `zend_wait`: `stopped` once it has |
+| `thread_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
+| `task_start {thread, name, prompt, priority?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
+| `task_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
+| `task_reply {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `task_start` |
+| `task_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
+| `task_stop {worker, reason?, wait_s?}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `task_reply` to redirect (§6.2) | As `task_wait`: `stopped` once it has |
 | `journal_read {journal, entry?, offset?, limit?}` | Without `entry`: the journal's entries, one line each, with open items. With an `entry` (or an entry address, `…#12`): pages the turns behind it | The journal as the prompt reads it, or `limit` lines from `offset` (200 by default, 400 at most) |
 | `journal_grep {journal, pattern, entry?, max_results?}` | Case-insensitive substring search of a journal's entries' turns; `journal` may be a subtree (`T:review-layers/*`) | Each hit's path, entry, turn and line; 20 hits by default, 50 at most |
 | `journal_note {journal, text}` | Records a note — a decision and its reason, what the user said — on a thread or project journal as one entry (§4) | The entry's address |
-| `zend_threads {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
-| `zend_archive {thread}` | Archives a finished feature's thread | The thread's last state |
+| `thread_list {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
+| `thread_archive {thread}` | Archives a finished feature's thread | The thread's last state |
 
 **How they are served.** The member serving `/mcp` runs the tools in
 process, on the session (`zend/src/mcp/tools/`, one file per tool), not
@@ -168,7 +168,7 @@ through zend's REST routes:
   projected exactly as a chat turn is. Its draft is `journal_draft`, its
   entries `journal`, its evidence `journal_turns`, and its archive
   `archive_worker`, which keeps the journal text (§4).
-- **`zend_nudge`** queues as records under the worker's conversation
+- **`task_nudge`** queues as records under the worker's conversation
   (`zend/src/mcp/nudges.rs`), so it reaches the worker whichever member took
   the call; the loop takes the queue where a tool round's results become the
   next turn's input — after the check that ends a round with no results, so a
@@ -202,9 +202,9 @@ server-side, for as long as they take, so fan-out inside zend meets no client
 limit at all. Only Claude's wait on zend is bounded, and a tool call is never
 held longer than `wait_s`:
 
-- **Start everything, then wait on all of it.** `zend_task` answers `running`
+- **Start everything, then wait on all of it.** `task_start` answers `running`
   within `wait_s` and the worker carries on, so Claude starts as many tasks as
-  it wants in one turn. `zend_wait {workers: [...]}` then waits on the whole
+  it wants in one turn. `task_wait {workers: [...]}` then waits on the whole
   set and answers as soon as **any** of them leaves `running` — `done`,
   `question`, `stuck` or `error` — with that worker's result and, for each
   worker still running, what it has done. Claude handles that one (reads the
@@ -238,10 +238,10 @@ held longer than `wait_s`:
 
 | Client | `wait_s` default | `wait_s` at most | How long waits are carried |
 |---|---|---|---|
-| claude.ai, Claude Desktop | 45 s | 200 s, inside the 240 s cap | Polling: each `zend_wait` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
+| claude.ai, Claude Desktop | 45 s | 200 s, inside the 240 s cap | Polling: each `task_wait` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
 | Claude Code | 45 s | 3,600 s, inside the server entry's `timeout` | Polling as above by default; a longer `wait_s` holds the call, and a main-conversation call running past 2 min moves to a background task and Claude works on, notified when it answers |
 
-`zend_task`, `zend_wait` and `zend_answer` answer one of:
+`task_start`, `task_wait` and `task_reply` answer one of:
 
 | State | Meaning |
 |---|---|
@@ -269,7 +269,7 @@ stuck stays live, costing nothing while idle, until it is answered.
   may record a band of its own under `decode_band`
   (`DecodePriority::METADATA_KEY`), which the scheduler reads when it makes the
   conversation's slot (`scheduler::band::recorded_band`) in place of its
-  layer's. `zend_task` records it from `priority` — `normal` by default, `high`
+  layer's. `task_start` records it from `priority` — `normal` by default, `high`
   for a task someone is waiting on interactively — before the task's first
   turn, and a part decodes as its worker does. Priority is a decode-to-prefill
   airtime ratio, not strict ordering
@@ -288,7 +288,7 @@ anchors live: what Claude decided and why, what the user said, what each task
 found. A skill names the thread from what it is asked about; two unrelated
 tasks never share one, because a shared thread answers from the wrong history.
 
-`zend_attach` binds an MCP session to a thread and creates it on first use, so
+`thread_attach` binds an MCP session to a thread and creates it on first use, so
 `"self"` means the same thing over MCP as inside zend. Several Claude sessions
 may attach to one thread — a Claude Code session and a claude.ai chat on the
 same feature — and each entry they cause names the session it came from.
@@ -297,8 +297,8 @@ same feature — and each entry they cause names the session it came from.
 nothing in it is decoded. Each entry is built by the server from what Claude
 did, so it says exactly what Claude said, with no model between:
 
-1. **From the calls Claude makes, unasked.** Each `zend_task`, `zend_answer`
-   and `zend_nudge` becomes one entry: the task's name and what it was asked,
+1. **From the calls Claude makes, unasked.** Each `task_start`, `task_reply`
+   and `task_nudge` becomes one entry: the task's name and what it was asked,
    and, once it ends, the worker's entry line and its address
    (`T:review-layers/verify-expiry#3`). The worker's evidence stays with the
    worker; the thread holds what Claude read. Delegating is the record:
@@ -320,7 +320,7 @@ Claude learns to keep the thread from the tools' own descriptions and the
 skills (§7.1). The thread's journal is the anchor Claude re-reads after its
 own context is compacted.
 
-**A worker — one per task — is where a task's work runs.** `zend_task` creates
+**A worker — one per task — is where a task's work runs.** `task_start` creates
 it under the `name` the call gives it (§5.2). **A worker inherits its
 ancestors' journals, never their turns** (§5.1): it is minted like any
 dialogue, from `base_conv` and the priming chain (`zend/src/session.rs:3117-3123,
@@ -359,7 +359,7 @@ and they go only when its thread is tombstoned (§16). An archived conversation
 is not open, so the calendar fold, which runs over the open conversations, never
 folds it (`docs/zend_journal.md` §4.2); its addresses stay exact.
 
-**When the feature is done, the thread is archived too** (`zend_archive`), on
+**When the feature is done, the thread is archived too** (`thread_archive`), on
 Claude's call or the skill's. Until then it stands, costing nothing while
 idle: every conversation's K/V is in the substrate.
 
@@ -385,7 +385,7 @@ user turn is Claude's — the task, an answer, a nudge — so `Heard` renders
 **Every task ends with an entry.** The journal drafts on its own cadence —
 every 16 turns, or under selection pressure (`zend/src/journal/state.rs:23,
 101`) — so a long task may already have entries. When the task's turn ends,
-`zend_task` asks for a draft (`POST …/journal/draft`) and polls
+`task_start` asks for a draft (`POST …/journal/draft`) and polls
 `GET …/journal` until the journal covers the task's last turn. The task's
 result is every entry whose span overlaps the task's turns, the last of them
 first. Two things about the draft route shape this:
@@ -404,7 +404,7 @@ first. Two things about the draft route shape this:
 
 A draft that skips the final stretch (`journal_skip`, `style.rs:47-52`) still
 advances `covered_to`; the task's result is then its earlier entries, and
-`zend_task` says the final stretch added nothing.
+`task_start` says the final stretch added nothing.
 
 **The prompt makes the entry tight.** A skill's prompt ends by asking for a
 final response in a fixed shape — verdict, findings, pointers (file:line,
@@ -506,8 +506,8 @@ conversation and its descendants, and through the tools by its owner (§16).
 
 ### 5.2 Names and addresses
 
-**The call that creates a conversation names it.** `zend_attach` takes
-`thread`, `zend_task` takes `name`, and a worker starting a part names it the
+**The call that creates a conversation names it.** `thread_attach` takes
+`thread`, `task_start` takes `name`, and a worker starting a part names it the
 same way (§6.1): the name is a mandatory field, so nothing is named after the
 fact. A name is a kebab-case slug of at most 40 characters saying what the
 conversation is for — `verify-expiry`, `check-plan` — not a sequence number;
@@ -583,7 +583,7 @@ is not `journal_write`: that name is already the drafter's answer grammar,
 `journal` is one of:
 
 - `"self"` — the caller's own: a worker's own journal, or over MCP the thread
-  the session is attached to. Over MCP before any `zend_attach` it is refused:
+  the session is attached to. Over MCP before any `thread_attach` it is refused:
   a write must never land in another feature's history by an implicit default.
 - **a bare name** — resolved up the caller's lineage (§5.2); anything else is
   an error naming what was not found.
@@ -669,7 +669,7 @@ any other conversation is told it cannot start parts:
   it has ended, rather than starting it again or failing as a live-sibling
   clash. A part whose member stopped running it is started afresh, once.
 
-**Claude can fan out too**, by issuing several `zend_task` calls at once; those
+**Claude can fan out too**, by issuing several `task_start` calls at once; those
 workers are siblings under the thread. A worker's own parts are for splitting
 one task; Claude's parallel tasks are for unrelated work.
 
@@ -705,15 +705,15 @@ not a call to re-dispatch. The worker settles `question`, is not archived, and
 its working set and locks stand; its K/V is in the substrate, so a question
 waiting an hour costs nothing. The thread's journal gains a `Task asks:` entry.
 
-**The question reaches Claude as a tool result.** The `zend_task` call on the
-worker, or the `zend_wait` call whose set includes it, answers `question` with
-it — a `zend_wait` over many workers returns on the first question, however
+**The question reaches Claude as a tool result.** The `task_start` call on the
+worker, or the `task_wait` call whose set includes it, answers `question` with
+it — a `task_wait` over many workers returns on the first question, however
 long the others still run. When no call is
-waiting, `zend_threads` lists the thread as having a worker waiting, so the
+waiting, `thread_list` lists the thread as having a worker waiting, so the
 next look finds it. Claude checks what it needs through the pointers and
-answers with `zend_answer`.
+answers with `task_reply`.
 
-**The answer is the worker's next turn.** `zend_answer {worker, answer}`
+**The answer is the worker's next turn.** `task_reply {worker, answer}`
 submits it as the worker's next message through the same session path a chat
 turn takes, and the worker carries on with the answer in its history, so a
 later round, its journal and its verifier all see what was decided. The answer
@@ -727,10 +727,10 @@ rounds of a repeated call, and the round cap at `MAX_TOOL_ROUNDS = 32`
 a closing turn that may not call tools. The loop sends `StreamItem::Closing`
 when it closes (`CLOSED_BY_REPEATS`, `CLOSED_BY_CAP`), which the chat stream
 shows nothing for and the worker reads as **stuck**: it settles `stuck` with
-its closing response, unarchived, and Claude answers with `zend_answer`
+its closing response, unarchived, and Claude answers with `task_reply`
 exactly as for a question.
 
-**Claude can also push unasked.** `zend_nudge` queues guidance as records
+**Claude can also push unasked.** `task_nudge` queues guidance as records
 under the worker's conversation; the worker's next tool round takes it and
 adds it to that round's results as Claude's words, literal text under a line
 naming whose they are.
@@ -738,16 +738,16 @@ A nudge never interrupts a decoding round. Today a second message on a busy
 conversation waits on its lock until the whole turn ends
 (`zend/src/session.rs:3848-3862`), which is too late to steer it.
 
-**Claude can stop a worker going the wrong way.** `zend_stop {worker,
+**Claude can stop a worker going the wrong way.** `task_stop {worker,
 reason?}` queues a stop as a record under the worker's conversation
 (`zend/src/mcp/stops.rs`), read where a nudge is: at the worker's next tool
 round, never mid-decode. That round then closes the loop as the round cap does
 — its results carry the stop and Claude's reason, the next turn may not call
 tools, and the loop sends `StreamItem::Closing(CLOSED_BY_CLAUDE)` — so the
 worker answers with what it has found and what remains. It settles **stuck**
-with `stopped` set, unarchived: `zend_answer` redirects it ("use v2 and
-answer"), or `zend_archive` ends it. The call waits for the stop as
-`zend_wait` does. A stop the turn never reaches, because it ended without
+with `stopped` set, unarchived: `task_reply` redirects it ("use v2 and
+answer"), or `thread_archive` ends it. The call waits for the stop as
+`task_wait` does. A stop the turn never reaches, because it ended without
 another round, is cleared at settling and entered on the thread as
 `Stop dropped:`.
 
@@ -786,11 +786,11 @@ client actually reads:
 
 - **The tools' own descriptions** — the one channel both clients deliver to the
   model. claude.ai discards an MCP server's `instructions` (§13.3), so
-  `zend_attach`'s and `journal_note`'s descriptions carry the rule: attach to
+  `thread_attach`'s and `journal_note`'s descriptions carry the rule: attach to
   the feature's thread before working on it; note each decision with its
   reason, and anything the user states, with `journal_note`; read the thread's
   journal after the context is compacted; pass the thread to every
-  `zend_task`.
+  `task_start`.
 - **The server's `instructions`** say the same at more length; Claude Code
   delivers them (at most 4,096 characters, §13.3).
 - **The global skills** (§9), which every work skill's steps follow — attach,
@@ -839,11 +839,11 @@ what it holds against what maintenance counts as live
 maintenance commands on one member — `member` is its app and 16-hex-digit node
 id, as `cluster_status` lists them, sent as `x-tokera-node`
 (`web/src/cluster/route.rs:91-159`) — and answers `202 {job, command, stream}`
-(`host/src/commands/mod.rs:174-182`). `cluster_job {member, job, wait_s?}`
+(`host/src/commands/mod.rs:174-182`). `cluster_job_status {member, job, wait_s?}`
 reads `GET /v1/cluster/command/job/:id`: NDJSON, a `started` line, `step`
 lines, and one terminal `done` or `error` (`host/src/commands/jobs.rs:76-108`),
 summarised to its last state and its errors. A job is readable only on the
-member that ran it (`mod.rs:226-235`), so `cluster_job` names the same member;
+member that ran it (`mod.rs:226-235`), so `cluster_job_status` names the same member;
 one command runs per member at a time, and a second answers 409
 (`jobs.rs:134-141`), which the tool reports as busy rather than an error.
 
@@ -889,7 +889,7 @@ name before it is parsed):
 ### 8.3 Building and testing
 
 `agent_job {node?, repo, branch, program, args, timeout_s?, stage?}` runs a
-program on an agent, and `agent_log {node, job, from?, grep?}` reads it. Agents
+program on an agent, and `agent_job_log {node, job, from?, grep?}` reads it. Agents
 run inside each motherd at low priority (`motherd/motherd.yaml`,
 `motherd/agent.yaml`).
 
@@ -902,7 +902,7 @@ run inside each motherd at low priority (`motherd/motherd.yaml`,
   where it runs without waiting for it to end — the agent's `POST /v1/jobs`
   takes members only (`agent/src/routes.rs`), and this member is one.
 - **Logs** come as `tail?from=<byte>` in chunks of up to 256 KiB
-  (`agent/src/jobs.rs`). `agent_log` pages by byte offset and greps the page
+  (`agent/src/jobs.rs`). `agent_job_log` pages by byte offset and greps the page
   here; it leads with how the job stands — running or ended, its exit code,
   and what it staged.
 - **Choosing an agent** follows §11.3: sticky on `x-tokera-lineage`, a
@@ -941,9 +941,9 @@ are Admin-only at the endpoint:
 
 | Tool | keep route | Class |
 |---|---|---|
-| `keep_state {host}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended | Look |
-| `keep_trial {host, service, artifact}` | `POST /v1/keep/trial` — the trial, run as a job: accepted at once, its outcome read with `keep_state` | Care |
-| `keep_service {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |
+| `service_status {host}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended | Look |
+| `service_trial {host, service, artifact}` | `POST /v1/keep/trial` — the trial, run as a job: accepted at once, its outcome read with `service_status` | Care |
+| `service_control {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |
 
 Every trial keep runs — through the cluster or its loopback switch — is on its
 board (`keep/src/board.rs`) while it runs and after it ends, and a second is
@@ -969,16 +969,16 @@ names a `stage` — `target/release/motherd.exe` — has the agent copy that fil
 to its `stage_dir`, the machine's `keep/stage/` (`agent/src/config.rs`), once
 the run exits 0: written beside its name and renamed into place, from the
 checkout's build outputs, which the sandbox never sets aside or removes. The
-job's view answers the staged path (`Staged`), which `agent_log` reports.
+job's view answers the staged path (`Staged`), which `agent_job_log` reports.
 
 ### 8.5 The substrate
 
 | Tool | Wraps | Class |
 |---|---|---|
-| `zend_layer {name}` | `GET /v1/substrate/zend/layer/:name` | Look |
-| `zend_layer_toggle {name}` | `POST /v1/substrate/zend/layer/:name/toggle` | Care |
-| `zend_timeline {id}` | `GET /v1/substrate/zend/timeline/:tl` | Look |
-| `zend_timeline_delete {id}` | `DELETE /v1/substrate/zend/timeline/:tl` | Decide |
+| `layer_read {name}` | `GET /v1/substrate/zend/layer/:name` | Look |
+| `layer_toggle {name}` | `POST /v1/substrate/zend/layer/:name/toggle` | Care |
+| `timeline_read {id}` | `GET /v1/substrate/zend/timeline/:tl` | Look |
+| `timeline_delete {id}` | `DELETE /v1/substrate/zend/timeline/:tl` | Decide |
 
 All four exist and are `Role::Admin` (`zend/src/api/mod.rs:105-128`). Wiping a
 member's substrate is not a tool: it is the user's decision, carried out on
@@ -1190,7 +1190,7 @@ page far inside both clients' bounds.
 MCP's tasks extension (`io.modelcontextprotocol/tasks`, 2026-07-28) would
 carry long work natively, but only Claude Code's terminal CLI supports it in
 beta — not the VS Code extension — and claude.ai does not document it;
-`running` and a `zend_wait` over a set of workers work on every client, so they
+`running` and a `task_wait` over a set of workers work on every client, so they
 are the design.
 
 ### 13.3 Server instructions
@@ -1223,9 +1223,9 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 ## 14. Tests
 
 - Every tool against a mock gateway and member: each tool's request and its
-  exact response bytes, every state of §3.3, the `running` → `zend_wait` path,
+  exact response bytes, every state of §3.3, the `running` → `task_wait` path,
   every row of §15.
-- `zend_wait` over a set: answering on the first worker to leave `running`
+- `task_wait` over a set: answering on the first worker to leave `running`
   with the others' lines; a question from one worker returned while another
   still builds; the stream opened at once with progress notifications;
   `wait_s` clamped to 200 s for a claude.ai `clientInfo` and 3,600 s for
@@ -1250,7 +1250,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - Addresses: a bare name resolving upward only; an entry and a claim address;
   a folded entry's address resolving to the fold, its turns still readable; a
   cross-journal citation accepted for an ancestor and refused otherwise.
-- `"self"` over MCP refused before `zend_attach` and the thread after it;
+- `"self"` over MCP refused before `thread_attach` and the thread after it;
   `journal_note` refused to a worker; Claude's note on a `T:` and `P:` journal
   becoming one entry with its text filed behind it and no model reply.
 - Inheritance: a worker minted from `base_conv` with its thread as journal
@@ -1260,7 +1260,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   above it resealed and no descendant's own journal resealed; the reader's line
   pinned by nothing else; the 8K ancestor budget dropping the outermost lines
   first.
-- The thread: each `zend_task`, `zend_answer` and `zend_nudge` entered with the
+- The thread: each `task_start`, `task_reply` and `task_nudge` entered with the
   worker's entry, not its outcome; two attached sessions' entries each naming
   their session.
 - A task's end: the forced draft polled to `covered_to`; `draft_running`
@@ -1268,10 +1268,10 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   entry overlapping its turns.
 - The question block read only from its own line at a reply's end; a reply
   ending in one settling `question`, unarchived, with a `Task asks:` entry;
-  `zend_wait` answering it; `zend_answer` refused for a worker not waiting,
+  `task_wait` answering it; `task_reply` refused for a worker not waiting,
   landing as the next turn otherwise, entered as `Claude answered:`; a restart
   finding a finished turn. `StreamItem::Closing` settling the worker `stuck`.
-- `zend_nudge` queued, surviving a restart, and taken at the next round head,
+- `task_nudge` queued, surviving a restart, and taken at the next round head,
   never mid-decode.
 - `sub_run`: a part started under the worker's path, pinning its ancestors'
   journals; concurrent parts in one round; its entry as the tool response; a
@@ -1285,7 +1285,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - keep: its routes on its own socket — state, a trial as a job, start, stop,
   restart — against a keep on loopback; a trial refused for an artifact not
   built from `origin/main`.
-- The agent: a run job submitted through the member route; `agent_log` paging
+- The agent: a run job submitted through the member route; `agent_job_log` paging
   by byte offset and grepping; a job lost to a motherd restart reported lost.
 - One live end-to-end run per skill, graded as the replays were, before the
   routing rules make it the default.
@@ -1317,18 +1317,18 @@ and reached the way a real client reaches it:
 |---|---|
 | zend down, or not ready | `cluster_status` says so; work skills fall back to Claude; operations still run |
 | A name clashes with an ancestor's or a live sibling's | Refused before anything runs, naming the clash; the caller picks another |
-| A `journal` names nothing, or `"self"` before `zend_attach` | Refused, naming what was not found; nothing is written |
+| A `journal` names nothing, or `"self"` before `thread_attach` | Refused, naming what was not found; nothing is written |
 | A worker calls `journal_note` | Refused, saying a finding belongs in its final response |
 | A worker is blocked on a decision | It ends its final response with a question block (§6.2) rather than guessing or stopping; Claude answers and it carries on |
-| A turn hits the repeat guard or the round cap | The task answers `stuck` with the closing response; Claude answers with `zend_answer` |
-| A turn errors | `zend_task` answers `error`; the skill retries once with a fresh worker on the same thread, then falls back. The failed worker is archived like any finished one, so its evidence stays readable |
-| The forced draft is refused or skips | `zend_task` answers the task's earlier entries and says the final stretch added nothing; with none at all, the final response's text and that no entry was kept |
+| A turn hits the repeat guard or the round cap | The task answers `stuck` with the closing response; Claude answers with `task_reply` |
+| A turn errors | `task_start` answers `error`; the skill retries once with a fresh worker on the same thread, then falls back. The failed worker is archived like any finished one, so its evidence stays readable |
+| The forced draft is refused or skips | `task_start` answers the task's earlier entries and says the final stretch added nothing; with none at all, the final response's text and that no entry was kept |
 | Archiving a worker fails | The outcome is already on the thread; the worker is left live and archived by the next task on its thread |
-| A task stalls | `zend_wait` keeps answering with it still `running` past the skill's timeout; Claude does the job, and the stalled turn finishes or fails on its own |
-| A client cuts a call off before `wait_s` | Nothing is lost: the work runs on zend regardless, and the next `zend_wait` answers its state |
+| A task stalls | `task_wait` keeps answering with it still `running` past the skill's timeout; Claude does the job, and the stalled turn finishes or fails on its own |
+| A client cuts a call off before `wait_s` | Nothing is lost: the work runs on zend regardless, and the next `task_wait` answers its state |
 | A command's member is busy | `cluster_command` answers busy (409); the skill waits for the running job and retries |
-| A command's or an agent job fails | `cluster_job` / `agent_log` answer its errors; the skill reports them and stops |
-| A trial fails | keep restores the previous binary; `keep_state` reports the rollback |
+| A command's or an agent job fails | `cluster_job_status` / `agent_job_log` answer its errors; the skill reports them and stops |
+| A trial fails | keep restores the previous binary; `service_status` reports the rollback |
 | The motherd running a worker restarts mid-task | The worker resumes on the member that claims it (`resume_unfinished_turns`). Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
 | An OAuth token expires | The client refreshes it; a refused refresh signs the user in again |
 

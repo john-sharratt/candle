@@ -1,6 +1,6 @@
 ---
 name: zend-rollback
-description: Roll the cluster back to a named earlier build — a rollout of that build, planned by the gateway and started only with the user's approval — and confirm every member runs it. Uses the zend MCP's cluster_status and cluster_command tools. Use when a released build misbehaves. Always needs the user's approval. An Admin's.
+description: Roll the cluster back to a named earlier build — a rollout of that build, planned by the gateway and started only with the user's approval — and confirm every member runs it. Uses the zend MCP's cluster_status and cluster_command tools. Use when a released build misbehaves. Always needs the user's approval. Admins only.
 ---
 
 # Rolling back

@@ -1,4 +1,4 @@
-//! `npc_channel {world}`: what a world's channel has carried —
+//! `bot_channel_read {world}`: what a world's channel has carried —
 //! `GET /v1/world/:wid/channel`.
 
 use std::sync::Arc;
@@ -17,14 +17,14 @@ use crate::engine::get_channel;
 pub struct Read;
 
 impl Tool for Read {
-    const NAME: &'static str = "npc_channel";
+    const NAME: &'static str = "bot_channel_read";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Read a Battle Cities world's channel — the one every character in the \
-                world is on — as you have heard it: what was said since you joined it, oldest \
-                first. A world's id is in npc_list.",
+            "description": "Read a world's channel — the group chat every bot in that world is on — \
+                as you have heard it: what was said since you joined it, oldest first. A world's id is \
+                in bot_list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

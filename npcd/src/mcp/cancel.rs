@@ -1,4 +1,4 @@
-//! `npc_mission_cancel {npc}`: call off a character's open mission —
+//! `bot_mission_cancel {bot}`: call off a bot's open mission —
 //! `POST /v1/npc/:nid/mission/cancel`.
 
 use std::sync::Arc;
@@ -17,37 +17,36 @@ use crate::engine::mission_api;
 pub struct Cancel;
 
 impl Tool for Cancel {
-    const NAME: &'static str = "npc_mission_cancel";
+    const NAME: &'static str = "bot_mission_cancel";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Call off the mission a Battle Cities character is carrying. The \
-                character is told it was withdrawn; nothing is kept of it. Missions queued for it \
-                are untouched.",
+            "description": "Call off the mission a bot is carrying. The bot is told it was withdrawn; \
+                nothing is kept of it. Missions queued for it are untouched.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."}
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."}
                 },
-                "required": ["npc"],
+                "required": ["bot"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let npc = match string(args, "npc") {
-            Ok(n) => n,
+        let bot = match string(args, "bot") {
+            Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
         let res =
-            mission_api::cancel(State(Arc::clone(s)), Path(npc.to_string()), headers.clone()).await;
+            mission_api::cancel(State(Arc::clone(s)), Path(bot.to_string()), headers.clone()).await;
         Answer::of(read::<CancelReply>(res).await.map(|r| {
             if r.cancelled {
-                format!("Character {npc}'s mission is called off; it has been told.")
+                format!("Bot {bot}'s mission is called off; it has been told.")
             } else {
-                format!("Character {npc} was carrying no mission.")
+                format!("Bot {bot} was carrying no mission.")
             }
         }))
     }

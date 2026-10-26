@@ -5,14 +5,14 @@
 //! conversation, submitted as `POST /v1/chat/completions` submits one, so it is
 //! projected with provenance, the working set and the journal like any
 //! dialogue. It runs in a task of its own, never inside a tool call: the call
-//! that started it answers within `wait_s`, and `zend_wait` reads how it stands.
+//! that started it answers within `wait_s`, and `task_wait` reads how it stands.
 //!
 //! When a turn ends, the task asks for a journal draft at once instead of
 //! waiting for the cadence, waits for it, and takes the entries written since
 //! the turn began. Then the worker settles:
 //!
 //! - **asking** — its final response ended with the question block of
-//!   [`ASKING`] — it waits, live, for `zend_answer`;
+//!   [`ASKING`] — it waits, live, for `task_reply`;
 //! - **stuck** — the repeat guard or the round cap closed its tools — it waits
 //!   the same way;
 //! - **done** or **failed** — it is archived, its evidence kept.
@@ -391,7 +391,7 @@ pub fn nudge(
             "`{}` is not working, so it would never read a nudge; {}",
             worker.path(),
             if worker.state.live() {
-                "it waits on an answer — use `zend_answer`"
+                "it waits on an answer — use `task_reply`"
             } else {
                 "it has finished — start a new task"
             }
@@ -431,7 +431,7 @@ pub fn stop(
             "`{}` is not running, so there is nothing to stop; {}",
             worker.path(),
             if worker.state.live() {
-                "it waits on an answer — redirect it with `zend_answer`"
+                "it waits on an answer — redirect it with `task_reply`"
             } else {
                 "it has finished"
             }
@@ -512,7 +512,7 @@ enum Ended {
 }
 
 impl Ended {
-    /// Whether Claude stopped the turn (`zend_stop`).
+    /// Whether Claude stopped the turn (`task_stop`).
     fn stopped(&self) -> bool {
         matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CLAUDE)
     }
@@ -1203,7 +1203,7 @@ mod tests {
         assert!(!w.stopped);
 
         // **A stopped worker is live, and says Claude stopped it**: stuck,
-        // so `zend_answer` redirects it.
+        // so `task_reply` redirects it.
         let mut w = worker();
         let (label, line) = settle(
             &mut w,

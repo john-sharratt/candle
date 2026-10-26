@@ -1,7 +1,7 @@
-//! `zend_timeline {id, offset?, limit?}`: one conversation in the substrate
+//! `timeline_read {id, offset?, limit?}`: one conversation in the substrate
 //! (`docs/claude_zend_gateway.md` §8.5) — `GET
 //! /v1/substrate/zend/timeline/:tl`, read in process: what it is, its lineage,
-//! and its turns a page at a time, each cut to its first line. An Admin's.
+//! and its turns a page at a time, each cut to its first line. Admins only.
 
 use serde_json::{json, Value};
 
@@ -10,7 +10,7 @@ use crate::api::substrate::TimelineDetail;
 use crate::mcp::ops;
 use crate::mcp::workers::first_line;
 
-pub const NAME: &str = "zend_timeline";
+pub const NAME: &str = "timeline_read";
 
 const DEFAULT_LIMIT: usize = 40;
 const MAX_LIMIT: usize = 400;
@@ -20,10 +20,10 @@ const HALF: usize = 160;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read one conversation in zend's substrate by its timeline id, as `zend_layer` lists \
-            it: its label, layer, tokens, metadata and lineage, then its turns a page at a time — each \
-            turn's index, kind (normal, or a summary of turns or of summaries), tokens, and the first line \
-            of each half. An Admin's.",
+        "description": "Read one stored conversation — a timeline in zend's substrate, the store everything \
+            zend keeps lives in — by the id `layer_read` lists: its label, layer, tokens, metadata and \
+            lineage, then its turns a page at a time, each with its index, kind (normal, or a summary of \
+            turns or of summaries), tokens, and the first line of each half. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -96,7 +96,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         })
         .and_then(|s| s.parse::<u64>().ok())
     else {
-        return Answer::error("`id` is a timeline id, a decimal number as `zend_layer` lists it");
+        return Answer::error("`id` is a timeline id, a decimal number as `layer_read` lists it");
     };
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let limit = (args

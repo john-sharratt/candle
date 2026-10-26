@@ -1,7 +1,7 @@
 //! `agent_job {node?, repo, branch, program, args, timeout_s?}`: run a program
 //! on an agent (`docs/claude_zend_gateway.md` §8.3) — a build, a test run —
 //! against a branch as the agent fetches it. It answers once the job has
-//! started; `agent_log` reads it. An Admin's.
+//! started; `agent_job_log` reads it. Admins only.
 //!
 //! The job goes over this member's own agent stream, placed as the gateway
 //! places any job — sticky on the caller, spilling to an idle agent, low
@@ -24,21 +24,23 @@ const MAX_TIMEOUT_S: u64 = 4 * 3_600;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Run a program — a build, a test run — on an agent, against a repository's branch as \
-            it stands on origin: a program and its arguments, never a shell line, within the agent's \
-            allow-list. Answers the job and the agent it runs on; read it with `agent_log`. A job lives in \
-            its agent's process: one lost to a restart is reported lost, and is run again. Name `node` to \
-            pin an agent; otherwise the gateway places it. An Admin's.",
+        "description": "Run a build or a test run on a build agent — a cluster machine that checks out a \
+            repository and runs programs on it, never one serving traffic — against a branch as it stands on \
+            origin. Give a program and its arguments, never a shell line; the agent runs only programs on \
+            its allow-list. Answers the job id and the agent it runs on; follow it with `agent_job_log`. A \
+            job lives in its agent's process: one lost to a restart is reported lost, and is run again. Name \
+            `node` to pin an agent; otherwise the gateway picks one. With `stage`, the file the job builds is \
+            staged for `service_trial` once the job succeeds. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "node": {"type": "string", "description": "The agent's node, to pin one."},
+                "node": {"type": "string", "description": "The agent's node id, to pin one."},
                 "repo": {"type": "string", "description": "The repository, as the workspace names it."},
                 "branch": {"type": "string", "description": "The branch to run on."},
                 "program": {"type": "string", "description": "The program, e.g. `cargo`."},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "Its arguments."},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_S, "description": "The longest it may run (1800 by default)."},
-                "stage": {"type": "string", "description": "A file the job builds, relative to the checkout — `target/release/motherd.exe` — staged for that machine's keep once the job exits 0; `agent_log` answers where."}
+                "stage": {"type": "string", "description": "A file the job builds, relative to the checkout — `target/release/motherd.exe` — staged for `service_trial` on that machine once the job exits 0; `agent_job_log` answers where."}
             },
             "required": ["repo", "branch", "program", "args"],
             "additionalProperties": false
@@ -74,7 +76,7 @@ pub fn job_of(args: &Value) -> Result<RunJob, String> {
     })
 }
 
-/// An agent's node as `agent_log` takes it.
+/// An agent's node as `agent_job_log` takes it.
 pub fn place(node: u64) -> String {
     format!("{node:016x}")
 }
@@ -106,8 +108,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     match agents.node_of(at) {
         Ok(node) => Answer::ok(format!(
-            "Started `{command}` as job {} on agent {}: {:?}. Read it with `agent_log {{node: \"{}\", \
-             job: \"{}\"}}`.",
+            "Started `{command}` as job {} on agent {}: {:?}. Read it with `agent_job_log {{node: \
+             \"{}\", job: \"{}\"}}`.",
             view.id,
             place(node),
             view.status,

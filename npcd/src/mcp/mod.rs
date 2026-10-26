@@ -1,6 +1,8 @@
-//! Battle Cities' MCP server, at `/v1/mcp` (`docs/mcp_app.md` §4): the tools
-//! that operate the game's characters — list them, give and manage their
-//! missions, message them, read and speak on their world's channel.
+//! npcd's MCP server, at `/v1/mcp` (`docs/mcp_app.md` §4): the tools that
+//! manage the caller's characters as **bots** — list them, give and manage
+//! their missions, message them, read and speak on their world's channel. The
+//! model meets them as bots to be managed; a bot is an npcd character, named by
+//! its `npc_id`.
 //!
 //! **Each tool is its route, called in-process.** A tool calls the handler
 //! that answers the same act over HTTP, with the caller's own headers, and
@@ -11,20 +13,20 @@
 //! asks more than `User` — speaking on a channel, a Creator's — makes it
 //! itself.
 //!
-//! A call reaches the member holding the character or world it names
+//! A call reaches the member holding the bot or world it names
 //! (`Derived::McpSubject`), where that route's handler would run.
 //!
 //! | Module | Tool |
 //! |---|---|
-//! | [`list`] | `npc_list` — the caller's characters |
-//! | [`mission`] | `npc_mission` — what a character carries, and how its last went |
-//! | [`give`] | `npc_mission_give` — give one a mission |
-//! | [`step`] | `npc_mission_step` — sign off or add a step |
-//! | [`cancel`] | `npc_mission_cancel` — call off its mission |
-//! | [`message`] | `npc_message` — message it on its handset |
-//! | [`messages`] | `npc_messages` — the caller's thread with it |
-//! | [`channel`] | `npc_channel` — a world's channel |
-//! | [`channel_post`] | `npc_channel_post` — speak on a world's channel |
+//! | [`list`] | `bot_list` — the caller's bots |
+//! | [`mission_read`] | `bot_mission_read` — what a bot carries, and how its last went |
+//! | [`give`] | `bot_mission_give` — give one a mission |
+//! | [`step`] | `bot_mission_step` — sign off or add a step |
+//! | [`cancel`] | `bot_mission_cancel` — call off its mission |
+//! | [`message_send`] | `bot_message_send` — message it on its handset |
+//! | [`message_read`] | `bot_message_read` — the caller's thread with it |
+//! | [`channel_read`] | `bot_channel_read` — a world's channel |
+//! | [`channel_post`] | `bot_channel_post` — speak on a world's channel |
 //!
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
 //! [`view`] words a mission.
@@ -46,30 +48,32 @@ use crate::identity::require;
 
 pub mod args;
 pub mod cancel;
-pub mod channel;
 pub mod channel_post;
+pub mod channel_read;
 pub mod give;
 pub mod list;
-pub mod message;
-pub mod messages;
-pub mod mission;
+pub mod message_read;
+pub mod message_send;
+pub mod mission_read;
 pub mod route;
 pub mod step;
 pub mod view;
 
-/// What the server is, plainly: it operates a game's characters.
-pub const DESCRIPTION: &str = "Battle Cities: operate the game's characters — list them, give and \
-manage their missions, message them, and read and speak on their world's channel.";
+/// What the server is, plainly: it manages bots.
+pub const DESCRIPTION: &str =
+    "Bots: manage your bots — list them, give and manage their missions, \
+message them, and read and speak on their world's channel.";
 
 /// How the tools go together.
-pub const INSTRUCTIONS: &str = "The npc_* tools operate Battle Cities, Tokera's game. npc_list \
-names your characters; the others take a character's id from it. Give a mission with \
-npc_mission_give and follow it with npc_mission; talk to a character with npc_message and read its \
-answers with npc_messages.";
+pub const INSTRUCTIONS: &str =
+    "The bot_* tools manage your bots: autonomous agents, each living in \
+a world and acting on its own. bot_list names them; the others take a bot's id from it. Give a \
+mission with bot_mission_give and follow it with bot_mission_read; talk to a bot with \
+bot_message_send and read its replies with bot_message_read.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
-    name: "battle-cities".into(),
-    title: "Battle Cities".into(),
+    name: "bots".into(),
+    title: "Bots".into(),
     description: DESCRIPTION.into(),
     instructions: INSTRUCTIONS.into(),
     icon: None,
@@ -108,7 +112,7 @@ impl Answer {
     }
 }
 
-/// One Battle Cities tool.
+/// One bot tool.
 pub trait Tool {
     const NAME: &'static str;
     fn definition() -> Value;
@@ -123,13 +127,13 @@ pub trait Tool {
 pub fn definitions() -> Value {
     json!([
         list::List::definition(),
-        mission::Mission::definition(),
+        mission_read::Mission::definition(),
         give::Give::definition(),
         step::Step::definition(),
         cancel::Cancel::definition(),
-        message::Message::definition(),
-        messages::Thread::definition(),
-        channel::Read::definition(),
+        message_send::Message::definition(),
+        message_read::Thread::definition(),
+        channel_read::Read::definition(),
         channel_post::Post::definition(),
     ])
 }
@@ -138,13 +142,13 @@ pub fn definitions() -> Value {
 pub async fn call(s: &Arc<Authored>, headers: &HeaderMap, name: &str, args: &Value) -> Answer {
     match name {
         list::List::NAME => list::List::call(s, headers, args).await,
-        mission::Mission::NAME => mission::Mission::call(s, headers, args).await,
+        mission_read::Mission::NAME => mission_read::Mission::call(s, headers, args).await,
         give::Give::NAME => give::Give::call(s, headers, args).await,
         step::Step::NAME => step::Step::call(s, headers, args).await,
         cancel::Cancel::NAME => cancel::Cancel::call(s, headers, args).await,
-        message::Message::NAME => message::Message::call(s, headers, args).await,
-        messages::Thread::NAME => messages::Thread::call(s, headers, args).await,
-        channel::Read::NAME => channel::Read::call(s, headers, args).await,
+        message_send::Message::NAME => message_send::Message::call(s, headers, args).await,
+        message_read::Thread::NAME => message_read::Thread::call(s, headers, args).await,
+        channel_read::Read::NAME => channel_read::Read::call(s, headers, args).await,
         channel_post::Post::NAME => channel_post::Post::call(s, headers, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }
@@ -204,10 +208,12 @@ impl Server for Authored {
 
 #[cfg(test)]
 mod tests {
+    use cluster::dispatch::MCP_SUBJECTS;
+
     use super::*;
 
     #[test]
-    fn every_tool_has_an_npc_name_a_description_and_an_object_schema() {
+    fn every_tool_has_a_bot_name_a_description_and_an_object_schema() {
         let defs = definitions();
         let names: Vec<&str> = defs
             .as_array()
@@ -222,22 +228,21 @@ mod tests {
         assert_eq!(
             names,
             [
-                "npc_list",
-                "npc_mission",
-                "npc_mission_give",
-                "npc_mission_step",
-                "npc_mission_cancel",
-                "npc_message",
-                "npc_messages",
-                "npc_channel",
-                "npc_channel_post"
+                "bot_list",
+                "bot_mission_read",
+                "bot_mission_give",
+                "bot_mission_step",
+                "bot_mission_cancel",
+                "bot_message_send",
+                "bot_message_read",
+                "bot_channel_read",
+                "bot_channel_post"
             ]
         );
     }
 
-    /// **Every tool acting on a character or a world names it as the cluster
-    /// routes by** — `npc` or `world` — so the call reaches the member holding
-    /// it (`cluster::dispatch::MCP_SUBJECTS`).
+    /// **Every tool acting on a bot or a world names it as the cluster routes
+    /// by** ([`MCP_SUBJECTS`]), so the call reaches the member holding it.
     #[test]
     fn every_tool_names_its_subject_as_the_cluster_routes_by() {
         for d in definitions().as_array().unwrap() {
@@ -246,11 +251,11 @@ mod tests {
                 .as_array()
                 .map(|r| r.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            if d["name"] == "npc_list" {
+            if d["name"] == "bot_list" {
                 assert!(required.is_empty());
                 continue;
             }
-            let subject = ["npc", "world"]
+            let subject = MCP_SUBJECTS
                 .into_iter()
                 .find(|k| props.contains_key(*k))
                 .unwrap_or_else(|| panic!("{} names no subject", d["name"]));

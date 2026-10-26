@@ -1,4 +1,4 @@
-//! `npc_messages {npc}`: the caller's thread with a character —
+//! `bot_message_read {bot}`: the caller's thread with a bot —
 //! `GET /v1/npc/:nid/message`.
 
 use std::sync::Arc;
@@ -17,40 +17,40 @@ use crate::engine::get_messages;
 pub struct Thread;
 
 impl Tool for Thread {
-    const NAME: &'static str = "npc_messages";
+    const NAME: &'static str = "bot_message_read";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Read your handset thread with a Battle Cities character, oldest first: \
-                what you sent it and what it answered.",
+            "description": "Read your message thread with a bot, oldest first: what you sent it with \
+                bot_message_send and what it replied.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."}
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."}
                 },
-                "required": ["npc"],
+                "required": ["bot"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let npc = match string(args, "npc") {
-            Ok(n) => n,
+        let bot = match string(args, "bot") {
+            Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
-        let res = get_messages(State(Arc::clone(s)), headers.clone(), Path(npc.to_string())).await;
-        Answer::of(read::<Messages>(res).await.map(|t| render(npc, &t)))
+        let res = get_messages(State(Arc::clone(s)), headers.clone(), Path(bot.to_string())).await;
+        Answer::of(read::<Messages>(res).await.map(|t| render(bot, &t)))
     }
 }
 
 /// The thread, a line per message.
-pub fn render(npc: &str, t: &Messages) -> String {
+pub fn render(bot: &str, t: &Messages) -> String {
     if !t.in_a_world {
-        return format!("Character {npc} has no body in a world, so there is no handset thread.");
+        return format!("Bot {bot} is in no world, so there is no handset thread.");
     }
-    let with = t.with.as_deref().unwrap_or(npc);
+    let with = t.with.as_deref().unwrap_or(bot);
     if t.messages.is_empty() {
         return format!("Nothing has been said between you and {with} yet.");
     }
@@ -91,7 +91,7 @@ mod tests {
         };
         assert_eq!(
             render("1z", &away),
-            "Character 1z has no body in a world, so there is no handset thread."
+            "Bot 1z is in no world, so there is no handset thread."
         );
     }
 }

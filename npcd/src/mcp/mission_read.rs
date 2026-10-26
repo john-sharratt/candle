@@ -1,4 +1,4 @@
-//! `npc_mission {npc}`: what a character is carrying, and how its last mission
+//! `bot_mission_read {bot}`: what a bot is carrying, and how its last mission
 //! went — `GET /v1/npc/:nid/mission`.
 
 use std::sync::Arc;
@@ -17,38 +17,37 @@ use crate::engine::mission_api;
 pub struct Mission;
 
 impl Tool for Mission {
-    const NAME: &'static str = "npc_mission";
+    const NAME: &'static str = "bot_mission_read";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Read a Battle Cities character's mission: the one it is carrying — its \
-                brief, each step and whether it was achieved or thwarted — and the last one it \
-                finished, with its answer and its report (pass or fail, and its account), and how \
-                many more are queued for it. Call it again to follow a mission as the character \
-                works.",
+            "description": "Read a bot's missions: the one it is carrying — its brief, each step and \
+                whether it was achieved or thwarted — and the last one it finished, with its answer and \
+                its report (pass or fail, and its account), and how many more are queued for it. Call \
+                it again to follow a mission as the bot works.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."}
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."}
                 },
-                "required": ["npc"],
+                "required": ["bot"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let npc = match string(args, "npc") {
-            Ok(n) => n,
+        let bot = match string(args, "bot") {
+            Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
         let res =
-            mission_api::status(State(Arc::clone(s)), Path(npc.to_string()), headers.clone()).await;
+            mission_api::status(State(Arc::clone(s)), Path(bot.to_string()), headers.clone()).await;
         Answer::of(
             read::<MissionStatus>(res)
                 .await
-                .map(|st| view::status(npc, &st)),
+                .map(|st| view::status(bot, &st)),
         )
     }
 }

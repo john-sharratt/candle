@@ -1,4 +1,4 @@
-//! `zend_wait {workers, wait_s?}`: wait on one or more workers, answering as
+//! `task_wait {workers, wait_s?}`: wait on one or more workers, answering as
 //! soon as any of them stops running (`docs/claude_zend_gateway.md` §3.3).
 
 use serde_json::{json, Value};
@@ -9,20 +9,19 @@ use crate::mcp::reported::{self, Mark};
 use crate::mcp::threads::{State, Worker};
 use crate::mcp::workers;
 
-pub const NAME: &str = "zend_wait";
+pub const NAME: &str = "task_wait";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Wait on running zend workers, by path (`T:<thread>/<name>`, as `zend_task` answered \
-            it). Answers as soon as any of them stops running — done with its journal entry, failed, asking you \
-            a question, or stuck — and one line for each still running, so start every task first and wait on \
-            them all; handle the one that settled (answer a question or a stuck worker with `zend_answer`), \
-            then wait again on the rest. A worker that is done answers with its final response in full. If \
-            `wait_s` passes first, every one is still running, and each says what it has done so far — its \
-            rounds, thinking and tool calls — with any journal entries it has written since you last heard: \
-            call again, or stop waiting if the entries already answer you. Every answer gives only entries \
-            you have not been given before. The work runs on zend whether or not anyone waits.",
+        "description": "Wait on running workers, by the paths `task_start` answered (`T:<thread>/<name>`). \
+            Answers as soon as any one stops running — done, failed, asking you a question, or stuck — with a \
+            line for each still running. So start every task first and wait on them all, handle the one that \
+            settled (reply to a question or a stuck worker with `task_reply`), then wait again on the rest. A \
+            worker that is done answers with its final response in full. If `wait_s` passes first, each says \
+            what it has done so far, with any journal entries it wrote since you last heard: call again, or \
+            stop waiting if the entries already answer you. No entry is given twice. The work goes on whether \
+            or not anyone waits.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -57,19 +56,19 @@ pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
     match w.state {
         State::Running => format!("{} — {}{entries}", w.path(), w.doing(workers::now_ms())),
         State::Question => format!(
-            "{} — asks Claude (answer with `zend_answer`; it waits until then):\n{}{entries}",
+            "{} — asks Claude (reply with `task_reply`; it waits until then):\n{}{entries}",
             w.path(),
             w.question.as_deref().unwrap_or("")
         ),
         State::Stuck if w.stopped => format!(
-            "{} — stopped, as you asked; it is live. Redirect it with `zend_answer`, or end it \
-             with `zend_archive`. Its closing response:\n{}{entries}",
+            "{} — stopped, as you asked; it is live. Redirect it with `task_reply`, or end it \
+             with `thread_archive`. Its closing response:\n{}{entries}",
             w.path(),
             w.final_text
         ),
         State::Stuck => format!(
             "{} — stuck: the repeat guard or the round cap closed its tools. Say how to go on \
-             with `zend_answer`. Its closing response:\n{}{entries}",
+             with `task_reply`. Its closing response:\n{}{entries}",
             w.path(),
             w.final_text
         ),
@@ -120,7 +119,7 @@ pub fn render(read: &[(String, Option<Worker>)], seen: &dyn Fn(&Worker) -> Optio
 /// and answer with [`render`], carrying the entries it hands over as marks to
 /// keep once it is delivered, so the next answer gives only newer ones. A wait
 /// its client's ceiling cut short says so while anything still runs. What
-/// `zend_wait`, `zend_task` and `zend_answer` answer.
+/// `task_wait`, `task_start` and `task_reply` answer.
 pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Wait) -> Answer {
     let owner = ctx.caller.key();
     let read = match workers::wait(
@@ -230,7 +229,7 @@ mod tests {
         asks.question = Some("QUESTION: Inclusive?".into());
         assert_eq!(
             result_of(&asks, None),
-            "T:review/v — asks Claude (answer with `zend_answer`; it waits until then):\n\
+            "T:review/v — asks Claude (reply with `task_reply`; it waits until then):\n\
              QUESTION: Inclusive?"
         );
         let stuck = worker("v", State::Stuck);

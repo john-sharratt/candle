@@ -1,6 +1,6 @@
-//! `zend_layer {name, offset?, limit?}`: the conversations one projection layer
+//! `layer_read {name, offset?, limit?}`: the conversations one projection layer
 //! holds (`docs/claude_zend_gateway.md` §8.5) — `GET
-//! /v1/substrate/zend/layer/:name`, read in process. An Admin's.
+//! /v1/substrate/zend/layer/:name`, read in process. Admins only.
 
 use serde_json::{json, Value};
 
@@ -8,7 +8,7 @@ use super::{string, Answer, Ctx, LOADING};
 use crate::api::substrate::LayerConversations;
 use crate::mcp::ops;
 
-pub const NAME: &str = "zend_layer";
+pub const NAME: &str = "layer_read";
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
@@ -16,10 +16,11 @@ const MAX_LIMIT: usize = 500;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "List the conversations one of zend's projection layers holds — `repo_map`, \
-            `code_reading`, `dependency_analysis`, `code_review`, `security_review`, `dialogue` — each with \
-            its timeline id, label, repository, turns and tokens, a page at a time. The timeline id is what \
-            `zend_timeline` reads. An Admin's.",
+        "description": "Read what one of zend's projection layers holds. A layer is one kind of analysis kept \
+            about the repositories — `repo_map`, `code_reading`, `dependency_analysis`, `code_review`, \
+            `security_review`, `dialogue` — and workers read from it; each piece of it is a stored \
+            conversation, a timeline. Lists the layer's timelines, each with its id, label, repository, \
+            turns and tokens, a page at a time; read one with `timeline_read`. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {

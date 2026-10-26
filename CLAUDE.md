@@ -310,7 +310,7 @@ default is to delegate, through the skills in `skills/` (`zend-thread` first):
 
 - **Delegate** anything reading-heavy or mechanical — implementing a spec,
   answering a codebase question, writing tests, building, testing, a trial
-  deploy, watching, reviewing, researching — as a `zend_task` on this work's
+  deploy, watching, reviewing, researching — as a `task_start` on this work's
   thread.
 - **Call directly** the short operations — `cluster_status`, `cluster_logs`, a
   job's result.

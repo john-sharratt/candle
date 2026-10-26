@@ -1,6 +1,6 @@
 ---
 name: zend-test
-description: Build a branch and run its tests on a cluster agent — never on a member serving traffic — and report pass or fail, the failing tests and their output, using the zend MCP's agent_job and agent_log tools. Use to test a branch before review or merge. An Admin's.
+description: Build a branch and run its tests on a cluster agent — never on a member serving traffic — and report pass or fail, the failing tests and their output, using the zend MCP's agent_job and agent_job_log tools. Use to test a branch before review or merge. Admins only.
 ---
 
 # Testing a branch on an agent
@@ -11,11 +11,11 @@ description: Build a branch and run its tests on a cluster agent — never on a 
    timeout_s}` — e.g. `["test", "-p", "<crate>", "--no-fail-fast"]`. Name
    the crates the change touches; the whole workspace takes long. One job per
    crate, started together, when several are touched.
-2. Read it: `agent_log {node, job}` answers how it stands; when it is still
+2. Read it: `agent_job_log {node, job}` answers how it stands; when it is still
    running, wait a little and read again with `from` set to where the last
    page ended. The job's outcome is in its first line once it has ended: exit
    code, and `timed out` if it ran past `timeout_s`.
-3. On failure, find the failures: `agent_log {node, job, grep: "FAILED"}`, then
+3. On failure, find the failures: `agent_job_log {node, job, grep: "FAILED"}`, then
    read around each — `panicked at`, the assertion values.
 4. Report:
    - **PASS** or **FAIL**, per crate, with the `test result:` line quoted.

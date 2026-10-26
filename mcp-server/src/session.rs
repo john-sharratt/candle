@@ -33,7 +33,7 @@ pub struct Session {
     pub owner: String,
     pub client: Client,
     pub protocol: String,
-    /// What the server keeps on it, by name: zend the thread `zend_attach`
+    /// What the server keeps on it, by name: zend the thread `thread_attach`
     /// bound it to, an aggregator its sessions on the servers it wraps.
     #[serde(default)]
     pub held: BTreeMap<String, String>,

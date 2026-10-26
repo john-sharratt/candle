@@ -1,4 +1,4 @@
-//! `npc_message {npc, text}`: message a character on its handset —
+//! `bot_message_send {bot, text}`: message a bot on its handset —
 //! `POST /v1/npc/:nid/message`.
 
 use std::sync::Arc;
@@ -18,29 +18,29 @@ use crate::engine::post_message;
 pub struct Message;
 
 impl Tool for Message {
-    const NAME: &'static str = "npc_message";
+    const NAME: &'static str = "bot_message_send";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Message a Battle Cities character on its handset, as you — the thread \
-                the characters themselves use, so it reads and answers it as it would anyone's. \
-                Read its replies with npc_messages.",
+            "description": "Message a bot on its handset — the phone it carries in its world — as you. \
+                Bots message each other the same way, so it reads and answers yours as it would \
+                anyone's, in its own time. Read its replies with bot_message_read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."},
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."},
                     "text": {"type": "string", "description": "What to say."}
                 },
-                "required": ["npc", "text"],
+                "required": ["bot", "text"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let (npc, text) = match (string(args, "npc"), string(args, "text")) {
-            (Ok(n), Ok(t)) => (n, t),
+        let (bot, text) = match (string(args, "bot"), string(args, "text")) {
+            (Ok(b), Ok(t)) => (b, t),
             (Err(e), _) | (_, Err(e)) => return Answer::error(e),
         };
         let say = Say {
@@ -49,7 +49,7 @@ impl Tool for Message {
         let res = post_message(
             State(Arc::clone(s)),
             headers.clone(),
-            Path(npc.to_string()),
+            Path(bot.to_string()),
             Ok(Json(say)),
         )
         .await;

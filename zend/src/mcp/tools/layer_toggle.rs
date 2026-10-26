@@ -1,9 +1,9 @@
-//! `zend_layer_toggle {name}`: flip a projection layer's kill switch
+//! `layer_toggle {name}`: flip a projection layer's kill switch
 //! (`docs/claude_zend_gateway.md` §8.5) — `POST
 //! /v1/substrate/zend/layer/:name/toggle`. The switch is held in each member's
 //! memory, so on a clustered member the request goes up and the gateway asks
 //! every member; alone, it flips this one. A restart clears it. A Care
-//! operation, an Admin's.
+//! operation, Admins only.
 
 use std::time::Duration;
 
@@ -13,18 +13,18 @@ use serde_json::{json, Value};
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 
-pub const NAME: &str = "zend_layer_toggle";
+pub const NAME: &str = "layer_toggle";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Flip one projection layer out of, or back into, every member's projection — to test \
-            whether a layer's content is behind a bad answer. Held in memory: a restart clears it. Answers \
-            each member's new state. An Admin's.",
+        "description": "Switch one projection layer off, or back on, on every member: while off, workers do \
+            not read from it — to test whether a layer's content is behind a bad answer. Held in memory: a \
+            restart switches it back on. Answers each member's new state. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The layer."}
+                "name": {"type": "string", "description": "The layer, as `layer_read` names it."}
             },
             "required": ["name"],
             "additionalProperties": false

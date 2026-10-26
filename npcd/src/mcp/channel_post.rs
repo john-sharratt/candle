@@ -1,4 +1,4 @@
-//! `npc_channel_post {world, text}`: speak on a world's channel —
+//! `bot_channel_post {world, text}`: speak on a world's channel —
 //! `POST /v1/world/:wid/channel`, a Creator's.
 
 use std::sync::Arc;
@@ -20,14 +20,13 @@ use crate::identity::require;
 pub struct Post;
 
 impl Tool for Post {
-    const NAME: &'static str = "npc_channel_post";
+    const NAME: &'static str = "bot_channel_post";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Speak on a Battle Cities world's channel, as you: every character in \
-                the world hears it. Only the game's Creator may; for one character, use \
-                npc_message.",
+            "description": "Post on a world's channel, as you: every bot in that world hears it. Only a \
+                person with the game's Creator role may post; to reach one bot, use bot_message_send.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

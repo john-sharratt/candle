@@ -1,7 +1,7 @@
-//! `keep_state {host}`: how a machine's keep stands
-//! (`docs/claude_zend_gateway.md` §8.4) — each service it keeps: its stable
-//! file's build, whether it runs, the trial running on it and how the last one
-//! ended. An Admin's.
+//! `service_status {host}`: how a machine's services stand, as its keep — the
+//! supervisor that runs them — reports (`docs/claude_zend_gateway.md` §8.4):
+//! each one's stable file's build, whether it runs, the trial running on it and
+//! how the last one ended. Admins only.
 
 use std::time::Duration;
 
@@ -13,14 +13,16 @@ use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 use crate::mcp::workers::now_ms;
 
-pub const NAME: &str = "keep_state";
+pub const NAME: &str = "service_status";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read a machine's keep: each service it keeps (motherd, web) — the build its stable \
-            file holds, whether it runs, any trial running on it, and how the last trial ended, proven or \
-            rolled back. Read it after `keep_trial` to learn the trial's outcome. An Admin's.",
+        "description": "Read how one machine's services stand — motherd (the daemon running zend and npcd) \
+            and web (the gateway) — as keep, the supervisor that runs them, reports it: the build each one's \
+            installed binary is, whether it runs, any trial of a new build in progress, and how the last \
+            trial ended, proven or rolled back. Read it after `service_trial` to learn the trial's outcome. \
+            Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -1,5 +1,5 @@
 //! MCP sessions, kept as records so any member answers a client
-//! (`docs/claude_zend_gateway.md` §3), and the signal a waiting `zend_wait`
+//! (`docs/claude_zend_gateway.md` §3), and the signal a waiting `task_wait`
 //! wakes on.
 //!
 //! - **Sessions** are `mcp_server`'s ([`mcp_server::session`]): a handshake
@@ -7,11 +7,11 @@
 //!   person, its client and — when the aggregator calls on its behalf — the
 //!   aggregator's own session. zend keeps them in its substrate
 //!   ([`RecordStore`]), so every member reads the same ones, and holds one
-//!   thing on each: the thread `zend_attach` bound it to ([`ATTACHED`]), which
+//!   thing on each: the thread `thread_attach` bound it to ([`ATTACHED`]), which
 //!   `"self"` names. Which client opened it bounds how long a call may wait
 //!   (§3.3).
 //! - **A change signal**, bumped whenever a worker's state moves on this
-//!   member, which `zend_wait` wakes on; it also re-reads every few seconds,
+//!   member, which `task_wait` wakes on; it also re-reads every few seconds,
 //!   since a worker another member runs changes its record without bumping
 //!   this one.
 
@@ -30,7 +30,7 @@ use super::records::Records;
 /// stop waiting on what it reads.
 pub const DEFAULT_WAIT_S: u64 = 45;
 
-/// What a session holds the thread `zend_attach` bound it to under.
+/// What a session holds the thread `thread_attach` bound it to under.
 pub const ATTACHED: &str = "attached";
 
 const PREFIX: &str = "mcp/session/";

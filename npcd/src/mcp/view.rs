@@ -1,4 +1,4 @@
-//! How a character's mission reads in a tool's answer: its brief, each step
+//! How a bot's mission reads in a tool's answer: its brief, each step
 //! and how it went, its answer and report, and what waits behind it.
 
 use crate::engine::bodies::{MissionStatus, MissionView};
@@ -55,12 +55,12 @@ pub fn mission(m: &MissionView) -> String {
     out
 }
 
-/// What a character is carrying, what it last finished, and how many more
-/// are queued for it.
-pub fn status(npc: &str, s: &MissionStatus) -> String {
+/// What a bot is carrying, what it last finished, and how many more are
+/// queued for it.
+pub fn status(bot: &str, s: &MissionStatus) -> String {
     let mut out = match (&s.mission, s.on_mission) {
-        (Some(m), true) => format!("Character {npc} is on a mission.\n{}", mission(m)),
-        _ => format!("Character {npc} is not on a mission."),
+        (Some(m), true) => format!("Bot {bot} is on a mission.\n{}", mission(m)),
+        _ => format!("Bot {bot} is not on a mission."),
     };
     let last_shown = s.on_mission.then_some(()).and(s.mission.as_ref());
     if let Some(done) = &s.finished {
@@ -137,7 +137,7 @@ mod tests {
             lodged: 2,
         };
         let text = status("1z", &s);
-        assert!(text.starts_with("Character 1z is on a mission.\nOpen — "));
+        assert!(text.starts_with("Bot 1z is on a mission.\nOpen — "));
         assert!(text.contains("\n\nLast finished:\nFinished — "));
         assert!(text.ends_with("\n\n2 more queued for it at the command table."));
         let idle = MissionStatus {
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(
             status("1z", &idle),
             format!(
-                "Character 1z is not on a mission.\n\nLast finished:\n{}",
+                "Bot 1z is not on a mission.\n\nLast finished:\n{}",
                 mission(&view(false))
             )
         );

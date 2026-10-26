@@ -17,8 +17,8 @@ The feature's thread, or `review-<branch>` for a standalone review.
 
 ## Delegate
 
-For a large change, split it: one `zend_task` per area, started together,
-then one `zend_wait` over all of them. Each with this prompt:
+For a large change, split it: one `task_start` per area, started together,
+then one `task_wait` over all of them. Each with this prompt:
 
 ```
 Review <branch | these files | this diff> of <repository> for:

@@ -289,7 +289,7 @@ mod tests {
                 &caller(),
                 &on,
                 "tools/call",
-                json!({"name": "npc_list"}),
+                json!({"name": "bot_list"}),
                 true,
             )
             .build()
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(
             body["params"],
             json!({
-                "name": "npc_list",
+                "name": "bot_list",
                 "_meta": {
                     "io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
                     "com.tokera/session": "s1",

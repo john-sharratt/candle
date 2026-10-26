@@ -1,4 +1,4 @@
-//! `zend_archive {thread}`: archive a finished feature's thread
+//! `thread_archive {thread}`: archive a finished feature's thread
 //! (`docs/claude_zend_gateway.md` §4).
 //!
 //! A thread is archived only when nothing on it is still working; its workers
@@ -12,13 +12,13 @@ use crate::mcp::names;
 use crate::mcp::threads::{self, Note, State, Thread};
 use crate::mcp::workers::now_ms;
 
-pub const NAME: &str = "zend_archive";
+pub const NAME: &str = "thread_archive";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Archive a thread whose feature is done, so it no longer lists as open. Refused while \
-            any worker on it is still running; workers waiting on an answer are archived with it, their \
+            any worker on it is still running; workers waiting on a reply are archived with it, their \
             questions kept. Its journal and every worker's evidence stay readable, and attaching to the \
             thread again reopens it.",
         "inputSchema": {

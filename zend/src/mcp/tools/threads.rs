@@ -1,4 +1,4 @@
-//! `zend_threads {include_archived?}`: the caller's threads, newest first, and
+//! `thread_list {include_archived?}`: the caller's threads, newest first, and
 //! how each stands (`docs/claude_zend_gateway.md` §3.2, §6.2).
 
 use serde_json::{json, Value};
@@ -7,15 +7,15 @@ use super::{Answer, Ctx};
 use crate::mcp::threads::{self, State, Thread, Worker};
 use crate::mcp::workers::{first_line, now_ms};
 
-pub const NAME: &str = "zend_threads";
+pub const NAME: &str = "thread_list";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "List your zend threads, newest first: each one's path, how many tasks it has had, \
-            each worker still running with what it has done so far, and any waiting on you — a question to \
-            answer, or a stuck worker — with its path. Use it to find the thread of a feature you worked on before, and to see what is \
-            waiting on you when no call was open to return it.",
+        "description": "List your threads, newest first: each one's path, how many tasks it has had, each \
+            worker still running with what it has done so far, and any waiting on you — a question to answer, \
+            or a stuck worker — with its path. Use it to find the thread of a feature you worked on before, \
+            and to see what is waiting on you when no call was open to return it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -90,7 +90,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         })
         .collect();
     if lines.is_empty() {
-        return Answer::ok("You have no threads yet: `zend_attach` starts one.");
+        return Answer::ok("You have no threads yet: `thread_attach` starts one.");
     }
     Answer::ok(lines.join("\n"))
 }

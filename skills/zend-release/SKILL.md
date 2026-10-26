@@ -1,6 +1,6 @@
 ---
 name: zend-release
-description: Take a commit on origin/main through the whole release — tests on an agent, a keep trial on one machine, the cluster's certification of the candidate watched to its end, and the rollout watched member by member — stopping at each decision for the user's approval. Uses the zend MCP's operations tools. Use when the user asks to release or roll out a build. An Admin's.
+description: Take a commit on origin/main through the whole release — tests on an agent, a keep trial on one machine, the cluster's certification of the candidate watched to its end, and the rollout watched member by member — stopping at each decision for the user's approval. Uses the zend MCP's operations tools. Use when the user asks to release or roll out a build. Admins only.
 ---
 
 # Releasing a build
@@ -40,7 +40,7 @@ certifies it by mirroring traffic.
 3. With approval: `cluster_command {name: "rollout", args: {app: "zend",
    build, confirm: "<build>"}, confirm: "approved by the user"}`.
 4. Watch member by member with `cluster_status` until every member runs the
-   build and is ready. `cluster_job` reads the rollout's job.
+   build and is ready. `cluster_job_status` reads the rollout's job.
 5. Report: every member, its build, `started` time and state.
 
 ## If anything goes wrong

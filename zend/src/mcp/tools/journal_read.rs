@@ -21,14 +21,14 @@ const DEFAULT_LINES: u64 = 200;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read a journal. `journal` is `\"self\"` for the thread this session is attached to, \
-            a thread's path (`T:<thread>`) for every task started on it and how each ended, a worker's \
-            path (`T:<thread>/<name>`) for the entries its conversation kept, or a project's \
-            (`P:<repository>`) for its standing rules. With `entry` — or an address, `T:<thread>/<name>#12` \
-            — reads one entry: for a worker, pages the turns behind it — the evidence behind a claim — \
-            `limit` lines from `offset`; for a thread or project, the note itself. Read the entry first, \
-            and the turns only where a claim needs checking. Re-read the thread's journal after your \
-            context is compacted.",
+        "description": "Read a journal: a thread's, a worker's or a project's. `journal` names it — \
+            `\"self\"` or `T:<thread>` for a thread (every task started on it, how each ended, and the notes on \
+            it); `T:<thread>/<name>` for a worker (the entries it wrote about its work); `P:<repository>` for a \
+            project (its standing rules). With `entry`, or an address such as `T:<thread>/<name>#12`, it reads \
+            one entry instead: a thread's or project's note, or — for a worker — the turns behind that entry, \
+            `limit` lines from `offset`, which are the evidence for what it claims. Read the entry first and its \
+            turns only where a claim needs checking. Re-read the thread's journal after your context is \
+            compacted.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -47,7 +47,7 @@ pub fn definition() -> Value {
 fn resolve(ctx: &Ctx, journal: &str) -> Result<Path, String> {
     if journal == "self" {
         return ctx.attached().map(Path::Thread).ok_or_else(|| {
-            "`self` names the attached thread, and none is attached: call `zend_attach` first"
+            "`self` names the attached thread, and none is attached: call `thread_attach` first"
                 .into()
         });
     }

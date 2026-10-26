@@ -1,4 +1,4 @@
-//! `zend_attach {thread}`: bind the MCP session to a thread, creating it on
+//! `thread_attach {thread}`: bind the MCP session to a thread, creating it on
 //! first use (`docs/claude_zend_gateway.md` §4).
 
 use serde_json::{json, Value};
@@ -9,17 +9,18 @@ use crate::mcp::state::ATTACHED;
 use crate::mcp::threads;
 use crate::mcp::workers::now_ms;
 
-pub const NAME: &str = "zend_attach";
+pub const NAME: &str = "thread_attach";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Attach this session to a zend thread — Claude's own conversation in zend for one \
-            feature or area — creating it on first use. Attach before working on a feature, and again \
-            after your context is compacted. A thread is named for what it is about, as a kebab-case slug \
-            (`review-layers`, `bc-wearables`); two unrelated pieces of work never share one. Answers the \
-            thread's path and its journal: every task started on it and how each ended. After attaching, \
-            `\"self\"` names this thread in `journal_read`.",
+        "description": "Attach this session to a thread, creating it on first use. A thread is the place for \
+            one feature or area of work: the tasks you delegate for it run under it, and its journal keeps \
+            every task started and how it ended, and every decision you note. Attach before working on a \
+            feature, and again after your context is compacted. Name a thread for what it is about, as a \
+            kebab-case slug (`review-layers`, `bc-wearables`); two unrelated pieces of work never share one. \
+            Answers the thread's path and its journal. After attaching, `\"self\"` names this thread in the \
+            `journal_*` tools.",
         "inputSchema": {
             "type": "object",
             "properties": {

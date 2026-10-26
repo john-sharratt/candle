@@ -33,10 +33,10 @@ static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub enum State {
     Running,
     /// Its turn ended asking Claude a question; it waits, live, for
-    /// `zend_answer`.
+    /// `task_reply`.
     Question,
     /// The repeat guard or the round cap closed its tools; it waits, live, for
-    /// `zend_answer` to say how to go on.
+    /// `task_reply` to say how to go on.
     Stuck,
     Done,
     Error,
@@ -49,7 +49,7 @@ impl State {
         matches!(self, Self::Running | Self::Question | Self::Stuck)
     }
 
-    /// Whether zend is still working on it: what `zend_wait` waits out.
+    /// Whether zend is still working on it: what `task_wait` waits out.
     pub fn working(self) -> bool {
         matches!(self, Self::Running)
     }
@@ -142,8 +142,8 @@ pub struct Worker {
     /// Why its turn ended with no journal entry, as the draft recorded it;
     /// none when it kept one.
     pub no_entry: Option<String>,
-    /// Whether Claude stopped its last turn (`zend_stop`): it is stuck, live,
-    /// for `zend_answer` to redirect.
+    /// Whether Claude stopped its last turn (`task_stop`): it is stuck, live,
+    /// for `task_reply` to redirect.
     #[serde(default)]
     pub stopped: bool,
 }
@@ -201,7 +201,7 @@ impl Worker {
 pub struct Thread {
     pub name: String,
     pub created_ms: u64,
-    /// The feature is done (`zend_archive`); attaching to it again reopens it.
+    /// The feature is done (`thread_archive`); attaching to it again reopens it.
     #[serde(default)]
     pub archived: bool,
 }

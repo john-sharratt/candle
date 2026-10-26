@@ -18,14 +18,13 @@ const MAX_NOTE: usize = 2_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Record a note on a thread's journal: a decision and why, something the user said or \
-            asked for, a constraint every later task must keep. Note each decision as you make it — the \
-            thread's journal is what you re-read after your context is compacted, and every worker on the \
-            thread starts with it in its prompt. One note per decision, in a sentence or two. `journal` is \
-            `\"self\"` for the attached thread, or `T:<thread>`. A standing rule of a whole repository — a \
-            convention from its CLAUDE.md, something the user says always holds — goes on its project \
-            journal, `P:<repository>`, which every task in every thread starts with. Workers' journals are \
-            written by the workers themselves.",
+        "description": "Record a note on a thread's or a project's journal: a decision and why, something the \
+            user said or asked for, a constraint every later task must keep. One note per decision, in a \
+            sentence or two, as you make it — the thread's journal is what you re-read after your context is \
+            compacted, and every worker on the thread starts with it in its prompt. `journal` is `\"self\"` \
+            for the attached thread, or `T:<thread>`. A standing rule of a whole repository — a convention \
+            from its CLAUDE.md, something the user says always holds — goes on its project journal, \
+            `P:<repository>`, which every task in every thread starts with. Workers write their own journals.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -74,7 +73,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         match ctx.attached() {
             Some(t) => Target::Thread(t),
             None => return Answer::error(
-                "`self` names the attached thread, and none is attached: call `zend_attach` first",
+                "`self` names the attached thread, and none is attached: call `thread_attach` first",
             ),
         }
     } else {

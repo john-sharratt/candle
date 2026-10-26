@@ -1,7 +1,7 @@
-//! `agent_log {node, job, from?, grep?}`: read an agent job's log
+//! `agent_job_log {node, job, from?, grep?}`: read an agent job's log
 //! (`docs/claude_zend_gateway.md` §8.3), a page at a time by byte offset — the
 //! agent hands out at most 256 KiB per read — and, with `grep`, only the lines
-//! of the page that hold it. An Admin's.
+//! of the page that hold it. Admins only.
 
 use std::fmt::Display;
 
@@ -11,20 +11,20 @@ use serde_json::{json, Value};
 use super::{string, Answer, Ctx};
 use crate::mcp::ops;
 
-pub const NAME: &str = "agent_log";
+pub const NAME: &str = "agent_job_log";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read an agent job: how it stands — running or ended, its exit code, and for a job \
-            that staged a build, where — then its log from byte `from` (0 by default): a page of up to \
-            256 KiB and the offset to read on from. With `grep`, only the page's lines that hold it \
-            (ignoring case), numbered as in the page. Read the last page for a test summary or a build \
-            error. An Admin's.",
+        "description": "Read a job `agent_job` started: how it stands — running or ended, its exit code, and \
+            for a job that staged a build, where the build is — then its log from byte `from` (0 by \
+            default), a page of up to 256 KiB with the offset to read on from. With `grep`, only the page's \
+            lines that hold it (ignoring case), numbered as in the page. Read the last page for a test \
+            summary or a build error. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "node": {"type": "string", "description": "The agent's node, as `agent_job` answered it."},
+                "node": {"type": "string", "description": "The agent's node id, as `agent_job` answered it."},
                 "job": {"type": "string", "description": "The job's id."},
                 "from": {"type": "integer", "minimum": 0, "description": "The byte to read from."},
                 "grep": {"type": "string", "description": "Only lines holding this text, ignoring case."}

@@ -1,7 +1,7 @@
 //! `gateway_command {name, args?, confirm?}`: one of the gateway's own commands
 //! (`docs/claude_zend_gateway.md` §8.2) — `raise-floor`, `cancel-floor`. Each is
 //! a decision, refused without the user's approval. It reaches the gateway this
-//! member's socket is on. An Admin's.
+//! member's socket is on. Admins only.
 //!
 //! The gateway's drain is not one: draining closes the very socket this tool
 //! reaches the gateway by, and a drained gateway admits none for an undrain to
@@ -28,11 +28,13 @@ pub fn route_of(name: &str) -> Option<String> {
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Run one of the gateway's own commands: `raise-floor` (end an app's grace period now) \
-            or `cancel-floor` (discard its pending floor), with `args: {app}`. Each is a decision: ask \
-            the user, and pass `confirm: \"approved by the user\"` only with their approval. Draining a \
-            gateway is not a tool — it would cut this connection — and is done from the gateway's page. \
-            An Admin's.",
+        "description": "Run one of the gateway's own upgrade commands, for an app (`zend` or `npcd`) whose \
+            members are moving to a new build. During an upgrade the gateway keeps routing to members on the \
+            older build for a grace period, until the app's floor — the oldest build it still routes to — \
+            rises. `raise-floor` raises it now, ending the grace period; `cancel-floor` drops a pending rise. \
+            Pass `args: {app}`. Each is a decision: ask the user, and pass `confirm: \"approved by the user\"` \
+            only with their approval. Draining a gateway is not a tool — it would cut this connection — and \
+            is done from the gateway's page. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {

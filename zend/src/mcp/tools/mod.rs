@@ -1,16 +1,22 @@
-//! The tools `/mcp` offers, one file each: its definition — name, description,
-//! input schema — and its call. The work tools (`docs/claude_zend_gateway.md`
-//! §3.2) delegate to zend and read what came back; the operations tools (§8)
-//! see and run the cluster — its members, their commands, the agents, each
-//! machine's keep, the substrate — and every one but `cluster_status` and
-//! `cluster_logs` is an Admin's, with each decision gated on the user's
-//! approval ([`super::ops`]).
+//! The tools zend's MCP server offers, one file each: its definition — name,
+//! description, input schema — and its call. The work tools
+//! (`docs/claude_zend_gateway.md` §3.2) delegate to zend and read what came
+//! back; the operations tools (§8) see and run the cluster — its members,
+//! their commands, the build agents, each machine's service supervisor, the
+//! substrate — and every one but `cluster_status` and `cluster_logs` is for
+//! Admins only, with each decision gated on the user's approval
+//! ([`super::ops`]).
+//!
+//! A tool's name says what it acts on and what it does to it — `task_start`,
+//! `service_status` — never the process that serves it.
 //!
 //! **The descriptions carry the rules.** claude.ai discards a server's
 //! `instructions` (§13.3), so what Claude must do to keep its thread — attach
 //! first, name each task for what it is for, read the journal after its
 //! context is compacted — is said in the descriptions, the one channel every
-//! client delivers.
+//! client delivers. **And they define their terms**: a model meets these tools
+//! cold, so a description glosses the system's own words where it uses them —
+//! a worker, a member, a build agent, keep — and opens with what the tool does.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,31 +31,31 @@ use super::state::{ATTACHED, DEFAULT_WAIT_S};
 use crate::session::ZendSession;
 
 mod agent_job;
-mod agent_log;
-mod answer;
+mod agent_job_log;
 mod archive;
 mod attach;
 mod cluster_audit;
 mod cluster_command;
-mod cluster_job;
+mod cluster_job_status;
 mod cluster_logs;
 mod cluster_status;
 mod gateway_command;
 mod journal_grep;
 mod journal_note;
 mod journal_read;
-mod keep_service;
-mod keep_state;
-mod keep_trial;
+mod layer_read;
+mod layer_toggle;
 mod nudge;
+mod reply;
+mod service_control;
+mod service_status;
+mod service_trial;
 mod stop;
 mod task;
 mod threads;
+mod timeline_delete;
+mod timeline_read;
 pub(crate) mod wait;
-mod zend_layer;
-mod zend_layer_toggle;
-mod zend_timeline;
-mod zend_timeline_delete;
 
 /// What a tool answers when it needs the model and zend is still loading it.
 pub const LOADING: &str = "zend is still loading its model; try again shortly";
@@ -127,7 +133,7 @@ pub fn definitions() -> Value {
         attach::definition(),
         task::definition(),
         wait::definition(),
-        answer::definition(),
+        reply::definition(),
         nudge::definition(),
         stop::definition(),
         journal_read::definition(),
@@ -139,17 +145,17 @@ pub fn definitions() -> Value {
         cluster_logs::definition(),
         cluster_audit::definition(),
         cluster_command::definition(),
-        cluster_job::definition(),
+        cluster_job_status::definition(),
         gateway_command::definition(),
         agent_job::definition(),
-        agent_log::definition(),
-        keep_state::definition(),
-        keep_trial::definition(),
-        keep_service::definition(),
-        zend_layer::definition(),
-        zend_layer_toggle::definition(),
-        zend_timeline::definition(),
-        zend_timeline_delete::definition(),
+        agent_job_log::definition(),
+        service_status::definition(),
+        service_trial::definition(),
+        service_control::definition(),
+        layer_read::definition(),
+        layer_toggle::definition(),
+        timeline_read::definition(),
+        timeline_delete::definition(),
     ])
 }
 
@@ -159,7 +165,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         attach::NAME => attach::call(ctx, args),
         task::NAME => task::call(ctx, args).await,
         wait::NAME => wait::call(ctx, args).await,
-        answer::NAME => answer::call(ctx, args).await,
+        reply::NAME => reply::call(ctx, args).await,
         nudge::NAME => nudge::call(ctx, args),
         stop::NAME => stop::call(ctx, args).await,
         journal_read::NAME => journal_read::call(ctx, args),
@@ -171,17 +177,17 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
-        cluster_job::NAME => cluster_job::call(ctx, args).await,
+        cluster_job_status::NAME => cluster_job_status::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
         agent_job::NAME => agent_job::call(ctx, args).await,
-        agent_log::NAME => agent_log::call(ctx, args).await,
-        keep_state::NAME => keep_state::call(ctx, args).await,
-        keep_trial::NAME => keep_trial::call(ctx, args).await,
-        keep_service::NAME => keep_service::call(ctx, args).await,
-        zend_layer::NAME => zend_layer::call(ctx, args),
-        zend_layer_toggle::NAME => zend_layer_toggle::call(ctx, args).await,
-        zend_timeline::NAME => zend_timeline::call(ctx, args),
-        zend_timeline_delete::NAME => zend_timeline_delete::call(ctx, args).await,
+        agent_job_log::NAME => agent_job_log::call(ctx, args).await,
+        service_status::NAME => service_status::call(ctx, args).await,
+        service_trial::NAME => service_trial::call(ctx, args).await,
+        service_control::NAME => service_control::call(ctx, args).await,
+        layer_read::NAME => layer_read::call(ctx, args),
+        layer_toggle::NAME => layer_toggle::call(ctx, args).await,
+        timeline_read::NAME => timeline_read::call(ctx, args),
+        timeline_delete::NAME => timeline_delete::call(ctx, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }
 }
@@ -255,32 +261,32 @@ mod tests {
         assert_eq!(
             names,
             [
-                "zend_attach",
-                "zend_task",
-                "zend_wait",
-                "zend_answer",
-                "zend_nudge",
-                "zend_stop",
+                "thread_attach",
+                "task_start",
+                "task_wait",
+                "task_reply",
+                "task_nudge",
+                "task_stop",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
-                "zend_threads",
-                "zend_archive",
+                "thread_list",
+                "thread_archive",
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
                 "cluster_command",
-                "cluster_job",
+                "cluster_job_status",
                 "gateway_command",
                 "agent_job",
-                "agent_log",
-                "keep_state",
-                "keep_trial",
-                "keep_service",
-                "zend_layer",
-                "zend_layer_toggle",
-                "zend_timeline",
-                "zend_timeline_delete"
+                "agent_job_log",
+                "service_status",
+                "service_trial",
+                "service_control",
+                "layer_read",
+                "layer_toggle",
+                "timeline_read",
+                "timeline_delete"
             ]
         );
     }

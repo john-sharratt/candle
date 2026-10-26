@@ -1,9 +1,10 @@
-//! `keep_trial {host, service, artifact}`: try a build on one machine through
-//! its keep (`docs/claude_zend_gateway.md` §8.4) — keep's A/B trial, run as a
-//! job: accepted at once, its outcome read with `keep_state`. keep refuses an
-//! artifact not built exactly from a commit on `origin/main`, and promotes it
-//! only once it serves, restoring the previous binary otherwise, so a bad build
-//! cannot keep a member down. A Care operation, an Admin's.
+//! `service_trial {host, service, artifact}`: try a build of a service on one
+//! machine through its keep (`docs/claude_zend_gateway.md` §8.4) — keep's A/B
+//! trial, run as a job: accepted at once, its outcome read with
+//! `service_status`. keep refuses an artifact not built exactly from a commit
+//! on `origin/main`, and promotes it only once it serves, restoring the
+//! previous binary otherwise, so a bad build cannot keep a member down. A Care
+//! operation, Admins only.
 
 use std::time::Duration;
 
@@ -13,20 +14,21 @@ use serde_json::{json, Value};
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 
-pub const NAME: &str = "keep_trial";
+pub const NAME: &str = "service_trial";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Try a staged build on one machine through its keep: keep runs the artifact on the \
-            service's stable path and promotes it once it prints its serving line, within ten minutes, or \
-            puts the previous binary back. Answers at once; read the outcome with `keep_state`. Only a \
-            build of a commit on origin/main is tried — a branch is tested on an agent. `artifact` is a \
-            path on that machine, as the build job that staged it answered.",
+        "description": "Try a new build of a service — motherd or web — on one machine. keep, the supervisor \
+            that runs the machine's services, starts the build in place of the installed one and keeps it \
+            once it reports it is serving, within ten minutes; otherwise it puts the previous binary back. \
+            Answers at once; read the outcome with `service_status`. Only a build of a commit on origin/main \
+            is tried — test a branch with `agent_job`. `artifact` is the build's path on that machine, as \
+            `agent_job_log` answered it for the job that staged it. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "The machine."},
+                "host": {"type": "string", "description": "The machine, as `cluster_status` names it."},
                 "service": {"type": "string", "enum": ["motherd", "web"]},
                 "artifact": {"type": "string", "description": "The staged executable's path on that machine."}
             },
@@ -61,7 +63,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     match reply.and_then(|r| json_of(&r)) {
         Ok(_) => Answer::ok(format!(
             "keep on {host} is trying {artifact} as {service}: it is proven once it serves, within \
-             ten minutes, or rolled back. Read the outcome with `keep_state {{host: \"{host}\"}}`."
+             ten minutes, or rolled back. Read the outcome with `service_status {{host: \"{host}\"}}`."
         )),
         Err(e) => Answer::error(format!("keep on {host}: {e}")),
     }

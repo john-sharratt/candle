@@ -1,5 +1,5 @@
-//! `npc_mission_give {npc, brief, steps?, start?}`: give a character a
-//! mission — `POST /v1/npc/:nid/mission`.
+//! `bot_mission_give {bot, brief, steps?, start?}`: give a bot a mission —
+//! `POST /v1/npc/:nid/mission`.
 
 use std::sync::Arc;
 
@@ -18,34 +18,34 @@ use crate::engine::mission_api;
 pub struct Give;
 
 impl Tool for Give {
-    const NAME: &'static str = "npc_mission_give";
+    const NAME: &'static str = "bot_mission_give";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Give a Battle Cities character a mission: a `brief` saying what is asked \
-                of it, and the `steps` in order. With no steps, steps are drawn from the rooms, \
-                machines and people the brief names, plus reporting back. By default it carries the \
-                mission at once and is roused to read it now — replacing any mission it was \
-                carrying; with `start` false it is queued for the character to collect at the \
-                command table. Follow it with npc_mission.",
+            "description": "Give a bot a mission: a `brief` saying what is asked of it, and the `steps` \
+                in order. With no steps, steps are drawn from the rooms, machines and people the brief \
+                names, plus reporting back. By default the bot carries the mission at once and is roused \
+                to read it now, replacing any mission it was carrying; with `start` false it is queued \
+                instead, for the bot to collect at the command table — the place in its world where \
+                bots take up missions. Follow it with bot_mission_read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."},
-                    "brief": {"type": "string", "description": "What is asked of the character."},
-                    "steps": {"type": "array", "items": {"type": "string"}, "description": "The steps, in order, each in the character's own second person (\"go to the plant room\")."},
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."},
+                    "brief": {"type": "string", "description": "What is asked of the bot."},
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "The steps, in order, each addressed to the bot (\"go to the plant room\")."},
                     "start": {"type": "boolean", "description": "Carry it now (true, the default) or queue it at the command table (false)."}
                 },
-                "required": ["npc", "brief"],
+                "required": ["bot", "brief"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let (npc, brief) = match (string(args, "npc"), string(args, "brief")) {
-            (Ok(n), Ok(b)) => (n, b),
+        let (bot, brief) = match (string(args, "bot"), string(args, "brief")) {
+            (Ok(b), Ok(t)) => (b, t),
             (Err(e), _) | (_, Err(e)) => return Answer::error(e),
         };
         let lodge = LodgeRequest {
@@ -55,27 +55,27 @@ impl Tool for Give {
         };
         let res = mission_api::lodge(
             State(Arc::clone(s)),
-            Path(npc.to_string()),
+            Path(bot.to_string()),
             headers.clone(),
             Json(lodge),
         )
         .await;
-        Answer::of(read::<LodgeReply>(res).await.map(|r| render(npc, &r)))
+        Answer::of(read::<LodgeReply>(res).await.map(|r| render(bot, &r)))
     }
 }
 
 /// What giving the mission did.
-pub fn render(npc: &str, r: &LodgeReply) -> String {
+pub fn render(bot: &str, r: &LodgeReply) -> String {
     let steps = match r.steps {
         0 => "no steps".to_string(),
         1 => "1 step".to_string(),
         n => format!("{n} steps"),
     };
     if r.carrying {
-        format!("Character {npc} is carrying it now ({steps}): {}", r.prompt)
+        format!("Bot {bot} is carrying it now ({steps}): {}", r.prompt)
     } else {
         format!(
-            "Queued for character {npc} to collect at the command table ({steps}): {}",
+            "Queued for bot {bot} to collect at the command table ({steps}): {}",
             r.prompt
         )
     }
@@ -95,7 +95,7 @@ mod tests {
         };
         assert_eq!(
             render("1z", &r),
-            "Character 1z is carrying it now (3 steps): Check the valve."
+            "Bot 1z is carrying it now (3 steps): Check the valve."
         );
         let q = LodgeReply {
             lodged: true,
@@ -105,7 +105,7 @@ mod tests {
         };
         assert_eq!(
             render("1z", &q),
-            "Queued for character 1z to collect at the command table (1 step): Check the valve."
+            "Queued for bot 1z to collect at the command table (1 step): Check the valve."
         );
     }
 }

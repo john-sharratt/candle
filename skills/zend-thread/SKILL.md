@@ -1,6 +1,6 @@
 ---
 name: zend-thread
-description: How to keep a zend thread while working with the zend MCP tools — attach to the feature's thread before delegating, note each decision and anything the user states, pass the thread to every task, and re-read its journal after context is compacted. Use whenever you call any zend_* or journal_* tool, and before following any other zend skill.
+description: How to keep a zend thread while working with the zend MCP tools — attach to the feature's thread before delegating, note each decision and anything the user states, pass the thread to every task, and re-read its journal after context is compacted. Use whenever you call any thread_*, task_* or journal_* tool, and before following any other zend skill.
 ---
 
 # Keeping a zend thread
@@ -14,7 +14,7 @@ what every later task knows.
 
 ## The loop
 
-1. **Attach first.** `zend_attach {thread}` with a kebab-case name for the
+1. **Attach first.** `thread_attach {thread}` with a kebab-case name for the
    feature (`review-layers`, `bc-wearables`, `release-5739c544`). Two
    unrelated pieces of work never share a thread: a shared thread answers from
    the wrong history. Attach again after your context is compacted.
@@ -25,24 +25,24 @@ what every later task knows.
    later tasks must keep. A standing rule of the whole repository goes on the
    project journal instead: `journal_note {journal: "P:<repository>"}`. Every
    task in every thread starts with that.
-4. **Delegate with `zend_task`**, passing the thread and a name saying what the
+4. **Delegate with `task_start`**, passing the thread and a name saying what the
    worker does. State the task in full: the worker shares the thread's
    journal, not your conversation.
 5. **Wait on everything at once.** Start every independent task first, then
-   `zend_wait {workers: [...]}` on all of them; it answers as soon as one
+   `task_wait {workers: [...]}` on all of them; it answers as soon as one
    settles, and otherwise every 45 s with what each worker has done — its
    rounds, thinking, tool calls by name — and any journal entries it wrote
    since you last heard. Tell the user one line of where things stand, then
    wait again. Stop waiting early if the entries already answer you.
 6. **Answer what asks.** A worker that is blocked ends its turn with a
    `QUESTION:` block — options, what it tried, pointers. Check the pointers,
-   decide, and `zend_answer`. A **stuck** worker (its loop was closed) is
+   decide, and `task_reply`. A **stuck** worker (its loop was closed) is
    answered the same way: say how to go on.
-7. **Steer without waiting** with `zend_nudge` while a worker runs. When its
+7. **Steer without waiting** with `task_nudge` while a worker runs. When its
    progress shows it off course — the same fetch failing, a step repeated, a
-   path you no longer want — `zend_stop` it with a reason: it stops at its next
-   tool round and answers with what it has, then `zend_answer` redirects it.
-8. **Archive** the thread with `zend_archive` once the feature is done.
+   path you no longer want — `task_stop` it with a reason: it stops at its next
+   tool round and answers with what it has, then `task_reply` redirects it.
+8. **Archive** the thread with `thread_archive` once the feature is done.
 
 ## Reading results
 
@@ -66,5 +66,5 @@ given. An entry is a line, then claims, each labelled with how it was known —
   committing under the repository's rules, any Decide operation. Those stay
   with you and the user.
 - Never paste a worker's claims to the user as fact without the check above.
-- Never let zend stall you: if `zend_wait` keeps answering `running` past
+- Never let zend stall you: if `task_wait` keeps answering `running` past
   the skill's timeout, or zend is down, do the work yourself.

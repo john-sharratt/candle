@@ -1,4 +1,4 @@
-//! `zend_nudge {worker, message}`: guidance for a running worker, taken at its
+//! `task_nudge {worker, message}`: guidance for a running worker, taken at its
 //! next tool round (`docs/claude_zend_gateway.md` §6.2).
 
 use serde_json::{json, Value};
@@ -7,16 +7,16 @@ use super::{string, Answer, Ctx};
 use crate::mcp::names::Path;
 use crate::mcp::workers;
 
-pub const NAME: &str = "zend_nudge";
+pub const NAME: &str = "task_nudge";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Send guidance to a zend worker that is still running, unasked — when its journal or \
-            its question shows it heading the wrong way, or repeating a step. The message joins its next \
-            tool round's results, so it is read at the next point the worker looks up, never mid-thought; a \
-            worker that ends its turn without another tool round never reads it, and the thread's journal \
-            says so. For a worker that asked or is stuck, use `zend_answer`.",
+        "description": "Send unasked guidance to a worker that is still running — when its journal shows it \
+            heading the wrong way, or repeating a step. The message joins its next tool round's results, so \
+            it is read at the next point the worker looks up, never mid-thought; a worker that ends its turn \
+            without another tool round never reads it, and the thread's journal says so. It does not stop the \
+            worker: for that use `task_stop`, and for a worker that asked or is stuck, `task_reply`.",
         "inputSchema": {
             "type": "object",
             "properties": {

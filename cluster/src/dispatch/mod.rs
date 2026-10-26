@@ -17,7 +17,10 @@ mod derived;
 mod extract;
 mod table;
 
-pub use derived::{content_text, conversation_key, passthrough_key, Derived, PASSTHROUGH_MODEL};
+pub use derived::{
+    content_text, conversation_key, mcp_subject_key, passthrough_key, Derived, MCP_SUBJECTS,
+    PASSTHROUGH_MODEL,
+};
 pub use extract::{extract, Extracted, BODY_LIMIT};
 pub use table::{Matched, Route, RouteTable};
 

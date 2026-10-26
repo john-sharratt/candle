@@ -1,4 +1,4 @@
-//! Guidance Claude sends a running worker unasked — `zend_nudge`
+//! Guidance Claude sends a running worker unasked — `task_nudge`
 //! (`docs/claude_zend_gateway.md` §6.2).
 //!
 //! A nudge never interrupts a decoding turn: it waits until the worker's next

@@ -19,11 +19,11 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Search journals for a word or phrase (case-insensitive substring), to find the \
-            evidence behind a claim without paging through it. `journal` is a worker's path \
-            (`T:<thread>/<name>`) to search the turns behind its entries — or one `entry` of them — or a \
-            thread's subtree (`T:<thread>/*`) to search every worker on it, `\"self\"` / `T:<thread>` \
-            for the thread's own journal, or `P:<repository>` for a project's standing rules. Each hit \
-            names its journal, entry, turn and line; read around one with `journal_read` and the entry.",
+            evidence behind a claim without paging through it. `journal` names where to search: a worker \
+            (`T:<thread>/<name>`), through the turns behind its entries, or behind one `entry`; every worker \
+            on a thread (`T:<thread>/*`), when you do not know which one learned it; a thread's own journal \
+            (`\"self\"` or `T:<thread>`); or a project's standing rules (`P:<repository>`). Each hit names its \
+            journal, entry, turn and line; read around one with `journal_read` and the entry.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -53,7 +53,7 @@ fn scope(ctx: &Ctx, journal: &str) -> Result<Scope, String> {
     let thread = |t: String| Scope::Notes(format!("T:{t}"), t);
     if journal == "self" {
         return ctx.attached().map(thread).ok_or_else(|| {
-            "`self` names the attached thread, and none is attached: call `zend_attach` first"
+            "`self` names the attached thread, and none is attached: call `thread_attach` first"
                 .into()
         });
     }

@@ -6,13 +6,21 @@ own tools as an ordinary MCP server at `/v1/mcp`. The aggregator lists all of
 those tools as one server and passes each call to the backend that lists its
 tool, as the signed-in caller.
 
-- **zend** serves the engineering tools: `zend_*`, `journal_*`, and the
-  operations tools. They are zend's own. A task's turn streams in zend's
-  process, `sub_run` calls back into the worker lifecycle, and the operations
-  tools ride zend's cluster socket (§3).
-- **npcd** serves Battle Cities' tools (§4). Each one lists characters, gives
-  or manages a mission, messages a character, or reads or posts on a world's
-  channel. Each tool is the route for the same act, called in-process.
+- **zend** serves the engineering tools: `thread_*`, `task_*`, `journal_*`,
+  `layer_*`, `timeline_*`, and the operations tools (`cluster_*`,
+  `gateway_command`, `agent_*`, `service_*`). They are zend's own. A task's
+  turn streams in zend's process, `sub_run` calls back into the worker
+  lifecycle, and the operations tools ride zend's cluster socket (§3).
+- **npcd** serves the `bot_*` tools (§4). A **bot** is what Claude is shown
+  of an npcd character: an autonomous agent, living in a world, to be
+  managed. Each tool lists bots, gives or manages a mission, messages a bot,
+  or reads or posts on a world's channel. Each tool is the route for the same
+  act, called in-process.
+
+**Naming.** A tool's name says what it acts on and what it does to it —
+`task_start`, `service_status`, `bot_message_send` — never the process that
+serves it. Its description opens with what it does and glosses the system's
+own words where it uses them: a worker, a member, a build agent, keep.
 
 There is no interface between the aggregator and the backends except MCP
 itself. The protocol is written once, in the **`mcp-server`** crate: JSON-RPC,
@@ -116,7 +124,7 @@ and a relisting keeps the routes of any backend that did not answer.
 
 zend's tools are the ones it always served (`zend/src/mcp/tools/`). Its
 sessions are records in its substrate (`zend/src/mcp/state.rs`,
-`RecordStore`), so any member answers. The thread `zend_attach` binds is held
+`RecordStore`), so any member answers. The thread `thread_attach` binds is held
 on the session under `attached`, which is what `"self"` names. The route is
 `Dispatch::Any`.
 
@@ -127,29 +135,30 @@ caller's headers. It reads the handler's answer back as that route's body type
 (`npcd/src/engine/bodies.rs`). So ownership and the wording of a refusal are
 the route's: a character the caller does not own is one npcd does not show
 them. A route's role is checked by its guard, not its handler. The one tool
-whose route asks more than `User`, `npc_channel_post`, checks the Creator role
+whose route asks more than `User`, `bot_channel_post`, checks the Creator role
 itself.
 
 | Tool | Route | Does |
 |---|---|---|
-| `npc_list {state?, world?, q?}` | `GET /v1/npc` | The caller's characters: id, name, world, state, mood |
-| `npc_mission {npc}` | `GET /v1/npc/:nid/mission` | What the character carries or last finished: brief, steps and how each went, its answer and report, how many more are queued |
-| `npc_mission_give {npc, brief, steps?, start?}` | `POST /v1/npc/:nid/mission` | Lodge a mission. `start` (true by default) carries it at once and rouses the character; false queues it for the command table |
-| `npc_mission_step {npc, done?, outcome?, add?}` | `POST /v1/npc/:nid/mission/step` | Sign off the first open step (achieved or thwarted), or add one |
-| `npc_mission_cancel {npc}` | `POST /v1/npc/:nid/mission/cancel` | Call off the open mission; the character is told |
-| `npc_message {npc, text}` | `POST /v1/npc/:nid/message` | Message the character on its handset, as the caller |
-| `npc_messages {npc}` | `GET /v1/npc/:nid/message` | The caller's thread with the character |
-| `npc_channel {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
-| `npc_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
+| `bot_list {state?, world?, q?}` | `GET /v1/npc` | The caller's bots: id, name, world, state, mood |
+| `bot_mission_read {bot}` | `GET /v1/npc/:nid/mission` | What the bot carries or last finished: brief, steps and how each went, its answer and report, how many more are queued |
+| `bot_mission_give {bot, brief, steps?, start?}` | `POST /v1/npc/:nid/mission` | Lodge a mission. `start` (true by default) carries it at once and rouses the bot; false queues it for the command table |
+| `bot_mission_step {bot, done?, outcome?, add?}` | `POST /v1/npc/:nid/mission/step` | Sign off the first open step (achieved or thwarted), or add one |
+| `bot_mission_cancel {bot}` | `POST /v1/npc/:nid/mission/cancel` | Call off the open mission; the bot is told |
+| `bot_message_send {bot, text}` | `POST /v1/npc/:nid/message` | Message the bot on its handset, as the caller |
+| `bot_message_read {bot}` | `GET /v1/npc/:nid/message` | The caller's thread with the bot |
+| `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
+| `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease
 (`Dispatch::Owner`). The MCP route goes the same way: its key is derived from
-the body (`Derived::McpSubject`). That key is a `tools/call`'s `npc`
-argument, or failing that its `world` argument. A call naming neither, and
-any other message, goes wherever the gateway's fallback sends it. Every npcd
-tool that acts on a character or a world names it under one of those two
-arguments. A test holds them to it.
+the body (`Derived::McpSubject`). That key is a `tools/call`'s `bot`
+argument — the character's `npc_id` — or failing that its `world` argument
+(`cluster::dispatch::MCP_SUBJECTS`). A call naming neither, and any other
+message, goes wherever the gateway's fallback sends it. Every npcd tool that
+acts on a bot or a world names it under one of those two arguments. A test
+holds them to it.
 
 npcd's tools hold nothing on a session, so its sessions are carried whole in
 their ids (`mcp_server::SealedStore`). A handshake one member answered is
@@ -203,8 +212,8 @@ Deploy in this order:
   characters, exactly as through npcd's routes.
 - **A mission is npcd's own**: a brief and steps, lodged as a person lodges
   one (`Origin::Lodged`), not a new kind.
-- **Watching a character work** means calling `npc_mission` and `npc_messages`
-  again. Waits with progress stay zend's pattern.
+- **Watching a bot work** means calling `bot_mission_read` and
+  `bot_message_read` again. Waits with progress stay zend's pattern.
 - **One card for every backend.** The client sees the aggregator's card. Each
   backend's card describes it as a server of its own, which is what it is when
   called directly.

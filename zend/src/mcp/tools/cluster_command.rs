@@ -1,5 +1,9 @@
 //! `cluster_command {member, name, args?, confirm?}`: run one of a member's
-//! maintenance commands (`docs/claude_zend_gateway.md` §8.2). An Admin's.
+//! maintenance commands (`docs/claude_zend_gateway.md` §8.2). Admins only.
+//!
+//! The commands it names and offers are the members' own table
+//! (`host::commands::class::COMMANDS`), so a command added there is offered
+//! here, in its class, with nothing to keep in step.
 //!
 //! - **Classed before anything is sent** ([`class_of`]): a Look runs, a Care
 //!   runs, a Decide is refused without the endpoint's `confirm` — the user's
@@ -15,7 +19,7 @@
 use std::time::Duration;
 
 use axum::http::Method;
-use host::commands::class::{class_of, Class};
+use host::commands::class::{class_of, Class, COMMANDS};
 use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
@@ -23,24 +27,39 @@ use crate::mcp::ops::{self, json_of, why};
 
 pub const NAME: &str = "cluster_command";
 
+/// The commands of `class`, by name, as the members define them.
+fn named(class: Class) -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .filter(|(_, c)| *c == class)
+        .map(|(n, _)| *n)
+        .collect()
+}
+
 pub fn definition() -> Value {
+    let (look, care, decide) = (named(Class::Look), named(Class::Care), named(Class::Decide));
+    let sendable: Vec<&str> = look.iter().chain(&care).chain(&decide).copied().collect();
     json!({
         "name": NAME,
-        "description": "Run one maintenance command on one zend member, named by its node as `cluster_status` \
-            lists it. Answers its job, which `cluster_job` reads. Look commands (audit, self-check, \
-            check-disk) and Care commands (drain, undrain, compact, maintain, expire-tombstones, catch-up, \
-            resync, rejoin, release-leases, pause-rollout, resume-rollout) run as asked. Decide commands \
-            (restart, shutdown, set-quorum, certify-anyway, reject-build, rollout, rollback, prune-builds, \
-            upgrade-now) change what the cluster runs: ask the user first, and pass `confirm: \"approved by \
-            the user\"` only with their approval for that command on that member. The member's own \
-            arguments go in `args` — `app`, `build`, `from`, `max_members`, `builds`, `keep` — and a \
-            destructive one's typed target (the machine's name; for rollout, the build) as `args.confirm`. \
-            `rollout` without `args.confirm` answers the gateway's plan and changes nothing. An Admin's.",
+        "description": format!(
+            "Run one maintenance command on one member of the cluster — a machine running zend and npcd — \
+            named by its node id as `cluster_status` lists it. Answers the job it started; read that with \
+            `cluster_job_status`. Commands come in three kinds. Look commands only read ({}) and Care \
+            commands are routine upkeep ({}): both run as asked. Decide commands change what the cluster \
+            runs ({}): ask the user first, and pass `confirm: \"approved by the user\"` only with their \
+            approval for that command on that member. A command's own arguments go in `args` — `app`, \
+            `build`, `from`, `max_members`, `builds`, `keep` — and a destructive one's typed target (the \
+            machine's name; for `rollout`, the build) as `args.confirm`. `rollout` without `args.confirm` \
+            answers the plan and changes nothing. Admins only.",
+            look.join(", "),
+            care.join(", "),
+            decide.join(", "),
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "member": {"type": "string", "description": "The member's node, 16 hex digits. Not used for rollout, which the gateway places."},
-                "name": {"type": "string", "description": "The command."},
+                "member": {"type": "string", "description": "The member's node id, 16 hex digits. Not used for `rollout`, which the gateway places."},
+                "name": {"type": "string", "enum": sendable, "description": "The command."},
                 "args": {"type": "object", "description": "The command's own arguments."},
                 "confirm": {"type": "string", "description": "`approved by the user`, for a Decide command the user approved."}
             },
@@ -66,7 +85,7 @@ pub fn gate(name: &str, confirm: Option<&str>) -> Result<Class, String> {
 /// A started job as the tool answers it.
 pub fn render_started(member: &str, answer: &Value) -> String {
     format!(
-        "Started `{}` on {member} as job {} — read it with `cluster_job {{member: \"{member}\", job: {}}}`.",
+        "Started `{}` on {member} as job {} — read it with `cluster_job_status {{member: \"{member}\", job: {}}}`.",
         answer.get("command").and_then(Value::as_str).unwrap_or("?"),
         answer.get("job").map_or_else(|| "?".into(), Value::to_string),
         answer.get("job").map_or_else(|| "?".into(), Value::to_string),
@@ -154,8 +173,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
             Err(e) => Answer::error(e),
         },
         409 => Answer::error(format!(
-            "{member} is busy with another command: {} — read its job with `cluster_job`, then try \
-             again",
+            "{member} is busy with another command: {} — read its job with `cluster_job_status`, \
+             then try again",
             why(&reply)
         )),
         status => Answer::error(format!("`{name}` on {member}: {status} — {}", why(&reply))),
@@ -189,8 +208,29 @@ mod tests {
     fn a_started_command_names_its_job_and_how_to_read_it() {
         assert_eq!(
             render_started("00000000000000ab", &json!({"job": 7, "command": "drain"})),
-            "Started `drain` on 00000000000000ab as job 7 — read it with `cluster_job {member: \
-             \"00000000000000ab\", job: 7}`."
+            "Started `drain` on 00000000000000ab as job 7 — read it with `cluster_job_status \
+             {member: \"00000000000000ab\", job: 7}`."
         );
+    }
+
+    /// **The tool offers every command a member runs through the gateway, and
+    /// nothing else**: the machine's own switches are never in its enum, and
+    /// every Decide command is named as one in the description.
+    #[test]
+    fn the_offered_commands_are_the_members_own_less_the_machines_switches() {
+        let def = definition();
+        let offered: Vec<&str> = def["inputSchema"]["properties"]["name"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(offered.len(), COMMANDS.len() - 2);
+        assert!(!offered.contains(&"offline") && !offered.contains(&"online"));
+        for name in offered {
+            assert!(gate(name, Some(ops::APPROVED)).is_ok(), "{name}");
+        }
+        let text = def["description"].as_str().unwrap();
+        assert!(text.contains(&named(Class::Decide).join(", ")), "{text}");
     }
 }

@@ -16,10 +16,11 @@ pub const NAME: &str = "cluster_status";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "How the cluster stands: each zend member — its machine, node, build, state, when it \
-            started and how its tenants (zend, npcd) stand — and, for an Admin, the gateway's view: each \
-            app's floor and ready members, upgrades in progress, members in fault. Check it before \
-            delegating heavy work, before and after any operation, and whenever a task stalls.",
+        "description": "How the cluster stands: each member — a machine running the motherd daemon, which \
+            hosts zend and npcd — with its machine name, node id, build, state, when it started, and how \
+            zend and npcd on it stand; and, for an Admin, the gateway's view: each app's floor (the oldest \
+            build it still routes to) and ready members, upgrades in progress, members in fault. Check it \
+            before delegating heavy work, before and after any operation, and whenever a task stalls.",
         "inputSchema": {
             "type": "object",
             "properties": {},

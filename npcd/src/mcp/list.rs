@@ -1,5 +1,4 @@
-//! `npc_list {state?, world?, q?}`: the caller's Battle Cities characters —
-//! `GET /v1/npc`.
+//! `bot_list {state?, world?, q?}`: the caller's bots — `GET /v1/npc`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,20 +16,21 @@ use crate::engine::bodies::NpcList;
 pub struct List;
 
 impl Tool for List {
-    const NAME: &'static str = "npc_list";
+    const NAME: &'static str = "bot_list";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "List your Battle Cities characters: each one's id (what the other npc_* \
-                tools name it by), name, world, state and mood. Filter by `state` (active, idle, \
-                asleep, suspended), by `world`, or by text in its name with `q`.",
+            "description": "List your bots — autonomous agents, each living in a world and acting on \
+                its own: each one's id (what the other bot_* tools name it by), name, world, state and \
+                mood. Filter by `state` (active, idle, asleep, \
+                suspended), by `world`, or by text in its name with `q`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "state": {"type": "string", "enum": ["active", "idle", "asleep", "suspended", "any"], "description": "Only characters in this state."},
-                    "world": {"type": "string", "description": "Only characters in this world."},
-                    "q": {"type": "string", "description": "Only characters whose name holds this text."}
+                    "state": {"type": "string", "enum": ["active", "idle", "asleep", "suspended", "any"], "description": "Only bots in this state."},
+                    "world": {"type": "string", "description": "Only bots in this world."},
+                    "q": {"type": "string", "description": "Only bots whose name holds this text."}
                 },
                 "additionalProperties": false
             }
@@ -49,15 +49,15 @@ impl Tool for List {
     }
 }
 
-/// A line per character.
+/// A line per bot.
 pub fn render(list: &NpcList) -> String {
     if list.items.is_empty() {
-        return "You have no characters that match.".into();
+        return "You have no bots that match.".into();
     }
     list.items
         .iter()
         .map(|n| {
-            let mut line = format!("{} — npc {}, {}", n.name, n.npc_id, n.state);
+            let mut line = format!("{} — bot {}, {}", n.name, n.npc_id, n.state);
             if let Some(w) = n.world_id.as_deref().filter(|w| !w.is_empty()) {
                 line.push_str(&format!(", in {w}"));
             }
@@ -76,7 +76,7 @@ mod tests {
     use crate::engine::bodies::Npc;
 
     #[test]
-    fn a_character_is_a_line_naming_its_id() {
+    fn a_bot_is_a_line_naming_its_id() {
         let list = NpcList {
             items: vec![
                 Npc {
@@ -99,11 +99,11 @@ mod tests {
         };
         assert_eq!(
             render(&list),
-            "Paxon Vael — npc 1z, active, in battle-cities, mood wary\nIone — npc 2a, asleep"
+            "Paxon Vael — bot 1z, active, in battle-cities, mood wary\nIone — bot 2a, asleep"
         );
         assert_eq!(
             render(&NpcList { items: vec![] }),
-            "You have no characters that match."
+            "You have no bots that match."
         );
     }
 }

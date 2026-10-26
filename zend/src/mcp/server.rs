@@ -19,9 +19,9 @@ use crate::session::ZendSession;
 /// the tools' descriptions say the same.
 pub const INSTRUCTIONS: &str = "zend runs work on hardware you own: delegate reading, implementing \
 against a written spec, building, testing, reviewing and researching to it, and keep orchestration, \
-design and approvals yourself. Attach to the feature's thread with zend_attach before working on it, \
-and again after your context is compacted. Start tasks with zend_task — state each in full and name it \
-for what it does — and wait on them together with zend_wait. A task's result is its worker's journal \
+design and approvals yourself. Attach to the feature's thread with thread_attach before working on it, \
+and again after your context is compacted. Start tasks with task_start — state each in full and name it \
+for what it does — and wait on them together with task_wait. A task's result is its worker's journal \
 entry: an entry is evidence, not truth, so check a claim against the turns it cites (journal_read with \
 the entry) before acting on it.";
 

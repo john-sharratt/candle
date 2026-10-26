@@ -9,9 +9,9 @@
 //! said since.
 //!
 //! **`mcp_subject`**: an MCP `tools/call` names what it acts on among its
-//! arguments — a character as `npc`, a world as `world` — and is answered by
-//! the member holding that, as the route for the same act would be
-//! (`docs/mcp_app.md` §4). Any other message names nothing.
+//! arguments — an npcd character as `bot`, a world as `world` — and is
+//! answered by the member holding that, as the route for the same act would
+//! be (`docs/mcp_app.md` §4). Any other message names nothing.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -50,7 +50,7 @@ impl Derived {
 
 /// The arguments an MCP `tools/call` may name its subject by, in the order
 /// they are looked for.
-pub const MCP_SUBJECTS: [&str; 2] = ["npc", "world"];
+pub const MCP_SUBJECTS: [&str; 2] = ["bot", "world"];
 
 /// What an MCP `tools/call` body acts on: the first of [`MCP_SUBJECTS`] its
 /// arguments name, trimmed; `None` for any other message.
@@ -210,24 +210,24 @@ mod tests {
         );
     }
 
-    /// **A tool call reaches the holder of what it acts on**: its character,
-    /// else its world; a call naming neither, and any other message, names
-    /// nothing and goes wherever the route's fallback sends it.
+    /// **A tool call reaches the holder of what it acts on**: its bot, else
+    /// its world; a call naming neither, and any other message, names nothing
+    /// and goes wherever the route's fallback sends it.
     #[test]
-    fn an_mcp_tool_call_is_keyed_by_its_character_or_its_world() {
+    fn an_mcp_tool_call_is_keyed_by_its_bot_or_its_world() {
         let call = |args: Value| {
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                   "params": {"name": "npc_mission", "arguments": args}})
+                   "params": {"name": "bot_mission_read", "arguments": args}})
         };
         assert_eq!(
-            Derived::McpSubject.key(&call(json!({"npc": " 1z ", "world": "w1"}))),
+            Derived::McpSubject.key(&call(json!({"bot": " 1z ", "world": "w1"}))),
             Some("1z".into())
         );
         assert_eq!(
             Derived::McpSubject.key(&call(json!({"world": "w1", "text": "hi"}))),
             Some("w1".into())
         );
-        assert_eq!(Derived::McpSubject.key(&call(json!({"npc": ""}))), None);
+        assert_eq!(Derived::McpSubject.key(&call(json!({"bot": ""}))), None);
         assert_eq!(Derived::McpSubject.key(&call(json!({"q": "Pax"}))), None);
         assert_eq!(
             Derived::McpSubject.key(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})),

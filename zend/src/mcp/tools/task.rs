@@ -1,4 +1,4 @@
-//! `zend_task {thread, name, prompt, priority?, wait_s?}`: start a task on a
+//! `task_start {thread, name, prompt, priority?, wait_s?}`: start a task on a
 //! new worker, and wait for it up to `wait_s` (`docs/claude_zend_gateway.md`
 //! §3.2, §3.3, §3.4).
 
@@ -9,20 +9,20 @@ use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::threads::Priority;
 use crate::mcp::workers;
 
-pub const NAME: &str = "zend_task";
+pub const NAME: &str = "task_start";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Delegate a task to zend: start it on a new worker under a thread, and wait for it \
-            up to `wait_s`. The worker is a native zend conversation with provenance over the code's \
-            analysis layers and its own tools; its result is its journal entry. State the task in full in \
-            `prompt` — what to do, what to verify before answering, and the shape of the final response \
-            (verdict, findings, pointers such as file:line). Name the worker for what it does, as a \
-            kebab-case slug (`verify-expiry`), never a number. Answers `done` with the worker's final \
-            response and its journal entries, or running with its path and what it has done so far — then \
-            call `zend_wait` on it, or start more tasks first and wait on them all at once. Pass the thread \
-            you attached to.",
+        "description": "Delegate a task: start it on a new worker under a thread, and wait for it up to \
+            `wait_s`. A worker is a model conversation running on zend, on hardware the user owns, with the \
+            repository's analysis to read from and its own tools to read, run and edit with; its result is \
+            the journal entry it writes. Pass the thread you attached to. State the task in full in `prompt` — \
+            what to do, what to verify before answering, and the shape of the final response (verdict, \
+            findings, pointers such as file:line). Name the worker for what it does, as a kebab-case slug \
+            (`verify-expiry`), never a number. Answers `done` with the worker's final response and its \
+            journal entries, or `running` with its path and what it has done so far — then call `task_wait` \
+            on it, or start more tasks first and wait on them all at once.",
         "inputSchema": {
             "type": "object",
             "properties": {

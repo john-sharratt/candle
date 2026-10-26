@@ -1,7 +1,7 @@
-//! `cluster_job {member, job, wait_s?}`: how a maintenance command's job stands
-//! (`docs/claude_zend_gateway.md` §8.2). Its stream — a `started` line, `step`
-//! lines, one terminal `done` or `error` — is read on the member that ran it, as
-//! far as it has come within `wait_s`, and summarised. An Admin's.
+//! `cluster_job_status {member, job, wait_s?}`: how a maintenance command's job
+//! stands (`docs/claude_zend_gateway.md` §8.2). Its stream — a `started` line,
+//! `step` lines, one terminal `done` or `error` — is read on the member that ran
+//! it, as far as it has come within `wait_s`, and summarised. Admins only.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::ops::{self, why};
 
-pub const NAME: &str = "cluster_job";
+pub const NAME: &str = "cluster_job_status";
 
 /// The steps a summary quotes, from the end.
 const STEPS_SHOWN: usize = 12;
@@ -19,16 +19,16 @@ const STEPS_SHOWN: usize = 12;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read a maintenance command's job on the member that ran it: whether it is running, \
-            done or failed, its last steps, and its result or error. Waits up to `wait_s` for it to end, \
-            answering as it stands then. A job lives in its member's memory: one lost to a restart is \
-            reported lost — check `cluster_status` and run the command again. An Admin's.",
+        "description": "Read how a maintenance job stands — the job `cluster_command` started on a member: \
+            whether it is running, done or failed, its last steps, and its result or error. Waits up to \
+            `wait_s` for it to end, answering as it stands then. A job lives in its member's memory: one lost \
+            to a restart is reported lost — check `cluster_status` and run the command again. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "member": {"type": "string", "description": "The member's node, as `cluster_command` answered it."},
                 "job": {"type": "integer", "minimum": 0, "description": "The job's id."},
-                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait for it to end (50 by default)."}
+                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait for it to end (45 by default)."}
             },
             "required": ["member", "job"],
             "additionalProperties": false

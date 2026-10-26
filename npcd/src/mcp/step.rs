@@ -1,5 +1,5 @@
-//! `npc_mission_step {npc, done?, outcome?, add?}`: sign off or add a step on
-//! a character's open mission — `POST /v1/npc/:nid/mission/step`.
+//! `bot_mission_step {bot, done?, outcome?, add?}`: sign off or add a step on
+//! a bot's open mission — `POST /v1/npc/:nid/mission/step`.
 
 use std::sync::Arc;
 
@@ -19,32 +19,31 @@ use crate::engine::mission_api;
 pub struct Step;
 
 impl Tool for Step {
-    const NAME: &'static str = "npc_mission_step";
+    const NAME: &'static str = "bot_mission_step";
 
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Change the steps of a Battle Cities character's open mission: sign off a \
-                step with `done` (its text, or the start of it) as achieved or, with `outcome` \
-                thwarted, as failed; or add a step with `add`. The character reads its steps again \
-                before its next turn.",
+            "description": "Change the steps of the mission a bot is carrying: sign off a step with \
+                `done` (its text, or the start of it) as achieved — or, with `outcome` thwarted, as \
+                failed — or add a step with `add`. The bot reads its steps again before it next acts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "npc": {"type": "string", "description": "The character's id, as npc_list gives it."},
+                    "bot": {"type": "string", "description": "The bot's id, as bot_list gives it."},
                     "done": {"type": "string", "description": "The step to sign off."},
                     "outcome": {"type": "string", "enum": ["achieved", "thwarted"], "description": "How it went (achieved by default)."},
                     "add": {"type": "string", "description": "A step to add."}
                 },
-                "required": ["npc"],
+                "required": ["bot"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let npc = match string(args, "npc") {
-            Ok(n) => n,
+        let bot = match string(args, "bot") {
+            Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
         let outcome = match optional(args, "outcome") {
@@ -61,17 +60,17 @@ impl Tool for Step {
         };
         let res = mission_api::step(
             State(Arc::clone(s)),
-            Path(npc.to_string()),
+            Path(bot.to_string()),
             headers.clone(),
             Json(req.clone()),
         )
         .await;
-        Answer::of(read::<StepReply>(res).await.map(|r| render(npc, &req, &r)))
+        Answer::of(read::<StepReply>(res).await.map(|r| render(bot, &req, &r)))
     }
 }
 
 /// What the step request did.
-pub fn render(npc: &str, req: &StepRequest, r: &StepReply) -> String {
+pub fn render(bot: &str, req: &StepRequest, r: &StepReply) -> String {
     let mut said = Vec::new();
     if let Some(done) = &req.done {
         said.push(match r.ticked {
@@ -92,7 +91,7 @@ pub fn render(npc: &str, req: &StepRequest, r: &StepReply) -> String {
             _ => format!("could not add \"{add}\" — it has no open mission"),
         });
     }
-    format!("Character {npc}: {}.", said.join("; "))
+    format!("Bot {bot}: {}.", said.join("; "))
 }
 
 #[cfg(test)]
@@ -115,7 +114,7 @@ mod tests {
                     added: Some(true)
                 }
             ),
-            "Character 1z: signed off \"scan the valve\" as thwarted; added \"find Pax\"."
+            "Bot 1z: signed off \"scan the valve\" as thwarted; added \"find Pax\"."
         );
         assert_eq!(
             render(
@@ -126,8 +125,8 @@ mod tests {
                     added: None
                 }
             ),
-            "Character 1z: no open step matches \"scan the valve\"; could not add \"find Pax\" — \
-             it has no open mission."
+            "Bot 1z: no open step matches \"scan the valve\"; could not add \"find Pax\" — it has \
+             no open mission."
         );
     }
 }

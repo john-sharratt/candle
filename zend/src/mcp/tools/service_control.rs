@@ -1,7 +1,7 @@
-//! `keep_service {host, service, action, confirm?}`: restart, stop or start a
-//! service through its machine's keep (`docs/claude_zend_gateway.md` §8.4). A
-//! restart and a start are Care; a stop holds the service down until it is
-//! started again, which is a decision the user approves. An Admin's.
+//! `service_control {host, service, action, confirm?}`: restart, stop or start
+//! a service through its machine's keep (`docs/claude_zend_gateway.md` §8.4).
+//! A restart and a start are Care; a stop holds the service down until it is
+//! started again, which is a decision the user approves. Admins only.
 
 use std::time::Duration;
 
@@ -11,19 +11,20 @@ use serde_json::{json, Value};
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 
-pub const NAME: &str = "keep_service";
+pub const NAME: &str = "service_control";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Restart, stop or start a service (motherd, web) through its machine's keep. A restart \
-            runs the binary already kept, with no trial; a start lifts a stop. A stop holds the service down \
-            until it is started again — a decision: ask the user, and pass `confirm: \"approved by the \
-            user\"` only with their approval. An Admin's.",
+        "description": "Restart, stop or start a service — motherd (the daemon running zend and npcd) or web \
+            (the gateway) — on one machine, through keep, the supervisor that runs them. A restart runs the \
+            installed binary again, with no trial; a start lifts a stop. A stop holds the service down until \
+            it is started again — a decision: ask the user, and pass `confirm: \"approved by the user\"` only \
+            with their approval. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "The machine."},
+                "host": {"type": "string", "description": "The machine, as `cluster_status` names it."},
                 "service": {"type": "string", "enum": ["motherd", "web"]},
                 "action": {"type": "string", "enum": ["restart", "stop", "start"]},
                 "confirm": {"type": "string", "description": "`approved by the user`, for a stop."}

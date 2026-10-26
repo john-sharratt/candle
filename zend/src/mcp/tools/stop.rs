@@ -1,4 +1,4 @@
-//! `zend_stop {worker, reason?, wait_s?}`: stop a running worker at its next
+//! `task_stop {worker, reason?, wait_s?}`: stop a running worker at its next
 //! tool round, so it answers with what it has and can be redirected
 //! (`docs/claude_zend_gateway.md` §6.2).
 
@@ -9,16 +9,16 @@ use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::names::Path;
 use crate::mcp::workers;
 
-pub const NAME: &str = "zend_stop";
+pub const NAME: &str = "task_stop";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Stop a zend worker that is running the wrong way — the same fetch failing, a step \
+        "description": "Stop a running worker that is going the wrong way — the same fetch failing, a step \
             repeated, a path you no longer want. It stops at its next tool round, never mid-thought: no \
             further tool call runs, and it answers with what it has found and what remains. It is then \
-            stopped but live: redirect it with `zend_answer`, or end it with `zend_archive`. Waits for it \
-            to stop as `zend_wait` does. For guidance that should not end its tools, use `zend_nudge`.",
+            stopped but live: redirect it with `task_reply`, or end it with `thread_archive`. Waits for it \
+            to stop as `task_wait` does. For guidance that should not end its tools, use `task_nudge`.",
         "inputSchema": {
             "type": "object",
             "properties": {

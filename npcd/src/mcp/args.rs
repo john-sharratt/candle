@@ -1,4 +1,4 @@
-//! Reading a Battle Cities tool's arguments.
+//! Reading a bot tool's arguments.
 
 use serde_json::Value;
 

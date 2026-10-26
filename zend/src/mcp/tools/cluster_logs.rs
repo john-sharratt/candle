@@ -1,6 +1,6 @@
 //! `cluster_logs`: what the members' logs say (`docs/claude_zend_gateway.md`
 //! §8.1) — `GET /v1/logs`, which the gateway asks every member and gathers;
-//! with `node`, one member's, which takes an Admin.
+//! with `node`, one member's, which is for Admins only.
 
 use std::time::Duration;
 
@@ -21,19 +21,20 @@ const MAX_LIMIT: u64 = 5000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Search the members' logs for what they say about a symptom: every member's lines that \
-            match, oldest first, each under its member. `grep` is a regular expression the whole line must \
-            match; narrow with `level`, `tenant` and `since`. A page, never a stream: call again with a later \
-            `since` to read on. Cite the lines you rely on.",
+        "description": "Search the logs of the cluster's members — the machines running zend and npcd — for \
+            what they say about a symptom: every member's matching lines, oldest first, each under its member. \
+            `grep` is a regular expression found anywhere in a line; narrow with `level`, `tenant` and \
+            `since`. A page, never a stream: call again with a later `since` to read on. Cite the lines you \
+            rely on.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "grep": {"type": "string", "description": "A regular expression each line must match."},
+                "grep": {"type": "string", "description": "A regular expression; a line is kept when it is found anywhere in it."},
                 "level": {"type": "string", "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"], "description": "The least level kept."},
                 "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one tenant wrote."},
                 "since": {"type": "string", "description": "Only lines stamped at or after this: an RFC 3339 prefix such as `2026-10-16T00:20`."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the latest kept (200 by default)."},
-                "node": {"type": "string", "description": "One member's node, as `cluster_status` lists it (an Admin's)."}
+                "node": {"type": "string", "description": "One member's node id, as `cluster_status` lists it (Admins only)."}
             },
             "additionalProperties": false
         }
