@@ -2033,6 +2033,30 @@ impl Scheduler {
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
         }
+        // **A guest waiting for room closes admission**, the queue head's forced
+        // admission included. The ground it is short of is held by work in
+        // flight, and every prefill admitted now would take what that work gives
+        // back as it finishes: on WhiteWorld (2026-10-26) draws were refused
+        // 96–928 MiB short four times while the Makers kept starting turns.
+        // Deadlock-free because the wait is: a job waits only while something
+        // is running (`EngineRoom::busy`), and for at most `ROOM_PATIENCE`, and
+        // its drain sets `settled_since_admit` when it ends. One atomic load.
+        //
+        // **Except `Urgent`.** A person waiting on the turn itself — a live
+        // dialogue's next reply — does not sit behind an image draw for minutes;
+        // it goes in unjudged, as the forced head does, and the guest waits on.
+        // Everything below it stays queued.
+        if self.guests.queue.waiting_for_room() {
+            while self.running_members() < Self::MAX_PREFILL_WIDTH
+                && self.highest_queued_band() == Some(DecodePriority::Urgent)
+            {
+                let Some(work) = self.pop_highest_band_head() else {
+                    break;
+                };
+                self.begin_forced(work);
+            }
+            return;
+        }
 
         // VRAM-pressure backpressure. Each admitted prefill pins its
         // conversation's KV in VRAM, so under pressure we shed hot KV to the
@@ -2276,6 +2300,20 @@ impl Scheduler {
             );
             self.begin_section_forced(s);
         }
+    }
+
+    /// The highest band any queued prefill or pending submission is at, without
+    /// taking it — what [`Self::pop_highest_band_head`] would take from.
+    fn highest_queued_band(&self) -> Option<DecodePriority> {
+        self.prefill_queue
+            .iter()
+            .map(|w| self.decode_priority_or_high(w.sequence_id))
+            .chain(
+                self.pending_submits
+                    .iter()
+                    .map(|p| self.decode_priority_or_high(p.parent())),
+            )
+            .max_by_key(|&b| rank(b))
     }
 
     /// Remove and return the first queued prefill of the highest band queued,
@@ -6792,6 +6830,73 @@ mod wave_chunk_tests {
         assert!(
             scheduler.settled_since_admit,
             "a prefill that left is an admission opportunity"
+        );
+    }
+
+    /// **A guest waiting for room closes admission, the forced head included.**
+    /// With nothing in flight and admission unsettled, the queue head is
+    /// normally forced in so the engine makes progress; while a guest waits,
+    /// that turn would take the ground the guest is waiting for. Once the wait
+    /// clears, the head is forced in as before.
+    #[test]
+    fn a_guest_waiting_for_room_closes_admission_and_the_forced_head() {
+        use crate::guest::work::{GuestRequest, MatteRequest};
+        use crate::guest::Guest;
+        use std::time::Duration;
+
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(seq, (0..64u32).collect()).work);
+        scheduler.settled_since_admit = false;
+
+        let queue = Arc::clone(&scheduler.guests.queue);
+        let _receipt = queue
+            .submit(GuestRequest::Matte(MatteRequest {
+                pixels: vec![0; 4 * 4 * 3],
+                width: 4,
+                height: 4,
+            }))
+            .unwrap();
+        queue.requeue(queue.take(Guest::Matte), Duration::from_secs(60));
+
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "a turn was admitted while a guest waited for its ground"
+        );
+        assert!(scheduler.active_prefills.is_empty());
+
+        // A person's own turn is not held behind the draw.
+        let live = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(live, DecodePriority::Urgent);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(live, (0..16u32).collect()).work);
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler
+                .active_prefills
+                .iter()
+                .map(|p| p.work.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![live],
+            "an urgent turn waited behind the guest, or a lower band came in with it"
+        );
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "the high turn stays queued"
+        );
+        scheduler.active_prefills.clear();
+
+        let _ = queue.take(Guest::Matte);
+        scheduler.promote_new_prefills();
+        assert!(
+            scheduler.prefill_queue.is_empty(),
+            "with the wait cleared, the idle engine did not force its queue head"
         );
     }
 
