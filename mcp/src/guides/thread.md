@@ -22,7 +22,9 @@ answer it and stop.
    (`review-layers`, `model-releases-research`). Two unrelated pieces of work
    never share a thread; one piece of work never spans two.
 4. Read what it answers: the journal so far. If it holds earlier tasks, start
-   from what they found, not from scratch.
+   from what they found, not from scratch. An answer that begins "Created" is
+   a new thread — when you meant an existing one, the name was mistyped:
+   archive the new one (`thread_archive`) and attach the right name.
 
 ## While working
 

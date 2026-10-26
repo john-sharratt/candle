@@ -84,8 +84,10 @@ URLs. Check it this way:
 - Every claim you will rely on cites a file:line with the line quoted; one
   that does not is unverified. `ask`'s template demands this.
 - `journal_grep` the worker's journal for each cited file or symbol: the hit
-  shows the turn where it read it, and whether the quoted line is what the
-  file said.
+  shows the turn where it read it, and whether the quoted text is what the
+  file said. It shows the text, not where it sits in the file, so it cannot
+  catch a wrong line number — a citation off by a few lines needs the
+  repository itself.
 - Continue the worker with what is missing — "quote the line for each of
   these", "you cited X without reading it; read it" — as in step 2.
 - If you have the repository yourself (Claude Code in it), open the cited

@@ -64,3 +64,9 @@ A call holds at most about four minutes — less on claude.ai — whatever
 any client gives up on the call. When no call is open — a new
 conversation, after compaction — `thread_list` shows what is running and what
 waits on you.
+
+**"MCP server connection lost"** (or a call that errors with no answer from
+Zen) is the connection between your client and Zen dropping, not Zen
+restarting, and it can happen at any `wait_s`. Make the same call again at
+once; nothing was lost, and a reply sent on a call that dropped has usually
+landed — `repo_task_wait` shows whether the worker is running it.

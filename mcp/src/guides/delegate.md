@@ -91,7 +91,9 @@ For work on the web:
 ## Splitting
 
 Split broad work into independent tasks, each with its own prompt, name and
-final response. Start them all, then `repo_task_wait` on all of them together.
+final response. Start them all — each `repo_task_start` with `wait_s: 5`, as a
+start holds for its whole `wait_s` and several in a row add up — then
+`repo_task_wait` on all of them together.
 Name each worker for what it does (`verify-expiry`), never a number. A name
 already used on the thread gets the next free one (`verify-expiry.2`), so
 always wait on the path `repo_task_start` answers, not the name you asked
