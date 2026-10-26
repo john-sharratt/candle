@@ -88,14 +88,22 @@ pub fn quantize(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Quantized> {
     let bh = batch * heads;
 
     let vst = v_stride(seq);
-    let q8 = Tensor::zeros(rows * head_dim, DType::U8, &dev)?;
-    let k8 = Tensor::zeros(rows * head_dim, DType::U8, &dev)?;
+    // **Beside `q`, and uninitialised where the quantizer writes every byte.**
+    // `zeros` took each from the pool with a memset, and so did the output in
+    // [`Quantized::attend`] — and an output with no arena ticket hands that to
+    // everything after it: on a co-resident guest the rest of every block, the
+    // out-projection to the residual, went to the pool, ~2 GB a denoise step.
+    let q8 = q.empty_beside(rows * head_dim, DType::U8)?;
+    let k8 = q.empty_beside(rows * head_dim, DType::U8)?;
     // Padded rows, so the kernel's 16-byte V reads are aligned at any `seq`.
-    let v8 = Tensor::zeros(bh * head_dim * vst, DType::U8, &dev)?;
-    let qs = Tensor::zeros(rows, DType::F32, &dev)?;
-    let ks = Tensor::zeros(rows, DType::F32, &dev)?;
-    let vs = Tensor::zeros(bh * head_dim, DType::F32, &dev)?;
-    let vmean = Tensor::zeros(bh * head_dim, DType::F32, &dev)?;
+    // The quantizer writes `seq` of each `vst` and the attention reads the
+    // whole row, so the padding is read before anything writes it: zeroed.
+    let v8 = q.empty_beside(bh * head_dim * vst, DType::U8)?;
+    v8.zero_set()?;
+    let qs = q.empty_beside(rows, DType::F32)?;
+    let ks = q.empty_beside(rows, DType::F32)?;
+    let vs = q.empty_beside(bh * head_dim, DType::F32)?;
+    let vmean = q.empty_beside(bh * head_dim, DType::F32)?;
 
     unsafe {
         let (qp, kp, vp) = (
@@ -169,10 +177,11 @@ impl Quantized {
         };
         let stream = cuda.cuda_stream();
         let raw = stream.cu_stream() as *mut core::ffi::c_void;
-        let out = Tensor::zeros(
+        // Beside the operands, for the reason they are; the kernel writes every
+        // element, so no memset.
+        let out = self.q8.empty_beside(
             (self.batch, self.heads, self.seq, self.head_dim),
             DType::BF16,
-            device,
         )?;
         unsafe {
             let q8 = dev_ptr!(self.q8, u8, &stream, "q8");
