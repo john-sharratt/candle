@@ -118,12 +118,13 @@ pub trait EngineRoom {
 /// How long a job refused for room waits for work in flight to give its ground
 /// back before it is answered [`GuestError::NoRoom`].
 ///
-/// **A refusal on a busy card is usually a matter of minutes.** On WhiteWorld
-/// (2026-10-26) four draws were refused 96–928 MiB short with the weight side
-/// at its floor, while turns in flight held the rest; one drawn five minutes
-/// earlier fitted. Long enough for a Maker's turn to finish, short of the
-/// connector giving the call up.
-pub const ROOM_PATIENCE: Duration = Duration::from_secs(180);
+/// **Long enough for the turns in flight to finish, and no longer.** Admission
+/// is closed for the whole wait, so every second of it is the cast standing
+/// still. On WhiteWorld (2026-10-26) a 1024² draw that waited drew 70 s in,
+/// once the last decode ended; a wait that ran its full three minutes found the
+/// card idle and still short after about two, and held the Makers for nothing
+/// in the rest. The user set a minute.
+pub const ROOM_PATIENCE: Duration = Duration::from_secs(60);
 
 /// How often a job waiting for room is tried again. Each try walks the
 /// shedding ladder with normal inference blocked, so it is paced rather than
