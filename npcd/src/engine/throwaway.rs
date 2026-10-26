@@ -8,7 +8,7 @@
 //! registered, path-less "(untitled)" timeline. This guard is the tail every
 //! path shares.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
@@ -21,7 +21,7 @@ use candle_conversation::ConversationEngine;
 /// seals onto a tombstoned timeline whose records nothing reads and the next
 /// compaction drops.
 pub struct Throwaway {
-    engine: Arc<Mutex<ConversationEngine>>,
+    engine: Arc<ConversationEngine>,
     timeline: TimelineId,
     /// What the conversation was for, for the warning when the tombstone
     /// itself fails.
@@ -29,11 +29,7 @@ pub struct Throwaway {
 }
 
 impl Throwaway {
-    pub fn new(
-        engine: &Arc<Mutex<ConversationEngine>>,
-        timeline: TimelineId,
-        what: &'static str,
-    ) -> Self {
+    pub fn new(engine: &Arc<ConversationEngine>, timeline: TimelineId, what: &'static str) -> Self {
         Self {
             engine: Arc::clone(engine),
             timeline,
@@ -44,15 +40,13 @@ impl Throwaway {
 
 impl Drop for Throwaway {
     fn drop(&mut self) {
-        if let Ok(engine) = self.engine.lock() {
-            if let Err(e) = engine.tombstone_timeline(self.timeline) {
-                tracing::warn!(
-                    "{} conversation {} could not be retired: {e:?} — it stays selectable \
-                     and nothing will ever read it",
-                    self.what,
-                    self.timeline
-                );
-            }
+        if let Err(e) = self.engine.tombstone_timeline(self.timeline) {
+            tracing::warn!(
+                "{} conversation {} could not be retired: {e:?} — it stays selectable and \
+                 nothing will ever read it",
+                self.what,
+                self.timeline
+            );
         }
     }
 }

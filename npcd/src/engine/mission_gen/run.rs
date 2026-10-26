@@ -7,7 +7,7 @@
 //! do. The loop runs one at a time per world while the table is open and its
 //! pool is below the configured level.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use candle_conversation::guest::resolve_seed;
@@ -297,7 +297,7 @@ const JUDGE_SYSTEM: &str = "You are a careful reader of a fictional world's reco
 /// Whether a correction's two quotes contradict each other, by a second
 /// reading.
 async fn contradict(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     raw: &str,
 ) -> anyhow::Result<bool> {
@@ -429,7 +429,7 @@ fn retry_prompt(asked: &str, faults: &[String]) -> String {
 /// One reading of `op`'s draft by the table, asked up to [`ATTEMPTS`] times
 /// until it is an acceptable one — `None` when none was.
 async fn table_reading(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     config: &Config,
     asked: &str,

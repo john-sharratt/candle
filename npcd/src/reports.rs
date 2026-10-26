@@ -101,7 +101,7 @@ fn split_catalog(described: Value) -> (Vec<Value>, Value) {
 }
 
 impl Reports for NpcdReports {
-    /// On the blocking pool: the maintenance read takes the engine's lock.
+    /// On the blocking pool: the maintenance read takes the substrate's locks.
     fn status(&self) -> BoxFuture<'_, TenantStatus> {
         let authored = Arc::clone(&self.authored);
         Box::pin(async move {
