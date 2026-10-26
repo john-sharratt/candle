@@ -62,25 +62,33 @@ the second.
 ## 4. The anchor
 
 ```
-anchor = base64url( H( normalise(text) ‖ occurrence ) )[0..4]
+anchor(p) = base64url( H( seed ‖ normalise(text) ) )[0..4]
 ```
 
 - **`H`** is SHA-256. Only its first 24 bits are used: four base64url
   characters (`A–Z a–z 0–9 - _`), so no JSON escaping.
 - **`normalise`** strips trailing whitespace from each line and normalises line
   endings, so formatting noise does not change an anchor.
-- **`occurrence`** disambiguates repeated text: the first paragraph with a given
-  normalised text has occurrence 1, the next identical one 2, and so on, in
-  document order. A unique paragraph's anchor therefore depends on its own text
-  and nothing else; only other copies of the same text are affected when one is
-  inserted or removed. Short repeated lines are the common case in prose ("No.",
-  a scene-break line), and they are exactly what a reviewer edits.
-- **Collisions** between different paragraphs are resolved by the engine, which
-  computes every anchor of the document at once: the colliding paragraphs after
-  the first take five characters, then six, until each is unique within the
-  document. Correctness never depends on the hash length; the length only bounds
-  how often this happens and how likely a stale anchor is to name a new
-  paragraph by chance.
+- **`seed`** makes every anchor unique within the document. The engine computes
+  the document's anchors at once, in document order, each at `seed = 0`; a
+  paragraph whose anchor an earlier paragraph already holds is hashed again at
+  `seed = 1`, then 2, until its anchor is free.
+  - **Duplicates are collisions.** Two identical paragraphs collide at seed 0,
+    so the second takes seed 1: repeated text needs no mechanism of its own.
+    Short repeated lines are the common case in prose ("No.", a scene-break
+    line), and they are exactly what a reviewer edits.
+  - **Every anchor is four characters**, whatever collided, so the grammar and
+    the decode cost are uniform.
+  - **Document order decides who keeps seed 0**, so the same text always reads
+    with the same anchors. A unique paragraph's anchor depends on its own text
+    alone. A bumped anchor depends on the earlier paragraph it collided with: if
+    that one is removed, the bumped paragraph's anchor changes, and an edit
+    holding the old one is refused (§6), never applied to the wrong copy.
+  - Correctness never depends on the hash length; the length only bounds how
+    often a seed is bumped and how likely a stale anchor is to name a new
+    paragraph by chance.
+
+How often a seed is bumped, and how likely a stale anchor is to match new text:
 
 | anchor | space | collision, 60 paragraphs | collision, 300 lines | stale anchor matching new text |
 |---|---|---|---|---|
@@ -124,8 +132,8 @@ b4_K| Then the order came down on the shared frequency…
   anchored one.
 - **`delete`** removes the unit; `text` is not given.
 - One operation per call. Several calls from one read stay valid, because an
-  edit changes only its own unit's anchor (and, for a repeated text, its
-  copies' occurrence anchors).
+  edit changes only its own unit's anchor (and the anchor of any later unit
+  whose seed was bumped by it — a copy of the same text).
 
 ### The grammar
 
@@ -192,8 +200,9 @@ cost is negligible beside the decode it saves.
 Unit tests beside the code, asserting raw values:
 
 - **Anchors**: fixed expected strings for known paragraphs; trailing-whitespace
-  and line-ending normalisation; occurrence indices for repeated text; collision
-  extension to five characters on a constructed collision.
+  and line-ending normalisation; two identical paragraphs taking seeds 0 and 1;
+  a constructed collision between different texts resolved by a seed bump, the
+  anchor still four characters.
 - **Edits**: each operation on a small document, the restored blank lines, the
   reply's new anchors; a scoped `old` that occurs twice in the unit is refused,
   once is applied.
