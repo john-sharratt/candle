@@ -142,6 +142,10 @@ pub struct Worker {
     /// Why its turn ended with no journal entry, as the draft recorded it;
     /// none when it kept one.
     pub no_entry: Option<String>,
+    /// Whether Claude stopped its last turn (`zend_stop`): it is stuck, live,
+    /// for `zend_answer` to redirect.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// How often the member running a task says so on its record.
@@ -174,6 +178,15 @@ impl Worker {
             worker: self.name.clone(),
         }
         .text()
+    }
+
+    /// What its current turn has done, in one sentence, at `now_ms`.
+    pub fn doing(&self, now_ms: u64) -> String {
+        let elapsed = now_ms.saturating_sub(self.turn_ms);
+        match &self.activity {
+            Some(a) => a.sentence(elapsed),
+            None => Activity::default().sentence(elapsed),
+        }
     }
 
     /// Whether it is a part of another worker's task, not a task Claude
@@ -438,6 +451,7 @@ mod tests {
             question: None,
             activity: None,
             no_entry: None,
+            stopped: false,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,

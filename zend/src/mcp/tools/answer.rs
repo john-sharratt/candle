@@ -1,8 +1,6 @@
 //! `zend_answer {worker, answer, wait_s?}`: answer a worker that asked or is
 //! stuck; the answer is its next turn (`docs/claude_zend_gateway.md` §6.2).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use super::wait::answer_for;
@@ -51,5 +49,5 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error(e);
     }
     let wanted = [(thread, name)];
-    answer_for(ctx, &wanted, Duration::from_secs(wait_secs(ctx, args))).await
+    answer_for(ctx, &wanted, wait_secs(ctx, args)).await
 }

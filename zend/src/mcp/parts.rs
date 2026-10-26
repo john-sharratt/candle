@@ -199,6 +199,7 @@ mod tests {
             question: None,
             activity: None,
             no_entry: None,
+            stopped: false,
         }
     }
 

@@ -113,7 +113,7 @@ use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::{lineage, names, nudges, threads};
+use crate::mcp::{lineage, names, nudges, stops, threads};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -261,6 +261,9 @@ pub enum StreamItem {
 pub const CLOSED_BY_REPEATS: &str = "repeats";
 /// [`StreamItem::Closing`]'s reason when the round cap closed it.
 pub const CLOSED_BY_CAP: &str = "round_cap";
+/// [`StreamItem::Closing`]'s reason when Claude stopped the worker
+/// (`zend_stop`, [`stops`]).
+pub const CLOSED_BY_CLAUDE: &str = "stopped";
 
 /// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
 /// shows it — the summariser's ghost summary turns hidden.
@@ -5005,6 +5008,27 @@ fn run_inference_stream(
                 closing = true;
                 let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CAP))).await;
             }
+            // A worker `/mcp` started reads what Claude sent it — a stop, a
+            // nudge — at this boundary, never mid-decode.
+            let from_claude =
+                owner_of(&conv_id).map(|_| state.engine.lock().unwrap().conversation().shared());
+            // Claude stopping it closes the loop here, as the cap does. A
+            // round the guard or the cap closed too is still Claude's stop,
+            // so the worker settles stopped. A round that ran nothing has no
+            // results to carry it and ends below; the stop is then reported
+            // unreached when the worker settles.
+            if let Some(shared) = from_claude.as_ref().filter(|_| !results.is_empty()) {
+                if let Some(reason) = stops::take(shared, &conv_id) {
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        iteration,
+                        "Claude stopped the task — the next turn answers without tools",
+                    );
+                    stops::notice(&mut results, &reason);
+                    closing = true;
+                    let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CLAUDE))).await;
+                }
+            }
             // Each result measured as its own block of the turn it is about to
             // become — the length its card shows.
             let tokens = results
@@ -5044,11 +5068,9 @@ fn run_inference_stream(
             // Guidance Claude queued for a worker `/mcp` started joins real
             // results only — after the check above, so a nudge never turns an
             // empty round into a turn, and one left queued when the loop ends
-            // is reported by the worker as undelivered. The round boundary is
-            // where it is read, never mid-decode.
-            if owner_of(&conv_id).is_some() {
-                let shared = state.engine.lock().unwrap().conversation().shared();
-                current_message = nudges::follow(current_message, &shared, &conv_id);
+            // is reported by the worker as undelivered.
+            if let Some(shared) = &from_claude {
+                current_message = nudges::follow(current_message, shared, &conv_id);
             }
 
             // The round-trip is now certain — the tools returned real output and

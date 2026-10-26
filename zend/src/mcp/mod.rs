@@ -20,6 +20,7 @@
 //! | [`lineage`] | The journals a worker or part inherits from above it |
 //! | [`ops`] | What the operations tools share: Admins only, the decision gate, the way up |
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
+//! | [`stops`] | Claude stopping a running worker, at its next tool round |
 //! | [`threads`] | Threads, workers and the thread's journal, as records |
 //! | [`names`] | Names and paths |
 //! | [`caller`] | Who is calling, and the key their records are kept under |
@@ -43,6 +44,7 @@ pub mod protocol;
 pub mod records;
 pub mod reported;
 pub mod state;
+pub mod stops;
 pub mod threads;
 pub mod tools;
 pub mod workers;

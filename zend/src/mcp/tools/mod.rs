@@ -13,6 +13,7 @@
 //! client delivers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,6 +41,7 @@ mod keep_service;
 mod keep_state;
 mod keep_trial;
 mod nudge;
+mod stop;
 mod task;
 mod threads;
 pub(crate) mod wait;
@@ -121,6 +123,7 @@ pub fn definitions() -> Value {
         wait::definition(),
         answer::definition(),
         nudge::definition(),
+        stop::definition(),
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
@@ -152,6 +155,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         wait::NAME => wait::call(ctx, args).await,
         answer::NAME => answer::call(ctx, args).await,
         nudge::NAME => nudge::call(ctx, args),
+        stop::NAME => stop::call(ctx, args).await,
         journal_read::NAME => journal_read::call(ctx, args),
         journal_note::NAME => journal_note::call(ctx, args),
         journal_grep::NAME => journal_grep::call(ctx, args),
@@ -185,14 +189,44 @@ pub fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("`{key}` is missing: it is a non-empty string"))
 }
 
+/// How long a call waits, and what it asked for when its client's ceiling cut
+/// that short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait {
+    pub secs: u64,
+    /// The `wait_s` asked for, when it was more than the client allows.
+    pub asked: Option<u64>,
+}
+
+impl Wait {
+    pub fn duration(self) -> Duration {
+        Duration::from_secs(self.secs)
+    }
+
+    /// What an answer says when the wait was cut: nothing otherwise.
+    pub fn note(self) -> Option<String> {
+        self.asked.map(|asked| {
+            format!(
+                "(You asked to wait {asked} s; this client's calls are cut off sooner, so this \
+                 one waited {} s. Call again to keep waiting.)",
+                self.secs
+            )
+        })
+    }
+}
+
 /// The seconds a call may wait: `wait_s` if given, the default otherwise, at
 /// most what the session's client allows.
-pub fn wait_secs(ctx: &Ctx, args: &Value) -> u64 {
+pub fn wait_secs(ctx: &Ctx, args: &Value) -> Wait {
     let ceiling = ctx.mcp.client.wait_ceiling();
-    args.get("wait_s")
+    let wanted = args
+        .get("wait_s")
         .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_WAIT_S)
-        .min(ceiling)
+        .unwrap_or(DEFAULT_WAIT_S);
+    Wait {
+        secs: wanted.min(ceiling),
+        asked: (wanted > ceiling).then_some(wanted),
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +254,7 @@ mod tests {
                 "zend_wait",
                 "zend_answer",
                 "zend_nudge",
+                "zend_stop",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
@@ -241,6 +276,29 @@ mod tests {
                 "zend_timeline",
                 "zend_timeline_delete"
             ]
+        );
+    }
+
+    /// **A wait its client cut short says so**, with what was asked and what
+    /// was waited; one within the ceiling says nothing.
+    #[test]
+    fn a_wait_cut_short_by_its_client_says_so() {
+        let cut = Wait {
+            secs: 200,
+            asked: Some(600),
+        };
+        assert_eq!(
+            cut.note().unwrap(),
+            "(You asked to wait 600 s; this client's calls are cut off sooner, so this one \
+             waited 200 s. Call again to keep waiting.)"
+        );
+        assert_eq!(
+            Wait {
+                secs: 45,
+                asked: None
+            }
+            .note(),
+            None
         );
     }
 

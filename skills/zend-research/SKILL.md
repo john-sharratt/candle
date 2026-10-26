@@ -27,8 +27,12 @@ Research: <the question, in full, with what the answer is for>
 - Prefer primary sources: specifications, official documentation, source code, the authors.
 - For a comparison, give each option the same criteria.
 - Cite every claim with the URL it came from. Mark anything you could not confirm UNVERIFIED.
+- Say nothing about this codebase you did not read in this task: a file, symbol or setting
+  named in your answer cites the file:line you read it at, or is marked UNVERIFIED. What you
+  know from your context is not a reading.
 - Before you answer, start a part named verify-sources with sub_run that re-opens each cited
-  URL you rely on and checks the claim is there.
+  URL you rely on and checks the claim is there — and checks each conclusion you drew from it
+  (what a method needs, what it changes) against what the source says.
 
 Final response, in this shape:
 ANSWER: the answer, in a few sentences
