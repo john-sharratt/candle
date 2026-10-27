@@ -201,20 +201,24 @@ pub struct MatteRequest {
     pub height: u32,
 }
 
-/// A picture and the alpha the network gave it.
+/// The alpha the network gave a picture, at the network's own side.
+///
+/// **Only the network's answer crosses back from the drain.** Everything after
+/// it — the alpha brought up to the picture's size, the subject's colour
+/// recovered under it ([`super::foreground`]), the PNG — is host work on the
+/// picture the caller still holds, so it runs in the caller's thread
+/// ([`super::matte::finish`]) while the engine is already serving again. Done
+/// inside the drain it stopped every character for the length of a
+/// full-resolution resample and encode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuestMatte {
+    /// The picture's size, which the alpha is brought up to.
     pub width: u32,
     pub height: u32,
-    /// PNG bytes, RGBA. Encoded on the scheduler thread before the ground goes
-    /// back, for the reason [`GuestImage::png`] is.
-    pub png: Vec<u8>,
-    /// The fraction of the picture the matte made at least half transparent.
-    ///
-    /// Reported so a caller can say something true about a picture where
-    /// almost nothing was lifted, rather than showing an unchanged image and
-    /// leaving somebody to wonder whether the button worked.
-    pub lifted: f32,
+    /// The network's side: `alpha` is `side · side` values.
+    pub side: u32,
+    /// Opacity, 0 transparent to 255 opaque, row-major.
+    pub alpha: Vec<u8>,
 }
 
 /// One unit of guest work.

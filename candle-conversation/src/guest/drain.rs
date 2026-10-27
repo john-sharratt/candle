@@ -1182,8 +1182,8 @@ mod tests {
                 Ok(GuestOutcome::Matte(GuestMatte {
                     width: 1,
                     height: 1,
-                    png: vec![],
-                    lifted: 0.0,
+                    side: 1,
+                    alpha: vec![0],
                 }))
             }
             fn unload(&mut self) {

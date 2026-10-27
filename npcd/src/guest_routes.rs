@@ -445,19 +445,34 @@ pub async fn post_cutout(State(s): State<Arc<Authored>>, Json(body): Json<Cutout
         return bad_reference(&format!("the picture is {w}×{h}, past the side limit"));
     }
 
+    // The route keeps the picture: the drain answers with the network's alpha
+    // alone, and the cutout is finished from both here, off the scheduler.
+    let pixels = decoded.into_raw();
     let request = GuestRequest::Matte(MatteRequest {
-        pixels: decoded.into_raw(),
+        pixels: pixels.clone(),
         width: w,
         height: h,
     });
     match run_guest(&s, request).await {
-        Ok(GuestOutcome::Matte(m)) => Json(json!({
-            "png_base64": base64::engine::general_purpose::STANDARD.encode(m.png),
-            "width": m.width,
-            "height": m.height,
-            "lifted": m.lifted,
-        }))
-        .into_response(),
+        Ok(GuestOutcome::Matte(m)) => {
+            let finished = tokio::task::spawn_blocking(move || {
+                candle_conversation::guest::matte::finish(&m, &pixels)
+            })
+            .await;
+            match finished {
+                Ok(Ok(cut)) => Json(json!({
+                    "png_base64": base64::engine::general_purpose::STANDARD.encode(cut.png),
+                    "width": w,
+                    "height": h,
+                    "lifted": cut.lifted,
+                }))
+                .into_response(),
+                Ok(Err(e)) => refusal(&GuestError::Failed(e)),
+                Err(e) => refusal(&GuestError::Failed(format!(
+                    "the cutout's finish failed: {e}"
+                ))),
+            }
+        }
         Ok(other) => refusal(&GuestError::Failed(format!(
             "the matte request came back as {}",
             other.guest()

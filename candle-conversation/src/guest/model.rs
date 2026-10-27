@@ -304,8 +304,8 @@ pub(crate) mod testing {
                 GuestRequest::Matte(r) => GuestOutcome::Matte(GuestMatte {
                     width: r.width,
                     height: r.height,
-                    png: vec![0x89, b'P', b'N', b'G'],
-                    lifted: 0.5,
+                    side: 1,
+                    alpha: vec![128],
                 }),
             })
         }
