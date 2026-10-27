@@ -5285,8 +5285,7 @@ fn resolve_u8_out(origin: Backing, dev: &CudaDevice, bytes: usize) -> Result<Res
     // other two. A `NoTicket` decline here is always a genuine provenance break:
     // the phase-first buffers described above do not reach it, because they seed
     // a synthesised ticket rather than arriving without one.
-    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
-        let ticket = ticket.expect("a carved range implies a ticket");
+    if let Some((ptr, ticket)) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
         return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     // SAFETY: the kernel the caller launches next fills this before anything
@@ -5314,8 +5313,7 @@ fn resolve_typed_out<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     // Attributed for the same reason as `alloc_inheriting` — this is the other
     // half of the same decision, and a report that cannot tell the two decline
     // reasons apart sends the reader to the wrong fix.
-    if let Some(ptr) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
-        let ticket = ticket.expect("a carved range implies a ticket");
+    if let Some((ptr, ticket)) = wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
         return Ok((ptr, None, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     // SAFETY: filled by the kernel the caller launches next.

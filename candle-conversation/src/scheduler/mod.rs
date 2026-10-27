@@ -39,6 +39,7 @@ mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
 mod first_sample;
+mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
@@ -3821,6 +3822,11 @@ pub(crate) struct Scheduler {
     /// A creep set aside mid-sweep for a higher band's prompt, resumed at the
     /// same layer once nothing above its band waits (`paused_creep`).
     paused_creep: Option<PausedCreep>,
+    /// The background prompts being prefilled as one gang, by sequence id, so
+    /// they reach their first tokens together and decode side by side
+    /// (`docs/prefill_gangs.md`). Fixed from formation until every member's
+    /// prefill is done.
+    prefill_gang: Vec<usize>,
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
@@ -4216,6 +4222,7 @@ impl Scheduler {
             wave_prefill_members: Vec::new(),
             wave_prefill_rows: Vec::new(),
             paused_creep: None,
+            prefill_gang: Vec::new(),
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
             prefill_waits: prefill_wait::PrefillWaits::default(),
@@ -16763,65 +16770,42 @@ mod tests {
         }
     }
 
-    /// **A spent forward still takes turns, as joins, while each member keeps a
-    /// chunk — and every join pays the tier its extra sequence adds.**
-    ///
-    /// Turns of 64 tokens fill the pass's rows; the ones after offer no rows and
-    /// are admitted until `chunk / CHUNK_SIZE` members share the pass, the carry
-    /// rule `share_within` forms the wave by. Each join is priced at the tier one
-    /// more sequence adds at the forward's rows, never at zero.
+    /// **A spent forward takes no more turns.** Turns of 64 tokens fill the
+    /// pass's rows, and the pass ends there: the forward is filled in order
+    /// (`gang::gang_shares`), so a turn past its rows would advance by
+    /// nothing while holding its store. The rest wait in the queue for the next
+    /// pass.
     #[test]
-    fn a_spent_forward_takes_joins_while_each_member_keeps_a_chunk() {
+    fn a_spent_forward_takes_no_more_turns() {
         use super::admit::{Ground, Kind};
         use super::admit_ground::AdmitPass;
         use crate::projection::DecodePriority;
 
         let mut sched = admission_scheduler();
         let chunk = sched.prefill_pass_budget();
-        let members = chunk / CHUNK_SIZE;
-        for _ in 0..members + 4 {
+        let queued = chunk / CHUNK_SIZE + 4;
+        for _ in 0..queued {
             let id = SequenceId(sched.session.create_sequence().unwrap());
             sched.prefill_queue.push_back(test_prefill_work(id));
         }
-        let dtype = sched.session.activation_dtype();
-        let tier = |n: usize| {
-            sched
-                .model
-                .wave_tier_bytes(chunk, n, &[], &[], &[], &[], dtype)
-                .unwrap_or(0)
-        };
-        let join_price: Vec<u64> = (0..=members)
-            .map(|n| tier(n + 1).saturating_sub(tier(n)))
-            .collect();
 
         let mut pass = AdmitPass::new(&mut sched);
         let mut offers = Vec::new();
         while let Some(cost) = pass.peek(Kind::Prefill, DecodePriority::High) {
-            offers.push((cost.rows, cost.activations));
+            offers.push(cost.rows);
             assert!(pass.admit(Kind::Prefill, DecodePriority::High, cost));
         }
-        assert_eq!(
-            offers.len(),
-            members,
-            "one chunk per member, and no further"
-        );
-        let rows: usize = offers.iter().map(|(r, _)| *r).sum();
-        assert_eq!(
-            rows, chunk,
-            "the rows go to the first offers until the pass is spent"
-        );
-        for (k, &(rows, activations)) in offers.iter().enumerate() {
-            if rows == 0 {
-                assert_eq!(
-                    activations, join_price[k],
-                    "join {k} pays the tier its sequence adds"
-                );
-            }
-        }
         assert!(
-            offers.iter().any(|(r, _)| *r == 0),
-            "the pass took joins once its rows were spent"
+            offers.iter().all(|&r| r > 0),
+            "every turn admitted rides the forward: {offers:?}"
         );
+        assert_eq!(
+            offers.iter().sum::<usize>(),
+            chunk,
+            "the rows go to the offers in order until the pass is spent"
+        );
+        assert!(offers.len() < queued, "the rest wait for the next pass");
+        assert_eq!(sched.prefill_queue.len(), queued - offers.len());
     }
 
     /// **Every figure admission compares must be in one currency.**

@@ -463,6 +463,65 @@ fn simple_eval_(
                 let output = input0.broadcast_add(input1)?;
                 values.insert(node.output[0].clone(), output);
             }
+            // https://onnx.ai/onnx/operators/onnx__Sum.html — any number of
+            // operands, broadcast together.
+            "Sum" => {
+                let mut acc = get(&node.input[0])?.clone();
+                for name in &node.input[1..] {
+                    acc = acc.broadcast_add(get(name)?)?;
+                }
+                values.insert(node.output[0].clone(), acc);
+            }
+            // https://onnx.ai/onnx/operators/onnx__GatherND.html
+            //
+            // `indices[..., :k]` addresses the first `k` axes after the
+            // `batch_dims` leading ones, which `indices` and `data` share; what
+            // is gathered is the rest of `data` at each address. Done as one
+            // `index_select` over `data` flattened to `[batch · addressed,
+            // rest]`, with each address turned into its row there on the
+            // device — BiRefNet's deformable convolution is 80 of these over
+            // a whole feature map's sampling positions, too many to walk.
+            "GatherND" => {
+                let data = get(&node.input[0])?;
+                let indices = get(&node.input[1])?.to_dtype(DType::I64)?;
+                let b = get_attr_opt::<i64>(node, "batch_dims")?
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let (d, ix) = (data.dims().to_vec(), indices.dims().to_vec());
+                let k = *ix.last().unwrap_or(&0);
+                if ix.len() < b + 1 || d.len() < b + k || d[..b] != ix[..b] {
+                    bail!("GatherND: indices {ix:?} do not address data {d:?} with batch_dims {b}");
+                }
+                let batch: usize = d[..b].iter().product();
+                let addressed: usize = d[b..b + k].iter().product();
+                let rest: Vec<usize> = d[b + k..].to_vec();
+                let per: usize = ix[b..ix.len() - 1].iter().product();
+                let idx = indices.reshape((batch, per, k))?;
+                let dev = idx.device();
+                let mut row = Tensor::zeros((batch, per), DType::I64, dev)?;
+                for (j, &extent) in d[b..b + k].iter().enumerate() {
+                    let extent_t = Tensor::new(extent as i64, dev)?;
+                    let col = idx.narrow(2, j, 1)?.squeeze(2)?;
+                    // A negative address counts from the end of its axis.
+                    let wrap = col
+                        .lt(&Tensor::zeros_like(&col)?)?
+                        .to_dtype(DType::I64)?
+                        .broadcast_mul(&extent_t)?;
+                    row = row.broadcast_mul(&extent_t)?.add(&col.add(&wrap)?)?;
+                }
+                let base = (Tensor::arange(0i64, batch as i64, dev)?
+                    .broadcast_mul(&Tensor::new(addressed as i64, dev)?)?)
+                .reshape((batch, 1))?;
+                let row = row.broadcast_add(&base)?.flatten_all()?;
+                let width: usize = rest.iter().product();
+                let gathered = data
+                    .contiguous()?
+                    .reshape((batch * addressed, width))?
+                    .index_select(&row, 0)?;
+                let mut shape = ix[..ix.len() - 1].to_vec();
+                shape.extend_from_slice(&rest);
+                values.insert(node.output[0].clone(), gathered.reshape(shape)?);
+            }
             "Sub" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;

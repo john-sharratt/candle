@@ -140,8 +140,17 @@ impl EngineRoom for Scheduler {
                 )
             },
         );
+        let h = self.hot_census();
+        let m = |b: u64| b >> 20;
         format!(
-            "{kv} | in flight: decodes={} prefills={} | idle {}",
+            "{kv} | hot_mib sections={} attended={} pinned={} unwarmed={} splice={} evictable={} \
+             | in flight: decodes={} prefills={} | idle {}",
+            m(h.sections),
+            m(h.attended),
+            m(h.pinned),
+            m(h.unwarmed),
+            m(h.splice),
+            m(h.evictable),
             self.active_decodes.len(),
             self.running_members(),
             self.idle_census(std::time::Instant::now()),

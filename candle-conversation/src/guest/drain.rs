@@ -214,6 +214,10 @@ pub fn drain_one<R: EngineRoom>(
     };
     freed += conceded;
     report.freed_mib = freed >> 20;
+    // Who still holds the ground once the ladder and the concession are done,
+    // said on success as well as on refusal: a card that fits today is the
+    // one whose holders show what tomorrow's refusal will be short of.
+    let held = room.holders();
 
     // Step 3. Claim only what the guest places itself — a second tenancy was
     // shed for above and claims its own regions from what that freed.
@@ -445,6 +449,7 @@ pub fn drain_one<R: EngineRoom>(
         // turns out to be.
         no_ticket_mib = declines.0 >> 20,
         closed_mib = declines.1 >> 20,
+        holders = %held,
         "guest drained"
     );
     report

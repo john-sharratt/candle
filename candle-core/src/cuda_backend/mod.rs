@@ -2816,7 +2816,9 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
     // provenance and a site whose generation closed both end up on `dev.alloc`
     // and are otherwise indistinguishable in any report. An open phase that
     // cannot hold the request is an error here, not a pool allocation.
-    if let Some(ptr) = wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)? {
+    if let Some((ptr, ticket)) =
+        wave_provenance::wave_alloc_attributed(ticket, bytes, INHERIT_ALIGN)?
+    {
         // **The arena and the weight zone share one reservation.**
         //
         // Wave arenas are carved upward from `span_base`; the expert weight zone
@@ -2840,7 +2842,6 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
         let slice = dev
             .stream_unleased()
             .upgrade_device_ptr::<T>(ptr, elem_count);
-        let ticket = ticket.expect("a carved range implies a ticket");
         return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
     Ok((dev.alloc::<T>(elem_count)?, Backing::Owned))

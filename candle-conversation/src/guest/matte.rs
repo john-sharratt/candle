@@ -98,6 +98,11 @@ enum Output {
     /// A probability in [0, 1]: clamped, nothing more. Normalising it would
     /// stretch a mostly transparent picture's faint edges to opaque.
     Alpha,
+    /// Logits a probability is the sigmoid of — BiRefNet exported without its
+    /// final activation, as `onnx-community/BiRefNet-ONNX` is (its 1024²
+    /// output measured in [−44.5, 34.6]). Clamped, they were a hard 0/1 matte
+    /// with every soft edge gone.
+    Sigmoid,
 }
 
 impl Family {
@@ -115,12 +120,27 @@ impl Family {
         }
     }
 
-    fn output(self) -> Output {
+    /// What this family's graph emits, given whether the graph's own last op
+    /// on its output is a `Sigmoid`. BiRefNet ships both ways — the HR export
+    /// applies it, the general one does not — so the graph is asked, not the
+    /// family.
+    fn output(self, ends_in_sigmoid: bool) -> Output {
         match self {
             Self::IsNet | Self::U2Net => Output::Logits,
-            Self::BiRefNet => Output::Alpha,
+            Self::BiRefNet if ends_in_sigmoid => Output::Alpha,
+            Self::BiRefNet => Output::Sigmoid,
         }
     }
+}
+
+/// Whether the node that makes `output` is a `Sigmoid`.
+fn ends_in_sigmoid(graph: &ModelProto, output: &str) -> bool {
+    graph.graph.as_ref().is_some_and(|g| {
+        g.node
+            .iter()
+            .find(|n| n.output.iter().any(|o| o == output))
+            .is_some_and(|n| n.op_type == "Sigmoid")
+    })
 }
 
 /// Where the matte guest's checkpoint is, and what it is.
@@ -155,6 +175,8 @@ struct Loaded {
     output: String,
     side: usize,
     family: Family,
+    /// What the graph's output is, and so how it becomes an alpha.
+    kind: Output,
 }
 
 impl MatteGuest {
@@ -261,17 +283,34 @@ fn weight_bytes(graph: &ModelProto) -> usize {
 /// holds the graph's live set — not its sum, since a value is dropped after its
 /// last reader.
 ///
-/// **Two kilobytes per input pixel.** The network's widest stage is its first —
-/// 64 channels at the full side, 256 bytes a pixel for *one* f32 tensor — and a
-/// U-shaped decoder holds several live at once across a skip connection; at
-/// one kilobyte, IS-Net at 1024² ran its 1 GiB heap out (WhiteWorld,
-/// 2026-10-27). The heap logs its peak on unload, which is what to set this
-/// from. Over-claiming costs the engine an eviction it did not need;
-/// under-claiming fails the matte after that eviction, the worse of the two.
-const HEADROOM_PER_PIXEL: usize = 2048;
+/// Per input pixel, by family ([`Family::headroom_per_pixel`]): the heap logs
+/// its peak on unload, which is what to set these from. Over-claiming costs
+/// the engine an eviction it did not need; under-claiming fails the matte
+/// after that eviction, the worse of the two.
+fn activation_headroom(side: usize, family: Family) -> usize {
+    (side * side * family.headroom_per_pixel()).max(256 << 20)
+}
 
-fn activation_headroom(side: usize) -> usize {
-    (side * side * HEADROOM_PER_PIXEL).max(256 << 20)
+impl Family {
+    /// Activation ground per input pixel, from each family's measured peak.
+    ///
+    /// - **IS-Net / U²-Net: two kilobytes.** The widest stage is the first —
+    ///   64 channels at the full side, 256 bytes a pixel for *one* f32 tensor —
+    ///   and a U-shaped decoder holds several live across a skip connection;
+    ///   at one kilobyte IS-Net at 1024² ran its 1 GiB heap out, and at two
+    ///   it peaks at 1,917 of 2,056 MiB (WhiteWorld, 2026-10-27).
+    /// - **BiRefNet: five.** The general export at 1024² peaked at 4,103 MiB
+    ///   from the pool (its Swin encoder's attention and the deformable
+    ///   decoder's sampling grids) but at 4,866 MiB in the guest heap, whose
+    ///   first-fit leaves gaps the pool's size classes do not — and the heap
+    ///   is what it runs in. The HR export at 2048² peaked at 8,237 MiB from
+    ///   the pool (2.0 KiB a pixel). The larger is claimed, with room over it.
+    fn headroom_per_pixel(self) -> usize {
+        match self {
+            Self::IsNet | Self::U2Net => 2048,
+            Self::BiRefNet => 5120,
+        }
+    }
 }
 
 impl GuestModel for MatteGuest {
@@ -290,11 +329,11 @@ impl GuestModel for MatteGuest {
         match self.graph() {
             Ok(g) => {
                 let side = declared_side(&g).map_or(1024, |(_, _, s)| s);
-                weight_bytes(&g) + activation_headroom(side)
+                weight_bytes(&g) + activation_headroom(side, self.spec.family)
             }
             Err(_) => {
                 let weights = std::fs::metadata(&self.spec.model).map_or(0, |m| m.len() as usize);
-                weights + activation_headroom(1024)
+                weights + activation_headroom(1024, self.spec.family)
             }
         }
     }
@@ -365,10 +404,12 @@ impl GuestModel for MatteGuest {
             "matte guest: weights placed"
         );
 
+        let kind = self.spec.family.output(ends_in_sigmoid(&graph, &output));
         self.loaded = Some(Loaded {
             device: device.clone(),
             graph,
             weights,
+            kind,
             input,
             output,
             side,
@@ -462,7 +503,23 @@ impl Loaded {
         // parse its own copy onto the host and move it to the pool.
         let mut values = self.weights.clone();
         values.insert(self.input.clone(), input);
-        let outputs = candle_onnx::simple_eval_on(&self.graph, values, &self.device)?;
+        // **Every chain in the graph carves from the heap, not only the
+        // input's.** A graph has many roots — constants, shapes, the sampling
+        // grids BiRefNet's decoder builds from them — and an op reading only
+        // those has no ticket to inherit; at 1024² that was 36 GB of pool
+        // allocations and an out-of-memory on every busy-card cutout. The drain
+        // owns the stream, so here "no ticket" can only mean this guest's.
+        let outputs = match &self.device {
+            Device::Cuda(cuda) => {
+                let seed = candle::cuda_backend::wave_provenance::WaveTicket::guest(
+                    cuda.cuda_stream().context().ordinal() as u32,
+                );
+                candle::cuda_backend::wave_provenance::with_ambient(seed, || {
+                    candle_onnx::simple_eval_on(&self.graph, values, &self.device)
+                })?
+            }
+            _ => candle_onnx::simple_eval_on(&self.graph, values, &self.device)?,
+        };
         let out = outputs.get(&self.output).ok_or_else(|| {
             candle::Error::Msg(format!(
                 "matte: the graph did not produce `{}`",
@@ -486,9 +543,10 @@ impl Loaded {
             );
         }
         flat.truncate(n);
-        match self.family.output() {
+        match self.kind {
             Output::Logits => normalise(&mut flat),
             Output::Alpha => flat.iter_mut().for_each(|a| *a = a.clamp(0.0, 1.0)),
+            Output::Sigmoid => flat.iter_mut().for_each(|a| *a = 1.0 / (1.0 + (-*a).exp())),
         }
 
         Ok(GuestOutcome::Matte(GuestMatte {
@@ -663,6 +721,31 @@ mod tests {
         assert!(png.get_pixel(14, 4)[3] < 16);
         // A picture of the wrong size is an error, not a panic.
         assert!(finish(&matte, &pixels[..30]).is_err());
+    }
+
+    /// **BiRefNet's output is read from its graph.** The HR export ends in a
+    /// `Sigmoid` and is clamped; the general one ends in logits and gets the
+    /// sigmoid here. The other families keep their own reading either way.
+    #[test]
+    fn a_birefnet_export_is_read_by_how_its_graph_ends() {
+        let graph = |op: &str| ModelProto {
+            graph: Some(candle_onnx::onnx::GraphProto {
+                node: vec![candle_onnx::onnx::NodeProto {
+                    op_type: op.into(),
+                    input: vec!["x".into()],
+                    output: vec!["alpha".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(ends_in_sigmoid(&graph("Sigmoid"), "alpha"));
+        assert!(!ends_in_sigmoid(&graph("Conv"), "alpha"));
+        assert!(!ends_in_sigmoid(&graph("Sigmoid"), "other"));
+        assert_eq!(Family::BiRefNet.output(true), Output::Alpha);
+        assert_eq!(Family::BiRefNet.output(false), Output::Sigmoid);
+        assert_eq!(Family::IsNet.output(true), Output::Logits);
     }
 
     /// What finishing a large cutout costs the caller's thread.
@@ -843,17 +926,21 @@ mod tests {
     #[test]
     fn the_headroom_scales_with_the_side_and_has_a_floor() {
         // 320² at two kilobytes a pixel is 200 MiB, under the floor.
+        let isnet = Family::IsNet;
         assert_eq!(
-            activation_headroom(320),
+            activation_headroom(320, isnet),
             256 << 20,
             "a small field gets the floor"
         );
         // 1024² is two gibibytes, well clear of it, and four times 512²'s claim.
-        assert_eq!(activation_headroom(1024), 2 << 30);
+        assert_eq!(activation_headroom(1024, isnet), 2 << 30);
         assert_eq!(
-            activation_headroom(1024),
-            4 * activation_headroom(512),
+            activation_headroom(1024, isnet),
+            4 * activation_headroom(512, isnet),
             "the claim must follow the area, not the side"
         );
+        // BiRefNet's measured heap peak at 1024², 4,866 MiB, fits under its claim.
+        let birefnet = activation_headroom(1024, Family::BiRefNet);
+        assert!(birefnet >= 4866 << 20, "{} MiB", birefnet >> 20);
     }
 }

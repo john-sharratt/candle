@@ -258,24 +258,65 @@ static DECLINE_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// from the behaviour: a caller that carves without asking here is a caller that
 /// does not appear in the totals. `Ok(None)` sends the caller to the pool; an
 /// open generation that cannot hold the request is an error ([`exhausted`]).
+///
+/// A carve answers with the ticket it was carved under, which the caller
+/// stamps on the storage: the operand's, or — for a ticketless operand inside
+/// [`with_ambient`] — the ambient seed, which the operand never had.
 #[track_caller]
 pub fn wave_alloc_attributed(
     from: Option<WaveTicket>,
     bytes: usize,
     align: usize,
-) -> crate::Result<Option<u64>> {
-    let Some(ticket) = from else {
+) -> crate::Result<Option<(u64, WaveTicket)>> {
+    let Some(ticket) = from.or_else(|| AMBIENT.with(|a| a.get())) else {
         record_decline(ArenaDecline::NoTicket, bytes);
         return Ok(None);
     };
     match wave_alloc(ticket, bytes, align) {
-        WaveCarve::Carved(ptr) => Ok(Some(ptr)),
+        WaveCarve::Carved(ptr) => Ok(Some((ptr, ticket))),
         WaveCarve::Closed => {
             record_decline(ArenaDecline::Closed, bytes);
             Ok(None)
         }
         WaveCarve::Exhausted(span) => Err(exhausted(ticket, bytes, span)),
     }
+}
+
+thread_local! {
+    /// The seed a ticketless operand's output takes on this thread, inside
+    /// [`with_ambient`]. `None` everywhere else, which is the rule above.
+    static AMBIENT: std::cell::Cell<Option<WaveTicket>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with `seed` standing in for any operand that carries no ticket of
+/// its own, on this thread.
+///
+/// # The one exception to "inherit from the operand", and why it is safe
+///
+/// Inheritance needs a root: something at the head of the chain that carries
+/// the ticket. A guest's interpreted graph has many roots — every `Constant`,
+/// `ConstantOfShape`, `Range` and shape computation starts a chain of its own,
+/// and BiRefNet's deformable decoder builds whole sampling grids from them. At
+/// 1024² those chains were 36 GB of allocations that never reached the guest's
+/// heap (`no_ticket_mib=36308`), and on a busy card the pool they fell to had
+/// no room: every cutout failed out of memory with the heap a quarter used
+/// (WhiteWorld, 2026-10-27).
+///
+/// A drain is where an ambient seed is sound. Inference is paused, the guest
+/// owns the stream, and nothing else on the scheduler thread allocates while
+/// `f` runs — so "ticketless here" can only mean "this guest's". The seed is a
+/// guest routing seed ([`WaveTicket::guest`]), which resolves to the pool
+/// whenever no guest generation is open, so it never names a range. It is
+/// restored when `f` returns or unwinds.
+pub fn with_ambient<R>(seed: WaveTicket, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<WaveTicket>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AMBIENT.with(|a| a.set(self.0));
+        }
+    }
+    let _restore = Restore(AMBIENT.with(|a| a.replace(Some(seed))));
+    f()
 }
 
 fn record_decline(why: ArenaDecline, bytes: usize) {
@@ -387,6 +428,27 @@ mod decline_tests {
             "a missing ticket is not a closed generation — the two have \
              different roots and must not share a counter",
         );
+    }
+
+    /// **The ambient seed is scoped**: set inside, restored after — nested, and
+    /// across an unwind — so a guest's seed can never outlive its drain on the
+    /// scheduler thread. Read through the thread-local, so the counters other
+    /// tests share are untouched.
+    #[test]
+    fn the_ambient_seed_is_scoped_and_restored() {
+        use super::{with_ambient, AMBIENT};
+        let (a, b) = (WaveTicket::guest(0), WaveTicket::guest(1));
+        let now = || AMBIENT.with(|x| x.get());
+        assert_eq!(now(), None);
+        with_ambient(a, || {
+            assert_eq!(now(), Some(a));
+            with_ambient(b, || assert_eq!(now(), Some(b)));
+            assert_eq!(now(), Some(a));
+        });
+        assert_eq!(now(), None);
+        let unwound = std::panic::catch_unwind(|| with_ambient(a, || panic!("inside")));
+        assert!(unwound.is_err());
+        assert_eq!(now(), None, "an unwind must not leave the seed behind");
     }
 
     /// A ticket whose generation is gone is charged to `Closed`.
