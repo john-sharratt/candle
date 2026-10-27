@@ -197,6 +197,17 @@ pub fn minimum_resident_slots(experts_per_layer: usize) -> usize {
     (PINNED_LAYERS + 1) * experts_per_layer + 1
 }
 
+/// How far a retraction may take the zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZoneFloor {
+    /// To [`minimum_resident_slots`] and no further: the engine serves tokens,
+    /// and a forward needs the pinned set plus a working layer.
+    Serving,
+    /// To the pinned set alone. Only while nothing forwards — a guest drain —
+    /// and only with the zone grown back to its floor before anything does.
+    Paused,
+}
+
 /// Where an evicted expert's next miss is served from.
 ///
 /// The warm tier and the NVMe pack hold disjoint experts, and the model's
@@ -531,6 +542,12 @@ impl ExpertCacheInner {
         self.num_moe_layers * self.experts_per_layer
     }
 
+    /// Slots the pinned layers fill — experts with no copy in the pack or the
+    /// warm tier, which no retraction may drop ([`ZoneFloor::Paused`]'s floor).
+    pub(crate) fn pinned_slots(&self) -> usize {
+        self.pinned_layers * self.experts_per_layer
+    }
+
     /// Slots not currently holding an expert.
     pub(crate) fn free_len(&self) -> usize {
         self.zone.free_count()
@@ -579,7 +596,11 @@ impl ExpertCacheInner {
     /// bookkeeping *inside the zone* is already applied; the per-slot tables
     /// here are truncated once the caller has moved what it is going to move,
     /// which is why this returns before touching them.
-    pub(crate) fn retract_zone(&mut self, target: usize) -> candle_nn::kv_cache::RetractPlan {
+    pub(crate) fn retract_zone(
+        &mut self,
+        target: usize,
+        within: ZoneFloor,
+    ) -> candle_nn::kv_cache::RetractPlan {
         // The pinned set does not move with the boundary — those experts have no
         // record in the pack and no warm slot, so unpinning one under pressure
         // would strand it. What keeps the eviction scan supplied instead is the
@@ -588,20 +609,31 @@ impl ExpertCacheInner {
         // (The failure this guards against is measured: a zone that retracted to
         // 297 slots against a 384-expert pinned set failed 1,774 consecutive
         // slot allocations, because `layer >= pinned_layers` matched nothing.)
+        //
+        // **Paused, the working layer goes too** (`ZoneFloor::Paused`): nothing
+        // forwards for the length of a guest drain, so nothing needs the room to
+        // serve a token, and the drain grows the zone back to its floor before
+        // the engine forwards again. The pinned set stays either way.
+        let floor = match within {
+            ZoneFloor::Serving => self.zone.min_capacity(),
+            ZoneFloor::Paused => self.pinned_slots().min(self.zone.capacity()),
+        };
         debug_assert!(
-            target.max(self.zone.min_capacity())
-                >= minimum_resident_slots(self.experts_per_layer).min(self.total_experts()),
-            "retraction target is below the floor that prices the fixed pinned set"
+            target.max(floor) >= self.pinned_slots().min(self.zone.capacity()),
+            "retraction target is below the fixed pinned set"
         );
-        // Keep key: pack-only experts survive a concession ahead of
-        // warm-backed ones, then the hotter within each tier — the eviction
-        // passes, inverted. The same key decides which survivor below the
-        // frontier a hotter doomed expert displaces; a pinned-layer expert is
-        // never displaced, having nowhere to reload from.
-        let keep: Vec<(bool, f32)> = (0..self.zone.capacity())
+        // Keep key: a pinned-layer expert above everything — it has nowhere to
+        // reload from, and a zone retracted to the pinned set holds exactly it —
+        // then pack-only experts ahead of warm-backed ones, then the hotter
+        // within each tier: the eviction passes, inverted. The same key decides
+        // which survivor below the frontier a hotter doomed expert displaces; a
+        // pinned-layer expert is never displaced.
+        let pinned_layers = self.pinned_layers;
+        let keep: Vec<(bool, bool, f32)> = (0..self.zone.capacity())
             .map(|i| {
-                self.slot_to_key[i].map_or((false, 0.0), |(layer, expert)| {
+                self.slot_to_key[i].map_or((false, false, 0.0), |(layer, expert)| {
                     (
+                        layer < pinned_layers,
                         self.reload_tier(layer, expert) == ReloadTier::Nvme,
                         self.score(layer, expert),
                     )
@@ -609,10 +641,10 @@ impl ExpertCacheInner {
             })
             .collect();
         let before = self.zone.capacity();
-        let pinned_layers = self.pinned_layers;
         let slot_to_key = &self.slot_to_key;
-        let plan = self.zone.retract_to(
+        let plan = self.zone.retract_within(
             target,
+            floor,
             |i| keep[i],
             |i| slot_to_key[i].is_some_and(|(layer, _)| layer >= pinned_layers),
         );
@@ -1663,9 +1695,51 @@ mod tests {
         inner.expert_scores[14] = 9.0; // slot 4: warm-backed and hot
         inner.set_warm_backed(&[(14, 0)]);
 
-        let plan = inner.retract_zone(4);
+        let plan = inner.retract_zone(4, ZoneFloor::Serving);
         assert_eq!(plan.relocate, vec![(5, 0)]);
         assert_eq!(plan.evict, vec![4]);
+    }
+
+    /// **Paused, the zone goes to the pinned set, and every pinned expert
+    /// survives** however cold, displacing hotter unpinned survivors: it has no
+    /// copy to come back from. Serving, the same ask stops at the floor.
+    #[test]
+    fn a_paused_concession_keeps_exactly_the_pinned_set() {
+        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 6, 6, 4), 48, 1);
+        let p = inner.pinned_layers;
+        assert_eq!(inner.pinned_slots(), p);
+        assert_eq!(p, 2, "the fixture prices two pinned layers");
+        for slot in 0..4 {
+            occupy(&mut inner, slot, p + slot, 0, slot as u32, 9.0); // hot, unpinned
+        }
+        occupy(&mut inner, 4, 0, 0, 4, 0.0); // pinned, doomed, coldest of all
+        occupy(&mut inner, 5, 1, 0, 5, 0.0); // pinned, doomed
+
+        let serving = inner.retract_zone(2, ZoneFloor::Serving);
+        assert_eq!(inner.zone.capacity(), 4, "serving, the stated floor holds");
+        assert!(serving.evict.iter().all(|&s| s >= 4));
+
+        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 6, 6, 4), 48, 1);
+        for slot in 0..4 {
+            occupy(&mut inner, slot, p + slot, 0, slot as u32, 9.0);
+        }
+        occupy(&mut inner, 4, 0, 0, 4, 0.0);
+        occupy(&mut inner, 5, 1, 0, 5, 0.0);
+        let plan = inner.retract_zone(0, ZoneFloor::Paused);
+        assert_eq!(
+            inner.zone.capacity(),
+            2,
+            "paused, the pinned set is the floor"
+        );
+        let kept: Vec<usize> = plan.relocate.iter().map(|&(from, _)| from).collect();
+        assert!(
+            kept.contains(&4) && kept.contains(&5),
+            "a pinned expert was dropped: relocate {:?}, evict {:?}",
+            plan.relocate,
+            plan.evict
+        );
+        assert!(!plan.evict.contains(&4) && !plan.evict.contains(&5));
+        assert_eq!(inner.zone.stated_floor(), 4, "the floor to grow back to");
     }
 
     /// A concession on a full zone trades a hot doomed expert for the coldest
@@ -1683,7 +1757,7 @@ mod tests {
         occupy(&mut inner, 4, p + 4, 0, 4, 9.0); // doomed, hot
         occupy(&mut inner, 5, p + 5, 0, 5, 0.05); // doomed, cold
 
-        let plan = inner.retract_zone(4);
+        let plan = inner.retract_zone(4, ZoneFloor::Serving);
         assert_eq!(plan.displace, vec![1]);
         assert_eq!(plan.relocate, vec![(4, 1)]);
         assert_eq!(plan.evict, vec![5]);

@@ -8,12 +8,15 @@
 //! worker waiting on a cold expert waits only on the stager, which needs no
 //! driver, so the quiesce always ends.
 
+use super::cache::ZoneFloor;
 use super::pipeline::PipelineState;
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::types::BoundaryAsk;
 use candle::cuda_backend::graph::{try_without_recording, Quiet};
 use candle::{Device, Result};
-use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, wave_is_live, weight_floor_after};
+use candle_nn::kv_cache::{
+    kv_spare_regions, set_weight_floor, wave_is_live, weight_floor_after, REGION_BYTES,
+};
 use cudarc::driver::CudaStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -113,15 +116,25 @@ impl PipelineState {
             // tier that cannot be placed fails its wave — so it says which gate
             // closed. The give-back direction is refused this way every forward
             // and stays quiet.
-            if let BoundaryAsk::Sell(wanted) = ask {
-                tracing::info!(
+            match ask {
+                BoundaryAsk::Sell(wanted) | BoundaryAsk::SellPaused(wanted) => tracing::info!(
                     target: "candle_transformers::expert_lre",
                     wanted,
                     wave_live = live,
                     invocation_unserved = unserved,
                     "weight side refused a KV purchase: the boundary moves only between \
                      forwards"
-                );
+                ),
+                // The one ask that must not be lost: a zone left below its floor
+                // cannot serve a token. Its caller asks again until it lands.
+                BoundaryAsk::RestoreFloor => tracing::warn!(
+                    target: "candle_transformers::expert_lre",
+                    wave_live = live,
+                    invocation_unserved = unserved,
+                    "the zone's floor could not be restored yet: the boundary moves only \
+                     between forwards"
+                ),
+                BoundaryAsk::Take(_) => {}
             }
             return Ok(0);
         }
@@ -179,15 +192,37 @@ impl PipelineState {
             return Ok(0);
         };
         let stream = cd.cuda_stream();
-        let growing = matches!(ask, BoundaryAsk::Take(_));
+        let growing = matches!(ask, BoundaryAsk::Take(_) | BoundaryAsk::RestoreFloor);
+        let within = match ask {
+            BoundaryAsk::SellPaused(_) => ZoneFloor::Paused,
+            _ => ZoneFloor::Serving,
+        };
         let delta = match ask {
-            BoundaryAsk::Take(0) | BoundaryAsk::Sell(0) => return Ok(0),
+            BoundaryAsk::Take(0) | BoundaryAsk::Sell(0) | BoundaryAsk::SellPaused(0) => {
+                return Ok(0)
+            }
             BoundaryAsk::Take(spare) => -(spare as isize),
-            BoundaryAsk::Sell(wanted) => wanted as isize,
+            BoundaryAsk::Sell(wanted) | BoundaryAsk::SellPaused(wanted) => wanted as isize,
+            BoundaryAsk::RestoreFloor => {
+                let short = self
+                    .inner
+                    .zone
+                    .stated_floor()
+                    .saturating_sub(self.inner.zone.capacity());
+                if short == 0 {
+                    return Ok(0);
+                }
+                -((short * self.inner.zone.slot_bytes()).div_ceil(REGION_BYTES) as isize)
+            }
         };
         let floor = weight_floor_after(&stream, delta)?;
         let before = self.inner.zone.capacity();
-        let target = self.inner.zone.capacity_for_frontier(floor);
+        let mut target = self.inner.zone.capacity_for_frontier(floor);
+        if ask == BoundaryAsk::RestoreFloor {
+            // Back to the floor and no further: what lies past it is the
+            // ordinary growth question's, with its slack.
+            target = target.min(self.inner.zone.stated_floor());
+        }
         if target == before {
             if growing {
                 // At the limit is not the same fact as nothing to take: a cache
@@ -244,12 +279,17 @@ impl PipelineState {
         // **Refuse before touching anything**, exactly as the growth path does:
         // a retraction refused half-way once left the zone believing it was
         // smaller while experts were still live past the new capacity.
-        if target.max(self.inner.zone.min_capacity()) >= before {
+        let floor_slots = match within {
+            ZoneFloor::Serving => self.inner.zone.min_capacity(),
+            ZoneFloor::Paused => self.inner.pinned_slots().min(before),
+        };
+        if target.max(floor_slots) >= before {
             tracing::info!(
                 target: "candle_transformers::expert_lre",
                 wanted = delta,
                 slots = before,
-                floor_slots = self.inner.zone.min_capacity(),
+                floor_slots,
+                paused = within == ZoneFloor::Paused,
                 "weight side is on its floor and can concede no further ground"
             );
             return Ok(0);
@@ -263,7 +303,7 @@ impl PipelineState {
         // The zone decides who moves and who goes; this performs it. A
         // displaced survivor is evicted first: the relocation into its slot
         // takes over the slot's bookkeeping.
-        let plan = self.inner.retract_zone(target);
+        let plan = self.inner.retract_zone(target, within);
         let displaced: Vec<(usize, usize)> = plan
             .displace
             .iter()

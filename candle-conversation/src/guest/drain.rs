@@ -100,6 +100,21 @@ pub trait EngineRoom {
     /// Let the weight side take back ground the shedding made it concede.
     fn reclaim(&mut self);
 
+    /// The last rung, for a drain still short once the ladder is spent: the
+    /// weight side concedes below the floor it needs to serve a token, down to
+    /// what has no copy anywhere else. `bytes` is the shortfall. Answers what
+    /// was conceded.
+    ///
+    /// Legal only because nothing forwards for the length of a drain — and only
+    /// with [`Self::restore_floor`] called before the drain returns, on every
+    /// path out of it.
+    fn concede_for_guest(&mut self, bytes: usize) -> u64;
+
+    /// Grow the weight side back to its serving floor after
+    /// [`Self::concede_for_guest`], from the ground the guest has handed back.
+    /// Answers whether it stands there.
+    fn restore_floor(&mut self) -> bool;
+
     /// Whether work is in flight that gives ground back when it finishes — a
     /// prefill, a section ingest or a decode. A refused job waits only while
     /// this holds: with nothing running, nothing will free what it is short of.
@@ -184,6 +199,20 @@ pub fn drain_one<R: EngineRoom>(
             break;
         }
     }
+    // Step 2b. **The weight side's working room, while nothing forwards.** Its
+    // floor is the pinned layers plus a layer's worst-case routed set, the room
+    // a forward needs to serve a token; for the length of a drain nothing does,
+    // and every expert past the pinned layers reloads from the pack or the warm
+    // tier. On WhiteWorld (2026-10-26) an edit gave up 48 MiB short with the
+    // zone on that floor — 513 slots, 0.95 GiB, above the pinned set. Only when
+    // still short, so a draw that fits never evicts an expert for it, and
+    // restored on every path out below.
+    let conceded = if room.free_bytes() < want {
+        room.concede_for_guest(want - room.free_bytes())
+    } else {
+        0
+    };
+    freed += conceded;
     report.freed_mib = freed >> 20;
 
     // Step 3. Claim only what the guest places itself — a second tenancy was
@@ -236,12 +265,15 @@ pub fn drain_one<R: EngineRoom>(
             report.failed = report.jobs - patient.len();
             report.waiting = patient.len();
             report.total_ms = started.elapsed().as_millis() as u64;
+            // The engine serves between tries, so the floor comes back first,
+            // waiting or not.
+            restore(room, conceded, guest);
             if patient.is_empty() {
                 room.reclaim();
             } else {
-                // The weight side keeps what it conceded while the job waits:
-                // taking it back now would evict the same experts again on the
-                // next try.
+                // Past its floor, the weight side keeps what it conceded while
+                // the job waits: taking more back now would evict the same
+                // experts again on the next try.
                 for (job, waited) in &patient {
                     job.emit(GuestEvent::WaitingForRoom {
                         short_mib: short >> 20,
@@ -286,6 +318,7 @@ pub fn drain_one<R: EngineRoom>(
         report.failed = report.jobs;
         report.total_ms = started.elapsed().as_millis() as u64;
         release(ground, guest);
+        restore(room, conceded, guest);
         room.reclaim();
         return report;
     }
@@ -388,6 +421,9 @@ pub fn drain_one<R: EngineRoom>(
     // model down, then ground back — is stated where it matters instead of
     // being a consequence of declaration order.
     release(ground, guest);
+    // Then the weight side's floor, from the ground just handed back, before
+    // the engine forwards again.
+    restore(room, conceded, guest);
     room.reclaim();
 
     report.total_ms = started.elapsed().as_millis() as u64;
@@ -447,6 +483,29 @@ fn release(ground: Arc<Mutex<GuestGround>>, guest: Guest) {
     drop(ground);
 }
 
+/// Grow the weight side back to its serving floor if the drain took it below,
+/// saying so loudly if it would not come back.
+///
+/// Every path out of [`drain_one`] after the concession comes through here,
+/// before [`EngineRoom::reclaim`] and before the scheduler forwards again. A
+/// zone left below its floor still serves — its slots above the pinned set
+/// still have victims — but a wide batch can then route to more experts than
+/// it holds, which is the state the floor exists to rule out.
+fn restore<R: EngineRoom>(room: &mut R, conceded: u64, guest: Guest) {
+    if conceded == 0 {
+        return;
+    }
+    if !room.restore_floor() {
+        tracing::error!(
+            target: "candle_conversation::guest",
+            %guest,
+            conceded_mib = conceded >> 20,
+            "the weight side did not grow back to its floor after a guest drain — the \
+             ground it conceded was taken by something else while the guest stood in it"
+        );
+    }
+}
+
 /// Turn a ground refusal into the error a caller reads.
 ///
 /// `NoRoom` is retryable and `Failed` is not, and the difference matters to a
@@ -485,6 +544,12 @@ mod tests {
         busy: bool,
         /// What the drain put back to wait, and the retry interval it gave.
         requeued: Vec<(Pending, Duration)>,
+        /// Bytes the weight side would concede below its floor for a guest.
+        concedable: usize,
+        /// Bytes it has conceded below its floor and not yet grown back.
+        below_floor: usize,
+        /// Bytes the guest's ground holds, until the drain hands it back.
+        claimed: usize,
     }
 
     impl EngineRoom for FakeRoom {
@@ -518,6 +583,7 @@ mod tests {
                 });
             }
             self.free -= want * REGION;
+            self.claimed += want * REGION;
             // Bases spaced two regions apart, so a test that straddled one
             // would be writing into the gap rather than into the next base.
             let bases = (0..want).map(|i| 0x1_0000_0000 + (i as u64 * 2 * REGION as u64));
@@ -536,6 +602,25 @@ mod tests {
         }
         fn holders(&self) -> String {
             format!("free={}", self.free)
+        }
+        fn concede_for_guest(&mut self, bytes: usize) -> u64 {
+            self.log.push("concede_for_guest");
+            let got = (self.concedable as u64).min(bytes as u64);
+            self.concedable -= got as usize;
+            self.free += got as usize;
+            self.below_floor += got as usize;
+            got
+        }
+        fn restore_floor(&mut self) -> bool {
+            self.log.push("restore_floor");
+            // The guest's ground has come home by now — the drain releases it
+            // before it restores — so it is free again, and the floor grows
+            // back out of it as the scheduler's does.
+            self.free += std::mem::take(&mut self.claimed);
+            let back = self.below_floor.min(self.free);
+            self.free -= back;
+            self.below_floor -= back;
+            self.below_floor == 0
         }
     }
 
@@ -712,6 +797,72 @@ mod tests {
             }],
             "the watcher was not told what the claim fell short by"
         );
+    }
+
+    /// **The weight side's working room is the last rung, and it always comes
+    /// back.** A drain the ladder left short asks the weight side below its
+    /// floor; the draw runs in what that freed, and the floor is restored before
+    /// the drain returns — then the ordinary reclaim. A draw that already fits
+    /// never asks.
+    #[test]
+    fn a_short_drain_takes_the_working_room_and_restores_it() {
+        let mut room = FakeRoom {
+            free: 48 << 20,
+            concedable: 32 << 20,
+            ..Default::default()
+        };
+        let (mut model, _, runs, _) = guest_model(Guest::Matte, 64 << 20);
+        let (_q, jobs, receipts) = queued(vec![matte_job()]);
+        let report = drain_one(&mut room, &mut model, jobs);
+
+        assert_eq!(report.served, 1, "the concession did not make room");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(receipts.into_iter().next().unwrap().wait().is_ok());
+        let at = |step| room.log.iter().position(|s| *s == step);
+        assert!(at("concede_for_guest") < at("claim_ground"));
+        assert!(
+            at("restore_floor") < at("reclaim"),
+            "the floor came back after the reclaim, or not at all: {:?}",
+            room.log
+        );
+        assert_eq!(
+            room.below_floor, 0,
+            "the weight side was left below its floor"
+        );
+
+        let mut room = FakeRoom {
+            free: 64 << 20,
+            concedable: 32 << 20,
+            ..Default::default()
+        };
+        let (mut model, _, _, _) = guest_model(Guest::Matte, 64 << 20);
+        let (_q, jobs, _r) = queued(vec![matte_job()]);
+        drain_one(&mut room, &mut model, jobs);
+        assert!(
+            !room.log.contains(&"concede_for_guest") && !room.log.contains(&"restore_floor"),
+            "a draw that fitted took experts for nothing: {:?}",
+            room.log
+        );
+    }
+
+    /// **A job that goes back to wait still gets the floor restored first**:
+    /// the engine serves between tries.
+    #[test]
+    fn a_waiting_job_restores_the_floor_before_it_waits() {
+        let mut room = FakeRoom {
+            free: 0,
+            concedable: 16 << 20,
+            busy: true,
+            ..Default::default()
+        };
+        let (mut model, _, _, _) = guest_model(Guest::Image, 64 << 20);
+        let (_q, jobs, _r) = queued(vec![image_job()]);
+        let report = drain_one(&mut room, &mut model, jobs);
+
+        assert_eq!(report.waiting, 1);
+        let at = |step| room.log.iter().position(|s| *s == step);
+        assert!(at("restore_floor").is_some() && at("restore_floor") < at("requeue"));
+        assert_eq!(room.below_floor, 0);
     }
 
     /// **The wait is bounded.** A job that has waited [`ROOM_PATIENCE`] is

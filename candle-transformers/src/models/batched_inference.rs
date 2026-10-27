@@ -6165,6 +6165,19 @@ pub trait ManagedBatchedModel {
     /// model runs with a smaller expert working set for no reason.
     fn reclaim_spare_ground(&self) {}
 
+    /// Concede weight-side ground below the serving floor for a guest drain. See
+    /// `BatchedModel::concede_for_guest`.
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        let _ = regions;
+        0
+    }
+
+    /// Grow the weight side back to its serving floor after a guest drain. See
+    /// `BatchedModel::restore_serving_floor`.
+    fn restore_serving_floor(&self) -> bool {
+        true
+    }
+
     /// Live VRAM held by the model's weights (fixed base + time-varying resident
     /// experts), for the whole-card VRAM decomposition. `None` if unavailable.
     fn resident_weight_bytes(&self) -> Option<usize> {
@@ -6458,6 +6471,14 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn reclaim_spare_ground(&self) {
         self.model().reclaim_spare_ground()
+    }
+
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        self.model().concede_for_guest(regions)
+    }
+
+    fn restore_serving_floor(&self) -> bool {
+        self.model().restore_serving_floor()
     }
 
     fn resident_weight_bytes(&self) -> Option<usize> {

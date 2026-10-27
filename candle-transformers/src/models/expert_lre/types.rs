@@ -617,10 +617,18 @@ pub struct RoutedLayer {
 pub enum BoundaryAsk {
     /// The KV side needs this many regions of weight-side ground.
     Sell(usize),
+    /// [`Self::Sell`] with the engine paused for a guest: the zone may go
+    /// below its serving floor to the pinned set (`ZoneFloor::Paused`). Always
+    /// followed by [`Self::RestoreFloor`] before the engine forwards again.
+    SellPaused(usize),
     /// The KV side is holding this many regions spare, which the weight side
     /// may take back — asked between forwards by the caller
     /// (`boundary::spare_for_growth`).
     Take(usize),
+    /// Grow the zone back to its stated floor, from free ground, after a
+    /// [`Self::SellPaused`] — whatever the slack and grant rules growth
+    /// otherwise keeps.
+    RestoreFloor,
 }
 
 /// Message sent to the pipeline thread.
