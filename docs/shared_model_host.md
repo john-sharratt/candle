@@ -353,7 +353,7 @@ differently today:
 
 | Setting | zend | npcd | Rule |
 |---|---|---|---|
-| `prefill_pass_tokens` | sized from the card (2048–8192) | 8192 (`runtime.rs:133`) | max |
+| `prefill_pass_tokens` | sized from the card (`prefill_width`: VRAM × link) | 8192 (`runtime.rs:163`) | max, then clamped to the card's width |
 | `min_rope_factor` | 2 (schema `rope.min_yarn_factor`, `session.rs:1253`) | unset | max — RoPE schedule is the model's |
 | `qsa_selection_budget`, `qsa_strata` | CLI (`session.rs:1249-1250`) | unset | zend's; npcd sets none |
 | `max_response_tokens` | 65,536 (`session.rs:349`) | 16,384 (the builder default) | max |
@@ -364,6 +364,12 @@ differently today:
 `CoreRequests` carries these (`candle_conversation::engine_slot::CoreRequests`); the
 tenant that builds the engine merges every tenant's by the rule column before it
 builds (§3.2), and the merged values are what the engine logs at start.
+
+The prefill width is a request against a ceiling: the merge picks what the tenants
+want, and the builder clamps it to what the card carries (`prefill_width`, by its
+VRAM and measured host→device link). Past that width each window's transient tier is
+bought from the expert zone and decode pays for it after the window — on the RTX PRO
+5000 npcd's 8,192 over the card's 3,072 conceded ~8 GB of experts every window.
 
 Settings that already agree need no rule: `compression_level` is 5 for both (zend sets
 it, `session.rs:1258`; npcd gets the builder default, `builder.rs:205`), and a
