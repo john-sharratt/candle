@@ -1374,6 +1374,36 @@ impl CudaDevice {
         )
     }
 
+    /// The most the pool has had in use at once since the last
+    /// [`Self::reset_pool_used_peak`] — the activation peak of whatever ran in
+    /// between, which `pool_used_bytes` sampled afterwards cannot see.
+    pub fn pool_used_peak_bytes(&self) -> Result<usize> {
+        self.pool_attr(cudarc::driver::sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)
+    }
+
+    /// Start [`Self::pool_used_peak_bytes`] again from what is in use now.
+    pub fn reset_pool_used_peak(&self) -> Result<()> {
+        use cudarc::driver::sys;
+        self.context.bind_to_thread().w()?;
+        let dev = self.context.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // The driver resets a high-water mark by being handed zero.
+        let mut zero: u64 = 0;
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, dev)
+                .result()
+                .w()?;
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                &mut zero as *mut u64 as *mut std::ffi::c_void,
+            )
+            .result()
+            .w()?;
+        }
+        Ok(())
+    }
+
     fn pool_attr(&self, attr: cudarc::driver::sys::CUmemPool_attribute_enum) -> Result<usize> {
         use cudarc::driver::sys;
         self.context.bind_to_thread().w()?;

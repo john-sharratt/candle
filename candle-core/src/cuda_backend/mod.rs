@@ -2593,32 +2593,19 @@ impl CudaStorageSlice {
     /// `cuMemFreeAsync` on an interior pointer, which the driver rejects into a
     /// silently-recorded error rather than a panic — so the mistake does not
     /// announce itself.
-    fn leak_view(self) {
+    ///
+    /// Answers the view's device address, which the lease's arena may want back
+    /// ([`wave_provenance::wave_release`]).
+    fn leak_view(self) -> u64 {
         match self {
-            Self::U8(s) => {
-                s.leak();
-            }
-            Self::U32(s) => {
-                s.leak();
-            }
-            Self::I64(s) => {
-                s.leak();
-            }
-            Self::BF16(s) => {
-                s.leak();
-            }
-            Self::F16(s) => {
-                s.leak();
-            }
-            Self::F32(s) => {
-                s.leak();
-            }
-            Self::F64(s) => {
-                s.leak();
-            }
-            Self::F8E4M3(s) => {
-                s.leak();
-            }
+            Self::U8(s) => s.leak(),
+            Self::U32(s) => s.leak(),
+            Self::I64(s) => s.leak(),
+            Self::BF16(s) => s.leak(),
+            Self::F16(s) => s.leak(),
+            Self::F32(s) => s.leak(),
+            Self::F64(s) => s.leak(),
+            Self::F8E4M3(s) => s.leak(),
             Self::Moved => Self::unreachable_moved(),
         }
     }
@@ -2636,11 +2623,16 @@ impl Drop for CudaStorage {
                 // once that launch has been issued.
                 let slice = std::mem::replace(&mut self.slice, CudaStorageSlice::Moved);
                 self.device.retire(slice);
-                return;
             }
-            Backing::Lease(_) => {}
+            Backing::Lease(origin) => {
+                let ptr = std::mem::replace(&mut self.slice, CudaStorageSlice::Moved).leak_view();
+                // An arena that frees as its storages die takes the range back;
+                // every other arena ignores this.
+                if let LeaseOrigin::Wave(ticket) = origin {
+                    wave_provenance::wave_release(ticket, ptr);
+                }
+            }
         }
-        std::mem::replace(&mut self.slice, CudaStorageSlice::Moved).leak_view();
     }
 }
 
@@ -3509,7 +3501,14 @@ impl CudaStorage {
         let (fresh, fresh_backing) = self.reinterpret_slice_as(dtype, elem_count)?;
         let previous = std::mem::replace(&mut self.slice, fresh);
         match self.backing {
-            Backing::Lease(_) => previous.leak_view(),
+            // The old range is no storage's any more: an arena that frees takes
+            // it back, behind a fence recorded after the cast that reads it.
+            Backing::Lease(origin) => {
+                let ptr = previous.leak_view();
+                if let LeaseOrigin::Wave(ticket) = origin {
+                    wave_provenance::wave_release(ticket, ptr);
+                }
+            }
             // Retired, not dropped: the cast and the copy just issued read it,
             // and while this thread records a wave they have not run yet — a
             // free now would queue ahead of them.

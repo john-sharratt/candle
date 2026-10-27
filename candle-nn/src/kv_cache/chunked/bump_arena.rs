@@ -1140,8 +1140,14 @@ static GUEST_ARENA_OPEN: AtomicBool = AtomicBool::new(false);
 /// against every other drain by the scheduler thread, so the previous one has
 /// finished by the time this runs; replacing rather than refusing means a drain
 /// that died without closing cannot wedge every later one.
-pub fn open_guest_arena(stream: &Arc<CudaStream>, base: u64, capacity: usize) {
+/// Register this module's resolver for wave tickets — idempotent, and needed by
+/// anything that carves for a ticket, the guest heap included.
+pub(super) fn install_resolver() {
     candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
+}
+
+pub fn open_guest_arena(stream: &Arc<CudaStream>, base: u64, capacity: usize) {
+    install_resolver();
     let ordinal = stream.context().ordinal();
     let arena = BumpArena::over(stream, "guest", base, capacity, Reclaim::Fence);
     let mut map = guest_domains().lock().unwrap();
@@ -2482,6 +2488,11 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCar
     // by returning `None` — the right answer for the wrong reason, and one that
     // would silently stop working if a fourth phase were ever added.
     if ticket.arena == GUEST_ARENA {
+        // A guest that opened a heap carves there: it frees as tensors die,
+        // which a graph without stages needs (`guest_heap`).
+        if let Some(carved) = super::guest_heap::carve(ticket, bytes, align) {
+            return carved;
+        }
         let Ok(map) = guest_domains().lock() else {
             return WaveCarve::Closed;
         };

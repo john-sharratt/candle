@@ -66,6 +66,8 @@ mod gpu_test_lock;
 pub mod growth_policy;
 #[cfg(feature = "cuda")]
 pub mod guard;
+#[cfg(feature = "cuda")]
+pub mod guest_heap;
 #[cfg(not(feature = "cuda"))]
 mod guest_stage_cpu;
 mod head_gids;
@@ -209,6 +211,8 @@ pub use bump_arena::{
 };
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};
+#[cfg(feature = "cuda")]
+pub use guest_heap::{close_guest_heap, open_guest_heap, GuestHeapStats};
 #[cfg(not(feature = "cuda"))]
 pub use guest_stage_cpu::{guest_chain, guest_stage};
 #[cfg(feature = "cuda")]

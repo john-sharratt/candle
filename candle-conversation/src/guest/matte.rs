@@ -51,10 +51,16 @@ use candle::{DType, Device, Tensor};
 use candle_onnx::onnx::ModelProto;
 use image::imageops::FilterType;
 
+use candle_nn::kv_cache::{close_guest_heap, open_guest_heap};
+
 use super::ground::GuestGround;
 use super::model::GuestModel;
 use super::progress::{GuestEvent, GuestSink};
-use super::varground::place_bytes;
+use super::varground::{into_arena, place_bytes};
+
+/// Where each activation range starts: what `cudaMalloc` guarantees, so a
+/// heap carve is as aligned as the pool allocation it replaces.
+const HEAP_ALIGN: usize = 256;
 use super::work::{Guest, GuestMatte, GuestOutcome, GuestRequest, MatteRequest};
 
 /// Which published network this is, and therefore how it wants its input.
@@ -78,20 +84,41 @@ pub enum Family {
     IsNet,
     /// U²-Net and its `silueta` relatives — ImageNet channel statistics.
     U2Net,
+    /// BiRefNet (HR matting) — ImageNet statistics, and an output that is
+    /// already a probability: the export applies its sigmoid in the graph.
+    #[serde(rename = "birefnet")]
+    BiRefNet,
+}
+
+/// What a family's output is, and therefore how it becomes an alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Output {
+    /// Unbounded logits, min–max normalised per picture — see [`normalise`].
+    Logits,
+    /// A probability in [0, 1]: clamped, nothing more. Normalising it would
+    /// stretch a mostly transparent picture's faint edges to opaque.
+    Alpha,
 }
 
 impl Family {
     fn mean(self) -> [f32; 3] {
         match self {
             Self::IsNet => [0.5, 0.5, 0.5],
-            Self::U2Net => [0.485, 0.456, 0.406],
+            Self::U2Net | Self::BiRefNet => [0.485, 0.456, 0.406],
         }
     }
 
     fn std(self) -> [f32; 3] {
         match self {
             Self::IsNet => [1.0, 1.0, 1.0],
-            Self::U2Net => [0.229, 0.224, 0.225],
+            Self::U2Net | Self::BiRefNet => [0.229, 0.224, 0.225],
+        }
+    }
+
+    fn output(self) -> Output {
+        match self {
+            Self::IsNet | Self::U2Net => Output::Logits,
+            Self::BiRefNet => Output::Alpha,
         }
     }
 }
@@ -305,6 +332,19 @@ impl GuestModel for MatteGuest {
                     .map_err(|e| format!("matte guest: placing {}: {e}", t.name))?;
                 weights.insert(t.name.clone(), placed);
             }
+            // **The rest of the ground is the activations' heap.** A graph has
+            // no stages for a bump to rewind at, so its intermediates come from
+            // a heap that frees as each one dies (`guest_heap`) — without one
+            // they came from the CUDA pool, outside the span, and a busy card
+            // left the pool 0.6 GB while the claimed ground stood unused.
+            if let Device::Cuda(cuda) = device {
+                let runs: Vec<(u64, usize)> = g
+                    .take_rest(HEAP_ALIGN)
+                    .into_iter()
+                    .map(|p| (p.ptr, p.len))
+                    .collect();
+                open_guest_heap(&cuda.cuda_stream(), &runs);
+            }
         }
 
         // **One barrier for the whole load**, for the reason `GroundVars::with`
@@ -352,6 +392,21 @@ impl GuestModel for MatteGuest {
     }
 
     fn unload(&mut self) {
+        // The heap closes before the ground goes back: a carve after that would
+        // land on regions that are attention state again. Its peak is the
+        // activation figure `footprint_bytes` should be claiming.
+        if let Some(Device::Cuda(cuda)) = self.loaded.as_ref().map(|l| &l.device) {
+            if let Some(s) = close_guest_heap(&cuda.cuda_stream()) {
+                tracing::info!(
+                    target: "candle_conversation::guest",
+                    family = ?self.spec.family,
+                    heap_mib = s.capacity >> 20,
+                    peak_mib = s.peak >> 20,
+                    carves = s.carves,
+                    "matte guest: activation heap"
+                );
+            }
+        }
         // Every weight views ground, and the drain hands it back the moment
         // this returns. The parsed graph is host memory and stays.
         self.loaded = None;
@@ -394,7 +449,12 @@ impl Loaded {
                 chw[c * n + i] = (px[c] as f32 / 255.0 - mean[c]) / std[c];
             }
         }
-        let input = Tensor::from_vec(chw, (1, 3, self.side, self.side), &self.device)?;
+        // Seeded into the heap: every op takes its ticket from its first operand,
+        // so the chain from here carves there rather than from the pool.
+        let input = into_arena(
+            &Tensor::from_vec(chw, (1, 3, self.side, self.side), &self.device)?,
+            &self.device,
+        )?;
 
         // The placed weights are handed in rather than re-read from the proto,
         // which is what keeps them in ground: `simple_eval` would otherwise
@@ -425,7 +485,10 @@ impl Loaded {
             );
         }
         flat.truncate(n);
-        normalise(&mut flat);
+        match self.family.output() {
+            Output::Logits => normalise(&mut flat),
+            Output::Alpha => flat.iter_mut().for_each(|a| *a = a.clamp(0.0, 1.0)),
+        }
 
         let grey: image::GrayImage = image::ImageBuffer::from_raw(
             side,

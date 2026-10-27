@@ -151,6 +151,30 @@ impl Bump {
         self.offset = 0;
     }
 
+    /// Hand out everything still placeable, one placement per run — the tail of
+    /// the run in progress and every run after it — each starting at `align`.
+    ///
+    /// For a tenant that sub-allocates the rest itself: a guest's activation
+    /// heap, which frees and so cannot be a bump. One placement per run because
+    /// two runs are separated by another tenant's ground. A tail too short to
+    /// align into is left out.
+    pub fn take_rest(&mut self, align: usize) -> Vec<Placement> {
+        let align = align.max(1);
+        let mut out = Vec::new();
+        while let Some(run) = self.runs.get(self.run) {
+            let at = self.offset.next_multiple_of(align);
+            if at < run.bytes {
+                out.push(Placement {
+                    ptr: run.base + at as u64,
+                    len: run.bytes - at,
+                });
+            }
+            self.run += 1;
+            self.offset = 0;
+        }
+        out
+    }
+
     /// Place `len` bytes, aligned to `align`.
     ///
     /// **An allocation never crosses a run boundary.** Two runs are separated by
@@ -266,6 +290,11 @@ impl GuestGround {
     /// See [`Bump::rewind`]; the regions stay claimed.
     pub fn rewind(&mut self) {
         self.bump.rewind()
+    }
+
+    /// See [`Bump::take_rest`].
+    pub fn take_rest(&mut self, align: usize) -> Vec<Placement> {
+        self.bump.take_rest(align)
     }
 
     /// The coalesced stretches this ground occupies.
@@ -389,6 +418,32 @@ mod tests {
     /// never promised one.
     fn scattered() -> Bump {
         Bump::new(vec![0x4000, 0x1000, 0x5000], 0x1000)
+    }
+
+    /// **The rest is every run's remainder, one placement each**, starting at
+    /// the alignment, and nothing is left to place after it. The run in
+    /// progress gives its tail; a later run gives all of itself.
+    #[test]
+    fn take_rest_hands_out_every_runs_remainder() {
+        let mut b = scattered();
+        // Runs in claim order: [0x4000, +0x2000), then [0x1000, +0x1000).
+        b.place(0x100, 1).unwrap();
+        let rest = b.take_rest(0x200);
+        assert_eq!(
+            rest,
+            vec![
+                Placement {
+                    ptr: 0x4200,
+                    len: 0x1e00
+                },
+                Placement {
+                    ptr: 0x1000,
+                    len: 0x1000
+                },
+            ]
+        );
+        assert_eq!(b.free(), 0, "the rest was all of it");
+        assert!(b.place(1, 1).is_err());
     }
 
     /// An allocation spanning two *adjacent* regions is served, because there is
