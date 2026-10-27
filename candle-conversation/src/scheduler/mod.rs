@@ -50,6 +50,7 @@ pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
 mod norm_warm;
+mod owed_pins;
 mod paused_creep;
 mod pending_ranges;
 pub mod phase_ring;
@@ -94,6 +95,7 @@ use phase_split::cobatched_step_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
+use self::owed_pins::OwedPins;
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
 use self::request_laps::RequestLaps;
@@ -3856,6 +3858,9 @@ pub(crate) struct Scheduler {
     /// The steps of the request in hand, named in the log when it holds the
     /// wave thread long ([`Self::handle_request`]).
     request_laps: RequestLaps,
+    /// The substrates owed a working-set pin republish that found the write
+    /// lock held ([`Self::republish_pins`]).
+    owed_pins: OwedPins,
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
@@ -4253,6 +4258,7 @@ impl Scheduler {
             paused_creep: None,
             prefill_gang: Vec::new(),
             request_laps: RequestLaps::default(),
+            owed_pins: OwedPins::default(),
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
             prefill_waits: prefill_wait::PrefillWaits::default(),
@@ -11233,7 +11239,7 @@ impl Scheduler {
     /// evict mid-forward). Recomputed wholesale each call, so residences that
     /// have left every working set drop out and become evictable again.
     fn publish_working_set_pins(
-        &self,
+        &mut self,
         conversation: &Conversation,
         extra_sections: &[SectionId],
         extra_turns: &[TurnKey],
@@ -11246,6 +11252,34 @@ impl Scheduler {
         conversation
             .write()
             .set_working_set_pins(&keep_turns, &keep_sections);
+        // The whole live set, so a republish this substrate was owed is in it.
+        self.owed_pins.settled(conversation);
+    }
+
+    /// Republish `conversation`'s substrate's keep-set — the live working sets
+    /// alone — if its write lock is free now, and owe it otherwise
+    /// ([`OwedPins`]): what a slot's retirement does, which only takes pins
+    /// away and so can wait a wave rather than hold the wave thread behind a
+    /// maintenance op. [`Self::settle_owed_pins`] retries what is owed.
+    fn republish_pins(&mut self, conversation: &Conversation) {
+        let (keep_sections, keep_turns) = self.live_working_sets();
+        match conversation.try_write() {
+            Some(mut substrate) => {
+                substrate.set_working_set_pins(&keep_turns, &keep_sections);
+                drop(substrate);
+                self.owed_pins.settled(conversation);
+            }
+            None => self.owed_pins.owe(conversation),
+        }
+    }
+
+    /// Retry every owed republish ([`Self::republish_pins`]); those still
+    /// locked stay owed. Once a wave, so a pin outlives its slot by about the
+    /// length of the hold that blocked it.
+    pub(super) fn settle_owed_pins(&mut self) {
+        for conversation in self.owed_pins.take() {
+            self.republish_pins(&conversation);
+        }
     }
 
     /// Drop `slot`'s projection working set and republish the keep-set without
@@ -11277,7 +11311,9 @@ impl Scheduler {
     /// This is the only place [`Self::slot_projection_state`] is removed from,
     /// which is what makes "a removal is always followed by a republish" hold
     /// by construction rather than by every caller remembering. Keep it that
-    /// way: a bare `remove` elsewhere re-opens the wedge silently.
+    /// way: a bare `remove` elsewhere re-opens the wedge silently. The
+    /// republish runs now when the substrate's write lock is free and is owed
+    /// to the next wave when it is not ([`Self::republish_pins`]).
     fn retire_slot_projection_state(
         &mut self,
         slot: SequenceId,
@@ -11287,7 +11323,7 @@ impl Scheduler {
             return;
         }
         if let Some(conversation) = conversation {
-            self.publish_working_set_pins(&conversation, &[], &[]);
+            self.republish_pins(&conversation);
         }
     }
 

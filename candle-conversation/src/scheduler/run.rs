@@ -1281,6 +1281,8 @@ impl Scheduler {
                 t_gpu.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            // A freed slot's pins, owed while its substrate's lock was held.
+            self.settle_owed_pins();
             // Closed BEFORE the flush block: the flush is the window boundary
             // itself, and its own cost is already accounted (eviction/sync carve
             // out of the remainder), so folding it in here would double-count.

@@ -6294,24 +6294,43 @@ impl Substrate {
     pub fn refresh_cold_refs(&mut self) {
         let streams = &self.streams;
         for slot in &mut self.residence {
-            let Some(cold) = &mut slot.cold else { continue };
-            let Some(stream) = streams.get(slot.stream_id) else {
-                continue;
-            };
-            let n_layers = cold.len();
-            let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
-            if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
-                continue;
-            }
-            for (layer, seq) in cold.iter_mut().enumerate() {
-                for (c, chunk) in seq.chunks.iter_mut().enumerate() {
-                    let flat = (layer * chunks_per_layer + c) as u64;
-                    if let Some(loc) = stream.chunks.get(&flat) {
-                        chunk.log_offset = loc.offset;
-                        chunk.record_len = loc.record_size;
-                        chunk.token_count = loc.token_count as u16;
-                    }
+            Self::refresh_slot_cold_refs(streams, slot);
+        }
+    }
+
+    /// One residence's cold references, re-read from its stream's index.
+    fn refresh_slot_cold_refs(streams: &StreamIndex, slot: &mut SequenceResidence) {
+        let Some(cold) = &mut slot.cold else { return };
+        let Some(stream) = streams.get(slot.stream_id) else {
+            return;
+        };
+        let n_layers = cold.len();
+        let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
+        if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
+            return;
+        }
+        for (layer, seq) in cold.iter_mut().enumerate() {
+            for (c, chunk) in seq.chunks.iter_mut().enumerate() {
+                let flat = (layer * chunks_per_layer + c) as u64;
+                if let Some(loc) = stream.chunks.get(&flat) {
+                    chunk.log_offset = loc.offset;
+                    chunk.record_len = loc.record_size;
+                    chunk.token_count = loc.token_count as u16;
                 }
+            }
+        }
+    }
+
+    /// [`Self::refresh_cold_refs`] for the residences of `moved` alone — what
+    /// a maintenance op that relocated those streams' chunks has to refresh.
+    /// Every other residence's references are untouched by the op, and
+    /// walking every chunk of every residence held the substrate write lock
+    /// ~0.4 s per op on BlackWorld's 357 GB store (2026-10-27).
+    pub fn refresh_cold_refs_of(&mut self, moved: &HashSet<StreamId>) {
+        let streams = &self.streams;
+        for slot in &mut self.residence {
+            if moved.contains(&slot.stream_id) {
+                Self::refresh_slot_cold_refs(streams, slot);
             }
         }
     }
@@ -11834,6 +11853,65 @@ mod tests {
         assert_eq!(
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
+        );
+    }
+
+    /// **A maintenance op refreshes the residences of the streams it moved,
+    /// and no others**: two turns' chunks are repointed in the index, one
+    /// stream is named moved, and only its turn's cold reference follows.
+    #[test]
+    fn refresh_cold_refs_of_repoints_only_the_moved_streams() {
+        let (_, _, first, mut sub) = make_timeline();
+        let second = TimelineId::from_raw(4243).unwrap();
+        sub.register_timeline(second, LayerId::for_test(1), GroupId::for_test(1));
+        let loc = |offset: u64| ChunkLoc {
+            segment: FIRST_SEGMENT,
+            offset,
+            payload_len: 100,
+            record_size: 4096,
+            token_count: 32,
+            format: 4,
+        };
+        let cold_at = |offset: u64| {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: offset,
+                    record_len: 4096,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+        let mut turn = |timeline: TimelineId, offset: u64| {
+            let stream = turn_stream_id(timeline.raw(), 0);
+            sub.apply_chunk_loc(stream, 0, loc(offset), RecordIdentity::NONE);
+            let idx = sub.restore_turn(
+                timeline,
+                TurnLayout::default(),
+                TokenBuffer::default(),
+                32,
+                Some(cold_at(offset)),
+                0,
+                1,
+            );
+            (stream, idx)
+        };
+        let (moved_stream, moved_idx) = turn(first, 4096);
+        let (kept_stream, kept_idx) = turn(second, 8192);
+        sub.apply_chunk_loc(moved_stream, 0, loc(100_000), RecordIdentity::NONE);
+        sub.apply_chunk_loc(kept_stream, 0, loc(200_000), RecordIdentity::NONE);
+
+        sub.refresh_cold_refs_of(&HashSet::from([moved_stream]));
+
+        let offset_of = |sub: &Substrate, timeline, idx| {
+            let r = sub.turn_residence(timeline, idx).unwrap();
+            sub.residence[r.0].cold.as_ref().unwrap()[0].chunks[0].log_offset
+        };
+        assert_eq!(offset_of(&sub, first, moved_idx), 100_000);
+        assert_eq!(
+            offset_of(&sub, second, kept_idx),
+            8192,
+            "a stream the op did not move keeps its reference"
         );
     }
 

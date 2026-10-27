@@ -230,11 +230,16 @@ on open.)
 
 ## 8. Trigger policy
 
-A sealed segment becomes a **compact** candidate only when **both** hold
-(interpretation of "> 1 minute and > 10% saving per segment" — confirm):
+A sealed segment becomes a **compact** candidate only when **both** hold:
 
 - **Savings**: `dead_bytes(segment) / segment_bytes ≥ SEGMENT_COMPACT_MIN_DEAD`
-  (**10%**), i.e. relocating is worth the I/O.
+  (**20%**), i.e. relocating is worth the I/O. Relocating a segment rewrites
+  its live bytes to reclaim its dead ones, so the threshold bounds the write
+  amplification at `1/ratio`. At 10% it ran 6–9×: BlackWorld's 357 GB store
+  (2026-10-27) rewrote 3.3–3.9 GB of live records every 15–60 s to reclaim
+  ~0.6 GB, and each op's plan and apply holds stalled the scheduler's
+  substrate writes behind it. At 20% the amplification is at most 5× and the
+  dead weight a segment carries at most a fifth.
 - **Settle/rate-limit**: at least `SEGMENT_COMPACT_MIN_AGE` (**60 s**) since the
   segment was sealed or last compacted — so a hot segment isn't churned and a
   just-sealed one has time to accumulate deaths.
@@ -320,7 +325,7 @@ Mirrors how the load-progress overlay already streams from the daemon.
 ```rust
 const SEGMENT_TARGET_BYTES: u64      = 4 * 1024 * 1024 * 1024; // ≈4 GB seal point
 const COMBINE_SEGMENT_BYTES: u64     = 2 * 1024 * 1024 * 1024; // combine below this
-const SEGMENT_COMPACT_MIN_DEAD: f32  = 0.10;                   // ≥10% savings
+const SEGMENT_COMPACT_MIN_DEAD: f32  = 0.20;                   // ≥20% savings
 const SEGMENT_COMPACT_MIN_AGE_S: u64 = 60;                     // settle/rate-limit
 const OPEN_SEALED_SEGMENTS: usize    = 8;                      // LRU of DirectFiles
 ```
@@ -396,7 +401,7 @@ handle selection) is exercised on the live GPU daemon, since it drives the
    live records to the active (highest-id) segment, then drop the sources. This
    is the invariant that keeps the store **manifest-free** (id-order = recency).
    *No LSN/generation state is introduced.*
-2. **Compact trigger = `dead_ratio ≥ 10%` AND `age_since_seal ≥ 60 s`** (settle +
+2. **Compact trigger = `dead_ratio ≥ 20%` AND `age_since_seal ≥ 60 s`** (settle +
    rate-limit). Drop is unconditional at `live_bytes == 0`; combine on adjacency
    + the 2 GB size threshold.
 3. **Turns may span a seal.** Seal on any record boundary at ~4 GB; a turn's
