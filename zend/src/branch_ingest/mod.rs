@@ -86,6 +86,17 @@ pub struct BranchIngest {
 }
 
 impl BranchIngest {
+    /// The file keys found to be binary: this process's, and every one a
+    /// reading recorded in the substrate (`code_read::binary_mark`) — on this
+    /// member before a restart, or on another member, whose verdict arrived
+    /// with replication.
+    fn known_binary(&self, ctx: &RefreshContext<'_>) -> HashSet<String> {
+        let conversation = ctx.engine.lock().unwrap().conversation();
+        let mut binary = self.binary.lock().unwrap();
+        binary.extend(code_read::binary_mark::recorded(&conversation));
+        binary.clone()
+    }
+
     /// One pass over `layers`. Returns whether any layer changed.
     pub fn pass(
         &self,
@@ -185,7 +196,7 @@ impl BranchIngest {
         let (corpus, held_back, progress) = (read.corpus, read.held_back, read.progress);
         // A file found to be binary is never read, so it is not a unit: its
         // path's older versions must not wait on it as their replacement.
-        let binary = self.binary.lock().unwrap().clone();
+        let binary = self.known_binary(ctx);
         let files = readable(&corpus.ingest.files, &binary);
         let retained = readable(&corpus.retain.files, &binary);
         let live: Vec<Live<'_>> = files
