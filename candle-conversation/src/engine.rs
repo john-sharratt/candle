@@ -7,6 +7,7 @@ use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
 use crate::group_scanner::GroupScanner;
 use crate::guest::reach;
+use crate::guest::Guest;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::ingest_warmer::IngestWarmer;
 use crate::models::identity::ModelKey;
@@ -403,8 +404,12 @@ impl ConversationEngine {
                 "guest draws on this node reach {side}x{side}"
             );
         }
-        // And to the cluster, whose gateways place a draw where it is reached.
-        reach::state(guests.queue.reach());
+        // And to the cluster, whose gateways place a draw where it is reached —
+        // nowhere here when this node has no image guest to draw with.
+        reach::state(reach::advertised(
+            guests.queue.reach(),
+            guests.registry.has(Guest::Image),
+        ));
         let guests_for_scheduler = Arc::clone(&guests);
 
         let eos_tokens = config.eos_tokens.clone();

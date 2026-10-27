@@ -57,6 +57,17 @@ pub fn side_for_card(card_bytes: u64) -> u32 {
         .map_or(REACH[REACH.len() - 1].1, |&(_, side)| side)
 }
 
+/// The reach a node tells its cluster: its card's `side` when it has an image
+/// guest to draw with, and 0 when it has none — a gateway then sends it no
+/// draw, which it could only refuse.
+pub fn advertised(side: u32, draws: bool) -> u32 {
+    if draws {
+        side
+    } else {
+        0
+    }
+}
+
 /// Whether a `width × height` draw is within a reach of `side × side`.
 pub fn within(width: u32, height: u32, side: u32) -> bool {
     width as u64 * height as u64 <= side as u64 * side as u64
@@ -76,6 +87,14 @@ mod tests {
         assert_eq!(side_for_card(32 * GIB - 300 * (1 << 20)), 2048);
         assert_eq!(side_for_card(0), 512);
         assert_eq!(side_for_card(96 * GIB), 2048);
+    }
+
+    /// **A node with no image guest tells its cluster it draws nothing**,
+    /// whatever its card; one with a guest, its card's side.
+    #[test]
+    fn a_node_without_an_image_guest_advertises_no_reach() {
+        assert_eq!(advertised(2048, true), 2048);
+        assert_eq!(advertised(2048, false), 0);
     }
 
     /// The reach is an area: a tall picture of the same pixel count is served
