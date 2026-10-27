@@ -86,10 +86,14 @@ instructions and icon a client shows. The backends' own cards are never shown.
 **`tools/list`** asks every backend for its tools, in parallel and as the
 caller, and lists them in backend order. It also keeps a note of which backend
 lists which tool. A name an earlier backend already listed is left out. A
-backend that cannot be listed — restarting, still loading its model — costs
-only its own tools: claude.ai shows a refused list as no tools at all, and
-lists again for each conversation, so a short list lasts only until the
-backend is back. Only when no backend answers is the list refused.
+backend that cannot be listed — restarting, still loading its model — is
+listed as it last was for that caller, and a call to one of its tools
+meanwhile answers that it is down and to try again. claude.ai does not list
+again for each conversation: a list missing npcd's tools, taken during a
+restart, still had no image tools half an hour later (2026-10-27). A backend
+never listed for the caller costs only its own tools. Only when nothing can be
+listed is the list refused, since claude.ai shows a refused list as no tools at
+all.
 
 **Its own tools are the guides** (`docs/mcp_guides.md` §2): `guide_list` and
 `guide_read`, listed first and answered locally, never sent to a backend. Each
@@ -126,8 +130,8 @@ something on a call's stream at least every 15 s. After 60 s with nothing, the
 aggregator gives the call up and answers an error, rather than holding the
 client on keep-alives of its own.
 
-**One backend down costs only its own tools.** `tools/list` is still an
-error, as above. A call to a tool whose backend is known goes straight there,
+**One backend down costs none of its tools it was ever listed with.**
+`tools/list` keeps them, as above. A call to a tool whose backend is known goes straight there,
 and a relisting keeps the routes of any backend that did not answer.
 
 ## 4. The backends

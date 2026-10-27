@@ -31,11 +31,13 @@ mod backend;
 mod caller;
 mod config;
 mod guides;
+mod last_listed;
 mod sse;
 
 use app::App;
 use backend::{Backend, Link};
 use config::Config;
+use last_listed::LastListed;
 
 #[derive(Parser)]
 struct Args {
@@ -67,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             .collect(),
         link: Link::new(&config.gateway)?,
         routes: RwLock::new(HashMap::new()),
+        last_listed: LastListed::default(),
         library: guides::embedded()?,
     });
     tracing::info!(guides = app.library.count(), "guides loaded");

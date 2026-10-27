@@ -25,6 +25,7 @@ use crate::backend::{Backend, Link, OnBehalf};
 use crate::caller::Caller;
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
+use crate::last_listed::LastListed;
 
 /// What every request is served with.
 pub struct App {
@@ -35,6 +36,9 @@ pub struct App {
     pub link: Link,
     /// Which backend runs each tool, by name, as they were last listed.
     pub routes: RwLock<HashMap<String, usize>>,
+    /// Each backend's last listing for each caller, listed in its place while
+    /// it cannot be.
+    pub last_listed: LastListed,
     /// The guides served beside the backends' tools (`docs/mcp_guides.md`).
     pub library: Library,
 }
@@ -111,6 +115,7 @@ impl App {
             (got, started.elapsed())
         }))
         .await;
+        let who = call.caller.key();
         let mut lists = Vec::new();
         let mut failed = Vec::new();
         let mut why_failed = Vec::new();
@@ -124,16 +129,22 @@ impl App {
                         ms = took.as_millis() as u64,
                         "mcp: listed"
                     );
+                    self.last_listed.keep(&who, i, &tools);
                     lists.push((i, tools));
                 }
                 Err(why) => {
+                    let last = self.last_listed.recall(&who, i);
                     tracing::warn!(
                         backend,
                         ms = took.as_millis() as u64,
+                        listed_as_last = last.as_ref().map_or(0, Vec::len),
                         "mcp: listing failed: {why}"
                     );
                     failed.push(i);
                     why_failed.push(format!("the {backend} tools could not be listed: {why}"));
+                    if let Some(tools) = last {
+                        lists.push((i, tools));
+                    }
                 }
             }
         }
@@ -175,11 +186,12 @@ impl Server for App {
         Ok(self.store.clone())
     }
 
-    /// The tools of every backend that answered. A backend down — restarting,
-    /// still loading its model — costs only its own tools: claude.ai shows a
-    /// refused list as no tools at all, and lists again for each conversation,
-    /// so a short list lasts only until the backend is back. Only when no
-    /// backend answers is the list refused.
+    /// The tools of every backend. A backend down — restarting, still loading
+    /// its model — is listed as it last was for this caller (`LastListed`):
+    /// a client keeps the list it was given across conversations, so a short
+    /// one would outlast the outage. One never listed is left out. Only when
+    /// nothing at all can be listed is the list refused, since claude.ai shows
+    /// a refused list as no tools at all.
     ///
     /// The guide tools come first, and each backend tool a guide lists carries
     /// the line naming its guides.
