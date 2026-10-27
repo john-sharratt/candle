@@ -161,6 +161,29 @@ pub fn wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCarve {
     }
 }
 
+/// Hand back the range at a device address an arena carved for a ticket, now
+/// that the storage over it has been dropped. Installed by candle-nn.
+pub type WaveReleaseFn = fn(WaveTicket, u64);
+
+static WAVE_RELEASE: OnceLock<WaveReleaseFn> = OnceLock::new();
+
+/// Register the release hook. Idempotent, like [`install_wave_allocator`].
+pub fn install_wave_release(f: WaveReleaseFn) {
+    let _ = WAVE_RELEASE.set(f);
+}
+
+/// A storage leased from `ticket`'s arena at `ptr` is gone.
+///
+/// A bump arena frees nothing per storage — its generation rewinds — and
+/// ignores this; an arena that frees as storages die (candle-nn's guest heap)
+/// returns the range. Called from every wave lease's drop, so with nothing
+/// installed it is a load and a return.
+pub fn wave_release(ticket: WaveTicket, ptr: u64) {
+    if let Some(f) = WAVE_RELEASE.get() {
+        f(ticket, ptr);
+    }
+}
+
 /// The error an open generation's overrun becomes.
 ///
 /// **There is no fallback for it.** A request that overruns an open phase is a

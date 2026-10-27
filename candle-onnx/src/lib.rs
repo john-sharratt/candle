@@ -13,6 +13,7 @@ pub mod onnx {
 }
 
 pub mod eval;
+pub mod grid_sample;
 pub use eval::{dtype, get_tensor, simple_eval, simple_eval_on};
 
 pub fn read_file<P: AsRef<std::path::Path>>(p: P) -> Result<onnx::ModelProto> {

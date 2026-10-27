@@ -183,8 +183,8 @@ pub(super) async fn answer(
     Answer::picture(
         said(&drawn.said, link.map_err(|e| e.to_string())),
         Picture {
-            data: drawn.base64,
-            mime_type: drawn.mime.into(),
+            data: drawn.shown,
+            mime_type: drawn.shown_mime.into(),
         },
     )
 }
@@ -201,14 +201,15 @@ async fn retire_unless_portrait(s: &Authored, id: &str) {
     }
 }
 
-/// A finished picture: what it says of itself, and its file — the bytes to
-/// store and their base64 for the image block.
+/// A finished picture: what it says of itself, its file — the bytes stored —
+/// and what the answer shows the model, in base64 with its type: the file
+/// itself, or a smaller JPEG of it ([`super::edit_mode::preview`]).
 #[derive(Debug)]
 pub(super) struct Drawn {
     pub said: String,
     pub file: Vec<u8>,
-    pub base64: String,
-    pub mime: &'static str,
+    pub shown: String,
+    pub shown_mime: &'static str,
 }
 
 /// The answer's text: the draw's own line, then its link and how long the
@@ -309,8 +310,9 @@ fn outcome(stream: &[u8], format: Format) -> Result<Drawn, String> {
                 .as_str()
                 .ok_or("the draw finished without a picture")?;
             let (file, mime) = file(png, format)?;
-            // A PNG is the route's own, already in base64.
-            let base64 = match format {
+            // A draw is within a megapixel and shown as itself; a PNG is the
+            // route's own, already in base64.
+            let shown = match format {
                 Format::Png => png.to_string(),
                 Format::Jpeg => BASE64.encode(&file),
             };
@@ -320,8 +322,8 @@ fn outcome(stream: &[u8], format: Format) -> Result<Drawn, String> {
                     last["width"], last["height"], last["seed"]
                 ),
                 file,
-                base64,
-                mime,
+                shown,
+                shown_mime: mime,
             })
         }
         Some("error") => {
@@ -365,7 +367,7 @@ mod tests {
         let d = outcome(done, Format::Png).unwrap();
         assert_eq!(d.said, "Drew a 512x512 image, seed 7.");
         assert_eq!(
-            (d.file.as_slice(), d.base64.as_str(), d.mime),
+            (d.file.as_slice(), d.shown.as_str(), d.shown_mime),
             (&[0x89, 0x50, 0x4E][..], "iVBO", "image/png")
         );
 

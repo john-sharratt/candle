@@ -37,6 +37,10 @@
 use candle::Device;
 use candle_nn::kv_cache::{runs_from, span_region_refusal, RegionRun, SpanClaims, SpanRegion};
 
+/// The longest run a claim asks for at once: 64 regions, 1 GiB. Longer runs are
+/// rarely free in one piece, and a refusal halves the ask anyway.
+const CLAIM_RUN_REGIONS: usize = 64;
+
 /// One placed allocation: where it is and how much room it has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -151,6 +155,30 @@ impl Bump {
         self.offset = 0;
     }
 
+    /// Hand out everything still placeable, one placement per run — the tail of
+    /// the run in progress and every run after it — each starting at `align`.
+    ///
+    /// For a tenant that sub-allocates the rest itself: a guest's activation
+    /// heap, which frees and so cannot be a bump. One placement per run because
+    /// two runs are separated by another tenant's ground. A tail too short to
+    /// align into is left out.
+    pub fn take_rest(&mut self, align: usize) -> Vec<Placement> {
+        let align = align.max(1);
+        let mut out = Vec::new();
+        while let Some(run) = self.runs.get(self.run) {
+            let at = self.offset.next_multiple_of(align);
+            if at < run.bytes {
+                out.push(Placement {
+                    ptr: run.base + at as u64,
+                    len: run.bytes - at,
+                });
+            }
+            self.run += 1;
+            self.offset = 0;
+        }
+        out
+    }
+
     /// Place `len` bytes, aligned to `align`.
     ///
     /// **An allocation never crosses a run boundary.** Two runs are separated by
@@ -220,10 +248,24 @@ impl GuestGround {
         let claims = SpanClaims::open(device, "a guest's ground")
             .map_err(|e| GroundError::Window(e.to_string()))?;
         let mut regions = Vec::with_capacity(want);
-        for _ in 0..want {
-            match claims.claim() {
-                Ok(Some(r)) => regions.push(r),
-                Ok(None) => {
+        // **In runs, the longest the span will give.** One region at a time takes
+        // whatever the free list holds, scattered, and a guest's largest tensor
+        // must fit one run: a matte guest's 576 MiB activation was refused by a
+        // heap of 1,032 MiB that had 140 MiB in use (WhiteWorld, 2026-10-27). A
+        // run is asked for at the longest still wanted, halved on refusal down
+        // to a single region, so a fragmented span still serves the claim.
+        let mut ask = want.min(CLAIM_RUN_REGIONS);
+        while regions.len() < want {
+            ask = ask.min(want - regions.len());
+            let got = if ask > 1 {
+                claims.claim_run(ask).map(|run| run.unwrap_or_default())
+            } else {
+                claims.claim().map(|r| r.into_iter().collect())
+            };
+            match got {
+                Ok(run) if !run.is_empty() => regions.extend(run),
+                Ok(_) if ask > 1 => ask /= 2,
+                Ok(_) => {
                     let got = regions.len();
                     // Dropped before the error is built, so the ground is back
                     // on the KV side by the time anyone reads the message.
@@ -266,6 +308,11 @@ impl GuestGround {
     /// See [`Bump::rewind`]; the regions stay claimed.
     pub fn rewind(&mut self) {
         self.bump.rewind()
+    }
+
+    /// See [`Bump::take_rest`].
+    pub fn take_rest(&mut self, align: usize) -> Vec<Placement> {
+        self.bump.take_rest(align)
     }
 
     /// The coalesced stretches this ground occupies.
@@ -389,6 +436,32 @@ mod tests {
     /// never promised one.
     fn scattered() -> Bump {
         Bump::new(vec![0x4000, 0x1000, 0x5000], 0x1000)
+    }
+
+    /// **The rest is every run's remainder, one placement each**, starting at
+    /// the alignment, and nothing is left to place after it. The run in
+    /// progress gives its tail; a later run gives all of itself.
+    #[test]
+    fn take_rest_hands_out_every_runs_remainder() {
+        let mut b = scattered();
+        // Runs in claim order: [0x4000, +0x2000), then [0x1000, +0x1000).
+        b.place(0x100, 1).unwrap();
+        let rest = b.take_rest(0x200);
+        assert_eq!(
+            rest,
+            vec![
+                Placement {
+                    ptr: 0x4200,
+                    len: 0x1e00
+                },
+                Placement {
+                    ptr: 0x1000,
+                    len: 0x1000
+                },
+            ]
+        );
+        assert_eq!(b.free(), 0, "the rest was all of it");
+        assert!(b.place(1, 1).is_err());
     }
 
     /// An allocation spanning two *adjacent* regions is served, because there is

@@ -14,7 +14,7 @@ use crate::cuda_backend::alloc_inheriting;
 use crate::cuda_backend::graph::outside_capture;
 use crate::cuda_backend::last_cuda_kernel_launch;
 use crate::cuda_backend::stream_alloc;
-use crate::cuda_backend::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
+use crate::cuda_backend::wave_provenance::{self, wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
 use crate::cuda_backend::INHERIT_ALIGN;
 use crate::quantized::k_quants::GgmlType;
@@ -408,7 +408,12 @@ impl Drop for QCudaStorage {
         // `ManuallyDrop::take` is the move-out that `leak`'s by-value signature
         // needs, and it touches no CUDA API on the way (see the field's note).
         let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
-        data.inner.leak();
+        let ptr = data.inner.leak();
+        // An arena that frees as its storages die takes the range back; every
+        // other arena ignores this — as `CudaStorage::drop`.
+        if let Backing::Lease(LeaseOrigin::Wave(ticket)) = self.backing {
+            wave_provenance::wave_release(ticket, ptr);
+        }
     }
 }
 

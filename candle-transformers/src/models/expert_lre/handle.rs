@@ -1249,9 +1249,21 @@ impl ExpertCache {
             ask: BoundaryAsk::SellPaused(regions),
             response_tx,
         }) {
+            tracing::warn!(
+                target: "candle_transformers::expert_lre",
+                regions,
+                "a guest's concession could not reach the expert pipeline: its thread is gone"
+            );
             return 0;
         }
-        response_rx.recv().unwrap_or(0)
+        let conceded = response_rx.recv().unwrap_or(0);
+        tracing::info!(
+            target: "candle_transformers::expert_lre",
+            regions,
+            conceded_mib = conceded >> 20,
+            "the expert pipeline answered a guest's concession"
+        );
+        conceded
     }
 
     /// Grow the zone back to its serving floor after [`Self::concede_for_guest`],
