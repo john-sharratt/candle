@@ -151,6 +151,12 @@ left — `{x: 0.25, y: 0, w: 0.5, h: 1}` is the middle half — so judge it by
 looking. Put several adjustments in one `adjust` call: each edit re-encodes
 the picture.
 
+The picture in an answer is a preview for you to look at: a JPEG at most
+1024 a side. A picture with transparency — every `remove_background` result
+— is shown over a grey checkerboard, so the squares are where it is clear;
+the file at the link is the full transparent PNG. Give the user the link's
+file, never the preview.
+
 To make a small picture larger with real detail rather than smoother pixels,
 use `prompt` at the larger size with `hold` about 0.7 (up to 1024 a side);
 `resize` makes it larger without adding detail.

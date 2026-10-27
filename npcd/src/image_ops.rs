@@ -208,6 +208,27 @@ pub fn rotate(img: &DynamicImage, degrees: u32, flip: Option<Flip>) -> DynamicIm
     }
 }
 
+/// The side of a [`on_checkerboard`] square, in pixels.
+const CHECKER: u32 = 16;
+
+/// `img` laid over a light-grey checkerboard, as transparency is shown: what a
+/// model looking at a cutout sees of it. A picture's transparency is only in
+/// its alpha, which a look at its colours does not show — over the board, a
+/// removed background reads as removed.
+pub fn on_checkerboard(img: &DynamicImage) -> RgbImage {
+    let rgba = img.to_rgba8();
+    RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let square = if (x / CHECKER + y / CHECKER).is_multiple_of(2) {
+            255u32
+        } else {
+            204
+        };
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let blend = |c: u8| ((c as u32 * a as u32 + square * (255 - a as u32) + 127) / 255) as u8;
+        Rgb([blend(r), blend(g), blend(b)])
+    })
+}
+
 /// `img` as the file kept: a PNG (transparency kept) or a JPEG (laid over
 /// white first), with its type.
 pub fn encode(img: &DynamicImage, png: bool) -> Result<(Vec<u8>, &'static str), String> {
@@ -366,6 +387,23 @@ mod tests {
         assert_eq!(back.get_pixel(0, 0).0[3], 0, "transparency kept");
         let (jpeg, mime) = encode(&DynamicImage::ImageRgba8(out), false).unwrap();
         assert_eq!((mime, &jpeg[..2]), ("image/jpeg", &[0xFF, 0xD8][..]));
+    }
+
+    /// **Transparency shows as the board**: a clear pixel is the square under
+    /// it, an opaque one itself, a half-clear one between.
+    #[test]
+    fn a_cutout_on_the_checkerboard_shows_where_it_is_clear() {
+        let mut rgba = image::RgbaImage::new(32, 1);
+        rgba.put_pixel(0, 0, Rgba([10, 20, 30, 0]));
+        rgba.put_pixel(16, 0, Rgba([10, 20, 30, 0]));
+        rgba.put_pixel(1, 0, Rgba([10, 20, 30, 255]));
+        rgba.put_pixel(17, 0, Rgba([0, 0, 0, 128]));
+        let out = on_checkerboard(&DynamicImage::ImageRgba8(rgba));
+        assert_eq!(out.get_pixel(0, 0), &Rgb([255, 255, 255]), "a light square");
+        assert_eq!(out.get_pixel(16, 0), &Rgb([204, 204, 204]), "a dark square");
+        assert_eq!(out.get_pixel(1, 0), &Rgb([10, 20, 30]), "opaque");
+        // (0·128 + 204·127 + 127) / 255 = 102.
+        assert_eq!(out.get_pixel(17, 0), &Rgb([102, 102, 102]));
     }
 
     #[test]
