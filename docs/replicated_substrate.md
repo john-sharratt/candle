@@ -1089,9 +1089,9 @@ misread, and on an admitted socket closes it 4400.
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
 | `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
-| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) |
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
-| `ROUTES` | 14 | `blob table` (§5.2's encoding) |
+| `ROUTES` | 14 | `blob table` (§5.2's encoding: each route's methods, path, dispatch, mirror and, from protocol 6, `u8 reach`) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
 | `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` (the key's own last state record's `oseq`, protocol 4) |
 | `COORD` | 17 | `blob state` (§12.1's encoding) |
@@ -1313,7 +1313,15 @@ A route also declares its **mirror mode** for certifying a new build: `Exact` wi
 volatile fields, `Shape`, or `None` (§3.8). It defaults to `None`, so a route that writes
 is never mirrored by omission.
 
-The table a member sends in `ROUTES` is `declared(roles)` with both columns. The gateway
+And its **reach** (`Api::reach`, protocol 6): `Any`, the default, or `Draw` for a route
+that draws a picture. The gateway reads a `Draw` route's body for the draw's
+`width × height` (`cluster::dispatch::draw_area`) and places it only among the members
+whose card reaches that many pixels (§5.3). A side the body leaves out is the draw's
+default, 512. A JSON-RPC body is sized only when it calls `image_generate`, or
+`image_edit` drawing with both sides named — an edit missing a side takes its picture's
+shape, which only the member holding the picture knows.
+
+The table a member sends in `ROUTES` is `declared(roles)` with these columns. The gateway
 matches request paths against it with the same matcher axum uses (`matchit`).
 
 | Dispatch | Picks |
@@ -1372,7 +1380,8 @@ Routes by group (the full table is in each crate's `declared`):
 | npcd `/v1/interaction/:ix*` | `Owner(Path("ix"))` — interaction ids are minted as `<nid>-<n>`, so the owner is in the id |
 | npcd `/v1/world/:wid/*` live state (channel, posting, the internal `act` route), `/v1/pulse/operations*`, `/v1/pulse/missions*` | `Owner(Path("wid"))`, the world's authority (§9.2); a route among them that names no world goes `Best` |
 | npcd `/v1/life/:who/*` | `Sticky(Path("who"))` — a generation and the job reporting on it stay on one member |
-| npcd `/v1/simulate`, `/v1/generate/*`, `/v1/image/*`, `/v1/guest/image`, the effector mount `/v1/local/*` | `Best` |
+| npcd `/v1/simulate`, `/v1/generate/*`, `/v1/image/*`, `/v1/guest/image`, the effector mount `/v1/local/*` | `Best`; `/v1/image/generate` and `/v1/guest/image` reach `Draw` |
+| npcd `/v1/npc/mcp` | `Owner(Derived(mcp_subject))`, reach `Draw`: a tool call goes to the holder of the bot, world or picture it names, and a draw among the members whose card reaches it |
 | npcd authored reads (`/v1/world`, `/v1/personality`, `/v1/mind/*`, `/v1/npc` list, `/v1/me/profile*`, `/v1/life/catalog`) | `Any` |
 | npcd authored writes | `Best` — they become VFS events (§10.3) |
 | `/v1/status`, `/v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/projections`, `/v1/layers`, `/v1/profile`, `/v1/substrate`, `/v1/tools/calibrate`, npcd `/v1/pulse`, `/v1/pulse/census`, `/v1/pulse/world`, `/v1/pulse/broadcast`, `/v1/pulse/announce`, `/v1/pulse/command-table`, `/v1/pulse/guardian`, `/v1/guest` | `Aggregate(Envelope)` — what each member holds or does for the characters it runs |
@@ -1391,6 +1400,18 @@ Routes by group (the full table is in each crate's `declared`):
   replaces.
 - **`idle`**: the scheduler can admit now — a free slot and a prefill backlog under its
   budget (`slots`, `budget`, `used` in the wave rows, `host/src/endpoints/waves.rs:43-70`).
+- **`guest_reach`** (protocol 6): the side of the largest square its card draws, as its
+  engine states it from the card's size (`candle_conversation::guest::reach`: 16 GB
+  draws 512², 24 GB 1024², 32 GB and up 2048²) — an area, so any shape of as many pixels.
+  Zero until its engine has stated it.
+
+**A draw is placed only where it is reached.** For a route of reach `Draw` (§5.2), every
+choice below — `Best`, a sticky or owner key nobody holds, a canary's share — is made
+among the members whose `guest_reach²` holds the draw's pixels. When none does, it is
+made among those that reach furthest: the member's own refusal (`beyond_reach`, naming
+its reach) then tells the caller the largest draw the app serves, in the shape that
+route answers in. A key's holder keeps the key whatever its reach, and refuses a draw
+its card cannot hold the same way.
 
 The gateway adds what no `CAPACITY` can say in time: **`in_flight`**, the requests it
 has handed each member and the member is still answering. A request routed `Best`,

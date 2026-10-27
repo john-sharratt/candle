@@ -10,8 +10,11 @@
 //! of the baseline's requests on a mirrored route are mirrored to it
 //! ([`super::mirror`]).
 //!
-//! Three things beside the dispatch:
+//! Four things beside the dispatch:
 //!
+//! - **A draw's reach.** A route declared `Reach::Draw` has its body read for
+//!   the draw's `width × height`, and is placed only among the members whose
+//!   card reaches that many pixels (`cluster::dispatch::Reach`).
 //! - **UI pinning.** A page's files come from one member: the first UI request
 //!   is dealt round robin and answered with `tokera_ui_<app>`, and every UI
 //!   request carrying it goes to that member while it is ready.
@@ -30,8 +33,11 @@ use axum::body::{to_bytes, Body};
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
-use cluster::dispatch::{extract, Dispatch, Extracted, KeySource, Merge, Mirror, BODY_LIMIT};
+use cluster::dispatch::{
+    draw_area, extract, Dispatch, Extracted, KeySource, Merge, Mirror, Reach, BODY_LIMIT,
+};
 use cluster::gateway::{Class, Pick, NODE_HEADER};
+use serde_json::Value;
 
 use super::load::carry;
 use super::mirror::{mirrored, sampled, Route};
@@ -162,18 +168,20 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let (dispatch, params, route_key, mirror) = match table.lookup(&method, &path) {
+    let (dispatch, params, route_key, mirror, reach) = match table.lookup(&method, &path) {
         Some(m) => (
             m.route.dispatch.clone(),
             m.params,
             format!("{method} {}", m.route.path),
             m.route.mirror.clone(),
+            m.route.reach,
         ),
         None => (
             Dispatch::Ui,
             Vec::new(),
             format!("{method} UI"),
             Mirror::None,
+            Reach::Any,
         ),
     };
     let sample = Route {
@@ -186,37 +194,54 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
         _ => Vec::new(),
     };
     let mut req = req;
-    let mut key = match extract(&sources, &params, req.headers(), None) {
-        Extracted::Key(k) => Some(k),
-        Extracted::None => None,
-        Extracted::NeedsBody => {
-            let (parts, body) = req.into_parts();
-            let bytes = match to_bytes(body, BODY_LIMIT).await {
-                Ok(b) => b,
-                Err(_) => {
-                    return Routed::Answered(errors::respond(
-                        Problem::too_large(format!(
-                            "a request routed by its body may be at most {} MiB",
-                            BODY_LIMIT >> 20
-                        )),
-                        ctx.want_html,
-                    ))
+    let first = extract(&sources, &params, req.headers(), None);
+    // The body is read for a key a later source finds in it, and for the size
+    // of a draw, which is placed only where a card reaches it.
+    let (mut key, draw) = if first == Extracted::NeedsBody || reach != Reach::Any {
+        let (parts, body) = req.into_parts();
+        let bytes = match to_bytes(body, BODY_LIMIT).await {
+            Ok(b) => b,
+            Err(_) => {
+                return Routed::Answered(errors::respond(
+                    Problem::too_large(format!(
+                        "a request routed by its body may be at most {} MiB",
+                        BODY_LIMIT >> 20
+                    )),
+                    ctx.want_html,
+                ))
+            }
+        };
+        let key = match first {
+            Extracted::Key(k) => Some(k),
+            Extracted::None => None,
+            Extracted::NeedsBody => {
+                match extract(&sources, &params, &parts.headers, Some(&bytes)) {
+                    Extracted::Key(k) => Some(k),
+                    _ => None,
                 }
-            };
-            let key = match extract(&sources, &params, &parts.headers, Some(&bytes)) {
-                Extracted::Key(k) => Some(k),
-                _ => None,
-            };
-            req = Request::from_parts(parts, Body::from(bytes));
-            key
-        }
+            }
+        };
+        let draw = match reach {
+            Reach::Any => None,
+            Reach::Draw => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|body| draw_area(&body)),
+        };
+        req = Request::from_parts(parts, Body::from(bytes));
+        (key, draw)
+    } else {
+        let key = match first {
+            Extracted::Key(k) => Some(k),
+            _ => None,
+        };
+        (key, None)
     };
     if key.as_deref() == Some("") {
         key = None;
     }
 
     let pin = pinned(&req, app);
-    let picked = hub.pick(app, &dispatch, key.as_deref(), pin);
+    let picked = hub.pick(app, &dispatch, draw, key.as_deref(), pin);
     match picked.pick {
         Pick::Configured => none_ready(gateway, app, &ctx, req).await,
         Pick::Member(node) => {

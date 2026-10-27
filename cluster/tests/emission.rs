@@ -114,7 +114,7 @@ async fn a_slow_member_lags_and_comes_back() {
     .await;
     for _ in 0..4 {
         assert_ne!(
-            gw.pick(APP, &Dispatch::Any, None, None).pick,
+            gw.pick(APP, &Dispatch::Any, None, None, None).pick,
             Pick::Member(2),
             "no request routed to a lagging member"
         );

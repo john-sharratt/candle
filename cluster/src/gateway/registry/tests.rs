@@ -52,15 +52,21 @@ fn a_closing_member_is_routed_nothing() {
     let mut r = three();
     r.closing("zend", 2, 99);
     let picks: Vec<Pick> = (0..6)
-        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
         .collect();
     assert!(picks.contains(&Pick::Member(2)), "another session's end");
     r.closing("zend", 2, 2);
     for _ in 0..6 {
-        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(2));
-        assert_ne!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(2));
         assert_ne!(
-            r.pick_canary("zend", &Dispatch::Best, None, None, 2, &mut || true),
+            r.pick("zend", &Dispatch::Any, None, None, None),
+            Pick::Member(2)
+        );
+        assert_ne!(
+            r.pick("zend", &Dispatch::Best, None, None, None),
+            Pick::Member(2)
+        );
+        assert_ne!(
+            r.pick_canary("zend", &Dispatch::Best, None, None, None, 2, &mut || true),
             Pick::Member(2),
             "a closing canary is no canary"
         );
@@ -76,13 +82,16 @@ fn a_lagging_member_is_routed_nothing() {
     assert!(r.set_lagging("zend", 2, true));
     assert!(!r.set_lagging("zend", 2, true), "no change");
     for _ in 0..6 {
-        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(2));
+        assert_ne!(
+            r.pick("zend", &Dispatch::Any, None, None, None),
+            Pick::Member(2)
+        );
         assert_ne!(r.answerer("zend", 1), Some(2));
     }
     assert!(r.clustered("zend"));
     r.set_lagging("zend", 2, false);
     let picks: Vec<Pick> = (0..3)
-        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
         .collect();
     assert!(picks.contains(&Pick::Member(2)));
 }
@@ -99,27 +108,27 @@ fn a_candidate_takes_its_share_and_no_more() {
     let mut yes = || true;
     let mut no = || false;
     assert_eq!(
-        r.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut yes),
+        r.pick_canary("zend", &Dispatch::Best, None, None, None, 3, &mut yes),
         Pick::Member(3)
     );
     assert_eq!(
-        r.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut no),
+        r.pick_canary("zend", &Dispatch::Best, None, None, None, 3, &mut no),
         Pick::Member(2)
     );
     for _ in 0..4 {
         assert_ne!(
-            r.pick_canary("zend", &Dispatch::Any, None, None, 3, &mut no),
+            r.pick_canary("zend", &Dispatch::Any, None, None, None, 3, &mut no),
             Pick::Member(3)
         );
     }
     let sticky = Dispatch::sticky_path("id");
     assert_eq!(
-        r.pick_canary("zend", &sticky, Some("new"), None, 3, &mut yes),
+        r.pick_canary("zend", &sticky, None, Some("new"), None, 3, &mut yes),
         Pick::Member(3)
     );
     r.claims("zend").claim(b"held", Epoch { ms: 1, node: 2 });
     assert_eq!(
-        r.pick_canary("zend", &sticky, Some("held"), None, 3, &mut yes),
+        r.pick_canary("zend", &sticky, None, Some("held"), None, 3, &mut yes),
         Pick::Member(2),
         "a held key stays with its holder"
     );
@@ -127,6 +136,7 @@ fn a_candidate_takes_its_share_and_no_more() {
         r.pick_canary(
             "zend",
             &Dispatch::Aggregate(Merge::Envelope),
+            None,
             None,
             None,
             3,
@@ -138,7 +148,7 @@ fn a_candidate_takes_its_share_and_no_more() {
     alone.join(member(3, 3));
     alone.capacity("zend", 3, capacity(MemberState::Ready, 1, true, 1));
     assert_eq!(
-        alone.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut no),
+        alone.pick_canary("zend", &Dispatch::Best, None, None, None, 3, &mut no),
         Pick::Member(3)
     );
 }
@@ -180,15 +190,27 @@ fn sticky() -> Dispatch {
 #[test]
 fn the_mode_follows_ready_members() {
     let mut r = Registry::new();
-    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    assert_eq!(
+        r.pick("zend", &Dispatch::Any, None, None, None),
+        Pick::Configured
+    );
     r.join(member(1, 1));
     assert!(!r.clustered("zend"), "admitted but loading");
-    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    assert_eq!(
+        r.pick("zend", &Dispatch::Any, None, None, None),
+        Pick::Configured
+    );
     r.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
     assert!(r.clustered("zend"));
-    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(1));
+    assert_eq!(
+        r.pick("zend", &Dispatch::Any, None, None, None),
+        Pick::Member(1)
+    );
     assert!(r.leave("zend", 1, 1));
-    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    assert_eq!(
+        r.pick("zend", &Dispatch::Any, None, None, None),
+        Pick::Configured
+    );
     assert!(!r.clustered("npcd"), "another app is untouched");
 }
 
@@ -219,7 +241,7 @@ fn a_loading_member_stands_by() {
 }
 
 fn best(r: &mut Registry) -> Pick {
-    r.pick("zend", &Dispatch::Best, None, None)
+    r.pick("zend", &Dispatch::Best, None, None, None)
 }
 
 /// **`Best` divides each member's power by its requests in flight** (§5.3):
@@ -278,7 +300,7 @@ fn best_takes_the_largest_share_of_power_per_request() {
 fn any_goes_round_robin() {
     let mut r = three();
     let picks: Vec<Pick> = (0..4)
-        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
         .collect();
     assert_eq!(
         picks,
@@ -298,19 +320,19 @@ fn a_sticky_key_follows_its_claim() {
     let mut r = three();
     r.claims("zend").claim(b"c-1", Epoch { ms: 1, node: 1 });
     assert_eq!(
-        r.pick("zend", &sticky(), Some("c-1"), None),
+        r.pick("zend", &sticky(), None, Some("c-1"), None),
         Pick::Member(1)
     );
     assert_eq!(
-        r.pick("zend", &sticky(), Some("c-2"), None),
+        r.pick("zend", &sticky(), None, Some("c-2"), None),
         Pick::Member(2)
     );
     r.claims("zend").claim(b"c-3", Epoch { ms: 1, node: 9 });
     assert_eq!(
-        r.pick("zend", &sticky(), Some("c-3"), None),
+        r.pick("zend", &sticky(), None, Some("c-3"), None),
         Pick::Member(2)
     );
-    assert_eq!(r.pick("zend", &sticky(), None, None), Pick::Member(2));
+    assert_eq!(r.pick("zend", &sticky(), None, None, None), Pick::Member(2));
 }
 
 /// **A key let go goes to the best member holding what its holder wrote**
@@ -326,15 +348,21 @@ fn a_released_key_goes_to_a_member_holding_its_last_turn() {
     r.applied("zend", 3, vec![(1, 500)]);
     // Without the handover, node 2 (power 300) takes it; it lacks node 1's
     // records past 100, so among 1 (its own writer) and 3 the larger share.
-    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(3));
     assert_eq!(
-        r.pick("zend", &sticky(), Some("other"), None),
+        r.pick("zend", &sticky(), None, Some("c"), None),
+        Pick::Member(3)
+    );
+    assert_eq!(
+        r.pick("zend", &sticky(), None, Some("other"), None),
         Pick::Member(2),
         "a key never let go is not held back"
     );
 
     r.applied("zend", 2, vec![(1, 500)]);
-    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(2));
+    assert_eq!(
+        r.pick("zend", &sticky(), None, Some("c"), None),
+        Pick::Member(2)
+    );
     assert!(
         r.apps["zend"].handovers.is_empty(),
         "every member holds it: forgotten"
@@ -343,7 +371,7 @@ fn a_released_key_goes_to_a_member_holding_its_last_turn() {
     // Released by a member gone, before anyone applied its last records.
     r.released("zend", b"d", 9, 10);
     assert_eq!(
-        r.pick("zend", &sticky(), Some("d"), None),
+        r.pick("zend", &sticky(), None, Some("d"), None),
         Pick::Member(2),
         "nobody holds it: among them all"
     );
@@ -384,10 +412,13 @@ fn a_member_holding_a_released_key_complete_may_take_it() {
     r.applied("zend", 2, vec![(1, 100)]);
     r.applied("zend", 3, vec![(1, 100)]);
     // Node 1 (power 100) is the only member holding it.
-    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(1));
+    assert_eq!(
+        r.pick("zend", &sticky(), None, Some("c"), None),
+        Pick::Member(1)
+    );
     r.completed("zend", 2, &[b"c".to_vec(), b"never-released".to_vec()]);
     assert_eq!(
-        r.pick("zend", &sticky(), Some("c"), None),
+        r.pick("zend", &sticky(), None, Some("c"), None),
         Pick::Member(2),
         "node 2, the most powerful, now holds it complete"
     );
@@ -401,7 +432,10 @@ fn a_member_holding_a_released_key_complete_may_take_it() {
     // Released again, through a later record: node 2's report was for the
     // release before.
     r.released("zend", b"c", 1, 900);
-    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(1));
+    assert_eq!(
+        r.pick("zend", &sticky(), None, Some("c"), None),
+        Pick::Member(1)
+    );
 }
 
 /// Set node `n`'s learned rates, its backlog and its decodes on `r`.
@@ -819,13 +853,16 @@ fn a_lagging_member_is_placed_by_conversation() {
     r.set_lagging("zend", 2, true);
     assert_eq!(best(&mut r), Pick::Member(2), "a new conversation");
     assert_eq!(
-        r.pick("zend", &sticky(), Some("new"), None),
+        r.pick("zend", &sticky(), None, Some("new"), None),
         Pick::Member(2),
         "a key nobody holds or let go"
     );
     assert_eq!(r.answerer("zend", 3), Some(1), "never the answerer");
     for _ in 0..4 {
-        assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(1));
+        assert_eq!(
+            r.pick("zend", &Dispatch::Any, None, None, None),
+            Pick::Member(1)
+        );
     }
 
     // Released by node 1 through its record 900: node 2 has applied 1's
@@ -834,12 +871,12 @@ fn a_lagging_member_is_placed_by_conversation() {
     r.released("zend", b"old", 1, 900);
     r.applied("zend", 2, vec![(1, 500)]);
     assert_eq!(
-        r.pick("zend", &sticky(), Some("old"), None),
+        r.pick("zend", &sticky(), None, Some("old"), None),
         Pick::Member(1)
     );
     r.applied("zend", 2, vec![(1, 900)]);
     assert_eq!(
-        r.pick("zend", &sticky(), Some("old"), None),
+        r.pick("zend", &sticky(), None, Some("old"), None),
         Pick::Member(2)
     );
 }
@@ -853,13 +890,13 @@ fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {
     r.applied("zend", 3, vec![(1, 400)]);
     let mut take = || true;
     assert_eq!(
-        r.pick_canary("zend", &sticky(), Some("c"), None, 3, &mut take),
+        r.pick_canary("zend", &sticky(), None, Some("c"), None, 3, &mut take),
         Pick::Member(2),
         "the canary lacks it: picked as ever"
     );
     r.applied("zend", 3, vec![(1, 500)]);
     assert_eq!(
-        r.pick_canary("zend", &sticky(), Some("c"), None, 3, &mut take),
+        r.pick_canary("zend", &sticky(), None, Some("c"), None, 3, &mut take),
         Pick::Member(3)
     );
 }
@@ -870,18 +907,18 @@ fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {
 #[test]
 fn ui_files_come_from_the_pinned_member() {
     let mut r = three();
-    let Pick::Pinned(first) = r.pick("zend", &Dispatch::Ui, None, None) else {
+    let Pick::Pinned(first) = r.pick("zend", &Dispatch::Ui, None, None, None) else {
         panic!()
     };
     for _ in 0..3 {
         assert_eq!(
-            r.pick("zend", &Dispatch::Ui, None, Some(first)),
+            r.pick("zend", &Dispatch::Ui, None, None, Some(first)),
             Pick::Member(first)
         );
     }
     r.leave("zend", first, first);
     assert!(matches!(
-        r.pick("zend", &Dispatch::Ui, None, Some(first)),
+        r.pick("zend", &Dispatch::Ui, None, None,Some(first)),
         Pick::Pinned(n) if n != first
     ));
 }
@@ -891,7 +928,13 @@ fn an_aggregate_reaches_every_ready_member() {
     let mut r = three();
     r.capacity("zend", 2, capacity(MemberState::Loading, 1, true, 1));
     assert_eq!(
-        r.pick("zend", &Dispatch::Aggregate(Merge::Envelope), None, None),
+        r.pick(
+            "zend",
+            &Dispatch::Aggregate(Merge::Envelope),
+            None,
+            None,
+            None
+        ),
         Pick::All(vec![1, 3])
     );
 }
@@ -976,17 +1019,21 @@ fn a_syncing_member_is_routed_only_its_own() {
     r.applied("zend", 1, vec![(1, 500)]);
     r.set_syncing("zend", 3, true);
     for _ in 0..6 {
-        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(3));
+        assert_ne!(
+            r.pick("zend", &Dispatch::Any, None, None, None),
+            Pick::Member(3)
+        );
         assert_ne!(r.answerer("zend", 2), Some(3));
     }
     let sticky = Dispatch::sticky_path("id");
     r.claims("zend").claim(b"mine", Epoch { ms: 1, node: 3 });
     assert_eq!(
-        r.pick("zend", &sticky, Some("mine"), None),
+        r.pick("zend", &sticky, None, Some("mine"), None),
         Pick::Member(3),
         "a conversation it holds is its, syncing or not"
     );
-    let Pick::All(asked) = r.pick("zend", &Dispatch::Aggregate(Merge::Union), None, None) else {
+    let Pick::All(asked) = r.pick("zend", &Dispatch::Aggregate(Merge::Union), None, None, None)
+    else {
         panic!("an aggregate asks every loaded member");
     };
     assert!(
@@ -1017,7 +1064,7 @@ fn a_syncing_member_is_routed_only_its_own() {
     r.set_lagging("zend", 1, true);
     r.set_lagging("zend", 2, true);
     assert_eq!(
-        r.pick("zend", &Dispatch::Any, None, None),
+        r.pick("zend", &Dispatch::Any, None, None, None),
         Pick::Member(3),
         "nobody in sync is serving: the syncing member serves"
     );
@@ -1030,4 +1077,98 @@ fn only_a_member_joining_beside_a_serving_one_syncs() {
     let r = three();
     assert!(r.has_routable("zend", 4));
     assert!(!Registry::new().has_routable("zend", 1));
+}
+
+/// Three members whose cards reach 512², 1024² and 2048², the smallest card the
+/// most powerful and the largest the least.
+fn reaching() -> Registry {
+    let mut r = Registry::new();
+    for (node, power, reach) in [(1, 300, 512), (2, 200, 1024), (3, 100, 2048)] {
+        r.join(member(node, node));
+        r.capacity(
+            "zend",
+            node,
+            Capacity {
+                guest_reach: reach,
+                ..capacity(MemberState::Ready, power, true, 4)
+            },
+        );
+    }
+    r
+}
+
+/// **A draw goes only to a member whose card reaches it**, the best of those;
+/// a request that draws nothing goes to the best of them all. Reach is an
+/// area: a 768 × 1344 draw is one a 1024² card serves.
+#[test]
+fn a_draw_goes_only_to_a_member_whose_card_reaches_it() {
+    let mut r = reaching();
+    let mut pick = |draw| r.pick("zend", &Dispatch::Best, draw, None, None);
+    assert_eq!(pick(None), Pick::Member(1));
+    assert_eq!(pick(Some(512 * 512)), Pick::Member(1));
+    assert_eq!(pick(Some(768 * 1344)), Pick::Member(2));
+    assert_eq!(pick(Some(1024 * 1040)), Pick::Member(3));
+    assert_eq!(pick(Some(2048 * 2048)), Pick::Member(3));
+}
+
+/// **A draw no card reaches goes to the one that reaches furthest**, whose own
+/// refusal names the largest draw the app serves — not to the configured
+/// upstream, and not to the best member, which would name a smaller one.
+#[test]
+fn a_draw_no_card_reaches_goes_to_the_furthest() {
+    let mut r = reaching();
+    assert_eq!(
+        r.pick("zend", &Dispatch::Best, Some(4096 * 4096), None, None),
+        Pick::Member(3)
+    );
+}
+
+/// **A key nobody holds is placed by reach too; a held key stays with its
+/// holder**, whose own refusal answers a draw its card does not reach.
+#[test]
+fn a_held_key_keeps_its_holder_and_a_free_one_is_placed_by_reach() {
+    let mut r = reaching();
+    let owner = Dispatch::Owner(KeySource::Body("image".into()));
+    assert_eq!(
+        r.pick("zend", &owner, Some(2048 * 2048), Some("free"), None),
+        Pick::Member(3)
+    );
+    r.claims("zend").claim(b"held", Epoch { ms: 1, node: 1 });
+    assert_eq!(
+        r.pick("zend", &owner, Some(2048 * 2048), Some("held"), None),
+        Pick::Member(1)
+    );
+}
+
+/// **A canary is never handed a draw its card does not reach**, even on its
+/// share: the draw is placed as ever.
+#[test]
+fn a_canary_takes_no_draw_its_card_does_not_reach() {
+    let mut r = reaching();
+    let mut yes = || true;
+    assert_eq!(
+        r.pick_canary(
+            "zend",
+            &Dispatch::Best,
+            Some(2048 * 2048),
+            None,
+            None,
+            1,
+            &mut yes
+        ),
+        Pick::Member(3)
+    );
+    assert_eq!(
+        r.pick_canary(
+            "zend",
+            &Dispatch::Best,
+            Some(512 * 512),
+            None,
+            None,
+            1,
+            &mut yes
+        ),
+        Pick::Member(1),
+        "one it reaches is its share"
+    );
 }

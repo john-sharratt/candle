@@ -30,6 +30,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD};
+use cluster::dispatch::DRAW_DEFAULT_SIDE;
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageFormat;
 use mcp_server::origin;
@@ -92,8 +93,8 @@ impl Tool for Generate {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "What to draw."},
-                    "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": 512, "description": "Width in pixels, a multiple of 16."},
-                    "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": 512, "description": "Height in pixels, a multiple of 16."},
+                    "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Width in pixels, a multiple of 16."},
+                    "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Height in pixels, a multiple of 16."},
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps: 12 is the default and a good finish; 8 (the model's trained count) for speed. More buys finish, not variety."},
                     "seed": {"type": "integer", "minimum": 0, "description": "Seed, for repeating a draw; random when absent."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
@@ -259,7 +260,7 @@ pub(super) fn body(args: &Value) -> Result<ImageBody, String> {
     let prompt = string(args, "prompt")?.to_string();
     let side = |key: &str| -> Result<u32, String> {
         match args.get(key) {
-            None | Some(Value::Null) => Ok(512),
+            None | Some(Value::Null) => Ok(DRAW_DEFAULT_SIDE),
             Some(v) => match v.as_u64() {
                 Some(n) if n <= MAX_SIDE as u64 => Ok(n as u32),
                 _ => Err(format!("`{key}` is a whole number up to {MAX_SIDE}")),

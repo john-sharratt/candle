@@ -15,6 +15,7 @@
 
 mod derived;
 mod extract;
+mod reach;
 mod table;
 
 pub use derived::{
@@ -22,6 +23,7 @@ pub use derived::{
     MCP_SUBJECTS, PASSTHROUGH_MODEL,
 };
 pub use extract::{extract, Extracted, BODY_LIMIT};
+pub use reach::{draw_area, reaches, Reach, DRAW_DEFAULT_SIDE, MCP_DRAW, MCP_EDIT};
 pub use table::{Matched, Route, RouteTable};
 
 /// Where a key is read from.

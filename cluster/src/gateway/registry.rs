@@ -12,7 +12,7 @@ use applied_set::AppliedSet;
 
 use super::agents::{choose, Choice, Need};
 use super::claims::Claims;
-use crate::dispatch::{Dispatch, RouteTable};
+use crate::dispatch::{reaches, Dispatch, RouteTable};
 use crate::frame::{BuildId, Capacity, ClaimInfo, MemberInfo, MemberState, RepoAd, PLACEMENT_WIDE};
 
 /// One admitted member.
@@ -474,22 +474,24 @@ impl Registry {
     /// `power / (1 + in_flight)`, among those with room — idle, or with more
     /// free slots than it has requests in flight — or among them all when none
     /// has. Of equal shares, an idle member; then the lowest node.
-    fn best(&self, app: &str) -> Option<u64> {
-        self.best_but(app, None)
+    fn best(&self, app: &str, draw: Option<u64>) -> Option<u64> {
+        self.best_but(app, draw, None)
     }
 
-    fn best_but(&self, app: &str, except: Option<u64>) -> Option<u64> {
-        best_of(self.placeable_but(app, except))
+    fn best_but(&self, app: &str, draw: Option<u64>, except: Option<u64>) -> Option<u64> {
+        best_of(self.placeable_but(app, draw, except))
     }
 
-    /// The members a conversation may be placed on, but `except`.
-    fn placeable_but(&self, app: &str, except: Option<u64>) -> Vec<&MemberView> {
-        self.apps.get(app).map_or_else(Vec::new, |a| {
+    /// The members a request may be placed on, but `except`: for a draw of
+    /// `draw` pixels, those whose card reaches it ([`within_reach`]).
+    fn placeable_but(&self, app: &str, draw: Option<u64>, except: Option<u64>) -> Vec<&MemberView> {
+        let placeable = self.apps.get(app).map_or_else(Vec::new, |a| {
             a.members
                 .values()
                 .filter(|m| m.placeable() && Some(m.node) != except)
                 .collect()
-        })
+        });
+        within_reach(placeable, draw)
     }
 
     /// Where a request for sticky `key`, which no member here holds, goes
@@ -499,13 +501,13 @@ impl Registry {
     /// before anyone applied its last turn — among them all, which is the most
     /// anyone holds (§2.4). A handover every candidate already holds is
     /// forgotten.
-    fn best_for(&mut self, app: &str, key: Option<&str>) -> Option<u64> {
+    fn best_for(&mut self, app: &str, draw: Option<u64>, key: Option<&str>) -> Option<u64> {
         let handover = key.and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).cloned());
         let Some(h) = handover else {
-            return self.best(app);
+            return self.best(app, draw);
         };
         let (pick, everyone_holds) = {
-            let ready = self.placeable_but(app, None);
+            let ready = self.placeable_but(app, draw, None);
             let holding: Vec<&MemberView> =
                 ready.iter().copied().filter(|m| h.held_by(m)).collect();
             let everyone_holds = holding.len() == ready.len();
@@ -564,12 +566,18 @@ impl Registry {
         choice
     }
 
-    /// Where a request with `dispatch` goes. `key` is its sticky or owner key;
-    /// `pinned` the member its page came from (`tokera_ui_<app>`).
+    /// Where a request with `dispatch` goes. `draw` is the pixel area it draws,
+    /// on a route declared [`crate::dispatch::Reach::Draw`]; `key` its sticky or
+    /// owner key; `pinned` the member its page came from (`tokera_ui_<app>`).
+    ///
+    /// A draw is placed among the members whose card reaches it. A key's
+    /// holder still serves it whatever its reach: the key is the holder's, and
+    /// its own refusal names what it draws.
     pub fn pick(
         &mut self,
         app: &str,
         dispatch: &Dispatch,
+        draw: Option<u64>,
         key: Option<&str>,
         pinned: Option<u64>,
     ) -> Pick {
@@ -596,7 +604,7 @@ impl Registry {
                         .unwrap_or_default(),
                 );
             }
-            Dispatch::Best => self.best(app),
+            Dispatch::Best => self.best(app, draw),
             Dispatch::Any => self.round_robin(app),
             // A key held by a member here goes to it — syncing, or still
             // loading, included: the conversation is the holder's, possibly
@@ -612,7 +620,7 @@ impl Registry {
                 });
                 match holder {
                     Some(h) if self.member(app, h).is_some() => Some(h),
-                    _ => self.best_for(app, key),
+                    _ => self.best_for(app, draw, key),
                 }
             }
             Dispatch::Ui => {
@@ -629,11 +637,14 @@ impl Registry {
     /// `Any` request, or a sticky one whose key no member here holds, is the
     /// candidate's when `take` says this one is its share, and otherwise goes
     /// to the baseline — the candidate left out, unless it is the only member
-    /// ready. Every other request is picked as ever.
+    /// ready. Every other request is picked as ever. A draw the candidate's
+    /// card does not reach is never its share.
+    #[allow(clippy::too_many_arguments)]
     pub fn pick_canary(
         &mut self,
         app: &str,
         dispatch: &Dispatch,
+        draw: Option<u64>,
         key: Option<&str>,
         pinned: Option<u64>,
         canary: u64,
@@ -660,18 +671,50 @@ impl Registry {
         let canary_holds = key
             .and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).cloned())
             .is_none_or(|h| self.member(app, canary).is_some_and(|m| h.held_by(m)));
-        if !shared || !canary_holds || !routable(self, canary) {
-            return self.pick(app, dispatch, key, pinned);
+        let canary_reaches = draw.is_none_or(|area| {
+            self.member(app, canary)
+                .is_some_and(|m| reaches(guest_reach(m), area))
+        });
+        if !shared || !canary_holds || !canary_reaches || !routable(self, canary) {
+            return self.pick(app, dispatch, draw, key, pinned);
         }
         if take() {
             return Pick::Member(canary);
         }
         let baseline = match dispatch {
             Dispatch::Any => self.round_robin_but(app, Some(canary)),
-            _ => self.best_but(app, Some(canary)),
+            _ => self.best_but(app, draw, Some(canary)),
         };
         Pick::Member(baseline.unwrap_or(canary))
     }
+}
+
+/// The side of the largest square `m` draws, as its last `CAPACITY` said;
+/// zero before it has said one.
+fn guest_reach(m: &MemberView) -> u32 {
+    m.capacity.as_ref().map_or(0, |c| c.guest_reach)
+}
+
+/// The members of `pool` a draw of `draw` pixels may go to: those whose card
+/// reaches it; when none does, those that reach furthest, whose own refusal
+/// then names the largest draw the app serves. Every member for a request that
+/// draws nothing.
+fn within_reach(pool: Vec<&MemberView>, draw: Option<u64>) -> Vec<&MemberView> {
+    let Some(area) = draw else {
+        return pool;
+    };
+    let reaching: Vec<&MemberView> = pool
+        .iter()
+        .copied()
+        .filter(|m| reaches(guest_reach(m), area))
+        .collect();
+    if !reaching.is_empty() {
+        return reaching;
+    }
+    let furthest = pool.iter().map(|m| guest_reach(m)).max().unwrap_or(0);
+    pool.into_iter()
+        .filter(|m| guest_reach(m) == furthest)
+        .collect()
 }
 
 /// The prefill a turn brings, in tokens, when no candidate has said what the

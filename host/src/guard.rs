@@ -51,7 +51,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{self, MethodRouter};
 use axum::{Json, Router};
-use cluster::dispatch::{Dispatch, Mirror, Route, RouteTable};
+use cluster::dispatch::{Dispatch, Mirror, Reach, Route, RouteTable};
 use serde_json::json;
 use web::auth::{Role, Roles};
 
@@ -73,6 +73,9 @@ pub struct Guarded {
     /// How a candidate build is checked against it (§3.8); `None` unless the
     /// registration says otherwise, so nothing that writes is ever mirrored.
     pub mirror: Mirror,
+    /// What its member must reach to serve it — a draw's area ([`Api::reach`]);
+    /// any member unless the registration says otherwise.
+    pub reach: Reach,
 }
 
 impl fmt::Display for Guarded {
@@ -153,6 +156,7 @@ impl Guarded {
             path,
             dispatch: self.dispatch.clone(),
             mirror: self.mirror.clone(),
+            reach: self.reach,
         };
         if self.nested {
             vec![
@@ -291,6 +295,7 @@ where
             methods: methods.names,
             dispatch,
             mirror: Mirror::None,
+            reach: Reach::Any,
         });
         self.router = self.router.route(path, guarded);
         self
@@ -302,6 +307,16 @@ where
     pub fn mirror(mut self, mirror: Mirror) -> Self {
         if let Some(last) = self.declared.last_mut() {
             last.mirror = mirror;
+        }
+        self
+    }
+
+    /// Place the route just registered only on a member that reaches what it
+    /// asks for: [`Reach::Draw`] for a route that draws, so a gateway sends a
+    /// draw to a member whose card holds its area (§5.3).
+    pub fn reach(mut self, reach: Reach) -> Self {
+        if let Some(last) = self.declared.last_mut() {
+            last.reach = reach;
         }
         self
     }
@@ -324,6 +339,7 @@ where
             methods: Vec::new(),
             dispatch,
             mirror: Mirror::None,
+            reach: Reach::Any,
         });
         self.router = self.router.nest(path, router);
         self
@@ -508,6 +524,7 @@ mod tests {
                     methods: vec!["GET", "HEAD"],
                     dispatch: Dispatch::Any,
                     mirror: Mirror::None,
+                    reach: Reach::Any,
                 },
                 Guarded {
                     path: "/b",
@@ -516,6 +533,7 @@ mod tests {
                     methods: vec!["POST", "DELETE"],
                     dispatch: Dispatch::sticky_path("id"),
                     mirror: Mirror::None,
+                    reach: Reach::Any,
                 },
                 Guarded {
                     path: "/c",
@@ -524,6 +542,7 @@ mod tests {
                     methods: vec![],
                     dispatch: Dispatch::Best,
                     mirror: Mirror::None,
+                    reach: Reach::Any,
                 },
             ]
         );
@@ -576,6 +595,7 @@ mod tests {
             methods: vec![],
             dispatch: Dispatch::Any,
             mirror: Mirror::None,
+            reach: Reach::Any,
         }
     }
 
@@ -602,6 +622,33 @@ mod tests {
         assert_eq!(read.route.mirror, Mirror::Exact(vec!["at_ms".into()]));
         let write = table.lookup("POST", "/v1/things").unwrap();
         assert_eq!(write.route.mirror, Mirror::None);
+    }
+
+    /// A route that draws says so beside its dispatch, and the table carries
+    /// it; a route that says nothing is served by any member (§5.3).
+    #[test]
+    fn a_route_reaches_only_as_it_declares() {
+        let api = Api::<()>::new(roles())
+            .route(
+                "/v1/draw",
+                Role::User,
+                Dispatch::Best,
+                post(|| async { "" }),
+            )
+            .reach(Reach::Draw)
+            .route(
+                "/v1/read",
+                Role::User,
+                Dispatch::Best,
+                post(|| async { "" }),
+            );
+        let table = dispatch_table(api.declared()).unwrap();
+        let draw = table.lookup("POST", "/v1/draw").unwrap();
+        assert_eq!(draw.route.reach, Reach::Draw);
+        assert!(draw.route.reads_body());
+        let read = table.lookup("POST", "/v1/read").unwrap();
+        assert_eq!(read.route.reach, Reach::Any);
+        assert!(!read.route.reads_body());
     }
 
     /// A request can reach both routes when they are one path whatever their

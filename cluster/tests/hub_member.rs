@@ -167,7 +167,7 @@ async fn members_join_route_and_carry_streams() {
     .await;
     assert!(!hub.clustered("zend"));
     assert_eq!(
-        hub.pick("zend", &Dispatch::Any, None, None).pick,
+        hub.pick("zend", &Dispatch::Any, None, None, None).pick,
         Pick::Configured
     );
 
@@ -177,32 +177,34 @@ async fn members_join_route_and_carry_streams() {
     assert_eq!(hub.table("zend"), Some(routes()));
     // Only A is ready: every class goes to it.
     assert_eq!(
-        hub.pick("zend", &Dispatch::Best, None, None).pick,
+        hub.pick("zend", &Dispatch::Best, None, None, None).pick,
         Pick::Member(1)
     );
     b.ready.store(true, Ordering::SeqCst);
     b.app.capacity_changed();
     // B has the higher power.
     until("B ready", || {
-        hub.pick("zend", &Dispatch::Best, None, None).pick == Pick::Member(2)
+        hub.pick("zend", &Dispatch::Best, None, None, None).pick == Pick::Member(2)
     })
     .await;
     // A request B is answering halves its share, 102 / 2 against A's 101:
     // the next goes to A, and to B again once B's answer is done.
-    let held = hub.pick("zend", &Dispatch::Best, None, None);
+    let held = hub.pick("zend", &Dispatch::Best, None, None, None);
     assert_eq!(held.pick, Pick::Member(2));
     assert!(held.load.is_some(), "a Best request is work for its member");
     assert_eq!(
-        hub.pick("zend", &Dispatch::Best, None, None).pick,
+        hub.pick("zend", &Dispatch::Best, None, None, None).pick,
         Pick::Member(1)
     );
     assert!(
-        hub.pick("zend", &Dispatch::Any, None, None).load.is_none(),
+        hub.pick("zend", &Dispatch::Any, None, None, None)
+            .load
+            .is_none(),
         "an Any request is not counted"
     );
     drop(held);
     assert_eq!(
-        hub.pick("zend", &Dispatch::Best, None, None).pick,
+        hub.pick("zend", &Dispatch::Best, None, None, None).pick,
         Pick::Member(2)
     );
 
@@ -210,8 +212,14 @@ async fn members_join_route_and_carry_streams() {
     // the claim, refuses to serve it.
     assert!(matches!(a.app.claim(b"c-1"), Check::Took(_)));
     until("the claim routed", || {
-        hub.pick("zend", &Dispatch::sticky_path("id"), Some("c-1"), None)
-            .pick
+        hub.pick(
+            "zend",
+            &Dispatch::sticky_path("id"),
+            None,
+            Some("c-1"),
+            None,
+        )
+        .pick
             == Pick::Member(1)
     })
     .await;

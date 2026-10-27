@@ -36,6 +36,7 @@ use candle_conversation::guest::{
     GuestError, GuestEvent, GuestOutcome, GuestRequest, GuestSink, ImageLora, ImageRequest,
     MatteRequest, DEFAULT_REFERENCE_HOLD,
 };
+use cluster::dispatch::DRAW_DEFAULT_SIDE;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::unbounded_channel;
@@ -99,8 +100,10 @@ pub struct CutoutBody {
     pub png_base64: String,
 }
 
+/// The side a draw leaves out — the one the gateway sizes a draw by when it
+/// places it ([`DRAW_DEFAULT_SIDE`]).
 fn default_side() -> u32 {
-    512
+    DRAW_DEFAULT_SIDE
 }
 
 /// Twenty-four, against the eight Z-Image-Turbo's schedule is trained at.

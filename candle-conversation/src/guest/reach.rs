@@ -24,6 +24,24 @@
 //! at its own fixed side whatever the picture, scaling down to it and the alpha
 //! back up, so its cost does not follow the picture at all.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// The reach this process's engine stated, for what it tells its cluster.
+static STATED: AtomicU32 = AtomicU32::new(0);
+
+/// Say what this process draws: `side`, the largest square its card serves.
+/// Read by the cluster member's `CAPACITY` ([`stated`]), so a gateway places a
+/// draw where a card reaches it.
+pub fn state(side: u32) {
+    STATED.store(side, Ordering::Relaxed);
+}
+
+/// The largest square side this process draws, as its engine stated it; zero
+/// before an engine has.
+pub fn stated() -> u32 {
+    STATED.load(Ordering::Relaxed)
+}
+
 /// `(smallest card, largest square side drawn on it)`, largest card first.
 ///
 /// The thresholds fall between the estate's cards (16, 24 and 32 GB) so a

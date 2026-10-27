@@ -1,5 +1,6 @@
 //! A member's dispatch table (§5.2): each route's methods, path pattern,
-//! dispatch and mirror mode, as `ROUTES` carries it and the gateway matches it.
+//! dispatch, mirror mode and reach, as `ROUTES` carries it and the gateway
+//! matches it.
 //!
 //! Path patterns are axum's — `:param` for one segment, `*rest` for the rest —
 //! and are matched with `matchit`, the matcher axum itself uses. One path may
@@ -8,17 +9,18 @@
 //! answers every method.
 //!
 //! On the wire: `list<route>`, a route being `list<str> methods · str path ·
-//! dispatch · mirror`; a dispatch `u8` tag — 0 `Best`, 1 `Sticky list<key>`,
-//! 2 `Owner key`, 3 `Aggregate u8 merge` (0 envelope, 1 first found, 2 lines),
-//! 4 `Any`, 5 `Ui`; a key `u8` tag — 0 path, 1 header, 2 body, 3 derived —
-//! then `str` its name; a mirror `u8` — 0 none, 1 shape, 2 `Exact list<str>`.
+//! dispatch · mirror · reach`; a dispatch `u8` tag — 0 `Best`, 1 `Sticky
+//! list<key>`, 2 `Owner key`, 3 `Aggregate u8 merge` (0 envelope, 1 first
+//! found, 2 lines), 4 `Any`, 5 `Ui`; a key `u8` tag — 0 path, 1 header, 2 body,
+//! 3 derived — then `str` its name; a mirror `u8` — 0 none, 1 shape, 2 `Exact
+//! list<str>`; a reach `u8` — 0 any, 1 draw (protocol 6).
 
 use std::collections::HashMap;
 use std::fmt;
 
 use matchit::Router as Matcher;
 
-use super::{Derived, Dispatch, KeySource, Merge, Mirror};
+use super::{Derived, Dispatch, KeySource, Merge, Mirror, Reach};
 use crate::wire::{Reader, WireError, Writer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub struct Route {
     pub path: String,
     pub dispatch: Dispatch,
     pub mirror: Mirror,
+    pub reach: Reach,
 }
 
 impl Route {
@@ -37,7 +40,14 @@ impl Route {
             path: path.to_string(),
             dispatch,
             mirror: Mirror::None,
+            reach: Reach::Any,
         }
+    }
+
+    /// Whether the gateway must buffer the request body to route it: to read
+    /// its key, or to size its draw.
+    pub fn reads_body(&self) -> bool {
+        self.dispatch.reads_body() || self.reach != Reach::Any
     }
 
     fn answers(&self, method: &str) -> bool {
@@ -131,6 +141,7 @@ impl RouteTable {
             .str(&r.path);
             write_dispatch(w, &r.dispatch);
             write_mirror(w, &r.mirror);
+            write_reach(w, r.reach);
         });
         w.into_bytes()
     }
@@ -143,6 +154,7 @@ impl RouteTable {
                 path: r.str()?,
                 dispatch: read_dispatch(r)?,
                 mirror: read_mirror(r)?,
+                reach: read_reach(r)?,
             })
         })?;
         r.finish()?;
@@ -264,6 +276,26 @@ fn read_mirror(r: &mut Reader) -> Result<Mirror, WireError> {
     })
 }
 
+fn write_reach(w: &mut Writer, reach: Reach) {
+    w.u8(match reach {
+        Reach::Any => 0,
+        Reach::Draw => 1,
+    });
+}
+
+fn read_reach(r: &mut Reader) -> Result<Reach, WireError> {
+    Ok(match r.u8()? {
+        0 => Reach::Any,
+        1 => Reach::Draw,
+        v => {
+            return Err(WireError::Invalid {
+                what: r.what(),
+                value: v as u64,
+            })
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +343,7 @@ mod tests {
                 path: "/v1/y".into(),
                 dispatch: Dispatch::Aggregate(Merge::FirstFound),
                 mirror: Mirror::Exact(vec!["t".into()]),
+                reach: Reach::Draw,
             },
         ])
         .unwrap();
@@ -321,11 +354,12 @@ mod tests {
         want.extend(b"/v1/x/:id");
         want.extend([1, 1, 0, 0, 0, 0, 2, 0, 0, 0]);
         want.extend(b"id");
-        want.push(0);
+        want.extend([0, 0]);
         want.extend([0, 0, 0, 0, 5, 0, 0, 0]);
         want.extend(b"/v1/y");
         want.extend([3, 1, 2, 1, 0, 0, 0, 1, 0, 0, 0]);
         want.extend(b"t");
+        want.push(1);
         assert_eq!(t.encode(), want);
         assert_eq!(RouteTable::decode(&want).unwrap(), t);
         assert_eq!(

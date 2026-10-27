@@ -44,7 +44,7 @@ async fn request(
     key: &str,
     turn: u32,
 ) -> Result<u64, String> {
-    let picked = gw.pick(APP, &sticky(), Some(key), None);
+    let picked = gw.pick(APP, &sticky(), None, Some(key), None);
     let Pick::Member(n) = picked.pick else {
         return Err("no member to route to".into());
     };
@@ -116,7 +116,7 @@ async fn h8_active_active_and_cut_off() {
 
     // A request in flight on g1 when it is killed fails; later ones succeed
     // through g0.
-    let Pick::Member(n) = g1.pick(APP, &sticky(), Some("conv0"), None).pick else {
+    let Pick::Member(n) = g1.pick(APP, &sticky(), None, Some("conv0"), None).pick else {
         panic!("g1 routes nothing");
     };
     let mut in_flight = g1.open(APP, n, APP).unwrap();
