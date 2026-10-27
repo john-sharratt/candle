@@ -239,55 +239,35 @@ pub(super) fn admit_within(lens: impl IntoIterator<Item = usize>, budget: usize)
     admitted
 }
 
-/// The rows each of `remaining` advances in one forward of `budget` rows, in
-/// order: the budget **shared** across every member it can carry.
+/// The rows each of `remaining` advances in one forward of `budget` rows: the
+/// budget **filled in order**, each member taking all it has or all that is
+/// left. The caller orders the members — by band, then the shortest remaining
+/// prompt first — so the budget goes to the prompts nearest their first token.
 ///
-/// Each member takes `min(remaining, level)` with the level as high as the budget
-/// allows, so short members finish and long ones take the rest. Members are
-/// carried in order while each can have at least `least` rows (or its whole
-/// remainder, if smaller); those past that get `0` and ride a later forward. The
-/// first member always advances, so a prompt wider than the whole budget still
-/// makes progress.
+/// A member is carried only while what is left gives it at least `least` rows
+/// (or its whole remainder, if smaller); the rest get `0` and ride a later
+/// forward. The first member always advances, so a prompt wider than the whole
+/// budget still makes progress.
 ///
-/// **Why shared rather than whole turns in order.** A forward that takes whole
-/// turns until the next one does not fit leaves the remainder for a later forward
-/// — and once the carried turns finish prefilling they decode, and the later
-/// forward creeps behind that decode a layer per step. Measured on the
-/// Qwen3.6-35B-A3B: eight ~645-row prompts against a 3,691-row budget went seven
-/// and one, and the eighth's first token waited out the other seven's whole
-/// decode. Shared, the eight advance together, finish together, and decode as one
-/// cohort — the shape the forward gate runs. The rows per forward are the same.
-pub(super) fn share_within(remaining: &[usize], budget: usize, least: usize) -> Vec<usize> {
+/// **Why in order rather than shared.** Shared — every member taking an equal
+/// level — a group of prompts finishes together, which is what a burst of equal
+/// prompts arriving at once wants. A stream of long prompts arriving one after
+/// another does not: on BlackWorld's code_read ingest (2026-10-27) 13 file
+/// conversations of ~14k-token pages each took ~80 rows of a ~1,000-row sweep,
+/// none reached its first token for minutes, the decode ran 2.1 rows wide and
+/// every one of them held its recurrent state the whole while. Filled in order,
+/// the nearest finish first and decode while the next ones prefill; the rows per
+/// forward are the same.
+pub(super) fn fill_in_order(remaining: &[usize], budget: usize, least: usize) -> Vec<usize> {
     let mut out = vec![0; remaining.len()];
-    // Members carried: in order, while each can have its least share.
-    let mut carried = 0usize;
-    let mut floor_rows = 0usize;
-    for &r in remaining {
-        let need = r.min(least);
-        if carried > 0 && floor_rows + need > budget {
+    let mut left = budget;
+    for (i, (o, &r)) in out.iter_mut().zip(remaining).enumerate() {
+        let take = r.min(left);
+        if i > 0 && take < r.min(least) {
             break;
         }
-        floor_rows += need;
-        carried += 1;
-    }
-    let members = &remaining[..carried];
-    // The highest level whose shares fit: `Σ min(r, level)` only grows with the
-    // level, so the largest fitting one is a binary search over `[1, max]`.
-    let fits = |level: usize| members.iter().map(|&r| r.min(level)).sum::<usize>() <= budget;
-    let max = members.iter().copied().max().unwrap_or(0);
-    let (mut lo, mut hi) = (1usize, max);
-    let mut level = 1usize;
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        if fits(mid) {
-            level = mid;
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    for (o, &r) in out.iter_mut().zip(members) {
-        *o = r.min(level);
+        *o = if i == 0 { r.min(budget.max(1)) } else { take };
+        left = left.saturating_sub(*o);
     }
     out
 }
@@ -304,44 +284,54 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// **Eight equal prompts share the forward and finish together** — 461 rows
-    /// each against 3,691 (8 × 462 would be 3,696), then their last 184 each.
+    /// **The budget is filled in order**: eight equal prompts against 3,691 rows
+    /// go five whole, the sixth the 466 left, and two wait for the next forward.
     #[test]
-    fn equal_prompts_share_the_budget_and_finish_together() {
-        assert_eq!(share_within(&[645; 8], 3691, 32), vec![461; 8]);
-        assert_eq!(share_within(&[184; 8], 3691, 32), vec![184; 8]);
+    fn equal_prompts_fill_the_budget_in_order() {
+        assert_eq!(
+            fill_in_order(&[645; 8], 3691, 32),
+            vec![645, 645, 645, 645, 645, 466, 0, 0]
+        );
+        assert_eq!(fill_in_order(&[184; 8], 3691, 32), vec![184; 8]);
     }
 
-    /// A short member finishes whole and the long ones split what it left.
+    /// **The nearest prompt finishes, and the next takes what it left** — the
+    /// ingest shape: 13 long pages against a 1,024-row sweep are not 13 slivers
+    /// of 78 but one page advancing by the whole sweep.
     #[test]
-    fn a_short_member_finishes_and_the_rest_take_what_it_left() {
+    fn the_nearest_prompt_finishes_and_the_next_takes_what_it_left() {
         assert_eq!(
-            share_within(&[100, 2000, 2000], 1000, 32),
-            vec![100, 450, 450]
+            fill_in_order(&[100, 2000, 2000], 1000, 32),
+            vec![100, 900, 0]
         );
+        let mut pages = vec![14_000; 13];
+        pages[0] = 300;
+        let got = fill_in_order(&pages, 1024, 32);
+        assert_eq!(got[..3], [300, 724, 0]);
+        assert!(got[2..].iter().all(|&a| a == 0));
     }
 
     /// Everything fits: everyone advances by all it has.
     #[test]
     fn members_that_fit_whole_advance_whole() {
-        assert_eq!(share_within(&[300, 500], 4096, 32), vec![300, 500]);
+        assert_eq!(fill_in_order(&[300, 500], 4096, 32), vec![300, 500]);
     }
 
-    /// More members than the budget can give each its least share: carried in
-    /// order up to that, and the rest wait.
+    /// A member is carried only while what is left gives it its least share:
+    /// 20 rows left is short of a 32-row least, so the next waits, while a
+    /// remainder shorter than the least rides whole.
     #[test]
-    fn a_crowd_is_carried_in_order_up_to_the_least_share() {
-        let got = share_within(&[645; 200], 3691, 32);
-        assert_eq!(got[..115], [32; 115]);
-        assert!(got[115..].iter().all(|&a| a == 0));
-        assert!(got.iter().sum::<usize>() <= 3691);
+    fn a_member_rides_only_with_its_least_share() {
+        assert_eq!(fill_in_order(&[1000, 500], 1020, 32), vec![1000, 0]);
+        assert_eq!(fill_in_order(&[1000, 12], 1020, 32), vec![1000, 12]);
+        assert_eq!(fill_in_order(&[1000, 500], 1040, 32), vec![1000, 40]);
     }
 
     /// One member wider than the whole budget still advances by the budget.
     #[test]
     fn a_member_wider_than_the_budget_still_advances() {
-        assert_eq!(share_within(&[10_000], 3691, 32), vec![3691]);
-        assert_eq!(share_within(&[], 3691, 32), Vec::<usize>::new());
+        assert_eq!(fill_in_order(&[10_000], 3691, 32), vec![3691]);
+        assert_eq!(fill_in_order(&[], 3691, 32), Vec::<usize>::new());
     }
 
     /// **In order, up to the budget, and always at least one.**

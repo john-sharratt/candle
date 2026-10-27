@@ -1031,7 +1031,7 @@ impl Scheduler {
     }
 
     /// The residency a cohort of these members leaves at `rows` wide: the zone
-    /// less the tier their water-filled shares of `rows` place, beside the
+    /// less the tier their in-order shares of `rows` place, beside the
     /// running decodes.
     fn weights_at_width(
         &self,
@@ -1079,7 +1079,7 @@ impl Scheduler {
         rows: usize,
         stage: &[(usize, usize, usize)],
     ) -> u64 {
-        let shares = super::admission::share_within(q_lens, rows, CHUNK_SIZE);
+        let shares = super::admission::fill_in_order(q_lens, rows, CHUNK_SIZE);
         let mut adv = Vec::new();
         let mut off = Vec::new();
         let mut sq = Vec::new();
@@ -3603,8 +3603,14 @@ impl Scheduler {
             .iter()
             .filter(|p| !paused.contains(&p.work.sequence_id.0))
             .collect();
+        // **Within a band, the prompt nearest its first token leads**, so the
+        // budget filled in order (`admission::fill_in_order`) finishes it and
+        // it decodes while the next ones prefill.
         candidates.sort_by_key(|p| {
-            std::cmp::Reverse(rank(self.decode_priority_or_high(p.work.sequence_id)))
+            (
+                std::cmp::Reverse(rank(self.decode_priority_or_high(p.work.sequence_id))),
+                p.work.tokens.len().saturating_sub(p.offset),
+            )
         });
         // **A `High` group carries `High` prompts only.** Every row in a group
         // rides every layer of its sweep, so a person's prompt beside eight
@@ -3673,17 +3679,16 @@ impl Scheduler {
             .map(|s| s.to_owned());
         members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
 
-        // ── Bounded by what one forward can carry, and shared ────────────────
+        // ── Bounded by what one forward can carry, filled in order ───────────
         //
         // The group's rows are the sum of its members' advances, and the forward
         // prices its transient tier from that sum. Unbounded, a burst of queued
         // turns became one forward: npcd's world ingest on the routed
         // Qwen3.6-35B-A3B asked for a 3.3 GB tier against a 3.0 GB gap between the
         // KV frontier and the weight floor, and every turn in the wave failed with
-        // it. So the members share the pass budget — each advances a fair slice of
-        // its prompt and the rest rides the next group — rather than whole turns
-        // being admitted until one does not fit, which held the turns past that
-        // point back behind the others' decode. See `admission::share_within`.
+        // it. So the pass budget is filled in the order above — the nearest
+        // prompt takes all it has, the next what is left — and the rest rides the
+        // next group. See `admission::fill_in_order`.
         let remaining: Vec<usize> = members
             .iter()
             .map(|m| match m {
@@ -3695,7 +3700,7 @@ impl Scheduler {
         // A queue that passes the cap by no more than the model's slack rides
         // whole, rather than leaving a straggler group a sweep of its own.
         let budget = self.prefill_group_budget(remaining.iter().sum());
-        let shares = super::admission::share_within(&remaining, budget, CHUNK_SIZE);
+        let shares = super::admission::fill_in_order(&remaining, budget, CHUNK_SIZE);
         let members_before = std::mem::take(&mut members);
         for (m, share) in members_before.into_iter().zip(shares) {
             if share == 0 {
@@ -4035,7 +4040,7 @@ impl Scheduler {
                 ground_mib = ground >> 20,
                 "creep cohort narrowed to the tier its windows will place"
             );
-            let shares = super::admission::share_within(&q_lens, target, CHUNK_SIZE);
+            let shares = super::admission::fill_in_order(&q_lens, target, CHUNK_SIZE);
             let before = std::mem::take(members);
             for (m, share) in before.into_iter().zip(shares) {
                 if share == 0 {
