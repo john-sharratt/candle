@@ -9,9 +9,11 @@
 //! a restart by keeping the store and dropping everything else.
 
 mod file;
+mod held_key;
 mod memory;
 
 pub use file::{FileJournal, DEFAULT_SIZE, HALF, MAX_KEY, MAX_VALUE};
+pub use held_key::held_key;
 pub use memory::MemoryVotes;
 
 use std::io;

@@ -24,40 +24,36 @@ use crate::consensus::votes::VoteStore;
 use crate::consensus::{Config, Millis, Out, Paxos};
 use crate::frame::{Accepted, Frame, Nack, Prepare, Promise, Propose, Release};
 
-/// How a frame's key is stored: `app`, a zero byte, then the Paxos key.
-fn scoped(app: &str, key: &[u8]) -> io::Result<Vec<u8>> {
-    use crate::consensus::votes::MAX_KEY;
+/// How a frame's key is voted on: `app`, a zero byte, then the Paxos key.
+/// Its length is the acceptor's to fit (`consensus::votes::held_key`): a key
+/// the scope took past a journal slot was refused here, and no round for it
+/// was ever decided.
+fn scoped(app: &str, key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(app.len() + 1 + key.len());
     out.extend_from_slice(app.as_bytes());
     out.push(0);
     out.extend_from_slice(key);
-    if out.is_empty() || out.len() > MAX_KEY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("a tie-break key is 1 to {MAX_KEY} bytes, not {}", out.len()),
-        ));
-    }
-    Ok(out)
+    out
 }
 
-fn scope(app: &str, frame: &Frame) -> io::Result<Option<Frame>> {
-    Ok(Some(match frame {
+fn scope(app: &str, frame: &Frame) -> Option<Frame> {
+    Some(match frame {
         Frame::Prepare(p) => Frame::Prepare(Prepare {
-            key: scoped(app, &p.key)?,
+            key: scoped(app, &p.key),
             ballot: p.ballot,
         }),
         Frame::Propose(p) => Frame::Propose(Propose {
-            key: scoped(app, &p.key)?,
+            key: scoped(app, &p.key),
             ballot: p.ballot,
             value: p.value.clone(),
         }),
         Frame::Release(r) => Frame::Release(Release {
-            key: scoped(app, &r.key)?,
+            key: scoped(app, &r.key),
             ballot: r.ballot,
             through: r.through,
         }),
-        _ => return Ok(None),
-    }))
+        _ => return None,
+    })
 }
 
 /// Put the proposer's key back and mark the reply as this gateway's vote.
@@ -143,7 +139,7 @@ impl TieBreak {
             return Ok(None);
         };
         let original = original.to_vec();
-        let Some(scoped) = scope(app, frame)? else {
+        let Some(scoped) = scope(app, frame) else {
             return Ok(None);
         };
         let now = self.now();
@@ -201,6 +197,37 @@ mod tests {
         // npcd's gen/1 has not been promised.
         let reply = again.consider("npcd", &prepare(4)).unwrap().unwrap();
         assert!(matches!(reply, Frame::Promise(_)), "{reply:?}");
+    }
+
+    /// **A key the scope takes past a journal slot is still voted on**: the
+    /// measured 128-byte ingest key, 133 scoped, is promised on a file journal
+    /// and the promise survives a restart, where it was refused outright and
+    /// its round never decided (BlackWorld, 2026-10-27).
+    #[test]
+    fn a_long_key_is_promised_and_held_across_a_restart() {
+        use crate::consensus::votes::{FileJournal, MAX_KEY};
+        let key = b"ingest/v3:candle/docs/results/flash_next_single_session_rtx_pro_5000_72gb_2026-10-06.md@c209644b98224bfce329a662dd3ef740e03f41d6".to_vec();
+        assert_eq!(key.len(), MAX_KEY);
+        let prepare = Frame::Prepare(Prepare {
+            key: key.clone(),
+            ballot: Ballot { round: 3, node: 4 },
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("gateway-votes");
+        let open = || {
+            let journal = FileJournal::open(&path, 64 * 1024).unwrap();
+            TieBreak::open(7, 0, Box::new(journal)).unwrap()
+        };
+        let mut t = open();
+        match t.consider("zend", &prepare).unwrap().unwrap() {
+            Frame::Promise(p) => assert_eq!(p.key, key, "answered under the member's key"),
+            other => panic!("a long key is promised: {other:?}"),
+        }
+        drop(t);
+        match open().consider("zend", &prepare).unwrap().unwrap() {
+            Frame::Nack(n) => assert_eq!(n.promised, Ballot { round: 3, node: 4 }),
+            other => panic!("the promise survived the restart: {other:?}"),
+        }
     }
 
     /// The lowest node votes, and only once every configured peer has been seen.

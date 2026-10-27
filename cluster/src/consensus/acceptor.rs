@@ -12,6 +12,8 @@
 //! - A key whose decision the member has **learned** — written as a
 //!   replicated record — no longer needs a slot: the acceptor answers for it
 //!   from the decision, as an acceptance above every ballot.
+//! - Every key is held as [`held_key`] holds it, so a key longer than a
+//!   journal slot is voted on under its digest rather than refused.
 
 use std::io;
 use std::time::Duration;
@@ -19,7 +21,7 @@ use std::time::Duration;
 use super::clock::Millis;
 use super::maps::Map;
 use super::value::Value;
-use super::votes::{Vote, VoteStore};
+use super::votes::{held_key, Vote, VoteStore};
 use crate::frame::{AcceptedValue, Ballot};
 
 /// A ballot above every ballot a proposer can hold: what a learned decision
@@ -98,6 +100,7 @@ impl<S: VoteStore> Acceptor<S> {
     }
 
     pub fn prepare(&mut self, key: &[u8], ballot: Ballot, now: Millis) -> io::Result<PrepareReply> {
+        let key = &*held_key(key);
         if self.decided.contains_key(key) {
             // Every proposer adopts a learned decision.
             return Ok(PrepareReply::Promise(self.reported(key, now)));
@@ -120,6 +123,7 @@ impl<S: VoteStore> Acceptor<S> {
         value: &[u8],
         now: Millis,
     ) -> io::Result<ProposeReply> {
+        let key = &*held_key(key);
         if let Some(decided) = self.decided.get(key) {
             return Ok(if decided == value {
                 ProposeReply::Accepted
@@ -153,6 +157,7 @@ impl<S: VoteStore> Acceptor<S> {
 
     /// The holder of the lease accepted at `ballot` handed it back at `now`.
     pub fn release(&mut self, key: &[u8], ballot: Ballot, now: Millis) -> io::Result<()> {
+        let key = &*held_key(key);
         let Some(vote) = self.votes.get(key) else {
             return Ok(());
         };
@@ -174,6 +179,7 @@ impl<S: VoteStore> Acceptor<S> {
     /// `key`'s decision is recorded in the substrate: answer from it, and
     /// free the slot.
     pub fn learn(&mut self, key: &[u8], value: Vec<u8>) -> io::Result<()> {
+        let key = &*held_key(key);
         self.decided.insert(key.to_vec(), value);
         if self.votes.remove(key).is_some() {
             self.store.free(key)?;
@@ -219,10 +225,10 @@ impl<S: VoteStore> Acceptor<S> {
 
     /// The vote held for `key`, for tests and the status page.
     pub fn vote(&self, key: &[u8]) -> Option<&Vote> {
-        self.votes.get(key)
+        self.votes.get(&*held_key(key))
     }
 
-    /// Every key this acceptor holds a vote for.
+    /// Every key this acceptor holds a vote for, as [`held_key`] holds it.
     pub fn keys(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.votes.keys()
     }
