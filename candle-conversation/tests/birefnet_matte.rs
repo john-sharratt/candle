@@ -21,12 +21,14 @@ use std::time::Instant;
 
 use candle::{DType, Device, Tensor};
 
-/// The export, at the revision this was measured against.
-fn checkpoint() -> PathBuf {
-    dirs_home().join(
-        ".cache/huggingface/hub/models--PinkPixel--birefnet-hr-matting-onnx/snapshots/\
-         792518b9d4dfe9793891712677de25e554f948c6/model.onnx",
-    )
+/// One export, at the revision this was measured against.
+fn checkpoint(file: &str) -> PathBuf {
+    dirs_home()
+        .join(
+            ".cache/huggingface/hub/models--PinkPixel--birefnet-hr-matting-onnx/snapshots/\
+             792518b9d4dfe9793891712677de25e554f948c6",
+        )
+        .join(file)
 }
 
 fn dirs_home() -> PathBuf {
@@ -39,8 +41,19 @@ fn dirs_home() -> PathBuf {
 
 #[test]
 #[ignore = "loads BiRefNet HR (0.9 GB) and runs one 2048² forward on the card; needs it to itself"]
-fn birefnet_hr_matting_costs_this_much() {
-    let path = checkpoint();
+fn birefnet_hr_matting_fp32_costs_this_much() {
+    measure("model.onnx");
+}
+
+#[test]
+#[ignore = "loads BiRefNet HR fp16 (0.45 GB) and runs one 2048² forward on the card; needs it to itself"]
+fn birefnet_hr_matting_fp16_costs_this_much() {
+    measure("model_fp16.onnx");
+}
+
+/// One forward of `file`: its weights, wall time, activation peak and alpha.
+fn measure(file: &str) {
+    let path = checkpoint(file);
     assert!(path.exists(), "the checkpoint is not at {path:?}");
     let device = Device::new_cuda(0).unwrap();
     let cuda = device.as_cuda_device().unwrap();
@@ -81,7 +94,24 @@ fn birefnet_hr_matting_costs_this_much() {
             }
         }
     }
-    let input = Tensor::from_vec(chw, (1, 3, side, side), &device).unwrap();
+    // In the dtype the graph declares: an fp16 export may take f16 or keep f32.
+    let declared = graph
+        .input
+        .iter()
+        .find(|i| i.name == "image")
+        .and_then(|i| match i.r#type.as_ref()?.value.as_ref()? {
+            candle_onnx::onnx::type_proto::Value::TensorType(t) => {
+                candle_onnx::onnx::tensor_proto::DataType::try_from(t.elem_type).ok()
+            }
+            _ => None,
+        })
+        .and_then(candle_onnx::dtype)
+        .unwrap_or(DType::F32);
+    let input = Tensor::from_vec(chw, (1, 3, side, side), &device)
+        .unwrap()
+        .to_dtype(declared)
+        .unwrap();
+    println!("input dtype {declared:?}");
     values.insert("image".to_string(), input);
 
     cuda.reset_pool_used_peak().unwrap();
