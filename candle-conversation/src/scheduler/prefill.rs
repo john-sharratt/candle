@@ -2805,6 +2805,29 @@ impl Scheduler {
         Some((relieved.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
+    /// The union of every live slot's projection working set — what relief
+    /// eviction protects ([`Self::evict_cold_tail`]).
+    pub(super) fn relief_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+        let mut keep_sections: Vec<SectionId> = Vec::new();
+        let mut keep_turns: Vec<TurnKey> = Vec::new();
+        for st in self.slot_projection_state.values() {
+            keep_sections.extend(st.working_set.sections.iter().copied());
+            keep_turns.extend(st.working_set.turns.iter().copied());
+        }
+        (keep_sections, keep_turns)
+    }
+
+    /// The hot bytes across the resident conversations, by why relief
+    /// eviction would or would not take them.
+    pub(super) fn hot_census(&self) -> crate::substrate::HotCensus {
+        let (keep_sections, keep_turns) = self.relief_keep_list();
+        let mut census = crate::substrate::HotCensus::default();
+        for conv in self.distinct_substrates() {
+            census += conv.read().hot_census(&keep_sections, &keep_turns);
+        }
+        census
+    }
+
     /// Shed least-recently-used hot turn KV to the warm (RAM) tier across the
     /// resident conversations, freeing up to `target_bytes` of pool VRAM.
     /// Oldest-first and reversible (a reselected turn reloads from RAM). Only
@@ -2826,12 +2849,7 @@ impl Scheduler {
         // each conversation's own substrate, so passing the global union to every
         // conversation only ever protects that conversation's own attended turns
         // (a non-matching key is a no-op) — no per-conversation grouping needed.
-        let mut keep_sections: Vec<SectionId> = Vec::new();
-        let mut keep_turns: Vec<TurnKey> = Vec::new();
-        for st in self.slot_projection_state.values() {
-            keep_sections.extend(st.working_set.sections.iter().copied());
-            keep_turns.extend(st.working_set.turns.iter().copied());
-        }
+        let (keep_sections, keep_turns) = self.relief_keep_list();
 
         let t = std::time::Instant::now();
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };

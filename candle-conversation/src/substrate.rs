@@ -882,6 +882,36 @@ pub struct EvictionReport {
     pub bytes: u64,
 }
 
+/// Hot VRAM bytes by why [`Substrate::evict_hot_to_free`] would or would not
+/// take them. A refusal for room that freed nothing says which of these held
+/// the ground; without it "live" is one figure with no owner.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HotCensus {
+    /// Sections: pinned, never on the hot LRU.
+    pub sections: u64,
+    /// In a live slot's working set (the keep list).
+    pub attended: u64,
+    /// In some dialogue's pinned working set.
+    pub pinned: u64,
+    /// No warm copy yet, so dropping the hot one would lose it.
+    pub unwarmed: u64,
+    /// A splice source.
+    pub splice: u64,
+    /// What an eviction may take.
+    pub evictable: u64,
+}
+
+impl std::ops::AddAssign for HotCensus {
+    fn add_assign(&mut self, o: Self) {
+        self.sections += o.sections;
+        self.attended += o.attended;
+        self.pinned += o.pinned;
+        self.unwarmed += o.unwarmed;
+        self.splice += o.splice;
+        self.evictable += o.evictable;
+    }
+}
+
 /// Which tiers a residence currently occupies. Returned by
 /// [`Substrate::turn_tier_state`] / [`Substrate::section_tier_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3262,6 +3292,56 @@ impl Substrate {
             count,
             bytes: freed,
         }
+    }
+
+    /// [`Self::evict_hot_to_free`]'s view of this substrate's hot bytes,
+    /// without evicting anything: what it would take, and what it protects
+    /// and why. The first reason that applies is the one counted, in the order
+    /// the eviction checks them.
+    pub fn hot_census(&self, keep_sections: &[SectionId], keep_turns: &[TurnKey]) -> HotCensus {
+        let mut census = HotCensus::default();
+        let mut keep: HashSet<ResidenceIndex> = HashSet::new();
+        for &sid in keep_sections {
+            if let Some(e) = self.sections.get(&sid) {
+                keep.insert(e.residence);
+            }
+        }
+        for &key in keep_turns {
+            if let Some(e) = self.turn(key.timeline, key.index) {
+                keep.insert(e.content.residence);
+            }
+        }
+        let mut pinned: HashSet<ResidenceIndex> = HashSet::new();
+        for timeline in self.pinned_anywhere() {
+            if let Some(entry) = self.timelines.get(&timeline) {
+                pinned.extend(entry.turns.values().map(|t| t.content.residence));
+            }
+        }
+        for e in self.sections.values() {
+            let slot = &self.residence[e.residence.0];
+            if slot.hot.is_some() {
+                census.sections += slot.byte_size;
+            }
+        }
+        for idx in self.hot_lru.iter().copied() {
+            let slot = &self.residence[idx.0];
+            if slot.hot.is_none() {
+                continue;
+            }
+            let b = slot.byte_size;
+            if keep.contains(&idx) {
+                census.attended += b;
+            } else if pinned.contains(&idx) {
+                census.pinned += b;
+            } else if slot.warm.is_none() {
+                census.unwarmed += b;
+            } else if slot.splice_source {
+                census.splice += b;
+            } else {
+                census.evictable += b;
+            }
+        }
+        census
     }
 
     /// Drop the hot copy of each of `turns` that also holds a warm copy, keeping
@@ -10205,6 +10285,30 @@ mod tests {
             "the pinned file stays hot"
         );
         assert!(sub.residence[b.0].hot.is_none(), "the unpinned one goes");
+    }
+
+    /// The census counts what the eviction would take and names what it
+    /// protects, and evicts nothing itself.
+    #[test]
+    fn hot_census_reads_as_the_eviction_would() {
+        let (layer, group, file, mut sub) = make_timeline();
+        let (_, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
+        let other = unshared_timeline(1);
+        sub.register_timeline(other, layer, group);
+        let (_, b) = install_hot_and_warm(&mut sub, other, 50_000_000);
+        let dialogue = unshared_timeline(2);
+        sub.register_timeline(dialogue, layer, group);
+        sub.set_working_set_share(group, WorkingSetShare::Remainder);
+        assert!(sub.working_set_restore_lock(dialogue, file));
+
+        let census = sub.hot_census(&[], &[]);
+        assert_eq!(census.pinned, 100_000_000);
+        assert_eq!(census.evictable, 50_000_000);
+        assert!(sub.residence[a.0].hot.is_some() && sub.residence[b.0].hot.is_some());
+        assert_eq!(
+            sub.evict_hot_to_free(&[], &[], u64::MAX).bytes,
+            census.evictable
+        );
     }
 
     /// Targeted demotion drops the hot copy of exactly the NAMED turns (keeping
