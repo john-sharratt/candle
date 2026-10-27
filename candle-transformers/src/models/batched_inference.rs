@@ -6173,6 +6173,12 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// Copy the pinned experts to host memory and concede their ground for a
+    /// guest drain still short. See `BatchedModel::stash_pinned_for_guest`.
+    fn stash_pinned_for_guest(&self) -> u64 {
+        0
+    }
+
     /// Grow the weight side back to its serving floor after a guest drain. See
     /// `BatchedModel::restore_serving_floor`.
     fn restore_serving_floor(&self) -> bool {
@@ -6476,6 +6482,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn concede_for_guest(&self, regions: usize) -> u64 {
         self.model().concede_for_guest(regions)
+    }
+
+    fn stash_pinned_for_guest(&self) -> u64 {
+        self.model().stash_pinned_for_guest()
     }
 
     fn restore_serving_floor(&self) -> bool {

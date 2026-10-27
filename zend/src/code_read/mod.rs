@@ -24,6 +24,7 @@
 //! sequences, exactly like any other batch of concurrent conversations the
 //! engine wave-batches together.
 
+pub mod binary_mark;
 mod lines;
 mod link;
 
@@ -786,6 +787,15 @@ fn process_one_file(
                 "skip: binary content behind a text extension",
             );
             job.binary.lock().unwrap().insert(job.key.to_string());
+            // Recorded, so no later pass, restart or member plans it again.
+            let conversation = ctx.engine.lock().unwrap().conversation();
+            if let Err(e) = binary_mark::record(&conversation, job.key) {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    "could not record the file as binary; the next pass sniffs it again: {e:#}",
+                );
+            }
             return Ok(());
         }
         Some(bytes) => (

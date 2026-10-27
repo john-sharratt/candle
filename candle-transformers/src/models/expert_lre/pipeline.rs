@@ -387,6 +387,9 @@ pub(crate) struct PipelineState {
     pub(crate) profile: ProfileAccumulator,
     /// Shared telemetry counters (always-on).
     pub(crate) stats: Arc<Mutex<PipelineStats>>,
+    /// The pinned experts' bytes while a guest stands in their ground
+    /// ([`BoundaryAsk::StashPinned`]), with the frontier they occupied.
+    pub(crate) pinned_stash: Option<(u64, Vec<u8>)>,
 }
 
 impl PipelineState {
@@ -474,6 +477,7 @@ impl PipelineState {
             pack_read_secs: None,
             profile: ProfileAccumulator::new(),
             stats,
+            pinned_stash: None,
         })
     }
 

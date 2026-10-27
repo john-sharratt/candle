@@ -1266,6 +1266,21 @@ impl ExpertCache {
         conceded
     }
 
+    /// After [`Self::concede_for_guest`] left the zone on its pinned set and
+    /// the guest is still short: copy the pinned experts to host memory and
+    /// concede their ground too ([`BoundaryAsk::StashPinned`]). Answers the
+    /// bytes conceded. The caller owns the restore, as for the concession.
+    pub fn stash_pinned_for_guest(&self) -> u64 {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if !self.send(PipelineMessage::RenegotiateBoundary {
+            ask: BoundaryAsk::StashPinned,
+            response_tx,
+        }) {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
+    }
+
     /// Grow the zone back to its serving floor after [`Self::concede_for_guest`],
     /// from the ground the guest has handed back. Answers whether the zone now
     /// stands at or above the floor — `true` at once for a zone that never went
@@ -1274,8 +1289,9 @@ impl ExpertCache {
         #[cfg(feature = "cuda")]
         {
             let at_floor = |s: &PipelineStats| {
-                s.expert_slot_bytes == 0
-                    || s.zone_bytes >= self.serving_floor_slots * s.expert_slot_bytes
+                !s.pinned_stashed
+                    && (s.expert_slot_bytes == 0
+                        || s.zone_bytes >= self.serving_floor_slots * s.expert_slot_bytes)
             };
             if at_floor(&PipelineStats::snapshot(&self.stats)) {
                 return true;

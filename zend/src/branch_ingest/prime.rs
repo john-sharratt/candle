@@ -143,7 +143,7 @@ impl BranchIngest {
             };
             (corpus_of(folders), corpus_of(files))
         };
-        let binary = self.binary.lock().unwrap().clone();
+        let binary = self.known_binary(ctx);
         let file_items: Vec<FileItem> = file_corpus
             .ingest
             .files
