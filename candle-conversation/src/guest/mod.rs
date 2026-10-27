@@ -60,6 +60,7 @@ pub mod progress;
 pub mod queue;
 pub mod reach;
 pub mod seed;
+pub mod staging;
 pub mod tiled;
 pub mod varground;
 pub mod windowed;

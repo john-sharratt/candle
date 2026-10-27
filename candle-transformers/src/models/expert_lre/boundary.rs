@@ -162,7 +162,9 @@ impl PipelineState {
                 // the per-forward growth question is deferred this way routinely.
                 if matches!(
                     ask,
-                    BoundaryAsk::SellPaused(_) | BoundaryAsk::RestoreFloor | BoundaryAsk::StashPinned
+                    BoundaryAsk::SellPaused(_)
+                        | BoundaryAsk::RestoreFloor
+                        | BoundaryAsk::StashPinned
                 ) {
                     tracing::info!(
                         target: "candle_transformers::expert_lre",
