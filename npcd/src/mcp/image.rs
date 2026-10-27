@@ -81,7 +81,9 @@ impl Tool for Generate {
             "description": "Draw, paint or generate a picture, image, photo or illustration — the \
                 user's own image model (Z-Image-Turbo, on their GPU). Use it for any request to \
                 draw or create an image, rather than drawing one yourself in SVG, code or a \
-                widget. The answer is the picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
+                widget. To change a picture already drawn, edited or uploaded — \"make it a \
+                black cat\", \"add a hat\", \"brighter\" — use image_edit with its link instead: \
+                a new draw is a different picture. The answer is the picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
                 link to the file that works for 24 hours without signing in. The user may not see \
                 the picture in the tool result: to show it to them, download the link and send \
                 them the file, or give them the link. Describe the subject, style, lighting and \
@@ -216,17 +218,27 @@ pub(super) struct Drawn {
 /// The answer's text: the draw's own line, then its link and how long the
 /// picture lives — or, when the file could not be stored, that there is none
 /// and why.
+///
+/// **It says that a change is an edit of this picture**, at the moment the
+/// next request is read: a model holding only the tool descriptions answers
+/// "make it a black cat" with a new draw — another cat, another room.
 fn said(drawn: &str, link: Result<(String, Kept), String>) -> String {
     match link {
         Ok((url, Kept::Edited)) => format!(
             "{drawn} A new image, kept for 1 hour or until two more edits follow it. The image \
              it was edited from stays until this one is edited — edit from that to undo this \
-             step. The file, without signing in: {url}"
+             step. {EDIT_IT} The file, without signing in: {url}"
         ),
-        Ok((url, _)) => format!("{drawn} The file, for 24 hours and without signing in: {url}"),
+        Ok((url, _)) => {
+            format!("{drawn} {EDIT_IT} The file, for 24 hours and without signing in: {url}")
+        }
         Err(e) => format!("{drawn} There is no link to the file: it could not be stored ({e})."),
     }
 }
+
+/// What a stored picture's answer says to do with a change asked of it.
+const EDIT_IT: &str = "When the user asks to change this picture, edit it: pass this link \
+                       to image_edit as `image`, rather than drawing a new one.";
 
 /// The `format` argument.
 pub(super) fn format(args: &Value) -> Result<Format, String> {
@@ -393,14 +405,18 @@ mod tests {
                     Kept::Drawn
                 ))
             ),
-            "Drew a 512x512 image, seed 7. The file, for 24 hours and without signing in: \
+            "Drew a 512x512 image, seed 7. When the user asks to change this picture, edit it: \
+             pass this link to image_edit as `image`, rather than drawing a new one. The file, \
+             for 24 hours and without signing in: \
              https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd"
         );
         assert_eq!(
             said("Drew it.", Ok(("U".into(), Kept::Edited))),
             "Drew it. A new image, kept for 1 hour or until two more edits follow it. The image \
              it was edited from stays until this one is edited — edit from that to undo this \
-             step. The file, without signing in: U"
+             step. When the user asks to change this picture, edit it: pass this link to \
+             image_edit as `image`, rather than drawing a new one. The file, without signing \
+             in: U"
         );
         assert_eq!(
             said("Drew it.", Err("no such image".into())),

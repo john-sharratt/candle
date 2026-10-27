@@ -1,9 +1,18 @@
 ---
 name: image
-description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, refine it with image_edit (add or remove details, change the light or the style), and send the user the file from the link the answer carries.
+description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself — and for any request to change one already drawn or given ("make it a black cat"), which is an image_edit of that picture, never a new draw. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, refine it with image_edit (add or remove details, change the light or the style), and send the user the file from the link the answer carries.
 tools: [image_generate, image_edit, image_upload]
 ---
 # Generating an image
+
+**Draw or edit?** A request to change a picture already in the conversation —
+one you drew, edited, or the user gave you — is an edit of that picture, even
+when it names only the change: "make it a black cat", "add a hat", "brighter",
+"without the pot". Pass its link to `image_edit` (mode `prompt` for anything
+the model draws; the other modes for size, crop, colour, turn, background). A
+new `image_generate` draws a different picture — another pose, another room —
+and loses what the user liked. Draw again only when they ask for a new
+picture, or when an edit cannot get there (below).
 
 `image_generate` draws with **Z-Image-Turbo**: a 6B diffusion transformer
 whose text encoder is a language model (Qwen3-4B), distilled to draw in about

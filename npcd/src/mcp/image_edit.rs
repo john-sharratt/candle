@@ -81,7 +81,10 @@ impl Tool for Edit {
             "description": "Edit a picture: redraw it by a prompt (add or remove a detail, change \
                 the light, the colours or the style), resize it, crop it, adjust its brightness, \
                 contrast or saturation, rotate or mirror it, or remove its background — on the \
-                user's own image model. `image` is the link or id image_generate, an earlier \
+                user's own image model. Use it whenever the user asks to change a picture \
+                already in the conversation, even when they name only the change (\"make it \
+                a black cat\"): image_generate would draw a different picture, and this keeps \
+                what was right. `image` is the link or id image_generate, an earlier \
                 image_edit, or image_upload (for a picture of the user's own) answered with; \
                 `mode` picks the edit (prompt by default), and each mode takes only its own \
                 arguments. For prompt, the prompt describes the whole picture as it should end \
