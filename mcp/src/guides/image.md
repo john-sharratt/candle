@@ -82,9 +82,12 @@ clothing. A prompt that leaves an age unclear may be declined.
 - **Steps:** pass `steps: 12`. The model is trained for 8 — use 8 when speed
   matters most; 12 buys finish; more than that buys little and costs time,
   never variety.
-- **Seed:** every draw says the seed it used ("Drew a 1024x768 image, seed
-  …"). Pass that seed back only to redraw the same picture with a small prompt
-  change. **Shift:** leave it alone.
+- **Seed:** every draw and edit says the seed it used ("Drew a 1024x768
+  image, seed …"). Pass that seed back to redraw the same picture with a small
+  prompt change. An edit needs none: it starts from the seed its picture
+  keeps (below). A seed Zen chooses is always below 2⁵³, so it comes back
+  exact; one you choose yourself must be too — a larger number is rounded in
+  JSON and names a different draw. **Shift:** leave it alone.
 - **Time:** a draw takes from about half a minute to three, most of it the
   prompt check and loading the image model — up to three minutes more when
   it has to wait for room on a busy card. Some clients show no progress
@@ -196,16 +199,37 @@ push the finish, and when the user asks to change a photo of their own
   hangs from the shelf", delete the sentence about the cat. The model has no
   instructions, only a description: "remove the cat" alone gives it nothing
   else to draw, and names the cat besides.
-- **`hold`** is how much of the original survives. Starting points: 0.5
-  (the default) to remove a detail or change a colour; **about 0.3 to add an
-  object that is not there** — a basket, a bandana, a lantern — which at 0.5
-  comes out as a smudge; about 0.3 too for a large change — a new style, a
-  different time of day; **about 0.2 to change the subject
-  itself** — its colour, its breed, what it wears ("make it a black cat"),
-  which at 0.3 and above keeps its old colours; about 0.7 for a light touch
-  to the whole picture — a tint, a finish. Look at the result: the change did not happen — lower
-  it; the picture drifted from the original — raise it. Past about 0.45 the
-  subject itself (a face, an animal) no longer changes much.
+- **`hold`** is how much of the original survives — its layout, and its
+  tones too: what is held carries the original's light and dark, so a change
+  of brightness needs far less of it than a change of hue. Starting points:
+
+  | The change | `hold` |
+  |---|---|
+  | A light touch to the whole picture — a tint, a finish | 0.7 |
+  | Remove a detail, or recolour something small | 0.5 (the default) |
+  | Add an object that is not there — a basket, a bandana, a lantern (at 0.5 it comes out as a smudge) | 0.3 |
+  | A large change to the whole — a new style, another time of day | 0.3 |
+  | Recolour the subject at about the same lightness — ginger to grey, red to blue | 0.2 |
+  | **Recolour the subject across light and dark** — a ginger cat made black, a black dress made white | **0.05–0.08** |
+
+  Measured on a ginger tabby made black, one picture, one prompt, one seed:
+  at 0.20 the cat came out dark chocolate brown, at 0.15 charcoal with a warm
+  chest, at 0.12 brown-black with its stripes showing, at 0.10 mostly black
+  with a bronze sheen, and only at 0.05 solid black — the original's tones
+  and stripes survive in what is held. Past about 0.45 the subject itself (a
+  face, an animal) no longer changes much.
+- **The seed is the picture's own.** At a low `hold` the seed decides the
+  layout: with a fresh one each try, the cat sat in a new pose in a new frame;
+  with one seed fixed, the layout stayed put from 0.15 down to 0.05. So every
+  picture Zen draws keeps the seed that drew it in its file, and an edit given
+  no `seed` starts from that one — the same noise the picture came from. Leave
+  `seed` out; pass one only to try a different layout. An `adjust` or a
+  `remove_background` passes the seed on; a `crop`, `resize` or `rotate`
+  changes the layout it drew, so the next prompt edit chooses its own. A
+  picture of the user's own keeps no seed until its first prompt edit,
+  which chooses one and keeps it; a Zen picture uploaded again keeps its own.
+- **Then adjust:** the change did not take — lower `hold`; the layout drifted
+  — pass a `seed` only if you meant to; otherwise raise `hold`.
 - **One change at a time**, each edit from the last one's link. Every edit
   is a new image with its own link, and Zen keeps the last two: the newest,
   and the one it was edited from. A step that went wrong is undone by

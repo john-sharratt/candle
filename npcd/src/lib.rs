@@ -40,6 +40,7 @@ pub mod guests;
 pub mod identity;
 pub mod image_links;
 pub mod image_ops;
+pub mod image_seed;
 pub mod images;
 pub mod lifegen;
 pub mod mcp;

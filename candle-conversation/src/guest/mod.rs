@@ -73,7 +73,7 @@ pub use matte::{Family as MatteFamily, MatteGuest, MatteSpec};
 pub use model::{GuestModel, GuestRegistry};
 pub use progress::{GuestEvent, GuestSink};
 pub use queue::{GuestQueue, GuestReceipt};
-pub use seed::{resolve_seed, Seeded};
+pub use seed::{resolve_seed, Seeded, EXACT_IN_JSON};
 pub use varground::GroundVars;
 pub use work::{
     Guest, GuestError, GuestImage, GuestMatte, GuestOutcome, GuestRequest, ImageLora,

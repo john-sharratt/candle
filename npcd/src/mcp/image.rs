@@ -30,7 +30,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD};
+use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD, EXACT_IN_JSON};
 use cluster::dispatch::DRAW_DEFAULT_SIDE;
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageFormat;
@@ -42,6 +42,7 @@ use super::route::refused;
 use super::{Answer, Picture, Tool};
 use crate::api::{now_ms, Authored};
 use crate::guest_routes::{post_image, ImageBody};
+use crate::image_seed;
 use crate::images::Kept;
 
 pub struct Generate;
@@ -99,7 +100,7 @@ impl Tool for Generate {
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Width in pixels, a multiple of 16."},
                     "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Height in pixels, a multiple of 16."},
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps: 12 is the default and a good finish; 8 (the model's trained count) for speed. More buys finish, not variety."},
-                    "seed": {"type": "integer", "minimum": 0, "description": "Seed, for repeating a draw; random when absent."},
+                    "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "Seed, for repeating a draw; random when absent. Below 2^53, so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
                     "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back: jpeg (about a sixth of the bytes) or png (lossless)."}
                 },
@@ -349,6 +350,12 @@ fn outcome(stream: &[u8], format: Format, verb: &str) -> Result<Drawn, String> {
                 .as_str()
                 .ok_or("the draw finished without a picture")?;
             let (file, mime) = file(png, format)?;
+            // The seed it drew with, kept in the file, so an edit of it starts
+            // from the same noise (`crate::image_seed`).
+            let file = match last["seed"].as_u64() {
+                Some(seed) => image_seed::stamp(&file, seed),
+                None => file,
+            };
             // A draw is within a megapixel and shown as itself; a PNG is the
             // route's own, already in base64.
             let shown = match format {
@@ -383,6 +390,10 @@ fn outcome(stream: &[u8], format: Format, verb: &str) -> Result<Drawn, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, RgbImage};
+
     use super::*;
 
     #[test]
@@ -415,6 +426,20 @@ mod tests {
             "Redrew a 512x512 image, seed 7.",
             "an edit's answer says it drew again"
         );
+
+        // A real picture keeps the seed it was drawn with, in either format.
+        let mut png = Vec::new();
+        DynamicImage::ImageRgb8(RgbImage::new(8, 8))
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        let real = format!(
+            "{{\"event\":\"done\",\"width\":8,\"height\":8,\"png_base64\":\"{}\",\"seed\":4321}}\n",
+            BASE64.encode(&png)
+        );
+        for format in [Format::Png, Format::Jpeg] {
+            let d = outcome(real.as_bytes(), format, "Drew").unwrap();
+            assert_eq!(image_seed::read(&d.file), Some(4321), "{format:?}");
+        }
 
         let failed =
             b"{\"event\":\"error\",\"error\":\"no_room\",\"detail\":\"full\",\"retry\":true}\n";
