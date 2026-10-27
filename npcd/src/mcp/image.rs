@@ -22,6 +22,7 @@
 //! admin-only `restricted` one is not offered here.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::to_bytes;
 use axum::extract::State;
@@ -125,6 +126,16 @@ pub(super) enum Made<'a> {
     Edited { from: &'a str },
 }
 
+impl Made<'_> {
+    /// What the answer says was done: a picture drawn, or one drawn again.
+    fn verb(self) -> &'static str {
+        match self {
+            Made::Drawn => "Drew",
+            Made::Edited { .. } => "Redrew",
+        }
+    }
+}
+
 /// Run the draw `body` asks for and answer with its picture as `format`, and
 /// a link to it for as long as it is kept — `image_generate`'s answer, and
 /// `image_edit`'s.
@@ -144,7 +155,7 @@ pub(super) async fn draw(
     if !status.is_success() {
         return Answer::error(refused(status.as_u16(), &bytes));
     }
-    match outcome(&bytes, format) {
+    match outcome(&bytes, format, made.verb()) {
         Ok(drawn) => answer(s, headers, drawn, made).await,
         Err(e) => Answer::error(e),
     }
@@ -160,6 +171,8 @@ pub(super) async fn answer(
     made: Made<'_>,
 ) -> Answer {
     let now = now_ms();
+    let started = Instant::now();
+    let mut put_ms = None;
     // Handed over the moment it is stored, ahead of anything that awaits, so
     // an edit of it is placed among its holders however this call ends.
     let stored = match made {
@@ -171,6 +184,7 @@ pub(super) async fn answer(
         Made::Edited { from } => match s.images.put_edited(&drawn.file, from, now) {
             Ok((id, gone)) => {
                 s.hand_over_image(&id);
+                put_ms = Some(started.elapsed().as_millis() as u64);
                 if let Some(gone) = gone {
                     retire_unless_portrait(s, &gone).await;
                 }
@@ -179,6 +193,17 @@ pub(super) async fn answer(
             Err(e) => Err(e),
         },
     };
+    let total_ms = started.elapsed().as_millis() as u64;
+    let put_ms = put_ms.unwrap_or(total_ms);
+    // The store's two stages: writing the picture, and retiring the one two
+    // edits back (a scan of the portraits that might still use it).
+    tracing::info!(
+        target: "npcd::mcp::image",
+        bytes = drawn.file.len(),
+        put_ms,
+        retire_ms = total_ms - put_ms,
+        "image kept"
+    );
     let link = stored.map(|(id, why)| {
         let path = s.image_links.path(&id, now / 1000, why);
         (format!("{}{path}", origin::of(headers)), why)
@@ -225,9 +250,10 @@ pub(super) struct Drawn {
 fn said(drawn: &str, link: Result<(String, Kept), String>) -> String {
     match link {
         Ok((url, Kept::Edited)) => format!(
-            "{drawn} A new image, kept for 1 hour or until two more edits follow it. The image \
-             it was edited from stays until this one is edited — edit from that to undo this \
-             step. {EDIT_IT} The file, without signing in: {url}"
+            "{drawn} A new image, kept for 1 hour, or until the picture edited from it is \
+             edited in turn. The image it was edited from stays until this one is edited — edit \
+             from that to undo this step. {EDIT_IT} The file, for 1 hour and without signing \
+             in: {url}"
         ),
         Ok((url, _)) => {
             format!("{drawn} {EDIT_IT} The file, for 24 hours and without signing in: {url}")
@@ -307,9 +333,9 @@ pub(super) fn body(args: &Value) -> Result<ImageBody, String> {
     })
 }
 
-/// The draw the stream's last line carries, its file as `format`, or what
-/// went wrong.
-fn outcome(stream: &[u8], format: Format) -> Result<Drawn, String> {
+/// The draw the stream's last line carries, its file as `format`, said with
+/// `verb` ("Drew", "Redrew"), or what went wrong.
+fn outcome(stream: &[u8], format: Format, verb: &str) -> Result<Drawn, String> {
     let last = String::from_utf8_lossy(stream)
         .lines()
         .rev()
@@ -331,7 +357,7 @@ fn outcome(stream: &[u8], format: Format) -> Result<Drawn, String> {
             };
             Ok(Drawn {
                 said: format!(
-                    "Drew a {}x{} image, seed {}.",
+                    "{verb} a {}x{} image, seed {}.",
                     last["width"], last["height"], last["seed"]
                 ),
                 file,
@@ -377,20 +403,26 @@ mod tests {
     fn a_finished_draw_is_a_file_and_an_error_line_is_an_error() {
         let done = b"{\"event\":\"loading\"}\n{\"event\":\"step\",\"done\":1,\"total\":9}\n\
             {\"event\":\"done\",\"width\":512,\"height\":512,\"png_base64\":\"iVBO\",\"seed\":7}\n";
-        let d = outcome(done, Format::Png).unwrap();
+        let d = outcome(done, Format::Png, Made::Drawn.verb()).unwrap();
         assert_eq!(d.said, "Drew a 512x512 image, seed 7.");
         assert_eq!(
             (d.file.as_slice(), d.shown.as_str(), d.shown_mime),
             (&[0x89, 0x50, 0x4E][..], "iVBO", "image/png")
         );
+        let edited = Made::Edited { from: "x" }.verb();
+        assert_eq!(
+            outcome(done, Format::Png, edited).unwrap().said,
+            "Redrew a 512x512 image, seed 7.",
+            "an edit's answer says it drew again"
+        );
 
         let failed =
             b"{\"event\":\"error\",\"error\":\"no_room\",\"detail\":\"full\",\"retry\":true}\n";
         assert_eq!(
-            outcome(failed, Format::Jpeg).unwrap_err(),
+            outcome(failed, Format::Jpeg, "Drew").unwrap_err(),
             "no_room: full (worth retrying)"
         );
-        assert!(outcome(b"", Format::Jpeg).is_err());
+        assert!(outcome(b"", Format::Jpeg, "Drew").is_err());
     }
 
     /// **The answer names the link and how long it works**, or says there is
@@ -412,11 +444,11 @@ mod tests {
         );
         assert_eq!(
             said("Drew it.", Ok(("U".into(), Kept::Edited))),
-            "Drew it. A new image, kept for 1 hour or until two more edits follow it. The image \
-             it was edited from stays until this one is edited — edit from that to undo this \
-             step. When the user asks to change this picture, edit it: pass this link to \
-             image_edit as `image`, rather than drawing a new one. The file, without signing \
-             in: U"
+            "Drew it. A new image, kept for 1 hour, or until the picture edited from it is \
+             edited in turn. The image it was edited from stays until this one is edited — edit \
+             from that to undo this step. When the user asks to change this picture, edit it: \
+             pass this link to image_edit as `image`, rather than drawing a new one. The file, \
+             for 1 hour and without signing in: U"
         );
         assert_eq!(
             said("Drew it.", Err("no such image".into())),

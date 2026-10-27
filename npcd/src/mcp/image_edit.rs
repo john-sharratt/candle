@@ -38,6 +38,7 @@
 //! so the edit says so at once and the caller stores it again.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::to_bytes;
 use axum::extract::State;
@@ -89,8 +90,8 @@ impl Tool for Edit {
                 `mode` picks the edit (prompt by default), and each mode takes only its own \
                 arguments. For prompt, the prompt describes the whole picture as it should end \
                 up, and `hold` is how much of the original survives. Every edit makes a new \
-                image with its own link, kept for 1 hour or until two more edits follow it; the \
-                image before stays until the new one is edited, so editing from it undoes a \
+                image with its own link, kept for 1 hour, or until the picture edited from it is \
+                edited in turn; the image before stays until the new one is edited, so editing from it undoes a \
                 step. Read the guide `image` first.",
             "inputSchema": {
                 "type": "object",
@@ -98,7 +99,7 @@ impl Tool for Edit {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate, image_edit or image_upload answer gave."},
                     "mode": {"type": "string", "enum": ["prompt", "resize", "crop", "adjust", "rotate", "remove_background"], "default": "prompt", "description": "The edit: prompt (redraw by a prompt), resize, crop, adjust (brightness, contrast, saturation), rotate (and mirror), remove_background."},
                     "prompt": {"type": "string", "description": "prompt: the whole picture as it should end up, with the change in it."},
-                    "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "description": "prompt: how much of the original survives, 0.5 when absent — about 0.2 to change the subject itself (its colour, breed or clothing: \"make it a black cat\"), 0.3 for a large change to the whole (a new style, another time of day), 0.5 to add or remove a detail, 0.7 for a light touch."},
+                    "hold": {"type": "number", "minimum": 0.0, "maximum": decimal(MAX_REFERENCE_HOLD), "description": "prompt: how much of the original survives, 0.5 when absent — about 0.2 to change the subject itself (its colour, breed or clothing: \"make it a black cat\"), 0.3 for a large change to the whole (a new style, another time of day), 0.5 to add or remove a detail, 0.7 for a light touch."},
                     "width": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: width in pixels (prompt: a multiple of 16, at most 1024); the other side follows the picture's shape when only one is given."},
                     "height": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: height in pixels, as width."},
                     "scale": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 4.0, "description": "resize: a factor of the picture's own size, in place of width and height (at most 2048 a side)."},
@@ -128,13 +129,15 @@ impl Tool for Edit {
             Ok(m) => m,
             Err(e) => return Answer::error(e),
         };
+        let started = Instant::now();
         let source = match source(s, args) {
             Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
+        let read_ms = started.elapsed().as_millis() as u64;
         let from = image_id(args["image"].as_str().unwrap_or_default());
         let made = Made::Edited { from };
-        match mode {
+        let answer = match mode {
             Mode::Prompt => match edit_body(args, &source, guest_reach(s).unwrap_or(MAX_SIDE)) {
                 Ok(body) => draw(s, headers, body, format, made).await,
                 Err(e) => Answer::error(e),
@@ -153,8 +156,26 @@ impl Tool for Edit {
                     Err(e) => Answer::error(format!("the edit failed: {e}")),
                 }
             }
-        }
+        };
+        // Where an edit's time went: reading its picture, and the whole of it —
+        // the store's own stages are on the "image kept" line before this.
+        tracing::info!(
+            target: "npcd::mcp::image",
+            mode = ?mode,
+            read_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "image edited"
+        );
+        answer
     }
+}
+
+/// `x` as the decimal it is written as — `0.95`, where widening the `f32`
+/// gives `0.949999988079071` in a schema a model reads.
+fn decimal(x: f32) -> f64 {
+    x.to_string()
+        .parse()
+        .expect("an f32's own decimal is an f64")
 }
 
 /// The picture with its background removed — the matte guest, through the
@@ -316,6 +337,16 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    /// **The schema says the limit as it is written**, not as an `f32` widens.
+    #[test]
+    fn the_hold_limit_is_its_own_decimal() {
+        assert_eq!(decimal(0.95), 0.95);
+        assert_eq!(
+            Edit::definition()["inputSchema"]["properties"]["hold"]["maximum"],
+            json!(0.95)
+        );
+    }
 
     #[test]
     fn a_link_or_an_id_names_the_image() {

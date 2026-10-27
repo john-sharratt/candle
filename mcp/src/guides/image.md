@@ -148,14 +148,16 @@ own arguments (one it does not take is refused, naming those it does):
 |---|---|---|---|
 | `prompt` (default) | add or remove a detail, change the light, palette or style | `prompt`, `hold` | `{mode: "prompt", prompt: "…the whole picture…", hold: 0.5}` |
 | `resize` | bigger or smaller | `width` or `height` (the other follows), or `scale` | `{mode: "resize", width: 512}` |
-| `crop` | a square, a wide or tall frame, or a part | `crop`: an aspect, or a box of fractions | `{mode: "crop", crop: "16:9"}`, `{mode: "crop", crop: {x: 0, y: 0, w: 0.5, h: 1}}` |
+| `crop` | a square, a wide or tall frame, or a part | `crop`: an aspect — `square` (or `1:1`), `16:9`, `9:16`, `4:3`, `3:4`, `3:2`, `2:3` — or a box of fractions | `{mode: "crop", crop: "16:9"}`, `{mode: "crop", crop: {x: 0, y: 0, w: 0.5, h: 1}}` |
 | `adjust` | brighter, more contrast, more or less colour | `brightness`, `contrast`, `saturation`, each −1 to 1 | `{mode: "adjust", brightness: 0.2, saturation: -0.1}` |
 | `rotate` | turn or mirror | `rotate` (90, 180, 270 clockwise), `flip` | `{mode: "rotate", rotate: 90}` |
 | `remove_background` | the subject alone | — | `{mode: "remove_background"}` → a PNG, transparent where the background was |
 
-Every mode takes `image` and `format`. Resize, crop, adjust and rotate are
-instant and never wait for room on the card; `prompt` and `remove_background`
-use the image engine. A crop box is fractions of the picture from its top
+Every mode takes `image` and `format`. Resize, crop, adjust and rotate need
+no image engine and never wait for room on the card; `prompt` and
+`remove_background` use the image engine. A `prompt` edit takes a `width` and
+`height` that are multiples of 16, at most 1024; `resize` takes any size up to
+2048. A crop box is fractions of the picture from its top
 left — `{x: 0.25, y: 0, w: 0.5, h: 1}` is the middle half — so judge it by
 looking. Put several adjustments in one `adjust` call: each edit re-encodes
 the picture.
@@ -195,8 +197,10 @@ push the finish, and when the user asks to change a photo of their own
   instructions, only a description: "remove the cat" alone gives it nothing
   else to draw, and names the cat besides.
 - **`hold`** is how much of the original survives. Starting points: 0.5
-  (the default) to add or remove a detail; about 0.3 for a large change —
-  a new style, a different time of day; **about 0.2 to change the subject
+  (the default) to remove a detail or change a colour; **about 0.3 to add an
+  object that is not there** — a basket, a bandana, a lantern — which at 0.5
+  comes out as a smudge; about 0.3 too for a large change — a new style, a
+  different time of day; **about 0.2 to change the subject
   itself** — its colour, its breed, what it wears ("make it a black cat"),
   which at 0.3 and above keeps its old colours; about 0.7 for a light touch
   to the whole picture — a tint, a finish. Look at the result: the change did not happen — lower
@@ -208,16 +212,17 @@ push the finish, and when the user asks to change a photo of their own
   editing from the one before — its link still works until the newest is
   edited again. Anything older is deleted as you go; to go further back,
   upload or draw it again.
-- **An edit lives 1 hour, or until two more edits follow it** — the answer
-  says so. Give the user the file of the one they want to keep (below)
-  rather than its link.
+- **An edit lives 1 hour, or until the picture edited from it is itself
+  edited** — editing from the same picture again and again keeps it. Give
+  the user the file of the one they want to keep (below) rather than its
+  link.
 
 ## Give it to the user
 
-The link opens the file for 24 hours without signing in — the permission is
-in the link, so pass it on whole and do not trim its `?exp=…&sig=…`. After
-that the link stops working and Zen deletes the picture, so what the user
-keeps is a file, not the link.
+The link opens the file without signing in — a draw's for 24 hours, an
+edit's for 1 hour. The permission is in the link, so pass it on whole and do
+not trim its `?exp=…&sig=…`. After that the link stops working and Zen
+deletes the picture, so what the user keeps is a file, not the link.
 
 1. When you can send the user a file (a tool that sends or attaches one),
    download the link into your workspace and send that file. It is the JPEG
