@@ -391,6 +391,7 @@ fn guest_refusal(e: &GuestError) -> Response {
         GuestError::Refused(_) => (StatusCode::BAD_REQUEST, "bad_request"),
         GuestError::NoRoom { .. } => (StatusCode::SERVICE_UNAVAILABLE, "no_room"),
         GuestError::Unavailable(_) => (StatusCode::NOT_IMPLEMENTED, "no_image_model"),
+        GuestError::BeyondReach { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "beyond_reach"),
         GuestError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "guest_failed"),
         GuestError::Abandoned => (StatusCode::SERVICE_UNAVAILABLE, "shutting_down"),
     };

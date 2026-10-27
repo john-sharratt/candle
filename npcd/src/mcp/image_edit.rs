@@ -56,7 +56,7 @@ use super::image::{answer, body, draw, format, Drawn, Made, MAX_SIDE};
 use super::route::refused;
 use super::{Answer, Tool};
 use crate::api::Authored;
-use crate::guest_routes::{post_cutout, CutoutBody, ImageBody};
+use crate::guest_routes::{guest_reach, post_cutout, CutoutBody, ImageBody};
 use crate::image_ops;
 use crate::images::{ImageError, Images};
 use crate::refimage;
@@ -132,7 +132,7 @@ impl Tool for Edit {
         let from = image_id(args["image"].as_str().unwrap_or_default());
         let made = Made::Edited { from };
         match mode {
-            Mode::Prompt => match edit_body(args, &source) {
+            Mode::Prompt => match edit_body(args, &source, guest_reach(s).unwrap_or(MAX_SIDE)) {
                 Ok(body) => draw(s, headers, body, format, made).await,
                 Err(e) => Answer::error(e),
             },
@@ -229,8 +229,9 @@ fn unavailable(id: &str) -> String {
 
 /// The draw's body: the tool's dials as `image_generate` reads them, the
 /// picture as its reference, held by `hold`, and the picture's own shape when
-/// no size is given.
-fn edit_body(args: &Value, source: &[u8]) -> Result<ImageBody, String> {
+/// no size is given — fitted within `reach`, the largest square this node
+/// draws, so a default never asks for more than the card serves.
+fn edit_body(args: &Value, source: &[u8], reach: u32) -> Result<ImageBody, String> {
     if source.len() > refimage::MAX_BYTES {
         return Err(format!(
             "the picture is {} bytes and the limit is {}",
@@ -258,6 +259,7 @@ fn edit_body(args: &Value, source: &[u8]) -> Result<ImageBody, String> {
             (w, h),
             given_w.then_some(body.width),
             given_h.then_some(body.height),
+            reach,
         );
     }
     body.reference_hold = match args.get("hold") {
@@ -272,25 +274,32 @@ fn edit_body(args: &Value, source: &[u8]) -> Result<ImageBody, String> {
 }
 
 /// A `w` × `h` picture's shape as a draw can take it: the long side at most
-/// [`MAX_SIDE`], both sides multiples of 16, the aspect kept as near as that
-/// allows.
-fn fitted_size(w: u32, h: u32) -> (u32, u32) {
+/// [`MAX_SIDE`], the area at most `reach`², both sides multiples of 16, the
+/// aspect kept as near as that allows.
+fn fitted_size(w: u32, h: u32, reach: u32) -> (u32, u32) {
     let (w, h) = (w.max(1), h.max(1));
     let long = w.max(h).min(MAX_SIDE);
     let scale = long as f64 / w.max(h) as f64;
+    let area = reach as f64 / (w as f64 * h as f64).sqrt();
+    if area < scale {
+        // Down to the multiple of 16 below, so rounding cannot carry the
+        // draw past the reach it was fitted to.
+        let down = |side: f64| ((side / 16.0).floor() as u32 * 16).clamp(16, MAX_SIDE);
+        return (down(w as f64 * area), down(h as f64 * area));
+    }
     (snap(w as f64 * scale), snap(h as f64 * scale))
 }
 
 /// The draw's size for a `picture` of `(w, h)` when the caller gave `width`,
 /// `height`, or neither: a side given is kept and the other follows the
-/// picture's aspect; with neither, [`fitted_size`].
-fn shaped(picture: (u32, u32), width: Option<u32>, height: Option<u32>) -> (u32, u32) {
+/// picture's aspect; with neither, [`fitted_size`] within `reach`.
+fn shaped(picture: (u32, u32), width: Option<u32>, height: Option<u32>, reach: u32) -> (u32, u32) {
     let (w, h) = (picture.0.max(1) as f64, picture.1.max(1) as f64);
     match (width, height) {
         (Some(width), Some(height)) => (width, height),
         (Some(width), None) => (width, snap(width as f64 * h / w)),
         (None, Some(height)) => (snap(height as f64 * w / h), height),
-        (None, None) => fitted_size(picture.0, picture.1),
+        (None, None) => fitted_size(picture.0, picture.1, reach),
     }
 }
 
@@ -321,22 +330,39 @@ mod tests {
     /// limit and both sides to multiples of 16.
     #[test]
     fn a_picture_keeps_its_shape_within_the_draws_limits() {
-        assert_eq!(fitted_size(576, 1024), (576, 1024));
-        assert_eq!(fitted_size(768, 768), (768, 768));
-        assert_eq!(fitted_size(4032, 3024), (1024, 768));
-        assert_eq!(fitted_size(1080, 1920), (576, 1024));
-        assert_eq!(fitted_size(500, 333), (496, 336));
-        assert_eq!(fitted_size(3000, 10), (1024, 16));
+        assert_eq!(fitted_size(576, 1024, 1024), (576, 1024));
+        assert_eq!(fitted_size(768, 768, 1024), (768, 768));
+        assert_eq!(fitted_size(4032, 3024, 1024), (1024, 768));
+        assert_eq!(fitted_size(1080, 1920, 1024), (576, 1024));
+        assert_eq!(fitted_size(500, 333, 1024), (496, 336));
+        assert_eq!(fitted_size(3000, 10, 1024), (1024, 16));
+    }
+
+    /// **A node with a smaller reach fits the default to its area**, keeping
+    /// the shape and never rounding past it: a 512-reach node (AlienWorld's
+    /// 16 GB card) draws a phone photo at about a quarter megapixel.
+    #[test]
+    fn the_default_fits_the_nodes_reach() {
+        for (w, h, want) in [
+            (4032, 3024, (576, 432)),
+            (1920, 1080, (672, 384)),
+            (1024, 1024, (512, 512)),
+            (500, 333, (496, 336)),
+        ] {
+            let got = fitted_size(w, h, 512);
+            assert_eq!(got, want, "{w}x{h}");
+            assert!(got.0 * got.1 <= 512 * 512, "{w}x{h} fitted past the reach");
+        }
     }
 
     /// **One side given keeps it and the other follows the picture.**
     #[test]
     fn one_side_given_and_the_other_follows_the_picture() {
-        assert_eq!(shaped((1920, 1080), Some(512), None), (512, 288));
-        assert_eq!(shaped((1920, 1080), None, Some(576)), (1024, 576));
-        assert_eq!(shaped((1080, 1920), None, Some(1024)), (576, 1024));
-        assert_eq!(shaped((1920, 1080), Some(512), Some(512)), (512, 512));
-        assert_eq!(shaped((1920, 1080), None, None), (1024, 576));
+        assert_eq!(shaped((1920, 1080), Some(512), None, 1024), (512, 288));
+        assert_eq!(shaped((1920, 1080), None, Some(576), 1024), (1024, 576));
+        assert_eq!(shaped((1080, 1920), None, Some(1024), 1024), (576, 1024));
+        assert_eq!(shaped((1920, 1080), Some(512), Some(512), 1024), (512, 512));
+        assert_eq!(shaped((1920, 1080), None, None, 1024), (1024, 576));
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -352,26 +378,29 @@ mod tests {
     #[test]
     fn the_picture_is_the_reference_and_sizes_the_draw() {
         let pic = png(1920, 1080);
-        let b = edit_body(&json!({"prompt": "add a lantern"}), &pic).unwrap();
+        let b = edit_body(&json!({"prompt": "add a lantern"}), &pic, 1024).unwrap();
         assert_eq!((b.width, b.height), (1024, 576));
         assert_eq!(b.reference_hold, HOLD);
         assert_eq!(b.reference.as_deref(), Some(BASE64.encode(&pic).as_str()));
+        let b = edit_body(&json!({"prompt": "add a lantern"}), &pic, 512).unwrap();
+        assert_eq!((b.width, b.height), (672, 384));
 
         let b = edit_body(
             &json!({"prompt": "x", "hold": 0.7, "width": 512, "height": 512}),
             &pic,
+            1024,
         )
         .unwrap();
         assert_eq!((b.width, b.height, b.reference_hold), (512, 512, 0.7));
-        let b = edit_body(&json!({"prompt": "x", "width": 512}), &pic).unwrap();
+        let b = edit_body(&json!({"prompt": "x", "width": 512}), &pic, 1024).unwrap();
         assert_eq!((b.width, b.height), (512, 288));
 
-        assert!(edit_body(&json!({"prompt": "x", "hold": 1.0}), &pic).is_err());
+        assert!(edit_body(&json!({"prompt": "x", "hold": 1.0}), &pic, 1024).is_err());
         assert!(
-            edit_body(&json!({"prompt": "x", "width": 500}), &pic).is_err(),
+            edit_body(&json!({"prompt": "x", "width": 500}), &pic, 1024).is_err(),
             "a redraw's side is a multiple of 16"
         );
-        assert!(edit_body(&json!({"prompt": "x"}), b"not a picture").is_err());
-        assert!(edit_body(&json!({"prompt": "  "}), &pic).is_err());
+        assert!(edit_body(&json!({"prompt": "x"}), b"not a picture", 1024).is_err());
+        assert!(edit_body(&json!({"prompt": "  "}), &pic, 1024).is_err());
     }
 }

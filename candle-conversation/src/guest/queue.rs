@@ -18,7 +18,7 @@
 //! is also what makes the queue a queue rather than a mailbox.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -156,6 +156,9 @@ pub struct GuestQueue {
     /// When a waiting job may be tried again, as milliseconds since `epoch`.
     retry_at_ms: AtomicU64,
     epoch: Instant,
+    /// The largest square side this node's card draws ([`super::reach`]).
+    /// The request's own per-side limit until the engine states its card.
+    reach_side: AtomicU32,
 }
 
 impl Default for GuestQueue {
@@ -168,6 +171,7 @@ impl Default for GuestQueue {
             waiting: AtomicBool::new(false),
             retry_at_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            reach_side: AtomicU32::new(super::work::MAX_IMAGE_SIDE),
         }
     }
 }
@@ -179,6 +183,16 @@ impl GuestQueue {
 
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// State this node's reach: the largest square side its card draws.
+    pub fn set_reach(&self, side: u32) {
+        self.reach_side.store(side, Ordering::Relaxed);
+    }
+
+    /// The largest square side this node draws — what a caller is told.
+    pub fn reach(&self) -> u32 {
+        self.reach_side.load(Ordering::Relaxed)
     }
 
     /// Queue a job whose caller wants only the answer.
@@ -199,6 +213,16 @@ impl GuestQueue {
     ) -> Result<GuestReceipt, GuestError> {
         if let Err(why) = request.check() {
             return Err(GuestError::Refused(why));
+        }
+        if let GuestRequest::Image(r) = &request {
+            let side = self.reach();
+            if !super::reach::within(r.width, r.height, side) {
+                return Err(GuestError::BeyondReach {
+                    width: r.width,
+                    height: r.height,
+                    side,
+                });
+            }
         }
         if self.closed.load(Ordering::Acquire) {
             return Err(GuestError::Abandoned);
@@ -466,6 +490,47 @@ mod tests {
         assert!(matches!(q.submit(bad), Err(GuestError::Refused(_))));
         assert_eq!(q.depth(), 0);
         assert!(!q.has_work());
+    }
+
+    /// **A draw past the card's reach is refused at once, naming the reach.**
+    /// Queued, it would evict the engine and wait out its patience for ground
+    /// the card does not have. Within the reach, any shape of the area is fine.
+    #[test]
+    fn a_draw_past_the_reach_is_refused_with_the_reach() {
+        let q = GuestQueue::new();
+        q.set_reach(512);
+        let draw = |width, height| {
+            GuestRequest::Image(ImageRequest {
+                prompt: "a lantern".into(),
+                width,
+                height,
+                steps: 8,
+                seed: None,
+                lora: ImageLora::default(),
+                reference: None,
+                shift: None,
+            })
+        };
+        let e = q.submit(draw(1024, 1024)).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                GuestError::BeyondReach {
+                    width: 1024,
+                    height: 1024,
+                    side: 512
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(
+            e.to_string()
+                .contains("only 512x512 is currently available"),
+            "{e}"
+        );
+        assert_eq!(q.depth(), 0);
+        assert!(q.submit(draw(256, 1024)).is_ok());
+        assert_eq!(q.depth(), 1);
     }
 
     /// **Shutdown answers everyone.** A caller blocked in `wait` is blocked on

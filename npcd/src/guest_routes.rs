@@ -140,11 +140,27 @@ pub async fn get_guests(State(s): State<Arc<Authored>>) -> Response {
     let Some(minds) = minds else {
         return Json(json!({ "ready": false, "guests": [], "backlog": 0 })).into_response();
     };
-    let (guests, backlog) = {
+    let (guests, backlog, reach) = {
         let engine = minds.engine();
-        (engine.configured_guests(), engine.guest_backlog())
+        (
+            engine.configured_guests(),
+            engine.guest_backlog(),
+            engine.guest_reach(),
+        )
     };
-    Json(json!({ "ready": true, "guests": guests, "backlog": backlog })).into_response()
+    // `reach` is the largest square side this node's card draws, so a caller
+    // or the gateway can send a larger draw to a node that has it.
+    Json(json!({ "ready": true, "guests": guests, "backlog": backlog, "reach": reach }))
+        .into_response()
+}
+
+/// The largest square side this node draws ([`candle_conversation::guest::reach`]),
+/// once the engine is up.
+pub fn guest_reach(s: &Authored) -> Option<u32> {
+    let rt = s.runtime.as_ref()?;
+    let minds = rt.minds.read().unwrap().clone()?;
+    let reach = minds.engine().guest_reach();
+    Some(reach)
 }
 
 /// `POST /v1/guest/image`
@@ -294,6 +310,7 @@ pub async fn post_image(
                     GuestError::Refused(_) => ("refused", false),
                     GuestError::NoRoom { .. } => ("no_room", true),
                     GuestError::Unavailable(_) => ("no_guest", false),
+                    GuestError::BeyondReach { .. } => ("beyond_reach", false),
                     GuestError::Failed(_) => ("failed", false),
                     GuestError::Abandoned => ("abandoned", true),
                 };
@@ -457,6 +474,7 @@ fn refusal(e: &GuestError) -> Response {
         GuestError::Refused(_) => StatusCode::BAD_REQUEST,
         GuestError::NoRoom { .. } => StatusCode::SERVICE_UNAVAILABLE,
         GuestError::Unavailable(_) => StatusCode::NOT_IMPLEMENTED,
+        GuestError::BeyondReach { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         GuestError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         GuestError::Abandoned => StatusCode::SERVICE_UNAVAILABLE,
     };
@@ -666,6 +684,7 @@ mod tests {
                 GuestError::Refused(_) => ("refused", false),
                 GuestError::NoRoom { .. } => ("no_room", true),
                 GuestError::Unavailable(_) => ("no_guest", false),
+                GuestError::BeyondReach { .. } => ("beyond_reach", false),
                 GuestError::Failed(_) => ("failed", false),
                 GuestError::Abandoned => ("abandoned", true),
             };
@@ -685,6 +704,15 @@ mod tests {
             (
                 GuestError::Unavailable(candle_conversation::guest::Guest::Image),
                 "no_guest",
+                false,
+            ),
+            (
+                GuestError::BeyondReach {
+                    width: 1024,
+                    height: 1024,
+                    side: 512,
+                },
+                "beyond_reach",
                 false,
             ),
             (GuestError::Failed("the decoder".into()), "failed", false),

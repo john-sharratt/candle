@@ -389,6 +389,19 @@ impl ConversationEngine {
             queue: Arc::new(crate::guest::GuestQueue::new()),
             registry: guests,
         });
+        // How large a draw this card serves, stated once from its size: a draw
+        // past it is refused at submission rather than evicting the engine for
+        // ground the card does not have. A device with no memory report (the
+        // CPU) keeps the request's own per-side limit.
+        if let Ok((_, card)) = session.device().mem_get_info() {
+            let side = crate::guest::reach::side_for_card(card as u64);
+            guests.queue.set_reach(side);
+            tracing::info!(
+                card_mib = card >> 20,
+                side,
+                "guest draws on this node reach {side}x{side}"
+            );
+        }
         let guests_for_scheduler = Arc::clone(&guests);
 
         let eos_tokens = config.eos_tokens.clone();
@@ -838,6 +851,11 @@ impl ConversationEngine {
     /// The guests this deployment configured, for a status view.
     pub fn configured_guests(&self) -> Vec<crate::guest::Guest> {
         self.core.guests.registry.configured()
+    }
+
+    /// The largest square side this node draws ([`crate::guest::reach`]).
+    pub fn guest_reach(&self) -> u32 {
+        self.core.guests.queue.reach()
     }
 
     /// How many guest jobs are waiting.

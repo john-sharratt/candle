@@ -44,6 +44,7 @@
 //! | [`drain`] | The sequence: evict → claim → load → serve → hand back. |
 //! | [`tiled`] | The autoencoder a tile at a time, so its peak is fixed. |
 //! | [`varground`] | A `VarBuilder` that places into ground, so any candle model loads there. |
+//! | [`reach`] | How large a draw this node's card serves, from its size. |
 //! | [`image`] | The Stable Diffusion backend. |
 
 pub mod checkpoint;
@@ -55,6 +56,7 @@ pub mod matte;
 pub mod model;
 pub mod progress;
 pub mod queue;
+pub mod reach;
 pub mod seed;
 pub mod tiled;
 pub mod varground;

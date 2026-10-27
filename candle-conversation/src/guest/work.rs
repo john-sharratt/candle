@@ -420,6 +420,10 @@ pub enum GuestError {
     NoRoom { wanted_mib: u64, freed_mib: u64 },
     /// The guest is not configured on this deployment.
     Unavailable(Guest),
+    /// A draw larger than this node's card serves ([`super::reach`]). Not
+    /// retryable here — no quieter moment makes the card larger — but a node
+    /// with a larger reach may serve it.
+    BeyondReach { width: u32, height: u32, side: u32 },
     /// The guest ran and failed.
     Failed(String),
     /// The daemon shut down with the job still queued.
@@ -439,6 +443,16 @@ impl std::fmt::Display for GuestError {
                  after evicting everything sheddable — try again when the engine is quieter"
             ),
             Self::Unavailable(g) => write!(f, "no {g} guest is configured on this deployment"),
+            Self::BeyondReach {
+                width,
+                height,
+                side,
+            } => write!(
+                f,
+                "{width}x{height} is unavailable on this node: only {side}x{side} is currently \
+                 available here (up to {} pixels in any shape)",
+                *side as u64 * *side as u64
+            ),
             Self::Failed(e) => write!(f, "the guest failed: {e}"),
             Self::Abandoned => f.write_str("the daemon shut down before this job ran"),
         }
