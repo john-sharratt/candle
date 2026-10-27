@@ -55,6 +55,10 @@ pub use chunked::growth_policy::{
 pub use chunked::held_ground::{HeldClaim, HeldStats};
 #[cfg(feature = "cuda")]
 pub use chunked::held_ledger::HeldSite;
+/// Where the tier may stand and what the KV side may reach — the span's
+/// arithmetic. Pure, and public for the same reason: three of the partition's
+/// worst defects were geometry, and none of them needed a GPU to find.
+pub use chunked::launch_scratch::launch_scratch_reserve;
 #[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
 /// The carve of a bulk prefill attention launch and the cut that bounds it —
@@ -70,14 +74,11 @@ pub use chunked::seal_gather::{gather_sealed_chunks, GatheredChunk};
 pub use chunked::slot_share_bytes;
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
-/// Where the tier may stand and what the KV side may reach — the span's
-/// arithmetic. Pure, and public for the same reason: three of the partition's
-/// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    ffn_work_dtype, phase_offsets, tier_footprint, BufferShape, Chain, DeltaNetWidths, Encoding,
-    HyperWidths, LayerPhase, ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth,
-    BUMP_ALIGNMENT, DELTA_NET_SCAN_CHUNK, SLOT_HEADER_BYTES,
+    ffn_work_dtype, launch_plan, phase_offsets, tier_footprint, BufferShape, Chain, DeltaNetWidths,
+    Encoding, HyperWidths, LayerPhase, ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan,
+    WaveWidth, BUMP_ALIGNMENT, DELTA_NET_SCAN_CHUNK, SLOT_HEADER_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

@@ -177,16 +177,24 @@ async fn remove_background(s: &Arc<Authored>, source: &[u8]) -> Result<Drawn, St
     let file = BASE64
         .decode(png64.as_bytes())
         .map_err(|e| format!("the cutout's picture is not base64: {e}"))?;
-    let img = image::load_from_memory(&file)
-        .map_err(|e| format!("the cutout's picture could not be read: {e}"))?;
+    // Decoding a 2048-pixel PNG and encoding its preview: off the async workers.
+    let (file, (shown, shown_mime)) = spawn_blocking(move || {
+        let img = image::load_from_memory(&file)
+            .map_err(|e| format!("the cutout's picture could not be read: {e}"))?;
+        let shown = preview(&img, &file, "image/png")?;
+        Ok::<_, String>((file, shown))
+    })
+    .await
+    .map_err(|e| format!("the cutout's preview failed: {e}"))??;
     Ok(Drawn {
         said: format!(
-            "Removed the background: now a {}x{} PNG, transparent where the background was.",
+            "Removed the background: now a {}x{} PNG, transparent where the background was \
+             (shown here over a checkerboard; the file at the link is the transparent PNG).",
             v["width"], v["height"]
         ),
-        base64: preview(&img, &file, true)?,
         file,
-        mime: "image/png",
+        shown,
+        shown_mime,
     })
 }
 

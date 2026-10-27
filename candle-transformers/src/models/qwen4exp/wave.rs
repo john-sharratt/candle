@@ -35,10 +35,11 @@ use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
-    arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_slot_moves,
-    plan_wave_transient, region_stats, relocate_tensor, ArenaSlot, DeltaNetWidths, HyperWidths,
-    KvCache, LayerPhase, ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds,
-    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
+    arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
+    launch_scratch_reserve, plan_slot_moves, plan_wave_transient, region_stats, relocate_tensor,
+    ArenaSlot, DeltaNetWidths, HyperWidths, KvCache, LayerPhase, ModelGeometry,
+    PrefillKvStageLayout, PrefillLaunchBounds, SharedExpertWidths, SlotTenant, SpanRegion,
+    WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
@@ -2513,7 +2514,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             accept_rows: scored,
             ..WaveWidth::prefill(span_rows, spans)
         };
-        Some(WavePlan::new(geometry).tier_bytes(width) as u64)
+        let scratch = launch_scratch_reserve(&self.model.device);
+        Some(WavePlan::new(geometry).tier_bytes(width, scratch) as u64)
     }
 
     /// The widest prefill **this card** can place: the rows whose whole tier —
@@ -2548,7 +2550,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Some(ground) = self.placeable_tier_bytes() {
             let ground = ground.saturating_sub(withheld).max(WAVE_SPAN_BYTES);
             let fits = WavePlan::new(self.wave_geometry(act_dtype))
-                .max_prefill_rows_for_tier_and_kv(ground, WaveWidth::default(), kv_row);
+                .max_prefill_rows_for_tier_and_kv(
+                    ground,
+                    WaveWidth::default(),
+                    kv_row,
+                    launch_scratch_reserve(&self.model.device),
+                );
             if fits > 0 {
                 cap = cap.min(fits);
             }

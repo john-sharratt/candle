@@ -61,7 +61,7 @@ use candle::Result;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::region_pool::{carve_persist, place_transient, release_transient};
 use super::wave_census::{self, Carve};
-use super::wave_plan::{phase_offsets, tier_footprint, LayerPhase};
+use super::wave_plan::{align_phase_plan, launch_plan, phase_offsets, tier_footprint, LayerPhase};
 use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
 /// A range handed out by a [`Generation`].
@@ -1064,26 +1064,6 @@ fn fallback_plan() -> [usize; 3] {
     align_phase_plan([WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES])
 }
 
-/// The boundary every phase span's base must land on.
-///
-/// The same quantum ops carve at (`INHERIT_ALIGN` in candle-core), because a
-/// span's base is laid out from the entries before it ([`phase_offsets`]): an
-/// entry that is not a multiple of this shifts the forward span off the
-/// boundary, and a carve's alignment is only as good as its span's base (see
-/// [`aligned_start`]).
-const WAVE_SPAN_ALIGN: usize = 256;
-
-/// A phase plan with every entry rounded up to [`WAVE_SPAN_ALIGN`].
-///
-/// Applied where a plan enters the domain — recording and fallback — so every
-/// consumer (the tier purchase and the span layout, through [`tier_footprint`]
-/// and [`phase_offsets`]) sees the same figures and the spans always start
-/// aligned. The rounding is priced into the tier: the purchase is the footprint
-/// of the *rounded* entries.
-fn align_phase_plan(plan: [usize; 3]) -> [usize; 3] {
-    plan.map(|bytes| bytes.div_ceil(WAVE_SPAN_ALIGN) * WAVE_SPAN_ALIGN)
-}
-
 /// Arena coordinate for a domain that is **not** a wave half.
 ///
 /// The persistence domain stages on the copy stream and reclaims by fence, so a
@@ -1979,8 +1959,7 @@ fn place_plan(stream: &Arc<CudaStream>, per_phase: [usize; 3], scratch: usize) -
 /// rounded layout would place a tier the last span overruns.
 fn with_launch_scratch(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> ([usize; 3], usize) {
     let scratch = scratch_reserve(stream.context().ordinal());
-    let [attn, ffn, forward] = per_phase;
-    (align_phase_plan([attn, ffn, forward + scratch]), scratch)
+    (launch_plan(per_phase, scratch), scratch)
 }
 
 /// The plan that covers both `standing` and `wanted`, phase by phase.
@@ -2719,10 +2698,8 @@ mod turn_tests {
 #[cfg(test)]
 mod tests {
 
-    use super::{
-        align_phase_plan, aligned_start, cover_target, covering_plan, tier_footprint, Cover,
-        WAVE_SPAN_ALIGN,
-    };
+    use super::{aligned_start, cover_target, covering_plan, tier_footprint, Cover};
+    use crate::kv_cache::chunked::wave_plan::WAVE_SPAN_ALIGN;
 
     /// A walk wider than the forward raises the phases it outgrows and keeps the
     /// ones the forward reserved for something else.
@@ -3059,22 +3036,6 @@ mod tests {
         // An aligned base costs nothing extra: identical to offset-only rounding.
         assert_eq!(aligned_start(0x1000, 100, 256), 256);
         assert_eq!(aligned_start(0x1000, 0, 256), 0);
-    }
-
-    /// Plans are rounded to the span quantum where they are recorded, so the
-    /// back-to-back layout keeps every span base on the boundary and the tier
-    /// purchase (the sum) covers the layout exactly.
-    #[test]
-    fn phase_plans_round_to_the_span_quantum() {
-        let plan = align_phase_plan([1, WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN + 1]);
-        assert_eq!(
-            plan,
-            [WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN, 2 * WAVE_SPAN_ALIGN]
-        );
-        assert_eq!(align_phase_plan([0, 0, 0]), [0, 0, 0]);
-        // Already-rounded plans pass through unchanged.
-        let exact = [4 * WAVE_SPAN_ALIGN, 512 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
-        assert_eq!(align_phase_plan(exact), exact);
     }
 
     /// A plan is recorded even when no tier can be placed for it, so the

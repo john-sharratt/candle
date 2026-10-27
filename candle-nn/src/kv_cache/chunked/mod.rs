@@ -81,6 +81,8 @@ mod io;
 /// it compiles to nothing in a production build.
 #[cfg(all(feature = "cuda", feature = "tensor-assert"))]
 pub mod kv_integrity;
+/// The launchers' scratch reserve, read where a wave is priced.
+pub mod launch_scratch;
 mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;

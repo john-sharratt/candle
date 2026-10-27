@@ -224,11 +224,12 @@ pub(super) fn pixel(
         Some(_) => format == Format::Png,
     };
     let (file, mime) = image_ops::encode(&img, png)?;
+    let (shown, shown_mime) = preview(&img, &file, mime)?;
     Ok(Drawn {
         said: format!("{done}: now {w}x{h}."),
-        base64: preview(&img, &file, png)?,
         file,
-        mime,
+        shown,
+        shown_mime,
     })
 }
 
@@ -237,21 +238,41 @@ pub(super) fn pixel(
 /// the whole picture.
 const PREVIEW_SIDE: u32 = 1024;
 
-/// The base64 of what an answer shows: the file itself when it is within
-/// [`PREVIEW_SIDE`], otherwise the picture brought within it.
-pub(super) fn preview(img: &DynamicImage, file: &[u8], png: bool) -> Result<String, String> {
+/// What an answer shows the model, in base64 with its type: **always a JPEG
+/// within [`PREVIEW_SIDE`]** — the file itself when it already is one, else
+/// the picture brought within it, a picture with transparency laid over a
+/// checkerboard ([`image_ops::on_checkerboard`]) so its cutting shows.
+///
+/// The answer is one message, and on a slow link it is the whole of the wait:
+/// a cutout's PNG runs to a megabyte and took minutes to reach the client
+/// where its JPEG takes seconds — and a PNG's transparency is not seen at all
+/// by a model reading its colours. The file kept is the PNG, whole.
+pub(super) fn preview(
+    img: &DynamicImage,
+    file: &[u8],
+    mime: &'static str,
+) -> Result<(String, &'static str), String> {
     let (w, h) = img.dimensions();
-    if w.max(h) <= PREVIEW_SIDE {
-        return Ok(BASE64.encode(file));
+    let small = w.max(h) <= PREVIEW_SIDE;
+    if small && mime == "image/jpeg" {
+        return Ok((BASE64.encode(file), mime));
     }
-    let size = image_ops::resized_size(
-        (w, h),
-        (w >= h).then_some(PREVIEW_SIDE),
-        (h > w).then_some(PREVIEW_SIDE),
-        None,
-    )?;
-    let (small, _) = image_ops::encode(&image_ops::resize(img, size), png)?;
-    Ok(BASE64.encode(small))
+    let mut shown = if img.color().has_alpha() {
+        DynamicImage::ImageRgb8(image_ops::on_checkerboard(img))
+    } else {
+        img.clone()
+    };
+    if !small {
+        let size = image_ops::resized_size(
+            (w, h),
+            (w >= h).then_some(PREVIEW_SIDE),
+            (h > w).then_some(PREVIEW_SIDE),
+            None,
+        )?;
+        shown = image_ops::resize(&shown, size);
+    }
+    let (jpeg, jpeg_mime) = image_ops::encode(&shown, false)?;
+    Ok((BASE64.encode(jpeg), jpeg_mime))
 }
 
 /// A number argument, absent as `None`.
@@ -310,8 +331,8 @@ mod tests {
     }
 
     /// **A picture with transparency stays a PNG unless a JPEG is asked
-    /// for**, and a large one is answered with a preview within 1024 while the
-    /// file kept is whole.
+    /// for**, and is shown as a JPEG over the checkerboard; a large one is
+    /// shown within 1024 while the file kept is whole.
     #[test]
     fn a_cutout_stays_a_png_and_a_large_picture_is_previewed() {
         let mut out = Cursor::new(Vec::new());
@@ -320,7 +341,21 @@ mod tests {
             .unwrap();
         let clear = out.into_inner();
         let d = pixel(Mode::Rotate, &json!({"rotate": 180}), &clear, Format::Jpeg).unwrap();
-        assert_eq!(d.mime, "image/png", "format not given: the cutout's own");
+        assert_eq!(
+            &d.file[..4],
+            b"\x89PNG",
+            "format not given: the cutout's own"
+        );
+        assert_eq!(d.shown_mime, "image/jpeg");
+        let shown = image::load_from_memory(&BASE64.decode(&d.shown).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(shown.dimensions(), (8, 4));
+        let lum = |p: &Rgb<u8>| p.0.iter().map(|&c| c as u32).sum::<u32>() / 3;
+        assert!(
+            lum(shown.get_pixel(0, 0)) > 240,
+            "clear shows the light square"
+        );
         let d = pixel(
             Mode::Rotate,
             &json!({"rotate": 180, "format": "jpeg"}),
@@ -328,16 +363,16 @@ mod tests {
             Format::Jpeg,
         )
         .unwrap();
-        assert_eq!(d.mime, "image/jpeg", "asked for");
+        assert_eq!(&d.file[..2], &[0xFF, 0xD8], "asked for");
 
         let big = png(1536, 768);
         let d = pixel(Mode::Rotate, &json!({"rotate": 180}), &big, Format::Jpeg).unwrap();
         assert_eq!(decoded(&d).dimensions(), (1536, 768), "the file is whole");
-        let shown = image::load_from_memory(&BASE64.decode(&d.base64).unwrap()).unwrap();
+        let shown = image::load_from_memory(&BASE64.decode(&d.shown).unwrap()).unwrap();
         assert_eq!(
-            shown.dimensions(),
-            (1024, 512),
-            "what is shown is within 1024"
+            (shown.dimensions(), d.shown_mime),
+            ((1024, 512), "image/jpeg"),
+            "what is shown is a JPEG within 1024"
         );
     }
 
@@ -422,8 +457,12 @@ mod tests {
         assert_eq!(d.said, "Mirrored: now 8x4.");
 
         let d = pixel(Mode::Crop, &json!({"crop": "square"}), &src, Format::Jpeg).unwrap();
-        assert_eq!((d.mime, &d.file[..2]), ("image/jpeg", &[0xFF, 0xD8][..]));
-        assert_eq!(d.base64, BASE64.encode(&d.file));
+        assert_eq!(&d.file[..2], &[0xFF, 0xD8], "a JPEG");
+        assert_eq!(
+            (d.shown.as_str(), d.shown_mime),
+            (BASE64.encode(&d.file).as_str(), "image/jpeg"),
+            "a small JPEG is shown as itself"
+        );
     }
 
     #[test]

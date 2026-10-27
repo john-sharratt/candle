@@ -45,10 +45,10 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    fragmentation, plan_pool, region_stats, ArenaKey, ArenaLocation, ChunkedKvBacking,
-    CompressionPolicy, Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat,
-    ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat, SizeClass, WavePlan,
-    WaveWidth, REGION_BYTES, WAVE_FFN_BYTES,
+    fragmentation, launch_scratch_reserve, plan_pool, region_stats, ArenaKey, ArenaLocation,
+    ChunkedKvBacking, CompressionPolicy, Fragmentation, GpuArenaClassStats, GroundLost, HeadGids,
+    KvCache, KvFormat, ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat,
+    SizeClass, WavePlan, WaveWidth, REGION_BYTES, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -4460,7 +4460,8 @@ pub trait ManagedBatchedModel {
                     .sum::<usize>(),
             ..prefill
         };
-        Some(WavePlan::new(geometry).tier_bytes(width) as u64)
+        let scratch = launch_scratch_reserve(self.device());
+        Some(WavePlan::new(geometry).tier_bytes(width, scratch) as u64)
     }
 
     /// Rows the KV side has room to admit, or `None` when it cannot say.
