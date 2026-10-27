@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn whiteworlds_config_reads() {
         let c = shipped("mcp.whiteworld.yaml");
-        assert_eq!(c.gateway, "http://192.168.0.5");
+        assert_eq!(c.gateway, "http://192.168.0.4");
         assert_eq!(c.cluster.host, "whiteworld");
         assert_eq!(c.cluster.name, "tokera.com");
         served_alike(&c);

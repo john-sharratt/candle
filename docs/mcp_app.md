@@ -263,7 +263,7 @@ carrying.
 |---|---|
 | `bind` | Where it listens (`127.0.0.1:8095`) |
 | `trusted_gateways` | The peers on that listener whose `X-Tokera-*` it believes (`127.0.0.1`) |
-| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.0.5` on WhiteWorld) |
+| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.0.4` — BlackWorld's wired address — on WhiteWorld) |
 | `cluster` | The gateway it joins as `mcp`: `urls` (space-separated, best first), `name` (the certificate's), `group_key`, and `host`, its name on the status page |
 | `state` | The folder its node is kept in |
 | `served` | The file beside it every machine serves alike, `mcp/served.yaml` |
@@ -317,8 +317,12 @@ the leg ran at 4–11 KB/s, while the gateway itself answered over the internet
 at ~650 KB/s. An image edit that finished in npcd in 12 ms reached claude.ai
 28 s later, because its ~127 KB of base64 crossed the slow leg twice. A member
 belongs only on a machine whose link to the gateway is fast: BlackWorld's is
-loopback, and WhiteWorld's served BlackWorld a 109 KB file in 10–14 ms
-(2026-10-28), against 9.9 s for the same file from AlienWorld's leg.
+loopback, and WhiteWorld's is wired, to BlackWorld's wired address. The same
+109 KB file took 4–18 ms from `192.168.0.4` to WhiteWorld, and 9.7 s
+(11 KB/s) from `192.168.0.5`, BlackWorld's Wi-Fi, which answers its first
+byte at once and then sends at that rate to every machine on the LAN
+(2026-10-28). That, not AlienWorld's own Wi-Fi, was most of AlienWorld's
+leg; a member calls the gateway at `.4`.
 
 Deploy in this order:
 
