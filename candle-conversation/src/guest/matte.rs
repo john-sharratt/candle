@@ -257,17 +257,18 @@ fn weight_bytes(graph: &ModelProto) -> usize {
 
 /// Ground for one matte's activations, at the graph's own side.
 ///
-/// A headroom figure rather than a claim, like the image guest's: these come
-/// from the CUDA pool, so what it sizes is the room the drain leaves by
-/// evicting.
+/// Claimed with the weights and handed to the guest heap (`guest_heap`), which
+/// holds the graph's live set — not its sum, since a value is dropped after its
+/// last reader.
 ///
-/// **A kilobyte per input pixel**, which sounds extravagant and is not. The
-/// network's widest stage is its first — 64 channels at the full side, so 256
-/// bytes a pixel for *one* tensor in f32 — and a U-shaped decoder holds several
-/// live at once across a skip connection. Over-claiming costs the engine an
-/// eviction it did not need; under-claiming is an out-of-memory discovered
-/// after the eviction has already happened, which is the worse of the two.
-const HEADROOM_PER_PIXEL: usize = 1024;
+/// **Two kilobytes per input pixel.** The network's widest stage is its first —
+/// 64 channels at the full side, 256 bytes a pixel for *one* f32 tensor — and a
+/// U-shaped decoder holds several live at once across a skip connection; at
+/// one kilobyte, IS-Net at 1024² ran its 1 GiB heap out (WhiteWorld,
+/// 2026-10-27). The heap logs its peak on unload, which is what to set this
+/// from. Over-claiming costs the engine an eviction it did not need;
+/// under-claiming fails the matte after that eviction, the worse of the two.
+const HEADROOM_PER_PIXEL: usize = 2048;
 
 fn activation_headroom(side: usize) -> usize {
     (side * side * HEADROOM_PER_PIXEL).max(256 << 20)

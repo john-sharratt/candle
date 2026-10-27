@@ -37,6 +37,10 @@
 use candle::Device;
 use candle_nn::kv_cache::{runs_from, span_region_refusal, RegionRun, SpanClaims, SpanRegion};
 
+/// The longest run a claim asks for at once: 64 regions, 1 GiB. Longer runs are
+/// rarely free in one piece, and a refusal halves the ask anyway.
+const CLAIM_RUN_REGIONS: usize = 64;
+
 /// One placed allocation: where it is and how much room it has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -244,10 +248,24 @@ impl GuestGround {
         let claims = SpanClaims::open(device, "a guest's ground")
             .map_err(|e| GroundError::Window(e.to_string()))?;
         let mut regions = Vec::with_capacity(want);
-        for _ in 0..want {
-            match claims.claim() {
-                Ok(Some(r)) => regions.push(r),
-                Ok(None) => {
+        // **In runs, the longest the span will give.** One region at a time takes
+        // whatever the free list holds, scattered, and a guest's largest tensor
+        // must fit one run: a matte guest's 576 MiB activation was refused by a
+        // heap of 1,032 MiB that had 140 MiB in use (WhiteWorld, 2026-10-27). A
+        // run is asked for at the longest still wanted, halved on refusal down
+        // to a single region, so a fragmented span still serves the claim.
+        let mut ask = want.min(CLAIM_RUN_REGIONS);
+        while regions.len() < want {
+            ask = ask.min(want - regions.len());
+            let got = if ask > 1 {
+                claims.claim_run(ask).map(|run| run.unwrap_or_default())
+            } else {
+                claims.claim().map(|r| r.into_iter().collect())
+            };
+            match got {
+                Ok(run) if !run.is_empty() => regions.extend(run),
+                Ok(_) if ask > 1 => ask /= 2,
+                Ok(_) => {
                     let got = regions.len();
                     // Dropped before the error is built, so the ground is back
                     // on the KV side by the time anyone reads the message.
