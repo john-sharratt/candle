@@ -1,14 +1,15 @@
-# The MCP aggregator, beside the gateway on BlackWorld under keep
-# (docs/mcp_app.md §5, §6). Run from the repository root:
+# The MCP aggregator on BlackWorld, beside the gateway, under keep
+# (docs/mcp_app.md §5, §6). WhiteWorld runs `mcp.whiteworld.yaml`. Run from
+# the repository root:
 #
 #   target\release\mcp.exe --config mcp/mcp.yaml
 
-# Where it listens: loopback only. The gateway's `/mcp` route on
-# code.tokera.com points here, and nothing else needs to reach it.
+# Where it listens: loopback only. The gateway's `/mcp` route names this as
+# its upstream, which answers while no `mcp` member is joined.
 bind: "127.0.0.1:8095"
 
-# The peers whose X-Tokera-* identity is believed: the gateway, which proxies
-# `/mcp` to this loopback address and so arrives from loopback.
+# The peers on that listener whose X-Tokera-* identity is believed: the
+# gateway, which proxies to this loopback address and so arrives from loopback.
 trusted_gateways: ["127.0.0.1"]
 
 # The gateway's entrance every backend is reached through, as the caller: the
@@ -16,56 +17,16 @@ trusted_gateways: ["127.0.0.1"]
 # (`server.trusted_backends` in web/web.yaml).
 gateway: "http://127.0.0.1"
 
-# Where MCP sessions are kept.
+# The cluster it joins as the app `mcp`: the gateway sends `/mcp` to its
+# members in turn, over the socket each dialled.
+cluster:
+  urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  name: tokera.com
+  group_key: web/secrets/group.key
+  host: blackworld
+
+# Where its node is kept.
 state: "mcp/state"
 
-# What a client shows. Plain, so the server is treated as the tool it is: the
-# name and the moon are branding from Battle Cities, whose lore lives on the
-# sign-in page, never in what the model reads.
-server:
-  name: zen
-  title: Zen
-  description: >-
-    Zen Code: coding and CI/CD in the user's own repositories and on their own
-    machines. Delegate work in a repository — implementing, testing, building,
-    reviewing — to its workers, which run it on hardware the user owns and keep
-    a journal of what they found. It also manages the user's bots: list them,
-    give and manage their missions, and message them. And it is the user's
-    image generator: image_generate draws a picture or photo from a
-    description, on their own GPU. The name is branding from
-    Tokera's game Battle Cities; the tools are ordinary engineering and
-    management tools.
-  instructions: >-
-    Zen reaches what you cannot: the user's repositories, machines, cluster and
-    bots. Work in a repository — reading, implementing against a written spec,
-    building, testing, reviewing — goes to Zen's workers with repo_task_start;
-    keep orchestration, design and approvals yourself, and do web research with
-    your own tools. Call guide_list first. Attach to the feature's thread with
-    thread_attach before working on it, and again after your context is
-    compacted. Start tasks with repo_task_start — state each in full and name
-    it for what it does — and wait on them together with repo_task_wait. A
-    task's result is its worker's journal entry: an entry is evidence, not
-    truth, so check a claim against the turns it cites (journal_read with the
-    entry) before acting on it. The bot_* tools manage the user's bots —
-    autonomous agents, each living in a world and acting on its own: bot_list
-    names them, and the others take a bot's id from it. Any request to draw,
-    paint, generate or create a picture, image, photo or illustration goes to
-    image_generate — read the `image` guide (guide_read) first; it is the
-    user's own image model, so use it rather than drawing one yourself in SVG,
-    code or a widget. The user may not see the picture in the tool result:
-    send them the file from the link the answer carries. To change a picture
-    — add or remove a detail, resize, crop, brighten or recolour it, rotate
-    it, remove its background, or edit a photo of the user's — use
-    image_edit, which takes the link a draw answered with; a picture of the
-    user's own goes to Zen first with image_upload.
-  icon: /brand/zen.png
-
-# The MCP servers whose tools are served, each at its path on its site, by
-# the name a failure tells the client: zend's tools, then npcd's.
-backends:
-  - name: coding
-    host: code.tokera.com
-    path: /v1/mcp
-  - name: bot
-    host: bot.tokera.com
-    path: /v1/npc/mcp
+# The card and backends every machine serves, beside this file.
+served: served.yaml

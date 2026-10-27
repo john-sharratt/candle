@@ -12,9 +12,13 @@ path = "src/main.rs"
 anyhow       = { workspace = true }
 axum         = { version = "0.7" }
 clap         = { workspace = true }
-# keep's proof line (`cluster::upgrade::switch::PROOF`).
+# Its membership of the app `mcp`, and keep's proof line.
 cluster      = { path = "../cluster" }
+cluster-dial = { path = "../cluster-dial" }
 futures      = { workspace = true }
+# The gateway's streams, served with the listener's router.
+hyper        = { version = "1", features = ["server", "http1"] }
+hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
 # The guides, embedded at build time (`src/guides/`).
 include_dir  = { version = "0.7" }
 mcp-server   = { path = "../mcp-server" }
@@ -24,6 +28,10 @@ serde_json   = { workspace = true }
 serde_yaml   = { workspace = true }
 sha2         = "0.10"
 tokio        = { version = "1", features = ["full"] }
+tower        = { version = "0.5" }
 tracing      = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 web          = { path = "../web" }
+
+[dev-dependencies]
+tempfile     = { workspace = true }

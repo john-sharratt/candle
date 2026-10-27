@@ -33,13 +33,14 @@ server:
   bind: "0.0.0.0:80"
 
   # The backends that call back through this gateway for the person they serve
-  # (docs/mcp_app.md §2): the mcp app beside this gateway, which runs Claude's
-  # tools on zend and npcd as the signed-in caller and calls back over loopback.
-  # From here a person's /mcp access token is honoured on any path; the token
-  # names the person, never the address. Loopback is safe to list because no
-  # public request arrives from it: Cloudflare reaches :80 from its own
-  # addresses, and the TLS entrance sees the client's.
-  trusted_backends: ["127.0.0.1"]
+  # (docs/mcp_app.md §2): the mcp app's members, which run Claude's tools on
+  # zend and npcd as the signed-in caller — BlackWorld's beside this gateway,
+  # calling back over loopback, and WhiteWorld's across the LAN. From these a
+  # person's /mcp access token is honoured on any path; the token names the
+  # person, never the address. Loopback is safe to list because no public
+  # request arrives from it: Cloudflare reaches :80 from its own addresses,
+  # and the TLS entrance sees the client's.
+  trusted_backends: ["127.0.0.1", "192.168.0.6"]
 
   # ── the TLS entrance ──────────────────────────────────────────────────────
   # HTTP/3 over QUIC on udp, with HTTP/2 and HTTP/1.1 over tcp for a client
@@ -318,13 +319,15 @@ sites:
         upstream: "https://192.168.0.5:8444"
         self_signed: true
         cluster: zend
-      # The MCP endpoint for Claude connectors, served by the mcp app beside
-      # this gateway on loopback (docs/mcp_app.md), which calls zend and npcd
-      # back through this gateway as the signed-in caller. Sign-in and OAuth
-      # stay the gateway's.
+      # The MCP endpoint for Claude connectors, served by the mcp app's
+      # members in turn (docs/mcp_app.md), each of which calls zend and npcd
+      # back through this gateway as the signed-in caller; BlackWorld's
+      # listener answers while none is joined. Sign-in and OAuth stay the
+      # gateway's.
       - prefix: /mcp
         exact: true
         upstream: "http://127.0.0.1:8095"
+        cluster: mcp
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.

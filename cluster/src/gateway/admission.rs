@@ -7,18 +7,28 @@
 //! first that is neither a local build (§3.10) nor on a build its `HELLO` says
 //! the group rejected (§3.11), for the floor. A member below the floor is
 //! admitted to upgrade when a member holds the floor's build (§3.5).
+//!
+//! The [`SERVICES`](super::SERVICES) have neither: keep releases each
+//! machine's on its own, so a member is admitted on whatever build it runs
+//! (§3.1, D1).
 
 use std::collections::HashMap;
 
+use super::hub::is_service;
 use crate::close::{Close, CloseCode};
 use crate::frame::{BuildId, Hello, ModelId};
 
 /// How far a member's clock may be from the gateway's (§3.4, 4417).
 pub const MAX_SKEW_MS: u64 = 60_000;
 
-/// The apps that carry a model lock. Agents and the failsafe run none (§3.6).
+/// The apps that carry a model lock. Agents and the services run none (§3.6).
 fn locked(app: &str) -> bool {
-    app != "agent" && app != "keep"
+    app != "agent" && !is_service(app)
+}
+
+/// The apps that carry a build floor: every one but the services.
+fn floored(app: &str) -> bool {
+    !is_service(app)
 }
 
 #[derive(Debug, Default)]
@@ -71,7 +81,7 @@ impl Admission {
         // The build floor, on `count` alone; a local build is never below it
         // (§3.10).
         let mut upgrading = false;
-        if let Some((floor, setter, setter_host)) = &policy.floor {
+        if let Some((floor, setter, setter_host)) = policy.floor.as_ref().filter(|_| floored(app)) {
             if !hello.build.is_local() && hello.build.count < floor.count {
                 if !held(floor) {
                     return Err(Close::new(
@@ -125,7 +135,7 @@ impl Admission {
         // Admitted: the first member that is neither a local build nor on a
         // build the group rejected sets the floor, the first member the lock,
         // and a node's newer session replaces its older one.
-        if policy.floor.is_none() && !hello.build.is_local() && !hello.rejected {
+        if floored(app) && policy.floor.is_none() && !hello.build.is_local() && !hello.rejected {
             policy.floor = Some((hello.build.clone(), hello.node, hello.host.clone()));
         }
         if locked(app) && policy.lock.is_none() {
@@ -261,6 +271,25 @@ mod tests {
         .is_ok());
     }
 
+    /// **A service has no floor** (D1): keep releases each machine's on its
+    /// own, so two machines on different builds are both admitted to serve,
+    /// whichever joined first — neither closed 4410 nor sent to upgrade.
+    #[test]
+    fn a_service_is_admitted_on_any_build() {
+        for app in ["keep", "mcp"] {
+            let mut a = Admission::new();
+            let first = admit(&mut a, hello(app, 1, build(4900, ""), None, NOW)).unwrap();
+            assert_eq!(first.floor, None);
+            let older = a
+                .decide(&hello(app, 2, build(4800, ""), None, NOW), NOW, |_| true)
+                .unwrap();
+            assert_eq!((older.floor, older.upgrading), (None, false));
+            let refused_nowhere = admit(&mut a, hello(app, 3, build(4700, ""), None, NOW));
+            assert!(refused_nowhere.is_ok(), "{app}: {refused_nowhere:?}");
+            assert!(a.floor(app).is_none());
+        }
+    }
+
     /// A member below the floor is admitted to upgrade when some member holds
     /// the floor's build.
     #[test]
@@ -310,6 +339,7 @@ mod tests {
         assert!(admit(&mut a, hello("zend", 2, build(1, ""), Some(model(2)), NOW)).is_ok());
         assert!(admit(&mut a, hello("agent", 9, build(1, ""), None, NOW)).is_ok());
         assert!(admit(&mut a, hello("keep", 8, build(1, ""), None, NOW)).is_ok());
+        assert!(admit(&mut a, hello("mcp", 7, build(1, ""), None, NOW)).is_ok());
         assert_eq!(
             admit(&mut a, hello("npcd", 3, build(1, ""), None, NOW))
                 .unwrap_err()

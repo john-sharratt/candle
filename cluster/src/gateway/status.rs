@@ -93,6 +93,9 @@ pub fn mode_name(clustered: bool, standing_by: bool) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppView {
     pub app: String,
+    /// One of the services (`SERVICES`): no floor, model lock, quorum or
+    /// rollout to show or act on.
+    pub service: bool,
     /// `clustered`, `loading` or `dumb` ([`mode_name`]), and since when the
     /// routing's mode last changed.
     pub mode: &'static str,

@@ -87,21 +87,34 @@ pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
 /// How many refused handshakes the status page lists.
 pub const REFUSALS_KEPT: usize = 100;
 
-/// The apps a member may join (§3.1). `keep` is the failsafe: it is listed
-/// on the status page and is not a replication group.
-pub const APPS: [&str; 4] = ["zend", "npcd", AGENT_APP, KEEP];
+/// The apps a member may join (§3.1). `keep` and `mcp` are [`SERVICES`]:
+/// listed on the status page, and not replication groups.
+pub const APPS: [&str; 5] = ["zend", "npcd", AGENT_APP, KEEP, MCP];
 
 /// The agents' app (§11).
 const AGENT_APP: &str = "agent";
 
-/// The failsafe's app. It joins so the status page can list it. It is never
-/// certified, never given a share of live traffic, and never rolled out.
+/// The failsafe's app. It joins so the status page can list it, and so an
+/// Admin's operations tools reach it.
 pub const KEEP: &str = "keep";
 
+/// The MCP aggregator's app (`docs/mcp_app.md`): the `/mcp` route's members.
+pub const MCP: &str = "mcp";
+
+/// The apps keep runs on each machine and releases there itself: each member
+/// is admitted on whatever build it runs, holds no substrate and no model,
+/// and is never certified or rolled out. Their members serve as they join.
+pub const SERVICES: [&str; 2] = [KEEP, MCP];
+
+/// Whether `app` is one of the [`SERVICES`].
+pub fn is_service(app: &str) -> bool {
+    SERVICES.contains(&app)
+}
+
 /// Whether `app` takes a candidate, a canary share, or a rollout. `agent`
-/// follows the daemons' floor; `keep` does none of it.
+/// follows the daemons' floor; the [`SERVICES`] do none of it.
 pub fn rolls_out(app: &str) -> bool {
-    app != AGENT_APP && app != KEEP
+    app != AGENT_APP && !is_service(app)
 }
 
 /// Live events unsent on a member's ordered lane past which it is lagging.
@@ -1335,6 +1348,7 @@ fn app_view(s: &State, app: &str) -> AppView {
         max_members: quorum.map(|(m, _)| m),
         quorum: quorum.map(|(_, q)| q),
         app: app.to_string(),
+        service: is_service(app),
         mode: mode_name(mode.clustered, s.registry.standing_by(app).is_some()),
         since_ms: mode.since_ms,
         floor: s.admission.floor(app).cloned(),

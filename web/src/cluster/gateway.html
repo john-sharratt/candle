@@ -260,7 +260,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
 const chip = (cls, text) => `<span class="chip ${cls}">${esc(text)}</span>`;
 const STATE_CLS = {ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", disabled: "warn", fault: "crit"};
 const MODE_CLS = {joined: "ok", fault: "crit", cut_off: "warn", rejoining: "warn", reloading: "warn", draining: "warn"};
-const APP_NAME = {zend: "Zen", npcd: "NPCs", agent: "Agents", keep: "keep"};
+const APP_NAME = {zend: "Zen", npcd: "NPCs", agent: "Agents", keep: "keep", mcp: "MCP"};
 const appName = (a) => APP_NAME[a] || a;
 
 /* ── reading ─────────────────────────────────────────────────────────────── */
@@ -373,10 +373,11 @@ function renderOverview(s, earlier) {
 function sayApp(a, s) {
   if (a.app === "keep") {
     return a.members
-      ? "The failsafe is up. It watches web and motherd, and it is not rolled out."
+      ? "The failsafe is up. It watches web, motherd and mcp, and it is not rolled out."
       : "The failsafe has not joined.";
   }
   if (!a.members) return "No member has joined. Its routes go to the configured upstream.";
+  if (a.service) return `${plural(a.ready, "member")} of ${a.members} serving. Each machine's keep releases its own; it is not rolled out.`;
   if (a.mode === "clustered") return `${plural(a.ready, "member")} of ${a.members} ready and serving.`;
   if (a.mode === "loading") return `${plural(a.members, "member")} joined, still loading — its loading page answers until it is ready.`;
   return "Members are joined but none is ready.";
@@ -461,7 +462,7 @@ function memberLine(m, s, operate) {
 function renderApps(s) {
   $("apps").innerHTML = s.apps.map((a) => {
     const members = membersOf(s, a.app);
-    const operate = a.app !== "keep";
+    const operate = !a.service;
     const facts = (operate ? [
       ["Floor", a.floor ? buildName(a.floor) : "none yet"],
       a.pending_floor ? ["Rising to", `${buildName(a.pending_floor)} ${a.grace_ends_ms ? countdown(a.grace_ends_ms, s.now_ms) : "once it loads"}`] : null,
@@ -482,7 +483,7 @@ function renderApps(s) {
 }
 
 function renderUpgrades(s) {
-  const blocks = s.upgrades.filter((u) => u.app !== "keep" && membersOf(s, u.app).length).map((u) => {
+  const blocks = s.upgrades.filter((u) => !(appOf(s, u.app) || {}).service && membersOf(s, u.app).length).map((u) => {
     const a = appOf(s, u.app) || {};
     const c = u.candidate;
     let say;

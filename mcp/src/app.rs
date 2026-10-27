@@ -18,7 +18,7 @@ use std::time::Instant;
 use axum::http::HeaderMap;
 use futures::future::join_all;
 use mcp_server::protocol::text_result;
-use mcp_server::{Call, Identity, LocalStore, Server, Store};
+use mcp_server::{Call, Identity, SealedStore, Server, Store};
 use serde_json::Value;
 
 use crate::backend::{Backend, Link, OnBehalf};
@@ -30,8 +30,9 @@ use crate::last_listed::LastListed;
 /// What every request is served with.
 pub struct App {
     pub identity: Identity,
-    pub gateways: Vec<IpAddr>,
-    pub store: Arc<LocalStore>,
+    /// Sessions carried whole in their ids: the aggregator holds nothing on
+    /// one, so every member reads a session another opened.
+    pub store: Arc<SealedStore>,
     pub backends: Vec<Backend>,
     pub link: Link,
     /// Which backend runs each tool, by name, as they were last listed.
@@ -174,8 +175,10 @@ impl Server for App {
         &self.identity
     }
 
-    fn caller(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<Caller> {
-        Caller::of(headers, peer, &self.gateways)
+    /// Whoever the believed headers name ([`crate::believed`] dropped any
+    /// other's before the router).
+    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Option<Caller> {
+        Caller::of(headers)
     }
 
     fn owner(&self, caller: &Caller) -> String {

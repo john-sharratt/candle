@@ -11,7 +11,6 @@
 //! restarts, and its lineage claims stay its own.
 
 use std::convert::Infallible;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +21,7 @@ use cluster::dial::Connect;
 use cluster::frame::{Capacity, MemberState};
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
-use cluster::member::{AppMember, Identity};
+use cluster::member::{kept_node, AppMember, Identity};
 use cluster::session::VirtualConn;
 use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
@@ -32,7 +31,6 @@ use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use rand::random;
 use tokio::time::interval;
 use tower::Service;
 use zend_vfs::Priority;
@@ -54,20 +52,7 @@ const RELEASE_EVERY: Duration = Duration::from_secs(30);
 /// This agent's node: kept in `dir`'s [`NODE_FILE`], drawn at random the first
 /// time.
 pub fn node_in(dir: &Path) -> anyhow::Result<u64> {
-    let path = dir.join(NODE_FILE);
-    if let Ok(text) = fs::read_to_string(&path) {
-        return u64::from_str_radix(text.trim(), 16)
-            .map_err(|e| anyhow::anyhow!("{}: not a node: {e}", path.display()));
-    }
-    fs::create_dir_all(dir)?;
-    let node = loop {
-        let n: u64 = random();
-        if n != 0 {
-            break n;
-        }
-    };
-    fs::write(&path, format!("{node:016x}\n"))?;
-    Ok(node)
+    Ok(kept_node(&dir.join(NODE_FILE))?)
 }
 
 /// What `CAPACITY` reports for `jobs`, with `found` the toolchains on the
@@ -230,6 +215,8 @@ pub fn join(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use zend_vfs::CommandPolicy;
 
     use super::*;

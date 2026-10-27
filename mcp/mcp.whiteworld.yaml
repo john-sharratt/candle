@@ -1,0 +1,30 @@
+# The MCP aggregator on WhiteWorld, under keep (docs/mcp_app.md §5, §6): a
+# second member of the app `mcp`, which the gateway on BlackWorld sends `/mcp`
+# to in turn with BlackWorld's. Run from the repository root:
+#
+#   target\release\mcp.exe --config mcp/mcp.whiteworld.yaml
+
+# Where it listens: loopback only. Requests reach this member over the socket
+# it dials; the listener is the gateway route's upstream on BlackWorld alone.
+bind: "127.0.0.1:8095"
+
+# The peers on that listener whose X-Tokera-* identity is believed.
+trusted_gateways: ["127.0.0.1"]
+
+# The gateway's LAN entrance every backend is reached through, as the caller:
+# the caller's own token rides each call, which the gateway honours from this
+# machine (`server.trusted_backends` in web/web.yaml).
+gateway: "http://192.168.0.5"
+
+# The cluster it joins as the app `mcp`.
+cluster:
+  urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  name: tokera.com
+  group_key: web/secrets/group.key
+  host: whiteworld
+
+# Where its node is kept.
+state: "mcp/state"
+
+# The card and backends every machine serves, beside this file.
+served: served.yaml
