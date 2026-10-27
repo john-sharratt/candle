@@ -77,6 +77,7 @@ pub mod narrator;
 pub mod normalization;
 mod penalty_counts;
 pub mod persistence;
+mod prefill_width;
 pub mod projection;
 /// The process-wide hot-path span profiler, for a daemon that serves its own
 /// timings.

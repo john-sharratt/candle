@@ -761,6 +761,37 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::reclaim_spare_ground(self);
     }
 
+    /// The experts only: a streamed layer's floor is the pinned head plus the
+    /// one cell a streamed layer lands in, which has no copy in any tier.
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .map_or(0, |c| c.concede_for_guest(regions))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = regions;
+            0
+        }
+    }
+
+    fn restore_serving_floor(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .is_none_or(|c| c.restore_serving_floor())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            true
+        }
+    }
+
     /// Dense tensors **plus** whatever experts are resident, which is what the
     /// trait asks for and what the whole-card decomposition subtracts the expert
     /// half back out of. Reporting only the experts made the dense half cancel

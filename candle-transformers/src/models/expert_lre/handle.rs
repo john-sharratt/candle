@@ -495,6 +495,11 @@ pub struct ExpertCache {
     trace: Arc<Mutex<RoutingTrace>>,
     #[cfg(feature = "cuda")]
     pinned_slots: usize,
+    /// The zone's serving floor in slots — `minimum_resident_slots` — which a
+    /// guest's concession may go below and [`Self::restore_serving_floor`]
+    /// brings it back to.
+    #[cfg(feature = "cuda")]
+    serving_floor_slots: usize,
 }
 
 /// Everything [`ExpertCache::new`] needs, gathered rather than passed as nine
@@ -1028,6 +1033,7 @@ impl ExpertCache {
             stats,
             trace,
             pinned_slots,
+            serving_floor_slots: floor,
         })
     }
 
@@ -1224,6 +1230,59 @@ impl ExpertCache {
             return 0;
         }
         response_rx.recv().unwrap_or(0)
+    }
+
+    /// [`Self::request_kv_ground`] while the engine is paused for a guest: the
+    /// zone may go below its serving floor, down to the pinned layers — the
+    /// experts with no copy in the pack or the warm tier. Every other expert
+    /// reloads from its tier when next routed.
+    ///
+    /// **The caller owns the restore.** A zone left below its floor cannot serve
+    /// a token, so before the engine forwards again the caller must call
+    /// [`Self::restore_serving_floor`] until it answers `true`.
+    pub fn concede_for_guest(&self, regions: usize) -> u64 {
+        if regions == 0 {
+            return 0;
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if !self.send(PipelineMessage::RenegotiateBoundary {
+            ask: BoundaryAsk::SellPaused(regions),
+            response_tx,
+        }) {
+            return 0;
+        }
+        response_rx.recv().unwrap_or(0)
+    }
+
+    /// Grow the zone back to its serving floor after [`Self::concede_for_guest`],
+    /// from the ground the guest has handed back. Answers whether the zone now
+    /// stands at or above the floor — `true` at once for a zone that never went
+    /// below it, and for a build without `cuda`.
+    pub fn restore_serving_floor(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            let at_floor = |s: &PipelineStats| {
+                s.expert_slot_bytes == 0
+                    || s.zone_bytes >= self.serving_floor_slots * s.expert_slot_bytes
+            };
+            if at_floor(&PipelineStats::snapshot(&self.stats)) {
+                return true;
+            }
+            candle_nn::kv_cache::reclaim_empty_arenas();
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            if !self.send(PipelineMessage::RenegotiateBoundary {
+                ask: BoundaryAsk::RestoreFloor,
+                response_tx,
+            }) {
+                return false;
+            }
+            let _ = response_rx.recv();
+            at_floor(&PipelineStats::snapshot(&self.stats))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            true
+        }
     }
 
     /// Send to the pipeline thread; `false` if it is gone (or, in a build
