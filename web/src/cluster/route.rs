@@ -37,6 +37,7 @@ use cluster::dispatch::{
     draw_area, extract, Dispatch, Extracted, KeySource, Merge, Mirror, Reach, BODY_LIMIT,
 };
 use cluster::gateway::{Class, Pick, NODE_HEADER};
+use cluster::member::PREFER_PEER;
 use serde_json::Value;
 
 use super::load::carry;
@@ -241,13 +242,22 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
     }
 
     let pin = pinned(&req, app);
-    let picked = hub.pick(app, &dispatch, draw, key.as_deref(), pin);
+    // A member that asks for a peer gets one when one can take it
+    // (`docs/guest_draw_orchestration.md` §3); any other request is placed as
+    // a client's is.
+    let peer_of = ctx
+        .from_member
+        .filter(|_| req.headers().contains_key(PREFER_PEER));
+    let picked = hub.pick_from(app, &dispatch, draw, key.as_deref(), pin, peer_of);
     match picked.pick {
         Pick::Configured => none_ready(gateway, app, &ctx, req).await,
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
+            // Never a member's ask for a peer: an unproven build is not handed
+            // the members' own traffic, as a shadow or otherwise.
             let to_candidate = match mirror {
                 Mirror::None => None,
+                _ if peer_of.is_some() => None,
                 _ => hub.mirror_to(app, node),
             };
             let res = match to_candidate {

@@ -72,7 +72,14 @@ impl Mode {
     pub fn params(self) -> &'static [&'static str] {
         match self {
             Mode::Prompt => &[
-                "prompt", "hold", "width", "height", "steps", "seed", "shift",
+                "prompt",
+                "hold",
+                "width",
+                "height",
+                "steps",
+                "seed",
+                "shift",
+                "authorization",
             ],
             Mode::Resize => &["width", "height", "scale"],
             Mode::Crop => &["crop"],

@@ -432,6 +432,10 @@ pub enum GuestError {
     Failed(String),
     /// The daemon shut down with the job still queued.
     Abandoned,
+    /// Its caller withdrew it while it was still queued
+    /// ([`super::GuestQueue::cancel`]) — a draw whose prompt was refused
+    /// before the drain took it.
+    Cancelled,
 }
 
 impl std::fmt::Display for GuestError {
@@ -459,6 +463,7 @@ impl std::fmt::Display for GuestError {
             ),
             Self::Failed(e) => write!(f, "the guest failed: {e}"),
             Self::Abandoned => f.write_str("the daemon shut down before this job ran"),
+            Self::Cancelled => f.write_str("the job was withdrawn before it ran"),
         }
     }
 }

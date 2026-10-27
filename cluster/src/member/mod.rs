@@ -15,5 +15,7 @@ pub use app::{
 };
 pub use claims::{Check, MemberClaims};
 pub use link::{Link, Links, START_WAIT};
-pub use listener::{decide, Arrival, Serve, DUMB_HOP, DUMB_HOP_VALUE, FROM_MEMBER, STATUS_PATH};
+pub use listener::{
+    decide, Arrival, Serve, DUMB_HOP, DUMB_HOP_VALUE, FROM_MEMBER, PREFER_PEER, STATUS_PATH,
+};
 pub use node_file::kept_node;

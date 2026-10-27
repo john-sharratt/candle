@@ -47,6 +47,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::Authored;
+use crate::authorize::{local, Compliance, IMAGE};
+use crate::compliance::Denial;
 use crate::npcs;
 
 /// The framing a portrait needs and a character description does not carry.
@@ -258,13 +260,22 @@ pub async fn post_generate(
     // body, or a document edited through the console — so this route reaches
     // the generator exactly as `/v1/image/generate` does and is checked the same
     // way. Gating only the direct route would leave the character editor as the
-    // way around it. See [`crate::compliance`].
-    if let Err(denial) = crate::compliance::check(&s, &prompt).await {
+    // way around it. See [`crate::compliance`]. Checked first, then drawn: a
+    // portrait's prompt is generated, and nobody waits on its latency
+    // (`docs/guest_draw_orchestration.md` §2); a prompt authorized moments ago
+    // is not asked again.
+    let checked = local(
+        &Compliance(Arc::clone(&s)),
+        &s.authorizations,
+        &s.authorized,
+        IMAGE,
+        &prompt,
+    )
+    .await;
+    if let Err(denial) = checked {
         let (status, code, retry) = match denial {
-            crate::compliance::Denial::Refused => (StatusCode::FORBIDDEN, "prompt_declined", false),
-            crate::compliance::Denial::Unavailable(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "check_unavailable", true)
-            }
+            Denial::Refused => (StatusCode::FORBIDDEN, "prompt_declined", false),
+            Denial::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "check_unavailable", true),
         };
         return refused(status, code, &denial.to_string(), retry);
     }
@@ -394,6 +405,7 @@ fn guest_refusal(e: &GuestError) -> Response {
         GuestError::BeyondReach { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "beyond_reach"),
         GuestError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "guest_failed"),
         GuestError::Abandoned => (StatusCode::SERVICE_UNAVAILABLE, "shutting_down"),
+        GuestError::Cancelled => (StatusCode::CONFLICT, "cancelled"),
     };
     let retry = matches!(e, GuestError::NoRoom { .. } | GuestError::Abandoned);
     refused(status, code, &e.to_string(), retry)

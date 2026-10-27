@@ -41,6 +41,7 @@ use super::args::string;
 use super::route::refused;
 use super::{Answer, Picture, Tool};
 use crate::api::{now_ms, Authored};
+use crate::authorize::Authorization;
 use crate::guest_routes::{post_image, ImageBody};
 use crate::image_seed;
 use crate::images::Kept;
@@ -91,8 +92,8 @@ impl Tool for Generate {
                 them the file, or give them the link. Describe the subject, style, lighting and \
                 composition in plain sentences; variety comes from the prompt, not the seed. A \
                 draw takes about half a minute to two, and progress arrives while it works. \
-                Prompts are checked first and a declined one is refused. Read the guide `image` \
-                first.",
+                Every prompt is checked while it is drawn, and a declined one is refused and its \
+                picture never kept. Read the guide `image` first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -102,7 +103,8 @@ impl Tool for Generate {
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps: 12 is the default and a good finish; 8 (the model's trained count) for speed. More buys finish, not variety."},
                     "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "Seed, for repeating a draw; random when absent. Below 2^53, so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
-                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back: jpeg (about a sixth of the bytes) or png (lossless)."}
+                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back: jpeg (about a sixth of the bytes) or png (lossless)."},
+                    "authorization": {"type": "object", "description": "A prompt authorization an admin minted for exactly this prompt: the content check is skipped. Leave it out otherwise."}
                 },
                 "required": ["prompt"],
                 "additionalProperties": false
@@ -321,6 +323,13 @@ pub(super) fn body(args: &Value) -> Result<ImageBody, String> {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_f64().ok_or("`shift` is a number")?),
     };
+    let authorization = match args.get("authorization") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<Authorization>(v.clone())
+                .map_err(|e| format!("`authorization` is not one: {e}"))?,
+        ),
+    };
     Ok(ImageBody {
         prompt,
         width: side("width")?,
@@ -331,6 +340,7 @@ pub(super) fn body(args: &Value) -> Result<ImageBody, String> {
         reference: None,
         reference_hold: DEFAULT_REFERENCE_HOLD,
         shift,
+        authorization,
     })
 }
 

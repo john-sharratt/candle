@@ -856,6 +856,12 @@ impl ConversationEngine {
         Ok(receipt)
     }
 
+    /// Withdraw guest job `seq` while it is still queued; `false` once a drain
+    /// has taken it ([`crate::guest::GuestQueue::cancel`]).
+    pub fn cancel_guest(&self, seq: u64) -> bool {
+        self.core.guests.queue.cancel(seq)
+    }
+
     /// The guests this deployment configured, for a status view.
     pub fn configured_guests(&self) -> Vec<crate::guest::Guest> {
         self.core.guests.registry.configured()

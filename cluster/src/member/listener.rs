@@ -22,6 +22,13 @@ pub const DUMB_HOP_VALUE: &str = "dumb";
 /// and on nothing else.
 pub const FROM_MEMBER: &str = "x-tokera-from-member";
 
+/// The header a member sets on a request it sends up to ask that it be placed
+/// on a peer — another member of its app, never a certifying canary — while
+/// one can take it (`docs/guest_draw_orchestration.md` §3). Honoured only on a
+/// request that came up from a member; a request without it is placed as a
+/// client's is.
+pub const PREFER_PEER: &str = "x-tokera-prefer-peer";
+
 /// The one path that never forwards.
 pub const STATUS_PATH: &str = "/v1/status";
 

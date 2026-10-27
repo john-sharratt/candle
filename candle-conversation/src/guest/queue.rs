@@ -305,6 +305,33 @@ impl GuestQueue {
         self.depth.store(q.len(), Ordering::Release);
     }
 
+    /// Withdraw job `seq` while it is still queued — one put back to wait for
+    /// room included — answering its caller [`GuestError::Cancelled`]. `false`
+    /// once a drain has taken it: it is drawn then, and its caller drops what
+    /// it draws.
+    ///
+    /// **The wait goes with the last job that was waiting.** `waiting` closes
+    /// prefill admission ([`Self::waiting_for_room`]) and only a drain's `take`
+    /// clears it otherwise; with no job left for a drain to take, a cancel that
+    /// left it set would close admission for good.
+    pub fn cancel(&self, seq: u64) -> bool {
+        let mut q = self.inner.lock().unwrap();
+        let Some(at) = q.iter().position(|p| p.seq == seq) else {
+            return false;
+        };
+        let Some(job) = q.remove(at) else {
+            return false;
+        };
+        if !q.iter().any(|p| p.waiting_since.is_some()) {
+            self.waiting.store(false, Ordering::Release);
+            self.retry_at_ms.store(0, Ordering::Release);
+        }
+        self.depth.store(q.len(), Ordering::Release);
+        drop(q);
+        job.answer(Err(GuestError::Cancelled));
+        true
+    }
+
     /// Take every job for `guest`, in submission order, leaving the rest.
     ///
     /// One guest at a time because loading is what a drain is paying for, and
@@ -562,6 +589,49 @@ mod tests {
         drop(r);
         let taken = q.take(Guest::Image);
         taken.into_iter().next().unwrap().answer(Ok(an_image()));
+    }
+
+    /// **A queued job can be withdrawn**, and its caller hears `Cancelled`; one
+    /// a drain has taken cannot, and an unknown one is not there to withdraw.
+    #[test]
+    fn a_queued_job_is_cancelled_and_a_taken_one_is_not() {
+        let q = GuestQueue::new();
+        let a = q.submit(image()).unwrap();
+        let b = q.submit(matte()).unwrap();
+        let seq = a.seq;
+        assert!(q.cancel(seq));
+        assert_eq!(a.wait(), Err(GuestError::Cancelled));
+        assert_eq!(q.depth(), 1);
+        assert!(!q.cancel(seq), "cancelled twice");
+        let taken = q.take(Guest::Matte);
+        assert!(!q.cancel(b.seq), "a taken job was withdrawn");
+        assert_eq!(taken.len(), 1);
+        assert!(!q.cancel(999));
+    }
+
+    /// **Cancelling the last job waiting for room reopens admission**; while
+    /// another waiting job remains, admission stays closed for it.
+    #[test]
+    fn cancelling_the_last_waiting_job_clears_the_wait() {
+        let q = GuestQueue::new();
+        let a = q.submit(image()).unwrap();
+        let b = q.submit(image()).unwrap();
+        let mut taken = q.take(Guest::Image);
+        for job in &mut taken {
+            job.waited(Instant::now());
+        }
+        q.requeue(taken, Duration::from_secs(60));
+        assert!(q.waiting_for_room());
+
+        assert!(q.cancel(a.seq));
+        assert!(q.waiting_for_room(), "another job still waits for room");
+        assert!(q.cancel(b.seq));
+        assert!(
+            !q.waiting_for_room(),
+            "admission stayed closed with nothing waiting"
+        );
+        assert_eq!(q.retry_wait(), None);
+        assert_eq!(q.depth(), 0);
     }
 
     /// **A job put back to wait for room holds admission closed and is not due

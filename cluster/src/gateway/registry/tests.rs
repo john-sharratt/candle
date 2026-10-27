@@ -1163,6 +1163,71 @@ fn draws_go_round_the_cards_strongest_first() {
     );
 }
 
+/// **A member's own `Best` request goes to a peer while one can take it**,
+/// and back to the sender only when it is alone; anyone else's is placed as
+/// ever.
+#[test]
+fn a_members_own_request_goes_to_a_peer() {
+    let mut r = reaching();
+    let mut ask = |sender, canary| {
+        r.pick_from(
+            "zend",
+            &Dispatch::Best,
+            None,
+            None,
+            None,
+            PeerAsk { sender, canary },
+        )
+    };
+    assert_eq!(
+        ask(Some(1), None),
+        Pick::Member(2),
+        "the most powerful member but the sender"
+    );
+    assert_eq!(
+        ask(Some(1), Some(2)),
+        Pick::Member(3),
+        "and a canary avoided as well"
+    );
+    assert_eq!(
+        ask(None, None),
+        Pick::Member(1),
+        "a client's request is placed by power as ever"
+    );
+
+    // Only the sender and a canary: the sender, not the unproven build.
+    let mut two = Registry::new();
+    for node in [1, 2] {
+        two.join(member(node, node));
+        two.capacity(
+            "zend",
+            node,
+            capacity(MemberState::Ready, 100 * node as u32, true, 4),
+        );
+    }
+    let ask = PeerAsk {
+        sender: Some(1),
+        canary: Some(2),
+    };
+    assert_eq!(
+        two.pick_from("zend", &Dispatch::Best, None, None, None, ask),
+        Pick::Member(1)
+    );
+
+    let mut alone = Registry::new();
+    alone.join(member(1, 1));
+    alone.capacity("zend", 1, capacity(MemberState::Ready, 100, true, 4));
+    let ask = PeerAsk {
+        sender: Some(1),
+        canary: None,
+    };
+    assert_eq!(
+        alone.pick_from("zend", &Dispatch::Best, None, None, None, ask),
+        Pick::Member(1),
+        "alone, the sender takes its own request"
+    );
+}
+
 /// **Of cards of one size, the more powerful draws first.**
 #[test]
 fn of_equal_cards_the_more_powerful_draws_first() {

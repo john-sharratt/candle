@@ -113,7 +113,8 @@ impl Tool for Edit {
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "description": "prompt: denoise steps, as image_generate's (12 when absent)."},
                     "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "prompt: seed; when absent, the seed the picture was drawn with (kept in its file), so a low-hold edit keeps its layout — or a fresh one for a picture that keeps none. Pass one only to try a different layout, below 2^53 so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "prompt: the schedule's shift; the deployment's own when absent."},
-                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back; remove_background is always a PNG, to keep its transparency."}
+                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back; remove_background is always a PNG, to keep its transparency."},
+                    "authorization": {"type": "object", "description": "prompt: a prompt authorization an admin minted for exactly this prompt: the content check is skipped. Leave it out otherwise."}
                 },
                 "required": ["image"],
                 "additionalProperties": false

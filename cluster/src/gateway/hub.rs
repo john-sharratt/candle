@@ -56,7 +56,7 @@ use super::load::{Load, Picked};
 use super::log::{CoordLog, Entry};
 use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
-use super::registry::{MemberView, Pick, Registry};
+use super::registry::{MemberView, PeerAsk, Pick, Registry};
 use super::status::{
     mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
@@ -1154,6 +1154,24 @@ impl Hub {
         key: Option<&str>,
         pinned: Option<u64>,
     ) -> Picked {
+        self.pick_from(app, dispatch, draw, key, pinned, None)
+    }
+
+    /// [`Self::pick`] for a request `sender`, a member of `app`, sent up asking
+    /// for a peer ([`super::registry::Registry::pick_from`]): a `Best` request
+    /// is placed away from the sender, and away from a canary while one
+    /// certifies — certification samples clients' traffic, and an unproven
+    /// build is not handed the members' own. Any other is placed as a client's
+    /// is.
+    pub fn pick_from(
+        self: &Arc<Self>,
+        app: &str,
+        dispatch: &Dispatch,
+        draw: Option<u64>,
+        key: Option<&str>,
+        pinned: Option<u64>,
+        sender: Option<u64>,
+    ) -> Picked {
         let mut s = self.state();
         let State {
             registry,
@@ -1168,13 +1186,22 @@ impl Hub {
                 registry.closing(app, *node, socket.session);
             }
         }
-        let pick = match upgrades.canary(app) {
-            Some(candidate) => {
+        let canary = upgrades.canary(app);
+        let peer_of = sender.filter(|_| matches!(dispatch, Dispatch::Best));
+        let pick = match (canary, peer_of) {
+            (canary, Some(sender)) => {
+                let ask = PeerAsk {
+                    sender: Some(sender),
+                    canary,
+                };
+                registry.pick_from(app, dispatch, draw, key, pinned, ask)
+            }
+            (Some(candidate), None) => {
                 registry.pick_canary(app, dispatch, draw, key, pinned, candidate, &mut || {
                     upgrades.take_share(app)
                 })
             }
-            None => registry.pick(app, dispatch, draw, key, pinned),
+            (None, None) => registry.pick(app, dispatch, draw, key, pinned),
         };
         let work = matches!(
             dispatch,

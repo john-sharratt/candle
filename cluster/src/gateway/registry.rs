@@ -67,6 +67,15 @@ pub struct MemberView {
     pub closing: bool,
 }
 
+/// What a member's request for a peer avoids ([`Registry::pick_from`]): the
+/// member that sent it, and a canary while one certifies. Both `None` — the
+/// default — for a client's request, placed as ever.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerAsk {
+    pub sender: Option<u64>,
+    pub canary: Option<u64>,
+}
+
 /// How many of an origin's latest writes a member may still lack and count
 /// as in sync: events in flight when its `ACK` was sent.
 pub const SYNC_SLACK: u64 = 64;
@@ -491,6 +500,28 @@ impl Registry {
         place(self.placeable_but(app, draw, except), draw)
     }
 
+    /// [`Self::best`] for a member asking for a peer ([`Self::pick_from`]):
+    /// neither `sender` nor `canary` while another qualifies; then not the
+    /// canary; then anyone.
+    fn best_for_peer(&self, app: &str, draw: Option<u64>, ask: PeerAsk) -> Option<u64> {
+        let pool = self.placeable_but(app, draw, None);
+        let without = |out: &[Option<u64>]| -> Vec<&MemberView> {
+            pool.iter()
+                .copied()
+                .filter(|m| !out.contains(&Some(m.node)))
+                .collect()
+        };
+        let peers = without(&[ask.sender, ask.canary]);
+        if !peers.is_empty() {
+            return place(peers, draw);
+        }
+        let proven = without(&[ask.canary]);
+        if !proven.is_empty() {
+            return place(proven, draw);
+        }
+        place(pool, draw)
+    }
+
     /// The members a request may be placed on, but `except`: for a draw of
     /// `draw` pixels, those whose card reaches it ([`within_reach`]).
     fn placeable_but(&self, app: &str, draw: Option<u64>, except: Option<u64>) -> Vec<&MemberView> {
@@ -590,6 +621,25 @@ impl Registry {
         key: Option<&str>,
         pinned: Option<u64>,
     ) -> Pick {
+        self.pick_from(app, dispatch, draw, key, pinned, PeerAsk::default())
+    }
+
+    /// [`Self::pick`] for a request a member of `app` sent up asking for a
+    /// peer ([`PeerAsk`]): placed `Best`, it goes to a member that is neither
+    /// the sender nor the canary when one can take it; else back to the sender
+    /// rather than to an unproven canary; and to the canary only when it is
+    /// all there is (`docs/guest_draw_orchestration.md` §3). A member asks a
+    /// peer for what its own engine is too busy to do — a draw's prompt
+    /// authorization while it draws.
+    pub fn pick_from(
+        &mut self,
+        app: &str,
+        dispatch: &Dispatch,
+        draw: Option<u64>,
+        key: Option<&str>,
+        pinned: Option<u64>,
+        ask: PeerAsk,
+    ) -> Pick {
         if !self.clustered(app) {
             return Pick::Configured;
         }
@@ -613,7 +663,8 @@ impl Registry {
                         .unwrap_or_default(),
                 );
             }
-            Dispatch::Best => self.best(app, draw),
+            Dispatch::Best if ask == PeerAsk::default() => self.best(app, draw),
+            Dispatch::Best => self.best_for_peer(app, draw, ask),
             Dispatch::Any => self.round_robin(app),
             // A key held by a member here goes to it — syncing, or still
             // loading, included: the conversation is the holder's, possibly

@@ -44,6 +44,8 @@ use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
 use crate::accounts::{self, Accounts, NameError, PatchError};
+use crate::authorize;
+use crate::authorize::{Cache as AuthorizationCache, Signer};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
 use crate::drafts::routes as drafts;
@@ -111,6 +113,12 @@ pub struct Authored {
     /// ([`crate::image_links`]). This process's own key until the tenant,
     /// joining a cluster, sets the one every member derives.
     pub image_links: ImageLinks,
+    /// Signs and checks prompt authorizations ([`crate::authorize`]). This
+    /// process's own key until the tenant, joining a cluster, sets the one
+    /// every member derives.
+    pub authorizations: Signer,
+    /// The authorizations this member has, for their lifetime.
+    pub authorized: AuthorizationCache,
     /// `personality_id -> image_id` for the portraits personalities were
     /// authored with — see [`crate::personality_portrait`].
     ///
@@ -187,6 +195,8 @@ impl Authored {
             libraries: SyncRwLock::new(Arc::new(libraries)),
             images,
             image_links: ImageLinks::minted(),
+            authorizations: Signer::minted(),
+            authorized: AuthorizationCache::default(),
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
             authored_dir,
@@ -439,6 +449,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::User,
             Dispatch::Best,
             post(guest_routes::post_cutout),
+        )
+        // A prompt cleared and signed (`docs/guest_draw_orchestration.md` §1):
+        // for members — another member drawing — and admins, gated in the
+        // handler, which reads the member stamp the route table cannot.
+        .route(
+            authorize::peer::PATH,
+            Role::Unauthenticated,
+            Dispatch::Best,
+            post(authorize::route::post_authorize),
         )
         // The guests each member is running.
         .route(
@@ -3085,7 +3104,11 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use cluster::member::FROM_MEMBER;
     use tower::ServiceExt;
+    use web::cluster::ClusterPeer;
+
+    use crate::authorize::Authorization;
 
     use crate::engine::api as engine_api;
     use crate::projection::Source;
@@ -3270,6 +3293,70 @@ mod tests {
         assert_eq!(me["email"], "wren@example.com");
         assert_eq!(me["display"], "Wren S");
         assert!(me["user_id"].as_str().unwrap().starts_with("u_"));
+    }
+
+    /// **A prompt is authorized for a member or an admin, never a user**, and
+    /// only an admin mints one without the check. With no engine the check
+    /// cannot run, which a member and an admin hear as `check_unavailable`.
+    #[tokio::test]
+    async fn prompt_authorization_is_for_members_and_admins() {
+        let st = state(tmp("authorize"));
+        let ask = |sub: &str, mint: bool| {
+            send(
+                "/v1/prompt/authorize",
+                "POST",
+                sub,
+                json!({ "purpose": "image", "prompt": "a lighthouse", "mint": mint }),
+            )
+        };
+        let (status, body) = call(router(Arc::clone(&st)), ask("google-1", false)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("members_only"))
+        );
+
+        let (status, body) = call(router(Arc::clone(&st)), ask(ADMIN, true)).await;
+        assert_eq!(status, StatusCode::OK);
+        let a: Authorization = serde_json::from_value(body["authorization"].clone()).unwrap();
+        assert_eq!(
+            st.authorizations
+                .verify(&a, "image", "a lighthouse", now_ms()),
+            Ok(()),
+            "an admin's mint is this member's signature over the prompt"
+        );
+
+        let (status, body) = call(router(Arc::clone(&st)), ask(ADMIN, false)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("check_unavailable"))
+        );
+
+        let from_member = |mint: bool| {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/prompt/authorize")
+                .header("content-type", "application/json")
+                .header(FROM_MEMBER, "00000000000000ab")
+                .body(Body::from(
+                    json!({ "purpose": "image", "prompt": "a lighthouse", "mint": mint })
+                        .to_string(),
+                ))
+                .unwrap();
+            req.extensions_mut().insert(ClusterPeer { cluster: 0 });
+            req
+        };
+        let (status, body) = call(router(Arc::clone(&st)), from_member(false)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("check_unavailable")),
+            "a member's ask runs the check"
+        );
+        let (status, body) = call(router(st), from_member(true)).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("admins_only")),
+            "only an admin mints"
+        );
     }
 
     /// The account is the caller's own: profile routes need a signed-in caller.
@@ -3905,6 +3992,8 @@ mod tests {
                 // it sits in this table rather than the engine's and answers on
                 // a daemon that has none.
                 ("/v1/image/cutout", "user"),
+                // Members and admins, gated in the handler on the member stamp.
+                ("/v1/prompt/authorize", "unauthenticated"),
                 // The co-resident models. `admin` including the read, because a
                 // guest job **stops the world**: the scheduler evicts the
                 // engine's KV working set to make room, and every character in

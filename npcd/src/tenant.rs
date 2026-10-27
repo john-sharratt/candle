@@ -40,6 +40,7 @@ use web::auth::Roles;
 use crate::accounts::Accounts;
 use crate::api::{self, Authored};
 use crate::authority;
+use crate::authorize::{self, Signer};
 use crate::clock;
 use crate::collections::Libraries;
 use crate::effector::router::{router as effector_router, Local};
@@ -497,6 +498,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // A link one member signs, another member may be asked to open.
     if let Some(join) = &ctx.cluster {
         authored.image_links = ImageLinks::new(join.derive_key(image_links::PURPOSE));
+        authored.authorizations = Signer::new(join.derive_key(authorize::token::KEY_PURPOSE));
         // Said before the engine load joins: the gateway takes a member's
         // weight from its admission. The runtime refuses leases on its own
         // account too (`Standing::characters`), so one lent before this is

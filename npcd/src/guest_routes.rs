@@ -25,7 +25,7 @@
 //! for it again, and a header is a worse place to put it than the body it
 //! belongs to.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -33,17 +33,20 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
 use candle_conversation::guest::{
-    GuestError, GuestEvent, GuestOutcome, GuestRequest, GuestSink, ImageLora, ImageRequest,
-    MatteRequest, DEFAULT_REFERENCE_HOLD,
+    GuestError, GuestEvent, GuestOutcome, GuestReceipt, GuestRequest, GuestSink, ImageLora,
+    ImageRequest, MatteRequest, DEFAULT_REFERENCE_HOLD,
 };
 use cluster::dispatch::DRAW_DEFAULT_SIDE;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::unbounded_channel;
-use web::auth::Role;
 
-use crate::api::Authored;
-use crate::identity::require;
+use crate::api::{now_ms, Authored};
+use crate::authorize::{
+    self, AdminWaiver, Authorization, Clearance, ClusterPeers, Compliance, Engine, Parts, Stopped,
+    IMAGE,
+};
+use crate::engine::mind::Minds;
 use crate::ndjson;
 use crate::refimage;
 
@@ -82,6 +85,10 @@ pub struct ImageBody {
     /// The schedule's shift, or the deployment's own when absent.
     #[serde(default)]
     pub shift: Option<f64>,
+    /// An authorization for this prompt ([`crate::authorize`]): verified, it
+    /// stands in for the content check, which then does not run.
+    #[serde(default)]
+    pub authorization: Option<Authorization>,
 }
 
 fn default_hold() -> f32 {
@@ -204,41 +211,41 @@ pub async fn post_image(
     // cannot silently hand this waiver to every user. First, before the engine
     // check, because it depends on nothing but the headers — who you are does
     // not change while the engine loads.
-    if body.lora == ImageLora::Restricted {
-        if let Err(refusal) = require(&headers, &s.roles, Role::Admin) {
-            return *refusal;
+    let waiver = if body.lora == ImageLora::Restricted {
+        match AdminWaiver::of(&headers, &s.roles) {
+            Ok(w) => Some(Clearance::AdminWaiver(w)),
+            Err(refusal) => return *refusal,
         }
-    }
+    } else {
+        None
+    };
 
     if !engine_ready(&s) {
         return unavailable();
     }
 
-    // **Before the stream opens, and before the image guest is queued.** The
-    // prompt is read by the resident model first; see [`crate::compliance`] for
-    // where the line is and why a failure to check stops the draw. Refused here
-    // as a status rather than in band, because nothing has been started yet and
-    // a caller branching on 403 should not have to parse a 200. A restricted
-    // draw was authorised above and does not take this gate.
-    let denial = if body.lora == ImageLora::Restricted {
-        None
-    } else {
-        crate::compliance::check(&s, &body.prompt).await.err()
+    // **An authorization the caller brought is verified before the stream
+    // opens**, so a forged or stale one is still a status; one that verifies
+    // stands in for the content check (`docs/guest_draw_orchestration.md` §2).
+    // A restricted draw carries the Admin's waiver instead.
+    let given = match (waiver, &body.authorization) {
+        (Some(w), _) => Some(w),
+        (None, Some(a)) => match s.authorizations.verify(a, IMAGE, &body.prompt, now_ms()) {
+            Ok(()) => Some(Clearance::Authorized(a.clone())),
+            Err(e) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "authorization_invalid",
+                        "detail": e.to_string(),
+                        "retry": false,
+                    })),
+                )
+                    .into_response()
+            }
+        },
+        (None, None) => None,
     };
-    if let Some(denial) = denial {
-        let status = match denial {
-            crate::compliance::Denial::Refused => StatusCode::FORBIDDEN,
-            crate::compliance::Denial::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        let retry = matches!(denial, crate::compliance::Denial::Unavailable(_));
-        return (
-            status,
-            Json(
-                json!({ "error": "prompt_declined", "detail": denial.to_string(), "retry": retry }),
-            ),
-        )
-            .into_response();
-    }
 
     // **Decoded and fitted here, before the queue.** A reference that turns out
     // not to be a picture would otherwise be discovered inside a drain, which
@@ -274,8 +281,13 @@ pub async fn post_image(
     // filled would stop the engine until the HTTP client read. What can
     // accumulate here is one line per step, which is single digits.
     let (tx, rx) = unbounded_channel::<Value>();
+    // **The job's progress goes through a sender the call takes back when it
+    // answers.** A refused draw answers while a drain may still hold its job;
+    // were the sink to keep a sender of its own, step lines would follow the
+    // terminal line and the stream would stay open until the drain ended.
+    let progress = Arc::new(Mutex::new(Some(tx.clone())));
     let sink = {
-        let tx = tx.clone();
+        let progress = Arc::clone(&progress);
         GuestSink::new(move |e| {
             let line = match e {
                 GuestEvent::Loading => json!({ "event": "loading" }),
@@ -290,48 +302,79 @@ pub async fn post_image(
             // A send that fails means the reader hung up. The job runs on: the
             // drain has already evicted the engine's working set for it, and
             // stopping now would pay that cost for nothing.
-            let _ = tx.send(line);
+            if let Some(tx) = progress.lock().unwrap().as_ref() {
+                let _ = tx.send(line);
+            }
         })
     };
 
+    // **Drawn now, cleared alongside** (`docs/guest_draw_orchestration.md`
+    // §2): the draw is queued at once and its prompt authorized by a peer
+    // meanwhile — or here first, with no peer — and the picture leaves only
+    // once cleared. A refusal is the stream's last line, as every other failure
+    // of a draw already is.
     tokio::spawn(async move {
-        let line = match run_guest_watched(&s, request, sink).await {
-            Ok(GuestOutcome::Image(i)) => json!({
-                "event": "done",
-                "width": i.width,
-                "height": i.height,
-                "png_base64": base64::engine::general_purpose::STANDARD.encode(&i.png),
-                "seed": i.seed,
-            }),
-            Ok(other) => ndjson::error_line(
-                "wrong_guest",
-                &format!("the image request came back as {}", other.guest()),
-                false,
-            ),
-            Err(e) => {
-                let (code, retry) = match &e {
-                    GuestError::Refused(_) => ("refused", false),
-                    GuestError::NoRoom { .. } => ("no_room", true),
-                    GuestError::Unavailable(_) => ("no_guest", false),
-                    GuestError::BeyondReach { .. } => ("beyond_reach", false),
-                    GuestError::Failed(_) => ("failed", false),
-                    GuestError::Abandoned => ("abandoned", true),
-                };
-                ndjson::error_line(code, &e.to_string(), retry)
-            }
+        let Some(rt) = s.runtime.clone() else {
+            let _ = tx.send(guest_error_line(&GuestError::Abandoned));
+            return;
         };
+        let check = Compliance(Arc::clone(&s));
+        let peers = ClusterPeers::new(rt);
+        let guest = Engine(Arc::clone(&s));
+        let parts = Parts {
+            check: &check,
+            peer: &peers,
+            guest: &guest,
+            signer: &s.authorizations,
+            cache: &s.authorized,
+        };
+        let waiting = tx.clone();
+        let authorizing = move || {
+            let _ = waiting.send(json!({ "event": "authorizing" }));
+        };
+        let line = match authorize::draw(parts, request, given, sink, authorizing).await {
+            Ok(r) => json!({
+                "event": "done",
+                "width": r.image.width,
+                "height": r.image.height,
+                "png_base64": base64::engine::general_purpose::STANDARD.encode(&r.image.png),
+                "seed": r.image.seed,
+                "authorization": r.authorization,
+            }),
+            Err(Stopped::Declined(why)) => ndjson::error_line("prompt_declined", &why, false),
+            Err(Stopped::CheckUnavailable(why)) => {
+                ndjson::error_line("check_unavailable", &why, true)
+            }
+            Err(Stopped::Guest(e)) => guest_error_line(&e),
+        };
+        // Answered: nothing more reaches the stream, which closes with this.
+        progress.lock().unwrap().take();
         let _ = tx.send(line);
     });
 
     ndjson::stream(rx)
 }
 
+/// A guest job's failure as a stream's last line.
+fn guest_error_line(e: &GuestError) -> Value {
+    let (code, retry) = match e {
+        GuestError::Refused(_) => ("refused", false),
+        GuestError::NoRoom { .. } => ("no_room", true),
+        GuestError::Unavailable(_) => ("no_guest", false),
+        GuestError::BeyondReach { .. } => ("beyond_reach", false),
+        GuestError::Failed(_) => ("failed", false),
+        GuestError::Abandoned => ("abandoned", true),
+        GuestError::Cancelled => ("cancelled", false),
+    };
+    ndjson::error_line(code, &e.to_string(), retry)
+}
+
 /// Queue a job, wait for it, and hand the caller the outcome.
 ///
-/// **The one place a guest job is submitted from.** The portrait route and the
-/// life-node route both go through it, so the lock discipline and the blocking
-/// behaviour below are stated once rather than re-derived per caller — and a
-/// caller that got either wrong would take the console down with it.
+/// The portrait route and the life-node route both go through it, and it
+/// through [`submit_watched`], so the lock discipline and the blocking
+/// behaviour are stated once rather than re-derived per caller — and a caller
+/// that got either wrong would take the console down with it.
 ///
 /// The submission only pushes. A guest receipt is a channel, not a borrow, so
 /// a caller waiting on a drain holds nothing any other route needs — getting
@@ -367,18 +410,39 @@ pub async fn run_guest_watched(
     request: GuestRequest,
     sink: GuestSink,
 ) -> Result<GuestOutcome, GuestError> {
-    let Some(rt) = s.runtime.as_ref() else {
-        return Err(GuestError::Abandoned);
-    };
-    let minds = rt.minds.read().unwrap().clone();
-    let Some(minds) = minds else {
-        return Err(GuestError::Abandoned);
-    };
-    let receipt = { minds.engine().submit_guest_watched(request, sink)? };
-
+    let receipt = submit_watched(s, request, sink)?;
     // Awaited directly: the receipt's reply is a channel, so a drain that
     // takes a minute parks a future rather than a worker.
     receipt.wait_async().await
+}
+
+/// Queue a job on this member's engine, its progress to `sink`; its receipt.
+///
+/// **The one place a guest job is submitted from** — [`run_guest_watched`]
+/// and the draw orchestration ([`crate::authorize::Engine`]) both come here.
+/// The submission only pushes: the receipt is a channel, not a borrow, so a
+/// caller waiting on a drain holds nothing any other route needs.
+pub fn submit_watched(
+    s: &Arc<Authored>,
+    request: GuestRequest,
+    sink: GuestSink,
+) -> Result<GuestReceipt, GuestError> {
+    let minds = loaded(s).ok_or(GuestError::Abandoned)?;
+    minds.engine().submit_guest_watched(request, sink)
+}
+
+/// Withdraw guest job `seq` from this member's engine while it is still
+/// queued; `false` once a drain has taken it, or with no engine.
+pub fn cancel(s: &Arc<Authored>, seq: u64) -> bool {
+    loaded(s).is_some_and(|minds| minds.engine().cancel_guest(seq))
+}
+
+/// The loaded model's minds, once the engine is up; the lock released before
+/// anything is asked of them.
+fn loaded(s: &Arc<Authored>) -> Option<Arc<Minds>> {
+    let rt = s.runtime.as_ref()?;
+    let minds = rt.minds.read().unwrap().clone();
+    minds
 }
 
 /// The guests this daemon has configured, for a status view.
@@ -495,6 +559,7 @@ fn refusal(e: &GuestError) -> Response {
         GuestError::BeyondReach { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         GuestError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         GuestError::Abandoned => StatusCode::SERVICE_UNAVAILABLE,
+        GuestError::Cancelled => StatusCode::CONFLICT,
     };
     let retry = matches!(e, GuestError::NoRoom { .. } | GuestError::Abandoned);
     (
@@ -695,19 +760,9 @@ mod tests {
     /// mapping is pinned here rather than left to the arm order.
     #[test]
     fn every_refusal_has_a_streamed_code_and_a_retry_flag() {
-        // The same construction as the route's, over every variant. A new
-        // `GuestError` breaks this match, which is the point.
-        let line = |e: &GuestError| {
-            let (code, retry) = match e {
-                GuestError::Refused(_) => ("refused", false),
-                GuestError::NoRoom { .. } => ("no_room", true),
-                GuestError::Unavailable(_) => ("no_guest", false),
-                GuestError::BeyondReach { .. } => ("beyond_reach", false),
-                GuestError::Failed(_) => ("failed", false),
-                GuestError::Abandoned => ("abandoned", true),
-            };
-            ndjson::error_line(code, &e.to_string(), retry)
-        };
+        // The route's own mapping, over every variant: a new `GuestError` breaks
+        // its match, which is the point.
+        let line = guest_error_line;
 
         for (e, code, retry) in [
             (GuestError::Refused("too wide".into()), "refused", false),
@@ -735,6 +790,7 @@ mod tests {
             ),
             (GuestError::Failed("the decoder".into()), "failed", false),
             (GuestError::Abandoned, "abandoned", true),
+            (GuestError::Cancelled, "cancelled", false),
         ] {
             let v = line(&e);
             assert_eq!(v["event"], "error");
