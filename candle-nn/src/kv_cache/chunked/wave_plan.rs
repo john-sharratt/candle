@@ -51,9 +51,11 @@
 //! A layer opens two generations — one spanning attention → `o_proj`, one
 //! spanning the FFN — and each drops before the next opens, resetting its span.
 //! So a span holds **one layer phase**, never a whole wave, and each phase gets
-//! its own arena ([`super::bump_arena`]) sized from its own peak rather than
-//! both from the larger. A third, the forward phase, holds what the head needs
-//! after the last layer.
+//! its own arena ([`super::bump_arena`]) sized from its own peak. The two layer
+//! phases are never live at once, so their arenas share one region of the
+//! tier, the larger of the two ([`tier_footprint`]). A third, the forward
+//! phase, holds what crosses every layer and what the head needs after the
+//! last, and stands beside them.
 //!
 //! Within a phase more than one [`Chain`] can run, and they combine two
 //! different ways depending on *why* there is more than one:
@@ -406,6 +408,33 @@ pub enum LayerPhase {
     /// whole reason this phase is separate rather than folded into the layer
     /// phases, which scale with tokens.
     Forward,
+}
+
+/// The bytes a tier holding spans of `per_phase` (attention, FFN, forward)
+/// occupies: the two **layer** phases share one region — the larger of the
+/// two — and the forward span stands beside it.
+///
+/// A layer's attention generation drops before its FFN generation opens, and
+/// `begin_wave` refuses to open one while the other is live, so the two spans
+/// are never written at once and can lie on the same ground. The forward span
+/// cannot join them: it holds what crosses every layer — the residual, the
+/// ragged-prefill tables, the head — and is live for the whole forward.
+///
+/// Laid side by side, the tier cost the sum of the three; on Qwen3.8-Flash-Next
+/// at 3,072 rows that was ~1.2 GB of DeltaNet mixer and ~1.0 GB of FFN for
+/// spans that are never live together.
+pub fn tier_footprint(per_phase: [usize; 3]) -> usize {
+    let [attention, ffn, forward] = per_phase;
+    attention.max(ffn) + forward
+}
+
+/// Where each span of a tier holding `per_phase` starts, as an offset from the
+/// tier's base, in the order of `per_phase`: the attention and FFN spans both
+/// at the base, the forward span past the larger of them. The layout
+/// [`tier_footprint`] prices.
+pub fn phase_offsets(per_phase: [usize; 3]) -> [usize; 3] {
+    let [attention, ffn, _] = per_phase;
+    [0, 0, attention.max(ffn)]
 }
 
 /// The model shapes a layer's buffers are derived from.
@@ -2305,17 +2334,18 @@ impl WavePlan {
             .unwrap_or(0)
     }
 
-    /// What the transient tier will actually cost for `rows` — the **sum** of
-    /// the phase spans, which is what `plan_wave_transient` buys.
+    /// What the transient tier will actually cost for `rows` — the
+    /// [`tier_footprint`] of the phase spans, which is what `plan_wave_transient`
+    /// buys: the attention and FFN spans share one region, the larger of the two,
+    /// and the forward span stands beside it.
     ///
-    /// **Not [`Self::wave_bytes`], and that difference is the whole bug this
-    /// exists to fix.** `wave_bytes` is the *max* over phases, because a single
-    /// phase's span is what one layer needs at a time. The tier is every phase
-    /// laid down side by side, so it costs their sum — roughly three times the
-    /// max on this geometry. Sizing waves with the max under-priced the tier by
-    /// that factor, and no choice of budget corrects a formula measuring the
-    /// wrong quantity: measured, waves were composed whose tier wanted 6.5 GiB
-    /// against a 912 MiB guarantee, and were refused 62 times in one run.
+    /// **Not [`Self::wave_bytes`].** `wave_bytes` is the *max* over all three
+    /// phases, the span one phase needs at a time. The forward span is live for
+    /// the whole forward, across every layer phase, so it cannot share their
+    /// ground; only the two layer phases, which never run at once, can. Sizing
+    /// waves with the max under-priced the tier by the forward span and more:
+    /// measured, waves were composed whose tier wanted 6.5 GiB against a
+    /// 912 MiB guarantee, and were refused 62 times in one run.
     ///
     /// **Mirrors the arithmetic in the forward exactly** — the two must agree
     /// or the wave admitted is not the wave priced. That includes the absence
@@ -2335,9 +2365,11 @@ impl WavePlan {
         // `TARGET_ARENA_BYTES` is the region size read from the ungated source,
         // as `span_geometry` does — `region_pool::REGION_BYTES` is CUDA-only and
         // this plan is not.
-        let raw = self.phase_bytes(LayerPhase::Attention, w)
-            + self.phase_bytes(LayerPhase::Ffn, w)
-            + self.phase_bytes(LayerPhase::Forward, w);
+        let raw = tier_footprint([
+            self.phase_bytes(LayerPhase::Attention, w),
+            self.phase_bytes(LayerPhase::Ffn, w),
+            self.phase_bytes(LayerPhase::Forward, w),
+        ]);
         raw.div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
     }
 
@@ -3119,21 +3151,47 @@ mod tests {
         }
     }
 
-    /// **The tier costs the SUM of the phases, not the largest of them.**
-    ///
-    /// This is the defect the tier bound exists to fix, and nothing else would
-    /// catch its return: sizing waves with `wave_bytes` under-prices the tier by
-    /// roughly the phase count, which let waves ask for a 6.5 GiB tier against a
-    /// 912 MiB guarantee and be refused 62 times in one run.
+    /// **The two layer phases share one region; the forward span stands beside
+    /// it.** The footprint and the layout, as raw figures.
     #[test]
-    fn tier_bytes_is_the_sum_of_phases_and_exceeds_the_largest_one() {
+    fn the_layer_phases_share_a_region_beside_the_forward_span() {
+        assert_eq!(tier_footprint([300, 200, 50]), 350);
+        assert_eq!(tier_footprint([200, 300, 50]), 350);
+        assert_eq!(tier_footprint([0, 0, 50]), 50);
+        assert_eq!(phase_offsets([300, 200, 50]), [0, 0, 300]);
+        assert_eq!(phase_offsets([200, 300, 50]), [0, 0, 300]);
+    }
+
+    /// **The tier is the footprint of the phases — no less than the largest of
+    /// them, and less than their sum wherever both layer phases carve.** The
+    /// lower bound is the defect the tier bound exists to fix: sizing waves with
+    /// `wave_bytes` alone let them ask for a 6.5 GiB tier against a 912 MiB
+    /// guarantee and be refused 62 times in one run. The upper is what sharing
+    /// the layer phases' ground gives back.
+    #[test]
+    fn tier_bytes_is_the_footprint_of_the_phases() {
         let p = WavePlan::new(moe());
         for rows in [1usize, 64, 512, 4096] {
+            let phases = [
+                p.phase_bytes(LayerPhase::Attention, w(rows)),
+                p.phase_bytes(LayerPhase::Ffn, w(rows)),
+                p.phase_bytes(LayerPhase::Forward, w(rows)),
+            ];
+            let tier = p.tier_bytes(w(rows));
+            assert_eq!(
+                tier,
+                tier_footprint(phases).div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES,
+                "rows {rows}"
+            );
             assert!(
-                p.tier_bytes(w(rows)) > p.wave_bytes(w(rows)),
-                "rows {rows}: tier {} must exceed the largest single phase {}",
-                p.tier_bytes(w(rows)),
+                tier >= p.wave_bytes(w(rows)),
+                "rows {rows}: tier {tier} under the largest single phase {}",
                 p.wave_bytes(w(rows)),
+            );
+            let sum: usize = phases.iter().sum();
+            assert!(
+                tier_footprint(phases) < sum,
+                "rows {rows}: both layer phases carve, so sharing must cost less than {sum}"
             );
         }
     }
