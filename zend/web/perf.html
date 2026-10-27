@@ -265,9 +265,9 @@ mount(document.getElementById('page'),
           h('i', { style: 'background:var(--ink-faint);opacity:.45' }), 'faded')),
       h('div', { class: 'flow' }, cFlow, flowReadout)),
     card('Phase throughput',
-      'Tokens per second <b>per phase</b>, as delivered — each phase’s tokens over each 10-second slot of the '
-      + 'clock, the last 20 minutes. A slot is drawn once it has finished, so a point never moves. Two scales: '
-      + '<b>left</b> is large-batch prefill, <b>right</b> is decode.',
+      'Peak tokens per second <b>per phase</b>, as delivered — in each 10-second slot of the clock, the best '
+      + 'wave’s tokens for that phase over the wave’s wall-clock, the last 20 minutes. A slot is drawn once it has '
+      + 'finished, so a point never moves. Two scales: <b>left</b> is large-batch prefill, <b>right</b> is decode.',
       h('div', { class: 'legend' },
         h('span', {}, h('i', { style: `background:${PH.prefill}` }), 'prefill — left'),
         h('span', {}, h('i', { style: `background:${PH.decode}` }), 'decode — right')),
@@ -412,12 +412,15 @@ add(makeStackChart(cPhase, () => {
 /* Dual axis on purpose: prefill runs orders of magnitude above decode, and one
  * scale would draw decode as a flat line along the floor.
  *
- * Delivered rates: each phase's tokens over a fixed 10-second slot of the
- * clock. The slot's length is the denominator, not the windows that happened
- * to land in it — the ring drops windows in which nothing ran, so summing the
- * windows read a slot with one busy second as a whole slot at that rate.
+ * Peak delivered rates: in each fixed 10-second slot of the clock, the
+ * highest of its waves' rates, each wave's phase tokens over that wave's own
+ * wall-clock (`win`) — the rate the phase-timing tooltip quotes for a bar. Not
+ * over the phase's own time, which is the scheduler thread's time to issue the
+ * work rather than the card's to run it (see the tooltip above); and not
+ * averaged over the slot, which smoothed a two-second decode burst into the
+ * quieter waves beside it. A slot no wave ran in draws as zero.
  *
- * Only finished slots are drawn: a slot still filling changes its rate on every
+ * Only finished slots are drawn: a slot still filling changes its peak on every
  * poll, which is what kept the line moving with nothing new behind it. With
  * each window's time held (`stable`), a finished slot never changes again. */
 const SLOT_MS = 10000, SLOT_SPAN_MS = 20 * 60000;
@@ -425,17 +428,25 @@ add(makeChart(cPhRate, () => {
   const now = Date.now();
   const current = Math.floor(now / SLOT_MS);
   const first = Math.floor((now - SLOT_SPAN_MS) / SLOT_MS);
-  const tok = new Map();
+  // Every point of one wave carries that wave's time and window, so a wave is
+  // its points at one `at`.
+  const waves = new Map();
   for (const p of PTS) {
     const s = Math.floor(p.at / SLOT_MS);
-    if (s < first || s >= current) continue;
-    if (!tok.has(s)) tok.set(s, {});
-    const e = tok.get(s);
-    e[p.kind] = (e[p.kind] || 0) + (p.tok || 0);
+    if (s < first || s >= current || !(p.win > 0)) continue;
+    if (!waves.has(p.at)) waves.set(p.at, { s, win: p.win, tok: {} });
+    const w = waves.get(p.at);
+    w.tok[p.kind] = (w.tok[p.kind] || 0) + (p.tok || 0);
+  }
+  const peak = new Map();
+  for (const w of waves.values()) {
+    if (!peak.has(w.s)) peak.set(w.s, {});
+    const e = peak.get(w.s);
+    for (const [k, n] of Object.entries(w.tok)) e[k] = Math.max(e[k] || 0, n / (w.win / 1000));
   }
   const slots = [];
-  for (let s = first; s < current; s++) slots.push([s, tok.get(s) || {}]);
-  const rate = (e, k) => (e[k] || 0) / (SLOT_MS / 1000);
+  for (let s = first; s < current; s++) slots.push([s, peak.get(s) || {}]);
+  const rate = (e, k) => e[k] || 0;
   return {
     // Each slot is drawn at its end.
     xs: slots.map(([s]) => ((s + 1) * SLOT_MS - now) / 60000),
