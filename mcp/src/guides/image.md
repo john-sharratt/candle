@@ -84,10 +84,10 @@ clothing. A prompt that leaves an age unclear may be declined.
   never variety.
 - **Seed:** every draw and edit says the seed it used ("Drew a 1024x768
   image, seed …"). Pass that seed back to redraw the same picture with a small
-  prompt change, and to every try of a low-`hold` edit (below). A seed Zen
-  chooses is always below 2⁵³, so it comes back exact; one you choose
-  yourself must be too — a larger number is rounded in JSON and names a
-  different draw. **Shift:** leave it alone.
+  prompt change. An edit needs none: it starts from the seed its picture
+  keeps (below). A seed Zen chooses is always below 2⁵³, so it comes back
+  exact; one you choose yourself must be too — a larger number is rounded in
+  JSON and names a different draw. **Shift:** leave it alone.
 - **Time:** a draw takes from about half a minute to three, most of it the
   prompt check and loading the image model — up to three minutes more when
   it has to wait for room on a busy card. Some clients show no progress
@@ -218,12 +218,18 @@ push the finish, and when the user asks to change a photo of their own
   with a bronze sheen, and only at 0.05 solid black — the original's tones
   and stripes survive in what is held. Past about 0.45 the subject itself (a
   face, an animal) no longer changes much.
-- **Below about 0.15, pin the seed.** At a low `hold` the seed decides the
+- **The seed is the picture's own.** At a low `hold` the seed decides the
   layout: with a fresh one each try, the cat sat in a new pose in a new frame;
-  with one seed fixed, the layout stayed put from 0.15 down to 0.05. Take the
-  seed the first edit answered with and pass it to each try after it.
+  with one seed fixed, the layout stayed put from 0.15 down to 0.05. So every
+  picture Zen draws keeps the seed that drew it in its file, and an edit given
+  no `seed` starts from that one — the same noise the picture came from. Leave
+  `seed` out; pass one only to try a different layout. An `adjust` or a
+  `remove_background` passes the seed on; a `crop`, `resize` or `rotate`
+  changes the layout it drew, so the next prompt edit chooses its own. A
+  picture of the user's own keeps no seed until its first prompt edit,
+  which chooses one and keeps it; a Zen picture uploaded again keeps its own.
 - **Then adjust:** the change did not take — lower `hold`; the layout drifted
-  — pin the seed first, and only then raise `hold`.
+  — pass a `seed` only if you meant to; otherwise raise `hold`.
 - **One change at a time**, each edit from the last one's link. Every edit
   is a new image with its own link, and Zen keeps the last two: the newest,
   and the one it was edited from. A step that went wrong is undone by

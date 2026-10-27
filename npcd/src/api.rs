@@ -52,6 +52,7 @@ use crate::engine::runtime::Runtime;
 use crate::guest_routes;
 use crate::identity::require;
 use crate::image_links::{ImageLinks, Refused};
+use crate::image_seed;
 use crate::images::{ImageError, Images, Kept};
 use crate::lifegen::job::Jobs;
 use crate::lifegen::narrate as lifegen_narrate;
@@ -1860,6 +1861,14 @@ async fn put_upload(
     // stored picture unplaced.
     let kept = spawn_blocking(move || {
         let (jpeg, width, height) = refimage::normalised(&bytes).map_err(NotKept::Picture)?;
+        // A Zen picture uploaded again keeps the seed that drew it, which the
+        // re-encode drops — unless it was shrunk, when the seed no longer
+        // names the noise these pixels came from.
+        let jpeg = if refimage::dimensions(&bytes) == Ok((width, height)) {
+            image_seed::carry(&bytes, jpeg)
+        } else {
+            jpeg
+        };
         let now = now_ms();
         let id = s
             .images

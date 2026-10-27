@@ -97,6 +97,9 @@ notify     = "6"
 # picker and what this daemon hands back — a format list is an attack surface,
 # so it stays the short one the rest of the workspace already compiles.
 image      = { workspace = true }
+# The CRC a PNG chunk carries, for the seed a picture keeps in its file
+# (`src/image_seed.rs`). Already in the tree beneath `image`.
+crc32fast  = "1.5"
 # The alpha-matte network behind "remove background". ONNX rather than a
 # hand-written architecture because the model is somebody else's published
 # graph and this fork already carries a runtime for those — see `src/matte.rs`

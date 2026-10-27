@@ -59,6 +59,7 @@ use super::{Answer, Tool};
 use crate::api::Authored;
 use crate::guest_routes::{guest_reach, post_cutout, CutoutBody, ImageBody};
 use crate::image_ops;
+use crate::image_seed;
 use crate::images::{ImageError, Images};
 use crate::refimage;
 
@@ -99,7 +100,7 @@ impl Tool for Edit {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate, image_edit or image_upload answer gave."},
                     "mode": {"type": "string", "enum": ["prompt", "resize", "crop", "adjust", "rotate", "remove_background"], "default": "prompt", "description": "The edit: prompt (redraw by a prompt), resize, crop, adjust (brightness, contrast, saturation), rotate (and mirror), remove_background."},
                     "prompt": {"type": "string", "description": "prompt: the whole picture as it should end up, with the change in it."},
-                    "hold": {"type": "number", "minimum": 0.0, "maximum": decimal(MAX_REFERENCE_HOLD), "description": "prompt: how much of the original survives — its layout and its light and dark — 0.5 when absent: 0.7 for a light touch, 0.5 to remove a detail, 0.3 to add an object or for a large change to the whole, 0.2 to recolour the subject at the same lightness (ginger to grey), 0.05–0.08 to recolour it across light and dark (\"make it a black cat\"). Below 0.15 pass a seed, the first try's, to every try: there the seed decides the layout."},
+                    "hold": {"type": "number", "minimum": 0.0, "maximum": decimal(MAX_REFERENCE_HOLD), "description": "prompt: how much of the original survives — its layout and its light and dark — 0.5 when absent: 0.7 for a light touch, 0.5 to remove a detail, 0.3 to add an object or for a large change to the whole, 0.2 to recolour the subject at the same lightness (ginger to grey), 0.05–0.08 to recolour it across light and dark (\"make it a black cat\"). Below 0.15 the seed decides the layout; leave `seed` out and the picture's own keeps it."},
                     "width": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: width in pixels (prompt: a multiple of 16, at most 1024); the other side follows the picture's shape when only one is given."},
                     "height": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: height in pixels, as width."},
                     "scale": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 4.0, "description": "resize: a factor of the picture's own size, in place of width and height (at most 2048 a side)."},
@@ -110,7 +111,7 @@ impl Tool for Edit {
                     "rotate": {"type": "integer", "enum": [90, 180, 270], "description": "rotate: degrees clockwise."},
                     "flip": {"type": "string", "enum": ["horizontal", "vertical"], "description": "rotate: mirror left to right, or top to bottom (after any turn)."},
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "description": "prompt: denoise steps, as image_generate's (12 when absent)."},
-                    "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "prompt: seed; random when absent. Pass the first try's to each try of a low-hold edit, below 2^53 so it comes back exact."},
+                    "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "prompt: seed; when absent, the seed the picture was drawn with (kept in its file), so a low-hold edit keeps its layout — or a fresh one for a picture that keeps none. Pass one only to try a different layout, below 2^53 so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "prompt: the schedule's shift; the deployment's own when absent."},
                     "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back; remove_background is always a PNG, to keep its transparency."}
                 },
@@ -143,15 +144,16 @@ impl Tool for Edit {
                 Err(e) => Answer::error(e),
             },
             Mode::RemoveBackground => match remove_background(s, &source).await {
-                Ok(drawn) => answer(s, headers, drawn, made).await,
+                Ok(drawn) => answer(s, headers, kept(drawn, passed_on(mode, &source)), made).await,
                 Err(e) => Answer::error(e),
             },
             _ => {
                 // A moment's pixel work, but a 2048-pixel resample all the
                 // same: off the async workers.
                 let args = args.clone();
+                let seed = passed_on(mode, &source);
                 match spawn_blocking(move || pixel(mode, &args, &source, format)).await {
-                    Ok(Ok(drawn)) => answer(s, headers, drawn, made).await,
+                    Ok(Ok(drawn)) => answer(s, headers, kept(drawn, seed), made).await,
                     Ok(Err(e)) => Answer::error(e),
                     Err(e) => Answer::error(format!("the edit failed: {e}")),
                 }
@@ -168,6 +170,24 @@ impl Tool for Edit {
         );
         answer
     }
+}
+
+/// The seed an edit that draws nothing new passes on: its picture's, when the
+/// edit keeps the layout that seed drew (`crate::image_seed`) — a colour
+/// adjustment, a cutout — and none after a crop, a resize or a turn.
+fn passed_on(mode: Mode, source: &[u8]) -> Option<u64> {
+    match mode {
+        Mode::Adjust | Mode::RemoveBackground => image_seed::read(source),
+        Mode::Prompt | Mode::Resize | Mode::Crop | Mode::Rotate => None,
+    }
+}
+
+/// `drawn` with `seed` kept in its file, when there is one to keep.
+fn kept(mut drawn: Drawn, seed: Option<u64>) -> Drawn {
+    if let Some(seed) = seed {
+        drawn.file = image_seed::stamp(&drawn.file, seed);
+    }
+    drawn
 }
 
 /// `x` as the decimal it is written as — `0.95`, where widening the `f32`
@@ -264,6 +284,11 @@ fn edit_body(args: &Value, source: &[u8], reach: u32) -> Result<ImageBody, Strin
         ));
     }
     let mut body = body(args)?;
+    // No seed asked for: the one that drew the picture, so the edit starts
+    // from the same noise and a low hold keeps its layout.
+    if body.seed.is_none() {
+        body.seed = image_seed::read(source);
+    }
     let given = |key: &str| args.get(key).filter(|v| !v.is_null()).is_some();
     let (given_w, given_h) = (given("width"), given("height"));
     // The schema's sides are a resize's too; a redraw's are the draw's own.
@@ -436,5 +461,18 @@ mod tests {
         );
         assert!(edit_body(&json!({"prompt": "x"}), b"not a picture", 1024).is_err());
         assert!(edit_body(&json!({"prompt": "  "}), &pic, 1024).is_err());
+    }
+
+    /// **An edit with no seed takes the one its picture keeps**; one asked
+    /// for wins; a picture with none leaves the draw to choose.
+    #[test]
+    fn an_edit_starts_from_its_pictures_seed() {
+        let pic = image_seed::stamp(&png(64, 64), 1234);
+        let b = edit_body(&json!({"prompt": "x"}), &pic, 1024).unwrap();
+        assert_eq!(b.seed, Some(1234));
+        let b = edit_body(&json!({"prompt": "x", "seed": 9}), &pic, 1024).unwrap();
+        assert_eq!(b.seed, Some(9));
+        let b = edit_body(&json!({"prompt": "x"}), &png(64, 64), 1024).unwrap();
+        assert_eq!(b.seed, None);
     }
 }
