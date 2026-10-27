@@ -671,6 +671,36 @@ impl GalleryArena {
         })
     }
 
+    /// Give up every unpinned turn, working set and all, and answer the
+    /// reservation bytes that went back to the span. **Only for a guest's
+    /// drain**: nothing scans while it runs, and every turn rebuilds from the
+    /// substrate on its next scan — the 1.6–2.0 s an index rebuild costs, once,
+    /// against a draw that otherwise cannot run.
+    pub fn evict_all_for_guest(&self) -> u64 {
+        let before = self.resident_bytes();
+        let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        let gone: Vec<StreamId> = res
+            .iter()
+            .filter(|(_, rt)| rt.pinned == 0)
+            .map(|(sid, _)| *sid)
+            .collect();
+        for sid in &gone {
+            res.remove(sid); // drops the run → frees pages
+            self.residency_gen.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(res);
+        let after = self.resident_bytes();
+        let freed = before.saturating_sub(after);
+        tracing::info!(
+            target: "candle_conversation::provenance",
+            turns = gone.len(),
+            resident_mib_before = before >> 20,
+            resident_mib_after = after >> 20,
+            "gallery emptied for a guest"
+        );
+        freed
+    }
+
     /// Evict least-recently-used unpinned turns until at least `want` bytes are
     /// freed, regardless of recent use. Returns the bytes freed. The tests use it
     /// to empty the arena and prove a rebuild reproduces the scan; nothing in the

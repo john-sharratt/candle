@@ -526,6 +526,16 @@ pub trait BatchedModelCore {
         0
     }
 
+    /// After [`Self::concede_for_guest`], for a drain still short: copy what has
+    /// no copy anywhere else — the pinned experts — to host memory and concede
+    /// its ground as well. Restored by [`Self::restore_serving_floor`], which
+    /// answers `false` until it is back. Answers the bytes conceded.
+    ///
+    /// Dense models have nothing pinned to move and return zero.
+    fn stash_pinned_for_guest(&self) -> u64 {
+        0
+    }
+
     /// Grow the weight side back to its serving floor after
     /// [`Self::concede_for_guest`], answering whether it stands there. Only legal
     /// between forwards, like [`Self::reclaim_spare_ground`].

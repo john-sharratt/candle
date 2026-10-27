@@ -125,6 +125,13 @@ impl PipelineState {
                     "weight side refused a KV purchase: the boundary moves only between \
                      forwards"
                 ),
+                BoundaryAsk::StashPinned => tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    wave_live = live,
+                    invocation_unserved = unserved,
+                    "the pinned experts were not stashed: the boundary moves only between \
+                     forwards"
+                ),
                 // The one ask that must not be lost: a zone left below its floor
                 // cannot serve a token. Its caller asks again until it lands.
                 BoundaryAsk::RestoreFloor => tracing::warn!(
@@ -153,7 +160,10 @@ impl PipelineState {
                 // A guest's concession or its restore deferred is one the caller
                 // is waiting on with the engine stopped, so it is said at INFO;
                 // the per-forward growth question is deferred this way routinely.
-                if matches!(ask, BoundaryAsk::SellPaused(_) | BoundaryAsk::RestoreFloor) {
+                if matches!(
+                    ask,
+                    BoundaryAsk::SellPaused(_) | BoundaryAsk::RestoreFloor | BoundaryAsk::StashPinned
+                ) {
                     tracing::info!(
                         target: "candle_transformers::expert_lre",
                         ?ask,
@@ -203,15 +213,26 @@ impl PipelineState {
             return Ok(0);
         };
         let stream = cd.cuda_stream();
+        // **The pinned set's ground comes back first, and alone.** While it is
+        // out, the zone believes it holds slots whose ground the KV side has,
+        // so no other move may be priced against it: a refused unstash leaves
+        // the stash standing and the restore is asked again.
+        match ask {
+            BoundaryAsk::StashPinned => return self.stash_pinned(quiet),
+            BoundaryAsk::RestoreFloor => self.unstash_pinned(quiet)?,
+            _ if self.pinned_stash.is_some() => return Ok(0),
+            _ => {}
+        }
         let growing = matches!(ask, BoundaryAsk::Take(_) | BoundaryAsk::RestoreFloor);
         let within = match ask {
             BoundaryAsk::SellPaused(_) => ZoneFloor::Paused,
             _ => ZoneFloor::Serving,
         };
         let delta = match ask {
-            BoundaryAsk::Take(0) | BoundaryAsk::Sell(0) | BoundaryAsk::SellPaused(0) => {
-                return Ok(0)
-            }
+            BoundaryAsk::Take(0)
+            | BoundaryAsk::Sell(0)
+            | BoundaryAsk::SellPaused(0)
+            | BoundaryAsk::StashPinned => return Ok(0),
             BoundaryAsk::Take(spare) => -(spare as isize),
             BoundaryAsk::Sell(wanted) | BoundaryAsk::SellPaused(wanted) => wanted as isize,
             BoundaryAsk::RestoreFloor => {
@@ -389,6 +410,117 @@ impl PipelineState {
             "weight side gave ground to KV"
         );
         Ok(conceded)
+    }
+
+    /// Copy the pinned set to host memory and hand its ground to the KV side
+    /// ([`BoundaryAsk::StashPinned`]). Answers the bytes conceded.
+    ///
+    /// **Only from the pinned set, and nothing in the zone moves.** The zone
+    /// must already stand on its pinned slots (a `SellPaused`), which are
+    /// slots `0..n`, contiguous against the span's right edge; their bytes go
+    /// to the host whole and the published floor moves to the edge. Tables,
+    /// slot views and every captured address stay as they are, and
+    /// [`Self::unstash_pinned`] writes the same bytes back to the same
+    /// addresses, so a pinned expert's address never changes. Nothing forwards
+    /// until it has: [`PipelineStats::pinned_stashed`] holds the serving floor
+    /// unmet.
+    ///
+    /// [`PipelineStats::pinned_stashed`]: super::types::PipelineStats::pinned_stashed
+    fn stash_pinned(&mut self, quiet: &Quiet) -> Result<u64> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(0);
+        };
+        if self.pinned_stash.is_some() {
+            return Ok(0);
+        }
+        let n = self.inner.zone.capacity();
+        let pinned = self.inner.pinned_slots();
+        if n == 0 || n > pinned {
+            tracing::info!(
+                target: "candle_transformers::expert_lre",
+                slots = n,
+                pinned_slots = pinned,
+                "the pinned experts were not stashed: the zone does not stand on its pinned set"
+            );
+            return Ok(0);
+        }
+        let stream = cd.cuda_stream();
+        let frontier = self.inner.zone.frontier_for_capacity();
+        let len = n * self.inner.zone.slot_bytes();
+        let edge = frontier + len as u64;
+        self.quiesce_before_handover(quiet)?;
+        self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
+        let started = std::time::Instant::now();
+        let mut host = vec![0u8; len];
+        // SAFETY: `[frontier, edge)` is the zone's own ground — its `n` slots,
+        // live and quiesced — and `host` is exactly that long.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(
+                &mut host,
+                frontier,
+                self.copy_stream.cu_stream(),
+            )
+        }
+        .map_err(candle::Error::wrap)?;
+        self.copy_stream
+            .synchronize()
+            .map_err(candle::Error::wrap)?;
+        self.quiesce_before_handover(quiet)?;
+        set_weight_floor(&stream, edge)?;
+        self.pinned_stash = Some((frontier, host));
+        if let Ok(mut s) = self.stats.lock() {
+            s.pinned_stashed = true;
+        }
+        self.publish_gauges();
+        tracing::info!(
+            target: "candle_transformers::expert_lre",
+            slots = n,
+            stashed_mib = len >> 20,
+            ms = started.elapsed().as_millis() as u64,
+            "the pinned experts stand in host memory for a guest"
+        );
+        Ok(len as u64)
+    }
+
+    /// Put the pinned set back where [`Self::stash_pinned`] took it from:
+    /// the floor first, so a refusal (KV still standing in that ground) lands
+    /// with nothing moved and the stash kept for the next ask, then the bytes.
+    fn unstash_pinned(&mut self, quiet: &Quiet) -> Result<()> {
+        let Device::Cuda(cd) = &self.device else {
+            return Ok(());
+        };
+        let Some((frontier, _)) = self.pinned_stash.as_ref() else {
+            return Ok(());
+        };
+        let frontier = *frontier;
+        let stream = cd.cuda_stream();
+        self.quiesce_before_handover(quiet)?;
+        set_weight_floor(&stream, frontier)?;
+        let Some((_, host)) = self.pinned_stash.take() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        // SAFETY: the floor now stands at `frontier` again, so the ground is
+        // the zone's; nothing reads a pinned slot until this returns.
+        let copied = unsafe {
+            cudarc::driver::result::memcpy_htod_async(frontier, &host, self.copy_stream.cu_stream())
+        }
+        .and_then(|()| self.copy_stream.synchronize());
+        if let Err(e) = copied {
+            self.pinned_stash = Some((frontier, host));
+            return Err(candle::Error::wrap(e));
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.pinned_stashed = false;
+        }
+        self.publish_gauges();
+        tracing::info!(
+            target: "candle_transformers::expert_lre",
+            restored_mib = host.len() >> 20,
+            ms = started.elapsed().as_millis() as u64,
+            "the pinned experts are back in VRAM"
+        );
+        Ok(())
     }
 
     /// Retire every kernel in flight before a byte changes owner.

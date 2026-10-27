@@ -1081,6 +1081,10 @@ impl ManagedBatchedModel for BatchedEngine {
         self.engine.experts().concede_for_guest(regions)
     }
 
+    fn stash_pinned_for_guest(&self) -> u64 {
+        self.engine.experts().stash_pinned_for_guest()
+    }
+
     fn restore_serving_floor(&self) -> bool {
         self.engine.experts().restore_serving_floor()
     }

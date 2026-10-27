@@ -3388,6 +3388,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.model.experts.concede_for_guest(regions)
     }
 
+    fn stash_pinned_for_guest(&self) -> u64 {
+        self.model.experts.stash_pinned_for_guest()
+    }
+
     fn restore_serving_floor(&self) -> bool {
         self.model.experts.restore_serving_floor()
     }
