@@ -43,6 +43,23 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("?")
 }
 
+/// The build under `key`, as the gateway and every member write one —
+/// `{count, hash, local}` — read as `count-hash`, with ` (local)` for a
+/// build with uncommitted changes; `None` when there is none.
+fn build_of(v: &Value, key: &str) -> Option<String> {
+    let b = v.get(key).filter(|b| b.is_object())?;
+    let local = b
+        .get("local")
+        .and_then(Value::as_str)
+        .is_some_and(|l| !l.is_empty());
+    Some(format!(
+        "{}-{}{}",
+        b.get("count").and_then(Value::as_u64)?,
+        b.get("hash").and_then(Value::as_str)?,
+        if local { " (local)" } else { "" }
+    ))
+}
+
 /// The members' own statuses, as the gateway's envelope gathered them.
 pub fn render_members(envelope: &Value, now: u64) -> String {
     let members = envelope
@@ -64,7 +81,7 @@ pub fn render_members(envelope: &Value, now: u64) -> String {
         }
         let mut line = format!(
             "\n- {host} {node} build {}: {}",
-            str_of(&body, "build"),
+            build_of(&body, "build").as_deref().unwrap_or("?"),
             str_of(&body, "state")
         );
         if let Some(d) = body
@@ -97,7 +114,7 @@ pub fn render_gateway(status: &Value) -> String {
     let mut out = format!(
         "gateway {} (build {}){}",
         str_of(status, "gateway"),
-        str_of(status, "build"),
+        build_of(status, "build").as_deref().unwrap_or("?"),
         if status.get("draining").and_then(Value::as_bool) == Some(true) {
             ", draining"
         } else {
@@ -111,14 +128,23 @@ pub fn render_gateway(status: &Value) -> String {
         .flatten()
     {
         out.push_str(&format!(
-            "\n- {}: {}, {} of {} ready, floor {}",
+            "\n- {}: {}, {} of {} ready",
             str_of(app, "app"),
             str_of(app, "mode"),
             app.get("ready").and_then(Value::as_u64).unwrap_or(0),
             app.get("members").and_then(Value::as_u64).unwrap_or(0),
-            app.get("floor").and_then(Value::as_str).unwrap_or("none"),
         ));
-        if let Some(p) = app.get("pending_floor").and_then(Value::as_str) {
+        // A service is admitted on any build and never rolled out: it has
+        // no floor to name.
+        if app.get("service").and_then(Value::as_bool) == Some(true) {
+            out.push_str(", a service (no floor, released per machine)");
+            continue;
+        }
+        out.push_str(&format!(
+            ", floor {}",
+            build_of(app, "floor").as_deref().unwrap_or("none")
+        ));
+        if let Some(p) = build_of(app, "pending_floor") {
             out.push_str(&format!(", pending floor {p}"));
         }
     }
@@ -129,16 +155,11 @@ pub fn render_gateway(status: &Value) -> String {
         .flatten()
     {
         out.push_str(&format!(
-            "\n  {} {} {} build {}{}: {}",
+            "\n  {} {} {} build {}: {}",
             str_of(m, "app"),
             str_of(m, "host"),
             str_of(m, "node"),
-            str_of(m, "build"),
-            if m.get("local_build").and_then(Value::as_bool) == Some(true) {
-                " (local)"
-            } else {
-                ""
-            },
+            build_of(m, "build").as_deref().unwrap_or("?"),
             str_of(m, "state"),
         ));
     }
@@ -220,7 +241,7 @@ mod tests {
         let envelope = json!({
             "members": [
                 {"node": "00000000000000ab", "host": "blackworld", "status": 200, "body": {
-                    "state": "ready", "build": "5739-c544", "detail": "",
+                    "state": "ready", "build": {"count": 5739, "hash": "c544", "local": ""}, "detail": "",
                     "started_at_ms": NOW - 7_200_000,
                     "tenants": {"npcd": {"state": "ready"}, "zend": {"state": "loading"}}
                 }},
@@ -238,19 +259,37 @@ mod tests {
         );
     }
 
+    /// The gateway's status as `/gateway/status.json` writes it: every build
+    /// an object, and a candidate's already a name.
     #[test]
     fn the_gateways_view_names_apps_members_and_candidates() {
+        let b = |count: u64, hash: &str, local: &str| json!({"count": count, "hash": hash, "local": local});
         let status = json!({
-            "gateway": "bw", "build": "1-a", "draining": false,
-            "apps": [{"app": "zend", "mode": "clustered", "ready": 2, "members": 2, "floor": "10-h"}],
-            "members": [{"app": "zend", "host": "bw", "node": "01", "build": "10-h", "local_build": false, "state": "ready"}],
+            "gateway": "bw", "build": b(1, "a", ""), "draining": false,
+            "apps": [
+                {"app": "zend", "service": false, "mode": "clustered", "ready": 2, "members": 2,
+                 "floor": b(10, "h", ""), "pending_floor": b(11, "h", "")},
+                {"app": "npcd", "service": false, "mode": "dumb", "ready": 0, "members": 0,
+                 "floor": null, "pending_floor": null},
+                {"app": "mcp", "service": true, "mode": "clustered", "ready": 2, "members": 2,
+                 "floor": null, "pending_floor": null}
+            ],
+            "members": [
+                {"app": "zend", "host": "bw", "node": "01", "build": b(10, "h", ""), "local_build": false, "state": "ready"},
+                {"app": "mcp", "host": "ww", "node": "03", "build": b(12, "j", "9f"), "local_build": true, "state": "ready"}
+            ],
             "upgrades": [{"app": "zend", "candidate": {"node": "02", "build": "11-h", "state": "certifying"}}],
             "faults": []
         });
         assert_eq!(
             render_gateway(&status),
-            "gateway bw (build 1-a)\n- zend: clustered, 2 of 2 ready, floor 10-h\n  \
-             zend bw 01 build 10-h: ready\nupgrade zend: candidate 11-h on 02, \"certifying\""
+            "gateway bw (build 1-a)\n\
+             - zend: clustered, 2 of 2 ready, floor 10-h, pending floor 11-h\n\
+             - npcd: dumb, 0 of 0 ready, floor none\n\
+             - mcp: clustered, 2 of 2 ready, a service (no floor, released per machine)\n  \
+             zend bw 01 build 10-h: ready\n  \
+             mcp ww 03 build 12-j (local): ready\n\
+             upgrade zend: candidate 11-h on 02, \"certifying\""
         );
     }
 

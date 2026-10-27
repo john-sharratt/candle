@@ -13,8 +13,10 @@ trusted_gateways: ["127.0.0.1"]
 
 # The gateway's LAN entrance every backend is reached through, as the caller:
 # the caller's own token rides each call, which the gateway honours from this
-# machine (`server.trusted_backends` in web/web.yaml).
-gateway: "http://192.168.0.5"
+# machine (`server.trusted_backends` in web/web.yaml). BlackWorld's wired
+# address, not its Wi-Fi one: on 2026-10-28 a 109 KB answer from 192.168.0.5
+# reached WhiteWorld in 9.7 s (11 KB/s), and from 192.168.0.4 in 4–18 ms.
+gateway: "http://192.168.0.4"
 
 # The cluster it joins as the app `mcp`.
 cluster:
