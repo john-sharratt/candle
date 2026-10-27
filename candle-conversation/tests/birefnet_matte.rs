@@ -202,7 +202,7 @@ fn measure_in(path: PathBuf, heap: Option<usize>) -> usize {
     device.synchronize().unwrap();
     let secs = t.elapsed().as_secs_f64();
     let peak = cuda.pool_used_peak_bytes().unwrap();
-    let escaped = peak.saturating_sub(before) as usize;
+    let escaped = peak.saturating_sub(before);
     if heap.is_some() {
         println!(
             "pool grew {} MiB over the forward, outside the heap",

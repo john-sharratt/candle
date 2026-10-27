@@ -5169,7 +5169,6 @@ impl Scheduler {
                     cobatched_decode_rows(decode_inputs, verify_inputs),
                     0,
                     sec_adv.iter().sum(),
-                    t_wave.elapsed().as_micros() as u64,
                 );
                 super::PREFILL_OK_TOKENS.fetch_add(
                     sec_adv.iter().sum::<usize>() as u64,
@@ -5400,11 +5399,11 @@ impl Scheduler {
             if sc_seqs > 0 {
                 self.wave_stats.record_section(sc_seqs, sc_swept, sc_kv, ms);
             }
-            // The phase timeline's share of this sweep: one forward, split by rows
-            // between the decode rows that rode it and the members above.
+            // The phase timeline's share of this sweep: the rows that rode it,
+            // which the decode step it ran in is split by.
             let decode_rows = cobatched_decode_rows(decode_inputs, verify_inputs);
             self.wave_stats
-                .record_cobatched_split(decode_rows, pf_tok, sc_tok, creep_us);
+                .record_cobatched_split(decode_rows, pf_tok, sc_tok);
             // **Teach the planner what this machine actually did.** A forward is
             // `T = X/bw + W·c` — non-resident expert bytes over the bus, plus
             // compute for the rows — so one observation is one equation in two

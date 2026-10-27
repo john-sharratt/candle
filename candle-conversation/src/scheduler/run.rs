@@ -371,19 +371,26 @@ impl Scheduler {
                 // left with all its tokens and the step read as committing
                 // fewer — none at all through WhiteWorld's minute of ending turns
                 // (3cccc3fcb, 2026-10-21: 0.00 after 3.38).
+                let committed: usize = decoding_before
+                    .iter()
+                    .map(|&(id, before)| {
+                        self.active_decodes
+                            .get(&id)
+                            .map_or(0, |s| s.generated_tokens.len().saturating_sub(before))
+                    })
+                    .sum();
                 if !decoding_before.is_empty() {
-                    let committed: usize = decoding_before
-                        .iter()
-                        .map(|&(id, before)| {
-                            self.active_decodes
-                                .get(&id)
-                                .map_or(0, |s| s.generated_tokens.len().saturating_sub(before))
-                        })
-                        .sum();
                     self.tokens_per_step
                         .add_value(committed as f64 / decoding_before.len() as f64);
                 }
                 let step = t_step.elapsed();
+                // The phase timeline's decode: the tokens the step committed, and
+                // the step's wall-clock split with the creep that rode it.
+                self.wave_stats.add_decode_committed(committed as u64);
+                self.wave_stats.close_decode_step(
+                    step.as_micros() as u64,
+                    self.decode_only_step.map(|d| d.as_micros() as u64),
+                );
                 profile::record(
                     if self.wave_cobatched {
                         "decode:cobatched:step"

@@ -3,8 +3,9 @@
 //! Decode, prefill and section rows share a single sweep when they are
 //! co-batched, so the sweep's time has to be shared out rather than charged to
 //! each — the phase timeline is wall-clock, and its bands must sum to the
-//! window. Rows are the measure: the forward's cost is its rows' projections and
-//! attention, and every row of every class goes through the same layers.
+//! window. The decode rows keep what a decode-only step takes; the creep beside
+//! them takes the rest of the step, divided between its classes by rows
+//! ([`cobatched_step_shares`]).
 
 use candle::Tensor;
 
@@ -18,29 +19,41 @@ pub(super) fn cobatched_decode_rows(decode_inputs: &[Tensor], verify_inputs: &[T
         .sum()
 }
 
-/// The prefill and section shares, in the forward's own unit, of a forward of
-/// `fwd` that carried `decode_rows`, `prefill_rows` and `section_rows`. The
-/// decode share is the remainder, and stays with the decode quantum the forward
-/// ran in. A forward with no rows has nothing to share.
+/// The prefill and section shares, in microseconds, of a decode step of
+/// `step_us` that carried `prefill_rows` and `section_rows` of creep beside
+/// `decode_rows` decode rows. The decode share is the remainder, and stays
+/// with the decode quantum the step ran in.
 ///
-/// Only a forward that ran **inside the decode quantum** is shared out — the
-/// caller says so (`in_decode_quantum`), because only there is the whole sweep
-/// in decode's timer to be moved. The same wave step also runs from the
-/// prefill quantum with no decode rows, its time already prefill's; sharing that
-/// one too counted it twice — a 5.2 s window drew a 9.4 s prefill band.
-pub(super) fn cobatched_shares(
-    in_decode_quantum: bool,
+/// **The step's wall-clock is the measure, not the forward's launch.** A step
+/// ends with its logits read back, so it holds the device's time; the host's
+/// time around the creep's launch does not, and split by that, a 3,072-row
+/// creep's device time surfaced at the readback inside decode's timer — one
+/// decode row of three forwards drew 3.1 s of decode (BlackWorld, 2026-10-27).
+/// The creep's part is what the step took past a decode-only step
+/// (`decode_only_us`, which the scheduler learns from them), the cost it
+/// prices a creep's debt by too, shared between prefill and section by their
+/// rows. Before a decode-only step has been measured the rows share the whole
+/// step; a step with no decode rows is the creep's entirely.
+pub(super) fn cobatched_step_shares(
+    step_us: u64,
+    decode_only_us: Option<u64>,
     decode_rows: usize,
     prefill_rows: usize,
     section_rows: usize,
-    fwd: u64,
 ) -> (u64, u64) {
-    let total = (decode_rows + prefill_rows + section_rows) as u128;
-    if !in_decode_quantum || total == 0 {
+    let creep_rows = prefill_rows + section_rows;
+    if creep_rows == 0 {
         return (0, 0);
     }
-    let share = |rows: usize| (fwd as u128 * rows as u128 / total) as u64;
-    (share(prefill_rows), share(section_rows))
+    let creep_us = match (decode_rows, decode_only_us) {
+        (0, _) => step_us,
+        (_, Some(alone)) => step_us - alone.min(step_us),
+        (_, None) => {
+            (step_us as u128 * creep_rows as u128 / (creep_rows + decode_rows) as u128) as u64
+        }
+    };
+    let prefill = (creep_us as u128 * prefill_rows as u128 / creep_rows as u128) as u64;
+    (prefill, creep_us - prefill)
 }
 
 /// The share of `tokens` a creep forward over layers `[start, end)` of `n`
@@ -99,41 +112,58 @@ mod tests {
         assert_eq!(full_sweep_us(35_000, 12, 12, 48), 0);
     }
 
-    /// The measured case: 3 decode rows beside an 8,192-token prefill in a
-    /// 4,645 ms sweep. Prefill takes all but ~1.7 ms of it.
+    /// **The creep takes what the step took past a decode-only step**: 3
+    /// decode rows beside an 8,192-token prefill in a 4,645 ms step, a
+    /// decode-only step being 40 ms, leave decode its 40 ms.
     #[test]
-    fn a_long_prefill_takes_its_sweep_from_a_short_decode() {
+    fn the_creep_takes_the_step_past_a_decode_only_one() {
         assert_eq!(
-            cobatched_shares(true, 3, 8_192, 0, 4_645_000),
+            cobatched_step_shares(4_645_000, Some(40_000), 3, 8_192, 0),
+            (4_605_000, 0)
+        );
+    }
+
+    /// Before a decode-only step has been measured, the rows share the step.
+    #[test]
+    fn unmeasured_the_rows_share_the_step() {
+        assert_eq!(
+            cobatched_step_shares(4_645_000, None, 3, 8_192, 0),
             (4_643_299, 0)
         );
     }
 
+    /// A step no longer than a decode-only one leaves the creep nothing.
     #[test]
-    fn shares_follow_rows_and_never_exceed_the_forward() {
-        let (pf, sc) = cobatched_shares(true, 10, 30, 60, 1_000);
-        assert_eq!((pf, sc), (300, 600));
-        assert!(pf + sc <= 1_000);
+    fn a_step_within_a_decode_only_one_is_decodes() {
         assert_eq!(
-            cobatched_shares(true, 0, 5, 5, 1_001),
-            (500, 500),
-            "floored, never over"
+            cobatched_step_shares(30_000, Some(40_000), 3, 100, 0),
+            (0, 0)
         );
     }
 
-    /// The measured window: a decode-less wave of 8,190 prefill rows ran from
-    /// the prefill quantum, whose timer already holds it. Nothing moves.
+    /// The creep's part is shared between prefill and section by their rows,
+    /// and the two never exceed it.
     #[test]
-    fn a_forward_outside_the_decode_quantum_shares_nothing() {
-        assert_eq!(cobatched_shares(false, 0, 8_190, 0, 4_700_000), (0, 0));
-        assert_eq!(cobatched_shares(false, 3, 8_190, 0, 4_700_000), (0, 0));
+    fn prefill_and_section_share_the_creeps_part_by_rows() {
+        assert_eq!(
+            cobatched_step_shares(1_000_000, Some(400_000), 10, 30, 60),
+            (200_000, 400_000)
+        );
+        assert_eq!(
+            cobatched_step_shares(1_001, Some(0), 1, 5, 5),
+            (500, 501),
+            "floored, the rest to section"
+        );
     }
 
     /// A decode-less wave driven from INSIDE the decode quantum (every decode
     /// excluded that wave) is all prefill's and section's — decode held it.
     #[test]
     fn a_decode_less_wave_inside_the_decode_quantum_moves_whole() {
-        assert_eq!(cobatched_shares(true, 0, 600, 200, 8_000), (6_000, 2_000));
+        assert_eq!(
+            cobatched_step_shares(8_000, Some(5_000), 0, 600, 200),
+            (6_000, 2_000)
+        );
     }
 
     /// Two plain decode rows and a five-row verify block are seven rows.
@@ -150,8 +180,8 @@ mod tests {
     }
 
     #[test]
-    fn a_forward_with_only_decode_rows_or_none_shares_nothing() {
-        assert_eq!(cobatched_shares(true, 8, 0, 0, 9_999), (0, 0));
-        assert_eq!(cobatched_shares(true, 0, 0, 0, 9_999), (0, 0));
+    fn a_step_with_only_decode_rows_or_none_shares_nothing() {
+        assert_eq!(cobatched_step_shares(9_999, Some(1), 8, 0, 0), (0, 0));
+        assert_eq!(cobatched_step_shares(9_999, None, 0, 0, 0), (0, 0));
     }
 }
