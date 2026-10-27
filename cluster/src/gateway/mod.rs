@@ -33,7 +33,8 @@ pub use claims::Claims;
 pub use coord_log::changes;
 pub use drain::DRAIN_WAIT;
 pub use hub::{
-    rolls_out, Hub, MemberStream, APPS, CATCHUP_CAP, KEEP, LAG_CAP, MEMBERS_EVERY, REFUSALS_KEPT,
+    is_service, rolls_out, Hub, MemberStream, APPS, CATCHUP_CAP, KEEP, LAG_CAP, MCP, MEMBERS_EVERY,
+    REFUSALS_KEPT, SERVICES,
 };
 pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};

@@ -1,4 +1,4 @@
-//! `keep` — the failsafe for `web` and `motherd`.
+//! `keep` — the failsafe for `web`, `motherd` and `mcp`.
 //!
 //! On startup it runs the executable at each service's stable path, with the
 //! arguments from its config. That child is detached: stdout and stderr are
@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(cluster.url, "https://gateway.tokera.com:9443");
         assert_eq!(cluster.name, "tokera.com");
         assert_eq!(cluster.host, "blackworld");
-        assert_eq!(cfg.services.len(), 2);
+        assert_eq!(cfg.services.len(), 3);
         assert_eq!(
             cfg.services[0].stable,
             PathBuf::from(STABLE_DIR).join("web.exe")
@@ -857,8 +857,13 @@ mod tests {
             cfg.services[1].stable,
             PathBuf::from(STABLE_DIR).join("motherd.exe")
         );
+        assert_eq!(
+            cfg.services[2].stable,
+            PathBuf::from(STABLE_DIR).join("mcp.exe")
+        );
         assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
         assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);
+        assert_eq!(cfg.services[2].args, ["--config", "mcp/mcp.yaml"]);
     }
 
     /// `/` is a switch, `/<action>/<name>` that action on that service,

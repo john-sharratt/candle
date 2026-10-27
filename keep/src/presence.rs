@@ -5,7 +5,6 @@
 //! its bytes, and nothing here is certified or rolled out. The failsafe loop
 //! does not run on this thread.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,7 +13,7 @@ use cluster::frame::{Capacity, MemberState};
 use cluster::gateway::KEEP;
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
-use cluster::member::{AppMember, Identity};
+use cluster::member::{kept_node, AppMember, Identity};
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
 use serde::Deserialize;
@@ -59,7 +58,8 @@ pub fn start(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) {
 }
 
 async fn join(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) -> anyhow::Result<()> {
-    let node = node_in(state)?;
+    // The same node across restarts.
+    let node = kept_node(&state.join("node"))?;
     let key = GroupKey::load(&cluster.group_key).map_err(|e| anyhow::anyhow!("group key: {e}"))?;
     let target = Target::parse(&cluster.url, Some(&cluster.name))?;
     let member = AppMember::new(
@@ -131,22 +131,4 @@ fn capacity() -> Capacity {
         mem_free_mib: machine.mem_free_mib,
         ..Capacity::default()
     }
-}
-
-/// The same node across restarts, drawn once into `state`.
-fn node_in(dir: &Path) -> anyhow::Result<u64> {
-    let path = dir.join("node");
-    if let Ok(text) = fs::read_to_string(&path) {
-        return u64::from_str_radix(text.trim(), 16)
-            .map_err(|e| anyhow::anyhow!("{}: not a node: {e}", path.display()));
-    }
-    fs::create_dir_all(dir)?;
-    let node = loop {
-        let n: u64 = rand::random();
-        if n != 0 {
-            break n;
-        }
-    };
-    fs::write(&path, format!("{node:016x}\n"))?;
-    Ok(node)
 }

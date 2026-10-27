@@ -23,3 +23,7 @@ services:
     stable: keep/stable/motherd.exe
     args: ["--config", "motherd/motherd.yaml"]
     cwd: D:/prog/candle
+  - name: mcp
+    stable: keep/stable/mcp.exe
+    args: ["--config", "mcp/mcp.yaml"]
+    cwd: D:/prog/candle

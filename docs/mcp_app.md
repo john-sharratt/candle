@@ -42,8 +42,8 @@ claude.ai / Claude Code
    │  POST /mcp  (Authorization: Bearer <gateway token>)
    ▼
 web gateway (BlackWorld)  ── token → identity (auth::mcp) ── X-Tokera-* ──┐
-   ▼                                                                      │
-aggregator (AlienWorld, :8095)   believes X-Tokera-* only from the gateway │
+   ▼  `cluster: mcp` — each request to the next joined member             │
+aggregator (BlackWorld or WhiteWorld), over the socket it dialled        │
    │                                                                      │
    │  POST http://<gateway>/v1/mcp      Host: code.tokera.com
    │  POST http://<gateway>/v1/npc/mcp  Host: bot.tokera.com
@@ -62,21 +62,34 @@ nothing about access.
 
 ## 2. Trust
 
-- **gateway → aggregator.** The aggregator's config names the gateway's
-  addresses in `trusted_gateways`: BlackWorld's `192.168.0.5` and `.4`,
-  because the gateway's outbound LAN connection can leave from either. The
-  aggregator believes the identity headers only from those peers, and only
-  when the client's bearer token came with them. From anywhere else nobody is
-  calling, and the client is sent to sign in.
-- **aggregator → gateway.** The gateway's `server.trusted_backends` lists the
-  aggregator's address (AlienWorld, `192.168.0.237`). From a listed backend,
-  a request that carries a person's MCP access token is read as that person,
-  on any path (`Auth::mcp_delegated`). A backend's own `X-Tokera-*` headers
-  are still stripped on ingress. The address alone names nobody, so a process
-  on that machine can act only for a person whose token it was handed.
+- **gateway → aggregator.** Each aggregator is a member of the app `mcp`: it
+  dials the gateway and proves the group key, and the gateway sends `/mcp`
+  down that socket. A request off the socket is believed — the gateway at the
+  other end set its identity headers itself — exactly as motherd's host
+  believes one. BlackWorld's also listens on loopback, the route's upstream
+  while no member is joined, and believes the identity headers there only
+  from a peer in `trusted_gateways` (`127.0.0.1`). From anywhere else they
+  are dropped before anything reads them (`believed`), and they name
+  someone only when the client's bearer token came with them. Without both,
+  nobody is calling, and the client is sent to sign in.
+- **aggregator → gateway.** The gateway's `server.trusted_backends` lists
+  each aggregator's address: `127.0.0.1` for BlackWorld's, which calls back
+  over loopback, and `192.168.0.6` for WhiteWorld's, which calls back across
+  the LAN. From a listed backend, a request that carries a person's MCP
+  access token is read as that person, on any path (`Auth::mcp_delegated`). A
+  backend's own `X-Tokera-*` headers are still stripped on ingress. The
+  address alone names nobody, so a process on a listed machine can act only
+  for a person whose token it was handed.
 
-The loop-back is plain HTTP on the LAN to the gateway's `:80` entrance, which
-is the one Cloudflare's tunnel reaches, with the site named in `Host`.
+Listing loopback is safe only because no public request arrives from it.
+Cloudflare reaches the `:80` entrance from its own addresses, and the TLS
+entrance records the client's. A tunnel or local proxy that delivered public
+traffic from loopback would make every public request a trusted backend; if
+one is ever put in front of the gateway, the aggregator's loop-back must move
+to an address that proxy never uses.
+
+The loop-back is plain HTTP to the gateway's `:80` entrance, with the site
+named in `Host`.
 
 ## 3. The aggregator
 
@@ -115,9 +128,17 @@ keeps no handshake session to lose. Each request carries two things in its
 aggregator's own session id, in `com.tokera/session`. The backend keys what it
 holds by person, client and that session (`mcp_server::stateless_key`). So two
 claude.ai conversations of one person, each a session of the aggregator's, are
-two sessions at zend, each with its own attached thread. The aggregator keeps
-its own sessions in a file (`mcp/state/sessions.json`), and they survive a
-restart.
+two sessions at zend, each with its own attached thread. The aggregator holds
+nothing on a session of its own, so it keeps none: each is carried whole in
+its id (`mcp_server::SealedStore`), as npcd's are. Any member reads a session
+another member opened, a restart loses none, and nothing sticks a caller to
+one member.
+
+**Every member is the same.** Beside the sessions, an aggregator keeps only
+what it relearns: which backend lists each tool (listed again on a miss) and
+each caller's last listing of a backend that is down. So the gateway deals
+`/mcp` to its members in turn (`Dispatch::Any`), and one member leaving costs
+the calls it was running and nothing else.
 
 **What a delivered answer changes is the backend's.** zend marks the journal
 entries an answer handed over once that answer has left on its stream. When
@@ -235,14 +256,22 @@ carrying.
 
 ## 5. The aggregator app
 
-`mcp/` builds a binary, `mcp`, configured by `mcp/mcp.yaml`:
+`mcp/` builds a binary, `mcp`, configured by one file per machine —
+`mcp/mcp.yaml` on BlackWorld, `mcp/mcp.whiteworld.yaml` on WhiteWorld:
 
 | Key | Meaning |
 |---|---|
-| `bind` | Where it listens (`0.0.0.0:8095`) |
-| `trusted_gateways` | The peers whose `X-Tokera-*` it believes |
-| `gateway` | The gateway's LAN entrance every backend is reached through (`http://192.168.0.5`) |
-| `state` | The folder its sessions are kept in |
+| `bind` | Where it listens (`127.0.0.1:8095`) |
+| `trusted_gateways` | The peers on that listener whose `X-Tokera-*` it believes (`127.0.0.1`) |
+| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.0.5` on WhiteWorld) |
+| `cluster` | The gateway it joins as `mcp`: `urls` (space-separated, best first), `name` (the certificate's), `group_key`, and `host`, its name on the status page |
+| `state` | The folder its node is kept in |
+| `served` | The file beside it every machine serves alike, `mcp/served.yaml` |
+
+`served.yaml` holds:
+
+| Key | Meaning |
+|---|---|
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
 | `backends` | The servers whose tools it serves, in list order: `{name, host, path}` each — the path is the app's own MCP route on that site. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
 
@@ -251,17 +280,45 @@ carrying.
 | `app` | The aggregated server: the card, the merged list, each call routed |
 | `backend` | One backend, called through the gateway as the caller; its progress read off the stream |
 | `sse` | Reading an event stream across chunks |
-| `caller` | Who is calling, believed from the gateway, and the token that names them |
-| `config` | `mcp/mcp.yaml` |
+| `believed` | Whose identity headers are kept: the socket's, and a listed gateway's |
+| `caller` | Who is calling, from the believed headers, and the token that names them |
+| `presence` | The cluster socket: joining as `mcp`, declaring `/mcp`, serving the gateway's streams |
+| `config` | Each machine's file, and the `served` file they share |
 | `guides` | The guide library: the embedded `.md` files, `guide_list` / `guide_read`, the "Guides:" lines |
 
 ## 6. Deployment
 
-The aggregator runs on AlienWorld while it is iterated. It is built there,
-run from the repository root, and its port is open in the host firewall. The
-gateway's `/mcp` route on `code.tokera.com` points at it by address
-(`upstream: http://192.168.0.237:8095`, no `cluster:`), and
-`server.trusted_backends` lists that address.
+The aggregator runs on BlackWorld and WhiteWorld, each as a keep service
+(`mcp`, `--config mcp/mcp.yaml` or `mcp/mcp.whiteworld.yaml`, from the
+repository root). Each joins the gateway as a member of the app `mcp`, one of
+the gateway's services (`cluster::gateway::SERVICES`): admitted on whatever
+build it runs, with no floor, no model lock, no certification and no rollout.
+Each machine's is released there like `web`: build
+`cargo build --release -p mcp`, stage `keep/stage/mcp.exe`, and POST its path
+to keep. Once its listener is bound and its socket dialling it prints keep's
+proof line, `INFO serving`, on stderr, and keep's trial waits for it.
+
+The gateway's `/mcp` route on `code.tokera.com` is `cluster: mcp`: each
+request goes to the next joined member, over that member's socket, so no
+member opens a port to the gateway. Its `upstream`,
+`http://127.0.0.1:8095`, is BlackWorld's listener, which answers while no
+member is joined — after a gateway restart, before the members dial again.
+
+**Resilience.** One member down, the other takes every request, and the
+calls the first was running fail with it. Both down, the route goes to the
+upstream; with BlackWorld's process down too, `/mcp` answers that it is
+down. A member back joins and takes its share at once, since it loads
+nothing.
+
+**Why not AlienWorld.** It ran there first, on a laptop on Wi-Fi, and every
+MCP answer crossed that LAN leg twice: the backend's answer into the
+aggregator, then the aggregator's answer back to the gateway. On 2026-10-27
+the leg ran at 4–11 KB/s, while the gateway itself answered over the internet
+at ~650 KB/s. An image edit that finished in npcd in 12 ms reached claude.ai
+28 s later, because its ~127 KB of base64 crossed the slow leg twice. A member
+belongs only on a machine whose link to the gateway is fast: BlackWorld's is
+loopback, and WhiteWorld's served BlackWorld a 109 KB file in 10–14 ms
+(2026-10-28), against 9.9 s for the same file from AlienWorld's leg.
 
 Deploy in this order:
 
