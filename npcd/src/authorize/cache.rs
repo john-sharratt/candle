@@ -58,9 +58,12 @@ impl Cache {
         }
     }
 
-    /// Remember that `prompt` was refused for `purpose` at `now_ms`.
+    /// Remember that `prompt` was refused for `purpose` at `now_ms`, dropping
+    /// any authorization kept for it: a refusal outweighs an allow from a check
+    /// that answered the other way.
     pub fn refuse(&self, purpose: &str, prompt: &str, now_ms: u64) {
         let key = (purpose.to_string(), prompt_sha256(prompt));
+        self.held.lock().unwrap().remove(&key);
         let mut refused = self.refused.lock().unwrap();
         refused.retain(|_, exp| *exp > now_ms);
         if !refused.contains_key(&key) && refused.len() >= CAPACITY {
@@ -140,5 +143,18 @@ mod tests {
         assert!(!cache.refused(IMAGE, "a wolf", 2_000));
         assert!(!cache.refused("portrait", "a fox", 2_000));
         assert!(!cache.refused(IMAGE, "a fox", 1_000 + LIFETIME.as_millis() as u64));
+    }
+
+    /// **A refusal drops the authorization kept for the same prompt**, so a
+    /// retry is not drawn on an allow the refusal overruled.
+    #[test]
+    fn a_refusal_drops_the_kept_authorization() {
+        let s = Signer::new([2; 32]);
+        let cache = Cache::default();
+        cache.put(s.sign(IMAGE, "a fox", 1_000), 1_000);
+        cache.put(s.sign(IMAGE, "a wolf", 1_000), 1_000);
+        cache.refuse(IMAGE, "a fox", 2_000);
+        assert_eq!(cache.get(IMAGE, "a fox", 2_000), None);
+        assert!(cache.get(IMAGE, "a wolf", 2_000).is_some());
     }
 }

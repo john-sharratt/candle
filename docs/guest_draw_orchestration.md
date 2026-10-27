@@ -1,4 +1,4 @@
-# One call: draw now, authorize on a peer, release on both
+# One call: draw now, authorize meanwhile, release on both
 
 A draw today runs in series on one member: the content check (four one-token
 questions on the resident model, `npcd/src/compliance.rs`), then the guest
@@ -11,7 +11,8 @@ a drain stops that member's engine — but it can on another.
 So the check becomes its own step yielding a **signed authorization** for a
 prompt, and a draw is **started at once, held, and released** only once it is
 cleared. The member a draw landed on starts it, asks a peer for the
-authorization at the same moment, and answers when both are done. The caller
+authorization and runs its own check at the same moment, and answers when the
+draw is done and either check has allowed it. The caller
 makes one call; a caller that already holds an authorization passes it and no
 check runs.
 
@@ -89,31 +90,51 @@ On the member the call landed on (D):
    `require(Admin)` (`guest_routes.rs:207-227`).
 3. **None given, another npcd member routable:** submit the guest job at once
    and, at the same moment, send `POST /v1/prompt/authorize` up (`send_up`,
-   `host/src/cluster/up.rs:46`, `read_for` 30 s). The gateway places it by
-   `Best`, and **a request a member sends up never goes back to that member
-   while another member of its app is routable** (§3). D chooses no peer: the
-   gateway has the live capacity, D sees only admission weights (`MemberInfo`,
-   `cluster/src/frame/types.rs:118`).
+   `host/src/cluster/up.rs:46`, `read_for` 30 s) **and start D's own check**.
+   The gateway places the peer's by `Best`, and **a request a member sends up
+   never goes back to that member while another member of its app is
+   routable** (§3). D chooses no peer: the gateway has the live capacity, D
+   sees only admission weights (`MemberInfo`, `cluster/src/frame/types.rs:118`).
+
+   Both checks race because neither is reliably the quicker. D's waits out
+   its own drain (the drain stops D's engine) and then answers in about a
+   second and a half. The peer's does not wait for the drain, but it queues
+   behind its own member's work. Measured 2026-10-28, with BlackWorld drawing
+   and WhiteWorld checking: D's check released at ≈9 s from the call. The
+   peer's took 14.6 and 24.4 s, and twice ran past its 30 s budget, because
+   WhiteWorld's waves were held by a background prefill. Drawn behind a 30 s
+   peer timeout, the local check would release at ≈38 s. Both checks ask the
+   same questions of the same prescribed model under a fixed seed and
+   stencil, so they reach the same verdict. Whichever answers first stands,
+   and the other is dropped. A dropped check frees its turns' sequences
+   (`Sequence`'s drop, `candle-conversation/src/conversation.rs`). On the
+   peer, that depends on the drop reaching its handler through the gateway.
+   WhiteWorld's log shows it does: the two checks BlackWorld gave up on never
+   decoded once WhiteWorld's waves cleared, while a later check did.
 4. **None given, no other member routable:** check locally first, then draw —
    today's order. The gateway rule sends the request back to D when D is the
    only member, so D knows this from the group (`npcd_members`) and does not
    send it.
 5. **The join.** The stream opens at once (`loading`, `step`, `waiting` as
-   today), and when the draw is done and the verdict is not, an
+   today), and when the draw is done and neither check has allowed it, an
    `{"event":"authorizing"}` line. Then:
-   - **allowed** (a 200 the D re-verifies) → the picture is released: the
-     `done` line as today, with the `authorization` in it, so a caller that
-     retries can pass it back;
-   - **refused** — a body whose `error` is `prompt_declined`, and only that →
-     the picture is dropped unseen — never stored, linked, shown or logged by
-     content — and the stream's last line is
+   - **allowed** by either (D's own, or a peer's 200 that D re-verifies and
+     caches) → the picture is released once drawn: the `done` line as today,
+     with the `authorization` in it, so a caller that retries can pass it
+     back;
+   - **refused** by either before the release — D's check refusing, or a peer
+     body whose `error` is `prompt_declined`, and only that → the picture is
+     dropped unseen — never stored, linked, shown or logged by content — and
+     the stream's last line is
      `{"event":"error","error":"prompt_declined","retry":false}`;
-   - **peer failed** — any other non-200 (a gateway 403/404/503 `Problem`), a
-     transport error, or no answer within 30 s → checked locally once the draw
-     has finished (D's engine is free then), and joined on that; a local
-     `Unavailable` ends the stream `check_unavailable`, `retry: true`;
+   - **one check failed** — D's `Unavailable`, or from the peer any other
+     non-200 (a gateway 403/404/503 `Problem`), a transport error, no answer
+     within 30 s, or an authorization that does not verify on D → the other
+     decides;
+   - **both failed** → nothing is kept, and the stream ends
+     `check_unavailable`, `retry: true`, naming both failures;
    - **the draw failed** (`no_room`, `failed`) → the draw's error, as today,
-     at once; no local check; a verdict still on its way is not waited for;
+     at once; the checks still on their way are not waited for;
    - **D dies** → the stream drops; nothing was stored.
 6. **Refused:** answered at once. The job is withdrawn behind the answer —
    cancelled while still queued (below); held by a drain, tried again every
@@ -156,7 +177,9 @@ dropped at its `exp_ms`. A retry that lands on D — a `no_room` retry, a redraw
 — asks no one; one that lands elsewhere carries the `authorization` the `done`
 line returned. Refusals are kept the same way: a prompt refused within ten
 minutes is declined at once, neither drawn nor asked again — what keeps the
-cost of drawing first to one drain per refused prompt.
+cost of drawing first to one drain per refused prompt. A refusal drops any
+authorization kept for its prompt and is asked ahead of the cache, so when the
+two checks disagree the refusal stands.
 
 **The stream after a refusal.** The job's progress reaches the stream through
 a sender the call takes back when it answers, so a refusal is the stream's
@@ -174,8 +197,9 @@ field too.
 
 One line per call at the join, `draw released` on `npcd::authorize`:
 `drawn_ms` and `authorized_ms` from the call's start, its `source` (`peer`,
-`local`, `given`, `cache`, `waiver`), and `total_ms` — the moment it was
-released.
+`local`, `given`, `cache`, `waiver`; `refused` for a prompt declined from the
+cache, `none` when both checks failed), and `total_ms` — the moment it was
+released or stopped.
 
 ## 3. The gateway rule (a)
 
@@ -296,13 +320,18 @@ orchestration's tests fake. The inline `crate::compliance::Denial` paths
   cannot be cancelled.
 - The orchestration, with fake `ContentCheck`, `PeerAuthorizer` and
   `GuestDraw`: given-valid draws with no check; given-invalid refuses before
-  the stream; peer allows → released with the authorization in `done`; peer
-  refuses → dropped, nothing stored, `prompt_declined`; refusal while queued →
-  cancelled; a refused job a drain puts back → withdrawn; peer 403 `Problem` /
-  503 / timeout → local check after the draw, announced; no peer → local
+  the stream; peer allows first → released with the peer's authorization,
+  kept; D's check allows while the peer is slow → released without waiting on
+  the peer; peer refuses → dropped, nothing stored, `prompt_declined`; D's
+  check refuses → withdrawn, the refusal kept; refusal while queued →
+  cancelled; a refused job a drain puts back → withdrawn; peer fails or its
+  authorization does not verify → D's check decides, the wait announced; both
+  fail → `check_unavailable` naming both, the job withdrawn; no peer → local
   first; draw fails → its error; a prompt refused moments ago → declined with
   no draw and no check.
-- The cache: authorizations and refusals kept for their lifetime and bounded.
+- The cache: authorizations and refusals kept for their lifetime and bounded;
+  a refusal drops the authorization kept for its prompt, and overrules the
+  other check's allow on a retry.
 - The gateway rule: a member's `Best` request asking for a peer goes to
   another member, never a canary while one is left, and to the sender when
   none is; a client's is placed as ever.

@@ -1,11 +1,12 @@
-//! One call: draw now, authorize on a peer, release on both
+//! One call: draw now, authorize meanwhile, release on both
 //! (`docs/guest_draw_orchestration.md` §2).
 //!
 //! A clearance in hand — given, cached, or an Admin's waiver — draws and
-//! releases at once. With none, and a peer to ask, the draw is submitted and
-//! the peer asked at the same moment; the picture is held until the verdict.
-//! With no peer the check runs here first, as it always did. A picture leaves
-//! only through [`Held::open`].
+//! releases at once. With none, and a peer to ask, the draw is submitted, the
+//! peer asked and the check run here, all at the same moment; the picture is
+//! held until either check allows it, and a refusal from either before then
+//! stands. With no peer the check runs here first. A picture leaves only
+//! through [`Held::open`].
 
 use std::pin::pin;
 use std::time::{Duration, Instant};
@@ -71,6 +72,14 @@ where
         _ => return Err(Stopped::Guest(GuestError::Refused("not a draw".into()))),
     };
     let ms = |at: Instant| at.duration_since(started).as_millis() as u64;
+    // Refused moments ago: answered now, not drawn again for the same answer.
+    // Asked ahead of the cache, so a refusal outweighs an allow kept for the
+    // same prompt.
+    if given.is_none() && parts.cache.refused(IMAGE, &prompt, now_ms()) {
+        log("refused", 0, 0, ms(Instant::now()));
+        return Err(Stopped::Declined(Denial::Refused.to_string()));
+    }
+
     // A clearance in hand: draw and release. The cache is asked only when the
     // caller brought none.
     let (source, clearance) = match given {
@@ -93,12 +102,6 @@ where
         return out;
     }
 
-    // Refused moments ago: answered now, not drawn again for the same answer.
-    if parts.cache.refused(IMAGE, &prompt, now_ms()) {
-        log("refused", 0, 0, ms(Instant::now()));
-        return Err(Stopped::Declined(Denial::Refused.to_string()));
-    }
-
     // No peer: check here first — nothing else can answer.
     if !parts.peer.available() {
         let a = authorized_here(&parts, &prompt).await?;
@@ -111,76 +114,110 @@ where
         return out;
     }
 
-    // A peer: draw and ask at once.
+    // A peer: draw, ask the peer and check here, all at once. The picture is
+    // released once drawn and either check allows it; a refusal from either
+    // stands; a check that fails leaves the other to decide. The check here
+    // waits while the drain holds this member's engine and finishes after it;
+    // the peer's does not wait, but queues behind its own member's work — so
+    // whichever is quicker that moment decides.
     let submitted = parts.guest.submit(request, sink).map_err(Stopped::Guest)?;
     let seq = submitted.seq;
     let mut outcome: Outcome = submitted.outcome;
-    let mut verdict = pin!(parts.peer.authorize(IMAGE, &prompt));
+    let mut peer = pin!(parts.peer.authorize(IMAGE, &prompt));
+    let mut here = pin!(authorized_here(&parts, &prompt));
     let mut authorizing = Some(authorizing);
-    let (held, verdict, drawn, authorized) = tokio::select! {
-        v = &mut verdict => {
-            let authorized = Instant::now();
-            if let PeerVerdict::Refused(why) = &v {
-                // Answered now; the job is withdrawn — or drawn and dropped —
-                // behind the answer.
-                parts.cache.refuse(IMAGE, &prompt, now_ms());
-                let guest = parts.guest.clone();
-                tokio::spawn(async move { withdraw(&guest, seq, outcome).await });
-                log("peer", 0, ms(authorized), ms(Instant::now()));
-                return Err(Stopped::Declined(why.clone()));
-            }
-            let held = image(outcome.await, &prompt);
-            (held, v, Instant::now(), authorized)
+    let mut held: Option<Held<GuestImage>> = None;
+    let mut cleared: Option<(&'static str, Clearance)> = None;
+    let (mut peer_done, mut here_done) = (false, false);
+    let (mut drawn, mut authorized) = (0, 0);
+    let mut failed: Vec<String> = Vec::new();
+    loop {
+        if held.is_some() && cleared.is_some() {
+            break;
         }
-        o = &mut outcome => {
-            let drawn = Instant::now();
-            let held = image(o, &prompt)?;
-            if let Some(said) = authorizing.take() {
-                said();
-            }
-            let v = verdict.await;
-            (Ok(held), v, drawn, Instant::now())
+        if cleared.is_none() && peer_done && here_done {
+            // Neither check could answer: nothing drawn is kept.
+            withdraw_undrawn(parts.guest, held.is_some(), seq, outcome);
+            log("none", drawn, 0, ms(Instant::now()));
+            return Err(Stopped::CheckUnavailable(failed.join("; ")));
         }
-    };
-    let clearance = match verdict {
-        PeerVerdict::Allowed(a) => match parts.signer.verify(&a, IMAGE, &prompt, now_ms()) {
-            Ok(()) => {
-                parts.cache.put(a.clone(), now_ms());
-                Some(Clearance::Authorized(a))
+        tokio::select! {
+            o = &mut outcome, if held.is_none() => {
+                drawn = ms(Instant::now());
+                held = Some(image(o, &prompt)?);
+                if cleared.is_none() {
+                    if let Some(said) = authorizing.take() {
+                        said();
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("a peer's authorization did not verify here: {e}");
-                None
+            v = &mut peer, if !peer_done => {
+                peer_done = true;
+                match v {
+                    PeerVerdict::Allowed(a) => {
+                        match parts.signer.verify(&a, IMAGE, &prompt, now_ms()) {
+                            Ok(()) => {
+                                parts.cache.put(a.clone(), now_ms());
+                                if cleared.is_none() {
+                                    authorized = ms(Instant::now());
+                                    cleared = Some(("peer", Clearance::Authorized(a)));
+                                }
+                            }
+                            Err(e) => failed.push(format!("the peer's authorization: {e}")),
+                        }
+                    }
+                    PeerVerdict::Refused(why) => {
+                        parts.cache.refuse(IMAGE, &prompt, now_ms());
+                        withdraw_undrawn(parts.guest, held.is_some(), seq, outcome);
+                        log("peer", drawn, ms(Instant::now()), ms(Instant::now()));
+                        return Err(Stopped::Declined(why));
+                    }
+                    PeerVerdict::Failed(why) => {
+                        tracing::warn!("a peer could not authorize a draw: {why}");
+                        failed.push(why);
+                    }
+                }
             }
-        },
-        PeerVerdict::Refused(why) => {
-            parts.cache.refuse(IMAGE, &prompt, now_ms());
-            log("peer", ms(drawn), ms(authorized), ms(Instant::now()));
-            return Err(Stopped::Declined(why));
-        }
-        PeerVerdict::Failed(why) => {
-            tracing::warn!("a peer could not authorize a draw, so it is checked here: {why}");
-            None
-        }
-    };
-    let held = held?;
-    let (source, clearance) = match clearance {
-        Some(c) => ("peer", c),
-        // The peer gave no verdict: checked here now the draw is done and the
-        // engine is free — a wait the caller is told about.
-        None => {
-            if let Some(said) = authorizing.take() {
-                said();
+            l = &mut here, if !here_done => {
+                here_done = true;
+                match l {
+                    Ok(a) => {
+                        if cleared.is_none() {
+                            authorized = ms(Instant::now());
+                            cleared = Some(("local", Clearance::Authorized(a)));
+                        }
+                    }
+                    Err(Stopped::CheckUnavailable(why)) => {
+                        tracing::warn!("this member could not authorize a draw: {why}");
+                        failed.push(why);
+                    }
+                    Err(stopped) => {
+                        withdraw_undrawn(parts.guest, held.is_some(), seq, outcome);
+                        log("local", drawn, ms(Instant::now()), ms(Instant::now()));
+                        return Err(stopped);
+                    }
+                }
             }
-            (
-                "local",
-                Clearance::Authorized(authorized_here(&parts, &prompt).await?),
-            )
         }
+    }
+    let (Some(held), Some((source, clearance))) = (held, cleared) else {
+        unreachable!("the loop leaves only with both");
     };
     let out = release(held, clearance);
-    log(source, ms(drawn), ms(authorized), ms(Instant::now()));
+    log(source, drawn, authorized, ms(Instant::now()));
     out
+}
+
+/// Withdraw job `seq` behind the answer, unless it was already `drawn` — then
+/// the picture is simply dropped.
+fn withdraw_undrawn<D>(guest: &D, drawn: bool, seq: u64, outcome: Outcome)
+where
+    D: GuestDraw + Clone + Send + Sync + 'static,
+{
+    if !drawn {
+        let guest = guest.clone();
+        tokio::spawn(async move { withdraw(&guest, seq, outcome).await });
+    }
 }
 
 /// How often a refused job is withdrawn again while a drain holds it.
@@ -309,16 +346,22 @@ mod tests {
         }
     }
 
-    /// A check that answers `verdict` and counts its calls.
+    /// A check that answers `verdict` after `delay` and counts its calls.
     struct FakeCheck {
         verdict: Result<(), Denial>,
+        delay: Duration,
         calls: AtomicUsize,
     }
 
     impl FakeCheck {
         fn answering(verdict: Result<(), Denial>) -> Self {
+            Self::after(verdict, 0)
+        }
+
+        fn after(verdict: Result<(), Denial>, delay_ms: u64) -> Self {
             Self {
                 verdict,
+                delay: Duration::from_millis(delay_ms),
                 calls: AtomicUsize::new(0),
             }
         }
@@ -327,8 +370,11 @@ mod tests {
     impl ContentCheck for FakeCheck {
         fn check(&self, _: &str) -> impl Future<Output = Result<(), Denial>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let v = self.verdict.clone();
-            async move { v }
+            let (v, delay) = (self.verdict.clone(), self.delay);
+            async move {
+                sleep(delay).await;
+                v
+            }
         }
     }
 
@@ -484,21 +530,20 @@ mod tests {
         assert_eq!(check.calls.load(Ordering::SeqCst), 0);
     }
 
-    /// **A peer that allows releases the picture**, and its authorization is
-    /// kept, so the same prompt again asks no one.
+    /// **A peer that allows first releases the picture**, and its
+    /// authorization is kept, so the same prompt again asks no one.
     #[tokio::test]
     async fn a_peers_authorization_releases_and_is_kept() {
         let signer = Signer::new([4; 32]);
         let cache = Cache::default();
-        let a = signer.sign(IMAGE, PROMPT, now_ms());
-        let check = FakeCheck::answering(Ok(()));
+        let a = signer.sign(IMAGE, PROMPT, now_ms() - 5_000);
+        let check = FakeCheck::after(Ok(()), 10_000);
         let (guest, finish) = FakeGuest::slow(1);
         let allowing = peer(true, Some(PeerVerdict::Allowed(a.clone())), 0);
         finish.send(()).unwrap();
         let (out, _) = run(&check, &allowing, &guest, &signer, &cache, None).await;
         assert_eq!(out.unwrap().authorization, Some(a.clone()));
         assert_eq!(cache.get(IMAGE, PROMPT, now_ms()), Some(a));
-        assert_eq!(check.calls.load(Ordering::SeqCst), 0);
 
         let (out, _) = run(
             &check,
@@ -518,7 +563,7 @@ mod tests {
         let signer = Signer::new([4; 32]);
         let a = signer.sign(IMAGE, PROMPT, now_ms());
         let (out, asked) = run(
-            &FakeCheck::answering(Ok(())),
+            &FakeCheck::after(Ok(()), 50),
             &peer(true, Some(PeerVerdict::Allowed(a)), 50),
             &FakeGuest::quick(),
             &signer,
@@ -604,29 +649,96 @@ mod tests {
         assert_eq!(out.unwrap_err(), Stopped::Guest(no_room));
     }
 
-    /// **A peer that fails at once still says the draw is waiting on its
-    /// verdict** while the check runs here.
+    /// **The check here releases the picture while the peer is still
+    /// queued**, and nothing waits on the peer once it has.
     #[tokio::test]
-    async fn a_local_check_after_the_draw_is_announced() {
-        let (guest, finish) = FakeGuest::slow(1);
-        drop(finish);
-        let (_, asked) = run(
-            &FakeCheck::answering(Ok(())),
-            &peer(true, Some(PeerVerdict::Failed("503".into())), 0),
-            &guest,
-            &Signer::new([4; 32]),
-            &Cache::default(),
+    async fn the_check_here_releases_while_the_peer_is_slow() {
+        let signer = Signer::new([4; 32]);
+        let cache = Cache::default();
+        let late = signer.sign(IMAGE, PROMPT, now_ms() - 5_000);
+        let started = Instant::now();
+        let (out, _) = run(
+            &FakeCheck::after(Ok(()), 30),
+            &peer(true, Some(PeerVerdict::Allowed(late.clone())), 60_000),
+            &FakeGuest::quick(),
+            &signer,
+            &cache,
             None,
         )
         .await;
-        assert!(asked);
+        let a = out.unwrap().authorization.unwrap();
+        assert_ne!(a, late, "released on the peer's answer");
+        assert_eq!(signer.verify(&a, IMAGE, PROMPT, now_ms()), Ok(()));
+        assert_eq!(cache.get(IMAGE, PROMPT, now_ms()), Some(a));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited on the peer"
+        );
+    }
+
+    /// **A refusal here withdraws the draw** while the peer is still queued.
+    #[tokio::test]
+    async fn a_refusal_here_withdraws_the_draw() {
+        let (guest, _finish) = FakeGuest::slow(1);
+        let cache = Cache::default();
+        let (out, _) = run(
+            &FakeCheck::answering(Err(Denial::Refused)),
+            &peer(true, Some(PeerVerdict::Failed("never".into())), 60_000),
+            &guest,
+            &Signer::new([4; 32]),
+            &cache,
+            None,
+        )
+        .await;
+        assert_eq!(
+            out.unwrap_err(),
+            Stopped::Declined(Denial::Refused.to_string())
+        );
+        until_cancelled(&guest).await;
+        assert!(guest.cancelled.load(Ordering::SeqCst));
+        assert!(cache.refused(IMAGE, PROMPT, now_ms()));
+    }
+
+    /// **A refusal overrules an allow from the other check**: the call is
+    /// declined, and a retry is neither drawn nor released on the allow.
+    #[tokio::test]
+    async fn a_refusal_overrules_the_other_checks_allow() {
+        let cache = Cache::default();
+        let (guest, _finish) = FakeGuest::slow(1);
+        let (out, _) = run(
+            &FakeCheck::answering(Ok(())),
+            &peer(true, Some(PeerVerdict::Refused("not this".into())), 30),
+            &guest,
+            &Signer::new([4; 32]),
+            &cache,
+            None,
+        )
+        .await;
+        assert_eq!(out.unwrap_err(), Stopped::Declined("not this".into()));
+
+        let again = FakeGuest::quick();
+        let (out, _) = run(
+            &FakeCheck::answering(Ok(())),
+            &peer(true, None, 0),
+            &again,
+            &Signer::new([4; 32]),
+            &cache,
+            None,
+        )
+        .await;
+        assert!(matches!(out.unwrap_err(), Stopped::Declined(_)));
+        assert_eq!(
+            again.submitted.load(Ordering::SeqCst),
+            0,
+            "drawn on the allow"
+        );
     }
 
     /// **A refusal after the drain took the job drops the picture.**
     #[tokio::test]
     async fn a_refusal_after_the_draw_drops_the_picture() {
         let (out, _) = run(
-            &FakeCheck::answering(Ok(())),
+            &FakeCheck::after(Ok(()), 10_000),
             &peer(true, Some(PeerVerdict::Refused("not this".into())), 30),
             &FakeGuest::quick(),
             &Signer::new([4; 32]),
@@ -637,17 +749,18 @@ mod tests {
         assert_eq!(out.unwrap_err(), Stopped::Declined("not this".into()));
     }
 
-    /// **A peer that fails is replaced by this member's check, after the
-    /// draw**; one whose authorization does not verify here, the same.
+    /// **A peer that fails leaves this member's check to decide**, and the
+    /// draw done meanwhile says it is waiting; a peer whose authorization does
+    /// not verify here, the same.
     #[tokio::test]
-    async fn a_failed_peer_is_checked_here_after_the_draw() {
+    async fn a_failed_peer_leaves_the_check_here_to_decide() {
         let signer = Signer::new([4; 32]);
         for v in [
             PeerVerdict::Failed("503".into()),
             PeerVerdict::Allowed(Signer::new([5; 32]).sign(IMAGE, PROMPT, now_ms())),
         ] {
-            let check = FakeCheck::answering(Ok(()));
-            let (out, _) = run(
+            let check = FakeCheck::after(Ok(()), 50);
+            let (out, asked) = run(
                 &check,
                 &peer(true, Some(v), 0),
                 &FakeGuest::quick(),
@@ -657,18 +770,31 @@ mod tests {
             )
             .await;
             assert!(out.is_ok());
+            assert!(asked, "no `authorizing` while the check here ran");
             assert_eq!(check.calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// **Both checks failing keeps nothing**: the check is unavailable, and
+    /// says why each failed.
+    #[tokio::test]
+    async fn both_checks_failing_keeps_nothing() {
+        let (guest, _finish) = FakeGuest::slow(1);
         let (out, _) = run(
             &FakeCheck::answering(Err(Denial::Unavailable("busy".into()))),
             &peer(true, Some(PeerVerdict::Failed("503".into())), 0),
-            &FakeGuest::quick(),
-            &signer,
+            &guest,
+            &Signer::new([4; 32]),
             &Cache::default(),
             None,
         )
         .await;
-        assert!(matches!(out.unwrap_err(), Stopped::CheckUnavailable(_)));
+        let Stopped::CheckUnavailable(why) = out.unwrap_err() else {
+            panic!("not unavailable");
+        };
+        assert!(why.contains("503") && why.contains("busy"), "{why}");
+        until_cancelled(&guest).await;
+        assert!(guest.cancelled.load(Ordering::SeqCst));
     }
 
     /// **With no peer the check runs first**, and a refused prompt is never
@@ -695,7 +821,7 @@ mod tests {
     async fn a_prompt_refused_moments_ago_is_not_drawn_again() {
         let cache = Cache::default();
         let (out, _) = run(
-            &FakeCheck::answering(Ok(())),
+            &FakeCheck::after(Ok(()), 10_000),
             &peer(true, Some(PeerVerdict::Refused("not this".into())), 0),
             &FakeGuest::quick(),
             &Signer::new([4; 32]),
