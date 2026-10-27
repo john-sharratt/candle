@@ -2791,12 +2791,12 @@ impl Scheduler {
             let _ = self.session.release_empty_arenas();
             self.pack_until_settled(PackGoal::Ground);
         }
-        // **The working sets of slots with nothing in flight, last.** The
-        // rungs above protect every slot's working set, which is right between
-        // forwards; a drain blocks every forward, so only a slot mid-turn still
-        // has its working set referenced. The rest reload warm→hot at their
-        // next projection, a few seconds at the link's rate against a draw
-        // that otherwise cannot run. As the weight side's concession goes
+        // **Dialogue working-set locks, last.** The rungs above protect every
+        // dialogue's locked working set (`Substrate::evict_hot_to_free`), which
+        // is right between forwards; a drain blocks every forward, so only a
+        // slot with a turn on it still needs its own. The rest reload warm→hot
+        // at their next projection, a few seconds at the link's rate against a
+        // draw that otherwise cannot run — as the weight side's concession goes
         // below its serving floor for the drain alone.
         let short = target.saturating_sub(free(self));
         if short > 0 {
@@ -2831,50 +2831,43 @@ impl Scheduler {
         Some((relieved.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
-    /// The union of every live slot's projection working set — what relief
-    /// eviction protects ([`Self::evict_cold_tail`]).
-    pub(super) fn relief_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+    /// The union of the working sets of the slots that are not idle — a turn
+    /// running, carved or queued on them ([`Self::slot_idle`]). What the
+    /// working-set pins hold, and what relief eviction protects
+    /// ([`Self::evict_cold_tail`]).
+    ///
+    /// **An idle slot's working set is not live.** An npcd conversation keeps
+    /// its slot bound between turns, and while every bound slot's set counted,
+    /// each publish re-pinned and re-stamped it: the idle demote never reached
+    /// it and relief never might. On WhiteWorld (2026-10-27) one idle
+    /// dialogue's set grew to 16 GB of hot K/V across turns and refused image
+    /// draws with nothing running. Left out, it ages like any other unit — the
+    /// idle demote's own grace spares the gap between quick turns — and its next
+    /// projection lifts back from warm what it selects.
+    pub(super) fn live_working_sets(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
         let mut keep_sections: Vec<SectionId> = Vec::new();
         let mut keep_turns: Vec<TurnKey> = Vec::new();
-        for st in self.slot_projection_state.values() {
+        for (&slot, st) in &self.slot_projection_state {
+            if self.slot_idle(slot) {
+                continue;
+            }
             keep_sections.extend(st.working_set.sections.iter().copied());
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
         (keep_sections, keep_turns)
     }
 
-    /// The working sets of the slots with a turn in flight — prefilling,
-    /// decoding, or in a creep running or paused mid-sweep — the only ones a
-    /// drain must not evict.
-    fn in_flight_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
-        let mut seqs: HashSet<SequenceId> = HashSet::new();
-        seqs.extend(self.active_prefills.iter().map(|p| p.work.sequence_id));
-        seqs.extend(self.active_decodes.keys().copied());
-        seqs.extend(
-            self.wave_prefill_members
-                .iter()
-                .map(|m| SequenceId(m.seq_id())),
-        );
-        if let Some(paused) = &self.paused_creep {
-            seqs.extend(paused.seq_ids().into_iter().map(SequenceId));
-        }
-        let slots: HashSet<SequenceId> = seqs.iter().map(|&s| self.owning_slot(s)).collect();
-        let mut keep_sections: Vec<SectionId> = Vec::new();
-        let mut keep_turns: Vec<TurnKey> = Vec::new();
-        for slot in seqs.iter().chain(slots.iter()) {
-            if let Some(st) = self.slot_projection_state.get(slot) {
-                keep_sections.extend(st.working_set.sections.iter().copied());
-                keep_turns.extend(st.working_set.turns.iter().copied());
-            }
-        }
-        (keep_sections, keep_turns)
+    /// What relief eviction protects: [`Self::live_working_sets`].
+    pub(super) fn relief_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+        self.live_working_sets()
     }
 
-    /// Shed to warm the hot turns of every working set but those of slots with
-    /// a turn in flight ([`Self::in_flight_keep_list`]), up to `target_bytes`.
-    /// **Only inside a guest's drain**, where nothing forwards until it ends.
+    /// Shed to warm the hot turns of every working set but the live ones
+    /// ([`Self::live_working_sets`]), dialogue working-set locks included, up
+    /// to `target_bytes`. **Only inside a guest's drain**, where nothing
+    /// forwards until it ends.
     fn evict_idle_working_sets(&mut self, target_bytes: u64) -> crate::substrate::EvictionReport {
-        let (keep_sections, keep_turns) = self.in_flight_keep_list();
+        let (keep_sections, keep_turns) = self.live_working_sets();
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
         let mut remaining = target_bytes;
         for conv in self.distinct_substrates() {
@@ -7123,6 +7116,34 @@ mod wave_chunk_tests {
             1,
             "with the wait cleared, the idle engine did not force its queue head"
         );
+    }
+
+    /// An idle slot's working set is not live: it is neither pinned nor kept
+    /// from relief. A turn queued on the slot makes it live again.
+    #[test]
+    fn only_a_slot_with_a_turn_on_it_keeps_its_working_set_live() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let slot = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let key = TurnKey::new(
+            crate::projection::TimelineId::for_test(999),
+            crate::projection::TurnIndex(0),
+        );
+        scheduler
+            .slot_projection_state
+            .entry(slot)
+            .or_default()
+            .working_set
+            .turns
+            .push(key);
+
+        let (_, turns) = scheduler.live_working_sets();
+        assert!(turns.is_empty(), "an idle slot's working set was live");
+
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(slot, (0..16u32).collect()).work);
+        let (_, turns) = scheduler.live_working_sets();
+        assert_eq!(turns, vec![key]);
     }
 
     /// An urgent prompt queued behind a high prefill outranks it, and so is not
