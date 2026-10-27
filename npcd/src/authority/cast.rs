@@ -105,6 +105,22 @@ impl Runtime {
                 let mine = lease.is_some_and(|l| l.holder == me);
                 let awake = self.scheduler.pace_of(npc).is_some();
                 let handing = self.standing.handing(npc);
+                if !self.standing.characters() {
+                    // **A member that runs no characters runs none**, whatever
+                    // its leases say. One still naming it — lent before it was
+                    // told so — is handed back once the authority names where
+                    // it goes next; until then it is held and not run.
+                    if awake {
+                        self.put_down(npc);
+                    }
+                    let next = lease.is_some_and(|l| l.next.is_some());
+                    if mine && next && !handing && self.standing.begin_handing(npc) {
+                        self.hand_back(&world, npc);
+                    } else if !mine && handing {
+                        self.standing.end_handing(npc);
+                    }
+                    continue;
+                }
                 match (mine, awake) {
                     (true, false) if !handing => {
                         let ready = lease

@@ -233,6 +233,7 @@ mod tests {
                 },
                 model: None,
                 repos: Vec::new(),
+                leaseholder: true,
             },
             GroupKey::from_bytes([1; 32]),
             Vec::new(),

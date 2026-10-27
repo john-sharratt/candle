@@ -343,6 +343,7 @@ fn zend_member(node: u64) -> Arc<AppMember> {
                 describe: "model".into(),
             }),
             repos: Vec::new(),
+            leaseholder: true,
         },
         key(),
         vec!["https://gw".into()],

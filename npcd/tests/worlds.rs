@@ -215,6 +215,11 @@ impl Member {
 /// Start `store` as a member of `gw`, hosting the vault as `world`, with a
 /// body for each of `cast` standing in the green room.
 async fn member(gw: &Gw, store: Store, world: &str, cast: &[u64]) -> Member {
+    member_as(gw, store, world, cast, true).await
+}
+
+/// [`member`], taking leases or not (`Identity::leaseholder`).
+async fn member_as(gw: &Gw, store: Store, world: &str, cast: &[u64], leaseholder: bool) -> Member {
     let Store { dir, shared, conv } = store;
     let node = conv.node();
     let replication = ConversationStore::new(conv, 0, || {})
@@ -253,6 +258,7 @@ async fn member(gw: &Gw, store: Store, world: &str, cast: &[u64]) -> Member {
                 describe: "model".into(),
             }),
             repos: vec![],
+            leaseholder,
         },
         key(),
         vec!["https://gw".into()],
@@ -514,6 +520,46 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
         replica.rt.scheduler.inbox_depth(speaker).unwrap() > before
     })
     .await;
+}
+
+/// **A member that takes no lease holds no world and runs no character**,
+/// though the world is named for it and half the cast would be lent to it
+/// were it weighed like the other: the member that takes leases holds the
+/// world and every character, and the other follows the records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_member_that_takes_no_lease_runs_nothing() {
+    let gw = gateway();
+    let (sa, sb) = (store(), store());
+    let nodes = [sa.node(), sb.node()];
+    let world = &world_for(&nodes, sb.node());
+    let cast = cast_for(&nodes, 3);
+    let a = member(&gw, sa, world, &cast).await;
+    let b = member_as(&gw, sb, world, &cast, false).await;
+    let both = [&a, &b];
+
+    until("a holds the world and every character", WITHIN, || {
+        let leases = leases_of(&a.rt.standing.written(world));
+        a.role(world).is_authority()
+            && leases.len() == cast.len()
+            && leases.values().all(|l| l.holder == hex(a.node()))
+    })
+    .await;
+    until("b follows the records", WITHIN, || {
+        b.rt.standing.written(world) == a.rt.standing.written(world)
+    })
+    .await;
+    until("every character awake on a alone", WITHIN, || {
+        cast.iter().all(|&npc| a.awake(npc) && !b.awake(npc))
+    })
+    .await;
+    assert_eq!(authority_of(world, &both).len(), 1);
+    assert_eq!(b.role(world), Role::Replica);
+    assert!(
+        weighed(&a)
+            .iter()
+            .any(|m| m.node == b.node() && m.weight == 0.0),
+        "b is listed at weight 0"
+    );
 }
 
 /// **A world moves to the member rendezvous names, after the one handing it

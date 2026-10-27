@@ -383,7 +383,9 @@ member                                               gateway
 - `node` is the member's persistent 64-bit id (§3.7); `host` is a display name.
 - `build` is `{ count, hash, local }` (§3.5). `model` is the `ModelKey` the substrate is
   bound to — the fields `same_model` compares, plus `describe()` for display; agents
-  send none. `power` and `repos` feed routing (§5.3, §10.1, §11.2).
+  send none. `repos` feeds routing (§10.1, §11.2). `power` becomes the member's
+  rendezvous weight (§9.5): its measured power, at least 1, or 0 for a member that takes
+  no lease. Routing reads the live power in `CAPACITY` (§5.3), never this one.
 - **One session per node.** A `HELLO` from a node that already has a session on this
   gateway for the app replaces it, once its proof passes: the old session is closed
   4409 and its streams fail as §5.6 says. A socket that drops and is re-dialled at once
@@ -3266,6 +3268,22 @@ owner(k) = argmax over members m of   -w_m / ln(u(k, m))
   fixed for the session. Neither the second-by-second idle flag nor the drifting
   measured power (§5.3) feeds it, so neither load churn nor a better measurement moves
   worlds while the membership stands.
+
+**A member that takes no lease.** An npcd configured `characters: false`
+(`--no-characters`) says `power` 0 in its `HELLO`, so it is listed at weight 0, and
+**a member of weight 0 owns no key** — not even alone, with every other member away. A
+leaseholder says at least 1, so a weight of 0 never means "not measured yet". The
+member that takes none never proposes for a world, so it is never a world's authority
+and never keeps a Makers' table, and no character is lent to it. It refuses on its own
+account too, so leases from before it was configured so do not run there: a world
+lease it still holds it hands over at once, and a character lease still naming it is
+handed back as soon as the authority names where the character goes next — held, and
+not run, until then. Everything else is as for any member: it replicates the
+substrate, votes, applies the cast as records, and serves the routes the gateway places
+by its live power and reach (§5.3) — draws among them. With every member that takes
+leases away, the worlds wait for one to return; nothing moves to the member that takes
+none. The setting needs a cluster: an npcd with none is every world's authority, and is
+refused it.
 
 ### 9.6 Moving a world and routing to it
 

@@ -70,6 +70,7 @@ async fn join(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) -> anyh
             build: this_build(),
             model: None,
             repos: Vec::new(),
+            leaseholder: true,
         },
         key,
         vec![target.url.clone()],

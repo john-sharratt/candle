@@ -102,6 +102,7 @@ fn member(
             build,
             model: Some(model),
             repos: vec![],
+            leaseholder: true,
         },
         key(),
         vec!["https://gw".into()],

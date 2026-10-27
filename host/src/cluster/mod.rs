@@ -194,6 +194,9 @@ pub struct AppLink {
     own_oseq: OnceLock<Box<dyn Fn() -> u64 + Send + Sync>>,
     /// The repositories the tenant holds, for `HELLO` (§10.1).
     repos: OnceLock<Vec<RepoAd>>,
+    /// Whether rendezvous may name this member (`Identity::leaseholder`); a
+    /// leaseholder unless the tenant says otherwise before it joins.
+    leaseholder: OnceLock<bool>,
 }
 
 impl Drop for Cluster {
@@ -270,6 +273,7 @@ impl Cluster {
                             member: OnceLock::new(),
                             own_oseq: OnceLock::new(),
                             repos: OnceLock::new(),
+                            leaseholder: OnceLock::new(),
                         }),
                     )
                 })
@@ -352,6 +356,7 @@ impl Cluster {
                 build: self.build.clone(),
                 model,
                 repos: link.repos.get().cloned().unwrap_or_default(),
+                leaseholder: link.leaseholder.get().copied().unwrap_or(true),
             },
             self.settings.key.clone(),
             self.targets.iter().map(|t| t.url.clone()).collect(),
@@ -539,6 +544,19 @@ impl AppLink {
     /// a conversation's repositories (§10.1).
     pub fn set_repos(&self, repos: Vec<RepoAd>) {
         let _ = self.repos.set(repos);
+    }
+
+    /// Whether rendezvous may name this member, before it joins: `false` keeps
+    /// it out of every lease while it replicates and serves (§9.5).
+    pub fn set_leaseholder(&self, leaseholder: bool) {
+        if self.member.get().is_some() || self.leaseholder.set(leaseholder).is_err() {
+            tracing::error!(
+                app = self.app,
+                leaseholder,
+                "a member's leaseholding was set after it was admitted, or twice — its admission \
+                 stands as it was"
+            );
+        }
     }
 
     /// The tenant finished loading, or went back to it: `CAPACITY` says so at

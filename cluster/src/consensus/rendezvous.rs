@@ -33,9 +33,14 @@ pub fn score(key: &[u8], node: u64, weight: f64) -> f64 {
 
 /// The member that owns `key`, or `None` with no members. Ties — vanishingly
 /// rare — go to the lower node, so every member agrees.
+///
+/// **A member of weight 0 owns nothing**, even alone: it was admitted saying
+/// rendezvous may not name it (`Identity::leaseholder`), and a scan that let it
+/// win by default would hand it a world the moment every other member is away.
 pub fn owner(key: &[u8], members: &[Weighted]) -> Option<u64> {
     members
         .iter()
+        .filter(|m| m.weight > 0.0)
         .map(|m| (score(key, m.node, m.weight), m.node))
         .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))
         .map(|(_, node)| node)
@@ -91,6 +96,16 @@ mod tests {
             assert!(after == was || was == 2, "a leave moved {i} from {was}");
         }
         assert_eq!(owner(b"k", &[]), None);
+    }
+
+    /// **A member of weight 0 owns no key**, beside others or alone.
+    #[test]
+    fn a_member_of_weight_zero_owns_nothing() {
+        let ms = members(&[(1, 1.0), (2, 0.0)]);
+        for i in 0..2000u32 {
+            assert_eq!(owner(&i.to_le_bytes(), &ms), Some(1));
+        }
+        assert_eq!(owner(b"k", &members(&[(2, 0.0)])), None);
     }
 
     /// Shares tend to the weights.

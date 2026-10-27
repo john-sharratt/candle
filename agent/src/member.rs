@@ -155,6 +155,7 @@ impl Agent {
                 build: this_build(),
                 model: None,
                 repos: jobs.checkouts().ads(),
+                leaseholder: true,
             },
             key,
             urls,
