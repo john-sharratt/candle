@@ -266,3 +266,85 @@ fn reciprocal() -> Result<()> {
     assert_eq!(floats(&out["y"]), vec![-0.25, 0.5, 2.0]);
     Ok(())
 }
+
+/// Every operand, broadcast together.
+#[test]
+fn sum_of_three_broadcasts() -> Result<()> {
+    let a = Tensor::new(&[[1f32, 2.0], [3.0, 4.0]], &Device::Cpu)?;
+    let b = Tensor::new(&[10f32, 20.0], &Device::Cpu)?;
+    let c = Tensor::new(100f32, &Device::Cpu)?;
+    let out = run("Sum", vec![("a", a), ("b", b), ("c", c)], vec![], &["y"])?;
+    assert_eq!(
+        out["y"].to_vec2::<f32>()?,
+        vec![vec![111.0, 122.0], vec![113.0, 124.0]]
+    );
+    Ok(())
+}
+
+fn gather_nd(data: Tensor, indices: Tensor, batch_dims: i64) -> Result<Tensor> {
+    let mut out = run(
+        "GatherND",
+        vec![("data", data), ("indices", indices)],
+        vec![("batch_dims", Attr::Int(batch_dims))],
+        &["y"],
+    )?;
+    Ok(out.remove("y").unwrap())
+}
+
+/// The operator definition's examples 1, 3 and 5, and a negative address.
+#[test]
+fn gather_nd_as_the_definition_reads() -> Result<()> {
+    let dev = &Device::Cpu;
+    // Example 1: whole addresses pick elements.
+    let y = gather_nd(
+        Tensor::new(&[[0i64, 1], [2, 3]], dev)?,
+        Tensor::new(&[[0i64, 0], [1, 1]], dev)?,
+        0,
+    )?;
+    assert_eq!(y.to_vec1::<i64>()?, vec![0, 3]);
+
+    // Example 3: a partial address picks a slice.
+    let cube = Tensor::new(&[[[0i64, 1], [2, 3]], [[4, 5], [6, 7]]], dev)?;
+    let y = gather_nd(cube.clone(), Tensor::new(&[[0i64, 1], [1, 0]], dev)?, 0)?;
+    assert_eq!(y.to_vec2::<i64>()?, vec![vec![2, 3], vec![4, 5]]);
+
+    // Example 5: one batch axis, each batch addressed on its own.
+    let y = gather_nd(cube, Tensor::new(&[[1i64], [0]], dev)?, 1)?;
+    assert_eq!(y.to_vec2::<i64>()?, vec![vec![2, 3], vec![4, 5]]);
+
+    // A negative address counts from the end.
+    let y = gather_nd(
+        Tensor::new(&[[0i64, 1], [2, 3]], dev)?,
+        Tensor::new(&[[-1i64, -1]], dev)?,
+        0,
+    )?;
+    assert_eq!(y.to_vec1::<i64>()?, vec![3]);
+    Ok(())
+}
+
+/// Two batch axes, as BiRefNet's deformable convolution gathers: each
+/// `(n, c)` plane sampled at its own positions.
+#[test]
+fn gather_nd_with_two_batch_axes() -> Result<()> {
+    let dev = &Device::Cpu;
+    // [2, 2, 3]: plane (n, c) holds 100n + 10c + i.
+    let data: Vec<f32> = (0..2)
+        .flat_map(|n| (0..2).flat_map(move |c| (0..3).map(move |i| (100 * n + 10 * c + i) as f32)))
+        .collect();
+    let data = Tensor::from_vec(data, (2, 2, 3), dev)?;
+    // [2, 2, 2, 1]: two positions per plane.
+    let idx = Tensor::new(
+        &[[[[2i64], [0]], [[1], [1]]], [[[0], [2]], [[2], [1]]]],
+        dev,
+    )?;
+    let y = gather_nd(data, idx, 2)?;
+    assert_eq!(y.dims(), &[2, 2, 2]);
+    assert_eq!(
+        y.to_vec3::<f32>()?,
+        vec![
+            vec![vec![2.0, 0.0], vec![11.0, 11.0]],
+            vec![vec![100.0, 102.0], vec![112.0, 111.0]]
+        ]
+    );
+    Ok(())
+}
