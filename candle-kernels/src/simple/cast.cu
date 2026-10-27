@@ -1760,6 +1760,7 @@ CAST_OP(int64_t, __nv_bfloat16, cast_i64_bf16)  // i64→bf16
 CAST_OP_VEC2(float, __nv_bfloat16, cast_f32_bf16)  // Vectorized f32->bf16
 CAST_OP(double,   __nv_bfloat16, cast_f64_bf16)
 CAST_THROUGH_OP(__nv_bfloat16, uint8_t, float, cast_bf16_u8)
+CAST_THROUGH_OP(__nv_bfloat16, int64_t, float, cast_bf16_i64)
 CAST_OP_VEC2(__nv_bfloat16, __half, cast_bf16_f16)  // Vectorized bf16->f16
 CAST_OP_VEC2(__half, __nv_bfloat16, cast_f16_bf16)  // Vectorized f16->bf16
 
@@ -1784,6 +1785,10 @@ CAST_OP(__half, __half, cast_f16_f16)
 
 CAST_THROUGH_OP(__half, uint8_t,  float, cast_f16_u8)
 CAST_OP(__half, uint32_t, cast_f16_u32)
+// Through f32: an f16 shape arithmetic (`Ceil` → `Cast` to INT64, as the fp16
+// converter leaves BiRefNet) had no kernel, and the dispatcher launched
+// nothing — the result was whatever the allocation held.
+CAST_THROUGH_OP(__half, int64_t,  float, cast_f16_i64)
 CAST_OP_VEC2(__half, float, cast_f16_f32)  // Vectorized f16->f32
 CAST_OP(__half, double,   cast_f16_f64)
 CAST_OP(uint8_t,  __half, cast_u8_f16 )

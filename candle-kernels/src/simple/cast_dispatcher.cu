@@ -100,6 +100,7 @@ extern "C" __global__ void cast_f64_f8_e4m3(size_t, size_t, const size_t*, const
 // From f16
 extern "C" __global__ void cast_f16_u8(size_t, size_t, const size_t*, const __half*, uint8_t*);
 extern "C" __global__ void cast_f16_u32(size_t, size_t, const size_t*, const __half*, uint32_t*);
+extern "C" __global__ void cast_f16_i64(size_t, size_t, const size_t*, const __half*, int64_t*);
 extern "C" __global__ void cast_f16_f32(size_t, size_t, const size_t*, const __half*, float*);
 extern "C" __global__ void cast_f16_f64(size_t, size_t, const size_t*, const __half*, double*);
 extern "C" __global__ void cast_f16_bf16(size_t, size_t, const size_t*, const __half*, __nv_bfloat16*);
@@ -108,6 +109,7 @@ extern "C" __global__ void cast_f16_f8_e4m3(size_t, size_t, const size_t*, const
 // From bf16
 extern "C" __global__ void cast_bf16_u8(size_t, size_t, const size_t*, const __nv_bfloat16*, uint8_t*);
 extern "C" __global__ void cast_bf16_u32(size_t, size_t, const size_t*, const __nv_bfloat16*, uint32_t*);
+extern "C" __global__ void cast_bf16_i64(size_t, size_t, const size_t*, const __nv_bfloat16*, int64_t*);
 extern "C" __global__ void cast_bf16_f32(size_t, size_t, const size_t*, const __nv_bfloat16*, float*);
 extern "C" __global__ void cast_bf16_f64(size_t, size_t, const size_t*, const __nv_bfloat16*, double*);
 extern "C" __global__ void cast_bf16_f16(size_t, size_t, const size_t*, const __nv_bfloat16*, __half*);
@@ -611,6 +613,7 @@ extern "C" void run_cast(
             case 1: cast_f16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (double*)out); break;
             case 2: cast_f16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (uint8_t*)out); break;
             case 3: cast_f16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (uint32_t*)out); break;
+            case 4: cast_f16_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (int64_t*)out); break;
             case 6: cast_f16_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (__nv_bfloat16*)out); break;
             case 7: cast_f16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (__nv_fp8_e4m3*)out); break;
         }
@@ -623,6 +626,7 @@ extern "C" void run_cast(
             case 1: cast_bf16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (double*)out); break;
             case 2: cast_bf16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint8_t*)out); break;
             case 3: cast_bf16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint32_t*)out); break;
+            case 4: cast_bf16_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (int64_t*)out); break;
             case 5: cast_bf16_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__half*)out); break;
             case 7: cast_bf16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_fp8_e4m3*)out); break;
         }
