@@ -450,8 +450,8 @@ impl<'a> AdmitPass<'a> {
     /// The tier the held cohort can give up at its next fit: what its members
     /// stand at now, less what they would stand at each held to the least
     /// advance. A running member is never taken out — it narrows, and keeps
-    /// advancing — and `fill_in_order` gives the next fit's rows to the members
-    /// nearest their first token first, so a short newcomer finishes in the
+    /// advancing — and `gang::gang_shares` gives the next fit's rows to the
+    /// short members first, so a short newcomer finishes in the
     /// sweep it joins while the long members take what it leaves.
     ///
     /// **Only between sweeps.** The narrowing lands at the next fit, so it can
@@ -755,7 +755,7 @@ impl AdmitPass<'_> {
         // would offer ground that is already spoken for.
         //
         // **A full forward takes no more turns** ([`room_left`]): its rows are
-        // filled in order (`admission::fill_in_order`), so a turn past them would
+        // filled in order (`gang::gang_shares`), so a turn past them would
         // advance by nothing while holding its store. Every member in flight is
         // counted, sections and paused prefills included. See [`Self::room`].
         let (turn, seq) = (w.tokens.len(), w.sequence_id);
@@ -1464,7 +1464,7 @@ impl Scheduler {
 /// spent, or `None` when it is full.
 ///
 /// **A full forward takes no more turns.** Its rows are filled in order
-/// (`admission::fill_in_order`), so a turn joining a full forward advances by
+/// (`gang::gang_shares`), so a turn joining a full forward advances by
 /// nothing until the ones ahead finish — yet it claims its store and scratch
 /// at admission, and holds them while it waits. Joined while every member could
 /// still advance a chunk, BlackWorld's code_read ingest (2026-10-27) held 13

@@ -39,6 +39,7 @@ mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
 mod first_sample;
+mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
@@ -3821,6 +3822,11 @@ pub(crate) struct Scheduler {
     /// A creep set aside mid-sweep for a higher band's prompt, resumed at the
     /// same layer once nothing above its band waits (`paused_creep`).
     paused_creep: Option<PausedCreep>,
+    /// The background prompts being prefilled as one gang, by sequence id, so
+    /// they reach their first tokens together and decode side by side
+    /// (`docs/prefill_gangs.md`). Fixed from formation until every member's
+    /// prefill is done.
+    prefill_gang: Vec<usize>,
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
@@ -4216,6 +4222,7 @@ impl Scheduler {
             wave_prefill_members: Vec::new(),
             wave_prefill_rows: Vec::new(),
             paused_creep: None,
+            prefill_gang: Vec::new(),
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
             prefill_waits: prefill_wait::PrefillWaits::default(),
@@ -16765,7 +16772,7 @@ mod tests {
 
     /// **A spent forward takes no more turns.** Turns of 64 tokens fill the
     /// pass's rows, and the pass ends there: the forward is filled in order
-    /// (`admission::fill_in_order`), so a turn past its rows would advance by
+    /// (`gang::gang_shares`), so a turn past its rows would advance by
     /// nothing while holding its store. The rest wait in the queue for the next
     /// pass.
     #[test]

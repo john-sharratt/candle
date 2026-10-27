@@ -10,6 +10,7 @@ use super::creep_slice::time_bounded_layers;
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
+use super::gang;
 use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
@@ -1031,8 +1032,8 @@ impl Scheduler {
     }
 
     /// The residency a cohort of these members leaves at `rows` wide: the zone
-    /// less the tier their in-order shares of `rows` place, beside the
-    /// running decodes.
+    /// less the tier their shares of `rows` ([`Self::cohort_shares`]) place,
+    /// beside the running decodes.
     fn weights_at_width(
         &self,
         q_lens: &[usize],
@@ -1079,7 +1080,7 @@ impl Scheduler {
         rows: usize,
         stage: &[(usize, usize, usize)],
     ) -> u64 {
-        let shares = super::admission::fill_in_order(q_lens, rows, CHUNK_SIZE);
+        let shares = self.cohort_shares(seqs, q_lens, rows);
         let mut adv = Vec::new();
         let mut off = Vec::new();
         let mut sq = Vec::new();
@@ -1104,6 +1105,97 @@ impl Scheduler {
             )
             .unwrap_or(0);
         zone.saturating_sub(tier)
+    }
+
+    /// The rows each member of a cohort — `seqs`, with `remaining` rows each,
+    /// laid out shorts, gang, the rest — advances in a forward of `budget`
+    /// rows: [`gang::gang_shares`] over the members of [`Self::prefill_gang`].
+    /// The one division a cohort is formed, narrowed and priced by, so a gang
+    /// stays in step however its width is cut.
+    pub(super) fn cohort_shares(
+        &self,
+        seqs: &[usize],
+        remaining: &[usize],
+        budget: usize,
+    ) -> Vec<usize> {
+        let in_gang: Vec<bool> = seqs.iter().map(|s| self.prefill_gang.contains(s)).collect();
+        gang::gang_shares(remaining, &in_gang, budget, CHUNK_SIZE)
+    }
+
+    /// The gang a group forms with (`docs/prefill_gangs.md`): the live one —
+    /// those of its members still prefilling — or, in a `background` group with
+    /// none live, a new one from the long prompts not `paused`, the highest
+    /// band's in arrival order, as wide as [`Self::gang_width`] allows. A long
+    /// prompt is one a pass cannot finish.
+    fn prefill_gang_for(&self, background: bool, paused: &HashSet<usize>) -> Vec<usize> {
+        let prefilling = |p: &ActivePrefill| {
+            p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len()
+        };
+        let live: Vec<usize> = self
+            .prefill_gang
+            .iter()
+            .copied()
+            .filter(|&s| {
+                self.active_prefills
+                    .iter()
+                    .any(|p| p.work.sequence_id.0 == s && prefilling(p))
+            })
+            .collect();
+        if !live.is_empty() || !background {
+            return live;
+        }
+        let cap = self.max_prefill_pass_tokens;
+        let longs: Vec<(usize, usize)> = self
+            .active_prefills
+            .iter()
+            .filter(|p| {
+                prefilling(p)
+                    && !paused.contains(&p.work.sequence_id.0)
+                    && p.work.tokens.len() - p.offset > cap
+            })
+            .map(|p| {
+                (
+                    p.work.sequence_id.0,
+                    rank(self.decode_priority_or_high(p.work.sequence_id)),
+                )
+            })
+            .collect();
+        let width = self.gang_width(longs.len());
+        let formed = gang::form_gang(&longs, width);
+        if !formed.is_empty() {
+            let remaining: usize = self
+                .active_prefills
+                .iter()
+                .filter(|p| formed.contains(&p.work.sequence_id.0))
+                .map(|p| p.work.tokens.len() - p.offset)
+                .sum();
+            tracing::info!(
+                target: "candle_conversation::scheduler::creep",
+                members = formed.len(),
+                width,
+                longs = longs.len(),
+                remaining,
+                "prefill gang formed"
+            );
+        }
+        formed
+    }
+
+    /// How wide a gang of up to `longs` prompts may run: the widest whose decode
+    /// step, by the learned decode model at the weight zone's residency, costs
+    /// no more than twice a lone decode's ([`gang::gang_width`]). `1` — no gang
+    /// — while the decode model is unlearned.
+    fn gang_width(&self, longs: usize) -> usize {
+        let Some(rate) = self.wave_rate.as_ref().filter(|r| r.decode_learned()) else {
+            return 1;
+        };
+        let Some(zone) = super::interleave::effective_weight_zone_bytes(0) else {
+            return 1;
+        };
+        let per = rate.experts_per_decode(0);
+        gang::gang_width(longs, |n| {
+            rate.decode_step_secs(n.saturating_mul(per), zone)
+        })
     }
 
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
@@ -3604,7 +3696,7 @@ impl Scheduler {
             .filter(|p| !paused.contains(&p.work.sequence_id.0))
             .collect();
         // **Within a band, the prompt nearest its first token leads**, so the
-        // budget filled in order (`admission::fill_in_order`) finishes it and
+        // budget filled in order (`gang::gang_shares`) finishes it and
         // it decodes while the next ones prefill.
         candidates.sort_by_key(|p| {
             (
@@ -3646,6 +3738,26 @@ impl Scheduler {
         if high_only {
             candidates.retain(|p| !below_floor(self.decode_priority_or_high(p.work.sequence_id)));
         }
+        // ── A background group prefills its long prompts as a gang ───────────
+        //
+        // With nothing live leading, the long prompts are prefilled together so
+        // they reach their first tokens in the same forward and decode side by
+        // side, rather than one at a time and one row wide
+        // (`docs/prefill_gangs.md`). The shorts ride ahead of the gang and the
+        // longs outside it behind; stable, so each lane keeps its band and
+        // nearest-first order.
+        let gang = self.prefill_gang_for(!high_only, &paused);
+        if !high_only && !gang.is_empty() {
+            candidates.sort_by_key(|p| {
+                if gang.contains(&p.work.sequence_id.0) {
+                    1
+                } else if p.work.tokens.len().saturating_sub(p.offset) > cap {
+                    2
+                } else {
+                    0
+                }
+            });
+        }
         for p in candidates {
             if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
                 continue;
@@ -3660,6 +3772,7 @@ impl Scheduler {
                 advance: (p.work.tokens.len() - p.offset).min(cap),
             });
         }
+        self.prefill_gang = gang;
         // ── One adapter per wave ─────────────────────────────────────────────
         //
         // Same rule the decode cohort follows, applied where the prefill group
@@ -3687,8 +3800,9 @@ impl Scheduler {
         // Qwen3.6-35B-A3B asked for a 3.3 GB tier against a 3.0 GB gap between the
         // KV frontier and the weight floor, and every turn in the wave failed with
         // it. So the pass budget is filled in the order above — the nearest
-        // prompt takes all it has, the next what is left — and the rest rides the
-        // next group. See `admission::fill_in_order`.
+        // prompt takes all it has, the next what is left, a gang in proportion
+        // to its remainders — and the rest rides the next group. See
+        // `gang::gang_shares`.
         let remaining: Vec<usize> = members
             .iter()
             .map(|m| match m {
@@ -3700,7 +3814,8 @@ impl Scheduler {
         // A queue that passes the cap by no more than the model's slack rides
         // whole, rather than leaving a straggler group a sweep of its own.
         let budget = self.prefill_group_budget(remaining.iter().sum());
-        let shares = super::admission::fill_in_order(&remaining, budget, CHUNK_SIZE);
+        let seqs: Vec<usize> = members.iter().map(WaveMember::seq_id).collect();
+        let shares = self.cohort_shares(&seqs, &remaining, budget);
         let members_before = std::mem::take(&mut members);
         for (m, share) in members_before.into_iter().zip(shares) {
             if share == 0 {
@@ -4040,7 +4155,7 @@ impl Scheduler {
                 ground_mib = ground >> 20,
                 "creep cohort narrowed to the tier its windows will place"
             );
-            let shares = super::admission::fill_in_order(&q_lens, target, CHUNK_SIZE);
+            let shares = self.cohort_shares(&seqs, &q_lens, target);
             let before = std::mem::take(members);
             for (m, share) in before.into_iter().zip(shares) {
                 if share == 0 {
@@ -6985,6 +7100,120 @@ mod wave_chunk_tests {
             ),
             "the prompt past the reach carries its own error"
         );
+    }
+
+    /// The `(seq_id, advance)` of each prefill the group formed with.
+    fn rode(scheduler: &Scheduler) -> Vec<(usize, usize)> {
+        scheduler
+            .wave_prefill_members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { seq_id, advance } => (*seq_id, *advance),
+                WaveMember::Section { .. } => unreachable!("no sections were offered"),
+            })
+            .collect()
+    }
+
+    /// **A background gang rides between the shorts and the other longs**
+    /// (`docs/prefill_gangs.md`): the short `Low` prompt first, the gang's two
+    /// pages next sharing in proportion, and the long prompt that arrived
+    /// first but is outside the gang behind them — the group divided as
+    /// `gang::gang_shares` divides it.
+    #[test]
+    fn a_background_gang_rides_between_the_shorts_and_the_other_longs() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let outside = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let g1 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let g2 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let short = SequenceId(scheduler.session.create_sequence().expect("create"));
+        for (seq, len) in [
+            (outside, 4 * cap),
+            (g1, 4 * cap),
+            (g2, 4 * cap),
+            (short, 100),
+        ] {
+            scheduler.slot_bands.insert(seq, DecodePriority::Low);
+            scheduler
+                .active_prefills
+                .push(dialogue_prefill(seq, vec![1; len]));
+        }
+        scheduler.prefill_gang = vec![g1.0, g2.0];
+
+        scheduler.form_wave_group(false);
+
+        let budget = scheduler.prefill_group_budget(100 + 3 * cap);
+        let shares = gang::gang_shares(
+            &[100, cap, cap, cap],
+            &[false, true, true, false],
+            budget,
+            CHUNK_SIZE,
+        );
+        let expected: Vec<(usize, usize)> = [short.0, g1.0, g2.0, outside.0]
+            .into_iter()
+            .zip(shares)
+            .filter(|&(_, s)| s > 0)
+            .collect();
+        assert_eq!(rode(&scheduler), expected);
+        assert_eq!(expected[1].1, expected[2].1, "the gang advances in step");
+        assert_eq!(scheduler.prefill_gang, vec![g1.0, g2.0], "the gang holds");
+    }
+
+    /// **A live prompt leads, and the gang waits intact**: a `High` prompt's
+    /// group carries `High` prompts only, filled in order, and the background
+    /// gang is still the gang when the background resumes.
+    #[test]
+    fn a_live_prompt_leads_and_the_gang_waits_intact() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let g1 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let g2 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let live = SequenceId(scheduler.session.create_sequence().expect("create"));
+        for seq in [g1, g2] {
+            scheduler.slot_bands.insert(seq, DecodePriority::Low);
+            scheduler
+                .active_prefills
+                .push(dialogue_prefill(seq, vec![1; 4 * cap]));
+        }
+        scheduler.slot_bands.insert(live, DecodePriority::High);
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(live, vec![1; 64]));
+        scheduler.prefill_gang = vec![g1.0, g2.0];
+
+        scheduler.form_wave_group(false);
+
+        assert_eq!(rode(&scheduler), vec![(live.0, 64)]);
+        assert_eq!(scheduler.prefill_gang, vec![g1.0, g2.0]);
+    }
+
+    /// **A gang dissolves when its prefill is done**, not its decode — and with
+    /// the decode model unlearned, no new one forms: the group is filled in
+    /// order.
+    #[test]
+    fn a_gang_dissolves_when_its_prefill_is_done() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let g1 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let g2 = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let next = SequenceId(scheduler.session.create_sequence().expect("create"));
+        for seq in [g1, g2, next] {
+            scheduler.slot_bands.insert(seq, DecodePriority::Low);
+            scheduler
+                .active_prefills
+                .push(dialogue_prefill(seq, vec![1; 4 * cap]));
+        }
+        scheduler.active_prefills[0].offset = 4 * cap;
+        scheduler.active_prefills[1].offset = 4 * cap;
+        scheduler.prefill_gang = vec![g1.0, g2.0];
+
+        scheduler.form_wave_group(false);
+
+        assert!(
+            scheduler.prefill_gang.is_empty(),
+            "no gang outlives its prefill"
+        );
+        assert_eq!(rode(&scheduler)[0].0, next.0);
     }
 }
 
