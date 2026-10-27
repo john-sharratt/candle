@@ -60,7 +60,11 @@ pub fn main() -> Result<()> {
             let graph = model.graph.unwrap();
             let weights: std::collections::HashSet<_> =
                 graph.initializer.iter().map(|i| i.name.as_str()).collect();
-            for input in graph.input.iter().filter(|i| !weights.contains(i.name.as_str())) {
+            for input in graph
+                .input
+                .iter()
+                .filter(|i| !weights.contains(i.name.as_str()))
+            {
                 println!("input {}: {:?}", input.name, input.r#type);
             }
             for output in graph.output.iter() {
@@ -70,7 +74,11 @@ pub fn main() -> Result<()> {
             for node in graph.node.iter() {
                 *ops.entry(node.op_type.as_str()).or_default() += 1;
             }
-            println!("{} initializers, {} nodes", graph.initializer.len(), graph.node.len());
+            println!(
+                "{} initializers, {} nodes",
+                graph.initializer.len(),
+                graph.node.len()
+            );
             for (op, n) in ops {
                 println!("{n:6}  {op}");
             }

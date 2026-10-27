@@ -437,6 +437,30 @@ pub fn phase_offsets(per_phase: [usize; 3]) -> [usize; 3] {
     [0, 0, attention.max(ffn)]
 }
 
+/// The boundary every phase span's base must land on.
+///
+/// The same quantum ops carve at (`INHERIT_ALIGN` in candle-core), because a
+/// span's base is laid out from the entries before it ([`phase_offsets`]): an
+/// entry that is not a multiple of this shifts the forward span off the
+/// boundary, and a carve's alignment is only as good as its span's base.
+pub(crate) const WAVE_SPAN_ALIGN: usize = 256;
+
+/// A phase plan with every entry rounded up to [`WAVE_SPAN_ALIGN`].
+pub(crate) fn align_phase_plan(plan: [usize; 3]) -> [usize; 3] {
+    plan.map(|bytes| bytes.div_ceil(WAVE_SPAN_ALIGN) * WAVE_SPAN_ALIGN)
+}
+
+/// The spans a forward lays out for buffers of `per_phase`: the forward-wide
+/// span widened by `launch_scratch` — what the launchers carve inside their
+/// launches (`candle::cuda_backend::scratch_reserve`) — and every entry
+/// aligned. The one normalisation the tier's price ([`WavePlan::tier_bytes`])
+/// and its placement (`plan_wave_transient`) both apply, so the wave admission
+/// prices is the wave the forward places.
+pub fn launch_plan(per_phase: [usize; 3], launch_scratch: usize) -> [usize; 3] {
+    let [attention, ffn, forward] = per_phase;
+    align_phase_plan([attention, ffn, forward + launch_scratch])
+}
+
 /// The model shapes a layer's buffers are derived from.
 ///
 /// Deliberately **width-free**: a wave's row count is an argument to the sizing
@@ -2361,15 +2385,24 @@ impl WavePlan {
     /// nothing, and the placement was refused by one region — on every wave,
     /// 29,000 times in seven minutes, the same wave re-formed each time because
     /// nothing in its price had changed.
-    pub fn tier_bytes(&self, w: WaveWidth) -> usize {
+    ///
+    /// **With the launchers' scratch, because the placement carries it.**
+    /// `launch_scratch` is the reserve the forward span is widened by
+    /// ([`launch_plan`]); priced without it, admission fitted a 32-row creep
+    /// window whose 48 MiB tier the placement refused one region short, with
+    /// the weight side at its floor, four times over (WhiteWorld, 2026-10-27).
+    pub fn tier_bytes(&self, w: WaveWidth, launch_scratch: usize) -> usize {
         // `TARGET_ARENA_BYTES` is the region size read from the ungated source,
         // as `span_geometry` does — `region_pool::REGION_BYTES` is CUDA-only and
         // this plan is not.
-        let raw = tier_footprint([
-            self.phase_bytes(LayerPhase::Attention, w),
-            self.phase_bytes(LayerPhase::Ffn, w),
-            self.phase_bytes(LayerPhase::Forward, w),
-        ]);
+        let raw = tier_footprint(launch_plan(
+            [
+                self.phase_bytes(LayerPhase::Attention, w),
+                self.phase_bytes(LayerPhase::Ffn, w),
+                self.phase_bytes(LayerPhase::Forward, w),
+            ],
+            launch_scratch,
+        ));
         raw.div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
     }
 
@@ -2384,9 +2417,14 @@ impl WavePlan {
     /// Bisected rather than divided: the `div_ceil` steps make the cost a
     /// staircase, so dividing the budget by a per-row average lands inside a
     /// step and over-admits.
-    pub fn max_prefill_rows_for_tier(&self, budget: usize, head: WaveWidth) -> usize {
+    pub fn max_prefill_rows_for_tier(
+        &self,
+        budget: usize,
+        head: WaveWidth,
+        launch_scratch: usize,
+    ) -> usize {
         max_rows_within_cost(budget, |rows| {
-            self.tier_bytes(head.with_one_more_sequence(rows))
+            self.tier_bytes(head.with_one_more_sequence(rows), launch_scratch)
         })
     }
 
@@ -2408,13 +2446,14 @@ impl WavePlan {
         budget: usize,
         head: WaveWidth,
         kv_row_bytes: usize,
+        launch_scratch: usize,
     ) -> usize {
         max_rows_within_cost(budget, |rows| {
             let kv = rows
                 .saturating_mul(kv_row_bytes)
                 .div_ceil(TARGET_ARENA_BYTES)
                 .saturating_mul(TARGET_ARENA_BYTES);
-            self.tier_bytes(head.with_one_more_sequence(rows))
+            self.tier_bytes(head.with_one_more_sequence(rows), launch_scratch)
                 .saturating_add(kv)
         })
     }
@@ -3162,6 +3201,59 @@ mod tests {
         assert_eq!(phase_offsets([200, 300, 50]), [0, 0, 300]);
     }
 
+    /// Plans are rounded to the span quantum, so the layout keeps every span
+    /// base on the boundary and the footprint covers the layout exactly.
+    #[test]
+    fn phase_plans_round_to_the_span_quantum() {
+        let plan = align_phase_plan([1, WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN + 1]);
+        assert_eq!(
+            plan,
+            [WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN, 2 * WAVE_SPAN_ALIGN]
+        );
+        assert_eq!(align_phase_plan([0, 0, 0]), [0, 0, 0]);
+        // Already-rounded plans pass through unchanged.
+        let exact = [4 * WAVE_SPAN_ALIGN, 512 * WAVE_SPAN_ALIGN, WAVE_SPAN_ALIGN];
+        assert_eq!(align_phase_plan(exact), exact);
+    }
+
+    /// **The launchers' scratch widens the forward span, and only it** — then
+    /// every entry is aligned. Raw figures.
+    #[test]
+    fn the_launch_plan_carries_the_scratch_on_the_forward_span() {
+        assert_eq!(launch_plan([300, 200, 50], 1000), [512, 256, 1280]);
+        assert_eq!(launch_plan([300, 200, 50], 0), [512, 256, 256]);
+        assert_eq!(launch_plan([0, 0, 0], 0), [0, 0, 0]);
+    }
+
+    /// **The tier admission prices is the tier the forward places**, launch
+    /// scratch included. A 48 MiB plan whose forward span the scratch widens by
+    /// one byte past its region is one region dearer — the region WhiteWorld's
+    /// creep window was refused by when its price left the scratch out.
+    #[test]
+    fn tier_bytes_prices_the_launch_scratch_the_placement_carries() {
+        let p = WavePlan::new(moe());
+        for rows in [1usize, 64, 4096] {
+            let phases = [
+                p.phase_bytes(LayerPhase::Attention, w(rows)),
+                p.phase_bytes(LayerPhase::Ffn, w(rows)),
+                p.phase_bytes(LayerPhase::Forward, w(rows)),
+            ];
+            for scratch in [0usize, 4096, 3 * TARGET_ARENA_BYTES + 1] {
+                let placed = tier_footprint(launch_plan(phases, scratch));
+                assert_eq!(
+                    p.tier_bytes(w(rows), scratch),
+                    placed.div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES,
+                    "rows {rows}, scratch {scratch}"
+                );
+            }
+            assert!(
+                p.tier_bytes(w(rows), 3 * TARGET_ARENA_BYTES + 1)
+                    >= p.tier_bytes(w(rows), 0) + 3 * TARGET_ARENA_BYTES,
+                "rows {rows}: the scratch must be paid for"
+            );
+        }
+    }
+
     /// **The tier is the footprint of the phases — no less than the largest of
     /// them, and less than their sum wherever both layer phases carve.** The
     /// lower bound is the defect the tier bound exists to fix: sizing waves with
@@ -3177,10 +3269,11 @@ mod tests {
                 p.phase_bytes(LayerPhase::Ffn, w(rows)),
                 p.phase_bytes(LayerPhase::Forward, w(rows)),
             ];
-            let tier = p.tier_bytes(w(rows));
+            let tier = p.tier_bytes(w(rows), 0);
             assert_eq!(
                 tier,
-                tier_footprint(phases).div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES,
+                tier_footprint(launch_plan(phases, 0)).div_ceil(TARGET_ARENA_BYTES)
+                    * TARGET_ARENA_BYTES,
                 "rows {rows}"
             );
             assert!(
@@ -3204,10 +3297,10 @@ mod tests {
         let p = WavePlan::new(moe());
         for rows in [1usize, 64, 128, 512, 4096] {
             assert_eq!(
-                p.tier_bytes(w(rows)) % TARGET_ARENA_BYTES,
+                p.tier_bytes(w(rows), 4096) % TARGET_ARENA_BYTES,
                 0,
                 "rows {rows}: {} is not region-aligned",
-                p.tier_bytes(w(rows)),
+                p.tier_bytes(w(rows), 4096),
             );
         }
     }
@@ -3219,14 +3312,15 @@ mod tests {
         let p = WavePlan::new(moe());
         let budget = WAVE_SPAN_BYTES;
         let head = WaveWidth::prefill(0, 1);
-        let rows = p.max_prefill_rows_for_tier(budget, head);
+        let scratch = 4096;
+        let rows = p.max_prefill_rows_for_tier(budget, head, scratch);
         assert!(rows > 0, "the guaranteed span must price at least one row");
         assert!(
-            p.tier_bytes(head.with_one_more_sequence(rows)) <= budget,
+            p.tier_bytes(head.with_one_more_sequence(rows), scratch) <= budget,
             "the accepted width must fit"
         );
         assert!(
-            p.tier_bytes(head.with_one_more_sequence(rows + 1)) > budget,
+            p.tier_bytes(head.with_one_more_sequence(rows + 1), scratch) > budget,
             "one row more must not fit — otherwise the bound is leaving ground unused",
         );
     }
@@ -3238,8 +3332,8 @@ mod tests {
     fn a_standing_head_narrows_the_prefill_the_tier_admits() {
         let p = WavePlan::new(moe());
         let budget = WAVE_SPAN_BYTES;
-        let empty = p.max_prefill_rows_for_tier(budget, WaveWidth::prefill(0, 1));
-        let loaded = p.max_prefill_rows_for_tier(budget, WaveWidth::decode(32));
+        let empty = p.max_prefill_rows_for_tier(budget, WaveWidth::prefill(0, 1), 0);
+        let loaded = p.max_prefill_rows_for_tier(budget, WaveWidth::decode(32), 0);
         assert!(
             loaded < empty,
             "32 decode rows must cost prefill width: {loaded} vs {empty}"
@@ -3254,17 +3348,18 @@ mod tests {
         let p = WavePlan::new(moe());
         let budget = 4 * WAVE_SPAN_BYTES;
         let head = WaveWidth::prefill(0, 1);
+        let scratch = 4096;
         assert_eq!(
-            p.max_prefill_rows_for_tier_and_kv(budget, head, 0),
-            p.max_prefill_rows_for_tier(budget, head),
+            p.max_prefill_rows_for_tier_and_kv(budget, head, 0, scratch),
+            p.max_prefill_rows_for_tier(budget, head, scratch),
         );
 
         // Qwen3-30B-A3B's KV per row: K and V, 4 KV heads × 128, BF16, 48 layers.
         let kv_row = 2 * 4 * 128 * 2 * 48;
-        let rows = p.max_prefill_rows_for_tier_and_kv(budget, head, kv_row);
-        assert!(rows < p.max_prefill_rows_for_tier(budget, head));
+        let rows = p.max_prefill_rows_for_tier_and_kv(budget, head, kv_row, scratch);
+        assert!(rows < p.max_prefill_rows_for_tier(budget, head, scratch));
         let cost = |r: usize| {
-            p.tier_bytes(head.with_one_more_sequence(r))
+            p.tier_bytes(head.with_one_more_sequence(r), scratch)
                 + (r * kv_row).div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
         };
         assert!(cost(rows) <= budget, "the accepted width must fit");
@@ -3276,7 +3371,7 @@ mod tests {
     #[test]
     fn a_budget_below_one_row_prices_nothing() {
         let p = WavePlan::new(moe());
-        assert_eq!(p.max_prefill_rows_for_tier(1, WaveWidth::default()), 0);
+        assert_eq!(p.max_prefill_rows_for_tier(1, WaveWidth::default(), 0), 0);
     }
 
     /// Qwen3-30B-A3B's real shapes.
