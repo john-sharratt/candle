@@ -1,19 +1,20 @@
-# The MCP aggregator on AlienWorld (docs/mcp_app.md §5). Run from the
-# repository root:
+# The MCP aggregator, beside the gateway on BlackWorld under keep
+# (docs/mcp_app.md §5, §6). Run from the repository root:
 #
 #   target\release\mcp.exe --config mcp/mcp.yaml
 
-# Where it listens. The gateway's `/mcp` route on code.tokera.com points here.
-bind: "0.0.0.0:8095"
+# Where it listens: loopback only. The gateway's `/mcp` route on
+# code.tokera.com points here, and nothing else needs to reach it.
+bind: "127.0.0.1:8095"
 
-# The peers whose X-Tokera-* identity is believed: BlackWorld's gateway, whose
-# outbound LAN connection may leave from either address.
-trusted_gateways: ["192.168.0.5", "192.168.0.4"]
+# The peers whose X-Tokera-* identity is believed: the gateway, which proxies
+# `/mcp` to this loopback address and so arrives from loopback.
+trusted_gateways: ["127.0.0.1"]
 
-# The gateway's LAN entrance every backend is reached through, as the caller:
-# the caller's own token rides each call, which the gateway honours from this
-# machine (`server.trusted_backends` in web/web.yaml).
-gateway: "http://192.168.0.5"
+# The gateway's entrance every backend is reached through, as the caller: the
+# caller's own token rides each call, which the gateway honours from loopback
+# (`server.trusted_backends` in web/web.yaml).
+gateway: "http://127.0.0.1"
 
 # Where MCP sessions are kept.
 state: "mcp/state"

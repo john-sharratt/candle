@@ -43,7 +43,7 @@ claude.ai / Claude Code
    ▼
 web gateway (BlackWorld)  ── token → identity (auth::mcp) ── X-Tokera-* ──┐
    ▼                                                                      │
-aggregator (AlienWorld, :8095)   believes X-Tokera-* only from the gateway │
+aggregator (127.0.0.1:8095)  believes X-Tokera-* only from the gateway  │
    │                                                                      │
    │  POST http://<gateway>/v1/mcp      Host: code.tokera.com
    │  POST http://<gateway>/v1/npc/mcp  Host: bot.tokera.com
@@ -62,21 +62,28 @@ nothing about access.
 
 ## 2. Trust
 
-- **gateway → aggregator.** The aggregator's config names the gateway's
-  addresses in `trusted_gateways`: BlackWorld's `192.168.0.5` and `.4`,
-  because the gateway's outbound LAN connection can leave from either. The
-  aggregator believes the identity headers only from those peers, and only
-  when the client's bearer token came with them. From anywhere else nobody is
-  calling, and the client is sent to sign in.
-- **aggregator → gateway.** The gateway's `server.trusted_backends` lists the
-  aggregator's address (AlienWorld, `192.168.0.237`). From a listed backend,
-  a request that carries a person's MCP access token is read as that person,
-  on any path (`Auth::mcp_delegated`). A backend's own `X-Tokera-*` headers
-  are still stripped on ingress. The address alone names nobody, so a process
-  on that machine can act only for a person whose token it was handed.
+- **gateway → aggregator.** The aggregator listens on loopback only and names
+  `127.0.0.1` in `trusted_gateways`: the gateway proxies `/mcp` to
+  `127.0.0.1:8095`, so its requests arrive from loopback. The aggregator
+  believes the identity headers only from that peer, and only when the
+  client's bearer token came with them. From anywhere else nobody is calling,
+  and the client is sent to sign in.
+- **aggregator → gateway.** The gateway's `server.trusted_backends` lists
+  `127.0.0.1`. From a listed backend, a request that carries a person's MCP
+  access token is read as that person, on any path (`Auth::mcp_delegated`). A
+  backend's own `X-Tokera-*` headers are still stripped on ingress. The
+  address alone names nobody, so a process on the gateway's machine can act
+  only for a person whose token it was handed.
 
-The loop-back is plain HTTP on the LAN to the gateway's `:80` entrance, which
-is the one Cloudflare's tunnel reaches, with the site named in `Host`.
+Listing loopback is safe only because no public request arrives from it.
+Cloudflare reaches the `:80` entrance from its own addresses, and the TLS
+entrance records the client's. A tunnel or local proxy that delivered public
+traffic from loopback would make every public request a trusted backend; if
+one is ever put in front of the gateway, the aggregator's loop-back must move
+to an address that proxy never uses.
+
+The loop-back is plain HTTP to the gateway's `:80` entrance, with the site
+named in `Host`.
 
 ## 3. The aggregator
 
@@ -239,9 +246,9 @@ carrying.
 
 | Key | Meaning |
 |---|---|
-| `bind` | Where it listens (`0.0.0.0:8095`) |
-| `trusted_gateways` | The peers whose `X-Tokera-*` it believes |
-| `gateway` | The gateway's LAN entrance every backend is reached through (`http://192.168.0.5`) |
+| `bind` | Where it listens (`127.0.0.1:8095`) |
+| `trusted_gateways` | The peers whose `X-Tokera-*` it believes (`127.0.0.1`) |
+| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1`) |
 | `state` | The folder its sessions are kept in |
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
 | `backends` | The servers whose tools it serves, in list order: `{name, host, path}` each — the path is the app's own MCP route on that site. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
@@ -257,11 +264,22 @@ carrying.
 
 ## 6. Deployment
 
-The aggregator runs on AlienWorld while it is iterated. It is built there,
-run from the repository root, and its port is open in the host firewall. The
-gateway's `/mcp` route on `code.tokera.com` points at it by address
-(`upstream: http://192.168.0.237:8095`, no `cluster:`), and
-`server.trusted_backends` lists that address.
+The aggregator runs on BlackWorld beside the gateway, as a keep service
+(`keep/keep.yaml`: `mcp`, `--config mcp/mcp.yaml`, from the repository root).
+Once its listener is bound it prints keep's proof line, `INFO serving`, on
+stderr, and keep's trial waits for it. It is released like
+`web`: build `cargo build --release -p mcp`, stage `keep/stage/mcp.exe`, and
+POST its path to keep. The gateway's `/mcp` route on `code.tokera.com` points
+at it over loopback (`upstream: http://127.0.0.1:8095`, no `cluster:`), and
+`server.trusted_backends` lists `127.0.0.1`. No firewall port is open for it.
+
+**Why beside the gateway.** It ran on AlienWorld, a laptop on Wi-Fi, and every
+MCP answer crossed that LAN leg twice: the backend's answer into the
+aggregator, then the aggregator's answer back to the gateway. On 2026-10-27
+the leg ran at 4–11 KB/s, while the gateway itself answered over the internet
+at ~650 KB/s. An image edit that finished in npcd in 12 ms reached claude.ai
+28 s later, because its ~127 KB of base64 crossed the slow leg twice. Over
+loopback that leg costs nothing.
 
 Deploy in this order:
 

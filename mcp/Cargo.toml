@@ -12,6 +12,8 @@ path = "src/main.rs"
 anyhow       = { workspace = true }
 axum         = { version = "0.7" }
 clap         = { workspace = true }
+# keep's proof line (`cluster::upgrade::switch::PROOF`).
+cluster      = { path = "../cluster" }
 futures      = { workspace = true }
 # The guides, embedded at build time (`src/guides/`).
 include_dir  = { version = "0.7" }

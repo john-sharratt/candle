@@ -82,14 +82,9 @@ mod tests {
     #[test]
     fn the_shipped_config_reads() {
         let c = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/mcp.yaml"))).unwrap();
-        assert_eq!(c.bind, "0.0.0.0:8095");
-        assert_eq!(
-            c.trusted_gateways,
-            [
-                "192.168.0.5".parse::<IpAddr>().unwrap(),
-                "192.168.0.4".parse().unwrap()
-            ]
-        );
+        assert_eq!(c.bind, "127.0.0.1:8095");
+        assert_eq!(c.trusted_gateways, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(c.gateway, "http://127.0.0.1");
         assert_eq!(
             c.backends,
             [

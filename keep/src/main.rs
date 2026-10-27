@@ -1,4 +1,4 @@
-//! `keep` — the failsafe for `web` and `motherd`.
+//! `keep` — the failsafe for `web`, `motherd` and `mcp`.
 //!
 //! On startup it runs the executable at each service's stable path, with the
 //! arguments from its config. That child is detached: stdout and stderr are

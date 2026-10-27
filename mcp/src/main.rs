@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 use axum::routing::post;
 use axum::Router;
 use clap::Parser;
+use cluster::upgrade::switch::PROOF;
 use mcp_server::http;
 use mcp_server::LocalStore;
 use tokio::net::TcpListener;
@@ -88,6 +89,10 @@ async fn main() -> anyhow::Result<()> {
         backends = ?config.backends.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
         "serving"
     );
+    // The listener is bound and this is the call that accepts. The line is the
+    // whole of a stderr line: `keep` treats the process as serving only once it
+    // has read it.
+    eprintln!("{PROOF}");
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
