@@ -745,14 +745,14 @@ mod tests {
     /// The headroom has a floor and grows with the field the network runs over.
     #[test]
     fn the_headroom_scales_with_the_side_and_has_a_floor() {
-        // 320² at a kilobyte a pixel is 100 MiB, under the floor.
+        // 320² at two kilobytes a pixel is 200 MiB, under the floor.
         assert_eq!(
             activation_headroom(320),
             256 << 20,
             "a small field gets the floor"
         );
-        // 1024² is a gibibyte, well clear of it, and four times 512²'s claim.
-        assert_eq!(activation_headroom(1024), 1 << 30);
+        // 1024² is two gibibytes, well clear of it, and four times 512²'s claim.
+        assert_eq!(activation_headroom(1024), 2 << 30);
         assert_eq!(
             activation_headroom(1024),
             4 * activation_headroom(512),
