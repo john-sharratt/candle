@@ -89,11 +89,10 @@ fn member(hub: &Arc<Hub>, node: u64) -> Arc<AppMember> {
         },
         key(),
         vec!["mem".into()],
-        RouteTable::new(vec![Route::new(
-            &[],
-            "/v1/status",
-            Dispatch::Aggregate(Merge::Envelope),
-        )])
+        RouteTable::new(vec![
+            Route::new(&[], "/v1/status", Dispatch::Aggregate(Merge::Envelope)),
+            Route::new(&[], "/v1/phases", Dispatch::Aggregate(Merge::Envelope)),
+        ])
         .unwrap(),
         Box::new(|| Capacity {
             state: MemberState::Ready,
@@ -109,15 +108,28 @@ fn member(hub: &Arc<Hub>, node: u64) -> Arc<AppMember> {
         None,
         WallInstant::now(),
     );
-    let router = Router::new().route(
-        "/v1/status",
-        get(move || async move {
-            if node == SLOW {
-                sleep(Duration::from_secs(60)).await;
-            }
-            axum::Json(json!({"node": node}))
-        }),
-    );
+    let router = Router::new()
+        .route(
+            "/v1/status",
+            get(move || async move {
+                if node == SLOW {
+                    sleep(Duration::from_secs(60)).await;
+                }
+                axum::Json(json!({"node": node}))
+            }),
+        )
+        .route(
+            "/v1/phases",
+            get(move || async move {
+                if node == SLOW {
+                    sleep(Duration::from_secs(60)).await;
+                }
+                axum::Json(json!({
+                    "fuse": { "series": { "points": ["win"] } },
+                    "points": [{ "at": 5000, "kind": "decode", "tok": node, "win": 4000 + node }],
+                }))
+            }),
+        );
     tokio::spawn(app.clone().run(0, ToHub(hub.clone()), move |conn| {
         serve_stream(conn, router.clone())
     }));
@@ -154,6 +166,7 @@ sites:
 
     let asked = Instant::now();
     let res = router
+        .clone()
         .oneshot(
             Request::get("/v1/status")
                 .header("host", "code.test")
@@ -183,6 +196,29 @@ sites:
             assert_eq!(m["body"]["node"], node);
         }
     }
+    assert_eq!(
+        body.get("cluster"),
+        None,
+        "an answer that declares no fusion has no cluster body"
+    );
+
+    // An answer that says how it adds up is answered fused as well: the seven
+    // members that answered in time, their tokens summed and the longest window.
+    let res = router
+        .oneshot(
+            Request::get("/v1/phases")
+                .header("host", "code.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(
+        body["cluster"],
+        json!({ "points": [{ "at": 5000, "kind": "decode", "tok": 28, "win": 4007 }] })
+    );
     let elapsed = wall.elapsed();
     println!("H6 (aggregate): {MEMBERS} members, one late, answered in {took:?} virtual, {elapsed:?} wall");
     assert!(elapsed <= BUDGET, "took {elapsed:?}");

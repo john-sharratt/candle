@@ -2149,9 +2149,20 @@ impl Scheduler {
         // conversation's KV in VRAM, so under pressure we shed hot KV to the
         // substrate rather than piling on more concurrent prefills; if that
         // doesn't clear it, leave the rest queued this pass.
+        //
+        // **Not over a prompt that outranks everything in flight.** The pile it
+        // guards against is more of the same band beside the work running; a
+        // higher band's prompt is not more of it but what that work is set aside
+        // for (`pause_creep`), and only once admitted. Held here it waits for
+        // the work it outranks to finish. On WhiteWorld (2026-10-27 08:16) an
+        // image draw's four one-token Urgent content checks waited 7.5 minutes
+        // behind one High dialogue's 155k-token creep: relief ran 80 times and
+        // relieved nothing, since the ground was that creep's own working set.
+        // It still goes to the fill below, which prices it like any other offer.
         if in_flight > 0
             && self.vram_under_pressure()
             && self.relieve_vram_pressure("promote", VramPhase::Load, ReliefNeed::Paced)
+            && !self.a_queued_prompt_outranks_the_work_in_flight()
         {
             // Pressure survived eviction — stop piling on this pass (the
             // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
@@ -2780,6 +2791,21 @@ impl Scheduler {
             let _ = self.session.release_empty_arenas();
             self.pack_until_settled(PackGoal::Ground);
         }
+        // **Dialogue working-set locks, last.** The rungs above protect every
+        // dialogue's locked working set (`Substrate::evict_hot_to_free`), which
+        // is right between forwards; a drain blocks every forward, so only a
+        // slot with a turn on it still needs its own. The rest reload warm→hot
+        // at their next projection, a few seconds at the link's rate against a
+        // draw that otherwise cannot run — as the weight side's concession goes
+        // below its serving floor for the drain alone.
+        let short = target.saturating_sub(free(self));
+        if short > 0 {
+            let evicted = self.evict_idle_working_sets(short);
+            if evicted.bytes > 0 {
+                let _ = self.session.release_empty_arenas();
+                self.pack_until_settled(PackGoal::Ground);
+            }
+        }
         let freed = free(self).saturating_sub(before);
         tracing::info!(
             target: "candle_conversation::scheduler::timing",
@@ -2805,16 +2831,66 @@ impl Scheduler {
         Some((relieved.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
-    /// The union of every live slot's projection working set — what relief
-    /// eviction protects ([`Self::evict_cold_tail`]).
-    pub(super) fn relief_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+    /// The union of the working sets of the slots that are not idle — a turn
+    /// running, carved or queued on them ([`Self::slot_idle`]). What the
+    /// working-set pins hold, and what relief eviction protects
+    /// ([`Self::evict_cold_tail`]).
+    ///
+    /// **An idle slot's working set is not live.** An npcd conversation keeps
+    /// its slot bound between turns, and while every bound slot's set counted,
+    /// each publish re-pinned and re-stamped it: the idle demote never reached
+    /// it and relief never might. On WhiteWorld (2026-10-27) one idle
+    /// dialogue's set grew to 16 GB of hot K/V across turns and refused image
+    /// draws with nothing running. Left out, it ages like any other unit — the
+    /// idle demote's own grace spares the gap between quick turns — and its next
+    /// projection lifts back from warm what it selects.
+    pub(super) fn live_working_sets(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
         let mut keep_sections: Vec<SectionId> = Vec::new();
         let mut keep_turns: Vec<TurnKey> = Vec::new();
-        for st in self.slot_projection_state.values() {
+        for (&slot, st) in &self.slot_projection_state {
+            if self.slot_idle(slot) {
+                continue;
+            }
             keep_sections.extend(st.working_set.sections.iter().copied());
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
         (keep_sections, keep_turns)
+    }
+
+    /// What relief eviction protects: [`Self::live_working_sets`].
+    pub(super) fn relief_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+        self.live_working_sets()
+    }
+
+    /// Shed to warm the hot turns of every working set but the live ones
+    /// ([`Self::live_working_sets`]), dialogue working-set locks included, up
+    /// to `target_bytes`. **Only inside a guest's drain**, where nothing
+    /// forwards until it ends.
+    fn evict_idle_working_sets(&mut self, target_bytes: u64) -> crate::substrate::EvictionReport {
+        let (keep_sections, keep_turns) = self.live_working_sets();
+        let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        let mut remaining = target_bytes;
+        for conv in self.distinct_substrates() {
+            if remaining == 0 {
+                break;
+            }
+            let r = conv
+                .write()
+                .evict_hot_for_guest(&keep_sections, &keep_turns, remaining);
+            remaining = remaining.saturating_sub(r.bytes);
+            report.count += r.count;
+            report.bytes += r.bytes;
+        }
+        if report.count > 0 {
+            tracing::info!(
+                target: "candle_conversation::guest",
+                count = report.count,
+                evicted_mib = report.bytes >> 20,
+                target_mib = target_bytes >> 20,
+                "idle working sets shed to warm for a guest"
+            );
+        }
+        report
     }
 
     /// The hot bytes across the resident conversations, by why relief
@@ -3197,6 +3273,38 @@ impl Scheduler {
             self.wave_prefill_members.iter().any(|m| m.seq_id() == seq)
                 || self.paused_creep.as_ref().is_some_and(|c| c.holds(seq))
         })
+    }
+
+    /// Whether a queued prompt — carved or still a submission — belongs to a
+    /// band above every prefill and section in flight: one the work running
+    /// would be set aside for once it is admitted.
+    pub(super) fn a_queued_prompt_outranks_the_work_in_flight(&self) -> bool {
+        let queued = self
+            .prefill_queue
+            .iter()
+            .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
+            .chain(
+                self.pending_submits
+                    .iter()
+                    .map(|p| rank(self.decode_priority_or_high(p.parent()))),
+            )
+            .max();
+        let Some(queued) = queued else {
+            return false;
+        };
+        let running = self
+            .active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none())
+            .map(|p| rank(self.decode_priority_or_high(p.work.sequence_id)))
+            .chain(
+                self.active_section_ingests
+                    .iter()
+                    .filter(|s| s.error.is_none())
+                    .map(|s| rank(s.band)),
+            )
+            .max();
+        running.is_none_or(|r| queued > r)
     }
 
     /// Whether a prefill or section that can advance, and that `held` does not
@@ -5054,7 +5162,6 @@ impl Scheduler {
                     cobatched_decode_rows(decode_inputs, verify_inputs),
                     0,
                     sec_adv.iter().sum(),
-                    t_wave.elapsed().as_micros() as u64,
                 );
                 super::PREFILL_OK_TOKENS.fetch_add(
                     sec_adv.iter().sum::<usize>() as u64,
@@ -5285,11 +5392,11 @@ impl Scheduler {
             if sc_seqs > 0 {
                 self.wave_stats.record_section(sc_seqs, sc_swept, sc_kv, ms);
             }
-            // The phase timeline's share of this sweep: one forward, split by rows
-            // between the decode rows that rode it and the members above.
+            // The phase timeline's share of this sweep: the rows that rode it,
+            // which the decode step it ran in is split by.
             let decode_rows = cobatched_decode_rows(decode_inputs, verify_inputs);
             self.wave_stats
-                .record_cobatched_split(decode_rows, pf_tok, sc_tok, creep_us);
+                .record_cobatched_split(decode_rows, pf_tok, sc_tok);
             // **Teach the planner what this machine actually did.** A forward is
             // `T = X/bw + W·c` — non-resident expert bytes over the bus, plus
             // compute for the rows — so one observation is one equation in two
@@ -7009,6 +7116,65 @@ mod wave_chunk_tests {
             1,
             "with the wait cleared, the idle engine did not force its queue head"
         );
+    }
+
+    /// An idle slot's working set is not live: it is neither pinned nor kept
+    /// from relief. A turn queued on the slot makes it live again.
+    #[test]
+    fn only_a_slot_with_a_turn_on_it_keeps_its_working_set_live() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let slot = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let key = TurnKey::new(
+            crate::projection::TimelineId::for_test(999),
+            crate::projection::TurnIndex(0),
+        );
+        scheduler
+            .slot_projection_state
+            .entry(slot)
+            .or_default()
+            .working_set
+            .turns
+            .push(key);
+
+        let (_, turns) = scheduler.live_working_sets();
+        assert!(turns.is_empty(), "an idle slot's working set was live");
+
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(slot, (0..16u32).collect()).work);
+        let (_, turns) = scheduler.live_working_sets();
+        assert_eq!(turns, vec![key]);
+    }
+
+    /// An urgent prompt queued behind a high prefill outranks it, and so is not
+    /// held by the pressure gate; another high one beside it is.
+    #[test]
+    fn only_a_higher_band_outranks_the_work_in_flight() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        assert!(!scheduler.a_queued_prompt_outranks_the_work_in_flight());
+
+        let running = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(running, DecodePriority::High);
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(running, (0..4_000u32).collect()));
+
+        let same = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(same, DecodePriority::High);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(same, (0..64u32).collect()).work);
+        assert!(
+            !scheduler.a_queued_prompt_outranks_the_work_in_flight(),
+            "a prompt of the running band is more of the same"
+        );
+
+        let urgent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(urgent, DecodePriority::Urgent);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(urgent, (0..16u32).collect()).work);
+        assert!(scheduler.a_queued_prompt_outranks_the_work_in_flight());
     }
 
     /// **A dialogue prefill enters the wave group in pass-sized chunks.** It

@@ -90,8 +90,11 @@ use super::{
 use crate::substrate::{IndexPage, StreamKey, StreamRuntime, Substrate};
 
 /// Compact trigger: a sealed segment must be at least this fraction dead
-/// weight before relocating it is worth the I/O (§8).
-pub const SEGMENT_COMPACT_MIN_DEAD: f64 = 0.10;
+/// weight before relocating it is worth the I/O (§8). Relocating rewrites the
+/// live bytes to reclaim the dead, so this bounds the write amplification at
+/// its inverse: at 10% a 357 GB store rewrote 3.3–3.9 GB every 15–60 s to
+/// reclaim ~0.6 GB (BlackWorld, 2026-10-27).
+pub const SEGMENT_COMPACT_MIN_DEAD: f64 = 0.20;
 
 /// Compact trigger: a sealed segment must have settled at least this long
 /// since it was sealed (or last compacted) — a rate-limit so a just-sealed
@@ -377,6 +380,15 @@ impl MaintenancePlan {
     }
 }
 
+/// An op a liveness scan picked, and the stats it picked it from — what
+/// [`SubstratePersistence::plan_chosen`] gathers a plan for.
+pub struct Chosen {
+    op: MaintenanceOp,
+    stats: Vec<SegmentStat>,
+    /// The scan's own time, for the plan's log line.
+    liveness_ms: u64,
+}
+
 /// Record bytes one batch re-emits or relocates under a single hold of the
 /// persistence lock. Relocation reads and re-appends at ~100 MB/s (a 3.6 GB
 /// segment took 37 s), so this bounds what a seal write or cold load waits
@@ -460,8 +472,11 @@ impl MaintenanceResult {
     /// relocated copy is dead (reclaimed by a later pass) and skipped — the
     /// newer copy wins. One that still does is the record the copy was taken
     /// from, so the copy is applied under that record's identity, which it
-    /// kept. Held under a brief substrate write lock only.
+    /// kept. Held under a brief substrate write lock only: the cold references
+    /// refreshed are those of the streams whose chunks moved, not every
+    /// residence's.
     pub fn apply_to_substrate(&self, substrate: &mut Substrate) {
+        let mut moved: HashSet<StreamId> = HashSet::new();
         for (key, idx, old, new) in &self.chunk_updates {
             let held = substrate.stream_at(*key).and_then(|s| {
                 let id = s.ids.chunks.get(idx).copied().unwrap_or_default();
@@ -470,6 +485,7 @@ impl MaintenanceResult {
             if let Some((loc, id)) = held {
                 if loc == *old {
                     substrate.apply_chunk_loc(key.stream_id, *idx, *new, id);
+                    moved.insert(key.stream_id);
                 }
             }
         }
@@ -512,7 +528,7 @@ impl MaintenanceResult {
                 substrate.apply_branch_checkpoint_loc(*sid, *new, id);
             }
         }
-        substrate.refresh_cold_refs();
+        substrate.refresh_cold_refs_of(&moved);
     }
 }
 
@@ -906,21 +922,42 @@ impl SubstratePersistence {
         substrate: &Substrate,
         force: bool,
     ) -> Result<Option<MaintenancePlan>> {
-        self.plan_with(substrate, |stats| pick_maintenance_op(stats, force))
+        Ok(self
+            .choose_maintenance(substrate, force)?
+            .map(|chosen| self.plan_chosen(substrate, chosen)))
     }
 
     /// [`Self::plan_maintenance`] restricted to dropping a fully-dead segment:
     /// what a member whose volume is full may still run, since a drop needs no
     /// scratch space (`docs/replicated_substrate.md` §7.7).
     pub fn plan_drop(&self, substrate: &Substrate) -> Result<Option<MaintenancePlan>> {
-        self.plan_with(substrate, pick_drop)
+        Ok(self
+            .choose_drop(substrate)?
+            .map(|chosen| self.plan_chosen(substrate, chosen)))
     }
 
-    fn plan_with(
+    /// The first half of [`Self::plan_maintenance`]: the per-segment liveness
+    /// scan and the op it picks, or `None` for a no-op pass. Apart from
+    /// [`Self::plan_chosen`] so a caller can release its locks between them —
+    /// each half is a substrate read hold of half a second on a large store,
+    /// and a writer waits out whichever it meets rather than both. The chosen
+    /// op stays valid across the gap: only maintenance retires a segment, and
+    /// it runs one op at a time.
+    pub fn choose_maintenance(&self, substrate: &Substrate, force: bool) -> Result<Option<Chosen>> {
+        self.choose_with(substrate, |stats| pick_maintenance_op(stats, force))
+    }
+
+    /// [`Self::choose_maintenance`] restricted to dropping a fully-dead
+    /// segment ([`Self::plan_drop`]).
+    pub fn choose_drop(&self, substrate: &Substrate) -> Result<Option<Chosen>> {
+        self.choose_with(substrate, pick_drop)
+    }
+
+    fn choose_with(
         &self,
         substrate: &Substrate,
         pick: impl Fn(&[SegmentStat]) -> Option<MaintenanceOp>,
-    ) -> Result<Option<MaintenancePlan>> {
+    ) -> Result<Option<Chosen>> {
         if self.is_read_only() {
             return Ok(None);
         }
@@ -941,9 +978,22 @@ impl SubstratePersistence {
                 age_secs: self.segments.sealed_age_secs(id, now)?,
             });
         }
-        let Some(op) = pick(&stats) else {
-            return Ok(None);
-        };
+        Ok(pick(&stats).map(|op| Chosen {
+            op,
+            stats,
+            liveness_ms,
+        }))
+    }
+
+    /// The second half of [`Self::plan_maintenance`]: everything `chosen`'s op
+    /// relocates and re-emits, gathered so the slow I/O phase runs without the
+    /// substrate lock.
+    pub fn plan_chosen(&self, substrate: &Substrate, chosen: Chosen) -> MaintenancePlan {
+        let Chosen {
+            op,
+            stats,
+            liveness_ms,
+        } = chosen;
         // Re-emit only the resident records whose current copy the op is about
         // to drop (see `resident_to_carry`).
         let t_resident = Instant::now();
@@ -1013,7 +1063,7 @@ impl SubstratePersistence {
             op,
             resident_census.summary()
         );
-        Ok(Some(MaintenancePlan {
+        MaintenancePlan {
             op,
             resident,
             chunk_relocs,
@@ -1025,7 +1075,7 @@ impl SubstratePersistence {
             npc_relocs,
             vfs_relocs,
             blob_relocs,
-        }))
+        }
     }
 
     /// The resident records an op targeting `targets` must re-emit.
@@ -2037,11 +2087,16 @@ impl SubstratePersistence {
     /// read-back records the substrate index still references and the current
     /// copy of each carried resident record, with the same distill/tombstone
     /// filter [`super::compaction::collect_live_records`] applies.
+    ///
+    /// Summed as the records are visited rather than gathered first: a store
+    /// of millions of live records spent most of the plan's substrate read
+    /// hold — 520 ms of 1.1 s on BlackWorld (2026-10-27), every 15 s —
+    /// building the list only to add it up.
     pub fn segment_liveness(&self, substrate: &Substrate) -> HashMap<SegmentId, u64> {
         let mut live: HashMap<SegmentId, u64> = HashMap::new();
-        for r in self.counted_live_records(substrate).0 {
+        self.visit_counted_live_records(substrate, |r| {
             *live.entry(r.segment).or_default() += r.size;
-        }
+        });
         live
     }
 
@@ -2092,6 +2147,18 @@ impl SubstratePersistence {
         &self,
         substrate: &Substrate,
     ) -> (Vec<CountedRecord>, CarriedStreams) {
+        let mut live: Vec<CountedRecord> = Vec::new();
+        let carried = self.visit_counted_live_records(substrate, |r| live.push(r));
+        (live, carried)
+    }
+
+    /// [`Self::counted_live_records`], each record handed to `visit` as it is
+    /// counted; answers the carry map.
+    fn visit_counted_live_records(
+        &self,
+        substrate: &Substrate,
+        mut visit: impl FnMut(CountedRecord),
+    ) -> CarriedStreams {
         let tombstoned: HashSet<u64> = substrate
             .tombstoned_timelines()
             .iter()
@@ -2103,14 +2170,13 @@ impl SubstratePersistence {
             .map(|(t, m)| (t.raw(), *m))
             .collect();
 
-        let mut live: Vec<CountedRecord> = Vec::new();
         for (rt, loc) in [
             (RecordType::ModelKey, self.manifest.model_key),
             (RecordType::Template, self.manifest.template),
             (RecordType::Tokenizer, self.manifest.tokenizer),
         ] {
             if let Some(loc) = loc {
-                live.push(CountedRecord::at(rt, &loc));
+                visit(CountedRecord::at(rt, &loc));
             }
         }
         // Streams maintenance carries forward, mapped to whether their signature
@@ -2147,7 +2213,7 @@ impl SubstratePersistence {
             carried.insert((key.stream_id.0, key.writer), shed.keep_sig());
             if shed.keep_chunks() {
                 for loc in entry.chunks.values() {
-                    live.push(CountedRecord {
+                    visit(CountedRecord {
                         record_type: RecordType::Chunk,
                         segment: loc.segment,
                         offset: loc.offset,
@@ -2157,7 +2223,7 @@ impl SubstratePersistence {
             }
             if shed.keep_tokens() {
                 if let Some(loc) = entry.tokens {
-                    live.push(CountedRecord::at(RecordType::Tokens, &loc));
+                    visit(CountedRecord::at(RecordType::Tokens, &loc));
                 }
             }
         }
@@ -2169,7 +2235,7 @@ impl SubstratePersistence {
         // as dead. Counted by the carry rule above: the decl and commit always,
         // the signature records only when the stream keeps its signature.
         for (rt, loc) in self.carried_metadata(&carried) {
-            live.push(CountedRecord::at(rt, loc));
+            visit(CountedRecord::at(rt, loc));
         }
         // The payload-keyed resident records, current copy each — counted by
         // exactly the gates `gather_resident_set` re-emits them by, so what is
@@ -2215,7 +2281,7 @@ impl SubstratePersistence {
                 _ => false,
             };
             if carried_record {
-                live.push(CountedRecord::at(key.record_type, loc));
+                visit(CountedRecord::at(key.record_type, loc));
             }
         }
         // Recurrent-state snapshots: one live tail per conversation, tracked in
@@ -2224,7 +2290,7 @@ impl SubstratePersistence {
         // live conversations' tails — a timeline tombstone removes its entry —
         // so every entry counts.
         for (_sid, loc) in substrate.recurrent_snapshot_entries() {
-            live.push(CountedRecord::at(RecordType::Snapshot, &loc));
+            visit(CountedRecord::at(RecordType::Snapshot, &loc));
         }
         // Prompt-branch checkpoints, by the same rule: one live record per
         // branch, tracked in the substrate index, and carried forward by
@@ -2232,7 +2298,7 @@ impl SubstratePersistence {
         // Flash-Next — so leaving them uncounted read every segment holding one
         // as that much dead, and carried them forward again on every pass.
         for (_sid, loc) in substrate.branch_checkpoint_entries() {
-            live.push(CountedRecord::at(RecordType::BranchCheckpoint, &loc));
+            visit(CountedRecord::at(RecordType::BranchCheckpoint, &loc));
         }
         // Characters. Tracked persistence-side rather than on the substrate
         // index — the substrate holds no opinion about an NPC — and the map is
@@ -2242,25 +2308,25 @@ impl SubstratePersistence {
         // without it the dead ratio is overstated, maintenance re-emits the
         // whole cast forward on every pass, and the log churns.
         for loc in self.npc_locs.values() {
-            live.push(CountedRecord::at(RecordType::Npc, loc));
+            visit(CountedRecord::at(RecordType::Npc, loc));
         }
         // A live conversation's file events and tombstones — exactly what
         // `vfs_relocations` carries, so a segment holding only a retired
         // conversation's, or only events a tombstone killed, reads as dead.
         for (_, tl) in vfs_carried(substrate, &self.vfs_index) {
             for loc in tl.events().values() {
-                live.push(CountedRecord::at(RecordType::VfsEvent, loc));
+                visit(CountedRecord::at(RecordType::VfsEvent, loc));
             }
             for loc in tl.tombstones().values() {
-                live.push(CountedRecord::at(RecordType::VfsTombstone, loc));
+                visit(CountedRecord::at(RecordType::VfsTombstone, loc));
             }
         }
         // Blobs — exactly what `blob_relocations` carries: a retired one is
         // not in the index, so its segment reads as that much dead.
         for (_, loc) in self.blob_index.blobs() {
-            live.push(CountedRecord::at(RecordType::Blob, &loc));
+            visit(CountedRecord::at(RecordType::Blob, &loc));
         }
-        (live, carried)
+        carried
     }
 }
 
@@ -4749,9 +4815,18 @@ mod tests {
         // Dead enough but not settled → no op.
         let young = [stat(1, 1000, 100, 10)];
         assert_eq!(pick_maintenance_op(&young, false), None);
-        // Settled but not dead enough (5% < 10%) → no op.
+        // Settled but not dead enough → no op: 5%, and the 15% BlackWorld
+        // rewrote a 4.3 GB segment for every 15–60 s.
         let clean = [stat(1, 1000, 950, 999)];
         assert_eq!(pick_maintenance_op(&clean, false), None);
+        let churn = [stat(1, 1000, 850, 999)];
+        assert_eq!(pick_maintenance_op(&churn, false), None);
+        // A fifth dead → compact.
+        let fifth = [stat(1, 1000, 800, 999)];
+        assert_eq!(
+            pick_maintenance_op(&fifth, false),
+            Some(MaintenanceOp::Compact(SegmentId(1)))
+        );
         // Settled and 90% dead → compact.
         let dead = [stat(1, 1000, 100, 999)];
         assert_eq!(

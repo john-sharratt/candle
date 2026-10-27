@@ -249,9 +249,36 @@ fn select_conversation(
     };
     let turns: &[(TurnKey, f32)] = &own;
 
-    // Split: last `recent` turns are inviolate regardless of score.
+    // Split: the last `recent` turns hold their seats regardless of score.
     let split_at = turns.len().saturating_sub(recent);
-    let (older, inviolate) = turns.split_at(split_at);
+    let (older, recent_turns) = turns.split_at(split_at);
+
+    // **Recent within the window, newest first, the newest always.** A seat
+    // earned by recency still costs tokens, and a window that recency may
+    // overrun is no window. On WhiteWorld (2026-10-27) a Maker's turns ran
+    // ~15.6k tokens each — whole drafts and the table's verdicts on them — so
+    // `recent: 16` under a 16k window projected ~170k tokens, 16 GB of hot K/V,
+    // and image draws were refused beside it. The newest turn stays whatever it
+    // costs: it is the exchange the conversation is in. The lineage is charged
+    // first; it is bounded by its own cap, not by this.
+    let inviolate: Vec<(TurnKey, f32)> = match budget_tokens {
+        Some(budget) => {
+            let mut spent: usize = inherited.iter().map(|(idx, _)| token_counts(*idx)).sum();
+            let mut kept: Vec<(TurnKey, f32)> = Vec::new();
+            for (i, &(key, score)) in recent_turns.iter().enumerate().rev() {
+                let cost = token_counts(key);
+                let newest = i + 1 == recent_turns.len();
+                if !newest && spent + cost > budget {
+                    break;
+                }
+                spent += cost;
+                kept.push((key, score));
+            }
+            kept.reverse();
+            kept
+        }
+        None => recent_turns.to_vec(),
+    };
 
     // Historical: threshold-filtered, top-k by score — with the same zero-score
     // exclusion as `select_top_k`. The recent window below earns its seats by
@@ -270,8 +297,8 @@ fn select_conversation(
     });
     historical.truncate(historical_top_k);
 
-    // Budget pass: trim historical (lowest-scored first); neither the recent
-    // window nor the inherited lineage is ever dropped.
+    // Budget pass: trim historical (lowest-scored first) to what the recent
+    // window and the inherited lineage leave.
     if let Some(budget) = budget_tokens {
         let kept_tokens: usize = inviolate
             .iter()
@@ -419,6 +446,24 @@ mod tests {
         assert!(r.contains(&anc(9, 0)), "lineage kept under budget: {r:?}");
         assert!(r.contains(&t(2)), "recent window kept under budget: {r:?}");
         assert!(!r.contains(&t(0)), "historical trimmed first: {r:?}");
+    }
+
+    /// The recent window fits the budget newest-first, and the newest turn is
+    /// kept even when it alone overruns it.
+    #[test]
+    fn the_recent_window_fits_the_budget_newest_first() {
+        let turns = vec![(t(0), 0.9), (t(1), 0.9), (t(2), 0.9), (t(3), 0.9)];
+        let rule = SelectionRule::Sequence {
+            recent: 4,
+            historical_top_k: 0,
+        };
+        // Room for two of the 10-token turns.
+        let r = apply_selection(&rule, 0.0, &turns, Some(25), &tc, Some(own()));
+        assert_eq!(r, vec![t(2), t(3)]);
+        let r = apply_selection(&rule, 0.0, &turns, Some(5), &tc, Some(own()));
+        assert_eq!(r, vec![t(3)], "the newest turn is the exchange itself");
+        let r = apply_selection(&rule, 0.0, &turns, None, &tc, Some(own()));
+        assert_eq!(r.len(), 4, "no budget, no trim");
     }
 
     /// With no target timeline every turn is treated as the conversation's
@@ -617,15 +662,15 @@ mod tests {
     }
 
     #[test]
-    fn conversation_inviolate_exceeds_budget_still_included() {
-        // Even if inviolate set alone exceeds budget, it is never dropped.
+    fn conversation_recent_past_the_budget_keeps_only_the_newest() {
+        // A recent window that alone exceeds the budget keeps its newest turn.
         let turns = vec![(t(0), 0.9), (t(1), 0.5)];
         let rule = SelectionRule::Sequence {
             recent: 2,
             historical_top_k: 1,
         };
         let r = apply_selection(&rule, 0.0, &turns, Some(5), &tc, None);
-        assert_eq!(r, vec![t(0), t(1)]);
+        assert_eq!(r, vec![t(1)]);
     }
 
     #[test]

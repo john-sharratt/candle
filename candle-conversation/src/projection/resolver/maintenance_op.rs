@@ -61,9 +61,15 @@ pub struct MaintenanceOp {
 }
 
 impl Conversation {
-    /// Plan an op of the kind `pass` allows and start it: the plan under a
-    /// brief read + persistence lock, with the relocation watch started in the
-    /// same hold so every write after the plan is known to the relocation.
+    /// Plan an op of the kind `pass` allows and start it, in two brief read +
+    /// persistence holds: the liveness scan that chooses the op, then the
+    /// gather of what it relocates, with the relocation watch started in that
+    /// second hold so every write after the plan is known to the relocation.
+    /// Each hold is about half a second on a large store, and a substrate
+    /// writer — the wave thread republishing its pins, an elevate — waits out
+    /// one of them rather than both: held together they were 1.1 s every 15 s
+    /// (BlackWorld, 2026-10-27).
+    ///
     /// `None` when there is nothing to do, or an op is already in flight — an
     /// op releases the lock between its batches, so a second pass (the forced
     /// `POST /v1/substrate/zend/maintenance` beside the background thread's)
@@ -71,30 +77,40 @@ impl Conversation {
     /// in flight owns `running`.
     pub(super) fn begin_maintenance_op(&self, pass: Pass) -> candle::Result<Option<MaintenanceOp>> {
         let t_plan = Instant::now();
-        let (plan, dir) = {
-            let mut p = self.persistence.lock_behind_waiters().unwrap();
+        let in_flight = || {
+            tracing::debug!(
+                target: "candle_conversation::persistence::maintenance",
+                "a maintenance op is already relocating — this pass plans none"
+            );
+        };
+        let chosen = {
+            let p = self.persistence.lock_behind_waiters().unwrap();
             if p.relocation_in_flight() {
-                tracing::debug!(
-                    target: "candle_conversation::persistence::maintenance",
-                    "a maintenance op is already relocating — this pass plans none"
-                );
+                in_flight();
                 return Ok(None);
             }
             let substrate = self.read();
-            let plan = match pass {
-                Pass::Gated => p.plan_maintenance(&substrate, false),
-                Pass::Forced => p.plan_maintenance(&substrate, true),
-                Pass::DropOnly => p.plan_drop(&substrate),
+            match pass {
+                Pass::Gated => p.choose_maintenance(&substrate, false),
+                Pass::Forced => p.choose_maintenance(&substrate, true),
+                Pass::DropOnly => p.choose_drop(&substrate),
             }
-            .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?;
-            if plan.is_some() {
-                p.watch_relocation();
-            }
-            (plan, p.dir().to_path_buf())
+            .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
         };
-        let Some(plan) = plan else {
+        let Some(chosen) = chosen else {
             self.refresh_maintenance_status();
             return Ok(None);
+        };
+        let (plan, dir) = {
+            let mut p = self.persistence.lock_behind_waiters().unwrap();
+            if p.relocation_in_flight() {
+                in_flight();
+                return Ok(None);
+            }
+            let substrate = self.read();
+            let plan = p.plan_chosen(&substrate, chosen);
+            p.watch_relocation();
+            (plan, p.dir().to_path_buf())
         };
         let plan_ms = t_plan.elapsed().as_millis() as u64;
         // "In progress" for the GUI's spinner, across every pass the op spans.

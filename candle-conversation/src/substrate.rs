@@ -3233,6 +3233,34 @@ impl Substrate {
         keep_turns: &[TurnKey],
         target_bytes: u64,
     ) -> EvictionReport {
+        self.evict_hot_inner(keep_sections, keep_turns, target_bytes, true)
+    }
+
+    /// [`Self::evict_hot_to_free`] for a guest's drain, with no dialogue's
+    /// pinned working set protected — only `keep_*`.
+    ///
+    /// **Nothing forwards for the length of a drain.** A pinned working set is
+    /// content a model was told it has, and the promise is kept by its next
+    /// projection, which lifts what it selects warm→hot before that turn's
+    /// first forward. Evicted here, it reloads from RAM then. Held, it was the
+    /// draw: on WhiteWorld (2026-10-27 09:37) one dialogue's 16 GB working set
+    /// left a draw 6.8 GB short with nothing in flight, and the draw failed.
+    pub fn evict_hot_for_guest(
+        &mut self,
+        keep_sections: &[SectionId],
+        keep_turns: &[TurnKey],
+        target_bytes: u64,
+    ) -> EvictionReport {
+        self.evict_hot_inner(keep_sections, keep_turns, target_bytes, false)
+    }
+
+    fn evict_hot_inner(
+        &mut self,
+        keep_sections: &[SectionId],
+        keep_turns: &[TurnKey],
+        target_bytes: u64,
+        protect_pinned: bool,
+    ) -> EvictionReport {
         if target_bytes == 0 {
             return EvictionReport { count: 0, bytes: 0 };
         }
@@ -3248,9 +3276,11 @@ impl Substrate {
                 keep.insert(e.content.residence);
             }
         }
-        for timeline in self.pinned_anywhere() {
-            if let Some(entry) = self.timelines.get(&timeline) {
-                keep.extend(entry.turns.values().map(|t| t.content.residence));
+        if protect_pinned {
+            for timeline in self.pinned_anywhere() {
+                if let Some(entry) = self.timelines.get(&timeline) {
+                    keep.extend(entry.turns.values().map(|t| t.content.residence));
+                }
             }
         }
 
@@ -6264,24 +6294,43 @@ impl Substrate {
     pub fn refresh_cold_refs(&mut self) {
         let streams = &self.streams;
         for slot in &mut self.residence {
-            let Some(cold) = &mut slot.cold else { continue };
-            let Some(stream) = streams.get(slot.stream_id) else {
-                continue;
-            };
-            let n_layers = cold.len();
-            let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
-            if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
-                continue;
-            }
-            for (layer, seq) in cold.iter_mut().enumerate() {
-                for (c, chunk) in seq.chunks.iter_mut().enumerate() {
-                    let flat = (layer * chunks_per_layer + c) as u64;
-                    if let Some(loc) = stream.chunks.get(&flat) {
-                        chunk.log_offset = loc.offset;
-                        chunk.record_len = loc.record_size;
-                        chunk.token_count = loc.token_count as u16;
-                    }
+            Self::refresh_slot_cold_refs(streams, slot);
+        }
+    }
+
+    /// One residence's cold references, re-read from its stream's index.
+    fn refresh_slot_cold_refs(streams: &StreamIndex, slot: &mut SequenceResidence) {
+        let Some(cold) = &mut slot.cold else { return };
+        let Some(stream) = streams.get(slot.stream_id) else {
+            return;
+        };
+        let n_layers = cold.len();
+        let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
+        if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
+            return;
+        }
+        for (layer, seq) in cold.iter_mut().enumerate() {
+            for (c, chunk) in seq.chunks.iter_mut().enumerate() {
+                let flat = (layer * chunks_per_layer + c) as u64;
+                if let Some(loc) = stream.chunks.get(&flat) {
+                    chunk.log_offset = loc.offset;
+                    chunk.record_len = loc.record_size;
+                    chunk.token_count = loc.token_count as u16;
                 }
+            }
+        }
+    }
+
+    /// [`Self::refresh_cold_refs`] for the residences of `moved` alone — what
+    /// a maintenance op that relocated those streams' chunks has to refresh.
+    /// Every other residence's references are untouched by the op, and
+    /// walking every chunk of every residence held the substrate write lock
+    /// ~0.4 s per op on BlackWorld's 357 GB store (2026-10-27).
+    pub fn refresh_cold_refs_of(&mut self, moved: &HashSet<StreamId>) {
+        let streams = &self.streams;
+        for slot in &mut self.residence {
+            if moved.contains(&slot.stream_id) {
+                Self::refresh_slot_cold_refs(streams, slot);
             }
         }
     }
@@ -10287,6 +10336,28 @@ mod tests {
         assert!(sub.residence[b.0].hot.is_none(), "the unpinned one goes");
     }
 
+    /// A guest's drain takes a pinned working set too, and still spares the
+    /// keep list.
+    #[test]
+    fn evict_hot_for_guest_takes_pinned_working_sets_but_not_the_keep_list() {
+        let (layer, group, file, mut sub) = make_timeline();
+        let (a_idx, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
+        let other = unshared_timeline(1);
+        sub.register_timeline(other, layer, group);
+        let (b_idx, b) = install_hot_and_warm(&mut sub, other, 100_000_000);
+        let dialogue = unshared_timeline(2);
+        sub.register_timeline(dialogue, layer, group);
+        sub.set_working_set_share(group, WorkingSetShare::Remainder);
+        assert!(sub.working_set_restore_lock(dialogue, file));
+
+        let report = sub.evict_hot_for_guest(&[], &[TurnKey::new(other, b_idx)], u64::MAX);
+        assert_eq!(report.count, 1);
+        assert!(sub.residence[a.0].hot.is_none(), "the pinned file goes");
+        assert!(sub.residence[a.0].warm.is_some(), "and keeps its warm copy");
+        assert!(sub.residence[b.0].hot.is_some(), "the kept turn stays");
+        let _ = a_idx;
+    }
+
     /// The census counts what the eviction would take and names what it
     /// protects, and evicts nothing itself.
     #[test]
@@ -11782,6 +11853,65 @@ mod tests {
         assert_eq!(
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
+        );
+    }
+
+    /// **A maintenance op refreshes the residences of the streams it moved,
+    /// and no others**: two turns' chunks are repointed in the index, one
+    /// stream is named moved, and only its turn's cold reference follows.
+    #[test]
+    fn refresh_cold_refs_of_repoints_only_the_moved_streams() {
+        let (_, _, first, mut sub) = make_timeline();
+        let second = TimelineId::from_raw(4243).unwrap();
+        sub.register_timeline(second, LayerId::for_test(1), GroupId::for_test(1));
+        let loc = |offset: u64| ChunkLoc {
+            segment: FIRST_SEGMENT,
+            offset,
+            payload_len: 100,
+            record_size: 4096,
+            token_count: 32,
+            format: 4,
+        };
+        let cold_at = |offset: u64| {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: offset,
+                    record_len: 4096,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+        let mut turn = |timeline: TimelineId, offset: u64| {
+            let stream = turn_stream_id(timeline.raw(), 0);
+            sub.apply_chunk_loc(stream, 0, loc(offset), RecordIdentity::NONE);
+            let idx = sub.restore_turn(
+                timeline,
+                TurnLayout::default(),
+                TokenBuffer::default(),
+                32,
+                Some(cold_at(offset)),
+                0,
+                1,
+            );
+            (stream, idx)
+        };
+        let (moved_stream, moved_idx) = turn(first, 4096);
+        let (kept_stream, kept_idx) = turn(second, 8192);
+        sub.apply_chunk_loc(moved_stream, 0, loc(100_000), RecordIdentity::NONE);
+        sub.apply_chunk_loc(kept_stream, 0, loc(200_000), RecordIdentity::NONE);
+
+        sub.refresh_cold_refs_of(&HashSet::from([moved_stream]));
+
+        let offset_of = |sub: &Substrate, timeline, idx| {
+            let r = sub.turn_residence(timeline, idx).unwrap();
+            sub.residence[r.0].cold.as_ref().unwrap()[0].chunks[0].log_offset
+        };
+        assert_eq!(offset_of(&sub, first, moved_idx), 100_000);
+        assert_eq!(
+            offset_of(&sub, second, kept_idx),
+            8192,
+            "a stream the op did not move keeps its reference"
         );
     }
 

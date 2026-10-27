@@ -50,6 +50,7 @@ pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
 mod norm_warm;
+mod owed_pins;
 mod paused_creep;
 mod pending_ranges;
 pub mod phase_ring;
@@ -65,6 +66,7 @@ mod projection_identity;
 mod recurrent_park;
 pub mod relief_trace;
 mod reproject_abandon;
+mod request_laps;
 mod run;
 mod sample;
 mod seal_scan;
@@ -89,12 +91,14 @@ use band::recorded_band;
 use detached::Detached;
 use expert_counters::ExpertCounters;
 use graph_window::graph_window;
-use phase_split::cobatched_shares;
+use phase_split::cobatched_step_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
+use self::owed_pins::OwedPins;
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
+use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -2470,9 +2474,15 @@ struct WaveStats {
     drain_elevate_ms: u64,
     drain_glue_ms: u64,
     /// The prefill and section shares of the co-batched forwards inside the
-    /// decode quantum, in microseconds — see [`Self::record_cobatched_split`].
+    /// decode quantum, in microseconds — see [`Self::close_decode_step`].
     cobatched_prefill_us: u64,
     cobatched_section_us: u64,
+    /// The `(decode, prefill, section)` rows of the decode step in flight's
+    /// co-batched forwards, split by [`Self::close_decode_step`].
+    step_rows: (usize, usize, usize),
+    /// Tokens the window's decode steps committed — the decode phase's tokens
+    /// ([`Self::add_decode_committed`]).
+    decode_committed: u64,
     /// Set for the span of the decode quantum, so a co-batched split is taken
     /// only from a forward whose time decode's timer holds — the same wave step
     /// also runs from the prefill quantum.
@@ -2518,6 +2528,8 @@ impl WaveStats {
             drain_glue_ms: 0,
             cobatched_prefill_us: 0,
             cobatched_section_us: 0,
+            step_rows: (0, 0, 0),
+            decode_committed: 0,
             in_decode_quantum: false,
             experts_prev: None,
             graphs_prev: None,
@@ -2530,31 +2542,46 @@ impl WaveStats {
         self.timing.add(wall_us, overhead_us);
     }
 
-    /// Split one co-batched forward's wall-clock between the classes that rode
-    /// it, by their share of its rows.
-    ///
-    /// The forward runs inside the decode quantum, so all of it is already in
-    /// `decode_ms`; this records how much of it was prefill's and section's work,
-    /// which the phase window moves out of decode. A forward cannot be spent
-    /// twice: a 3-row decode beside an 8K-token prefill shared one 4.6 s sweep,
-    /// and charging that sweep to both drew a decode bar the length of the whole
-    /// window at ~12 tok/s.
+    /// Note the rows one co-batched forward carried, for the decode step it
+    /// rode to be split by ([`Self::close_decode_step`]). Only a forward inside
+    /// the decode quantum is noted: the same wave step also runs from the
+    /// prefill quantum with no decode rows, its time already prefill's, and
+    /// sharing that one too counted it twice — a 5.2 s window drew a 9.4 s
+    /// prefill band.
     fn record_cobatched_split(
         &mut self,
         decode_rows: usize,
         prefill_rows: usize,
         section_rows: usize,
-        fwd_us: u64,
     ) {
-        let (pf, sc) = cobatched_shares(
-            self.in_decode_quantum,
-            decode_rows,
-            prefill_rows,
-            section_rows,
-            fwd_us,
-        );
+        if !self.in_decode_quantum {
+            return;
+        }
+        let (d, p, s) = self.step_rows;
+        self.step_rows = (d + decode_rows, p + prefill_rows, s + section_rows);
+    }
+
+    /// Split one decode step's wall-clock between the classes that rode it
+    /// (`phase_split::cobatched_step_shares`), given what a decode-only step
+    /// takes.
+    ///
+    /// The step ran inside the decode quantum, so all of it is already in
+    /// `decode_ms`; this records how much of it was prefill's and section's
+    /// work, which the phase window moves out of decode. A step cannot be spent
+    /// twice: a 3-row decode beside an 8K-token prefill shared one 4.6 s sweep,
+    /// and charging that sweep to both drew a decode bar the length of the whole
+    /// window at ~12 tok/s.
+    fn close_decode_step(&mut self, step_us: u64, decode_only_us: Option<u64>) {
+        let (d, p, s) = std::mem::take(&mut self.step_rows);
+        let (pf, sc) = cobatched_step_shares(step_us, decode_only_us, d, p, s);
         self.cobatched_prefill_us += pf;
         self.cobatched_section_us += sc;
+    }
+
+    /// Count the tokens a decode step committed — what the decode phase
+    /// delivered, which a step's rows overstate by every draft rejected.
+    fn add_decode_committed(&mut self, tokens: u64) {
+        self.decode_committed += tokens;
     }
 
     /// Accumulate one eviction event (relief-ladder shed of resident KV).
@@ -2961,6 +2988,7 @@ impl WaveStats {
         self.drain_glue_ms = 0;
         self.cobatched_prefill_us = 0;
         self.cobatched_section_us = 0;
+        self.decode_committed = 0;
     }
 
     /// Emit this window's per-phase measurements to the GUI ring as a **disjoint**
@@ -2995,8 +3023,8 @@ impl WaveStats {
         // Continuous-fair-wave co-batching folds the prefill cohort and section
         // chunks INTO the decode quantum — one shared forward per wave — so their
         // own quanta (`prefill_ms`/`section_ms`) hold little and their time sits in
-        // `decode_ms`. Each co-batched forward's share of prefill and section rows
-        // (`record_cobatched_split`) is moved out of decode into those phases, so
+        // `decode_ms`. Each decode step's creep share — the step past a
+        // decode-only one (`close_decode_step`) — is moved out of decode into those phases, so
         // every band is wall-clock the window actually spent and the bands sum to
         // it. Charging the shared forward to every class instead stacked one sweep
         // two and three times: a 5.3 s window drew a 9.9 s bar, its 65-token decode
@@ -3075,20 +3103,20 @@ impl WaveStats {
         );
 
         let mut phases: Vec<PhaseMeasure> = Vec::new();
-        let mut inference = |kind: PhaseKind, ch: &WaveChannel, dur_ms: u64| {
-            if ch.fwds == 0 && dur_ms == 0 {
-                return;
-            }
+        // The decode phase's tokens are the ones its steps committed, not the
+        // rows they scored: a speculative step scores a drafted block per
+        // sequence, and counting it whole credited decode with every draft it
+        // rejected.
+        if self.decode.fwds > 0 || decode_dur > 0 {
             phases.push(PhaseMeasure {
-                kind,
-                dur_ms: dur_ms as u32,
-                tokens: ch.tok_sum,
+                kind: PhaseKind::Decode,
+                dur_ms: decode_dur as u32,
+                tokens: self.decode_committed,
                 bytes: 0,
-                seqs: ch.seq_max as u32,
-                count: ch.fwds as u32,
+                seqs: self.decode.seq_max as u32,
+                count: self.decode.fwds as u32,
             });
-        };
-        inference(PhaseKind::Decode, &self.decode, decode_dur);
+        }
         // One prefill band for every prefill the window ran: the async-queue
         // dialogue prefill, the drain-path ingest prefill, and section ingest —
         // which is prefill of a section's tokens, run by the same wave step from
@@ -3827,6 +3855,12 @@ pub(crate) struct Scheduler {
     /// (`docs/prefill_gangs.md`). Fixed from formation until every member's
     /// prefill is done.
     prefill_gang: Vec<usize>,
+    /// The steps of the request in hand, named in the log when it holds the
+    /// wave thread long ([`Self::handle_request`]).
+    request_laps: RequestLaps,
+    /// The substrates owed a working-set pin republish that found the write
+    /// lock held ([`Self::republish_pins`]).
+    owed_pins: OwedPins,
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
@@ -4223,6 +4257,8 @@ impl Scheduler {
             wave_prefill_rows: Vec::new(),
             paused_creep: None,
             prefill_gang: Vec::new(),
+            request_laps: RequestLaps::default(),
+            owed_pins: OwedPins::default(),
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
             prefill_waits: prefill_wait::PrefillWaits::default(),
@@ -4348,14 +4384,25 @@ impl Scheduler {
     fn handle_request(&mut self, req: SchedulerRequest) -> bool {
         let name = req.span_name();
         let began = Instant::now();
+        self.request_laps.start();
         let keep_going = self.handle_request_now(req);
         let took = began.elapsed();
         if took >= SLOW_REQUEST {
-            tracing::info!(
-                request = name,
-                took_ms = took.as_millis() as u64,
-                "scheduler: a request held the wave thread"
-            );
+            // With its steps, where the handler laps them (`request_laps`).
+            if self.request_laps.any() {
+                tracing::info!(
+                    request = name,
+                    took_ms = took.as_millis() as u64,
+                    steps = %self.request_laps,
+                    "scheduler: a request held the wave thread"
+                );
+            } else {
+                tracing::info!(
+                    request = name,
+                    took_ms = took.as_millis() as u64,
+                    "scheduler: a request held the wave thread"
+                );
+            }
         }
         keep_going
     }
@@ -4925,13 +4972,16 @@ impl Scheduler {
                             "slot {sequence_id} was freed before its turn was admitted"
                         ))));
                 }
+                self.request_laps.lap("pending_submits");
                 // A turn view borrows this slot's blocks, so it cannot outlive
                 // them; and a view freed directly takes its registration with it.
                 self.discard_turn_views_of(sequence_id);
                 self.turn_views.remove(&sequence_id);
+                self.request_laps.lap("turn_views");
                 if let Err(e) = self.session.free_sequence(sequence_id.0) {
                     tracing::warn!("failed to free sequence {}: {}", sequence_id, e);
                 }
+                self.request_laps.lap("session_free");
                 // The session owns the KV; per-sequence state the MODEL keeps
                 // outside it (a recurrent store) is freed here or not at all.
                 // Slot ids recycle, so this is correctness, not housekeeping.
@@ -4942,6 +4992,7 @@ impl Scheduler {
                         e
                     );
                 }
+                self.request_laps.lap("model_release");
                 // Clean up persistent sampling state.
                 self.sampling_states.remove(&sequence_id);
                 // Drop the conversation handle and projection target
@@ -4953,7 +5004,9 @@ impl Scheduler {
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
+                self.request_laps.lap("slot_maps");
                 self.retire_slot_projection_state(sequence_id, freed_conversation);
+                self.request_laps.lap("projection_state");
                 // Purge any DEFERRED glue plan for this slot. A queued gap-fill
                 // must never outlive the slot layout it was planned against: the
                 // freed id is recycled immediately (the code_read scope workers
@@ -4972,7 +5025,9 @@ impl Scheduler {
                 // recycled — a stale prefill entry keyed by the freed id would
                 // collide with the reused slot in the next wave-group assembly.
                 self.purge_freed_slot_scheduling_state(sequence_id);
+                self.request_laps.lap("scheduling_state");
                 self.prune_ingest_timeline(freed_target);
+                self.request_laps.lap("ingest_timeline");
                 true
             }
 
@@ -11184,17 +11239,12 @@ impl Scheduler {
     /// evict mid-forward). Recomputed wholesale each call, so residences that
     /// have left every working set drop out and become evictable again.
     fn publish_working_set_pins(
-        &self,
+        &mut self,
         conversation: &Conversation,
         extra_sections: &[SectionId],
         extra_turns: &[TurnKey],
     ) {
-        let mut keep_turns: Vec<TurnKey> = Vec::new();
-        let mut keep_sections: Vec<SectionId> = Vec::new();
-        for st in self.slot_projection_state.values() {
-            keep_sections.extend(st.working_set.sections.iter().copied());
-            keep_turns.extend(st.working_set.turns.iter().copied());
-        }
+        let (mut keep_sections, mut keep_turns) = self.live_working_sets();
         keep_sections.extend(extra_sections.iter().copied());
         keep_turns.extend(extra_turns.iter().copied());
         // The publish advances the substrate's own wave clock and stamps the
@@ -11202,6 +11252,34 @@ impl Scheduler {
         conversation
             .write()
             .set_working_set_pins(&keep_turns, &keep_sections);
+        // The whole live set, so a republish this substrate was owed is in it.
+        self.owed_pins.settled(conversation);
+    }
+
+    /// Republish `conversation`'s substrate's keep-set — the live working sets
+    /// alone — if its write lock is free now, and owe it otherwise
+    /// ([`OwedPins`]): what a slot's retirement does, which only takes pins
+    /// away and so can wait a wave rather than hold the wave thread behind a
+    /// maintenance op. [`Self::settle_owed_pins`] retries what is owed.
+    fn republish_pins(&mut self, conversation: &Conversation) {
+        let (keep_sections, keep_turns) = self.live_working_sets();
+        match conversation.try_write() {
+            Some(mut substrate) => {
+                substrate.set_working_set_pins(&keep_turns, &keep_sections);
+                drop(substrate);
+                self.owed_pins.settled(conversation);
+            }
+            None => self.owed_pins.owe(conversation),
+        }
+    }
+
+    /// Retry every owed republish ([`Self::republish_pins`]); those still
+    /// locked stay owed. Once a wave, so a pin outlives its slot by about the
+    /// length of the hold that blocked it.
+    pub(super) fn settle_owed_pins(&mut self) {
+        for conversation in self.owed_pins.take() {
+            self.republish_pins(&conversation);
+        }
     }
 
     /// Drop `slot`'s projection working set and republish the keep-set without
@@ -11233,7 +11311,9 @@ impl Scheduler {
     /// This is the only place [`Self::slot_projection_state`] is removed from,
     /// which is what makes "a removal is always followed by a republish" hold
     /// by construction rather than by every caller remembering. Keep it that
-    /// way: a bare `remove` elsewhere re-opens the wedge silently.
+    /// way: a bare `remove` elsewhere re-opens the wedge silently. The
+    /// republish runs now when the substrate's write lock is free and is owed
+    /// to the next wave when it is not ([`Self::republish_pins`]).
     fn retire_slot_projection_state(
         &mut self,
         slot: SequenceId,
@@ -11243,7 +11323,7 @@ impl Scheduler {
             return;
         }
         if let Some(conversation) = conversation {
-            self.publish_working_set_pins(&conversation, &[], &[]);
+            self.republish_pins(&conversation);
         }
     }
 
