@@ -290,18 +290,18 @@ typedef struct __align__(16) {
             int qs2;   // thread 2: elems 16-23
             int qs3;   // thread 3: elems 24-31
             int qs4;   // thread 4: elems 32-39
-            half d0;   // thread 0-3 scale
-            half d1;   // thread 4-7 scale
+            __half_raw d0;   // thread 0-3 scale
+            __half_raw d1;   // thread 4-7 scale
             int qs5;   // thread 5: elems 40-47
             int qs6;   // thread 6: elems 48-55
             int qs7;   // thread 7: elems 56-63
-            half2 _pad0; // padding for alignment
-            half2 _pad1; // padding for alignment
+            __half2_raw _pad0; // padding for alignment
+            __half2_raw _pad1; // padding for alignment
             int qs8;   // thread 8: elems 64-71
             int qs9;   // thread 9: elems 72-79
             int qs10;  // thread 10: elems 80-87
-            half d2;   // thread 8-11 scale
-            half d3;   // thread 12-15 scale
+            __half_raw d2;   // thread 8-11 scale
+            __half_raw d3;   // thread 12-15 scale
             int qs11;  // thread 11: elems 88-95
             int qs12;  // thread 12: elems 96-103
             int qs13;  // thread 13: elems 104-111
@@ -328,18 +328,18 @@ typedef struct __align__(16) {
             int qs1;   // thread 1: elems 8-15
             int qs2;   // thread 2: elems 16-23
             int qs3;   // thread 3: elems 24-31
-            half2 dm0; // thread 0-3 scale/min
+            __half2_raw dm0; // thread 0-3 scale/min
             int qs4;   // thread 4: elems 32-39
             int qs5;   // thread 5: elems 40-47
             int qs6;   // thread 6: elems 48-55
             int qs7;   // thread 7: elems 56-63
-            half2 dm1; // thread 4-7 scale/min
-            half2 dm2; // thread 8-11 scale/min
+            __half2_raw dm1; // thread 4-7 scale/min
+            __half2_raw dm2; // thread 8-11 scale/min
             int qs8;   // thread 8: elems 64-71
             int qs9;   // thread 9: elems 72-79
             int qs10;  // thread 10: elems 80-87
             int qs11;  // thread 11: elems 88-95
-            half2 dm3; // thread 12-15 scale/min
+            __half2_raw dm3; // thread 12-15 scale/min
             int qs12;  // thread 12: elems 96-103
             int qs13;  // thread 13: elems 104-111
             int qs14;  // thread 14: elems 112-119
@@ -366,22 +366,22 @@ typedef struct __align__(16) {
             int qs2;   // thread 2: elems 16-23
             int qs3;   // thread 3: elems 24-31
             int qh0123;// threads 0-3: high bits (packed uint8_t)
-            half d0;   // thread 0-3 scale
+            __half_raw d0;   // thread 0-3 scale
             int _spad0;// scale padding
             int qs4;   // thread 4: elems 32-39
             int qs5;   // thread 5: elems 40-47
             int qs6;   // thread 6: elems 48-55
             int qs7;   // thread 7: elems 56-63
             int qh4567;// threads 4-7: high bits
-            half d1;   // thread 4-7 scale
-            half d2;   // thread 8-11 scale
+            __half_raw d1;   // thread 4-7 scale
+            __half_raw d2;   // thread 8-11 scale
             int qh891011;// threads 8-11: high bits
             int qs8;   // thread 8: elems 64-71
             int qs9;   // thread 9: elems 72-79
             int qs10;  // thread 10: elems 80-87
             int qs11;  // thread 11: elems 88-95
             int _spad1;// scale padding
-            half d3;   // thread 12-15 scale
+            __half_raw d3;   // thread 12-15 scale
             int qs12;  // thread 12: elems 96-103
             int qs13;  // thread 13: elems 104-111
             int qs14;  // thread 14: elems 112-119
@@ -409,20 +409,20 @@ typedef struct __align__(16) {
             int qs2;   // thread 2: elems 16-23
             int qs3;   // thread 3: elems 24-31
             int qh0123;// threads 0-3: high bits (packed uint8_t)
-            half2 dm0; // thread 0-3 scale/min
+            __half2_raw dm0; // thread 0-3 scale/min
             int qs4;   // thread 4: elems 32-39
             int qs5;   // thread 5: elems 40-47
             int qs6;   // thread 6: elems 48-55
             int qs7;   // thread 7: elems 56-63
             int qh4567;// threads 4-7: high bits
-            half2 dm1; // thread 4-7 scale/min
-            half2 dm2; // thread 8-11 scale/min
+            __half2_raw dm1; // thread 4-7 scale/min
+            __half2_raw dm2; // thread 8-11 scale/min
             int qh891011;// threads 8-11: high bits
             int qs8;   // thread 8: elems 64-71
             int qs9;   // thread 9: elems 72-79
             int qs10;  // thread 10: elems 80-87
             int qs11;  // thread 11: elems 88-95
-            half2 dm3; // thread 12-15 scale/min
+            __half2_raw dm3; // thread 12-15 scale/min
             int qs12;  // thread 12: elems 96-103
             int qs13;  // thread 13: elems 104-111
             int qs14;  // thread 14: elems 112-119
@@ -448,9 +448,9 @@ typedef struct __align__(16) {
             int2 qs0;   // thread 0: elems 0-7
             int2 qs1;   // thread 1: elems 8-15
             int2 qs2;   // thread 2: elems 16-23
-            half d0;    // thread 0-3 scale
-            half d1;    // thread 4-7 scale
-            half2 _pad0;
+            __half_raw d0;    // thread 0-3 scale
+            __half_raw d1;    // thread 4-7 scale
+            __half2_raw _pad0;
             int2 qs3;   // thread 3: elems 24-31
             int2 qs4;   // thread 4: elems 32-39
             int2 qs5;   // thread 5: elems 40-47
@@ -461,9 +461,9 @@ typedef struct __align__(16) {
             int2 qs10;  // thread 10: elems 80-87
             int2 qs11;  // thread 11: elems 88-95
             int2 qs12;  // thread 12: elems 96-103
-            half d2;    // thread 8-11 scale
-            half d3;    // thread 12-15 scale
-            half2 _pad1;
+            __half_raw d2;    // thread 8-11 scale
+            __half_raw d3;    // thread 12-15 scale
+            __half2_raw _pad1;
             int2 qs13;  // thread 13: elems 104-111
             int2 qs14;  // thread 14: elems 112-119
             int2 qs15;  // thread 15: elems 120-127
@@ -489,8 +489,8 @@ typedef struct __align__(16) {
             int2 qs0;    // thread 0: elems 0-7
             int2 qs1;    // thread 1: elems 8-15
             int2 qs2;    // thread 2: elems 16-23
-            half2 dm0;   // thread 0-3 (d, m)
-            half2 _pad0;
+            __half2_raw dm0;   // thread 0-3 (d, m)
+            __half2_raw _pad0;
             int2 qs3;    // thread 3: elems 24-31
             int2 qs4;    // thread 4: elems 32-39
             int2 qs5;    // thread 5: elems 40-47
@@ -501,13 +501,13 @@ typedef struct __align__(16) {
             int2 qs10;   // thread 10: elems 80-87
             int2 qs11;   // thread 11: elems 88-95
             int2 qs12;   // thread 12: elems 96-103
-            half2 dm1;   // thread 4-7 (d, m)
-            half2 dm2;   // thread 8-11 (d, m)
+            __half2_raw dm1;   // thread 4-7 (d, m)
+            __half2_raw dm2;   // thread 8-11 (d, m)
             int2 qs13;   // thread 13: elems 104-111
             int2 qs14;   // thread 14: elems 112-119
             int2 qs15;   // thread 15: elems 120-127
-            half2 dm3;   // thread 12-15 (d, m)
-            half2 _pad1;
+            __half2_raw dm3;   // thread 12-15 (d, m)
+            __half2_raw _pad1;
         };
         int4 pack[10];
         int data[40];
@@ -535,28 +535,28 @@ typedef struct __align__(16) {
         struct {
             uint16_t qs0;    // thread 0
             uint16_t qs1;    // thread 1
-            half2 dm0;       // (d,m) for threads 0-1
+            __half2_raw dm0;       // (d,m) for threads 0-1
             uint16_t qs2;    // thread 2
             uint16_t qs3;    // thread 3
-            half2 dm1;       // (d,m) for threads 2-3
+            __half2_raw dm1;       // (d,m) for threads 2-3
             uint16_t qs4;    // thread 4
             uint16_t qs5;    // thread 5
-            half2 dm2;       // (d,m) for threads 4-5
+            __half2_raw dm2;       // (d,m) for threads 4-5
             uint16_t qs6;    // thread 6
             uint16_t qs7;    // thread 7
-            half2 dm3;       // (d,m) for threads 6-7
+            __half2_raw dm3;       // (d,m) for threads 6-7
             uint16_t qs8;    // thread 8
             uint16_t qs9;    // thread 9
-            half2 dm4;       // (d,m) for threads 8-9
+            __half2_raw dm4;       // (d,m) for threads 8-9
             uint16_t qs10;   // thread 10
             uint16_t qs11;   // thread 11
-            half2 dm5;       // (d,m) for threads 10-11
+            __half2_raw dm5;       // (d,m) for threads 10-11
             uint16_t qs12;   // thread 12
             uint16_t qs13;   // thread 13
-            half2 dm6;       // (d,m) for threads 12-13
+            __half2_raw dm6;       // (d,m) for threads 12-13
             uint16_t qs14;   // thread 14
             uint16_t qs15;   // thread 15
-            half2 dm7;       // (d,m) for threads 14-15
+            __half2_raw dm7;       // (d,m) for threads 14-15
         };
         int4 pack[4];
         int data[16];
@@ -582,7 +582,7 @@ typedef struct __align__(16) {
             uint16_t qs0;    // thread 0: low bits (offset 0)
             uint8_t qh0;     // thread 0: high bits (offset 2)
             uint8_t pad0;    // padding for alignment (offset 3)
-            half2 dm0;       // (d,m) for threads 0-1 (offset 4, aligned!)
+            __half2_raw dm0;       // (d,m) for threads 0-1 (offset 4, aligned!)
             uint8_t qh1;     // thread 1: high bits (offset 8)
             uint8_t pad1;    // padding (offset 9)
             uint16_t qs1;    // thread 1: low bits (offset 10)
@@ -591,7 +591,7 @@ typedef struct __align__(16) {
             uint16_t qs2;    // thread 2 (offset 12)
             uint8_t qh2;     // thread 2: high bits (offset 14)
             uint8_t pad2;    // padding (offset 15)
-            half2 dm1;       // (d,m) for threads 2-3 (offset 16, aligned!)
+            __half2_raw dm1;       // (d,m) for threads 2-3 (offset 16, aligned!)
             uint8_t qh3;     // thread 3: high bits (offset 20)
             uint8_t pad3;    // padding (offset 21)
             uint16_t qs3;    // thread 3 (offset 22)
@@ -600,7 +600,7 @@ typedef struct __align__(16) {
             uint16_t qs4;    // thread 4 (offset 24)
             uint8_t qh4;     // thread 4: high bits (offset 26)
             uint8_t pad4;    // padding (offset 27)
-            half2 dm2;       // (d,m) for threads 4-5 (offset 28, aligned!)
+            __half2_raw dm2;       // (d,m) for threads 4-5 (offset 28, aligned!)
             uint8_t qh5;     // thread 5: high bits (offset 32)
             uint8_t pad5;    // padding (offset 33)
             uint16_t qs5;    // thread 5 (offset 34)
@@ -609,7 +609,7 @@ typedef struct __align__(16) {
             uint16_t qs6;    // thread 6 (offset 36)
             uint8_t qh6;     // thread 6: high bits (offset 38)
             uint8_t pad6;    // padding (offset 39)
-            half2 dm3;       // (d,m) for threads 6-7 (offset 40, aligned!)
+            __half2_raw dm3;       // (d,m) for threads 6-7 (offset 40, aligned!)
             uint8_t qh7;     // thread 7: high bits (offset 44)
             uint8_t pad7;    // padding (offset 45)
             uint16_t qs7;    // thread 7 (offset 46)
@@ -618,7 +618,7 @@ typedef struct __align__(16) {
             uint16_t qs8;    // thread 8 (offset 48)
             uint8_t qh8;     // thread 8: high bits (offset 50)
             uint8_t pad8;    // padding (offset 51)
-            half2 dm4;       // (d,m) for threads 8-9 (offset 52, aligned!)
+            __half2_raw dm4;       // (d,m) for threads 8-9 (offset 52, aligned!)
             uint8_t qh9;     // thread 9: high bits (offset 56)
             uint8_t pad9;    // padding (offset 57)
             uint16_t qs9;    // thread 9 (offset 58)
@@ -627,7 +627,7 @@ typedef struct __align__(16) {
             uint16_t qs10;   // thread 10 (offset 60)
             uint8_t qh10;    // thread 10: high bits (offset 62)
             uint8_t pad10;   // padding (offset 63)
-            half2 dm5;       // (d,m) for threads 10-11 (offset 64, aligned!)
+            __half2_raw dm5;       // (d,m) for threads 10-11 (offset 64, aligned!)
             uint8_t qh11;    // thread 11: high bits (offset 68)
             uint8_t pad11;   // padding (offset 69)
             uint16_t qs11;   // thread 11 (offset 70)
@@ -636,7 +636,7 @@ typedef struct __align__(16) {
             uint16_t qs12;   // thread 12 (offset 72)
             uint8_t qh12;    // thread 12: high bits (offset 74)
             uint8_t pad12;   // padding (offset 75)
-            half2 dm6;       // (d,m) for threads 12-13 (offset 76, aligned!)
+            __half2_raw dm6;       // (d,m) for threads 12-13 (offset 76, aligned!)
             uint8_t qh13;    // thread 13: high bits (offset 80)
             uint8_t pad13;   // padding (offset 81)
             uint16_t qs13;   // thread 13 (offset 82)
@@ -645,7 +645,7 @@ typedef struct __align__(16) {
             uint16_t qs14;   // thread 14 (offset 84)
             uint8_t qh14;    // thread 14: high bits (offset 86)
             uint8_t pad14;   // padding (offset 87)
-            half2 dm7;       // (d,m) for threads 14-15 (offset 88, aligned!)
+            __half2_raw dm7;       // (d,m) for threads 14-15 (offset 88, aligned!)
             uint8_t qh15;    // thread 15: high bits (offset 92)
             uint8_t pad15;   // padding (offset 93)
             uint16_t qs15;   // thread 15 (offset 94)
@@ -670,8 +670,8 @@ typedef struct __align__(16) {
             int qs1;   // thread 1: elems 8-15
             int qs2;   // thread 2: elems 16-23
             int qs3;   // thread 3: elems 24-31
-            half2 dm0; // thread 0-3 scale/min
-            half2 dm1; // thread 4-7 scale/min
+            __half2_raw dm0; // thread 0-3 scale/min
+            __half2_raw dm1; // thread 4-7 scale/min
             int qs4;   // thread 4: elems 32-39
             int qs5;   // thread 5: elems 40-47
             int qs6;   // thread 6: elems 48-55
@@ -680,8 +680,8 @@ typedef struct __align__(16) {
             int qs9;   // thread 9: elems 72-79
             int qs10;  // thread 10: elems 80-87
             int qs11;  // thread 11: elems 88-95
-            half2 dm2; // thread 8-11 scale/min
-            half2 dm3; // thread 12-15 scale/min
+            __half2_raw dm2; // thread 8-11 scale/min
+            __half2_raw dm3; // thread 12-15 scale/min
             int qs12;  // thread 12: elems 96-103
             int qs13;  // thread 13: elems 104-111
             int qs14;  // thread 14: elems 112-119
@@ -740,7 +740,7 @@ static_assert(sizeof(block_c_mxfp4_k128) == 64, "block_c_mxfp4_k128 must be 64 b
 typedef struct __align__(16) {
     union {
         struct {
-            half2 dm0; // thread 0-3 scale/min
+            __half2_raw dm0; // thread 0-3 scale/min
             int qh0123;// threads 0-3: high bits (packed uint8_t)
             int qs0;   // thread 0: elems 0-7 (low 4 bits)
             int qs1;   // thread 1: elems 8-15
@@ -751,8 +751,8 @@ typedef struct __align__(16) {
             int qs6;   // thread 6: elems 48-55
             int qs7;   // thread 7: elems 56-63
             int qh4567;// threads 4-7: high bits
-            half2 dm1; // thread 4-7 scale/min
-            half2 dm2; // thread 8-11 scale/min
+            __half2_raw dm1; // thread 4-7 scale/min
+            __half2_raw dm2; // thread 8-11 scale/min
             int qh891011;// threads 8-11: high bits
             int qs8;   // thread 8: elems 64-71
             int qs9;   // thread 9: elems 72-79
@@ -763,7 +763,7 @@ typedef struct __align__(16) {
             int qs14;  // thread 14: elems 112-119
             int qs15;  // thread 15: elems 120-127
             int qh12131415;// threads 12-15: high bits
-            half2 dm3; // thread 12-15 scale/min
+            __half2_raw dm3; // thread 12-15 scale/min
         };
         int4 pack[7];
         int data[28];
@@ -868,8 +868,8 @@ typedef struct __align__(16) {
             int2 qs0;    // thread 0: elems 0-7
             int2 qs1;    // thread 1: elems 8-15
             int2 qs2;    // thread 2: elems 16-23
-            half2 d0;    // thread 0-3 scale (d0.x = d, d0.y = unused)
-            half2 _pad0;
+            __half2_raw d0;    // thread 0-3 scale (d0.x = d, d0.y = unused)
+            __half2_raw _pad0;
             int2 qs3;    // thread 3: elems 24-31
             int2 qs4;    // thread 4: elems 32-39
             int2 qs5;    // thread 5: elems 40-47
@@ -880,13 +880,13 @@ typedef struct __align__(16) {
             int2 qs10;   // thread 10: elems 80-87
             int2 qs11;   // thread 11: elems 88-95
             int2 qs12;   // thread 12: elems 96-103
-            half2 d1;    // thread 4-7 scale (same value, d1.x = d)
-            half2 d2;    // thread 8-11 scale (same value, d2.x = d)
+            __half2_raw d1;    // thread 4-7 scale (same value, d1.x = d)
+            __half2_raw d2;    // thread 8-11 scale (same value, d2.x = d)
             int2 qs13;   // thread 13: elems 104-111
             int2 qs14;   // thread 14: elems 112-119
             int2 qs15;   // thread 15: elems 120-127
-            half2 d3;    // thread 12-15 scale (same value, d3.x = d)
-            half2 _pad1;
+            __half2_raw d3;    // thread 12-15 scale (same value, d3.x = d)
+            __half2_raw _pad1;
         };
         int4 pack[10];
         int data[40];
@@ -1030,8 +1030,8 @@ template <> struct int8_chunk_bytes<block_c_mxfp4_k1024> { static constexpr int 
 // Thread t loads qs[t] (8 × 4-bit nibbles)
 typedef struct __align__(16) {
     uint32_t qs[16];      // 16 threads × 1 int (8 nibbles each) = 128 elements
-    half scale;      // scale for entire block
-    half zero;       // zero point for entire block
+    __half_raw scale;      // scale for entire block
+    __half_raw zero;       // zero point for entire block
     int _pad[3];     // padding to 80 bytes (16-byte aligned)
     
     template<typename T>

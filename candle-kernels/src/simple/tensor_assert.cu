@@ -47,6 +47,7 @@
 // Empty tensors are a no-op (the launcher returns before launching).
 
 #include <cstdint>
+#include <cfloat>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
