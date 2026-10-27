@@ -61,7 +61,7 @@ use candle::Result;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::region_pool::{carve_persist, place_transient, release_transient};
 use super::wave_census::{self, Carve};
-use super::wave_plan::LayerPhase;
+use super::wave_plan::{phase_offsets, tier_footprint, LayerPhase};
 use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
 /// A range handed out by a [`Generation`].
@@ -1066,19 +1066,20 @@ fn fallback_plan() -> [usize; 3] {
 
 /// The boundary every phase span's base must land on.
 ///
-/// The same quantum ops carve at (`INHERIT_ALIGN` in candle-core), because the
-/// spans are laid out back-to-back and each span's base is the previous one's
-/// end: an entry that is not a multiple of this shifts every span after it off
-/// the boundary, and a carve's alignment is only as good as its span's base
-/// (see [`aligned_start`]).
+/// The same quantum ops carve at (`INHERIT_ALIGN` in candle-core), because a
+/// span's base is laid out from the entries before it ([`phase_offsets`]): an
+/// entry that is not a multiple of this shifts the forward span off the
+/// boundary, and a carve's alignment is only as good as its span's base (see
+/// [`aligned_start`]).
 const WAVE_SPAN_ALIGN: usize = 256;
 
 /// A phase plan with every entry rounded up to [`WAVE_SPAN_ALIGN`].
 ///
 /// Applied where a plan enters the domain — recording and fallback — so every
-/// consumer (the tier purchase sums it, the span layout walks it) sees the same
-/// figures and the spans always start aligned. The rounding is priced into the
-/// tier: the purchase is the sum of the *rounded* entries.
+/// consumer (the tier purchase and the span layout, through [`tier_footprint`]
+/// and [`phase_offsets`]) sees the same figures and the spans always start
+/// aligned. The rounding is priced into the tier: the purchase is the footprint
+/// of the *rounded* entries.
 fn align_phase_plan(plan: [usize; 3]) -> [usize; 3] {
     plan.map(|bytes| bytes.div_ceil(WAVE_SPAN_ALIGN) * WAVE_SPAN_ALIGN)
 }
@@ -1140,8 +1141,14 @@ static GUEST_ARENA_OPEN: AtomicBool = AtomicBool::new(false);
 /// against every other drain by the scheduler thread, so the previous one has
 /// finished by the time this runs; replacing rather than refusing means a drain
 /// that died without closing cannot wedge every later one.
-pub fn open_guest_arena(stream: &Arc<CudaStream>, base: u64, capacity: usize) {
+/// Register this module's resolver for wave tickets — idempotent, and needed by
+/// anything that carves for a ticket, the guest heap included.
+pub(super) fn install_resolver() {
     candle::cuda_backend::wave_provenance::install_wave_allocator(resolve_wave_alloc);
+}
+
+pub fn open_guest_arena(stream: &Arc<CudaStream>, base: u64, capacity: usize) {
+    install_resolver();
     let ordinal = stream.context().ordinal();
     let arena = BumpArena::over(stream, "guest", base, capacity, Reclaim::Fence);
     let mut map = guest_domains().lock().unwrap();
@@ -1480,6 +1487,16 @@ fn phase_index(phase: LayerPhase) -> usize {
         LayerPhase::Attention => 0,
         LayerPhase::Ffn => 1,
         LayerPhase::Forward => FORWARD_ARENA as usize,
+    }
+}
+
+/// The layer phase whose span shares `phase`'s ground ([`phase_offsets`]) —
+/// `None` for the forward span, which has its own.
+fn other_layer_phase(phase: LayerPhase) -> Option<LayerPhase> {
+    match phase {
+        LayerPhase::Attention => Some(LayerPhase::Ffn),
+        LayerPhase::Ffn => Some(LayerPhase::Attention),
+        LayerPhase::Forward => None,
     }
 }
 
@@ -1940,7 +1957,7 @@ fn place_plan(stream: &Arc<CudaStream>, per_phase: [usize; 3], scratch: usize) -
     // Outside the lock. A failure here leaves no tier standing and
     // `reserved_by_forward` clear, so the forward that fails takes nothing with
     // it — the next one starts against the whole partition.
-    let bought: usize = per_phase.iter().sum();
+    let bought = tier_footprint(per_phase);
     let base = place_transient(&stream, bought)?;
     with_wave_domain(&stream, |domain| {
         domain.placed_at = Some(base);
@@ -2088,7 +2105,7 @@ fn cover_target(
             let merged = covering_plan(standing, wanted);
             if merged == standing {
                 Cover::Keep
-            } else if merged.iter().sum::<usize>() <= bytes {
+            } else if tier_footprint(merged) <= bytes {
                 Cover::Relay(merged)
             } else {
                 Cover::Place(wanted)
@@ -2181,7 +2198,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                 None
             } else {
                 let plan = domain.planned.unwrap_or_else(fallback_plan);
-                let wanted: usize = plan.iter().sum();
+                let wanted = tier_footprint(plan);
                 // A tier whose top already crosses the weight floor must be
                 // re-placed however large it is, so the `bytes >= wanted` arm below
                 // cannot keep it. `plan_wave_transient` leaves exactly this state
@@ -2219,7 +2236,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                 // Hand the old one back first when there is one, so its ground is
                 // marked dirty and the next tenant cleans it.
                 release_transient(&stream);
-                let bought: usize = plan.iter().sum();
+                let bought = tier_footprint(plan);
                 Some((place_transient(&stream, bought)?, bought))
             }
             None => None,
@@ -2233,6 +2250,20 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                  phase re-entered while still open — the inner guard's drop would \
                  reset the span the outer one is still handing out."
                 )
+            }
+            // **The two layer phases share one region** (`phase_offsets`), so one
+            // may not open while the other is live: its first carve would land on
+            // the other's buffers. A layer runs them in sequence, so this is a
+            // phase entered out of turn — refuse rather than corrupt (principle 7).
+            if let Some(other) = other_layer_phase(phase) {
+                if domain.arenas[phase_index(other)].is_live() {
+                    candle::bail!(
+                        "wave domain: the {phase:?} span shares its ground with the \
+                         {other:?} span, which still has a live generation. A layer \
+                         leaves one phase before entering the next; opening this one \
+                         would carve over the other's buffers."
+                    )
+                }
             }
             // **The arenas come into existence here; the ground they sit on does
             // not.** [`plan_wave_transient`] reserved that once for the whole
@@ -2289,7 +2320,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                 // anyway is the corruption: the last span runs off the tier's top
                 // into whatever is above it, which on this span is the expert weight
                 // zone. Refusing costs one wave; the alternative cost a model.
-                let need: usize = plan.iter().sum();
+                let need = tier_footprint(plan);
                 match domain.placed_bytes {
                     Some(bytes) if need > bytes => {
                         return Err(candle::Error::Msg(format!(
@@ -2330,10 +2361,13 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                         )));
                     }
                 }
-                let mut at = base;
+                // The two layer phases at the base, sharing it — never live at
+                // once, which the check below enforces — and the forward span past
+                // the larger of them (`phase_offsets`, the layout `tier_footprint`
+                // priced).
+                let offsets = phase_offsets(plan);
                 for (i, arena) in domain.arenas.iter().enumerate() {
-                    arena.rebase(at, plan[i])?;
-                    at += plan[i] as u64;
+                    arena.rebase(base + offsets[i] as u64, plan[i])?;
                 }
                 domain.plan_pending = false;
             } else if let Some(plan) = domain.planned {
@@ -2482,6 +2516,11 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCar
     // by returning `None` — the right answer for the wrong reason, and one that
     // would silently stop working if a fourth phase were ever added.
     if ticket.arena == GUEST_ARENA {
+        // A guest that opened a heap carves there: it frees as tensors die,
+        // which a graph without stages needs (`guest_heap`).
+        if let Some(carved) = super::guest_heap::carve(ticket, bytes, align) {
+            return carved;
+        }
         let Ok(map) = guest_domains().lock() else {
             return WaveCarve::Closed;
         };
@@ -2681,7 +2720,8 @@ mod turn_tests {
 mod tests {
 
     use super::{
-        align_phase_plan, aligned_start, cover_target, covering_plan, Cover, WAVE_SPAN_ALIGN,
+        align_phase_plan, aligned_start, cover_target, covering_plan, tier_footprint, Cover,
+        WAVE_SPAN_ALIGN,
     };
 
     /// A walk wider than the forward raises the phases it outgrows and keeps the
@@ -2712,7 +2752,7 @@ mod tests {
     fn a_standing_tier_that_covers_the_walk_is_kept() {
         let forward = [64_256, 30_720, 4_096];
         let narrower = [32_000, 20_480, 4_096];
-        let bytes = forward.iter().sum();
+        let bytes = tier_footprint(forward);
         assert_eq!(
             cover_target(Some(forward), Some(bytes), narrower),
             Cover::Keep
@@ -2745,8 +2785,8 @@ mod tests {
     #[test]
     fn a_merged_plan_that_outgrows_the_standing_tier_places_only_the_walk() {
         let prefill = [2_000_000_000, 6_000_000_000, 992_501_760];
-        let bytes = prefill.iter().sum();
-        let walk = [2_000_086_016, 20_480, 8_192];
+        let bytes = tier_footprint(prefill);
+        let walk = [6_000_086_016, 20_480, 8_192];
         assert_eq!(
             cover_target(Some(prefill), Some(bytes), walk),
             Cover::Place(walk)
@@ -3092,7 +3132,7 @@ mod tests {
 mod wave_tests {
     use super::{
         begin_forward, begin_wave, cover_wave_transient, enter_arena_window, plan_wave_transient,
-        wave_domain_stats, LayerPhase,
+        tier_footprint, wave_domain_stats, LayerPhase,
     };
     use candle::{Device, Result};
     use std::sync::Arc;
@@ -3287,6 +3327,32 @@ mod wave_tests {
         Ok(())
     }
 
+    /// **The layer phases share ground, so neither opens while the other is
+    /// live.** Each refuses while the other's guard stands, and opens once it
+    /// has dropped — a layer's two phases in sequence, as the forward runs them.
+    #[test]
+    fn a_layer_phase_refuses_while_the_other_is_live() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let attention = begin_wave(&s, LayerPhase::Attention)?;
+        let refused = begin_wave(&s, LayerPhase::Ffn)
+            .err()
+            .expect("the FFN span opened over a live attention span");
+        assert!(
+            refused.to_string().contains("shares its ground"),
+            "{refused}"
+        );
+        drop(attention);
+        let ffn = begin_wave(&s, LayerPhase::Ffn)?;
+        assert!(
+            begin_wave(&s, LayerPhase::Attention).is_err(),
+            "the attention span opened over a live FFN span"
+        );
+        drop(ffn);
+        drop(begin_wave(&s, LayerPhase::Attention)?);
+        Ok(())
+    }
+
     /// **A tier handed back for an arena takes its plan with it.** Left behind,
     /// the plan is re-placed by the next guard that finds no tier: a draft walk
     /// that priced itself into a prefill's standing tier, then claimed its KV
@@ -3297,7 +3363,7 @@ mod wave_tests {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let ordinal = s.context().ordinal();
-        let fallback: usize = super::fallback_plan().iter().sum();
+        let fallback = tier_footprint(super::fallback_plan());
         // A forward wider than anything the fallback plans for.
         let wide = super::fallback_plan().map(|b| b + (16 << 20));
         {
@@ -3319,7 +3385,7 @@ mod wave_tests {
         // still regions short of the wide plan, which is 48 MiB wider.
         let guard = begin_wave(&s, LayerPhase::Attention)?;
         let placed = tier(ordinal);
-        let wide_bytes: usize = wide.iter().sum();
+        let wide_bytes = tier_footprint(wide);
         assert!(
             placed >= fallback && placed < wide_bytes,
             "the guard placed {placed} B: the fallback is {fallback} B, the finished \
@@ -3467,7 +3533,7 @@ mod wave_tests {
                 .map(|r| r.transient_bytes)
                 .unwrap_or(0)
         };
-        let fallback: usize = super::fallback_plan().iter().sum();
+        let fallback = tier_footprint(super::fallback_plan());
         let wide = super::fallback_plan().map(|b| b + (16 << 20));
         {
             let _open = begin_forward(&s);
@@ -3566,11 +3632,14 @@ mod wave_tests {
         Ok(())
     }
 
-    /// The two phases must not share a span. If they did, the FFN's reset would
-    /// free the attention output the residual add is still reading, and each
-    /// span would have to be sized for the larger of the two phases.
+    /// **The two layer phases share their ground** ([`phase_offsets`]): a layer's
+    /// FFN carves from where its attention carved, once the attention guard has
+    /// dropped. Safe because a range borrows its guard — the attention output the
+    /// residual add reads cannot outlive the attention phase — and because
+    /// neither phase opens while the other is live
+    /// ([`a_layer_phase_refuses_while_the_other_is_live`]).
     #[test]
-    fn the_phases_have_separate_spans() -> Result<()> {
+    fn the_layer_phases_share_their_ground() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let g1 = begin_wave(&s, LayerPhase::Attention)?;
@@ -3581,7 +3650,10 @@ mod wave_tests {
         let ffn = g2.alloc(4096, 256)?.ptr;
         drop(g2);
 
-        assert_ne!(attn, ffn, "attention and FFN shared a span");
+        assert_eq!(
+            attn, ffn,
+            "the FFN did not carve where the attention phase did"
+        );
         Ok(())
     }
 
@@ -3605,24 +3677,31 @@ mod wave_tests {
         Ok(())
     }
 
-    /// Both phases may be open at once — they are different spans — but
-    /// re-entering one while it is still open is refused (principle 7): the
-    /// inner guard's drop would reset the span the outer one is filling.
+    /// Re-entering a phase while it is still open is refused (principle 7): the
+    /// inner guard's drop would reset the span the outer one is filling. The
+    /// forward span may stand beside a layer phase — it has ground of its own.
     #[test]
     fn re_entering_a_live_phase_is_refused() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let _attn = begin_wave(&s, LayerPhase::Attention)?;
-        let ffn = begin_wave(&s, LayerPhase::Ffn)?;
+        let forward = begin_wave(&s, LayerPhase::Forward)?;
+        let attn = begin_wave(&s, LayerPhase::Attention)?;
         assert!(
             begin_wave(&s, LayerPhase::Attention).is_err(),
             "re-entering the live attention span must be refused"
         );
+        drop(attn);
+        let ffn = begin_wave(&s, LayerPhase::Ffn)?;
         assert!(
             begin_wave(&s, LayerPhase::Ffn).is_err(),
             "re-entering the live FFN span must be refused"
         );
+        assert!(
+            begin_wave(&s, LayerPhase::Forward).is_err(),
+            "re-entering the live forward span must be refused"
+        );
         drop(ffn);
+        drop(forward);
         Ok(())
     }
 

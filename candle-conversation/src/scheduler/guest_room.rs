@@ -83,8 +83,16 @@ impl EngineRoom for Scheduler {
     /// back from. Legal here for the reason the claim is: between forwards, on
     /// the scheduler thread, so nothing forwards until the drain returns.
     fn concede_for_guest(&mut self, bytes: usize) -> u64 {
-        self.model
-            .concede_for_guest(bytes.div_ceil(candle_nn::kv_cache::REGION_BYTES))
+        let regions = bytes.div_ceil(candle_nn::kv_cache::REGION_BYTES);
+        let conceded = self.model.concede_for_guest(regions);
+        tracing::info!(
+            target: "candle_conversation::guest",
+            short_mib = bytes >> 20,
+            regions,
+            conceded_mib = conceded >> 20,
+            "the weight side's working room, conceded for a guest"
+        );
+        conceded
     }
 
     /// Asked again after a pack when refused: the guest's regions came back

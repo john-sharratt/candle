@@ -75,9 +75,9 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
-    ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
-    DELTA_NET_SCAN_CHUNK, SLOT_HEADER_BYTES,
+    ffn_work_dtype, phase_offsets, tier_footprint, BufferShape, Chain, DeltaNetWidths, Encoding,
+    HyperWidths, LayerPhase, ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth,
+    BUMP_ALIGNMENT, DELTA_NET_SCAN_CHUNK, SLOT_HEADER_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
@@ -86,10 +86,11 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,
-    end_wave_transient, guest_domain_stats, open_guest_arena, plan_wave_transient,
-    wave_domain_layout, wave_domain_stats, wave_is_live, BumpRange, Covering, ForwardOpen,
-    WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
+    begin_forward, begin_guest, begin_wave, close_guest_arena, close_guest_heap,
+    cover_wave_transient, end_wave_transient, guest_domain_stats, open_guest_arena,
+    open_guest_heap, plan_wave_transient, wave_domain_layout, wave_domain_stats, wave_is_live,
+    BumpRange, Covering, ForwardOpen, GuestHeapStats, WaveGeneration, GUEST_ARENA,
+    KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

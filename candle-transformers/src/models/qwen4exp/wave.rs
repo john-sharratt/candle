@@ -3373,6 +3373,18 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.model.experts.reclaim_spare_ground();
     }
 
+    /// The experts' working room, down to the pinned layers, for a guest that
+    /// runs while the waves are paused. Left to the trait's default this model
+    /// conceded nothing, and every image draw on a busy WhiteWorld waited out
+    /// its patience 7 GiB short (`conceded_mib=0`, 2026-10-27).
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        self.model.experts.concede_for_guest(regions)
+    }
+
+    fn restore_serving_floor(&self) -> bool {
+        self.model.experts.restore_serving_floor()
+    }
+
     /// The expert pipeline thread's spans — where its time goes serving each
     /// routed layer, which decides how far behind the GPU it runs.
     fn snapshot_profiles(&self) -> ProfileSnapshot {

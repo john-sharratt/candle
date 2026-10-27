@@ -150,10 +150,21 @@ impl PipelineState {
         let conceded = match try_without_recording(|quiet| self.renegotiate_boundary(quiet, ask)) {
             Some(conceded) => conceded,
             None => {
-                tracing::debug!(
-                    target: "candle_transformers::expert_lre",
-                    "boundary move deferred: a wave capture is recording"
-                );
+                // A guest's concession or its restore deferred is one the caller
+                // is waiting on with the engine stopped, so it is said at INFO;
+                // the per-forward growth question is deferred this way routinely.
+                if matches!(ask, BoundaryAsk::SellPaused(_) | BoundaryAsk::RestoreFloor) {
+                    tracing::info!(
+                        target: "candle_transformers::expert_lre",
+                        ?ask,
+                        "boundary move deferred: a wave capture is recording"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "candle_transformers::expert_lre",
+                        "boundary move deferred: a wave capture is recording"
+                    );
+                }
                 Ok(0)
             }
         };
@@ -222,6 +233,18 @@ impl PipelineState {
             // Back to the floor and no further: what lies past it is the
             // ordinary growth question's, with its slack.
             target = target.min(self.inner.zone.stated_floor());
+        }
+        if matches!(ask, BoundaryAsk::SellPaused(_) | BoundaryAsk::RestoreFloor) {
+            tracing::info!(
+                target: "candle_transformers::expert_lre",
+                ?ask,
+                delta,
+                slots = before,
+                target,
+                pinned_slots = self.inner.pinned_slots(),
+                stated_floor = self.inner.zone.stated_floor(),
+                "a guest's boundary move"
+            );
         }
         if target == before {
             if growing {

@@ -766,10 +766,15 @@ impl ManagedBatchedModel for HybridBatched {
     fn concede_for_guest(&self, regions: usize) -> u64 {
         #[cfg(feature = "cuda")]
         {
-            self.model()
-                .experts
-                .as_ref()
-                .map_or(0, |c| c.concede_for_guest(regions))
+            let Some(cache) = self.model().experts.as_ref() else {
+                tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    regions,
+                    "a guest asked for the experts' working room, and this model has no expert cache"
+                );
+                return 0;
+            };
+            cache.concede_for_guest(regions)
         }
         #[cfg(not(feature = "cuda"))]
         {

@@ -1076,6 +1076,15 @@ impl ManagedBatchedModel for BatchedEngine {
         self.engine.experts().reclaim_spare_ground();
     }
 
+    /// The experts' working room, down to the pinned layers, for a paused guest.
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        self.engine.experts().concede_for_guest(regions)
+    }
+
+    fn restore_serving_floor(&self) -> bool {
+        self.engine.experts().restore_serving_floor()
+    }
+
     fn snapshot_profiles(&self) -> ProfileSnapshot {
         // Drain the expert pipeline thread's `pipe_*` spans and, in a profile
         // build, the expert GEMMs' worker counters (copy and cold-wait time) so

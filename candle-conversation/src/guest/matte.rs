@@ -51,10 +51,16 @@ use candle::{DType, Device, Tensor};
 use candle_onnx::onnx::ModelProto;
 use image::imageops::FilterType;
 
+use candle_nn::kv_cache::{close_guest_heap, open_guest_heap};
+
 use super::ground::GuestGround;
 use super::model::GuestModel;
 use super::progress::{GuestEvent, GuestSink};
-use super::varground::place_bytes;
+use super::varground::{into_arena, place_bytes};
+
+/// Where each activation range starts: what `cudaMalloc` guarantees, so a
+/// heap carve is as aligned as the pool allocation it replaces.
+const HEAP_ALIGN: usize = 256;
 use super::work::{Guest, GuestMatte, GuestOutcome, GuestRequest, MatteRequest};
 
 /// Which published network this is, and therefore how it wants its input.
@@ -78,20 +84,41 @@ pub enum Family {
     IsNet,
     /// U²-Net and its `silueta` relatives — ImageNet channel statistics.
     U2Net,
+    /// BiRefNet (HR matting) — ImageNet statistics, and an output that is
+    /// already a probability: the export applies its sigmoid in the graph.
+    #[serde(rename = "birefnet")]
+    BiRefNet,
+}
+
+/// What a family's output is, and therefore how it becomes an alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Output {
+    /// Unbounded logits, min–max normalised per picture — see [`normalise`].
+    Logits,
+    /// A probability in [0, 1]: clamped, nothing more. Normalising it would
+    /// stretch a mostly transparent picture's faint edges to opaque.
+    Alpha,
 }
 
 impl Family {
     fn mean(self) -> [f32; 3] {
         match self {
             Self::IsNet => [0.5, 0.5, 0.5],
-            Self::U2Net => [0.485, 0.456, 0.406],
+            Self::U2Net | Self::BiRefNet => [0.485, 0.456, 0.406],
         }
     }
 
     fn std(self) -> [f32; 3] {
         match self {
             Self::IsNet => [1.0, 1.0, 1.0],
-            Self::U2Net => [0.229, 0.224, 0.225],
+            Self::U2Net | Self::BiRefNet => [0.229, 0.224, 0.225],
+        }
+    }
+
+    fn output(self) -> Output {
+        match self {
+            Self::IsNet | Self::U2Net => Output::Logits,
+            Self::BiRefNet => Output::Alpha,
         }
     }
 }
@@ -230,17 +257,18 @@ fn weight_bytes(graph: &ModelProto) -> usize {
 
 /// Ground for one matte's activations, at the graph's own side.
 ///
-/// A headroom figure rather than a claim, like the image guest's: these come
-/// from the CUDA pool, so what it sizes is the room the drain leaves by
-/// evicting.
+/// Claimed with the weights and handed to the guest heap (`guest_heap`), which
+/// holds the graph's live set — not its sum, since a value is dropped after its
+/// last reader.
 ///
-/// **A kilobyte per input pixel**, which sounds extravagant and is not. The
-/// network's widest stage is its first — 64 channels at the full side, so 256
-/// bytes a pixel for *one* tensor in f32 — and a U-shaped decoder holds several
-/// live at once across a skip connection. Over-claiming costs the engine an
-/// eviction it did not need; under-claiming is an out-of-memory discovered
-/// after the eviction has already happened, which is the worse of the two.
-const HEADROOM_PER_PIXEL: usize = 1024;
+/// **Two kilobytes per input pixel.** The network's widest stage is its first —
+/// 64 channels at the full side, 256 bytes a pixel for *one* f32 tensor — and a
+/// U-shaped decoder holds several live at once across a skip connection; at
+/// one kilobyte, IS-Net at 1024² ran its 1 GiB heap out (WhiteWorld,
+/// 2026-10-27). The heap logs its peak on unload, which is what to set this
+/// from. Over-claiming costs the engine an eviction it did not need;
+/// under-claiming fails the matte after that eviction, the worse of the two.
+const HEADROOM_PER_PIXEL: usize = 2048;
 
 fn activation_headroom(side: usize) -> usize {
     (side * side * HEADROOM_PER_PIXEL).max(256 << 20)
@@ -305,6 +333,19 @@ impl GuestModel for MatteGuest {
                     .map_err(|e| format!("matte guest: placing {}: {e}", t.name))?;
                 weights.insert(t.name.clone(), placed);
             }
+            // **The rest of the ground is the activations' heap.** A graph has
+            // no stages for a bump to rewind at, so its intermediates come from
+            // a heap that frees as each one dies (`guest_heap`) — without one
+            // they came from the CUDA pool, outside the span, and a busy card
+            // left the pool 0.6 GB while the claimed ground stood unused.
+            if let Device::Cuda(cuda) = device {
+                let runs: Vec<(u64, usize)> = g
+                    .take_rest(HEAP_ALIGN)
+                    .into_iter()
+                    .map(|p| (p.ptr, p.len))
+                    .collect();
+                open_guest_heap(&cuda.cuda_stream(), &runs);
+            }
         }
 
         // **One barrier for the whole load**, for the reason `GroundVars::with`
@@ -352,6 +393,21 @@ impl GuestModel for MatteGuest {
     }
 
     fn unload(&mut self) {
+        // The heap closes before the ground goes back: a carve after that would
+        // land on regions that are attention state again. Its peak is the
+        // activation figure `footprint_bytes` should be claiming.
+        if let Some(Device::Cuda(cuda)) = self.loaded.as_ref().map(|l| &l.device) {
+            if let Some(s) = close_guest_heap(&cuda.cuda_stream()) {
+                tracing::info!(
+                    target: "candle_conversation::guest",
+                    family = ?self.spec.family,
+                    heap_mib = s.capacity >> 20,
+                    peak_mib = s.peak >> 20,
+                    carves = s.carves,
+                    "matte guest: activation heap"
+                );
+            }
+        }
         // Every weight views ground, and the drain hands it back the moment
         // this returns. The parsed graph is host memory and stays.
         self.loaded = None;
@@ -394,7 +450,12 @@ impl Loaded {
                 chw[c * n + i] = (px[c] as f32 / 255.0 - mean[c]) / std[c];
             }
         }
-        let input = Tensor::from_vec(chw, (1, 3, self.side, self.side), &self.device)?;
+        // Seeded into the heap: every op takes its ticket from its first operand,
+        // so the chain from here carves there rather than from the pool.
+        let input = into_arena(
+            &Tensor::from_vec(chw, (1, 3, self.side, self.side), &self.device)?,
+            &self.device,
+        )?;
 
         // The placed weights are handed in rather than re-read from the proto,
         // which is what keeps them in ground: `simple_eval` would otherwise
@@ -425,7 +486,10 @@ impl Loaded {
             );
         }
         flat.truncate(n);
-        normalise(&mut flat);
+        match self.family.output() {
+            Output::Logits => normalise(&mut flat),
+            Output::Alpha => flat.iter_mut().for_each(|a| *a = a.clamp(0.0, 1.0)),
+        }
 
         let grey: image::GrayImage = image::ImageBuffer::from_raw(
             side,
@@ -681,14 +745,14 @@ mod tests {
     /// The headroom has a floor and grows with the field the network runs over.
     #[test]
     fn the_headroom_scales_with_the_side_and_has_a_floor() {
-        // 320² at a kilobyte a pixel is 100 MiB, under the floor.
+        // 320² at two kilobytes a pixel is 200 MiB, under the floor.
         assert_eq!(
             activation_headroom(320),
             256 << 20,
             "a small field gets the floor"
         );
-        // 1024² is a gibibyte, well clear of it, and four times 512²'s claim.
-        assert_eq!(activation_headroom(1024), 1 << 30);
+        // 1024² is two gibibytes, well clear of it, and four times 512²'s claim.
+        assert_eq!(activation_headroom(1024), 2 << 30);
         assert_eq!(
             activation_headroom(1024),
             4 * activation_headroom(512),

@@ -1,3 +1,4 @@
+use crate::grid_sample::{grid_sample, Mode as GridMode, Padding as GridPadding};
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use crate::onnx::{self, GraphProto};
@@ -284,6 +285,7 @@ fn resize_linear_axis(t: &Tensor, dim: usize, out_n: usize, ct_mode: &str) -> Re
         hi.push(((f as usize) + 1).min(in_n - 1) as u32);
         frac.push(s - f);
     }
+    let t = t.contiguous()?;
     let a = t.index_select(&Tensor::from_vec(lo, out_n, dev)?, dim)?;
     let b = t.index_select(&Tensor::from_vec(hi, out_n, dev)?, dim)?;
 
@@ -430,8 +432,18 @@ fn simple_eval_(
             )
         }
     }
+    // **A value is dropped after the last node that reads it.** Every node's
+    // output used to stay in `values` until the graph ended, so a graph's peak
+    // was the sum of all its activations rather than of those alive at once —
+    // which a 29,105-node graph at 2048² (BiRefNet) cannot afford on any card.
+    let dying = dead_after(graph);
     // The nodes are topologically sorted so we can just process them in order.
-    for node in graph.node.iter() {
+    for (at, node) in graph.node.iter().enumerate() {
+        if at > 0 {
+            for name in &dying[at - 1] {
+                values.remove(*name);
+            }
+        }
         let get = |input_name: &str| match values.get(input_name) {
             Some(value) => Ok(value),
             None => bail!("cannot find {input_name} for op '{}'", node.name),
@@ -499,9 +511,14 @@ fn simple_eval_(
                 values.insert(node.output[0].clone(), xs);
             }
             "MatMul" => {
-                let input0 = get(&node.input[0])?;
-                let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_matmul(input1)?;
+                // An exported graph hands MatMul whatever its Transposes and
+                // Slices left — a key transposed for attention is a strided view
+                // at an offset — and the BLAS path takes only the layouts it can
+                // describe. A copy where a layout is not contiguous; a no-op
+                // where it is.
+                let input0 = get(&node.input[0])?.contiguous()?;
+                let input1 = get(&node.input[1])?.contiguous()?;
+                let output = input0.broadcast_matmul(&input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Reshape" => {
@@ -700,8 +717,10 @@ fn simple_eval_(
                     .map(|&x| x as usize)
                     .collect();
 
+                // The value attribute is parsed on the host; the output lives
+                // where its shape did, as `Shape`'s does.
                 let xs = Tensor::ones(shape_vec, value.dtype(), input.device())?
-                    .broadcast_mul(&value)?;
+                    .broadcast_mul(&value.to_device(input.device())?)?;
                 values.insert(node.output[0].clone(), xs);
             }
             "Unsqueeze" => {
@@ -773,8 +792,12 @@ fn simple_eval_(
                         let index = indices.to_vec0::<i64>()? as usize;
                         xs.narrow(axis, index, 1)?.squeeze(axis)?
                     }
-                    [_] => xs.index_select(indices, axis)?,
+                    // `index_select` reads contiguous storage only, and an exported
+                    // graph gathers from views (a Transpose's output) as freely
+                    // as from anything else.
+                    [_] => xs.contiguous()?.index_select(indices, axis)?,
                     [first, _] => {
+                        let xs = xs.contiguous()?;
                         let mut v = Vec::with_capacity(*first);
                         for i in 0..*first {
                             v.push(xs.index_select(&indices.get(i)?, axis)?)
@@ -830,7 +853,10 @@ fn simple_eval_(
                         .add(indices)?
                 };
 
-                values.insert(node.output[0].clone(), data.gather(indices, axis)?);
+                values.insert(
+                    node.output[0].clone(),
+                    data.contiguous()?.gather(&indices.contiguous()?, axis)?,
+                );
             }
             "Shape" => {
                 // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Shape
@@ -865,13 +891,16 @@ fn simple_eval_(
                 let limit = get(&node.input[1])?;
                 let delta = get(&node.input[2])?;
 
+                // On the device its bounds came from, as `Shape`'s output is: a
+                // range is as often a coordinate grid multiplied into the
+                // graph's real tensors (BiRefNet's sampling grids) as an index.
                 macro_rules! arange_step {
                     ($t: ty) => {
                         Tensor::arange_step(
                             start.to_vec0::<$t>()?,
                             limit.to_vec0::<$t>()?,
                             delta.to_vec0::<$t>()?,
-                            &Device::Cpu,
+                            start.device(),
                         )?
                     };
                 }
@@ -1241,24 +1270,84 @@ fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
-                    bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
-                        node.input.len(),
-                        node.name
-                    );
-                }
                 if pads.rank() != 1 {
                     bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
                 }
-                if pads.dim(0).unwrap() != 2 * data.rank() {
-                    bail!("Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}", pads, data.rank());
+                // `constant_value` (input 2) and `axes` (input 3), both optional:
+                // with axes, `pads` holds a pre and a post per named axis only.
+                let fill = match get_opt(2).transpose()? {
+                    Some(v) => v
+                        .to_dtype(DType::F64)?
+                        .flatten_all()?
+                        .to_vec1::<f64>()?
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0),
+                    None => 0.0,
+                };
+                let axes: Vec<usize> = match get_opt(3).transpose()? {
+                    Some(a) => a
+                        .to_vec1::<i64>()?
+                        .iter()
+                        .map(|&i| data.normalize_axis(i))
+                        .collect::<Result<_>>()?,
+                    None => (0..data.rank()).collect(),
+                };
+                let given = pads.to_vec1::<i64>()?;
+                if given.len() != 2 * axes.len() {
+                    bail!("Pad expects 'pads' input len to be 2 * the axes it pads: pads: {}, axes: {}", pads, axes.len());
                 }
-
-                let pads = pads.to_vec1::<i64>()?;
+                let mut pads = vec![0i64; 2 * data.rank()];
+                for (k, &axis) in axes.iter().enumerate() {
+                    pads[axis] = given[k];
+                    pads[data.rank() + axis] = given[axes.len() + k];
+                }
                 let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
 
                 match mode {
+                    "constant" | "edge" => {
+                        let mut out = data.clone();
+                        for axis in 0..data.rank() {
+                            let (pre, post) = (pads_pre[axis], pads_post[axis]);
+                            // A negative pad crops, as the spec allows.
+                            let len = out.dim(axis)? as i64;
+                            let lo = (-pre).max(0);
+                            let hi = (-post).max(0);
+                            if lo + hi > 0 {
+                                out =
+                                    out.narrow(axis, lo as usize, (len - lo - hi).max(0) as usize)?;
+                            }
+                            let (pre, post) = (pre.max(0) as usize, post.max(0) as usize);
+                            if pre == 0 && post == 0 {
+                                continue;
+                            }
+                            out = if mode == "constant" {
+                                let mut shape = out.dims().to_vec();
+                                let block = |n: usize, shape: &mut Vec<usize>| -> Result<Tensor> {
+                                    shape[axis] = n;
+                                    Tensor::full(fill, shape.as_slice(), out.device())?
+                                        .to_dtype(out.dtype())
+                                };
+                                let mut parts = Vec::with_capacity(3);
+                                if pre > 0 {
+                                    parts.push(block(pre, &mut shape)?);
+                                }
+                                parts.push(out.clone());
+                                if post > 0 {
+                                    parts.push(block(post, &mut shape)?);
+                                }
+                                Tensor::cat(&parts, axis)?
+                            } else {
+                                // Edge: the outermost slice repeated, by clamped index.
+                                let dim = out.dim(axis)? as i64;
+                                let idx =
+                                    (-(pre as i64)..dim + post as i64).map(|i| i.clamp(0, dim - 1));
+                                out.contiguous()?
+                                    .index_select(&Tensor::from_iter(idx, out.device())?, axis)?
+                            };
+                        }
+                        values.insert(node.output[0].clone(), out);
+                    }
                     "reflect" => {
                         let mut out = data.clone();
                         for (i, &dim) in data.dims().iter().enumerate().rev() {
@@ -1279,7 +1368,7 @@ fn simple_eval_(
                                 Tensor::full(0i64, (dim,), out.device())?
                             };
 
-                            out = out.index_select(&idx, i)?;
+                            out = out.contiguous()?.index_select(&idx, i)?;
                         }
 
                         values.insert(node.output[0].clone(), out);
@@ -2305,6 +2394,100 @@ fn simple_eval_(
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             }
+            "GridSample" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GridSample
+                let mode = GridMode::parse(get_attr_opt::<str>(node, "mode")?.unwrap_or("linear"))?;
+                let padding = GridPadding::parse(
+                    get_attr_opt::<str>(node, "padding_mode")?.unwrap_or("zeros"),
+                )?;
+                let align = get_attr_opt::<i64>(node, "align_corners")?
+                    .copied()
+                    .unwrap_or(0)
+                    != 0;
+                let xs = get(&node.input[0])?;
+                let grid = get(&node.input[1])?;
+                let ys = grid_sample(xs, grid, mode, padding, align)?;
+                values.insert(node.output[0].clone(), ys);
+            }
+            "LayerNormalization" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#LayerNormalization
+                // Normalised over `axis..rank`, worked in f32 (`stash_type` 1,
+                // the only one the spec defines) and cast back.
+                let eps = get_attr_opt::<f32>(node, "epsilon")?
+                    .copied()
+                    .unwrap_or(1e-5) as f64;
+                let xs = get(&node.input[0])?;
+                let axis =
+                    xs.normalize_axis(get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(-1))?;
+                let scale = get(&node.input[1])?;
+                let bias = get_opt(2).transpose()?;
+                let dims = xs.dims().to_vec();
+                let outer: usize = dims[..axis].iter().product();
+                let inner: usize = dims[axis..].iter().product();
+                let flat = xs.to_dtype(DType::F32)?.reshape((outer, inner))?;
+                let mean = flat.mean_keepdim(1)?;
+                let centred = flat.broadcast_sub(&mean)?;
+                let inv_std = (centred.sqr()?.mean_keepdim(1)? + eps)?.sqrt()?.recip()?;
+                let normed = centred.broadcast_mul(&inv_std)?.reshape(dims.as_slice())?;
+                let mut ys = normed.broadcast_mul(&scale.to_dtype(DType::F32)?)?;
+                if let Some(b) = bias {
+                    ys = ys.broadcast_add(&b.to_dtype(DType::F32)?)?;
+                }
+                values.insert(node.output[0].clone(), ys.to_dtype(xs.dtype())?);
+                // The optional Mean and InvStdDev outputs keep the input's rank,
+                // with 1s along the normalised axes.
+                let stat_shape: Vec<usize> = dims
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| if i < axis { d } else { 1 })
+                    .collect();
+                for (k, stat) in [(1, mean), (2, inv_std)] {
+                    if let Some(name) = node.output.get(k).filter(|s| !s.is_empty()) {
+                        values.insert(name.clone(), stat.reshape(stat_shape.as_slice())?);
+                    }
+                }
+            }
+            "GlobalAveragePool" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#GlobalAveragePool
+                let xs = get(&node.input[0])?;
+                let dims = xs.dims().to_vec();
+                if dims.len() < 3 {
+                    bail!("GlobalAveragePool needs [N, C, spatial...], got {dims:?}")
+                }
+                let spatial: usize = dims[2..].iter().product();
+                let mut kept = dims[..2].to_vec();
+                kept.extend(vec![1; dims.len() - 2]);
+                let ys = xs
+                    .reshape((dims[0], dims[1], spatial))?
+                    .mean_keepdim(2)?
+                    .reshape(kept.as_slice())?;
+                values.insert(node.output[0].clone(), ys);
+            }
+            "Mod" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Mod
+                // `fmod` 0 takes the divisor's sign (an integer mod), 1 the
+                // dividend's (C's fmod). Worked in f64, which holds every
+                // integer these graphs compute shapes with exactly.
+                let fmod = get_attr_opt::<i64>(node, "fmod")?.copied().unwrap_or(0) != 0;
+                let a = get(&node.input[0])?;
+                let b = get(&node.input[1])?;
+                let dtype = a.dtype();
+                let (a64, b64) = (a.to_dtype(DType::F64)?, b.to_dtype(DType::F64)?);
+                let quotient = a64.broadcast_div(&b64)?;
+                let whole = if fmod {
+                    // Truncation: the floor of |q| with q's sign.
+                    quotient.abs()?.floor()?.mul(&quotient.sign()?)?
+                } else {
+                    quotient.floor()?
+                };
+                let ys = a64.broadcast_sub(&whole.broadcast_mul(&b64)?)?;
+                values.insert(node.output[0].clone(), ys.to_dtype(dtype)?);
+            }
+            "Reciprocal" => {
+                // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Reciprocal
+                let xs = get(&node.input[0])?;
+                values.insert(node.output[0].clone(), xs.recip()?);
+            }
             "Resize" => {
                 let input = get(&node.input[0])?;
 
@@ -2592,6 +2775,56 @@ fn simple_eval_(
         .collect()
 }
 
+/// For each node of `graph`, the values nothing after it reads.
+///
+/// Only values this graph's own nodes produce, and none of its outputs: an
+/// initializer or a caller's input is the caller's to keep — a guest's weights
+/// are placed in its own ground and handed in — and an `If` branch shares the
+/// enclosing graph's `values`, so what it drops must be its own. A name read
+/// inside a node's subgraph counts as read by that node.
+fn dead_after(graph: &onnx::GraphProto) -> Vec<Vec<&str>> {
+    let outputs: HashSet<&str> = graph.output.iter().map(|o| o.name.as_str()).collect();
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for (at, node) in graph.node.iter().enumerate() {
+        for name in node.output.iter().filter(|s| !s.is_empty()) {
+            last.entry(name.as_str()).or_insert(at);
+        }
+    }
+    for (at, node) in graph.node.iter().enumerate() {
+        let mut reads = Vec::new();
+        node_reads(node, &mut reads);
+        for name in reads {
+            if let Some(l) = last.get_mut(name) {
+                *l = (*l).max(at);
+            }
+        }
+    }
+    let mut dying = vec![Vec::new(); graph.node.len()];
+    for (name, at) in last {
+        if !outputs.contains(name) {
+            dying[at].push(name);
+        }
+    }
+    dying
+}
+
+/// Every value name `node` reads: its inputs, and whatever its subgraphs read.
+fn node_reads<'a>(node: &'a onnx::NodeProto, into: &mut Vec<&'a str>) {
+    into.extend(
+        node.input
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(String::as_str),
+    );
+    for attr in node.attribute.iter() {
+        for g in attr.g.iter().chain(attr.graphs.iter()) {
+            for inner in g.node.iter() {
+                node_reads(inner, into);
+            }
+        }
+    }
+}
+
 fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
     let (longest, shortest) = if shape_a.len() > shape_b.len() {
         (shape_a, shape_b)
@@ -2623,4 +2856,73 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
         shape_out = broadcast_shape(&shape_out, shape)?;
     }
     Ok(shape_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(op: &str, inputs: &[&str], outputs: &[&str]) -> onnx::NodeProto {
+        onnx::NodeProto {
+            op_type: op.to_string(),
+            input: inputs.iter().map(|s| s.to_string()).collect(),
+            output: outputs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn value(name: &str) -> onnx::ValueInfoProto {
+        onnx::ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// `a` is read by nodes 1 and 2, so it dies after 2; `b` after 2; `c` is an
+    /// output and never dies; the input `x` and the weight `w` are the
+    /// caller's and are never listed.
+    #[test]
+    fn a_value_dies_after_its_last_reader() {
+        let graph = onnx::GraphProto {
+            node: vec![
+                node("Relu", &["x"], &["a"]),
+                node("Mul", &["a", "w"], &["b"]),
+                node("Add", &["a", "b"], &["c"]),
+            ],
+            output: vec![value("c")],
+            ..Default::default()
+        };
+        let mut dying = dead_after(&graph);
+        dying.iter_mut().for_each(|d| d.sort());
+        assert_eq!(dying, vec![vec![], vec![], vec!["a", "b"]]);
+    }
+
+    /// A value read only inside an `If` branch lives until the `If` node, and
+    /// an output nothing reads dies where it is made.
+    #[test]
+    fn a_subgraph_read_keeps_a_value_alive_to_its_node() {
+        let branch = onnx::GraphProto {
+            node: vec![node("Identity", &["a"], &["inner"])],
+            output: vec![value("inner")],
+            ..Default::default()
+        };
+        let mut cond = node("If", &["flag"], &["d"]);
+        cond.attribute.push(onnx::AttributeProto {
+            name: "then_branch".to_string(),
+            g: Some(branch),
+            ..Default::default()
+        });
+        let graph = onnx::GraphProto {
+            node: vec![
+                node("Relu", &["x"], &["a", "unused"]),
+                node("Shape", &["x"], &["flag"]),
+                cond,
+            ],
+            output: vec![value("d")],
+            ..Default::default()
+        };
+        let mut dying = dead_after(&graph);
+        dying.iter_mut().for_each(|d| d.sort());
+        assert_eq!(dying, vec![vec!["unused"], vec![], vec!["a", "flag"]]);
+    }
 }
