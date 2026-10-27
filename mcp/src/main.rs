@@ -29,7 +29,10 @@ use cluster::upgrade::switch::PROOF;
 use mcp_server::http;
 use mcp_server::SealedStore;
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+use web::log_file::RotatingFileLog;
 
 mod app;
 mod backend;
@@ -53,14 +56,32 @@ struct Args {
     config: PathBuf,
 }
 
+/// The log's name in the state folder.
+const LOG_NAME: &str = "mcp.log";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_writer(io::stderr)
-        .init();
     let args = Args::parse();
     let config = Config::load(&args.config)?;
+    // Stderr, which a trial's file captures, and `mcp.log` in the state
+    // folder: keep starts a kept service with its output detached, and an
+    // aggregator that logs only there keeps no record of a call at all. An
+    // unopenable file leaves stderr alone.
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let to_file = RotatingFileLog::new(&config.state, LOG_NAME).map(|w| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(w)
+            .with_filter(filter())
+    });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_filter(filter()),
+        )
+        .with(to_file)
+        .init();
     let app = Arc::new(App {
         identity: config.identity(),
         store: Arc::new(SealedStore),
