@@ -6,15 +6,21 @@
 //! The formats are chosen by their peak over the whole window, not by the
 //! latest census, so a format that held most of the KV an hour ago keeps its
 //! band and its colour while it drains rather than vanishing into `other`.
+//!
+//! Each row's tokens are keyed by the series' name, so a cluster's rows add up
+//! format by format whatever order each member ranks its formats in
+//! (`cluster::dispatch::fuse`).
+
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 
 /// The series' name for the formats outside the top.
 pub const OTHER: &str = "other";
 
-/// One census: seconds before the answer, and `(format, tokens)` rows.
+/// One census: its slot (unix ms), and `(format, tokens)` rows.
 pub struct Census {
-    pub age: f64,
+    pub at: u64,
     pub rows: Vec<(String, f64)>,
 }
 
@@ -28,9 +34,9 @@ pub struct MixSeries {
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct MixRow {
-    pub age: f64,
-    /// Tokens per series, in [`MixSeries::formats`] order.
-    pub tok: Vec<f64>,
+    pub at: u64,
+    /// Tokens per series, by the series' name.
+    pub tok: BTreeMap<String, f64>,
 }
 
 /// Fold `censuses` into at most `top` named series and one [`OTHER`].
@@ -54,17 +60,16 @@ pub fn mix_series(censuses: &[Census], top: usize) -> MixSeries {
     let rows = censuses
         .iter()
         .map(|c| {
-            let mut tok = vec![0.0; formats.len()];
+            let mut tok: BTreeMap<String, f64> = BTreeMap::new();
             for (name, tokens) in &c.rows {
-                match formats[..named].iter().position(|f| f == name) {
-                    Some(i) => tok[i] += tokens,
-                    None => tok[named] += tokens,
-                }
+                let series = if formats[..named].contains(name) {
+                    name.as_str()
+                } else {
+                    OTHER
+                };
+                *tok.entry(series.to_owned()).or_default() += tokens;
             }
-            MixRow {
-                age: (c.age * 100.0).round() / 100.0,
-                tok,
-            }
+            MixRow { at: c.at, tok }
         })
         .collect();
     MixSeries { formats, rows }
@@ -74,11 +79,15 @@ pub fn mix_series(censuses: &[Census], top: usize) -> MixSeries {
 mod tests {
     use super::*;
 
-    fn census(age: f64, rows: &[(&str, f64)]) -> Census {
+    fn census(at: u64, rows: &[(&str, f64)]) -> Census {
         Census {
-            age,
+            at,
             rows: rows.iter().map(|(n, t)| (n.to_string(), *t)).collect(),
         }
+    }
+
+    fn tok(rows: &[(&str, f64)]) -> BTreeMap<String, f64> {
+        rows.iter().map(|(n, t)| (n.to_string(), *t)).collect()
     }
 
     /// The top formats by peak keep their own series, in peak order; the rest
@@ -87,8 +96,8 @@ mod tests {
     fn the_top_formats_by_peak_keep_their_series_and_the_rest_fold_into_other() {
         let s = mix_series(
             &[
-                census(8.0, &[("BF16", 900.0), ("Q4_0", 100.0), ("Q2_0", 5.0)]),
-                census(4.0, &[("Q4_0", 600.0), ("Q8_0", 50.0), ("Q2_0", 7.0)]),
+                census(5_000, &[("BF16", 900.0), ("Q4_0", 100.0), ("Q2_0", 5.0)]),
+                census(10_000, &[("Q4_0", 600.0), ("Q8_0", 50.0), ("Q2_0", 7.0)]),
             ],
             2,
         );
@@ -97,12 +106,12 @@ mod tests {
             s.rows,
             vec![
                 MixRow {
-                    age: 8.0,
-                    tok: vec![900.0, 100.0, 5.0]
+                    at: 5_000,
+                    tok: tok(&[("BF16", 900.0), ("Q4_0", 100.0), ("other", 5.0)])
                 },
                 MixRow {
-                    age: 4.0,
-                    tok: vec![0.0, 600.0, 57.0]
+                    at: 10_000,
+                    tok: tok(&[("Q4_0", 600.0), ("other", 57.0)])
                 },
             ]
         );
@@ -111,13 +120,13 @@ mod tests {
     /// No more formats than the top: no `other` series at all.
     #[test]
     fn few_formats_have_no_other() {
-        let s = mix_series(&[census(1.0, &[("Q4_0", 3.0)])], 6);
+        let s = mix_series(&[census(5_000, &[("Q4_0", 3.0)])], 6);
         assert_eq!(s.formats, vec!["Q4_0"]);
         assert_eq!(
             s.rows,
             vec![MixRow {
-                age: 1.0,
-                tok: vec![3.0]
+                at: 5_000,
+                tok: tok(&[("Q4_0", 3.0)])
             }]
         );
     }

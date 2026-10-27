@@ -1549,15 +1549,18 @@ with `x-tokera-aggregate: 1`. The consoles read it through
 - **the loading screens and build checks** (`memberStatus`) — the status of a member
   ready for the tenant, since the gateway sends the console's requests to ready members;
   until one is, the first member that answered; with none, "connecting";
-- **zend's telemetry page** (`pick`) — one member at a time, chosen from a member picker
-  shown when more than one answered;
+- **zend's telemetry page** (`pick`) — the cluster as a whole from the fused `cluster`
+  body, or one member, chosen from a member picker shown when more than one answered;
 - **the substrate overview** (`memberWith`) — the first member that holds the tenant's
   line;
 - **the npcd console's instruments** — the one member's answer, as npcd's group has one
   member (§16, item 19).
 
 `/v1/status` aggregated also carries a `group` block — floor, model lock, member count —
-that the gateway adds. `FirstFound` returns the first `2xx` body unwrapped.
+that the gateway adds. An answer that declares how it adds up across members (`fuse`:
+`/v1/telemetry`, `/v1/phases`) is also answered fused, as `cluster`, so a console draws
+the cluster as it draws one member (`docs/performance_series.md` §3). `FirstFound`
+returns the first `2xx` body unwrapped.
 
 An aggregate covers the members connected to the gateway that took the request. With
 every member joined to every cluster, that is all of them. The envelope lists the

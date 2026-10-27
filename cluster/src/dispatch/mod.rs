@@ -15,6 +15,7 @@
 
 mod derived;
 mod extract;
+pub mod fuse;
 mod reach;
 mod table;
 

@@ -730,12 +730,13 @@ pub fn snapshot_migrates() -> Vec<MigrateSnapshot> {
         .collect()
 }
 
-/// Constructor used by the scheduler — `at` is stamped in [`push_wave`]. `vram`
-/// is the card's bands, `proj` is `(pdrain, drain_elevate, drain_glue, reproj,
-/// scan, reproj_glue, layout)` ms, `slots` is `(slots, decodes, prefills,
-/// sections)`, `waves` is `(waves, wall_us, overhead_us)`.
+/// A wave sample: the scheduler's, and what the readers' tests fold — `at` is
+/// stamped in [`push_wave`]. `vram` is the card's bands, `proj` is `(pdrain,
+/// drain_elevate, drain_glue, reproj, scan, reproj_glue, layout)` ms, `slots`
+/// is `(slots, decodes, prefills, sections)`, `waves` is `(waves, wall_us,
+/// overhead_us)`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn wave_sample(
+pub fn wave_sample(
     ws_ms: u32,
     fwd_ms: u32,
     tok: u64,

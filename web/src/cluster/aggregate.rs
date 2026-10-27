@@ -3,7 +3,8 @@
 //! - **`Envelope`**: `{ "members": [ { node, host, build, status, body } ] }`,
 //!   a member past its deadline listed with `status: 504, error: "deadline"`,
 //!   so a partial view reads as partial. `/v1/status` also carries a `group`
-//!   block: the floor, the model lock, the member count.
+//!   block: the floor, the model lock, the member count. Answers that declare
+//!   how they add up (`fuse`) are also answered fused, as `cluster`.
 //! - **`FirstFound`**: the first `2xx` answer, unwrapped.
 //!
 //! Answered with `x-tokera-aggregate: 1`.
@@ -16,6 +17,7 @@ use axum::extract::Request;
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use cluster::dispatch::fuse::fuse;
 use cluster::dispatch::{Merge, BODY_LIMIT};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -223,6 +225,7 @@ async fn envelope(
     });
     let answers = join_all(asks).await;
     let mut late = 0;
+    let mut answered: Vec<Value> = Vec::new();
     let members: Vec<Value> = answers
         .into_iter()
         .map(|(node, answer)| {
@@ -235,6 +238,9 @@ async fn envelope(
                     let body = serde_json::from_slice::<Value>(&a.body).unwrap_or_else(|_| {
                         Value::String(String::from_utf8_lossy(&a.body).into_owned())
                     });
+                    if a.status.is_success() {
+                        answered.push(body.clone());
+                    }
                     json!({ "node": node, "host": host, "build": build,
                             "status": a.status.as_u16(), "body": body })
                 }
@@ -248,6 +254,12 @@ async fn envelope(
         .collect();
     gateway.hub.traffic.aggregate(late);
     let mut out = json!({ "members": members });
+    // An answer that says how it adds up is answered for the cluster as well:
+    // the members' fused into one, so a console draws the cluster as it draws
+    // one member (`cluster::dispatch::fuse`).
+    if let Some(fused) = fuse(&answered) {
+        out["cluster"] = fused;
+    }
     if path == STATUS_PATH {
         // Who answered for the members, and on which build: a member's status
         // names its own, and nothing else public named the gateway's.

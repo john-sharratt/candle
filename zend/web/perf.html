@@ -91,7 +91,11 @@
  *
  * Five endpoints, polled together every four seconds:
  *   /v1/telemetry    waves, the resident KV by format, migrations, host RAM
- *   /v1/phases       the scheduler's per-wave phase ring, ages relative to now
+ *   /v1/phases       the scheduler's phases, slot by slot
+ *
+ * Both are answered on one wall-clock grid of 5-second slots, and through a
+ * clustered gateway the envelope carries the cluster's rows already added up
+ * (`cluster`, `docs/performance_series.md`) — the page draws, never fuses.
  *   /v1/projections  what projection had to lift back into VRAM, by name
  *   /v1/memory       the allocator's own view
  *   /v1/layers       the newest decode and prefill forward, layer by layer
@@ -247,7 +251,7 @@ mount(document.getElementById('page'),
   h('div', { class: 'panel' },
     h('h3', { style: 'margin-top:0' }, 'Phase timeline — last 2 minutes'),
     h('div', { class: 'tiny dim', style: 'margin-bottom:10px', html:
-      'One bar per wave, newest on the <b>right</b>. Height is time spent in each phase, stacked — so a tall '
+      'One bar per 5-second slot, newest on the <b>right</b>. Height is time spent in each phase, stacked — so a tall '
       + '<b>projection</b>, <b>sync</b> or <b>idle</b> segment is time <i>not</i> spent generating. Watch the flip '
       + 'between small-batch decode and large-batch prefill.' }),
     phLegend, cPhase),
@@ -265,9 +269,9 @@ mount(document.getElementById('page'),
           h('i', { style: 'background:var(--ink-faint);opacity:.45' }), 'faded')),
       h('div', { class: 'flow' }, cFlow, flowReadout)),
     card('Phase throughput',
-      'Peak tokens per second <b>per phase</b>, as delivered — in each 10-second slot of the clock, the best '
-      + 'wave’s tokens for that phase over the wave’s wall-clock, the last 20 minutes. A slot is drawn once it has '
-      + 'finished, so a point never moves. Two scales: <b>left</b> is large-batch prefill, <b>right</b> is decode.',
+      'Peak tokens per second <b>per phase</b>, as delivered — in each 5-second slot, the best wave’s tokens '
+      + 'for that phase over the wave’s wall-clock, the last 20 minutes; for the cluster, the members’ peaks '
+      + 'added. Two scales: <b>left</b> is large-batch prefill, <b>right</b> is decode.',
       h('div', { class: 'legend' },
         h('span', {}, h('i', { style: `background:${PH.prefill}` }), 'prefill — left'),
         h('span', {}, h('i', { style: `background:${PH.decode}` }), 'decode — right')),
@@ -289,9 +293,9 @@ mount(document.getElementById('page'),
       'The KV resident in VRAM by the format it is stored in, in tokens, stacked. The six formats that held the '
       + 'most keep their own band; the rest are <b>other</b>.', mixLegend, cArena),
     card('Migration passes',
-      'One point per hot→warm pass: how long it took, and how much of that was compress-to-warm rather than '
-      + 'the copy. A pass with nothing to move is drawn at zero every few seconds, so a quiet drain reads as '
-      + 'quiet rather than stopped.', cMig)),
+      'Hot→warm passes per 5-second slot: how long they took, and how much of that was compress-to-warm '
+      + 'rather than the copy. Passes with nothing to move are drawn at zero, so a quiet drain reads as quiet '
+      + 'rather than stopped.', cMig)),
   h('div', { class: 'grid g2' },
     card('Projection cost', 'Where projection time goes: drain, re-projection, scan, layout.', cProj),
     card('Active work', 'Resident conversations, and the decode / prefill widths sharing them.', cSlots)),
@@ -305,29 +309,16 @@ mount(document.getElementById('page'),
 const series = (data, color, label, extra) => ({ data, color, label, ...(extra || {}) });
 
 /* ── time ───────────────────────────────────────────────────────────────────
- * Every row is pinned to the clock time it ran (`at`, fixed on arrival) and
- * every axis runs to now. The engine writes no rows while nothing runs, so a
- * chart that ends at its last row reads as frozen in time; ending at now, with
- * the stretch since drawn as idle, it reads as idle. */
-const IDLE_MS = 8000;               // waves land every ~2 s while anything runs
-/* A row's clock time, held to what it was first read as. Each poll derives it
- * afresh from `age`, which is rounded and read a request's latency late, so the
- * same row lands a few milliseconds apart poll to poll — enough to cross a
- * bucket edge and move a point that has not changed. Within half a second of
- * a time already seen, it is that time. */
-const SEEN = new Map();
-function stable(at) {
-  const s = Math.round(at / 1000);
-  for (const k of [s, s - 1, s + 1]) {
-    const v = SEEN.get(k);
-    if (v != null && Math.abs(v - at) < 500) return v;
-  }
-  SEEN.set(s, at);
-  return at;
-}
-function forgetBefore(cutoff) {
-  for (const [k, v] of SEEN) if (v < cutoff) SEEN.delete(k);
-}
+ * Every row is one finished slot of the server's wall-clock grid, stamped `at`
+ * with the slot's start in unix milliseconds (`docs/performance_series.md`), so
+ * a row lands where it ran however many polls follow, and every axis runs to
+ * now. The engine writes no rows while nothing runs, so a chart that ends at
+ * its last row reads as frozen in time; ending at now, with the stretch since
+ * drawn as idle, it reads as idle. */
+const SLOT_MS = 5000;
+/* Idle once three slots pass with no row: the newest finished slot started up
+ * to two slots ago, and a poll lands up to one more late. */
+const IDLE_MS = 3 * SLOT_MS;
 const minsAgo = (at) => (at - Date.now()) / 60000;
 const xAgo = (v) => (v > -0.05 ? 'now' : v > -1 ? `${Math.round(v * 60)}s` : `${Math.round(v)}m`);
 /* When the engine last ran anything, or 0 before it ever has. */
@@ -359,36 +350,33 @@ const axis = (rows) => ({ xs: rows.map((r) => minsAgo(r.at)), xnow: 0, xFmt: xAg
 const charts = [];
 const add = (c) => { if (c) charts.push(c); return c; };
 
-/* Phase bars: one stacked column per wave over the last two minutes. `age` is
- * seconds before now, so the ring re-times itself on every poll and the newest
- * bar is always hard against the right edge. */
+/* Phase bars: one stacked column per slot over the last two minutes, labelled
+ * by how long ago the slot ended. */
+const BAR_SPAN_MS = 2 * 60000;
 add(makeStackChart(cPhase, () => {
-  const wins = new Map();
+  const now = Date.now();
+  const slots = new Map();
   for (const p of PTS) {
-    if (p.age > 130) continue;
-    const key = Math.round(p.age);
-    // Tokens are bucketed alongside the duration, not dropped: the bar's
-    // HEIGHT is time, but the question asked of a bar is almost always "was
-    // that time productive", and that needs both. Every point of one wave
-    // carries that wave's `age` and window, so the window is counted once.
-    if (!wins.has(key)) wins.set(key, { age: key, ph: {}, tk: {}, win: new Map() });
-    const w = wins.get(key);
-    w.ph[p.kind] = (w.ph[p.kind] || 0) + p.dur;
-    w.tk[p.kind] = (w.tk[p.kind] || 0) + (p.tok || 0);
-    w.win.set(p.age, p.win);
+    const end = p.at + SLOT_MS;
+    if (now - end > BAR_SPAN_MS) continue;
+    // Tokens are carried alongside the duration, not dropped: the bar's HEIGHT
+    // is time, but the question asked of a bar is almost always "was that time
+    // productive", and that needs both. Every phase of a slot carries the
+    // slot's window.
+    if (!slots.has(p.at)) slots.set(p.at, { at: p.at, age: Math.max(0, (now - end) / 1000), ph: {}, tk: {}, wall: p.win });
+    const s = slots.get(p.at);
+    s.ph[p.kind] = p.dur;
+    s.tk[p.kind] = p.tok || 0;
   }
-  const bars = [...wins.values()].sort((a, b) => b.age - a.age)
-    .map((w) => ({
-      age: w.age, parts: w.ph, toks: w.tk,
-      wall: [...w.win.values()].reduce((a, x) => a + x, 0),
-    }));
+  const bars = [...slots.values()].sort((a, b) => a.at - b.at)
+    .map((s) => ({ age: s.age, parts: s.ph, toks: s.tk, wall: s.wall }));
   return {
     bars, keys: PHASES,
     color: (k) => PH[k],
     yFmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 's' : v.toFixed(0) + 'ms'),
-    xLabel: (b) => (b.age === 0 ? 'now' : '-' + b.age.toFixed(0) + 's'),
+    xLabel: (b) => (b.age < 1 ? 'now' : '-' + b.age.toFixed(0) + 's'),
     // Time and tokens together, and the rate as delivered: the phase's tokens
-    // over the wave's wall-clock. A phase's own time is the scheduler thread's,
+    // over the slot's waves' wall-clock. A phase's own time is the scheduler thread's,
     // which for a prefill that reads nothing back is the time to queue it, not
     // to run it — the GPU finishes it under whatever waits next — so tokens over
     // phase time read tens of thousands per second for work the card did at a
@@ -412,44 +400,31 @@ add(makeStackChart(cPhase, () => {
 /* Dual axis on purpose: prefill runs orders of magnitude above decode, and one
  * scale would draw decode as a flat line along the floor.
  *
- * Peak delivered rates: in each fixed 10-second slot of the clock, the
- * highest of its waves' rates, each wave's phase tokens over that wave's own
- * wall-clock (`win`) — the rate the phase-timing tooltip quotes for a bar. Not
- * over the phase's own time, which is the scheduler thread's time to issue the
- * work rather than the card's to run it (see the tooltip above); and not
- * averaged over the slot, which smoothed a two-second decode burst into the
- * quieter waves beside it. A slot no wave ran in draws as zero.
- *
- * Only finished slots are drawn: a slot still filling changes its peak on every
- * poll, which is what kept the line moving with nothing new behind it. With
- * each window's time held (`stable`), a finished slot never changes again. */
-const SLOT_MS = 10000, SLOT_SPAN_MS = 20 * 60000;
+ * Peak delivered rates: each slot's `peak`, the best of its waves' rates —
+ * each wave's phase tokens over that wave's own wall-clock, the rate the
+ * phase-timing tooltip quotes — and for the cluster the members' peaks added,
+ * what the cards delivered side by side. Not over the phase's own time, which
+ * is the scheduler thread's time to issue the work rather than the card's to
+ * run it (see the tooltip above); and not averaged over the slot, which
+ * smoothed a two-second decode burst into the quieter waves beside it. A slot
+ * no wave ran in draws as zero. */
+const RATE_SPAN_MS = 20 * 60000;
 add(makeChart(cPhRate, () => {
   const now = Date.now();
-  const current = Math.floor(now / SLOT_MS);
-  const first = Math.floor((now - SLOT_SPAN_MS) / SLOT_MS);
-  // Every point of one wave carries that wave's time and window, so a wave is
-  // its points at one `at`.
-  const waves = new Map();
-  for (const p of PTS) {
-    const s = Math.floor(p.at / SLOT_MS);
-    if (s < first || s >= current || !(p.win > 0)) continue;
-    if (!waves.has(p.at)) waves.set(p.at, { s, win: p.win, tok: {} });
-    const w = waves.get(p.at);
-    w.tok[p.kind] = (w.tok[p.kind] || 0) + (p.tok || 0);
-  }
+  const current = Math.floor(now / SLOT_MS) * SLOT_MS;
+  const first = Math.floor((now - RATE_SPAN_MS) / SLOT_MS) * SLOT_MS;
   const peak = new Map();
-  for (const w of waves.values()) {
-    if (!peak.has(w.s)) peak.set(w.s, {});
-    const e = peak.get(w.s);
-    for (const [k, n] of Object.entries(w.tok)) e[k] = Math.max(e[k] || 0, n / (w.win / 1000));
+  for (const p of PTS) {
+    if (p.at < first) continue;
+    if (!peak.has(p.at)) peak.set(p.at, {});
+    peak.get(p.at)[p.kind] = p.peak || 0;
   }
   const slots = [];
-  for (let s = first; s < current; s++) slots.push([s, peak.get(s) || {}]);
+  for (let at = first; at < current; at += SLOT_MS) slots.push([at, peak.get(at) || {}]);
   const rate = (e, k) => e[k] || 0;
   return {
     // Each slot is drawn at its end.
-    xs: slots.map(([s]) => ((s + 1) * SLOT_MS - now) / 60000),
+    xs: slots.map(([at]) => (at + SLOT_MS - now) / 60000),
     xnow: 0,
     xFmt: xAgo,
     series: [
@@ -527,7 +502,7 @@ add(makeChart(cArena, () => {
   const R = timeline(MIX.rows);
   let base = R.map(() => 0);
   const layers = MIX.formats.map((f, i) => {
-    const top = R.map((r, j) => base[j] + ((r.tok && r.tok[i]) || 0));
+    const top = R.map((r, j) => base[j] + ((r.tok && r.tok[f]) || 0));
     const layer = series(top, mixColor(f, i), f, { type: 'area', baseData: base, lw: 1 });
     base = top;
     return layer;
@@ -539,12 +514,12 @@ add(makeChart(cArena, () => {
     emptyText: 'no census yet',
     tip: (i) => {
       const r = R[i] || {};
-      const tok = r.tok || [];
-      const total = tok.reduce((a, x) => a + x, 0);
+      const tok = r.tok || {};
+      const total = Object.values(tok).reduce((a, x) => a + x, 0);
       return [
         { t: `${fmtNum(Math.round(total))} tokens resident` },
         ...MIX.formats.map((f, k) => ({
-          t: `${f} ${fmtNum(Math.round(tok[k] || 0))} (${total > 0 ? ((100 * (tok[k] || 0)) / total).toFixed(0) : 0}%)`,
+          t: `${f} ${fmtNum(Math.round(tok[f] || 0))} (${total > 0 ? ((100 * (tok[f] || 0)) / total).toFixed(0) : 0}%)`,
           c: mixColor(f, k),
         })).reverse(),
       ];
@@ -552,8 +527,8 @@ add(makeChart(cArena, () => {
   };
 }));
 
-/* Migration passes are events, not a series: each point is one pass, and the
- * axis still runs to now so a quiet drain reads as quiet. */
+/* Migration passes, slot by slot: what each slot's passes moved and the time
+ * they took. The axis still runs to now so a quiet drain reads as quiet. */
 add(makeChart(cMig, () => ({
   ...axis(MG),
   series: [
@@ -832,133 +807,12 @@ function drawFailure(cv, err) {
 }
 
 /* ── the cluster as a whole ──────────────────────────────────────────────
- * Every panel draws one engine's rows. The cluster view hands them one
- * engine's worth made of every member's: rows on a shared 2 s clock, each
- * field the cluster's — sizes, counts and VRAM bands summed; a wave's own
- * durations the longest of the members', so a rate (tokens over the wave's
- * wall-clock) reads as the cluster's. Nothing is left out: a member with no
- * row in a slot adds nothing to it. Phase points and migration passes are
- * fused onto the same clock, so the cluster is drawn at one engine's
- * resolution however many members answer, rather than at their sum. */
-const FUSE_MS = 2000;
-const LONGEST = new Set(['ws', 'fwd', 'wave_ms', 'quanta_ms']);
-
-function fuseInto(into, row, longest) {
-  for (const [k, v] of Object.entries(row)) {
-    if (k === 'at' || k === 'age') continue;
-    if (typeof v === 'number') {
-      into[k] = longest.has(k) ? Math.max(into[k] ?? v, v) : (into[k] || 0) + v;
-    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      into[k] = fuseInto(into[k] && typeof into[k] === 'object' ? into[k] : {}, v, longest);
-    } else if (typeof v === 'boolean') {
-      into[k] = !!into[k] || v;
-    } else if (into[k] === undefined) {
-      into[k] = v;
-    }
-  }
-  return into;
-}
-
-/* Each member's rows, one fused row per slot of the shared clock. `longest`
- * names the durations, which take the longest member's rather than a sum. */
-function fuseRows(lists, longest) {
-  const slots = new Map();
-  for (const rows of lists) {
-    for (const r of rows) {
-      const s = Math.round(r.at / FUSE_MS);
-      if (!slots.has(s)) slots.set(s, { at: s * FUSE_MS, age: r.age });
-      fuseInto(slots.get(s), r, longest);
-    }
-  }
-  return [...slots.values()].sort((a, b) => a.at - b.at);
-}
-
-/* A migration pass's durations: the cards drain side by side, so a slot's pass
- * took as long as its longest member's, while what moved adds up. */
-const MIGRATE_LONGEST = new Set(['migrate', 'quant', 'copy', 'total']);
-
-/* Phase points, one per kind per slot of the shared clock, so the cluster is
- * drawn at the resolution one engine is, however many members answer. Within
- * a member a slot's waves add up, their windows too; across members the cards
- * run side by side, so the tokens, bytes, sequences and operations add, and a
- * phase's time and the slot's window are the longest member's — every kind in
- * a slot carries that one window, so a bar counts it once and a rate reads as
- * the cluster's tokens over the cluster's wall-clock. `now` re-times each slot
- * as an age, which the phase bars key on. */
-function fusePoints(lists, now) {
-  const slots = new Map();
-  for (const pts of lists) {
-    const own = new Map();
-    for (const p of pts) {
-      const s = Math.round(p.at / FUSE_MS);
-      if (!own.has(s)) own.set(s, { kinds: {}, wins: new Map() });
-      const o = own.get(s);
-      o.wins.set(p.at, p.win || 0);
-      const k = o.kinds[p.kind] || (o.kinds[p.kind] = { dur: 0, tok: 0, by: 0, seq: 0, n: 0 });
-      k.dur += p.dur || 0;
-      k.tok += p.tok || 0;
-      k.by += p.by || 0;
-      k.seq = Math.max(k.seq, p.seq || 0);
-      k.n += p.n || 0;
-    }
-    for (const [s, o] of own) {
-      if (!slots.has(s)) slots.set(s, { win: 0, kinds: {} });
-      const into = slots.get(s);
-      into.win = Math.max(into.win, [...o.wins.values()].reduce((a, x) => a + x, 0));
-      for (const [kind, k] of Object.entries(o.kinds)) {
-        const f = into.kinds[kind] || (into.kinds[kind] = { dur: 0, tok: 0, by: 0, seq: 0, n: 0 });
-        f.dur = Math.max(f.dur, k.dur);
-        f.tok += k.tok;
-        f.by += k.by;
-        f.seq += k.seq;
-        f.n += k.n;
-      }
-    }
-  }
-  const out = [];
-  for (const [s, slot] of slots) {
-    const at = s * FUSE_MS;
-    for (const [kind, f] of Object.entries(slot.kinds)) {
-      out.push({ at, age: (now - at) / 1000, kind, win: slot.win, ...f });
-    }
-  }
-  return out.sort((a, b) => a.at - b.at);
-}
-
-/* The hosts' memory added up; a reading any member lacks is absent. */
-function sumHost(hosts) {
-  const out = {};
-  for (const h of hosts) {
-    for (const [k, v] of Object.entries(h)) {
-      if (typeof v !== 'number') { if (!(k in out)) out[k] = v; continue; }
-      out[k] = out[k] === null ? null : (out[k] || 0) + v;
-    }
-    for (const k of Object.keys(out)) if (h[k] === null) out[k] = null;
-  }
-  return out;
-}
-
-/* The arena mix: every member's formats, each member's counts moved onto
- * them, summed per slot. */
-function fuseMix(mixes) {
-  const formats = [];
-  for (const x of mixes) for (const f of x.formats) if (!formats.includes(f)) formats.push(f);
-  const lists = mixes.map((x) => x.rows.map((row) => {
-    const tok = formats.map(() => 0);
-    (row.tok || []).forEach((n, i) => { tok[formats.indexOf(x.formats[i])] += n; });
-    return { ...row, tok };
-  }));
-  const slots = new Map();
-  for (const rows of lists) {
-    for (const row of rows) {
-      const s = Math.round(row.at / FUSE_MS);
-      const have = slots.get(s);
-      if (!have) { slots.set(s, { ...row, at: s * FUSE_MS }); continue; }
-      have.tok = have.tok.map((n, i) => n + row.tok[i]);
-    }
-  }
-  return { formats, rows: [...slots.values()].sort((a, b) => a.at - b.at) };
-}
+ * Every panel draws one engine's rows. For the cluster as a whole the gateway
+ * answers them already added up (`cluster` in its envelope,
+ * `cluster::dispatch::fuse`), on the same 5-second slots one member answers:
+ * sizes, counts and VRAM bands summed, a wave's own durations the longest
+ * member's, so a rate (tokens over the wave's wall-clock) reads as the
+ * cluster's. The page draws it as it draws one member. */
 
 /* The layer flow draws single forwards, which do not add up across cards: the
  * busiest member's — the one whose newest wave moved the most tokens. */
@@ -988,35 +842,28 @@ async function refresh() {
     NODES = pick(t, null).members;
     if (member && !NODES.some((n) => n.node === member)) member = '';
     paintMembers(NODES);
-    // Each row's wall-clock time, fixed once on arrival: `age` is seconds
-    // before the server answered, so it grows every poll, and anything keyed
-    // on it slides. `stable` holds it to the first reading.
-    const at = Date.now();
-    const pin = (rows) => (rows || []).map((r) => ({ ...r, at: stable(at - r.age * 1000) }));
+    // The telemetry and the phases are slot rows already: for the cluster as a
+    // whole, the gateway's fused answer; otherwise the one member's.
+    const take = (tel, ph) => {
+      W = tel.waves || []; MG = tel.migrate || []; HOST = tel.host || {};
+      MIX = { formats: tel.mix_formats || [], rows: tel.mix || [] };
+      PTS = (ph && ph.points) || [];
+    };
     if (clusterView()) {
-      // Every member's answer to each endpoint, fused into the one view every
-      // panel already draws — see `fuseRows`.
       const each = (x) => (x === null ? [] : NODES.map((n) => pick(x, n.node).body).filter(Boolean));
       const tels = each(t);
-      W = fuseRows(tels.map((b) => pin(b.waves)), LONGEST);
-      MG = fuseRows(tels.map((b) => pin(b.migrate)), MIGRATE_LONGEST);
-      HOST = sumHost(tels.map((b) => b.host || {}));
-      MIX = fuseMix(tels.map((b) => ({ formats: (b.mix && b.mix.formats) || [], rows: pin(b.mix && b.mix.rows) })));
-      PTS = fusePoints(each(p).map((b) => pin(b.points)), at);
+      take(t.cluster || {}, p && p.cluster);
       PROM = each(r).flatMap((b) => b.items || []);
       LAYERS = busiest(each(l).map((b) => b.passes || []), tels);
       MEM = each(m)[0] || null;
     } else {
       const of = (x) => (x === null ? null : pick(x, member || null).body);
-      const tel = of(t) || {}, ph = of(p), pr = of(r), ly = of(l);
-      W = pin(tel.waves); MG = pin(tel.migrate); HOST = tel.host || {};
-      MIX = { formats: (tel.mix && tel.mix.formats) || [], rows: pin(tel.mix && tel.mix.rows) };
-      PTS = pin(ph && ph.points);
+      const pr = of(r), ly = of(l);
+      take(of(t) || {}, of(p));
       PROM = (pr && pr.items) || [];
       LAYERS = (ly && ly.passes) || [];
       MEM = of(m);
     }
-    forgetBefore(at - 5 * 3600 * 1000);
     lastAt = Date.now();
     failures = 0;
     live.textContent = '● live';

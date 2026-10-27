@@ -7,53 +7,90 @@
 //! migration timings are pushed straight from the scheduler and persistence
 //! threads. One scheduler serves every tenant, so these are the engine's, not
 //! any one tenant's. Nothing is parsed out of the log, so the dashboard works
-//! regardless of log level and pays no file I/O. Sample times are returned as
-//! elapsed seconds within the returned window (oldest = 0), so the page's "now
-//! on the right" axis places the newest sample at the right edge.
+//! regardless of log level and pays no file I/O.
+//!
+//! Every series is answered on the shared wall-clock grid
+//! (`docs/performance_series.md`): one row per finished `slots::SLOT_MS` slot,
+//! stamped `at` with the slot's start in unix milliseconds, and each answer
+//! declares in `fuse` how its rows add up across a cluster — which the gateway
+//! does (`cluster::dispatch::fuse`), so no console adds anything up itself.
 
 use std::time::Instant;
 
 use axum::Json;
 use candle_conversation::layer_trace::{self, PassTrace};
 use candle_conversation::phase_ring::{
-    snapshot, snapshot_migrates, snapshot_mixes, snapshot_projected, snapshot_waves, VramBands,
+    snapshot, snapshot_migrates, snapshot_mixes, snapshot_projected, snapshot_waves, MigrateSample,
+    PhaseSnapshot, VramBands, WaveSample,
 };
 use serde::Serialize;
+use serde_json::{json, Value};
 
-use super::format_mix::{mix_series, Census, MixSeries};
+use super::format_mix::{mix_series, Census, MixRow};
+use super::slots::{by_slot, now_ms};
 
-/// The per-wave rows.
+/// The engine's rows, slot by slot.
 #[derive(Serialize, Default, Clone)]
 pub struct WaveSeries {
     waves: Vec<Wave>,
-    /// The resident KV by storage format, over time.
-    mix: MixSeries,
+    /// The resident KV by storage format, each row's tokens by series name.
+    mix: Vec<MixRow>,
+    /// The arena's series in stacking order: the top formats, then `other`.
+    mix_formats: Vec<String>,
     migrate: Vec<Migrate>,
     /// `true` once any arena / migration sample exists — the pressure panels
     /// have data.
     has_pressure: bool,
+    /// How the answer adds up across a cluster ([`telemetry_fuse`]).
+    fuse: Value,
 }
 
 /// The formats the arena panel names; the rest are `other`.
 const MIX_TOP: usize = 6;
 
-#[derive(Serialize, Clone)]
+/// How `/v1/telemetry`'s answer adds up across a cluster: each slot's rows add,
+/// but a wave's and a migration pass's durations are the longest member's —
+/// the cards ran side by side — so the cluster's tokens over its `ws` is the
+/// cluster's rate. Host memory adds; the arena's series are every member's.
+fn telemetry_fuse() -> Value {
+    json!({
+        "series": {
+            "waves": ["ws", "fwd", "wave_ms", "quanta_ms"],
+            "migrate": ["migrate", "quant", "copy", "total"],
+            "mix": [],
+        },
+        "sum": ["host"],
+        "union": ["mix_formats"],
+    })
+}
+
+/// How `/v1/phases`' answer adds up: each kind's tokens, bytes, sequences,
+/// operations and peak rate add; its time and the slot's window are the
+/// longest member's.
+fn phases_fuse() -> Value {
+    json!({ "series": { "points": ["dur", "win"] } })
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct Wave {
-    /// Seconds before the answer — a page fixes each row's clock time from
-    /// it once, so a row stays where it ran however many polls follow.
-    age: f64,
-    /// Wave wall-clock and forward time, **both milliseconds** — as are every
-    /// other duration on this record (`pdrain`, `delev`, `dglue`, `reproj`,
-    /// `scan`, `rglue`, `layout`). The page divides `tok` by `ws` for
-    /// throughput and plots the two on one axis, so a unit that disagrees with
-    /// the name is a silently wrong reading rather than an error.
+    /// The slot's start, unix milliseconds.
+    at: u64,
+    /// The slot's waves' wall-clock, summed, and the longest mean forward,
+    /// **both milliseconds** — as is every other duration on this record
+    /// (`pdrain`, `delev`, `dglue`, `reproj`, `scan`, `rglue`, `layout`, each
+    /// the slot's sum). The page divides `tok` by `ws` for throughput and
+    /// plots the two on one axis, so a unit that disagrees with the name is a
+    /// silently wrong reading rather than an error.
     ws: f64,
     fwd: f64,
+    /// Tokens the slot's waves fed.
     tok: f64,
+    // The slot's last wave's state: the KV budget and use, the backlog.
     budget: f64,
     used: f64,
     backlog: f64,
-    /// The whole card at this wave, cut by what holds each byte (MiB).
+    /// The whole card at the slot's last wave, cut by what holds each byte
+    /// (MiB).
     vram: Vram,
     // Projection decomposition (ms): pdrain (drain minus re-attributed prefill) +
     // drain elevate/glue; reproject total + scan/glue/layout.
@@ -64,17 +101,51 @@ struct Wave {
     scan: f64,
     rglue: f64,
     layout: f64,
-    // Active-work counts: resident conversations + decode/prefill/section widths.
+    // Active-work counts at the slot's last wave: resident conversations +
+    // decode/prefill/section widths.
     slots: f64,
     dec: f64,
     pre: f64,
     sec: f64,
-    /// The window's waves — run-loop passes that ran a forward — and, per
-    /// wave, its mean wall-clock and the part spent in the quanta (ms). Both
-    /// `null` for a window with no wave.
+    /// The slot's waves — run-loop passes that ran a forward — and, per wave,
+    /// its mean wall-clock and the part spent in the quanta (ms). Both `null`
+    /// for a slot with no wave.
     waves: f64,
     wave_ms: Option<f64>,
     quanta_ms: Option<f64>,
+}
+
+/// One slot's wave samples, oldest first, as its row; none for no sample.
+fn fold_waves(at: u64, rows: &[&WaveSample]) -> Option<Wave> {
+    let last = *rows.last()?;
+    let sum = |f: fn(&WaveSample) -> u64| rows.iter().map(|s| f(s)).sum::<u64>();
+    let waves = sum(|s| s.waves);
+    let (wave_ms, quanta_ms) =
+        per_wave(waves, sum(|s| s.wave_wall_us), sum(|s| s.wave_overhead_us));
+    Some(Wave {
+        at,
+        ws: sum(|s| s.ws_ms as u64) as f64,
+        fwd: rows.iter().map(|s| s.fwd_ms).max().unwrap_or(0) as f64,
+        tok: sum(|s| s.tok) as f64,
+        budget: last.budget_mib as f64,
+        used: last.used_mib as f64,
+        backlog: last.backlog as f64,
+        vram: last.vram.into(),
+        pdrain: sum(|s| s.pdrain_ms) as f64,
+        delev: sum(|s| s.drain_elevate_ms) as f64,
+        dglue: sum(|s| s.drain_glue_ms) as f64,
+        reproj: sum(|s| s.reproj_ms) as f64,
+        scan: sum(|s| s.reproj_scan_ms) as f64,
+        rglue: sum(|s| s.reproj_glue_ms) as f64,
+        layout: sum(|s| s.reproj_layout_ms) as f64,
+        slots: last.slots as f64,
+        dec: last.decodes as f64,
+        pre: last.prefills as f64,
+        sec: last.sections as f64,
+        waves: waves as f64,
+        wave_ms,
+        quanta_ms,
+    })
 }
 
 /// `(mean wall, mean quanta)` per wave, in ms, from the window's summed
@@ -128,10 +199,12 @@ impl From<VramBands> for Vram {
     }
 }
 
-#[derive(Serialize, Clone)]
+/// One slot's hot→warm migration passes: what they moved, and the time they
+/// took (ms), summed.
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct Migrate {
-    /// Seconds before the answer, as [`Wave::age`].
-    age: f64,
+    /// The slot's start, unix milliseconds.
+    at: u64,
     res: f64,
     mib: f64,
     migrate: f64,
@@ -139,47 +212,111 @@ struct Migrate {
     copy: f64,
     total: f64,
 }
-/// One phase measurement for the GUI phase graphs: `age` seconds before now,
-/// `kind` the phase label, `dur` its wall-clock (ms) this wave, `win` the wave
-/// window (ms), `tok`/`by` the token / byte volume, `seq` concurrent sequences,
-/// `n` the operation count (forwards / seals / evicted residences).
-#[derive(Serialize, Clone)]
+
+/// One slot's passes, as its row.
+fn fold_migrates(at: u64, rows: &[&MigrateSample]) -> Migrate {
+    let sum = |f: fn(&MigrateSample) -> u64| rows.iter().map(|s| f(s)).sum::<u64>() as f64;
+    Migrate {
+        at,
+        res: sum(|s| s.residences),
+        mib: sum(|s| s.mib),
+        migrate: sum(|s| s.migrate_ms),
+        quant: sum(|s| s.quantize_ms),
+        copy: sum(|s| s.copy_ms),
+        total: sum(|s| s.total_ms),
+    }
+}
+
+/// One phase over one slot, for the phase graphs: `kind` the phase label,
+/// `dur` the wall-clock (ms) it held across the slot's waves, `win` those
+/// waves' windows (ms) summed, `tok`/`by` the token / byte volume, `seq` the
+/// most sequences one wave carried, `n` the operation count (forwards / seals
+/// / evicted residences), and `peak` the best of the slot's waves' delivered
+/// rate — the phase's tokens over that wave's window, tokens a second.
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct PhasePoint {
-    age: f64,
+    /// The slot's start, unix milliseconds.
+    at: u64,
     kind: &'static str,
-    dur: u32,
-    win: u32,
+    dur: u64,
+    win: u64,
     tok: u64,
     by: u64,
     seq: u32,
-    n: u32,
+    n: u64,
+    peak: f64,
+}
+
+/// One slot's phase measurements, oldest first, as a row per phase in the
+/// order the phases first ran. A wave's measurements share its age, which is
+/// how its window is counted once.
+fn fold_points(at: u64, points: &[&PhaseSnapshot]) -> Vec<PhasePoint> {
+    let mut win = 0u64;
+    let mut wave: Option<f64> = None;
+    let mut out: Vec<PhasePoint> = Vec::new();
+    for p in points {
+        if wave != Some(p.age_s) {
+            wave = Some(p.age_s);
+            win += u64::from(p.window_ms);
+        }
+        let i = match out.iter().position(|q| q.kind == p.kind) {
+            Some(i) => i,
+            None => {
+                out.push(PhasePoint {
+                    at,
+                    kind: p.kind,
+                    dur: 0,
+                    win: 0,
+                    tok: 0,
+                    by: 0,
+                    seq: 0,
+                    n: 0,
+                    peak: 0.0,
+                });
+                out.len() - 1
+            }
+        };
+        let q = &mut out[i];
+        q.dur += u64::from(p.dur_ms);
+        q.tok += p.tokens;
+        q.by += p.bytes;
+        q.seq = q.seq.max(p.seqs);
+        q.n += u64::from(p.count);
+        if p.window_ms > 0 {
+            q.peak = q
+                .peak
+                .max(round2(p.tokens as f64 * 1000.0 / f64::from(p.window_ms)));
+        }
+    }
+    for q in &mut out {
+        q.win = win;
+    }
+    out
 }
 
 #[derive(Serialize, Default, Clone)]
 pub struct Phases {
     points: Vec<PhasePoint>,
+    /// How the answer adds up across a cluster ([`phases_fuse`]).
+    fuse: Value,
 }
 
-/// `GET /v1/phases` — the scheduler's in-process per-wave phase ring, read fresh
-/// each poll (ages relative to *now*). Feeds the phase bar (2 min) and phase line
-/// (60 min) graphs on `perf.html`. The ring snapshot clones a bounded but
-/// non-trivial vector under a lock, so it runs on a blocking thread.
+/// `GET /v1/phases` — the scheduler's in-process per-wave phase ring, one row
+/// per phase per finished slot. Feeds the phase bars (2 min) and the phase
+/// throughput graph (20 min) on `perf.html`. The ring snapshot clones a
+/// bounded but non-trivial vector under a lock, so it runs on a blocking
+/// thread.
 pub async fn phases() -> Json<Phases> {
     let body = tokio::task::spawn_blocking(|| {
-        let points = snapshot()
+        let snap = snapshot();
+        let points = by_slot(&snap, now_ms(), |p| p.age_s)
             .into_iter()
-            .map(|p| PhasePoint {
-                age: round2(p.age_s),
-                kind: p.kind,
-                dur: p.dur_ms,
-                win: p.window_ms,
-                tok: p.tokens,
-                by: p.bytes,
-                seq: p.seqs,
-                n: p.count,
-            })
+            .flat_map(|(at, group)| fold_points(at, &group))
             .collect();
-        Phases { points }
+        Phases {
+            points,
+            fuse: phases_fuse(),
+        }
     })
     .await
     .unwrap_or_default();
@@ -291,76 +428,49 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// Assemble the series from the rings, each row stamped with its age in seconds
-/// before this answer. Not an elapsed time from the oldest sample: that origin
-/// moves as the rings trim, so every row slid along the page's axis on every
-/// poll whether anything ran or not. The ring clones are bounded but not free,
-/// so callers run this off the async workers.
+/// Assemble the series from the rings, one row per finished `slots::SLOT_MS` slot,
+/// stamped with the slot's start on the wall clock — so a row lands where it
+/// ran however many polls follow, and every member's rows line up. The ring
+/// clones are bounded but not free, so callers run this off the async workers.
 pub fn wave_series() -> WaveSeries {
+    let now = now_ms();
     let waves = snapshot_waves();
-    let migr = snapshot_migrates();
-
-    let wave_series: Vec<Wave> = waves
-        .iter()
-        .map(|w| {
-            let s = &w.sample;
-            let (wave_ms, quanta_ms) = per_wave(s.waves, s.wave_wall_us, s.wave_overhead_us);
-            Wave {
-                age: round2(w.age_s),
-                ws: s.ws_ms as f64,
-                fwd: s.fwd_ms as f64,
-                tok: s.tok as f64,
-                budget: s.budget_mib as f64,
-                used: s.used_mib as f64,
-                backlog: s.backlog as f64,
-                vram: s.vram.into(),
-                pdrain: s.pdrain_ms as f64,
-                delev: s.drain_elevate_ms as f64,
-                dglue: s.drain_glue_ms as f64,
-                reproj: s.reproj_ms as f64,
-                scan: s.reproj_scan_ms as f64,
-                rglue: s.reproj_glue_ms as f64,
-                layout: s.reproj_layout_ms as f64,
-                slots: s.slots as f64,
-                dec: s.decodes as f64,
-                pre: s.prefills as f64,
-                sec: s.sections as f64,
-                waves: s.waves as f64,
-                wave_ms,
-                quanta_ms,
-            }
+    let wave_rows: Vec<Wave> = by_slot(&waves, now, |w| w.age_s)
+        .into_iter()
+        .filter_map(|(at, group)| {
+            let samples: Vec<&WaveSample> = group.iter().map(|w| &w.sample).collect();
+            fold_waves(at, &samples)
         })
         .collect();
-    let censuses: Vec<Census> = snapshot_mixes()
+    // A census is a state: the slot's last one stands for it.
+    let mixes = snapshot_mixes();
+    let censuses: Vec<Census> = by_slot(&mixes, now, |m| m.age_s)
         .into_iter()
-        .map(|m| Census {
-            age: m.age_s,
-            rows: m.rows,
+        .filter_map(|(at, group)| {
+            group.last().map(|m| Census {
+                at,
+                rows: m.rows.clone(),
+            })
         })
         .collect();
     let mix = mix_series(&censuses, MIX_TOP);
-    let migrate_series: Vec<Migrate> = migr
-        .iter()
-        .map(|m| {
-            let s = &m.sample;
-            Migrate {
-                age: round2(m.age_s),
-                res: s.residences as f64,
-                mib: s.mib as f64,
-                migrate: s.migrate_ms as f64,
-                quant: s.quantize_ms as f64,
-                copy: s.copy_ms as f64,
-                total: s.total_ms as f64,
-            }
+    let migrates = snapshot_migrates();
+    let migrate_rows: Vec<Migrate> = by_slot(&migrates, now, |m| m.age_s)
+        .into_iter()
+        .map(|(at, group)| {
+            let samples: Vec<&MigrateSample> = group.iter().map(|m| &m.sample).collect();
+            fold_migrates(at, &samples)
         })
         .collect();
 
-    let has_pressure = !mix.rows.is_empty() || !migrate_series.is_empty();
+    let has_pressure = !mix.rows.is_empty() || !migrate_rows.is_empty();
     WaveSeries {
-        waves: wave_series,
-        mix,
-        migrate: migrate_series,
+        waves: wave_rows,
+        mix: mix.rows,
+        mix_formats: mix.formats,
+        migrate: migrate_rows,
         has_pressure,
+        fuse: telemetry_fuse(),
     }
 }
 
@@ -371,6 +481,7 @@ mod tests {
     use std::time::Duration;
 
     use candle_conversation::layer_trace::LayerVisit;
+    use candle_conversation::phase_ring::{migrate_sample, wave_sample};
 
     /// The card's bands reach the page by name, every one of them.
     #[test]
@@ -482,7 +593,7 @@ mod tests {
     }
 
     /// With no engine in this process the rings are empty, and the series say
-    /// so rather than inventing a row.
+    /// so rather than inventing a row — and still say how they add up.
     #[test]
     fn no_engine_is_empty_series() {
         let s = serde_json::to_value(wave_series()).unwrap();
@@ -490,10 +601,151 @@ mod tests {
             s,
             serde_json::json!({
                 "waves": [],
-                "mix": {"formats": [], "rows": []},
+                "mix": [],
+                "mix_formats": [],
                 "migrate": [],
                 "has_pressure": false,
+                "fuse": {
+                    "series": {
+                        "waves": ["ws", "fwd", "wave_ms", "quanta_ms"],
+                        "migrate": ["migrate", "quant", "copy", "total"],
+                        "mix": [],
+                    },
+                    "sum": ["host"],
+                    "union": ["mix_formats"],
+                },
             })
+        );
+    }
+
+    /// **A slot's waves are one row**: their wall-clock, tokens and projection
+    /// time add; the longest mean forward stands; the state — budget, backlog,
+    /// card, widths — is the last wave's; and the per-wave means come from the
+    /// summed microseconds over all 22 waves.
+    #[test]
+    fn a_slots_waves_fold_into_one_row() {
+        let first = wave_sample(
+            2_000,
+            30,
+            500,
+            100,
+            50,
+            10,
+            VramBands::default(),
+            (1, 2, 3, 4, 5, 6, 7),
+            (5, 2, 1, 0),
+            (10, 400_000, 100_000),
+        );
+        let card = VramBands {
+            kv: 9.0,
+            ..VramBands::default()
+        };
+        let second = wave_sample(
+            2_500,
+            45,
+            700,
+            110,
+            60,
+            20,
+            card,
+            (10, 20, 30, 40, 50, 60, 70),
+            (6, 3, 2, 1),
+            (12, 600_000, 200_000),
+        );
+        assert_eq!(
+            fold_waves(5_000, &[&first, &second]),
+            Some(Wave {
+                at: 5_000,
+                ws: 4_500.0,
+                fwd: 45.0,
+                tok: 1_200.0,
+                budget: 110.0,
+                used: 60.0,
+                backlog: 20.0,
+                vram: card.into(),
+                pdrain: 11.0,
+                delev: 22.0,
+                dglue: 33.0,
+                reproj: 44.0,
+                scan: 55.0,
+                rglue: 66.0,
+                layout: 77.0,
+                slots: 6.0,
+                dec: 3.0,
+                pre: 2.0,
+                sec: 1.0,
+                waves: 22.0,
+                wave_ms: Some(45.45),
+                quanta_ms: Some(31.82),
+            })
+        );
+        assert_eq!(fold_waves(5_000, &[]), None);
+    }
+
+    /// **A slot's phases are a row each**, in the order they first ran: each
+    /// wave's window counted once into the slot's (2,000 + 2,500 ms), and the
+    /// decode's peak the better wave's — 500 tokens over 2 s, not 600 over
+    /// 2.5 s.
+    #[test]
+    fn a_slots_phases_fold_into_a_row_each_with_the_best_waves_rate() {
+        let point = |kind, age_s, window_ms, dur_ms, tokens, seqs, count| PhaseSnapshot {
+            kind,
+            age_s,
+            window_ms,
+            dur_ms,
+            tokens,
+            bytes: 0,
+            seqs,
+            count,
+        };
+        let a_decode = point("decode", 3.0, 2_000, 1_500, 500, 20, 15);
+        let a_prefill = point("prefill", 3.0, 2_000, 400, 4_000, 2, 3);
+        let b_decode = point("decode", 1.0, 2_500, 2_000, 600, 24, 16);
+        assert_eq!(
+            fold_points(10_000, &[&a_decode, &a_prefill, &b_decode]),
+            vec![
+                PhasePoint {
+                    at: 10_000,
+                    kind: "decode",
+                    dur: 3_500,
+                    win: 4_500,
+                    tok: 1_100,
+                    by: 0,
+                    seq: 24,
+                    n: 31,
+                    peak: 250.0,
+                },
+                PhasePoint {
+                    at: 10_000,
+                    kind: "prefill",
+                    dur: 400,
+                    win: 4_500,
+                    tok: 4_000,
+                    by: 0,
+                    seq: 2,
+                    n: 3,
+                    peak: 2_000.0,
+                },
+            ]
+        );
+    }
+
+    /// A slot's migration passes add up, what they moved and how long they took.
+    #[test]
+    fn a_slots_migration_passes_add_up() {
+        let a = migrate_sample(3, 10, 100, 40, 50, 120);
+        let b = migrate_sample(2, 5, 200, 10, 150, 210);
+        assert_eq!(
+            fold_migrates(15_000, &[&a, &b]),
+            Migrate {
+                at: 15_000,
+                res: 5.0,
+                mib: 15.0,
+                migrate: 300.0,
+                quant: 50.0,
+                copy: 200.0,
+                total: 330.0,
+            }
         );
     }
 }

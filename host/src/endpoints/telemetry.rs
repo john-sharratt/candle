@@ -3,8 +3,10 @@
 //! `/v1/telemetry` carries two different kinds of data side by side, because
 //! they are different data and not the same data twice: the host's sampled
 //! hour (`gpu`, `model`, `host`, `series`, `sample_period_s`, `uptime_s`, every
-//! tenant's columns on one time axis) and the engine's per-wave rows (`waves`,
-//! `mix`, `migrate`, `has_pressure`). Memory is in MiB throughout.
+//! tenant's columns on one time axis) and the engine's rows, one per 5-second
+//! slot of the wall clock (`waves`, `mix`, `mix_formats`, `migrate`,
+//! `has_pressure`), with `fuse` saying how the answer adds up across a cluster
+//! (`docs/performance_series.md`). Memory is in MiB throughout.
 
 use std::sync::Arc;
 
@@ -66,7 +68,14 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "{key} missing: {v}");
         }
-        for key in ["waves", "mix", "migrate", "has_pressure"] {
+        for key in [
+            "waves",
+            "mix",
+            "mix_formats",
+            "migrate",
+            "has_pressure",
+            "fuse",
+        ] {
             assert!(v.get(key).is_some(), "{key} missing: {v}");
         }
         assert!(v["host"]["total_mib"].as_u64().is_some_and(|m| m > 0));

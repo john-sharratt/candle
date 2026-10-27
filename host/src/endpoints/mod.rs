@@ -13,6 +13,7 @@ mod log_grep;
 mod logs;
 mod me;
 mod profile;
+mod slots;
 pub(crate) mod status;
 mod telemetry;
 mod waves;
