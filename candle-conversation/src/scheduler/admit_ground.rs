@@ -450,9 +450,9 @@ impl<'a> AdmitPass<'a> {
     /// The tier the held cohort can give up at its next fit: what its members
     /// stand at now, less what they would stand at each held to the least
     /// advance. A running member is never taken out — it narrows, and keeps
-    /// advancing — and `share_within` gives every member of the next fit its
-    /// whole remainder up to a common level, so a short newcomer finishes in the
-    /// sweep it joins while the long members keep the level's rows.
+    /// advancing — and `fill_in_order` gives the next fit's rows to the members
+    /// nearest their first token first, so a short newcomer finishes in the
+    /// sweep it joins while the long members take what it leaves.
     ///
     /// **Only between sweeps.** The narrowing lands at the next fit, so it can
     /// pay only for claims that land there too. Mid-sweep, an admitted turn
@@ -754,21 +754,10 @@ impl AdmitPass<'_> {
         // the rate model's own cap check counts them, so a clip that ignored them
         // would offer ground that is already spoken for.
         //
-        // **A full forward still takes turns, as members of a shared cohort.**
-        //
-        // Once the rows are spent, a further turn adds none to this forward, but
-        // it is not therefore turned away: the forwards that follow share their
-        // rows across every prefill in flight (`admission::share_within`), so it
-        // prefills beside the others and decodes in their cohort rather than a
-        // whole cohort behind. One forward's rows are not a cap on how many turns
-        // may join: a cohort admitted whole prefills together and decodes at its
-        // full width, where one cut at the rows decodes in halves.
-        //
-        // It joins while every member can still advance at least one chunk a
-        // forward — the rule `share_within` carries members by — so admission and
-        // the wave that forms from it agree on who rides. Every member in flight
-        // is counted, sections and paused prefills included: a pause lifts, and
-        // its turn then shares the same forwards. See [`Self::room`].
+        // **A full forward takes no more turns** ([`room_left`]): its rows are
+        // filled in order (`admission::fill_in_order`), so a turn past them would
+        // advance by nothing while holding its store. Every member in flight is
+        // counted, sections and paused prefills included. See [`Self::room`].
         let (turn, seq) = (w.tokens.len(), w.sequence_id);
         // **A store is charged once.** A turn whose sequence already holds a
         // store has that store's regions in the residency this offer is read
@@ -1156,8 +1145,8 @@ impl Scheduler {
     /// group at each member's advance and depth, then **every prefill and
     /// section admitted that has not joined it yet**.
     ///
-    /// Those are the next group's members as surely as the held ones —
-    /// `share_within` carries every prefill in flight — and an earlier pass
+    /// Those are the next group's members as surely as the held ones — the
+    /// group is formed from every prefill in flight — and an earlier pass
     /// charged their tier against the draft it composed. Starting the next pass
     /// from the held group alone forgets that charge: measured on the 3090
     /// scratch daemon (2026-10-18), five passes in two seconds each read
@@ -1472,8 +1461,15 @@ impl Scheduler {
 }
 
 /// Rows a forward `chunk_rows` wide still has for an offer once `taken` are
-/// spent, or `None` when it is full and one more member beside `members`
-/// could not advance a chunk.
+/// spent, or `None` when it is full.
+///
+/// **A full forward takes no more turns.** Its rows are filled in order
+/// (`admission::fill_in_order`), so a turn joining a full forward advances by
+/// nothing until the ones ahead finish — yet it claims its store and scratch
+/// at admission, and holds them while it waits. Joined while every member could
+/// still advance a chunk, BlackWorld's code_read ingest (2026-10-27) held 13
+/// prefills' recurrent stores at once against one forward's rows. It is offered
+/// again at the next pass, once rows have come free.
 ///
 /// **A closed forward has no rows left, whatever its width.** Closing ends the
 /// rows at what the pass admitted, and the cohort composes at no less than a
@@ -1482,15 +1478,15 @@ impl Scheduler {
 /// had just refused with the same rows, the rate refused it again, and the
 /// pass never ended: on BlackWorld (d919bd410, 2026-10-20) one 4-row `Normal`
 /// prompt was offered and refused every 1.4 ms for four hours, and no wave ran
-/// to step the seventeen decodes the refusal was protecting. Closed, the turn
-/// comes back as a join — the rows already spent are the ones it shares.
+/// to step the seventeen decodes the refusal was protecting. Closed with no
+/// member in it, the turn comes back as a join and advances by that chunk.
 fn room_left(chunk_rows: usize, taken: usize, closed: bool, members: usize) -> Option<usize> {
     let room = if closed {
         0
     } else {
         chunk_rows.saturating_sub(taken)
     };
-    if room == 0 && (members + 1).saturating_mul(CHUNK_SIZE) > chunk_rows {
+    if room == 0 && members > 0 {
         return None;
     }
     Some(room)
@@ -1510,13 +1506,25 @@ mod tests {
             Some(0),
             "a closed pass re-offers the turn as a join, not with the rows it was refused"
         );
-        // With a member already sharing that chunk, there is no room for a
-        // join that could advance beside it either.
+        // With a member already in that chunk, there is no room for a join.
         assert_eq!(room_left(CHUNK_SIZE, 0, true, 1), None);
         // Open, a wider forward still has its unspent rows.
         assert_eq!(
             room_left(4 * CHUNK_SIZE, CHUNK_SIZE, false, 1),
             Some(3 * CHUNK_SIZE)
+        );
+    }
+
+    /// **A full forward takes no turn beside its members**, however many more
+    /// chunks it is wide: filled in order, the join would advance by nothing
+    /// while holding its store.
+    #[test]
+    fn a_full_forward_takes_no_join() {
+        assert_eq!(room_left(64 * CHUNK_SIZE, 64 * CHUNK_SIZE, false, 2), None);
+        assert_eq!(room_left(64 * CHUNK_SIZE, 64 * CHUNK_SIZE, true, 2), None);
+        assert_eq!(
+            room_left(64 * CHUNK_SIZE, 63 * CHUNK_SIZE, false, 2),
+            Some(CHUNK_SIZE)
         );
     }
 
