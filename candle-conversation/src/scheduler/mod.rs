@@ -11189,12 +11189,7 @@ impl Scheduler {
         extra_sections: &[SectionId],
         extra_turns: &[TurnKey],
     ) {
-        let mut keep_turns: Vec<TurnKey> = Vec::new();
-        let mut keep_sections: Vec<SectionId> = Vec::new();
-        for st in self.slot_projection_state.values() {
-            keep_sections.extend(st.working_set.sections.iter().copied());
-            keep_turns.extend(st.working_set.turns.iter().copied());
-        }
+        let (mut keep_sections, mut keep_turns) = self.live_working_sets();
         keep_sections.extend(extra_sections.iter().copied());
         keep_turns.extend(extra_turns.iter().copied());
         // The publish advances the substrate's own wave clock and stamps the
