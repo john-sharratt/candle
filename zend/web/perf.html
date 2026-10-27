@@ -837,17 +837,19 @@ function drawFailure(cv, err) {
  * field the cluster's — sizes, counts and VRAM bands summed; a wave's own
  * durations the longest of the members', so a rate (tokens over the wave's
  * wall-clock) reads as the cluster's. Nothing is left out: a member with no
- * row in a slot adds nothing to it. */
+ * row in a slot adds nothing to it. Phase points and migration passes are
+ * fused onto the same clock, so the cluster is drawn at one engine's
+ * resolution however many members answer, rather than at their sum. */
 const FUSE_MS = 2000;
 const LONGEST = new Set(['ws', 'fwd', 'wave_ms', 'quanta_ms']);
 
-function fuseInto(into, row) {
+function fuseInto(into, row, longest) {
   for (const [k, v] of Object.entries(row)) {
     if (k === 'at' || k === 'age') continue;
     if (typeof v === 'number') {
-      into[k] = LONGEST.has(k) ? Math.max(into[k] ?? v, v) : (into[k] || 0) + v;
+      into[k] = longest.has(k) ? Math.max(into[k] ?? v, v) : (into[k] || 0) + v;
     } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      into[k] = fuseInto(into[k] && typeof into[k] === 'object' ? into[k] : {}, v);
+      into[k] = fuseInto(into[k] && typeof into[k] === 'object' ? into[k] : {}, v, longest);
     } else if (typeof v === 'boolean') {
       into[k] = !!into[k] || v;
     } else if (into[k] === undefined) {
@@ -857,20 +859,71 @@ function fuseInto(into, row) {
   return into;
 }
 
-/* Each member's rows, one fused row per slot of the shared clock. */
-function fuseRows(lists) {
+/* Each member's rows, one fused row per slot of the shared clock. `longest`
+ * names the durations, which take the longest member's rather than a sum. */
+function fuseRows(lists, longest) {
   const slots = new Map();
   for (const rows of lists) {
     for (const r of rows) {
       const s = Math.round(r.at / FUSE_MS);
       if (!slots.has(s)) slots.set(s, { at: s * FUSE_MS, age: r.age });
-      fuseInto(slots.get(s), r);
+      fuseInto(slots.get(s), r, longest);
     }
   }
   return [...slots.values()].sort((a, b) => a.at - b.at);
 }
 
-const byTime = (rows) => rows.sort((a, b) => a.at - b.at);
+/* A migration pass's durations: the cards drain side by side, so a slot's pass
+ * took as long as its longest member's, while what moved adds up. */
+const MIGRATE_LONGEST = new Set(['migrate', 'quant', 'copy', 'total']);
+
+/* Phase points, one per kind per slot of the shared clock, so the cluster is
+ * drawn at the resolution one engine is, however many members answer. Within
+ * a member a slot's waves add up, their windows too; across members the cards
+ * run side by side, so the tokens, bytes, sequences and operations add, and a
+ * phase's time and the slot's window are the longest member's — every kind in
+ * a slot carries that one window, so a bar counts it once and a rate reads as
+ * the cluster's tokens over the cluster's wall-clock. `now` re-times each slot
+ * as an age, which the phase bars key on. */
+function fusePoints(lists, now) {
+  const slots = new Map();
+  for (const pts of lists) {
+    const own = new Map();
+    for (const p of pts) {
+      const s = Math.round(p.at / FUSE_MS);
+      if (!own.has(s)) own.set(s, { kinds: {}, wins: new Map() });
+      const o = own.get(s);
+      o.wins.set(p.at, p.win || 0);
+      const k = o.kinds[p.kind] || (o.kinds[p.kind] = { dur: 0, tok: 0, by: 0, seq: 0, n: 0 });
+      k.dur += p.dur || 0;
+      k.tok += p.tok || 0;
+      k.by += p.by || 0;
+      k.seq = Math.max(k.seq, p.seq || 0);
+      k.n += p.n || 0;
+    }
+    for (const [s, o] of own) {
+      if (!slots.has(s)) slots.set(s, { win: 0, kinds: {} });
+      const into = slots.get(s);
+      into.win = Math.max(into.win, [...o.wins.values()].reduce((a, x) => a + x, 0));
+      for (const [kind, k] of Object.entries(o.kinds)) {
+        const f = into.kinds[kind] || (into.kinds[kind] = { dur: 0, tok: 0, by: 0, seq: 0, n: 0 });
+        f.dur = Math.max(f.dur, k.dur);
+        f.tok += k.tok;
+        f.by += k.by;
+        f.seq += k.seq;
+        f.n += k.n;
+      }
+    }
+  }
+  const out = [];
+  for (const [s, slot] of slots) {
+    const at = s * FUSE_MS;
+    for (const [kind, f] of Object.entries(slot.kinds)) {
+      out.push({ at, age: (now - at) / 1000, kind, win: slot.win, ...f });
+    }
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
 
 /* The hosts' memory added up; a reading any member lacks is absent. */
 function sumHost(hosts) {
@@ -945,11 +998,11 @@ async function refresh() {
       // panel already draws — see `fuseRows`.
       const each = (x) => (x === null ? [] : NODES.map((n) => pick(x, n.node).body).filter(Boolean));
       const tels = each(t);
-      W = fuseRows(tels.map((b) => pin(b.waves)));
-      MG = byTime(tels.flatMap((b) => pin(b.migrate)));
+      W = fuseRows(tels.map((b) => pin(b.waves)), LONGEST);
+      MG = fuseRows(tels.map((b) => pin(b.migrate)), MIGRATE_LONGEST);
       HOST = sumHost(tels.map((b) => b.host || {}));
       MIX = fuseMix(tels.map((b) => ({ formats: (b.mix && b.mix.formats) || [], rows: pin(b.mix && b.mix.rows) })));
-      PTS = byTime(each(p).flatMap((b) => pin(b.points)));
+      PTS = fusePoints(each(p).map((b) => pin(b.points)), at);
       PROM = each(r).flatMap((b) => b.items || []);
       LAYERS = busiest(each(l).map((b) => b.passes || []), tels);
       MEM = each(m)[0] || null;
