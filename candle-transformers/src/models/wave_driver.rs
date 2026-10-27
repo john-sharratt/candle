@@ -48,7 +48,8 @@ use super::residual_rows::{
 use candle::quantized::pinned_staging::Generation;
 use candle_nn::kv_cache::PREFILL_KV_STAGE_MIN_Q_LEN;
 use candle_nn::kv_cache::{
-    begin_wave, end_wave_transient, plan_wave_transient, provision_held_ground, LayerPhase,
+    begin_wave, end_wave_transient, plan_wave_transient, provision_held_ground, tier_footprint,
+    LayerPhase,
 };
 
 /// What a sweep does with the forward it is handed (`docs/wave_step.md` §2.1).
@@ -1383,7 +1384,7 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
             // A wide window's placement, with the span it stood on: a frontier
             // that climbs gigabytes over a sweep while little more is live is
             // read straight off these, window by window.
-            let placed: usize = plan.iter().sum();
+            let placed = tier_footprint(plan);
             if placed >= 1 << 30 {
                 if let Some(rs) = candle_nn::kv_cache::region_stats(stream.context().ordinal()) {
                     tracing::info!(
