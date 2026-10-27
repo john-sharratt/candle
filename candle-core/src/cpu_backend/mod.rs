@@ -2235,7 +2235,9 @@ impl BackendStorage for CpuStorage {
                 Ok(Self::F64(data))
             }
             (Self::F8E4M3(storage), DType::F64) => {
-                let data = unary_map(storage, layout, |v| v.to_f64());
+                // Through f32, as every other arm here: `to_f64` on this type
+                // never returned (found by the all-pairs cast test).
+                let data = unary_map(storage, layout, |v| v.to_f32() as f64);
                 Ok(Self::F64(data))
             }
             (Self::U8(storage), DType::F8E4M3) => {

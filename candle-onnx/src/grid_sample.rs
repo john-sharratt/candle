@@ -81,48 +81,60 @@ pub fn grid_sample(
         ),
     };
 
-    let flat = x.reshape((n, c, h * w))?;
+    // **Pixels as rows.** Each tap reads one whole row of channels for every
+    // output position, so the image is laid out `[N, H·W, C]` once and each
+    // corner is a row select by a `[P]` index. Gathering from `[N, C, H·W]`
+    // instead needs the index broadcast over every channel — a `u32` the size of
+    // the output per corner — and held four full copies alive at once; at 2048²
+    // that was the larger part of BiRefNet's 16 GB activation peak.
+    let rows = x
+        .permute((0, 2, 3, 1))?
+        .reshape((n, h * w, c))?
+        .contiguous()?;
     let positions = ho * wo;
-    let read = |xs: &Tensor, ys: &Tensor, weight: &Tensor| -> Result<Tensor> {
-        // A tap outside the image weighs nothing; its index is clamped only so
-        // the gather stays in bounds, and what it reads is multiplied away.
-        let inside = xs
-            .ge(0f32)?
-            .mul(&xs.le((w - 1) as f32)?)?
-            .mul(&ys.ge(0f32)?)?
-            .mul(&ys.le((h - 1) as f32)?)?
-            .to_dtype(DType::F32)?;
-        let index = (ys.clamp(0f32, (h - 1) as f32)? * w as f64)?
-            .add(&xs.clamp(0f32, (w - 1) as f32)?)?
-            .to_dtype(DType::U32)?
-            .reshape((n, 1, positions))?
-            .broadcast_as((n, c, positions))?
-            .contiguous()?;
-        let weight = weight.mul(&inside)?.reshape((n, 1, positions))?;
-        flat.gather(&index, 2)?
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&weight)
-    };
-
-    let out = match mode {
-        Mode::Bilinear => {
-            let (x0, y0) = (ix.floor()?, iy.floor()?);
-            let (x1, y1) = ((&x0 + 1.0)?, (&y0 + 1.0)?);
-            let (wx1, wy1) = (ix.sub(&x0)?, iy.sub(&y0)?);
-            let (wx0, wy0) = (wx1.affine(-1.0, 1.0)?, wy1.affine(-1.0, 1.0)?);
-            let a = read(&x0, &y0, &wx0.mul(&wy0)?)?;
-            let b = read(&x1, &y0, &wx1.mul(&wy0)?)?;
-            let cc = read(&x0, &y1, &wx0.mul(&wy1)?)?;
-            let d = read(&x1, &y1, &wx1.mul(&wy1)?)?;
-            ((a + b)? + (cc + d)?)?
-        }
-        Mode::Nearest => read(
-            &round_half_even(&ix)?,
-            &round_half_even(&iy)?,
-            &ix.ones_like()?,
-        )?,
-    };
-    out.reshape((n, c, ho, wo))?.to_dtype(x.dtype())
+    let mut batches = Vec::with_capacity(n);
+    for b in 0..n {
+        let rows = rows.get(b)?;
+        let (bx, by) = (ix.get(b)?.flatten_all()?, iy.get(b)?.flatten_all()?);
+        // One tap: `[P, C]` in f32, weighted. A tap outside the image weighs
+        // nothing; its index is clamped only so the select stays in bounds, and
+        // what it reads is multiplied away.
+        let read = |xs: &Tensor, ys: &Tensor, weight: &Tensor| -> Result<Tensor> {
+            let inside = xs
+                .ge(0f32)?
+                .mul(&xs.le((w - 1) as f32)?)?
+                .mul(&ys.ge(0f32)?)?
+                .mul(&ys.le((h - 1) as f32)?)?
+                .to_dtype(DType::F32)?;
+            let index = (ys.clamp(0f32, (h - 1) as f32)? * w as f64)?
+                .add(&xs.clamp(0f32, (w - 1) as f32)?)?
+                .to_dtype(DType::U32)?;
+            let weight = weight.mul(&inside)?.reshape((positions, 1))?;
+            rows.index_select(&index, 0)?
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&weight)
+        };
+        // Accumulated one corner at a time, so two `[P, C]` are alive, not four.
+        let out = match mode {
+            Mode::Bilinear => {
+                let (x0, y0) = (bx.floor()?, by.floor()?);
+                let (x1, y1) = ((&x0 + 1.0)?, (&y0 + 1.0)?);
+                let (wx1, wy1) = (bx.sub(&x0)?, by.sub(&y0)?);
+                let (wx0, wy0) = (wx1.affine(-1.0, 1.0)?, wy1.affine(-1.0, 1.0)?);
+                let mut acc = read(&x0, &y0, &wx0.mul(&wy0)?)?;
+                acc = (acc + read(&x1, &y0, &wx1.mul(&wy0)?)?)?;
+                acc = (acc + read(&x0, &y1, &wx0.mul(&wy1)?)?)?;
+                (acc + read(&x1, &y1, &wx1.mul(&wy1)?)?)?
+            }
+            Mode::Nearest => read(
+                &round_half_even(&bx)?,
+                &round_half_even(&by)?,
+                &bx.ones_like()?,
+            )?,
+        };
+        batches.push(out.t()?.reshape((c, ho, wo))?.to_dtype(x.dtype())?);
+    }
+    Tensor::stack(&batches, 0)
 }
 
 /// A normalised coordinate in pixels: `align_corners` puts -1 and 1 on the

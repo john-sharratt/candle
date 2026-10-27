@@ -436,9 +436,9 @@ fn simple_eval_(
     // output used to stay in `values` until the graph ended, so a graph's peak
     // was the sum of all its activations rather than of those alive at once —
     // which a 29,105-node graph at 2048² (BiRefNet) cannot afford on any card.
-    let dying = dead_after(graph);
-    // The nodes are topologically sorted so we can just process them in order.
-    for (at, node) in graph.node.iter().enumerate() {
+    let nodes = schedule(graph);
+    let dying = dead_after(graph.output.iter().map(|o| o.name.as_str()), &nodes);
+    for (at, node) in nodes.iter().copied().enumerate() {
         if at > 0 {
             for name in &dying[at - 1] {
                 values.remove(*name);
@@ -2775,22 +2775,94 @@ fn simple_eval_(
         .collect()
 }
 
-/// For each node of `graph`, the values nothing after it reads.
+/// The order `graph`'s nodes run in: the file's own when it is topological, as
+/// the standard requires, else a stable topological sort of it.
 ///
-/// Only values this graph's own nodes produce, and none of its outputs: an
+/// Not every exporter keeps the rule. The fp16 converter
+/// (`onnxconverter_common.float16`) appends the cast it inserts after each
+/// graph input at the *end* of the node list, so BiRefNet's fp16 export
+/// asked for `graph_input_cast_0` at its first convolution, 29,000 nodes
+/// before the cast that makes it. onnxruntime sorts on load; so does this.
+/// A graph with a cycle keeps the file's order and fails where it reads
+/// what nothing has made yet, as it did before.
+fn schedule(graph: &onnx::GraphProto) -> Vec<&onnx::NodeProto> {
+    let mut producer: HashMap<&str, usize> = HashMap::new();
+    for (at, node) in graph.node.iter().enumerate() {
+        for name in node.output.iter().filter(|s| !s.is_empty()) {
+            producer.entry(name.as_str()).or_insert(at);
+        }
+    }
+    let deps: Vec<Vec<usize>> = graph
+        .node
+        .iter()
+        .enumerate()
+        .map(|(at, node)| {
+            let mut reads = Vec::new();
+            node_reads(node, &mut reads);
+            let mut deps: Vec<usize> = reads
+                .into_iter()
+                .filter_map(|name| producer.get(name).copied())
+                .filter(|&p| p != at)
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            deps
+        })
+        .collect();
+    if deps
+        .iter()
+        .enumerate()
+        .all(|(at, d)| d.iter().all(|&p| p < at))
+    {
+        return graph.node.iter().collect();
+    }
+    let mut waiting: Vec<usize> = deps.iter().map(Vec::len).collect();
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); graph.node.len()];
+    for (at, d) in deps.iter().enumerate() {
+        for &p in d {
+            readers[p].push(at);
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..graph.node.len())
+        .filter(|&at| waiting[at] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
+    let mut order = Vec::with_capacity(graph.node.len());
+    while let Some(std::cmp::Reverse(at)) = ready.pop() {
+        order.push(&graph.node[at]);
+        for &r in &readers[at] {
+            waiting[r] -= 1;
+            if waiting[r] == 0 {
+                ready.push(std::cmp::Reverse(r));
+            }
+        }
+    }
+    if order.len() < graph.node.len() {
+        return graph.node.iter().collect();
+    }
+    order
+}
+
+/// For each of `nodes`, in the order they run, the values nothing after it
+/// reads.
+///
+/// Only values these nodes produce, and none of the graph's `outputs`: an
 /// initializer or a caller's input is the caller's to keep — a guest's weights
 /// are placed in its own ground and handed in — and an `If` branch shares the
 /// enclosing graph's `values`, so what it drops must be its own. A name read
 /// inside a node's subgraph counts as read by that node.
-fn dead_after(graph: &onnx::GraphProto) -> Vec<Vec<&str>> {
-    let outputs: HashSet<&str> = graph.output.iter().map(|o| o.name.as_str()).collect();
+fn dead_after<'a>(
+    outputs: impl Iterator<Item = &'a str>,
+    nodes: &[&'a onnx::NodeProto],
+) -> Vec<Vec<&'a str>> {
+    let outputs: HashSet<&str> = outputs.collect();
     let mut last: HashMap<&str, usize> = HashMap::new();
-    for (at, node) in graph.node.iter().enumerate() {
+    for (at, node) in nodes.iter().enumerate() {
         for name in node.output.iter().filter(|s| !s.is_empty()) {
             last.entry(name.as_str()).or_insert(at);
         }
     }
-    for (at, node) in graph.node.iter().enumerate() {
+    for (at, node) in nodes.iter().enumerate() {
         let mut reads = Vec::new();
         node_reads(node, &mut reads);
         for name in reads {
@@ -2799,7 +2871,7 @@ fn dead_after(graph: &onnx::GraphProto) -> Vec<Vec<&str>> {
             }
         }
     }
-    let mut dying = vec![Vec::new(); graph.node.len()];
+    let mut dying = vec![Vec::new(); nodes.len()];
     for (name, at) in last {
         if !outputs.contains(name) {
             dying[at].push(name);
@@ -2892,9 +2964,7 @@ mod tests {
             output: vec![value("c")],
             ..Default::default()
         };
-        let mut dying = dead_after(&graph);
-        dying.iter_mut().for_each(|d| d.sort());
-        assert_eq!(dying, vec![vec![], vec![], vec!["a", "b"]]);
+        assert_eq!(dying(&graph), vec![vec![], vec![], vec!["a", "b"]]);
     }
 
     /// A value read only inside an `If` branch lives until the `If` node, and
@@ -2921,8 +2991,58 @@ mod tests {
             output: vec![value("d")],
             ..Default::default()
         };
-        let mut dying = dead_after(&graph);
+        assert_eq!(
+            dying(&graph),
+            vec![vec!["unused"], vec![], vec!["a", "flag"]]
+        );
+    }
+
+    fn dying(graph: &onnx::GraphProto) -> Vec<Vec<&str>> {
+        let mut dying = dead_after(
+            graph.output.iter().map(|o| o.name.as_str()),
+            &schedule(graph),
+        );
         dying.iter_mut().for_each(|d| d.sort());
-        assert_eq!(dying, vec![vec!["unused"], vec![], vec!["a", "flag"]]);
+        dying
+    }
+
+    fn ops(graph: &onnx::GraphProto) -> Vec<&str> {
+        schedule(graph).iter().map(|n| n.op_type.as_str()).collect()
+    }
+
+    /// The fp16 converter's shape: the input's cast last in the file, read by
+    /// the first node. It runs first; the rest keep the file's order.
+    #[test]
+    fn a_cast_appended_after_its_readers_runs_before_them() {
+        let graph = onnx::GraphProto {
+            node: vec![
+                node("Conv", &["x16", "w"], &["a"]),
+                node("Relu", &["a"], &["b"]),
+                node("Sigmoid", &["b"], &["c"]),
+                node("Cast", &["x"], &["x16"]),
+            ],
+            output: vec![value("c")],
+            ..Default::default()
+        };
+        assert_eq!(ops(&graph), vec!["Cast", "Conv", "Relu", "Sigmoid"]);
+        assert_eq!(
+            dying(&graph),
+            vec![vec![], vec!["x16"], vec!["a"], vec!["b"]]
+        );
+    }
+
+    /// A sorted graph keeps its order exactly, independent branches included.
+    #[test]
+    fn a_sorted_graph_runs_in_the_files_order() {
+        let graph = onnx::GraphProto {
+            node: vec![
+                node("Relu", &["x"], &["a"]),
+                node("Sigmoid", &["x"], &["b"]),
+                node("Add", &["a", "b"], &["c"]),
+            ],
+            output: vec![value("c")],
+            ..Default::default()
+        };
+        assert_eq!(ops(&graph), vec!["Relu", "Sigmoid", "Add"]);
     }
 }

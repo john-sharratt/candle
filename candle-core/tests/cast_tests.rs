@@ -629,6 +629,86 @@ test_device!(
     cast_bf16_to_u32_metal
 );
 
+/// A 16-bit float to INT64, signed: the cast an fp16 ONNX graph's shape
+/// arithmetic ends in. CUDA had no kernel for either and launched nothing.
+fn cast_half_to_i64(device: &Device, half: DType) -> Result<()> {
+    let data: Vec<f32> = (-50..50).map(|i| i as f32).collect();
+    let t = Tensor::from_slice(&data, 100, device)?
+        .to_dtype(half)?
+        .to_dtype(DType::I64)?;
+    let want: Vec<i64> = (-50..50).collect();
+    assert_eq!(t.to_vec1::<i64>()?, want);
+    Ok(())
+}
+
+fn cast_f16_to_i64(device: &Device) -> Result<()> {
+    cast_half_to_i64(device, DType::F16)
+}
+
+fn cast_bf16_to_i64(device: &Device) -> Result<()> {
+    cast_half_to_i64(device, DType::BF16)
+}
+
+test_device!(
+    cast_f16_to_i64,
+    cast_f16_to_i64_cpu,
+    cast_f16_to_i64_cuda,
+    cast_f16_to_i64_metal
+);
+test_device!(
+    cast_bf16_to_i64,
+    cast_bf16_to_i64_cpu,
+    cast_bf16_to_i64_cuda,
+    cast_bf16_to_i64_metal
+);
+
+/// **Every pair the device casts agrees with the host.** A pair the CUDA
+/// dispatcher has no arm for returns without a launch, and the result is
+/// whatever the allocation held: f16 → i64 and bf16 → i64 were two such, found
+/// only when a graph's shape came out 2.3e17 wide. The host is checked on the
+/// way: its f8e4m3 → f64 never returned. Small non-negative integers, which
+/// every dtype here holds exactly.
+#[cfg(feature = "cuda")]
+#[test]
+fn every_cuda_cast_pair_matches_the_cpu() -> Result<()> {
+    let device = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let all = [
+        DType::U8,
+        DType::U32,
+        DType::I64,
+        DType::BF16,
+        DType::F16,
+        DType::F32,
+        DType::F64,
+        DType::F8E4M3,
+    ];
+    let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let mut wrong = Vec::new();
+    for &src in &all {
+        let host = Tensor::from_slice(&data, 16, &Device::Cpu)?.to_dtype(src)?;
+        let card = host.to_device(&device)?;
+        for &dst in &all {
+            let want = host.to_dtype(dst)?.to_dtype(DType::F64)?.to_vec1::<f64>()?;
+            let got = card
+                .to_dtype(dst)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F64)?
+                .to_vec1::<f64>()?;
+            if got != want {
+                wrong.push(format!("{src:?} -> {dst:?}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "casts that disagree with the host: {wrong:#?}");
+    Ok(())
+}
+
 // =============================================================================
 // U8 source casts
 // =============================================================================
