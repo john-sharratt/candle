@@ -45,10 +45,12 @@
 //! | [`tiled`] | The autoencoder a tile at a time, so its peak is fixed. |
 //! | [`varground`] | A `VarBuilder` that places into ground, so any candle model loads there. |
 //! | [`reach`] | How large a draw this node's card serves, from its size. |
+//! | [`foreground`] | The subject's colour under a cutout's soft edges, so no old background shows. |
 //! | [`image`] | The Stable Diffusion backend. |
 
 pub mod checkpoint;
 pub mod drain;
+pub mod foreground;
 pub mod ground;
 pub mod groundgguf;
 pub mod image;

@@ -491,36 +491,72 @@ impl Loaded {
             Output::Alpha => flat.iter_mut().for_each(|a| *a = a.clamp(0.0, 1.0)),
         }
 
-        let grey: image::GrayImage = image::ImageBuffer::from_raw(
-            side,
-            side,
-            flat.iter().map(|a| (a * 255.0).round() as u8).collect(),
-        )
-        .ok_or_else(|| candle::Error::Msg("matte: the alpha is not S*S values".into()))?;
-        // Lanczos on the way back up: this is an alpha channel and its edges
-        // are the whole product, so a cheaper filter's stair-stepping would be
-        // visible exactly where it matters.
-        let alpha = image::imageops::resize(&grey, w, h, FilterType::Lanczos3);
-
-        let mut rgba = vec![0u8; (w * h) as usize * 4];
-        let mut lifted = 0usize;
-        for (i, a) in alpha.as_raw().iter().enumerate() {
-            rgba[i * 4] = r.pixels[i * 3];
-            rgba[i * 4 + 1] = r.pixels[i * 3 + 1];
-            rgba[i * 4 + 2] = r.pixels[i * 3 + 2];
-            rgba[i * 4 + 3] = *a;
-            if *a < 128 {
-                lifted += 1;
-            }
-        }
-        let png = encode_rgba(&rgba, w, h)?;
         Ok(GuestOutcome::Matte(GuestMatte {
             width: w,
             height: h,
-            png,
-            lifted: lifted as f32 / (w * h) as f32,
+            side,
+            alpha: flat.iter().map(|a| (a * 255.0).round() as u8).collect(),
         }))
     }
+}
+
+/// A finished cutout: the PNG, and how much of the picture it lifted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cutout {
+    /// RGBA, transparent where the background was.
+    pub png: Vec<u8>,
+    /// The fraction of the picture the matte made at least half transparent.
+    ///
+    /// Reported so a caller can say something true about a picture where
+    /// almost nothing was lifted, rather than showing an unchanged image and
+    /// leaving somebody to wonder whether the button worked.
+    pub lifted: f32,
+}
+
+/// The cutout of `pixels` (RGB8, the picture the matte was asked about) under
+/// the network's alpha — host work, run by the caller after the drain.
+///
+/// The alpha comes up to the picture's size with Lanczos: it is an alpha
+/// channel and its edges are the whole product, so a cheaper filter's
+/// stair-stepping would show exactly where it matters. The colour kept under
+/// it is the subject's own ([`super::foreground::estimate`]), not the picture's:
+/// a soft edge's pixel is a mix with the old background, and keeping the mix
+/// left a halo and a fringe round every edge it touched.
+pub fn finish(matte: &GuestMatte, pixels: &[u8]) -> Result<Cutout, String> {
+    let (w, h) = (matte.width, matte.height);
+    let n = w as usize * h as usize;
+    if pixels.len() != n * 3 {
+        return Err(format!(
+            "matte: the picture is {} bytes, not {w}x{h}x3",
+            pixels.len()
+        ));
+    }
+    let grey: image::GrayImage =
+        image::ImageBuffer::from_raw(matte.side, matte.side, matte.alpha.clone())
+            .ok_or_else(|| "matte: the alpha is not side*side values".to_string())?;
+    let alpha = image::imageops::resize(&grey, w, h, FilterType::Lanczos3);
+    let alpha = alpha.as_raw();
+
+    let rgb: Vec<f32> = pixels.iter().map(|&v| v as f32 / 255.0).collect();
+    let a: Vec<f32> = alpha.iter().map(|&v| v as f32 / 255.0).collect();
+    let fg = super::foreground::estimate(&rgb, &a, w as usize, h as usize);
+
+    let mut rgba = vec![0u8; n * 4];
+    let mut lifted = 0usize;
+    for i in 0..n {
+        for c in 0..3 {
+            rgba[i * 4 + c] = (fg[i * 3 + c] * 255.0).round() as u8;
+        }
+        rgba[i * 4 + 3] = alpha[i];
+        if alpha[i] < 128 {
+            lifted += 1;
+        }
+    }
+    let png = encode_rgba(&rgba, w, h).map_err(|e| e.to_string())?;
+    Ok(Cutout {
+        png,
+        lifted: lifted as f32 / n.max(1) as f32,
+    })
 }
 
 /// How the network's own output becomes an alpha channel.
@@ -596,6 +632,67 @@ mod tests {
         let mut v = vec![-4.0, -2.0, 0.0, 2.0, 4.0];
         normalise(&mut v);
         assert_eq!(v, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    /// **The finished cutout is the picture's size, its alpha the network's
+    /// brought up, its colour the subject's.** A red square on green, matted
+    /// opaque on the left half: the PNG comes back at the picture's size, half
+    /// lifted, and the opaque half is the red the picture had there.
+    #[test]
+    fn a_finished_cutout_is_the_pictures_size_and_the_subjects_colour() {
+        let (w, h) = (16u32, 8u32);
+        let mut pixels = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                pixels.extend_from_slice(if x < 8 { &[255, 0, 0] } else { &[0, 255, 0] });
+            }
+        }
+        let matte = GuestMatte {
+            width: w,
+            height: h,
+            side: 2,
+            alpha: vec![255, 0, 255, 0],
+        };
+        let cut = finish(&matte, &pixels).unwrap();
+        assert!((cut.lifted - 0.5).abs() < 0.1, "lifted {}", cut.lifted);
+        let png = image::load_from_memory(&cut.png).unwrap().to_rgba8();
+        assert_eq!(png.dimensions(), (w, h));
+        let px = png.get_pixel(1, 4);
+        assert_eq!(px[3], 255);
+        assert!(px[0] > 240 && px[1] < 15, "{px:?}");
+        assert!(png.get_pixel(14, 4)[3] < 16);
+        // A picture of the wrong size is an error, not a panic.
+        assert!(finish(&matte, &pixels[..30]).is_err());
+    }
+
+    /// What finishing a large cutout costs the caller's thread.
+    ///
+    /// ```text
+    /// cargo test --release -p candle-conversation --lib finishing_a_large_cutout -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "times a 12 Mpx finish; a measurement, not a check"]
+    fn finishing_a_large_cutout_costs_this_much() {
+        for (w, h) in [(1024u32, 1024u32), (2048, 2048), (4032, 3024)] {
+            let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+            let side = 1024u32;
+            let alpha = (0..side * side)
+                .map(|i| ((i % side) * 255 / side) as u8)
+                .collect();
+            let matte = GuestMatte {
+                width: w,
+                height: h,
+                side,
+                alpha,
+            };
+            let t = std::time::Instant::now();
+            let cut = finish(&matte, &pixels).unwrap();
+            println!(
+                "{w}x{h}: finished in {:.2} s, {} KB",
+                t.elapsed().as_secs_f64(),
+                cut.png.len() >> 10
+            );
+        }
     }
 
     /// A network that answered one value everywhere carries no matte, and the
