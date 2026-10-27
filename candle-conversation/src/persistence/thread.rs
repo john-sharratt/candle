@@ -711,24 +711,7 @@ fn install_hot_to_warm(
             "cached hot → warm (with hot Q-format replace)"
         );
         total_bytes = total_bytes.saturating_add(bytes);
-        if view.residence_evict_when_cold(idx) {
-            // Completed-ingest / collection-member residence flagged for full
-            // eviction: don't keep the fresh GPU Q copy resident — install
-            // warm-only and drop hot now, so the VRAM returns immediately.
-            // The warm→cold write (reading the CPU warm copy) then frees warm
-            // too via `install_cold`, leaving it cold-only. The just-produced
-            // `hot` Q sequences drop here → arena chunks return to the pool.
-            view.install_warm_and_evict_hot(idx, warm);
-        } else {
-            // Atomic dual install: replace residence.hot with the new GPU
-            // Q-format sequences (drops the old R16/F16 Arcs from
-            // record_turn), and install warm with the CPU copy. The next
-            // turn's apply_projection injects residence.hot directly — no
-            // warm→hot promotion needed, no kv_migrate scatter into
-            // freshly-allocated arenas. Decode reads exactly the bytes the
-            // convert kernel wrote.
-            view.install_warm_and_hot(idx, hot, warm);
-        }
+        view.install_migrated(idx, hot, warm);
     }
     (total_bytes, count)
 }

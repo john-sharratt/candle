@@ -2050,6 +2050,37 @@ impl Substrate {
         }
     }
 
+    /// Install one hot→warm migrate's result: `hot`, the quantized GPU copy the
+    /// convert wrote, and `warm`, its CPU copy.
+    ///
+    /// A residence flagged `evict_when_cold` takes warm only and drops hot now,
+    /// so its VRAM returns at once; the warm→cold write then frees warm too
+    /// ([`Self::install_cold`]), leaving it cold-only. Every other residence
+    /// takes both ([`Self::install_warm_and_hot`]): the next projection injects
+    /// the quantized hot copy directly, so decode reads exactly the bytes the
+    /// convert wrote.
+    ///
+    /// **A flagged residence a live working set names takes both as well.** Its
+    /// hot copy has to stay for the wave reading it, and the copy that stays is
+    /// the quantized one, not the native form the forward wrote: keeping the
+    /// native one held a pinned turn at three times its stored size. The flag
+    /// stands, and [`Self::demote_idle_hot`] sheds the hot copy once the
+    /// residence leaves the working set.
+    pub fn install_migrated(
+        &mut self,
+        residence: ResidenceIndex,
+        hot: Vec<SealedSequence>,
+        warm: Vec<SealedSequence>,
+    ) {
+        if self.residence[residence.0].evict_when_cold
+            && !self.working_set_pins.contains(&residence)
+        {
+            self.install_warm_and_evict_hot(residence, warm);
+        } else {
+            self.install_warm_and_hot(residence, hot, warm);
+        }
+    }
+
     /// Atomic dual install: replace the residence's hot AND install
     /// warm at the same time. Used by the persistence thread after a
     /// quantize-in-place pass produces new GPU Q-format chunks (hot)
@@ -2152,15 +2183,6 @@ impl Substrate {
     /// Set by the scheduler's collection-member quantize drain.
     pub fn mark_section_evict_when_cold(&mut self, residence: ResidenceIndex) {
         self.residence[residence.0].evict_when_cold = true;
-    }
-
-    /// Whether `residence` is flagged for full eviction once its KV is durable
-    /// on disk — read by the persistence thread's hot→warm install so a flagged
-    /// turn goes straight to warm-only (its GPU copy freed the moment warm
-    /// lands) rather than lingering hot until cold. See
-    /// [`SequenceResidence::evict_when_cold`].
-    pub fn residence_evict_when_cold(&self, residence: ResidenceIndex) -> bool {
-        self.residence[residence.0].evict_when_cold
     }
 
     /// Publish the scheduler's live working set as the eviction keep-set —
@@ -2486,27 +2508,34 @@ impl Substrate {
     > + '_ {
         self.hot_lru.iter().filter_map(|&idx| {
             let slot = &self.residence[idx.0];
-            if slot.warm.is_some() {
-                return None;
-            }
-            // Skip residences pinned into the current wave's working set: a
-            // slot the in-flight decode is actively attending is about to be
-            // (or is being) elevated warm→hot on the shared copy stream and
-            // on the persistence thread this drain runs on. Backing it up
-            // hot→warm right now is redundant work that MONOPOLISES the
-            // persistence thread + stream against the very elevation
-            // the decode is blocked on — the tier-migration livelock where the
-            // same working set churns hot→warm every pass while the decode
-            // lands zero forwards. Defer its warm copy until it leaves the
-            // working set (mirrors the pinned hot-drop defer in
-            // `mark_timeline_evict_when_cold`). Durability is only deferred,
-            // not lost: the authoritative hot copy stays resident while pinned,
-            // and the next unpinned pass makes the warm copy.
-            if self.working_set_pins.contains(&idx) {
+            if slot.warm.is_some() || self.pin_defers_warm(idx) {
                 return None;
             }
             slot.hot.as_ref().map(|hot| (idx, hot, slot.compression))
         })
+    }
+
+    /// Whether the working set's pin on `idx` defers its warm copy.
+    ///
+    /// **Only for a residence already persisted** — one recalled hot from its
+    /// cold record, or whose cold write is in flight. Its hot copy is the stored
+    /// form already, and backing it up hot→warm while the in-flight decode
+    /// attends it is redundant work that monopolises the persistence thread and
+    /// stream against the elevation the decode is blocked on: the tier-migration
+    /// livelock, the same working set churning every pass while the decode lands
+    /// zero forwards. Its warm copy waits until it leaves the working set.
+    ///
+    /// **Never for a fresh seal.** Its hot copy is the native form the forward
+    /// wrote, and the hot→warm migrate is also what swaps that for the quantized
+    /// form (`install_warm_and_hot`). Deferred while pinned, a turn its own
+    /// conversation keeps attending stayed native for the conversation's whole
+    /// life: on BlackWorld (2026-10-27) one `code_read` of a 67-page file held
+    /// 160k tokens at 23.6 KB/token — 3.6 GB — where its persisted turns read
+    /// 8.1 KB/token. It is migrated once, as any seal is; it then has a warm
+    /// copy, so it is never a candidate again.
+    fn pin_defers_warm(&self, idx: ResidenceIndex) -> bool {
+        let slot = &self.residence[idx.0];
+        self.working_set_pins.contains(&idx) && (slot.cold.is_some() || slot.cold_pending)
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -2521,11 +2550,11 @@ impl Substrate {
             .iter()
             .filter_map(|&idx| {
                 let slot = &self.residence[idx.0];
-                // Match `snapshot_pending_warm`'s pin skip: a pinned residence is
-                // NOT drainable this pass, so counting it would report a backlog
-                // the drain intentionally never clears — the admission
+                // Match `snapshot_pending_warm`'s pin skip: a deferred residence
+                // is NOT drainable this pass, so counting it would report a
+                // backlog the drain intentionally never clears — the admission
                 // backpressure would then throttle forever on a phantom deficit.
-                if self.working_set_pins.contains(&idx) {
+                if self.pin_defers_warm(idx) {
                     return None;
                 }
                 (slot.hot.is_some() && slot.warm.is_none()).then_some(slot.byte_size)
@@ -2578,7 +2607,7 @@ impl Substrate {
             .iter()
             .filter(|&&idx| {
                 let slot = &self.residence[idx.0];
-                slot.warm.is_none() && slot.hot.is_some() && !self.working_set_pins.contains(&idx)
+                slot.warm.is_none() && slot.hot.is_some() && !self.pin_defers_warm(idx)
             })
             .count()
     }
@@ -2607,7 +2636,7 @@ impl Substrate {
             if slot.hot.is_none() || slot.warm.is_some() {
                 continue;
             }
-            if self.working_set_pins.contains(&idx) {
+            if self.pin_defers_warm(idx) {
                 pc += 1;
                 pb += slot.byte_size;
             } else {
@@ -9128,7 +9157,8 @@ mod tests {
     /// its own.** The persistence thread snapshots one group under its migrate
     /// guard, so the per-policy snapshot must return exactly that policy's
     /// pending residences — and skip what the whole snapshot skips: a
-    /// residence already warm, and one pinned into the wave's working set.
+    /// residence already warm, and a persisted one pinned into the wave's
+    /// working set.
     #[test]
     fn pending_warm_is_named_by_policy_and_snapshotted_per_group() {
         let lossless = ConvCompression {
@@ -9147,6 +9177,7 @@ mod tests {
             sub.install_hot(r, vec![minimal_sealed_layer()]);
         }
         sub.install_warm(warm, vec![minimal_sealed_layer()]);
+        sub.residence[pinned.0].cold_pending = true;
         sub.working_set_pins.insert(pinned);
 
         let mut policies = sub.pending_warm_policies();
@@ -10619,6 +10650,141 @@ mod tests {
             "unpinned warm installed"
         );
         assert!(!sub.hot_lru.contains(&unpinned));
+    }
+
+    /// **A migrate's quantized hot copy replaces the native one wherever hot
+    /// stays.** Unflagged, both tiers install; flagged and unpinned, hot goes
+    /// and warm stays; flagged but in a live working set, hot stays for the
+    /// reading wave — and it is the migrate's quantized copy that stays, with
+    /// the flag still set for the demote that sheds it later.
+    #[test]
+    fn a_migrate_keeps_its_quantized_copy_wherever_hot_stays() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let fresh = |sub: &mut Substrate| {
+            let idx = sub
+                .append_complete(
+                    timeline,
+                    TurnPartWrite {
+                        sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                        ..Default::default()
+                    },
+                    identity_migrate,
+                )
+                .unwrap();
+            (idx, sub.turn_residence(timeline, idx).unwrap())
+        };
+        let (_, plain) = fresh(&mut sub);
+        let (_, flagged) = fresh(&mut sub);
+        let (pinned_idx, flagged_pinned) = fresh(&mut sub);
+        sub.residence[flagged.0].evict_when_cold = true;
+        sub.residence[flagged_pinned.0].evict_when_cold = true;
+        sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
+        // The migrate's quantized copy, told apart from the native one by its
+        // token count.
+        let quantized = || {
+            vec![SealedSequence {
+                token_count: 7,
+                ..minimal_sealed_layer()
+            }]
+        };
+        for r in [plain, flagged, flagged_pinned] {
+            sub.install_migrated(r, quantized(), vec![minimal_sealed_layer()]);
+        }
+        let hot_tokens = |sub: &Substrate, r: ResidenceIndex| {
+            sub.residence[r.0].hot.as_ref().map(|h| h[0].token_count)
+        };
+
+        assert_eq!(hot_tokens(&sub, plain), Some(7));
+        assert!(sub.residence[plain.0].warm.is_some());
+
+        assert_eq!(
+            hot_tokens(&sub, flagged),
+            None,
+            "flagged, unpinned: hot goes"
+        );
+        assert!(sub.residence[flagged.0].warm.is_some());
+
+        assert_eq!(
+            hot_tokens(&sub, flagged_pinned),
+            Some(7),
+            "flagged and pinned: the quantized copy stays, not the native one"
+        );
+        assert!(sub.residence[flagged_pinned.0].warm.is_some());
+        assert!(
+            sub.residence[flagged_pinned.0].evict_when_cold,
+            "the flag stands"
+        );
+    }
+
+    /// **A pinned fresh seal is migrated; a pinned persisted residence is not.**
+    /// The migrate is what swaps a seal's native hot copy for its quantized one,
+    /// so deferring it while pinned left a turn its own conversation keeps
+    /// attending native for the conversation's whole life. Only a residence
+    /// already persisted — recalled from cold, or with its cold write in
+    /// flight — is held back while the working set names it, and every count
+    /// that mirrors the work list agrees.
+    #[test]
+    fn a_pinned_fresh_seal_is_migrated_and_a_pinned_recall_is_not() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let fresh_hot = |sub: &mut Substrate| {
+            let idx = sub
+                .append_complete(
+                    timeline,
+                    TurnPartWrite {
+                        sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                        ..Default::default()
+                    },
+                    identity_migrate,
+                )
+                .unwrap();
+            (idx, sub.turn_residence(timeline, idx).unwrap())
+        };
+        let (fresh_idx, fresh) = fresh_hot(&mut sub);
+        let (recalled_idx, recalled) = fresh_hot(&mut sub);
+        let (writing_idx, writing) = fresh_hot(&mut sub);
+        let (_, unpinned_recall) = fresh_hot(&mut sub);
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+        sub.residence[recalled.0].cold = Some(cold());
+        sub.residence[unpinned_recall.0].cold = Some(cold());
+        sub.residence[writing.0].cold_pending = true;
+        for (r, bytes) in [
+            (fresh, 1_000),
+            (recalled, 200),
+            (writing, 30),
+            (unpinned_recall, 4),
+        ] {
+            sub.residence[r.0].byte_size = bytes;
+        }
+        sub.set_working_set_pins(
+            &[
+                TurnKey::new(timeline, fresh_idx),
+                TurnKey::new(timeline, recalled_idx),
+                TurnKey::new(timeline, writing_idx),
+            ],
+            &[],
+        );
+
+        let mut pending: Vec<ResidenceIndex> = sub
+            .snapshot_pending_warm_for(None)
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
+        pending.sort_unstable_by_key(|r| r.0);
+        let mut want = vec![fresh, unpinned_recall];
+        want.sort_unstable_by_key(|r| r.0);
+        assert_eq!(pending, want);
+        assert_eq!(sub.pending_warm_count(), 2);
+        assert_eq!(sub.pending_warm_bytes(), 1_004);
+        assert_eq!(sub.warm_backlog_split(), (2, 1_004, 2, 230));
     }
 
     /// `mark_timeline_evict_when_cold`'s immediate hot-drop skips a pinned
