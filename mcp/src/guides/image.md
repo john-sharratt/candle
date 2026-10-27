@@ -196,8 +196,10 @@ push the finish, and when the user asks to change a photo of their own
   else to draw, and names the cat besides.
 - **`hold`** is how much of the original survives. Starting points: 0.5
   (the default) to add or remove a detail; about 0.3 for a large change —
-  a new style, a different time of day; about 0.7 for a light touch — a
-  colour, a finish. Look at the result: the change did not happen — lower
+  a new style, a different time of day; **about 0.2 to change the subject
+  itself** — its colour, its breed, what it wears ("make it a black cat"),
+  which at 0.3 and above keeps its old colours; about 0.7 for a light touch
+  to the whole picture — a tint, a finish. Look at the result: the change did not happen — lower
   it; the picture drifted from the original — raise it. Past about 0.45 the
   subject itself (a face, an animal) no longer changes much.
 - **One change at a time**, each edit from the last one's link. Every edit
