@@ -35,16 +35,19 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use candle::quantized::cuda::{ko_repacked_bytes, QCudaStorage, MATRIX_ROW_PADDING};
 use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{GgmlDType, Int8Mode, QStorage, QTensor};
 use candle::{Device, Shape};
 use candle_transformers::quantized_var_builder::VarBuilder;
+use cudarc::driver::result::{memcpy_htod_async, memset_d8_async};
 
 use super::checkpoint;
 use super::ground::GuestGround;
-use super::windowed::Windowed;
+use super::staging::Staging;
+use super::windowed::{window_bytes, Windowed};
 
 /// The most of a checkpoint read off the disk at once: 16 direct reads of
 /// 4 MiB in flight four times over, and a host buffer the engine's RAM does not
@@ -68,14 +71,19 @@ const PLACE_ALIGN: usize = 256;
 /// card without the int8 MMA gets.
 ///
 /// **Read in file order, a window at a time** ([`Windowed`]): the tensors are
-/// sorted by where they sit, gathered into windows of up to [`WINDOW`], and
-/// each window comes off the disk unbuffered before its tensors are placed.
+/// sorted by where they sit and gathered into windows of up to [`WINDOW`]
+/// ([`plan_windows`]), and each window comes off the disk unbuffered, straight
+/// into a pinned buffer ([`Staging`]).
 ///
-/// **One barrier per window, not one per tensor.** Every copy is issued against
-/// the stream without waiting, exactly as `GroundVars::with` does, so the
-/// transfers pipeline; the window is overwritten only after the stream has
-/// drained it, and the sync before returning orders the whole set before any
-/// read.
+/// **The disk and the card overlap.** Every copy out of a window is one async
+/// DMA and every repack an async launch, so placing a window issues its work
+/// and returns; the next window is then read into the other buffer while the
+/// card drains this one. A buffer is refilled only after the event recorded
+/// past its copies, and the sync before returning orders the whole set before
+/// any read. Copied out of pageable memory instead, every tensor's copy
+/// synchronised the stream, so each waited out every kernel before it and the
+/// disk and the card took turns: on BlackWorld (2026-10-27) the transformer's
+/// 7.2 GB placed in 2.19 s and the encoder's in 1.14 s, each about 3.3 GB/s.
 ///
 /// `skip` names tensors the model will never ask for, so they are not placed.
 /// Ground is the KV side's, taken for the length of a drain, and a tensor
@@ -88,6 +96,7 @@ pub fn place_gguf(
     mode: Int8Mode,
     skip: &[&str],
 ) -> Result<VarBuilder, String> {
+    let began = Instant::now();
     let header = checkpoint::gguf_header(path).map_err(|e| format!("{path:?}: {e}"))?;
     let mut file = Windowed::open(path).map_err(|e| format!("{path:?}: {e}"))?;
     let Device::Cuda(cuda) = device else {
@@ -107,22 +116,33 @@ pub fn place_gguf(
         })
         .collect();
     wanted.sort_by_key(|&(_, _, _, start, _)| start);
+    let ranges: Vec<(u64, u64)> = wanted.iter().map(|t| (t.3, t.4)).collect();
+    let windows = plan_windows(&ranges, WINDOW);
+    let largest = windows
+        .iter()
+        .map(|w| window_bytes(w.from, w.to))
+        .max()
+        .unwrap_or(0);
+    let mut staging = Staging::new(largest).map_err(|e| format!("guest weights: staging: {e}"))?;
+    let staged_ms = began.elapsed().as_millis() as u64;
+    let stream = cuda.cuda_stream();
 
     let mut placed: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(wanted.len());
     let mut twins = 0usize;
-    let mut at = 0usize;
-    while at < wanted.len() {
-        // A window holds every tensor that ends within `WINDOW` of the first's
-        // start, and always holds that first one, however large it is.
-        let from = wanted[at].3;
-        let mut until = at + 1;
-        while until < wanted.len() && wanted[until].4 - from <= WINDOW {
-            until += 1;
-        }
-        let to = wanted[at..until].iter().map(|t| t.4).max().unwrap_or(from);
-        let window = file
-            .read(from, to)
-            .map_err(|e| format!("{path:?}: reading bytes {from}..{to}: {e}"))?;
+    let mut read = std::time::Duration::ZERO;
+    let mut bytes = 0u64;
+    for w in &windows {
+        let (slot, buf) = staging
+            .acquire()
+            .map_err(|e| format!("guest weights: the staging barrier: {e}"))?;
+        let t_read = Instant::now();
+        let landed = file
+            .read_into(w.from, w.to, buf)
+            .map_err(|e| format!("{path:?}: reading bytes {}..{}: {e}", w.from, w.to))?;
+        read += t_read.elapsed();
+        bytes += w.to - w.from;
+        let window = &buf[landed];
+        let (from, at, until) = (w.from, w.first, w.end);
 
         for (name, shape, dtype, start, end) in &wanted[at..until] {
             let (shape, dtype) = (shape, *dtype);
@@ -151,19 +171,64 @@ pub fn place_gguf(
             placed.insert((*name).clone(), Arc::new(qt));
         }
 
-        // The window is read into again next; every copy out of it lands first.
-        device
-            .synchronize()
-            .map_err(|e| format!("guest weights: the load barrier: {e}"))?;
-        at = until;
+        // The buffer is refilled two windows on, once these copies have landed.
+        staging
+            .issued(slot, &stream)
+            .map_err(|e| format!("guest weights: the staging event: {e}"))?;
     }
-    tracing::debug!(
+    device
+        .synchronize()
+        .map_err(|e| format!("guest weights: the load barrier: {e}"))?;
+    drop(staging);
+    // At info: the load is most of a draw's own cost, and whether a slow one is
+    // the disk or the card is the first thing it has to answer.
+    tracing::info!(
         target: "candle_conversation::guest",
+        path = %path.display(),
         tensors = placed.len(),
         int8_twins = twins,
+        mib = bytes >> 20,
+        windows = windows.len(),
+        staged_ms,
+        read_ms = read.as_millis() as u64,
+        total_ms = began.elapsed().as_millis() as u64,
         "placed a gguf in guest ground"
     );
     Ok(VarBuilder::from_tensors(placed, device.clone()))
+}
+
+/// One window of a checkpoint: the file bytes `from..to`, holding the sorted
+/// tensors `first..end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub from: u64,
+    pub to: u64,
+    pub first: usize,
+    pub end: usize,
+}
+
+/// The windows sorted tensor `ranges` (`start..end` in the file) are read in:
+/// each holds every tensor that ends within `cap` of its first one's start, and
+/// always that first one, however large it is.
+pub fn plan_windows(ranges: &[(u64, u64)], cap: u64) -> Vec<Window> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < ranges.len() {
+        let from = ranges[at].0;
+        let mut end = at + 1;
+        while end < ranges.len() && ranges[end].1 - from <= cap {
+            end += 1;
+        }
+        let to = ranges[at..end].iter().map(|r| r.1).max().unwrap_or(from);
+        out.push(Window {
+            from,
+            to,
+            first: at,
+            end,
+        });
+        at = end;
+    }
+    out
 }
 
 /// Upload one tensor, repack it into ground as its KO twin, drop the source.
@@ -190,13 +255,10 @@ fn place_ko_twin(
     let mut scratch = QCudaStorage::zeros(cuda, shape.elem_count(), dtype)?;
     let stream = cuda.cuda_stream();
     // SAFETY: `zeros` allocated at least `raw.len()` bytes at this address (it
-    // adds row padding on top), and the slice is `forget`ed rather than dropped
-    // so it never frees storage the `QCudaStorage` owns.
-    let mut dst = unsafe { stream.upgrade_device_ptr::<u8>(scratch.data_ptr_mut(), raw.len()) };
-    stream
-        .memcpy_htod(raw, &mut dst.slice_mut(..raw.len()))
+    // adds row padding on top) on this stream, and `raw` is a pinned staging
+    // buffer `place_gguf` refills only after the event past this copy.
+    unsafe { memcpy_htod_async(scratch.data_ptr_mut(), raw, stream.cu_stream()) }
         .map_err(candle::Error::wrap)?;
-    std::mem::forget(dst);
 
     // The routing seed, as `place_verbatim` — and this is the path that matters
     // most, because the int8 twin is what the image transformer's thirty-four
@@ -234,19 +296,21 @@ fn place_verbatim(
             .map_err(|e| candle::Error::Msg(format!("placing {dtype:?}: {e}")))?
     };
     let stream = cuda.cuda_stream();
-    // SAFETY: `at.ptr` names `padded` bytes of ground this guest holds, and the
-    // slice is `forget`ed below rather than dropped, so it never tries to free an
-    // address the pool did not allocate.
-    let mut dst = unsafe { stream.upgrade_device_ptr::<u8>(at.ptr, padded) };
-    stream
-        .memcpy_htod(raw, &mut dst.slice_mut(..raw.len()))
-        .map_err(candle::Error::wrap)?;
-    if padded > raw.len() {
-        stream
-            .memset_zeros(&mut dst.slice_mut(raw.len()..padded))
+    // SAFETY: `at.ptr` names `padded` bytes of ground this guest holds, and
+    // `raw` is a pinned staging buffer `place_gguf` refills only after the
+    // event past this copy.
+    unsafe {
+        memcpy_htod_async(at.ptr, raw, stream.cu_stream()).map_err(candle::Error::wrap)?;
+        if padded > raw.len() {
+            memset_d8_async(
+                at.ptr + raw.len() as u64,
+                0,
+                padded - raw.len(),
+                stream.cu_stream(),
+            )
             .map_err(candle::Error::wrap)?;
+        }
     }
-    std::mem::forget(dst);
 
     // SAFETY: the bytes are in flight to a range this guest owns, the ground
     // outlives every tensor handed out (the drain drops the model before the
@@ -304,4 +368,41 @@ pub fn ground_bytes(path: &Path, mode: Int8Mode, skip: &[&str]) -> Result<usize,
         total += bytes.next_multiple_of(PLACE_ALIGN);
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Windows follow the file**: tensors that end within the cap of the
+    /// window's first start share it, the next starts a window of its own, and
+    /// a tensor wider than the cap is a window by itself.
+    #[test]
+    fn windows_gather_tensors_up_to_the_cap() {
+        let ranges = [(0, 100), (100, 250), (250, 300), (300, 900), (900, 950)];
+        assert_eq!(
+            plan_windows(&ranges, 300),
+            vec![
+                Window {
+                    from: 0,
+                    to: 300,
+                    first: 0,
+                    end: 3
+                },
+                Window {
+                    from: 300,
+                    to: 900,
+                    first: 3,
+                    end: 4
+                },
+                Window {
+                    from: 900,
+                    to: 950,
+                    first: 4,
+                    end: 5
+                },
+            ]
+        );
+        assert_eq!(plan_windows(&[], 300), Vec::<Window>::new());
+    }
 }
