@@ -2149,9 +2149,20 @@ impl Scheduler {
         // conversation's KV in VRAM, so under pressure we shed hot KV to the
         // substrate rather than piling on more concurrent prefills; if that
         // doesn't clear it, leave the rest queued this pass.
+        //
+        // **Not over a prompt that outranks everything in flight.** The pile it
+        // guards against is more of the same band beside the work running; a
+        // higher band's prompt is not more of it but what that work is set aside
+        // for (`pause_creep`), and only once admitted. Held here it waits for
+        // the work it outranks to finish. On WhiteWorld (2026-10-27 08:16) an
+        // image draw's four one-token Urgent content checks waited 7.5 minutes
+        // behind one High dialogue's 155k-token creep: relief ran 80 times and
+        // relieved nothing, since the ground was that creep's own working set.
+        // It still goes to the fill below, which prices it like any other offer.
         if in_flight > 0
             && self.vram_under_pressure()
             && self.relieve_vram_pressure("promote", VramPhase::Load, ReliefNeed::Paced)
+            && !self.a_queued_prompt_outranks_the_work_in_flight()
         {
             // Pressure survived eviction — stop piling on this pass (the
             // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
@@ -3197,6 +3208,38 @@ impl Scheduler {
             self.wave_prefill_members.iter().any(|m| m.seq_id() == seq)
                 || self.paused_creep.as_ref().is_some_and(|c| c.holds(seq))
         })
+    }
+
+    /// Whether a queued prompt — carved or still a submission — belongs to a
+    /// band above every prefill and section in flight: one the work running
+    /// would be set aside for once it is admitted.
+    pub(super) fn a_queued_prompt_outranks_the_work_in_flight(&self) -> bool {
+        let queued = self
+            .prefill_queue
+            .iter()
+            .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
+            .chain(
+                self.pending_submits
+                    .iter()
+                    .map(|p| rank(self.decode_priority_or_high(p.parent()))),
+            )
+            .max();
+        let Some(queued) = queued else {
+            return false;
+        };
+        let running = self
+            .active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none())
+            .map(|p| rank(self.decode_priority_or_high(p.work.sequence_id)))
+            .chain(
+                self.active_section_ingests
+                    .iter()
+                    .filter(|s| s.error.is_none())
+                    .map(|s| rank(s.band)),
+            )
+            .max();
+        running.is_none_or(|r| queued > r)
     }
 
     /// Whether a prefill or section that can advance, and that `held` does not
@@ -7009,6 +7052,37 @@ mod wave_chunk_tests {
             1,
             "with the wait cleared, the idle engine did not force its queue head"
         );
+    }
+
+    /// An urgent prompt queued behind a high prefill outranks it, and so is not
+    /// held by the pressure gate; another high one beside it is.
+    #[test]
+    fn only_a_higher_band_outranks_the_work_in_flight() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        assert!(!scheduler.a_queued_prompt_outranks_the_work_in_flight());
+
+        let running = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(running, DecodePriority::High);
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(running, (0..4_000u32).collect()));
+
+        let same = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(same, DecodePriority::High);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(same, (0..64u32).collect()).work);
+        assert!(
+            !scheduler.a_queued_prompt_outranks_the_work_in_flight(),
+            "a prompt of the running band is more of the same"
+        );
+
+        let urgent = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(urgent, DecodePriority::Urgent);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(urgent, (0..16u32).collect()).work);
+        assert!(scheduler.a_queued_prompt_outranks_the_work_in_flight());
     }
 
     /// **A dialogue prefill enters the wave group in pass-sized chunks.** It
