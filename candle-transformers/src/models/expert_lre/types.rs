@@ -263,6 +263,10 @@ pub struct PipelineStats {
     /// filled by a reader that asks for them beside the tallies; 0 otherwise.
     pub hit_lru: f64,
     pub hit_ceiling: f64,
+    /// The pinned experts stand in host memory for a guest
+    /// ([`BoundaryAsk::StashPinned`]): the zone cannot serve a token until
+    /// [`BoundaryAsk::RestoreFloor`] has put them back.
+    pub pinned_stashed: bool,
 }
 
 impl PipelineStats {
@@ -629,6 +633,12 @@ pub enum BoundaryAsk {
     /// [`Self::SellPaused`] — whatever the slack and grant rules growth
     /// otherwise keeps.
     RestoreFloor,
+    /// After a [`Self::SellPaused`] that left the zone on its pinned set, still
+    /// short: copy the pinned experts — the ones with no copy anywhere else —
+    /// to host memory and hand their ground to the KV side too. Undone by
+    /// [`Self::RestoreFloor`], which puts every byte back at the address it
+    /// left before anything else moves.
+    StashPinned,
 }
 
 /// Message sent to the pipeline thread.

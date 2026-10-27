@@ -127,6 +127,16 @@ impl Runtime {
             }
             let key = lease_key(&world);
             let held = r.holds(&key);
+            if !self.standing.characters() {
+                // **A member that runs no characters is never a world's
+                // authority.** It never asks; one it holds — taken before it
+                // was told so — it hands over at once, to whichever member
+                // rendezvous names, or to none until one returns.
+                if held {
+                    self.hand_over(&hosted, member, r);
+                }
+                continue;
+            }
             if role == Role::Disconnected {
                 // Back once some member runs the world: its records are what
                 // the world is, and what was lived here is scrapped.

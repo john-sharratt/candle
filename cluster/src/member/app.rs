@@ -86,6 +86,13 @@ pub struct Identity {
     /// The model the substrate is bound to; `None` for an agent.
     pub model: Option<ModelId>,
     pub repos: Vec<RepoAd>,
+    /// Whether rendezvous may name this member — to propose for a lease, or to
+    /// be lent work under one (`docs/replicated_substrate.md` §9.5). One that
+    /// may not says `power` 0 in its `HELLO`, and a leaseholder at least 1, so
+    /// the gateway lists the first at weight 0, which owns no key. It still
+    /// replicates, votes and serves requests: its live power, in `CAPACITY`,
+    /// is what places those.
+    pub leaseholder: bool,
 }
 
 /// What the host measures for `CAPACITY` (§5.3).
@@ -453,7 +460,13 @@ impl AppMember {
             build: self.id.build.clone(),
             rejected: self.rejected.load(Ordering::Relaxed),
             model: self.id.model.clone(),
-            power: (self.capacity)().power,
+            // At least 1 for a leaseholder, so weight 0 says only "takes no
+            // lease" and never "not measured yet".
+            power: if self.id.leaseholder {
+                (self.capacity)().power.max(1)
+            } else {
+                0
+            },
             repos: self.id.repos.clone(),
             now_ms: now_ms(),
             // `join` draws a fresh nonce.
@@ -966,6 +979,10 @@ mod tests {
     /// A member on no cluster: its announcements go nowhere, its claims are its
     /// own.
     fn alone() -> Arc<AppMember> {
+        alone_as(true, 0)
+    }
+
+    fn alone_as(leaseholder: bool, power: u32) -> Arc<AppMember> {
         AppMember::new(
             Identity {
                 app: "zend".into(),
@@ -978,14 +995,28 @@ mod tests {
                 },
                 model: None,
                 repos: Vec::new(),
+                leaseholder,
             },
             GroupKey::from_bytes([1; 32]),
             Vec::new(),
             RouteTable::new(Vec::new()).unwrap(),
-            Box::new(Capacity::default),
+            Box::new(move || Capacity {
+                power,
+                ..Capacity::default()
+            }),
             None,
             Instant::now(),
         )
+    }
+
+    /// **A member rendezvous may not name says power 0 at admission**, which
+    /// the gateway lists as its weight; a leaseholder says its power, and 1
+    /// when it has measured none, so 0 never means anything else.
+    #[test]
+    fn a_member_that_takes_no_lease_is_admitted_at_weight_zero() {
+        assert_eq!(alone_as(true, 300).hello().power, 300);
+        assert_eq!(alone_as(true, 0).hello().power, 1);
+        assert_eq!(alone_as(false, 300).hello().power, 0);
     }
 
     /// **A claim following use goes with its last use; the app is told only

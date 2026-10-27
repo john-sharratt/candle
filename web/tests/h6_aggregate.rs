@@ -85,6 +85,7 @@ fn member(hub: &Arc<Hub>, node: u64) -> Arc<AppMember> {
                 describe: "Flash-Next".into(),
             }),
             repos: vec![],
+            leaseholder: true,
         },
         key(),
         vec!["mem".into()],

@@ -23,7 +23,7 @@ use candle_conversation::models::DialectType;
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::{OpenStage, SUBSTRATE_DIR};
 use candle_conversation::Capabilities;
-use clap::Args;
+use clap::{ArgAction, Args};
 use cluster::dispatch::Dispatch;
 use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
@@ -138,6 +138,14 @@ pub struct NpcdArgs {
     /// depends on it: the conversation stays retired either way.
     #[arg(long, value_name = "DAYS", default_value_t = DEFAULT_TOMBSTONE_RETENTION_DAYS)]
     pub tombstone_retention: u64,
+
+    /// Whether this member runs characters. `false` — `--no-characters`, or
+    /// `characters: false` in `motherd.yaml` — keeps it out of every world and
+    /// character lease (`docs/replicated_substrate.md` §9.5): it replicates
+    /// the substrate, serves the routes and draws, and no character or Maker
+    /// runs here, even with every other member away.
+    #[arg(long = "no-characters", action = ArgAction::SetFalse)]
+    pub characters: bool,
 }
 
 /// `--mind-branch`'s default.
@@ -194,6 +202,7 @@ impl Default for NpcdArgs {
             forget_journal: false,
             wipe_conversations: false,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
+            characters: true,
         }
     }
 }
@@ -313,6 +322,14 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         anyhow::bail!(
             "--mind-repo is read through an agent, and there is none: give the process an \
              `agent:` file naming a checkout of it, or a --cluster"
+        );
+    }
+    // With no cluster this daemon is every world's authority and runs every
+    // character: there is no other member for them to run on.
+    if !args.characters && ctx.cluster.is_none() {
+        anyhow::bail!(
+            "--no-characters keeps a member out of the leases its cluster lends, and there is \
+             no cluster: give it one, or let it run characters"
         );
     }
     match &repo {
@@ -480,6 +497,14 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // A link one member signs, another member may be asked to open.
     if let Some(join) = &ctx.cluster {
         authored.image_links = ImageLinks::new(join.derive_key(image_links::PURPOSE));
+        // Said before the engine load joins: the gateway takes a member's
+        // weight from its admission. The runtime refuses leases on its own
+        // account too (`Standing::characters`), so one lent before this is
+        // handed back.
+        join.link().set_leaseholder(args.characters);
+        if !args.characters {
+            tracing::info!("characters: off — this member takes no world or character lease");
+        }
     }
 
     // ── the engine ─────────────────────────────────────────────────────────
@@ -515,6 +540,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     if ctx.cluster.is_some() {
         runtime.standing.set_clustered();
     }
+    runtime.standing.set_characters(args.characters);
     host_worlds(&runtime, &authored, &authored_dir).await;
 
     // ── the routes ─────────────────────────────────────────────────────────
@@ -1071,6 +1097,16 @@ mod tests {
         assert_eq!(flags, yaml);
         assert!(Cli::try_parse_from(["npcd", "--content", "web/content/npcd"]).is_err());
         assert!(serde_yaml::from_str::<NpcdArgs>("content: x").is_err());
+    }
+
+    /// **A member runs characters unless told not to**, by flag or by
+    /// `motherd.yaml`, the two reading the same setting.
+    #[test]
+    fn characters_run_unless_turned_off() {
+        assert!(parse(&[]).characters);
+        assert!(!parse(&["--no-characters"]).characters);
+        let yaml: NpcdArgs = serde_yaml::from_str("characters: false\n").unwrap();
+        assert_eq!(yaml, parse(&["--no-characters"]));
     }
 
     /// Every one-shot flag is a real flag of the binary — a relaunch strips

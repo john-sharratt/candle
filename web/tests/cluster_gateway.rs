@@ -269,6 +269,7 @@ fn joined(gateway: SocketAddr, node: u64, power: u32, ready: bool) -> Member {
                 describe: "Flash-Next".into(),
             }),
             repos: vec![],
+            leaseholder: true,
         },
         key(),
         vec![format!("ws://{gateway}")],

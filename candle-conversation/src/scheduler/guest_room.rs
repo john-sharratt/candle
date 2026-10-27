@@ -95,6 +95,28 @@ impl EngineRoom for Scheduler {
         conceded
     }
 
+    fn empty_gallery(&mut self) -> u64 {
+        let Some(gallery) = self.gallery_arena.as_ref() else {
+            return 0;
+        };
+        let freed = gallery.evict_all_for_guest();
+        if freed > 0 {
+            let _ = self.session.release_empty_arenas();
+            self.pack_until_settled(PackGoal::Ground);
+        }
+        freed
+    }
+
+    fn stash_pinned_for_guest(&mut self) -> u64 {
+        let stashed = self.model.stash_pinned_for_guest();
+        tracing::info!(
+            target: "candle_conversation::guest",
+            stashed_mib = stashed >> 20,
+            "the pinned experts, stashed for a guest"
+        );
+        stashed
+    }
+
     /// Asked again after a pack when refused: the guest's regions came back
     /// free, but an arena standing at the frontier can sit on the ground the
     /// weight side grows into, and a pack moves it down.
@@ -142,9 +164,14 @@ impl EngineRoom for Scheduler {
         );
         let h = self.hot_census();
         let m = |b: u64| b >> 20;
+        let gallery = self
+            .gallery_arena
+            .as_ref()
+            .map_or(0, |g| g.resident_bytes());
         format!(
-            "{kv} | hot_mib sections={} attended={} pinned={} unwarmed={} splice={} evictable={} \
-             | in flight: decodes={} prefills={} | idle {}",
+            "{kv} gallery={} | hot_mib sections={} attended={} pinned={} unwarmed={} splice={} \
+             evictable={} | in flight: decodes={} prefills={} | idle {}",
+            m(gallery),
             m(h.sections),
             m(h.attended),
             m(h.pinned),

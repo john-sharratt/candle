@@ -74,6 +74,7 @@ fn member(hub: &Arc<Hub>) -> Member {
                 describe: "model".into(),
             }),
             repos: vec![],
+            leaseholder: true,
         },
         key(),
         vec!["https://gw".into()],

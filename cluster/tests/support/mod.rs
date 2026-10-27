@@ -212,6 +212,7 @@ fn build(
                 describe: "model".into(),
             }),
             repos: vec![],
+            leaseholder: true,
         },
         key(),
         hubs.iter().map(|_| "https://gw".to_string()).collect(),

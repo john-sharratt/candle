@@ -110,6 +110,21 @@ pub trait EngineRoom {
     /// path out of it.
     fn concede_for_guest(&mut self, bytes: usize) -> u64;
 
+    /// Still short past the concession: give up the whole belief-scan
+    /// gallery, a cache every turn rebuilds on its next scan. Answers the
+    /// bytes that went back to the span.
+    fn empty_gallery(&mut self) -> u64 {
+        0
+    }
+
+    /// Still short past the gallery: the weight side copies its pinned
+    /// experts — what has no copy anywhere else — to host memory and concedes
+    /// their ground too. Undone by [`Self::restore_floor`], on every path out,
+    /// like the concession. Answers what was conceded.
+    fn stash_pinned_for_guest(&mut self) -> u64 {
+        0
+    }
+
     /// Grow the weight side back to its serving floor after
     /// [`Self::concede_for_guest`], from the ground the guest has handed back.
     /// Answers whether it stands there.
@@ -207,11 +222,21 @@ pub fn drain_one<R: EngineRoom>(
     // zone on that floor — 513 slots, 0.95 GiB, above the pinned set. Only when
     // still short, so a draw that fits never evicts an expert for it, and
     // restored on every path out below.
-    let conceded = if room.free_bytes() < want {
+    let mut conceded = if room.free_bytes() < want {
         room.concede_for_guest(want - room.free_bytes())
     } else {
         0
     };
+    // Step 2c. **The last two, cheapest first, only while still short:** the
+    // gallery, which each conversation's next scan rebuilds, then the pinned
+    // experts, copied to the host and put back before the engine forwards. The
+    // user ruled both in (2026-10-27) for a draw that is otherwise refused.
+    if room.free_bytes() < want {
+        freed += room.empty_gallery();
+    }
+    if room.free_bytes() < want {
+        conceded += room.stash_pinned_for_guest();
+    }
     freed += conceded;
     report.freed_mib = freed >> 20;
     // Who still holds the ground once the ladder and the concession are done,

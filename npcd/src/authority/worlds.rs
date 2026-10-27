@@ -20,6 +20,10 @@ use crate::world_state::Records;
 
 pub struct Standing {
     clustered: AtomicBool,
+    /// Whether this member runs characters (`characters:` in its config). One
+    /// that does not runs none, is never a world's authority, and hands back
+    /// any lease still naming it (`docs/replicated_substrate.md` §9.5).
+    characters: AtomicBool,
     roles: Roles,
     /// When each world took its role, in wall-clock milliseconds.
     since: Mutex<BTreeMap<String, u64>>,
@@ -62,6 +66,7 @@ impl Standing {
     pub fn new(clustered: bool) -> Self {
         let standing = Self {
             clustered: AtomicBool::new(false),
+            characters: AtomicBool::new(true),
             roles: Roles::new(Role::Authority { epoch: 0 }),
             since: Mutex::new(BTreeMap::new()),
             written: Mutex::new(BTreeMap::new()),
@@ -93,6 +98,15 @@ impl Standing {
     pub fn set_clustered(&self) {
         self.clustered.store(true, Ordering::Relaxed);
         self.roles.set_default(Role::Replica);
+    }
+
+    pub fn characters(&self) -> bool {
+        self.characters.load(Ordering::Relaxed)
+    }
+
+    /// Whether this member runs characters. Set before any world is hosted.
+    pub fn set_characters(&self, characters: bool) {
+        self.characters.store(characters, Ordering::Relaxed);
     }
 
     /// The cluster this member joined.
@@ -248,9 +262,9 @@ impl Standing {
     }
 
     /// Whether this member runs character `npc`. A daemon with no cluster
-    /// runs them all.
+    /// runs them all; one that runs no characters, none.
     pub fn runs(&self, npc: u64) -> bool {
-        !self.clustered() || self.held.lock().unwrap().contains(&npc)
+        self.characters() && (!self.clustered() || self.held.lock().unwrap().contains(&npc))
     }
 
     pub fn held(&self) -> BTreeSet<u64> {
@@ -341,6 +355,16 @@ mod tests {
         member.set_role("w1", Role::Disconnected, 5);
         assert!(member.writes("w1"));
         assert_eq!(member.since("w1"), 5);
+    }
+
+    /// **A member that runs no characters runs none**, whatever it would run
+    /// otherwise.
+    #[test]
+    fn a_member_without_characters_runs_none() {
+        let w = Standing::new(false);
+        assert!(w.characters() && w.runs(42));
+        w.set_characters(false);
+        assert!(!w.runs(42));
     }
 
     /// The old objects go once each converted world has written its records,
