@@ -46,6 +46,9 @@ pub struct MemberView {
     /// (§5.3): counted at the pick, so a burst sees its own earlier picks
     /// before the member's next `CAPACITY` reports them.
     pub in_flight: u32,
+    /// Of those, the draws (§5.3): what a draw's placement spreads by, since a
+    /// card draws one picture at a time whatever else it answers meanwhile.
+    pub drawing: u32,
     /// Jobs handed to it, an agent, since its last `CAPACITY` (§11.3): a job
     /// is started and then read back, so it holds no request open to count,
     /// and the next `CAPACITY` reports it running. Until then the choice
@@ -342,23 +345,29 @@ impl Registry {
         changed
     }
 
-    /// A request handed to `node`: one more in flight there. Returns the
-    /// member's session, which [`Self::end`] names, or `None` for a node not
-    /// admitted.
-    pub fn begin(&mut self, app: &str, node: u64) -> Option<u64> {
+    /// A request handed to `node`, a draw when `draw`: one more in flight
+    /// there. Returns the member's session, which [`Self::end`] names, or
+    /// `None` for a node not admitted.
+    pub fn begin(&mut self, app: &str, node: u64, draw: bool) -> Option<u64> {
         let m = self.app(app).members.get_mut(&node)?;
         m.in_flight += 1;
         m.placed += 1;
+        if draw {
+            m.drawing += 1;
+        }
         Some(m.session)
     }
 
     /// A request [`Self::begin`] counted against `node`'s `session` is
     /// answered. A session since replaced counted its own requests, so the
     /// newer one's count is left alone.
-    pub fn end(&mut self, app: &str, node: u64, session: u64) {
+    pub fn end(&mut self, app: &str, node: u64, session: u64, draw: bool) {
         if let Some(m) = self.app(app).members.get_mut(&node) {
             if m.session == session {
                 m.in_flight = m.in_flight.saturating_sub(1);
+                if draw {
+                    m.drawing = m.drawing.saturating_sub(1);
+                }
             }
         }
     }
@@ -479,7 +488,7 @@ impl Registry {
     }
 
     fn best_but(&self, app: &str, draw: Option<u64>, except: Option<u64>) -> Option<u64> {
-        best_of(self.placeable_but(app, draw, except))
+        place(self.placeable_but(app, draw, except), draw)
     }
 
     /// The members a request may be placed on, but `except`: for a draw of
@@ -512,9 +521,9 @@ impl Registry {
                 ready.iter().copied().filter(|m| h.held_by(m)).collect();
             let everyone_holds = holding.len() == ready.len();
             let pick = if holding.is_empty() {
-                best_of(ready)
+                place(ready, draw)
             } else {
-                best_of(holding)
+                place(holding, draw)
             };
             (pick, everyone_holds)
         };
@@ -911,6 +920,56 @@ fn capacity_of(m: &MemberView) -> &Capacity {
 fn has_room(m: &MemberView) -> bool {
     let c = capacity_of(m);
     c.idle || c.slots_free > m.in_flight
+}
+
+/// The member of `pool` a request goes to: a draw by [`draw_of`], anything
+/// else by [`best_of`].
+fn place(pool: Vec<&MemberView>, draw: Option<u64>) -> Option<u64> {
+    match draw {
+        Some(_) => draw_of(pool),
+        None => best_of(pool),
+    }
+}
+
+/// Where a draw goes among `pool` (§5.3): **the strongest card not drawing,
+/// and in turn the rest** — the fewest draws in flight, then the card that
+/// draws furthest (`guest_reach`, its size), then the most live power, then
+/// the lower node. One draw at a time lands on the strongest card; a burst
+/// goes round every card that reaches it, strongest first each round.
+///
+/// Reach before power: `power` is a decode rate, or a card's size before it
+/// has decoded, and says little of how a card draws; its reach is the card.
+fn draw_of(pool: Vec<&MemberView>) -> Option<u64> {
+    let seen: Vec<String> = pool
+        .iter()
+        .map(|m| {
+            format!(
+                "{:016x} drawing={} reach={} power={}",
+                m.node,
+                m.drawing,
+                guest_reach(m),
+                capacity_of(m).power
+            )
+        })
+        .collect();
+    let pick = pool
+        .into_iter()
+        .min_by(|a, b| {
+            a.drawing
+                .cmp(&b.drawing)
+                .then(guest_reach(b).cmp(&guest_reach(a)))
+                .then(capacity_of(b).power.cmp(&capacity_of(a).power))
+                .then(a.node.cmp(&b.node))
+        })
+        .map(|m| m.node);
+    tracing::info!(
+        target: "cluster::gateway::placement",
+        picked = %pick.map_or_else(|| "none".to_string(), |n| format!("{n:016x}")),
+        by = "draw",
+        candidates = %seen.join("; "),
+        "placed"
+    );
+    pick
 }
 
 /// `a` against `b` for [`Registry::best`]: the larger share of power per

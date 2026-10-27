@@ -449,6 +449,7 @@ impl Hub {
                 lagging: false,
                 syncing,
                 in_flight: 0,
+                drawing: 0,
                 handed: 0,
                 placed: 0,
                 closing: false,
@@ -1168,8 +1169,8 @@ impl Hub {
         );
         let load = match pick {
             Pick::Member(node) if work => registry
-                .begin(app, node)
-                .map(|session| Load::new(Arc::clone(self), app, node, session)),
+                .begin(app, node, draw.is_some())
+                .map(|session| Load::new(Arc::clone(self), app, node, session, draw.is_some())),
             _ => None,
         };
         Picked { pick, load }

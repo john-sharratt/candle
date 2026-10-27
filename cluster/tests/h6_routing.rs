@@ -123,6 +123,7 @@ fn view(node: u64, session: u64) -> MemberView {
         lagging: false,
         syncing: false,
         in_flight: 0,
+        drawing: 0,
         handed: 0,
         placed: 0,
         closing: false,

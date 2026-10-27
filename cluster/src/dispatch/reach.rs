@@ -6,15 +6,18 @@
 //! and says so in `CAPACITY` (`guest_reach`, the side of that square). A route
 //! declared [`Reach::Draw`] has its body read for the draw's `width × height`,
 //! and the gateway places it only among the members whose square holds that
-//! area. When none does it places it among those that reach furthest, and the
-//! member's own refusal names the largest draw the cluster serves.
+//! area — the strongest not drawing, and in turn the rest. When none does it
+//! places it among those that reach furthest, and the member's own refusal
+//! names the largest draw the cluster serves.
 //!
 //! The size is read where the member reads it: a JSON-RPC `tools/call` of a
 //! draw tool carries it among its `arguments`, a draw route's own body at its
 //! top level; any other JSON-RPC message asks for no draw. A side not given is the draw's default, [`DRAW_DEFAULT_SIDE`].
 //! An edit's size follows its picture when a side is missing, which only the
 //! member holding the picture knows, so an edit is sized here only when it
-//! names both sides; otherwise its member fits it to its own reach.
+//! names both sides; otherwise it is sized 0 — every card reaches it, and it
+//! still counts as a draw on the card it goes to — and its member fits it to
+//! its own reach.
 
 use serde_json::Value;
 
@@ -37,8 +40,11 @@ pub const MCP_DRAW: &str = "image_generate";
 /// The MCP tool that draws from a picture, in its `prompt` mode.
 pub const MCP_EDIT: &str = "image_edit";
 
-/// The pixel area the draw in `body` asks for; `None` when it asks for none
-/// the gateway can size — an MCP call of any other tool, or another message.
+/// The pixel area the draw in `body` asks for; `None` when it draws nothing —
+/// an MCP call of any other tool, an edit that only resizes, crops, adjusts or
+/// turns, or another message. An edit its member sizes — one that does not name
+/// both sides, or one that takes the background away — is 0: it reaches every
+/// card, and is still a draw on the card it goes to.
 pub fn draw_area(body: &Value) -> Option<u64> {
     if body.get("jsonrpc").is_none() {
         return area(body, DRAW_DEFAULT_SIDE);
@@ -50,14 +56,18 @@ pub fn draw_area(body: &Value) -> Option<u64> {
     let args = params.get("arguments")?;
     match params.get("name").and_then(Value::as_str)? {
         MCP_DRAW => area(args, DRAW_DEFAULT_SIDE),
-        MCP_EDIT => {
-            let prompt_mode = args
-                .get("mode")
-                .and_then(Value::as_str)
-                .is_none_or(|m| m == "prompt");
-            let both = side(args, "width").is_some() && side(args, "height").is_some();
-            (prompt_mode && both).then(|| area(args, 0)).flatten()
-        }
+        MCP_EDIT => match args.get("mode").and_then(Value::as_str) {
+            None | Some("prompt") => {
+                let both = side(args, "width").is_some() && side(args, "height").is_some();
+                if both {
+                    area(args, 0)
+                } else {
+                    Some(0)
+                }
+            }
+            Some("remove_background") => Some(0),
+            Some(_) => None,
+        },
         _ => None,
     }
 }
@@ -104,8 +114,9 @@ mod tests {
         assert_eq!(draw_area(&json!({"prompt": "p"})), Some(262_144));
     }
 
-    /// **An MCP draw is sized from its arguments; an edit only when it names
-    /// both sides and draws; any other tool not at all.**
+    /// **An MCP draw is sized from its arguments; an edit that draws by both
+    /// sides it names, or 0 when its member sizes it; an edit that only
+    /// reshapes, and any other tool, not at all.**
     #[test]
     fn an_mcp_call_is_sized_only_when_it_draws() {
         assert_eq!(
@@ -125,7 +136,12 @@ mod tests {
             edit(json!({"image": "x", "mode": "prompt", "width": 64, "height": 32})),
             Some(2_048)
         );
-        assert_eq!(edit(json!({"image": "x", "width": 1024})), None);
+        assert_eq!(edit(json!({"image": "x", "width": 1024})), Some(0));
+        assert_eq!(edit(json!({"image": "x", "prompt": "p"})), Some(0));
+        assert_eq!(
+            edit(json!({"image": "x", "mode": "remove_background"})),
+            Some(0)
+        );
         assert_eq!(
             edit(json!({"image": "x", "mode": "resize", "width": 4096, "height": 4096})),
             None

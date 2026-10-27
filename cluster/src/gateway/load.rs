@@ -14,15 +14,18 @@ pub struct Load {
     app: String,
     node: u64,
     session: u64,
+    /// A draw, which the member's draw count holds too.
+    draw: bool,
 }
 
 impl Load {
-    pub(super) fn new(hub: Arc<Hub>, app: &str, node: u64, session: u64) -> Self {
+    pub(super) fn new(hub: Arc<Hub>, app: &str, node: u64, session: u64, draw: bool) -> Self {
         Self {
             hub,
             app: app.to_string(),
             node,
             session,
+            draw,
         }
     }
 }
@@ -32,7 +35,7 @@ impl Drop for Load {
         self.hub
             .state()
             .registry
-            .end(&self.app, self.node, self.session);
+            .end(&self.app, self.node, self.session, self.draw);
     }
 }
 

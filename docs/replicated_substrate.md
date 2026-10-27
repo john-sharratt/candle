@@ -1415,6 +1415,19 @@ its reach) then tells the caller the largest draw the app serves, in the shape t
 route answers in. A key's holder keeps the key whatever its reach, and refuses a draw
 its card cannot hold the same way.
 
+**Among the cards that reach it, a draw goes to the strongest not drawing, and in turn
+the rest.** In place of `Best`'s power per request, a draw — fresh, a key nobody holds,
+or a canary's baseline — goes to the member with the fewest draws in flight, then the
+largest `guest_reach` (the card itself), then the most live `power`, then the lower
+node. The gateway counts a member's draws as it counts its `in_flight` below: at the
+pick, and until the answer ends. An edit that draws (`image_edit` by a prompt, or taking
+the background away) counts as a draw wherever its key sends it; one that does not name
+both sides is sized 0, which every card reaches, and its member fits it. So one draw at
+a time lands on the strongest card, and a burst goes round every card that reaches it,
+strongest first each round. A card draws one picture at a time whatever else it answers,
+which is why its draws, not its requests, are what a draw spreads by. The count is each
+gateway's own: draws placed through another gateway are not in it.
+
 The gateway adds what no `CAPACITY` can say in time: **`in_flight`**, the requests it
 has handed each member and the member is still answering. A request routed `Best`,
 sticky or owner is counted at the pick — in the same hold of the registry, so two picks

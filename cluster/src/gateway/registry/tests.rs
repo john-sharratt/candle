@@ -38,6 +38,7 @@ fn member(node: u64, session: u64) -> MemberView {
         lagging: false,
         syncing: false,
         in_flight: 0,
+        drawing: 0,
         handed: 0,
         placed: 0,
         closing: false,
@@ -254,14 +255,14 @@ fn best_takes_the_largest_share_of_power_per_request() {
     let mut r = three();
     // Shares 100, 300, 200: the busy 300 still has five free slots.
     assert_eq!(best(&mut r), Pick::Member(2));
-    let first = r.begin("zend", 2).expect("admitted");
+    let first = r.begin("zend", 2, false).expect("admitted");
     // 100, 300/2 = 150, 200.
     assert_eq!(best(&mut r), Pick::Member(3));
-    r.begin("zend", 3);
+    r.begin("zend", 3, false);
     // 100, 150, 200/2 = 100.
     assert_eq!(best(&mut r), Pick::Member(2));
-    r.begin("zend", 2);
-    r.begin("zend", 2);
+    r.begin("zend", 2, false);
+    r.begin("zend", 2, false);
     // 100, 300/4 = 75, 100: two idle members tie, and the lower node takes it.
     assert_eq!(best(&mut r), Pick::Member(1));
     // Node 1 busy with no free slot has no room; node 3, idle, still has.
@@ -271,8 +272,8 @@ fn best_takes_the_largest_share_of_power_per_request() {
     // has three requests on five slots, so it has room until it holds five.
     r.capacity("zend", 3, capacity(MemberState::Ready, 200, false, 1));
     assert_eq!(best(&mut r), Pick::Member(2), "the only one with room");
-    r.begin("zend", 2);
-    r.begin("zend", 2);
+    r.begin("zend", 2, false);
+    r.begin("zend", 2, false);
     assert_eq!(
         r.member("zend", 2).map(|m| m.in_flight),
         Some(5),
@@ -283,12 +284,12 @@ fn best_takes_the_largest_share_of_power_per_request() {
 
     // An answer ends its request; one from a session since replaced leaves
     // the newer session's count alone.
-    r.end("zend", 2, first);
+    r.end("zend", 2, first, false);
     assert_eq!(r.member("zend", 2).map(|m| m.in_flight), Some(4));
     r.join(member(2, 9));
     r.capacity("zend", 2, capacity(MemberState::Ready, 300, false, 5));
-    r.begin("zend", 2);
-    r.end("zend", 2, first);
+    r.begin("zend", 2, false);
+    r.end("zend", 2, first, false);
     assert_eq!(r.member("zend", 2).map(|m| m.in_flight), Some(1));
 
     // A member in fault mode or upgrading is not ready, and takes nothing.
@@ -474,7 +475,7 @@ fn a_turn_goes_where_it_finishes_soonest() {
     assert_eq!(best(&mut r), Pick::Member(3));
     // A turn handed to node 3 is 2,048 more tokens there: 16.90 s, and node 1
     // is now the soonest.
-    r.begin("zend", 3);
+    r.begin("zend", 3, false);
     assert_eq!(best(&mut r), Pick::Member(1));
 
     // Node 2 has not learned a decode yet: it takes one turn, to learn from,
@@ -482,13 +483,13 @@ fn a_turn_goes_where_it_finishes_soonest() {
     // against node 3's 16.90 s, as before.
     learned(&mut r, 2, 300, 0, 2_000, 0);
     assert_eq!(best(&mut r), Pick::Member(2), "probed");
-    r.begin("zend", 2);
+    r.begin("zend", 2, false);
     assert_eq!(best(&mut r), Pick::Member(1));
-    r.begin("zend", 1);
+    r.begin("zend", 1, false);
     assert_eq!(best(&mut r), Pick::Member(1), "16.26 s against 16.90 s");
-    r.begin("zend", 1);
+    r.begin("zend", 1, false);
     assert_eq!(best(&mut r), Pick::Member(1), "16.78 s against 16.90 s");
-    r.begin("zend", 1);
+    r.begin("zend", 1, false);
     assert_eq!(best(&mut r), Pick::Member(3), "17.29 s against 16.90 s");
 
     // None learned: by power per request.
@@ -612,14 +613,14 @@ fn an_unlearned_member_takes_one_turn_at_a_time() {
     );
     r.capacity("zend", 2, capacity(MemberState::Ready, 300, true, 64));
     assert_eq!(best(&mut r), Pick::Member(2), "the probe goes first");
-    let probe = r.begin("zend", 2).expect("admitted");
+    let probe = r.begin("zend", 2, false).expect("admitted");
     for _ in 0..23 {
         assert_eq!(best(&mut r), Pick::Member(1));
-        r.begin("zend", 1);
+        r.begin("zend", 1, false);
     }
 
     // Its turn answered, it is probed again.
-    r.end("zend", 2, probe);
+    r.end("zend", 2, probe, false);
     assert_eq!(best(&mut r), Pick::Member(2));
 }
 
@@ -643,7 +644,7 @@ fn a_burst_spills_to_the_slower_member_at_the_crossover() {
         .map(|_| {
             let p = best(&mut r);
             if let Pick::Member(n) = p {
-                r.begin("zend", n);
+                r.begin("zend", n, false);
             }
             p
         })
@@ -668,7 +669,7 @@ fn a_reported_turn_is_not_charged_a_prompt_again() {
     learned(&mut r, 1, 541, 0, 1_196, 28_862);
     learned(&mut r, 2, 27, 0, 980, 94_871);
     for _ in 0..20 {
-        r.begin("zend", 1);
+        r.begin("zend", 1, false);
     }
     // Twenty handed and unreported: 1.712 × 21 + 14.78 = 50.73 s against
     // node 2's 50.66 s.
@@ -694,8 +695,8 @@ fn an_answered_request_is_not_charged_a_prompt() {
     learned(&mut r, 2, 27, 0, 980, 94_871);
     // Thirty handed to node 1 and answered at once, before its next report.
     for _ in 0..30 {
-        let session = r.begin("zend", 1).expect("admitted");
-        r.end("zend", 1, session);
+        let session = r.begin("zend", 1, false).expect("admitted");
+        r.end("zend", 1, session, false);
     }
     assert_eq!(
         r.member("zend", 1).map(|m| (m.placed, m.in_flight)),
@@ -733,7 +734,7 @@ fn a_burst_prices_the_step_it_makes() {
         .map(|_| {
             let p = best(&mut r);
             if let Pick::Member(n) = p {
-                r.begin("zend", n);
+                r.begin("zend", n, false);
             }
             p
         })
@@ -797,7 +798,7 @@ fn a_burst_prices_the_prefill_it_makes() {
             .map(|_| {
                 let p = best(r);
                 if let Pick::Member(n) = p {
-                    r.begin("zend", n);
+                    r.begin("zend", n, false);
                 }
                 p
             })
@@ -1097,18 +1098,113 @@ fn reaching() -> Registry {
     r
 }
 
-/// **A draw goes only to a member whose card reaches it**, the best of those;
-/// a request that draws nothing goes to the best of them all. Reach is an
-/// area: a 768 × 1344 draw is one a 1024² card serves.
+/// **A draw goes only to a member whose card reaches it**, the strongest card
+/// of those; a request that draws nothing goes to the best of them all by
+/// power. Reach is an area: a 768 × 1344 draw is one a 1024² card serves.
 #[test]
 fn a_draw_goes_only_to_a_member_whose_card_reaches_it() {
-    let mut r = reaching();
+    let mut r = Registry::new();
+    for (node, power, reach) in [(1, 300, 512), (2, 200, 1024)] {
+        r.join(member(node, node));
+        r.capacity(
+            "zend",
+            node,
+            Capacity {
+                guest_reach: reach,
+                ..capacity(MemberState::Ready, power, true, 4)
+            },
+        );
+    }
     let mut pick = |draw| r.pick("zend", &Dispatch::Best, draw, None, None);
     assert_eq!(pick(None), Pick::Member(1));
-    assert_eq!(pick(Some(512 * 512)), Pick::Member(1));
+    assert_eq!(pick(Some(512 * 512)), Pick::Member(2), "the larger card");
     assert_eq!(pick(Some(768 * 1344)), Pick::Member(2));
-    assert_eq!(pick(Some(1024 * 1040)), Pick::Member(3));
-    assert_eq!(pick(Some(2048 * 2048)), Pick::Member(3));
+    assert_eq!(pick(Some(1024 * 1040)), Pick::Member(2), "the furthest");
+}
+
+/// A draw of `area` placed `Best` and handed to its member: its node.
+fn draw(r: &mut Registry, area: u64) -> u64 {
+    match r.pick("zend", &Dispatch::Best, Some(area), None, None) {
+        Pick::Member(node) => {
+            r.begin("zend", node, true).expect("admitted");
+            node
+        }
+        other => panic!("a draw was placed {other:?}"),
+    }
+}
+
+/// **Draws go to the strongest card not drawing, and in turn the rest**: a
+/// burst goes round every card that reaches it, the largest card first each
+/// round, and a card that finishes its draw is the next one's again. A
+/// request that draws nothing is placed as ever.
+#[test]
+fn draws_go_round_the_cards_strongest_first() {
+    let mut r = reaching();
+    let burst: Vec<u64> = (0..6).map(|_| draw(&mut r, 512 * 512)).collect();
+    assert_eq!(burst, [3, 2, 1, 3, 2, 1]);
+    r.end("zend", 1, 1, true);
+    assert_eq!(draw(&mut r, 512 * 512), 1, "the card that finished");
+    assert_eq!(
+        draw(&mut r, 512 * 512),
+        3,
+        "then round again, largest first"
+    );
+
+    let mut r = reaching();
+    let large: Vec<u64> = (0..4).map(|_| draw(&mut r, 1024 * 1024)).collect();
+    assert_eq!(large, [3, 2, 3, 2], "only the cards that reach it");
+
+    let mut r = reaching();
+    draw(&mut r, 512 * 512);
+    assert_eq!(
+        r.pick("zend", &Dispatch::Best, None, None, None),
+        Pick::Member(1),
+        "a request that draws nothing goes by power per request in flight"
+    );
+}
+
+/// **Of cards of one size, the more powerful draws first.**
+#[test]
+fn of_equal_cards_the_more_powerful_draws_first() {
+    let mut r = Registry::new();
+    for (node, power) in [(1, 100), (2, 300)] {
+        r.join(member(node, node));
+        r.capacity(
+            "zend",
+            node,
+            Capacity {
+                guest_reach: 2048,
+                ..capacity(MemberState::Ready, power, true, 4)
+            },
+        );
+    }
+    let burst: Vec<u64> = (0..4).map(|_| draw(&mut r, 1024 * 1024)).collect();
+    assert_eq!(burst, [2, 1, 2, 1]);
+}
+
+/// **A draw answered by a session since replaced does not count against the
+/// new one**, and a new session starts with none drawing.
+#[test]
+fn a_replaced_sessions_draws_do_not_count_against_the_new_one() {
+    let mut r = reaching();
+    assert_eq!(draw(&mut r, 512 * 512), 3);
+    r.join(member(3, 30));
+    r.capacity(
+        "zend",
+        3,
+        Capacity {
+            guest_reach: 2048,
+            ..capacity(MemberState::Ready, 100, true, 4)
+        },
+    );
+    assert_eq!(r.member("zend", 3).unwrap().drawing, 0);
+    assert_eq!(draw(&mut r, 512 * 512), 3);
+    r.end("zend", 3, 3, true);
+    assert_eq!(
+        r.member("zend", 3).unwrap().drawing,
+        1,
+        "the old session's end"
+    );
 }
 
 /// **A draw no card reaches goes to the one that reaches furthest**, whose own
