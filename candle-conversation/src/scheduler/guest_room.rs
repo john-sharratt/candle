@@ -22,11 +22,17 @@ use std::time::Duration;
 
 use candle::Device;
 
+use super::prefill::PackGoal;
 use super::Scheduler;
 use crate::guest::drain::EngineRoom;
 use crate::guest::ground::{GroundError, GuestGround};
 use crate::guest::queue::Pending;
 use crate::guest::{drain_one, DrainReport, Guests};
+
+/// Packs tried between refused floor restores before the drain gives up and
+/// says so. The ground is the guest's own, just handed back; a refusal means
+/// an arena moved onto it, which one pack undoes.
+const FLOOR_RESTORE_TRIES: usize = 3;
 
 impl EngineRoom for Scheduler {
     fn device(&self) -> Device {
@@ -71,6 +77,36 @@ impl EngineRoom for Scheduler {
         //
         // Legal here for the same reason the claim was: between forwards.
         self.model.reclaim_spare_ground();
+    }
+
+    /// Through the model, which knows which of its weights have a copy to come
+    /// back from. Legal here for the reason the claim is: between forwards, on
+    /// the scheduler thread, so nothing forwards until the drain returns.
+    fn concede_for_guest(&mut self, bytes: usize) -> u64 {
+        let regions = bytes.div_ceil(candle_nn::kv_cache::REGION_BYTES);
+        let conceded = self.model.concede_for_guest(regions);
+        tracing::info!(
+            target: "candle_conversation::guest",
+            short_mib = bytes >> 20,
+            regions,
+            conceded_mib = conceded >> 20,
+            "the weight side's working room, conceded for a guest"
+        );
+        conceded
+    }
+
+    /// Asked again after a pack when refused: the guest's regions came back
+    /// free, but an arena standing at the frontier can sit on the ground the
+    /// weight side grows into, and a pack moves it down.
+    fn restore_floor(&mut self) -> bool {
+        for _ in 0..FLOOR_RESTORE_TRIES {
+            if self.model.restore_serving_floor() {
+                return true;
+            }
+            let _ = self.session.release_empty_arenas();
+            self.pack_until_settled(PackGoal::Ground);
+        }
+        self.model.restore_serving_floor()
     }
 
     fn busy(&self) -> bool {

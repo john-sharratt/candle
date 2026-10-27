@@ -39,6 +39,7 @@ pub mod guest_routes;
 pub mod guests;
 pub mod identity;
 pub mod image_links;
+pub mod image_ops;
 pub mod images;
 pub mod lifegen;
 pub mod mcp;

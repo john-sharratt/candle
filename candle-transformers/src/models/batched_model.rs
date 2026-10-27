@@ -515,6 +515,26 @@ pub trait BatchedModelCore {
     /// Dense models have no movable boundary and do nothing.
     fn reclaim_spare_ground(&self) {}
 
+    /// [`Self::request_kv_ground`] for a guest drain, with the engine stopped
+    /// between waves: the weight side may go below the floor it needs to serve a
+    /// token, down to what has no copy anywhere else, because nothing forwards
+    /// until [`Self::restore_serving_floor`] has answered `true`.
+    ///
+    /// Dense models have no movable boundary and return zero.
+    fn concede_for_guest(&self, regions: usize) -> u64 {
+        let _ = regions;
+        0
+    }
+
+    /// Grow the weight side back to its serving floor after
+    /// [`Self::concede_for_guest`], answering whether it stands there. Only legal
+    /// between forwards, like [`Self::reclaim_spare_ground`].
+    ///
+    /// Dense models never leave their floor and answer `true`.
+    fn restore_serving_floor(&self) -> bool {
+        true
+    }
+
     /// Live VRAM bytes held by the model's weights — fixed base weights plus the
     /// **time-varying** resident-expert footprint (MoE experts page VRAM↔RAM
     /// under pressure). `None` if the model can't report it (dense models, no

@@ -261,6 +261,14 @@ impl WeightZone {
         self.floor.min(self.capacity)
     }
 
+    /// The floor as stated, whatever the capacity: what a zone taken below it
+    /// for a guest ([`Self::retract_within`]) must be grown back to before the
+    /// engine serves again. [`Self::min_capacity`] cannot say, because below
+    /// the floor it reads as the capacity.
+    pub fn stated_floor(&self) -> usize {
+        self.floor
+    }
+
     /// Slots that fit between `frontier` and the span's right edge.
     ///
     /// The conversion from an address the KV side computed into the slot count
@@ -423,6 +431,24 @@ impl WeightZone {
         score: impl Fn(usize) -> K,
         displaceable: impl Fn(usize) -> bool,
     ) -> RetractPlan {
+        self.retract_within(new_capacity, self.min_capacity(), score, displaceable)
+    }
+
+    /// [`Self::retract_to`] against a floor the caller states, which may be
+    /// below the zone's own.
+    ///
+    /// **Only while nothing can be served.** The zone's floor is what a forward
+    /// needs to serve a token; a guest drain stops the engine between waves, and
+    /// for its length the weight side may hold no more than what has no copy
+    /// anywhere else. The caller grows the zone back to [`Self::stated_floor`]
+    /// before the engine forwards again.
+    pub fn retract_within<K: PartialOrd>(
+        &mut self,
+        new_capacity: usize,
+        floor: usize,
+        score: impl Fn(usize) -> K,
+        displaceable: impl Fn(usize) -> bool,
+    ) -> RetractPlan {
         // **The weight side has a floor of its own, and it had none.**
         // `MIN_ELASTIC_RESERVE` bounds how far the weight side may *grow* — it
         // protects the KV side's minimum. Nothing bounded the other direction,
@@ -440,7 +466,7 @@ impl WeightZone {
         // Conceding *less* than asked is a slowdown. Conceding everything is an
         // engine that no longer works, so the floor holds even against a caller
         // that insists.
-        let new_capacity = new_capacity.max(self.min_capacity());
+        let new_capacity = new_capacity.max(floor.min(self.capacity));
         if new_capacity >= self.capacity {
             return RetractPlan::default();
         }
@@ -644,6 +670,37 @@ mod tests {
         // be — clamped rather than refused, so a small card still loads.
         let small = WeightZone::new(END, SLOT, 64, 64, 385);
         assert_eq!(small.min_capacity(), 64);
+    }
+
+    /// **Below the floor only when the caller says so, and the floor is still
+    /// known afterwards.** `retract_within` is a guest drain's, with nothing
+    /// forwarding: it may take the zone to the floor it is given. Below its
+    /// floor the zone reads `min_capacity` as its capacity, so the figure to
+    /// grow back to is `stated_floor`.
+    #[test]
+    fn a_stated_floor_lets_a_paused_retraction_go_below_the_serving_floor() {
+        let mut z = WeightZone::new(END, SLOT, 2377, 2377, 385);
+        z.retract_within(0, 256, |_| 0.0, |_| true);
+        assert_eq!(z.capacity(), 256, "stopped at the floor it was given");
+        assert_eq!(
+            z.min_capacity(),
+            256,
+            "below the floor, it reads as the capacity"
+        );
+        assert_eq!(
+            z.stated_floor(),
+            385,
+            "the floor to grow back to is still known"
+        );
+
+        z.retract_to(0, |_| 0.0, |_| true);
+        assert_eq!(
+            z.capacity(),
+            256,
+            "an ordinary retraction takes nothing more"
+        );
+        assert_eq!(z.grow_to(385), 129);
+        assert_eq!(z.min_capacity(), 385);
     }
 
     /// **The floor applies from the moment the zone is big enough to have one.**

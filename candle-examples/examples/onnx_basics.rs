@@ -1,10 +1,12 @@
 //! ONNX model inspection and evaluation via `candle-onnx`.
 //!
-//! Two subcommands over an `.onnx` protobuf file: `print --file <p>` dumps the
-//! parsed `ModelProto` and every graph node, and `simple-eval --file <p>` builds
-//! zero-filled inputs from the graph's declared input shapes (skipping names
-//! that are graph initializers) and runs the ONNX interpreter over them.
-//! Requires the `onnx` feature.
+//! Three subcommands over an `.onnx` protobuf file: `print --file <p>` dumps the
+//! parsed `ModelProto` and every graph node, `ops --file <p>` lists the op types
+//! the graph uses with their counts and its declared inputs and outputs — what to
+//! check against the interpreter before running a new export, without printing
+//! its weights — and `simple-eval --file <p>` builds zero-filled inputs from the
+//! graph's declared input shapes (skipping names that are graph initializers) and
+//! runs the ONNX interpreter over them. Requires the `onnx` feature.
 
 use anyhow::Result;
 use candle::{Device, Tensor};
@@ -14,6 +16,10 @@ use clap::{Parser, Subcommand};
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
     Print {
+        #[arg(long)]
+        file: String,
+    },
+    Ops {
         #[arg(long)]
         file: String,
     },
@@ -39,6 +45,34 @@ pub fn main() -> Result<()> {
             let graph = model.graph.unwrap();
             for node in graph.node.iter() {
                 println!("{node:?}");
+            }
+        }
+        Command::Ops { file } => {
+            let model = candle_onnx::read_file(file)?;
+            println!(
+                "opset {:?}",
+                model
+                    .opset_import
+                    .iter()
+                    .map(|o| (o.domain.as_str(), o.version))
+                    .collect::<Vec<_>>()
+            );
+            let graph = model.graph.unwrap();
+            let weights: std::collections::HashSet<_> =
+                graph.initializer.iter().map(|i| i.name.as_str()).collect();
+            for input in graph.input.iter().filter(|i| !weights.contains(i.name.as_str())) {
+                println!("input {}: {:?}", input.name, input.r#type);
+            }
+            for output in graph.output.iter() {
+                println!("output {}: {:?}", output.name, output.r#type);
+            }
+            let mut ops = std::collections::BTreeMap::<&str, usize>::new();
+            for node in graph.node.iter() {
+                *ops.entry(node.op_type.as_str()).or_default() += 1;
+            }
+            println!("{} initializers, {} nodes", graph.initializer.len(), graph.node.len());
+            for (op, n) in ops {
+                println!("{n:6}  {op}");
             }
         }
         Command::SimpleEval { file } => {
