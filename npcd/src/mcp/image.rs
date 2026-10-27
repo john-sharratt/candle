@@ -30,7 +30,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD};
+use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD, EXACT_IN_JSON};
 use cluster::dispatch::DRAW_DEFAULT_SIDE;
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageFormat;
@@ -99,7 +99,7 @@ impl Tool for Generate {
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Width in pixels, a multiple of 16."},
                     "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": DRAW_DEFAULT_SIDE, "description": "Height in pixels, a multiple of 16."},
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps: 12 is the default and a good finish; 8 (the model's trained count) for speed. More buys finish, not variety."},
-                    "seed": {"type": "integer", "minimum": 0, "description": "Seed, for repeating a draw; random when absent."},
+                    "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "Seed, for repeating a draw; random when absent. Below 2^53, so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
                     "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back: jpeg (about a sixth of the bytes) or png (lossless)."}
                 },

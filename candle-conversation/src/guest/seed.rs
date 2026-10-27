@@ -13,6 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The seed a request will actually sample with: the caller's, or a fresh draw.
 ///
+/// **A fresh draw fits in 53 bits.** A seed is reported so it can be passed
+/// back, and it comes back as a JSON number: one above 2⁵³ is rounded on the
+/// way (12515120709136806574 returned as 12515120709136806000), and the
+/// "same seed" then draws a different picture.
+///
 /// The counter is not decoration. Windows reads the system clock at ~100 ns
 /// granularity and a drain serves its whole backlog back-to-back, so two jobs
 /// can land inside one tick and read the same nanosecond — the same repetition
@@ -25,9 +30,12 @@ pub fn resolve_seed(asked: Option<u64>) -> u64 {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x5EED);
-        now ^ DRAWS.fetch_add(1, Ordering::Relaxed).wrapping_mul(GOLDEN)
+        (now ^ DRAWS.fetch_add(1, Ordering::Relaxed).wrapping_mul(GOLDEN)) & EXACT_IN_JSON
     })
 }
+
+/// The largest integer a JSON number carries exactly: 2⁵³ − 1.
+pub const EXACT_IN_JSON: u64 = (1 << 53) - 1;
 
 /// The 64-bit golden-ratio odd constant, as used by SplitMix64.
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -90,6 +98,18 @@ mod tests {
     fn a_thousand_draws_in_a_burst_are_all_distinct() {
         let seen: HashSet<u64> = (0..1000).map(|_| resolve_seed(None)).collect();
         assert_eq!(seen.len(), 1000, "the clock repeated and nothing caught it");
+    }
+
+    /// **A fresh seed survives a JSON round trip**: it is at most 2⁵³ − 1, so
+    /// passed back as a number it names the same draw.
+    #[test]
+    fn a_fresh_seed_is_exact_as_a_json_number() {
+        for _ in 0..1000 {
+            let seed = resolve_seed(None);
+            assert!(seed <= EXACT_IN_JSON, "{seed} rounds in JSON");
+            assert_eq!(seed as f64 as u64, seed);
+        }
+        assert_eq!(EXACT_IN_JSON, 9_007_199_254_740_991);
     }
 
     /// The other half: a caller that pins a seed gets exactly it, which is what

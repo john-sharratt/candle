@@ -46,7 +46,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use candle_conversation::guest::MAX_REFERENCE_HOLD;
+use candle_conversation::guest::{EXACT_IN_JSON, MAX_REFERENCE_HOLD};
 use cluster::dispatch::image_id;
 use serde_json::{json, Value};
 use tokio::task::spawn_blocking;
@@ -99,7 +99,7 @@ impl Tool for Edit {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate, image_edit or image_upload answer gave."},
                     "mode": {"type": "string", "enum": ["prompt", "resize", "crop", "adjust", "rotate", "remove_background"], "default": "prompt", "description": "The edit: prompt (redraw by a prompt), resize, crop, adjust (brightness, contrast, saturation), rotate (and mirror), remove_background."},
                     "prompt": {"type": "string", "description": "prompt: the whole picture as it should end up, with the change in it."},
-                    "hold": {"type": "number", "minimum": 0.0, "maximum": decimal(MAX_REFERENCE_HOLD), "description": "prompt: how much of the original survives, 0.5 when absent — about 0.2 to change the subject itself (its colour, breed or clothing: \"make it a black cat\"), 0.3 for a large change to the whole (a new style, another time of day), 0.5 to add or remove a detail, 0.7 for a light touch."},
+                    "hold": {"type": "number", "minimum": 0.0, "maximum": decimal(MAX_REFERENCE_HOLD), "description": "prompt: how much of the original survives — its layout and its light and dark — 0.5 when absent: 0.7 for a light touch, 0.5 to remove a detail, 0.3 to add an object or for a large change to the whole, 0.2 to recolour the subject at the same lightness (ginger to grey), 0.05–0.08 to recolour it across light and dark (\"make it a black cat\"). Below 0.15 pass a seed, the first try's, to every try: there the seed decides the layout."},
                     "width": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: width in pixels (prompt: a multiple of 16, at most 1024); the other side follows the picture's shape when only one is given."},
                     "height": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: height in pixels, as width."},
                     "scale": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 4.0, "description": "resize: a factor of the picture's own size, in place of width and height (at most 2048 a side)."},
@@ -110,7 +110,7 @@ impl Tool for Edit {
                     "rotate": {"type": "integer", "enum": [90, 180, 270], "description": "rotate: degrees clockwise."},
                     "flip": {"type": "string", "enum": ["horizontal", "vertical"], "description": "rotate: mirror left to right, or top to bottom (after any turn)."},
                     "steps": {"type": "integer", "minimum": 1, "maximum": 100, "description": "prompt: denoise steps, as image_generate's (12 when absent)."},
-                    "seed": {"type": "integer", "minimum": 0, "description": "prompt: seed; random when absent."},
+                    "seed": {"type": "integer", "minimum": 0, "maximum": EXACT_IN_JSON, "description": "prompt: seed; random when absent. Pass the first try's to each try of a low-hold edit, below 2^53 so it comes back exact."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "prompt: the schedule's shift; the deployment's own when absent."},
                     "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back; remove_background is always a PNG, to keep its transparency."}
                 },
