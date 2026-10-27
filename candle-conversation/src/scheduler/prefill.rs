@@ -2791,6 +2791,21 @@ impl Scheduler {
             let _ = self.session.release_empty_arenas();
             self.pack_until_settled(PackGoal::Ground);
         }
+        // **The working sets of slots with nothing in flight, last.** The
+        // rungs above protect every slot's working set, which is right between
+        // forwards; a drain blocks every forward, so only a slot mid-turn still
+        // has its working set referenced. The rest reload warm→hot at their
+        // next projection, a few seconds at the link's rate against a draw
+        // that otherwise cannot run. As the weight side's concession goes
+        // below its serving floor for the drain alone.
+        let short = target.saturating_sub(free(self));
+        if short > 0 {
+            let evicted = self.evict_idle_working_sets(short);
+            if evicted.bytes > 0 {
+                let _ = self.session.release_empty_arenas();
+                self.pack_until_settled(PackGoal::Ground);
+            }
+        }
         let freed = free(self).saturating_sub(before);
         tracing::info!(
             target: "candle_conversation::scheduler::timing",
@@ -2826,6 +2841,63 @@ impl Scheduler {
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
         (keep_sections, keep_turns)
+    }
+
+    /// The working sets of the slots with a turn in flight — prefilling,
+    /// decoding, or in a creep running or paused mid-sweep — the only ones a
+    /// drain must not evict.
+    fn in_flight_keep_list(&self) -> (Vec<SectionId>, Vec<TurnKey>) {
+        let mut seqs: HashSet<SequenceId> = HashSet::new();
+        seqs.extend(self.active_prefills.iter().map(|p| p.work.sequence_id));
+        seqs.extend(self.active_decodes.keys().copied());
+        seqs.extend(
+            self.wave_prefill_members
+                .iter()
+                .map(|m| SequenceId(m.seq_id())),
+        );
+        if let Some(paused) = &self.paused_creep {
+            seqs.extend(paused.seq_ids().into_iter().map(SequenceId));
+        }
+        let slots: HashSet<SequenceId> = seqs.iter().map(|&s| self.owning_slot(s)).collect();
+        let mut keep_sections: Vec<SectionId> = Vec::new();
+        let mut keep_turns: Vec<TurnKey> = Vec::new();
+        for slot in seqs.iter().chain(slots.iter()) {
+            if let Some(st) = self.slot_projection_state.get(slot) {
+                keep_sections.extend(st.working_set.sections.iter().copied());
+                keep_turns.extend(st.working_set.turns.iter().copied());
+            }
+        }
+        (keep_sections, keep_turns)
+    }
+
+    /// Shed to warm the hot turns of every working set but those of slots with
+    /// a turn in flight ([`Self::in_flight_keep_list`]), up to `target_bytes`.
+    /// **Only inside a guest's drain**, where nothing forwards until it ends.
+    fn evict_idle_working_sets(&mut self, target_bytes: u64) -> crate::substrate::EvictionReport {
+        let (keep_sections, keep_turns) = self.in_flight_keep_list();
+        let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        let mut remaining = target_bytes;
+        for conv in self.distinct_substrates() {
+            if remaining == 0 {
+                break;
+            }
+            let r = conv
+                .write()
+                .evict_hot_for_guest(&keep_sections, &keep_turns, remaining);
+            remaining = remaining.saturating_sub(r.bytes);
+            report.count += r.count;
+            report.bytes += r.bytes;
+        }
+        if report.count > 0 {
+            tracing::info!(
+                target: "candle_conversation::guest",
+                count = report.count,
+                evicted_mib = report.bytes >> 20,
+                target_mib = target_bytes >> 20,
+                "idle working sets shed to warm for a guest"
+            );
+        }
+        report
     }
 
     /// The hot bytes across the resident conversations, by why relief
