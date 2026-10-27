@@ -1910,7 +1910,7 @@ fn served(s: &Authored, id: &str, cache: &'static str) -> Response {
 fn image_err(e: ImageError) -> Response {
     match e {
         ImageError::NotAnImage => err(StatusCode::BAD_REQUEST, "not_an_image", &e.to_string()),
-        ImageError::TooLarge(_) => err(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &e.to_string()),
+        ImageError::TooLarge(..) => err(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &e.to_string()),
         ImageError::NotFound => err(StatusCode::NOT_FOUND, "image_not_found", &e.to_string()),
         ImageError::Io(io) => {
             // The path is not in the reply: it is the estate's own shape, and a

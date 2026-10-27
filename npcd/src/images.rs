@@ -42,15 +42,21 @@ use std::path::Path;
 use candle_conversation::persistence::blob::{hex, parse_hex};
 use candle_conversation::persistence::{PersistenceError, SharedSubstrate};
 
-/// Four megabytes. A generous portrait and nowhere near a way to fill a disk
-/// one upload at a time.
-pub const MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Sixteen megabytes: room for a picture kept for a while — an edit's 2048-pixel
+/// PNG with transparency, a picture whose background was removed — retired
+/// within the day, so nowhere near a way to fill a disk.
+pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Four megabytes: a picture kept for good, a portrait — generous for one, and
+/// nowhere near a way to fill a disk one upload at a time.
+pub const MAX_KEPT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ImageError {
     /// Not one of the formats this accepts, by its own first bytes.
     NotAnImage,
-    TooLarge(usize),
+    /// Its size, and the limit it passed.
+    TooLarge(usize, usize),
     NotFound,
     Io(io::Error),
 }
@@ -62,7 +68,7 @@ impl std::fmt::Display for ImageError {
                 f,
                 "that is not a PNG, JPEG, WebP or GIF — judged by the file itself, not its name"
             ),
-            Self::TooLarge(n) => write!(f, "{n} bytes exceeds the {MAX_BYTES} byte limit"),
+            Self::TooLarge(n, max) => write!(f, "{n} bytes exceeds the {max} byte limit"),
             Self::NotFound => write!(f, "no such image"),
             Self::Io(e) => write!(f, "{e}"),
         }
@@ -167,6 +173,9 @@ impl Images {
     /// while that is stored this way — a portrait made of it — is kept from then
     /// on rather than retired (`kept`).
     pub fn put(&self, bytes: &[u8]) -> Result<String, ImageError> {
+        if bytes.len() > MAX_KEPT_BYTES {
+            return Err(ImageError::TooLarge(bytes.len(), MAX_KEPT_BYTES));
+        }
         let id = self.store(bytes)?;
         self.keep_for_good(&id)?;
         Ok(id)
@@ -175,7 +184,7 @@ impl Images {
     /// Store `bytes` as an image and give back its id.
     fn store(&self, bytes: &[u8]) -> Result<String, ImageError> {
         if bytes.len() > MAX_BYTES {
-            return Err(ImageError::TooLarge(bytes.len()));
+            return Err(ImageError::TooLarge(bytes.len(), MAX_BYTES));
         }
         let ext = sniff(bytes).ok_or(ImageError::NotAnImage)?;
         let sha256 = self.shared.put_blob(bytes.to_vec())?;
@@ -311,7 +320,10 @@ mod tests {
         let (_dir, images) = store();
         let mut huge = png();
         huge.resize(MAX_BYTES + 1, 0);
-        assert!(matches!(images.put(&huge), Err(ImageError::TooLarge(_))));
+        assert!(matches!(
+            images.put(&huge),
+            Err(ImageError::TooLarge(_, MAX_KEPT_BYTES))
+        ));
     }
 
     /// **An id arrives in a URL, so only a hash and a known format are ever

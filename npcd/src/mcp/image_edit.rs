@@ -1,8 +1,10 @@
-//! `image_edit {image, prompt, hold?, width?, height?, steps?, seed?, shift?,
-//! format?}`: change a picture by a prompt — the same draw as
-//! `image_generate` (`POST /v1/image/generate`), started from the picture.
+//! `image_edit {image, mode?, …}`: change a picture — redraw it by a prompt,
+//! resize, crop, adjust, rotate, or remove its background
+//! ([`super::edit_mode`]).
 //!
-//! The picture is the draw's **reference**: the walk starts from it rather than
+//! **`prompt`** (the default) is the same draw as `image_generate`
+//! (`POST /v1/image/generate`), started from the picture: the picture is the
+//! draw's **reference**: the walk starts from it rather than
 //! from noise, and `hold` is how much of it survives. So the prompt describes
 //! the whole picture as it should end up, not only the change, and the answer
 //! is a new picture with its own id and link — which is itself something to
@@ -10,6 +12,13 @@
 //! edit kept an hour, and the picture two edits back retired as the new one
 //! is made (`crate::images::Kept`), so the step before is always there to
 //! undo to and repeated edits do not pile up.
+//!
+//! **The other modes need no draw.** Resize, crop, adjust and rotate are
+//! pixel work done here in a moment ([`crate::image_ops`]), never queued
+//! behind a draw and never short of room on the card; remove_background is
+//! the matte guest (`POST /v1/image/cutout`), one forward, answered as a PNG
+//! with the background transparent. Every mode answers alike — a new image in
+//! the chain, its link, its lifetime.
 //!
 //! **A picture is named, never sent.** `image` takes the link or id a draw, an
 //! edit or an upload (`image_upload`) answered with, and the bytes are read
@@ -30,18 +39,25 @@
 
 use std::sync::Arc;
 
+use axum::body::to_bytes;
+use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use candle_conversation::guest::MAX_REFERENCE_HOLD;
 use cluster::dispatch::image_id;
 use serde_json::{json, Value};
+use tokio::task::spawn_blocking;
 
 use super::args::string;
-use super::image::{body, draw, format, Made, MAX_SIDE, STEPS};
+use super::edit_mode::{pixel, preview, Mode};
+use super::image::{answer, body, draw, format, Drawn, Made, MAX_SIDE};
+use super::route::refused;
 use super::{Answer, Tool};
 use crate::api::Authored;
-use crate::guest_routes::ImageBody;
+use crate::guest_routes::{post_cutout, CutoutBody, ImageBody};
+use crate::image_ops;
 use crate::images::{ImageError, Images};
 use crate::refimage;
 
@@ -62,45 +78,121 @@ impl Tool for Edit {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Edit a picture by a prompt — add or remove a detail, change the light, \
-                the colours or the style, refine a draw — on the user's own image model. `image` \
-                is the link or id image_generate, an earlier image_edit, or image_upload (for a \
-                picture of the user's own) answered with. The prompt describes the whole picture \
-                as it should end up, not only the change; `hold` is how much of the original \
-                survives. Every edit makes a new image with its own link, kept for 1 hour or \
-                until two more edits follow it; the image before stays until the new one is \
-                edited, so editing from it undoes a step. Read the guide `image` first.",
+            "description": "Edit a picture: redraw it by a prompt (add or remove a detail, change \
+                the light, the colours or the style), resize it, crop it, adjust its brightness, \
+                contrast or saturation, rotate or mirror it, or remove its background — on the \
+                user's own image model. `image` is the link or id image_generate, an earlier \
+                image_edit, or image_upload (for a picture of the user's own) answered with; \
+                `mode` picks the edit (prompt by default), and each mode takes only its own \
+                arguments. For prompt, the prompt describes the whole picture as it should end \
+                up, and `hold` is how much of the original survives. Every edit makes a new \
+                image with its own link, kept for 1 hour or until two more edits follow it; the \
+                image before stays until the new one is edited, so editing from it undoes a \
+                step. Read the guide `image` first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate, image_edit or image_upload answer gave."},
-                    "prompt": {"type": "string", "description": "The whole picture as it should end up, with the change in it."},
-                    "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "default": HOLD, "description": "How much of the original survives: about 0.3 for a large change, 0.5 to add or remove a detail, 0.7 for a light touch."},
-                    "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "description": "Width in pixels, a multiple of 16; the original's shape when absent."},
-                    "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "description": "Height in pixels, a multiple of 16; the original's shape when absent."},
-                    "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps, as image_generate's."},
-                    "seed": {"type": "integer", "minimum": 0, "description": "Seed; random when absent."},
-                    "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
-                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back."}
+                    "mode": {"type": "string", "enum": ["prompt", "resize", "crop", "adjust", "rotate", "remove_background"], "default": "prompt", "description": "The edit: prompt (redraw by a prompt), resize, crop, adjust (brightness, contrast, saturation), rotate (and mirror), remove_background."},
+                    "prompt": {"type": "string", "description": "prompt: the whole picture as it should end up, with the change in it."},
+                    "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "description": "prompt: how much of the original survives, 0.5 when absent — about 0.3 for a large change, 0.5 to add or remove a detail, 0.7 for a light touch."},
+                    "width": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: width in pixels (prompt: a multiple of 16, at most 1024); the other side follows the picture's shape when only one is given."},
+                    "height": {"type": "integer", "minimum": 1, "maximum": image_ops::MAX_SIDE, "description": "prompt or resize: height in pixels, as width."},
+                    "scale": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 4.0, "description": "resize: a factor of the picture's own size, in place of width and height (at most 2048 a side)."},
+                    "crop": {"description": "crop: an aspect cut from the centre — square, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3 — or a box {x, y, w, h} as fractions of the picture (0 to 1, from the top left).", "oneOf": [{"type": "string"}, {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}}, "required": ["x", "y", "w", "h"]}]},
+                    "brightness": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "adjust: -1 to 1, 0 unchanged (0.2 is a little brighter)."},
+                    "contrast": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "adjust: -1 (flat grey) to 1, 0 unchanged."},
+                    "saturation": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "adjust: -1 (greyscale) to 1, 0 unchanged."},
+                    "rotate": {"type": "integer", "enum": [90, 180, 270], "description": "rotate: degrees clockwise."},
+                    "flip": {"type": "string", "enum": ["horizontal", "vertical"], "description": "rotate: mirror left to right, or top to bottom (after any turn)."},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 100, "description": "prompt: denoise steps, as image_generate's (12 when absent)."},
+                    "seed": {"type": "integer", "minimum": 0, "description": "prompt: seed; random when absent."},
+                    "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "prompt: the schedule's shift; the deployment's own when absent."},
+                    "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back; remove_background is always a PNG, to keep its transparency."}
                 },
-                "required": ["image", "prompt"],
+                "required": ["image"],
                 "additionalProperties": false
             }
         })
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
+        let checked = Mode::of(args).and_then(|mode| {
+            mode.check(args)?;
+            Ok((mode, format(args)?))
+        });
+        let (mode, format) = match checked {
+            Ok(m) => m,
+            Err(e) => return Answer::error(e),
+        };
         let source = match source(s, args) {
             Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
         let from = image_id(args["image"].as_str().unwrap_or_default());
-        match edit_body(args, &source).and_then(|b| Ok((b, format(args)?))) {
-            Ok((body, format)) => draw(s, headers, body, format, Made::Edited { from }).await,
-            Err(e) => Answer::error(e),
+        let made = Made::Edited { from };
+        match mode {
+            Mode::Prompt => match edit_body(args, &source) {
+                Ok(body) => draw(s, headers, body, format, made).await,
+                Err(e) => Answer::error(e),
+            },
+            Mode::RemoveBackground => match remove_background(s, &source).await {
+                Ok(drawn) => answer(s, headers, drawn, made).await,
+                Err(e) => Answer::error(e),
+            },
+            _ => {
+                // A moment's pixel work, but a 2048-pixel resample all the
+                // same: off the async workers.
+                let args = args.clone();
+                match spawn_blocking(move || pixel(mode, &args, &source, format)).await {
+                    Ok(Ok(drawn)) => answer(s, headers, drawn, made).await,
+                    Ok(Err(e)) => Answer::error(e),
+                    Err(e) => Answer::error(format!("the edit failed: {e}")),
+                }
+            }
         }
     }
 }
+
+/// The picture with its background removed — the matte guest, through the
+/// route that serves it (`POST /v1/image/cutout`) — as a PNG, transparent where
+/// the background was.
+async fn remove_background(s: &Arc<Authored>, source: &[u8]) -> Result<Drawn, String> {
+    let body = CutoutBody {
+        png_base64: BASE64.encode(source),
+    };
+    let res = post_cutout(State(Arc::clone(s)), Json(body)).await;
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), CUTOUT_LIMIT)
+        .await
+        .map_err(|e| format!("the cutout could not be read: {e}"))?;
+    if !status.is_success() {
+        return Err(refused(status.as_u16(), &bytes));
+    }
+    let v: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("the cutout's answer: {e}"))?;
+    let png64 = v["png_base64"]
+        .as_str()
+        .ok_or("the cutout answered without a picture")?;
+    let file = BASE64
+        .decode(png64.as_bytes())
+        .map_err(|e| format!("the cutout's picture is not base64: {e}"))?;
+    let img = image::load_from_memory(&file)
+        .map_err(|e| format!("the cutout's picture could not be read: {e}"))?;
+    Ok(Drawn {
+        said: format!(
+            "Removed the background: now a {}x{} PNG, transparent where the background was.",
+            v["width"], v["height"]
+        ),
+        base64: preview(&img, &file, true)?,
+        file,
+        mime: "image/png",
+    })
+}
+
+/// The most of the cutout's answer read back: a 2048-pixel PNG with
+/// transparency, in base64, with room.
+const CUTOUT_LIMIT: usize = 48 << 20;
 
 /// The bytes of the picture `image` names.
 fn source(s: &Authored, args: &Value) -> Result<Vec<u8>, String> {
@@ -141,6 +233,17 @@ fn edit_body(args: &Value, source: &[u8]) -> Result<ImageBody, String> {
     let mut body = body(args)?;
     let given = |key: &str| args.get(key).filter(|v| !v.is_null()).is_some();
     let (given_w, given_h) = (given("width"), given("height"));
+    // The schema's sides are a resize's too; a redraw's are the draw's own.
+    for (side, given, key) in [
+        (body.width, given_w, "width"),
+        (body.height, given_h, "height"),
+    ] {
+        if given && (side < 16 || side % 16 != 0) {
+            return Err(format!(
+                "a prompt edit's `{key}` is a multiple of 16 from 16 to {MAX_SIDE}"
+            ));
+        }
+    }
     if !(given_w && given_h) {
         let (w, h) = refimage::dimensions(source)?;
         (body.width, body.height) = shaped(
@@ -256,6 +359,10 @@ mod tests {
         assert_eq!((b.width, b.height), (512, 288));
 
         assert!(edit_body(&json!({"prompt": "x", "hold": 1.0}), &pic).is_err());
+        assert!(
+            edit_body(&json!({"prompt": "x", "width": 500}), &pic).is_err(),
+            "a redraw's side is a multiple of 16"
+        );
         assert!(edit_body(&json!({"prompt": "x"}), b"not a picture").is_err());
         assert!(edit_body(&json!({"prompt": "  "}), &pic).is_err());
     }

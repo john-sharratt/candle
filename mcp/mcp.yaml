@@ -53,9 +53,10 @@ server:
     user's own image model, so use it rather than drawing one yourself in SVG,
     code or a widget. The user may not see the picture in the tool result:
     send them the file from the link the answer carries. To change a picture
-    — add or remove a detail, refine a draw, or edit a photo of the user's —
-    use image_edit, which takes the link a draw answered with; a picture of
-    the user's own goes to Zen first with image_upload.
+    — add or remove a detail, resize, crop, brighten or recolour it, rotate
+    it, remove its background, or edit a photo of the user's — use
+    image_edit, which takes the link a draw answered with; a picture of the
+    user's own goes to Zen first with image_upload.
   icon: /brand/zen.png
 
 # The MCP servers whose tools are served, each at its path on its site, by

@@ -31,8 +31,8 @@
 //! | [`image_edit`] | `image_edit` — change a picture by a prompt, answered the same way |
 //! | [`image_upload`] | `image_upload` — a link the user's own picture is sent to, for `image_edit` |
 //!
-//! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
-//! [`view`] words a mission.
+//! [`args`] reads a tool's arguments, [`route`] reads a handler's answer,
+//! [`view`] words a mission, and [`edit_mode`] is `image_edit`'s modes.
 //!
 //! `image_generate` and `image_upload` act on nothing stored, so like
 //! `bot_list` they name no subject and go to the best member. `image_edit`
@@ -58,6 +58,7 @@ pub mod args;
 pub mod cancel;
 pub mod channel_post;
 pub mod channel_read;
+pub mod edit_mode;
 pub mod give;
 pub mod image;
 pub mod image_edit;

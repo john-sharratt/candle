@@ -132,7 +132,30 @@ Two or three rounds is normal.
 
 ## Edit and refine
 
-`image_edit` changes a picture by a prompt: it draws again starting from the
+`image_edit` changes a picture; `mode` says how, and each mode takes only its
+own arguments (one it does not take is refused, naming those it does):
+
+| `mode` | For | Arguments | Example |
+|---|---|---|---|
+| `prompt` (default) | add or remove a detail, change the light, palette or style | `prompt`, `hold` | `{mode: "prompt", prompt: "…the whole picture…", hold: 0.5}` |
+| `resize` | bigger or smaller | `width` or `height` (the other follows), or `scale` | `{mode: "resize", width: 512}` |
+| `crop` | a square, a wide or tall frame, or a part | `crop`: an aspect, or a box of fractions | `{mode: "crop", crop: "16:9"}`, `{mode: "crop", crop: {x: 0, y: 0, w: 0.5, h: 1}}` |
+| `adjust` | brighter, more contrast, more or less colour | `brightness`, `contrast`, `saturation`, each −1 to 1 | `{mode: "adjust", brightness: 0.2, saturation: -0.1}` |
+| `rotate` | turn or mirror | `rotate` (90, 180, 270 clockwise), `flip` | `{mode: "rotate", rotate: 90}` |
+| `remove_background` | the subject alone | — | `{mode: "remove_background"}` → a PNG, transparent where the background was |
+
+Every mode takes `image` and `format`. Resize, crop, adjust and rotate are
+instant and never wait for room on the card; `prompt` and `remove_background`
+use the image engine. A crop box is fractions of the picture from its top
+left — `{x: 0.25, y: 0, w: 0.5, h: 1}` is the middle half — so judge it by
+looking. Put several adjustments in one `adjust` call: each edit re-encodes
+the picture.
+
+To make a small picture larger with real detail rather than smoother pixels,
+use `prompt` at the larger size with `hold` about 0.7 (up to 1024 a side);
+`resize` makes it larger without adding detail.
+
+The rest of this section is about `prompt`. It draws again starting from the
 picture instead of from noise, keeping as much of it as `hold` says. Use it
 after a draw to add or remove a detail, change the light or the palette, or
 push the finish, and when the user asks to change a photo of their own

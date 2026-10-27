@@ -99,12 +99,18 @@ pub fn conform(bytes: &[u8], width: u32, height: u32, hold: f32) -> Result<Image
 /// pixels happened to hold — usually black — which the model reads as part of
 /// the picture.
 pub fn decode(bytes: &[u8]) -> Result<RgbImage, String> {
+    Ok(over_white(decode_upright(bytes)?))
+}
+
+/// The picture `bytes` hold, turned as its camera recorded, its transparency
+/// kept — what an edit that is not a draw works on.
+pub fn decode_upright(bytes: &[u8]) -> Result<DynamicImage, String> {
     let mut decoder = decoder(bytes)?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("the picture could not be decoded: {e}"))?;
     img.apply_orientation(orientation);
-    Ok(over_white(img))
+    Ok(img)
 }
 
 /// The longest side an uploaded picture is kept at: twice the largest draw,

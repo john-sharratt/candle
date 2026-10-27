@@ -141,10 +141,21 @@ pub(super) async fn draw(
     if !status.is_success() {
         return Answer::error(refused(status.as_u16(), &bytes));
     }
-    let drawn = match outcome(&bytes, format) {
-        Ok(d) => d,
-        Err(e) => return Answer::error(e),
-    };
+    match outcome(&bytes, format) {
+        Ok(drawn) => answer(s, headers, drawn, made).await,
+        Err(e) => Answer::error(e),
+    }
+}
+
+/// Keep `drawn` — what a draw or an edit made — and answer with it: stored
+/// for as long as `made` says, handed over, the picture two edits back
+/// retired, and a link for its lifetime.
+pub(super) async fn answer(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    drawn: Drawn,
+    made: Made<'_>,
+) -> Answer {
     let now = now_ms();
     // Handed over the moment it is stored, ahead of anything that awaits, so
     // an edit of it is placed among its holders however this call ends.
@@ -190,14 +201,14 @@ async fn retire_unless_portrait(s: &Authored, id: &str) {
     }
 }
 
-/// A finished draw: what it says of itself, and the file `format` asked for —
-/// its bytes to store and its base64 for the image block.
+/// A finished picture: what it says of itself, and its file — the bytes to
+/// store and their base64 for the image block.
 #[derive(Debug)]
-struct Drawn {
-    said: String,
-    file: Vec<u8>,
-    base64: String,
-    mime: &'static str,
+pub(super) struct Drawn {
+    pub said: String,
+    pub file: Vec<u8>,
+    pub base64: String,
+    pub mime: &'static str,
 }
 
 /// The answer's text: the draw's own line, then its link and how long the
