@@ -58,6 +58,7 @@ use agent::config::AgentConfig;
 use agent::jobs::Jobs;
 use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
+use candle_conversation::guest::reach;
 use candle_conversation::phase_ring::{latest_wave, learned_rates, rates_read_every};
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, ModelId, RepoAd};
@@ -375,7 +376,14 @@ impl Cluster {
                     tokens_per_step: r.tokens_per_step,
                     high_backlog_tokens: r.high_backlog_tokens,
                 });
-                capacity(state, telemetry.capacity(), wave, rates, measure())
+                capacity(
+                    state,
+                    telemetry.capacity(),
+                    wave,
+                    rates,
+                    measure(),
+                    reach::stated(),
+                )
             }),
             replication,
             Instant::now(),

@@ -218,7 +218,7 @@ fn h6_routing_decisions_match_the_reference() {
         let pinned = matches!(dispatch, Dispatch::Ui)
             .then(|| rng.random_range(0..14u64))
             .filter(|p| *p > 0);
-        let got = registry.pick(APP, dispatch, key, pinned);
+        let got = registry.pick(APP, dispatch, None, key, pinned);
         let want = model.pick(dispatch, key, pinned);
         assert_eq!(
             got, want,

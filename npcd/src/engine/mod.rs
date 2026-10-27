@@ -127,7 +127,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use cluster::dispatch::{Dispatch, Merge};
+use cluster::dispatch::{Dispatch, Merge, Reach};
 use host::guard::{delete, get, patch, post};
 use serde_json::{json, Value};
 use web::auth::{Identity, Role, Roles};
@@ -572,12 +572,14 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Best,
             post(gen_attributes),
         )
+        // Drawn on a member whose card reaches its area (`guest::reach`).
         .route(
             "/v1/image/generate",
             Role::User,
             Dispatch::Best,
             post(gen_image),
         )
+        .reach(Reach::Draw)
         .route(
             "/v1/image/models",
             Role::User,

@@ -6,6 +6,7 @@ use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
 use crate::group_scanner::GroupScanner;
+use crate::guest::reach;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::ingest_warmer::IngestWarmer;
 use crate::models::identity::ModelKey;
@@ -394,7 +395,7 @@ impl ConversationEngine {
         // ground the card does not have. A device with no memory report (the
         // CPU) keeps the request's own per-side limit.
         if let Ok((_, card)) = session.device().mem_get_info() {
-            let side = crate::guest::reach::side_for_card(card as u64);
+            let side = reach::side_for_card(card as u64);
             guests.queue.set_reach(side);
             tracing::info!(
                 card_mib = card >> 20,
@@ -402,6 +403,8 @@ impl ConversationEngine {
                 "guest draws on this node reach {side}x{side}"
             );
         }
+        // And to the cluster, whose gateways place a draw where it is reached.
+        reach::state(guests.queue.reach());
         let guests_for_scheduler = Arc::clone(&guests);
 
         let eos_tokens = config.eos_tokens.clone();

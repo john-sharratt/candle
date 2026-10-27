@@ -138,6 +138,8 @@ pub struct MemberRow {
     pub prompt_tokens: Option<u32>,
     pub reply_tokens: Option<u32>,
     pub tokens_per_step_milli: Option<u32>,
+    /// The side of the largest square its card draws: where a draw is placed.
+    pub guest_reach: Option<u32>,
     /// Requests this gateway has handed it and it is still answering (§5.3).
     pub in_flight: u32,
     pub state: &'static str,
@@ -204,6 +206,7 @@ impl MemberRow {
             prompt_tokens: c.map(|c| c.prompt_tokens),
             reply_tokens: c.map(|c| c.reply_tokens),
             tokens_per_step_milli: c.map(|c| c.tokens_per_step_milli),
+            guest_reach: c.map(|c| c.guest_reach),
             in_flight: m.in_flight,
             state: state_name(m.state()),
             session: m.session,
@@ -318,6 +321,7 @@ mod tests {
             prompt_tokens: None,
             reply_tokens: None,
             tokens_per_step_milli: None,
+            guest_reach: None,
             in_flight: 0,
             state: "ready",
             session: 1,

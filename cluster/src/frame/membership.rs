@@ -82,6 +82,10 @@ pub struct Capacity {
     /// above 1000 where it speculates. A reply of `reply_tokens` takes that many
     /// fewer steps, which the step time alone does not say. Zero until learned.
     pub tokens_per_step_milli: u32,
+    /// The side of the largest square its card draws — a draw of up to that
+    /// many pixels in any shape (`crate::dispatch::Reach::Draw`). Zero for a
+    /// member whose engine has not stated its card, and for an agent.
+    pub guest_reach: u32,
 }
 
 /// The rows beyond its decodes at which a member states its wide figures
@@ -112,7 +116,8 @@ impl Capacity {
             .u32(self.prefill_tok_s_wide)
             .u32(self.prompt_tokens)
             .u32(self.reply_tokens)
-            .u32(self.tokens_per_step_milli);
+            .u32(self.tokens_per_step_milli)
+            .u32(self.guest_reach);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -138,6 +143,7 @@ impl Capacity {
             prompt_tokens: r.u32()?,
             reply_tokens: r.u32()?,
             tokens_per_step_milli: r.u32()?,
+            guest_reach: r.u32()?,
         })
     }
 

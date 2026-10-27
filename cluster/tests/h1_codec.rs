@@ -72,6 +72,7 @@ fn mix() -> Vec<Frame> {
             prompt_tokens: 2_700,
             reply_tokens: 380,
             tokens_per_step_milli: 1_000,
+            guest_reach: 1024,
         }),
         Frame::Prepare(Prepare {
             key: b"world/w1".to_vec(),

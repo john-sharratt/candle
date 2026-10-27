@@ -705,7 +705,10 @@ fn every_cuda_cast_pair_matches_the_cpu() -> Result<()> {
             }
         }
     }
-    assert!(wrong.is_empty(), "casts that disagree with the host: {wrong:#?}");
+    assert!(
+        wrong.is_empty(),
+        "casts that disagree with the host: {wrong:#?}"
+    );
     Ok(())
 }
 

@@ -1136,6 +1136,7 @@ impl Hub {
         self: &Arc<Self>,
         app: &str,
         dispatch: &Dispatch,
+        draw: Option<u64>,
         key: Option<&str>,
         pinned: Option<u64>,
     ) -> Picked {
@@ -1155,11 +1156,11 @@ impl Hub {
         }
         let pick = match upgrades.canary(app) {
             Some(candidate) => {
-                registry.pick_canary(app, dispatch, key, pinned, candidate, &mut || {
+                registry.pick_canary(app, dispatch, draw, key, pinned, candidate, &mut || {
                     upgrades.take_share(app)
                 })
             }
-            None => registry.pick(app, dispatch, key, pinned),
+            None => registry.pick(app, dispatch, draw, key, pinned),
         };
         let work = matches!(
             dispatch,

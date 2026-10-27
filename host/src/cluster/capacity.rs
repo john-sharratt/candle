@@ -14,6 +14,8 @@
 //!   a burst of them cost it —
 //!   the gateway places a turn where it would finish soonest
 //!   (`docs/cooperative_admission.md` §2.1); zero until it has learned them.
+//! - **`guest_reach`** is the side of the largest square its card draws, as
+//!   its engine stated it: a gateway places a draw only where it is reached.
 
 use cluster::frame::{Capacity, MemberState};
 use cluster::machine::Machine;
@@ -82,6 +84,7 @@ pub fn capacity(
     wave: Option<Wave>,
     rates: Option<Rates>,
     machine: Machine,
+    guest_reach: u32,
 ) -> Capacity {
     // What the scheduler learned stands while it is quiet: a rate is the
     // card's, not the window's. Only a rate it has actually measured is said.
@@ -145,6 +148,7 @@ pub fn capacity(
         prompt_tokens: rates.map_or(0, |r| tokens(r.prompt_tokens)),
         reply_tokens: rates.map_or(0, |r| tokens(r.reply_tokens)),
         tokens_per_step_milli: rates.map_or(0, |r| tokens(r.tokens_per_step * 1000.0)),
+        guest_reach,
     }
 }
 
@@ -208,12 +212,29 @@ mod tests {
     /// 100 before.
     #[test]
     fn power_is_the_peak_decode_rate_or_the_card() {
-        let c = capacity(MemberState::Ready, card(Some(171.6)), None, None, machine());
+        let c = capacity(
+            MemberState::Ready,
+            card(Some(171.6)),
+            None,
+            None,
+            machine(),
+            0,
+        );
         assert_eq!(c.power, 172);
-        let c = capacity(MemberState::Loading, card(None), None, None, machine());
+        let c = capacity(MemberState::Loading, card(None), None, None, machine(), 0);
         assert_eq!((c.power, c.state), (737, MemberState::Loading));
         assert_eq!((c.vram_free_mib, c.cores, c.load_milli), (4_096, 16, 1_250));
         assert_eq!((c.os.as_str(), c.mem_free_mib), ("linux", 20_000));
+    }
+
+    /// **What its card draws is said as its engine stated it**, and nothing
+    /// before the engine has.
+    #[test]
+    fn the_reach_is_said_as_the_engine_stated_it() {
+        let c = capacity(MemberState::Ready, card(None), None, None, machine(), 2048);
+        assert_eq!(c.guest_reach, 2048);
+        let c = capacity(MemberState::Loading, card(None), None, None, machine(), 0);
+        assert_eq!(c.guest_reach, 0);
     }
 
     /// A recent wave with a backlog or a full budget is not idle; one with
@@ -223,7 +244,7 @@ mod tests {
     /// decides idleness, never the backlog a placed turn is said to wait on.
     #[test]
     fn idle_reads_the_newest_wave() {
-        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), None, machine());
+        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), None, machine(), 0);
         let busy = at(wave(1.0, 3, 8_000));
         assert_eq!(
             (busy.idle, busy.prefill_backlog, busy.decodes),
@@ -240,7 +261,7 @@ mod tests {
             (quiet.idle, quiet.decodes, quiet.prefill_backlog),
             (true, 0, 0)
         );
-        let never = capacity(MemberState::Ready, card(None), None, None, machine());
+        let never = capacity(MemberState::Ready, card(None), None, None, machine(), 0);
         assert_eq!((never.idle, never.slots_free), (true, 0));
     }
 
@@ -268,6 +289,7 @@ mod tests {
             Some(wave(1.0, 91_818, 0)),
             Some(learned),
             machine(),
+            0,
         );
         assert_eq!(
             (c.prefill_tok_s, c.decode_step_next_us, c.prefill_backlog),
@@ -289,6 +311,7 @@ mod tests {
                 ..learned
             }),
             machine(),
+            0,
         );
         assert_eq!(
             (flat.decode_step_next_us, flat.decode_step_wide_us),
@@ -298,7 +321,7 @@ mod tests {
             (flat.prefill_tok_s, flat.prefill_tok_s_wide),
             (2_303, 2_303)
         );
-        let none = capacity(MemberState::Ready, card(None), None, None, machine());
+        let none = capacity(MemberState::Ready, card(None), None, None, machine(), 0);
         assert_eq!(
             (
                 none.prefill_tok_s,
@@ -324,6 +347,7 @@ mod tests {
             None,
             Some(unmeasured),
             machine(),
+            0,
         );
         assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (0, 0));
     }

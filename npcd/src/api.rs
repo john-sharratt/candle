@@ -26,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
+use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror, Reach};
 use host::guard::{delete, get, post, put};
 use mcp_server::http as mcp_http;
 use mcp_server::origin;
@@ -446,12 +446,14 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Aggregate(Merge::Envelope),
             get(guest_routes::get_guests),
         )
+        // Drawn on a member whose card reaches its area (`guest::reach`).
         .route(
             "/v1/guest/image",
             Role::Admin,
             Dispatch::Best,
             post(guest_routes::post_image),
         )
+        .reach(Reach::Draw)
         .route(
             "/v1/generate/prose",
             Role::Admin,
@@ -597,7 +599,8 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // starts a sign-in. A tool call goes to the member holding the
         // character or world it acts on, as the route for the same act would.
         // Under npcd's own prefix: zend serves `/v1/mcp`, and one host may
-        // carry both tenants, whose routes must not meet.
+        // carry both tenants, whose routes must not meet. A call that draws
+        // goes to a member whose card reaches its area.
         .route(
             "/v1/npc/mcp",
             Role::Unauthenticated,
@@ -606,6 +609,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
                 .get(mcp_http::get)
                 .delete(mcp_http::delete::<Authored>),
         )
+        .reach(Reach::Draw)
         // Backup and restore the whole cast, for a substrate wipe-and-rebuild.
         // Admin-only: export carries every character's record regardless of
         // owner, and import writes them verbatim into a fresh substrate.
