@@ -58,12 +58,39 @@ fn birefnet_hr_matting_fp16_costs_this_much() {
 #[test]
 #[ignore = "loads BiRefNet general fp16 (0.49 GB) and runs one forward on the card; needs it to itself"]
 fn birefnet_general_fp16_costs_this_much() {
-    measure(home().join(".cache/zend/models/onnx-community--BiRefNet-ONNX/model_fp16.onnx"));
+    measure(general());
+}
+
+/// **In a guest heap, the forward leaves the pool alone.** The matte guest's
+/// shape: the activations' heap open over ground, the input seeded into it,
+/// and the forward run under the guest's ambient seed so every chain — the
+/// graph's constants and sampling grids as well as the input's — carves there.
+/// Without the seed, 36 GB of a 1024² forward's allocations missed the heap and
+/// a busy card's pool could not hold them (WhiteWorld, 2026-10-27).
+#[test]
+#[ignore = "loads BiRefNet general fp16 and runs one forward in a 5 GiB guest heap; needs the card to itself"]
+fn birefnet_general_in_a_guest_heap_leaves_the_pool_alone() {
+    let escaped = measure_in(general(), Some(5 << 30));
+    assert!(
+        escaped < 256 << 20,
+        "{} MiB of the forward still came from the pool",
+        escaped >> 20
+    );
+}
+
+fn general() -> PathBuf {
+    home().join(".cache/zend/models/onnx-community--BiRefNet-ONNX/model_fp16.onnx")
 }
 
 /// One forward of the graph at `path`: its weights, wall time, activation
 /// peak and output range.
 fn measure(path: PathBuf) {
+    measure_in(path, None);
+}
+
+/// [`measure`], optionally with the activations' heap open over `heap` bytes
+/// as the matte guest runs it. Returns what the pool grew by over the forward.
+fn measure_in(path: PathBuf, heap: Option<usize>) -> usize {
     assert!(path.exists(), "the checkpoint is not at {path:?}");
     let device = Device::new_cuda(0).unwrap();
     let cuda = device.as_cuda_device().unwrap();
@@ -139,14 +166,49 @@ fn measure(path: PathBuf) {
         .unwrap()
         .to_dtype(declared)
         .unwrap();
+
+    // The heap's ground is one pool allocation made before the measurement,
+    // so whatever the pool grows by during the forward escaped the heap.
+    let stream = cuda.cuda_stream();
+    let ground = heap.map(|bytes| {
+        let g = stream.alloc_zeros::<u8>(bytes).unwrap();
+        let base = {
+            use candle::cuda_backend::cudarc::driver::DevicePtr;
+            g.device_ptr(&stream).0
+        };
+        candle_nn::kv_cache::open_guest_heap(&stream, &[(base, bytes)]);
+        g
+    });
+    let image = if heap.is_some() {
+        candle_conversation::guest::varground::into_arena(&image, &device).unwrap()
+    } else {
+        image
+    };
     values.insert(input.name.clone(), image);
+    device.synchronize().unwrap();
+    let before = cuda.pool_used_bytes().unwrap();
 
     cuda.reset_pool_used_peak().unwrap();
     let t = Instant::now();
-    let out = candle_onnx::simple_eval_on(&model, values, &device).unwrap();
+    let seed =
+        candle::cuda_backend::wave_provenance::WaveTicket::guest(stream.context().ordinal() as u32);
+    let out = match heap {
+        Some(_) => candle::cuda_backend::wave_provenance::with_ambient(seed, || {
+            candle_onnx::simple_eval_on(&model, values, &device)
+        })
+        .unwrap(),
+        None => candle_onnx::simple_eval_on(&model, values, &device).unwrap(),
+    };
     device.synchronize().unwrap();
     let secs = t.elapsed().as_secs_f64();
     let peak = cuda.pool_used_peak_bytes().unwrap();
+    let escaped = peak.saturating_sub(before) as usize;
+    if heap.is_some() {
+        println!(
+            "pool grew {} MiB over the forward, outside the heap",
+            escaped >> 20
+        );
+    }
 
     let o = out[&output]
         .flatten_all()
@@ -165,4 +227,17 @@ fn measure(path: PathBuf) {
         if lo >= 0.0 && hi <= 1.0 { "a probability" } else { "logits" },
     );
     assert_eq!(out[&output].dims(), &[1, 1, side, side]);
+    drop((o, out));
+    if let Some(g) = ground {
+        if let Some(s) = candle_nn::kv_cache::close_guest_heap(&stream) {
+            println!(
+                "heap {} MiB, peak {} MiB, {} carves",
+                s.capacity >> 20,
+                s.peak >> 20,
+                s.carves
+            );
+        }
+        drop(g);
+    }
+    escaped
 }

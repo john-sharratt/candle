@@ -299,15 +299,16 @@ impl Family {
     ///   and a U-shaped decoder holds several live across a skip connection;
     ///   at one kilobyte IS-Net at 1024² ran its 1 GiB heap out, and at two
     ///   it peaks at 1,917 of 2,056 MiB (WhiteWorld, 2026-10-27).
-    /// - **BiRefNet: four and a half.** The general export at 1024² peaked at
-    ///   4,103 MiB of activations (4.0 KiB a pixel, its Swin encoder's
-    ///   attention and the deformable decoder's sampling grids), the HR
-    ///   export at 2048² at 8,237 MiB (2.0 KiB). The larger is claimed, with
-    ///   an eighth over it.
+    /// - **BiRefNet: five.** The general export at 1024² peaked at 4,103 MiB
+    ///   from the pool (its Swin encoder's attention and the deformable
+    ///   decoder's sampling grids) but at 4,866 MiB in the guest heap, whose
+    ///   first-fit leaves gaps the pool's size classes do not — and the heap
+    ///   is what it runs in. The HR export at 2048² peaked at 8,237 MiB from
+    ///   the pool (2.0 KiB a pixel). The larger is claimed, with room over it.
     fn headroom_per_pixel(self) -> usize {
         match self {
             Self::IsNet | Self::U2Net => 2048,
-            Self::BiRefNet => 4608,
+            Self::BiRefNet => 5120,
         }
     }
 }
@@ -502,7 +503,23 @@ impl Loaded {
         // parse its own copy onto the host and move it to the pool.
         let mut values = self.weights.clone();
         values.insert(self.input.clone(), input);
-        let outputs = candle_onnx::simple_eval_on(&self.graph, values, &self.device)?;
+        // **Every chain in the graph carves from the heap, not only the
+        // input's.** A graph has many roots — constants, shapes, the sampling
+        // grids BiRefNet's decoder builds from them — and an op reading only
+        // those has no ticket to inherit; at 1024² that was 36 GB of pool
+        // allocations and an out-of-memory on every busy-card cutout. The drain
+        // owns the stream, so here "no ticket" can only mean this guest's.
+        let outputs = match &self.device {
+            Device::Cuda(cuda) => {
+                let seed = candle::cuda_backend::wave_provenance::WaveTicket::guest(
+                    cuda.cuda_stream().context().ordinal() as u32,
+                );
+                candle::cuda_backend::wave_provenance::with_ambient(seed, || {
+                    candle_onnx::simple_eval_on(&self.graph, values, &self.device)
+                })?
+            }
+            _ => candle_onnx::simple_eval_on(&self.graph, values, &self.device)?,
+        };
         let out = outputs.get(&self.output).ok_or_else(|| {
             candle::Error::Msg(format!(
                 "matte: the graph did not produce `{}`",
@@ -922,8 +939,8 @@ mod tests {
             4 * activation_headroom(512, isnet),
             "the claim must follow the area, not the side"
         );
-        // BiRefNet's measured 4,103 MiB at 1024² fits under its claim.
+        // BiRefNet's measured heap peak at 1024², 4,866 MiB, fits under its claim.
         let birefnet = activation_headroom(1024, Family::BiRefNet);
-        assert!(birefnet >= 4103 << 20, "{} MiB", birefnet >> 20);
+        assert!(birefnet >= 4866 << 20, "{} MiB", birefnet >> 20);
     }
 }
