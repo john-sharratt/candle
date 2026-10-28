@@ -172,14 +172,6 @@ roles_file: "../host/roles.yaml"
 #     client_id: "REPLACE-ME.apps.googleusercontent.com"
 #     client_secret_file: "secrets/google.secret"
 #     redirect_uri: "https://tokera.com/auth/callback"
-#   # optional: /mcp clients that take a fixed client id (Claude needs none —
-#   # it names its own metadata document). secret_sha256 is the hex SHA-256 of
-#   # the secret the client holds; leave it out for a PKCE-only client.
-#   mcp_clients:
-#     - id: "zen-grok-REPLACE-ME"
-#       name: "Grok"
-#       redirect_uris: ["https://grok.com/connectors-oauth-exchange-code/"]
-#       secret_sha256: "REPLACE-ME"
 #   YAML
 
 # ── the cluster (docs/replicated_substrate.md) ──────────────────────────────

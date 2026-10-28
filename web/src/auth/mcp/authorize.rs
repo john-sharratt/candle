@@ -5,10 +5,9 @@
 //!    user is — the gateway's own session cookie. Nobody signed in is sent to
 //!    `/auth/login`, which brings them back here.
 //! 2. For a signed-in user only, the client's metadata document is fetched
-//!    (`super::client`, fenced to public hosts) — or, for a client registered
-//!    in the config, read from there (`super::registered`) — and the redirect
-//!    matched against it. None of that redirects anywhere, since a redirect
-//!    not yet checked is not one to send a browser to.
+//!    (`super::client`, fenced to public hosts) and the redirect matched
+//!    against it — none of that redirects anywhere, since a redirect not yet
+//!    checked is not one to send a browser to.
 //! 3. **The user is asked.** A client document is anyone's to write, so a code
 //!    is never issued unasked: a link to this endpoint naming an attacker's
 //!    client would otherwise hand a signed-in user's code to the attacker. The
@@ -27,10 +26,8 @@ use super::grants::{
     self, Code, Consent, Grant, Kind, CODE_TTL_SECS, CONSENT_TTL_SECS, REFRESH_TTL_SECS,
 };
 use super::page::respond;
-use super::registered;
 use crate::auth::oidc::urlencode;
 use crate::auth::session::{Identity, Key};
-use crate::config::McpClient;
 use crate::html::escape;
 
 /// A client's authorization request, checked.
@@ -44,20 +41,13 @@ pub struct Request {
 }
 
 /// Check `query` as a request for `resource` — the `/mcp` this origin serves.
-/// A client id is one of `clients`, or a URL naming a metadata document.
-pub fn parse(
-    query: &HashMap<String, String>,
-    resource: &str,
-    clients: &[McpClient],
-) -> Result<Request, String> {
+pub fn parse(query: &HashMap<String, String>, resource: &str) -> Result<Request, String> {
     let get = |k: &str| query.get(k).map(String::as_str).filter(|v| !v.is_empty());
     if get("response_type") != Some("code") {
         return Err("`response_type` must be `code`".into());
     }
     let client_id = get("client_id").ok_or("`client_id` is missing")?;
-    if registered::find(clients, client_id).is_none() {
-        client::check_id(client_id)?;
-    }
+    client::check_id(client_id)?;
     let redirect_uri = get("redirect_uri").ok_or("`redirect_uri` is missing")?;
     let challenge = get("code_challenge").ok_or("`code_challenge` is missing: PKCE is required")?;
     if get("code_challenge_method") != Some("S256") {
@@ -175,14 +165,13 @@ fn see_other(location: &str) -> Response {
 /// `identity`.
 pub async fn ask(
     key: &Key,
-    clients: &[McpClient],
     identity: Option<Identity>,
     path_and_query: &str,
     query: &HashMap<String, String>,
     resource: &str,
     now: u64,
 ) -> Response {
-    let req = match parse(query, resource, clients) {
+    let req = match parse(query, resource) {
         Ok(req) => req,
         Err(why) => return page(StatusCode::BAD_REQUEST, &why),
     };
@@ -191,18 +180,15 @@ pub async fn ask(
     let Some(identity) = identity else {
         return see_other(&format!("/auth/login?next={}", urlencode(path_and_query)));
     };
-    let doc: ClientDoc = match registered::find(clients, &req.client_id) {
-        Some(c) => registered::doc(c),
-        None => match client::fetch(&req.client_id).await {
-            Ok(doc) => doc,
-            Err(why) => return page(StatusCode::BAD_REQUEST, &why),
-        },
+    let doc: ClientDoc = match client::fetch(&req.client_id).await {
+        Ok(doc) => doc,
+        Err(why) => return page(StatusCode::BAD_REQUEST, &why),
     };
     if !client::allows_redirect(&doc, &req.redirect_uri) {
         return page(
             StatusCode::BAD_REQUEST,
             &format!(
-                "`{}` is not one of the redirects this client may be sent to",
+                "the client's document does not list `{}` as one of its redirects",
                 req.redirect_uri
             ),
         );
@@ -282,7 +268,6 @@ mod tests {
     use super::*;
     use crate::auth::mcp::grants::testing::{grant, key};
     use crate::auth::mcp::page::PAGE_POLICY;
-    use crate::auth::mcp::registered::testing::{grok, GROK_ID, GROK_REDIRECT};
 
     const RESOURCE: &str = "https://code.tokera.com/mcp";
 
@@ -310,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_good_request_reads_and_each_missing_piece_is_named() {
-        let req = parse(&query(&good()), RESOURCE, &[]).unwrap();
+        let req = parse(&query(&good()), RESOURCE).unwrap();
         assert_eq!(req.state.as_deref(), Some("xyz"));
         for (drop, why) in [
             ("response_type", "response_type"),
@@ -320,68 +305,13 @@ mod tests {
             ("code_challenge_method", "S256"),
         ] {
             let q: Vec<_> = good().into_iter().filter(|(k, _)| *k != drop).collect();
-            let err = parse(&query(&q), RESOURCE, &[]).unwrap_err();
+            let err = parse(&query(&q), RESOURCE).unwrap_err();
             assert!(err.contains(why), "{drop}: {err}");
         }
         let mut other = good();
         other.retain(|(k, _)| *k != "resource");
         other.push(("resource", "https://evil.example/mcp"));
-        assert!(parse(&query(&other), RESOURCE, &[]).is_err());
-    }
-
-    fn grok_request(redirect: &'static str) -> Vec<(&'static str, &'static str)> {
-        let mut q = good();
-        q.retain(|(k, _)| *k != "client_id" && *k != "redirect_uri");
-        q.push(("client_id", GROK_ID));
-        q.push(("redirect_uri", redirect));
-        q
-    }
-
-    /// **A registered client's plain id reads; an unregistered one does not**,
-    /// since a plain id names no document to fetch.
-    #[test]
-    fn a_plain_client_id_reads_only_when_registered() {
-        let q = query(&grok_request(GROK_REDIRECT));
-        assert_eq!(parse(&q, RESOURCE, &[grok()]).unwrap().client_id, GROK_ID);
-        let err = parse(&q, RESOURCE, &[]).unwrap_err();
-        assert!(err.contains("not a URL"), "{err}");
-    }
-
-    /// **A registered client is asked about with its own name, and sent only
-    /// to a redirect it is registered for** — read from the config, with no
-    /// document fetched.
-    #[tokio::test]
-    async fn a_registered_client_is_asked_about_by_name_at_its_redirects_only() {
-        let who = grant().identity(u64::MAX);
-        let res = ask(
-            &key(),
-            &[grok()],
-            Some(who.clone()),
-            "/oauth/authorize",
-            &query(&grok_request(GROK_REDIRECT)),
-            RESOURCE,
-            100,
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains(r#"<span class="client">Grok</span>"#));
-        assert!(html.contains("<code>grok.com</code>"));
-
-        let res = ask(
-            &key(),
-            &[grok()],
-            Some(who),
-            "/oauth/authorize",
-            &query(&grok_request("https://evil.example/cb")),
-            RESOURCE,
-            100,
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(parse(&query(&other), RESOURCE).is_err());
     }
 
     #[test]
