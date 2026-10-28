@@ -36,7 +36,9 @@ use serde::Serialize;
 
 use super::turn_status::{turn_in, TurnStatus};
 use super::Scheduler;
-use crate::projection::{Builder, GroupId, Schema, Substrate, SubstrateRead, SubstrateRef};
+use crate::projection::{
+    Builder, GroupId, Reserved, Schema, Substrate, SubstrateRead, SubstrateRef,
+};
 use crate::provenance::gallery_arena::{HolderKind, ResidentRun};
 use crate::provenance::GalleryArena;
 
@@ -45,6 +47,19 @@ pub const CENSUS_EVERY: Duration = Duration::from_secs(60);
 
 /// A substrate's groups by id: each one's layer and group name.
 pub type GroupNames = HashMap<GroupId, (String, String)>;
+
+/// The engine's reserved groups, named by their kind. A reserved conversation
+/// projects under a synthetic schema whose one layer and group are called
+/// `dialogue` / `primary_conversation` whatever the kind, so named from its
+/// builder every calibration question reads as a dialogue turn.
+const RESERVED_GROUPS: [(Reserved, &str); 6] = [
+    (Reserved::Titler, "titler"),
+    (Reserved::ToolSummary, "tool_summary"),
+    (Reserved::ToolSummaryRestricted, "tool_summary_restricted"),
+    (Reserved::Calibration, "calibration"),
+    (Reserved::Prose, "prose"),
+    (Reserved::Passthrough, "passthrough"),
+];
 
 /// The census as it stood when last taken.
 pub struct CensusCache {
@@ -307,15 +322,20 @@ impl Scheduler {
     }
 
     /// The group names of every builder captured for one of `substrate`'s
-    /// timelines.
+    /// timelines, the reserved groups named by their kind first.
     fn group_names_of(&self, substrate: &Substrate) -> GroupNames {
         let mut seen: HashSet<*const Builder> = HashSet::new();
         group_names(
-            self.timeline_projections
+            RESERVED_GROUPS
                 .iter()
-                .filter(|(tl, _)| substrate.custom_of(**tl).is_some())
-                .filter(|(_, b)| seen.insert(Arc::as_ptr(b)))
-                .flat_map(|(_, b)| schema_groups(b.schema())),
+                .map(|&(kind, name)| (GroupId::reserved(kind), name, name))
+                .chain(
+                    self.timeline_projections
+                        .iter()
+                        .filter(|(tl, _)| substrate.custom_of(**tl).is_some())
+                        .filter(|(_, b)| seen.insert(Arc::as_ptr(b)))
+                        .flat_map(|(_, b)| schema_groups(b.schema())),
+                ),
         )
     }
 
