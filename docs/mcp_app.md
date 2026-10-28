@@ -310,6 +310,20 @@ upstream; with BlackWorld's process down too, `/mcp` answers that it is
 down. A member back joins and takes its share at once, since it loads
 nothing.
 
+Measured on 2026-10-28, each case from claude.ai:
+
+| Case | What the client saw |
+|---|---|
+| Both members up | Calls dealt to each in turn |
+| One member stopped | Every call served by the other, none failed |
+| A member killed mid-draw | That call failed — "MCP server connection lost" — and the next, 4 s later, was served by the other |
+| Both stopped | `503 upstream_unavailable`, then `upstream_backoff`, each with "may be restarting or briefly offline" |
+| One started again | Joined at once and served within ~6 s; the first call after succeeded |
+
+A call lost with its member does not cancel the work behind it: the killed
+draw ran to the end in npcd and its picture was stored, with no answer to
+carry its link.
+
 **Why not AlienWorld.** It ran there first, on a laptop on Wi-Fi, and every
 MCP answer crossed that LAN leg twice: the backend's answer into the
 aggregator, then the aggregator's answer back to the gateway. On 2026-10-27
