@@ -13,7 +13,7 @@ use axum::routing::post;
 use axum::Router;
 use mcp_server::http::{self, SESSION_HEADER, VERSION_HEADER};
 use mcp_server::protocol::{text_result, MODERN};
-use mcp_server::{Call, Identity, LocalStore, Server, Store};
+use mcp_server::{Call, Identity, LocalStore, NoCaller, Server, Store};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
@@ -38,11 +38,12 @@ impl Server for Stand {
         &self.identity
     }
 
-    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Option<String> {
+    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Result<String, NoCaller> {
         headers
             .get("x-who")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
+            .ok_or(NoCaller::SignedOut)
     }
 
     fn owner(&self, caller: &String) -> String {

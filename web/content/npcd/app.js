@@ -115,7 +115,8 @@ definePage({ path: '/logs', role: 'user', nav: { section: 'main', order: 70, lab
 // same nav entry.
 definePage({ path: '/system', role: 'user', under: '/performance',
   load: () => import('./pages/system.js') });
-definePage({ path: '/me', role: 'user', load: () => import('./pages/profile.js') });
+// A guest's own account is the one thing a guest owns (`docs/guest_access.md` §3).
+definePage({ path: '/me', role: 'guest', load: () => import('./pages/profile.js') });
 // The signed-out landing page. Necessarily reachable by nobody in particular.
 definePage({ path: '/welcome', role: 'unauthenticated', load: () => import('./pages/landing.js') });
 

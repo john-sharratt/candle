@@ -7,8 +7,9 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
-use mcp_server::{Call, Identity, Server, Store};
+use mcp_server::{Call, Identity, NoCaller, Server, Store};
 use serde_json::Value;
+use web::auth::Role;
 
 use super::caller::Caller;
 use super::state::RecordStore;
@@ -39,6 +40,10 @@ name is branding from Tokera's game Battle Cities; the tools are ordinary engine
 /// brand folder.
 pub const ICON_PATH: &str = "/brand/zen.png";
 
+/// What a guest — signed in, not on the role table — is told.
+const NOT_LISTED: &str =
+    "this account is not on the list of people who may use Zen; ask the estate's owner to add it";
+
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "zen".into(),
     title: "Zen".into(),
@@ -56,10 +61,16 @@ impl Server for ZendSession {
         &IDENTITY
     }
 
-    /// Whoever the gateway names: this member believes the identity headers
-    /// only from the gateways it trusts.
-    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Option<Caller> {
-        Caller::of(headers, self.roles())
+    /// Whoever the gateway names, if the role table names them too: this
+    /// member believes the identity headers only from the gateways it trusts,
+    /// and a guest — signed in, not listed — is refused, not challenged to
+    /// sign in again (`docs/guest_access.md` §6).
+    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Result<Caller, NoCaller> {
+        let caller = Caller::of(headers, self.roles()).ok_or(NoCaller::SignedOut)?;
+        if !caller.role.at_least(Role::User) {
+            return Err(NoCaller::NotAllowed(NOT_LISTED.into()));
+        }
+        Ok(caller)
     }
 
     fn owner(&self, caller: &Caller) -> String {

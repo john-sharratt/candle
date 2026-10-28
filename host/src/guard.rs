@@ -424,7 +424,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn roles() -> Roles {
-        serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap()
+        serde_yaml::from_str(
+            "people:\n  - sub: boss\n    role: admin\n  - sub: friend\n    role: user\n",
+        )
+        .unwrap()
     }
 
     fn app(min: Role) -> Router {
@@ -458,8 +461,17 @@ mod tests {
             StatusCode::OK
         );
 
+        assert_eq!(call(Role::Guest, None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(Role::Guest, Some("nobody")).await, StatusCode::OK);
+
+        // Signed in is not on the table: a stranger is a guest, and a `User`
+        // route is the table's people's.
         assert_eq!(call(Role::User, None).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call(Role::User, Some("nobody")).await, StatusCode::OK);
+        assert_eq!(
+            call(Role::User, Some("nobody")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(call(Role::User, Some("friend")).await, StatusCode::OK);
         assert_eq!(call(Role::User, Some("boss")).await, StatusCode::OK);
 
         assert_eq!(call(Role::Admin, None).await, StatusCode::UNAUTHORIZED);

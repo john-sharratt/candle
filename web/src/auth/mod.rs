@@ -47,7 +47,7 @@ pub mod role;
 pub mod session;
 
 pub use gateways::Gateways;
-pub use role::{Principal, Role, Roles};
+pub use role::{Person, Principal, Role, Roles};
 pub use session::Identity;
 
 use crate::config::Auth as AuthConfig;
@@ -348,7 +348,12 @@ async fn callback(
         auth.secure,
     );
 
-    tracing::info!(sub = %identity.sub, email = %identity.email, "signed in");
+    tracing::info!(
+        sub = %identity.sub,
+        email = %identity.email,
+        role = %auth.roles.of(Some(&identity)),
+        "signed in"
+    );
     see_other(&pending.next, &[jar, drop_pending])
 }
 
@@ -451,11 +456,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = Arc::new(auth(
             dir.path(),
-            "admins: [{ email: a@x.com }]\ncreators: [{ email: c@x.com }]\n",
+            "people:\n\
+             \x20 - { email: a@x.com, role: admin }\n\
+             \x20 - { email: c@x.com, role: creator }\n\
+             \x20 - { email: u@x.com, role: user }\n",
         ));
         assert_eq!(me_as(auth.clone(), "a@x.com").await["role"], "admin");
         assert_eq!(me_as(auth.clone(), "c@x.com").await["role"], "creator");
         assert_eq!(me_as(auth.clone(), "u@x.com").await["role"], "user");
+        assert_eq!(me_as(auth.clone(), "g@x.com").await["role"], "guest");
         let anon = me(State(auth), HeaderMap::new()).await;
         let anon: Value =
             serde_json::from_slice(&to_bytes(anon.into_body(), 1 << 16).await.unwrap()).unwrap();

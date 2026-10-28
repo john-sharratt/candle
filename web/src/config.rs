@@ -1248,13 +1248,17 @@ google:
         assert_eq!(shipped, include_str!("../../host/roles.yaml"));
 
         let dir = tmpdir();
-        std::fs::write(dir.join("roles.yaml"), "admins:\n  - email: a@x.com\n").unwrap();
+        std::fs::write(
+            dir.join("roles.yaml"),
+            "people:\n  - email: a@x.com\n    role: admin\n",
+        )
+        .unwrap();
         let y = format!(
             "roles_file: \"roles.yaml\"\n{}",
             YAML.trim_start_matches('\n')
         );
         let c = Config::from_yaml(&y, &dir).unwrap();
-        assert_eq!(c.roles.admins.len(), 1);
+        assert!(!c.roles.names_no_admin(), "the table's admin was read");
         assert_eq!(c.roles_file.unwrap(), dir.join("roles.yaml"));
 
         let missing = format!(
@@ -1266,7 +1270,7 @@ google:
             "a named table must exist"
         );
         assert!(
-            Config::from_yaml(&format!("roles:\n  admins: []\n{YAML}"), &dir).is_err(),
+            Config::from_yaml(&format!("roles:\n  people: []\n{YAML}"), &dir).is_err(),
             "an inline table is not read"
         );
     }

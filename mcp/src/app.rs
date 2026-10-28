@@ -18,7 +18,7 @@ use std::time::Instant;
 use axum::http::HeaderMap;
 use futures::future::join_all;
 use mcp_server::protocol::text_result;
-use mcp_server::{Call, Identity, SealedStore, Server, Store};
+use mcp_server::{Call, Identity, NoCaller, SealedStore, Server, Store};
 use serde_json::Value;
 
 use crate::backend::{Backend, Link, OnBehalf};
@@ -176,9 +176,10 @@ impl Server for App {
     }
 
     /// Whoever the believed headers name ([`crate::believed`] dropped any
-    /// other's before the router).
-    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Option<Caller> {
-        Caller::of(headers)
+    /// other's before the router). Whether they may use a backend's tools is
+    /// that backend's to answer, from the role table it reads.
+    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Result<Caller, NoCaller> {
+        Caller::of(headers).ok_or(NoCaller::SignedOut)
     }
 
     fn owner(&self, caller: &Caller) -> String {

@@ -1,24 +1,34 @@
-# Who holds a role on this estate — every tenant of the host reads this one
-# table (`docs/shared_model_host.md` §3.5).
+# Who may use this estate, and as what — every tenant of the host and the
+# gateway read this one table (`docs/shared_model_host.md` §3.5,
+# `docs/guest_access.md`).
 #
-# Four levels — unauthenticated, user, admin, creator. Reading is open; only an
-# admin may change authored content on disk (npcd's worlds and personalities)
-# or use zend's Comprehensive tools mode (the network, code, the git writers,
-# programs on this host). `creators` outranks `admins`, so anybody listed there
-# does not also need listing here. It is the one role npcd's fiction reads: a
-# creator messaging a character is addressed inside the world as "(The
-# Creator)" — see `web/src/auth/role.rs`.
+# It is an allowlist. Signing in proves who someone is and grants nothing:
+# a person below gets the role written beside them, and anyone else who signs
+# in is a `guest` — their own account, nothing that runs the model, no zend and
+# no `/mcp`.
+#
+#   user     their own characters, zend, `/mcp`
+#   admin    and change authored content on disk (npcd's worlds and
+#            personalities), zend's Comprehensive tools mode (the network,
+#            code, the git writers, programs on this host)
+#   creator  and the one role npcd's fiction reads: a creator messaging a
+#            character is addressed inside the world as "(The Creator)" — see
+#            `web/src/auth/role.rs`
 #
 # Compiled in (`host::access::ROLES`): there is no API that grants a role, and
 # whoever can edit this file and restart the process already holds what the
-# roles grant.
+# roles grant. A person named twice is refused at load.
 #
-# An entry names `sub` or `email`, never both. Matched on `email` and not `sub`,
-# deliberately, because THIS REPOSITORY IS PUBLIC: a subject id is a stable
-# identifier for a real Google account, and committed here it would be
-# published permanently. The email is already public — it is the author address
-# on every commit — so naming it costs nothing it has not already spent.
-admins:
-  - email: johnathan.sharratt@gmail.com
-creators:
-  - email: johnathan.sharratt@gmail.com
+# An entry names one of `sub`, `email` or `email_sha256`. THIS REPOSITORY IS
+# PUBLIC, so people are named by `email_sha256`: the SHA-256 of the address,
+# trimmed and lowercased, in hex —
+#
+#   printf '%s' 'someone@example.com' | sha256sum
+#
+# — so the file publishes no address. A `sub` would publish a stable
+# identifier for a real Google account, permanently.
+people:
+  - email_sha256: 26efd88e30e8f96830af64b41c1037c9beb4ca0a2cdc3573a7874244c206a025
+    role: creator
+  - email_sha256: 583eaf0ef44aa1ad59a8db43e029df5cfc6b9b77bb473d51ea0beed2b86f7225
+    role: user

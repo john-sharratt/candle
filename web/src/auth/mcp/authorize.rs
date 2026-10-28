@@ -8,12 +8,19 @@
 //!    (`super::client`, fenced to public hosts) and the redirect matched
 //!    against it — none of that redirects anywhere, since a redirect not yet
 //!    checked is not one to send a browser to.
-//! 3. **The user is asked.** A client document is anyone's to write, so a code
-//!    is never issued unasked: a link to this endpoint naming an attacker's
-//!    client would otherwise hand a signed-in user's code to the attacker. The
-//!    consent page names the client and where it will be sent, and posts back
-//!    the consent it showed — signed, and bound to the person it was shown to.
-//! 4. `POST` with the answer: a code to the redirect, or `access_denied`.
+//! 3. **The user is asked** — if the role table names them: a guest is refused
+//!    here, before any client document is fetched (`docs/guest_access.md`
+//!    §6). A client document is anyone's to write, so a code is never issued
+//!    unasked: a link to this endpoint naming an attacker's client would
+//!    otherwise hand a signed-in user's code to the attacker. The consent page
+//!    names the client and where it will be sent, and posts back the consent
+//!    it showed — signed, and bound to the person it was shown to.
+//! 4. `POST` with the answer: a code to the redirect, or `access_denied`. The
+//!    role is read again, so a person taken off the table between the page
+//!    and the answer is refused.
+//!
+//! Each step logs on `web::auth::mcp` — who, which client, where to, and the
+//! outcome; never a code.
 
 use std::collections::HashMap;
 
@@ -28,7 +35,26 @@ use super::grants::{
 use super::page::respond;
 use crate::auth::oidc::urlencode;
 use crate::auth::session::{Identity, Key};
+use crate::auth::{Role, Roles};
 use crate::html::escape;
+
+/// What a guest is told at the consent page.
+const NOT_ALLOWED: &str =
+    "this account is not on the list of people who may use Zen; ask the estate's owner to add it";
+
+/// Whether the role table lets `identity` connect a client: `User` and above.
+pub fn may_connect(roles: &Roles, identity: &Identity) -> bool {
+    roles.of(Some(identity)).at_least(Role::User)
+}
+
+/// Where a redirect sends a browser, by host — what the log and the consent
+/// page name rather than the whole redirect, whose query a client writes.
+fn host_of(redirect: &str) -> String {
+    Url::parse(redirect)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "(no readable host)".to_string())
+}
 
 /// A client's authorization request, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,10 +128,7 @@ pub fn answer_redirect(
 /// sent. Nothing is focused, so no keystroke meant for another window can
 /// press Allow.
 pub fn consent_card(consent: &Consent, sealed: &str) -> String {
-    let to = Url::parse(&consent.grant.redirect_uri)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| consent.grant.redirect_uri.clone());
+    let to = host_of(&consent.grant.redirect_uri);
     let who = if consent.grant.email.is_empty() {
         consent.grant.name.clone()
     } else {
@@ -165,6 +188,7 @@ fn see_other(location: &str) -> Response {
 /// `identity`.
 pub async fn ask(
     key: &Key,
+    roles: &Roles,
     identity: Option<Identity>,
     path_and_query: &str,
     query: &HashMap<String, String>,
@@ -180,11 +204,38 @@ pub async fn ask(
     let Some(identity) = identity else {
         return see_other(&format!("/auth/login?next={}", urlencode(path_and_query)));
     };
+    // And named in the role table: a guest fetches nothing either.
+    if !may_connect(roles, &identity) {
+        tracing::info!(
+            target: "web::auth::mcp",
+            email = %identity.email,
+            client = %req.client_id,
+            to = %host_of(&req.redirect_uri),
+            "consent refused: not on the role table"
+        );
+        return page(StatusCode::FORBIDDEN, NOT_ALLOWED);
+    }
     let doc: ClientDoc = match client::fetch(&req.client_id).await {
         Ok(doc) => doc,
-        Err(why) => return page(StatusCode::BAD_REQUEST, &why),
+        Err(why) => {
+            tracing::info!(
+                target: "web::auth::mcp",
+                email = %identity.email,
+                client = %req.client_id,
+                error = %why,
+                "consent refused: the client's document could not be read"
+            );
+            return page(StatusCode::BAD_REQUEST, &why);
+        }
     };
     if !client::allows_redirect(&doc, &req.redirect_uri) {
+        tracing::info!(
+            target: "web::auth::mcp",
+            email = %identity.email,
+            client = %req.client_id,
+            to = %host_of(&req.redirect_uri),
+            "consent refused: the redirect is not the client's"
+        );
         return page(
             StatusCode::BAD_REQUEST,
             &format!(
@@ -193,6 +244,14 @@ pub async fn ask(
             ),
         );
     }
+    tracing::info!(
+        target: "web::auth::mcp",
+        email = %identity.email,
+        client = %req.client_id,
+        name = %doc.display_name(),
+        to = %host_of(&req.redirect_uri),
+        "consent shown"
+    );
     let consent = Consent {
         grant: Grant {
             client_id: req.client_id,
@@ -218,6 +277,7 @@ pub async fn ask(
 /// Step 4: the answer `identity` gave.
 pub fn decide(
     key: &Key,
+    roles: &Roles,
     identity: Option<Identity>,
     form: &HashMap<String, String>,
     issuer: &str,
@@ -241,8 +301,26 @@ pub fn decide(
             "this consent was shown to someone else",
         );
     }
+    if !may_connect(roles, &identity) {
+        tracing::info!(
+            target: "web::auth::mcp",
+            email = %identity.email,
+            client = %consent.grant.client_id,
+            "consent refused: not on the role table"
+        );
+        return page(StatusCode::FORBIDDEN, NOT_ALLOWED);
+    }
     let state = consent.state.as_deref();
-    if form.get("decision").map(String::as_str) != Some("allow") {
+    let allowed = form.get("decision").map(String::as_str) == Some("allow");
+    tracing::info!(
+        target: "web::auth::mcp",
+        email = %identity.email,
+        client = %consent.grant.client_id,
+        to = %host_of(&consent.grant.redirect_uri),
+        "consent {}",
+        if allowed { "allowed" } else { "denied" }
+    );
+    if !allowed {
         return see_other(&answer_redirect(
             &consent.grant.redirect_uri,
             None,
@@ -266,7 +344,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::mcp::grants::testing::{grant, key};
+    use crate::auth::mcp::grants::testing::{grant, key, listed};
     use crate::auth::mcp::page::PAGE_POLICY;
 
     const RESOURCE: &str = "https://code.tokera.com/mcp";
@@ -364,6 +442,40 @@ mod tests {
         assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
     }
 
+    /// **A guest is refused at the consent page and at the answer**: signed in
+    /// is not enough to connect a client. Refused before any client document
+    /// is fetched.
+    #[tokio::test]
+    async fn a_guest_cannot_connect_a_client() {
+        let guest = grant().identity(u64::MAX);
+        let res = ask(
+            &key(),
+            &Roles::default(),
+            Some(guest.clone()),
+            "/oauth/authorize",
+            &query(&good()),
+            RESOURCE,
+            100,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let allow = query(&[("consent", &sealed(100)), ("decision", "allow")]);
+        let res = decide(
+            &key(),
+            &Roles::default(),
+            Some(guest),
+            &allow,
+            "https://i",
+            101,
+        );
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(
+            res.headers().get(header::LOCATION).is_none(),
+            "no code went out"
+        );
+    }
+
     fn location(res: &Response) -> String {
         res.headers()[header::LOCATION]
             .to_str()
@@ -378,7 +490,14 @@ mod tests {
     #[test]
     fn allowing_sends_a_code_that_opens_as_one() {
         let form = query(&[("consent", &sealed(100)), ("decision", "allow")]);
-        let res = decide(&key(), Some(grant().identity(9)), &form, "https://i", 101);
+        let res = decide(
+            &key(),
+            &listed(),
+            Some(grant().identity(9)),
+            &form,
+            "https://i",
+            101,
+        );
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
         let loc = location(&res);
         assert!(loc.starts_with("https://claude.ai/api/mcp/auth_callback?code="));
@@ -396,17 +515,25 @@ mod tests {
     #[test]
     fn denying_another_person_and_nobody_are_each_answered() {
         let deny = query(&[("consent", &sealed(100)), ("decision", "deny")]);
-        let res = decide(&key(), Some(grant().identity(9)), &deny, "https://i", 101);
+        let res = decide(
+            &key(),
+            &listed(),
+            Some(grant().identity(9)),
+            &deny,
+            "https://i",
+            101,
+        );
         assert!(location(&res).contains("error=access_denied&state=s"));
         let allow = query(&[("consent", &sealed(100)), ("decision", "allow")]);
         let mut intruder = grant().identity(9);
         intruder.sub = "intruder".into();
-        let res = decide(&key(), Some(intruder), &allow, "https://i", 101);
+        let res = decide(&key(), &listed(), Some(intruder), &allow, "https://i", 101);
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        let res = decide(&key(), None, &allow, "https://i", 101);
+        let res = decide(&key(), &listed(), None, &allow, "https://i", 101);
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let late = decide(
             &key(),
+            &listed(),
             Some(grant().identity(9)),
             &allow,
             "https://i",

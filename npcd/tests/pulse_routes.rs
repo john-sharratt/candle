@@ -104,7 +104,10 @@ impl Rig {
             Registry::load("personality", base.join("personalities")).unwrap(),
             accounts,
             npcs,
-            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            serde_yaml::from_str(&format!(
+                "people:\n  - sub: {ADMIN}\n    role: admin\n  - sub: {OWNER}\n    role: user\n  - sub: {STRANGER}\n    role: user\n"
+            ))
+            .unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
             images,

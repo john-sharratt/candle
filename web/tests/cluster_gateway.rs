@@ -39,7 +39,7 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::Service;
-use web::auth::{Principal, Roles};
+use web::auth::{Person, Principal, Role, Roles};
 use web::cluster::bearer_key::BearerKey;
 use web::cluster::ops_key::OpsKey;
 use web::cluster::{ClusterPeer, Gateway};
@@ -335,10 +335,11 @@ sites:
 "#
     );
     let mut cfg = Config::from_yaml(&yaml, content_dir()).unwrap();
-    cfg.roles = Roles {
-        admins: vec![Principal::Email(OPS_ADMIN.into())],
-        creators: Vec::new(),
-    };
+    cfg.roles = Roles::new(vec![Person {
+        who: Principal::Email(OPS_ADMIN.into()),
+        role: Role::Admin,
+    }])
+    .unwrap();
     let hub = Hub::new(key(), "gw-test");
     let ops_key = ops_key.map(|k| OpsKey::new(k, OPS_ADMIN));
     let router = Builder::new(cfg)

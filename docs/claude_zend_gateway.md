@@ -1149,13 +1149,21 @@ other request, and never see what a token means. The site table forwards
   presents a person's token as that person (`docs/mcp_app.md` §2). Nowhere
   else does a bearer token name anyone.
 
-**Who may use it: any signed-in user.** Every `/mcp` conversation is owned by
-its caller and served only to them or an Admin (§3.2). An Admin's tasks run
-Comprehensive and reach the operations tools; anyone else's run Restricted,
-reads `cluster_status` (the members' own statuses, not the gateway's view) and
+**Who may use it: the people the role table names.** `host/roles.yaml` is an
+allowlist, each person with a role (`docs/guest_access.md`); anyone else who
+signs in is a `Guest`. The consent page and its answer refuse a guest
+(`authorize::may_connect`), every token exchange — a refresh included — reads
+the table again, so a person taken off it is refused within an access token's
+hour, and zend's and npcd's MCP servers answer a guest `403` with no sign-in
+challenge (`mcp_server::NoCaller`). Consents
+and token exchanges log on `web::auth::mcp`: who, which client, where to, the
+outcome — never a code or a token. Every `/mcp` conversation is owned by its
+caller and served only to them or an Admin (§3.2). An Admin's tasks run
+Comprehensive and reach the operations tools; a user's run Restricted, read
+`cluster_status` (the members' own statuses, not the gateway's view) and
 `cluster_logs` (every member's, not one named member's) — the routes those
-wrap are open to any signed-in caller — and every other operations tool
-answers that it needs Admin (`ops::admin_only`).
+wrap are the table's people's — and every other operations tool answers that
+it needs Admin (`ops::admin_only`).
 
 **No new shared secret on the members.** Like the rest of the estate, the
 daemons hold no key that could mint a session or a token: only the gateways

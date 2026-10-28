@@ -4,7 +4,10 @@
 //! Form-urlencoded, as RFC 6749 and claude.ai require. Public clients (CIMD,
 //! `none` authentication) prove themselves with the PKCE verifier on the code
 //! exchange, and by holding the refresh token after it. Every exchange issues
-//! a fresh pair.
+//! a fresh pair, and only while the role table still names the person the
+//! grant is for: taken off it, their refresh token buys nothing, so access
+//! ends within an access token's hour (`docs/guest_access.md` §6). Each
+//! exchange logs its outcome on `web::auth::mcp`, never a token.
 
 use std::collections::HashMap;
 
@@ -12,10 +15,12 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 
+use super::authorize::may_connect;
 use super::grants::{self, Code, Grant, Kind, ACCESS_TTL_SECS, REFRESH_TTL_SECS};
 use super::metadata::SCOPE;
 use crate::auth::oidc::pkce_challenge;
 use crate::auth::session::Key;
+use crate::auth::Roles;
 
 /// A token pair as the token endpoint answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +53,43 @@ pub fn issue(key: &Key, grant: &Grant, now: u64) -> Issued {
     }
 }
 
-/// Exchange `form` for a token pair.
-pub fn exchange(key: &Key, form: &HashMap<String, String>, now: u64) -> Result<Issued, Refused> {
+/// Exchange `form` for a token pair, logging the outcome.
+pub fn exchange(
+    key: &Key,
+    roles: &Roles,
+    form: &HashMap<String, String>,
+    now: u64,
+) -> Result<Issued, Refused> {
+    let grant_type = form.get("grant_type").map_or("", String::as_str);
+    let client = form.get("client_id").map_or("", String::as_str);
+    let out = exchange_unlogged(key, roles, form, now);
+    match &out {
+        Ok((_, grant)) => tracing::info!(
+            target: "web::auth::mcp",
+            email = %grant.email,
+            client,
+            grant_type,
+            "token issued"
+        ),
+        Err(r) => tracing::info!(
+            target: "web::auth::mcp",
+            client,
+            grant_type,
+            error = r.error,
+            detail = %r.description,
+            "token refused"
+        ),
+    }
+    out.map(|(issued, _)| issued)
+}
+
+/// [`exchange`], answering the grant the pair was issued on beside it.
+fn exchange_unlogged(
+    key: &Key,
+    roles: &Roles,
+    form: &HashMap<String, String>,
+    now: u64,
+) -> Result<(Issued, Grant), Refused> {
     let get = |k: &str| form.get(k).map(String::as_str).filter(|v| !v.is_empty());
     let client_id =
         get("client_id").ok_or_else(|| refused("invalid_request", "`client_id` is missing"))?;
@@ -110,7 +150,13 @@ pub fn exchange(key: &Key, form: &HashMap<String, String>, now: u64) -> Result<I
             ));
         }
     }
-    Ok(issue(key, &grant, now))
+    if !may_connect(roles, &grant.identity(now)) {
+        return Err(refused(
+            "invalid_grant",
+            "this account is no longer on the list of people who may use Zen",
+        ));
+    }
+    Ok((issue(key, &grant, now), grant))
 }
 
 /// The token endpoint's answer to `result`.
@@ -143,7 +189,7 @@ pub fn answer(result: Result<Issued, Refused>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::mcp::grants::testing::{grant, key};
+    use crate::auth::mcp::grants::testing::{grant, key, listed};
     use crate::auth::mcp::grants::CODE_TTL_SECS;
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -153,6 +199,27 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// **Taken off the role table, a person's grant buys nothing**: neither
+    /// the code nor the refresh token issued while they were on it.
+    #[test]
+    fn a_person_off_the_table_is_refused_a_pair() {
+        let first = exchange(&key(), &listed(), &by_code(&code(100), VERIFIER), 101).unwrap();
+        let gone = Roles::default();
+        let err = exchange(&key(), &gone, &by_code(&code(100), VERIFIER), 101).unwrap_err();
+        assert_eq!(err.error, "invalid_grant");
+        let refresh = form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &first.refresh_token),
+            (
+                "client_id",
+                "https://claude.ai/oauth/mcp-oauth-client-metadata",
+            ),
+        ]);
+        assert!(exchange(&key(), &listed(), &refresh, 200).is_ok());
+        let err = exchange(&key(), &gone, &refresh, 200).unwrap_err();
+        assert_eq!(err.error, "invalid_grant");
     }
 
     fn code(now: u64) -> String {
@@ -188,12 +255,17 @@ mod tests {
 
     #[test]
     fn a_code_and_its_verifier_buy_a_pair_that_opens_as_the_grant() {
-        let issued = exchange(&key(), &by_code(&code(100), VERIFIER), 101).unwrap();
+        let issued = exchange(&key(), &listed(), &by_code(&code(100), VERIFIER), 101).unwrap();
         let access: Grant =
             grants::open(&key(), Kind::McpAccess, &issued.access_token, 102).unwrap();
         assert_eq!(access, grant());
         assert_eq!(issued.expires_in, ACCESS_TTL_SECS);
-        let late = exchange(&key(), &by_code(&code(100), VERIFIER), 100 + CODE_TTL_SECS);
+        let late = exchange(
+            &key(),
+            &listed(),
+            &by_code(&code(100), VERIFIER),
+            100 + CODE_TTL_SECS,
+        );
         assert_eq!(late.unwrap_err().error, "invalid_grant");
     }
 
@@ -201,22 +273,28 @@ mod tests {
     fn a_wrong_verifier_client_or_redirect_is_invalid_grant() {
         let k = key();
         assert_eq!(
-            exchange(&k, &by_code(&code(100), "wrong"), 101)
+            exchange(&k, &listed(), &by_code(&code(100), "wrong"), 101)
                 .unwrap_err()
                 .error,
             "invalid_grant"
         );
         let mut f = by_code(&code(100), VERIFIER);
         f.insert("client_id".into(), "https://evil.example/doc".into());
-        assert_eq!(exchange(&k, &f, 101).unwrap_err().error, "invalid_grant");
+        assert_eq!(
+            exchange(&k, &listed(), &f, 101).unwrap_err().error,
+            "invalid_grant"
+        );
         let mut f = by_code(&code(100), VERIFIER);
         f.insert("redirect_uri".into(), "https://evil.example/cb".into());
-        assert_eq!(exchange(&k, &f, 101).unwrap_err().error, "invalid_grant");
+        assert_eq!(
+            exchange(&k, &listed(), &f, 101).unwrap_err().error,
+            "invalid_grant"
+        );
     }
 
     #[test]
     fn a_refresh_token_buys_a_new_pair_and_an_access_token_is_not_one() {
-        let first = exchange(&key(), &by_code(&code(100), VERIFIER), 101).unwrap();
+        let first = exchange(&key(), &listed(), &by_code(&code(100), VERIFIER), 101).unwrap();
         let refresh = |token: &str| {
             form(&[
                 ("grant_type", "refresh_token"),
@@ -227,10 +305,10 @@ mod tests {
                 ),
             ])
         };
-        let second = exchange(&key(), &refresh(&first.refresh_token), 200).unwrap();
+        let second = exchange(&key(), &listed(), &refresh(&first.refresh_token), 200).unwrap();
         assert_ne!(second.access_token, first.access_token);
         assert_eq!(
-            exchange(&key(), &refresh(&first.access_token), 200)
+            exchange(&key(), &listed(), &refresh(&first.access_token), 200)
                 .unwrap_err()
                 .error,
             "invalid_grant"
@@ -241,13 +319,13 @@ mod tests {
     fn an_unknown_grant_type_and_another_resource_are_named() {
         let f = form(&[("grant_type", "client_credentials"), ("client_id", "x")]);
         assert_eq!(
-            exchange(&key(), &f, 1).unwrap_err().error,
+            exchange(&key(), &listed(), &f, 1).unwrap_err().error,
             "unsupported_grant_type"
         );
         let mut f = by_code(&code(100), VERIFIER);
         f.insert("resource".into(), "https://evil.example/mcp".into());
         assert_eq!(
-            exchange(&key(), &f, 101).unwrap_err().error,
+            exchange(&key(), &listed(), &f, 101).unwrap_err().error,
             "invalid_target"
         );
     }

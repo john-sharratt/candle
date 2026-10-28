@@ -111,6 +111,7 @@ pub fn open<T: DeserializeOwned>(key: &Key, kind: Kind, token: &str, now: u64) -
 #[cfg(test)]
 pub mod testing {
     use super::*;
+    use crate::auth::Roles;
 
     pub fn key() -> Key {
         Key::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap()
@@ -126,6 +127,15 @@ pub mod testing {
             email: "boss@example.com".into(),
             name: "Boss".into(),
         }
+    }
+
+    /// A role table naming [`grant`]'s person as a user.
+    pub fn listed() -> Roles {
+        serde_yaml::from_str(&format!(
+            "people:\n  - email: {}\n    role: user\n",
+            grant().email
+        ))
+        .unwrap()
     }
 }
 

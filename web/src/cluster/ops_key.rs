@@ -58,7 +58,7 @@ mod tests {
     use axum::http::{header, HeaderValue};
 
     use super::*;
-    use crate::auth::{Principal, Role, Roles};
+    use crate::auth::{Person, Principal, Role, Roles};
 
     fn bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -79,10 +79,11 @@ mod tests {
             BearerKey::from_hex(&"cd".repeat(32)).unwrap(),
             " op@tokera.com ",
         );
-        let roles = Roles {
-            admins: vec![Principal::Email("op@tokera.com".into())],
-            creators: Vec::new(),
-        };
+        let roles = Roles::new(vec![Person {
+            who: Principal::Email("op@tokera.com".into()),
+            role: Role::Admin,
+        }])
+        .unwrap();
         let id = ops.caller(&bearer(&"cd".repeat(32))).expect("presented");
         assert_eq!(
             (id.provider.as_str(), id.email.as_str()),

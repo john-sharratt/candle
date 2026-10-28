@@ -52,15 +52,21 @@ struct Harness {
 /// The temp workspace + log bus are kept alive by the returned guard.
 async fn boot() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config =
+    // `boss` is the admin and `friend` a user, so a test can say which caller
+    // it means by which subject it sends; any other subject is a guest.
+    let roles: Roles = serde_yaml::from_str(
+        "people:\n  - sub: boss\n    role: admin\n  - sub: friend\n    role: user\n",
+    )
+    .unwrap();
+    let mut config =
         DaemonConfig::new(zend::workspace::single_repo(tmp.path(), "project").expect("workspace"));
+    // The session reads the same table the routes are graded by, as the tenant
+    // hands it over at start (`zend::tenant`).
+    config.roles = roles.clone();
     let session = Arc::new(ZendSession::new(config));
     let log = LogBus::new(&["zend"]);
     let log_file = RotatingFileLog::new(tmp.path(), "harness.log").expect("log file");
     log.attach(&log_file);
-    // `boss` is the admin, so a test can say which caller it means by which
-    // subject it sends.
-    let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
     let shared = Arc::new(Shared {
         started_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -117,6 +123,60 @@ async fn boot() -> Harness {
         log: log_file,
         _tmp: tmp,
     }
+}
+
+/// A client signed in as `sub`, on the gateway's headers — a loopback peer is
+/// trusted to state them.
+fn signed_in(sub: &str) -> reqwest::Client {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert("x-tokera-user", sub.parse().unwrap());
+    h.insert("x-tokera-provider", "google".parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap()
+}
+
+/// **zend's conversations and chat are the role table's people's**: signed
+/// out they ask for a sign-in, and a guest — signed in, not listed — is
+/// refused. Nothing a stranger sends reaches the model or lists a
+/// conversation.
+#[tokio::test]
+async fn conversations_and_chat_are_the_tables_people_only() {
+    let hz = boot().await;
+    let base = format!("http://{}", hz.addr);
+    let chat = serde_json::json!({ "model": "zen-code", "conv_id": "c1", "messages": [] });
+    for (who, client, status) in [
+        ("signed out", reqwest::Client::new(), 401),
+        ("a guest", signed_in("stranger"), 403),
+    ] {
+        let r = client
+            .get(format!("{base}/v1/conversations"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{who} listed conversations");
+        let r = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&chat)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{who} reached chat");
+        let r = client
+            .get(format!("{base}/v1/conversations/c1/files"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{who} read a conversation's files");
+    }
+    // The model list runs nothing and names nothing private: still open.
+    let r = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
 }
 
 #[tokio::test]
@@ -203,6 +263,11 @@ async fn model_independent_api_contract() {
         })
     );
 
+    // Everything below is the admin's: zend's conversations and chat are the
+    // role table's people's (`conversations_and_chat_are_the_tables_people_only`),
+    // and the conversations these name no owner, which makes them an admin's.
+    let client = signed_in("boss");
+
     // conversations: model-less + empty tempdir -> an empty list, well-shaped
     let r = client
         .get(format!("{base}/v1/conversations"))
@@ -222,13 +287,19 @@ async fn model_independent_api_contract() {
         assert_eq!(r.status(), 404, "{path}");
     }
 
-    // the substrate views are an admin's: signed out, refused
-    let r = client
+    // the substrate views are an admin's: signed out, refused; a user, refused
+    let r = reqwest::Client::new()
         .get(format!("{base}/v1/substrate/zend/system-prompt"))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 401);
+    let r = signed_in("friend")
+        .get(format!("{base}/v1/substrate/zend/system-prompt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
 
     // **A turn must name its conversation.** There is no default conversation
     // for unaddressed turns to accumulate on, so a chat request without a
@@ -306,7 +377,8 @@ async fn model_independent_api_contract() {
 async fn conversation_files_wait_for_the_substrate() {
     let hz = boot().await;
     let base = format!("http://{}", hz.addr);
-    let client = reqwest::Client::new();
+    // `c1` names no owner, so it is the admin's to open.
+    let client = signed_in("boss");
     let r = client
         .get(format!("{base}/v1/conversations/c1/files"))
         .send()

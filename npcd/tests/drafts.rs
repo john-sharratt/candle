@@ -106,7 +106,7 @@ fn rig(record: bool) -> Rig {
         accounts,
         npcs,
         serde_yaml::from_str(&format!(
-            "admins:\n  - sub: {ADMIN}\n  - sub: {OTHER_ADMIN}\n"
+            "people:\n  - sub: {ADMIN}\n    role: admin\n  - sub: {OTHER_ADMIN}\n    role: admin\n  - sub: google-user\n    role: user\n"
         ))
         .unwrap(),
         Libraries::load(&Source::resolve(None).unwrap()),

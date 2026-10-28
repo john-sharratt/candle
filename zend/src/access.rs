@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     const ADMINS: [Role; 2] = [Role::Admin, Role::Creator];
-    const OTHERS: [Role; 2] = [Role::Unauthenticated, Role::User];
+    const OTHERS: [Role; 3] = [Role::Unauthenticated, Role::Guest, Role::User];
 
     #[test]
     fn admins_may_use_every_mode_and_default_to_comprehensive() {

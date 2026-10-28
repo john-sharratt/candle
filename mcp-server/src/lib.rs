@@ -32,5 +32,5 @@ pub mod session;
 pub use client::Client;
 pub use local_store::LocalStore;
 pub use sealed_store::SealedStore;
-pub use server::{Call, Identity, Server};
+pub use server::{Call, Identity, NoCaller, Server};
 pub use session::{stateless_key, Session, Store};

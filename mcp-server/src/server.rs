@@ -28,6 +28,19 @@ pub struct Identity {
     pub version: String,
 }
 
+/// Why a request names no caller, which decides how it is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoCaller {
+    /// Nobody is signed in: answered `401` with the challenge that starts a
+    /// client's sign-in.
+    SignedOut,
+    /// Somebody is signed in and may not use this server: answered `403` with
+    /// no challenge, since signing in again changes nothing — a challenge
+    /// would send the client round the sign-in to be refused at its end. The
+    /// text says why.
+    NotAllowed(String),
+}
+
 /// One request's call: who made it, on which session, and where the work it
 /// waits on says each step.
 pub struct Call<S: Server + ?Sized> {
@@ -71,9 +84,8 @@ pub trait Server: Send + Sync + 'static {
     fn identity(&self) -> &Identity;
 
     /// Who `headers` say is calling, from `peer` when the app was reached
-    /// directly; nobody, and the request is answered with the challenge that
-    /// starts a sign-in.
-    fn caller(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<Self::Caller>;
+    /// directly — or why nobody is ([`NoCaller`]).
+    fn caller(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Result<Self::Caller, NoCaller>;
 
     /// The key the caller's sessions are kept under.
     fn owner(&self, caller: &Self::Caller) -> String;

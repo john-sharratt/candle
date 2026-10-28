@@ -127,6 +127,7 @@ async fn authorize_ask(
         .map_or(metadata::AUTHORIZE_PATH, |p| p.as_str());
     authorize::ask(
         &auth.key,
+        &auth.roles,
         auth.identity(&headers),
         path_and_query,
         &query,
@@ -143,6 +144,7 @@ async fn authorize_decide(
 ) -> Response {
     authorize::decide(
         &auth.key,
+        &auth.roles,
         auth.identity(&headers),
         &form,
         &origin(&auth, &headers),
@@ -154,7 +156,12 @@ async fn token_exchange(
     State(auth): State<Arc<Auth>>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    token::answer(token::exchange(&auth.key, &form, session::now_secs()))
+    token::answer(token::exchange(
+        &auth.key,
+        &auth.roles,
+        &form,
+        session::now_secs(),
+    ))
 }
 
 #[cfg(test)]

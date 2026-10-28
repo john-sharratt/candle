@@ -792,37 +792,37 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // reads the account from npcd through [`account`].
         .route(
             "/v1/me/profile",
-            Role::User,
+            Role::Guest,
             Dispatch::Any,
             get(get_profile),
         )
         .route(
             "/v1/me/profile",
-            Role::User,
+            Role::Guest,
             Dispatch::Best,
             put(put_profile),
         )
         .route(
             "/v1/me/profile/history",
-            Role::User,
+            Role::Guest,
             Dispatch::Any,
             get(get_profile_history),
         )
         .route(
             "/v1/me/profile/history/:rev",
-            Role::User,
+            Role::Guest,
             Dispatch::Any,
             get(get_profile_revision),
         )
         .route(
             "/v1/me/profile/restore/:rev",
-            Role::User,
+            Role::Guest,
             Dispatch::Best,
             post(restore_profile),
         )
         .route(
             "/v1/me/unique-name",
-            Role::User,
+            Role::Guest,
             Dispatch::Best,
             put(put_unique_name),
         )
@@ -847,6 +847,15 @@ fn caller(s: &Arc<Authored>, headers: &HeaderMap) -> Result<Identity, Box<Respon
     Ok(require(headers, &s.roles, Role::User)?
         .into_identity()
         .expect("`Role::User` is only reachable with an identity"))
+}
+
+/// The caller's identity on an account route, which a guest — signed in, not
+/// on the role table — reaches too: their own account is the one thing a
+/// guest owns (`docs/guest_access.md` §3).
+fn account_holder(s: &Arc<Authored>, headers: &HeaderMap) -> Result<Identity, Box<Response>> {
+    Ok(require(headers, &s.roles, Role::Guest)?
+        .into_identity()
+        .expect("`Role::Guest` is only reachable with an identity"))
 }
 
 // ── the cast ─────────────────────────────────────────────────────────────────
@@ -2008,7 +2017,7 @@ pub async fn account(s: &Authored, id: &Identity) -> Result<Value, String> {
 }
 
 async fn get_profile(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -2024,7 +2033,7 @@ async fn put_profile(
     headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -2073,7 +2082,7 @@ async fn put_profile(
 /// rarely and read on every page load, so the history is the larger half of the
 /// record and almost never the part being asked for.
 async fn get_profile_history(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -2093,7 +2102,7 @@ async fn get_profile_revision(
     headers: HeaderMap,
     Path(rev): Path<u64>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -2117,7 +2126,7 @@ async fn restore_profile(
     headers: HeaderMap,
     Path(rev): Path<u64>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -2151,7 +2160,7 @@ async fn put_unique_name(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = match caller(&s, &headers) {
+    let id = match account_holder(&s, &headers) {
         Ok(id) => id,
         Err(r) => return *r,
     };
@@ -3137,10 +3146,29 @@ mod tests {
         router(state(tmp("state")))
     }
 
-    /// The subject the tests treat as an admin. Every other subject is an
-    /// ordinary user, which is what makes the two easy to tell apart in a
-    /// request.
+    /// The subject the tests treat as an admin. The tests' other subjects are
+    /// listed as users, which is what makes the two easy to tell apart in a
+    /// request; any subject the table does not name is a guest.
     const ADMIN: &str = "google-admin";
+
+    /// The subjects the tests sign in as who are on the role table as users.
+    const USERS: [&str; 6] = [
+        "google-1",
+        "google-2",
+        "google-user",
+        "google-someone-else",
+        "google-not-an-admin",
+        "google-plain-user",
+    ];
+
+    /// The role table these tests run under: [`ADMIN`] and [`USERS`].
+    fn people() -> String {
+        let mut yaml = format!("people:\n  - sub: {ADMIN}\n    role: admin\n");
+        for u in USERS {
+            yaml.push_str(&format!("  - sub: {u}\n    role: user\n"));
+        }
+        yaml
+    }
 
     /// Shared state, for a test that makes several requests against one store.
     /// `router` consumes its state, so the `Arc` is what gets reused.
@@ -3168,7 +3196,7 @@ mod tests {
             // Parsed from YAML rather than built by hand, so these tests fail
             // if the config shape the deployment writes stops matching the type
             // the daemon reads.
-            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            serde_yaml::from_str(&people()).unwrap(),
             // No mind, so no libraries — the collections route answers with
             // two empty collections, which is the truth for a test directory.
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
@@ -3907,12 +3935,45 @@ mod tests {
             send(
                 "/v1/image/cutout",
                 "POST",
-                "g1",
+                "google-1",
                 json!({ "png_base64": b64 }),
             ),
         )
         .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{out}");
+    }
+
+    /// **A guest — signed in, not on the role table — owns nothing and runs
+    /// nothing**: creating or listing characters and the model routes are the
+    /// table's people's, refused before the handler runs.
+    #[tokio::test]
+    async fn a_guest_owns_nothing_and_runs_nothing() {
+        let st = state(tmp("guest"));
+        for (path, method) in [("/v1/npc", "POST"), ("/v1/image/cutout", "POST")] {
+            let (s, out) = call(
+                router(st.clone()),
+                send(path, method, "google-stranger", json!({})),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}: {out}");
+            assert_eq!(out["role"], "guest", "{out}");
+        }
+        let (s, _) = call(router(st.clone()), get("/v1/npc", Some("google-stranger"))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // Their own account is the one thing a guest owns.
+        sign_in(&st, "google-stranger").await;
+        let req = send(
+            "/v1/me/profile",
+            "PUT",
+            "google-stranger",
+            json!({"description": "Just looking."}),
+        );
+        let (s, p) = call(router(st.clone()), req).await;
+        assert_eq!(s, StatusCode::OK, "{p}");
+        let (s, p) = call(router(st), get("/v1/me/profile", Some("google-stranger"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(p["description"], "Just looking.");
     }
 
     /// A malformed upload is still the caller's mistake, and is still answered
@@ -3927,7 +3988,7 @@ mod tests {
             send(
                 "/v1/image/cutout",
                 "POST",
-                "g1",
+                "google-1",
                 json!({ "png_base64": "bm90IGEgcGljdHVyZQ==" }),
             ),
         )
@@ -4091,12 +4152,12 @@ mod tests {
                 ("/v1/image/upload", "unauthenticated"),
                 // The caller's own account. `/v1/me` itself is the host's. The
                 // read and the write are registered apart for their dispatch.
-                ("/v1/me/profile", "user"),
-                ("/v1/me/profile", "user"),
-                ("/v1/me/profile/history", "user"),
-                ("/v1/me/profile/history/:rev", "user"),
-                ("/v1/me/profile/restore/:rev", "user"),
-                ("/v1/me/unique-name", "user"),
+                ("/v1/me/profile", "guest"),
+                ("/v1/me/profile", "guest"),
+                ("/v1/me/profile/history", "guest"),
+                ("/v1/me/profile/history/:rev", "guest"),
+                ("/v1/me/profile/restore/:rev", "guest"),
+                ("/v1/me/unique-name", "guest"),
             ]
         );
     }
@@ -5062,7 +5123,7 @@ mod tests {
             Registry::load("personality", base.join("personalities")).unwrap(),
             accounts,
             npcs,
-            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            serde_yaml::from_str(&people()).unwrap(),
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
             Mind::new(None),
             images,
@@ -5969,7 +6030,7 @@ layers:
             Registry::load("personality", base.join("personalities")).unwrap(),
             accounts,
             npcs,
-            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            serde_yaml::from_str(&people()).unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
             images,

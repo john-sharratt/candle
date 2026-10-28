@@ -218,7 +218,7 @@ mod tests {
             Registry::load("personality", base.join("personalities")).unwrap(),
             accounts,
             npcs,
-            serde_yaml::from_str("admins: []\n").unwrap(),
+            serde_yaml::from_str("people: []\n").unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
             images,

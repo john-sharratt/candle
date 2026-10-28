@@ -129,7 +129,8 @@ mod tests {
     fn the_caller_is_whoever_the_gateway_names_and_nobody_otherwise() {
         use axum::http::HeaderValue;
         use web::auth::forwarded::{PROVIDER, USER};
-        let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
+        let roles: Roles =
+            serde_yaml::from_str("people:\n  - sub: boss\n    role: admin\n").unwrap();
         let mut h = HeaderMap::new();
         assert!(Caller::of(&h, &roles).is_none());
         h.insert(USER, HeaderValue::from_static("boss"));
@@ -143,7 +144,8 @@ mod tests {
     /// caller, and an empty field is not sent.
     #[test]
     fn the_headers_a_caller_states_identify_it_again() {
-        let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
+        let roles: Roles =
+            serde_yaml::from_str("people:\n  - sub: boss\n    role: admin\n").unwrap();
         let caller = Caller {
             person: Person {
                 provider: "google".into(),
@@ -166,8 +168,12 @@ mod tests {
 
     #[test]
     fn the_role_is_read_from_the_table() {
-        let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
+        let roles: Roles = serde_yaml::from_str(
+            "people:\n  - sub: boss\n    role: admin\n  - sub: friend\n    role: user\n",
+        )
+        .unwrap();
         assert_eq!(person("google", "boss").role(&roles), Role::Admin);
-        assert_eq!(person("google", "someone").role(&roles), Role::User);
+        assert_eq!(person("google", "friend").role(&roles), Role::User);
+        assert_eq!(person("google", "someone").role(&roles), Role::Guest);
     }
 }

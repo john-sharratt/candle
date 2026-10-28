@@ -44,7 +44,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
-use mcp_server::{protocol, Call, Identity, Server, Store};
+use mcp_server::{protocol, Call, Identity, NoCaller, Server, Store};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity as Person;
@@ -52,7 +52,11 @@ use web::auth::Role;
 
 use crate::api::Authored;
 use crate::engine::bodies::Said;
-use crate::identity::require;
+use crate::identity::{identify, require};
+
+/// What a guest — signed in, not on the role table — is told.
+const NOT_LISTED: &str =
+    "this account is not on the list of people who may use Zen; ask the estate's owner to add it";
 
 pub mod args;
 pub mod cancel;
@@ -223,12 +227,16 @@ impl Server for Authored {
         &IDENTITY
     }
 
-    /// The signed-in person the gateway named; the host has already cleared
-    /// the identity headers from every peer that is not a trusted gateway.
-    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Option<Person> {
-        require(headers, &self.roles, Role::User)
-            .ok()?
-            .into_identity()
+    /// The signed-in person the gateway named, if the role table names them
+    /// too; the host has already cleared the identity headers from every peer
+    /// that is not a trusted gateway. A guest — signed in, not listed — is
+    /// refused, not challenged to sign in again (`docs/guest_access.md` §6).
+    fn caller(&self, headers: &HeaderMap, _peer: Option<IpAddr>) -> Result<Person, NoCaller> {
+        match require(headers, &self.roles, Role::User) {
+            Ok(held) => held.into_identity().ok_or(NoCaller::SignedOut),
+            Err(_) if identify(headers).is_ok() => Err(NoCaller::NotAllowed(NOT_LISTED.into())),
+            Err(_) => Err(NoCaller::SignedOut),
+        }
     }
 
     /// The first 16 hex digits of `sha256(provider \0 sub)`, as zend keys a

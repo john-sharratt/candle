@@ -63,11 +63,14 @@ pub const CONVERSATION_HEADER: &str = "x-tokera-conversation";
 
 /// zend's route table.
 ///
-/// The chat and conversation routes are open: an OpenAI client (Continue)
-/// sends no identity, and the tools dial resolves the caller's role itself
-/// ([`crate::access`]). The substrate views are an admin's: they read every
-/// conversation and name paths on this host. So are the agents: they show
-/// every conversation's commands, and switch the machines that run them.
+/// The chat and conversation routes are the role table's people's — `User`
+/// and up (`docs/guest_access.md`): chat runs the model, and the conversation
+/// routes list, read and delete what people wrote. A stranger, or a guest
+/// signed in but not listed, reaches neither. The model list runs nothing and
+/// stays open, and `/v1/mcp` names its own caller. The substrate views are an
+/// admin's: they read every conversation and name paths on this host. So are
+/// the agents: they show every conversation's commands, and switch the
+/// machines that run them.
 ///
 /// Under a cluster a conversation is served by the member holding its claim;
 /// the substrate's replicated state is read from any member, and what lives in
@@ -79,7 +82,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
     Api::new(roles)
         .route(
             "/v1/chat/completions",
-            Role::Unauthenticated,
+            Role::User,
             Dispatch::Sticky(vec![
                 KeySource::Header(CONVERSATION_HEADER.into()),
                 KeySource::Body("conv_id".into()),
@@ -95,7 +98,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
         )
         .route(
             "/v1/repo_map",
-            Role::Unauthenticated,
+            Role::User,
             Dispatch::Any,
             get(repo_map::completeness),
         )
@@ -180,7 +183,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
         )
         .route(
             "/v1/conversations",
-            Role::Unauthenticated,
+            Role::User,
             // Every member's list, merged by id: a member rejoining lists the
             // conversations it wrote cut off, which no other member holds yet.
             Dispatch::Aggregate(Merge::Union),
@@ -194,73 +197,73 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
         ]))
         .route(
             "/v1/conversations/:id",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(conversations::get).delete(conversations::delete),
         )
         .route(
             "/v1/conversations/:id/files",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(files::list).post(files::upload),
         )
         .route(
             "/v1/conversations/:id/files/:file_id",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(files::content).delete(files::delete),
         )
         .route(
             "/v1/conversations/:id/archive",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             post(conversations::archive),
         )
         .route(
             "/v1/conversations/:id/live",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(conversations::live),
         )
         .route(
             "/v1/conversations/:id/projections/:turn/:event",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(projections::get),
         )
         .route(
             "/v1/conversations/:id/projection-context",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             post(projections::context),
         )
         .route(
             "/v1/conversations/:id/prompt-tokens",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(prompt_tokens::get),
         )
         .route(
             "/v1/conversations/:id/journal",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(journal::get),
         )
         .route(
             "/v1/conversations/:id/journal/draft",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             post(journal::draft),
         )
         .route(
             "/v1/conversations/:id/journal/:eid",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             delete(journal::forget),
         )
         .route(
             "/v1/conversations/:id/journal/:eid/turns",
-            Role::Unauthenticated,
+            Role::User,
             conversation(),
             get(journal::turns),
         )
@@ -294,9 +297,9 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("/v1/chat/completions", "unauthenticated"),
+                ("/v1/chat/completions", "user"),
                 ("/v1/models", "unauthenticated"),
-                ("/v1/repo_map", "unauthenticated"),
+                ("/v1/repo_map", "user"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/layer/:name", "admin"),
@@ -310,28 +313,19 @@ mod tests {
                 ("/v1/agents/:node", "admin"),
                 ("/v1/agents/:node/jobs/:id", "admin"),
                 ("/v1/agents/:node/jobs/:id/stream", "admin"),
-                ("/v1/conversations", "unauthenticated"),
-                ("/v1/conversations/:id", "unauthenticated"),
-                ("/v1/conversations/:id/files", "unauthenticated"),
-                ("/v1/conversations/:id/files/:file_id", "unauthenticated"),
-                ("/v1/conversations/:id/archive", "unauthenticated"),
-                ("/v1/conversations/:id/live", "unauthenticated"),
-                (
-                    "/v1/conversations/:id/projections/:turn/:event",
-                    "unauthenticated"
-                ),
-                (
-                    "/v1/conversations/:id/projection-context",
-                    "unauthenticated"
-                ),
-                ("/v1/conversations/:id/prompt-tokens", "unauthenticated"),
-                ("/v1/conversations/:id/journal", "unauthenticated"),
-                ("/v1/conversations/:id/journal/draft", "unauthenticated"),
-                ("/v1/conversations/:id/journal/:eid", "unauthenticated"),
-                (
-                    "/v1/conversations/:id/journal/:eid/turns",
-                    "unauthenticated"
-                ),
+                ("/v1/conversations", "user"),
+                ("/v1/conversations/:id", "user"),
+                ("/v1/conversations/:id/files", "user"),
+                ("/v1/conversations/:id/files/:file_id", "user"),
+                ("/v1/conversations/:id/archive", "user"),
+                ("/v1/conversations/:id/live", "user"),
+                ("/v1/conversations/:id/projections/:turn/:event", "user"),
+                ("/v1/conversations/:id/projection-context", "user"),
+                ("/v1/conversations/:id/prompt-tokens", "user"),
+                ("/v1/conversations/:id/journal", "user"),
+                ("/v1/conversations/:id/journal/draft", "user"),
+                ("/v1/conversations/:id/journal/:eid", "user"),
+                ("/v1/conversations/:id/journal/:eid/turns", "user"),
                 ("/v1/mcp", "unauthenticated"),
             ]
         );

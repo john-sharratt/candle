@@ -36,9 +36,10 @@ use web::auth::forwarded::{identify, EMAIL, PROVIDER, USER};
 use web::auth::gateways::canonical;
 use web::auth::{Role, Roles};
 
-/// The estate's role table: who is an admin, who is a creator. Compiled in —
-/// there is no API that grants a role, and whoever can edit this file and
-/// restart the process already holds what the roles grant.
+/// The estate's role table: the people who may use the estate, each with a
+/// role, and anyone else signed in a guest. Compiled in — there is no API that
+/// grants a role, and whoever can edit this file and restart the process
+/// already holds what the roles grant.
 pub const ROLES: &str = include_str!("../roles.yaml");
 
 /// [`ROLES`], parsed.
@@ -139,9 +140,12 @@ mod tests {
     /// anonymous.
     #[test]
     fn the_role_is_read_from_the_gateways_headers() {
-        let t = table("admins:\n  - email: admin@example.com\n");
+        let t = table(
+            "people:\n  - email: admin@example.com\n    role: admin\n  - email: friend@example.com\n    role: user\n",
+        );
         assert_eq!(role(&HeaderMap::new(), &t), Role::Unauthenticated);
-        assert_eq!(role(&signed_in("someone@example.com"), &t), Role::User);
+        assert_eq!(role(&signed_in("someone@example.com"), &t), Role::Guest);
+        assert_eq!(role(&signed_in("friend@example.com"), &t), Role::User);
         assert_eq!(role(&signed_in("admin@example.com"), &t), Role::Admin);
     }
 
@@ -149,7 +153,7 @@ mod tests {
     /// written as the gateway would have written it.
     #[test]
     fn local_signin_names_a_loopback_caller_with_no_headers() {
-        let t = table("creators:\n  - email: me@example.com\n");
+        let t = table("people:\n  - email: me@example.com\n    role: creator\n");
         for from in ["127.0.0.1:9", "[::1]:9", "[::ffff:127.0.0.1]:9"] {
             let h = with_signin("me@example.com", HeaderMap::new(), peer(from));
             assert_eq!(role(&h, &t), Role::Creator, "{from}");
@@ -158,7 +162,7 @@ mod tests {
             assert_eq!(h[EMAIL], "me@example.com");
         }
         let h = with_signin("nobody@example.com", HeaderMap::new(), peer("127.0.0.1:9"));
-        assert_eq!(role(&h, &t), Role::User);
+        assert_eq!(role(&h, &t), Role::Guest);
     }
 
     /// A real forwarded identity always wins over the flag.

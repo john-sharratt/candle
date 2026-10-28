@@ -312,7 +312,7 @@ pub(crate) mod test_support {
 
     pub fn shared(tenants: Vec<(&'static str, Scripted)>) -> Arc<Shared> {
         Arc::new(Shared {
-            roles: serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap(),
+            roles: serde_yaml::from_str("people:\n  - sub: boss\n    role: admin\n").unwrap(),
             started_at_ms: 1_700_000_000_000,
             build: "0123456789abcdef".into(),
             model: ModelView::of_prescribed(),

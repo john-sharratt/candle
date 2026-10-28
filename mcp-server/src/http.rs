@@ -31,7 +31,7 @@ use crate::client::Client;
 use crate::jsonrpc::{self, Message};
 use crate::origin;
 use crate::protocol::{self, MODERN, UNSUPPORTED_VERSION};
-use crate::server::{Call, Server};
+use crate::server::{Call, NoCaller, Server};
 use crate::session::stateless_key;
 
 /// How often a running `tools/call` reports progress on its stream.
@@ -87,6 +87,19 @@ fn unauthorized(headers: &HeaderMap, title: &str) -> Response {
     res
 }
 
+/// The refusal of a request that names no caller: the sign-in challenge for
+/// nobody, a plain `403` for somebody who may not use `title`.
+fn refused(headers: &HeaderMap, title: &str, why: NoCaller) -> Response {
+    match why {
+        NoCaller::SignedOut => unauthorized(headers, title),
+        NoCaller::NotAllowed(message) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "forbidden", "message": message})),
+        )
+            .into_response(),
+    }
+}
+
 fn read_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)
@@ -123,8 +136,9 @@ pub async fn post<S: Server>(
         );
     }
     let identity = server.identity();
-    let Some(caller) = server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) else {
-        return unauthorized(&headers, &identity.title);
+    let caller = match server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) {
+        Ok(c) => c,
+        Err(why) => return refused(&headers, &identity.title, why),
     };
     let store = match server.store() {
         Ok(s) => s,
@@ -400,8 +414,9 @@ pub async fn delete<S: Server>(
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(caller) = server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) else {
-        return unauthorized(&headers, &server.identity().title);
+    let caller = match server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) {
+        Ok(c) => c,
+        Err(why) => return refused(&headers, &server.identity().title, why),
     };
     let Some(sid) = read_header(&headers, SESSION_HEADER) else {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -441,6 +456,20 @@ mod tests {
         let mut other = base.to_vec();
         other.push(("origin", "https://evil.example"));
         assert!(foreign_origin(&headers(&other)));
+    }
+
+    /// **Somebody who may not use the server is refused without a
+    /// challenge**: signing in again changes nothing, and a challenge would
+    /// send their client round the sign-in to be refused at its end.
+    #[test]
+    fn a_caller_not_allowed_is_refused_without_a_challenge() {
+        let h = headers(&[("host", "code.tokera.com"), ("authorization", "Bearer x")]);
+        let res = refused(&h, "Zen", NoCaller::NotAllowed("not on the list".into()));
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let res = refused(&h, "Zen", NoCaller::SignedOut);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_some());
     }
 
     #[test]

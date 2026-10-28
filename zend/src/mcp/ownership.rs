@@ -5,7 +5,9 @@
 //! ([`super::threads::conv_id`]) — so the check needs no lookup: an id that
 //! names an owner is served only to that person or an Admin, on every route
 //! that names a conversation. Ids that name no owner — the dialogues zend's own
-//! UI makes — keep the access they have.
+//! UI makes, and passthrough clients' — are an Admin's: nobody's name is on
+//! them, so no user can be shown to be theirs, and the role table names more
+//! than one person (`docs/guest_access.md` §5).
 //!
 //! A refusal is a `404`: a conversation someone may not open is, to them, not
 //! there, and a `403` would confirm that it is.
@@ -33,14 +35,14 @@ pub fn owner_of(conv_id: &str) -> Option<&str> {
 
 /// Whether the caller `headers` name may open `conv_id`.
 pub fn may_open(conv_id: &str, headers: &HeaderMap, roles: &Roles) -> bool {
-    let Some(owner) = owner_of(conv_id) else {
-        return true;
-    };
     let Ok(identity) = identify(headers) else {
         return false;
     };
     let person = Person::of(&identity);
-    person.key() == owner || person.role(roles).at_least(Role::Admin)
+    if person.role(roles).at_least(Role::Admin) {
+        return true;
+    }
+    owner_of(conv_id).is_some_and(|owner| person.key() == owner)
 }
 
 /// `%XX` escapes in a path segment, decoded; a malformed escape is kept as
@@ -79,7 +81,19 @@ pub fn path_conversation(path: &str) -> Option<String> {
 /// conversation header — a conversation its caller may not open is answered
 /// `404` before it reaches a handler. The chat route's body `conv_id` is
 /// checked in the handler, which is where the body is read.
+///
+/// **A caller below `User` is the route's to refuse.** This layer runs ahead
+/// of each route's own role check, and every route that names a conversation
+/// is the role table's people's; answered here, a stranger would be told a
+/// conversation is not there rather than to sign in, and a guest rather than
+/// that they are not on the list.
 pub async fn guard(State(session): State<Arc<ZendSession>>, req: Request, next: Next) -> Response {
+    let roles = session.roles();
+    let listed =
+        identify(req.headers()).is_ok_and(|id| Person::of(&id).role(roles).at_least(Role::User));
+    if !listed {
+        return next.run(req).await;
+    }
     let named = path_conversation(req.uri().path()).or_else(|| {
         req.headers()
             .get(CONVERSATION_HEADER)
@@ -87,7 +101,7 @@ pub async fn guard(State(session): State<Arc<ZendSession>>, req: Request, next: 
             .map(str::to_string)
     });
     if let Some(id) = named {
-        if !may_open(&id, req.headers(), session.roles()) {
+        if !may_open(&id, req.headers(), roles) {
             return not_found();
         }
     }
@@ -131,13 +145,28 @@ mod tests {
 
     #[test]
     fn an_owned_conversation_opens_for_its_owner_and_an_admin_only() {
-        let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
+        let roles: Roles = serde_yaml::from_str(
+            "people:\n  - sub: boss\n    role: admin\n  - sub: alice\n    role: user\n  - sub: mallory\n    role: user\n",
+        )
+        .unwrap();
         let id = format!("mcp:{}:review/verify", key("alice"));
         assert!(may_open(&id, &as_person("alice"), &roles));
         assert!(may_open(&id, &as_person("boss"), &roles));
         assert!(!may_open(&id, &as_person("mallory"), &roles));
         assert!(!may_open(&id, &HeaderMap::new(), &roles));
-        assert!(may_open("c-123", &HeaderMap::new(), &roles));
+    }
+
+    /// **A conversation that names no owner is an Admin's**: nobody's name is
+    /// on it, so no user — and nobody signed out — can be shown it.
+    #[test]
+    fn an_unowned_conversation_opens_for_an_admin_only() {
+        let roles: Roles = serde_yaml::from_str(
+            "people:\n  - sub: boss\n    role: admin\n  - sub: alice\n    role: user\n",
+        )
+        .unwrap();
+        assert!(may_open("c-123", &as_person("boss"), &roles));
+        assert!(!may_open("c-123", &as_person("alice"), &roles));
+        assert!(!may_open("c-123", &HeaderMap::new(), &roles));
     }
 
     #[test]

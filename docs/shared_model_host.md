@@ -506,7 +506,9 @@ keeps doing so.
   gateway in front has one to sign people in — and, like loopback trust itself, it
   extends to anything on the box that relays remote traffic onto loopback.
 - **Roles:** one estate table, `host/roles.yaml`, merging `zend/zend.roles.yaml` and
-  the `roles:` block of `npcd/npcd.web.yaml` (both deleted).
+  the `roles:` block of `npcd/npcd.web.yaml` (both deleted). It is an allowlist —
+  `people:`, each with a role of `user`, `admin` or `creator` — and a signed-in
+  caller it does not name is a `guest` (`docs/guest_access.md`).
 - **Guards:** every route — the host's and each tenant's — is registered through
   `host::guard::Api` (npcd's guard, moved), which cannot add a route without a role,
   and each shared endpoint carries the stricter of the two daemons' guards — with two

@@ -390,9 +390,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     tracing::info!("accounts: {} known", accounts.len());
 
     let roles = ctx.roles.clone();
-    if roles.is_empty() {
+    if roles.names_no_admin() {
         tracing::warn!(
-            "roles: nobody configured — worlds and personalities are read-only to everyone"
+            "roles: no admin or creator configured — worlds and personalities are read-only to everyone"
         );
     }
 

@@ -20,7 +20,7 @@ let current = null;
  * one account that owns the estate. It read as a broken sign-in rather than as
  * a missing table entry, because the chrome had the identity and the pages did
  * not. See `rankOf`. */
-const RANK = { unauthenticated: 0, user: 1, admin: 2, creator: 3 };
+const RANK = { unauthenticated: 0, guest: 1, user: 2, admin: 3, creator: 4 };
 
 /* Who is looking, as the SERVER decided. Set once at boot from `/v1/me`; a
  * page never computes it. `viewerRole` is a function rather than a value
@@ -230,10 +230,22 @@ export function start(host, onRoute) {
           <div class="tiny"></div></div>`,
       });
       const [title, detail] = page.querySelectorAll('div.empty > div:not(.big)');
-      title.textContent = hit.page.role === 'admin' ? 'Admins only' : 'Sign in to see this';
-      detail.textContent = hit.page.role === 'admin'
-        ? 'This page needs the admin role. You are signed in as ' + viewerRole() + '.'
-        : 'This page needs you to be signed in.';
+      /* Three different refusals, because each has a different remedy: an
+       * admin's page, a page for the people on the estate's list (a guest is
+       * signed in and not on it — signing in again changes nothing), and a
+       * page that only needs a sign-in. */
+      const guest = viewerRole() === 'guest';
+      if (hit.page.role === 'admin') {
+        title.textContent = 'Admins only';
+        detail.textContent = 'This page needs the admin role. You are signed in as ' + viewerRole() + '.';
+      } else if (guest) {
+        title.textContent = 'Not on the list';
+        detail.textContent = 'You are signed in, but this account is not on the list of people '
+          + 'who may use this. Ask the estate\'s owner to add it.';
+      } else {
+        title.textContent = 'Sign in to see this';
+        detail.textContent = 'This page needs you to be signed in.';
+      }
       /* **The way out has to be on this screen.**
        *
        * It had no controls at all, and that turned an expired session into a
