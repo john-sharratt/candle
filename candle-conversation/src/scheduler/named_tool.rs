@@ -1,10 +1,13 @@
 //! Steering a tool call's name to the tool its reasoning named.
 //!
-//! The stencil's name branch is a masked choice among every catalog name; it
-//! does not know what the model just decided. Here, at the moment the call
-//! opens, the reasoning since the last call is read back and, when it decides
-//! on exactly one of the branch's arms ([`named_arm`]), the driver is held to
-//! that arm. Nothing else about the call changes: the arguments are the model's.
+//! The stencil's name branch is a masked choice among the turn's tools (the
+//! catalog's names, or the ones the turn was given when its walk is held to
+//! them); it does not know what the model just decided. Here, at the moment
+//! the call opens, the reasoning since the last call is read back and, when it
+//! decides on exactly one of those arms ([`named_arm`]), the driver is held to
+//! that arm. A tool the turn was not given is never one of them, so reasoning
+//! that names one steers nothing. Nothing else about the call changes: the
+//! arguments are the model's.
 //!
 //! Only a call opened mid-turn by its trigger token is steered. A turn that
 //! *begins* inside the grammar (its scaffold prefilled before the first
@@ -35,7 +38,10 @@ fn steer_with(
     generated: &[TokenId],
     driver: &mut StencilDriver,
 ) -> Option<String> {
-    let arms = driver.tree().first_branch()?.arms();
+    let arms = match driver.held_arms() {
+        Some(held) => held,
+        None => driver.tree().first_branch()?.arms(),
+    };
     let reasoning = decode(generated)?;
     let decoded: Vec<String> = arms
         .iter()
@@ -57,7 +63,8 @@ mod tests {
 
     use super::*;
     use crate::stencil::{
-        compile, compile_tool_call_tree, parse_tools, StepMask, TestVocab, ToolCallEnvelope, Vocab,
+        compile, compile_tool_call_tree, held_branches, parse_tools, StepMask, TestVocab,
+        ToolCallEnvelope, Vocab,
     };
 
     const CATALOG: &str = r#"[
@@ -118,5 +125,34 @@ mod tests {
         assert_eq!(steer_with(decode(&v), &reasoning, &mut d), None);
         let text = call_text(&mut d, &v);
         assert!(text.contains("\"name\": \"file_list\""), "{text:?}");
+    }
+
+    /// **Reasoning cannot steer a held call to a tool the turn was not
+    /// given.** Held to `file_read`, a turn whose thinking settles on `write`
+    /// steers nothing, and the call writes the tool it was given; one that
+    /// settles on `file_read` steers to it.
+    #[test]
+    fn reasoning_naming_an_ungiven_tool_steers_nothing() {
+        let v = TestVocab::new();
+        let held = |d: &mut StencilDriver| {
+            let tree = d.tree();
+            let names = vec!["file_read".to_string()];
+            let h = held_branches(tree, &names, decode(&v));
+            d.hold_branches(Arc::new(h));
+        };
+        let mut d = driver(&v);
+        held(&mut d);
+        let reasoning = v.encode("The file is new, so use the `write` tool.");
+        assert_eq!(steer_with(decode(&v), &reasoning, &mut d), None);
+        let text = call_text(&mut d, &v);
+        assert!(text.contains("\"name\": \"file_read\""), "{text:?}");
+
+        let mut d = driver(&v);
+        held(&mut d);
+        let reasoning = v.encode("I'll use the `file_read` tool.");
+        assert_eq!(
+            steer_with(decode(&v), &reasoning, &mut d).as_deref(),
+            Some("file_read")
+        );
     }
 }

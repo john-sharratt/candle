@@ -12,9 +12,10 @@
 
 use std::sync::Arc;
 
+use super::held_arms::HeldBranches;
 use super::mask::AllowedSet;
 use super::session::{Observe, StencilAction, StencilSession};
-use super::tree::StencilTree;
+use super::tree::{NodeId, StencilTree};
 use super::vocab::TokenId;
 
 /// What [`StencilDriver::accept`] decided about the sampled token.
@@ -106,12 +107,58 @@ pub struct PathStats {
     pub bailed: bool,
 }
 
-/// One arm the walk is held to, token by token — see
-/// [`StencilDriver::steer_first_branch`].
+/// The arms of one branch the walk is held to, token by token — see
+/// [`StencilDriver::hold_branches`]. `live` are the arms (indices into `arms`)
+/// that every token so far has agreed with, `depth` how many tokens of the
+/// branch have been written.
+///
+/// The arms are shared, not copied: a turn's held arms are found once and every
+/// call it opens starts from the same `Arc`, so a hold costs one small index
+/// list per call and nothing in the compiled tree.
 #[derive(Clone)]
-struct ArmSteer {
-    tokens: Vec<TokenId>,
-    next: usize,
+struct ArmHold {
+    node: NodeId,
+    arms: Arc<[Vec<TokenId>]>,
+    live: Vec<u32>,
+    depth: usize,
+}
+
+impl ArmHold {
+    fn new(node: NodeId, arms: Arc<[Vec<TokenId>]>) -> Option<Self> {
+        let live: Vec<u32> = (0..arms.len() as u32)
+            .filter(|&i| !arms[i as usize].is_empty())
+            .collect();
+        (!live.is_empty()).then_some(ArmHold {
+            node,
+            arms,
+            live,
+            depth: 0,
+        })
+    }
+
+    /// The tokens of `frontier` some live arm writes next.
+    fn narrow(&self, frontier: &AllowedSet) -> Vec<TokenId> {
+        self.live
+            .iter()
+            .map(|&i| self.arms[i as usize][self.depth])
+            .filter(|&t| frontier.contains(t))
+            .collect()
+    }
+
+    /// Take `token`: keep the arms that wrote it. `false` once the branch is
+    /// complete (an arm ended on it) or no arm agreed — the hold is spent.
+    fn take(&mut self, token: TokenId) -> bool {
+        let depth = self.depth;
+        let arms = &self.arms;
+        self.live
+            .retain(|&i| arms[i as usize].get(depth) == Some(&token));
+        self.depth += 1;
+        !self.live.is_empty()
+            && !self
+                .live
+                .iter()
+                .any(|&i| self.arms[i as usize].len() == self.depth)
+    }
 }
 
 /// A live walk of one tree attached to a decoding sequence.
@@ -124,7 +171,10 @@ pub struct StencilDriver {
     session: StencilSession,
     done: bool,
     stats: PathStats,
-    steer: Option<ArmSteer>,
+    /// The arms each held branch is narrowed to, for the whole walk.
+    held: Option<Arc<HeldBranches>>,
+    /// The branch being written under a hold, if one is.
+    hold: Option<ArmHold>,
 }
 
 impl StencilDriver {
@@ -134,25 +184,44 @@ impl StencilDriver {
             session: StencilSession::new(tree),
             done: false,
             stats: PathStats::default(),
-            steer: None,
+            held: None,
+            hold: None,
         }
     }
 
-    /// Hold the tree's first branch ([`StencilTree::first_branch`]) to `arm`,
-    /// one of its arms' token sequences: each masked step narrows to the arm's
-    /// next token, so the branch completes on exactly that arm.
+    /// Hold every branch `held` names to its arms: each masked step of such a
+    /// branch, from its first token, is narrowed to the tokens a held arm
+    /// writes next, so the branch completes on one of them and on nothing else.
     ///
-    /// For a tool call this writes the tool the reasoning named
-    /// ([`named_arm`](super::named_arm)). A frontier that does not hold the
-    /// arm's next token — an arm this branch does not have — releases the
-    /// steer, and the step is masked to the whole frontier as usual.
+    /// For a tool call these are the tools the turn was given, on every name
+    /// branch of the call loop
+    /// ([`TriggerRegistry::holding`](super::TriggerRegistry::holding)): the
+    /// catalog's grammar is compiled once, and the turn's own tools are a
+    /// narrowing of it, so a tool the turn was not given cannot be written. A
+    /// frontier that holds none of the held arms' next tokens — arms the branch
+    /// does not have — releases the hold, and the step is masked to the whole
+    /// frontier as usual.
+    pub fn hold_branches(&mut self, held: Arc<HeldBranches>) {
+        self.held = Some(held);
+    }
+
+    /// Hold the tree's first branch ([`StencilTree::first_branch`]) to the
+    /// single arm `arm`: the tool the reasoning named
+    /// ([`named_arm`](super::named_arm)). Called before the walk starts.
     pub fn steer_first_branch(&mut self, arm: Vec<TokenId>) {
-        if !arm.is_empty() {
-            self.steer = Some(ArmSteer {
-                tokens: arm,
-                next: 0,
-            });
+        if let Some(node) = self.tree().first_branch_node() {
+            self.hold = ArmHold::new(node, Arc::from(vec![arm]));
         }
+    }
+
+    /// The arms the first branch may complete on: those it is held to, when it
+    /// is. `None` when nothing holds it.
+    pub fn held_arms(&self) -> Option<Vec<Vec<TokenId>>> {
+        if let Some(h) = &self.hold {
+            return Some(h.live.iter().map(|&i| h.arms[i as usize].clone()).collect());
+        }
+        let node = self.tree().first_branch_node()?;
+        self.held.as_ref()?.arms_at(node).map(|arms| arms.to_vec())
     }
 
     /// Whether the walk has finished (the caller should drop the driver and
@@ -228,12 +297,13 @@ impl StencilDriver {
                 }
                 StencilAction::MaskedDecode(set) => {
                     self.stats.branch_tokens += 1;
-                    if let Some(steer) = &self.steer {
-                        let want = steer.tokens[steer.next];
-                        if set.contains(want) {
-                            return StepMask::Branch(AllowedSet::from_tokens(vec![want]));
+                    self.enter_hold();
+                    if let Some(hold) = &self.hold {
+                        let want = hold.narrow(&set);
+                        if !want.is_empty() {
+                            return StepMask::Branch(AllowedSet::from_tokens(want));
                         }
-                        self.steer = None;
+                        self.hold = None;
                     }
                     return StepMask::Branch(set);
                 }
@@ -255,6 +325,26 @@ impl StencilDriver {
         }
     }
 
+    /// At a masked step: keep the hold on the branch the cursor is in, drop one
+    /// left on another, and start one when the cursor waits on the first token
+    /// of a held branch.
+    fn enter_hold(&mut self) {
+        let Some((node, at_root)) = self.session.in_branch() else {
+            self.hold = None;
+            return;
+        };
+        if self.hold.as_ref().is_some_and(|h| h.node == node) {
+            return;
+        }
+        self.hold = None;
+        if !at_root {
+            return;
+        }
+        if let Some(arms) = self.held.as_ref().and_then(|h| h.arms_at(node)) {
+            self.hold = ArmHold::new(node, Arc::clone(arms));
+        }
+    }
+
     /// Feed back the token sampled under the constraint from the preceding
     /// `Branch`/`Free` [`step`](Self::step).  `bytes` are its decoded bytes (used
     /// by free-text terminators).  An out-of-grammar token makes the session bail
@@ -269,11 +359,8 @@ impl StencilDriver {
     /// lookahead value ended on a delimiter the grammar does not continue with,
     /// and when a repair leaves the token nothing to contribute.
     pub fn accept(&mut self, token: TokenId, bytes: &[u8]) -> Healed {
-        if let Some(steer) = &mut self.steer {
-            steer.next += 1;
-            if token != steer.tokens[steer.next - 1] || steer.next == steer.tokens.len() {
-                self.steer = None;
-            }
+        if self.hold.as_mut().is_some_and(|hold| !hold.take(token)) {
+            self.hold = None;
         }
         let observed = self.session.observe(token, bytes);
         let rewrite = self.session.take_rewrite();

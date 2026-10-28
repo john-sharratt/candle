@@ -190,6 +190,17 @@ impl StencilSession {
         self.pushback.is_none() && matches!(self.cursor, Cursor::InFreeText { .. })
     }
 
+    /// The branch the cursor is in, and whether it waits on the branch's first
+    /// token (its trie's root) — what a hold on that branch keys on
+    /// ([`StencilDriver::hold_branches`](super::StencilDriver::hold_branches)).
+    /// `None` outside a branch.
+    pub fn in_branch(&self) -> Option<(NodeId, bool)> {
+        match self.cursor {
+            Cursor::InBranch { node, pos } => Some((node, pos == self.branch_trie(node).root())),
+            _ => None,
+        }
+    }
+
     /// What to do at the current cursor.  For static structure this advances the
     /// cursor and returns `Prefill`; for a branch/free-text it leaves the cursor
     /// awaiting a decoded token.

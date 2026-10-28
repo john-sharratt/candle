@@ -679,6 +679,40 @@ Multi-token triggers (a short literal that isn't a special token) are supported 
 a suffix automaton over the recent-token window, but the tool-call case needs
 only the single token.
 
+### 9.1 Holding a turn's calls to the tools it was given
+
+A tool-call tree is compiled once per tools mode from that mode's whole catalog,
+and each call level of its loop has a name branch offering every tool in it. A
+turn given fewer — a layer unit with two tools, a file's reading with
+`file_read` — narrows those branches per turn, without compiling anything:
+
+- `held_branches(tree, names, decode)` finds every **name branch** (a branch
+  whose arms spell exactly the catalog — the first branch's names — so an enum
+  or the loop's go-again choice never qualifies) and keeps the arms that spell a
+  given name. It decodes only branches with as many arms as the catalog.
+- `TriggerRegistry::holding(token, held)` returns the turn's registry with that
+  table on the trigger's binding; `ConversationEngine::holding_tools(triggers,
+  names)` does both, and errors when no given name is in the catalog.
+- The driver `driver_for` starts carries the table. At each masked step it keys
+  on the branch the cursor is in (`StencilSession::in_branch`): entering a held
+  branch at its first token starts a hold, each step is masked to the tokens a
+  still-live held arm writes next, and the hold ends when an arm completes.
+  Later branches — an argument's enum — are untouched.
+- Named-tool steering (`scheduler/named_tool.rs`) picks among the held arms, so
+  reasoning that names a tool the turn was not given steers nothing.
+
+**Cost.** The compiled tree is shared and unchanged. A held registry adds one
+table of `(branch node, arms)` — a few tokens per given tool per call level —
+built once for the conversation that runs under it (a layer unit, or once at
+boot for file reading). Per call, a hold is one index list over the held arms;
+per masked step of a name, a filter of the frontier against them.
+
+Before holding, a unit shown two tools could still decode any tool of its mode's
+catalog, and each such call was answered `not_available` after the fact — a
+wasted round, ten or so a day in ingest. The refusal stays in
+`zend::layers::run::only_given` as a check on the hold: a call it refuses got
+past the grammar, a stencil defect, and is logged at `ERROR` rather than run.
+
 ---
 
 ## 10. Scheduler integration

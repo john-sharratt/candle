@@ -86,7 +86,7 @@ use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::calibrate::{calibrate_layer, Frame as CalibrateFrame, Layer as CalibrateLayer};
-use crate::code_read::PATH_KEY;
+use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
@@ -778,6 +778,10 @@ struct InferenceState {
     /// ([`crate::tools::catalog_for`]). A turn decodes under its mode's, so a
     /// tool call is forced to an offered tool's exact JSON shape.
     tool_stencils: [Arc<TriggerRegistry>; ToolMode::ALL.len()],
+    /// The Restricted stencil with every call held to `file_read` — what a
+    /// file's reading decodes under, so it can call no other tool. Built once
+    /// at startup beside the stencils it narrows.
+    read_stencil: Arc<TriggerRegistry>,
     /// Per-effort-dial thinking-block steering trees, compiled once at startup.
     /// `None` when the tokenizer has no single `<think>`/`</think>` token.  Each
     /// turn replaces the `<think>` trigger with the dial's tree (see
@@ -1592,6 +1596,14 @@ impl InferenceState {
         };
         let [none, restricted, comprehensive] = ToolMode::ALL.map(compile);
         let tool_stencils = [none?, restricted?, comprehensive?];
+        // A file's reading calls `file_read` and nothing else: the Restricted
+        // grammar, its calls held to that one tool.
+        let read_stencil = engine
+            .holding_tools(
+                &tool_stencils[ToolMode::Restricted.level() as usize],
+                &[FILE_READ_TOOL.to_string()],
+            )
+            .map_err(|e| anyhow::anyhow!("file reading's tool stencil: {e}"))?;
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
@@ -3002,6 +3014,7 @@ impl InferenceState {
             workspace,
             base_branches,
             tool_stencils,
+            read_stencil,
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
@@ -3082,7 +3095,11 @@ impl InferenceState {
             formatted_prompt: &self.formatted_prompt,
             // `Off`, as repo_map's folder summaries run: a file read is a tool
             // round and a description, with no reasoning block between them.
-            think_triggers: turn_triggers(self, ThinkMode::Off, ToolMode::Restricted),
+            // Its calls are held to `file_read`, the one tool it is given.
+            think_triggers: match &self.think_steering {
+                Some(ts) => ts.registry_for(&self.read_stencil, ThinkMode::Off),
+                None => Arc::clone(&self.read_stencil),
+            },
             // Ingest reads; it runs no job, so it belongs to no lineage.
             tool_ctx: self.tool_host.context_for(
                 ToolMode::Restricted,

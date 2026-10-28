@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::driver::StencilDriver;
+use super::held_arms::HeldBranches;
 use super::session::StencilSession;
 use super::tree::StencilTree;
 use super::vocab::TokenId;
@@ -18,11 +19,13 @@ pub struct TriggerRegistry {
     by_token: HashMap<TokenId, Binding>,
 }
 
-/// A trigger's tree, and whether entering it spends the trigger for the turn.
+/// A trigger's tree, whether entering it spends the trigger for the turn, and
+/// the branches a walk of it is held on (see [`TriggerRegistry::holding`]).
 #[derive(Debug, Clone)]
 struct Binding {
     tree: Arc<StencilTree>,
     once: bool,
+    held: Option<Arc<HeldBranches>>,
 }
 
 impl TriggerRegistry {
@@ -35,7 +38,14 @@ impl TriggerRegistry {
     /// Register `tree` to start when `token` is emitted in free decode.
     /// Replaces any tree already bound to `token` (last write wins).
     pub fn register(&mut self, token: TokenId, tree: Arc<StencilTree>) {
-        self.by_token.insert(token, Binding { tree, once: false });
+        self.by_token.insert(
+            token,
+            Binding {
+                tree,
+                once: false,
+                held: None,
+            },
+        );
     }
 
     /// [`Self::with_trigger`] for a trigger that fires at most once per turn:
@@ -51,7 +61,14 @@ impl TriggerRegistry {
     #[must_use]
     pub fn with_once_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
         let mut by_token = self.by_token.clone();
-        by_token.insert(token, Binding { tree, once: true });
+        by_token.insert(
+            token,
+            Binding {
+                tree,
+                once: true,
+                held: None,
+            },
+        );
         TriggerRegistry { by_token }
     }
 
@@ -77,8 +94,37 @@ impl TriggerRegistry {
     #[must_use]
     pub fn with_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
         let mut by_token = self.by_token.clone();
-        by_token.insert(token, Binding { tree, once: false });
+        by_token.insert(
+            token,
+            Binding {
+                tree,
+                once: false,
+                held: None,
+            },
+        );
         TriggerRegistry { by_token }
+    }
+
+    /// A copy of this registry in which every walk `token` starts is held on
+    /// `held`'s branches ([`StencilDriver::hold_branches`]).
+    ///
+    /// The per-turn narrowing of a catalog compiled once: a turn given some of
+    /// the catalog's tools holds every tool-name branch to theirs
+    /// ([`held_branches`](super::held_branches)), so the shared tree is
+    /// untouched and the turn can write no other. An unbound `token` leaves the
+    /// registry as it is.
+    #[must_use]
+    pub fn holding(&self, token: TokenId, held: Arc<HeldBranches>) -> Self {
+        let mut by_token = self.by_token.clone();
+        if let Some(binding) = by_token.get_mut(&token) {
+            binding.held = Some(held);
+        }
+        TriggerRegistry { by_token }
+    }
+
+    /// The tree `token` starts, when it is a trigger.
+    pub fn tree_for(&self, token: TokenId) -> Option<&Arc<StencilTree>> {
+        self.by_token.get(&token).map(|b| &b.tree)
     }
 
     /// Return a copy of this registry with any binding for `token` removed.
@@ -112,9 +158,13 @@ impl TriggerRegistry {
     /// triggered tree — the decode-loop entry point.  An empty registry never
     /// triggers, so a turn with no tools simply free-decodes.
     pub fn driver_for(&self, token: TokenId) -> Option<StencilDriver> {
-        self.by_token
-            .get(&token)
-            .map(|b| StencilDriver::new(Arc::clone(&b.tree)))
+        self.by_token.get(&token).map(|b| {
+            let mut driver = StencilDriver::new(Arc::clone(&b.tree));
+            if let Some(held) = &b.held {
+                driver.hold_branches(Arc::clone(held));
+            }
+            driver
+        })
     }
 }
 

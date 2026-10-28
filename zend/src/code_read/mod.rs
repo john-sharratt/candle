@@ -218,7 +218,7 @@ pub const PASS_NAME: &str = "code_read";
 /// The one tool a file's hidden conversation may call — forced into the
 /// catalog via [`FORCE_TOOL_SELECTOR`] so the model reads coherently and
 /// never wanders into an unrelated tool.
-const FILE_READ_TOOL: &str = "file_read";
+pub(crate) const FILE_READ_TOOL: &str = "file_read";
 
 /// Decode budget per turn in a file's hidden conversation: room for the
 /// `<tool_call>` or the file's description. Thinking is off, so none of it goes

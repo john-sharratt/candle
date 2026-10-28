@@ -17,7 +17,7 @@ use candle_conversation::projection::{
     GroupId, OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::ThinkMode;
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, FinishReason, Sequence, TurnOptions, TurnText};
 
 use super::edges::edges;
@@ -490,22 +490,54 @@ fn unit_grants(spec: &LayerSpec, base: Grants) -> Grants {
     }
 }
 
-/// `steps` with every call of a tool the unit was not given refused, not run.
-fn only_given(steps: Vec<Step>, tools: &[String]) -> Vec<Step> {
+/// The steering a unit's turns run under: its layer's thinking over the call
+/// grammar of the mode whose catalog holds its tools, every call held to the
+/// tools the layer gives it — so a tool it was not given cannot be written,
+/// whatever its reasoning reaches for. Built once per unit, not per round.
+fn unit_triggers(
+    ctx: &RefreshContext<'_>,
+    spec: &LayerSpec,
+) -> anyhow::Result<Arc<TriggerRegistry>> {
+    let triggers = ctx.triggers_for(spec.think_mode(), spec.tool_mode());
+    if spec.tools.is_empty() {
+        return Ok(triggers);
+    }
+    ctx.engine
+        .lock()
+        .unwrap()
+        .holding_tools(&triggers, &spec.tools)
+        .map_err(|e| anyhow::anyhow!("layer `{}`: {e}", spec.layer))
+}
+
+/// `steps` with any call of a tool the unit was not given refused, not run.
+///
+/// [`unit_triggers`] holds every call to the unit's tools, so this never
+/// refuses a call the grammar is working: one it does refuse got past the
+/// hold, which is a defect in the stencil, and is logged as one rather than
+/// run on the unit's grants.
+fn only_given(steps: Vec<Step>, layer: &str, tools: &[String]) -> Vec<Step> {
     steps
         .into_iter()
         .map(|step| match step {
-            Step::Run(call) if !tools.contains(&call.name) => Step::Refuse(ToolResult {
-                response: serde_json::json!({
-                    "error": "not_available",
-                    "detail": format!(
-                        "`{}` is not available here; this conversation may call only {}",
-                        call.name,
-                        tools.join(", ")
-                    ),
-                }),
-                call,
-            }),
+            Step::Run(call) if !tools.contains(&call.name) => {
+                tracing::error!(
+                    target: "zend::layers",
+                    layer,
+                    tool = %call.name,
+                    "a call of a tool the unit was not given got past its held grammar",
+                );
+                Step::Refuse(ToolResult {
+                    response: serde_json::json!({
+                        "error": "not_available",
+                        "detail": format!(
+                            "`{}` is not available here; this conversation may call only {}",
+                            call.name,
+                            tools.join(", ")
+                        ),
+                    }),
+                    call,
+                })
+            }
             other => other,
         })
         .collect()
@@ -523,6 +555,7 @@ fn ask(
     let selection = unit_selection(spec);
     let tools = (!spec.tools.is_empty()).then(|| unit_tools(ctx, spec, job));
     let rounds = if tools.is_some() { MAX_TOOL_ROUNDS } else { 0 };
+    let triggers = unit_triggers(ctx, spec)?;
     let mut message = TurnText::from(job.prompt.clone());
     for round in 0..=rounds {
         if crate::ingest_cancel::cancelled() {
@@ -541,7 +574,7 @@ fn ask(
         let options = TurnOptions {
             sampling: Some(sampling),
             selection: selection.clone(),
-            triggers: ctx.triggers_for(spec.think_mode(), spec.tool_mode()),
+            triggers: Arc::clone(&triggers),
             tags: vec![spec.layer.clone(), job.subject.clone()],
             ..Default::default()
         };
@@ -585,7 +618,7 @@ fn ask(
         let Some(tools) = tools.as_ref().filter(|_| !steps.is_empty()) else {
             return answer_of(&resp.answer, round, &resp.stats.finish);
         };
-        let results = tool_round::run(tools, only_given(steps, &spec.tools));
+        let results = tool_round::run(tools, only_given(steps, &spec.layer, &spec.tools));
         let response = format_tool_responses(&results);
         if response.is_blank() {
             anyhow::bail!("the unit's tool calls answered nothing (round {round})");
@@ -905,8 +938,8 @@ mod tests {
         assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_read,file_grep"));
     }
 
-    /// A call of a tool the unit was not given is refused, never run; a call
-    /// of one it was given runs.
+    /// A call of a tool the unit was not given — one past its held grammar —
+    /// is refused, never run; a call of one it was given runs.
     #[test]
     fn a_call_outside_the_units_tools_is_refused() {
         let call = |name: &str| crate::tools::ToolCall {
@@ -914,10 +947,16 @@ mod tests {
             arguments: serde_json::json!({}),
         };
         let steps = vec![Step::Run(call("file_read")), Step::Run(call("file_edit"))];
-        let out = only_given(steps, &["file_read".to_string()]);
+        let out = only_given(steps, "deep", &["file_read".to_string()]);
         assert!(matches!(&out[0], Step::Run(c) if c.name == "file_read"));
         match &out[1] {
-            Step::Refuse(r) => assert_eq!(r.response["error"], "not_available"),
+            Step::Refuse(r) => {
+                assert_eq!(r.response["error"], "not_available");
+                assert_eq!(
+                    r.response["detail"],
+                    "`file_edit` is not available here; this conversation may call only file_read"
+                );
+            }
             other => panic!("file_edit was not refused: {other:?}"),
         }
     }

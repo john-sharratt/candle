@@ -27,9 +27,9 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_loop, HfVocab, StencilTree, ThinkMode,
-    ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
-    MAX_TOOL_CALLS_PER_TURN,
+    compile, compile_think_tree, compile_tool_call_loop, held_branches, HfVocab, StencilTree,
+    ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec,
+    TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
@@ -2099,6 +2099,37 @@ impl ConversationEngine {
         let mut registry = TriggerRegistry::new();
         registry.register(trigger, Arc::new(tree));
         Ok(Arc::new(registry))
+    }
+
+    /// `triggers` with every tool call held to `tools`: each name branch of
+    /// the call loop narrowed to the arms those names spell
+    /// ([`held_branches`]), so a call can write only a tool the turn was
+    /// given. The compiled catalog is shared and untouched; the turn carries
+    /// the held arms, a few tokens per tool per call level.
+    ///
+    /// Build it once for the conversation that runs under it, not per turn: it
+    /// decodes the catalog's name arms once per call level. `triggers` without
+    /// a tool call is returned as it is. A list naming no tool the catalog
+    /// holds is an error — a turn given tools it can never call.
+    pub fn holding_tools(
+        &self,
+        triggers: &Arc<TriggerRegistry>,
+        tools: &[String],
+    ) -> crate::Result<Arc<TriggerRegistry>> {
+        let tokenizer = &self.core.tokenizer;
+        let Some(trigger) = tokenizer.token_to_id("<tool_call>") else {
+            return Ok(Arc::clone(triggers));
+        };
+        let Some(tree) = triggers.tree_for(trigger) else {
+            return Ok(Arc::clone(triggers));
+        };
+        let held = held_branches(tree, tools, |t| tokenizer.decode(t, false).ok());
+        if held.is_empty() {
+            return Err(ConversationError::from(candle::Error::Msg(format!(
+                "tool stencil: none of {tools:?} is in the turn's catalog"
+            ))));
+        }
+        Ok(Arc::new(triggers.holding(trigger, Arc::new(held))))
     }
 
     /// Compile the thinking-block steering trees (one per effort dial, `Off`

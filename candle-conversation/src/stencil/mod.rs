@@ -35,6 +35,7 @@ mod driver;
 mod encode_cache;
 mod error;
 mod function_block;
+mod held_arms;
 mod json_lexer;
 mod mask;
 mod named_arm;
@@ -53,6 +54,8 @@ mod yaml;
 #[cfg(test)]
 mod edge_tests;
 #[cfg(test)]
+mod held_tests;
+#[cfg(test)]
 mod invoke_body_tests;
 #[cfg(test)]
 mod shaped_params_tests;
@@ -68,6 +71,7 @@ pub use compile::compile;
 pub use driver::{Healed, PathStats, StencilDriver, StepMask};
 pub use error::{BuildError, WalkError};
 pub use function_block::function_blocks_to_json;
+pub use held_arms::{held_branches, HeldBranches};
 pub use mask::{ban, boost, AllowedSet};
 pub use named_arm::{arm_name, named_arm};
 pub use session::{Observe, StencilAction, StencilSession};

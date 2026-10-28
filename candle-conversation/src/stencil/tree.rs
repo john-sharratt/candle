@@ -204,13 +204,29 @@ impl StencilTree {
     /// static runs alone. For a tool-call tree this is the tool name. `None`
     /// when a free-text span or the end comes first.
     pub fn first_branch(&self) -> Option<&TokenTrie> {
+        match self.node(self.first_branch_node()?) {
+            StencilNode::Branch { trie } => Some(trie),
+            _ => None,
+        }
+    }
+
+    /// The node of [`Self::first_branch`].
+    pub fn first_branch_node(&self) -> Option<NodeId> {
         let mut cur = self.root;
         loop {
             match self.node(cur) {
                 StencilNode::Static { next, .. } => cur = *next,
-                StencilNode::Branch { trie } => return Some(trie),
+                StencilNode::Branch { .. } => return Some(cur),
                 StencilNode::FreeText(_) | StencilNode::End => return None,
             }
+        }
+    }
+
+    /// The branch at `id`'s trie, when `id` is a branch.
+    pub fn branch(&self, id: NodeId) -> Option<&TokenTrie> {
+        match self.node(id) {
+            StencilNode::Branch { trie } => Some(trie),
+            _ => None,
         }
     }
 }
