@@ -273,6 +273,25 @@ impl GalleryArena {
             .len()
     }
 
+    /// Every resident turn: its stream, the bytes of the pages it holds, and
+    /// how long since a scan last used it — what a breakdown of the gallery by
+    /// whose turns it holds is made from.
+    pub fn resident_runs(&self) -> Vec<(StreamId, u64, Duration)> {
+        let now = Instant::now();
+        self.residency
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(sid, rt)| {
+                (
+                    *sid,
+                    pages_for(rt.n_tokens) as u64 * self.page_bytes,
+                    now.saturating_duration_since(rt.used),
+                )
+            })
+            .collect()
+    }
+
     /// Pages this arena's resident turns hold — its own share, where
     /// [`Self::page_bytes`] counts every gallery page on the device.
     #[cfg(test)]
@@ -741,7 +760,9 @@ impl GalleryArena {
         self.keep_within_ns.store(ns, Ordering::Relaxed);
     }
 
-    fn keep_within(&self) -> Option<Duration> {
+    /// How often a turn must be scanned to keep its ground; `None` keeps
+    /// everything ([`Self::set_keep_within`]).
+    pub fn keep_within(&self) -> Option<Duration> {
         match self.keep_within_ns.load(Ordering::Relaxed) {
             u64::MAX => None,
             ns => Some(Duration::from_nanos(ns)),

@@ -921,6 +921,20 @@ impl Conversation {
     /// wait when it is not — for a write that can be owed and retried, where
     /// waiting out another holder (a maintenance op's plan or apply) would
     /// stall the caller's thread for nothing.
+    /// [`Self::read`] without waiting: `None` while a writer holds the lock, for
+    /// a reader that may look again later rather than stall its thread behind
+    /// a write.
+    pub fn try_read(&self) -> Option<SubstrateRead<'_>> {
+        match self.inner.try_read() {
+            Ok(guard) => Some(SubstrateRead {
+                guard,
+                scores: None,
+            }),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(e)) => panic!("the substrate lock is poisoned: {e}"),
+        }
+    }
+
     pub fn try_write(&self) -> Option<SubstrateWrite<'_>> {
         match self.inner.try_write() {
             Ok(guard) => Some(SubstrateWrite { guard }),

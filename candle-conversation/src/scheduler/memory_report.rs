@@ -24,10 +24,11 @@ use std::time::Instant;
 use candle::vram::{host_pinned_bytes, AllocClass};
 use candle::wave_provenance::last_wave_declines;
 use candle::Device;
-use candle_nn::kv_cache::global_arena_memory_report;
+use candle_nn::kv_cache::{global_arena_memory_report, SlotTenant};
 use serde::Serialize;
 
 use super::admission::admit_quantum;
+use super::state_census::StateSection;
 use super::Scheduler;
 
 /// One full memory snapshot. All byte quantities are raw bytes; consumers
@@ -45,6 +46,9 @@ pub struct MemoryReport {
     pub experts: ExpertSection,
     pub weights: WeightSection,
     pub gallery: GallerySection,
+    /// The span's "state" band — its tenants — broken down by whose ground it
+    /// is ([`super::state_census`]).
+    pub state: StateSection,
     pub accounting: AccountingSection,
     /// The held ground, holder by holder. `None` before the reservation exists.
     pub held: Option<HeldSection>,
@@ -627,7 +631,7 @@ impl Scheduler {
         // In the same breath as `span_regions` above, for the reason on
         // `KvSection::span_tenants`: the total and its breakdown have to be one
         // moment or their difference reads as an uncounted tenant.
-        let span_tenants = candle_nn::kv_cache::arena_census(&self.device)
+        let span_tenants: Vec<SpanTenantRow> = candle_nn::kv_cache::arena_census(&self.device)
             .into_iter()
             .map(|t| SpanTenantRow {
                 tenant: t.tenant.label(),
@@ -636,6 +640,11 @@ impl Scheduler {
                 pools: t.pools,
             })
             .collect();
+        let recurrent_held = span_tenants
+            .iter()
+            .find(|t| t.tenant == SlotTenant::RecurrentState.label())
+            .map_or(0, |t| t.held_bytes as u64);
+        let state = self.state_section(recurrent_held);
         let kv = KvSection {
             classes,
             arenas,
@@ -861,6 +870,7 @@ impl Scheduler {
             experts,
             weights,
             gallery,
+            state,
             accounting,
             held,
         }
@@ -869,6 +879,9 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state_census::{
+        GalleryCensus, GalleryRow, RecurrentBreakdown, SlotRow, TurnStatus,
+    };
     use super::*;
 
     fn sample() -> MemoryReport {
@@ -966,6 +979,35 @@ mod tests {
             gallery: GallerySection {
                 resident_bytes: 268_435_456,
                 resident_turns: 42,
+            },
+            state: StateSection {
+                gallery: Some(GalleryCensus {
+                    taken_unix_ms: 1_700_000_000_000,
+                    page_bytes: 251_658_240,
+                    region_bytes: 268_435_456,
+                    keep_within_secs: Some(14_069),
+                    idle_past_keep_turns: 0,
+                    idle_past_keep_bytes: 0,
+                    substrates_skipped: 0,
+                    rows: vec![GalleryRow {
+                        status: TurnStatus::Live,
+                        layer: "code_reading".into(),
+                        group: "files".into(),
+                        turns: 42,
+                        bytes: 251_658_240,
+                    }],
+                }),
+                recurrent: RecurrentBreakdown {
+                    held_bytes: 2_113_929_216,
+                    store_bytes: 132_120_576,
+                    live_stores: 16,
+                    parked_stores: 0,
+                    slots: vec![SlotRow {
+                        layer: "code_reading".into(),
+                        group: "files".into(),
+                        slots: 16,
+                    }],
+                },
             },
             // Shaped like the measured 3.6-35B so the sums mean something: a
             // 64 GiB span holding the model, a pool reduced to per-wave churn,
