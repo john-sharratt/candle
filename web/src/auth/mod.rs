@@ -105,6 +105,10 @@ impl Auth {
             anyhow::bail!("{} is empty", cfg.google.client_secret_file.display());
         }
 
+        // A client the gateway could not honour is a configuration mistake,
+        // and found at startup rather than at someone's sign-in.
+        mcp::registered::check(&cfg.mcp_clients).map_err(|why| anyhow::anyhow!(why))?;
+
         let secure = cfg.google.redirect_uri.starts_with("https://");
         Ok(Self {
             cfg,

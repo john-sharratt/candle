@@ -33,6 +33,7 @@ pub mod client;
 pub mod grants;
 pub mod metadata;
 pub mod page;
+pub mod registered;
 pub mod token;
 
 use grants::{Grant, Kind};
@@ -127,6 +128,7 @@ async fn authorize_ask(
         .map_or(metadata::AUTHORIZE_PATH, |p| p.as_str());
     authorize::ask(
         &auth.key,
+        &auth.cfg.mcp_clients,
         auth.identity(&headers),
         path_and_query,
         &query,
@@ -152,9 +154,20 @@ async fn authorize_decide(
 
 async fn token_exchange(
     State(auth): State<Arc<Auth>>,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    token::answer(token::exchange(&auth.key, &form, session::now_secs()))
+    let basic = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(registered::basic);
+    token::answer(token::exchange(
+        &auth.key,
+        &auth.cfg.mcp_clients,
+        &form,
+        basic,
+        session::now_secs(),
+    ))
 }
 
 #[cfg(test)]

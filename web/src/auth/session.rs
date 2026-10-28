@@ -134,7 +134,9 @@ pub fn open(key: &Key, token: &str, now_secs: u64) -> Result<Identity, Invalid> 
     Ok(id)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Whether `a` and `b` are equal, in time that does not depend on where they
+/// first differ.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

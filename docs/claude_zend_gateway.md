@@ -1107,19 +1107,45 @@ other request, and never see what a token means. The site table forwards
   its one authorization server, and its own metadata (RFC 8414) at
   `/.well-known/oauth-authorization-server`. Exact bytes in
   `web/src/auth/mcp/metadata.rs`.
-- **Clients without registration.** The metadata advertises Client ID Metadata
-  Documents (`client_id_metadata_document_supported: true`, `"none"` in
-  `token_endpoint_auth_methods_supported`), so no registration endpoint is
-  offered. The gateway fetches the `client_id` URL (5 s, 64 KiB, no redirects),
-  refuses a document naming another client, and allows a redirect the document
-  lists — or, for a loopback redirect, one differing only in its port
-  (RFC 8252 §7.3). The two documents in use, fetched 2026-10-25:
-  `https://claude.ai/oauth/mcp-oauth-client-metadata` (Claude, redirect
-  `https://claude.ai/api/mcp/auth_callback`) and
-  `https://claude.ai/oauth/claude-code-client-metadata` (Claude Code,
-  redirects `http://localhost/callback` and `http://127.0.0.1/callback`).
+- **Two kinds of client, and no registration endpoint.** A `client_id` is
+  either a URL naming a Client ID Metadata Document, or a plain id registered
+  in the gateway's config.
+  - **Metadata documents** (`client_id_metadata_document_supported: true`,
+    `"none"` in `token_endpoint_auth_methods_supported`). The gateway fetches
+    the `client_id` URL (5 s, 64 KiB, no redirects), refuses a document naming
+    another client, and allows a redirect the document lists — or, for a
+    loopback redirect, one differing only in its port (RFC 8252 §7.3). The two
+    documents in use, fetched 2026-10-25:
+    `https://claude.ai/oauth/mcp-oauth-client-metadata` (Claude, redirect
+    `https://claude.ai/api/mcp/auth_callback`) and
+    `https://claude.ai/oauth/claude-code-client-metadata` (Claude Code,
+    redirects `http://localhost/callback` and `http://127.0.0.1/callback`).
+    The person connecting leaves the client id blank; the client fills it in.
+  - **Registered clients**, for a client that takes a fixed id typed into a
+    form — Grok's connectors do (2026-10-28), redirecting to
+    `https://grok.com/connectors-oauth-exchange-code/`. `auth.mcp_clients` in
+    the deployment's `auth.yaml` lists each by `id` (a plain name, not a URL),
+    `name` (what the consent page calls it), the `redirect_uris` it may be sent
+    to exactly, and optionally `secret_sha256`: the SHA-256 of its secret in
+    lowercase hex, so `auth.yaml` still holds no secret. The list is checked
+    at startup — an id that is empty, padded, holds a `:` (every URL does, and
+    a Basic header could not carry one) or is listed twice, a redirect neither
+    `https` nor loopback `http`, a hash that is not 64 lowercase hex digits
+    all stop the gateway (`web/src/auth/mcp/registered.rs`). A registered
+    client with a secret presents it at `/oauth/token` on every exchange, in
+    the form (`client_secret_post`) or a Basic header (`client_secret_basic`,
+    each half form-urlencoded, RFC 6749 §2.3.1), one or the other, never both
+    — before its code or refresh token is read. A wrong or missing secret, or
+    a Basic header that cannot be read, is `401 invalid_client` with
+    `WWW-Authenticate: Basic`. Both methods are advertised beside `"none"`.
+    A plain id is a client only while it is listed: taken off the list, its
+    refresh tokens are refused with it. PKCE is required of every client
+    either way. A secret the gateway's operator generates uses URL-safe
+    characters only, so it reads the same whether or not a client
+    form-encodes it into the header.
 - **`/oauth/authorize`** checks the request (PKCE `S256` required, the resource
-  this one), fetches the client's document and matches the redirect — none of
+  this one), fetches the client's document — or reads a registered client's
+  entry — and matches the redirect — none of
   which redirects anywhere, since an unchecked redirect is not one to send a
   browser to. **The user is then asked.** Who they are is the gateway's own
   session cookie; nobody signed in is sent to `/auth/login?next=…`, which
@@ -1131,7 +1157,7 @@ other request, and never see what a token means. The site table forwards
   and `iss` (RFC 9207), or `access_denied`.
 - **`/oauth/token`** takes form-urlencoded bodies; a code works with the PKCE
   verifier, for the client and redirect it was issued to; a refresh token buys
-  a fresh pair. Errors are RFC 6749's (`invalid_grant`,
+  a fresh pair. Errors are RFC 6749's (`invalid_client`, `invalid_grant`,
   `unsupported_grant_type`, `invalid_target`). A code lasts five minutes, an
   access token an hour, a refresh token 30 days.
 - **Stateless, like the session.** A consent, a code and each token are values
@@ -1247,7 +1273,11 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   model and a `conv_id`.
 - The authorization server: the `401` and its `resource_metadata`; both
   metadata documents' exact bytes; a CIMD client accepted, a redirect outside
-  the allowed set refused; PKCE `S256` required; the code exchange, refresh
+  the allowed set refused; a registered client's plain id read only when
+  registered, asked about by its name, and sent only to its redirects; its
+  secret required in the form or a Basic header on the code exchange and on
+  refresh, a wrong one `401 invalid_client`; a client list the gateway cannot
+  honour refused at startup; PKCE `S256` required; the code exchange, refresh
   rotation and `invalid_grant`; the consent page escaping what a client wrote,
   an answer from another person refused, a consent spent once; a secret never
   a record's key; a bearer token read on `/mcp` only.

@@ -164,6 +164,30 @@ pub struct Auth {
     /// secret. Rotating it signs everyone out, which is the intended lever.
     pub session_secret_file: PathBuf,
     pub google: Provider,
+    /// The `/mcp` clients registered here, for a client that takes a fixed
+    /// client id rather than naming a metadata document — Grok's connectors
+    /// do (`docs/claude_zend_gateway.md` §12). Empty: only metadata-document
+    /// clients (Claude) can sign in.
+    #[serde(default)]
+    pub mcp_clients: Vec<McpClient>,
+}
+
+/// One registered `/mcp` client in `auth.mcp_clients`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpClient {
+    /// The client id the client sends. Not a URL: an `https` id names a
+    /// metadata document instead.
+    pub id: String,
+    /// What the consent page calls it.
+    pub name: String,
+    /// The redirects it may be sent to, exactly.
+    pub redirect_uris: Vec<String>,
+    /// The SHA-256 of its secret, in hex. The secret itself is held by the
+    /// client alone, so this file still carries none. Absent: a public
+    /// client, proven by PKCE alone.
+    #[serde(default)]
+    pub secret_sha256: Option<String>,
 }
 
 fn d_session_hours() -> u64 {

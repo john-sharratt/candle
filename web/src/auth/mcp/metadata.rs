@@ -9,7 +9,8 @@
 //!   `/.well-known/oauth-authorization-server`. It advertises Client ID
 //!   Metadata Documents and the `none` client authentication, which is what
 //!   makes claude.ai and Claude Code both use CIMD, so no registration endpoint
-//!   is offered.
+//!   is offered. The two secret methods are for the clients registered in the
+//!   config (`super::registered`).
 
 use serde_json::{json, Value};
 
@@ -44,7 +45,8 @@ pub fn authorization_server(issuer: &str) -> Value {
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported":
+            ["none", "client_secret_post", "client_secret_basic"],
         "client_id_metadata_document_supported": true,
         "scopes_supported": [SCOPE],
         "authorization_response_iss_parameter_supported": true,
@@ -64,7 +66,7 @@ mod tests {
         );
         assert_eq!(
             authorization_server("https://code.tokera.com").to_string(),
-            r#"{"issuer":"https://code.tokera.com","authorization_endpoint":"https://code.tokera.com/oauth/authorize","token_endpoint":"https://code.tokera.com/oauth/token","response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"client_id_metadata_document_supported":true,"scopes_supported":["zend"],"authorization_response_iss_parameter_supported":true}"#
+            r#"{"issuer":"https://code.tokera.com","authorization_endpoint":"https://code.tokera.com/oauth/authorize","token_endpoint":"https://code.tokera.com/oauth/token","response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none","client_secret_post","client_secret_basic"],"client_id_metadata_document_supported":true,"scopes_supported":["zend"],"authorization_response_iss_parameter_supported":true}"#
         );
     }
 }
