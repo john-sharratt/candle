@@ -3359,9 +3359,10 @@ pub(crate) struct Scheduler {
     /// shared across conversations). `None` on non-CUDA devices — the reproject
     /// then falls back to the CPU per-file scan. See `docs/archived/paged_gallery_arena.md`.
     gallery_arena: Option<Arc<GalleryArena>>,
-    /// The gallery's last census and when it was taken — reused by the memory
-    /// report until it is [`state_census::GALLERY_CENSUS_EVERY`] old.
-    gallery_census: Option<(Instant, state_census::GalleryCensus)>,
+    /// The state band's last census — the gallery's, and each substrate's
+    /// group names — reused by the memory report until it is
+    /// [`state_census::CENSUS_EVERY`] old.
+    state_census: Option<state_census::CensusCache>,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
     /// Persistent sampling state per sequence ID (survives across turns).
@@ -4164,7 +4165,7 @@ impl Scheduler {
             model,
             session,
             gallery_arena,
-            gallery_census: None,
+            state_census: None,
             tag_ids: TagIds::of(&tokenizer),
             tokenizer,
             think_close,

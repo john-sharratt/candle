@@ -12,14 +12,22 @@
 //!   tombstoned, or not in any substrate at all, and the layer and group it was
 //!   written to — summed into rows. Reading every resident turn's stream is a
 //!   walk of the residency map and a lookup per turn, so it is taken at most
-//!   once per [`GALLERY_CENSUS_EVERY`] and published as it stood then; a
-//!   substrate whose lock a writer holds is skipped and counted rather than
-//!   waited on, so the census never stalls a wave.
+//!   once per [`CENSUS_EVERY`] and published as it stood then; a substrate
+//!   whose lock a writer holds is skipped and counted rather than waited on,
+//!   so the census never stalls a wave.
 //! - **Recurrent state** ([`RecurrentBreakdown`]): stores live and parked, what
-//!   one costs, and the live slots by the layer and group they serve. Cheap,
-//!   taken at every publish.
+//!   one costs, and the live slots by the layer and group they serve. Taken at
+//!   every publish, naming each slot's group from its substrate's names as the
+//!   last census found them.
+//!
+//! **Names come from every schema captured for a substrate.** A substrate's
+//! conversations do not share one builder — each layer's, and each
+//! conversation's submitted sections, are their own — so a group is named by
+//! whichever captured builder declares it ([`GroupNames`]). Group ids are
+//! small integers local to a substrate's schema, so names are never looked up
+//! across substrates: two daemons on one engine reuse the same ids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,11 +35,24 @@ use serde::Serialize;
 
 use super::Scheduler;
 use crate::persistence::streams::{StreamDecl, StreamId};
-use crate::projection::event::{group_name_of, layer_name_of_group};
-use crate::projection::{Builder, GroupId, TimelineId};
+use crate::projection::{
+    Builder, GroupId, Schema, Substrate, SubstrateRead, SubstrateRef, TimelineId,
+};
+use crate::provenance::GalleryArena;
 
-/// How often the gallery's census is taken again.
-pub const GALLERY_CENSUS_EVERY: Duration = Duration::from_secs(60);
+/// How often the census is taken again.
+pub const CENSUS_EVERY: Duration = Duration::from_secs(60);
+
+/// A substrate's groups by id: each one's layer and group name.
+pub type GroupNames = HashMap<GroupId, (String, String)>;
+
+/// The census as it stood when last taken.
+pub struct CensusCache {
+    at: Instant,
+    gallery: Option<GalleryCensus>,
+    /// Each substrate the census could read, with its group names.
+    names: Vec<(SubstrateRef, GroupNames)>,
+}
 
 /// The "state" band's breakdown.
 #[derive(Debug, Clone, Serialize)]
@@ -113,7 +134,8 @@ pub struct SlotRow {
 pub struct RecurrentBreakdown {
     /// Bytes its arenas hold (the census's `recurrent state` row).
     pub held_bytes: u64,
-    /// What one sequence's store costs.
+    /// What admitting one sequence costs: its store and its prefill scratch.
+    /// A decoding sequence holds less — the scratch goes back once it decodes.
     pub store_bytes: u64,
     /// Stores of sequences with a slot.
     pub live_stores: usize,
@@ -172,117 +194,160 @@ fn slot_rows(counts: HashMap<(String, String), usize>) -> Vec<SlotRow> {
     rows
 }
 
-/// A group's layer and group names in `schema`, empty where unknown.
-fn names(builder: Option<&Arc<Builder>>, group: Option<GroupId>) -> (String, String) {
-    match (builder, group) {
-        (Some(b), Some(g)) => (
-            layer_name_of_group(b.schema(), g)
-                .unwrap_or_default()
-                .to_string(),
-            group_name_of(b.schema(), g).unwrap_or_default().to_string(),
-        ),
-        _ => (String::new(), String::new()),
+/// `groups` — `(id, layer, group)` as each schema declares them — by id, the
+/// first declaration of an id naming it.
+pub fn group_names<'a>(
+    groups: impl IntoIterator<Item = (GroupId, &'a str, &'a str)>,
+) -> GroupNames {
+    let mut out = GroupNames::new();
+    for (id, layer, group) in groups {
+        out.entry(id)
+            .or_insert_with(|| (layer.to_string(), group.to_string()));
+    }
+    out
+}
+
+/// Every group `schema` declares, as `(id, layer, group)`.
+fn schema_groups(schema: &Schema) -> impl Iterator<Item = (GroupId, &str, &str)> {
+    schema.layers.iter().flat_map(|l| {
+        l.groups
+            .iter()
+            .map(move |g| (g.id, l.name.as_str(), g.name.as_str()))
+    })
+}
+
+/// The gallery's census over `reads`, each with the group names of its
+/// substrate's schemas; `skipped` substrates could not be read.
+fn census_gallery(
+    arena: &GalleryArena,
+    reads: &[(SubstrateRead<'_>, &GroupNames)],
+    skipped: usize,
+) -> GalleryCensus {
+    let runs = arena.resident_runs();
+    let keep = arena.keep_within();
+    let (idle_past_keep_turns, idle_past_keep_bytes) = match keep {
+        Some(k) => runs
+            .iter()
+            .filter(|(_, _, idle)| *idle > k)
+            .fold((0, 0), |(n, b), (_, bytes, _)| (n + 1, b + bytes)),
+        None => (0, 0),
+    };
+    let class_of = |sid: StreamId| {
+        for (read, names) in reads {
+            let Some(StreamDecl::Turn(t)) = read.stream_of(sid).and_then(|s| s.decl.as_ref())
+            else {
+                continue;
+            };
+            let status = match TimelineId::from_raw(t.timeline_id) {
+                Some(tl) if read.is_tombstoned(tl) => TurnStatus::Tombstoned,
+                _ => TurnStatus::Live,
+            };
+            let (layer, group) = GroupId::from_raw(t.group_id)
+                .and_then(|g| names.get(&g))
+                .cloned()
+                .unwrap_or_default();
+            return TurnClass {
+                status,
+                layer,
+                group,
+            };
+        }
+        TurnClass {
+            status: TurnStatus::Absent,
+            layer: String::new(),
+            group: String::new(),
+        }
+    };
+    let sized: Vec<(StreamId, u64)> = runs.iter().map(|(s, b, _)| (*s, *b)).collect();
+    GalleryCensus {
+        taken_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64),
+        page_bytes: sized.iter().map(|(_, b)| b).sum(),
+        region_bytes: arena.resident_bytes(),
+        keep_within_secs: keep.map(|k| k.as_secs()),
+        idle_past_keep_turns,
+        idle_past_keep_bytes,
+        substrates_skipped: skipped,
+        rows: tally(&sized, class_of),
     }
 }
 
 impl Scheduler {
-    /// The "state" band's breakdown, its gallery census at most
-    /// [`GALLERY_CENSUS_EVERY`] old. `recurrent_held` is the census's
-    /// `recurrent state` row, taken in the same breath as the report's.
+    /// The "state" band's breakdown, from a census at most [`CENSUS_EVERY`]
+    /// old. `recurrent_held` is the census's `recurrent state` row, taken in
+    /// the same breath as the report's.
     pub(super) fn state_section(&mut self, recurrent_held: u64) -> StateSection {
+        let stale = match &self.state_census {
+            Some(cache) => cache.at.elapsed() >= CENSUS_EVERY,
+            None => true,
+        };
+        if stale {
+            self.state_census = Some(self.take_census());
+        }
+        let cache = self.state_census.as_ref().expect("census taken above");
         StateSection {
-            gallery: self.gallery_census(),
-            recurrent: self.recurrent_breakdown(recurrent_held),
+            gallery: cache.gallery.clone(),
+            recurrent: self.recurrent_breakdown(recurrent_held, &cache.names),
         }
     }
 
-    fn gallery_census(&mut self) -> Option<GalleryCensus> {
-        let arena = Arc::clone(self.gallery_arena.as_ref()?);
-        if let Some((at, census)) = &self.gallery_census {
-            if at.elapsed() < GALLERY_CENSUS_EVERY {
-                return Some(census.clone());
-            }
-        }
-        let runs = arena.resident_runs();
-        let keep = arena.keep_within();
-        let (idle_past_keep_turns, idle_past_keep_bytes) = match keep {
-            Some(k) => runs
-                .iter()
-                .filter(|(_, _, idle)| *idle > k)
-                .fold((0, 0), |(n, b), (_, bytes, _)| (n + 1, b + bytes)),
-            None => (0, 0),
-        };
+    fn take_census(&self) -> CensusCache {
         let substrates = self.distinct_substrates();
         let mut skipped = 0usize;
-        let reads: Vec<_> = substrates
-            .iter()
-            .filter_map(|c| {
-                let read = c.try_read();
-                skipped += usize::from(read.is_none());
-                read
-            })
-            .collect();
-        // Each substrate's schema, from a projection captured for one of its
-        // own timelines.
-        let schemas: Vec<Option<&Arc<Builder>>> = reads
-            .iter()
-            .map(|read| {
-                self.timeline_projections
-                    .iter()
-                    .find(|(tl, _)| read.custom_of(**tl).is_some())
-                    .map(|(_, b)| b)
-            })
-            .collect();
-        let class_of = |sid: StreamId| {
-            for (read, schema) in reads.iter().zip(&schemas) {
-                let Some(StreamDecl::Turn(t)) = read.stream_of(sid).and_then(|s| s.decl.as_ref())
-                else {
-                    continue;
-                };
-                let status = match TimelineId::from_raw(t.timeline_id) {
-                    Some(tl) if read.is_tombstoned(tl) => TurnStatus::Tombstoned,
-                    _ => TurnStatus::Live,
-                };
-                let (layer, group) = names(*schema, GroupId::from_raw(t.group_id));
-                return TurnClass {
-                    status,
-                    layer,
-                    group,
-                };
-            }
-            TurnClass {
-                status: TurnStatus::Absent,
-                layer: String::new(),
-                group: String::new(),
-            }
-        };
-        let sized: Vec<(StreamId, u64)> = runs.iter().map(|(s, b, _)| (*s, *b)).collect();
-        let rows = tally(&sized, class_of);
-        drop(reads);
-        let census = GalleryCensus {
-            taken_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
-            page_bytes: sized.iter().map(|(_, b)| b).sum(),
-            region_bytes: arena.resident_bytes(),
-            keep_within_secs: keep.map(|k| k.as_secs()),
-            idle_past_keep_turns,
-            idle_past_keep_bytes,
-            substrates_skipped: skipped,
-            rows,
-        };
-        self.gallery_census = Some((Instant::now(), census.clone()));
-        Some(census)
+        let mut reads = Vec::new();
+        let mut names = Vec::new();
+        for conv in &substrates {
+            let Some(read) = conv.try_read() else {
+                skipped += 1;
+                continue;
+            };
+            names.push((conv.substrate_ref(), self.group_names_of(&read)));
+            reads.push(read);
+        }
+        let gallery = self.gallery_arena.as_ref().map(|arena| {
+            let paired: Vec<(SubstrateRead<'_>, &GroupNames)> = reads
+                .into_iter()
+                .zip(names.iter().map(|(_, n)| n))
+                .collect();
+            census_gallery(arena, &paired, skipped)
+        });
+        CensusCache {
+            at: Instant::now(),
+            gallery,
+            names,
+        }
     }
 
-    fn recurrent_breakdown(&self, held_bytes: u64) -> RecurrentBreakdown {
+    /// The group names of every builder captured for one of `substrate`'s
+    /// timelines.
+    fn group_names_of(&self, substrate: &Substrate) -> GroupNames {
+        let mut seen: HashSet<*const Builder> = HashSet::new();
+        group_names(
+            self.timeline_projections
+                .iter()
+                .filter(|(tl, _)| substrate.custom_of(**tl).is_some())
+                .filter(|(_, b)| seen.insert(Arc::as_ptr(b)))
+                .flat_map(|(_, b)| schema_groups(b.schema())),
+        )
+    }
+
+    fn recurrent_breakdown(
+        &self,
+        held_bytes: u64,
+        names: &[(SubstrateRef, GroupNames)],
+    ) -> RecurrentBreakdown {
         let (live_stores, parked_stores) = self.model.recurrent_census();
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
-        for target in self.slot_targets.values() {
-            let builder = self.timeline_projections.get(&target.timeline);
-            *counts
-                .entry(names(builder, Some(target.group)))
-                .or_default() += 1;
+        for (slot, target) in &self.slot_targets {
+            let named = self
+                .slot_conversations
+                .get(slot)
+                .and_then(|conv| names.iter().find(|(r, _)| r.is(conv)))
+                .and_then(|(_, n)| n.get(&target.group))
+                .cloned()
+                .unwrap_or_default();
+            *counts.entry(named).or_default() += 1;
         }
         let unbound = self
             .slot_conversations
@@ -363,6 +428,33 @@ mod tests {
     #[test]
     fn an_empty_gallery_has_no_rows() {
         assert!(tally(&[], |_| class(TurnStatus::Live, "", "")).is_empty());
+    }
+
+    /// **A substrate's groups are named by every schema captured for it**: a
+    /// group only the second schema declares is still named, and an id two
+    /// schemas both declare keeps the first one's names.
+    #[test]
+    fn groups_are_named_by_whichever_schema_declares_them() {
+        let id = |raw| GroupId::from_raw(raw).expect("group id");
+        let names = group_names([
+            (id(1), "code_reading", "scopes"),
+            (id(2), "repo_map", "structure"),
+            (id(2), "dialogue", "conversation"),
+            (id(3), "dependency_analysis", "dependencies"),
+        ]);
+        let mut got: Vec<(u32, &str, &str)> = names
+            .iter()
+            .map(|(g, (l, n))| (g.raw(), l.as_str(), n.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (1, "code_reading", "scopes"),
+                (2, "repo_map", "structure"),
+                (3, "dependency_analysis", "dependencies"),
+            ]
+        );
     }
 
     /// Slots are listed most first, a tie broken by name.
