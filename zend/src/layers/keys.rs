@@ -46,8 +46,9 @@ pub const SPEC_KEY: &str = "spec";
 pub const JOB_KEY: &str = "job";
 
 /// Bumped when what a unit of every layer means changes, so each is built
-/// again.
-pub const UNIT_KEY_VERSION: u32 = 1;
+/// again. 2: a unit stands as the one exchange it amounts to
+/// (`super::compact`), not as its whole reading.
+pub const UNIT_KEY_VERSION: u32 = 2;
 
 /// The content key of `layer`'s unit built on the unit `after`.
 pub fn unit_key(layer: &str, after: &str) -> String {
@@ -109,7 +110,7 @@ mod tests {
     #[test]
     fn a_units_key_names_its_layer_and_differs_by_what_it_built_on() {
         let a = unit_key("static_analysis", "v2:candle/a.rs@1");
-        assert!(a.starts_with("u1:static_analysis:"));
+        assert!(a.starts_with("u2:static_analysis:"));
         assert_ne!(a, unit_key("static_analysis", "v2:candle/a.rs@2"));
         assert_ne!(a, unit_key("critical_analysis", "v2:candle/a.rs@1"));
         assert_eq!(a, unit_key("static_analysis", "v2:candle/a.rs@1"));

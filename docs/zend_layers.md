@@ -108,6 +108,28 @@ does, and logs it (`zend::layers::provenance`): which units of other files it
 drew, the best-scored candidates, the scope each layer offered, and the tokens
 per group.
 
+**A unit stands as one exchange.** A unit is read in many turns — its
+question, each round of tool calls and what they answered, the reasoning
+between them — and what it stands for is its last answer. Once it has answered
+it is written again (`layers::compact`) as a conversation of one exchange,
+minted exactly as the reading was (same base, lineage, retrieval scopes and
+early tags):
+
+- the user turn is a short question naming the layer and the subject —
+  `Code review: candle/zend/src/rate.rs` — not the layer's prompt;
+- the assistant turn is the answer, its reasoning set aside, prefilled as a
+  no-reasoning content turn (`Sequence::insert_turn_staged`), not decoded.
+
+That conversation is committed — content key, dependencies, calibration — and
+the reading is tombstoned before it is minted, so a worker holds one
+conversation at a time. A unit that cannot be written again is not committed
+as its reading: both go, and it is read again next pass. What the substrate
+keeps of a unit is the answer's own K/V, and what a unit above inherits as
+its lineage is each unit below's answer, not its reading.
+
+A unit's subject names it in the substrate view, as a file's path names its
+reading.
+
 ## What stands, and what goes
 
 Each unit records:
@@ -244,11 +266,14 @@ An edit to the file still rebuilds its unit immediately, as for any layer.
 - `security_review` searches the web: up to four searches per unit, as its
   prompt asks, on every read. Its first build searches for every file; after
   that, a thirtieth of its files a day plus each edited file.
-- Every unit inherits its lower units' whole conversations, their tool reads
-  included: an upper unit's lineage reaches the inherited-chain cap. On a 64 GB
-  host the first tool-using upper layer once failed every unit on a
-  driver-level out-of-memory (pinned host memory) and did not on a fresh
-  process; host-memory admission is the engine's, and unproven here.
+- Every unit inherits its lower units as their one exchange each — question
+  and answer, no tool reads or reasoning — on top of the file's reading. Before
+  units were written again that way, an upper unit inherited whole readings
+  and its lineage reached the inherited-chain cap; on a 64 GB host the first
+  tool-using upper layer once failed every unit on a driver-level out-of-memory
+  (pinned host memory).
+- Writing a unit again costs one prefill of its question and answer after its
+  reading, on the same worker.
 
 ## Tied to a branch
 

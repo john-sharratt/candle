@@ -28,6 +28,7 @@
 //! its own file's phase so the layer never churns at once, standing until its
 //! replacement commits ([`expiry`]).
 
+pub mod compact;
 pub mod days;
 pub mod edges;
 pub mod expiry;

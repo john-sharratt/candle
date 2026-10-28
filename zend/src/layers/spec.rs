@@ -177,7 +177,8 @@ impl LayerSpec {
     /// catalog holds every tool it was given. Restricted's holds the
     /// read-only tools and no network tool, so a unit that researches decodes
     /// under Comprehensive's — its prompt still lists only its own tools, and
-    /// a call of any other is refused unrun (`super::run::only_given`).
+    /// its calls are held to them (`super::run::unit_triggers`), so it can
+    /// write no other.
     pub fn tool_mode(&self) -> ToolMode {
         if self.researches() {
             ToolMode::Comprehensive

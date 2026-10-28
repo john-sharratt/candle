@@ -257,7 +257,8 @@ pub fn ingest_units(
     Ok(report)
 }
 
-/// Read one unit: lease it, mint its conversation, ask it, commit it.
+/// Read one unit: lease it, mint its conversation, ask it, write it again as
+/// one exchange, commit that.
 fn read_one(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
@@ -273,48 +274,30 @@ fn read_one(
     if hold.recheck() && is_committed(ctx.engine, &job.key) {
         return Ok(());
     }
-    let mut conv = base
-        .lock()
-        .unwrap()
-        .fork()
-        .map_err(|e| anyhow::anyhow!("{} unit conversation: {e}", spec.layer))?;
-    let timeline = conv.timeline_id();
-    {
-        let e = ctx.engine.lock().unwrap();
-        if let Some(parent) = job.parent.or(ctx.chain_end) {
-            e.set_forked_from(timeline, parent)
-                .map_err(|err| anyhow::anyhow!("{} unit lineage: {err}", spec.layer))?;
-        }
-        e.set_timeline_summarize(timeline, false);
-        for (group, allowed) in &job.scopes {
-            e.set_retrieval_scope(timeline, *group, Arc::clone(allowed));
-        }
-    }
-    if let Err(err) = conv.seed_recurrent_from_lineage() {
-        tracing::warn!(
-            target: "zend::layers",
-            layer = %spec.layer,
-            subject = %job.subject,
-            "seeding recurrent memory from the unit's lineage failed: {err:#}",
-        );
-    }
-    // Named before the decode, so a crash's partial is found and retired at
-    // the next boot; the content key is withheld until it has answered.
-    let mut early = BTreeMap::new();
-    early.insert("kind".to_string(), spec.layer.clone());
-    early.insert(LAYER_KEY.to_string(), spec.layer.clone());
-    early.insert(SUBJECT_KEY.to_string(), job.subject.clone());
-    let answered = conv
-        .set_metadata_many(&early)
-        .map_err(|e| anyhow::anyhow!("naming the unit: {e}"))
-        .and_then(|()| ask(ctx, spec, job, &mut conv));
-    let answer = match answered {
+    let mut reading = mint_unit(ctx, spec, job, base)?;
+    let answer = match ask(ctx, spec, job, &mut reading) {
         Ok(answer) => answer,
         Err(e) => {
-            let _ = ctx.engine.lock().unwrap().tombstone_timeline(timeline);
+            let _ = ctx
+                .engine
+                .lock()
+                .unwrap()
+                .tombstone_timeline(reading.timeline_id());
             return Err(e);
         }
     };
+    // The unit stands as the one exchange it amounts to (`super::compact`),
+    // and the reading goes — first, so a worker holds one conversation at a
+    // time. A unit that cannot be written again is not committed as the
+    // reading: it is read again next pass.
+    let _ = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .tombstone_timeline(reading.timeline_id());
+    drop(reading);
+    let conv = super::compact::rewrite(ctx, spec, job, base, &answer)?;
+    let timeline = conv.timeline_id();
     // Every dependency is taken as ONE branch of the unit's holds it — its
     // first. Taken over all its branches, each dependency came from whichever
     // branch held it first, and where the branches disagree a unit could hold
@@ -390,8 +373,8 @@ fn read_one(
         anyhow::bail!("the content key was not written: {err:#}");
     }
     ctx.retrieval.mark_stale();
-    // Calibrated while its reading is still resident; a failure leaves the
-    // unit to the catch-up round ahead of the next pass.
+    // Calibrated while its exchange is still resident, just prefilled; a
+    // failure leaves the unit to the catch-up round ahead of the next pass.
     if let Some(cal) = calibrate {
         let calibrated = calibrate_committed(ctx, cal, base, timeline, &job.subject, &key);
         if let (Err(err), false) = (calibrated, crate::ingest_cancel::cancelled()) {
@@ -415,6 +398,59 @@ fn read_one(
         "unit committed",
     );
     Ok(())
+}
+
+/// A conversation for the unit `job` of `spec`'s layer: forked on `base`, its
+/// lineage the unit it builds on, scoped as the job's units are, its recurrent
+/// memory seeded from that lineage, and named — kind, layer, subject — before
+/// anything is written to it, so a crash's partial is found and retired at the
+/// next boot. The content key is withheld until the unit has answered. Both
+/// the unit's reading and the exchange it is written again as
+/// (`super::compact`) are minted here.
+pub(super) fn mint_unit(
+    ctx: &RefreshContext<'_>,
+    spec: &LayerSpec,
+    job: &UnitJob,
+    base: &Mutex<Sequence>,
+) -> anyhow::Result<Sequence> {
+    let conv = base
+        .lock()
+        .unwrap()
+        .fork()
+        .map_err(|e| anyhow::anyhow!("{} unit conversation: {e}", spec.layer))?;
+    let timeline = conv.timeline_id();
+    let named = (|| {
+        {
+            let e = ctx.engine.lock().unwrap();
+            if let Some(parent) = job.parent.or(ctx.chain_end) {
+                e.set_forked_from(timeline, parent)
+                    .map_err(|err| anyhow::anyhow!("{} unit lineage: {err}", spec.layer))?;
+            }
+            e.set_timeline_summarize(timeline, false);
+            for (group, allowed) in &job.scopes {
+                e.set_retrieval_scope(timeline, *group, Arc::clone(allowed));
+            }
+        }
+        if let Err(err) = conv.seed_recurrent_from_lineage() {
+            tracing::warn!(
+                target: "zend::layers",
+                layer = %spec.layer,
+                subject = %job.subject,
+                "seeding recurrent memory from the unit's lineage failed: {err:#}",
+            );
+        }
+        let mut early = BTreeMap::new();
+        early.insert("kind".to_string(), spec.layer.clone());
+        early.insert(LAYER_KEY.to_string(), spec.layer.clone());
+        early.insert(SUBJECT_KEY.to_string(), job.subject.clone());
+        conv.set_metadata_many(&early)
+            .map_err(|e| anyhow::anyhow!("naming the unit: {e}"))
+    })();
+    if let Err(e) = named {
+        let _ = ctx.engine.lock().unwrap().tombstone_timeline(timeline);
+        return Err(e);
+    }
+    Ok(conv)
 }
 
 /// Whether a unit leased under `key` is committed — under that key, or, for

@@ -108,6 +108,7 @@ use crate::journal::style::style_for;
 use crate::journal::text::JournalText;
 use crate::journal::world::{Citable, JournalsAbove};
 use crate::journal::{carry, draft, origin, pressure};
+use crate::layers::keys::SUBJECT_KEY;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
@@ -8831,6 +8832,17 @@ fn layer_totals(
         })
 }
 
+/// What a committed ingested unit is keyed by, workspace-relative: a file's
+/// reading by its path, a folder's by its folder, a layer's unit by its
+/// subject — the file or folder it analyses. `None` for a conversation that is
+/// no committed unit.
+fn committed_unit_key(meta: &BTreeMap<String, String>) -> Option<&String> {
+    meta.get(PATH_KEY)
+        .or_else(|| meta.get(DIR_KEY))
+        .or_else(|| meta.get(SUBJECT_KEY))
+        .filter(|_| meta.contains_key(CONTENT_KEY))
+}
+
 /// The conversations targeting a layer's groups, largest first. Enumerates
 /// EVERY registered timeline — not just user conversations — so internal
 /// content layers (repo_map, code_reading, the analysis layers) surface their
@@ -8859,7 +8871,7 @@ fn layer_conv_views(
                 .map(|s| s.to_string())
                 .or_else(|| {
                     s.custom_of(tl)
-                        .and_then(|m| m.get("path"))
+                        .and_then(|m| m.get(PATH_KEY).or_else(|| m.get(SUBJECT_KEY)))
                         .filter(|p| !p.is_empty())
                         .cloned()
                 })
@@ -8889,12 +8901,7 @@ fn layer_conv_views(
             // An ingested unit is keyed workspace-relative (`candle/CLAUDE.md`);
             // the view shows it the way the tools address it — its repository,
             // and the path inside it.
-            let unit_key = s.custom_of(tl).and_then(|m| {
-                m.get(PATH_KEY)
-                    .or_else(|| m.get(DIR_KEY))
-                    .filter(|_| m.contains_key(CONTENT_KEY))
-                    .cloned()
-            });
+            let unit_key = s.custom_of(tl).and_then(committed_unit_key).cloned();
             let (repo, label) = match &unit_key {
                 Some(key) => {
                     let (repo, inner) = shown_unit(key);
@@ -9549,6 +9556,43 @@ mod turn_cap_tests {
             MAX_TURN_TOKENS > longest_think + MAX_STRING_VALUE_TOKENS as usize,
             "{MAX_TURN_TOKENS} cannot hold {longest_think} thinking + {MAX_STRING_VALUE_TOKENS} of value",
         );
+    }
+}
+
+#[cfg(test)]
+mod unit_key_tests {
+    use std::collections::BTreeMap;
+
+    use super::committed_unit_key;
+
+    fn meta(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// **A committed unit is named by what it covers**: a file's reading by
+    /// its path, a folder by its folder, a layer's unit by its subject — and a
+    /// conversation without a content key by none of them.
+    #[test]
+    fn a_committed_unit_is_named_by_what_it_covers() {
+        let read = meta(&[("path", "candle/zend/src/rate.rs"), ("content_key", "k1")]);
+        assert_eq!(
+            committed_unit_key(&read).map(String::as_str),
+            Some("candle/zend/src/rate.rs")
+        );
+        let review = meta(&[
+            ("layer", "code_review"),
+            ("subject", "candle/zend/src/rate.rs"),
+            ("content_key", "u2:code_review:ab"),
+        ]);
+        assert_eq!(
+            committed_unit_key(&review).map(String::as_str),
+            Some("candle/zend/src/rate.rs")
+        );
+        let partial = meta(&[("layer", "code_review"), ("subject", "candle/x.rs")]);
+        assert_eq!(committed_unit_key(&partial), None);
     }
 }
 
