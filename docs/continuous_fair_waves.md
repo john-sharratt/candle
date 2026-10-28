@@ -332,16 +332,28 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   forward, and a full forward takes no more turns (`admit_ground::room_left`);
   nor does a group that leaves the offer out — a band below its own, another
   adapter, or a slot already prefilling, which runs one prefill at a time and
-  which a submission may not fork mid-prefill. Such a turn is walked past, as another band's is, so the turns
-  behind it that would lead the group are still offered — where that reorders
-  nothing on their slot: no turn changes a slot before work queued ahead of it
-  has forked it, and no fork — a turn-group case's view, a submission's —
-  reads a slot a turn queued ahead of it has yet to change. Once a pass has
-  closed its rows, a member comes back as a join — it rides the group's
-  forwards at its share without widening them — and a turn with no place ends
-  the band, since none behind it has rows to take either. Sections are not walked past: one can name the sections
-  before it as its prefix, and ingested ahead of them it would be sealed
-  against what of them had landed.
+  which a submission may not fork mid-prefill.
+
+  **Only a live band takes rows from the members behind it.** A `High` or
+  `Urgent` turn that leads its group is admitted though the forward is full,
+  taking rows from the members after it — that is the starvation this rule
+  ends — but never the last of a member's rows at its own band or above,
+  which would leave that member holding its store in no forward. Below the
+  live bands throughput matters more than latency, and a turn is admitted
+  only into rows the forward has spare, as it always was: taking rows from
+  the members ahead it would join without the rate model weighing it.
+
+  A live turn with no place is walked past, as another band's is, so the
+  turns behind it that would lead the group are still offered — where that
+  reorders nothing on their slot: no turn changes a slot before work queued
+  ahead of it has forked it, and no fork — a turn-group case's view, a
+  submission's — reads a slot a turn queued ahead of it has yet to change.
+  Below the live bands, and once a pass has closed its rows, the first turn
+  with no place ends the band as it always did: none behind has spare rows
+  either. A closed pass re-offers a live member as a join, riding the group's
+  forwards at its share without widening them. Sections are not walked past:
+  one can name the sections before it as its prefix, and ingested ahead of
+  them it would be sealed against what of them had landed.
 
   The rate model weighs the rows the offer *widens* its group by, not its
   share: a turn that leads a re-formed group takes rows from the members

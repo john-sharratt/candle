@@ -7087,6 +7087,57 @@ pub(super) mod wave_chunk_tests {
         s.active_prefills.iter().any(|p| p.work.sequence_id == seq)
     }
 
+    /// A scheduler with `band` prompts of `lens` rows in flight, a full
+    /// forward's worth, and a 64-row turn of `band` queued behind them.
+    fn full_forward(
+        band: DecodePriority,
+        lens: [usize; 2],
+    ) -> (Scheduler, Sender<SchedulerRequest>) {
+        let (mut s, tx) = make_test_scheduler();
+        assert!(
+            lens.iter().sum::<usize>() > s.composition_target(),
+            "the forward is full"
+        );
+        for len in lens {
+            let seq = SequenceId(s.session.create_sequence().expect("create"));
+            s.slot_bands.insert(seq, band);
+            s.active_prefills.push(dialogue_prefill(seq, vec![1; len]));
+        }
+        queue_turn(&mut s, band, 64);
+        (s, tx)
+    }
+
+    /// **No admission stalls a member of its band in flight.** A short live
+    /// turn leads its group and takes rows from the members behind it —
+    /// offered, as a join, while the last of them still advances; refused once
+    /// it would leave one running in no forward while holding its store.
+    #[test]
+    fn an_admission_never_stalls_a_member_in_flight() {
+        let pass = s_pass();
+        // Behind the short one the long member keeps a chunk and more.
+        let (mut s, _tx) = full_forward(DecodePriority::High, [pass - 112, 2 * pass]);
+        assert_eq!(offered_rows(&mut s, DecodePriority::High), Some(0));
+        // Behind it the long member would keep nothing.
+        let (mut s, _tx) = full_forward(DecodePriority::High, [pass - 32, 2 * pass]);
+        assert_eq!(offered_rows(&mut s, DecodePriority::High), None);
+    }
+
+    /// **Below the live bands a full forward takes no more turns**, as it
+    /// always has: there throughput matters more than latency, and a turn
+    /// taking rows from the members ahead would join without the rate model
+    /// weighing it.
+    #[test]
+    fn a_background_turn_takes_only_spare_rows() {
+        let pass = s_pass();
+        let (mut s, _tx) = full_forward(DecodePriority::Low, [pass - 112, 2 * pass]);
+        assert_eq!(offered_rows(&mut s, DecodePriority::Low), None);
+    }
+
+    /// The pass ceiling the test scheduler composes at.
+    fn s_pass() -> usize {
+        make_test_scheduler().0.prefill_pass_ceiling()
+    }
+
     /// **A turn is never walked ahead of one queued before it on its slot.**
     /// The long turn has no place beside the creep; the short one queued
     /// behind it on the same slot would lead the group, and still waits.

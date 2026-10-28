@@ -64,6 +64,8 @@ pub(super) struct Planned {
     /// Its rows left to prefill, and the position its next row lands at.
     pub(super) remaining: usize,
     pub(super) depth: usize,
+    /// The band it runs at.
+    pub(super) band: DecodePriority,
 }
 
 /// A gang a formation forms anew: how wide it may run, and how many long
@@ -122,6 +124,7 @@ impl NextGroup {
             },
             remaining: e.who.remaining,
             depth: e.who.depth,
+            band: e.who.band,
         });
     }
 }

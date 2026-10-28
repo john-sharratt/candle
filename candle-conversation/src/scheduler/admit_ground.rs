@@ -264,11 +264,12 @@ struct Placed {
 }
 
 /// A formation drawn without any offer — what an offer's group is measured
-/// against: the rows it carries and the tier it places.
-#[derive(Clone, Copy)]
+/// against: the rows it carries, the tier it places, and its members.
+#[derive(Clone)]
 struct Without {
     rows: usize,
     tier: u64,
+    members: Rc<[(usize, DecodePriority)]>,
 }
 
 impl Without {
@@ -279,6 +280,23 @@ impl Without {
             return 0;
         }
         group.rows().saturating_sub(self.rows)
+    }
+
+    /// Whether `group`, the same formation with an offer at `band` in it,
+    /// leaves out a member this one carries of that band or above. One of a
+    /// lower band it may set aside: that is the bands' order — the higher
+    /// runs first, and the lower after it.
+    fn stalled_by(&self, group: &NextGroup, band: DecodePriority) -> bool {
+        self.members
+            .iter()
+            .filter(|&&(_, member)| rank(member) >= rank(band))
+            .any(|&(seq, _)| {
+                !group
+                    .members
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| group.offer_at != Some(i) && p.member.seq_id() == seq)
+            })
     }
 }
 
@@ -372,7 +390,7 @@ impl<'a> AdmitPass<'a> {
     /// only offered as a member ([`room_left`]), and it rides the group's
     /// forwards as one. Composed at no rows, a join charged a cohort of 6,254
     /// rows that ran at 8,066.
-    fn priced(&self, group: &NextGroup, without: Without) -> (u64, usize) {
+    fn priced(&self, group: &NextGroup, without: &Without) -> (u64, usize) {
         let tier = self.sched.group_tier(group);
         (tier.saturating_sub(without.tier), group.offer_rows())
     }
@@ -423,7 +441,7 @@ impl<'a> AdmitPass<'a> {
     ) -> (usize, u64, u64) {
         self.narrowed = false;
         let rows = offer.remaining.min(room);
-        let (tier, own) = self.priced(&placed.group, placed.without);
+        let (tier, own) = self.priced(&placed.group, &placed.without);
         let residual = self.residual_for(own);
         if rows == 0 {
             return (0, tier, residual);
@@ -451,7 +469,7 @@ impl<'a> AdmitPass<'a> {
                 .sched
                 .group_in(&placed.prospect, Some(capped), placed.target);
             let without = self.without(offer.band, &placed.prospect, &group, placed.standing);
-            let (tier, own) = self.priced(&group, without);
+            let (tier, own) = self.priced(&group, &without);
             let residual = self.residual_for(own);
             if self.dislodges(claim, residual, tier) <= spendable {
                 fit = Some((without.widened_by(&group), tier, residual));
@@ -482,15 +500,20 @@ impl<'a> AdmitPass<'a> {
         target: usize,
     ) -> Without {
         let key = (band_index(band), target, like.alone);
-        if let Some(&without) = self.withouts.get(&key) {
-            return without;
+        if let Some(without) = self.withouts.get(&key) {
+            return without.clone();
         }
         let group = self.sched.without_in(prospect, like, target);
         let without = Without {
             rows: group.rows(),
             tier: self.sched.group_tier(&group),
+            members: group
+                .members
+                .iter()
+                .map(|p| (p.member.seq_id(), p.band))
+                .collect(),
         };
-        self.withouts.insert(key, without);
+        self.withouts.insert(key, without.clone());
         without
     }
 
@@ -803,6 +826,29 @@ impl AdmitPass<'_> {
         }
         let share = group.offer_at.map(|_| group.offer_rows());
         let room = room_left(share, self.closed)?;
+        // **No admission stalls a member of its band in flight.** A turn that
+        // leads its group takes rows from the members behind it, and that is
+        // the point; one that takes the last of a member's rows leaves it
+        // holding its store while it advances nothing, which is what a full
+        // forward refusing joins exists to prevent (`room_left`). Short turns
+        // queued behind a long one of their band would otherwise each be
+        // admitted ahead of it until it ran in no forward at all.
+        if without.stalled_by(&group, offer.band) {
+            return None;
+        }
+        // **Below the live bands a turn takes only rows the forward has
+        // spare.** There throughput matters more than latency
+        // (`docs/continuous_fair_waves.md` §7), and a turn taking rows from
+        // the members behind it joins without the rate model weighing the
+        // forward it widens nothing of. Open, it needs rows its group gains by
+        // it; closed, a group of its own.
+        if !offer.band.is_live() {
+            let alone = group.members.len() == 1;
+            let spare = without.widened_by(&group) > 0;
+            if !(alone || (!self.closed && spare)) {
+                return None;
+            }
+        }
         Some((
             room,
             Placed {
@@ -916,8 +962,11 @@ impl AdmitPass<'_> {
                 Queued::Offered(cost) => return Some(cost),
                 Queued::Spent => return self.peek_submit(prio),
                 // Closed, the forward's rows end where they stand: no turn
-                // behind it has rows to take either, and the band ends.
-                Queued::NoPlace if self.closed => return None,
+                // behind it has rows to take either, and the band ends. Below
+                // the live bands it ends at the first turn with no place, as a
+                // full forward always ended it: none behind would find spare
+                // rows the first did not.
+                Queued::NoPlace if self.closed || !prio.is_live() => return None,
                 // **A turn its group has no place for is walked past**, as
                 // another band's is. Ending the band there held every turn
                 // behind it: a turn of another adapter, or one a full group
@@ -1057,7 +1106,7 @@ impl AdmitPass<'_> {
             };
             match placed {
                 Some(room) => return Some(self.price_submit(room, offer, lift)),
-                None if self.closed => return None,
+                None if self.closed || !prio.is_live() => return None,
                 None => {
                     self.walked.past(parent.0, true);
                     self.submit_cursor[band] += 1;
