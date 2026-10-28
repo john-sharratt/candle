@@ -6,7 +6,7 @@ use super::admit;
 use super::admit_ground::AdmitPass;
 use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
-use super::creep_slice::time_bounded_layers;
+use super::creep_slice::{slice_target, time_bounded_layers};
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
@@ -2277,7 +2277,7 @@ impl Scheduler {
         };
         let mut pass = AdmitPass::new(self);
         let filled = admit::fill(&mut pass, &mut rate);
-        pass.conclude();
+        let unoffered = pass.conclude();
         self.wave_rate = Some(rate);
         // **Keep one prefill in flight, whatever the model says.**
         //
@@ -2339,6 +2339,9 @@ impl Scheduler {
                 sections = filled.sections,
                 in_flight,
                 queued = self.prefill_queue.len(),
+                // Submitted turns whose projection waits on admission — offered
+                // alongside the queue, and most of what waits in a tool loop.
+                pending = self.pending_submits.len(),
                 queued_sections = self.section_queue.len(),
                 // **The one field that distinguishes "refused" from "never
                 // asked".** A pass that skips admits nothing and refuses
@@ -2352,6 +2355,12 @@ impl Scheduler {
                 // the queue simply rides the next wave.
                 stopped_on_weights = filled.stopped_on_weights,
                 stopped_on_rate = filled.stopped_on_rate,
+                // And the two ends that are not judgements: the forward's rows
+                // already full with the cohort in flight, or the width
+                // backstop. Work waiting behind either was never offered, so
+                // without these a full forward read as admission refusing.
+                stopped_on_rows = unoffered.rows,
+                stopped_on_width = unoffered.width,
                 "admission pass"
             );
         }
@@ -5014,10 +5023,11 @@ impl Scheduler {
             ratio,
             self.decode_only_step.unwrap_or(std::time::Duration::ZERO),
         );
-        // A creep advances `ceil(N / R)` layers — and beside decode rows no
-        // more than a decode-only step's worth of them (`creep_slice`), times
-        // what `R < 1` lets a slice carry, so the share `R` sets is paid in
-        // steps, not seconds.
+        // A creep advances `ceil(N / R)` layers — and beside decode rows it
+        // yields to, no more than a decode-only step's worth of them
+        // (`creep_slice`), times what `R < 1` lets a slice carry, so the share
+        // `R` sets is paid in steps, not seconds. Beside only its own band's
+        // decodes it takes the arrival bound instead (`slice_target`).
         let creep_rows: usize = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
@@ -5030,8 +5040,12 @@ impl Scheduler {
                 creep_rows,
                 self.creep_layer_row_cost,
                 self.creep_layer_cost,
-                self.decode_only_step
-                    .map(|d| d.mul_f64(self.wave_step_slice)),
+                slice_target(
+                    band > 1 || derived.is_some(),
+                    self.decode_only_step,
+                    self.wave_step_slice,
+                    DECODE_LESS_SLICE,
+                ),
             )
         } else {
             // **Decode-less, still bounded in time.** With nothing decoding

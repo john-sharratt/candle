@@ -16,8 +16,40 @@
 //! slice times `R` — but it is paid in turns of a step or two, not seconds, so
 //! a co-batched step costs at most about twice a decode-only one. With nothing
 //! decoding there is nothing to protect and the creep runs its `ceil(N / R)`.
+//!
+//! **Beside only its own band's decodes the slice is the arrival bound**
+//! ([`slice_target`]). Nothing it yields to is decoding (`R = 1`), so the
+//! cadence of the decodes beside it is not what the bound protects: they are
+//! background work like the creep, and the debt `R = 1` sets — equal airtime —
+//! is the whole of what they are owed. A decode-only step's worth of layers
+//! under-pays the creep even that: the debt is its share over a decode-only
+//! step, repaid by the next decode step, which is longer. BlackWorld's layer
+//! ingest (2026-10-29, 3,072-row `Low` cohorts beside 1–3 `Low` decodes) ran
+//! co-batched steps of 115 ms against 72 ms decode-only ones, so the creep held
+//! 43 ms of every ~190 — under a quarter of the device — and prefilled at
+//! 0.5–2.6k tok/s on a card measured at 6.7k. The slice a decode-less creep
+//! takes ([`super::prefill::DECODE_LESS_SLICE`]) still bounds what a prompt of
+//! a higher band waits at the step's end.
 
 use std::time::Duration;
+
+/// How long a creep slice may run beside decode rows: one decode-only step's
+/// worth (`slice_steps` of them) while the creep yields to a decode beside it
+/// (`yields`) — an outranking band, or `High` beside `High` — and otherwise the
+/// arrival bound `arrival` a decode-less creep takes. `None` while no
+/// decode-only step has been measured, which takes a single layer.
+pub(super) fn slice_target(
+    yields: bool,
+    decode_only: Option<Duration>,
+    slice_steps: f64,
+    arrival: Duration,
+) -> Option<Duration> {
+    if yields {
+        decode_only.map(|d| d.mul_f64(slice_steps))
+    } else {
+        Some(arrival)
+    }
+}
 
 /// The newest step's weight in [`next_layer_row_cost`].
 const COST_WEIGHT: f64 = 0.25;
@@ -88,6 +120,35 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// **A creep that yields is bounded by the decode cadence; one beside only
+    /// its own band takes the arrival bound.** The measured case: 72 ms
+    /// decode-only steps, a 250 ms arrival bound.
+    #[test]
+    fn a_slice_is_the_decode_cadence_only_where_the_creep_yields() {
+        assert_eq!(slice_target(true, Some(ms(72)), 1.0, ms(250)), Some(ms(72)));
+        assert_eq!(
+            slice_target(true, Some(ms(72)), 2.0, ms(250)),
+            Some(ms(144))
+        );
+        assert_eq!(
+            slice_target(true, None, 1.0, ms(250)),
+            None,
+            "unmeasured, a layer"
+        );
+        assert_eq!(
+            slice_target(false, Some(ms(72)), 1.0, ms(250)),
+            Some(ms(250))
+        );
+        assert_eq!(slice_target(false, None, 1.0, ms(250)), Some(ms(250)));
+        // The 3,072-row cohort ran four layers in a 43 ms share, ~3.5 µs a
+        // layer-row: the arrival bound carries twenty-three.
+        let cost = Duration::from_nanos(3_500);
+        assert_eq!(
+            time_bounded_layers(48, 3_072, Some(cost), None, Some(ms(250))),
+            23
+        );
     }
 
     /// **The 1.7 s step, bounded.** 8,190 rows at 4.4 µs a layer-row is ~36 ms

@@ -216,6 +216,22 @@ pub(super) struct AdmitPass<'a> {
     /// the rate — what [`Self::conclude`] reads to replace the cohort's width.
     widened: bool,
     closed: bool,
+    /// Why an offer was never made, when one was waiting: see [`Unoffered`].
+    unoffered: Unoffered,
+}
+
+/// Why a pass stopped offering work that was still waiting, without refusing
+/// it. Neither is a judgement, so neither reaches the rate model's refusal
+/// flags — but a pass that ends on one with turns queued reads `admitted=0`,
+/// which without this looks like admission turning work away for no reason.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Unoffered {
+    /// The forward's rows were full ([`room_left`]): the cohort in flight
+    /// takes every row the pass budget allows, and a turn joining it would
+    /// advance by nothing.
+    pub rows: bool,
+    /// The [`Scheduler::MAX_PREFILL_WIDTH`] backstop was reached.
+    pub width: bool,
 }
 
 impl<'a> AdmitPass<'a> {
@@ -273,6 +289,7 @@ impl<'a> AdmitPass<'a> {
             offering_submit: false,
             widened: false,
             closed: false,
+            unoffered: Unoffered::default(),
         }
     }
 
@@ -280,11 +297,13 @@ impl<'a> AdmitPass<'a> {
     /// found every row it offered paying, so the width an earlier pass chose
     /// no longer holds and the cohort's forwards may widen to the budget. A
     /// pass that closed its rows has already recorded its own width
-    /// (`close_rows`); one that admitted no rows judged nothing.
-    pub(super) fn conclude(self) {
+    /// (`close_rows`); one that admitted no rows judged nothing. Answers why
+    /// waiting work went unoffered, for the pass's log line.
+    pub(super) fn conclude(self) -> Unoffered {
         if self.widened && !self.closed {
             self.sched.clear_rate_width();
         }
+        self.unoffered
     }
 
     /// What [`Self::wave`] gains by taking `member` (its remaining rows and
@@ -566,6 +585,9 @@ impl Ground for AdmitPass<'_> {
         if self.sched.running_members() >= Scheduler::MAX_PREFILL_WIDTH
             && !(kind == Kind::Prefill && self.sched.lower_band_active(prio))
         {
+            self.unoffered.width |= !self.sched.prefill_queue.is_empty()
+                || !self.sched.pending_submits.is_empty()
+                || !self.sched.section_queue.is_empty();
             return None;
         }
         match kind {
@@ -634,14 +656,17 @@ impl Ground for AdmitPass<'_> {
 impl AdmitPass<'_> {
     /// Rows of this wave's forward still free for an offer — see `peek_prefill`
     /// — or `None` when the forward is full and one more member could not
-    /// advance a chunk beside the rest.
-    fn room(&self) -> Option<usize> {
-        room_left(
+    /// advance a chunk beside the rest, which the pass records
+    /// ([`Unoffered::rows`]): it is asked only with an offer waiting.
+    fn room(&mut self) -> Option<usize> {
+        let room = room_left(
             self.chunk_rows,
             self.standing_rows.saturating_add(self.rows_taken),
             self.closed,
             self.sched.prefill_width() + self.sched.section_ingest_width(),
-        )
+        );
+        self.unoffered.rows |= room.is_none();
+        room
     }
 
     /// The section band's next candidate: the head of the section queue,

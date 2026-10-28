@@ -112,6 +112,17 @@ group's co-batched steps measured 133 ms. The share `R` sets is unchanged — th
 debt is still the slice times `R` — it is only paid in steps rather than seconds.
 With nothing decoding there is nothing to protect, and the creep runs its `N / R`.
 
+That bound is the decode cadence only where the creep **yields** to a decode
+beside it — an outranking band, or `High` beside `High`. Beside only decodes of
+its own band (`R = 1`) the slice takes the same arrival bound a decode-less creep
+does (`DECODE_LESS_SLICE`, 250 ms): those decodes are owed equal airtime and no
+more, and a decode-only step's worth of layers under-paid the creep even that,
+since the debt — its share over a decode-only step — is repaid by the next decode
+step, which is longer. BlackWorld's layer ingest (2026-10-29: 3,072-row `Low`
+cohorts beside 1–3 `Low` decodes) held the creep to 43 ms of every ~190 and
+prefilled at 0.5–2.6k tok/s on a card measured at 6.7k. The arrival bound keeps
+what a higher band's prompt waits at the step's end where it was.
+
 **An outranking decode is protected, and a `High` one from `High` work too.**
 The creep yields to the decodes that outrank it — and, when it is `High`, to the
 `High` decodes — at the highest of their ratios; with none, `R = 1` and it clears
