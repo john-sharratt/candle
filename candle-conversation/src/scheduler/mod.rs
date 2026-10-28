@@ -49,6 +49,7 @@ mod interleave;
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
+mod next_group;
 mod norm_warm;
 mod owed_pins;
 mod paused_creep;
@@ -82,6 +83,7 @@ mod sweep_forecast;
 mod test_substrate;
 mod turn_airtime;
 mod turn_group;
+mod walked;
 mod wave_logits;
 mod wave_retry;
 mod wave_timing;
@@ -154,7 +156,7 @@ use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::turn_text::TurnText;
 use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
-use admit::pass_budget::{RateWidth, RefusedDepth, RefusedWidth};
+use admit::pass_budget::{GroupCaps, RateWidth, RefusedDepth, RefusedWidth};
 use first_sample::PrefillEnd;
 
 use candle::cuda_backend::graph::CaptureStats;
@@ -2240,6 +2242,19 @@ pub(super) struct ActivePrefill {
     pub(super) prefill_start: Option<Instant>,
 }
 
+impl ActivePrefill {
+    /// Rows it has left to prefill.
+    pub(super) fn remaining(&self) -> usize {
+        self.work.tokens.len().saturating_sub(self.offset)
+    }
+
+    /// Whether it can still advance a row: not failed, not finished, and
+    /// with rows left.
+    pub(super) fn can_advance(&self) -> bool {
+        self.error.is_none() && self.finished.is_none() && self.remaining() > 0
+    }
+}
+
 /// Resolve a seal's block range against the slot as it actually stands.
 ///
 /// A seal is always the tail of its slot: `[from, end)`, where the end is the
@@ -2318,13 +2333,25 @@ pub(super) struct ActiveSectionIngest {
     pub(super) error: Option<ConversationError>,
 }
 
+impl ActiveSectionIngest {
+    /// Rows it has left to ingest.
+    pub(super) fn remaining(&self) -> usize {
+        self.tokens.len().saturating_sub(self.offset)
+    }
+
+    /// Whether it can still advance a row: not failed, and with rows left.
+    pub(super) fn can_advance(&self) -> bool {
+        self.error.is_none() && self.remaining() > 0
+    }
+}
+
 /// A member of the in-flight continuous-fair-wave prefill group
 /// (`docs/continuous_fair_waves.md`). The group creeps through the layers
 /// together with its residual held whole between waves; members are separated
 /// only at the head, where `forward_wave`'s logits are in caller order. A member
 /// is resolved live by `seq_id` (not a stored index) so `swap_remove` in either
 /// backing collection can't invalidate it mid-creep.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WaveMember {
     /// Dialogue-turn prefill chunk — resolved in `active_prefills`; covers
     /// `[offset, offset + advance)` of its token set (offset is stable until the
@@ -2344,6 +2371,13 @@ impl WaveMember {
         match self {
             WaveMember::Prefill { seq_id, .. } => *seq_id,
             WaveMember::Section { seq_id, .. } => *seq_id,
+        }
+    }
+
+    /// The rows this member advances in its group's sweep.
+    pub(super) fn advance(&self) -> usize {
+        match self {
+            WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
         }
     }
 }
@@ -10554,25 +10588,27 @@ impl Scheduler {
     /// left then — so the cap is sized against the ground less the KV the
     /// running decodes will add over a sweep ([`sweep_forecast`]), not against
     /// the ground standing now.
-    pub(super) fn prefill_group_budget(&self, total: usize) -> usize {
-        self.prefill_group_budget_at(total, self.composition_target())
+    ///
+    /// Against an explicit composition `target` — see
+    /// [`Self::composition_target_at`].
+    pub(super) fn prefill_group_budget_at(&self, total: usize, target: usize) -> usize {
+        self.group_caps().budget(total, target)
     }
 
-    /// [`Self::prefill_group_budget`] against an explicit composition target —
-    /// see [`Self::composition_target_at`].
-    pub(super) fn prefill_group_budget_at(&self, total: usize, target: usize) -> usize {
+    /// The caps [`Self::prefill_group_budget_at`] reads: the model's width cap
+    /// against the ground less what the running decodes add over a sweep, and
+    /// the KV side's. Neither turns on the group, so a formation reads them
+    /// once for every group it forms.
+    pub(super) fn group_caps(&self) -> GroupCaps {
         let dtype = self.session.activation_dtype();
         let withheld = self
             .model
             .kv_bytes_per_row(dtype)
             .map_or(0, |row| self.sweep_forecast.withheld_bytes(row));
-        admit::pass_budget::prefill_group_budget(
-            total,
-            target,
-            self.model.prefill_width_cap_withholding(dtype, withheld),
-            self.prefill_kv_token_cap(),
-            CHUNK_SIZE,
-        )
+        GroupCaps {
+            model: self.model.prefill_width_cap_withholding(dtype, withheld),
+            kv: self.prefill_kv_token_cap(),
+        }
     }
 
     /// Tokens the KV side's free ground can still back.

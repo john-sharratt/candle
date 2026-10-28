@@ -571,9 +571,11 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                         rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after)
                     } {
                         rate::Admit::Admitted { .. } => true,
+                        // A join widens nothing, so there are no rows to close
+                        // the forward at: its refusal ends the band.
                         rate::Admit::Refused(
                             r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
-                        ) if kind == Kind::Prefill && ground.close_rows() => {
+                        ) if kind == Kind::Prefill && cost.rows > 0 && ground.close_rows() => {
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             continue;
                         }

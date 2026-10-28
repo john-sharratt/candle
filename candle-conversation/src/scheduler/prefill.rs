@@ -11,6 +11,7 @@ use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
 use super::gang;
+use super::next_group::Sections;
 use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
@@ -673,14 +674,11 @@ impl Scheduler {
         // the figure and no decode was ever placed to narrow it — a fixed point
         // that kept WhiteWorld idle for dialogue (c673b63c9, 2026-10-19).
         let placed_step = self.wave_rate.as_ref().and_then(|r| {
-            let q_lens: Vec<usize> =
-                self.wave_prefill_members
-                    .iter()
-                    .map(|m| match m {
-                        WaveMember::Prefill { advance, .. }
-                        | WaveMember::Section { advance, .. } => *advance,
-                    })
-                    .collect();
+            let q_lens: Vec<usize> = self
+                .wave_prefill_members
+                .iter()
+                .map(WaveMember::advance)
+                .collect();
             let seqs: Vec<usize> = self
                 .wave_prefill_members
                 .iter()
@@ -1107,11 +1105,12 @@ impl Scheduler {
         zone.saturating_sub(tier)
     }
 
-    /// The rows each member of a cohort — `seqs`, with `remaining` rows each,
-    /// laid out shorts, gang, the rest — advances in a forward of `budget`
-    /// rows: [`gang::gang_shares`] over the members of [`Self::prefill_gang`].
-    /// The one division a cohort is formed, narrowed and priced by, so a gang
-    /// stays in step however its width is cut.
+    /// The rows each member of a formed cohort — `seqs`, with `remaining` rows
+    /// each, laid out shorts, gang, the rest — advances in a forward of
+    /// `budget` rows: [`gang::gang_shares`] over the members of
+    /// [`Self::prefill_gang`] — the division `Scheduler::form_group` forms the
+    /// cohort by, over the gang it stored — so a gang stays in step however its
+    /// width is cut.
     pub(super) fn cohort_shares(
         &self,
         seqs: &[usize],
@@ -1120,82 +1119,6 @@ impl Scheduler {
     ) -> Vec<usize> {
         let in_gang: Vec<bool> = seqs.iter().map(|s| self.prefill_gang.contains(s)).collect();
         gang::gang_shares(remaining, &in_gang, budget, CHUNK_SIZE)
-    }
-
-    /// The gang a group forms with (`docs/prefill_gangs.md`): the live one —
-    /// those of its members still prefilling — or, in a `background` group with
-    /// none live, a new one from the long prompts not `paused`, the highest
-    /// band's in arrival order, as wide as [`Self::gang_width`] allows. A long
-    /// prompt is one a pass cannot finish.
-    fn prefill_gang_for(&self, background: bool, paused: &HashSet<usize>) -> Vec<usize> {
-        let prefilling = |p: &ActivePrefill| {
-            p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len()
-        };
-        let live: Vec<usize> = self
-            .prefill_gang
-            .iter()
-            .copied()
-            .filter(|&s| {
-                self.active_prefills
-                    .iter()
-                    .any(|p| p.work.sequence_id.0 == s && prefilling(p))
-            })
-            .collect();
-        if !live.is_empty() || !background {
-            return live;
-        }
-        let cap = self.max_prefill_pass_tokens;
-        let longs: Vec<(usize, usize)> = self
-            .active_prefills
-            .iter()
-            .filter(|p| {
-                prefilling(p)
-                    && !paused.contains(&p.work.sequence_id.0)
-                    && p.work.tokens.len() - p.offset > cap
-            })
-            .map(|p| {
-                (
-                    p.work.sequence_id.0,
-                    rank(self.decode_priority_or_high(p.work.sequence_id)),
-                )
-            })
-            .collect();
-        let width = self.gang_width(longs.len());
-        let formed = gang::form_gang(&longs, width);
-        if !formed.is_empty() {
-            let remaining: usize = self
-                .active_prefills
-                .iter()
-                .filter(|p| formed.contains(&p.work.sequence_id.0))
-                .map(|p| p.work.tokens.len() - p.offset)
-                .sum();
-            tracing::info!(
-                target: "candle_conversation::scheduler::creep",
-                members = formed.len(),
-                width,
-                longs = longs.len(),
-                remaining,
-                "prefill gang formed"
-            );
-        }
-        formed
-    }
-
-    /// How wide a gang of up to `longs` prompts may run: the widest whose decode
-    /// step, by the learned decode model at the weight zone's residency, costs
-    /// no more than twice a lone decode's ([`gang::gang_width`]). `1` — no gang
-    /// — while the decode model is unlearned.
-    fn gang_width(&self, longs: usize) -> usize {
-        let Some(rate) = self.wave_rate.as_ref().filter(|r| r.decode_learned()) else {
-            return 1;
-        };
-        let Some(zone) = super::interleave::effective_weight_zone_bytes(0) else {
-            return 1;
-        };
-        let per = rate.experts_per_decode(0);
-        gang::gang_width(longs, |n| {
-            rate.decode_step_secs(n.saturating_mul(per), zone)
-        })
     }
 
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
@@ -3314,14 +3237,12 @@ impl Scheduler {
         let prefills = self
             .active_prefills
             .iter()
-            .filter(|p| p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len())
-            .filter(|p| !held(p.work.sequence_id.0))
+            .filter(|p| p.can_advance() && !held(p.work.sequence_id.0))
             .any(|p| above(self.decode_priority_or_high(p.work.sequence_id)));
         let sections = self
             .active_section_ingests
             .iter()
-            .filter(|s| s.error.is_none() && s.offset < s.tokens.len())
-            .filter(|s| !held(s.sequence_id.0))
+            .filter(|s| s.can_advance() && !held(s.sequence_id.0))
             .any(|s| above(s.band));
         prefills || sections
     }
@@ -3337,7 +3258,7 @@ impl Scheduler {
 
     /// The band a creep group runs at: its highest-ranked member's. A dialogue
     /// prefill runs at its slot's own band, a section chunk at its own.
-    fn creep_priority(&self, members: &[WaveMember]) -> DecodePriority {
+    pub(super) fn creep_priority(&self, members: &[WaveMember]) -> DecodePriority {
         members
             .iter()
             .map(|m| match m {
@@ -3420,7 +3341,7 @@ impl Scheduler {
     pub(super) fn section_ingest_width(&self) -> usize {
         self.active_section_ingests
             .iter()
-            .filter(|s| s.error.is_none() && s.offset < s.tokens.len())
+            .filter(|s| s.can_advance())
             .count()
     }
 
@@ -3458,8 +3379,7 @@ impl Scheduler {
         let active: Vec<usize> = (0..self.active_section_ingests.len())
             .filter(|&i| {
                 let s = &self.active_section_ingests[i];
-                s.error.is_none()
-                    && s.offset < s.tokens.len()
+                s.can_advance()
                     && !in_flight.contains(&s.sequence_id.0)
                     && (!band.is_live() || s.band.is_live())
             })
@@ -3532,11 +3452,7 @@ impl Scheduler {
         let band = self
             .active_section_ingests
             .iter()
-            .filter(|s| {
-                s.error.is_none()
-                    && s.offset < s.tokens.len()
-                    && !in_flight.contains(&s.sequence_id.0)
-            })
+            .filter(|s| s.can_advance() && !in_flight.contains(&s.sequence_id.0))
             .map(|s| s.band)
             .max_by_key(|&b| rank(b))?;
         (!self.waiting_above(band, |_| false)).then_some(band)
@@ -3762,7 +3678,7 @@ impl Scheduler {
     }
 
     /// Form a FRESH wave group into `wave_prefill_members`: ready dialogue
-    /// prefills in queue order up to [`Self::prefill_pass_budget`], plus — when
+    /// prefills up to the group budget ([`Self::form_group`]), plus — when
     /// `include_sections` and at least one prefill is present — section chunks in
     /// whatever of that budget the prefills left. Section chunks join
     /// only alongside a cohort (so they co-batch a creep that is happening anyway);
@@ -3774,13 +3690,13 @@ impl Scheduler {
         //
         // Each takes at most `max_prefill_pass_tokens` rows, packed under that
         // same per-forward budget (at least one always admitted), exactly like
-        // the section chunks below; its offset advances at the head and the rest
+        // the section chunks; its offset advances at the head and the rest
         // rides the next group. A prefill used to enter whole: a 15.2k-token
         // Cline turn asked this wave for a 13.2 GiB transient tier — more than
         // all the ground below the weight floor on a 16 GB card — so it could
         // never be placed and failed identically on every retry, after first
         // stripping the expert cache to its floor trying.
-        let cap = self.max_prefill_pass_tokens;
+        //
         // ── A prompt past the model's RoPE reach fails alone ─────────────────
         //
         // Its headers would be refused, and the refusal would fail every other
@@ -3802,213 +3718,53 @@ impl Scheduler {
                 )));
             }
         }
-        let mut members: Vec<WaveMember> = Vec::new();
-        // **The highest band leads the group.** The group's adapter is its
-        // first member's, so leading with a lower band could leave a waiting
-        // dialogue prompt out of the group re-formed to carry it
-        // (`creep_outranked_by_a_waiting_prompt`) — and that restart would then
-        // fire again every step, the creep never completing. Stable, so a band
-        // keeps its queue order.
-        // A paused creep's members are mid-sweep in their own group, so they
-        // join no other (`PausedCreep`).
+        // ── Who rides, in what order, and how far ────────────────────────────
+        //
+        // `Scheduler::form_group`, the formation admission prices its offers
+        // against (`next_group`). A paused creep's members are mid-sweep in
+        // their own group, so they join no other (`PausedCreep`).
         let paused = self
             .paused_creep
             .as_ref()
             .map(PausedCreep::seq_ids)
             .unwrap_or_default();
-        let mut candidates: Vec<&ActivePrefill> = self
-            .active_prefills
-            .iter()
-            .filter(|p| !paused.contains(&p.work.sequence_id.0))
-            .collect();
-        // **Within a band, the prompt nearest its first token leads**, so the
-        // budget filled in order (`gang::gang_shares`) finishes it and
-        // it decodes while the next ones prefill.
-        candidates.sort_by_key(|p| {
-            (
-                std::cmp::Reverse(rank(self.decode_priority_or_high(p.work.sequence_id))),
-                p.work.tokens.len().saturating_sub(p.offset),
-            )
-        });
-        // **A `High` group carries `High` prompts only.** Every row in a group
-        // rides every layer of its sweep, so a person's prompt beside eight
-        // characters' and ingest chunks waits for all of their rows — measured
-        // on `.5`, 2026-10-17, a 10-member, 8,190-row group creeping at one
-        // layer a step held a dialogue's first token ~24 s. Below `High`
-        // throughput matters more than latency, and the bands mix.
-        //
-        // A `High` section counts: it is a dialogue's own (a journal entry its
-        // next turn reads), and a group of ingest rows would hold it as long.
-        // With no `High` prompt to ride beside, it runs in the standalone
-        // section pass while this group stays empty.
-        //
-        // **An `Urgent` group carries `Urgent` prompts only**, for the same
-        // reason one band down: the check an image draw waits on, beside four
-        // Makers' table prompts, would wait for all of their rows.
-        let lead = candidates
-            .first()
-            .map(|p| self.decode_priority_or_high(p.work.sequence_id));
-        let high_section = include_sections
-            && self.active_section_ingests.iter().any(|s| {
-                s.band.is_live()
-                    && s.error.is_none()
-                    && s.offset < s.tokens.len()
-                    && !paused.contains(&s.sequence_id.0)
-            });
-        let floor = match lead.filter(|b| b.is_live()) {
-            Some(lead) => Some(lead),
-            None => high_section.then_some(DecodePriority::High),
+        let candidates = self.formation_candidates(&paused, |_| 0);
+        let sections = if include_sections {
+            Sections::Beside
+        } else {
+            Sections::Out
         };
-        let high_only = floor.is_some();
-        let below_floor = |b: DecodePriority| floor.is_some_and(|f| rank(b) < rank(f));
-        if high_only {
-            candidates.retain(|p| !below_floor(self.decode_priority_or_high(p.work.sequence_id)));
+        let group = self.form_group(
+            &candidates,
+            None,
+            sections,
+            self.composition_target(),
+            self.group_caps(),
+        );
+        if let Some(formed) = group.gang_formed {
+            let remaining: usize = candidates
+                .iter()
+                .filter(|c| group.gang.contains(&c.seq))
+                .map(|c| c.remaining)
+                .sum();
+            tracing::info!(
+                target: "candle_conversation::scheduler::creep",
+                members = group.gang.len(),
+                width = formed.width,
+                longs = formed.longs,
+                remaining,
+                "prefill gang formed"
+            );
         }
-        // ── A background group prefills its long prompts as a gang ───────────
-        //
-        // With nothing live leading, the long prompts are prefilled together so
-        // they reach their first tokens in the same forward and decode side by
-        // side, rather than one at a time and one row wide
-        // (`docs/prefill_gangs.md`). The shorts ride ahead of the gang and the
-        // longs outside it behind; stable, so each lane keeps its band and
-        // nearest-first order.
-        let gang = self.prefill_gang_for(!high_only, &paused);
-        if !high_only && !gang.is_empty() {
-            candidates.sort_by_key(|p| {
-                if gang.contains(&p.work.sequence_id.0) {
-                    1
-                } else if p.work.tokens.len().saturating_sub(p.offset) > cap {
-                    2
-                } else {
-                    0
-                }
-            });
-        }
-        for p in candidates {
-            if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
-                continue;
-            }
-            // Every prompt that can advance is a candidate, each offering at
-            // most a pass. Who rides and how far is decided below, where the
-            // members share the budget — stopping here at the first prompt that
-            // does not fit whole would decide it first, and hold every prompt
-            // behind that one back from a forward it could have shared.
-            members.push(WaveMember::Prefill {
-                seq_id: p.work.sequence_id.0,
-                advance: (p.work.tokens.len() - p.offset).min(cap),
-            });
-        }
-        self.prefill_gang = gang;
-        // ── One adapter per wave ─────────────────────────────────────────────
-        //
-        // Same rule the decode cohort follows, applied where the prefill group
-        // is formed: the projections run once over every row, so a group carries
-        // one adapter or none. The first ready prefill sets it and the rest wait
-        // for a group of their own — they are still active, so nothing is lost,
-        // and successive groups drain each adapter's queue in turn.
-        //
-        // Sections are filtered by the same key below rather than after the
-        // fact: a section chunk is an ordinary row of this forward, and an
-        // unadapted ingest riding an adapted group would be prefilled through
-        // the wrong projections and its KV written that way permanently.
-        let group_adapter = members
-            .first()
-            .map(|m| self.session.sequence_adapter(m.seq_id()))
-            .unwrap_or(None)
-            .map(|s| s.to_owned());
-        members.retain(|m| self.session.sequence_adapter(m.seq_id()) == group_adapter.as_deref());
-
-        // ── Bounded by what one forward can carry, filled in order ───────────
-        //
-        // The group's rows are the sum of its members' advances, and the forward
-        // prices its transient tier from that sum. Unbounded, a burst of queued
-        // turns became one forward: npcd's world ingest on the routed
-        // Qwen3.6-35B-A3B asked for a 3.3 GB tier against a 3.0 GB gap between the
-        // KV frontier and the weight floor, and every turn in the wave failed with
-        // it. So the pass budget is filled in the order above — the nearest
-        // prompt takes all it has, the next what is left, a gang in proportion
-        // to its remainders — and the rest rides the next group. See
-        // `gang::gang_shares`.
-        let remaining: Vec<usize> = members
-            .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
-                    *advance
-                }
-            })
-            .collect();
-        // A queue that passes the cap by no more than the model's slack rides
-        // whole, rather than leaving a straggler group a sweep of its own.
-        let budget = self.prefill_group_budget(remaining.iter().sum());
-        let seqs: Vec<usize> = members.iter().map(WaveMember::seq_id).collect();
-        let shares = self.cohort_shares(&seqs, &remaining, budget);
-        let members_before = std::mem::take(&mut members);
-        for (m, share) in members_before.into_iter().zip(shares) {
-            if share == 0 {
-                continue;
-            }
-            members.push(match m {
-                WaveMember::Prefill { seq_id, .. } => WaveMember::Prefill {
-                    seq_id,
-                    advance: share,
-                },
-                WaveMember::Section { seq_id, .. } => WaveMember::Section {
-                    seq_id,
-                    advance: share,
-                },
-            });
-        }
-        let mut used: usize = members
-            .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
-                    *advance
-                }
-            })
-            .sum();
-
-        if include_sections && !members.is_empty() {
-            for i in 0..self.active_section_ingests.len() {
-                let s = &self.active_section_ingests[i];
-                if s.error.is_some()
-                    || s.offset >= s.tokens.len()
-                    || paused.contains(&s.sequence_id.0)
-                    || below_floor(s.band)
-                {
-                    continue;
-                }
-                if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
-                    continue;
-                }
-                let advance = (s.tokens.len() - s.offset).min(budget);
-                // Sections share the forward, so they draw on the budget the
-                // prefills above have already spent and fill only what is left.
-                // The cohort already guarantees this group makes progress, so no
-                // section is forced in past it; the rest ride a later group or the
-                // standalone section pass.
-                if used + advance > budget {
-                    break;
-                }
-                members.push(WaveMember::Section {
-                    seq_id: s.sequence_id.0,
-                    advance,
-                });
-                used += advance;
-            }
-        }
+        let mut members = group.wave_members();
+        self.prefill_gang = group.gang;
+        let budget = group.budget;
         if members.is_empty() {
             self.wave_prefill_members = members;
             return;
         }
         self.fit_cohort_to_ground(&mut members);
-        let used: usize = members
-            .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
-                    *advance
-                }
-            })
-            .sum();
+        let used: usize = members.iter().map(WaveMember::advance).sum();
         let band = self.creep_priority(&members);
         // The decodes that set the ratio, by band — and how many count as
         // `High` only because their layer did not resolve.
@@ -4069,11 +3825,8 @@ impl Scheduler {
             }
             _ => None,
         };
-        let advance = |m: &WaveMember| match m {
-            WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
-        };
         for _ in 0..FIT_PASSES {
-            let q_lens: Vec<usize> = members.iter().map(advance).collect();
+            let q_lens: Vec<usize> = members.iter().map(WaveMember::advance).collect();
             let offsets: Vec<usize> = members
                 .iter()
                 .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
@@ -6984,17 +6737,24 @@ mod warm_budget_tests {
 }
 
 #[cfg(test)]
-mod wave_chunk_tests {
+pub(super) mod wave_chunk_tests {
     use std::sync::Arc;
     use std::time::Instant;
 
     use candle_transformers::models::rope_schedule::RungSelect;
 
+    use super::super::admit::rate::{DecodeModel, ExpertGeometry, RateModel};
+    use super::super::admit::{fill, Ground, Kind, WaveRate};
+    use super::super::admit_ground::AdmitPass;
+    use super::super::next_group::{Candidate, NextGroup, Offer};
     use super::super::tests::make_test_scheduler;
     use super::super::*;
 
     /// A dialogue prefill carrying `tokens` and nothing else.
-    pub(super) fn dialogue_prefill(seq: SequenceId, tokens: Vec<u32>) -> ActivePrefill {
+    pub(in crate::scheduler) fn dialogue_prefill(
+        seq: SequenceId,
+        tokens: Vec<u32>,
+    ) -> ActivePrefill {
         let (event_tx, _event_rx) = flume::unbounded();
         ActivePrefill {
             work: PrefillWork {
@@ -7209,6 +6969,390 @@ mod wave_chunk_tests {
         assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
     }
 
+    /// The rows admission offers the next turn of `band`'s queue — the rows it
+    /// widens its group by, nothing for a turn that joins — or `None` when it
+    /// offers none.
+    fn offered_rows(s: &mut Scheduler, band: DecodePriority) -> Option<usize> {
+        AdmitPass::new(s).peek(Kind::Prefill, band).map(|c| c.rows)
+    }
+
+    /// The group `offer`, at `band`, runs in at the cohort's composition
+    /// target — `None` when a paused creep resumes ahead of it.
+    fn group_for(s: &Scheduler, band: DecodePriority, offer: Option<Offer>) -> Option<NextGroup> {
+        let prospect = s.prospect(band)?;
+        Some(s.group_in(&prospect, offer, s.composition_target()))
+    }
+
+    /// An offer of a prompt `remaining` rows long, at `band`, on no slot in
+    /// flight.
+    fn prompt_offer(band: DecodePriority, remaining: usize) -> Offer {
+        Offer {
+            who: Candidate {
+                seq: usize::MAX,
+                band,
+                remaining,
+                depth: 0,
+                section: false,
+            },
+            cap: None,
+        }
+    }
+
+    /// A queued turn of `len` tokens on a new slot at `band`.
+    fn queue_turn(s: &mut Scheduler, band: DecodePriority, len: usize) -> SequenceId {
+        let seq = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(seq, band);
+        s.prefill_queue
+            .push_back(dialogue_prefill(seq, vec![1; len]).work);
+        seq
+    }
+
+    /// A `band` creep `len` tokens long, held mid-sweep.
+    fn creep_mid_sweep(s: &mut Scheduler, band: DecodePriority, len: usize) -> SequenceId {
+        let seq = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(seq, band);
+        s.active_prefills.push(dialogue_prefill(seq, vec![1; len]));
+        s.form_wave_group(false);
+        assert_eq!(s.wave_prefill_members.len(), 1, "the creep is held");
+        s.wave_prefill_cursor = 5;
+        seq
+    }
+
+    /// **A turn is offered beside a creep that fills the forward when it will
+    /// run ahead of it.** On WhiteWorld (2026-10-27 22:46–22:48) one `High`
+    /// member 158k tokens long held all of every forward's rows, and the room
+    /// every offer was sized against was nothing: four `Urgent` content checks
+    /// waited ninety seconds and an 87-token `High` turn six minutes. An
+    /// `Urgent` turn pauses the creep, so it runs in a group of its own, which
+    /// it widens. A short `High` turn leads the group re-formed at the sweep's
+    /// boundary, taking rows from the creep in a forward no wider — so it is
+    /// offered as a join, which the rate model does not refuse for the
+    /// forward's row cap. A `Normal` turn has no place in a `High` group.
+    #[test]
+    fn a_turn_that_runs_ahead_of_a_full_creep_is_offered_rows() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+
+        queue_turn(&mut s, DecodePriority::Urgent, 64);
+        assert_eq!(
+            offered_rows(&mut s, DecodePriority::Urgent),
+            Some(64),
+            "the creep is paused for the urgent turn"
+        );
+        queue_turn(&mut s, DecodePriority::High, 87);
+        assert_eq!(
+            offered_rows(&mut s, DecodePriority::High),
+            Some(0),
+            "the short turn leads the re-formed group, widening nothing"
+        );
+        let led = group_for(
+            &s,
+            DecodePriority::High,
+            Some(prompt_offer(DecodePriority::High, 87)),
+        )
+        .expect("nothing is paused");
+        assert_eq!(led.offer_at, Some(0), "it leads");
+        assert_eq!(led.offer_rows(), 87);
+        queue_turn(&mut s, DecodePriority::Normal, 64);
+        assert_eq!(
+            offered_rows(&mut s, DecodePriority::Normal),
+            None,
+            "a high group carries high prompts only"
+        );
+
+        // Between sweeps, the same: the short turn leads.
+        s.reset_wave_prefill();
+        assert_eq!(offered_rows(&mut s, DecodePriority::High), Some(0));
+    }
+
+    /// One admission pass through the rate model, as the scheduler runs it:
+    /// the standing cohort charged first, then each band offered in turn.
+    fn admission_pass(s: &mut Scheduler) {
+        s.settled_since_admit = true;
+        let mut rate = WaveRate::with_link_rate(
+            25e9,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        )
+        .with_min_gain(0.0);
+        let mut admission = AdmitPass::new(s);
+        fill(&mut admission, &mut rate);
+        admission.conclude();
+    }
+
+    /// Whether `seq`'s turn is in flight.
+    fn admitted(s: &Scheduler, seq: SequenceId) -> bool {
+        s.active_prefills.iter().any(|p| p.work.sequence_id == seq)
+    }
+
+    /// **A turn is never walked ahead of one queued before it on its slot.**
+    /// The long turn has no place beside the creep; the short one queued
+    /// behind it on the same slot would lead the group, and still waits.
+    #[test]
+    fn a_turn_does_not_overtake_one_on_its_own_slot() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 2 * pass);
+        let slot = queue_turn(&mut s, DecodePriority::High, 8 * pass);
+        s.prefill_queue
+            .push_back(dialogue_prefill(slot, vec![1; 64]).work);
+        assert_eq!(offered_rows(&mut s, DecodePriority::High), None);
+    }
+
+    /// **The rate model takes what the group takes.** Judged end to end — the
+    /// creep charged first, as `admit::fill` charges the standing cohort — the
+    /// short `High` turn joins the creep's re-formed group and the `Urgent`
+    /// check widens a group of its own; neither is refused for the rows' cap,
+    /// which the creep alone already fills.
+    #[test]
+    fn the_rate_model_admits_the_turns_a_full_creep_held_back() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let turn = queue_turn(&mut s, DecodePriority::High, 87);
+        admission_pass(&mut s);
+        assert!(admitted(&s, turn), "the short high turn was not admitted");
+
+        let check = queue_turn(&mut s, DecodePriority::Urgent, 64);
+        admission_pass(&mut s);
+        assert!(admitted(&s, check), "the urgent check was not admitted");
+    }
+
+    /// **A turn whose group a waiting prompt sets aside waits for its own.**
+    /// With an `Urgent` check admitted beside a `High` creep, the next group is
+    /// the check's — `Urgent` only — and the creep resumes after it. A `High`
+    /// turn has no rows in either until the creep's sweep ends, so it is not
+    /// admitted to hold its store through both.
+    #[test]
+    fn a_turn_waits_out_a_group_it_is_not_in() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let check = queue_turn(&mut s, DecodePriority::Urgent, 64);
+        let turn = queue_turn(&mut s, DecodePriority::High, 87);
+        admission_pass(&mut s);
+        assert!(admitted(&s, check));
+        assert!(!admitted(&s, turn));
+    }
+
+    /// **A turn with no place in its group is walked past, not the band
+    /// ended.** A long `High` turn behind a creep that fills the forward has
+    /// no rows in the group re-formed at the boundary; a short one queued
+    /// behind it leads that group, and is offered.
+    #[test]
+    fn a_turn_with_no_place_does_not_hold_the_band() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 2 * pass);
+        queue_turn(&mut s, DecodePriority::High, 8 * pass);
+        assert!(
+            group_for(
+                &s,
+                DecodePriority::High,
+                Some(prompt_offer(DecodePriority::High, 8 * pass))
+            )
+            .expect("nothing is paused")
+            .offer_at
+            .is_none(),
+            "the long turn has no rows beside the nearer creep"
+        );
+        let short = queue_turn(&mut s, DecodePriority::High, 64);
+        let mut admission = AdmitPass::new(&mut s);
+        let cost = admission
+            .peek(Kind::Prefill, DecodePriority::High)
+            .expect("the short turn is offered");
+        assert!(admission.admit(Kind::Prefill, DecodePriority::High, cost));
+        admission.conclude();
+        assert!(
+            s.active_prefills
+                .iter()
+                .any(|p| p.work.sequence_id == short),
+            "the short turn went in from behind the long one"
+        );
+        assert_eq!(s.prefill_queue.len(), 1, "the long one waits");
+    }
+
+    /// **A paused creep resumes ahead of a turn that does not outrank it.**
+    /// With nothing above its band waiting, the paused group goes back in
+    /// flight at the next step, and a turn of its own band waits out that
+    /// sweep — so it is not offered rows yet. A turn above it is.
+    #[test]
+    fn a_turn_behind_a_resuming_creep_is_not_offered_rows() {
+        let (mut s, _tx) = make_test_scheduler();
+        creep_mid_sweep(&mut s, DecodePriority::Low, 4_000);
+        s.pause_creep();
+        assert!(s.paused_creep.is_some());
+
+        queue_turn(&mut s, DecodePriority::Low, 64);
+        assert_eq!(
+            offered_rows(&mut s, DecodePriority::Low),
+            None,
+            "the paused creep resumes ahead of a turn of its own band"
+        );
+        queue_turn(&mut s, DecodePriority::Normal, 64);
+        assert_eq!(offered_rows(&mut s, DecodePriority::Normal), Some(64));
+    }
+
+    /// **The group admission prices is the group that forms.** One formation
+    /// serves both (`next_group`): the offer, once in flight, rides at exactly
+    /// the rows it was offered, beside exactly the members it was priced with.
+    #[test]
+    fn the_group_that_forms_is_the_one_admission_priced() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        for (band, len) in [
+            (DecodePriority::High, 8 * pass),
+            (DecodePriority::High, 300),
+            (DecodePriority::Low, 100),
+        ] {
+            let seq = SequenceId(s.session.create_sequence().expect("create"));
+            s.slot_bands.insert(seq, band);
+            s.active_prefills.push(dialogue_prefill(seq, vec![1; len]));
+        }
+        let turn = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(turn, DecodePriority::High);
+        let offer = Offer {
+            who: Candidate {
+                seq: turn.0,
+                band: DecodePriority::High,
+                remaining: 64,
+                depth: 0,
+                section: false,
+            },
+            cap: None,
+        };
+        let priced = group_for(&s, DecodePriority::High, Some(offer)).expect("no creep is paused");
+        assert_eq!(priced.offer_rows(), 64);
+
+        s.active_prefills.push(dialogue_prefill(turn, vec![1; 64]));
+        s.form_wave_group(false);
+        assert_eq!(s.wave_prefill_members, priced.wave_members());
+        assert_eq!(
+            s.wave_prefill_members[0],
+            WaveMember::Prefill {
+                seq_id: turn.0,
+                advance: 64
+            },
+            "the nearest prompt leads"
+        );
+    }
+
+    /// **A group formed and not yet run is no creep in flight.** It re-forms
+    /// from scratch at the next step, so its members are neither paused for an
+    /// offer nor counted as having swept: a `Normal` turn beside a `Low` one
+    /// leads a group the `Low` one still rides, at its full rows.
+    #[test]
+    fn a_group_not_yet_run_reforms_beside_the_offer() {
+        let (mut s, _tx) = make_test_scheduler();
+        let creep = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(creep, DecodePriority::Low);
+        s.active_prefills
+            .push(dialogue_prefill(creep, vec![1; 400]));
+        s.form_wave_group(false);
+        assert_eq!(s.wave_prefill_cursor, 0);
+        assert!(64 + 400 <= s.composition_target(), "both fit one pass");
+
+        let offer = prompt_offer(DecodePriority::Normal, 64);
+        let group = group_for(&s, DecodePriority::Normal, Some(offer)).expect("nothing is paused");
+        assert_eq!(
+            group.wave_members(),
+            vec![
+                WaveMember::Prefill {
+                    seq_id: usize::MAX,
+                    advance: 64
+                },
+                WaveMember::Prefill {
+                    seq_id: creep.0,
+                    advance: 400
+                },
+            ],
+            "below High the bands mix, and the unrun group is not paused"
+        );
+    }
+
+    /// **A section the prompts leave no room for is offered the standalone
+    /// section pass** — unless a prompt above its band waits, which holds that
+    /// pass.
+    #[test]
+    fn a_section_with_no_room_beside_the_prompts_runs_alone() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        let prompt = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(prompt, DecodePriority::High);
+        s.active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8 * pass]));
+        let section = |band| Offer {
+            who: Candidate {
+                seq: usize::MAX,
+                band,
+                remaining: 100,
+                depth: 0,
+                section: true,
+            },
+            cap: None,
+        };
+        let alone = group_for(
+            &s,
+            DecodePriority::High,
+            Some(section(DecodePriority::High)),
+        )
+        .expect("nothing is paused");
+        assert_eq!(alone.offer_rows(), 100);
+        assert_eq!(
+            alone.members.len(),
+            1,
+            "the prompt is not in the section pass"
+        );
+
+        let held = group_for(&s, DecodePriority::Low, Some(section(DecodePriority::Low)))
+            .expect("nothing is paused");
+        assert_eq!(
+            held.offer_rows(),
+            0,
+            "a high prompt waiting holds a low section's pass"
+        );
+    }
+
+    /// **A section below a paused creep waits behind it.** Nothing above the
+    /// creep's band waits, so it resumes ahead of any formation — and its
+    /// prompts, paused or not, hold a lower section's standalone pass
+    /// (`section_batch_band`).
+    #[test]
+    fn a_section_below_a_paused_creep_waits_behind_it() {
+        let (mut s, _tx) = make_test_scheduler();
+        creep_mid_sweep(&mut s, DecodePriority::High, 4_000);
+        s.pause_creep();
+        let section = Offer {
+            who: Candidate {
+                seq: usize::MAX,
+                band: DecodePriority::Low,
+                remaining: 100,
+                depth: 0,
+                section: true,
+            },
+            cap: None,
+        };
+        assert!(group_for(&s, DecodePriority::Low, Some(section)).is_none());
+    }
+
+    /// **A pass still finds wider rows paying.** With the cohort's width
+    /// narrowed to a chunk its one prompt fills, a turn has no place at that
+    /// width; offered at the deployment's target it widens its group, and is
+    /// offered there — the rows it widens it by.
+    #[test]
+    fn a_pass_still_finds_wider_rows_paying() {
+        let (mut s, _tx) = make_test_scheduler();
+        let running = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(running, DecodePriority::High);
+        s.active_prefills
+            .push(dialogue_prefill(running, vec![1; CHUNK_SIZE]));
+        s.set_rate_width(CHUNK_SIZE);
+        queue_turn(&mut s, DecodePriority::High, 200);
+        assert_eq!(offered_rows(&mut s, DecodePriority::High), Some(200));
+    }
+
     /// **Prefills share one pass budget.** The two short prompts ride whole and the
     /// one a whole pass long takes what is left, so all three advance together in
     /// a forward of exactly one pass — rather than the long one waiting out a
@@ -7326,7 +7470,8 @@ mod wave_chunk_tests {
 
         scheduler.form_wave_group(false);
 
-        let budget = scheduler.prefill_group_budget(100 + 3 * cap);
+        let budget =
+            scheduler.prefill_group_budget_at(100 + 3 * cap, scheduler.composition_target());
         let shares = gang::gang_shares(
             &[100, cap, cap, cap],
             &[false, true, true, false],

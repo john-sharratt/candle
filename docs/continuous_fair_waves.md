@@ -301,6 +301,78 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   only `High` sections; with no `High` prompt beside it, it runs in the
   standalone section pass. Below `High`, throughput matters more than latency,
   and the bands and section chunks mix as before.
+- **Admission sizes a turn against the group it will run in.** One function
+  answers which group forms next and what each member advances in it
+  (`scheduler::next_group`), and both the group's formation
+  (`form_wave_group`) and admission read it. The formation then fits the group
+  to the ground its windows will place (`fit_cohort_to_ground`), which
+  admission prices separately, and leaves sections out on a wave whose
+  standalone section pass already ran. What admission asks it, for an offer at
+  band `b`:
+  - *Which work stays set aside.* A creep in flight — one whose sweep has run
+    a layer; a group formed and not yet run re-forms from scratch — that `b`,
+    or any prompt already waiting, outranks is paused, unless a group is
+    paused already; then it finishes its sweep and its members re-enter the
+    formation the rows and positions that sweep advanced them. A creep `b`
+    does not outrank also re-enters at its sweep boundary, advanced. The
+    paused group's members are in no formation.
+  - *Whether a paused group resumes instead.* It does when nothing in the
+    formation — the offer included — is above its band; the offer then waits
+    behind a sweep it is not in, and is not offered rows.
+  - *The formation itself*, exactly as `form_wave_group` runs it: highest band
+    leading, then nearest its first token; a live band's group carrying its own
+    band only; a background gang (`docs/prefill_gangs.md`); one adapter; the
+    group budget shared by `gang::gang_shares`; sections in what the prompts
+    leave. A section the prompts leave no room for runs in the standalone
+    section pass — unless a prompt in flight is above it, which holds that
+    pass (`section_batch_band`) — and is packed as that pass packs
+    (`section_pack`).
+
+  The offer's rows are its share of that group. A share of nothing is a full
+  forward, and a full forward takes no more turns (`admit_ground::room_left`);
+  nor does a group that leaves the offer out — a band below its own, another
+  adapter, or a slot already prefilling, which runs one prefill at a time and
+  which a submission may not fork mid-prefill. Such a turn is walked past, as another band's is, so the turns
+  behind it that would lead the group are still offered — where that reorders
+  nothing on their slot: no turn changes a slot before work queued ahead of it
+  has forked it, and no fork — a turn-group case's view, a submission's —
+  reads a slot a turn queued ahead of it has yet to change. Once a pass has
+  closed its rows, a member comes back as a join — it rides the group's
+  forwards at its share without widening them — and a turn with no place ends
+  the band, since none behind it has rows to take either. Sections are not walked past: one can name the sections
+  before it as its prefix, and ingested ahead of them it would be sealed
+  against what of them had landed.
+
+  The rate model weighs the rows the offer *widens* its group by, not its
+  share: a turn that leads a re-formed group takes rows from the members
+  behind it in a forward no wider, and joins — charged its share on top of
+  the standing creep, it was refused for the row cap the creep alone already
+  filled. Rows and tier are both measured against the same formation without
+  it, at the width the pass stands at: a turn that widens its group clears
+  the cohort's width, every member widens with it, and that is the turn's to
+  pay for. A turn that only re-shares a full forward's rows adds next to no
+  tier, and one whose group is smaller than the one it displaces adds none,
+  those members having been priced at their own admission. It owes the creep
+  residual for its own rows. A turn admitted mid-sweep claims its store now
+  and runs from the boundary, the claim priced as any other.
+
+  An open pass places each turn at the deployment's target first, so it can
+  still find wider rows paying; a turn that would not widen its group there
+  is placed at the width the pass stands at. A turn sized to the floor is
+  priced at the rows it is clipped to; it, and a turn whose rows the rate
+  refuses, close the pass at the cohort's width as the rate model judged it
+  — the rows it charged before any offer and those the pass admitted. The
+  width is the cohort's, read by every formation until the cohort shrinks: a
+  narrower one for the turn's own group would bind every other group, a long
+  creep's included, for as long as that turn prefilled. Within it the
+  formation fits each group it forms to the ground its windows place
+  (`fit_cohort_to_ground`).
+
+  Sized against the standing cohort instead — the held group first, at its
+  fixed rows — one long member starved everything: on WhiteWorld (2026-10-27
+  22:46–22:48) a single `High` member 158k tokens long held all 3,072 rows of
+  every forward, four `Urgent` content checks were never offered for ninety
+  seconds, and an 87-token `High` turn waited six minutes.
 - **A sweep is never restarted.** Its finished layers have taken its rows into
   their carried state — the QSA index, the DeltaNet state, the PLE history — and
   nothing rolls that back; only the K/V is position-addressed, so only the K/V

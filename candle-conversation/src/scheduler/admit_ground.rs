@@ -35,10 +35,15 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::band::rank;
 use super::interleave;
+use super::next_group::{Candidate, NextGroup, Offer, Prospect};
+use super::walked::Walked;
 use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -86,22 +91,24 @@ fn deepest_chunk_offset(depth: usize, turn: usize, rows: usize) -> usize {
     depth + turn.saturating_sub(rows)
 }
 
-/// The prefill cohort a pass is composing: the held creep group, whose
-/// advances are fixed, then every member that will join it — admitted on an
-/// earlier pass or by this one — with its remaining rows and depth.
+/// The prefill cohort a pass opens on: the held creep group, whose advances
+/// are fixed, then every member admitted on an earlier pass that will join it,
+/// with its remaining rows and depth — the ground the standing wave reserves,
+/// and the rows the rate model charges before any offer. Each offer is priced
+/// in the group it joins instead ([`Scheduler::group_in`]).
 ///
-/// **An offer is charged what it adds to the forward the cohort will run, not
-/// what it would cost alone.** The tier is superlinear in spans and its launch
-/// carve follows each member's depth, so N admissions priced as N one-sequence
-/// waves understate the wave they compose — measured on the 3090 scratch
-/// daemon, calibration passes admitting 32 cases against ~2 GiB of priced tier
-/// whose forward then placed 4.48 GB and found no ground in 1,024 attempts.
+/// **The admitted members are part of it, not only the held group.** The tier
+/// is superlinear in spans and its launch carve follows each member's depth,
+/// so N admissions priced as N one-sequence waves understate the wave they
+/// compose — measured on the 3090 scratch daemon, calibration passes admitting
+/// 32 cases against ~2 GiB of priced tier whose forward then placed 4.48 GB and
+/// found no ground in 1,024 attempts.
 ///
-/// **Composed when priced, the way the group is formed** ([`Scheduler::compose`]):
-/// a member's rows are not fixed when it is admitted, because a turn that
-/// joined a spent forward still rides the cohort's windows once the group
-/// absorbs it. Pricing that join at no rows charged a cohort of 6,254 rows
-/// that ran at 8,066.
+/// **Composed the way the group takes them** ([`Scheduler::compose`]): a
+/// member's rows are not fixed when it is admitted, because a turn that joined
+/// a spent forward still rides the cohort's windows once the group absorbs it.
+/// Composed at no rows, that join charged a cohort of 6,254 rows that ran at
+/// 8,066.
 #[derive(Clone, Default)]
 pub(super) struct WaveDraft {
     held_rows: usize,
@@ -112,9 +119,7 @@ pub(super) struct WaveDraft {
     /// `(remaining, depth, sequence)` of each member not in the held group.
     joining: Vec<(usize, usize, usize)>,
     /// The width the rate model chose for the cohort, which its forwards are
-    /// composed at — `None` when no choice stands. A pass that widens clears
-    /// it, one that closes sets it; the draft follows, so each offer is priced
-    /// at the width its own admission leaves.
+    /// composed at — `None` when no choice stands.
     width: Option<usize>,
 }
 
@@ -125,6 +130,18 @@ pub(super) struct Composed {
     advances: Vec<usize>,
     depths: Vec<usize>,
     stage_seqs: Vec<usize>,
+}
+
+impl Composed {
+    /// Add `seq`'s `rows`, staged at the deepest chunk of the `remaining` it
+    /// has left from `depth` — see [`deepest_chunk_offset`].
+    fn stage(&mut self, seq: usize, depth: usize, remaining: usize, rows: usize) {
+        self.rows += rows;
+        self.advances.push(rows);
+        self.depths
+            .push(deepest_chunk_offset(depth, remaining, rows));
+        self.stage_seqs.push(seq);
+    }
 }
 
 /// A priority's slot in the per-band cursors. Four bands, in the order
@@ -164,32 +181,35 @@ pub(super) struct AdmitPass<'a> {
     /// Subtracting what has been taken so far makes each offer face the wave as
     /// it now stands, which is what the model is written to be asked.
     committed: u64,
-    /// Rows a prefill chunk may carry into this wave.
-    chunk_rows: usize,
-    /// Rows this pass has admitted, so each offer is sized to the room that is
-    /// still free rather than to the whole of [`Self::chunk_rows`]. See `peek`.
-    rows_taken: usize,
     /// The ground the wave already in flight reserves — its tier and its
     /// decodes' growth over a sweep, see [`Scheduler::standing_ground_bytes`].
     /// Read once: it describes committed work, so it cannot move under the
     /// pass.
     standing_tier: usize,
     /// The rows the cohort stood at when the pass opened. Read once, like the
-    /// tier: what this pass admits joins the cohort as it goes, and is counted
-    /// in [`Self::rows_taken`] instead.
+    /// tier: it is what the rate model charges the wave before any offer, and
+    /// what it adds [`Self::rows_taken`] to.
     standing_rows: usize,
-    /// The forward this pass is composing, and its tier — what each offer's
-    /// tier is priced against. See [`WaveDraft`].
-    wave: WaveDraft,
-    wave_tier: u64,
-    /// The rows [`Self::wave`] composes to — what an offer widens it from.
-    wave_rows: usize,
-    /// The member the offer [`Ground::peek`] last answered would add to
-    /// [`Self::wave`]: its remaining rows and depth.
-    offered: Option<(usize, usize, usize)>,
-    /// Whether that offer was sized to the floor, so its admission closes the
-    /// forward at its width — see `offer_tier`.
+    /// Rows this pass has admitted — with the standing rows, the cohort's
+    /// width as the rate model judges it, which a refusal closes at
+    /// (`close_rows`).
+    rows_taken: usize,
+    /// The width the next group composes at as this pass leaves it — `None`
+    /// for the deployment's target. It opens on the rate model's standing
+    /// choice; an admission that widens its group clears it (`take_offered`,
+    /// and the cohort's at `conclude`), and closing sets it, raised to the
+    /// chunk the cohort composes at no less than (`Scheduler::set_rate_width`).
+    width: Option<usize>,
+    /// Whether the offer [`Ground::peek`] last answered was sized to the
+    /// floor, so its admission closes the forward — see `offer_tier`.
     narrowed: bool,
+    /// Per band, what the formation an offer of that band joins draws from
+    /// ([`Scheduler::prospect`]) — `Some(None)` when a paused creep resumes
+    /// ahead of the band — and, per band, composition target and formation,
+    /// that formation without any offer. Formed once, and again after each
+    /// admission puts more work in flight.
+    prospects: [Option<Option<Rc<Prospect>>>; 4],
+    withouts: HashMap<(usize, usize, bool), Without>,
     /// Hole ground this pass has credited to admitted claims that have not yet
     /// landed — so two offers are not both told the same hole is theirs. See
     /// `admit::Cost::hole_credit`.
@@ -209,6 +229,9 @@ pub(super) struct AdmitPass<'a> {
     /// Per band, the next pending submission to offer ([`Scheduler::pending_submits`]),
     /// scanned once the band's queued work is spent.
     submit_cursor: [usize; 4],
+    /// The slots this pass walked work past on with no place in its group
+    /// (`peek_prefill`).
+    walked: Walked,
     /// Whether the offer [`Ground::peek`] last answered is a pending submission,
     /// which [`Ground::admit`] then materialises before it begins.
     offering_submit: bool,
@@ -216,6 +239,47 @@ pub(super) struct AdmitPass<'a> {
     /// the rate — what [`Self::conclude`] reads to replace the cohort's width.
     widened: bool,
     closed: bool,
+}
+
+/// A band's queued turn, as [`AdmitPass::peek_prefill`] finds it.
+enum Queued {
+    /// Priced, at the cost given.
+    Offered(Cost),
+    /// It has no place in the group it would join ([`AdmitPass::room`]).
+    NoPlace,
+    /// The band's queued work is spent; its pending submissions answer.
+    Spent,
+}
+
+/// Where an offer stands ([`AdmitPass::room`]): what the formation it joins
+/// draws from and the target it composes at, the group with the offer in it,
+/// and that formation without it at the width the pass stands at — what the
+/// next forward carries if the offer is not admitted.
+struct Placed {
+    prospect: Rc<Prospect>,
+    target: usize,
+    standing: usize,
+    group: NextGroup,
+    without: Without,
+}
+
+/// A formation drawn without any offer — what an offer's group is measured
+/// against: the rows it carries and the tier it places.
+#[derive(Clone, Copy)]
+struct Without {
+    rows: usize,
+    tier: u64,
+}
+
+impl Without {
+    /// The rows an offer widens this formation by, as `group` — the same
+    /// formation with it — carries them: none when it is no member there.
+    fn widened_by(&self, group: &NextGroup) -> usize {
+        if group.offer_at.is_none() {
+            return 0;
+        }
+        group.rows().saturating_sub(self.rows)
+    }
 }
 
 impl<'a> AdmitPass<'a> {
@@ -256,20 +320,19 @@ impl<'a> AdmitPass<'a> {
             per_block,
             recurrent,
             committed: 0,
-            rows_taken: 0,
-            chunk_rows,
             standing_tier,
             standing_rows: composed.rows,
-            wave_rows: composed.rows,
-            wave,
-            wave_tier,
-            offered: None,
+            rows_taken: 0,
+            width: wave.width,
             narrowed: false,
+            prospects: Default::default(),
+            withouts: HashMap::new(),
             holes_spoken: 0,
             narrowable,
             narrow_spoken: 0,
             prefill_cursor: [0; 4],
             submit_cursor: [0; 4],
+            walked: Walked::default(),
             offering_submit: false,
             widened: false,
             closed: false,
@@ -287,30 +350,45 @@ impl<'a> AdmitPass<'a> {
         }
     }
 
-    /// What [`Self::wave`] gains by taking `member` (its remaining rows and
-    /// depth) with its forwards composed at `width`: the tier, and the rows
-    /// the composed forward widens by. Zero when the model cannot price one.
+    /// What an offer adds to `group`, the group it runs in
+    /// ([`Scheduler::group_in`]): the tier that group places beyond what the
+    /// same formation places `without` it, and the rows it advances there.
+    /// Zero when the model cannot price one.
     ///
-    /// A member that adds no row is not free: the span tables hold an entry
-    /// per span, and pricing it at zero lets a forward widen to the sequence
-    /// cap on a tier admission never charged.
-    fn added(&self, member: (usize, usize, usize), width: Option<usize>) -> (u64, usize) {
-        let mut with = self.wave.clone();
-        with.joining.push(member);
-        with.width = width;
-        let composed = self.sched.compose(&with);
-        (
-            self.sched
-                .composed_tier(&composed)
-                .saturating_sub(self.wave_tier),
-            composed.rows.saturating_sub(self.wave_rows),
-        )
+    /// **Priced in that group, not the cohort standing now.** Mid-sweep the
+    /// standing cohort is the held group at its fixed rows, and a turn that
+    /// pauses it — or leads the group re-formed at its boundary — runs in a
+    /// forward those rows are not in. And against the group as it would form
+    /// without it, its members' rows re-shared: a turn that leads a full group
+    /// takes rows from the members behind it in a forward no wider, and places
+    /// next to no more tier. Measured against its fellow members at the shares
+    /// they keep beside it instead, it was charged the steepest slice of a
+    /// superlinear tier for rows the forward was carrying anyway. A group
+    /// smaller than the one it displaces — a `High` turn over a background
+    /// group — adds nothing: the members left out were priced at their own
+    /// admission.
+    ///
+    /// A join is priced at the rows the group gives it, not at none: it is
+    /// only offered as a member ([`room_left`]), and it rides the group's
+    /// forwards as one. Composed at no rows, a join charged a cohort of 6,254
+    /// rows that ran at 8,066.
+    fn priced(&self, group: &NextGroup, without: Without) -> (u64, usize) {
+        let tier = self.sched.group_tier(group);
+        (tier.saturating_sub(without.tier), group.offer_rows())
     }
 
-    /// An offer of `turn` tokens at `depth` whose claim (its K/V and store) is
-    /// `claim` bytes, given `room` rows free in the forward: the rows it earns
-    /// there, the tier it adds and the creep residual it owes. Records the
-    /// member, for the admit that follows.
+    /// An offer whose claim (its K/V and store) is `claim` bytes, given the
+    /// rows free for it where it stands, as [`Self::room`] found them: the rows
+    /// it widens its group by, the tier it adds and the creep residual it
+    /// owes.
+    ///
+    /// **The rows the rate model weighs are the group's widening, not the
+    /// offer's share of it.** A turn that leads a group re-formed at its
+    /// boundary takes rows from the members behind it, and the forward runs no
+    /// wider: charged its share on top of the standing cohort, an 87-row `High`
+    /// turn beside a creep already at the pass ceiling was refused for the
+    /// rows' cap. It joins instead, as a turn does that shares the forwards to
+    /// come rather than widening this one.
     ///
     /// Staged at its **deepest** chunk, not its first: the terms that follow
     /// depth — the pre-stage up to its key-chunk bound, and on a
@@ -319,61 +397,64 @@ impl<'a> AdmitPass<'a> {
     /// chunk costs a tier its first does not. A full-width chunk ending at the
     /// turn's last token bounds every chunk the turn will run.
     ///
-    /// The residual is sized by the cohort's composed rows, so it is owed for
-    /// the rows the offer widens the composition by — a join the group
-    /// absorbs owes it as surely as a turn with rows in this forward.
+    /// The residual is sized by the group's rows, so each offer owes its own
+    /// rows' share — a join the group absorbs as surely as a turn with rows in
+    /// this forward.
     ///
-    /// **Priced at the width its own admission leaves.** An offer with rows
-    /// widens the forward, and a pass that widens clears the rate model's
-    /// width (`conclude`), so the group then composes at the deployment's
-    /// target; a join leaves the width as it stands.
+    /// **Priced at the width its own admission leaves** — the one its group
+    /// was placed at ([`Self::room`]).
     ///
     /// **Sized to the floor when it cannot fit whole.** A turn whose rows would
     /// take residency under the prefill floor is offered the widest rows that
     /// still clear it — never fewer than the least advance — and the pass
-    /// closes at that width when it is admitted (`take_offered`), so the group
-    /// composes there and the turn advances by that much a forward. Offered
-    /// whole, it is refused on every pass: measured on the 3090 scratch daemon
-    /// (2026-10-18), a 4,325-row `High` tool-result prefill priced at a
-    /// 4,992 MiB tier against 954 MiB of room, refused for minutes while the
-    /// person waited, 22 turns cut at the client's deadline.
+    /// closes at the cohort's width when it is admitted (`take_offered`). The
+    /// formation does not carry the clip: a turn that leads its group takes
+    /// its share of that width, and the group it forms is fitted to the
+    /// ground its windows place (`fit_cohort_to_ground`). Offered whole, it is
+    /// refused on every pass: measured on the 3090 scratch daemon (2026-10-18),
+    /// a 4,325-row `High` tool-result prefill priced at a 4,992 MiB tier
+    /// against 954 MiB of room, refused for minutes while the person waited,
+    /// 22 turns cut at the client's deadline.
     fn offer_tier(
         &mut self,
-        room: usize,
-        turn: usize,
-        depth: usize,
-        seq: usize,
+        (room, placed): (usize, Placed),
+        offer: Candidate,
         claim: u64,
     ) -> (usize, u64, u64) {
-        let member = (turn, depth, seq);
-        self.offered = Some(member);
         self.narrowed = false;
-        let rows = turn.min(room);
+        let rows = offer.remaining.min(room);
+        let (tier, own) = self.priced(&placed.group, placed.without);
+        let residual = self.residual_for(own);
         if rows == 0 {
-            let (tier, widened) = self.added(member, self.wave.width);
-            return (0, tier, self.residual_for(widened));
+            return (0, tier, residual);
         }
-        let (tier, widened) = self.added(member, None);
-        let residual = self.residual_for(widened);
         let spendable = self
             .resident_weights()
             .saturating_sub(self.budget.prefill_floor);
         if self.dislodges(claim, residual, tier) <= spendable {
-            return (rows, tier, residual);
+            return (placed.without.widened_by(&placed.group), tier, residual);
         }
         // Chunk-aligned rows, bisected: the tier and the residual both grow
-        // with the rows, so the rows that fit are a prefix.
+        // with the rows, so the rows that fit are a prefix. Only the offer's
+        // cap moves, so its group is formed from the same prospect each time.
         let least = PREFILL_MIN_ADVANCE.min(rows).div_ceil(CHUNK_SIZE);
         let (mut lo, mut hi) = (least, rows.div_ceil(CHUNK_SIZE) - 1);
         let mut fit = None;
         while lo <= hi {
             let mid = (lo + hi) / 2;
             let r = (mid * CHUNK_SIZE).min(rows);
-            let width = self.standing_rows + self.rows_taken + r;
-            let (tier, widened) = self.added(member, Some(width));
-            let residual = self.residual_for(widened);
+            let capped = Offer {
+                who: offer,
+                cap: Some(r),
+            };
+            let group = self
+                .sched
+                .group_in(&placed.prospect, Some(capped), placed.target);
+            let without = self.without(offer.band, &placed.prospect, &group, placed.standing);
+            let (tier, own) = self.priced(&group, without);
+            let residual = self.residual_for(own);
             if self.dislodges(claim, residual, tier) <= spendable {
-                fit = Some((r, tier, residual));
+                fit = Some((without.widened_by(&group), tier, residual));
                 lo = mid + 1;
             } else {
                 hi = mid - 1;
@@ -386,8 +467,31 @@ impl<'a> AdmitPass<'a> {
             }
             // Not even the least advance fits: the whole offer is the honest
             // price, and the floor refuses it.
-            None => (rows, tier, residual),
+            None => (placed.without.widened_by(&placed.group), tier, residual),
         }
+    }
+
+    /// The formation `like` came from, drawn from `prospect` — an offer at
+    /// `band`'s — without any offer and composed at `target`: formed once per
+    /// band, target and formation until an admission puts more in flight.
+    fn without(
+        &mut self,
+        band: DecodePriority,
+        prospect: &Prospect,
+        like: &NextGroup,
+        target: usize,
+    ) -> Without {
+        let key = (band_index(band), target, like.alone);
+        if let Some(&without) = self.withouts.get(&key) {
+            return without;
+        }
+        let group = self.sched.without_in(prospect, like, target);
+        let without = Without {
+            rows: group.rows(),
+            tier: self.sched.group_tier(&group),
+        };
+        self.withouts.insert(key, without);
+        without
     }
 
     /// What an offer claiming `claim` with this residual and tier dislodges,
@@ -402,30 +506,41 @@ impl<'a> AdmitPass<'a> {
         .dislodged_bytes()
     }
 
-    /// The offer [`Self::offer_tier`] priced was admitted: it is a member of
-    /// the cohort the next offer is priced against, at the width its
-    /// admission leaves — closed where it was sized to the floor, cleared
-    /// where it widened the forward.
-    fn take_offered(&mut self, rows: usize) {
-        if let Some(member) = self.offered.take() {
-            self.wave.joining.push(member);
+    /// The offer [`Self::offer_tier`] priced, widening its group by `rows`, was
+    /// admitted: the rate model has charged those rows and judged them paying,
+    /// so they count toward the cohort's width and toward clearing the rate
+    /// model's narrower choice (`conclude`), and one sized to the floor closes
+    /// the cohort's forward. When it `joined` — a turn of it in flight now,
+    /// not answered elsewhere or handed back to the queue — the next offer's
+    /// group carries it, and one that widened its group clears the pass's
+    /// width.
+    ///
+    /// **A turn sized to the floor closes the cohort's forward, not one of
+    /// its own.** The width is the rate model's, read by every formation until
+    /// the cohort shrinks; a narrower width for the turn's group alone would
+    /// bind every other group as long as that turn prefilled, a long creep's
+    /// included. Within the cohort's width the formation fits the group it
+    /// forms to the ground its windows place (`fit_cohort_to_ground`).
+    fn take_offered(&mut self, rows: usize, joined: bool) {
+        self.rows_taken = self.rows_taken.saturating_add(rows);
+        self.widened |= rows > 0;
+        if joined {
+            self.prospects = Default::default();
+            self.withouts.clear();
         }
-        if self.narrowed {
-            self.narrowed = false;
-            self.close_rows();
-            return;
+        if std::mem::take(&mut self.narrowed) {
+            self.close_at(self.standing_rows.saturating_add(self.rows_taken));
+        } else if joined && rows > 0 && !self.closed {
+            self.width = None;
         }
-        if rows > 0 && !self.closed {
-            self.wave.width = None;
-        }
-        self.recompose();
     }
 
-    /// Re-read [`Self::wave`]'s composed tier and rows after it changed.
-    fn recompose(&mut self) {
-        let composed = self.sched.compose(&self.wave);
-        self.wave_tier = self.sched.composed_tier(&composed);
-        self.wave_rows = composed.rows;
+    /// End the forward's rows at `width`: the rate model's choice for the
+    /// cohort, which its next group composes at.
+    fn close_at(&mut self, width: usize) {
+        self.sched.set_rate_width(width);
+        self.closed = true;
+        self.width = self.sched.rate_width.map(|w| w.rows);
     }
 
     /// `cost` with the part of its claim that lands in holes credited: the
@@ -585,12 +700,13 @@ impl Ground for AdmitPass<'_> {
         if self.closed {
             return false;
         }
-        let width = self.standing_rows.saturating_add(self.rows_taken);
-        self.chunk_rows = width.max(CHUNK_SIZE);
-        self.sched.set_rate_width(width);
-        self.closed = true;
-        self.wave.width = Some(width);
-        self.recompose();
+        // **At the cohort's width, as the rate model judged it** — the rows it
+        // charged before any offer and those this pass admitted. The width is
+        // the cohort's, read at every formation until the cohort shrinks
+        // (`RateWidth::lapsed`); closed at the refused offer's own group
+        // instead, an `Urgent` offer refused beside a 3,072-row creep would
+        // compose that creep's next group at one chunk.
+        self.close_at(self.standing_rows.saturating_add(self.rows_taken));
         true
     }
 
@@ -632,16 +748,71 @@ impl Ground for AdmitPass<'_> {
 }
 
 impl AdmitPass<'_> {
-    /// Rows of this wave's forward still free for an offer — see `peek_prefill`
-    /// — or `None` when the forward is full and one more member could not
-    /// advance a chunk beside the rest.
-    fn room(&self) -> Option<usize> {
-        room_left(
-            self.chunk_rows,
-            self.standing_rows.saturating_add(self.rows_taken),
-            self.closed,
-            self.sched.prefill_width() + self.sched.section_ingest_width(),
-        )
+    /// Rows `offer` advances in the group it would run in
+    /// ([`Scheduler::prospect`], [`Scheduler::group_in`]) — see `peek_prefill`
+    /// — or `None` when
+    /// it is no member of that group, that group has none for it beside the
+    /// rest, or a paused creep resumes ahead of it. Every member of that group
+    /// is counted, prompts and sections alike; work the offer sets aside, or
+    /// leads at the group's re-formation, is not.
+    ///
+    /// Where it stands comes back beside the rows, composed at the width its
+    /// admission would leave — the pass's own, cleared when it widens its
+    /// group (`take_offered`) — so its pricing reads the same group.
+    ///
+    /// **Measured against the forward as it stands**, at the width the pass
+    /// stands at, whatever width its own group is placed at: an admission that
+    /// widens its group clears the cohort's width, so every member of that
+    /// group widens with it, and that is the offer's to pay for.
+    fn room(&mut self, offer: Candidate) -> Option<(usize, Placed)> {
+        let slot = band_index(offer.band);
+        if self.prospects[slot].is_none() {
+            self.prospects[slot] = Some(self.sched.prospect(offer.band).map(Rc::new));
+        }
+        let prospect = self.prospects[slot].clone().flatten()?;
+        // **Below the live band its group leads with, no formation has a place
+        // for it** — the turns of a lower band queued behind a `High` group
+        // are walked past without forming one each.
+        if prospect.leaves_out(offer.band) {
+            return None;
+        }
+        let asked = Offer {
+            who: offer,
+            cap: None,
+        };
+        let standing = self.sched.composition_target_at(self.width);
+        let place = |this: &mut Self, target| {
+            let group = this.sched.group_in(&prospect, Some(asked), target);
+            let without = this.without(offer.band, &prospect, &group, standing);
+            (group, without)
+        };
+        // **Placed at the deployment's target first**, the width an admission
+        // that widens its group leaves (`take_offered`): a pass that finds
+        // wider rows paying widens the cohort's forwards. A turn that would not
+        // widen it there — one that joins, or has no place — is placed at the
+        // width the pass stands at, which its group then composes at.
+        let wide = self.sched.composition_target_at(None);
+        let mut target = if self.closed { standing } else { wide };
+        let (mut group, mut without) = place(self, target);
+        // With no place at the wider target it has none at a narrower one: the
+        // budget fills in the same order, and shrinking it only cuts the
+        // members behind.
+        if target != standing && group.offer_at.is_some() && without.widened_by(&group) == 0 {
+            target = standing;
+            (group, without) = place(self, target);
+        }
+        let share = group.offer_at.map(|_| group.offer_rows());
+        let room = room_left(share, self.closed)?;
+        Some((
+            room,
+            Placed {
+                prospect,
+                target,
+                standing,
+                group,
+                without,
+            },
+        ))
     }
 
     /// The section band's next candidate: the head of the section queue,
@@ -649,23 +820,41 @@ impl AdmitPass<'_> {
     /// and its rows in the forward's tier. It never decodes. Strictly FIFO and
     /// never paused: admission takes every section in this band, and a
     /// section's own band decides only how it rides the forwards once admitted.
+    ///
+    /// **A head with no place in the forward it would ride ends the band**,
+    /// unlike a turn: a section can name the sections before it as its prefix
+    /// (`prefix_section_ids`), and one ingested ahead of its prefix is sealed
+    /// against what of it has landed — permanently.
     fn peek_section(&mut self) -> Option<Cost> {
         let s = self.sched.section_queue.front()?;
-        let (turn, seq) = (s.tokens.len(), s.sequence_id);
+        let (turn, seq, band) = (s.tokens.len(), s.sequence_id, s.band);
+        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let offer = Candidate {
+            seq: seq.0,
+            band,
+            remaining: turn,
+            depth,
+            section: true,
+        };
+        let room = self.room(offer)?;
+        Some(self.price_section(room, offer))
+    }
+
+    /// The queued section `offer` stands for, where it stands, priced.
+    fn price_section(&mut self, room: (usize, Placed), offer: Candidate) -> Cost {
+        let (turn, seq, depth) = (offer.remaining, offer.seq, offer.depth);
         // A reused slot already holds a store, whose regions the residency
         // already counts: its restart zeroes that store where it stands.
-        let recurrent = if self.sched.model.has_recurrent_state(seq.0) {
-            self.sched.model.prefill_scratch_bytes(seq.0) as u64
+        let recurrent = if self.sched.model.has_recurrent_state(seq) {
+            self.sched.model.prefill_scratch_bytes(seq) as u64
         } else {
             self.recurrent
         };
-        let room = self.room()?;
-        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
-        Some(self.credited(Cost {
+            self.offer_tier(room, offer, kv.saturating_add(recurrent));
+        self.credited(Cost {
             kv,
             recurrent,
             residual,
@@ -674,7 +863,7 @@ impl AdmitPass<'_> {
             activations,
             rows,
             decodes_after: false,
-        }))
+        })
     }
 
     /// Admit the section queue's head, priced at `cost`, and start it — its
@@ -695,11 +884,9 @@ impl AdmitPass<'_> {
             self.sched.section_queue.push_front(section);
             return false;
         }
-        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
-        self.take_offered(cost.rows);
+        self.take_offered(cost.rows, true);
         self.settle_holes(stranded, cost.hole_credit);
         self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
-        self.widened |= cost.rows > 0;
         // See `admit_prefill`: what the section dislodges as it runs is carried
         // so the offers behind it face the wave as it now stands, less what the
         // claim has already taken.
@@ -724,6 +911,27 @@ impl AdmitPass<'_> {
         // left off rather than where the previous band did, and nothing is
         // consumed by looking.
         let band = band_index(prio);
+        loop {
+            match self.peek_queued(prio, band) {
+                Queued::Offered(cost) => return Some(cost),
+                Queued::Spent => return self.peek_submit(prio),
+                // Closed, the forward's rows end where they stand: no turn
+                // behind it has rows to take either, and the band ends.
+                Queued::NoPlace if self.closed => return None,
+                // **A turn its group has no place for is walked past**, as
+                // another band's is. Ending the band there held every turn
+                // behind it: a turn of another adapter, or one a full group
+                // leaves out, kept the ones that would lead the group — nearer
+                // their first token, or of its adapter — from being offered.
+                // Nothing that would reorder its slot goes ahead of it
+                // ([`Walked`]).
+                Queued::NoPlace => self.prefill_cursor[band] += 1,
+            }
+        }
+    }
+
+    /// The band's queued turn at its cursor, priced.
+    fn peek_queued(&mut self, prio: DecodePriority, band: usize) -> Queued {
         while let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) {
             if self.sched.decode_priority_or_high(w.sequence_id) == prio {
                 break;
@@ -732,12 +940,12 @@ impl AdmitPass<'_> {
         }
         // The band's queued work first; then the submissions behind it.
         let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) else {
-            return self.peek_submit(prio);
+            return Queued::Spent;
         };
         self.offering_submit = false;
-        // **Offer what is LEFT of the wave's rows, not the whole cap.**
+        // **Offer the turn's share of its group, not the whole cap.**
         //
-        // Clipping to `chunk_rows` made every offer the size of the entire budget,
+        // Clipping to the pass cap made every offer the size of the entire budget,
         // so the first turn long enough to fill it took the wave alone and the next
         // one was refused `Cap` for exceeding a budget it was never shown. Measured
         // on this daemon at `--max-depth 3`: a 2,646-row head admitted, the next
@@ -745,20 +953,25 @@ impl AdmitPass<'_> {
         // running 2,646 of 4,880 with sequences queued and every wave
         // `seqs max=1`, at a fraction of the batched rate.
         //
-        // Offered the remainder, a turn takes the room that is actually free and
-        // the wave fills with as many turns as it takes. A turn clipped short is
-        // not turned away, it advances by that much and is offered again next wave
-        // — which is how a prefill longer than one forward already progresses.
+        // Offered its share, a turn takes the rows the group will actually give
+        // it and the wave fills with as many turns as it takes. A turn clipped
+        // short is not turned away, it advances by that much and is offered again
+        // next wave — which is how a prefill longer than one forward already
+        // progresses.
         //
-        // Standing rows count: they are in the forward this fill is composing, and
-        // the rate model's own cap check counts them, so a clip that ignored them
-        // would offer ground that is already spoken for.
+        // The members ahead of it count — they take their rows first — and the
+        // work it sets aside or leads does not (`Scheduler::prospect`).
         //
         // **A full forward takes no more turns** ([`room_left`]): its rows are
         // filled in order (`gang::gang_shares`), so a turn past them would
-        // advance by nothing while holding its store. Every member in flight is
-        // counted, sections and paused prefills included. See [`Self::room`].
+        // advance by nothing while holding its store. See [`Self::room`].
         let (turn, seq) = (w.tokens.len(), w.sequence_id);
+        let fork = self.sched.uncarved_case(w).is_some();
+        if self.walked.holds(seq.0, fork) {
+            // Held, it is walked past itself, and holds what is behind it.
+            self.walked.past(seq.0, fork);
+            return Queued::NoPlace;
+        }
         // **A store is charged once.** A turn whose sequence already holds a
         // store has that store's regions in the residency this offer is read
         // against — charging it again prices the same ground twice. A submitted
@@ -774,13 +987,23 @@ impl AdmitPass<'_> {
         } else {
             self.recurrent
         };
-        let room = self.room()?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let offer = Candidate {
+            seq: seq.0,
+            band: prio,
+            remaining: turn,
+            depth,
+            section: false,
+        };
+        let Some(room) = self.room(offer) else {
+            self.walked.past(seq.0, fork);
+            return Queued::NoPlace;
+        };
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
-        Some(self.credited(Cost {
+            self.offer_tier(room, offer, kv.saturating_add(recurrent));
+        Queued::Offered(self.credited(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
             // first chunk would admit a queue of turns whose tails cannot fit.
@@ -805,27 +1028,55 @@ impl AdmitPass<'_> {
     /// its tier is priced at the depth its projection will give it.
     fn peek_submit(&mut self, prio: DecodePriority) -> Option<Cost> {
         let band = band_index(prio);
-        while let Some(p) = self.sched.pending_submits.get(self.submit_cursor[band]) {
-            if self.sched.decode_priority_or_high(p.parent()) == prio {
-                break;
+        loop {
+            while let Some(p) = self.sched.pending_submits.get(self.submit_cursor[band]) {
+                if self.sched.decode_priority_or_high(p.parent()) == prio {
+                    break;
+                }
+                self.submit_cursor[band] += 1;
             }
-            self.submit_cursor[band] += 1;
+            let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
+            let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
+            // Keyed by its parent until its view is carved: the parent's adapter
+            // is the view's, and the index its tier is staged over is the one the
+            // view forks.
+            let offer = Candidate {
+                seq: parent.0,
+                band: prio,
+                remaining: turn,
+                depth,
+                section: false,
+            };
+            // Walked past with no place in its group, as a queued turn is
+            // (`peek_prefill`) — and behind a turn on its parent walked past,
+            // whose history it forks.
+            let placed = if self.walked.holds(parent.0, true) {
+                None
+            } else {
+                self.room(offer)
+            };
+            match placed {
+                Some(room) => return Some(self.price_submit(room, offer, lift)),
+                None if self.closed => return None,
+                None => {
+                    self.walked.past(parent.0, true);
+                    self.submit_cursor[band] += 1;
+                }
+            }
         }
-        let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
-        let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
-        let room = self.room()?;
+    }
+
+    /// The pending submission `offer` stands for, where it stands, priced with
+    /// its projection's `lift`.
+    fn price_submit(&mut self, room: (usize, Placed), offer: Candidate, lift: u64) -> Cost {
+        let (turn, depth) = (offer.remaining, offer.depth);
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(lift)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
-        let (rows, activations, residual) = self.offer_tier(
-            room,
-            turn,
-            depth,
-            parent.0,
-            kv.saturating_add(self.recurrent),
-        );
+        let (rows, activations, residual) =
+            self.offer_tier(room, offer, kv.saturating_add(self.recurrent));
         self.offering_submit = true;
-        Some(self.credited(Cost {
+        self.credited(Cost {
             kv,
             recurrent: self.recurrent,
             residual,
@@ -834,7 +1085,7 @@ impl AdmitPass<'_> {
             activations,
             rows,
             decodes_after: true,
-        }))
+        })
     }
 
     /// Admit the pending submission [`Self::peek_submit`] offered: put its
@@ -853,28 +1104,33 @@ impl AdmitPass<'_> {
         }
         let before = residency_now(self.standing_tier);
         let stranded = interleave::stranded_hole_bytes();
-        let begun = match self.sched.materialise_submit(pending) {
+        // Whether it was answered, and whether a turn of it is in flight now —
+        // the one that joins the group its offer was priced in.
+        let (begun, joined) = match self.sched.materialise_submit(pending) {
             Some(work) => match self.sched.begin_admitted(work) {
-                Ok(()) => true,
+                Ok(()) => (true, true),
                 Err(refused) => {
                     let (work, why) = *refused;
                     tracing::debug!(
                         target: "candle_conversation::scheduler::throttle",
                         "admitted submission could not begin — it waits as carved work: {why}",
                     );
+                    // Ahead of every queued turn, so every band's cursor moves
+                    // with what it pointed at.
                     self.sched.prefill_queue.push_front(work);
-                    false
+                    for c in &mut self.prefill_cursor {
+                        *c += 1;
+                    }
+                    (false, false)
                 }
             },
             // Its caller has the error, or it went to a turn group whose cases
             // are offered on their own.
-            None => true,
+            None => (true, false),
         };
-        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
-        self.take_offered(cost.rows);
+        self.take_offered(cost.rows, joined);
         self.settle_holes(stranded, cost.hole_credit);
         self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
-        self.widened |= cost.rows > 0;
         let carved = before.saturating_sub(residency_now(self.standing_tier));
         self.committed = self
             .committed
@@ -907,13 +1163,10 @@ impl AdmitPass<'_> {
             self.sched.prefill_queue.insert(at, work);
             return false;
         }
-        // Spend the rows this offer took, so the next offer in this pass is sized
-        // to what is left — see `peek`.
-        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
-        self.take_offered(cost.rows);
+        // In flight now, so the next offer's group carries it — see `room`.
+        self.take_offered(cost.rows, true);
         self.settle_holes(stranded, cost.hole_credit);
         self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
-        self.widened |= cost.rows > 0;
         // **Nothing is purchased here, and that is not an omission.**
         //
         // A turn's K/V is claimed incrementally, chunk by chunk, by the admit
@@ -1201,7 +1454,7 @@ impl Scheduler {
     /// sequence with no rows.
     ///
     /// **The ceiling is the width the group will be composed at** — the group
-    /// budget at the draft's width, the rule `prefill_group_budget` forms the
+    /// budget at the draft's width, the rule `prefill_group_budget_at` forms the
     /// group by — not the pass ceiling an offer is sized against. The group
     /// budget absorbs a total that passes the model's cap by no more than its
     /// slack, so a cohort can form wider than any ceiling an offer saw:
@@ -1225,14 +1478,26 @@ impl Scheduler {
         for &(remaining, depth, seq) in &wave.joining {
             let rows = remaining.min(ceiling.saturating_sub(out.rows));
             if rows > 0 {
-                out.advances.push(rows);
-                out.stage_seqs.push(seq);
-                out.depths
-                    .push(deepest_chunk_offset(depth, remaining, rows));
-                out.rows += rows;
+                out.stage(seq, depth, remaining, rows);
             }
         }
         out
+    }
+
+    /// The tier `group` places as the forward it runs, each member staged at
+    /// its deepest chunk.
+    fn group_tier(&self, group: &NextGroup) -> u64 {
+        let mut out = Composed {
+            rows: 0,
+            seqs: group.members.len(),
+            advances: Vec::with_capacity(group.members.len()),
+            depths: Vec::with_capacity(group.members.len()),
+            stage_seqs: Vec::with_capacity(group.members.len()),
+        };
+        for p in &group.members {
+            out.stage(p.member.seq_id(), p.depth, p.remaining, p.member.advance());
+        }
+        self.composed_tier(&out)
     }
 
     /// The tier a forward composed as `wave` places — the same planner the
@@ -1460,10 +1725,12 @@ impl Scheduler {
     }
 }
 
-/// Rows a forward `chunk_rows` wide still has for an offer once `taken` are
-/// spent, or `None` when it is full.
+/// Rows an offer whose `share` of its group is that many is offered, or
+/// `None` when the group has none for it.
 ///
-/// **A full forward takes no more turns.** Its rows are filled in order
+/// **A full forward takes no more turns.** With no share the offer is no
+/// member: the group it would join is full, or leaves it out — a band below
+/// the group's, another adapter. Its rows are filled in order
 /// (`gang::gang_shares`), so a turn joining a full forward advances by
 /// nothing until the ones ahead finish — yet it claims its store and scratch
 /// at admission, and holds them while it waits. Joined while every member could
@@ -1471,25 +1738,18 @@ impl Scheduler {
 /// prefills' recurrent stores at once against one forward's rows. It is offered
 /// again at the next pass, once rows have come free.
 ///
-/// **A closed forward has no rows left, whatever its width.** Closing ends the
-/// rows at what the pass admitted, and the cohort composes at no less than a
-/// chunk (`Scheduler::set_rate_width`), so a pass closed below a chunk is
-/// still a chunk wide. Read as room, that chunk re-offered the turn the rate
-/// had just refused with the same rows, the rate refused it again, and the
-/// pass never ended: on BlackWorld (d919bd410, 2026-10-20) one 4-row `Normal`
-/// prompt was offered and refused every 1.4 ms for four hours, and no wave ran
-/// to step the seventeen decodes the refusal was protecting. Closed with no
-/// member in it, the turn comes back as a join and advances by that chunk.
-fn room_left(chunk_rows: usize, taken: usize, closed: bool, members: usize) -> Option<usize> {
-    let room = if closed {
-        0
-    } else {
-        chunk_rows.saturating_sub(taken)
-    };
-    if room == 0 && members > 0 {
-        return None;
-    }
-    Some(room)
+/// **A closed forward has no rows left, whatever its width**, so a member
+/// comes back as a join: it rides the group's forwards at its share without
+/// widening them. Closing ends the rows at what the pass admitted, and the
+/// cohort composes at no less than a chunk (`Scheduler::set_rate_width`), so a
+/// pass closed below a chunk is still a chunk wide. Read as room, that chunk
+/// re-offered the turn the rate had just refused with the same rows, the rate
+/// refused it again, and the pass never ended: on BlackWorld (d919bd410,
+/// 2026-10-20) one 4-row `Normal` prompt was offered and refused every 1.4 ms
+/// for four hours, and no wave ran to step the seventeen decodes the refusal
+/// was protecting.
+fn room_left(share: Option<usize>, closed: bool) -> Option<usize> {
+    share.map(|rows| if closed { 0 } else { rows })
 }
 
 #[cfg(test)]
@@ -1500,32 +1760,20 @@ mod tests {
     fn a_closed_forward_offers_only_joins_even_below_a_chunk() {
         // Nothing standing, the rate refused the first rows offered: the pass
         // closes at width zero and composes at one chunk.
-        assert_eq!(room_left(CHUNK_SIZE, 0, false, 0), Some(CHUNK_SIZE));
+        assert_eq!(room_left(Some(CHUNK_SIZE), false), Some(CHUNK_SIZE));
         assert_eq!(
-            room_left(CHUNK_SIZE, 0, true, 0),
+            room_left(Some(CHUNK_SIZE), true),
             Some(0),
             "a closed pass re-offers the turn as a join, not with the rows it was refused"
         );
-        // With a member already in that chunk, there is no room for a join.
-        assert_eq!(room_left(CHUNK_SIZE, 0, true, 1), None);
-        // Open, a wider forward still has its unspent rows.
-        assert_eq!(
-            room_left(4 * CHUNK_SIZE, CHUNK_SIZE, false, 1),
-            Some(3 * CHUNK_SIZE)
-        );
     }
 
-    /// **A full forward takes no turn beside its members**, however many more
-    /// chunks it is wide: filled in order, the join would advance by nothing
-    /// while holding its store.
+    /// **A turn its group leaves out is not offered**, full or not: filled in
+    /// order, the forward would carry nothing of it while it held its store.
     #[test]
-    fn a_full_forward_takes_no_join() {
-        assert_eq!(room_left(64 * CHUNK_SIZE, 64 * CHUNK_SIZE, false, 2), None);
-        assert_eq!(room_left(64 * CHUNK_SIZE, 64 * CHUNK_SIZE, true, 2), None);
-        assert_eq!(
-            room_left(64 * CHUNK_SIZE, 63 * CHUNK_SIZE, false, 2),
-            Some(CHUNK_SIZE)
-        );
+    fn a_turn_its_group_leaves_out_is_not_offered() {
+        assert_eq!(room_left(None, false), None);
+        assert_eq!(room_left(None, true), None);
     }
 
     #[test]

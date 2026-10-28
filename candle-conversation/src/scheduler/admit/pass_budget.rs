@@ -105,6 +105,24 @@ pub(crate) fn prefill_group_budget(
     }
 }
 
+/// The caps a prefill group's budget is read against ([`prefill_group_budget`]):
+/// the model's width cap and the KV side's. Read once for every group a
+/// formation or an admission pass forms — the model's runs the tier planner
+/// over the ground standing, which no group changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupCaps {
+    pub model: usize,
+    pub kv: Option<usize>,
+}
+
+impl GroupCaps {
+    /// Tokens a group of `total` queued tokens shares at the composition
+    /// `target` — see [`prefill_group_budget`].
+    pub(crate) fn budget(&self, total: usize, target: usize) -> usize {
+        prefill_group_budget(total, target, self.model, self.kv, CHUNK_SIZE)
+    }
+}
+
 /// The forward width the admission rate model chose for a prefill cohort: the
 /// rows it admitted before judging that more would not make the forward
 /// faster, and how many prefills the cohort held when it judged.

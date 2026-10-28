@@ -706,12 +706,12 @@ impl Scheduler {
     /// ground is handed back. See `wave_retry` for when this is the right call.
     pub(super) fn fail_decode_less_wave(&mut self, why: &str) {
         for p in &mut self.active_prefills {
-            if p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len() {
+            if p.can_advance() {
                 p.error = Some(ConversationError::Other(why.to_string()));
             }
         }
         for s in &mut self.active_section_ingests {
-            if s.error.is_none() && s.offset < s.tokens.len() {
+            if s.can_advance() {
                 s.error = Some(ConversationError::Other(why.to_string()));
             }
         }
