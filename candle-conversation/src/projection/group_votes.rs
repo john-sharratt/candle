@@ -13,7 +13,7 @@ use super::ids::{GroupId, TimelineId};
 use crate::persistence::streams::StreamId;
 use crate::projection::Conversation;
 use crate::provenance::chunk_exclusion::uncut;
-use crate::provenance::gallery_arena::{PagedSegment, PagedWindow, TokenVotes};
+use crate::provenance::gallery_arena::{Holder, PagedSegment, PagedWindow, TokenVotes};
 use crate::provenance::{GalleryArena, WideQSig};
 
 /// The votes: each case's file, and every probe token's vote per fold group
@@ -55,9 +55,11 @@ fn group_segment<'a>(
             }
         }
     }
+    // Every active file of the group: a read across conversations.
     PagedSegment {
         windows,
         n_cases: files.len(),
+        holder: Holder::Shared,
     }
 }
 

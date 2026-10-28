@@ -35,7 +35,7 @@ use super::super::WideQSig;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
-use super::{GalleryArena, TokenVotes, TurnSigs};
+use super::{GalleryArena, Holder, TokenVotes, TurnSigs};
 
 /// What producing a scan's rows cost: the launch's timing, the probe tokens it
 /// scored (the rest were read from [`ProbeRows`]), and the row cache's own
@@ -59,10 +59,12 @@ pub struct PagedWindow<'a> {
     pub case: usize,
 }
 
-/// One segment (file): its windows and its exchange (case) count.
+/// One segment (file): its windows, its exchange (case) count, and who the
+/// turns it reads are held for (`docs/gallery_residency.md` §2).
 pub struct PagedSegment<'a> {
     pub windows: Vec<PagedWindow<'a>>,
     pub n_cases: usize,
+    pub holder: Holder,
 }
 
 /// `weights` for every one of `segments`.
@@ -164,8 +166,10 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 }
 
 /// Fingerprint the segment structure the built index depends on — file order,
-/// each file's case count, and every window's `(sid, fingerprint, turn length,
-/// start, end, case)`. Cheap (per-window, not per-token).
+/// each file's case count and holder, and every window's `(sid, fingerprint,
+/// turn length, start, end, case)`. Cheap (per-window, not per-token). The
+/// holder is in it so an index built for one reader never stands in for
+/// another's, whose build would widen what its turns are held for.
 ///
 /// **Trust boundary:** two guarantees back reuse. (1) Each turn's *run id*
 /// covers physical page moves — an evict/re-seal/compaction that relocates a
@@ -183,6 +187,7 @@ fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
     segments.len().hash(&mut h);
     for seg in segments {
         seg.n_cases.hash(&mut h);
+        seg.holder.hash(&mut h);
         seg.windows.len().hash(&mut h);
         for w in &seg.windows {
             w.sid.0.hash(&mut h);
@@ -245,7 +250,7 @@ impl GalleryArena {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
                         let t_ensure = Instant::now();
-                        let ensured = self.scan_ensure(w.sid, w.turn, w.fingerprint);
+                        let ensured = self.scan_ensure(w.sid, w.turn, w.fingerprint, seg.holder);
                         ensure_time += t_ensure.elapsed();
                         let ensured = match ensured {
                             Ok(e) => e,
@@ -982,6 +987,7 @@ mod tests {
     use super::super::IndexMiss;
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
+    use crate::projection::TimelineId;
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
 
     /// The launchers' `-(stage * 1000 + cudaError)` codes, decoded exactly —
@@ -1040,6 +1046,7 @@ mod tests {
                     },
                 ],
                 n_cases: 2,
+                holder: Holder::Shared,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1051,6 +1058,7 @@ mod tests {
                     case: 0,
                 }],
                 n_cases: 1,
+                holder: Holder::Shared,
             },
         ];
         let tail = vec![
@@ -1113,6 +1121,7 @@ mod tests {
                         case: 0,
                     }],
                     n_cases: 1,
+                    holder: Holder::Shared,
                 },
                 PagedSegment {
                     windows: vec![
@@ -1134,6 +1143,7 @@ mod tests {
                         },
                     ],
                     n_cases: 2,
+                    holder: Holder::Shared,
                 },
             ]
         };
@@ -1203,10 +1213,12 @@ mod tests {
             PagedSegment {
                 windows: vec![window(1, &a, 0), window(2, &b, 1)],
                 n_cases: 2,
+                holder: Holder::Shared,
             },
             PagedSegment {
                 windows: vec![window(3, &c, 0)],
                 n_cases: 1,
+                holder: Holder::Shared,
             },
         ];
         let p0 = vec![sig(0x1001), sig(0x3000 + 30), sig(0xBEEF)];
@@ -1281,6 +1293,7 @@ mod tests {
                     },
                 ],
                 n_cases: 2,
+                holder: Holder::Shared,
             },
             PagedSegment {
                 // Two sub-windows of ONE multi-page turn → different cases (a seam).
@@ -1303,6 +1316,7 @@ mod tests {
                     },
                 ],
                 n_cases: 2,
+                holder: Holder::Shared,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1314,6 +1328,7 @@ mod tests {
                     case: 0,
                 }],
                 n_cases: 1,
+                holder: Holder::Shared,
             },
         ];
 
@@ -1428,6 +1443,7 @@ mod tests {
                     },
                 ],
                 n_cases: 2,
+                holder: Holder::Shared,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1439,6 +1455,7 @@ mod tests {
                     case: 0,
                 }],
                 n_cases: 1,
+                holder: Holder::Shared,
             },
         ];
         let probe = vec![sig(0xA00 + 5), sig(0xC00 + 2), sig(0x999)];
@@ -1497,6 +1514,7 @@ mod tests {
                 case: 0,
             }],
             n_cases: 1,
+            holder: Holder::Shared,
         }];
         let seg_b = vec![PagedSegment {
             windows: vec![PagedWindow {
@@ -1508,6 +1526,7 @@ mod tests {
                 case: 0,
             }],
             n_cases: 1,
+            holder: Holder::Shared,
         }];
         let probe = vec![sig(0xA00 + 3), sig(0xB00 + 3)];
 
@@ -1557,6 +1576,7 @@ mod tests {
                 case: 0,
             }],
             n_cases: 1,
+            holder: Holder::Shared,
         }];
         let probe = vec![sig(0xA00 + 3)];
         let fp = fingerprint_segments(&seg_a);
@@ -1569,7 +1589,7 @@ mod tests {
         let other: Vec<WideQSig> = (0..10).map(|t| sig(0xC00 + t)).collect();
         let gen = arena.residency_gen();
         arena
-            .ensure_resident(turn_stream_id(9, 0), &other, 3)
+            .ensure_resident(turn_stream_id(9, 0), &other, 3, Holder::Shared)
             .unwrap();
         assert!(arena.residency_gen() > gen, "the upload is counted");
         let kept = arena
@@ -1581,7 +1601,9 @@ mod tests {
 
         // This index's own turn is re-sealed under a new fingerprint: its pages
         // are replaced, so the cached addresses are gone with them.
-        arena.ensure_resident(turn_stream_id(7, 0), &a, 2).unwrap();
+        arena
+            .ensure_resident(turn_stream_id(7, 0), &a, 2, Holder::Shared)
+            .unwrap();
         assert_eq!(
             arena.reuse_index(fp).err(),
             Some(IndexMiss::Stale),
@@ -1592,6 +1614,50 @@ mod tests {
             Some(IndexMiss::Absent),
             "the stale index was dropped from the cache"
         );
+    }
+
+    /// **A scan holds what it reads for its reader.** A scan masked to one
+    /// conversation holds the turn for it; the same segments read shared are a
+    /// different index (the holder is in the fingerprint), and the read widens
+    /// the turn to shared.
+    #[test]
+    fn a_scan_holds_its_turns_for_its_reader() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let a: Vec<WideQSig> = (0..20).map(|t| sig(0xD00 + t)).collect();
+        let own = Holder::Conversation(TimelineId::from_raw(12).unwrap());
+        let segment = |holder| {
+            vec![PagedSegment {
+                windows: vec![PagedWindow {
+                    sid: turn_stream_id(12, 0),
+                    fingerprint: 1,
+                    turn: (&a).into(),
+                    start: 0,
+                    end: 20,
+                    case: 0,
+                }],
+                n_cases: 1,
+                holder,
+            }]
+        };
+        let holder_now = || arena.resident_runs()[0].holder;
+        let probe = vec![sig(0xD00 + 4)];
+        arena
+            .scan_weighted(&segment(own), &[probe.as_slice()], &[])
+            .unwrap();
+        assert_eq!(holder_now(), own);
+        assert_ne!(
+            fingerprint_segments(&segment(own)),
+            fingerprint_segments(&segment(Holder::Shared)),
+        );
+        arena
+            .scan_weighted(&segment(Holder::Shared), &[probe.as_slice()], &[])
+            .unwrap();
+        assert_eq!(holder_now(), Holder::Shared);
     }
 
     /// **An index over a turn the gallery gave up is stale.** Built, then its
@@ -1616,11 +1682,12 @@ mod tests {
                 case: 0,
             }],
             n_cases: 1,
+            holder: Holder::Shared,
         }];
         let probe = vec![sig(0xB00 + 5)];
         let fp = fingerprint_segments(&seg);
         arena.scan_weighted(&seg, &[probe.as_slice()], &[]).unwrap();
-        arena.drop_turn(turn_stream_id(8, 0));
+        arena.drop_turns(&[turn_stream_id(8, 0)]);
         assert_eq!(arena.resident_turns(), 0);
         assert_eq!(arena.reuse_index(fp).err(), Some(IndexMiss::Stale));
     }
@@ -1669,6 +1736,7 @@ mod tests {
         let segments = vec![PagedSegment {
             windows,
             n_cases: turns.len(),
+            holder: Holder::Shared,
         }];
         let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
 
@@ -1679,9 +1747,8 @@ mod tests {
         // Scatter: drop the first arena's first turns, leaving more holes under
         // live pages than the second arena holds, then pack. `scan_weighted`
         // unpinned on its way out, so every survivor is movable.
-        for i in 0..4u64 {
-            arena.drop_turn(turn_stream_id(40 + i, 0));
-        }
+        let dropped: Vec<_> = (0..4u64).map(|i| turn_stream_id(40 + i, 0)).collect();
+        arena.drop_turns(&dropped);
         let report = arena.compact(0).unwrap();
         assert!(report.moved > 0, "nothing moved, so nothing is proven");
 
@@ -1801,7 +1868,11 @@ mod tests {
                 case: n_cases + 3,
             });
             next_turn += 3;
-            segs.push(PagedSegment { windows, n_cases });
+            segs.push(PagedSegment {
+                windows,
+                n_cases,
+                holder: Holder::Shared,
+            });
         }
 
         // Probes exercising tile tails: 1, 9 and 100 query tokens, and 161 —
@@ -1900,6 +1971,7 @@ mod tests {
                 PagedSegment {
                     windows,
                     n_cases: CASES_PER_SEGMENT,
+                    holder: Holder::Shared,
                 }
             })
             .collect();
@@ -1980,6 +2052,7 @@ mod tests {
                 PagedSegment {
                     windows,
                     n_cases: CASES,
+                    holder: Holder::Shared,
                 }
             })
             .collect();

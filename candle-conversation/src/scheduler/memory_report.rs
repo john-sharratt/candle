@@ -879,10 +879,10 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::state_census::{
-        GalleryCensus, GalleryRow, RecurrentBreakdown, SlotRow, TurnStatus,
-    };
+    use super::super::state_census::{GalleryCensus, GalleryRow, RecurrentBreakdown, SlotRow};
+    use super::super::turn_status::TurnStatus;
     use super::*;
+    use crate::provenance::gallery_arena::HolderKind;
 
     fn sample() -> MemoryReport {
         MemoryReport {
@@ -991,6 +991,7 @@ mod tests {
                     substrates_skipped: 0,
                     rows: vec![GalleryRow {
                         status: TurnStatus::Live,
+                        holder: HolderKind::Shared,
                         layer: "code_reading".into(),
                         group: "files".into(),
                         turns: 42,

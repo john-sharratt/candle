@@ -336,6 +336,12 @@ pub struct Substrate {
     /// [`Self::gallery_epoch`]).
     gallery_epoch: u64,
 
+    /// Bumped whenever a turn or a timeline is tombstoned — written here or
+    /// replayed from the log, a replicated record included. The scheduler's
+    /// gallery sweep looks for dead turns only when it has moved
+    /// (`docs/gallery_residency.md` §3); see [`Self::tombstone_epoch`].
+    tombstone_epoch: u64,
+
     /// Interior-mutable per-stream memo of what the belief scans read from a
     /// turn's projection-events blob — its seams and its selections — decoded
     /// from the JSON once per session instead of on every scan and every
@@ -4485,6 +4491,12 @@ impl Substrate {
         self.gallery_epoch
     }
 
+    /// The tombstone epoch: unchanged while no turn or timeline has been
+    /// tombstoned. See the field.
+    pub fn tombstone_epoch(&self) -> u64 {
+        self.tombstone_epoch
+    }
+
     /// `stream_id`'s stored wide-Q window, sized and fingerprinted but not
     /// decoded — it shares the stream's encoded buffer. `None` when the stream
     /// has no signature, an empty one, or one a scan must not read (see
@@ -5442,6 +5454,7 @@ impl Substrate {
                         writer: payload.turn_writer,
                     });
                     self.gallery_epoch += 1;
+                    self.tombstone_epoch += 1;
                 }
             }
             None => self.mark_timeline_dead(timeline),
@@ -5452,6 +5465,7 @@ impl Substrate {
     fn mark_timeline_dead(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
         self.gallery_epoch += 1;
+        self.tombstone_epoch += 1;
         // The same subsumption the live path applies — see
         // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a turn
         // tombstone read after its timeline's must not resurrect an entry the
@@ -5535,6 +5549,7 @@ impl Substrate {
         }
         self.tombstoned_turns.insert(mark);
         self.gallery_epoch += 1;
+        self.tombstone_epoch += 1;
         let (residence, retired_tokens) = match self
             .timelines
             .get_mut(&timeline)
@@ -5653,6 +5668,7 @@ impl Substrate {
     pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
         self.gallery_epoch += 1;
+        self.tombstone_epoch += 1;
         // **A wholesale tombstone subsumes every turn-scoped one it covers.**
         //
         // `tombstoned_turns` only ever grew, so a conversation that retired a
@@ -12308,6 +12324,56 @@ mod tests {
         let empty = turn_stream_id(1, 1);
         sub.set_wide_q_sigs_blob(empty, encode_wide_sigs(&[]));
         assert!(sub.wide_sig_window(empty).is_none(), "empty");
+    }
+
+    /// **Every tombstone moves the tombstone epoch, and nothing else does.**
+    /// The gallery sweep looks for dead turns only when it has moved, so a
+    /// tombstone that failed to move it would leave the dead turn's pages on
+    /// the card; a write that moved it would only cost a sweep.
+    #[test]
+    fn the_tombstone_epoch_moves_on_every_tombstone_and_only_then() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+        let (_, _, timeline, mut sub) = make_timeline();
+        let sid = turn_stream_id(timeline.raw(), 0);
+        let start = sub.tombstone_epoch();
+        sub.set_wide_q_sigs_blob(
+            sid,
+            encode_wide_sigs(&[WideQSig {
+                n_heads: 12,
+                words: vec![1; 24],
+            }]),
+        );
+        sub.set_projection_events_blob(sid, b"[]".to_vec());
+        assert_eq!(sub.tombstone_epoch(), start, "a write is not a tombstone");
+
+        sub.tombstone_turn(timeline, 0);
+        assert_eq!(sub.tombstone_epoch(), start + 1, "a turn tombstone");
+        sub.tombstone_timeline(timeline);
+        assert_eq!(sub.tombstone_epoch(), start + 2, "a timeline tombstone");
+
+        let other = TimelineId::from_raw(timeline.raw() + 1).unwrap();
+        sub.apply_tombstone(&TombstonePayload {
+            timeline_id: other.raw(),
+            turn_index: Some(3),
+            turn_writer: 0,
+            reason: None,
+        });
+        assert_eq!(
+            sub.tombstone_epoch(),
+            start + 3,
+            "a replayed turn tombstone"
+        );
+        sub.apply_tombstone(&TombstonePayload {
+            timeline_id: other.raw(),
+            turn_index: None,
+            turn_writer: 0,
+            reason: None,
+        });
+        assert_eq!(
+            sub.tombstone_epoch(),
+            start + 4,
+            "a replayed timeline tombstone"
+        );
     }
 
     /// **Every change a belief gallery is assembled from moves the epoch, and

@@ -39,6 +39,7 @@ mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
 mod first_sample;
+mod gallery_sweep;
 mod gang;
 mod graph_window;
 mod guest_room;
@@ -83,6 +84,7 @@ mod sweep_forecast;
 mod test_substrate;
 mod turn_airtime;
 mod turn_group;
+pub mod turn_status;
 mod wave_logits;
 mod wave_retry;
 mod wave_timing;
@@ -3363,6 +3365,8 @@ pub(crate) struct Scheduler {
     /// group names — reused by the memory report until it is
     /// [`state_census::CENSUS_EVERY`] old.
     state_census: Option<state_census::CensusCache>,
+    /// What the gallery sweep has seen and owes — see [`gallery_sweep`].
+    gallery_sweep: gallery_sweep::SweepState,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
     /// Persistent sampling state per sequence ID (survives across turns).
@@ -4166,6 +4170,7 @@ impl Scheduler {
             session,
             gallery_arena,
             state_census: None,
+            gallery_sweep: gallery_sweep::SweepState::default(),
             tag_ids: TagIds::of(&tokenizer),
             tokenizer,
             think_close,
@@ -5005,6 +5010,9 @@ impl Scheduler {
                 // bound to this slot.
                 let freed_conversation = self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
+                // Its conversation may now be unloaded, and its own gallery
+                // turns readable by no scan.
+                self.gallery_sweep.slot_freed();
                 self.ephemeral_slots.remove(&sequence_id);
                 self.slot_bands.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
@@ -7216,6 +7224,7 @@ impl Scheduler {
         let _ = self.model.release_sequence(slot.0);
         let freed_conversation = self.slot_conversations.remove(&slot);
         let freed_target = self.slot_targets.remove(&slot);
+        self.gallery_sweep.slot_freed();
         self.sampling_states.remove(&slot);
         self.retire_slot_projection_state(slot, freed_conversation);
         self.compression_event_sinks.remove(&slot);

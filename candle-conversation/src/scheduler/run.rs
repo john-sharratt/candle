@@ -1670,11 +1670,12 @@ impl Scheduler {
             .spend(super::step_census::Activity::Seal, t.elapsed());
     }
 
-    /// Update the gallery's keep trade and publish the learned rates, each
-    /// filed with the census (`step_census`).
+    /// Update the gallery's keep trade, give up its dead turns, and publish
+    /// the learned rates, each filed with the census (`step_census`).
     fn timed_rates_and_gallery(&mut self) {
         let t = Instant::now();
         self.update_gallery_keep();
+        self.sweep_gallery();
         let gallery = t.elapsed();
         self.publish_learned_rates();
         self.step_census

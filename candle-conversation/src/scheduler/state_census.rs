@@ -9,8 +9,9 @@
 //! This section does.
 //!
 //! - **The gallery** ([`GalleryCensus`]), per resident turn: its timeline live,
-//!   tombstoned, or not in any substrate at all, and the layer and group it was
-//!   written to — summed into rows. Reading every resident turn's stream is a
+//!   tombstoned, or not in any substrate at all, who it is held for (every
+//!   conversation, or its own — `docs/gallery_residency.md`), and the layer and
+//!   group it was written to — summed into rows. Reading every resident turn's stream is a
 //!   walk of the residency map and a lookup per turn, so it is taken at most
 //!   once per [`CENSUS_EVERY`] and published as it stood then; a substrate
 //!   whose lock a writer holds is skipped and counted rather than waited on,
@@ -33,11 +34,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use super::turn_status::{turn_in, TurnStatus};
 use super::Scheduler;
-use crate::persistence::streams::{StreamDecl, StreamId};
-use crate::projection::{
-    Builder, GroupId, Schema, Substrate, SubstrateRead, SubstrateRef, TimelineId,
-};
+use crate::projection::{Builder, GroupId, Schema, Substrate, SubstrateRead, SubstrateRef};
+use crate::provenance::gallery_arena::{HolderKind, ResidentRun};
 use crate::provenance::GalleryArena;
 
 /// How often the census is taken again.
@@ -62,25 +62,12 @@ pub struct StateSection {
     pub recurrent: RecurrentBreakdown,
 }
 
-/// Whether a resident turn's conversation still stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStatus {
-    /// Its timeline stands.
-    Live,
-    /// Its timeline is tombstoned: nothing projects it, and its pages wait on
-    /// the keep trade to go.
-    Tombstoned,
-    /// No substrate this engine reads declares its stream (or its substrate's
-    /// lock was held when the census looked).
-    Absent,
-}
-
-/// What a resident turn is: its timeline's standing, and the layer and group
-/// it was written to (empty when unknown).
+/// What a resident turn is: its timeline's standing, who it is held for, and
+/// the layer and group it was written to (empty when unknown).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnClass {
     pub status: TurnStatus,
+    pub holder: HolderKind,
     pub layer: String,
     pub group: String,
 }
@@ -89,6 +76,7 @@ pub struct TurnClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GalleryRow {
     pub status: TurnStatus,
+    pub holder: HolderKind,
     pub layer: String,
     pub group: String,
     pub turns: usize,
@@ -145,34 +133,37 @@ pub struct RecurrentBreakdown {
     pub slots: Vec<SlotRow>,
 }
 
-/// `runs` — each resident turn and its bytes — summed by `class_of` each
-/// turn, largest first.
+/// `runs` — the resident turns — summed by `class_of` each turn, largest
+/// first.
 pub fn tally(
-    runs: &[(StreamId, u64)],
-    class_of: impl Fn(StreamId) -> TurnClass,
+    runs: &[ResidentRun],
+    class_of: impl Fn(&ResidentRun) -> TurnClass,
 ) -> Vec<GalleryRow> {
-    let mut by: HashMap<(TurnStatus, String, String), (usize, u64)> = HashMap::new();
-    for &(sid, bytes) in runs {
-        let c = class_of(sid);
-        let row = by.entry((c.status, c.layer, c.group)).or_default();
+    type Key = (TurnStatus, HolderKind, String, String);
+    let mut by: HashMap<Key, (usize, u64)> = HashMap::new();
+    for run in runs {
+        let c = class_of(run);
+        let row = by
+            .entry((c.status, c.holder, c.layer, c.group))
+            .or_default();
         row.0 += 1;
-        row.1 += bytes;
+        row.1 += run.bytes;
     }
     let mut rows: Vec<GalleryRow> = by
         .into_iter()
-        .map(|((status, layer, group), (turns, bytes))| GalleryRow {
-            status,
-            layer,
-            group,
-            turns,
-            bytes,
-        })
+        .map(
+            |((status, holder, layer, group), (turns, bytes))| GalleryRow {
+                status,
+                holder,
+                layer,
+                group,
+                turns,
+                bytes,
+            },
+        )
         .collect();
-    rows.sort_by(|a, b| {
-        b.bytes
-            .cmp(&a.bytes)
-            .then_with(|| (a.status, &a.layer, &a.group).cmp(&(b.status, &b.layer, &b.group)))
-    });
+    let key = |r: &GalleryRow| (r.status, r.holder, r.layer.clone(), r.group.clone());
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| key(a).cmp(&key(b))));
     rows
 }
 
@@ -228,48 +219,44 @@ fn census_gallery(
     let (idle_past_keep_turns, idle_past_keep_bytes) = match keep {
         Some(k) => runs
             .iter()
-            .filter(|(_, _, idle)| *idle > k)
-            .fold((0, 0), |(n, b), (_, bytes, _)| (n + 1, b + bytes)),
+            .filter(|r| r.idle > k)
+            .fold((0, 0), |(n, b), r| (n + 1, b + r.bytes)),
         None => (0, 0),
     };
-    let class_of = |sid: StreamId| {
+    let class_of = |run: &ResidentRun| {
         for (read, names) in reads {
-            let Some(StreamDecl::Turn(t)) = read.stream_of(sid).and_then(|s| s.decl.as_ref())
-            else {
+            let Some((status, group)) = turn_in(read, run.sid) else {
                 continue;
             };
-            let status = match TimelineId::from_raw(t.timeline_id) {
-                Some(tl) if read.is_tombstoned(tl) => TurnStatus::Tombstoned,
-                _ => TurnStatus::Live,
-            };
-            let (layer, group) = GroupId::from_raw(t.group_id)
+            let (layer, group) = group
                 .and_then(|g| names.get(&g))
                 .cloned()
                 .unwrap_or_default();
             return TurnClass {
                 status,
+                holder: run.holder.kind(),
                 layer,
                 group,
             };
         }
         TurnClass {
             status: TurnStatus::Absent,
+            holder: run.holder.kind(),
             layer: String::new(),
             group: String::new(),
         }
     };
-    let sized: Vec<(StreamId, u64)> = runs.iter().map(|(s, b, _)| (*s, *b)).collect();
     GalleryCensus {
         taken_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64),
-        page_bytes: sized.iter().map(|(_, b)| b).sum(),
+        page_bytes: runs.iter().map(|r| r.bytes).sum(),
         region_bytes: arena.resident_bytes(),
         keep_within_secs: keep.map(|k| k.as_secs()),
         idle_past_keep_turns,
         idle_past_keep_bytes,
         substrates_skipped: skipped,
-        rows: tally(&sized, class_of),
+        rows: tally(&runs, class_of),
     }
 }
 
@@ -372,62 +359,82 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::streams::StreamId;
+    use crate::projection::TimelineId;
+    use crate::provenance::gallery_arena::Holder;
 
-    fn class(status: TurnStatus, layer: &str, group: &str) -> TurnClass {
+    fn class(run: &ResidentRun, status: TurnStatus, layer: &str, group: &str) -> TurnClass {
         TurnClass {
             status,
+            holder: run.holder.kind(),
             layer: layer.into(),
             group: group.into(),
         }
     }
 
+    fn run(sid: u64, bytes: u64, holder: Holder) -> ResidentRun {
+        ResidentRun {
+            sid: StreamId(sid),
+            bytes,
+            idle: Duration::ZERO,
+            holder,
+        }
+    }
+
+    fn row(
+        status: TurnStatus,
+        holder: HolderKind,
+        layer: &str,
+        group: &str,
+        turns: usize,
+        bytes: u64,
+    ) -> GalleryRow {
+        GalleryRow {
+            status,
+            holder,
+            layer: layer.into(),
+            group: group.into(),
+            turns,
+            bytes,
+        }
+    }
+
     /// **The gallery is summed by whose turns it holds**, largest first: two
     /// live code_reading turns are one row, a tombstoned turn of the same group
-    /// is a row of its own, and a stream no substrate declares is absent.
+    /// is a row of its own, a dialogue turn held for its conversation is one
+    /// more, and a stream no substrate declares is absent.
     #[test]
-    fn resident_turns_are_summed_by_status_layer_and_group() {
+    fn resident_turns_are_summed_by_status_holder_layer_and_group() {
+        let chat = Holder::Conversation(TimelineId::from_raw(9).unwrap());
         let runs = [
-            (StreamId(1), 6144),
-            (StreamId(2), 12288),
-            (StreamId(3), 6144),
-            (StreamId(4), 30720),
+            run(1, 6144, Holder::Shared),
+            run(2, 12288, Holder::Shared),
+            run(3, 6144, Holder::Shared),
+            run(4, 30720, Holder::Shared),
+            run(5, 24576, chat),
         ];
-        let rows = tally(&runs, |sid| match sid.0 {
-            1 | 2 => class(TurnStatus::Live, "code_reading", "files"),
-            3 => class(TurnStatus::Tombstoned, "code_reading", "files"),
-            _ => class(TurnStatus::Absent, "", ""),
+        let rows = tally(&runs, |r| match r.sid.0 {
+            1 | 2 => class(r, TurnStatus::Live, "code_reading", "files"),
+            3 => class(r, TurnStatus::Tombstoned, "code_reading", "files"),
+            5 => class(r, TurnStatus::Live, "dialogue", "chat"),
+            _ => class(r, TurnStatus::Absent, "", ""),
         });
+        use HolderKind::{Conversation, Shared};
+        use TurnStatus::{Absent, Live, Tombstoned};
         assert_eq!(
             rows,
             vec![
-                GalleryRow {
-                    status: TurnStatus::Absent,
-                    layer: String::new(),
-                    group: String::new(),
-                    turns: 1,
-                    bytes: 30720,
-                },
-                GalleryRow {
-                    status: TurnStatus::Live,
-                    layer: "code_reading".into(),
-                    group: "files".into(),
-                    turns: 2,
-                    bytes: 18432,
-                },
-                GalleryRow {
-                    status: TurnStatus::Tombstoned,
-                    layer: "code_reading".into(),
-                    group: "files".into(),
-                    turns: 1,
-                    bytes: 6144,
-                },
+                row(Absent, Shared, "", "", 1, 30720),
+                row(Live, Conversation, "dialogue", "chat", 1, 24576),
+                row(Live, Shared, "code_reading", "files", 2, 18432),
+                row(Tombstoned, Shared, "code_reading", "files", 1, 6144),
             ]
         );
     }
 
     #[test]
     fn an_empty_gallery_has_no_rows() {
-        assert!(tally(&[], |_| class(TurnStatus::Live, "", "")).is_empty());
+        assert!(tally(&[], |r| class(r, TurnStatus::Live, "", "")).is_empty());
     }
 
     /// **A substrate's groups are named by every schema captured for it**: a

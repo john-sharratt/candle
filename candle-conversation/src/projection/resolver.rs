@@ -26,8 +26,8 @@ use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
 use super::scan_stats::{scan_stats, GroupScan};
 use super::schema::{
-    CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
-    SystemPromptSchema,
+    CorruptTurnPolicy, GatherScope, GroupSchema, LayerSchema, Schema, SectionCollection,
+    SystemPromptItem, SystemPromptSchema,
 };
 use super::warm_pool;
 use super::working_set_observe::{working_set_config, working_set_fresh};
@@ -59,7 +59,7 @@ use crate::persistence::{
     PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
 };
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
-use crate::provenance::gallery_arena::{scan_split, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{scan_split, Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
@@ -224,6 +224,16 @@ fn ingest_group(schema: &Schema, layer: LayerId, group: GroupId) -> Option<&Grou
     let layer = schema.layers.iter().find(|l| l.id == layer)?;
     let group = layer.groups.iter().find(|g| g.id == group)?;
     is_warmable(group).then_some(group)
+}
+
+/// How `layer`'s turns are gathered — [`GatherScope::Shared`] for a layer the
+/// schema does not declare, whose turns nothing marks as one conversation's.
+fn layer_scope(schema: &Schema, layer: LayerId) -> GatherScope {
+    schema
+        .layers
+        .iter()
+        .find(|l| l.id == layer)
+        .map_or(GatherScope::Shared, |l| l.gather_scope)
 }
 
 /// Which corpus turns warm which collection member, in a deterministic order.
@@ -1053,6 +1063,14 @@ impl Conversation {
     /// assembling the tool catalog's. Every scope sees the same turns resident,
     /// so a group is preloaded whole rather than for one conversation's scope.
     ///
+    /// **Only what every conversation reads.** A layer gathered per
+    /// conversation (`gather_scope: conversation` — zend's dialogue) is read
+    /// only by its own conversation, and only while it is loaded: its scans
+    /// upload its own turns, and the scheduler gives them up when it unloads
+    /// (`docs/gallery_residency.md`). Preloading every such conversation the
+    /// substrate holds put 60,285 dialogue turns on BlackWorld's card for the
+    /// handful of chats open.
+    ///
     /// A failed upload is logged and skipped — the scan uploads what it does
     /// not find, so a preload that stops short costs that projection the
     /// difference and nothing else.
@@ -1065,7 +1083,11 @@ impl Conversation {
         let mut preload = GalleryPreload::default();
         {
             let sub = self.inner.read().unwrap();
-            for group in schema.layers.iter().flat_map(|l| l.groups.iter()) {
+            let shared = schema
+                .layers
+                .iter()
+                .filter(|l| l.gather_scope == GatherScope::Shared);
+            for group in shared.flat_map(|l| l.groups.iter()) {
                 if !group.is_scanned() {
                     continue;
                 }
@@ -1251,6 +1273,9 @@ impl Conversation {
                             })
                             .collect(),
                         n_cases: n,
+                        // A collection's gallery is drawn from every
+                        // conversation's turns.
+                        holder: Holder::Shared,
                     };
                     let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
@@ -1925,6 +1950,7 @@ impl Conversation {
                         })
                         .collect(),
                     n_cases: n,
+                    holder: Holder::Shared,
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
@@ -2032,7 +2058,8 @@ impl Conversation {
             let Some(group) = ingest_group(schema, layer, group) else {
                 continue;
             };
-            warmed_timelines += self.warm_timelines(group, &timelines, None);
+            warmed_timelines +=
+                self.warm_timelines(group, layer_scope(schema, layer), &timelines, None);
         }
         tracing::info!(
             timelines = warmed_timelines,
@@ -2101,7 +2128,7 @@ impl Conversation {
         let Some(group) = ingest_group(schema, layer, group) else {
             return 0;
         };
-        self.warm_timelines(group, timelines, Some(arena))
+        self.warm_timelines(group, layer_scope(schema, layer), timelines, Some(arena))
     }
 
     /// Warm one belief group's per-timeline hit levels by self-match —
@@ -2137,7 +2164,7 @@ impl Conversation {
             .unwrap()
             .active_timelines_for_group(group.id)
             .collect();
-        self.warm_timelines(group, &timelines, None)
+        self.warm_timelines(group, layer.gather_scope, &timelines, None)
     }
 
     /// Warm one timeline's hit levels by self-match — a conversation written
@@ -2153,18 +2180,19 @@ impl Conversation {
         let Some((layer, group)) = self.timeline_target(timeline) else {
             return false;
         };
-        let Some((_, group)) = warmable(schema, layer, group) else {
+        let Some((layer, group)) = warmable(schema, layer, group) else {
             return false;
         };
-        self.warm_timelines(group, &[timeline], None);
+        self.warm_timelines(group, layer.gather_scope, &[timeline], None);
         true
     }
 
-    /// Warm each of `timelines` of `group`, on `arena` when given. Returns how
-    /// many were asked for.
+    /// Warm each of `timelines` of `group` — a layer gathered `scope` — on
+    /// `arena` when given. Returns how many were asked for.
     fn warm_timelines(
         &self,
         group: &GroupSchema,
+        scope: GatherScope,
         timelines: &[TimelineId],
         arena: Option<&GalleryArena>,
     ) -> usize {
@@ -2173,7 +2201,7 @@ impl Conversation {
             if self.ingest_cancelled() {
                 break;
             }
-            self.warm_timeline(group, tl, arena);
+            self.warm_timeline(group, tl, arena, Holder::masked_to(scope, tl));
         }
         timelines.len()
     }
@@ -2193,7 +2221,15 @@ impl Conversation {
     /// far behind: the self-match ceiling `docs/provenance_score_normalization.md`
     /// §2 rejects, which put every live hit at 1–2% of the band. Its level is
     /// learned from query traffic, as §3 has it.
-    fn warm_timeline(&self, group: &GroupSchema, tl: TimelineId, arena: Option<&GalleryArena>) {
+    ///
+    /// What it reads on `arena` is held for `holder`.
+    fn warm_timeline(
+        &self,
+        group: &GroupSchema,
+        tl: TimelineId,
+        arena: Option<&GalleryArena>,
+        holder: Holder,
+    ) {
         // The file's own turn signatures and its candidates, under one
         // short-lived read lock, released before any scoring.
         let (sigs, files) = {
@@ -2228,7 +2264,7 @@ impl Conversation {
         }
         let probe_refs: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| *p).collect();
         let scan_span = profile::span("warm:scan");
-        let scanned = scan_file_scans(&files, group, &probe_refs, arena);
+        let scanned = scan_file_scans(&files, group, &probe_refs, arena, holder);
         scan_span.end();
         let _g = profile::span("warm:fold");
         let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
@@ -2359,7 +2395,16 @@ impl Conversation {
             // A layer the target compounds on is scored across conversations
             // like a dialogue's, its own layer still self-local.
             let self_local = self_local && sub.is_self_local_group(target.layer, group.id);
-            let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
+            let masked = self_local || group.id == target.group;
+            // Who the turns this scan reads are held for: a masked read of a
+            // conversation-scoped layer is that conversation's alone, anything
+            // else every conversation's (`docs/gallery_residency.md` §2).
+            let holder = if masked {
+                Holder::masked_to(layer.gather_scope, target.timeline)
+            } else {
+                Holder::Shared
+            };
+            let mut timelines: Vec<TimelineId> = if masked {
                 vec![target.timeline]
             } else if sub.is_append_only_layer(target.layer) {
                 // A compounded group never offers the target's own lineage:
@@ -2415,7 +2460,8 @@ impl Conversation {
             // (empty ⇒ uniform — repo_map peaks on L46 (§83), configured in the
             // schema YAML). Per probe, per file: `(fused, mass_base)`, the tail and
             // question windows riding one launch. ──
-            let scan_files = |probes: &[&[WideQSig]]| scan_file_scans(&files, group, probes, arena);
+            let scan_files =
+                |probes: &[&[WideQSig]]| scan_file_scans(&files, group, probes, arena, holder);
             // Concept F: the pinned question window scans as a second probe,
             // max-fused with the tail per exchange AFTER normalization.
             let question = match probe_q {
@@ -6430,6 +6476,7 @@ layers:
     #[test]
     fn a_calibrations_questions_vote_for_their_file() {
         use super::super::belief_files::{assemble_file_scans, scan_file_scans};
+        use crate::provenance::gallery_arena::Holder;
         use crate::provenance::{encode_wide_sigs, WideQSig};
         use crate::substrate::Substrate;
 
@@ -6545,9 +6592,101 @@ layers:
             .find(|g| g.id == scopes)
             .unwrap();
         let probe = vec![sig(question)];
-        let scanned = scan_file_scans(&files, group, &[probe.as_slice()], None);
+        let scanned = scan_file_scans(&files, group, &[probe.as_slice()], None, Holder::Shared);
         let (x_score, y_score) = (scanned[0][0].0[0], scanned[0][1].0[0]);
         assert!(y_score > x_score, "x {x_score} y {y_score}");
+    }
+
+    /// **The preload takes only what every conversation reads.** A shared
+    /// layer's two turns are preloaded; a conversation-scoped layer's three are
+    /// left for their own conversation's scans to upload while it is loaded.
+    #[test]
+    fn a_preload_takes_only_shared_layers() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+
+        const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: { kind: top_k, k: 2 }
+  - name: dialogue
+    gather_scope: conversation
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 100
+    groups:
+      - id: chat
+        selection: { kind: top_k, k: 2 }
+"#;
+        let builder = Builder::from_yaml(YAML).unwrap();
+        let conv = Conversation::ephemeral();
+        let write = |tl: TimelineId, n: u64| {
+            for t in 0..n {
+                let sigs = vec![WideQSig {
+                    n_heads: 12,
+                    words: vec![t; 24],
+                }];
+                let idx = conv
+                    .record_turn(
+                        tl,
+                        Role::User,
+                        TurnPartWrite {
+                            token_count: 1,
+                            ..Default::default()
+                        },
+                        |seqs| Ok(seqs.to_vec()),
+                    )
+                    .expect("record_turn");
+                conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(&sigs))
+                    .expect("persist sigs");
+            }
+        };
+        let (file, chat) = (
+            TimelineId::from_raw(61).unwrap(),
+            TimelineId::from_raw(62).unwrap(),
+        );
+        conv.register_timeline(
+            file,
+            builder.id_for_layer("files").unwrap(),
+            builder.id_for_group("scopes").unwrap(),
+        );
+        conv.register_timeline(
+            chat,
+            builder.id_for_layer("dialogue").unwrap(),
+            builder.id_for_group("chat").unwrap(),
+        );
+        write(file, 2);
+        write(chat, 3);
+        let preload = conv.preload_galleries(builder.schema(), None);
+        assert_eq!(preload.turns, 2, "only the shared layer's turns");
     }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.

@@ -21,7 +21,7 @@ use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
-use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, SigWindow, WideQSig,
@@ -431,11 +431,15 @@ fn with_calibration(
 /// competition, scored on its calibration windows alone with its own `z` and
 /// margin, in the same launch; its vote, weighed by the policy's
 /// `calibration_weight`, is added to the file's own score.
+///
+/// The turns read on the arena are held for `holder`
+/// (`docs/gallery_residency.md` §2).
 pub(crate) fn scan_file_scans(
     files: &[FileScan],
     group: &GroupSchema,
     probes: &[&[WideQSig]],
     arena: Option<&GalleryArena>,
+    holder: Holder,
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;
     let cal_weights = &group.policy.calibration_layer_weights;
@@ -508,7 +512,11 @@ pub(crate) fn scan_file_scans(
                     }));
                     n_cases += n_cases_of(f, cases);
                 }
-                PagedSegment { windows, n_cases }
+                PagedSegment {
+                    windows,
+                    n_cases,
+                    holder,
+                }
             })
             .collect();
         // The calibration competition, last: each calibrated file a case.
@@ -528,6 +536,7 @@ pub(crate) fn scan_file_scans(
             segments.push(PagedSegment {
                 windows,
                 n_cases: cal.len(),
+                holder,
             });
         }
         // `[probe][file][slot]`, the content competitions weighed by `w`, the
@@ -806,7 +815,7 @@ layers:
         let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
         let mut group = schema_group(ScanCases::File);
         let scores = |g: &GroupSchema| {
-            scan_file_scans(&files, g, &[probe.as_slice()], None)[0]
+            scan_file_scans(&files, g, &[probe.as_slice()], None, Holder::Shared)[0]
                 .iter()
                 .map(|(fused, _)| fused[0])
                 .collect::<Vec<f32>>()
@@ -835,7 +844,7 @@ layers:
         let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
         let mut group = schema_group(ScanCases::File);
         let scores = |g: &GroupSchema| {
-            scan_file_scans(&files, g, &[probe.as_slice()], None)[0]
+            scan_file_scans(&files, g, &[probe.as_slice()], None, Holder::Shared)[0]
                 .iter()
                 .map(|(fused, _)| fused[0])
                 .collect::<Vec<f32>>()

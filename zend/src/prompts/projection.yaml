@@ -1245,6 +1245,10 @@ layers:
       web chat.
     window: 116000
     score_threshold: 0.0
+    # One chat's turns are read only by that chat's own projections (its scans
+    # are masked to it), so they are resident in the provenance gallery only
+    # while it is loaded, and never preloaded (docs/gallery_residency.md).
+    gather_scope: conversation
     # Continuous-fair-wave: the interactive layer, a person waiting on each turn,
     # so `urgent` — above npcd's `high` table work — with its decode latency
     # protected most: a co-running background prefill is throttled to 1 layer of
