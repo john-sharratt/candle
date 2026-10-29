@@ -74,6 +74,24 @@ Each scan segment carries its `keep` from the reading policy:
 YAML: `gallery_keep: all` or `gallery_keep: 1` (tokens per code), likewise
 `calibration_gallery_keep`. Default `all`.
 
+zend's schema (`zend/src/prompts/projection.yaml`) sets `default_policy:`
+to two per code for content and calibration questions alike, so every
+layer inherits it, and the tool catalog back to `all`. Measured on
+BlackWorld (2026-10-29):
+
+| reader | per code | result |
+|---|---|---|
+| `code_reading` content, the daemon's own overlay (scan route) | 1 | R@1 / R@10 / MRR 0.363 / 0.668 / 0.454 against 0.362 / 0.683 / 0.462 |
+| same | **2** | **0.370 / 0.698 / 0.471** |
+| same, calibration questions too | **2** | **0.372 / 0.702 / 0.473** |
+| tool catalog (32 project asks) | 2 | hit@1 / hit@3 / MRR 0.750 / 0.812 / 0.808 |
+| same | all | 0.781 / 0.844 / 0.831 |
+| dialogue (selected turns of the 32 asks) | 2 | every ask's selection identical to `all` |
+
+`code_reading`'s 5,636 resident turns held 3.01 GiB of pages with every
+token and 1.12 GiB at two per code. The tool catalog's turns are nearly all
+one page whatever is dropped, so keeping them whole costs almost nothing.
+
 Keeps **cover** like fold groups do: `All` covers everything, more per code
 covers fewer. A resident turn serves a read whose keep its own covers; one
 held narrower is uploaded again under the union. A turn's keep is therefore

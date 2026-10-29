@@ -538,8 +538,9 @@ system_prompt:
         # signal — gating collapses Top-1 97.3% → 32.9% (results doc §25.8).
         layer_weights: [1.0, 1.0, 1.0]
         # Every token of a tool's turns on the card: they are short, nearly all
-        # one page whatever is dropped, and two per code cost the project asks
-        # hit@3 0.844 → 0.812 (docs/gallery_dedup.md §3).
+        # one page whatever is dropped, so keeping two per code saves almost
+        # nothing, and it bought the project asks no better rank (hit@3 0.812
+        # against 0.844 holding every token; docs/gallery_dedup.md §3).
         gallery_keep: all
         # Concept F (§8): the turn's pinned question window scans as a second
         # probe, max-fused with the decode tail after normalization.
