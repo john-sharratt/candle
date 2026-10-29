@@ -2341,7 +2341,12 @@ fn compose_narrated(answers: &[String], narration: &str) -> String {
     if !answers.is_empty() && !narration.is_empty() {
         s.push('\n');
     }
-    s.push_str(narration);
+    // The narration carries the compass — a refused document's last refusal
+    // among it — so it is bounded as an answer is.
+    match narration.char_indices().nth(ANSWER_MAX_CHARS) {
+        None => s.push_str(narration),
+        Some(_) => s.push_str(&bounded(narration)),
+    }
     s
 }
 
@@ -2356,6 +2361,8 @@ pub fn render_turn(speaker: Speaker, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::slice::from_ref;
 
     /// **Each layer beneath the turn's own is counted, with its best score.**
     /// The turn's own layer and the dreams (logged on their own) are not, and
@@ -2515,10 +2522,15 @@ mod tests {
                 "é".repeat(ANSWER_MAX_CHARS)
             )
         );
-        let turn = compose_narrated(&[past], "");
+        let turn = compose_narrated(from_ref(&past), "");
         assert!(turn.ends_with(
             "[cut: 7 more characters of this answer are not shown]\n</tool_response>\n"
         ));
+        // The narration — where the compass rides — is bounded the same way,
+        // and one within the bound is left exactly as it was.
+        let narrated = compose_narrated(&[], &past);
+        assert!(narrated.ends_with("[cut: 7 more characters of this answer are not shown]"));
+        assert_eq!(compose_narrated(&[], "  Rain.  "), "  Rain.  ");
     }
 
     /// A restart mid-day opens a second timeline, and it must carry the same

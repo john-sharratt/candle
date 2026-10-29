@@ -908,14 +908,29 @@ pub fn doc_compass(
 /// edits had not cleared the brief's words out of their drafts had no way left
 /// they were allowed to take, and their operations failed stuck. The refusal
 /// stays in front of them until a report is taken, and so do both ways.
+///
+/// **What it carries of the refusal is bounded** ([`COMPASS_REFUSAL_CHARS`]).
+/// It is in front of the Maker on every turn until a report is taken: one
+/// refusal of 412,000 characters, carried so, grew a turn to ~190k tokens.
 pub fn refused_compass(p: &str, refusal: &str, at: &DeskVerbs, way: Option<&str>) -> String {
     let desk = doc_compass_unwritten(&DocStep::Write(p.to_string()), at, way);
+    let refusal = match refusal.char_indices().nth(COMPASS_REFUSAL_CHARS) {
+        None => refusal.to_string(),
+        Some((cut, _)) => format!(
+            "{} … (the table said more; report it again to hear all of it)",
+            &refusal[..cut]
+        ),
+    };
     format!(
         "When you last reported {p}, the table would not take it: {refusal}\nIf you have put \
          that right since, commit it and report again. If not, mend those passages with \
          `file_edit` — or write it whole again: {desk}"
     )
 }
+
+/// The most of a refusal the compass carries, in characters: a gate's refusal
+/// names five faults of a kind and counts the rest, well inside it.
+pub const COMPASS_REFUSAL_CHARS: usize = 4_000;
 
 fn doc_compass_unwritten(doc: &DocStep, at: &DeskVerbs, way: Option<&str>) -> String {
     match (doc, at) {
@@ -1736,7 +1751,7 @@ mod tests {
     /// **At a desk, the compass says the exact act; away from one, the way.**
     #[test]
     fn the_compass_for_a_document_says_the_act_that_does_it() {
-        use super::{doc_compass, DeskVerbs, DocStep};
+        use super::{doc_compass, DeskVerbs, DocStep, COMPASS_REFUSAL_CHARS};
         let desk = DeskVerbs {
             read: Some("http://local/desk/1/file_read".into()),
             compose: Some("http://local/desk/1/compose".into()),
@@ -1797,6 +1812,15 @@ mod tests {
         assert!(refused.contains("`file_edit`"), "{refused}");
         assert!(refused.contains("http://local/desk/1/compose"), "{refused}");
         assert!(!refused.contains("do not write it again"), "{refused}");
+        // A refusal past the bound is carried by its opening: one kept from
+        // before the gate named five of a kind ran to 412,000 characters.
+        let huge = "x".repeat(COMPASS_REFUSAL_CHARS + 50);
+        let carried = super::refused_compass("layers/stories/y.md", &huge, &desk, None);
+        assert!(carried.contains(&format!(
+            "{} … (the table said more; report it again to hear all of it)\n",
+            "x".repeat(COMPASS_REFUSAL_CHARS)
+        )));
+        assert!(!carried.contains(&"x".repeat(COMPASS_REFUSAL_CHARS + 1)));
         // A terminal that reads but does not compose is not where a piece is
         // written: the way goes to a writing desk.
         let reads_only = DeskVerbs {
