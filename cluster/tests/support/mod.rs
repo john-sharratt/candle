@@ -203,6 +203,7 @@ fn build(
             app: APP.into(),
             node,
             host: format!("m{node}"),
+            card: node,
             build: build_id,
             model: Some(ModelId {
                 arch: "Qwen4Exp".into(),

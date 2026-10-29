@@ -24,10 +24,16 @@
 //!   holder answers `409` naming it (§5.4); the gateway answers `503` with
 //!   `Retry-After`, because the next attempt may land on a gateway the holder
 //!   is joined to.
+//! - **No card with room.** A request every eligible card is too full for
+//!   waits at the gateway, and is answered `503` with `Retry-After` if none
+//!   has room within the hold (`docs/cooperative_admission.md` §4.3). Each
+//!   request is named by an id in a `place` span, so its placement lines and
+//!   its `answered` line join (§4.6).
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
@@ -36,11 +42,12 @@ use axum::response::Response;
 use cluster::dispatch::{
     draw_area, extract, Dispatch, Extracted, KeySource, Merge, Mirror, Reach, BODY_LIMIT,
 };
-use cluster::gateway::{Class, Pick, NODE_HEADER};
+use cluster::gateway::{Class, Pick, Placing, HOLD, NODE_HEADER};
 use cluster::member::PREFER_PEER;
 use serde_json::Value;
+use tracing::Instrument;
 
-use super::load::carry;
+use super::load::{carry, Answering};
 use super::mirror::{mirrored, sampled, Route};
 use super::{aggregate, merge_ws, Gateway};
 use crate::auth::{cookie, Identity, Role, Roles};
@@ -119,6 +126,26 @@ fn addressed(req: &Request, ctx: &Context<'_>) -> Result<Option<u64>, Box<Proble
 
 /// How long a page waits before asking again while every member is loading.
 const LOADING_RETRY: Duration = Duration::from_secs(3);
+
+/// How long a client waits before asking again after every card stayed full
+/// for the whole hold.
+const FULL_RETRY: Duration = Duration::from_secs(5);
+
+/// The gateway's request ids, which name each request's placement lines.
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// The answer to a request no card had room for within the hold (§4.3).
+fn full(app: &str, want_html: bool) -> Response {
+    errors::respond(
+        Problem::backing_off("Every machine is busy — retrying in a moment.", FULL_RETRY).because(
+            format!(
+                "no {app} member's card had room for the request within {} s",
+                HOLD.as_secs()
+            ),
+        ),
+        want_html,
+    )
+}
 
 /// The gateway's own "reconnecting" page, which the consoles retry: the answer
 /// when `app` is admitted here yet has no member to send a request to — every
@@ -248,9 +275,24 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
     let peer_of = ctx
         .from_member
         .filter(|_| req.headers().contains_key(PREFER_PEER));
-    let picked = hub.pick_from(app, &dispatch, draw, key.as_deref(), pin, peer_of);
+    let id = REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = Instant::now();
+    let placing = Placing {
+        req: id,
+        app: app.to_string(),
+        dispatch: dispatch.clone(),
+        draw,
+        key: key.clone(),
+        pinned: pin,
+        sender: peer_of,
+    };
+    let span = tracing::info_span!("place", req = id, app, dispatch = dispatch.name());
+    let Some(picked) = hub.place(placing).instrument(span).await else {
+        return Routed::Answered(full(app, ctx.want_html));
+    };
     match picked.pick {
         Pick::Configured => none_ready(gateway, app, &ctx, req).await,
+        Pick::Wait => Routed::Answered(full(app, ctx.want_html)),
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
             // Never a member's ask for a peer: an unproven build is not handed
@@ -264,7 +306,13 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
                 Some(candidate) => mirrored(gateway, app, node, candidate, sample, &ctx, req).await,
                 None => sampled(gateway, app, node, sample, &ctx, req).await,
             };
-            Routed::Answered(carry(res, picked.load))
+            let answering = Answering {
+                req: id,
+                app: app.to_string(),
+                node,
+                started,
+            };
+            Routed::Answered(carry(res, picked.load, answering))
         }
         Pick::Pinned(node) => {
             hub.traffic.request(Class::Ui);

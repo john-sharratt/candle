@@ -128,6 +128,7 @@ mod tests {
             app: "npcd".into(),
             node: 3,
             host: String::new(),
+            card: 3,
             build: BuildId {
                 count: 1,
                 hash: String::new(),

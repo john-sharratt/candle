@@ -99,6 +99,7 @@ fn member(
             app: "zend".into(),
             node,
             host: format!("m{node}"),
+            card: node,
             build,
             model: Some(model),
             repos: vec![],

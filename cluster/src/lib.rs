@@ -16,6 +16,8 @@
 //! - [`replicate`]: a member's substrate replication — events out and in,
 //!   catch-ups, and the rejoin after a cut-off.
 //! - [`machine`]: the host as `CAPACITY` reports it.
+//! - [`card`]: this process's card id, which every member it runs names in
+//!   `HELLO`.
 //! - [`version`]: this build's `count`, `hash` and `local`, and
 //!   `--build-info`.
 //! - [`upgrade`]: a member's side of A/B upgrades — artifacts, fetching,
@@ -28,6 +30,7 @@
 //! `EVENT` stays opaque bytes here.
 
 pub mod backoff;
+pub mod card;
 pub mod clock;
 pub mod close;
 pub mod consensus;

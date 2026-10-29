@@ -1086,18 +1086,19 @@ misread, and on an admitted socket closes it 4400.
 
 | Kind | Tag | Body |
 |---|---|---|
-| `HELLO` | 1 | `u16 proto` · `str app` · `u64 node` · `str host` · `build` · `bool rejected` (the group rejected this build, §3.11) · `opt<model>` · `u32 power` · `list<str> repos` · `u64 now_ms` · `[32] nonce` |
+| `HELLO` | 1 | `u16 proto` · `str app` · `u64 node` · `str host` · `u64 card` (the process's card, zero for none; protocol 7, `cooperative_admission.md` §4.2) · `build` · `bool rejected` (the group rejected this build, §3.11) · `opt<model>` · `u32 power` · `list<str> repos` · `u64 now_ms` · `[32] nonce` |
 | `CHALLENGE` | 2 | `[32] nonce` · `[32] proof` |
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
 | `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
-| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) · `u32 bulk_backlog` (protocol 7) |
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding: each route's methods, path, dispatch, mirror and, from protocol 6, `u8 reach`) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
 | `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` (the key's own last state record's `oseq`, protocol 4) |
 | `COORD` | 17 | `blob state` (§12.1's encoding) |
 | `COMPLETE` | 18 | `list<blob> keys` — keys let go that the member holds complete (protocol 4; `cooperative_admission.md` §2.2) |
+| `PLAN` | 19 | `u64 epoch` · `list<u64 node · u32 weight>` — the weights the app's characters are lent by, gateway to member (protocol 7; `cooperative_admission.md` §4.4) |
 | `PREPARE` | 20 | `blob key` · `ballot` |
 | `PROMISE` | 21 | `blob key` · `ballot` · `opt<ballot · blob value>` accepted · `u64 from` · `u64 reply_to` |
 | `NACK` | 22 | `blob key` · `ballot promised` · `u64 from` · `u64 reply_to` |
@@ -1437,7 +1438,8 @@ counted.
 
 `Best` picks the ready member with the most power to spare per request,
 `power / (1 + in_flight)`, among those with room — idle, or with more free slots than
-requests in flight — and among them all when none has room. Of equal shares an idle
+requests in flight, on a card that is not full (`docs/cooperative_admission.md` §4.2).
+When none has room, the request waits at the gateway (§4.3 there). Of equal shares an idle
 member wins, then the lowest node. A member's own background work — ingest, a
 calibration pass — is not a request and does not count: the dialogue a request serves
 decodes at `High` priority, 64 shares to background work's one (`DecodePriority`). So the strongest member takes new conversations until its share per
@@ -3280,10 +3282,15 @@ owner(k) = argmax over members m of   -w_m / ln(u(k, m))
   same clusters see the same members and agree.
 - A member joining or leaving moves only the keys whose winner changed.
 - Each member holds a share of the keys proportional to its power.
-- `w` is the member's `weight` in `MEMBERS`: its `power` as it stood at admission,
-  fixed for the session. Neither the second-by-second idle flag nor the drifting
-  measured power (§5.3) feeds it, so neither load churn nor a better measurement moves
-  worlds while the membership stands.
+- For a world, `w` is the member's `weight` in `MEMBERS`: its `power` as it stood at
+  admission, fixed for the session. Neither the second-by-second idle flag nor the
+  drifting measured power (§5.3) feeds it, so neither load churn nor a better
+  measurement moves worlds while the membership stands.
+- For a character, `w` is the member's weight in the gateway's last `PLAN`
+  (`docs/cooperative_admission.md` §4.4): its power while its card is not busy with
+  latency or bulk work, and nothing — or only its share of the NPC floor — while it
+  is. The plan changes slowly (§4.5 there), so characters move only when a card's
+  load has changed and held. With no plan yet, a character's `w` is the world's.
 
 **A member that takes no lease.** An npcd configured `characters: false`
 (`--no-characters`) says `power` 0 in its `HELLO`, so it is listed at weight 0, and

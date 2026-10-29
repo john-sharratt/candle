@@ -1,5 +1,6 @@
-//! `MEMBERS`, `CAPACITY`, `PING`/`PONG`, `ROUTES`, `CLAIM`/`UNCLAIM` and
-//! `COORD` (§4.1, §5.3, §5.4, §12.1).
+//! `MEMBERS`, `CAPACITY`, `PING`/`PONG`, `ROUTES`, `CLAIM`/`UNCLAIM`,
+//! `COMPLETE`, `PLAN` and `COORD` (§4.1, §5.3, §5.4, §12.1;
+//! `docs/cooperative_admission.md` §2.2, §4.4).
 
 use super::types::{Epoch, MemberInfo, MemberState};
 use crate::wire::{Reader, WireError, Writer};
@@ -86,6 +87,10 @@ pub struct Capacity {
     /// many pixels in any shape (`crate::dispatch::Reach::Draw`). Zero for a
     /// member whose engine has not stated its card, and for an agent.
     pub guest_reach: u32,
+    /// Units of bulk work it has outstanding — zend's ingest units, queued or
+    /// running — which the gateway's plan moves movable work off the card for
+    /// (`docs/cooperative_admission.md` §4.4). Zero for every other member.
+    pub bulk_backlog: u32,
 }
 
 /// The rows beyond its decodes at which a member states its wide figures
@@ -117,7 +122,8 @@ impl Capacity {
             .u32(self.prompt_tokens)
             .u32(self.reply_tokens)
             .u32(self.tokens_per_step_milli)
-            .u32(self.guest_reach);
+            .u32(self.guest_reach)
+            .u32(self.bulk_backlog);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -144,6 +150,7 @@ impl Capacity {
             reply_tokens: r.u32()?,
             tokens_per_step_milli: r.u32()?,
             guest_reach: r.u32()?,
+            bulk_backlog: r.u32()?,
         })
     }
 
@@ -228,6 +235,42 @@ impl Complete {
         Ok(Self {
             keys: r.list(|r| r.blob_vec())?,
         })
+    }
+}
+
+/// The gateway's plan for the app's movable work (`docs/cooperative_admission.md`
+/// §4.4): the weight each member lends characters by, in place of the power it
+/// was admitted at. Sent to every member of the app when it changes, and to a
+/// member as it is admitted. `epoch` rises with every change, so a member keeps
+/// the newest plan whichever gateway sent it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub epoch: u64,
+    /// `(node, weight)` for each member the plan names; a member it does not
+    /// name lends nothing.
+    pub weights: Vec<(u64, u32)>,
+}
+
+impl Plan {
+    pub fn write(&self, w: &mut Writer) {
+        w.u64(self.epoch).list(&self.weights, |w, (node, weight)| {
+            w.u64(*node).u32(*weight);
+        });
+    }
+
+    pub fn read(r: &mut Reader) -> Result<Self, WireError> {
+        Ok(Self {
+            epoch: r.u64()?,
+            weights: r.list(|r| Ok((r.u64()?, r.u32()?)))?,
+        })
+    }
+
+    /// The weight `node` lends by, `None` for a member the plan does not name.
+    pub fn weight_of(&self, node: u64) -> Option<u32> {
+        self.weights
+            .iter()
+            .find(|(n, _)| *n == node)
+            .map(|(_, w)| *w)
     }
 }
 

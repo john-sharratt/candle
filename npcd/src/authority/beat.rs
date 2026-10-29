@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use cluster::frame::Pulse;
 
-use super::npc_lease::{leases_of, lend, with_leases, LEASES};
+use super::npc_lease::{leases_of, lend, moves, with_leases, LEASES};
 use super::pulse::{self, EVENTS};
 use super::role::Role;
 use super::told::{self, TOLD};
@@ -100,8 +100,27 @@ impl Runtime {
                 .into_iter()
                 .map(|(npc, _)| npc)
                 .collect();
-            let (members, joined) = self.npcd_members();
+            let (members, joined) = self.lending_members();
             let lent = lend(&cast, &current, &members, &joined, now_ms());
+            let moved = moves(&current, &lent);
+            if !moved.is_empty() {
+                let weights: Vec<String> = members
+                    .iter()
+                    .map(|m| format!("{:016x}={}", m.node, m.weight))
+                    .collect();
+                for m in moved {
+                    tracing::info!(
+                        target: "npcd::authority::lease",
+                        world,
+                        npc = m.nid,
+                        from = m.from,
+                        holder = m.holder,
+                        next = m.next.as_deref().unwrap_or(""),
+                        weights = %weights.join(" "),
+                        "lent"
+                    );
+                }
+            }
             with_leases(&mut records, &lent);
         }
         let changes = diff(&before, &records);

@@ -1705,6 +1705,13 @@ impl InferenceState {
             });
             let replication = store.replication()?;
             join.link().set_repos(repo_ads(&workspace));
+            // The ingest units still to do, which the gateway's plan moves
+            // characters off this card for (`docs/cooperative_admission.md` §4.4).
+            join.link().set_bulk(|| {
+                crate::ingest_backlog::snapshot().map_or(0, |b| {
+                    b.total.saturating_sub(b.processed).min(u64::from(u32::MAX)) as u32
+                })
+            });
             let report = |views: &[ClusterView]| {
                 progress.set_step_progress(admitted(views), views.len() as u64);
                 status_tx.send(connecting_detail(views)).ok();

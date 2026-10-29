@@ -46,7 +46,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::sync::oneshot;
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use super::admission::{Admission, Admitted};
 use super::agent_row::AgentRow;
@@ -56,7 +57,9 @@ use super::load::{Load, Picked};
 use super::log::{CoordLog, Entry};
 use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
-use super::registry::{MemberView, PeerAsk, Pick, Registry};
+use super::planner::{Planned, Planner, NPC_FLOOR_PERCENT};
+use super::queue::{Placing, Queue, Urgency, HOLD};
+use super::registry::{MemberView, PeerAsk, Pick, Registry, HOSTING_APP};
 use super::status::{
     mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
@@ -72,7 +75,9 @@ use crate::close::{Close, CloseCode};
 use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
-use crate::frame::{name, Admit, BuildFetch, BuildId, Frame, Hello, Lost, MemberState, Members};
+use crate::frame::{
+    name, Admit, BuildFetch, BuildId, Frame, Hello, Lost, MemberState, Members, Plan as PlanFrame,
+};
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
 use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, Ended, Incoming, Role, SessionHandle, VirtualConn};
@@ -186,6 +191,11 @@ pub(super) struct State {
     fetch_rr: usize,
     /// The catch-ups and fetches handed to an answerer and not yet `DONE`.
     pub open: OpenAnswers,
+    /// The units waiting for a card with room (`docs/cooperative_admission.md`
+    /// §4.3).
+    queue: Queue,
+    /// The plan for the movable work (§4.4–§4.5).
+    planner: Planner,
 }
 
 pub struct Hub {
@@ -201,6 +211,41 @@ pub struct Hub {
 
 pub(super) fn hex(node: u64) -> String {
     format!("{node:016x}")
+}
+
+/// The plan's log lines (`docs/cooperative_admission.md` §4.6): every card on
+/// each plan, and the weights when they moved.
+fn log_plan(planned: &Planned) {
+    let cards: Vec<String> = planned
+        .cards
+        .iter()
+        .map(|c| {
+            format!(
+                "{:?} latency={} bulk={} busy={} fence_milli={} quarters={}/{}",
+                c.key, c.latency, c.bulk, c.busy, c.fence_milli, c.quarters, c.target
+            )
+        })
+        .collect();
+    tracing::info!(
+        target: "cluster::gateway::plan",
+        epoch = planned.epoch,
+        floor_percent = NPC_FLOOR_PERCENT,
+        cards = %cards.join("; "),
+        "cards"
+    );
+    if planned.changed {
+        let weights: Vec<String> = planned
+            .weights
+            .iter()
+            .map(|(node, w)| format!("{node:016x}={w}"))
+            .collect();
+        tracing::info!(
+            target: "cluster::gateway::plan",
+            epoch = planned.epoch,
+            weights = %weights.join(" "),
+            "plan"
+        );
+    }
 }
 
 impl Hub {
@@ -402,7 +447,7 @@ impl Hub {
     }
 
     async fn run<T, R, F>(
-        &self,
+        self: &Arc<Self>,
         app: &str,
         hello: Hello,
         admitted: Admitted,
@@ -450,6 +495,7 @@ impl Hub {
             s.registry.join(MemberView {
                 node,
                 host: hello.host.clone(),
+                card: hello.card,
                 app: app.to_string(),
                 build: hello.build.clone(),
                 weight: hello.power,
@@ -500,9 +546,15 @@ impl Hub {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
                     Some(Incoming::Frame(frame)) => {
+                        let capacity = matches!(frame, Frame::Capacity(_));
                         if let Err(close) = self.on_frame(app, node, frame, &handle) {
                             handle.close(close.clone());
                             break Ended::Refused(close);
+                        }
+                        // What a card can take has been reported again: the
+                        // units waiting for room are placed by it (§4.3).
+                        if capacity {
+                            self.release_waiting();
                         }
                     }
                     Some(Incoming::Stream(conn)) => streams(MemberStream {
@@ -519,6 +571,7 @@ impl Hub {
                 _ = tick.tick() => {
                     let (epoch, members) = self.state().registry.listing(app);
                     let _ = handle.control(Frame::Members(Members { epoch, members }));
+                    self.plan_tick();
                 }
                 _ = receipts.tick() => self.receipt_tick(app, node),
             }
@@ -805,6 +858,13 @@ impl Hub {
         admitted: &Admitted,
         handle: &SessionHandle,
     ) {
+        // An npcd member lends by the plan from its first beat
+        // (`docs/cooperative_admission.md` §4.4).
+        if app == HOSTING_APP {
+            if let Some((epoch, weights)) = self.state().planner.current() {
+                let _ = handle.control(Frame::Plan(PlanFrame { epoch, weights }));
+            }
+        }
         let build = &hello.build;
         if admitted.upgrading {
             let floor = admitted.floor.clone().expect("upgrading is below a floor");
@@ -1173,12 +1233,27 @@ impl Hub {
         sender: Option<u64>,
     ) -> Picked {
         let mut s = self.state();
+        self.pick_in(&mut s, app, dispatch, draw, key, pinned, sender)
+    }
+
+    /// [`Self::pick_from`] under a hold of the state the caller already has.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_in(
+        self: &Arc<Self>,
+        s: &mut State,
+        app: &str,
+        dispatch: &Dispatch,
+        draw: Option<u64>,
+        key: Option<&str>,
+        pinned: Option<u64>,
+        sender: Option<u64>,
+    ) -> Picked {
         let State {
             registry,
             upgrades,
             sockets,
             ..
-        } = &mut *s;
+        } = s;
         // A session that has ended is still listed until its socket's cleanup
         // leaves, and no stream opens to it in between: route it nothing.
         for ((a, node), socket) in sockets.iter() {
@@ -1214,6 +1289,135 @@ impl Hub {
             _ => None,
         };
         Picked { pick, load }
+    }
+
+    /// [`Self::pick_from`], waiting at the gateway while every card the unit
+    /// may go to is full (`docs/cooperative_admission.md` §4.3): answered with
+    /// the pick once a card has room, most urgent and then oldest first, or
+    /// `None` once the unit has waited [`HOLD`].
+    pub async fn place(self: &Arc<Self>, placing: Placing) -> Option<Picked> {
+        let (seq, mut rx) = {
+            let mut s = self.state();
+            let picked = self.pick_in(
+                &mut s,
+                &placing.app,
+                &placing.dispatch,
+                placing.draw,
+                placing.key.as_deref(),
+                placing.pinned,
+                placing.sender,
+            );
+            if picked.pick != Pick::Wait {
+                return Some(picked);
+            }
+            let (tx, rx) = oneshot::channel();
+            let urgency = Urgency::of(&placing.app, placing.sender);
+            let app = placing.app.clone();
+            let seq = s.queue.push(placing, Instant::now(), tx);
+            tracing::info!(
+                target: "cluster::gateway::placement",
+                app,
+                urgency = urgency.name(),
+                depth = s.queue.len(),
+                "queued"
+            );
+            (seq, rx)
+        };
+        let since = Instant::now();
+        match timeout(HOLD, &mut rx).await {
+            Ok(Ok(picked)) => Some(picked),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                // Placed in the moment the hold ran out: taken, not refused.
+                if !self.state().queue.forget(seq) {
+                    if let Ok(picked) = rx.try_recv() {
+                        return Some(picked);
+                    }
+                }
+                tracing::info!(
+                    target: "cluster::gateway::placement",
+                    waited_ms = since.elapsed().as_millis() as u64,
+                    "refused"
+                );
+                None
+            }
+        }
+    }
+
+    /// How many units are waiting for a card with room (§4.3).
+    pub fn waiting(&self) -> usize {
+        self.state().queue.len()
+    }
+
+    /// Plan the movable work, once each [`super::planner::PLAN_EVERY`]
+    /// whichever socket's tick asks (§4.4): the fences go to latency
+    /// placement at once, and a changed plan to every npcd member.
+    pub(super) fn plan_tick(&self) {
+        let planned = {
+            let mut s = self.state();
+            let now = Instant::now();
+            if !s.planner.due(now) {
+                return;
+            }
+            let views = s.registry.card_views();
+            let planned = s.planner.plan(now, &views);
+            s.registry.set_fences(planned.fences.clone());
+            if planned.changed {
+                for ((a, _), socket) in &s.sockets {
+                    if a == HOSTING_APP {
+                        let _ = socket.handle.control(Frame::Plan(PlanFrame {
+                            epoch: planned.epoch,
+                            weights: planned.weights.clone(),
+                        }));
+                    }
+                }
+            }
+            planned
+        };
+        log_plan(&planned);
+    }
+
+    /// Place every waiting unit that now fits (§4.3), most urgent and then
+    /// oldest first; one that still fits nowhere waits on, and does not hold
+    /// back those behind it that fit elsewhere. Called whenever a card's count
+    /// falls and whenever a `CAPACITY` arrives. A unit placed for a client gone
+    /// meanwhile is uncounted as its pick drops — here, outside the state.
+    pub(super) fn release_waiting(self: &Arc<Self>) {
+        let mut placed = Vec::new();
+        {
+            let mut s = self.state();
+            if s.queue.len() == 0 {
+                return;
+            }
+            for w in s.queue.take_in_order() {
+                let picked = self.pick_in(
+                    &mut s,
+                    &w.ask.app,
+                    &w.ask.dispatch,
+                    w.ask.draw,
+                    w.ask.key.as_deref(),
+                    w.ask.pinned,
+                    w.ask.sender,
+                );
+                if picked.pick == Pick::Wait {
+                    s.queue.keep(w);
+                } else {
+                    placed.push((w, picked));
+                }
+            }
+        }
+        for (w, picked) in placed {
+            tracing::info!(
+                target: "cluster::gateway::placement",
+                req = w.ask.req,
+                app = w.ask.app,
+                urgency = w.urgency.name(),
+                picked = ?picked.pick,
+                waited_ms = w.since.elapsed().as_millis() as u64,
+                "released"
+            );
+            let _ = w.tx.send(picked);
+        }
     }
 
     /// Which agent of `app` runs a job (§11.3).

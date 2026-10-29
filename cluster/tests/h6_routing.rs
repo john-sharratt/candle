@@ -45,20 +45,13 @@ impl Model {
     }
 
     /// Nothing is in flight here — the registry is asked directly, never
-    /// through a hub — so each share of power is the whole power: among the
-    /// members with room (idle, or a free slot), or all when none has, the
+    /// through a hub — so each share of power is the whole power, and every
+    /// card has room: a card with nothing placed on it is never full
+    /// (`docs/cooperative_admission.md` §4.2), whatever its slots say. The
     /// highest power; of equals, an idle one; then the lowest node.
     fn best(&self) -> Option<u64> {
         let ready = self.ready();
-        let roomy: Vec<&(u64, Cap)> = ready
-            .iter()
-            .filter(|(_, c)| c.idle || c.slots > 0)
-            .collect();
-        let mut pool = if roomy.is_empty() {
-            ready.iter().collect()
-        } else {
-            roomy
-        };
+        let mut pool: Vec<&(u64, Cap)> = ready.iter().collect();
         pool.sort_by_key(|(n, c)| (Reverse(c.power), Reverse(c.idle), *n));
         pool.first().map(|(n, _)| *n)
     }
@@ -107,6 +100,7 @@ fn view(node: u64, session: u64) -> MemberView {
     MemberView {
         node,
         host: format!("m{node}"),
+        card: node,
         app: APP.into(),
         build: BuildId {
             count: 1,

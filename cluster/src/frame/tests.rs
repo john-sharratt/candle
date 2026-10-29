@@ -116,6 +116,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 app: "zend".into(),
                 node: 0x1122,
                 host: ".5".into(),
+                card: 0xc0de,
                 build: build(),
                 rejected: true,
                 model: Some(model.clone()),
@@ -133,6 +134,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .s("zend")
                 .u64(0x1122)
                 .s(".5")
+                .u64(0xc0de)
                 .build(&build())
                 .u8(1)
                 .u8(1)
@@ -215,6 +217,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 reply_tokens: 410,
                 tokens_per_step_milli: 2_650,
                 guest_reach: 2048,
+                bulk_backlog: 37,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -241,6 +244,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(410)
                 .u32(2_650)
                 .u32(2048)
+                .u32(37)
                 .0,
         ),
         (
@@ -283,6 +287,20 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .raw(b"ab")
                 .u32(1)
                 .raw(b"c")
+                .0,
+        ),
+        (
+            Frame::Plan(Plan {
+                epoch: 9,
+                weights: vec![(0xaa, 300), (0xbb, 0)],
+            }),
+            B::header(19, 0, 0)
+                .u64(9)
+                .u32(2)
+                .u64(0xaa)
+                .u32(300)
+                .u64(0xbb)
+                .u32(0)
                 .0,
         ),
         (

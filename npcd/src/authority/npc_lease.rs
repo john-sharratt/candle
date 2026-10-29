@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cluster::consensus::rendezvous::{owner, Weighted};
+use cluster::frame::Plan;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -99,6 +100,52 @@ pub fn lease_entity(nid: u64) -> String {
 /// The member rendezvous lends `nid` to among `members`.
 pub fn lent_to(nid: u64, members: &[Weighted]) -> Option<u64> {
     owner(nid.to_string().as_bytes(), members)
+}
+
+/// `ready` weighted as the gateway's plan lends characters
+/// (`docs/cooperative_admission.md` §4.4): each member by the weight the plan
+/// names for it, and nothing for one it does not name — a member the plan has
+/// not yet seen is not yet fit to host. With no plan, as they stand: the power
+/// each was admitted at, as worlds are weighed.
+pub fn by_plan(ready: Vec<Weighted>, plan: Option<&Plan>) -> Vec<Weighted> {
+    let Some(plan) = plan else {
+        return ready;
+    };
+    ready
+        .into_iter()
+        .map(|m| Weighted {
+            node: m.node,
+            weight: f64::from(plan.weight_of(m.node).unwrap_or(0)),
+        })
+        .collect()
+}
+
+/// A lease `lend` changed: a character lent for the first time, moved, or
+/// asked to move at its next turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub nid: u64,
+    /// Its holder before, empty for one never lent.
+    pub from: String,
+    pub holder: String,
+    /// The member it is to move to once its holder hands it back.
+    pub next: Option<String>,
+}
+
+/// Every lease in `lent` whose holder or next holder differs from `current`.
+pub fn moves(current: &BTreeMap<u64, NpcLease>, lent: &BTreeMap<u64, NpcLease>) -> Vec<Moved> {
+    lent.iter()
+        .filter_map(|(nid, l)| {
+            let before = current.get(nid);
+            let same = before.is_some_and(|b| b.holder == l.holder && b.next == l.next);
+            (!same).then(|| Moved {
+                nid: *nid,
+                from: before.map(|b| b.holder.clone()).unwrap_or_default(),
+                holder: l.holder.clone(),
+                next: l.next.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The leases the authority holds the cast to now: for each character of the
@@ -281,6 +328,81 @@ mod tests {
         current.insert(nid, moved.clone());
         let renewed = lend(&[nid], &current, &after, &joined(&[1, 2]), NOW + 50_000);
         assert_eq!(renewed[&nid].after, moved.after);
+    }
+
+    /// **Characters are lent by the plan's weights** (§4.4 of
+    /// `docs/cooperative_admission.md`): a member the plan gives nothing, or
+    /// does not name, is lent nothing, so its share moves to the others; with
+    /// no plan, by the admitted powers.
+    #[test]
+    fn characters_are_lent_by_the_plan() {
+        let ready = vec![
+            Weighted {
+                node: 1,
+                weight: 300.0,
+            },
+            Weighted {
+                node: 2,
+                weight: 140.0,
+            },
+            Weighted {
+                node: 3,
+                weight: 50.0,
+            },
+        ];
+        assert_eq!(by_plan(ready.clone(), None), ready, "no plan yet");
+        let plan = Plan {
+            epoch: 4,
+            weights: vec![(1, 0), (2, 140)],
+        };
+        let lent = by_plan(ready, Some(&plan));
+        assert_eq!(
+            lent.iter().map(|w| (w.node, w.weight)).collect::<Vec<_>>(),
+            vec![(1, 0.0), (2, 140.0), (3, 0.0)]
+        );
+        let cast: Vec<u64> = (1..=40).collect();
+        let leases = lend(&cast, &BTreeMap::new(), &lent, &joined(&[1, 2, 3]), NOW);
+        assert!(
+            leases.values().all(|l| node_of(&l.holder) == Some(2)),
+            "only the member the plan lends by holds any"
+        );
+    }
+
+    /// **What `lend` changed is listed**: a character lent for the first time,
+    /// one asked to move at its next boundary, and nothing for a lease renewed
+    /// in place.
+    #[test]
+    fn what_lend_changed_is_listed() {
+        let mut current = BTreeMap::new();
+        current.insert(7, fresh(1, NOW));
+        current.insert(8, fresh(1, NOW));
+        let mut lent = current.clone();
+        lent.insert(
+            8,
+            NpcLease {
+                next: Some(hex(2)),
+                ..fresh(1, NOW + 40_000)
+            },
+        );
+        lent.insert(9, fresh(2, NOW));
+        lent.insert(7, fresh(1, NOW + 40_000));
+        assert_eq!(
+            moves(&current, &lent),
+            vec![
+                Moved {
+                    nid: 8,
+                    from: hex(1),
+                    holder: hex(1),
+                    next: Some(hex(2)),
+                },
+                Moved {
+                    nid: 9,
+                    from: String::new(),
+                    holder: hex(2),
+                    next: None,
+                },
+            ]
+        );
     }
 
     /// An admin's release is lent again at once; a character gone from the

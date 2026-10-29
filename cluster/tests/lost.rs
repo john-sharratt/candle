@@ -25,6 +25,7 @@ fn hello(node: u64) -> Hello {
         app: "zend".into(),
         node,
         host: format!("m{node}"),
+        card: node,
         build: BuildId {
             count: 100,
             hash: "abc1234".into(),

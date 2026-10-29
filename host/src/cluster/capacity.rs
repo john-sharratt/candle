@@ -16,6 +16,9 @@
 //!   (`docs/cooperative_admission.md` §2.1); zero until it has learned them.
 //! - **`guest_reach`** is the side of the largest square its card draws, as
 //!   its engine stated it: a gateway places a draw only where it is reached.
+//! - **`bulk_backlog`** is the bulk work its tenant has outstanding — zend's
+//!   ingest units — which the gateway's plan moves characters off the card
+//!   for (`docs/cooperative_admission.md` §4.4).
 
 use cluster::frame::{Capacity, MemberState};
 use cluster::machine::Machine;
@@ -85,6 +88,7 @@ pub fn capacity(
     rates: Option<Rates>,
     machine: Machine,
     guest_reach: u32,
+    bulk_backlog: u32,
 ) -> Capacity {
     // What the scheduler learned stands while it is quiet: a rate is the
     // card's, not the window's. Only a rate it has actually measured is said.
@@ -149,6 +153,7 @@ pub fn capacity(
         reply_tokens: rates.map_or(0, |r| tokens(r.reply_tokens)),
         tokens_per_step_milli: rates.map_or(0, |r| tokens(r.tokens_per_step * 1000.0)),
         guest_reach,
+        bulk_backlog,
     }
 }
 
@@ -219,9 +224,18 @@ mod tests {
             None,
             machine(),
             0,
+            0,
         );
         assert_eq!(c.power, 172);
-        let c = capacity(MemberState::Loading, card(None), None, None, machine(), 0);
+        let c = capacity(
+            MemberState::Loading,
+            card(None),
+            None,
+            None,
+            machine(),
+            0,
+            0,
+        );
         assert_eq!((c.power, c.state), (737, MemberState::Loading));
         assert_eq!((c.vram_free_mib, c.cores, c.load_milli), (4_096, 16, 1_250));
         assert_eq!((c.os.as_str(), c.mem_free_mib), ("linux", 20_000));
@@ -231,10 +245,36 @@ mod tests {
     /// before the engine has.
     #[test]
     fn the_reach_is_said_as_the_engine_stated_it() {
-        let c = capacity(MemberState::Ready, card(None), None, None, machine(), 2048);
+        let c = capacity(
+            MemberState::Ready,
+            card(None),
+            None,
+            None,
+            machine(),
+            2048,
+            0,
+        );
         assert_eq!(c.guest_reach, 2048);
-        let c = capacity(MemberState::Loading, card(None), None, None, machine(), 0);
+        let c = capacity(
+            MemberState::Loading,
+            card(None),
+            None,
+            None,
+            machine(),
+            0,
+            0,
+        );
         assert_eq!(c.guest_reach, 0);
+    }
+
+    /// **The tenant's outstanding bulk work is said as it reports it**: the
+    /// units zend has queued or running, and nothing for a tenant with none.
+    #[test]
+    fn bulk_work_is_said_as_the_tenant_reports_it() {
+        let c = capacity(MemberState::Ready, card(None), None, None, machine(), 0, 37);
+        assert_eq!(c.bulk_backlog, 37);
+        let c = capacity(MemberState::Ready, card(None), None, None, machine(), 0, 0);
+        assert_eq!(c.bulk_backlog, 0);
     }
 
     /// A recent wave with a backlog or a full budget is not idle; one with
@@ -244,7 +284,17 @@ mod tests {
     /// decides idleness, never the backlog a placed turn is said to wait on.
     #[test]
     fn idle_reads_the_newest_wave() {
-        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), None, machine(), 0);
+        let at = |w: Wave| {
+            capacity(
+                MemberState::Ready,
+                card(None),
+                Some(w),
+                None,
+                machine(),
+                0,
+                0,
+            )
+        };
         let busy = at(wave(1.0, 3, 8_000));
         assert_eq!(
             (busy.idle, busy.prefill_backlog, busy.decodes),
@@ -261,7 +311,7 @@ mod tests {
             (quiet.idle, quiet.decodes, quiet.prefill_backlog),
             (true, 0, 0)
         );
-        let never = capacity(MemberState::Ready, card(None), None, None, machine(), 0);
+        let never = capacity(MemberState::Ready, card(None), None, None, machine(), 0, 0);
         assert_eq!((never.idle, never.slots_free), (true, 0));
     }
 
@@ -290,6 +340,7 @@ mod tests {
             Some(learned),
             machine(),
             0,
+            0,
         );
         assert_eq!(
             (c.prefill_tok_s, c.decode_step_next_us, c.prefill_backlog),
@@ -312,6 +363,7 @@ mod tests {
             }),
             machine(),
             0,
+            0,
         );
         assert_eq!(
             (flat.decode_step_next_us, flat.decode_step_wide_us),
@@ -321,7 +373,7 @@ mod tests {
             (flat.prefill_tok_s, flat.prefill_tok_s_wide),
             (2_303, 2_303)
         );
-        let none = capacity(MemberState::Ready, card(None), None, None, machine(), 0);
+        let none = capacity(MemberState::Ready, card(None), None, None, machine(), 0, 0);
         assert_eq!(
             (
                 none.prefill_tok_s,
@@ -347,6 +399,7 @@ mod tests {
             None,
             Some(unmeasured),
             machine(),
+            0,
             0,
         );
         assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (0, 0));

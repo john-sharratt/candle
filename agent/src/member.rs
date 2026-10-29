@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::Router;
+use cluster::card;
 use cluster::dial::Connect;
 use cluster::frame::{Capacity, MemberState};
 use cluster::handshake::GroupKey;
@@ -137,6 +138,7 @@ impl Agent {
                 app: APP.to_string(),
                 node,
                 host,
+                card: card::this(),
                 build: this_build(),
                 model: None,
                 repos: jobs.checkouts().ads(),

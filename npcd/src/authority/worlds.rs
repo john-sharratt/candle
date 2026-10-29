@@ -6,9 +6,10 @@
 //! A daemon with no cluster is the authority of every world and runs every
 //! character; nothing here is consulted beyond that.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use cluster::member::AppMember;
 use npc_map::world::Tick;
@@ -50,6 +51,9 @@ pub struct Standing {
     handing: Mutex<HashSet<u64>>,
     /// Characters part-way through a turn: a hand-back waits for its end.
     turning: Mutex<HashSet<u64>>,
+    /// Characters lent here that wait for their last holder's writes before
+    /// they wake, since when (`docs/cooperative_admission.md` §4.6).
+    arriving: Mutex<HashMap<u64, Instant>>,
     /// Writes on their way to a world's authority, each sent once until it
     /// has answered.
     sending: Mutex<HashSet<String>>,
@@ -79,6 +83,7 @@ impl Standing {
             held: Mutex::new(BTreeSet::new()),
             handing: Mutex::new(HashSet::new()),
             turning: Mutex::new(HashSet::new()),
+            arriving: Mutex::new(HashMap::new()),
             sending: Mutex::new(HashSet::new()),
             legacy: Mutex::new((BTreeSet::new(), BTreeSet::new())),
             member: OnceLock::new(),
@@ -282,6 +287,22 @@ impl Standing {
 
     pub fn handing(&self, npc: u64) -> bool {
         self.handing.lock().unwrap().contains(&npc)
+    }
+
+    /// `npc`, lent here, waits at `now` for its last holder's writes; the
+    /// first look starts its wait.
+    pub fn arriving(&self, npc: u64, now: Instant) {
+        self.arriving.lock().unwrap().entry(npc).or_insert(now);
+    }
+
+    /// `npc` woke here at `now`: how long it waited for its last holder's
+    /// writes, `None` when it waited for none.
+    pub fn arrived(&self, npc: u64, now: Instant) -> Option<Duration> {
+        self.arriving
+            .lock()
+            .unwrap()
+            .remove(&npc)
+            .map(|since| now.duration_since(since))
     }
 
     /// `npc`'s turn began; `false` if it is being handed back and must take

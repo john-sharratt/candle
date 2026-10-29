@@ -36,6 +36,9 @@ impl Drop for Load {
             .state()
             .registry
             .end(&self.app, self.node, self.session, self.draw);
+        // The card's count fell: a unit waiting for room may fit now
+        // (`docs/cooperative_admission.md` §4.3).
+        self.hub.release_waiting();
     }
 }
 

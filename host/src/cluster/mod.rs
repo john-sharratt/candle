@@ -60,6 +60,7 @@ use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
 use candle_conversation::guest::reach;
 use candle_conversation::phase_ring::{latest_wave, learned_rates, rates_read_every};
+use cluster::card;
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
@@ -197,6 +198,10 @@ pub struct AppLink {
     /// Whether rendezvous may name this member (`Identity::leaseholder`); a
     /// leaseholder unless the tenant says otherwise before it joins.
     leaseholder: OnceLock<bool>,
+    /// The bulk work the tenant has outstanding, for `CAPACITY.bulk_backlog`
+    /// (`docs/cooperative_admission.md` §4.4); none for a tenant that sets no
+    /// source.
+    bulk: OnceLock<Box<dyn Fn() -> u32 + Send + Sync>>,
 }
 
 impl Drop for Cluster {
@@ -274,6 +279,7 @@ impl Cluster {
                             own_oseq: OnceLock::new(),
                             repos: OnceLock::new(),
                             leaseholder: OnceLock::new(),
+                            bulk: OnceLock::new(),
                         }),
                     )
                 })
@@ -353,6 +359,7 @@ impl Cluster {
                 app: link.app.to_string(),
                 node,
                 host: self.settings.host.clone(),
+                card: card::this(),
                 build: self.build.clone(),
                 model,
                 repos: link.repos.get().cloned().unwrap_or_default(),
@@ -388,6 +395,7 @@ impl Cluster {
                     rates,
                     measure(),
                     reach::stated(),
+                    ready.bulk.get().map_or(0, |bulk| bulk()),
                 )
             }),
             replication,
@@ -544,6 +552,13 @@ impl AppLink {
     /// a conversation's repositories (§10.1).
     pub fn set_repos(&self, repos: Vec<RepoAd>) {
         let _ = self.repos.set(repos);
+    }
+
+    /// Where `CAPACITY` reads the tenant's outstanding bulk work from — zend's
+    /// ingest units — so the gateway's plan moves characters off this card
+    /// while it has some (`docs/cooperative_admission.md` §4.4).
+    pub fn set_bulk(&self, bulk: impl Fn() -> u32 + Send + Sync + 'static) {
+        let _ = self.bulk.set(Box::new(bulk));
     }
 
     /// Whether rendezvous may name this member, before it joins: `false` keeps

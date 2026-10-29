@@ -22,6 +22,7 @@ fn member(node: u64, session: u64) -> MemberView {
     MemberView {
         node,
         host: format!("m{node}"),
+        card: node,
         app: "zend".into(),
         build: BuildId {
             count: 1,
@@ -249,7 +250,9 @@ fn best(r: &mut Registry) -> Pick {
 /// the most powerful takes new work until its share per request falls below
 /// another's, busy or not — a member's own background work does not count. A
 /// member out of room is passed over while another has room; an equal share
-/// goes to an idle member, then the lowest node.
+/// goes to an idle member, then the lowest node. A card with nothing placed
+/// on it always has room, and with no card left with room the request waits
+/// (`docs/cooperative_admission.md` §4.2).
 #[test]
 fn best_takes_the_largest_share_of_power_per_request() {
     let mut r = three();
@@ -265,12 +268,19 @@ fn best_takes_the_largest_share_of_power_per_request() {
     r.begin("zend", 2, false);
     // 100, 300/4 = 75, 100: two idle members tie, and the lower node takes it.
     assert_eq!(best(&mut r), Pick::Member(1));
-    // Node 1 busy with no free slot has no room; node 3, idle, still has.
+    // Node 1 busy with no free slot has nothing placed on it, so it still
+    // has room for one: its own background work filled it, and the first
+    // unit is never refused for that. Shares 100/1 against node 3's 200/2.
     r.capacity("zend", 1, capacity(MemberState::Ready, 100, false, 0));
-    assert_eq!(best(&mut r), Pick::Member(3));
-    // With nobody left with room, the largest share of all takes it: node 2
-    // has three requests on five slots, so it has room until it holds five.
     r.capacity("zend", 3, capacity(MemberState::Ready, 200, false, 1));
+    assert_eq!(
+        best(&mut r),
+        Pick::Member(1),
+        "nothing placed: room for one"
+    );
+    r.begin("zend", 1, false);
+    // Now node 1 is out of slots and node 3's one slot is spoken for: node 2
+    // has three requests on five slots, so it has room until it holds five.
     assert_eq!(best(&mut r), Pick::Member(2), "the only one with room");
     r.begin("zend", 2, false);
     r.begin("zend", 2, false);
@@ -279,8 +289,8 @@ fn best_takes_the_largest_share_of_power_per_request() {
         Some(5),
         "five begun on node 2"
     );
-    // No room anywhere: 100/1, 300/6 = 50, 200/2 = 100 — tied, lower node.
-    assert_eq!(best(&mut r), Pick::Member(1));
+    // No room anywhere: the request waits at the gateway.
+    assert_eq!(best(&mut r), Pick::Wait);
 
     // An answer ends its request; one from a session since replaced leaves
     // the newer session's count alone.
@@ -554,7 +564,10 @@ fn a_turn_is_priced_at_the_size_the_members_report() {
     // Each candidate's finish is priced at that one size: this turn's 60-token
     // prompt at 1,000 tok/s, then 384 steps of 40 ms.
     let m = r.member("zend", 1).unwrap();
-    assert_eq!(finish_us(m, pool(&r)), Some(60_000 + 384 * 40_000));
+    assert_eq!(
+        finish_us(m, CardLoad::default(), pool(&r)),
+        Some(60_000 + 384 * 40_000)
+    );
 }
 
 /// **A reply takes the steps it takes on that card.** A card committing 2.5
@@ -585,8 +598,14 @@ fn a_speculating_card_is_priced_at_the_steps_its_reply_takes() {
     };
     let unlearned = r.member("zend", 1).unwrap();
     let speculating = r.member("zend", 2).unwrap();
-    assert_eq!(finish_us(unlearned, size), Some(100_000 + 500 * 40_000));
-    assert_eq!(finish_us(speculating, size), Some(100_000 + 200 * 40_000));
+    assert_eq!(
+        finish_us(unlearned, CardLoad::default(), size),
+        Some(100_000 + 500 * 40_000)
+    );
+    assert_eq!(
+        finish_us(speculating, CardLoad::default(), size),
+        Some(100_000 + 200 * 40_000)
+    );
 }
 
 /// **A member fresh from a restart is probed, not handed a share of a burst.**

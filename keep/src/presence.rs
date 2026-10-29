@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use cluster::card;
 use cluster::frame::{Capacity, MemberState};
 use cluster::gateway::KEEP;
 use cluster::handshake::GroupKey;
@@ -67,6 +68,7 @@ async fn join(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) -> anyh
             app: KEEP.to_string(),
             node,
             host: cluster.host,
+            card: card::this(),
             build: this_build(),
             model: None,
             repos: Vec::new(),

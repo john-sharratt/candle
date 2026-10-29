@@ -330,6 +330,7 @@ fn zend_member(node: u64) -> Arc<AppMember> {
             app: "zend".into(),
             node,
             host: "m".into(),
+            card: node,
             build: BuildId {
                 count: 1,
                 hash: "h".into(),

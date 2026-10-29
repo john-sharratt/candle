@@ -62,6 +62,7 @@ kinds! {
     Unclaim = 16,
     Coord = 17,
     Complete = 18,
+    Plan = 19,
     Prepare = 20,
     Promise = 21,
     Nack = 22,

@@ -53,6 +53,7 @@ fn hello(node: u64, proto: u16) -> Hello {
         app: "zend".into(),
         node,
         host: format!("m{node}"),
+        card: node,
         build: BuildId {
             count: 100,
             hash: "abc1234".into(),

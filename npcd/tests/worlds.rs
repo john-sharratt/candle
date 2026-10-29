@@ -245,6 +245,7 @@ async fn member_as(gw: &Gw, store: Store, world: &str, cast: &[u64], leaseholder
             app: "npcd".into(),
             node,
             host: format!("m{node:x}"),
+            card: node,
             build: BuildId {
                 count: 1,
                 hash: "h".into(),

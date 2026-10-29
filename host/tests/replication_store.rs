@@ -61,6 +61,7 @@ fn member(hub: &Arc<Hub>) -> Member {
             app: "zend".into(),
             node: conv.node(),
             host: "m".into(),
+            card: conv.node(),
             build: BuildId {
                 count: 1,
                 hash: "h".into(),

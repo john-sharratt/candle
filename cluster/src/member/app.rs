@@ -27,7 +27,7 @@ use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
     Admit, BuildId, Capacity, Claim, Complete, Coord, Epoch, Frame, Hello, MemberInfo, MemberState,
-    Members, ModelId, RepoAd, Routes, Unclaim,
+    Members, ModelId, Plan, RepoAd, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
@@ -82,6 +82,9 @@ pub struct Identity {
     pub app: String,
     pub node: u64,
     pub host: String,
+    /// The card it runs on, as its `HELLO` names it: [`crate::card::this`] for
+    /// a member of a real process (§4.2 of `docs/cooperative_admission.md`).
+    pub card: u64,
     pub build: BuildId,
     /// The model the substrate is bound to; `None` for an agent.
     pub model: Option<ModelId>,
@@ -153,6 +156,10 @@ pub struct AppMember {
     /// Keys let go that this member reported holding complete, re-sent whole on
     /// every admission until each is next claimed ([`AppMember::report_complete`]).
     reported: Mutex<BTreeSet<Vec<u8>>>,
+    /// The newest `PLAN` any gateway sent (`docs/cooperative_admission.md`
+    /// §4.4), kept when its socket closes: a member lends by the last plan it
+    /// was given.
+    plan: Mutex<Option<Plan>>,
 }
 
 /// What an app does when another member takes a key from its member.
@@ -231,6 +238,7 @@ impl AppMember {
             unclaimed: OnceLock::new(),
             key_through: OnceLock::new(),
             reported: Mutex::new(BTreeSet::new()),
+            plan: Mutex::new(None),
         })
     }
 
@@ -457,6 +465,7 @@ impl AppMember {
             app: self.id.app.clone(),
             node: self.id.node,
             host: self.id.host.clone(),
+            card: self.id.card,
             build: self.id.build.clone(),
             rejected: self.rejected.load(Ordering::Relaxed),
             model: self.id.model.clone(),
@@ -658,6 +667,12 @@ impl AppMember {
                 }
                 lock(&self.members)[c] = Some(m);
             }
+            Frame::Plan(plan) => {
+                let mut kept = lock(&self.plan);
+                if kept.as_ref().is_none_or(|k| plan.epoch > k.epoch) {
+                    *kept = Some(plan);
+                }
+            }
             Frame::Claim(claim) => {
                 // Claimed again: whatever this member reported of it is for a
                 // release that is over.
@@ -842,6 +857,13 @@ impl AppMember {
     /// Every member of the app this member sees across its clusters — the
     /// union of their `MEMBERS` lists, one entry per node, in node order. What
     /// rendezvous weighs (§9.5).
+    /// The newest plan a gateway sent, `None` before the first: the weights
+    /// this app's characters are lent by (`docs/cooperative_admission.md`
+    /// §4.4).
+    pub fn plan(&self) -> Option<Plan> {
+        lock(&self.plan).clone()
+    }
+
     pub fn group(&self) -> Vec<MemberInfo> {
         let mut by_node: BTreeMap<u64, MemberInfo> = BTreeMap::new();
         for m in lock(&self.members).iter().flatten() {
@@ -988,6 +1010,7 @@ mod tests {
                 app: "zend".into(),
                 node: 1,
                 host: "m".into(),
+                card: 1,
                 build: BuildId {
                     count: 1,
                     hash: "h".into(),
@@ -1052,6 +1075,26 @@ mod tests {
         assert_eq!(*lock(&told), vec![b"c-1".to_vec()]);
         member.on_frame(0, Frame::Claim(taken), false);
         assert_eq!(lock(&told).len(), 1, "told once");
+    }
+
+    /// **The newest plan stands, whichever gateway sent it** (§4.4 of
+    /// `docs/cooperative_admission.md`): an older plan arriving late on
+    /// another socket changes nothing, and none before the first.
+    #[test]
+    fn the_newest_plan_stands() {
+        let member = alone();
+        assert_eq!(member.plan(), None);
+        let plan = |epoch, weight| Plan {
+            epoch,
+            weights: vec![(1, weight)],
+        };
+        member.on_frame(0, Frame::Plan(plan(3, 75)), false);
+        member.on_frame(1, Frame::Plan(plan(2, 300)), false);
+        assert_eq!(member.plan(), Some(plan(3, 75)));
+        assert_eq!(member.plan().and_then(|p| p.weight_of(1)), Some(75));
+        assert_eq!(member.plan().and_then(|p| p.weight_of(9)), None);
+        member.on_frame(1, Frame::Plan(plan(4, 0)), false);
+        assert_eq!(member.plan(), Some(plan(4, 0)));
     }
 
     /// Without following use the claim outlives its uses, and nothing is told.

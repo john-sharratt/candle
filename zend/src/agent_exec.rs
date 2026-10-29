@@ -226,6 +226,7 @@ mod tests {
                 app: "zend".into(),
                 node: 1,
                 host: "m".into(),
+                card: 1,
                 build: BuildId {
                     count: 1,
                     hash: "h".into(),

@@ -10,6 +10,11 @@ pub struct Hello {
     pub app: String,
     pub node: u64,
     pub host: String,
+    /// The process it runs in, drawn at random once when that process starts:
+    /// every tenant of one motherd names the same, so the gateway counts their
+    /// work against one card (`docs/cooperative_admission.md` §4.2). Zero for
+    /// a sender that is no card — a peer gateway.
+    pub card: u64,
     pub build: BuildId,
     /// The group rejected this build, by the certification verdicts in the
     /// member's own substrate: it never sets a floor and is never a candidate,
@@ -30,7 +35,8 @@ impl Hello {
         w.u16(self.proto)
             .str(&self.app)
             .u64(self.node)
-            .str(&self.host);
+            .str(&self.host)
+            .u64(self.card);
         self.build.write(w);
         w.bool(self.rejected)
             .option(self.model.as_ref(), |w, m| m.write(w))
@@ -46,6 +52,7 @@ impl Hello {
             app: r.str()?,
             node: r.u64()?,
             host: r.str()?,
+            card: r.u64()?,
             build: BuildId::read(r)?,
             rejected: r.bool()?,
             model: r.option(ModelId::read)?,

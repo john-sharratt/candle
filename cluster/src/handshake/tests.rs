@@ -21,6 +21,7 @@ fn hello(node: u64) -> Hello {
         app: "zend".into(),
         node,
         host: ".5".into(),
+        card: node,
         build: BuildId {
             count: 10,
             hash: "abc".into(),

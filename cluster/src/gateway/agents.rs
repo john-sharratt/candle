@@ -137,6 +137,7 @@ mod tests {
         MemberView {
             node,
             host: format!("a{node}"),
+            card: node,
             app: "agent".into(),
             build: BuildId {
                 count: 1,

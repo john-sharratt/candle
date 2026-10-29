@@ -14,6 +14,11 @@ mod load;
 mod log;
 mod open_answers;
 mod paxos_log;
+mod placement;
+mod planner;
+mod queue;
+#[cfg(test)]
+mod queue_tests;
 mod registry;
 mod relay;
 mod status;
@@ -39,6 +44,7 @@ pub use hub::{
 pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};
 pub use paxos_log::paxos_step;
+pub use queue::{Placing, Urgency, HOLD};
 pub use registry::{MemberView, Pick, Registry};
 pub use status::{
     state_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,

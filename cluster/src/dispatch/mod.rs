@@ -79,6 +79,18 @@ impl Dispatch {
         Dispatch::Owner(KeySource::Path(param.into()))
     }
 
+    /// The dispatch's kind, as the placement log names it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Dispatch::Best => "best",
+            Dispatch::Sticky(_) => "sticky",
+            Dispatch::Owner(_) => "owner",
+            Dispatch::Aggregate(_) => "aggregate",
+            Dispatch::Any => "any",
+            Dispatch::Ui => "ui",
+        }
+    }
+
     /// Whether the gateway must buffer the request body to route it.
     pub fn reads_body(&self) -> bool {
         let reads = |k: &KeySource| matches!(k, KeySource::Body(_) | KeySource::Derived(_));

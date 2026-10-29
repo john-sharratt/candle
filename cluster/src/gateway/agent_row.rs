@@ -96,6 +96,7 @@ mod tests {
         let mut agent = MemberView {
             node: 0xa1,
             host: "build-1".into(),
+            card: 0xa1,
             app: "agent".into(),
             build: BuildId {
                 count: 7,

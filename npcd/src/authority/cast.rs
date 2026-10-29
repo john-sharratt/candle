@@ -9,11 +9,12 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use cluster::consensus::rendezvous::Weighted;
 use cluster::frame::MemberState;
 
-use super::npc_lease::{hex, leases_of};
+use super::npc_lease::{by_plan, hex, leases_of};
 use super::ops::{OpReply, WorldOp};
 use crate::engine::environment;
 use crate::engine::event::{EventKind, Salience};
@@ -39,6 +40,15 @@ impl Runtime {
             .collect();
         let joined = group.iter().map(|m| m.node).collect();
         (ready, joined)
+    }
+
+    /// The npcd members characters are lent among: [`Self::npcd_members`]
+    /// weighted by the gateway's plan (`docs/cooperative_admission.md` §4.4),
+    /// or as they stand before any plan. Worlds keep the admitted powers.
+    pub(crate) fn lending_members(&self) -> (Vec<Weighted>, BTreeSet<u64>) {
+        let (ready, joined) = self.npcd_members();
+        let plan = self.standing.member().and_then(|m| m.plan());
+        (by_plan(ready, plan.as_ref()), joined)
     }
 
     /// Take in characters created, changed or deleted on other members. The
@@ -126,8 +136,19 @@ impl Runtime {
                         let ready = lease
                             .and_then(|l| l.after)
                             .is_none_or(|a| applied(a.origin) >= a.through);
+                        let now = Instant::now();
                         if ready {
+                            if let Some(waited) = self.standing.arrived(npc, now) {
+                                tracing::info!(
+                                    target: "npcd::authority::lease",
+                                    npc,
+                                    waited_ms = waited.as_millis() as u64,
+                                    "arrived"
+                                );
+                            }
                             self.wake_character(npc);
+                        } else {
+                            self.standing.arriving(npc, now);
                         }
                     }
                     (true, true) => {

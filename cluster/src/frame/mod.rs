@@ -26,7 +26,9 @@ pub use builds::{BuildArtifacts, BuildChunk, BuildFetch, Verdict, VerdictResult,
 pub use consensus::{Accepted, AcceptedValue, Nack, Prepare, Promise, Propose, Release};
 pub use handshake::{Admit, Challenge, Hello, Prove};
 pub use kind::{Kind, Lane, FLAG_ADDRESSED, FLAG_CATCHUP, FLAG_TIEBREAK};
-pub use membership::{Capacity, Claim, Complete, Coord, Members, Routes, Unclaim, PLACEMENT_WIDE};
+pub use membership::{
+    Capacity, Claim, Complete, Coord, Members, Plan, Routes, Unclaim, PLACEMENT_WIDE,
+};
 pub use packing::{read_applied, write_applied};
 pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
 pub use pulse::Pulse;
@@ -60,6 +62,7 @@ pub enum Frame {
     Unclaim(Unclaim),
     Coord(Coord),
     Complete(Complete),
+    Plan(Plan),
     Prepare(Prepare),
     Promise(Promise),
     Nack(Nack),
@@ -141,6 +144,7 @@ impl Frame {
             Frame::Unclaim(_) => Kind::Unclaim,
             Frame::Coord(_) => Kind::Coord,
             Frame::Complete(_) => Kind::Complete,
+            Frame::Plan(_) => Kind::Plan,
             Frame::Prepare(_) => Kind::Prepare,
             Frame::Promise(_) => Kind::Promise,
             Frame::Nack(_) => Kind::Nack,
@@ -261,6 +265,7 @@ impl Frame {
                 w.blob(&b.state);
             }
             Frame::Complete(b) => b.write(&mut w),
+            Frame::Plan(b) => b.write(&mut w),
             Frame::Prepare(b) => b.write(&mut w),
             Frame::Promise(b) => b.write(&mut w),
             Frame::Nack(b) => b.write(&mut w),
@@ -352,6 +357,7 @@ impl Frame {
                 state: r.blob_vec()?,
             }),
             Kind::Complete => Frame::Complete(Complete::read(&mut r)?),
+            Kind::Plan => Frame::Plan(Plan::read(&mut r)?),
             Kind::Prepare => Frame::Prepare(Prepare::read(&mut r)?),
             Kind::Promise => {
                 let mut body = Promise::read(&mut r)?;
@@ -431,6 +437,7 @@ pub fn name(kind: Kind) -> &'static str {
         Kind::Unclaim => "UNCLAIM",
         Kind::Coord => "COORD",
         Kind::Complete => "COMPLETE",
+        Kind::Plan => "PLAN",
         Kind::Prepare => "PREPARE",
         Kind::Promise => "PROMISE",
         Kind::Nack => "NACK",

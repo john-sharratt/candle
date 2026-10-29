@@ -72,6 +72,7 @@ fn member(hub: &Arc<Hub>, node: u64) -> Arc<AppMember> {
             app: "zend".into(),
             node,
             host: format!("m{node}"),
+            card: node,
             build: BuildId {
                 count: 1,
                 hash: "h".into(),

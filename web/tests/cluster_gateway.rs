@@ -256,6 +256,7 @@ fn joined(gateway: SocketAddr, node: u64, power: u32, ready: bool) -> Member {
             app: "zend".into(),
             node,
             host: format!("m{node}"),
+            card: node,
             build: BuildId {
                 count: 7,
                 hash: "h7".into(),

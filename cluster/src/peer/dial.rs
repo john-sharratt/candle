@@ -30,6 +30,8 @@ impl Peering {
             app: GATEWAY_APP.to_string(),
             node: me.node,
             host: name.clone(),
+            // A gateway is no card: it runs no work a placement counts.
+            card: 0,
             build: me.build.clone(),
             rejected: false,
             model: None,

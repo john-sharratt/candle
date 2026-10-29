@@ -222,6 +222,7 @@ mod tests {
             app: app.into(),
             node,
             host: format!("m{node}"),
+            card: node,
             build,
             rejected: false,
             model,

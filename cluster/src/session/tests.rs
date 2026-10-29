@@ -283,6 +283,7 @@ async fn a_handshake_frame_after_admission_is_closed_4400() {
         app: "zend".into(),
         node: 1,
         host: String::new(),
+        card: 1,
         build: BuildId {
             count: 1,
             hash: String::new(),

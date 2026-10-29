@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::Router;
+use cluster::card;
 use cluster::dispatch::{Dispatch, Route, RouteTable};
 use cluster::frame::{Capacity, MemberState};
 use cluster::gateway::MCP;
@@ -100,6 +101,7 @@ pub fn join(config: &Config, router: Router) -> anyhow::Result<()> {
             app: MCP.to_string(),
             node,
             host: c.host.clone(),
+            card: card::this(),
             build: this_build(),
             model: None,
             repos: Vec::new(),
