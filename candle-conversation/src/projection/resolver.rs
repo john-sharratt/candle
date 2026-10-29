@@ -995,13 +995,13 @@ impl Conversation {
         let mut windows: Vec<SigWindow> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
         let mut sids: Vec<StreamId> = Vec::new();
-        // A tagged collection admits only turns in a gather scope, which the
-        // substrate indexes; an untagged one admits dialogue, which is every
-        // other turn, so it walks them all.
+        // A tagged collection admits only turns carrying its tags, which the
+        // substrate indexes by tag; an untagged one admits dialogue, which is
+        // every other turn, so it walks them all.
         let streams: Box<dyn Iterator<Item = TurnStream<'_>>> = if tags.is_empty() {
             Box::new(sub.all_turn_streams())
         } else {
-            Box::new(sub.tagged_turn_streams())
+            Box::new(sub.tagged_turn_streams(tags))
         };
         for turn in streams {
             let (sid, d) = (turn.stream_id, turn.decl);

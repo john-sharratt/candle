@@ -51,6 +51,7 @@ mod replicated_state;
 mod stamps;
 mod stream_index;
 mod supersession;
+mod tag_index;
 mod tombstones;
 mod turn_placement;
 
@@ -98,7 +99,6 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
-use crate::working_set::marks::is_dialogue;
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
 use deleted_set::DeletedSet;
@@ -109,6 +109,7 @@ use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
 use stream_index::{Declared, StreamIndex};
 pub use stream_index::{StreamKey, TurnStream};
+use tag_index::TagIndex;
 pub use tombstones::TurnMark;
 pub use turn_placement::RestoredTurn;
 
@@ -318,15 +319,16 @@ pub struct Substrate {
     streams: StreamIndex,
 
     /// The streams of `streams` whose declaration is a turn in a gather scope —
-    /// one carrying a tag that is not a working-set mark — kept in step with
-    /// every declaration installed and every stream removed.
+    /// one carrying a tag that is not a working-set mark — by tag, kept in step
+    /// with every declaration installed and every stream removed.
     ///
-    /// A tagged collection's gallery is drawn from these alone, and they are a
-    /// small fixed corpus (the tool calibration turns) beside a substrate of
-    /// every turn and chunk stream ingest has written. Walking all of `streams`
-    /// to find them was ~115 ms, paid on the first reprojection after every
-    /// seal anywhere in the workspace.
-    tagged_turns: BTreeSet<StreamKey>,
+    /// A tagged collection's gallery is drawn from the turns carrying its tags
+    /// alone: the tool catalog's few thousand beside a substrate of every turn
+    /// and chunk stream ingest has written. Walking all of `streams` to find
+    /// them was ~115 ms, and walking every gather scope's turns, ~75 ms, both
+    /// paid on the first reprojection after every seal anywhere in the
+    /// workspace. See [`TagIndex`].
+    tagged_turns: TagIndex,
 
     /// Bumped whenever anything a collection's belief gallery is assembled from
     /// changes — a stream declared, a signature or projection-event blob
@@ -4786,7 +4788,10 @@ impl Substrate {
             }
         }
         let key = StreamKey::of(stream_id, &id);
-        let tagged = matches!(&decl, StreamDecl::Turn(t) if !is_dialogue(&t.tags));
+        let turn_tags: Vec<String> = match &decl {
+            StreamDecl::Turn(t) => t.tags.clone(),
+            _ => Vec::new(),
+        };
         let section = matches!(decl, StreamDecl::PromptSection(_));
         let generation = SectionGeneration {
             writer: key.writer,
@@ -4824,11 +4829,7 @@ impl Substrate {
                 moved.push(stream_id);
             }
         }
-        if tagged {
-            self.tagged_turns.insert(key);
-        } else {
-            self.tagged_turns.remove(&key);
-        }
+        self.tagged_turns.set(key, &turn_tags);
         self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
@@ -4873,12 +4874,17 @@ impl Substrate {
         }
     }
 
-    /// Every stream declared as a turn in a gather scope — the members a
-    /// tagged collection's gallery is drawn from. See the `tagged_turns` field.
-    pub fn tagged_turn_streams(&self) -> impl Iterator<Item = TurnStream<'_>> + '_ {
+    /// Every stream declared as a turn carrying one of `tags`, in stream-key
+    /// order — the members a collection tagged `tags` draws its gallery from.
+    /// See the `tagged_turns` field.
+    pub fn tagged_turn_streams(
+        &self,
+        tags: &[String],
+    ) -> impl Iterator<Item = TurnStream<'_>> + '_ {
         self.tagged_turns
-            .iter()
-            .filter_map(|key| self.streams.turn(*key))
+            .with_any(tags)
+            .into_iter()
+            .filter_map(|key| self.streams.turn(key))
     }
 
     /// Every declared turn, each at its position in its timeline.
@@ -5852,7 +5858,7 @@ impl Substrate {
                     writer: 0,
                 };
                 moved.extend(self.streams.remove_writer(key));
-                self.tagged_turns.remove(&key);
+                self.tagged_turns.remove(key);
             }
         }
         self.forget_memos(&moved);
@@ -12496,7 +12502,7 @@ mod tests {
             })
         };
         let tagged = |sub: &Substrate| {
-            sub.tagged_turn_streams()
+            sub.tagged_turn_streams(&["tool".to_string()])
                 .map(|t| t.stream_id)
                 .collect::<Vec<_>>()
         };
