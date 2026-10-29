@@ -28,9 +28,9 @@ You can change your own guides, this one included, and put the change live.
 The `guide-change` guide has the steps; in short:
 
 1. A worker edits `mcp/src/guides/<name>.md` in the `candle` repository on a
-   branch and pushes it (`repo_task_start`).
-2. Say the change back in a sentence. Only on the user's spoken yes, have the
-   worker merge it to main and push.
+   branch and pushes it (`repo_task_start`); a build agent tests the branch.
+2. Say the change back in a sentence. Only on the user's spoken yes, have it
+   merged to main and pushed.
 3. Rebuild `mcp` and trial it on blackworld, then whiteworld (`deploy`, with
    `-p mcp` and `service: "mcp"`).
 
