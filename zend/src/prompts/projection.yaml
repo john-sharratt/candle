@@ -84,6 +84,13 @@ rope:
 
 default_policy:
   preset: high_recall_scope
+  # The GPU gallery holds the first two tokens of each code within a turn,
+  # content and calibration questions alike (docs/gallery_dedup.md); the
+  # substrate keeps every token. On code_reading's 600 held-out questions,
+  # R@1 / R@10 / MRR 0.362 / 0.683 / 0.462 with every token, 0.372 / 0.702 /
+  # 0.473 holding ~44% of them.
+  gallery_keep: 2
+  calibration_gallery_keep: 2
 
 
 # ── Layers ───────────────────────────────────────────────────────────────────
