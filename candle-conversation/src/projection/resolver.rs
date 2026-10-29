@@ -930,6 +930,13 @@ impl Conversation {
         )
     }
 
+    /// Send `mutation` to the substrate and return at once — see
+    /// [`SubstrateLock::send`]. For a thread that must not wait for the lock,
+    /// making a mutation whose result it does not read back.
+    pub fn send(&self, mutation: impl FnOnce(&mut Substrate) + Send + 'static) {
+        self.inner.send(mutation);
+    }
+
     /// Acquire a write guard for mutating operations (append, set_*).
     #[track_caller]
     pub fn write(&self) -> SubstrateWrite<'_> {

@@ -44,6 +44,7 @@ mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
+mod ingest_demote;
 mod injected_piece;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -3785,6 +3786,9 @@ pub(crate) struct Scheduler {
     /// RAM at ~50% capacity — long before the near-cap eviction ladder — keeping
     /// only a small rolling hot window resident during a bulk repo ingest.
     ingest_timelines: HashSet<TimelineId>,
+    /// The ingest demotes sent to the substrates, and what the applied ones
+    /// shed — dropped on this thread (`ingest_demote`).
+    ingest_demotes: ingest_demote::IngestDemotes,
 
     /// Set while `drain_submissions` runs: `apply_projection` defers each
     /// no-deferred-user gap-fill (ingest / compression) into `deferred_glue_fires`
@@ -4248,6 +4252,7 @@ impl Scheduler {
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
             ingest_timelines: HashSet::new(),
+            ingest_demotes: ingest_demote::IngestDemotes::default(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
             gallery_misses_seen: None,

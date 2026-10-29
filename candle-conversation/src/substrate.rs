@@ -45,6 +45,7 @@ mod dominance;
 mod ended_sections;
 mod label_records;
 mod lock;
+mod mutation_queue;
 #[cfg(test)]
 mod order_independence_tests;
 mod pending;
@@ -3432,6 +3433,12 @@ impl Substrate {
     /// Everything else is walked oldest-first off `hot_lru` (least-recently
     /// promoted ≈ least-recently active) and demoted until `target_bytes` is met —
     /// so a settled conversation's cold tail is shed before an active one's window.
+    ///
+    /// **The hot copies are handed back, not dropped.** A demote runs on
+    /// whichever thread applies it (`docs/substrate_mutation_queue.md` §2), and
+    /// a device chunk freed off the scheduler thread can land inside a KV
+    /// compaction pass; the caller returns them to the scheduler, which drops
+    /// them on its own thread.
     pub fn demote_cold_ingest(
         &mut self,
         ingest_timelines: &std::collections::HashSet<TimelineId>,
@@ -3439,9 +3446,9 @@ impl Substrate {
         keep_sections: &[SectionId],
         keep_recent: usize,
         target_bytes: u64,
-    ) -> EvictionReport {
+    ) -> (EvictionReport, Vec<Vec<SealedSequence>>) {
         if target_bytes == 0 {
-            return EvictionReport { count: 0, bytes: 0 };
+            return (EvictionReport { count: 0, bytes: 0 }, Vec::new());
         }
         // Protected residence: live working sets + each ingest timeline's rolling
         // window. Also collect which residence belongs to an ingest timeline —
@@ -3499,8 +3506,9 @@ impl Substrate {
             }
         }
         let count = victims.len();
+        let mut taken: Vec<Vec<SealedSequence>> = Vec::with_capacity(count);
         for idx in &victims {
-            self.residence[idx.0].hot = None;
+            taken.extend(self.residence[idx.0].hot.take());
             Self::remove_from_lru(&mut self.hot_lru, *idx);
         }
         if count > 0 {
@@ -3513,10 +3521,13 @@ impl Substrate {
                 "demote_cold_ingest (gentle-early, LRU) complete"
             );
         }
-        EvictionReport {
-            count,
-            bytes: freed,
-        }
+        (
+            EvictionReport {
+                count,
+                bytes: freed,
+            },
+            taken,
+        )
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -10485,7 +10496,12 @@ mod tests {
         // keep_recent = 2 → protect t3, t4 (the rolling window); no live working
         // set; unbounded target → demote the whole LRU tail t0, t1, t2 (all
         // warm-backed), oldest-first.
-        let report = sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX);
+        let (report, taken) = sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX);
+        assert_eq!(
+            taken.len(),
+            report.count,
+            "every demoted hot copy is handed back"
+        );
         assert_eq!(report.count, 3, "t0,t1,t2 demoted; t3,t4 window kept");
         assert_eq!(report.bytes, 300_000_000);
         for r in [t0, t1, t2] {
@@ -10507,7 +10523,9 @@ mod tests {
         // Idempotent: the demoted turns are now warm-only, so a second pass frees
         // nothing.
         assert_eq!(
-            sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX).count,
+            sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX)
+                .0
+                .count,
             0,
             "already demoted"
         );
@@ -10530,7 +10548,7 @@ mod tests {
         // keep_recent = 0 (nothing protected), target = 150 MB → the walk frees t0
         // (100 MB, still < target) then t1 (200 MB, ≥ target) and stops. t2, t3 stay
         // hot.
-        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, 150_000_000);
+        let (report, _) = sub.demote_cold_ingest(&ingest, &[], &[], 0, 150_000_000);
         assert_eq!(report.count, 2, "only the two oldest shed to meet target");
         assert_eq!(report.bytes, 200_000_000);
         assert!(sub.residence[t0.0].hot.is_none(), "oldest demoted");
@@ -10564,7 +10582,7 @@ mod tests {
         // Never registered on this substrate.
         ingest.insert(TimelineId::from_raw(4242).unwrap());
 
-        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
+        let (report, _) = sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
         assert_eq!(report.count, 2, "the registered ingest turns still demote");
         for r in [a, b] {
             assert!(sub.residence[r.0].hot.is_none(), "demoted");
@@ -10582,7 +10600,7 @@ mod tests {
 
         // Empty ingest set → this timeline is not an ingest timeline, so even an
         // unbounded target frees nothing.
-        let report =
+        let (report, _) =
             sub.demote_cold_ingest(&std::collections::HashSet::new(), &[], &[], 0, u64::MAX);
         assert_eq!(report.count, 0);
         for r in [a, b, c] {

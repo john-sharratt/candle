@@ -12,21 +12,31 @@
 //! The shape is `RwLock`'s — `read`, `write`, `try_read`, `try_write`, each a
 //! `LockResult` whose poison carries the guard — so a caller written against
 //! the std lock reads the same against this one.
+//!
+//! It also carries the substrate's [`MutationQueue`]: a mutation sent with
+//! [`SubstrateLock::send`] is applied by the next write acquisition, which
+//! drains the queue before handing out its guard
+//! (`docs/substrate_mutation_queue.md` §2).
 
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::{
-    LockResult, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, TryLockResult,
+    Arc, LockResult, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+    TryLockResult,
 };
 use std::time::{Duration, Instant};
 
+use super::mutation_queue::{Mutation, MutationQueue};
 use super::Substrate;
 
 /// A wait for the lock, or a hold of it, at least this long is logged.
 pub const SLOW: Duration = Duration::from_millis(250);
 
 /// See the module documentation.
-pub struct SubstrateLock(RwLock<Substrate>);
+pub struct SubstrateLock {
+    lock: RwLock<Substrate>,
+    queue: MutationQueue,
+}
 
 /// Which side of the lock an acquisition took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +122,24 @@ fn wrap_try<G, T>(result: TryLockResult<G>, wrap: impl FnOnce(G) -> T) -> TryLoc
 
 impl SubstrateLock {
     pub fn new(substrate: Substrate) -> Self {
-        SubstrateLock(RwLock::new(substrate))
+        SubstrateLock {
+            lock: RwLock::new(substrate),
+            queue: MutationQueue::default(),
+        }
+    }
+
+    /// Send `mutation` to the substrate and return at once: it is applied, in
+    /// order with every other, by the next write acquisition or the substrate's
+    /// applier thread. For a mutation whose result its sender does not read
+    /// back — a read before it is applied sees the substrate without it.
+    pub fn send(self: &Arc<Self>, mutation: impl FnOnce(&mut Substrate) + Send + 'static) {
+        let mutation: Mutation = Box::new(mutation);
+        self.queue.send(self, mutation);
+    }
+
+    /// Whether a sent mutation is waiting to be applied.
+    pub fn has_pending(&self) -> bool {
+        self.queue.is_pending()
     }
 
     /// A shared hold, waiting for it; the wait and the hold are timed against
@@ -121,7 +148,7 @@ impl SubstrateLock {
     pub fn read(&self) -> LockResult<SubstrateReadGuard<'_>> {
         let site = Location::caller();
         let asked = Instant::now();
-        let result = self.0.read();
+        let result = self.lock.read();
         note_wait(Side::Read, site, asked.elapsed());
         wrap_lock(result, |guard| SubstrateReadGuard {
             guard,
@@ -134,28 +161,22 @@ impl SubstrateLock {
     }
 
     /// An exclusive hold, waiting for it; the wait and the hold are timed
-    /// against the caller's site.
+    /// against the caller's site. Every mutation sent before it is applied
+    /// before the guard is handed out.
     #[track_caller]
     pub fn write(&self) -> LockResult<SubstrateWriteGuard<'_>> {
         let site = Location::caller();
         let asked = Instant::now();
-        let result = self.0.write();
+        let result = self.lock.write();
         note_wait(Side::Write, site, asked.elapsed());
-        wrap_lock(result, |guard| SubstrateWriteGuard {
-            guard,
-            held: Held {
-                side: Side::Write,
-                site,
-                since: Instant::now(),
-            },
-        })
+        wrap_lock(result, |guard| self.drained(guard, site))
     }
 
     /// A shared hold if one is free now; the hold is timed.
     #[track_caller]
     pub fn try_read(&self) -> TryLockResult<SubstrateReadGuard<'_>> {
         let site = Location::caller();
-        wrap_try(self.0.try_read(), |guard| SubstrateReadGuard {
+        wrap_try(self.lock.try_read(), |guard| SubstrateReadGuard {
             guard,
             held: Held {
                 side: Side::Read,
@@ -165,18 +186,30 @@ impl SubstrateLock {
         })
     }
 
-    /// An exclusive hold if one is free now; the hold is timed.
+    /// An exclusive hold if one is free now; the hold is timed, and every
+    /// mutation sent before it is applied before the guard is handed out.
     #[track_caller]
     pub fn try_write(&self) -> TryLockResult<SubstrateWriteGuard<'_>> {
         let site = Location::caller();
-        wrap_try(self.0.try_write(), |guard| SubstrateWriteGuard {
+        wrap_try(self.lock.try_write(), |guard| self.drained(guard, site))
+    }
+
+    /// `guard` with the sent mutations applied, timed from now.
+    fn drained<'a>(
+        &self,
+        mut guard: RwLockWriteGuard<'a, Substrate>,
+        site: &'static Location<'static>,
+    ) -> SubstrateWriteGuard<'a> {
+        let since = Instant::now();
+        self.queue.drain(&mut guard);
+        SubstrateWriteGuard {
             guard,
             held: Held {
                 side: Side::Write,
                 site,
-                since: Instant::now(),
+                since,
             },
-        })
+        }
     }
 }
 
@@ -257,6 +290,41 @@ mod tests {
         drop(read);
         wrote.recv().unwrap();
         writer.join().unwrap();
+    }
+
+    /// **A write sees every mutation sent before it, applied in the order
+    /// sent** — whether the applier took some of them first or the write
+    /// drains them itself — so a synchronous writer never overtakes a message.
+    #[test]
+    fn a_write_sees_every_message_sent_before_it_in_order() {
+        let lock = Arc::new(SubstrateLock::new(Substrate::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..100u32 {
+            let order = Arc::clone(&order);
+            lock.send(move |_| order.lock().unwrap().push(i));
+        }
+        drop(lock.write().unwrap());
+        assert_eq!(*order.lock().unwrap(), (0..100).collect::<Vec<u32>>());
+        assert!(!lock.has_pending());
+    }
+
+    /// **A message is applied with no other writer**: the applier takes the
+    /// lock for it. And it waits out a reader rather than skipping — the
+    /// message lands once the read lets go.
+    #[test]
+    fn the_applier_applies_a_message_once_a_reader_lets_go() {
+        let lock = Arc::new(SubstrateLock::new(Substrate::new()));
+        let (applied, done) = flume::bounded(1);
+        let read = lock.read().unwrap();
+        lock.send(move |_| applied.send(()).unwrap());
+        assert!(
+            done.recv_timeout(Duration::from_millis(300)).is_err(),
+            "applied under a reader"
+        );
+        drop(read);
+        done.recv_timeout(Duration::from_secs(10))
+            .expect("the applier never applied the message");
+        assert!(!lock.has_pending());
     }
 
     /// **A poisoned lock hands back its guard**, as the std lock does, so a
