@@ -598,10 +598,12 @@ impl HybridBatched {
     /// ([`RecurrentStateStore::fork_from`]), and the copy is seeded so the
     /// child's first wave does not reset it back to zero.
     ///
-    /// A parent whose snapshot is still held has no store to copy: the child
-    /// is built straight from the snapshot, and the parent keeps holding it for
-    /// its next view — one store per turn in flight, never one idling on the
-    /// parent beside it.
+    /// A parent whose snapshot is still held has no store to copy, and the
+    /// child is held the same snapshot rather than a store built from it: its
+    /// store is built when its state is first wanted, at its first wave, so a
+    /// fork waiting for its turn holds no device ground. The parent keeps
+    /// holding its snapshot for its next view — one store per turn in flight,
+    /// never one idling on the parent beside it.
     ///
     /// Errors when the parent carries no state: a fork of nothing is a caller
     /// bug, and returning quietly would hand the child zeros — which is the
@@ -611,24 +613,23 @@ impl HybridBatched {
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let forked = match map.get(&parent) {
-            Some(store) => store.fork_from()?,
+        match map.get(&parent) {
+            Some(store) => {
+                let forked = store.fork_from()?;
+                map.insert(child, forked);
+            }
             None => {
-                let staged = self.staged_map()?.get(&parent).cloned().ok_or_else(|| {
+                let mut staged = self.staged_map()?;
+                let held = staged.get(&parent).cloned().ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "qwen35: fork_recurrent from sequence {parent}, which carries no \
                          recurrent state — handing {child} zeros here is the amnesia this \
                          path exists to prevent"
                     ))
                 })?;
-                staged.build(
-                    &self.model.cfg.layer_kinds,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                )?
+                staged.insert(child, held);
             }
-        };
-        map.insert(child, forked);
+        }
         Ok(())
     }
 
@@ -640,6 +641,9 @@ impl HybridBatched {
     /// it over the turn's tokens, so what it holds now is what the parent's
     /// state becomes.
     ///
+    /// A child still holding only the snapshot it forked never ran a wave, so
+    /// it advanced nothing: its snapshot goes and the parent keeps what it has.
+    ///
     /// Errors when the child carries none, for the same reason as
     /// [`Self::fork_recurrent`]: silently leaving the parent's stale state in
     /// place would lose the turn without saying so.
@@ -648,6 +652,9 @@ impl HybridBatched {
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        if !map.contains_key(&child) && self.staged_map()?.remove(&child).is_some() {
+            return Ok(());
+        }
         let store = map.remove(&child).ok_or_else(|| {
             candle::Error::Msg(format!(
                 "qwen35: move_recurrent from sequence {child}, which carries no \

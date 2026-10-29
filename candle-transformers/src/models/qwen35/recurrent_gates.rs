@@ -14,6 +14,8 @@
 //! wrong produces text that is entirely fluent — which is the failure signature
 //! this whole area is built around (`docs/deltanet_state_persistence.md` §6).
 
+use std::sync::Arc;
+
 use candle::{DType, Device, Result, Tensor};
 
 use crate::models::batch_test::test_helpers::{gate_pack, hf_get};
@@ -305,6 +307,73 @@ fn a_fork_and_its_parent_produce_identical_continuations() -> Result<()> {
         diff(&parent_state, &export(&model, child)?).is_empty(),
         "identical tokens but different state — the continuations agreed by \
          accident of the attention layers, not because the recurrence carried"
+    );
+    Ok(())
+}
+
+// ── A fork of a held snapshot holds no store until it runs ───────────────────
+
+/// **A fork of a parent whose state is held as a snapshot builds no store
+/// until its first wave**, and a fork finalized without one leaves its parent
+/// as it was.
+///
+/// The parent's state is a real prefill's, exported and staged on a second
+/// sequence — a parked conversation after `unpark_from_record`. The fork is held
+/// the same snapshot: nothing on the card until the child runs, then a store
+/// holding exactly the snapshot's bytes. A second fork, finalized before it ever
+/// runs (a turn cancelled while it queued), moves nothing onto the parent.
+#[test]
+#[ignore = "Tier 2: loads the pinned Qwen3.6-35B-A3B GGUF (22 GB) and needs a GPU (~2 min)."]
+fn a_fork_of_a_held_snapshot_builds_its_store_at_its_first_wave() -> Result<()> {
+    eprintln!("run with: {RUN}");
+    let (model, device) = load()?;
+    let ids = prompt_tokens()?;
+    let mut session = model.create_batched_session(BatchedConfig::default())?;
+
+    let ran = session.create_sequence()?;
+    feed(&model, &mut session, ran, &ids, &device)?;
+    let (hash, layers) = ManagedBatchedModel::export_recurrent(&model, ran)?
+        .ok_or_else(|| candle::Error::Msg("the prefill left no recurrent state".into()))?;
+
+    let parent = session.create_sequence()?;
+    model.stage_recurrent(parent, hash, Arc::from(layers.clone()))?;
+    let stores = model.recurrent_len()?;
+    let child = session.create_sequence()?;
+    model.fork_recurrent(parent, child)?;
+    assert!(
+        !model.has_recurrent(child)?,
+        "the fork built its store before it ran"
+    );
+    assert!(
+        model.holds_recurrent(child)?,
+        "the fork holds no state at all"
+    );
+    assert_eq!(
+        model.recurrent_len()?,
+        stores,
+        "the fork put a store on the card"
+    );
+    assert!(
+        diff(&layers, &export(&model, child)?).is_empty(),
+        "the fork does not hold the parent's snapshot"
+    );
+
+    feed(&model, &mut session, child, &ids[..1], &device)?;
+    assert!(
+        model.has_recurrent(child)?,
+        "the child's first wave built no store"
+    );
+
+    let unrun = session.create_sequence()?;
+    model.fork_recurrent(parent, unrun)?;
+    model.move_recurrent(unrun, parent)?;
+    assert!(
+        !model.holds_recurrent(unrun)?,
+        "the finalized fork still holds its snapshot"
+    );
+    assert!(
+        diff(&layers, &export(&model, parent)?).is_empty(),
+        "finalizing a fork that never ran changed its parent"
     );
     Ok(())
 }

@@ -670,6 +670,106 @@ mod tests {
         Ok(())
     }
 
+    /// **A fork of a parent whose state is held as a snapshot holds that
+    /// snapshot, not a store, until it is admitted.** The parent's state is a
+    /// real prefill's, exported and staged on a second sequence — what a parked
+    /// conversation is after `unpark_from_record`. Forking it builds nothing on
+    /// the card; the parent keeps its snapshot for its next view; and the claim
+    /// admission makes builds the child a store holding exactly the snapshot's
+    /// bytes. Built at the fork instead, every ephemeral fork waiting for
+    /// admission held ~288 MiB.
+    #[test]
+    #[ignore = "loads this card's engine artifact and needs the GPU alone. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::a_fork_of_a_staged_parent_claims_its_store_at_admission \
+                -- --ignored --nocapture --test-threads=1"]
+    fn a_fork_of_a_staged_parent_claims_its_store_at_admission() -> Result<()> {
+        use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
+        use crate::models::delta_net::ExportedLayerState;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use std::sync::Arc;
+
+        let pack = engine()?;
+        let device = Device::new_cuda(0)?;
+        let model = Qwen4ExpBatched::new(Qwen4ExpGpu::load(&pack, &device)?)?;
+        let tok = tokenizer()?;
+        let ids: Vec<u32> = tok
+            .encode(
+                "The capital of France is Paris, and the capital of Spain is",
+                true,
+            )
+            .map_err(|e| candle::Error::Msg(format!("encode: {e}")))?
+            .get_ids()
+            .to_vec();
+        let mut session = model.create_batched_session(BatchedConfig::default())?;
+        let ran = session.create_sequence()?;
+        let prompt = Tensor::from_vec(ids.clone(), (1, ids.len()), &Device::Cpu)?;
+        let n_layers = ManagedBatchedModel::num_layers(&model);
+        drop(model.forward_wave(
+            &mut session,
+            &[],
+            &[],
+            &[ran],
+            std::slice::from_ref(&prompt),
+            &[],
+            &[],
+            0,
+            n_layers,
+            None,
+        )?);
+        let (hash, layers) = ManagedBatchedModel::export_recurrent(&model, ran)?
+            .ok_or_else(|| candle::Error::Msg("the prefill left no recurrent state".into()))?;
+        let same = |a: &[ExportedLayerState], b: &[ExportedLayerState]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| {
+                    x.layer_index == y.layer_index
+                        && x.state == y.state
+                        && x.conv_tail == y.conv_tail
+                })
+        };
+
+        let parent = session.create_sequence()?;
+        model.stage_recurrent(parent, hash, Arc::from(layers.clone()))?;
+        let stores = model.recurrent_len()?;
+        let child = session.create_sequence()?;
+        model.fork_recurrent(parent, child)?;
+        assert!(
+            !model.has_recurrent(child)?,
+            "the fork built its store before it was admitted"
+        );
+        assert_eq!(
+            model.recurrent_len()?,
+            stores,
+            "the fork put a store on the card"
+        );
+        assert!(
+            !model.has_recurrent(parent)?,
+            "forking from the parent's snapshot built the parent a store"
+        );
+
+        model.claim_carried_state(child)?;
+        assert!(
+            model.has_recurrent(child)?,
+            "admission's claim built no store"
+        );
+        let (child_hash, child_layers) = ManagedBatchedModel::export_recurrent(&model, child)?
+            .ok_or_else(|| candle::Error::Msg("the claimed child exports nothing".into()))?;
+        assert_eq!(child_hash, hash);
+        assert!(
+            same(&child_layers, &layers),
+            "the claimed store is not the snapshot the parent held"
+        );
+
+        // The parent still holds its snapshot: a second fork takes it too.
+        let second = session.create_sequence()?;
+        model.fork_recurrent(parent, second)?;
+        model.claim_carried_state(second)?;
+        let (_, second_layers) = ManagedBatchedModel::export_recurrent(&model, second)?
+            .ok_or_else(|| candle::Error::Msg("the second fork exports nothing".into()))?;
+        assert!(same(&second_layers, &layers));
+        Ok(())
+    }
+
     /// GPU engine smoke: load this card's engine pack onto the card, run
     /// the probe prompt through `forward_wave` (prefill + greedy decode), and
     /// require the oracle's own continuation. The first run of the wave path

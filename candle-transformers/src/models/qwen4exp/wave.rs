@@ -221,9 +221,9 @@ pub struct Qwen4ExpBatched {
     /// GDN snapshots held for sequences that have no store yet
     /// ([`Self::stage_recurrent`]): `(schedule hash, layers)`, the layers shared
     /// by every slot opened on one prompt branch. Installed when the sequence's
-    /// state is first wanted — a fork from it gets its own store built from the
-    /// snapshot, a claim or a wave on it builds its store — so a slot that has
-    /// not run a turn holds host bytes it shares, not a store of its own.
+    /// state is first wanted — a claim at admission or a wave on it builds its
+    /// store, and a fork from it is held the same snapshot — so a slot that has
+    /// not been admitted holds host bytes it shares, not a store of its own.
     pub(super) staged: RwLock<HashMap<usize, StagedSnapshot>>,
     /// Sequences whose store was dropped once their last seal was durable
     /// ([`Self::park_recurrent`]). Their state is the record's until it is
@@ -264,6 +264,13 @@ struct StepSnapshot {
     index: Vec<(usize, Vec<IndexSnapshot>)>,
     ple: Vec<(usize, PleState)>,
     seeds: Vec<(usize, Option<Tensor>)>,
+}
+
+/// The GDN state a fork's child takes from its parent: a copy of the store the
+/// parent holds, or the snapshot held for a parent that has none yet.
+enum Inherited {
+    Store(RecurrentStateStore),
+    Staged(StagedSnapshot),
 }
 
 /// The carried per-sequence state, and what persisting it costs.
@@ -469,29 +476,29 @@ impl Qwen4ExpBatched {
         // the QSA identity threshold, at which point every first turn failed
         // with `a query at position N needs M blocks but the index cache holds
         // 0 in injected pages`.
-        // A parent whose snapshot is still held has no store to copy: the child
-        // is built straight from the snapshot, and the parent keeps holding it
-        // for its next view. That is the whole point of holding it — one store
+        // A parent whose snapshot is still held has no store to copy, and the
+        // child takes the snapshot held, not a store built from it: the store is
+        // claimed at the child's admission (`claim_carried_state` installs a
+        // held snapshot), so a fork waiting to be admitted holds no device
+        // ground. An ephemeral fork can wait a long time — it is taken at its
+        // parent's turn boundary and queued like any turn — and building its
+        // store here put ~288 MiB per fork on the card before it was admitted.
+        // The parent keeps holding its snapshot for its next view: one store
         // per turn in flight, never a second one idling on the parent.
-        let forked = {
+        let inherited = {
             let map = self
                 .recurrent
                 .read()
                 .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
             match map.get(&parent) {
-                Some(store) => Some(store.fork_from()?),
-                None => {
-                    let staged = self
-                        .staged
-                        .read()
-                        .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
-                        .get(&parent)
-                        .cloned();
-                    let cfg = &self.model.cfg;
-                    staged
-                        .map(|s| s.build(&cfg.layer_kinds, &cfg.delta_net, &self.model.device))
-                        .transpose()?
-                }
+                Some(store) => Some(Inherited::Store(store.fork_from()?)),
+                None => self
+                    .staged
+                    .read()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+                    .get(&parent)
+                    .cloned()
+                    .map(Inherited::Staged),
             }
         };
         let ple = {
@@ -516,14 +523,23 @@ impl Qwen4ExpBatched {
                 None => None,
             }
         };
-        // Whether the parent has ever run a wave, read before its store is moved
+        // Whether the parent has ever run a wave, read before its state is moved
         // into the child: it decides what a missing index means below.
-        let parent_ran = forked.is_some();
-        if let Some(f) = forked {
-            self.recurrent
-                .write()
-                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
-                .insert(child, f);
+        let parent_ran = inherited.is_some();
+        match inherited {
+            Some(Inherited::Store(store)) => {
+                self.recurrent
+                    .write()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+                    .insert(child, store);
+            }
+            Some(Inherited::Staged(snapshot)) => {
+                self.staged
+                    .write()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+                    .insert(child, snapshot);
+            }
+            None => {}
         }
         if let Some(p) = ple {
             self.ple
