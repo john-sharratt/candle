@@ -102,7 +102,8 @@ pub async fn scan(
     // only waits for it, off the async runtime's workers.
     let calibrations = req.calibrations;
     let out = tokio::task::spawn_blocking(move || {
-        scanner.scan(group, calibrations, masked, excluded, probes)
+        // Every fold group: the harness weighs the raw votes itself.
+        scanner.scan(group, calibrations, masked, excluded, probes, None)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

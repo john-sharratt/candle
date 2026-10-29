@@ -21,7 +21,8 @@ extern "C" {
     ///   segment `s` owns tokens `[seg_tok_start[s], seg_tok_start[s+1])` and cases
     ///   `[seg_case_start[s], seg_case_start[s+1])`, device ptrs.
     /// - `page_ptr` / `pos_map`: the PAGED gallery (resident arena). `page_ptr` is
-    ///   `n_pages` absolute device addresses; `pos_map[j] = (page<<5)|in_pg` maps
+    ///   `n_pages * n_groups` absolute device addresses, `page_ptr[page * n_groups
+    ///   + g]` group `g`'s strip in that page; `pos_map[j] = (page<<5)|in_pg` maps
     ///   scanned-token `j` to its resident page. Both null ⇒ the CONTIGUOUS layout
     ///   in `gallery_words` (with `gallery_words` null in the paged case).
     /// - `n_groups` / `gw` / `wpt`: folded-signature geometry (`wpt = n_groups*gw`).

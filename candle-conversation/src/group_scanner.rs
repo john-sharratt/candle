@@ -10,6 +10,7 @@ use flume::Sender;
 
 use crate::persistence::streams::StreamId;
 use crate::projection::{Conversation, ExclusionReport, GroupId, GroupVotes};
+use crate::provenance::gallery_arena::GroupSet;
 use crate::provenance::WideQSig;
 use crate::scheduler::SchedulerRequest;
 
@@ -31,22 +32,34 @@ pub enum ScanRefused {
 }
 
 impl GroupScanner {
-    /// `probes`' raw votes against every active file of `group` — see
-    /// [`Conversation::scan_group_votes`]. Blocks until the scheduler, at
-    /// ingest priority, has run it.
     /// Learn `group`'s anomalous-chunk exclusion from up to `per_file` of each
     /// file's calibration questions, scanned here against its content alone,
     /// and set it for every live scan — see
     /// [`Conversation::learn_chunk_exclusion`]. Blocks for the scan; the
     /// attribution runs on the calling thread, holding no lock.
+    ///
+    /// Each competition is scanned in the fold groups its live scans weigh —
+    /// `content` for the files' own turns, `calibration` for their
+    /// calibrations — so the learn reads what those scans read, and never
+    /// widens a turn they keep narrow (`docs/gallery_residency.md` §4).
     pub fn learn_chunk_exclusion(
         &self,
         group: GroupId,
         per_file: usize,
+        content: GroupSet,
+        calibration: GroupSet,
     ) -> candle::Result<ExclusionReport> {
         self.conversation
             .learn_chunk_exclusion(group, per_file, |calibrations, masked, probes| {
-                match self.scan(group, calibrations, masked, HashMap::new(), probes) {
+                let groups = if calibrations { calibration } else { content };
+                match self.scan(
+                    group,
+                    calibrations,
+                    masked,
+                    HashMap::new(),
+                    probes,
+                    Some(groups),
+                ) {
                     Ok(votes) => votes,
                     Err(refused) => Err(candle::Error::Msg(format!(
                         "the chunk-exclusion scan was refused: {refused:?}"
@@ -55,6 +68,9 @@ impl GroupScanner {
             })
     }
 
+    /// `probes`' raw votes against every active file of `group` — see
+    /// [`Conversation::scan_group_votes`] — in `groups` (`None` for every fold
+    /// group). Blocks until the scheduler, at ingest priority, has run it.
     pub fn scan(
         &self,
         group: GroupId,
@@ -62,6 +78,7 @@ impl GroupScanner {
         masked: HashSet<StreamId>,
         excluded: HashMap<StreamId, Vec<Range<usize>>>,
         probes: Vec<Vec<WideQSig>>,
+        groups: Option<GroupSet>,
     ) -> Result<candle::Result<GroupVotes>, ScanRefused> {
         let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
@@ -72,6 +89,7 @@ impl GroupScanner {
                 masked,
                 excluded,
                 probes,
+                groups,
                 response_tx: tx,
             })
             .map_err(|_| ScanRefused::Gone)?;

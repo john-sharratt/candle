@@ -13,7 +13,7 @@ use super::ids::{GroupId, TimelineId};
 use crate::persistence::streams::StreamId;
 use crate::projection::Conversation;
 use crate::provenance::chunk_exclusion::uncut;
-use crate::provenance::gallery_arena::{Holder, PagedSegment, PagedWindow, TokenVotes};
+use crate::provenance::gallery_arena::{GroupSet, Holder, PagedSegment, PagedWindow, TokenVotes};
 use crate::provenance::{GalleryArena, WideQSig};
 
 /// The votes: each case's file, and every probe token's vote per fold group
@@ -26,12 +26,14 @@ pub struct GroupVotes {
 /// One segment over `files`, file `i` case `i`: each file's own windows, its
 /// calibrations' questions too when `calibrations` — pooled in the file's
 /// case, for a caller measuring them there — no window of a turn `masked`
-/// names, and none of the token ranges `excluded` names by turn.
+/// names, and none of the token ranges `excluded` names by turn, scanned in
+/// `groups` (the others vote for nothing).
 fn group_segment<'a>(
     files: &'a [FileScan],
     calibrations: bool,
     masked: &HashSet<StreamId>,
     excluded: &HashMap<StreamId, Vec<Range<usize>>>,
+    groups: GroupSet,
 ) -> PagedSegment<'a> {
     let mut windows = Vec::new();
     for (case, f) in files.iter().enumerate() {
@@ -60,6 +62,7 @@ fn group_segment<'a>(
         windows,
         n_cases: files.len(),
         holder: Holder::Shared,
+        groups,
     }
 }
 
@@ -67,7 +70,9 @@ impl Conversation {
     /// `probes`' raw votes against every active file of `group` — its
     /// calibrations' questions in the gallery when `calibrations`, the turns
     /// `masked` names left out, and the token ranges `excluded` names cut from
-    /// the gallery so the scan never sees them — on `arena`.
+    /// the gallery so the scan never sees them — on `arena`, in the fold
+    /// `groups` (`None` for every group of the arena).
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_group_votes(
         &self,
         group: GroupId,
@@ -75,6 +80,7 @@ impl Conversation {
         masked: &HashSet<StreamId>,
         excluded: &HashMap<StreamId, Vec<Range<usize>>>,
         probes: &[Vec<WideQSig>],
+        groups: Option<GroupSet>,
         arena: &GalleryArena,
     ) -> candle::Result<GroupVotes> {
         let (files, _) = {
@@ -82,7 +88,8 @@ impl Conversation {
             let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
             assemble_file_scans(&sub, timelines)
         };
-        let segment = group_segment(&files, calibrations, masked, excluded);
+        let groups = groups.unwrap_or_else(|| arena.all_groups());
+        let segment = group_segment(&files, calibrations, masked, excluded, groups);
         let probe_refs: Vec<&[WideQSig]> = probes.iter().map(Vec::as_slice).collect();
         let votes = arena.scan_votes(&[segment], &probe_refs)?;
         Ok(GroupVotes {
@@ -153,8 +160,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let with = group_segment(&files, true, &none, &uncut_all);
+        let all = GroupSet::all(3);
+        let with = group_segment(&files, true, &none, &uncut_all, all);
         assert_eq!(with.n_cases, 2);
+        assert_eq!(with.groups, all);
         assert_eq!(
             cases(&with),
             vec![
@@ -164,7 +173,7 @@ mod tests {
             ]
         );
 
-        let without = group_segment(&files, false, &none, &uncut_all);
+        let without = group_segment(&files, false, &none, &uncut_all, all);
         assert_eq!(
             cases(&without),
             vec![(turn_stream_id(71, 0), 0), (turn_stream_id(72, 0), 1)]
@@ -172,7 +181,7 @@ mod tests {
 
         let masked: HashSet<StreamId> = [turn_stream_id(73, 0), turn_stream_id(71, 0)].into();
         assert_eq!(
-            cases(&group_segment(&files, true, &masked, &uncut_all)),
+            cases(&group_segment(&files, true, &masked, &uncut_all, all)),
             vec![(turn_stream_id(72, 0), 1)]
         );
 
@@ -180,7 +189,7 @@ mod tests {
         let cut: HashMap<StreamId, Vec<Range<usize>>> =
             [(turn_stream_id(71, 0), vec![0..1])].into();
         assert_eq!(
-            cases(&group_segment(&files, false, &none, &cut)),
+            cases(&group_segment(&files, false, &none, &cut, all)),
             vec![(turn_stream_id(72, 0), 1)]
         );
     }

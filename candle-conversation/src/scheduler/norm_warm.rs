@@ -37,6 +37,7 @@ use crate::projection::{
     Builder, Conversation, GroupId, GroupVotes, LayerId, ProjectionTarget, Schema, TimelineId,
     WarmProbe,
 };
+use crate::provenance::gallery_arena::GroupSet;
 use crate::provenance::WideQSig;
 
 /// One replayed turn waiting to be scored, with what scoring it needs.
@@ -68,6 +69,8 @@ pub(super) struct ScanVotesJob {
     pub(super) masked: HashSet<StreamId>,
     pub(super) excluded: HashMap<StreamId, Vec<Range<usize>>>,
     pub(super) probes: Vec<Vec<WideQSig>>,
+    /// The fold groups to scan; `None` for every group.
+    pub(super) groups: Option<GroupSet>,
     /// The votes, or `None` when this scheduler has no arena.
     pub(super) response_tx: Sender<Option<candle::Result<GroupVotes>>>,
 }
@@ -162,6 +165,7 @@ impl Scheduler {
                         &scan.masked,
                         &scan.excluded,
                         &scan.probes,
+                        scan.groups,
                         arena,
                     )
                 });
@@ -290,6 +294,7 @@ mod tests {
             masked: HashSet::new(),
             excluded: HashMap::new(),
             probes: Vec::new(),
+            groups: None,
             response_tx: reply_tx,
         });
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));

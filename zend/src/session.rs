@@ -38,6 +38,8 @@ use candle_conversation::projection::{
     SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema,
     TimelineId, TurnIndex, WorkingSetShare,
 };
+use candle_conversation::provenance::gallery_arena::GroupSet;
+use candle_conversation::provenance::FOLD_GROUPS;
 use candle_conversation::stencil::{
     compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
@@ -3284,8 +3286,27 @@ impl InferenceState {
             let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
                 continue;
             };
+            // Each competition in the fold groups its live scans weigh.
+            let Some(policy) = self
+                .refresh_builder
+                .schema()
+                .layers
+                .iter()
+                .flat_map(|l| &l.groups)
+                .find(|g| g.id == group)
+                .map(|g| &g.policy)
+            else {
+                continue;
+            };
+            let content = GroupSet::weighed(&policy.layer_weights, FOLD_GROUPS);
+            let calibration = GroupSet::weighed(&policy.calibration_layer_weights, FOLD_GROUPS);
             let scanner = self.engine.lock().unwrap().group_scanner();
-            match scanner.learn_chunk_exclusion(group, EXCLUSION_QUESTIONS_PER_FILE) {
+            match scanner.learn_chunk_exclusion(
+                group,
+                EXCLUSION_QUESTIONS_PER_FILE,
+                content,
+                calibration,
+            ) {
                 Ok(r) => tracing::info!(
                     target: "zend::calibrate",
                     layer = %il.name,

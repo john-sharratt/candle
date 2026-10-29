@@ -85,7 +85,39 @@ conversation the substrate held was preloaded at start: on BlackWorld
 (2026-10-29) 60,285 zend dialogue turns, 1.07 GiB, for the handful of chats
 actually open.
 
-## 4. Seeing it
+## 4. Only the weighted fold groups are resident
+
+A signature carries three fold groups (layer regions of the model, 8 words a
+token each), and every scan weighs them by its policy: `code_reading`'s and the
+review layers' content by `layer_weights: [0, 1, 1]`, their calibration
+questions by `calibration_layer_weights: [0, 0, 1]`, `repo_map` by
+`[0.1, 1, 0.1]`, the tool catalog and dialogue by all three. A group weighed
+zero adds exactly nothing — the needle gate and the tally are both linear in
+the weights (`needle_tally_segments`) — so its words are neither uploaded nor
+scanned.
+
+- **A resident turn holds a group set** — the groups its readers weigh, packed
+  in a page of `|set| × 32 × 8` words, group-major as before. A read that needs
+  a group the turn lacks widens it (re-upload with the union), as holders
+  widen; a read that needs fewer is served from the wider page.
+- **A segment declares the groups it weighs** (`PagedSegment::groups`, from the
+  weights its scan applies), and a launch scans the union of its segments'
+  groups only: its probe is narrowed to them and its tally weighs them.
+- **The index addresses a (page, group), not a page.** `page_ptr[page × G + g]`
+  is the address of launch-group `g`'s words in that page — a descriptor table
+  (CLAUDE.md invariant 2b) — so the kernels read any packing. A group a turn
+  does not hold, scanned only because another segment of the launch weighs it,
+  points at one resident zero page; the segment's tally weighs it zero.
+- **Raw votes carry their groups** (`TokenVotes::groups`): the chunk-exclusion
+  learn scans the groups its competitions weigh, so learning never widens a
+  turn the live scans keep narrow, and never cuts a chunk for an anomaly in a
+  group no scan counts.
+
+Measured before this, on BlackWorld (2026-10-29): 5.5 GiB of gallery pages, of
+which `code_reading` content held 4.3 GiB with a third of every page weighed
+zero, and the calibration questions 1.09 GiB with two thirds weighed zero.
+
+## 5. Seeing it
 
 `/v1/memory` → `state.gallery.rows` sums resident turns by status (live,
 tombstoned, absent), holder (`shared`, `conversation`) and layer/group. After

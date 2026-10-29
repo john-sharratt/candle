@@ -67,7 +67,7 @@ using namespace nvcuda;
 extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
     const unsigned int *__restrict__ gallery_case,   // n_tokens GLOBAL case ids
     const unsigned long long *__restrict__ probe_words, // token-major n_probe * wpt
-    const unsigned long long *__restrict__ page_ptr, // page device addresses
+    const unsigned long long *__restrict__ page_ptr, // (page, group) device addresses
     const unsigned int *__restrict__ pos_map,        // n_tokens (page<<5)|in_pg
     int n_tokens,
     int n_probe_tokens,
@@ -105,8 +105,6 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
     __shared__ unsigned int sh_sum[BMMA_QT * BMMA_RANK_CAP];
     __shared__ unsigned int sh_sq[BMMA_QT * BMMA_RANK_CAP];
 
-    const size_t group_page_off = (size_t)g * BMMA_PAGE_TOKENS * BMMA_GW;
-
     // Stage the gallery chunk ONCE — it is reused across every query tile below.
     // Out-of-range tokens stage zero words (their tiles compute, the epilogue
     // skips them).
@@ -118,7 +116,8 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
         if (j < n_tokens) {
             const unsigned int pm = pos_map[j];
             const unsigned long long *tok =
-                (const unsigned long long *)page_ptr[pm >> 5] + group_page_off +
+                // Group g's strip in this page — one address per (page, group).
+                (const unsigned long long *)page_ptr[(size_t)(pm >> 5) * n_groups + g] +
                 (size_t)(pm & (BMMA_PAGE_TOKENS - 1)) * BMMA_GW;
             w = tok[k];
         }

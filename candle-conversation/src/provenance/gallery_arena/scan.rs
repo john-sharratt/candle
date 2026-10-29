@@ -35,7 +35,8 @@ use super::super::WideQSig;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
-use super::{GalleryArena, Holder, TokenVotes, TurnSigs};
+use super::token_votes::widen_rows;
+use super::{GalleryArena, GroupSet, Holder, TokenVotes, TurnSigs};
 
 /// What producing a scan's rows cost: the launch's timing, the probe tokens it
 /// scored (the rest were read from [`ProbeRows`]), and the row cache's own
@@ -59,12 +60,14 @@ pub struct PagedWindow<'a> {
     pub case: usize,
 }
 
-/// One segment (file): its windows, its exchange (case) count, and who the
-/// turns it reads are held for (`docs/gallery_residency.md` §2).
+/// One segment (file): its windows, its exchange (case) count, who the turns it
+/// reads are held for (`docs/gallery_residency.md` §2), and the fold groups its
+/// scan weighs (§4) — the groups its turns must hold, and the launch scans.
 pub struct PagedSegment<'a> {
     pub windows: Vec<PagedWindow<'a>>,
     pub n_cases: usize,
     pub holder: Holder,
+    pub groups: GroupSet,
 }
 
 /// `weights` for every one of `segments`.
@@ -88,11 +91,15 @@ struct DeviceIndex {
 }
 
 /// The assembled per-scan index, built from the resident arena. `page_ptr`
-/// holds absolute device addresses, valid while every referenced turn keeps
-/// the run it was built against (see `run_ids`).
+/// holds absolute device addresses — one per page per launch group, `page ×
+/// groups.len() + place`, the address of that group's words in that page —
+/// valid while every referenced turn keeps the run it was built against (see
+/// `run_ids`).
 pub(super) struct PagedIndex {
     /// `None` when the scan covers no token — nothing to launch.
     device: Option<DeviceIndex>,
+    /// The fold groups the launch scans: every group a segment weighs.
+    pub(super) groups: GroupSet,
     /// Scanned tokens (the length of `pos_map`).
     pub(super) n_tokens: usize,
     /// Host copy of the per-segment case prefixes, which the tally reads.
@@ -188,6 +195,7 @@ fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
     for seg in segments {
         seg.n_cases.hash(&mut h);
         seg.holder.hash(&mut h);
+        seg.groups.hash(&mut h);
         seg.windows.len().hash(&mut h);
         for w in &seg.windows {
             w.sid.0.hash(&mut h);
@@ -203,12 +211,35 @@ fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
 
 impl GalleryArena {
     /// Ensure every referenced turn is resident and assemble the paged index.
-    /// A turn is uploaded at most once per scan (deduped by `sid`); its pages'
-    /// device addresses are appended to `page_ptr` in first-encounter order and
-    /// every window into that turn resolves against the recorded base.
+    /// A turn is uploaded at most once per scan (deduped by `sid`), holding the
+    /// groups every segment reading it weighs; its pages get one `page_ptr`
+    /// entry per launch group, in first-encounter order, and every window into
+    /// that turn resolves against the recorded base page. A launch group the
+    /// turn does not hold — weighed only by another segment — points at the
+    /// arena's zero page.
     fn build_index(&self, segments: &[PagedSegment]) -> Result<PagedIndex> {
         let wpt = self.wpt();
+        let launch = segments
+            .iter()
+            .fold(GroupSet::default(), |g, s| g.union(s.groups));
+        let gw_bytes = (PAGE_TOKENS * self.gw() * std::mem::size_of::<u64>()) as u64;
+        // What each turn is read for, over every segment that reads it: the
+        // widest holder and the union of the groups.
+        let mut wants: HashMap<StreamId, (Holder, GroupSet)> = HashMap::new();
+        for seg in segments {
+            for w in &seg.windows {
+                wants
+                    .entry(w.sid)
+                    .and_modify(|(h, g)| {
+                        *h = h.widen(seg.holder);
+                        *g = g.union(seg.groups);
+                    })
+                    .or_insert((seg.holder, seg.groups));
+            }
+        }
+        let mut zero: Option<u64> = None;
         let mut turn_base: HashMap<StreamId, usize> = HashMap::new();
+        let mut n_pages = 0usize;
         let mut page_ptr: Vec<u64> = Vec::new();
         let mut pos_map: Vec<u32> = Vec::new();
         let mut case: Vec<u32> = Vec::new();
@@ -250,7 +281,9 @@ impl GalleryArena {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
                         let t_ensure = Instant::now();
-                        let ensured = self.scan_ensure(w.sid, w.turn, w.fingerprint, seg.holder);
+                        let (holder, groups) = wants[&w.sid];
+                        let ensured =
+                            self.scan_ensure(w.sid, w.turn, w.fingerprint, holder, groups);
                         ensure_time += t_ensure.elapsed();
                         let ensured = match ensured {
                             Ok(e) => e,
@@ -264,8 +297,27 @@ impl GalleryArena {
                         uploaded += usize::from(ensured.uploaded);
                         pinned_sids.push(w.sid);
                         run_ids.push(ensured.run_id);
-                        let b = page_ptr.len();
-                        page_ptr.extend_from_slice(&ensured.addrs);
+                        if !ensured.groups.covers(launch) && zero.is_none() {
+                            match self.zero_page_addr() {
+                                Ok(z) => zero = Some(z),
+                                Err(e) => {
+                                    for &s in &pinned_sids {
+                                        self.unpin(s);
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        for &addr in &ensured.addrs {
+                            for g in launch.iter() {
+                                page_ptr.push(match ensured.groups.place(g) {
+                                    Some(place) => addr + place as u64 * gw_bytes,
+                                    None => zero.expect("claimed above for a narrower turn"),
+                                });
+                            }
+                        }
+                        let b = n_pages;
+                        n_pages += ensured.addrs.len();
                         turn_base.insert(w.sid, b);
                         b
                     }
@@ -316,6 +368,7 @@ impl GalleryArena {
         );
         Ok(PagedIndex {
             device,
+            groups: launch,
             n_tokens,
             seg_case,
             n_cases: case_off,
@@ -323,7 +376,7 @@ impl GalleryArena {
             max_seg_cases,
             pinned_sids,
             run_ids,
-            rows: Mutex::new(ProbeRows::new(self.n_groups() * segments.len())),
+            rows: Mutex::new(ProbeRows::new(launch.len() * segments.len())),
         })
     }
 
@@ -521,7 +574,7 @@ impl GalleryArena {
                 // index over them, per byte of the set — the stall a turn's
                 // residency spares (`eviction`).
                 self.note_upload(
-                    super::pages_for(built.n_tokens) as u64 * self.page_bytes,
+                    super::pages_for(built.n_tokens) as u64 * self.page_bytes_for(built.groups),
                     t_index.elapsed(),
                 );
                 self.store_index(fp, built.clone());
@@ -647,6 +700,7 @@ impl GalleryArena {
         };
         let wpt = self.wpt();
         let n_groups = self.n_groups();
+        let gw = self.gw();
         let n_cases = idx.n_cases;
         let n_segments = idx.n_segments;
         let none = || {
@@ -659,18 +713,23 @@ impl GalleryArena {
         let Some(d_idx) = idx.device.as_ref() else {
             return Ok(none());
         };
-        if probes.is_empty() || n_segments == 0 || n_cases == 0 {
+        if probes.is_empty() || n_segments == 0 || n_cases == 0 || idx.groups.is_empty() {
             return Ok(none());
         }
 
-        // Batch probes (token-major, full-width only — the reference's filter).
+        // Batch probes (token-major, full-width only — the reference's filter),
+        // each token narrowed to the groups the launch scans: the kernel reads
+        // `launch × gw` words a token, as the index's pages give them.
+        let lwpt = idx.groups.len() * gw;
         let mut probe_words: Vec<u64> = Vec::new();
         let mut per_req_tokens: Vec<usize> = Vec::with_capacity(probes.len());
         for probe in probes {
             let mut cnt = 0usize;
             for tok in *probe {
                 if tok.words.len() >= wpt {
-                    probe_words.extend_from_slice(&tok.words[..wpt]);
+                    for g in idx.groups.iter() {
+                        probe_words.extend_from_slice(&tok.words[g * gw..(g + 1) * gw]);
+                    }
                     cnt += 1;
                 }
             }
@@ -679,6 +738,7 @@ impl GalleryArena {
         if probe_words.is_empty() {
             return Ok(none());
         }
+        let wpt = lwpt;
 
         // Only the tokens no earlier launch over this index scored go to the
         // kernel; the rest are read back from the rows it kept (`ProbeRows`).
@@ -712,6 +772,10 @@ impl GalleryArena {
         drop(rows);
         profile::record("arena:rows_assemble", t_assemble.elapsed());
         rows_us += t_assemble.elapsed().as_micros() as u64;
+        // Rows for every fold group, as every reader of raw votes indexes them:
+        // a group the launch did not scan voted for nothing.
+        let (out_case, out_vote) =
+            widen_rows(&out_case, &out_vote, idx.groups, n_groups, n_segments);
 
         Ok((
             TokenVotes {
@@ -743,9 +807,11 @@ impl GalleryArena {
         n_probe_tokens: usize,
         force: Option<PagedBackend>,
     ) -> Result<(Vec<i32>, Vec<f32>, LaunchTiming)> {
-        let wpt = self.wpt();
-        let n_groups = self.n_groups();
-        let gw = wpt / n_groups;
+        // The launch's own geometry: its groups, as the index addresses them
+        // and the probe was narrowed to.
+        let n_groups = idx.groups.len();
+        let gw = self.gw();
+        let wpt = n_groups * gw;
         let n_cases = idx.n_cases;
         let n_segments = idx.n_segments;
 
@@ -1047,6 +1113,7 @@ mod tests {
                 ],
                 n_cases: 2,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1059,6 +1126,7 @@ mod tests {
                 }],
                 n_cases: 1,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
         ];
         let tail = vec![
@@ -1122,6 +1190,7 @@ mod tests {
                     }],
                     n_cases: 1,
                     holder: Holder::Shared,
+                    groups: GroupSet::all(3),
                 },
                 PagedSegment {
                     windows: vec![
@@ -1144,6 +1213,7 @@ mod tests {
                     ],
                     n_cases: 2,
                     holder: Holder::Shared,
+                    groups: GroupSet::all(3),
                 },
             ]
         };
@@ -1214,11 +1284,13 @@ mod tests {
                 windows: vec![window(1, &a, 0), window(2, &b, 1)],
                 n_cases: 2,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
             PagedSegment {
                 windows: vec![window(3, &c, 0)],
                 n_cases: 1,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
         ];
         let p0 = vec![sig(0x1001), sig(0x3000 + 30), sig(0xBEEF)];
@@ -1294,6 +1366,7 @@ mod tests {
                 ],
                 n_cases: 2,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
             PagedSegment {
                 // Two sub-windows of ONE multi-page turn → different cases (a seam).
@@ -1317,6 +1390,7 @@ mod tests {
                 ],
                 n_cases: 2,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1329,6 +1403,7 @@ mod tests {
                 }],
                 n_cases: 1,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
         ];
 
@@ -1444,6 +1519,7 @@ mod tests {
                 ],
                 n_cases: 2,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1456,6 +1532,7 @@ mod tests {
                 }],
                 n_cases: 1,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             },
         ];
         let probe = vec![sig(0xA00 + 5), sig(0xC00 + 2), sig(0x999)];
@@ -1515,6 +1592,7 @@ mod tests {
             }],
             n_cases: 1,
             holder: Holder::Shared,
+            groups: GroupSet::all(3),
         }];
         let seg_b = vec![PagedSegment {
             windows: vec![PagedWindow {
@@ -1527,6 +1605,7 @@ mod tests {
             }],
             n_cases: 1,
             holder: Holder::Shared,
+            groups: GroupSet::all(3),
         }];
         let probe = vec![sig(0xA00 + 3), sig(0xB00 + 3)];
 
@@ -1577,6 +1656,7 @@ mod tests {
             }],
             n_cases: 1,
             holder: Holder::Shared,
+            groups: GroupSet::all(3),
         }];
         let probe = vec![sig(0xA00 + 3)];
         let fp = fingerprint_segments(&seg_a);
@@ -1589,7 +1669,13 @@ mod tests {
         let other: Vec<WideQSig> = (0..10).map(|t| sig(0xC00 + t)).collect();
         let gen = arena.residency_gen();
         arena
-            .ensure_resident(turn_stream_id(9, 0), &other, 3, Holder::Shared)
+            .ensure_resident(
+                turn_stream_id(9, 0),
+                &other,
+                3,
+                Holder::Shared,
+                GroupSet::all(3),
+            )
             .unwrap();
         assert!(arena.residency_gen() > gen, "the upload is counted");
         let kept = arena
@@ -1602,7 +1688,13 @@ mod tests {
         // This index's own turn is re-sealed under a new fingerprint: its pages
         // are replaced, so the cached addresses are gone with them.
         arena
-            .ensure_resident(turn_stream_id(7, 0), &a, 2, Holder::Shared)
+            .ensure_resident(
+                turn_stream_id(7, 0),
+                &a,
+                2,
+                Holder::Shared,
+                GroupSet::all(3),
+            )
             .unwrap();
         assert_eq!(
             arena.reuse_index(fp).err(),
@@ -1642,6 +1734,7 @@ mod tests {
                 }],
                 n_cases: 1,
                 holder,
+                groups: GroupSet::all(3),
             }]
         };
         let holder_now = || arena.resident_runs()[0].holder;
@@ -1658,6 +1751,124 @@ mod tests {
             .scan_weighted(&segment(Holder::Shared), &[probe.as_slice()], &[])
             .unwrap();
         assert_eq!(holder_now(), Holder::Shared);
+    }
+
+    /// **A scan of only the weighed groups is the full scan, bit for bit.**
+    /// Two files' content weighed `[0, 1, 1]` and a calibration turn weighed
+    /// `[0, 0, 1]`, one launch — on pages holding only those groups (the
+    /// calibration's group 1 read from the zero page), against an arena whose
+    /// pages hold all three. Every backend the card has must give identical
+    /// votes, and the narrow pages are a third and two thirds smaller.
+    #[test]
+    fn a_scan_of_the_weighed_groups_is_the_full_scan() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let mut rng = 0x6A1E_5EED_u64;
+        let a: Vec<WideQSig> = (0..70).map(|_| rand_sig(&mut rng)).collect();
+        let b: Vec<WideQSig> = (0..33).map(|_| rand_sig(&mut rng)).collect();
+        let c: Vec<WideQSig> = (0..9).map(|_| rand_sig(&mut rng)).collect();
+        let content = GroupSet::default().with(1).with(2);
+        let calibration = GroupSet::default().with(2);
+        fn w(sid: u64, turn: &[WideQSig], case: usize) -> PagedWindow<'_> {
+            PagedWindow {
+                sid: turn_stream_id(sid, 0),
+                fingerprint: sid,
+                turn: turn.into(),
+                start: 0,
+                end: turn.len(),
+                case,
+            }
+        }
+        let segments = |content: GroupSet, calibration: GroupSet| {
+            vec![
+                PagedSegment {
+                    windows: vec![w(91, &a, 0), w(92, &b, 1)],
+                    n_cases: 2,
+                    holder: Holder::Shared,
+                    groups: content,
+                },
+                PagedSegment {
+                    windows: vec![w(93, &c, 0)],
+                    n_cases: 1,
+                    holder: Holder::Shared,
+                    groups: calibration,
+                },
+            ]
+        };
+        let weights: [&[f32]; 2] = [&[0.0, 1.0, 1.0], &[0.0, 0.0, 1.0]];
+        let probe: Vec<WideQSig> = (0..20)
+            .map(|i| {
+                if i % 4 == 0 {
+                    a[i * 3].clone()
+                } else {
+                    rand_sig(&mut rng)
+                }
+            })
+            .collect();
+        let narrow = GalleryArena::new(&device, 24, 3).unwrap();
+        let full = GalleryArena::new(&device, 24, 3).unwrap();
+        let bits = |v: &[Vec<f32>]| {
+            v.iter()
+                .map(|p| p.iter().map(|x| x.to_bits()).collect::<Vec<u32>>())
+                .collect::<Vec<_>>()
+        };
+        let want = full
+            .scan_segment_weighted(
+                &segments(GroupSet::all(3), GroupSet::all(3)),
+                &[probe.as_slice()],
+                &weights,
+            )
+            .unwrap();
+        assert!(want[0].iter().any(|&v| v != 0.0), "nothing scored");
+        let narrow_segments = segments(content, calibration);
+        let got = narrow
+            .scan_segment_weighted(&narrow_segments, &[probe.as_slice()], &weights)
+            .unwrap();
+        assert_eq!(bits(&got), bits(&want), "auto backend");
+        let (has_bmma, has_imma) = narrow.tensor_caps();
+        let forced: Vec<Option<PagedBackend>> = [
+            Some(PagedBackend::Scalar),
+            has_bmma.then_some(PagedBackend::Bmma),
+            has_imma.then_some(PagedBackend::Imma),
+        ]
+        .into_iter()
+        .flatten()
+        .map(Some)
+        .collect();
+        for force in forced {
+            let got = narrow
+                .scan_weighted_impl(&narrow_segments, &[probe.as_slice()], &weights, force)
+                .unwrap();
+            assert_eq!(bits(&got), bits(&want), "{force:?}");
+        }
+        let bytes_of = |arena: &GalleryArena, sid: u64| {
+            arena
+                .resident_runs()
+                .into_iter()
+                .find(|r| r.sid == turn_stream_id(sid, 0))
+                .map(|r| r.bytes)
+        };
+        // 70 tokens are 3 pages: 3 × 4 KiB holding groups 1–2, 3 × 6 KiB all.
+        assert_eq!(bytes_of(&narrow, 91), Some(3 * 4096));
+        assert_eq!(bytes_of(&full, 91), Some(3 * 6144));
+        assert_eq!(
+            bytes_of(&narrow, 93),
+            Some(2048),
+            "the calibration holds group 2"
+        );
+        // A read weighing all three widens the narrow turn, and its scan agrees.
+        let wide = narrow
+            .scan_segment_weighted(
+                &segments(GroupSet::all(3), GroupSet::all(3)),
+                &[probe.as_slice()],
+                &weights,
+            )
+            .unwrap();
+        assert_eq!(bits(&wide), bits(&want));
+        assert_eq!(bytes_of(&narrow, 93), Some(6144), "widened to every group");
     }
 
     /// **An index over a turn the gallery gave up is stale.** Built, then its
@@ -1683,6 +1894,7 @@ mod tests {
             }],
             n_cases: 1,
             holder: Holder::Shared,
+            groups: GroupSet::all(3),
         }];
         let probe = vec![sig(0xB00 + 5)];
         let fp = fingerprint_segments(&seg);
@@ -1716,7 +1928,7 @@ mod tests {
         // pass has an arena it can empty (`plan_slot_moves` moves nothing it
         // cannot empty an arena with).
         let per_arena = candle_nn::kv_cache::REGION_BYTES
-            / candle_nn::kv_cache::slot_stride(arena.page_bytes as usize);
+            / candle_nn::kv_cache::slot_stride(arena.page_bytes_for(GroupSet::all(3)) as usize);
         let turn_tokens = (64 * super::super::PAGE_TOKENS) as u64;
         let turns: Vec<Vec<WideQSig>> = (0..(per_arena / 64 + 3) as u64)
             .map(|t| (0..turn_tokens).map(|k| sig((t << 32) + k)).collect())
@@ -1737,6 +1949,7 @@ mod tests {
             windows,
             n_cases: turns.len(),
             holder: Holder::Shared,
+            groups: GroupSet::all(3),
         }];
         let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
 
@@ -1872,6 +2085,7 @@ mod tests {
                 windows,
                 n_cases,
                 holder: Holder::Shared,
+                groups: GroupSet::all(3),
             });
         }
 
@@ -1972,6 +2186,7 @@ mod tests {
                     windows,
                     n_cases: CASES_PER_SEGMENT,
                     holder: Holder::Shared,
+                    groups: GroupSet::all(3),
                 }
             })
             .collect();
@@ -2053,6 +2268,7 @@ mod tests {
                     windows,
                     n_cases: CASES,
                     holder: Holder::Shared,
+                    groups: GroupSet::all(3),
                 }
             })
             .collect();

@@ -157,8 +157,9 @@ fn main() {
                 .collect(),
             n_cases: turns.len(),
             holder: Holder::Shared,
+            groups: arena.all_groups(),
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     // COLD: first scan makes every turn resident (transpose + delta H2D) and scans.
     let t = Instant::now();
@@ -249,6 +250,7 @@ fn main() {
             windows,
             n_cases: case,
             holder: Holder::Shared,
+            groups: arena.all_groups(),
         };
         // A wide probe (past the group scans' 256 budget) mirrors the live
         // collection probe: concatenate windows up to 320 sigs.

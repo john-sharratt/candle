@@ -21,7 +21,7 @@ use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
-use crate::provenance::gallery_arena::{Holder, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{GroupSet, Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, SigWindow, WideQSig,
@@ -516,6 +516,9 @@ pub(crate) fn scan_file_scans(
                     windows,
                     n_cases,
                     holder,
+                    // Only what the content competitions weigh is scanned, or
+                    // resident (`docs/gallery_residency.md` §4).
+                    groups: GroupSet::weighed(weights, arena.n_groups()),
                 }
             })
             .collect();
@@ -537,6 +540,7 @@ pub(crate) fn scan_file_scans(
                 windows,
                 n_cases: cal.len(),
                 holder,
+                groups: GroupSet::weighed(cal_weights, arena.n_groups()),
             });
         }
         // `[probe][file][slot]`, the content competitions weighed by `w`, the

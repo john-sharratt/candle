@@ -59,7 +59,7 @@ use crate::persistence::{
     PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
 };
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
-use crate::provenance::gallery_arena::{scan_split, Holder, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{scan_split, GroupSet, Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
@@ -1079,7 +1079,24 @@ impl Conversation {
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> GalleryPreload {
-        let mut windows: Vec<(StreamId, SigWindow)> = Vec::new();
+        // Each turn with the fold groups its scans weigh — a file's content by
+        // its group's `layer_weights`, its calibrations by the
+        // `calibration_layer_weights`, a collection's gallery by the
+        // collection's — the union where several read it, so the preload puts
+        // on the card exactly what the scans will read
+        // (`docs/gallery_residency.md` §4).
+        let n_groups = arena.map_or(0, GalleryArena::n_groups);
+        let mut order: Vec<StreamId> = Vec::new();
+        let mut wanted: HashMap<StreamId, (SigWindow, GroupSet)> = HashMap::new();
+        let mut want = |sid: StreamId, window: SigWindow, groups: GroupSet| {
+            wanted
+                .entry(sid)
+                .and_modify(|(_, g)| *g = g.union(groups))
+                .or_insert_with(|| {
+                    order.push(sid);
+                    (window, groups)
+                });
+        };
         let mut preload = GalleryPreload::default();
         {
             let sub = self.inner.read().unwrap();
@@ -1091,11 +1108,25 @@ impl Conversation {
                 if !group.is_scanned() {
                     continue;
                 }
+                let content = GroupSet::weighed(&group.policy.layer_weights, n_groups);
+                let calibration =
+                    GroupSet::weighed(&group.policy.calibration_layer_weights, n_groups);
                 let timelines: Vec<TimelineId> = sub.timelines_for_group(group.id).collect();
                 let (files, turns) = assemble_file_scans(&sub, timelines);
                 preload.turns += turns;
                 for f in files {
-                    windows.extend(f.arc_sids.into_iter().zip(f.arcs_kept));
+                    let mut by_arc = vec![GroupSet::default(); f.arc_sids.len()];
+                    for &(k, ..) in &f.windows {
+                        by_arc[k] = by_arc[k].union(content);
+                    }
+                    for &(k, ..) in &f.cal_windows {
+                        by_arc[k] = by_arc[k].union(calibration);
+                    }
+                    for ((sid, window), groups) in
+                        f.arc_sids.into_iter().zip(f.arcs_kept).zip(by_arc)
+                    {
+                        want(sid, window, groups);
+                    }
                 }
             }
         }
@@ -1106,19 +1137,28 @@ impl Conversation {
             let members: Vec<String> = coll.sections.iter().map(|s| s.name.clone()).collect();
             let (gallery, _, sids) = self.belief_gallery(&coll.name, &coll.policy.tags, &members);
             preload.turns += gallery.len();
-            windows.extend(sids.into_iter().zip(gallery));
+            let groups = GroupSet::weighed(&coll.policy.layer_weights, n_groups);
+            for (sid, window) in sids.into_iter().zip(gallery) {
+                want(sid, window, groups);
+            }
         }
         let Some(arena) = arena else {
             return preload;
         };
-        let mut seen: HashSet<StreamId> = HashSet::new();
-        windows.retain(|(sid, _)| seen.insert(*sid));
+        let windows: Vec<(StreamId, SigWindow, GroupSet)> = order
+            .into_iter()
+            .filter_map(|sid| {
+                let (window, groups) = wanted.remove(&sid)?;
+                Some((sid, window, groups))
+            })
+            .filter(|(_, _, groups)| !groups.is_empty())
+            .collect();
         let ensured = arena.ensure_all_resident(
             windows
                 .iter()
-                .map(|(sid, window)| (*sid, window.into(), window.fingerprint())),
+                .map(|(sid, window, groups)| (*sid, window.into(), window.fingerprint(), *groups)),
         );
-        for ((sid, window), done) in windows.iter().zip(ensured) {
+        for ((sid, window, _), done) in windows.iter().zip(ensured) {
             match done {
                 Ok(()) => {
                     preload.resident += 1;
@@ -1276,6 +1316,7 @@ impl Conversation {
                         // A collection's gallery is drawn from every
                         // conversation's turns.
                         holder: Holder::Shared,
+                        groups: GroupSet::weighed(&coll.policy.layer_weights, arena.n_groups()),
                     };
                     let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
@@ -1951,6 +1992,7 @@ impl Conversation {
                         .collect(),
                     n_cases: n,
                     holder: Holder::Shared,
+                    groups: GroupSet::weighed(weights, arena.n_groups()),
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {

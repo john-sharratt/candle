@@ -23,6 +23,7 @@
 //! `docs/gallery_residency.md`.
 
 pub(crate) mod eviction;
+mod groups;
 mod holder;
 mod page_io;
 mod pages;
@@ -32,8 +33,9 @@ pub mod scan_split;
 mod token_votes;
 mod turn_sigs;
 
+pub use groups::GroupSet;
 pub use holder::{Holder, HolderKind};
-pub use pages::{page_u64, pages_for, transpose_to_pages, PAGE_TOKENS};
+pub use pages::{page_words, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};
 pub use token_votes::TokenVotes;
 pub use turn_sigs::TurnSigs;
@@ -121,6 +123,9 @@ struct ResidentTurn {
     pinned: u32,
     /// Who it is held for, widened by every read ([`Holder::widen`]).
     holder: Holder,
+    /// The fold groups its pages hold — the union of what its reads weigh
+    /// (`docs/gallery_residency.md` §4).
+    groups: GroupSet,
 }
 
 impl ResidentTurn {
@@ -169,11 +174,12 @@ impl IndexMiss {
 }
 
 /// A turn made resident: its pages' device addresses (page order), the run id
-/// they belong to ([`ResidentTurn::run_id`]), and whether they were uploaded
-/// now rather than found resident.
+/// they belong to ([`ResidentTurn::run_id`]), the fold groups the pages hold,
+/// and whether they were uploaded now rather than found resident.
 pub(super) struct Ensured {
     pub addrs: Vec<u64>,
     pub run_id: u64,
+    pub groups: GroupSet,
     pub uploaded: bool,
 }
 
@@ -213,10 +219,16 @@ pub struct GalleryArena {
     /// dialogue's 7.4M-token index was rebuilt from scratch each reprojection
     /// (1.8–2.2 s) for uploads that touched none of its turns.
     index_cache: Mutex<HashMap<u64, scan::CachedIndex>>,
+    /// One page of zeros: what a scan's index points a (page, group) at when
+    /// the page does not hold that group — only ever a group the window's own
+    /// segment weighs zero (`docs/gallery_residency.md` §4). Claimed on first
+    /// need and never evicted.
+    zero_page: Mutex<Option<ArenaSlot>>,
     device: Device,
     wpt: usize,
     n_groups: usize,
-    page_bytes: u64,
+    /// Words a token holds per fold group.
+    gw: usize,
 }
 
 /// Weight of the newest upload in the arena's per-byte upload cost.
@@ -231,7 +243,7 @@ impl GalleryArena {
         if !matches!(device, Device::Cuda(_)) {
             candle::bail!("gallery arena requires a CUDA device");
         }
-        let pu64 = page_u64(wpt);
+        assert!(n_groups <= GroupSet::MAX, "{n_groups} fold groups");
         Ok(Self {
             residency: Mutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
@@ -240,12 +252,57 @@ impl GalleryArena {
             keep_within_ns: AtomicU64::new(u64::MAX),
             upload_us_per_byte: AtomicU64::new(0),
             index_cache: Mutex::new(HashMap::new()),
+            zero_page: Mutex::new(None),
             tensor_caps: OnceLock::new(),
             device: device.clone(),
             wpt,
             n_groups,
-            page_bytes: (pu64 * std::mem::size_of::<u64>()) as u64,
+            gw: wpt / n_groups,
         })
+    }
+
+    /// Words a token holds per fold group.
+    #[inline]
+    pub(super) fn gw(&self) -> usize {
+        self.gw
+    }
+
+    /// Every fold group of this arena's signatures.
+    #[inline]
+    pub fn all_groups(&self) -> GroupSet {
+        GroupSet::all(self.n_groups)
+    }
+
+    /// Bytes of one page holding `groups`.
+    #[inline]
+    fn page_bytes_for(&self, groups: GroupSet) -> u64 {
+        (page_words(self.gw, groups) * std::mem::size_of::<u64>()) as u64
+    }
+
+    /// Bytes of the pages `rt` holds.
+    fn run_bytes(&self, rt: &ResidentTurn) -> u64 {
+        pages_for(rt.n_tokens) as u64 * self.page_bytes_for(rt.groups)
+    }
+
+    /// The device address of the arena's zero page, claimed and written on
+    /// first use — one group wide, which is all a (page, group) entry reads.
+    pub(super) fn zero_page_addr(&self) -> Result<u64> {
+        let mut zero = self.zero_page.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = zero.as_ref() {
+            return Ok(slot.ptr());
+        }
+        let one = GroupSet::default().with(0);
+        let slots = claim_arena_slots(
+            &self.device,
+            SlotTenant::Gallery,
+            self.page_bytes_for(one) as usize,
+            1,
+        )?;
+        let words = slots[0].stride() / std::mem::size_of::<u64>();
+        page_io::write_pages(&self.device, &slots, &vec![0u64; words])?;
+        let addr = slots[0].ptr();
+        *zero = slots.into_iter().next();
+        Ok(addr)
     }
 
     /// The CUDA device the arena's slabs live on.
@@ -305,7 +362,7 @@ impl GalleryArena {
             .iter()
             .map(|(sid, rt)| ResidentRun {
                 sid: *sid,
-                bytes: pages_for(rt.n_tokens) as u64 * self.page_bytes,
+                bytes: self.run_bytes(rt),
                 idle: now.saturating_duration_since(rt.used),
                 holder: rt.holder,
             })
@@ -322,7 +379,7 @@ impl GalleryArena {
             if res.get(sid).is_some_and(|rt| rt.pinned == 0) {
                 if let Some(rt) = res.remove(sid) {
                     freed.0 += 1;
-                    freed.1 += pages_for(rt.n_tokens) as u64 * self.page_bytes;
+                    freed.1 += self.run_bytes(&rt);
                 }
             }
         }
@@ -352,8 +409,8 @@ impl GalleryArena {
     /// own keep rule (`evict_past_keep_locked`, run once before a scan's index build,
     /// a preload, and a single turn's miss), so
     /// reaching a refusal is the KV side having no region to spare for a gallery
-    /// that is already inside its budget.
-    fn alloc_and_upload(&self, sigs: TurnSigs<'_>) -> Result<PageRun> {
+    /// that is already inside its budget. The pages hold `groups` only.
+    fn alloc_and_upload(&self, sigs: TurnSigs<'_>, groups: GroupSet) -> Result<PageRun> {
         let n_pages = pages_for(sigs.len());
         if n_pages == 0 {
             return Ok(PageRun { slots: Vec::new() });
@@ -361,12 +418,12 @@ impl GalleryArena {
         let slots = claim_arena_slots(
             &self.device,
             SlotTenant::Gallery,
-            self.page_bytes as usize,
+            self.page_bytes_for(groups) as usize,
             n_pages,
         )?;
         let stride_words = slots[0].stride() / std::mem::size_of::<u64>();
-        let host_pages = sigs
-            .with_decoded(|sigs| transpose_to_pages(sigs, self.wpt, self.n_groups, stride_words));
+        let host_pages =
+            sigs.with_decoded(|sigs| transpose_to_pages(sigs, self.gw, groups, stride_words));
         page_io::write_pages(&self.device, &slots, &host_pages)?;
         Ok(PageRun { slots })
     }
@@ -390,7 +447,11 @@ impl GalleryArena {
     /// reprojection.
     ///
     /// `holder` is who this read is for; the turn's holder widens by it
-    /// ([`Holder::widen`]), on a hit and across a re-upload alike.
+    /// ([`Holder::widen`]), on a hit and across a re-upload alike. `groups` are
+    /// the fold groups the read weighs: a turn whose pages hold them all is a
+    /// hit, one missing any is uploaded again holding the union of what it held
+    /// and what this read weighs (`docs/gallery_residency.md` §4).
+    #[allow(clippy::too_many_arguments)]
     fn ensure_locked(
         &self,
         res: &mut HashMap<StreamId, ResidentTurn>,
@@ -399,6 +460,7 @@ impl GalleryArena {
         fingerprint: u64,
         pin: bool,
         holder: Holder,
+        groups: GroupSet,
     ) -> Result<Ensured> {
         debug_assert!(
             sigs.first_width().unwrap_or(self.wpt) == self.wpt,
@@ -412,7 +474,7 @@ impl GalleryArena {
         // a run needs the residency lock, so its slots can't be freed in this
         // window.
         match res.get_mut(&sid) {
-            Some(rt) if rt.fingerprint == fingerprint => {
+            Some(rt) if rt.fingerprint == fingerprint && rt.groups.covers(groups) => {
                 rt.lru = lru;
                 rt.touch(Instant::now());
                 rt.holder = rt.holder.widen(holder);
@@ -422,22 +484,26 @@ impl GalleryArena {
                 Ok(Ensured {
                     addrs: rt.run.addrs(),
                     run_id: rt.run_id,
+                    groups: rt.groups,
                     uploaded: false,
                 })
             }
             _ => self
-                .replace_locked(res, sid, sigs, fingerprint, pin, lru, holder)
-                .map(|(addrs, run_id)| Ensured {
+                .replace_locked(res, sid, sigs, fingerprint, pin, lru, holder, groups)
+                .map(|(addrs, run_id, groups)| Ensured {
                     addrs,
                     run_id,
+                    groups,
                     uploaded: true,
                 }),
         }
     }
 
-    /// The miss / stale-fingerprint branch of [`ensure_locked`](Self::ensure_locked):
-    /// free the old run and upload fresh pages, returning the new pages' addresses.
-    /// A re-uploaded turn keeps the wider of its old holder and `holder`.
+    /// The miss / stale-fingerprint / narrow-pages branch of
+    /// [`ensure_locked`](Self::ensure_locked): free the old run and upload fresh
+    /// pages, returning the new pages' addresses and the groups they hold. A
+    /// re-uploaded turn keeps the wider of its old holder and `holder`, and the
+    /// union of the groups its old pages held and `groups`.
     #[allow(clippy::too_many_arguments)]
     fn replace_locked(
         &self,
@@ -448,10 +514,13 @@ impl GalleryArena {
         pin: bool,
         lru: u64,
         holder: Holder,
-    ) -> Result<(Vec<u64>, u64)> {
+        groups: GroupSet,
+    ) -> Result<(Vec<u64>, u64, GroupSet)> {
         let mut holder = holder;
+        let mut groups = groups;
         if let Some(old) = res.remove(&sid) {
             holder = old.holder.widen(holder);
+            groups = old.groups.union(groups);
             // The scan thread always unpins before the next ensure on that thread,
             // so a replaced entry is never pinned. If this ever fires, an in-flight
             // scan's pages are about to be recycled — the arena would need a
@@ -467,7 +536,7 @@ impl GalleryArena {
         // old run id left with the removed entry, so any cached index over it is
         // already invalid.
         self.residency_gen.fetch_add(1, Ordering::Relaxed);
-        let run = self.alloc_and_upload(sigs)?;
+        let run = self.alloc_and_upload(sigs, groups)?;
         let addrs = run.addrs();
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         res.insert(
@@ -482,9 +551,10 @@ impl GalleryArena {
                 interval: None,
                 pinned: u32::from(pin),
                 holder,
+                groups,
             },
         );
-        Ok((addrs, run_id))
+        Ok((addrs, run_id, groups))
     }
 
     /// Ensure a turn is resident under `fingerprint`, returning its pages' device
@@ -497,37 +567,59 @@ impl GalleryArena {
     /// A miss first gives up the turns past their keep time: this is where
     /// gallery growth is bounded outside a scan, since `alloc_and_upload` adds
     /// a slab whenever the page pool is empty and nothing else ever shrinks the
-    /// arena. A hit admits nothing, so it makes no room. Held for `holder`.
+    /// arena. A hit admits nothing, so it makes no room. Held for `holder`,
+    /// holding at least `groups`.
     pub fn ensure_resident<'a>(
         &self,
         sid: StreamId,
         sigs: impl Into<TurnSigs<'a>>,
         fingerprint: u64,
         holder: Holder,
+        groups: GroupSet,
     ) -> Result<Vec<u64>> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        if res.get(&sid).is_none_or(|rt| rt.fingerprint != fingerprint) {
+        if res
+            .get(&sid)
+            .is_none_or(|rt| rt.fingerprint != fingerprint || !rt.groups.covers(groups))
+        {
             self.evict_past_keep_locked(&mut res);
         }
-        self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, false, holder)
-            .map(|ensured| ensured.addrs)
+        self.ensure_locked(
+            &mut res,
+            sid,
+            sigs.into(),
+            fingerprint,
+            false,
+            holder,
+            groups,
+        )
+        .map(|ensured| ensured.addrs)
     }
 
     /// [`ensure_resident`](Self::ensure_resident) for many turns at once — a
-    /// gallery preload, of shared turns — giving up the turns past their keep
-    /// time once, before the first, rather than before each miss: the pass
-    /// walks every resident turn. One result per turn, in order.
+    /// gallery preload, of shared turns, each holding the groups its readers
+    /// weigh — giving up the turns past their keep time once, before the
+    /// first, rather than before each miss: the pass walks every resident
+    /// turn. One result per turn, in order.
     pub fn ensure_all_resident<'a>(
         &self,
-        turns: impl IntoIterator<Item = (StreamId, TurnSigs<'a>, u64)>,
+        turns: impl IntoIterator<Item = (StreamId, TurnSigs<'a>, u64, GroupSet)>,
     ) -> Vec<Result<()>> {
         self.evict_past_keep();
         turns
             .into_iter()
-            .map(|(sid, sigs, fingerprint)| {
+            .map(|(sid, sigs, fingerprint, groups)| {
                 let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-                self.ensure_locked(&mut res, sid, sigs, fingerprint, false, Holder::Shared)
-                    .map(|_| ())
+                self.ensure_locked(
+                    &mut res,
+                    sid,
+                    sigs,
+                    fingerprint,
+                    false,
+                    Holder::Shared,
+                    groups,
+                )
+                .map(|_| ())
             })
             .collect()
     }
@@ -543,9 +635,18 @@ impl GalleryArena {
         sigs: impl Into<TurnSigs<'a>>,
         fingerprint: u64,
         holder: Holder,
+        groups: GroupSet,
     ) -> Result<Ensured> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, true, holder)
+        self.ensure_locked(
+            &mut res,
+            sid,
+            sigs.into(),
+            fingerprint,
+            true,
+            holder,
+            groups,
+        )
     }
 
     /// Release one pin taken by [`scan_ensure`](Self::scan_ensure).
@@ -670,17 +771,32 @@ impl GalleryArena {
     /// opens the arena window and quiesces the device; holding `residency` across
     /// that would block every scan. A turn evicted in that gap simply loses its
     /// move.
+    ///
+    /// **Planned per page size.** A page is as wide as the groups it holds, so
+    /// the gallery's slots come in one size per group count, each its own
+    /// arenas; a move never crosses sizes. `max_moves` (zero for no bound) is
+    /// the pass's budget across them all.
     pub fn compact(&self, max_moves: usize) -> Result<GalleryCompaction> {
         let regions_before = arena_regions(&self.device, SlotTenant::Gallery);
-        let moves = plan_slot_moves(
-            &self.device,
-            SlotTenant::Gallery,
-            self.page_bytes as usize,
-            max_moves,
-        )?;
-        let planned = moves.len();
-        let mut by_src: HashMap<u64, ArenaSlot> =
-            moves.into_iter().map(|m| (m.src, m.dst)).collect();
+        let mut by_src: HashMap<u64, ArenaSlot> = HashMap::new();
+        for k in 1..=self.n_groups {
+            let left = if max_moves == 0 {
+                0
+            } else {
+                match max_moves.saturating_sub(by_src.len()) {
+                    0 => break,
+                    n => n,
+                }
+            };
+            let moves = plan_slot_moves(
+                &self.device,
+                SlotTenant::Gallery,
+                self.page_bytes_for(GroupSet::all(k)) as usize,
+                left,
+            )?;
+            by_src.extend(moves.into_iter().map(|m| (m.src, m.dst)));
+        }
+        let planned = by_src.len();
         let mut moved = 0usize;
         let outcome = {
             let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
@@ -696,11 +812,12 @@ impl GalleryArena {
                     continue;
                 }
                 let mut moved_here = 0usize;
+                let page_bytes = self.page_bytes_for(rt.groups) as usize;
                 for slot in &mut rt.run.slots {
                     let Some(dst) = by_src.remove(&slot.ptr()) else {
                         continue;
                     };
-                    if let Err(e) = slot.copy_into(&dst, self.page_bytes as usize, &self.device) {
+                    if let Err(e) = slot.copy_into(&dst, page_bytes, &self.device) {
                         outcome = Err(e);
                         break;
                     }
@@ -777,20 +894,20 @@ impl GalleryArena {
     #[cfg(test)]
     fn evict_lru_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>, want: u64) -> u64 {
         // Order candidates by LRU ascending (oldest first), skipping pins.
-        let mut cands: Vec<(u64, StreamId, usize)> = res
+        let mut cands: Vec<(u64, StreamId, u64)> = res
             .iter()
             .filter(|(_, rt)| rt.pinned == 0)
-            .map(|(sid, rt)| (rt.lru, *sid, rt.n_tokens))
+            .map(|(sid, rt)| (rt.lru, *sid, self.run_bytes(rt)))
             .collect();
         cands.sort_by_key(|(lru, _, _)| *lru);
         let mut freed = 0u64;
-        for (_, sid, n_tokens) in cands {
+        for (_, sid, bytes) in cands {
             if freed >= want {
                 break;
             }
             res.remove(&sid); // drops the run → frees pages
             self.residency_gen.fetch_add(1, Ordering::Relaxed);
-            freed += pages_for(n_tokens) as u64 * self.page_bytes;
+            freed += bytes;
         }
         freed
     }
@@ -867,7 +984,7 @@ impl GalleryArena {
                         lru: rt.lru,
                         idle: now.saturating_duration_since(rt.used),
                         interval: rt.interval,
-                        bytes: pages_for(rt.n_tokens) as u64 * self.page_bytes,
+                        bytes: self.run_bytes(rt),
                         pinned: rt.pinned != 0,
                     },
                 )
@@ -940,14 +1057,14 @@ mod tests {
         let sigs: Vec<WideQSig> = (0..40).map(|t| sig((t as u64) << 40)).collect(); // 2 pages
         let fp = 0xDEADBEEF;
         let addrs = arena
-            .ensure_resident(sid(0), &sigs, fp, Holder::Shared)
+            .ensure_resident(sid(0), &sigs, fp, Holder::Shared, GroupSet::all(3))
             .unwrap();
         assert_eq!(addrs.len(), 2, "40 tokens → 2 pages");
         assert_eq!(arena.resident_turns(), 1);
 
         // Read pages back and check the transpose token-by-token.
-        let pw = page_u64(24);
-        let expect = transpose_to_pages(&sigs, 24, 3, pw);
+        let pw = page_words(8, GroupSet::all(3));
+        let expect = transpose_to_pages(&sigs, 8, GroupSet::all(3), pw);
         let res = arena.residency.lock().unwrap();
         let rt = res.get(&sid(0)).unwrap();
         assert_eq!(
@@ -977,7 +1094,7 @@ mod tests {
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..64).map(|t| sig(t as u64)).collect(); // 2 pages
         arena
-            .ensure_resident(sid(0), &sigs, 1, Holder::Shared)
+            .ensure_resident(sid(0), &sigs, 1, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let res = arena.residency.lock().unwrap();
         let run = &res.get(&sid(0)).unwrap().run;
@@ -1001,11 +1118,11 @@ mod tests {
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..10).map(|t| sig(t as u64)).collect();
         let a1 = arena
-            .ensure_resident(sid(0), &sigs, 7, Holder::Shared)
+            .ensure_resident(sid(0), &sigs, 7, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let live1 = arena.live_pages();
         let a2 = arena
-            .ensure_resident(sid(0), &sigs, 7, Holder::Shared)
+            .ensure_resident(sid(0), &sigs, 7, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let live2 = arena.live_pages();
         assert_eq!(a1, a2, "hit must return identical page addresses");
@@ -1024,13 +1141,13 @@ mod tests {
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..10).map(|t| sig(t as u64)).collect();
         let _ = arena
-            .ensure_resident(sid(0), &sigs, 1, Holder::Shared)
+            .ensure_resident(sid(0), &sigs, 1, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let live1 = arena.live_pages();
         // Re-seal to a bigger window under a new fingerprint.
         let sigs2: Vec<WideQSig> = (0..40).map(|t| sig((t + 100) as u64)).collect();
         let _ = arena
-            .ensure_resident(sid(0), &sigs2, 2, Holder::Shared)
+            .ensure_resident(sid(0), &sigs2, 2, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let live2 = arena.live_pages();
         // Old 1 page freed, 2 new pages live → net live == 2.
@@ -1052,20 +1169,20 @@ mod tests {
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs = |t: u64| -> Vec<WideQSig> { (0..32).map(|k| sig(t * 1000 + k)).collect() };
         arena
-            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared)
+            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared, GroupSet::all(3))
             .unwrap();
         arena
-            .ensure_resident(sid(1), &sigs(1), 2, Holder::Shared)
+            .ensure_resident(sid(1), &sigs(1), 2, Holder::Shared, GroupSet::all(3))
             .unwrap();
         arena.set_keep_within(Some(Duration::from_nanos(1)));
         std::thread::sleep(Duration::from_millis(2));
         arena
-            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared)
+            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared, GroupSet::all(3))
             .unwrap();
         assert_eq!(arena.resident_turns(), 2, "a hit admits nothing");
         std::thread::sleep(Duration::from_millis(2));
         arena
-            .ensure_resident(sid(2), &sigs(2), 3, Holder::Shared)
+            .ensure_resident(sid(2), &sigs(2), 3, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let res = arena.residency.lock().unwrap();
         assert_eq!(res.len(), 1, "the upload gave both idle turns up");
@@ -1085,17 +1202,17 @@ mod tests {
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs = |t: u64| -> Vec<WideQSig> { (0..32).map(|k| sig(t * 1000 + k)).collect() };
         arena
-            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared)
+            .ensure_resident(sid(0), &sigs(0), 1, Holder::Shared, GroupSet::all(3))
             .unwrap();
         arena
-            .ensure_resident(sid(1), &sigs(1), 2, Holder::Shared)
+            .ensure_resident(sid(1), &sigs(1), 2, Holder::Shared, GroupSet::all(3))
             .unwrap();
         arena.set_keep_within(Some(Duration::from_nanos(1)));
         std::thread::sleep(Duration::from_millis(2));
         let (s0, s2) = (sigs(0), sigs(2));
         let done = arena.ensure_all_resident([
-            (sid(0), TurnSigs::from(&s0), 1),
-            (sid(2), TurnSigs::from(&s2), 3),
+            (sid(0), TurnSigs::from(&s0), 1, GroupSet::all(3)),
+            (sid(2), TurnSigs::from(&s2), 3, GroupSet::all(3)),
         ]);
         assert_eq!(done.len(), 2);
         assert!(done.iter().all(|r| r.is_ok()));
@@ -1122,11 +1239,12 @@ mod tests {
         let tl = TimelineId::from_raw(7).unwrap();
         let own = Holder::Conversation(tl);
         let rows: Vec<WideQSig> = (0..32).map(sig).collect();
-        arena.ensure_resident(sid(0), &rows, 1, own).unwrap();
-        arena.ensure_resident(sid(0), &rows, 2, own).unwrap();
-        arena.ensure_resident(sid(1), &rows, 3, own).unwrap();
+        let all = GroupSet::all(3);
+        arena.ensure_resident(sid(0), &rows, 1, own, all).unwrap();
+        arena.ensure_resident(sid(0), &rows, 2, own, all).unwrap();
+        arena.ensure_resident(sid(1), &rows, 3, own, all).unwrap();
         arena
-            .ensure_resident(sid(1), &rows, 3, Holder::Shared)
+            .ensure_resident(sid(1), &rows, 3, Holder::Shared, GroupSet::all(3))
             .unwrap();
         let holder_of = |s: StreamId| {
             arena
@@ -1138,7 +1256,9 @@ mod tests {
         assert_eq!(holder_of(sid(0)), Some(own), "a re-seal keeps its holder");
         assert_eq!(holder_of(sid(1)), Some(Holder::Shared));
 
-        arena.scan_ensure(sid(1), &rows, 3, Holder::Shared).unwrap();
+        arena
+            .scan_ensure(sid(1), &rows, 3, Holder::Shared, GroupSet::all(3))
+            .unwrap();
         let (turns, bytes) = arena.drop_turns(&[sid(0), sid(1), sid(9)]);
         assert_eq!((turns, bytes), (1, 6144), "only the unpinned turn 0 goes");
         assert_eq!(holder_of(sid(0)), None);
@@ -1159,17 +1279,17 @@ mod tests {
         for t in 0..4u64 {
             let sigs: Vec<WideQSig> = (0..32).map(|k| sig(t * 1000 + k)).collect(); // 1 page each
             arena
-                .ensure_resident(sid(t), &sigs, t + 1, Holder::Shared)
+                .ensure_resident(sid(t), &sigs, t + 1, Holder::Shared, GroupSet::all(3))
                 .unwrap();
         }
         assert_eq!(arena.resident_turns(), 4);
         // Pin turns 2 and 3 via a scan-style ensure (hit → pins; fp = t+1).
         let dummy: Vec<WideQSig> = (0..32).map(sig).collect();
         arena
-            .scan_ensure(sid(2), &dummy, 3, Holder::Shared)
+            .scan_ensure(sid(2), &dummy, 3, Holder::Shared, GroupSet::all(3))
             .unwrap();
         arena
-            .scan_ensure(sid(3), &dummy, 4, Holder::Shared)
+            .scan_ensure(sid(3), &dummy, 4, Holder::Shared, GroupSet::all(3))
             .unwrap();
         // Evict everything possible — the pinned two must survive.
         let freed = arena.evict_lru(u64::MAX);
@@ -1214,12 +1334,18 @@ mod tests {
         };
         // Turns of 64 pages, enough to fill an arena and spill two into the next.
         let per_arena = candle_nn::kv_cache::REGION_BYTES
-            / candle_nn::kv_cache::slot_stride(arena.page_bytes as usize);
+            / candle_nn::kv_cache::slot_stride(arena.page_bytes_for(GroupSet::all(3)) as usize);
         let turn_tokens = 64 * PAGE_TOKENS;
         let n_turns = (per_arena / 64 + 3) as u64;
         for t in 0..n_turns {
             arena
-                .ensure_resident(sid(t), &sigs(t, turn_tokens), t + 1, Holder::Shared)
+                .ensure_resident(
+                    sid(t),
+                    &sigs(t, turn_tokens),
+                    t + 1,
+                    Holder::Shared,
+                    GroupSet::all(3),
+                )
                 .unwrap();
         }
         let regions_before = arena_regions(&device, SlotTenant::Gallery);
@@ -1249,8 +1375,8 @@ mod tests {
                 assert!(!res.contains_key(&sid(t)), "dropped turn is gone");
                 continue;
             }
-            let pw = page_u64(24);
-            let expect = transpose_to_pages(&sigs(t, turn_tokens), 24, 3, pw);
+            let pw = page_words(8, GroupSet::all(3));
+            let expect = transpose_to_pages(&sigs(t, turn_tokens), 8, GroupSet::all(3), pw);
             let run = &res.get(&sid(t)).expect("survivor").run;
             assert_eq!(run.slots.len() * pw, expect.len());
             for (p, slot) in run.slots.iter().enumerate() {
@@ -1277,12 +1403,14 @@ mod tests {
         let rows: Vec<WideQSig> = (0..64).map(sig).collect();
         for t in 0..4u64 {
             arena
-                .ensure_resident(sid(t), &rows, t + 1, Holder::Shared)
+                .ensure_resident(sid(t), &rows, t + 1, Holder::Shared, GroupSet::all(3))
                 .unwrap();
         }
         arena.drop_turns(&[sid(0), sid(2)]);
         // Pin one survivor; record where its pages sit.
-        arena.scan_ensure(sid(1), &rows, 2, Holder::Shared).unwrap();
+        arena
+            .scan_ensure(sid(1), &rows, 2, Holder::Shared, GroupSet::all(3))
+            .unwrap();
         let pinned_addrs: Vec<u64> = {
             let res = arena.residency.lock().unwrap();
             res.get(&sid(1)).unwrap().run.addrs()
@@ -1320,7 +1448,7 @@ mod tests {
         let rows: Vec<WideQSig> = (0..32).map(sig).collect();
         for t in 0..3u64 {
             arena
-                .ensure_resident(sid(t), &rows, t + 1, Holder::Shared)
+                .ensure_resident(sid(t), &rows, t + 1, Holder::Shared, GroupSet::all(3))
                 .unwrap();
         }
         let gen_before = arena.residency_gen();

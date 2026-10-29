@@ -86,17 +86,18 @@ extern "C" int bdp_take_pending_error() {
 //    token `j`'s group-`g` words are at `g*n_tokens*gw + j*gw`.
 //  * PAGED (`page_ptr != nullptr`): the gallery lives in the resident arena as
 //    group-major pages of BDP_PAGE_TOKENS tokens each. `pos_map[j] = (page<<5)|in_pg`
-//    resolves scanned-token `j` to its resident page + offset; `page_ptr[page]` is
-//    that page's absolute device address (the paged-KV `k_ptr` precedent). The
-//    coalesced load is identical — group-major pages keep a group's tokens
-//    contiguous, so only the base address per token differs.
+//    resolves scanned-token `j` to its resident page + offset; `page_ptr[page *
+//    n_groups + g]` is the absolute device address of launch-group `g`'s strip in
+//    that page (a descriptor per (page, group): a page holds only the groups its
+//    turn keeps). The coalesced load is identical — group-major pages keep a
+//    group's tokens contiguous, so only the base address per token differs.
 extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const unsigned long long *__restrict__ gallery_words, // GROUP-major buffer, or null (paged)
     const unsigned int *__restrict__ gallery_case,        // n_tokens (GLOBAL case id)
     const unsigned long long *__restrict__ probe_words,   // token-major: n_probe_tokens * wpt
     const int *__restrict__ seg_tok_start,                // n_segments+1 (token range per segment)
     const int *__restrict__ seg_case_start,               // n_segments+1 (case range per segment)
-    const unsigned long long *__restrict__ page_ptr,      // paged: n_pages device addresses, or null
+    const unsigned long long *__restrict__ page_ptr,      // paged: n_pages*n_groups (page, group) addresses, or null
     const unsigned int *__restrict__ pos_map,             // paged: n_tokens (page<<5)|in_pg, or null
     int n_probe_tokens,
     int n_groups,
@@ -170,10 +171,11 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
 
     const bool paged = (page_ptr != nullptr);
     // Contiguous: group g's strip is the whole gallery's group-g plane.
-    // Paged: group g's strip inside each 32-token page is at g*(32*gw).
+    // Paged: `page_ptr[page * n_groups + g]` is group g's strip in that page —
+    // a page holds only the groups its turn keeps, packed, so the address is
+    // per (page, group), not a fixed offset into the page.
     const unsigned long long *g_base =
         paged ? nullptr : gallery_words + (size_t)g * seg_tok_start[n_segments] * gw;
-    const size_t group_page_off = (size_t)g * BDP_PAGE_TOKENS * gw;
     unsigned long long lsum[BDP_TQ];
     unsigned long long lsumsq[BDP_TQ];
     for (int i = 0; i < tq; i++) {
@@ -200,7 +202,7 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
             const unsigned long long *tok;
             if (paged) {
                 const unsigned int pm = pos_map[j];
-                tok = (const unsigned long long *)page_ptr[pm >> 5] + group_page_off +
+                tok = (const unsigned long long *)page_ptr[(size_t)(pm >> 5) * n_groups + g] +
                       (size_t)(pm & (BDP_PAGE_TOKENS - 1)) * gw;
             } else {
                 tok = g_base + (size_t)j * gw;
@@ -297,7 +299,7 @@ extern "C" void run_batched_bdp_scan(
     const unsigned long long *probe_words,
     const int *seg_tok_start,
     const int *seg_case_start,
-    const unsigned long long *page_ptr, // paged: n_pages device addresses, or null
+    const unsigned long long *page_ptr, // paged: n_pages*n_groups (page, group) addresses, or null
     const unsigned int *pos_map,        // paged: n_tokens (page<<5)|in_pg, or null
     int n_probe_tokens,
     int n_groups,
