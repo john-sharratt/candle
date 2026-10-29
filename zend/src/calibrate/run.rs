@@ -40,7 +40,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
+use candle_conversation::{ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions};
 
 use super::permits::Permits;
 use super::plan::{plan, Prior, Unit};
@@ -418,13 +418,21 @@ fn thinking_selection() -> SelectionState {
 /// to the spec's `think` budget. Each conversation is tombstoned either way.
 /// A question the model did not think about fails the unit, which is
 /// calibrated again by a later pass.
+///
+/// **A question gives up its conversation the moment its turn ends**, read in
+/// the order the turns finish ([`FinishOrder`]). A transient conversation's
+/// recurrent store is never parked — it writes no record to park into — so a
+/// question waited on in submit order held its store until every question
+/// before it was done: on BlackWorld (2026-10-29) a hundred finished questions
+/// at a time, ~15 GiB of state beside a dozen running ones.
 fn thoughts(
     engine: &Mutex<ConversationEngine>,
     frame: &Frame<'_>,
     spec: &CalibrateSpec,
     questions: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let mut asked: Vec<(Sequence, TimelineId)> = Vec::with_capacity(questions.len());
+    let mut asked: Vec<Option<Sequence>> = Vec::with_capacity(questions.len());
+    let mut timelines: Vec<TimelineId> = Vec::with_capacity(questions.len());
     let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
         let e = engine.lock().unwrap();
         let conv = e
@@ -436,7 +444,8 @@ fn thoughts(
             )
             .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
         let timeline = conv.timeline_id();
-        asked.push((conv, timeline));
+        asked.push(Some(conv));
+        timelines.push(timeline);
         e.conversation().mark_timeline_transient(timeline);
         e.set_timeline_summarize(timeline, false);
         e.set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
@@ -444,7 +453,7 @@ fn thoughts(
     });
     let thought = opened.and_then(|()| {
         let mut handles = Vec::with_capacity(questions.len());
-        for ((conv, _), q) in asked.iter_mut().zip(questions) {
+        for (conv, q) in asked.iter_mut().zip(questions) {
             let options = TurnOptions {
                 max_tokens: Some(spec.think),
                 selection: thinking_selection(),
@@ -453,31 +462,47 @@ fn thoughts(
                 ..Default::default()
             };
             let handle = conv
+                .as_mut()
+                .expect("every question's conversation is open")
                 .submit_turn_with_options(q.clone(), options)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             handles.push(handle);
         }
-        let mut out = Vec::with_capacity(questions.len());
-        for (((conv, _), q), handle) in asked.iter_mut().zip(questions).zip(handles) {
-            let resp = handle
-                .wait_cancellable(crate::ingest_cancel::token())
-                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-            conv.finish_turn(handle, &resp)
-                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-            let thought = thinking_of(&resp.answer).ok_or_else(|| {
-                let opening: String = resp.text.chars().take(80).collect();
-                anyhow::anyhow!(
-                    "the model did not think about {q:?} (finish {:?}, it wrote {opening:?})",
-                    resp.stats.finish
-                )
-            })?;
-            out.push(thought);
+        let mut finished = FinishOrder::new(handles);
+        let mut out: Vec<Option<String>> = vec![None; questions.len()];
+        while let Some((i, handle, resp)) = finished
+            .next_cancellable(crate::ingest_cancel::token())
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?
+        {
+            let q = &questions[i];
+            let mut conv = asked[i].take().expect("a turn finishes once");
+            let thought = resp
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))
+                .and_then(|resp| {
+                    conv.finish_turn(handle, &resp)
+                        .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+                    thinking_of(&resp.answer).ok_or_else(|| {
+                        let opening: String = resp.text.chars().take(80).collect();
+                        anyhow::anyhow!(
+                            "the model did not think about {q:?} (finish {:?}, it wrote {opening:?})",
+                            resp.stats.finish
+                        )
+                    })
+                });
+            let _ = engine.lock().unwrap().tombstone_timeline(timelines[i]);
+            drop(conv);
+            out[i] = Some(thought?);
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|t| t.expect("every turn finished"))
+            .collect())
     });
     let e = engine.lock().unwrap();
-    for (_, timeline) in &asked {
-        let _ = e.tombstone_timeline(*timeline);
+    for (conv, timeline) in asked.iter().zip(&timelines) {
+        if conv.is_some() {
+            let _ = e.tombstone_timeline(*timeline);
+        }
     }
     thought
 }

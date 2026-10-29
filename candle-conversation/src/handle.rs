@@ -25,12 +25,18 @@ impl TurnHandle {
         Self { rx }
     }
 
+    /// The channel the turn's events arrive on, for a wait over several turns
+    /// ([`crate::FinishOrder`]).
+    pub(crate) fn receiver(&self) -> &Receiver<TurnEvent> {
+        &self.rx
+    }
+
     /// Classify one event on the way to completion: `Some` settles the wait —
     /// the turn's response or its error — and `None` is an intermediate event
     /// the waiters consume silently. Every wait (`wait`, `wait_cancellable`,
     /// `wait_async`) reads events through this, so a change to what ends a
     /// turn reaches the blocking and async callers together or not at all.
-    fn settle(event: TurnEvent) -> Option<crate::Result<TurnResponse>> {
+    pub(crate) fn settle(event: TurnEvent) -> Option<crate::Result<TurnResponse>> {
         match event {
             TurnEvent::Done(response) => Some(Ok(response)),
             TurnEvent::Error(e) => Some(Err(e)),
@@ -367,13 +373,13 @@ impl TokenDecoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use candle_transformers::models::batched_inference::SequenceStats;
     use futures::executor::block_on;
     use futures::StreamExt;
 
-    fn response(text: &str) -> TurnResponse {
+    pub(crate) fn response(text: &str) -> TurnResponse {
         TurnResponse {
             text: text.to_string(),
             answer: TurnText::literal(text),

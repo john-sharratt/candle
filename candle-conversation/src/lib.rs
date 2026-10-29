@@ -62,6 +62,7 @@ mod dry_reference;
 mod engine;
 mod engine_attachments;
 mod error;
+mod finish_order;
 /// The KV-fragmentation probe: the specification for the compaction pass, and the gate
 /// that keeps it honest. Reachable from both the integration tests and the
 /// `kv_fragmentation` example, which is why it is here rather than under `tests/`.
@@ -141,6 +142,7 @@ pub use engine::{
 };
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::ConversationError;
+pub use finish_order::{FinishOrder, Finished};
 pub use group_scanner::{GroupScanner, ScanRefused};
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use ingest_warmer::IngestWarmer;
