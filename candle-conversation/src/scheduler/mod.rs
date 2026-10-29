@@ -617,7 +617,7 @@ pub(crate) enum SchedulerRequest {
         /// shared substrate state — every conversation in the
         /// workspace sees the same map — but the handle is needed so
         /// the scheduler can call `restore_section` + `recover_*` on
-        /// the right `Arc<RwLock<Substrate>>`.
+        /// the right `Arc<SubstrateLock>`.
         conversation: Conversation,
         section_id: SectionId,
         stream_id: StreamId,

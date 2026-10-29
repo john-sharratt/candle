@@ -26,7 +26,7 @@
 //! ```
 //!
 //! The thread holds a [`Conversation`] handle so it shares the same
-//! `Arc<RwLock<Substrate>>` and `Arc<Mutex<SubstratePersistence>>` the
+//! `Arc<SubstrateLock>` and `Arc<Mutex<SubstratePersistence>>` the
 //! rest of the engine uses. Read locks are held only long enough to
 //! snapshot the work list — the slow CUDA-side migrations and
 //! gather/write work happen unlocked. Write locks are taken briefly

@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 mod maintenance_op;
@@ -68,7 +68,8 @@ use crate::provenance::{
 use crate::scheduler::profile;
 use crate::substrate::{
     ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, RestoredTurn, StoredSequence,
-    Substrate, SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
+    Substrate, SubstrateLock, SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite,
+    TurnStream,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -320,7 +321,7 @@ type GalleryKey = (String, Vec<String>, Vec<String>);
 /// A substrate named without being kept alive — see
 /// [`Conversation::substrate_ref`].
 #[derive(Clone)]
-pub(crate) struct SubstrateRef(Weak<RwLock<Substrate>>);
+pub(crate) struct SubstrateRef(Weak<SubstrateLock>);
 
 impl SubstrateRef {
     /// Whether `conversation` is a handle on this substrate.
@@ -342,7 +343,9 @@ impl SubstrateRef {
 /// Multiple conversations in the same workspace clone this handle; they all
 /// see (and write into) the same underlying [`Substrate`].  Locking is
 /// coarse-grained — one `RwLock` over the whole resolver — but scans and
-/// mutations are short, so contention is minimal in practice.
+/// mutations are short, so contention is minimal in practice — and a hold
+/// that is not, or a wait behind one, is logged with its site
+/// ([`SubstrateLock`]).
 ///
 /// # Phase 4 substrate semantics
 ///
@@ -357,7 +360,7 @@ impl SubstrateRef {
 ///   KV state via the scheduler.
 #[derive(Clone)]
 pub struct Conversation {
-    pub(super) inner: Arc<RwLock<Substrate>>,
+    pub(super) inner: Arc<SubstrateLock>,
     /// The process's one timeline allocator ([`process_timeline_allocator`]),
     /// so a timeline id minted on one substrate is never minted on another
     /// attached to the same engine.
@@ -571,7 +574,7 @@ impl Conversation {
         let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
         let sealed = persistence.sealed_reader();
         let minter = persistence.minter();
-        let inner = Arc::new(RwLock::new(substrate));
+        let inner = Arc::new(SubstrateLock::new(substrate));
         let persistence = Arc::new(PersistenceLock::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
@@ -852,6 +855,10 @@ impl Conversation {
     ///
     /// Use [`Self::read_scored`] when projecting against a freshly-built
     /// [`ProjectionScores`] from the wide-Q belief scan.
+    ///
+    /// Every acquisition here is timed against its caller's site
+    /// (`#[track_caller]` through to [`SubstrateLock`]).
+    #[track_caller]
     pub fn read(&self) -> SubstrateRead<'_> {
         SubstrateRead {
             guard: self.inner.read().unwrap(),
@@ -864,6 +871,7 @@ impl Conversation {
     /// populated by the reprojection's wide-Q belief scan on the call site's
     /// stack and dropped at end of scope. They are **not** held by the
     /// substrate.
+    #[track_caller]
     pub fn read_scored<'a>(&'a self, scores: &'a ProjectionScores) -> SubstrateRead<'a> {
         SubstrateRead {
             guard: self.inner.read().unwrap(),
@@ -874,11 +882,13 @@ impl Conversation {
     /// Acquire a target-aware read guard.  The returned [`TargetedRead`]
     /// implements [`ContentResolver`] with proper sibling-timeline masking
     /// for `target.group`, with score lookups returning zero (unscored).
+    #[track_caller]
     pub fn read_for(&self, target: ProjectionTarget) -> TargetedRead<'_> {
         TargetedRead::new(self.read(), target)
     }
 
     /// Target-aware variant of [`Self::read_scored`].
+    #[track_caller]
     pub fn read_for_scored<'a>(
         &'a self,
         target: ProjectionTarget,
@@ -921,6 +931,7 @@ impl Conversation {
     }
 
     /// Acquire a write guard for mutating operations (append, set_*).
+    #[track_caller]
     pub fn write(&self) -> SubstrateWrite<'_> {
         SubstrateWrite {
             guard: self.inner.write().unwrap(),
@@ -934,6 +945,7 @@ impl Conversation {
     /// [`Self::read`] without waiting: `None` while a writer holds the lock, for
     /// a reader that may look again later rather than stall its thread behind
     /// a write.
+    #[track_caller]
     pub fn try_read(&self) -> Option<SubstrateRead<'_>> {
         match self.inner.try_read() {
             Ok(guard) => Some(SubstrateRead {
@@ -945,6 +957,7 @@ impl Conversation {
         }
     }
 
+    #[track_caller]
     pub fn try_write(&self) -> Option<SubstrateWrite<'_>> {
         match self.inner.try_write() {
             Ok(guard) => Some(SubstrateWrite { guard }),

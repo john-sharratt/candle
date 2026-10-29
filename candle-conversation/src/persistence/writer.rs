@@ -30,7 +30,7 @@
 //! keeps; nothing is ever committed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ use super::resume::{self, TurnChunkGrid};
 use super::written_snapshots::{WrittenSnapshot, WrittenSnapshots};
 use super::{PersistenceError, PersistenceLock, Result};
 use crate::persistence::streams::StreamId;
-use crate::substrate::{ResidenceIndex, Substrate, TurnMark};
+use crate::substrate::{ResidenceIndex, SubstrateLock, TurnMark};
 
 /// Max pending write EVENTS before an enqueue blocks. Sized to absorb a full
 /// segment-compaction's worth of seal decls (the writer stalls on the persistence
@@ -314,7 +314,7 @@ impl SubstrateWriter {
     ///
     /// Over a read-only persistence handle no thread is spawned: there is
     /// nothing to append to and nothing to commit.
-    pub fn spawn(substrate: Arc<RwLock<Substrate>>, persistence: Arc<PersistenceLock>) -> Self {
+    pub fn spawn(substrate: Arc<SubstrateLock>, persistence: Arc<PersistenceLock>) -> Self {
         let (tx, rx) = channel::unbounded::<(WriteJob, u64)>();
         let backpressure = Arc::new(Backpressure {
             state: Mutex::new((0, 0)),
@@ -438,7 +438,7 @@ impl Drop for SubstrateWriter {
 /// Drainer loop: process a job, coalesce a burst, group-fsync once, repeat.
 fn writer_loop(
     rx: Receiver<(WriteJob, u64)>,
-    substrate: Arc<RwLock<Substrate>>,
+    substrate: Arc<SubstrateLock>,
     persistence: Arc<PersistenceLock>,
     bp: Arc<Backpressure>,
     progress: Arc<Progress>,
@@ -491,7 +491,7 @@ fn writer_loop(
 /// commits + acks + exits), else `None`.
 fn process_one(
     job: WriteJob,
-    substrate: &Arc<RwLock<Substrate>>,
+    substrate: &Arc<SubstrateLock>,
     persistence: &Arc<PersistenceLock>,
     snapshots: &WrittenSnapshots,
 ) -> Option<Sender<()>> {
@@ -762,7 +762,7 @@ fn process_one(
 /// persistence for the append/durability mark, then substrate for the index +
 /// hot-drop — so `slot.cold` is set only after the bytes are appended.
 fn write_kv_cold(
-    substrate: &Arc<RwLock<Substrate>>,
+    substrate: &Arc<SubstrateLock>,
     persistence: &Arc<PersistenceLock>,
     residence: ResidenceIndex,
     stream_id: StreamId,
@@ -826,7 +826,7 @@ fn append_snapshot(
 /// index now, and durably by an empty `Snapshot` record, after which a resume
 /// recomputes instead.
 fn retract_failed_snapshot(
-    substrate: &Arc<RwLock<Substrate>>,
+    substrate: &Arc<SubstrateLock>,
     persistence: &Arc<PersistenceLock>,
     stream_id: StreamId,
     error: &PersistenceError,
@@ -950,9 +950,9 @@ pub mod fault {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
-    use super::{fault, SubstrateWriter, WriteJob};
+    use super::{fault, SubstrateLock, SubstrateWriter, WriteJob};
     use crate::persistence::identity::RecordIdentity;
     use crate::persistence::record::{RecordType, SnapshotPayload};
     use crate::persistence::streams::StreamId;
@@ -982,7 +982,7 @@ mod tests {
         let other = StreamId(0xF00D_0078);
         let mut substrate = Substrate::new();
         let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
-        let substrate = Arc::new(RwLock::new(substrate));
+        let substrate = Arc::new(SubstrateLock::new(substrate));
         let persistence = Arc::new(PersistenceLock::new(p));
         let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
 
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(reloaded.recurrent_snapshot_loc(other), kept);
 
         // The next seal's snapshot is the stream's tail again, on reload too.
-        let substrate = Arc::new(RwLock::new(reloaded));
+        let substrate = Arc::new(SubstrateLock::new(reloaded));
         let persistence = Arc::new(PersistenceLock::new(p));
         let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
         writer.enqueue(WriteJob::Snapshot {
@@ -1051,7 +1051,7 @@ mod tests {
         let stream_id = StreamId(0xF00D_0090);
         let mut substrate = Substrate::new();
         let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
-        let substrate = Arc::new(RwLock::new(substrate));
+        let substrate = Arc::new(SubstrateLock::new(substrate));
         let persistence = Arc::new(PersistenceLock::new(p));
         let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
         let mut full = snapshot_at(0);
@@ -1108,7 +1108,7 @@ mod tests {
         let mut substrate = Substrate::new();
         let p =
             SubstratePersistence::open_in_with_substrate_read_only(&dir, &mut substrate).unwrap();
-        let substrate = Arc::new(RwLock::new(substrate));
+        let substrate = Arc::new(SubstrateLock::new(substrate));
         let persistence = Arc::new(PersistenceLock::new(p));
         let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
         let stream = StreamId(42);

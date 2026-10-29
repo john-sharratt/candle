@@ -96,13 +96,13 @@ pub mod written_snapshots;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::projection::TimelineId;
-use crate::substrate::{file_store_key, Substrate, TurnMark};
+use crate::substrate::{file_store_key, Substrate, SubstrateLock, TurnMark};
 
 use accounting::RecordAccounting;
 use adoption::Adoption;
@@ -297,7 +297,7 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 /// sides then append through the same cursor and compact against the same view.
 #[derive(Clone)]
 pub struct SharedSubstrate {
-    pub substrate: Arc<RwLock<Substrate>>,
+    pub substrate: Arc<SubstrateLock>,
     pub persistence: Arc<PersistenceLock>,
 }
 
@@ -326,7 +326,7 @@ impl SharedSubstrate {
     /// record classes are collected in the same pass.
     pub fn new(substrate: Substrate, persistence: SubstratePersistence) -> Self {
         Self {
-            substrate: Arc::new(RwLock::new(substrate)),
+            substrate: Arc::new(SubstrateLock::new(substrate)),
             persistence: Arc::new(PersistenceLock::new(persistence)),
         }
     }

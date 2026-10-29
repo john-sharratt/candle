@@ -34,11 +34,26 @@ use candle_conversation::turn_layout::TurnLayout;
 
 use crate::session::ZendSession;
 
+/// Run `read` — a walk under the substrate lock — on the blocking pool.
+///
+/// The lock is the engine's: a projection, a seal or the persistence thread
+/// can hold it for seconds, and a view waiting on it on the async runtime's
+/// worker thread held that thread too. A few such waits stalled every route
+/// those workers served — the performance page beside a slow substrate page.
+/// Off the runtime, only the view that needs the lock waits for it.
+async fn off_runtime<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, StatusCode> {
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 pub async fn system_prompt(
     State(session): State<Arc<ZendSession>>,
 ) -> Result<Json<SystemPromptView>, StatusCode> {
-    session
-        .substrate_system_prompt()
+    off_runtime(move || session.substrate_system_prompt())
+        .await?
         .map(Json)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -47,8 +62,8 @@ pub async fn layer(
     State(session): State<Arc<ZendSession>>,
     Path(name): Path<String>,
 ) -> Result<Json<LayerConversations>, StatusCode> {
-    session
-        .substrate_layer(&name)
+    off_runtime(move || session.substrate_layer(&name))
+        .await?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -77,13 +92,11 @@ pub async fn project(
     State(session): State<Arc<ZendSession>>,
     Json(req): Json<ProjectReq>,
 ) -> Result<Json<ProjectView>, StatusCode> {
-    // The probe is a real GPU prefill + belief scan — keep it off the async
-    // runtime's worker threads so an in-flight projection never stalls other
-    // requests. `substrate_project` is synchronous and internally blocking.
-    let out = tokio::task::spawn_blocking(move || session.substrate_project(&req.text))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    out.map(Json).ok_or(StatusCode::SERVICE_UNAVAILABLE)
+    // The probe is a real GPU prefill + belief scan, as well as a substrate read.
+    off_runtime(move || session.substrate_project(&req.text))
+        .await?
+        .map(Json)
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 pub async fn timeline(
@@ -93,8 +106,8 @@ pub async fn timeline(
     // Timeline ids are raw u64 — carried as a string on the wire so JS never
     // rounds them through its 2^53 float mantissa.
     let raw: u64 = tl.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    session
-        .substrate_timeline(raw)
+    off_runtime(move || session.substrate_timeline(raw))
+        .await?
         // Model not loaded, or no such timeline — either way there's nothing to
         // show; the viewer only requests this after a successful overview.
         .map(Json)
@@ -141,7 +154,7 @@ pub async fn delete_timeline(
     Path(tl): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let raw: u64 = tl.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    match session.tombstone_timeline_raw(raw) {
+    match off_runtime(move || session.tombstone_timeline_raw(raw)).await? {
         Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
         Some(Err(e)) => {
             tracing::warn!(timeline = raw, "tombstone_timeline_raw failed: {e}");
@@ -176,7 +189,7 @@ pub struct SystemPromptRetired {
 pub async fn retire_system_prompt(
     State(session): State<Arc<ZendSession>>,
 ) -> Result<Json<SystemPromptRetired>, StatusCode> {
-    match session.retire_system_prompt() {
+    match off_runtime(move || session.retire_system_prompt()).await? {
         Some(Ok(retired)) => Ok(Json(retired)),
         Some(Err(e)) => {
             tracing::warn!("retire_system_prompt failed: {e}");

@@ -44,6 +44,7 @@ mod deleted_set;
 mod dominance;
 mod ended_sections;
 mod label_records;
+mod lock;
 #[cfg(test)]
 mod order_independence_tests;
 mod pending;
@@ -55,7 +56,7 @@ mod tag_index;
 mod tombstones;
 mod turn_placement;
 
-use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, OnceLock};
 
 use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{
@@ -104,6 +105,7 @@ use crate::ConversationError;
 use deleted_set::DeletedSet;
 use ended_sections::EndedSections;
 use label_records::label_records;
+pub use lock::{SubstrateLock, SubstrateReadGuard, SubstrateWriteGuard};
 use pending::{PendingChild, PendingChildren};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
@@ -8326,7 +8328,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
 /// [`super::resolver::Conversation::read_scored`]; the bare
 /// [`super::resolver::Conversation::read`] returns the unscored variant.
 pub struct SubstrateRead<'a> {
-    pub(super) guard: RwLockReadGuard<'a, Substrate>,
+    pub(super) guard: SubstrateReadGuard<'a>,
     pub(super) scores: Option<&'a ProjectionScores>,
 }
 
@@ -8445,7 +8447,7 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
 /// Write guard over a [`Substrate`] inside a [`super::resolver::Conversation`].
 /// Holds the lock; drop to release.
 pub struct SubstrateWrite<'a> {
-    pub(super) guard: RwLockWriteGuard<'a, Substrate>,
+    pub(super) guard: SubstrateWriteGuard<'a>,
 }
 
 impl<'a> std::ops::Deref for SubstrateWrite<'a> {
