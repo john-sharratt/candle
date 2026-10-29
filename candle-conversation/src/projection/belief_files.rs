@@ -519,6 +519,7 @@ pub(crate) fn scan_file_scans(
                     // Only what the content competitions weigh is scanned, or
                     // resident (`docs/gallery_residency.md` §4).
                     groups: GroupSet::weighed(weights, arena.n_groups()),
+                    keep: group.policy.scan.gallery_keep,
                 }
             })
             .collect();
@@ -541,6 +542,7 @@ pub(crate) fn scan_file_scans(
                 n_cases: cal.len(),
                 holder,
                 groups: GroupSet::weighed(cal_weights, arena.n_groups()),
+                keep: group.policy.scan.calibration_gallery_keep,
             });
         }
         // `[probe][file][slot]`, the content competitions weighed by `w`, the

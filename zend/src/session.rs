@@ -3311,8 +3311,14 @@ impl InferenceState {
             else {
                 continue;
             };
-            let content = GroupSet::weighed(&policy.layer_weights, FOLD_GROUPS);
-            let calibration = GroupSet::weighed(&policy.calibration_layer_weights, FOLD_GROUPS);
+            let content = (
+                GroupSet::weighed(&policy.layer_weights, FOLD_GROUPS),
+                policy.scan.gallery_keep,
+            );
+            let calibration = (
+                GroupSet::weighed(&policy.calibration_layer_weights, FOLD_GROUPS),
+                policy.scan.calibration_gallery_keep,
+            );
             let scanner = self.engine.lock().unwrap().group_scanner();
             match scanner.learn_chunk_exclusion(
                 group,

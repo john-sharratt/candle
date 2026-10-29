@@ -59,7 +59,9 @@ use crate::persistence::{
     PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
 };
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
-use crate::provenance::gallery_arena::{scan_split, GroupSet, Holder, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{
+    scan_split, GroupSet, Holder, Keep, PagedSegment, PagedWindow,
+};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
@@ -1105,16 +1107,21 @@ impl Conversation {
         // collection's — the union where several read it, so the preload puts
         // on the card exactly what the scans will read
         // (`docs/gallery_residency.md` §4).
+        // Held under the union of what its readers keep of it, too
+        // (`docs/gallery_dedup.md` §3).
         let n_groups = arena.map_or(0, GalleryArena::n_groups);
         let mut order: Vec<StreamId> = Vec::new();
-        let mut wanted: HashMap<StreamId, (SigWindow, GroupSet)> = HashMap::new();
-        let mut want = |sid: StreamId, window: SigWindow, groups: GroupSet| {
+        let mut wanted: HashMap<StreamId, (SigWindow, GroupSet, Keep)> = HashMap::new();
+        let mut want = |sid: StreamId, window: SigWindow, groups: GroupSet, keep: Keep| {
             wanted
                 .entry(sid)
-                .and_modify(|(_, g)| *g = g.union(groups))
+                .and_modify(|(_, g, k)| {
+                    *g = g.union(groups);
+                    *k = k.union(keep);
+                })
                 .or_insert_with(|| {
                     order.push(sid);
-                    (window, groups)
+                    (window, groups, keep)
                 });
         };
         let mut preload = GalleryPreload::default();
@@ -1134,18 +1141,26 @@ impl Conversation {
                 let timelines: Vec<TimelineId> = sub.timelines_for_group(group.id).collect();
                 let (files, turns) = assemble_file_scans(&sub, timelines);
                 preload.turns += turns;
+                let scan = &group.policy.scan;
                 for f in files {
-                    let mut by_arc = vec![GroupSet::default(); f.arc_sids.len()];
+                    let mut by_arc = vec![(GroupSet::default(), Keep::All); f.arc_sids.len()];
+                    let mut read = |k: usize, groups: GroupSet, keep: Keep| {
+                        let (g, kept) = by_arc[k];
+                        // An arc no window reads is never preloaded; its keep
+                        // is the first reader's, not a union with `All`.
+                        let kept = if g.is_empty() { keep } else { kept.union(keep) };
+                        by_arc[k] = (g.union(groups), kept);
+                    };
                     for &(k, ..) in &f.windows {
-                        by_arc[k] = by_arc[k].union(content);
+                        read(k, content, scan.gallery_keep);
                     }
                     for &(k, ..) in &f.cal_windows {
-                        by_arc[k] = by_arc[k].union(calibration);
+                        read(k, calibration, scan.calibration_gallery_keep);
                     }
-                    for ((sid, window), groups) in
+                    for ((sid, window), (groups, keep)) in
                         f.arc_sids.into_iter().zip(f.arcs_kept).zip(by_arc)
                     {
-                        want(sid, window, groups);
+                        want(sid, window, groups, keep);
                     }
                 }
             }
@@ -1159,26 +1174,25 @@ impl Conversation {
             preload.turns += gallery.len();
             let groups = GroupSet::weighed(&coll.policy.layer_weights, n_groups);
             for (sid, window) in sids.into_iter().zip(gallery) {
-                want(sid, window, groups);
+                want(sid, window, groups, coll.policy.scan.gallery_keep);
             }
         }
         let Some(arena) = arena else {
             return preload;
         };
-        let windows: Vec<(StreamId, SigWindow, GroupSet)> = order
+        let windows: Vec<(StreamId, SigWindow, GroupSet, Keep)> = order
             .into_iter()
             .filter_map(|sid| {
-                let (window, groups) = wanted.remove(&sid)?;
-                Some((sid, window, groups))
+                let (window, groups, keep) = wanted.remove(&sid)?;
+                Some((sid, window, groups, keep))
             })
-            .filter(|(_, _, groups)| !groups.is_empty())
+            .filter(|(_, _, groups, _)| !groups.is_empty())
             .collect();
-        let ensured = arena.ensure_all_resident(
-            windows
-                .iter()
-                .map(|(sid, window, groups)| (*sid, window.into(), window.fingerprint(), *groups)),
-        );
-        for ((sid, window, _), done) in windows.iter().zip(ensured) {
+        let ensured =
+            arena.ensure_all_resident(windows.iter().map(|(sid, window, groups, keep)| {
+                (*sid, window.into(), window.fingerprint(), *groups, *keep)
+            }));
+        for ((sid, window, ..), done) in windows.iter().zip(ensured) {
             match done {
                 Ok(()) => {
                     preload.resident += 1;
@@ -1337,6 +1351,7 @@ impl Conversation {
                         // conversation's turns.
                         holder: Holder::Shared,
                         groups: GroupSet::weighed(&coll.policy.layer_weights, arena.n_groups()),
+                        keep: coll.policy.scan.gallery_keep,
                     };
                     let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
@@ -2013,6 +2028,7 @@ impl Conversation {
                     n_cases: n,
                     holder: Holder::Shared,
                     groups: GroupSet::weighed(weights, arena.n_groups()),
+                    keep: taught.policy.scan.gallery_keep,
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
@@ -6521,6 +6537,64 @@ layers:
         assert_eq!(conv.warm_group_normalization(schema, exchanges), 1);
         assert!(!conv.warm_timeline_normalization(schema, file));
         assert!(conv.warm_timeline_normalization(schema, exchange));
+    }
+
+    /// **A group's gallery keeps parse**: a count per code, `all`, the default
+    /// when omitted, and `0` or another word refused.
+    #[test]
+    fn gallery_keeps_parse_from_the_policy() {
+        use crate::provenance::gallery_arena::Keep;
+
+        let yaml = |policy: &str| {
+            format!(
+                r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: {{ kind: top_k, k: 2 }}
+        policy: {{ {policy} }}
+"#
+            )
+        };
+        let keeps = |policy: &str| {
+            Builder::from_yaml(&yaml(policy)).map(|b| {
+                let scan = b.schema().layers[0].groups[0].policy.scan;
+                (scan.gallery_keep, scan.calibration_gallery_keep)
+            })
+        };
+        assert_eq!(
+            keeps("gallery_keep: 1, calibration_gallery_keep: all").unwrap(),
+            (Keep::FirstPerCode(1), Keep::All)
+        );
+        assert_eq!(
+            keeps("cases: file").unwrap(),
+            (Keep::All, Keep::All),
+            "omitted keeps every token"
+        );
+        assert_eq!(
+            keeps("calibration_gallery_keep: 2").unwrap(),
+            (Keep::All, Keep::FirstPerCode(2))
+        );
+        assert!(keeps("gallery_keep: 0").is_err());
+        assert!(keeps("gallery_keep: some").is_err());
     }
 
     /// **A calibration's questions vote for the file they calibrate.** Two

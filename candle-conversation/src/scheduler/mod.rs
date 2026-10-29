@@ -139,7 +139,7 @@ use crate::projection::{
     CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
     SubstrateRef,
 };
-use crate::provenance::gallery_arena::GroupSet;
+use crate::provenance::gallery_arena::{GroupSet, Keep};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -859,6 +859,8 @@ pub(crate) enum SchedulerRequest {
         probes: Vec<Vec<WideQSig>>,
         /// The fold groups to scan; `None` for every group.
         groups: Option<GroupSet>,
+        /// Which of the turns' tokens the card holds for the scan.
+        keep: Keep,
         response_tx: Sender<Option<candle::Result<GroupVotes>>>,
     },
 
@@ -5598,6 +5600,7 @@ impl Scheduler {
                 excluded,
                 probes,
                 groups,
+                keep,
                 response_tx,
             } => {
                 // Background work, like an ingest slice: run from the loop top
@@ -5610,6 +5613,7 @@ impl Scheduler {
                     excluded,
                     probes,
                     groups,
+                    keep,
                     response_tx,
                 });
                 true

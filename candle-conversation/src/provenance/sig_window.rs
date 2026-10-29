@@ -101,6 +101,16 @@ impl SigWindow {
     pub fn decode(&self) -> Vec<WideQSig> {
         decode_wide_sigs(&self.blob).unwrap_or_default()
     }
+
+    /// The window's words, token-major and [`Self::width`] to a token, read
+    /// now into one buffer — what a pass over every token's bits reads, without
+    /// a [`WideQSig`] per token.
+    pub fn words(&self) -> Vec<u64> {
+        self.blob[self.header_len..self.header_len + self.n_tokens * self.width * 8]
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("an 8-byte chunk")))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +143,11 @@ mod tests {
         assert_eq!(w.width(), 24);
         assert!(!w.is_empty());
         assert_eq!(w.decode(), sigs);
+        let words = w.words();
+        assert_eq!(words.len(), 72);
+        assert_eq!(words[0], 0xAAAA_AAAA_AAAA_AAAA);
+        assert_eq!(words[24], 0x5555_5555_5555_5555);
+        assert_eq!(words[71], 7);
     }
 
     /// The fingerprint is the buffer's: two reads of one stored buffer agree,

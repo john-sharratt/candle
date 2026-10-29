@@ -37,6 +37,9 @@
 //!   one file and switching to another.
 //! - **Layers** (`layers`): fold-group weightings for content and for the
 //!   calibration competition apart, from one scan each.
+//! - **Dedup** (`dedup`): the content gallery reduced by a learned codebook —
+//!   near duplicates within a file, codes common across files — sized, and
+//!   judged on calibration questions.
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -76,6 +79,8 @@
 //!     <workspace dir> layers --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> dedup [sample files] [questions per file] --daemon <url> --node <hex>
 
 mod anomaly;
 mod attribution;
@@ -83,8 +88,10 @@ mod background;
 mod boilerplate;
 mod calibration_cut;
 mod chunk_factor;
+mod codebook;
 mod competitions;
 mod corpus;
+mod dedup_gate;
 mod density;
 mod judge;
 mod layers_gate;
@@ -288,11 +295,16 @@ fn main() -> anyhow::Result<()> {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
             scan_loop::run(&files, passes, daemon()?)?;
         }
+        "dedup" => {
+            let sample = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(200);
+            let per_file = args.get(3).map(|a| a.parse()).transpose()?.unwrap_or(3);
+            dedup_gate::run(&files, sample, per_file, daemon()?)?;
+        }
         other => {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
                  normalization, chunk-factor, density, question-cut, competitions, thinking, \
-                 calibration-cut, momentum, layers or scan-loop"
+                 calibration-cut, momentum, layers, scan-loop or dedup"
             )
         }
     }

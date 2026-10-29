@@ -67,6 +67,7 @@ use std::num::NonZeroUsize;
 use candle_transformers::models::dialect::{Dialect, DialectTemplate};
 use serde::Deserialize;
 
+use crate::provenance::gallery_arena::Keep;
 use crate::provenance::FusionMode;
 
 use super::adaptive::{
@@ -231,6 +232,33 @@ struct YamlPolicy {
     /// own. Omitted ⇒ inherit.
     #[serde(default)]
     calibration_weight: Option<f32>,
+    /// Which of each scanned turn's tokens the GPU gallery holds: `all`, or
+    /// the first `n` of each code within the turn. Omitted ⇒ inherit.
+    #[serde(default)]
+    gallery_keep: Option<YamlKeep>,
+    /// `gallery_keep` for the calibration competition's questions.
+    #[serde(default)]
+    calibration_gallery_keep: Option<YamlKeep>,
+}
+
+/// `all`, or a count of tokens to keep per code.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum YamlKeep {
+    PerCode(u8),
+    Named(String),
+}
+
+/// `keep` as the policy `name`'s `field` names it.
+fn parse_keep(name: &str, field: &str, keep: &YamlKeep) -> Result<Keep, ConstructionError> {
+    match keep {
+        YamlKeep::PerCode(n) if *n > 0 => Ok(Keep::FirstPerCode(*n)),
+        YamlKeep::Named(s) if s == "all" => Ok(Keep::All),
+        _ => Err(ConstructionError::InvalidPolicy {
+            name: name.to_string(),
+            reason: format!("{field} must be `all` or a count of tokens per code above 0"),
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -968,6 +996,12 @@ fn parse_policy(
     }
     if let Some(w) = yp.calibration_weight {
         scan.calibration_weight = w;
+    }
+    if let Some(k) = &yp.gallery_keep {
+        scan.gallery_keep = parse_keep(name, "gallery_keep", k)?;
+    }
+    if let Some(k) = &yp.calibration_gallery_keep {
+        scan.calibration_gallery_keep = parse_keep(name, "calibration_gallery_keep", k)?;
     }
     validate_scan(name, &scan)?;
     if calibration_layer_weights

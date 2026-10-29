@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::provenance::gallery_arena::Keep;
 use crate::provenance::FusionMode;
 
 /// Reference window for the Concept A.4 size ratio — the live probe cap
@@ -53,6 +54,12 @@ pub struct ScanPolicy {
     /// every vote, so they compete among themselves (`docs/
     /// provenance_scoped_signatures.md` §2.5).
     pub calibration_weight: f32,
+    /// Which of each scanned turn's tokens the GPU gallery holds — every one,
+    /// or the first of each code within the turn (`docs/gallery_dedup.md`).
+    /// The substrate keeps every token either way.
+    pub gallery_keep: Keep,
+    /// [`Self::gallery_keep`] for the calibration competition's questions.
+    pub calibration_gallery_keep: Keep,
 }
 
 /// What a turn group's scan scores as one case
@@ -84,6 +91,8 @@ impl Default for ScanPolicy {
             level_prior_cap: 8.0,
             cases: ScanCases::Exchange,
             calibration_weight: 1.0,
+            gallery_keep: Keep::All,
+            calibration_gallery_keep: Keep::All,
         }
     }
 }

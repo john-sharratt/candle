@@ -1,0 +1,67 @@
+# Independent asks for the project API (`POST /v1/substrate/zend/project`):
+# none is a calibration question or a turn in the substrate. Each names the
+# tools a correct projection ranks first — any one of them counts.
+- ask: "Show me the contents of candle-conversation/src/substrate/lock.rs"
+  tools: [file_read]
+- ask: "Find every place in the code that calls demote_cold_ingest"
+  tools: [git_grep, file_grep, file_search]
+- ask: "What changed in the last five commits?"
+  tools: [git_log]
+- ask: "Commit the staged changes with the message 'fix the lock timing'"
+  tools: [git_commit]
+- ask: "Push my current branch to origin"
+  tools: [git_push]
+- ask: "Which branch am I on, and do I have uncommitted changes?"
+  tools: [git_status]
+- ask: "Switch to the branch called feature-gallery"
+  tools: [git_switch]
+- ask: "Show me what commit 6f10e30b changed"
+  tools: [git_show]
+- ask: "What is 17 percent of 2,340?"
+  tools: [calculator]
+- ask: "What time is it in Tokyo right now?"
+  tools: [datetime]
+- ask: "Look up the IP address of gateway.tokera.com"
+  tools: [dns_lookup]
+- ask: "Is port 9443 open on 192.168.0.5?"
+  tools: [port_scan]
+- ask: "Ping 192.168.0.6 and tell me the latency"
+  tools: [ping_icmp]
+- ask: "Fetch https://example.com and show me the response headers"
+  tools: [http_request]
+- ask: "Compute the SHA-256 hash of the text 'hello world'"
+  tools: [hash_compute]
+- ask: "Encrypt this message with AES-GCM using the key I gave you"
+  tools: [aead_encrypt]
+- ask: "Run cargo test -p host and show me the output"
+  tools: [run_command, code_run]
+- ask: "Delete the file scratch/old_notes.txt"
+  tools: [file_delete]
+- ask: "In src/main.rs replace every occurrence of foo with bar"
+  tools: [file_edit]
+- ask: "List the files in the zend/src/api directory"
+  tools: [file_list]
+- ask: "Save my GitHub token as a credential so you can use it later"
+  tools: [credential_save]
+- ask: "Write a note to remind me to measure the telemetry window tomorrow"
+  tools: [notes_write]
+- ask: "Search my notes for anything about the gallery"
+  tools: [notes_search]
+- ask: "Generate a random 32-byte key for me"
+  tools: [random]
+- ask: "What machine is this, and how much RAM does it have?"
+  tools: [host_info]
+- ask: "Open an SSH session to 192.168.0.6"
+  tools: [ssh_open]
+- ask: "Connect to the Postgres database at db.local and count the rows in the users table"
+  tools: [sql_session_open, sql_session_query]
+- ask: "Sign this payload with my ed25519 key"
+  tools: [signature_sign]
+- ask: "Scan the local network 192.168.0.0/24 for hosts that are up"
+  tools: [ip_scan]
+- ask: "Upload report.pdf to the uploads folder on the remote file server"
+  tools: [remote_fs_session_put, remote_fs_session_open]
+- ask: "Where in the repository is the gallery arena's paged scan implemented?"
+  tools: [git_grep, file_search, file_grep]
+- ask: "Read back what I wrote in my journal yesterday"
+  tools: [journal_read, journal_grep]

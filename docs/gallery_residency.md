@@ -127,6 +127,11 @@ zero, and the calibration questions 1.11 GiB with two thirds weighed zero;
 after, 3.37 GiB (`code_reading` 2.88, calibration 0.42). The kernel's share of
 a belief scan fell from 2.25 to 2.12 ms.
 
+Within the groups a turn holds, the dedup overlay keeps only the tokens its
+readers ask for — every one, or the first of each code within the turn — and
+a turn several read holds the union of their keeps, as it holds the union of
+their groups (`docs/gallery_dedup.md`).
+
 ## 5. Seeing it
 
 `/v1/memory` → `state.gallery.rows` sums resident turns by status (live,

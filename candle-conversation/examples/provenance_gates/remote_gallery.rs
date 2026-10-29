@@ -82,6 +82,9 @@ pub struct RemoteGallery<'a> {
     /// Each file's index here, by its timeline.
     index_of: HashMap<u64, usize>,
     agent: ureq::Agent,
+    /// Tokens of each code within a turn the daemon's card holds for the
+    /// scans, `0` for every token (`docs/gallery_dedup.md`).
+    per_code: u8,
 }
 
 impl<'a> RemoteGallery<'a> {
@@ -95,6 +98,19 @@ impl<'a> RemoteGallery<'a> {
                 .map(|(i, f)| (f.timeline, i))
                 .collect(),
             agent: ureq::AgentBuilder::new().build(),
+            per_code: 0,
+        }
+    }
+
+    /// The same gallery, its scans holding the first `per_code` tokens of each
+    /// code within a turn on the daemon's card.
+    pub fn deduped(&self, per_code: u8) -> RemoteGallery<'a> {
+        RemoteGallery {
+            daemon: self.daemon,
+            files: self.files,
+            index_of: self.index_of.clone(),
+            agent: self.agent.clone(),
+            per_code,
         }
     }
 
@@ -138,7 +154,7 @@ impl<'a> RemoteGallery<'a> {
                 }
             }
         }
-        let body = json!({
+        let mut body = json!({
             "group": GROUP,
             "calibrations": questions == Questions::With,
             "masked": masked_sids,
@@ -151,6 +167,10 @@ impl<'a> RemoteGallery<'a> {
                 .map(|p| STANDARD.encode(encode_wide_sigs(p)))
                 .collect::<Vec<_>>(),
         });
+        // Only when asked for, so a scan of every token keeps its cached answer.
+        if self.per_code > 0 {
+            body["per_code"] = json!(self.per_code);
+        }
         let body = body.to_string();
         let kept = cache_path(&body);
         let answer = match fs::read_to_string(&kept) {

@@ -25,7 +25,7 @@ use candle::Device;
 use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
-use candle_conversation::provenance::gallery_arena::{Holder, PagedSegment, PagedWindow};
+use candle_conversation::provenance::gallery_arena::{Holder, Keep, PagedSegment, PagedWindow};
 use candle_conversation::provenance::{
     decode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig,
 };
@@ -158,6 +158,7 @@ fn main() {
             n_cases: turns.len(),
             holder: Holder::Shared,
             groups: arena.all_groups(),
+            keep: Keep::All,
         })
         .collect::<Vec<_>>();
 
@@ -251,6 +252,7 @@ fn main() {
             n_cases: case,
             holder: Holder::Shared,
             groups: arena.all_groups(),
+            keep: Keep::All,
         };
         // A wide probe (past the group scans' 256 budget) mirrors the live
         // collection probe: concatenate windows up to 320 sigs.

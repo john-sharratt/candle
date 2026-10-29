@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use candle_conversation::persistence::streams::StreamId;
 use candle_conversation::projection::GroupVotes;
+use candle_conversation::provenance::gallery_arena::Keep;
 use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
 use candle_conversation::ScanRefused;
 
@@ -49,6 +50,18 @@ pub struct ScanReq {
     pub excluded: Vec<Excluded>,
     /// Each probe's signatures, base64 of `encode_wide_sigs`.
     pub probes: Vec<String>,
+    /// Tokens of each code within a turn the card holds for the scan
+    /// (`docs/gallery_dedup.md`); `0`, or absent, holds every token.
+    #[serde(default)]
+    pub per_code: u8,
+}
+
+/// The keep `per_code` names.
+fn keep_of(per_code: u8) -> Keep {
+    match per_code {
+        0 => Keep::All,
+        n => Keep::FirstPerCode(n),
+    }
 }
 
 /// One turn's `[start, end)` tokens cut from the gallery.
@@ -101,9 +114,10 @@ pub async fn scan(
     // The scan runs on the scheduler thread at ingest priority; this thread
     // only waits for it, off the async runtime's workers.
     let calibrations = req.calibrations;
+    let keep = keep_of(req.per_code);
     let out = tokio::task::spawn_blocking(move || {
         // Every fold group: the harness weighs the raw votes itself.
-        scanner.scan(group, calibrations, masked, excluded, probes, None)
+        scanner.scan(group, calibrations, masked, excluded, probes, None, keep)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -249,6 +263,15 @@ mod tests {
         assert_eq!(got[&StreamId(7)], vec![0..32, 96..128]);
         assert_eq!(got[&StreamId(9)], vec![64..96]);
         assert!(decode_excluded(&[x("seven", 0, 1)]).is_err());
+    }
+
+    /// Absent or `0` holds every token; `n` the first `n` of each code.
+    #[test]
+    fn per_code_names_the_keep() {
+        assert_eq!(keep_of(0), Keep::All);
+        assert_eq!(keep_of(2), Keep::FirstPerCode(2));
+        let req: ScanReq = serde_json::from_str(r#"{"group":"scopes","probes":[]}"#).unwrap();
+        assert_eq!(req.per_code, 0);
     }
 
     #[test]

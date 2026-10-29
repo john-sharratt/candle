@@ -55,6 +55,22 @@ impl TurnSigs<'_> {
             Self::Encoded(w) => f(&w.decode()),
         }
     }
+
+    /// The turn's words, token-major, `width` to a token — a token of another
+    /// width cut or zero-padded to it, so token `t` is always at `t × width`.
+    pub fn words(&self, width: usize) -> Vec<u64> {
+        match self {
+            Self::Encoded(w) if w.width() == width => w.words(),
+            _ => self.with_decoded(|sigs| {
+                let mut out = vec![0u64; sigs.len() * width];
+                for (t, s) in sigs.iter().enumerate() {
+                    let n = s.words.len().min(width);
+                    out[t * width..t * width + n].copy_from_slice(&s.words[..n]);
+                }
+                out
+            }),
+        }
+    }
 }
 
 impl<'a> From<&'a [WideQSig]> for TurnSigs<'a> {
@@ -103,7 +119,19 @@ mod tests {
             assert!(form.token_has_width(2, 24));
             assert!(!form.token_has_width(2, 12));
             assert_eq!(form.with_decoded(<[WideQSig]>::to_vec), sigs);
+            let words = form.words(24);
+            assert_eq!(words.len(), 72);
+            assert_eq!((words[0], words[24], words[71]), (1, 2, 3));
         }
+    }
+
+    /// Words at another width are cut or zero-padded, one stride a token.
+    #[test]
+    fn words_hold_every_token_at_the_asked_width() {
+        let mut sigs = vec![sig(5), sig(6)];
+        sigs[1].words.truncate(2);
+        let words = TurnSigs::from(&sigs).words(4);
+        assert_eq!(words, vec![5, 5, 5, 5, 6, 6, 0, 0]);
     }
 
     /// A decoded turn is checked per token: one short token is refused alone.

@@ -36,7 +36,7 @@ use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
 use super::token_votes::widen_rows;
-use super::{GalleryArena, GroupSet, Holder, IndexMiss, TokenVotes, TurnSigs};
+use super::{GalleryArena, GroupSet, Holder, IndexMiss, Keep, KeepMask, TokenVotes, TurnSigs};
 
 /// What producing a scan's rows cost: the launch's timing, the probe tokens it
 /// scored (the rest were read from [`ProbeRows`]), and the row cache's own
@@ -61,13 +61,15 @@ pub struct PagedWindow<'a> {
 }
 
 /// One segment (file): its windows, its exchange (case) count, who the turns it
-/// reads are held for (`docs/gallery_residency.md` §2), and the fold groups its
-/// scan weighs (§4) — the groups its turns must hold, and the launch scans.
+/// reads are held for (`docs/gallery_residency.md` §2), the fold groups its
+/// scan weighs (§4) — the groups its turns must hold, and the launch scans —
+/// and which of its turns' tokens the card holds (`docs/gallery_dedup.md`).
 pub struct PagedSegment<'a> {
     pub windows: Vec<PagedWindow<'a>>,
     pub n_cases: usize,
     pub holder: Holder,
     pub groups: GroupSet,
+    pub keep: Keep,
 }
 
 /// `weights` for every one of `segments`.
@@ -197,10 +199,12 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 }
 
 /// Fingerprint the segment structure the built index depends on — file order,
-/// each file's case count and holder, and every window's `(sid, fingerprint,
-/// turn length, start, end, case)`. Cheap (per-window, not per-token). The
-/// holder is in it so an index built for one reader never stands in for
-/// another's, whose build would widen what its turns are held for.
+/// each file's case count, holder and keep, and every window's `(sid,
+/// fingerprint, turn length, start, end, case)`. Cheap (per-window, not
+/// per-token). The holder is in it so an index built for one reader never
+/// stands in for another's, whose build would widen what its turns are held
+/// for; the keep, so an index over a turn's kept tokens never stands in for a
+/// reader asking for more of them.
 ///
 /// The fold groups are not: readers of one segment set weighing different
 /// groups share its index, which a reuse checks covers what each segment
@@ -225,6 +229,7 @@ fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
     for seg in segments {
         seg.n_cases.hash(&mut h);
         seg.holder.hash(&mut h);
+        seg.keep.hash(&mut h);
         seg.windows.len().hash(&mut h);
         for w in &seg.windows {
             w.sid.0.hash(&mut h);
@@ -261,21 +266,43 @@ impl GalleryArena {
             .fold(GroupSet::default(), |g, s| g.union(*s));
         let gw_bytes = (PAGE_TOKENS * self.gw() * std::mem::size_of::<u64>()) as u64;
         // What each turn is read for, over every segment that reads it: the
-        // widest holder and the union of the groups.
-        let mut wants: HashMap<StreamId, (Holder, GroupSet)> = HashMap::new();
+        // widest holder, the union of the groups, and the union of the keeps.
+        let mut wants: HashMap<StreamId, (Holder, GroupSet, Keep)> = HashMap::new();
+        // Every turn under every keep by code a segment reads it by.
+        let mut reads: HashMap<(StreamId, Keep), (TurnSigs<'_>, u64)> = HashMap::new();
         for (seg, &groups) in segments.iter().zip(seg_groups) {
             for w in &seg.windows {
                 wants
                     .entry(w.sid)
-                    .and_modify(|(h, g)| {
+                    .and_modify(|(h, g, k)| {
                         *h = h.widen(seg.holder);
                         *g = g.union(groups);
+                        *k = k.union(seg.keep);
                     })
-                    .or_insert((seg.holder, groups));
+                    .or_insert((seg.holder, groups, seg.keep));
+                if seg.keep != Keep::All {
+                    reads
+                        .entry((w.sid, seg.keep))
+                        .or_insert((w.turn, w.fingerprint));
+                }
             }
         }
+        // Train the codebook and compute the masks the uploads and the walk
+        // below need, in parallel, before the first: they run a turn at a time.
+        let t_keeps = Instant::now();
+        self.prepare_keeps(
+            reads
+                .iter()
+                .map(|(&(sid, keep), &(turn, fp))| (sid, turn, fp, keep)),
+        );
+        let keeps_time = t_keeps.elapsed();
+        // Which of a turn's tokens a segment scans: its own keep's, each kept
+        // token at its place among the tokens the turn's pages hold — those of
+        // a keep covering it, so a reader scans what it asked for whoever
+        // else holds the turn wider.
+        let mut scanned: HashMap<(StreamId, Keep), Arc<KeepMask>> = HashMap::new();
         let mut zero: Option<u64> = None;
-        let mut turn_base: HashMap<StreamId, usize> = HashMap::new();
+        let mut turn_base: HashMap<StreamId, (usize, Arc<KeepMask>)> = HashMap::new();
         let mut n_pages = 0usize;
         let mut page_ptr: Vec<u64> = Vec::new();
         let mut pos_map: Vec<u32> = Vec::new();
@@ -312,15 +339,15 @@ impl GalleryArena {
                 if w.case >= seg.n_cases {
                     continue;
                 }
-                let base = match turn_base.get(&w.sid) {
-                    Some(&b) => b,
+                let (base, held) = match turn_base.get(&w.sid) {
+                    Some((b, m)) => (*b, Arc::clone(m)),
                     None => {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
                         let t_ensure = Instant::now();
-                        let (holder, groups) = wants[&w.sid];
+                        let (holder, groups, keep) = wants[&w.sid];
                         let ensured =
-                            self.scan_ensure(w.sid, w.turn, w.fingerprint, holder, groups);
+                            self.scan_ensure(w.sid, w.turn, w.fingerprint, holder, groups, keep);
                         ensure_time += t_ensure.elapsed();
                         let ensured = match ensured {
                             Ok(e) => e,
@@ -355,17 +382,28 @@ impl GalleryArena {
                         }
                         let b = n_pages;
                         n_pages += ensured.addrs.len();
-                        turn_base.insert(w.sid, b);
-                        b
+                        turn_base.insert(w.sid, (b, Arc::clone(&ensured.mask)));
+                        (b, ensured.mask)
                     }
                 };
+                let mask = if seg.keep == Keep::All {
+                    Arc::clone(&held)
+                } else {
+                    Arc::clone(scanned.entry((w.sid, seg.keep)).or_insert_with(|| {
+                        self.reader_mask(w.sid, w.fingerprint, w.turn, seg.keep)
+                    }))
+                };
                 for t in w.start..w.end.min(w.turn.len()) {
-                    // Uniform width only (mirror the reference's admission guard).
-                    if !w.turn.token_has_width(t, wpt) {
+                    // Uniform width only (mirror the reference's admission guard),
+                    // and only the tokens this segment keeps, at their place
+                    // among the ones the pages hold.
+                    if !w.turn.token_has_width(t, wpt) || !mask.keeps(t) {
                         continue;
                     }
-                    let page = base + t / PAGE_TOKENS;
-                    let in_pg = t % PAGE_TOKENS;
+                    debug_assert!(held.keeps(t), "a reader's kept token the pages lack");
+                    let place = held.rank(t);
+                    let page = base + place / PAGE_TOKENS;
+                    let in_pg = place % PAGE_TOKENS;
                     pos_map.push(((page as u32) << 5) | (in_pg as u32));
                     case.push((case_off + w.case) as u32);
                 }
@@ -398,6 +436,7 @@ impl GalleryArena {
             turns = pinned_sids.len(),
             uploaded,
             tokens = n_tokens,
+            keeps_ms = keeps_time.as_millis() as u64,
             ensure_with_lock_wait_ms = ensure_time.as_millis() as u64,
             walk_ms = walked.saturating_sub(ensure_time).as_millis() as u64,
             index_upload_ms = t_upload.elapsed().as_millis() as u64,
@@ -1096,6 +1135,7 @@ impl GalleryArena {
 
 #[cfg(test)]
 mod tests {
+    use super::super::pages_for;
     use super::super::tests::gallery_pool;
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
@@ -1160,6 +1200,7 @@ mod tests {
                 n_cases: 2,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1173,6 +1214,7 @@ mod tests {
                 n_cases: 1,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
         ];
         let tail = vec![
@@ -1237,6 +1279,7 @@ mod tests {
                     n_cases: 1,
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
+                    keep: Keep::All,
                 },
                 PagedSegment {
                     windows: vec![
@@ -1260,6 +1303,7 @@ mod tests {
                     n_cases: 2,
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
+                    keep: Keep::All,
                 },
             ]
         };
@@ -1331,12 +1375,14 @@ mod tests {
                 n_cases: 2,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
             PagedSegment {
                 windows: vec![window(3, &c, 0)],
                 n_cases: 1,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
         ];
         let p0 = vec![sig(0x1001), sig(0x3000 + 30), sig(0xBEEF)];
@@ -1413,6 +1459,7 @@ mod tests {
                 n_cases: 2,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
             PagedSegment {
                 // Two sub-windows of ONE multi-page turn → different cases (a seam).
@@ -1437,6 +1484,7 @@ mod tests {
                 n_cases: 2,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1450,6 +1498,7 @@ mod tests {
                 n_cases: 1,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
         ];
 
@@ -1566,6 +1615,7 @@ mod tests {
                 n_cases: 2,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1579,6 +1629,7 @@ mod tests {
                 n_cases: 1,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             },
         ];
         let probe = vec![sig(0xA00 + 5), sig(0xC00 + 2), sig(0x999)];
@@ -1639,6 +1690,7 @@ mod tests {
             n_cases: 1,
             holder: Holder::Shared,
             groups: GroupSet::all(3),
+            keep: Keep::All,
         }];
         let seg_b = vec![PagedSegment {
             windows: vec![PagedWindow {
@@ -1652,6 +1704,7 @@ mod tests {
             n_cases: 1,
             holder: Holder::Shared,
             groups: GroupSet::all(3),
+            keep: Keep::All,
         }];
         let probe = vec![sig(0xA00 + 3), sig(0xB00 + 3)];
 
@@ -1703,6 +1756,7 @@ mod tests {
             n_cases: 1,
             holder: Holder::Shared,
             groups: GroupSet::all(3),
+            keep: Keep::All,
         }];
         let probe = vec![sig(0xA00 + 3)];
         let fp = fingerprint_segments(&seg_a);
@@ -1721,6 +1775,7 @@ mod tests {
                 3,
                 Holder::Shared,
                 GroupSet::all(3),
+                Keep::All,
             )
             .unwrap();
         assert!(arena.residency_gen() > gen, "the upload is counted");
@@ -1741,6 +1796,7 @@ mod tests {
                 2,
                 Holder::Shared,
                 GroupSet::all(3),
+                Keep::All,
             )
             .unwrap();
         assert_eq!(
@@ -1752,6 +1808,142 @@ mod tests {
             arena.reuse_index(fp, &all).err(),
             Some(IndexMiss::Absent),
             "the stale index was dropped from the cache"
+        );
+    }
+
+    /// **A deduped scan is the raw scan of the tokens it keeps, bit for bit.**
+    /// Two turns of near duplicates — three base signatures each, each token
+    /// one of them, every fifth with a bit flipped — scanned keeping the first of each
+    /// code, against a fresh arena scanning every token of windows cut to the
+    /// kept runs. The deduped turns hold fewer pages; a reader keeping every
+    /// token then widens them, and scans as the raw arena does.
+    #[test]
+    fn a_deduped_scan_is_the_raw_scan_of_its_kept_tokens() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let mut rng = 0xDEDD_0B5E_u64;
+        let bases: Vec<WideQSig> = (0..6).map(|_| rand_sig(&mut rng)).collect();
+        // Every fifth token one bit off its base; the rest repeat it exactly,
+        // so whatever the codes, a turn holds tokens sharing one.
+        let near = |i: usize, from: usize| {
+            let mut s = bases[from + i % 3].clone();
+            if i.is_multiple_of(5) {
+                s.words[i % 24] ^= 1 << (i % 64);
+            }
+            s
+        };
+        let leak = |n: usize, from: usize| -> &'static [WideQSig] {
+            Box::leak((0..n).map(|i| near(i, from)).collect::<Box<[_]>>())
+        };
+        let (a, b) = (leak(90, 0), leak(50, 3));
+        let turns: [(u64, &'static [WideQSig]); 2] = [(81, a), (82, b)];
+        let segment = |keep: Keep, windows: Vec<PagedWindow<'static>>| PagedSegment {
+            windows,
+            n_cases: 2,
+            holder: Holder::Shared,
+            groups: GroupSet::all(3),
+            keep,
+        };
+        let whole = |a: &'static [WideQSig], b: &'static [WideQSig]| {
+            [(81u64, a, 0usize), (82, b, 1)]
+                .into_iter()
+                .map(|(sid, t, case)| PagedWindow {
+                    sid: turn_stream_id(sid, 0),
+                    fingerprint: sid,
+                    turn: t.into(),
+                    start: 0,
+                    end: t.len(),
+                    case,
+                })
+                .collect::<Vec<_>>()
+        };
+        let probe: Vec<WideQSig> = (0..12).map(|i| near(i * 7, 3 * (i % 2))).collect();
+        let weights: &[f32] = &[1.0, 1.0, 1.0];
+        let bits = |v: &[Vec<f32>]| {
+            v.iter()
+                .map(|p| p.iter().map(|x| x.to_bits()).collect::<Vec<u32>>())
+                .collect::<Vec<_>>()
+        };
+
+        let deduped = GalleryArena::new(&device, 24, 3).unwrap();
+        let one = Keep::FirstPerCode(1);
+        let got = deduped
+            .scan_weighted(&[segment(one, whole(a, b))], &[probe.as_slice()], weights)
+            .unwrap();
+        assert!(got[0].iter().any(|&v| v != 0.0), "nothing scored");
+        let book = deduped.dedup.book().expect("the scan trained a codebook");
+
+        // The raw scan of each turn's kept runs, on an arena that holds every
+        // token.
+        let mut cut = Vec::new();
+        let mut kept_pages = 0;
+        for (case, &(sid, t)) in turns.iter().enumerate() {
+            let mask = deduped
+                .dedup
+                .cached(turn_stream_id(sid, 0), sid, one, book.id())
+                .expect("the upload computed its mask");
+            assert!(
+                mask.kept() < t.len(),
+                "turn {sid} dropped its near duplicates"
+            );
+            kept_pages += pages_for(mask.kept()) as u64;
+            let mut s = 0;
+            while s < t.len() {
+                if !mask.keeps(s) {
+                    s += 1;
+                    continue;
+                }
+                let mut e = s;
+                while e < t.len() && mask.keeps(e) {
+                    e += 1;
+                }
+                cut.push(PagedWindow {
+                    sid: turn_stream_id(sid, 0),
+                    fingerprint: sid,
+                    turn: t.into(),
+                    start: s,
+                    end: e,
+                    case,
+                });
+                s = e;
+            }
+        }
+        let raw = GalleryArena::new(&device, 24, 3).unwrap();
+        let want = raw
+            .scan_weighted(&[segment(Keep::All, cut)], &[probe.as_slice()], weights)
+            .unwrap();
+        assert_eq!(bits(&got), bits(&want));
+        let pages =
+            |arena: &GalleryArena| arena.resident_runs().iter().map(|r| r.bytes).sum::<u64>();
+        assert_eq!(
+            pages(&deduped),
+            kept_pages * 6144,
+            "pages hold the kept tokens"
+        );
+        assert!(kept_pages < 5, "90 + 50 tokens are 5 pages raw");
+
+        // A reader keeping every token widens the turns, and scans as raw does.
+        let every = || [segment(Keep::All, whole(a, b))];
+        let full = deduped
+            .scan_weighted(&every(), &[probe.as_slice()], weights)
+            .unwrap();
+        let raw_full = raw
+            .scan_weighted(&every(), &[probe.as_slice()], weights)
+            .unwrap();
+        assert_eq!(bits(&full), bits(&raw_full));
+        assert_eq!(pages(&deduped), 5 * 6144);
+        // And a deduped reader of turns held whole still scans only its own
+        // kept tokens.
+        let again = deduped
+            .scan_weighted(&[segment(one, whole(a, b))], &[probe.as_slice()], weights)
+            .unwrap();
+        assert_eq!(
+            bits(&again),
+            bits(&got),
+            "a wider holding changes no reader"
         );
     }
 
@@ -1782,6 +1974,7 @@ mod tests {
                 n_cases: 1,
                 holder,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             }]
         };
         let holder_now = || arena.resident_runs()[0].holder;
@@ -1836,12 +2029,14 @@ mod tests {
                     n_cases: 2,
                     holder: Holder::Shared,
                     groups: content,
+                    keep: Keep::All,
                 },
                 PagedSegment {
                     windows: vec![w(93, &c, 0)],
                     n_cases: 1,
                     holder: Holder::Shared,
                     groups: calibration,
+                    keep: Keep::All,
                 },
             ]
         };
@@ -1956,6 +2151,7 @@ mod tests {
                 n_cases: 1,
                 holder: Holder::Shared,
                 groups,
+                keep: Keep::All,
             }]
         };
         let narrow_w: &[f32] = &[0.0, 1.0, 1.0];
@@ -2036,6 +2232,7 @@ mod tests {
             n_cases: 1,
             holder: Holder::Shared,
             groups: GroupSet::all(3),
+            keep: Keep::All,
         }];
         let probe = vec![sig(0xB00 + 5)];
         let fp = fingerprint_segments(&seg);
@@ -2094,6 +2291,7 @@ mod tests {
             n_cases: turns.len(),
             holder: Holder::Shared,
             groups: GroupSet::all(3),
+            keep: Keep::All,
         }];
         let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
 
@@ -2230,6 +2428,7 @@ mod tests {
                 n_cases,
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
+                keep: Keep::All,
             });
         }
 
@@ -2331,6 +2530,7 @@ mod tests {
                     n_cases: CASES_PER_SEGMENT,
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
+                    keep: Keep::All,
                 }
             })
             .collect();
@@ -2413,6 +2613,7 @@ mod tests {
                     n_cases: CASES,
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
+                    keep: Keep::All,
                 }
             })
             .collect();
