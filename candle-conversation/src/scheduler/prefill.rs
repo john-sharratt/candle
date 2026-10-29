@@ -3207,13 +3207,22 @@ impl Scheduler {
             if remaining == 0 {
                 break;
             }
-            let r = conv.write().demote_cold_ingest(
+            // A substrate another thread holds — maintenance's plan, a long
+            // projection read — is passed over this wave and demoted the next:
+            // the demote is relief, owed and retried every wave the pressure
+            // lasts. Waited for here, it stalled the scheduler thread 0.4–0.7 s
+            // at a time, 56 times in ten minutes on BlackWorld (2026-10-29).
+            let Some(mut sub) = conv.try_write() else {
+                continue;
+            };
+            let r = sub.demote_cold_ingest(
                 &self.ingest_timelines,
                 &keep_turns,
                 &keep_sections,
                 window,
                 remaining,
             );
+            drop(sub);
             remaining = remaining.saturating_sub(r.bytes);
             report.count += r.count;
             report.bytes += r.bytes;

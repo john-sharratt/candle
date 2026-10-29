@@ -38,6 +38,7 @@ pub mod compaction;
 pub mod content_hash;
 #[cfg(test)]
 mod convergence_tests;
+mod dead_ratio;
 pub mod deleted;
 pub mod elevate;
 #[cfg(test)]
@@ -96,7 +97,10 @@ pub mod written_snapshots;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
+
+use dead_ratio::dead_ratio_of;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -587,6 +591,9 @@ pub struct SubstratePersistence {
     /// surfaced in the daemon status for the GUI's compaction indicator.
     /// `None` until the first op runs.
     last_maintenance: Option<(String, u64)>,
+    /// The dead ratio the last liveness scan found, as `f32` bits — NaN before
+    /// the first ([`Self::scanned_dead_ratio`]).
+    scanned_dead_ratio: AtomicU32,
     /// The writes made since the running maintenance op was planned that its
     /// relocation must step around — see [`RelocationWatch`]. `Some` from the
     /// plan until the op's sources are unlinked (or the op fails), so it also
@@ -1400,6 +1407,7 @@ impl SubstratePersistence {
             last_index,
             recovered_records,
             last_maintenance: None,
+            scanned_dead_ratio: AtomicU32::new(f32::NAN.to_bits()),
             relocation_watch: None,
             metadata_locs,
             resident_locs,
@@ -3266,15 +3274,30 @@ impl SubstratePersistence {
         if total == 0 {
             return 0.0;
         }
-        // `segment_liveness` sums the read-back records (chunks/tokens) the index
-        // still references; everything else in the segments (superseded records,
-        // tombstoned-timeline records, per-stream metadata) is dead weight. `live`
-        // can't exceed `total` (each live record's bytes are in a counted
-        // segment), so `dead` is non-negative; clamp guards inherited-log streams
-        // whose bytes aren't in this log's `total`.
         let live: u64 = self.segment_liveness(substrate).values().sum();
-        let dead = total.saturating_sub(live);
-        (dead as f32 / total as f32).clamp(0.0, 1.0)
+        self.note_dead_ratio(total, live)
+    }
+
+    /// Record the dead ratio of `total` record bytes of which `live` are live,
+    /// and return it — what [`Self::scanned_dead_ratio`] answers until the next
+    /// liveness scan, this one's or maintenance's.
+    pub(crate) fn note_dead_ratio(&self, total: u64, live: u64) -> f32 {
+        let ratio = dead_ratio_of(total, live);
+        self.scanned_dead_ratio
+            .store(ratio.to_bits(), AtomicOrdering::Relaxed);
+        ratio
+    }
+
+    /// The dead ratio the last liveness scan found — maintenance's plan or a
+    /// [`Self::dead_ratio`] — without a scan of its own; `None` before the first.
+    ///
+    /// For a viewer: the scan walks the whole substrate under its read lock,
+    /// up to 0.86 s on BlackWorld (2026-10-29), and the substrate page asked
+    /// for it on every refresh — a hold every writer, the scheduler's among
+    /// them, waited out. Maintenance scans every pass anyway.
+    pub fn scanned_dead_ratio(&self) -> Option<f32> {
+        let ratio = f32::from_bits(self.scanned_dead_ratio.load(AtomicOrdering::Relaxed));
+        (!ratio.is_nan()).then_some(ratio)
     }
 
     /// Compact the store — reclaim dead weight by rewriting only the **live**

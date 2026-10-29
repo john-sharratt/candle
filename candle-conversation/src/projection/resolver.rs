@@ -5334,21 +5334,15 @@ impl Conversation {
         self.maintenance.lock().unwrap().clone()
     }
 
-    /// Non-blocking snapshot of the redo log's dead-byte ratio — superseded
-    /// last-writer-wins records plus tombstoned-stream bytes over total record
-    /// bytes, the same measure the auto-compaction trigger polls. `try_lock`s
-    /// the persistence layer so a read endpoint (the substrate viewer) never
-    /// stalls behind a compaction holding it across I/O; returns `None` when the
-    /// lock is momentarily contended rather than blocking.
+    /// The redo log's dead-byte ratio as the last liveness scan found it — the
+    /// measure the auto-compaction trigger and maintenance's plan read — for a
+    /// viewer. Takes no substrate lock: the scan walks the whole substrate under
+    /// it, up to 0.86 s on BlackWorld, and a viewer polling it was a hold every
+    /// writer waited out. `try_lock`s the persistence layer so it never stalls
+    /// behind a compaction holding that across I/O; `None` when it is
+    /// contended, or before the first scan.
     pub fn dead_ratio(&self) -> Option<f32> {
-        // Lock order MUST be `inner` then `persistence` — the same order the
-        // write path takes (see `with_persistence_scan` below) — or a viewer
-        // poll holding `persistence` while waiting on `inner` would deadlock a
-        // seal holding `inner` while waiting on `persistence`. `try_lock` on
-        // persistence keeps this non-blocking against an in-flight compaction.
-        let substrate = self.inner.read().unwrap();
-        let persistence = self.persistence.try_lock().ok()?;
-        Some(persistence.dead_ratio(&substrate))
+        self.persistence.try_lock().ok()?.scanned_dead_ratio()
     }
 
     /// Run `f` against the persistence layer's current manifest snapshot.

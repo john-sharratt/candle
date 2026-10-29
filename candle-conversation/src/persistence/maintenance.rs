@@ -968,6 +968,10 @@ impl SubstratePersistence {
         let t_liveness = Instant::now();
         let liveness = self.segment_liveness(substrate);
         let liveness_ms = t_liveness.elapsed().as_millis() as u64;
+        self.note_dead_ratio(
+            self.segments.total_record_bytes().unwrap_or(0),
+            liveness.values().sum(),
+        );
         let now = SystemTime::now();
         let mut stats = Vec::with_capacity(sealed.len());
         for &id in &sealed {
