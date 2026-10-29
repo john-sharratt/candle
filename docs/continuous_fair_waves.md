@@ -312,6 +312,25 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   only `High` sections; with no `High` prompt beside it, it runs in the
   standalone section pass. Below `High`, throughput matters more than latency,
   and the bands and section chunks mix as before.
+- **A live prompt joins a full forward when it would take rows there.** A
+  forward whose rows are spent takes no more turns (`admit_ground::room_left`):
+  filled in order, a turn behind the rest would hold its store while it
+  advanced nothing. But a `High` or `Urgent` prompt need not be behind them.
+  Its group carries its own band and above only, so work below it is no
+  competition — a creep of theirs pauses for it — and the group re-forms at
+  its sweep boundary nearest-first. What stands ahead of it is work above its
+  band, a paused creep of its band or above (which resumes first), and the
+  prompts of its own band nearer their first token; when those leave a chunk
+  of the pass budget, and none of them carries another adapter, it takes rows
+  (`Scheduler::runs_ahead`). Such a prompt is offered as a join, sharing the
+  forwards rather than widening them; refused, its band ends and nothing else
+  does (`Cost::ahead`): no rows close and no wave latches. Sections ride
+  behind every prompt in a group and keep the full forward's rule. Turned
+  away with the rest, a live prompt waited for rows only it could have taken: on WhiteWorld (2026-10-27 22:46–22:48) one `High` member 158k
+  tokens long held all 3,072 rows of every forward, four `Urgent` content
+  checks were never offered for ninety seconds, and an 87-token `High` turn
+  waited six minutes. Below the live bands throughput leads, and a full
+  forward takes no more turns.
 - **A sweep is never restarted.** Its finished layers have taken its rows into
   their carried state — the QSA index, the DeltaNet state, the PLE history — and
   nothing rolls that back; only the K/V is position-addressed, so only the K/V

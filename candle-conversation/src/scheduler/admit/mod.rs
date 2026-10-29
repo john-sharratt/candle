@@ -498,7 +498,11 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             continue;
                         }
                         rate::Admit::Refused(r) => {
-                            rate.latch_full();
+                            // A join running ahead of a full forward's members
+                            // ends its band alone (`Cost::ahead`).
+                            if !cost.ahead {
+                                rate.latch_full();
+                            }
                             out.note(r);
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             false
@@ -573,15 +577,19 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                         rate::Admit::Admitted { .. } => true,
                         rate::Admit::Refused(
                             r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
-                        ) if kind == Kind::Prefill && ground.close_rows() => {
+                        ) if kind == Kind::Prefill && !cost.ahead && ground.close_rows() => {
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             continue;
                         }
                         rate::Admit::Refused(r) => {
                             // `try_widen` leaves a rate refusal unlatched for
                             // the join above; with no join to make, it ends
-                            // the wave as `try_admit`'s does.
-                            rate.latch_full();
+                            // the wave as `try_admit`'s does — unless it is a
+                            // join running ahead of a full forward's members,
+                            // which ends its band alone (`Cost::ahead`).
+                            if !cost.ahead {
+                                rate.latch_full();
+                            }
                             out.note(r);
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             false
@@ -701,6 +709,11 @@ mod tests {
         running_band: Option<DecodePriority>,
         /// The prefill floor, when a case needs it apart from the decode floor.
         prefill_floor: u64,
+        /// Every prefill is offered as a join — a turn that goes on to decode —
+        /// and, with `reports_ahead`, as one running ahead of the members of a
+        /// full forward (`Cost::ahead`).
+        ahead: bool,
+        reports_ahead: bool,
     }
 
     impl Fake {
@@ -725,6 +738,8 @@ mod tests {
                 rows_closed: false,
                 running_band: None,
                 prefill_floor: FLOOR,
+                ahead: false,
+                reports_ahead: false,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -793,12 +808,17 @@ mod tests {
             let rows = match kind {
                 Kind::Decode => 1,
                 Kind::Prefill if self.join_after_head && !self.taken.is_empty() => 0,
-                Kind::Prefill if self.rows_closed => 0,
+                Kind::Prefill if self.rows_closed || self.ahead => 0,
                 _ => ROWS,
             };
+            // A turn joining ahead goes on to decode, as a turn does.
+            let decodes_after = kind == Kind::Prefill && self.ahead;
+            let ahead = kind == Kind::Prefill && self.reports_ahead;
             self.queue(kind).first().map(|&kv| Cost {
                 kv,
                 rows,
+                decodes_after,
+                ahead,
                 ..Default::default()
             })
         }
@@ -828,6 +848,49 @@ mod tests {
         fn outranks_active(&self, prio: DecodePriority) -> bool {
             self.running_band.is_some_and(|b| rank(b) < rank(prio))
         }
+    }
+
+    /// **A join that runs ahead, refused on the trade, ends its band and
+    /// nothing more**: the bands after it are still offered. Any other join
+    /// refused on the trade ends the wave. (A refusal on the floor latches the
+    /// wave inside the rate model, for every admission alike.)
+    #[test]
+    fn a_refused_join_running_ahead_leaves_the_bands_after_it_offered() {
+        let learned = || {
+            let mut rate = WaveRate::with_link_rate(
+                25e9,
+                ExpertGeometry::QWEN36_35B_A3B,
+                RateModel::default(),
+                DecodeModel::default(),
+            );
+            for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
+                rate.observe_decode(1, 0, u64::MAX, 20e-3);
+            }
+            rate
+        };
+        let section_after_refused_join = |reported: bool| {
+            // Beside many decodes, one more does not pay the gain the planner
+            // asks for; the section after it claims nothing.
+            let mut f = Fake::new(Vec::new(), vec![REGION], 12 << 30);
+            f.sections = vec![0];
+            f.active = 24;
+            f.decodes_active = 24;
+            f.prefill_prio = DecodePriority::High;
+            f.ahead = true;
+            f.reports_ahead = reported;
+            let got = fill(&mut f, &mut learned().with_min_gain(0.5));
+            assert!(got.stopped_on_rate, "the join was refused on the trade");
+            f.taken
+        };
+        assert_eq!(
+            section_after_refused_join(true),
+            vec![Kind::Section],
+            "the join was refused alone"
+        );
+        assert!(
+            section_after_refused_join(false).is_empty(),
+            "an ordinary refused join ends the wave"
+        );
     }
 
     /// **A dialogue turn is not held behind the background work it outranks —

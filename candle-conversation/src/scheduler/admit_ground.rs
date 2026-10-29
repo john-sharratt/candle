@@ -659,14 +659,42 @@ impl AdmitPass<'_> {
     /// advance a chunk beside the rest, which the pass records
     /// ([`Unoffered::rows`]): it is asked only with an offer waiting.
     fn room(&mut self) -> Option<usize> {
-        let room = room_left(
+        let room = self.rows_left();
+        self.unoffered.rows |= room.is_none();
+        room
+    }
+
+    /// The forward's rows still free, as [`Self::room`] reads them.
+    fn rows_left(&self) -> Option<usize> {
+        room_left(
             self.chunk_rows,
             self.standing_rows.saturating_add(self.rows_taken),
             self.closed,
             self.sched.prefill_width() + self.sched.section_ingest_width(),
-        );
-        self.unoffered.rows |= room.is_none();
-        room
+        )
+    }
+
+    /// [`Self::room`] for a prompt of `turn` tokens on `seq` at `prio`, and
+    /// whether it joins a full forward because it runs ahead of the members
+    /// there (`Cost::ahead`): a live prompt the formation would give rows
+    /// though the forward's rows are spent ([`Scheduler::runs_ahead`],
+    /// `docs/continuous_fair_waves.md` §7). Below the live bands a full forward
+    /// takes no more turns. A prompt offered as such a join was not left
+    /// unoffered, so only one turned away is recorded ([`Unoffered::rows`]).
+    fn prompt_room(
+        &mut self,
+        prio: DecodePriority,
+        turn: usize,
+        seq: usize,
+    ) -> Option<(usize, bool)> {
+        if let Some(room) = self.rows_left() {
+            return Some((room, false));
+        }
+        if prio.is_live() && self.sched.runs_ahead(prio, turn, seq) {
+            return Some((0, true));
+        }
+        self.unoffered.rows = true;
+        None
     }
 
     /// The section band's next candidate: the head of the section queue,
@@ -699,6 +727,7 @@ impl AdmitPass<'_> {
             activations,
             rows,
             decodes_after: false,
+            ahead: false,
         }))
     }
 
@@ -799,7 +828,7 @@ impl AdmitPass<'_> {
         } else {
             self.recurrent
         };
-        let room = self.room()?;
+        let (room, ahead) = self.prompt_room(prio, turn, seq.0)?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
@@ -819,6 +848,7 @@ impl AdmitPass<'_> {
             // The turn decodes when this prefill finishes, which is what puts
             // the decode model's judgement in play beside the prefill one.
             decodes_after: true,
+            ahead,
         }))
     }
 
@@ -838,7 +868,7 @@ impl AdmitPass<'_> {
         }
         let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
         let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
-        let room = self.room()?;
+        let (room, ahead) = self.prompt_room(prio, turn, parent.0)?;
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(lift)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
@@ -859,6 +889,7 @@ impl AdmitPass<'_> {
             activations,
             rows,
             decodes_after: true,
+            ahead,
         }))
     }
 
@@ -1482,6 +1513,49 @@ impl Scheduler {
             .filter(|(_, s)| !s.finished)
             .filter(|(&id, _)| rank(self.decode_priority_or_high(id)) >= rank(prio))
             .count()
+    }
+
+    /// Whether a live prompt of `turn` tokens on `seq` at `prio` would take
+    /// rows in the next group formed though the forward's rows are spent.
+    ///
+    /// Its group carries its own band and above (`form_wave_group`), so the
+    /// work in flight below it is no competition — a creep of theirs pauses
+    /// for it. What stands ahead of it: work above its band, which runs first;
+    /// a paused creep of its band or above, which resumes before any group
+    /// forms (`resume_creep`); and the prompts of its own band nearer their
+    /// first token, which the group re-formed nearest-first fills first, each
+    /// at most a pass. It takes rows when those leave at least a chunk of the
+    /// pass budget — and when none of them carries another adapter, since the
+    /// nearest sets the group's. Sections ride behind every prompt and take
+    /// nothing ahead of it.
+    pub(super) fn runs_ahead(&self, prio: DecodePriority, turn: usize, seq: usize) -> bool {
+        let paused_ahead = self
+            .paused_creep
+            .as_ref()
+            .is_some_and(|p| rank(p.band) >= rank(prio));
+        if paused_ahead || self.waiting_above(prio, |_| false) {
+            return false;
+        }
+        // Of its own band, the prompts nearer their first token. A paused
+        // creep's members are below its band here, so none of them is one.
+        let adapter = self.session.sequence_adapter(seq);
+        let mut rows_ahead = 0usize;
+        for p in &self.active_prefills {
+            let remaining = p.work.tokens.len().saturating_sub(p.offset);
+            if p.error.is_some()
+                || p.finished.is_some()
+                || remaining == 0
+                || remaining > turn
+                || self.decode_priority_or_high(p.work.sequence_id) != prio
+            {
+                continue;
+            }
+            if self.session.sequence_adapter(p.work.sequence_id.0) != adapter {
+                return false;
+            }
+            rows_ahead += remaining.min(self.max_prefill_pass_tokens);
+        }
+        rows_ahead + turn.min(CHUNK_SIZE) <= self.prefill_pass_budget()
     }
 }
 

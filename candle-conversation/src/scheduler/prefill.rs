@@ -7004,6 +7004,9 @@ mod wave_chunk_tests {
 
     use candle_transformers::models::rope_schedule::RungSelect;
 
+    use super::super::admit::rate::{DecodeModel, ExpertGeometry, RateModel};
+    use super::super::admit::{fill, Ground, Kind, WaveRate};
+    use super::super::admit_ground::AdmitPass;
     use super::super::tests::make_test_scheduler;
     use super::super::*;
 
@@ -7221,6 +7224,183 @@ mod wave_chunk_tests {
         let rows = inputs[0].to_vec2::<u32>().expect("u32 rows");
         assert_eq!(rows[0].len(), 200, "the tail chunk is what remains");
         assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
+    }
+
+    /// A queued turn of `len` tokens on a new slot at `band`.
+    fn queue_turn(s: &mut Scheduler, band: DecodePriority, len: usize) -> SequenceId {
+        let seq = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(seq, band);
+        s.prefill_queue
+            .push_back(dialogue_prefill(seq, vec![1; len]).work);
+        seq
+    }
+
+    /// A `band` creep `len` tokens long that fills the forward, held mid-sweep.
+    fn creep_mid_sweep(s: &mut Scheduler, band: DecodePriority, len: usize) {
+        let seq = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(seq, band);
+        s.active_prefills.push(dialogue_prefill(seq, vec![1; len]));
+        s.form_wave_group(false);
+        assert_eq!(s.wave_prefill_members.len(), 1, "the creep is held");
+        s.wave_prefill_cursor = 5;
+    }
+
+    /// Whether admission offers the next queued turn of `band` at all.
+    fn offered(s: &mut Scheduler, band: DecodePriority) -> bool {
+        AdmitPass::new(s).peek(Kind::Prefill, band).is_some()
+    }
+
+    /// One admission pass through the rate model, as the scheduler runs it:
+    /// the standing cohort charged first, then each band offered in turn.
+    fn admission_pass(s: &mut Scheduler) {
+        s.settled_since_admit = true;
+        let mut rate = WaveRate::with_link_rate(
+            25e9,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        )
+        .with_min_gain(0.0);
+        let mut admission = AdmitPass::new(s);
+        fill(&mut admission, &mut rate);
+        admission.conclude();
+    }
+
+    /// Whether `seq`'s turn is in flight.
+    fn admitted(s: &Scheduler, seq: SequenceId) -> bool {
+        s.active_prefills.iter().any(|p| p.work.sequence_id == seq)
+    }
+
+    /// **A live turn that runs ahead of a full creep is admitted.** On
+    /// WhiteWorld (2026-10-27 22:46–22:48) one `High` member 158k tokens long
+    /// held all of every forward's rows, and nothing else was offered: four
+    /// `Urgent` content checks waited ninety seconds and an 87-token `High`
+    /// turn six minutes. Judged end to end — the creep charged first, as
+    /// `admit::fill` charges the standing cohort — the short `High` turn joins,
+    /// to lead the group re-formed at the creep's boundary, and the `Urgent`
+    /// check joins, to pause the creep and run in a group of its own.
+    #[test]
+    fn a_live_turn_ahead_of_a_full_creep_is_admitted() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let turn = queue_turn(&mut s, DecodePriority::High, 87);
+        admission_pass(&mut s);
+        assert!(admitted(&s, turn), "the short high turn was not admitted");
+
+        let check = queue_turn(&mut s, DecodePriority::Urgent, 64);
+        admission_pass(&mut s);
+        assert!(admitted(&s, check), "the urgent check was not admitted");
+        assert!(
+            s.creep_outranked_by_a_waiting_prompt(),
+            "the check pauses the creep at the next step"
+        );
+    }
+
+    /// **The turn admitted ahead takes the rows it was admitted for.** At the
+    /// creep's sweep boundary the group re-forms nearest-first, and the short
+    /// `High` turn leads it with all of its rows.
+    #[test]
+    fn a_turn_admitted_ahead_leads_the_reformed_group() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let turn = queue_turn(&mut s, DecodePriority::High, 87);
+        admission_pass(&mut s);
+        assert!(admitted(&s, turn));
+
+        s.reset_wave_prefill();
+        s.form_wave_group(false);
+        assert!(
+            matches!(
+                s.wave_prefill_members.first(),
+                Some(&WaveMember::Prefill { seq_id, advance: 87 }) if seq_id == turn.0
+            ),
+            "the turn admitted ahead leads the group: {:?}",
+            s.wave_prefill_members
+        );
+    }
+
+    /// **Every content check of a draw is admitted, not one a sweep.** Four
+    /// `Urgent` checks beside a full `High` creep each take rows in the group
+    /// they form apart from it, which has room for all four.
+    #[test]
+    fn every_urgent_check_beside_a_full_creep_is_admitted() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let checks: Vec<SequenceId> = (0..4)
+            .map(|_| queue_turn(&mut s, DecodePriority::Urgent, 64))
+            .collect();
+        admission_pass(&mut s);
+        for check in checks {
+            assert!(admitted(&s, check), "a check was held back");
+        }
+    }
+
+    /// **Turns that would take no rows are not admitted to wait**, however
+    /// many are nearer their first token than the creep they would lead: once
+    /// the ones ahead of a turn fill the budget, it is held back.
+    #[test]
+    fn turns_ahead_of_a_creep_are_admitted_only_while_they_take_rows() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 8 * pass);
+        let turns: Vec<SequenceId> = (0..3)
+            .map(|_| queue_turn(&mut s, DecodePriority::High, pass - 100))
+            .collect();
+        admission_pass(&mut s);
+        let taken: Vec<bool> = turns.iter().map(|&t| admitted(&s, t)).collect();
+        assert_eq!(
+            taken,
+            vec![true, true, false],
+            "the first takes most of a pass and the second the rest"
+        );
+    }
+
+    /// **A live turn that would run behind every member still waits.** A
+    /// `High` turn longer than the creep it would join takes no rows until
+    /// that creep finishes, so it is not admitted to hold its store meanwhile.
+    #[test]
+    fn a_live_turn_behind_a_full_creep_waits() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::High, 2 * pass);
+        queue_turn(&mut s, DecodePriority::High, 16 * pass);
+        assert!(!offered(&mut s, DecodePriority::High));
+    }
+
+    /// **Work below a live turn's band does not make it ahead.** Its group
+    /// leaves that work out, so what decides is its own band: behind two
+    /// `High` prompts nearer their first tokens, filling the forward, a long
+    /// `High` turn would take no rows — and a `Low` prompt in flight beside
+    /// them changes nothing.
+    #[test]
+    fn a_live_turn_behind_its_own_band_waits_whatever_runs_below() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        for (band, len) in [
+            (DecodePriority::High, pass),
+            (DecodePriority::High, pass),
+            (DecodePriority::Low, pass),
+        ] {
+            let seq = SequenceId(s.session.create_sequence().expect("create"));
+            s.slot_bands.insert(seq, band);
+            s.active_prefills.push(dialogue_prefill(seq, vec![1; len]));
+        }
+        queue_turn(&mut s, DecodePriority::High, 8 * pass);
+        assert!(!offered(&mut s, DecodePriority::High));
+    }
+
+    /// **Below the live bands a full forward takes no more turns**, as it
+    /// always has: there throughput matters more than latency.
+    #[test]
+    fn a_background_turn_beside_a_full_creep_waits() {
+        let (mut s, _tx) = make_test_scheduler();
+        let pass = s.prefill_pass_ceiling();
+        creep_mid_sweep(&mut s, DecodePriority::Low, 8 * pass);
+        queue_turn(&mut s, DecodePriority::Low, 64);
+        assert!(!offered(&mut s, DecodePriority::Low));
     }
 
     /// **Prefills share one pass budget.** The two short prompts ride whole and the

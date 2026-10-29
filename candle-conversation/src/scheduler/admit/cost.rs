@@ -92,6 +92,12 @@ pub(crate) struct Cost {
     /// False for a section (nothing decodes after it) and for a decode's own
     /// cost (a continuation of a turn already admitted).
     pub decodes_after: bool,
+    /// A live turn joining a forward whose rows are spent because it runs
+    /// ahead of the members there (`admit_ground`, `Scheduler::runs_ahead`).
+    /// Refused, it ends its band and nothing more: it widens nothing, so its
+    /// refusal neither closes the forward's rows nor says the wave is full for
+    /// the bands after it.
+    pub ahead: bool,
 }
 
 impl Cost {
@@ -240,6 +246,7 @@ mod tests {
             activations: 3_000,
             rows: 128,
             decodes_after: false,
+            ahead: false,
         };
         assert_eq!(c.total(), 3_210);
         assert_eq!(Cost::default().total(), 0);
@@ -262,6 +269,7 @@ mod tests {
             activations: 64 * region,
             rows: 128,
             decodes_after: false,
+            ahead: false,
         };
         assert_eq!(c.claimed_bytes(), 2 * region, "rounded up, tier excluded");
         assert_eq!(Cost::default().claimed_bytes(), 0);
@@ -296,6 +304,7 @@ mod tests {
             activations: 3 * region,
             rows: 8,
             decodes_after: false,
+            ahead: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
         assert_eq!(step.dislodged_bytes(), 3 * region);
@@ -327,6 +336,7 @@ mod tests {
             activations: 128 << 20,
             rows: 3,
             decodes_after: false,
+            ahead: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
     }
