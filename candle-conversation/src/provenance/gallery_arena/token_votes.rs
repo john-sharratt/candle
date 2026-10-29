@@ -7,8 +7,10 @@
 //! under as many settings as it likes for the cost of one launch.
 //!
 //! Rows always cover every fold group, though a launch scans only the groups
-//! its segments weigh (`docs/gallery_residency.md` §4): a group it did not scan
-//! voted for nothing, which is what weighing it zero tallies.
+//! its segments weigh (`docs/gallery_residency.md` §4): a group a segment does
+//! not weigh voted for nothing in it, which is what weighing it zero tallies —
+//! whether the launch scanned that group for another segment, or for an
+//! earlier reader of the same index, or not at all.
 
 use super::groups::GroupSet;
 
@@ -56,21 +58,24 @@ impl TokenVotes {
 }
 
 /// A launch's rows over its `launch` groups, as rows over every one of
-/// `n_groups`: each scanned group's row where it stands, every other group
-/// voting for nothing (case `-1`, vote `0`). Rows are token-major, then group,
-/// then segment, on both sides.
+/// `n_groups` for segments weighing `weighed` (one set per segment, each
+/// within `launch`): a weighed group's row where it stands, every other group
+/// voting for nothing in that segment (case `-1`, vote `0`). Rows are
+/// token-major, then group, then segment, on both sides.
 pub(super) fn widen_rows(
     case: &[i32],
     vote: &[f32],
     launch: GroupSet,
+    weighed: &[GroupSet],
     n_groups: usize,
-    n_segments: usize,
 ) -> (Vec<i32>, Vec<f32>) {
+    let n_segments = weighed.len();
     let per_token = launch.len() * n_segments;
     if per_token == 0 {
         return (Vec::new(), Vec::new());
     }
-    if launch == GroupSet::all(n_groups) {
+    let all = GroupSet::all(n_groups);
+    if launch == all && weighed.iter().all(|&w| w == all) {
         return (case.to_vec(), vote.to_vec());
     }
     let n_tokens = case.len() / per_token;
@@ -80,8 +85,12 @@ pub(super) fn widen_rows(
         for (place, g) in launch.iter().enumerate() {
             let from = (t * launch.len() + place) * n_segments;
             let to = (t * n_groups + g) * n_segments;
-            out_case[to..to + n_segments].copy_from_slice(&case[from..from + n_segments]);
-            out_vote[to..to + n_segments].copy_from_slice(&vote[from..from + n_segments]);
+            for (s, w) in weighed.iter().enumerate() {
+                if w.contains(g) {
+                    out_case[to + s] = case[from + s];
+                    out_vote[to + s] = vote[from + s];
+                }
+            }
         }
     }
     (out_case, out_vote)
@@ -99,14 +108,43 @@ mod tests {
         // token 0: g1 [s0 s1], g2 [s0 s1]; token 1 likewise.
         let case = [10, 11, 20, 21, 12, 13, 22, 23];
         let vote = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let (c, v) = widen_rows(&case, &vote, launch, 3, 2);
+        let (c, v) = widen_rows(&case, &vote, launch, &[launch, launch], 3);
         assert_eq!(c, [-1, -1, 10, 11, 20, 21, -1, -1, 12, 13, 22, 23]);
         assert_eq!(
             v,
             [0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 7.0, 8.0]
         );
         let full = GroupSet::all(3);
-        assert_eq!(widen_rows(&c, &v, full, 3, 2), (c.clone(), v.clone()));
+        assert_eq!(
+            widen_rows(&c, &v, full, &[full, full], 3),
+            (c.clone(), v.clone())
+        );
+    }
+
+    /// **A group a segment does not weigh votes for nothing in it**, though the
+    /// launch scanned it: segment 1 weighs group 2 alone, so its group-1 rows
+    /// read empty while segment 0's stand. And a launch over every group read
+    /// by a narrower segment is masked the same way.
+    #[test]
+    fn a_group_a_segment_does_not_weigh_votes_for_nothing_in_it() {
+        let launch = GroupSet::default().with(1).with(2);
+        let only_2 = GroupSet::default().with(2);
+        let case = [10, 11, 20, 21, 12, 13, 22, 23];
+        let vote = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let (c, v) = widen_rows(&case, &vote, launch, &[launch, only_2], 3);
+        assert_eq!(c, [-1, -1, 10, -1, 20, 21, -1, -1, 12, -1, 22, 23]);
+        assert_eq!(
+            v,
+            [0.0, 0.0, 1.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 0.0, 7.0, 8.0]
+        );
+
+        let full = GroupSet::all(3);
+        let wide_case = [1, 2, 3];
+        let wide_vote = [1.0, 2.0, 3.0];
+        assert_eq!(
+            widen_rows(&wide_case, &wide_vote, full, &[only_2], 3),
+            (vec![-1, -1, 3], vec![0.0, 0.0, 3.0])
+        );
     }
 
     /// Rows are token-major, then group, then segment; a negative case is no

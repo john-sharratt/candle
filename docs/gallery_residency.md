@@ -108,14 +108,24 @@ scanned.
   (CLAUDE.md invariant 2b) — so the kernels read any packing. A group a turn
   does not hold, scanned only because another segment of the launch weighs it,
   points at one resident zero page; the segment's tally weighs it zero.
-- **Raw votes carry their groups** (`TokenVotes::groups`): the chunk-exclusion
-  learn scans the groups its competitions weigh, so learning never widens a
-  turn the live scans keep narrow, and never cuts a chunk for an anomaly in a
-  group no scan counts.
+- **Readers weighing different groups share an index.** The index cache is
+  keyed on the segments without their groups; a cached index serves a reader
+  when it scans every group each segment weighs, and is rebuilt over the
+  union when it does not. Its rows for a group a segment does not weigh read
+  as no vote, so an index wider than its reader gives exactly that reader's
+  scan. Keyed on the groups, a sealed turn read both by its conversation's
+  dialogue (every group) and by a narrower layer was two indices and two
+  launches on every scan.
+- **Raw votes cover every group** (`TokenVotes`), a group a segment does not
+  weigh voting for nothing in it. The chunk-exclusion learn scans the groups
+  its competitions weigh, so learning never widens a turn the live scans keep
+  narrow, and never cuts a chunk for an anomaly in a group no scan counts.
 
-Measured before this, on BlackWorld (2026-10-29): 5.5 GiB of gallery pages, of
-which `code_reading` content held 4.3 GiB with a third of every page weighed
-zero, and the calibration questions 1.09 GiB with two thirds weighed zero.
+Measured on BlackWorld (2026-10-29): before, 5.49 GiB of gallery pages, of
+which `code_reading` content held 4.29 GiB with a third of every page weighed
+zero, and the calibration questions 1.11 GiB with two thirds weighed zero;
+after, 3.37 GiB (`code_reading` 2.88, calibration 0.42). The kernel's share of
+a belief scan fell from 2.25 to 2.12 ms.
 
 ## 5. Seeing it
 

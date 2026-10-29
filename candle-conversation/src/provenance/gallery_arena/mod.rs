@@ -155,20 +155,25 @@ pub struct ResidentRun {
 }
 
 /// Why a scan could not reuse a cached index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum IndexMiss {
     /// No index was cached for the segment set — never built, evicted from
     /// the cache, or too large to cache.
     Absent,
     /// The cached index named a turn since evicted, moved or re-uploaded.
     Stale,
+    /// The cached index scans fewer fold groups than a segment weighs.
+    /// `covering` is each segment's groups widened by the cached index's:
+    /// built over those, the index serves this reader and the one before it.
+    Narrower { covering: Vec<GroupSet> },
 }
 
 impl IndexMiss {
-    pub(super) fn reason(self) -> &'static str {
+    pub(super) fn reason(&self) -> &'static str {
         match self {
             IndexMiss::Absent => "no index cached for this segment set",
             IndexMiss::Stale => "a turn it holds was evicted, moved or re-uploaded",
+            IndexMiss::Narrower { .. } => "the cached index scans fewer fold groups",
         }
     }
 }
@@ -664,23 +669,40 @@ impl GalleryArena {
         self.residency_gen.load(Ordering::Relaxed)
     }
 
-    /// Reuse the cached index if it matches `fingerprint` AND every turn it
-    /// references is still resident on the run it was built against — in which
-    /// case this **pins** them (bumping their LRU) for the scan and returns the
-    /// shared index. Otherwise says why it missed — no index cached, or a turn
-    /// it holds evicted, moved or re-uploaded — and the caller rebuilds.
+    /// Reuse the cached index if it matches `fingerprint`, scans every fold
+    /// group each segment weighs (`weighed`, one set per segment), AND every
+    /// turn it references is still resident on the run it was built against —
+    /// in which case this **pins** them (bumping their LRU) for the scan and
+    /// returns the shared index. Otherwise says why it missed — no index
+    /// cached, one scanning fewer groups, or a turn it holds evicted, moved or
+    /// re-uploaded — and the caller rebuilds.
+    ///
+    /// An index scanning more groups than a segment weighs serves it exactly:
+    /// groups are scanned independently, and the rows of the groups it does
+    /// not weigh are read as no vote ([`widen_rows`](token_votes::widen_rows)).
+    /// So two readers of one segment set weighing different groups share one
+    /// index — and its rows — over the union.
     ///
     /// A turn whose run id still matches has not been re-uploaded, evicted or
     /// moved since the build, so every address the index holds for it is still
     /// its page. That is checked per referenced turn — O(turns), not
     /// O(tokens) — so another conversation's uploads leave this index valid.
-    fn reuse_index(&self, fingerprint: u64) -> StdResult<Arc<scan::PagedIndex>, IndexMiss> {
+    fn reuse_index(
+        &self,
+        fingerprint: u64,
+        weighed: &[GroupSet],
+    ) -> StdResult<Arc<scan::PagedIndex>, IndexMiss> {
         let idx = {
             let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
             let entry = cache.get_mut(&fingerprint).ok_or(IndexMiss::Absent)?;
             entry.used = self.lru_clock.fetch_add(1, Ordering::Relaxed);
             entry.idx.clone()
         };
+        if !idx.serves(weighed) {
+            return Err(IndexMiss::Narrower {
+                covering: idx.covering(weighed),
+            });
+        }
         // Check + pin, all under the residency lock so a concurrent eviction can
         // neither slip in nor free a page the launch will read. Verified BEFORE
         // pinning any, so a stale index degrades to a rebuild rather than a
