@@ -156,10 +156,6 @@ pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.ya
 /// best-effort), which is preferable to unbounded growth under a burst.
 const TITLER_QUEUE_DEPTH: usize = 256;
 
-/// A substrate view's wait for the engine lock at least this long is logged —
-/// the substrate lock's own threshold.
-const VIEW_WAIT_SLOW: Duration = Duration::from_millis(250);
-
 /// How often a pass is asked for while a layer changes with time rather than
 /// with its branches: a day layer reads a day that closed
 /// (`crate::layers::days`), and a layer that expires reads again the units
@@ -6913,27 +6909,16 @@ impl ZendSession {
     /// replayed, with no titler or target layer built yet. `None` before the
     /// replay has finished.
     ///
-    /// Takes no conversation's lock: the base conversation's is held across a
-    /// calibration draft's fork, which the scheduler parks until the base's turn
-    /// ends. The substrate page answered in 11–14 s on BlackWorld (2026-10-29)
-    /// with no wait for the substrate lock logged.
+    /// Takes neither the engine's lock nor a conversation's: the substrate is
+    /// the handle cloned out at build, as `/v1/status` reads it. The engine
+    /// mutex is held across scheduler round trips — every calibration question
+    /// opens its conversation under it — and the views waited 9–16 s for it on
+    /// BlackWorld (2026-10-29); the base conversation's is held across a
+    /// calibration draft's fork.
     fn substrate_for_views(&self) -> Option<(Conversation, Option<TimelineId>, String)> {
         if let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) {
-            // Clone the handle out, dropping the engine lock at once. Its other
-            // holders can keep a view waiting for it, so a wait long enough to
-            // feel is said, as the substrate lock's are.
-            let asked = Instant::now();
-            let conv = state.engine.lock().unwrap().conversation();
-            let waited = asked.elapsed();
-            if waited >= VIEW_WAIT_SLOW {
-                tracing::warn!(
-                    target: "zend::session",
-                    waited_ms = waited.as_millis() as u64,
-                    "a substrate view waited long for the engine lock"
-                );
-            }
             return Some((
-                conv,
+                state.substrate.clone(),
                 Some(state.titler_timeline),
                 state.target_layer.clone(),
             ));
