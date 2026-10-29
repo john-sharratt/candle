@@ -119,10 +119,41 @@ impl Conversation {
         per_file: usize,
         scan: impl Fn(bool, HashSet<StreamId>, Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
     ) -> candle::Result<ExclusionReport> {
-        let (files, probes, standing) = {
+        // **Whether the standing exclusion holds is a count, read first.** The
+        // questions the learn would ask are counted without decoding one, so
+        // a pass that keeps its exclusion pays a walk of the calibrations, not
+        // the assembly of every file and the decode of every question:
+        // measured on BlackWorld (2026-10-28), 39 s for a `code_reading` of
+        // 2,387 files that kept its exclusion.
+        let (files, probes, asked) = {
             let sub = self.inner.read().unwrap();
             let standing = sub.chunk_exclusion(group);
             let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
+            let asked: usize = timelines
+                .iter()
+                .map(|&tl| {
+                    sub.calibrations_of(tl)
+                        .flat_map(|cal| {
+                            (0..sub.turn_count(cal)).map(move |i| turn_stream_id(cal.raw(), i))
+                        })
+                        .take(per_file)
+                        .filter(|&sid| sub.wide_sig_window(sid).is_some())
+                        .count()
+                })
+                .sum();
+            if standing.stands_for(asked) {
+                return Ok(ExclusionReport {
+                    files: timelines.len(),
+                    calibrated: timelines
+                        .iter()
+                        .filter(|&&tl| sub.calibrations_of(tl).next().is_some())
+                        .count(),
+                    probes: asked,
+                    cut: standing.chunks(),
+                    kept: true,
+                    ..Default::default()
+                });
+            }
             let (files, _) = assemble_file_scans(&sub, timelines);
             let width = files
                 .iter()
@@ -147,7 +178,7 @@ impl Conversation {
                     }
                 }
             }
-            (files, probes, standing)
+            (files, probes, asked)
         };
         let mut report = ExclusionReport {
             files: files.len(),
@@ -155,11 +186,6 @@ impl Conversation {
             probes: probes.len(),
             ..Default::default()
         };
-        if standing.stands_for(probes.len()) {
-            report.kept = true;
-            report.cut = standing.chunks();
-            return Ok(report);
-        }
         let exclusion = if probes.is_empty() {
             ChunkExclusion::default()
         } else {
@@ -194,7 +220,8 @@ impl Conversation {
                 calibration.outliers(Competition::Calibration.k()).collect();
             report.cut = cut.len();
             report.calibration_cut = cal_cut.len();
-            ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut)).learned_from(probes.len())
+            // Learned from the count the next pass's keep check reads.
+            ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut)).learned_from(asked)
         };
         self.inner
             .write()
@@ -468,5 +495,70 @@ mod tests {
             .collect();
         assert_eq!(votes.vote, expected);
         assert_eq!((votes.n_groups, votes.n_segments), (FOLD_GROUPS, 1));
+    }
+
+    /// **A standing exclusion is kept without a scan.** A file with one
+    /// calibration question learns once — content, then calibrations, two
+    /// scans — and the next learn, its questions unchanged, keeps that
+    /// exclusion and scans nothing.
+    #[test]
+    fn a_standing_exclusion_is_kept_without_a_scan() {
+        use crate::projection::{GroupId, LayerId};
+        use crate::substrate::{Substrate, TurnPartWrite};
+        use crate::turn::Role;
+
+        let conv = Conversation::ephemeral();
+        let (layer, group) = (LayerId::from_raw(1).unwrap(), GroupId::from_raw(1).unwrap());
+        let hidden = (LayerId::from_raw(2).unwrap(), GroupId::from_raw(2).unwrap());
+        let write = |tl: TimelineId, sigs: &[WideQSig]| {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: sigs.len(),
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(sigs))
+                .expect("persist sigs");
+        };
+        let (file_tl, cal_tl) = (TimelineId::for_test(81), TimelineId::for_test(82));
+        conv.register_timeline(file_tl, layer, group);
+        conv.register_timeline(cal_tl, hidden.0, hidden.1);
+        write(file_tl, &[sig(1), sig(2)]);
+        write(cal_tl, &[sig(3)]);
+        conv.set_conversation_metadata(
+            cal_tl,
+            Substrate::CALIBRATES_KEY,
+            &file_tl.raw().to_string(),
+        )
+        .unwrap();
+
+        let scans = std::cell::Cell::new(0);
+        let scan = |_: bool, _: HashSet<StreamId>, probes: Vec<Vec<WideQSig>>| {
+            scans.set(scans.get() + 1);
+            let n: usize = probes.iter().map(Vec::len).sum::<usize>() * FOLD_GROUPS;
+            Ok(GroupVotes {
+                files: vec![file_tl],
+                votes: TokenVotes {
+                    case: vec![0; n],
+                    vote: vec![0.0; n],
+                    per_probe: probes.iter().map(Vec::len).collect(),
+                    n_groups: FOLD_GROUPS,
+                    n_segments: 1,
+                },
+            })
+        };
+        let learned = conv.learn_chunk_exclusion(group, 4, scan).unwrap();
+        assert_eq!((learned.probes, learned.kept, scans.get()), (1, false, 2));
+        let kept = conv.learn_chunk_exclusion(group, 4, scan).unwrap();
+        assert_eq!(
+            (kept.files, kept.calibrated, kept.probes, kept.kept),
+            (1, 1, 1, true)
+        );
+        assert_eq!(scans.get(), 2, "the kept exclusion scanned nothing");
     }
 }

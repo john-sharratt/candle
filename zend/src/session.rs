@@ -726,6 +726,10 @@ struct InferenceState {
     /// that can move a branch wakes it, since a push moves the tracking refs
     /// itself and no origin probe will see a difference afterwards.
     ingest_wake: OnceLock<Arc<Notify>>,
+    /// Raised while the branch layers' chunk exclusions are being learned on
+    /// their own thread ([`InferenceState::learn_chunk_exclusions_behind`]),
+    /// so a pass ending while one learns does not start a second.
+    learning_exclusions: AtomicBool,
     /// The dialogue layer's working set (`docs/zend_working_set.md`), its
     /// `release_on` names checked against the tool registry at load. `None`
     /// when the schema declares none: nothing is seeded, locked or released,
@@ -2999,6 +3003,7 @@ impl InferenceState {
             branch_ingest: BranchIngest::default(),
             retrieval_scope,
             ingest_wake: OnceLock::new(),
+            learning_exclusions: AtomicBool::new(false),
             working_set,
             read_coverage: Coverage::default(),
             refresh_builder: proj_builder_refresh,
@@ -3222,6 +3227,36 @@ impl InferenceState {
         }
     }
 
+    /// Learn the chunk exclusions ([`Self::learn_chunk_exclusions`]) on a
+    /// thread of their own, so the next pass starts without waiting for them —
+    /// and not again while a learn is running: the pass after it learns from
+    /// what was written meanwhile.
+    ///
+    /// **Not at the end of the pass.** Learned there, every pass ended with
+    /// the scans: on BlackWorld (2026-10-28) a pass that read its units at
+    /// 23:53:43 learned until 23:57:01, and the layers read nothing, the GPU
+    /// idle, for those 3 m 18 s. The scans are background jobs the scheduler
+    /// runs between the next pass's waves.
+    pub(crate) fn learn_chunk_exclusions_behind(self: &Arc<Self>) {
+        if self.branch_layers.is_empty() || self.learning_exclusions.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let state = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("zend-exclusions".into())
+            .spawn(move || {
+                state.learn_chunk_exclusions();
+                state.learning_exclusions.store(false, Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            self.learning_exclusions.store(false, Ordering::SeqCst);
+            tracing::warn!(
+                target: "zend::calibrate",
+                "the chunk exclusions were not learned (no thread): {e}"
+            );
+        }
+    }
+
     /// Learn the chunk exclusion of every branch layer that declares a
     /// `calibrate:` block: the calibrations written are the background its
     /// generic chunks are told apart by. A standing exclusion is kept until its
@@ -3236,7 +3271,8 @@ impl InferenceState {
     /// derived layers write are projected without the cut. On the
     /// calibration competition the cut measured neutral (MRR 0.251 → 0.250);
     /// on content alone it bought MRR 0.172 → 0.186
-    /// (`docs/provenance_scoped_signatures.md` §2.6).
+    /// (`docs/provenance_scoped_signatures.md` §2.6). Run behind the passes
+    /// ([`Self::learn_chunk_exclusions_behind`]).
     fn learn_chunk_exclusions(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3307,14 +3343,9 @@ impl InferenceState {
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
-            // Learned whether or not the pass succeeded: a failed pass is read
-            // again only on the next branch move or layer clock, and the scans
-            // until then would run without an exclusion.
-            let passed = self
+            any |= self
                 .branch_ingest
-                .pass(&ctx, &self.workspace, &passes, &progress);
-            self.learn_chunk_exclusions();
-            any |= passed?;
+                .pass(&ctx, &self.workspace, &passes, &progress)?;
         }
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so
@@ -8305,12 +8336,20 @@ impl ZendSession {
                         let wake = Arc::new(Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
-                            let pass: Arc<dyn Fn() + Send + Sync> =
-                                Arc::new(move || match pass_state.refresh_ingest_layers() {
+                            let pass: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                                match pass_state.refresh_ingest_layers() {
                                     Ok(true) => tracing::info!("ingest pass: layers updated"),
-                                    Ok(false) => tracing::debug!("ingest pass: no layer changed"),
+                                    Ok(false) => {
+                                        tracing::debug!("ingest pass: no layer changed")
+                                    }
                                     Err(e) => tracing::warn!("ingest pass failed: {e:#}"),
-                                });
+                                }
+                                // Learned whether or not the pass succeeded: a
+                                // failed pass is read again only on the next
+                                // branch move or layer clock, and the scans until
+                                // then would run without an exclusion.
+                                pass_state.learn_chunk_exclusions_behind();
+                            });
                             let warm_state = Arc::clone(&state);
                             let after_first_pass: Arc<dyn Fn() + Send + Sync> =
                                 Arc::new(move || {
