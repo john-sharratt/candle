@@ -145,7 +145,7 @@ fn note_user(ctx: &Ctx, text: &str) -> Answer {
         now_ms(),
     ) {
         Ok(()) => Answer::ok(format!(
-            "Kept on {USER}: every new conversation of theirs starts with it."
+            "Kept on {USER} — every new conversation of theirs starts with it."
         )),
         Err(e) => Answer::error(e.to_string()),
     }

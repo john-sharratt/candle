@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -17,6 +18,10 @@ pub const GET: &str = "get_user_context";
 /// The tool an episode is recorded with, on the backend that answers
 /// [`GET`]. It is in no backend's listing; a client calling it is refused.
 pub const EPISODE: &str = "user_episode_note";
+/// How often, and how many times, a refused episode is recorded again: long
+/// enough together to outlast the memory's backend reloading its model.
+pub const EPISODE_RETRY: Duration = Duration::from_secs(30);
+pub const EPISODE_TRIES: u32 = 12;
 /// The silence after which a call is the first of a new conversation, for a
 /// client that keeps one session across them.
 pub const CONVERSATION_GAP_MS: u64 = 30 * 60 * 1000;

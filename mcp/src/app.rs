@@ -309,7 +309,10 @@ impl App {
 
 /// Record that `name`, called with `args`, did something for `call`'s caller
 /// — on the backend that keeps the memory, in the background, so the call's
-/// answer is never held for it.
+/// answer is never held for it. A record refused — the memory's backend
+/// restarting, its model still loading — is tried again, every
+/// [`context::EPISODE_RETRY`] up to [`context::EPISODE_TRIES`] times, so a
+/// picture drawn while zend reloads is still remembered.
 fn record_episode(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
     let Some(backend) = this.route(context::GET) else {
         return;
@@ -324,23 +327,31 @@ fn record_episode(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
             id: &id,
             session: &session,
         };
-        let answer = this
-            .link
-            .call(
-                &this.backends[backend],
-                &caller,
-                &on,
-                context::EPISODE,
-                &episode,
-                &|_| {},
-            )
-            .await;
-        if context::is_error(&answer) {
+        let tool = episode["tool"].as_str().unwrap_or("");
+        for attempt in 1..=context::EPISODE_TRIES {
+            let answer = this
+                .link
+                .call(
+                    &this.backends[backend],
+                    &caller,
+                    &on,
+                    context::EPISODE,
+                    &episode,
+                    &|_| {},
+                )
+                .await;
+            if !context::is_error(&answer) {
+                return;
+            }
             tracing::warn!(
-                tool = episode["tool"].as_str().unwrap_or(""),
+                tool,
+                attempt,
                 "mcp: an episode could not be recorded: {}",
                 first_line(context::text_of(&answer).unwrap_or(""))
             );
+            if attempt < context::EPISODE_TRIES {
+                tokio::time::sleep(context::EPISODE_RETRY).await;
+            }
         }
     });
 }

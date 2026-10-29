@@ -93,7 +93,10 @@ After a backend call answers without error, the aggregator records it with
 `user_episode_note {tool, summary}` on the backend that answers
 `get_user_context`, in the background: the call's answer is never held for
 it. `summary` is the call's first string argument (a prompt, a message, a
-name), cut at 160 characters. The client is the one the call came from.
+name), cut at 160 characters. The client is the one the call came from. A
+record refused — zend restarting, its model still loading — is tried again
+every 30 seconds, twelve times, which outlasts a model reload: a picture
+drawn while zend is down is still remembered once it is back.
 
 Not recorded: a tool its listing marks `annotations.readOnlyHint` — the MCP
 annotation every tool that only reads carries, in zend and npcd alike — the
