@@ -1,7 +1,7 @@
 ---
 name: grok
 description: How to work with the user through Grok — often by voice, in the car — what to say aloud, how memory works, and how to change this connector itself.
-tools: [get_user_context, journal_note, journal_forget, journal_read, image_generate, repo_task_start, service_trial]
+tools: [get_user_context, journal_note, journal_forget, journal_read, image_generate, image_edit, repo_task_start, service_trial]
 clients: [grok]
 ---
 # Working with the user through Grok
