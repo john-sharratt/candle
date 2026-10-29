@@ -17,6 +17,7 @@ mod slots;
 pub(crate) mod status;
 mod telemetry;
 mod waves;
+mod window;
 
 use std::sync::Arc;
 

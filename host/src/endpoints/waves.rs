@@ -17,6 +17,7 @@
 
 use std::time::Instant;
 
+use axum::extract::Query;
 use axum::Json;
 use candle_conversation::layer_trace::{self, PassTrace};
 use candle_conversation::phase_ring::{
@@ -28,6 +29,7 @@ use serde_json::{json, Value};
 
 use super::format_mix::{mix_series, Census, MixRow};
 use super::slots::{by_slot, now_ms};
+use super::window::Window;
 
 /// The engine's rows, slot by slot.
 #[derive(Serialize, Default, Clone)]
@@ -43,6 +45,19 @@ pub struct WaveSeries {
     has_pressure: bool,
     /// How the answer adds up across a cluster ([`telemetry_fuse`]).
     fuse: Value,
+}
+
+impl WaveSeries {
+    /// Only the rows of slots starting at or after `since_ms` — the window a
+    /// page draws. Four hours of rows were 2.9 MB a member, refetched every
+    /// poll by a page that draws the last twenty minutes.
+    pub fn since(mut self, since_ms: u64) -> Self {
+        self.waves.retain(|w| w.at >= since_ms);
+        self.mix.retain(|m| m.at >= since_ms);
+        self.migrate.retain(|m| m.at >= since_ms);
+        self.has_pressure = !self.mix.is_empty() || !self.migrate.is_empty();
+        self
+    }
 }
 
 /// The formats the arena panel names; the rest are `other`.
@@ -305,12 +320,15 @@ pub struct Phases {
 /// per phase per finished slot. Feeds the phase bars (2 min) and the phase
 /// throughput graph (20 min) on `perf.html`. The ring snapshot clones a
 /// bounded but non-trivial vector under a lock, so it runs on a blocking
-/// thread.
-pub async fn phases() -> Json<Phases> {
-    let body = tokio::task::spawn_blocking(|| {
+/// thread. Over the asked [`Window`]; every row the ring holds without one.
+pub async fn phases(Query(window): Query<Window>) -> Json<Phases> {
+    let body = tokio::task::spawn_blocking(move || {
         let snap = snapshot();
-        let points = by_slot(&snap, now_ms(), |p| p.age_s)
+        let now = now_ms();
+        let since = window.since(now);
+        let points = by_slot(&snap, now, |p| p.age_s)
             .into_iter()
+            .filter(|(at, _)| *at >= since)
             .flat_map(|(at, group)| fold_points(at, &group))
             .collect();
         Phases {
@@ -728,6 +746,56 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// **A window keeps the slots starting in it**, in every series, and says
+    /// there is no pressure data when none of those rows is in it.
+    #[test]
+    fn a_window_keeps_the_slots_starting_in_it() {
+        let wave = |at| {
+            fold_waves(
+                at,
+                &[&wave_sample(
+                    2_000,
+                    30,
+                    500,
+                    100,
+                    50,
+                    10,
+                    VramBands::default(),
+                    (0, 0, 0, 0, 0, 0, 0),
+                    (1, 1, 0, 0),
+                    (1, 2_000_000, 0),
+                )],
+            )
+            .unwrap()
+        };
+        let migrate = |at| fold_migrates(at, &[&migrate_sample(1, 1, 1, 1, 1, 1)]);
+        let series = WaveSeries {
+            waves: vec![wave(5_000), wave(10_000), wave(15_000)],
+            mix: vec![MixRow {
+                at: 5_000,
+                tok: Default::default(),
+            }],
+            mix_formats: vec!["Q4_0".into()],
+            migrate: vec![migrate(5_000), migrate(15_000)],
+            has_pressure: true,
+            fuse: telemetry_fuse(),
+        };
+        let kept = series.clone().since(10_000);
+        let ats = |w: &[Wave]| w.iter().map(|w| w.at).collect::<Vec<_>>();
+        assert_eq!(ats(&kept.waves), vec![10_000, 15_000]);
+        assert!(kept.mix.is_empty());
+        assert_eq!(
+            kept.migrate.iter().map(|m| m.at).collect::<Vec<_>>(),
+            vec![15_000]
+        );
+        assert!(kept.has_pressure);
+        assert_eq!(kept.mix_formats, vec!["Q4_0".to_string()]);
+
+        let none = series.since(20_000);
+        assert!(none.waves.is_empty() && none.migrate.is_empty());
+        assert!(!none.has_pressure);
     }
 
     /// A slot's migration passes add up, what they moved and how long they took.

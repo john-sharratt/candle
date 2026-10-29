@@ -10,18 +10,21 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use serde_json::{to_value, Map, Result as JsonResult, Value};
 
 use super::waves::wave_series;
+use super::window::Window;
 use super::Shared;
 use crate::telemetry::memory::{dump, MemoryDump};
 
-pub async fn telemetry(State(s): State<Arc<Shared>>) -> Json<Value> {
+/// The engine rows over the asked [`Window`] — every row the rings hold
+/// without one.
+pub async fn telemetry(State(s): State<Arc<Shared>>, Query(window): Query<Window>) -> Json<Value> {
     let body = tokio::task::spawn_blocking(move || {
         let mut body = as_object(to_value(s.telemetry.read()));
-        body.extend(as_object(to_value(wave_series())));
+        body.extend(as_object(to_value(wave_series().since(window.since_now()))));
         Value::Object(body)
     })
     .await
@@ -81,6 +84,14 @@ mod tests {
         assert!(v["host"]["total_mib"].as_u64().is_some_and(|m| m > 0));
         assert_eq!(v["engine_measured"], false);
         assert_eq!(v["has_pressure"], false);
+    }
+
+    /// A window is asked for by `span_s`, and the answer keeps its shape.
+    #[tokio::test]
+    async fn a_window_is_asked_for_by_span() {
+        let (code, v) = get_json(&app(shared(vec![])), "/v1/telemetry?span_s=1200").await;
+        assert_eq!(code, 200);
+        assert!(v["waves"].is_array() && v["fuse"].is_object(), "{v}");
     }
 
     #[tokio::test]

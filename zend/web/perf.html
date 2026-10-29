@@ -830,9 +830,13 @@ async function refresh() {
   try {
     // Only the first is required. The rest degrade to `null` so a daemon that
     // has not instrumented one greys a panel rather than blanking the page.
+    // The engine rows and the phases are asked for over the span the page
+    // draws: the whole rings were 3.7 MB a member, every poll, for twenty
+    // minutes of charts.
+    const span = `span_s=${RATE_SPAN_MS / 1000}`;
     const [t, p, r, m, l] = await Promise.all([
-      fetch('/v1/telemetry', { cache: 'no-store' }).then((r) => r.json()),
-      fetch('/v1/phases', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
+      fetch(`/v1/telemetry?${span}`, { cache: 'no-store' }).then((r) => r.json()),
+      fetch(`/v1/phases?${span}`, { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/projections', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/memory', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/layers', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
