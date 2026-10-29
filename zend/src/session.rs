@@ -156,6 +156,10 @@ pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.ya
 /// best-effort), which is preferable to unbounded growth under a burst.
 const TITLER_QUEUE_DEPTH: usize = 256;
 
+/// A substrate view's wait for the engine lock at least this long is logged —
+/// the substrate lock's own threshold.
+const VIEW_WAIT_SLOW: Duration = Duration::from_millis(250);
+
 /// How often a pass is asked for while a layer changes with time rather than
 /// with its branches: a day layer reads a day that closed
 /// (`crate::layers::days`), and a layer that expires reads again the units
@@ -670,6 +674,11 @@ struct InferenceState {
     tool_modes: Mutex<HashMap<String, ToolMode>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: Mutex<Sequence>,
+    /// The layer `base_conv` targets, named once at boot — what the substrate
+    /// views report as the target. Read through `base_conv` it waited out
+    /// that lock's holders: a calibration draft holds it across its fork,
+    /// which the scheduler parks until the base's turn ends.
+    target_layer: String,
     /// One prefilled template per `Folders`/`Files` ingest layer (`repo_map`,
     /// `code_reading`), keyed by layer name — `base_conv`'s exact counterpart
     /// for background ingestion. Built once at boot, alongside `base_conv`,
@@ -2998,6 +3007,7 @@ impl InferenceState {
             conversations: Mutex::new(HashMap::new()),
             conv_used: Mutex::new(HashMap::new()),
             tool_modes: Mutex::new(HashMap::new()),
+            target_layer: base_conv.target_layer_name(),
             base_conv: Mutex::new(base_conv),
             ingest_bases,
             chain_end: Mutex::new(None),
@@ -6902,12 +6912,31 @@ impl ZendSession {
     /// still loading the substrate the load published once its redo log
     /// replayed, with no titler or target layer built yet. `None` before the
     /// replay has finished.
+    ///
+    /// Takes no conversation's lock: the base conversation's is held across a
+    /// calibration draft's fork, which the scheduler parks until the base's turn
+    /// ends. The substrate page answered in 11–14 s on BlackWorld (2026-10-29)
+    /// with no wait for the substrate lock logged.
     fn substrate_for_views(&self) -> Option<(Conversation, Option<TimelineId>, String)> {
         if let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) {
-            let target_layer = state.base_conv.lock().unwrap().target_layer_name();
-            // Clone the handle out, dropping the engine lock at once.
+            // Clone the handle out, dropping the engine lock at once. Its other
+            // holders can keep a view waiting for it, so a wait long enough to
+            // feel is said, as the substrate lock's are.
+            let asked = Instant::now();
             let conv = state.engine.lock().unwrap().conversation();
-            return Some((conv, Some(state.titler_timeline), target_layer));
+            let waited = asked.elapsed();
+            if waited >= VIEW_WAIT_SLOW {
+                tracing::warn!(
+                    target: "zend::session",
+                    waited_ms = waited.as_millis() as u64,
+                    "a substrate view waited long for the engine lock"
+                );
+            }
+            return Some((
+                conv,
+                Some(state.titler_timeline),
+                state.target_layer.clone(),
+            ));
         }
         let conv = self.loading_substrate.read().unwrap().clone()?;
         Some((conv, None, String::new()))
