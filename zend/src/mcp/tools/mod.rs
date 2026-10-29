@@ -41,6 +41,7 @@ mod cluster_job_status;
 mod cluster_logs;
 mod cluster_status;
 mod gateway_command;
+mod journal_forget;
 mod journal_grep;
 mod journal_note;
 mod journal_read;
@@ -58,6 +59,8 @@ mod task;
 mod threads;
 mod timeline_delete;
 mod timeline_read;
+mod user_context;
+mod user_episode;
 pub(crate) mod wait;
 
 /// What a tool answers when it needs the model and zend is still loading it.
@@ -133,6 +136,7 @@ impl Answer {
 /// Every tool's definition, for `tools/list`.
 pub fn definitions() -> Value {
     json!([
+        user_context::definition(),
         attach::definition(),
         task::definition(),
         wait::definition(),
@@ -142,6 +146,7 @@ pub fn definitions() -> Value {
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
+        journal_forget::definition(),
         threads::definition(),
         archive::definition(),
         cluster_status::definition(),
@@ -165,6 +170,9 @@ pub fn definitions() -> Value {
 /// Run tool `name` with `args`.
 pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
     match name {
+        user_context::NAME => user_context::call(ctx, args),
+        user_episode::NAME => user_episode::call(ctx, args),
+        journal_forget::NAME => journal_forget::call(ctx, args),
         attach::NAME => attach::call(ctx, args),
         task::NAME => task::call(ctx, args).await,
         wait::NAME => wait::call(ctx, args).await,
@@ -264,6 +272,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "get_user_context",
                 "thread_attach",
                 "repo_task_start",
                 "repo_task_wait",
@@ -273,6 +282,7 @@ mod tests {
                 "journal_read",
                 "journal_grep",
                 "journal_note",
+                "journal_forget",
                 "thread_list",
                 "thread_archive",
                 "cluster_status",
@@ -290,6 +300,39 @@ mod tests {
                 "layer_toggle",
                 "timeline_read",
                 "timeline_delete"
+            ]
+        );
+    }
+
+    /// **Exactly the tools that only read say so** (`readOnlyHint`): the
+    /// aggregator records an episode for every other call
+    /// (`docs/mcp_user_context.md` §2.3).
+    #[test]
+    fn the_tools_that_only_read_say_so() {
+        let defs = definitions();
+        let read_only: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["annotations"]["readOnlyHint"] == true)
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            read_only,
+            [
+                "get_user_context",
+                "repo_task_wait",
+                "journal_read",
+                "journal_grep",
+                "thread_list",
+                "cluster_status",
+                "cluster_logs",
+                "cluster_audit",
+                "cluster_job_status",
+                "repo_job_log",
+                "service_status",
+                "layer_read",
+                "timeline_read"
             ]
         );
     }

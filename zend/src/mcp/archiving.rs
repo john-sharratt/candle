@@ -170,6 +170,7 @@ fn distil_claimed(
                     before.path()
                 ),
                 worker: Some(before.path()),
+                client: None,
             };
             if let Err(e) = threads::add_note(records, owner, &before.thread, &note) {
                 tracing::warn!(worker = %before.path(), "mcp: a lost task's end could not be entered: {e}");
@@ -272,6 +273,7 @@ pub fn archive_thread(
                 label: "Thread archived:".into(),
                 text: line.clone(),
                 worker: None,
+                client: None,
             };
             let kept = threads::put_thread(records, owner, &archived)
                 .and_then(|()| threads::add_note(records, owner, name, &note));

@@ -516,6 +516,7 @@ fn note(
             label: label.into(),
             text: format!("{} — {text}", worker.path()),
             worker: Some(worker.path()),
+            client: None,
         },
     )
     .map_err(|e| e.to_string())

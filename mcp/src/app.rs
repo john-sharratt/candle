@@ -9,6 +9,10 @@
 //! Beside the backends' tools it serves its own two, `guide_list` and
 //! `guide_read` (`crate::guides`), and adds to each backend tool a guide lists
 //! the line naming its guides.
+//!
+//! And it serves the user's context (`crate::context`): the client's guide in
+//! front of `get_user_context`, the same context after the first answer of a
+//! conversation, and an episode recorded for each call that did something.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -17,12 +21,14 @@ use std::time::Instant;
 
 use axum::http::HeaderMap;
 use futures::future::join_all;
+use mcp_server::http::now_ms;
 use mcp_server::protocol::text_result;
 use mcp_server::{Call, Identity, NoCaller, SealedStore, Server, Store};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::backend::{Backend, Link, OnBehalf};
 use crate::caller::Caller;
+use crate::context::{self, Conversations};
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
 use crate::last_listed::LastListed;
@@ -42,6 +48,10 @@ pub struct App {
     pub last_listed: LastListed,
     /// The guides served beside the backends' tools (`docs/mcp_guides.md`).
     pub library: Library,
+    /// The backend tools the last listing marked as only reading.
+    pub read_only: RwLock<BTreeSet<String>>,
+    /// When each conversation last had a call.
+    pub conversations: Conversations,
 }
 
 /// Every backend's tools in backend order, and which backend runs each: a
@@ -93,6 +103,12 @@ pub fn relearn(
         }
     }
     routes
+}
+
+/// How a call ran: answered, or given up because its client left.
+enum Ran {
+    Answered(Value),
+    Left,
 }
 
 /// What listing every backend found: the tools of those that answered, and
@@ -150,6 +166,10 @@ impl App {
             }
         }
         let (tools, learned) = merge(lists);
+        context::mark_read_only(
+            &mut self.read_only.write().unwrap_or_else(|e| e.into_inner()),
+            &tools,
+        );
         let mut routes = self.routes.write().unwrap_or_else(|e| e.into_inner());
         *routes = relearn(&routes, learned, &failed);
         Listed {
@@ -165,6 +185,164 @@ impl App {
             .get(name)
             .copied()
     }
+
+    /// The call, run by the backend that lists `name` — the tools listed
+    /// again first when none does yet, as after a restart — or answered here
+    /// when it is a guide tool.
+    async fn run(&self, call: &Call<Self>, name: &str, args: &Value) -> Ran {
+        if guide_tools::is_guide_tool(name) {
+            let answer = guide_tools::call(&self.library, name, args);
+            let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
+            tracing::info!(tool = name, guide, "mcp: guide served");
+            return Ran::Answered(answer);
+        }
+        let backend = match self.route(name) {
+            Some(b) => b,
+            None => {
+                let listed = self.list(call).await;
+                match self.route(name) {
+                    Some(b) => b,
+                    None if listed.failed.is_empty() => {
+                        return Ran::Answered(text_result(
+                            &format!("there is no tool `{name}`"),
+                            true,
+                        ))
+                    }
+                    None => return Ran::Answered(text_result(&listed.failed.join("; "), true)),
+                }
+            }
+        };
+        let on = OnBehalf {
+            id: &call.session_id,
+            session: &call.session,
+        };
+        let step = |line: String| call.step(line);
+        let started = Instant::now();
+        let to = &self.backends[backend].name;
+        // A client gone drops the backend's call with it, so the backend does
+        // not take an answer nobody read as delivered.
+        let answer = tokio::select! {
+            answer = self.link.call(
+                &self.backends[backend],
+                &call.caller,
+                &on,
+                name,
+                args,
+                &step,
+            ) => answer,
+            _ = call.abandoned() => {
+                tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
+                return Ran::Left;
+            }
+        };
+        let ms = started.elapsed().as_millis() as u64;
+        if context::is_error(&answer) {
+            let text = context::text_of(&answer).unwrap_or("");
+            tracing::warn!(
+                tool = name,
+                backend = to,
+                ms,
+                "mcp: call answered an error: {}",
+                first_line(text)
+            );
+        } else {
+            tracing::info!(tool = name, backend = to, ms, "mcp: called");
+        }
+        Ran::Answered(answer)
+    }
+
+    /// The user's context as served to `client`, from the memory's answer
+    /// to `get_user_context`: the client's guide in front of it. `None` when
+    /// the memory answered an error, which is logged.
+    fn served_context(&self, client: &str, answer: &Value) -> Option<String> {
+        let text = context::text_of(answer).unwrap_or("");
+        if context::is_error(answer) {
+            tracing::warn!(
+                client,
+                "mcp: the user's context could not be read: {}",
+                first_line(text)
+            );
+            return None;
+        }
+        Some(context::compose(
+            self.library.for_client(client),
+            client,
+            text,
+        ))
+    }
+
+    /// The user's context for `call`'s client, read from the backend that
+    /// keeps the memory — `None` when it cannot be, which is logged and costs
+    /// the call nothing.
+    async fn read_context(&self, call: &Call<Self>) -> Option<String> {
+        let client = call.session.client.name();
+        let Some(backend) = self.route(context::GET) else {
+            tracing::warn!(client, "mcp: no backend lists the user's context yet");
+            return None;
+        };
+        let on = OnBehalf {
+            id: &call.session_id,
+            session: &call.session,
+        };
+        let answer = self
+            .link
+            .call(
+                &self.backends[backend],
+                &call.caller,
+                &on,
+                context::GET,
+                &json!({}),
+                &|_| {},
+            )
+            .await;
+        self.served_context(client, &answer)
+    }
+
+    /// Whether the last listing marked `name` as only reading.
+    fn reads_only(&self, name: &str) -> bool {
+        self.read_only
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+    }
+}
+
+/// Record that `name`, called with `args`, did something for `call`'s caller
+/// — on the backend that keeps the memory, in the background, so the call's
+/// answer is never held for it.
+fn record_episode(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
+    let Some(backend) = this.route(context::GET) else {
+        return;
+    };
+    let this = Arc::clone(this);
+    let caller = call.caller.clone();
+    let id = call.session_id.clone();
+    let session = call.session.clone();
+    let episode = json!({"tool": name, "summary": context::summary(args)});
+    tokio::spawn(async move {
+        let on = OnBehalf {
+            id: &id,
+            session: &session,
+        };
+        let answer = this
+            .link
+            .call(
+                &this.backends[backend],
+                &caller,
+                &on,
+                context::EPISODE,
+                &episode,
+                &|_| {},
+            )
+            .await;
+        if context::is_error(&answer) {
+            tracing::warn!(
+                tool = episode["tool"].as_str().unwrap_or(""),
+                "mcp: an episode could not be recorded: {}",
+                first_line(context::text_of(&answer).unwrap_or(""))
+            );
+        }
+    });
 }
 
 impl Server for App {
@@ -224,63 +402,61 @@ impl Server for App {
         Ok(Value::Array(tools))
     }
 
-    /// The call, run by the backend that lists `name` — the tools listed
-    /// again first when none does yet, as after a restart.
+    /// The call (`App::run`), with the user's context: `get_user_context`
+    /// gets the client's guide in front, the first call of a conversation
+    /// gets the context after its answer, and a call that did something is
+    /// recorded as an episode (`docs/mcp_user_context.md` §2.2–§2.5).
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Value {
-        if guide_tools::is_guide_tool(name) {
-            let answer = guide_tools::call(&this.library, name, args);
-            let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
-            tracing::info!(tool = name, guide, "mcp: guide served");
-            return answer;
+        if name == context::EPISODE {
+            return text_result(&format!("there is no tool `{name}`"), true);
         }
-        let backend = match this.route(name) {
-            Some(b) => b,
-            None => {
-                let listed = this.list(call).await;
-                match this.route(name) {
-                    Some(b) => b,
-                    None if listed.failed.is_empty() => {
-                        return text_result(&format!("there is no tool `{name}`"), true)
-                    }
-                    None => return text_result(&listed.failed.join("; "), true),
-                }
+        let client = call.session.client.name();
+        let who = context::who(&call.caller.key(), client, &call.session_id);
+        let begins = this.conversations.begins(&who, now_ms());
+        let around = context::around(name, begins);
+        // The context is read beside the call: a first call costs one backend
+        // round trip, not two. Before any listing has said which backend
+        // keeps it, as after a restart, the call lists first and the context
+        // is read after it.
+        let (ran, user) = match (around.fetch_context, this.route(context::GET)) {
+            (false, _) => (this.run(call, name, args).await, None),
+            (true, Some(_)) => tokio::join!(this.run(call, name, args), this.read_context(call)),
+            (true, None) => {
+                let ran = this.run(call, name, args).await;
+                (ran, this.read_context(call).await)
             }
         };
-        let on = OnBehalf {
-            id: &call.session_id,
-            session: &call.session,
+        // A client that left neither had the context nor needs a record of
+        // an answer it never read.
+        let Ran::Answered(mut answer) = ran else {
+            return text_result("the client stopped listening", true);
         };
-        let step = |line: String| call.step(line);
-        let started = Instant::now();
-        let to = &this.backends[backend].name;
-        // A client gone drops the backend's call with it, so the backend does
-        // not take an answer nobody read as delivered.
-        let answer = tokio::select! {
-            answer = this.link.call(
-                &this.backends[backend],
-                &call.caller,
-                &on,
-                name,
-                args,
-                &step,
-            ) => answer,
-            _ = call.abandoned() => {
-                tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
-                return text_result("the client stopped listening", true);
+        if around.compose {
+            if let Some(served) = this.served_context(client, &answer) {
+                context::replace_text(&mut answer, &served);
             }
-        };
-        let ms = started.elapsed().as_millis() as u64;
-        if answer.get("isError").and_then(Value::as_bool) == Some(true) {
-            let text = answer["content"][0]["text"].as_str().unwrap_or("");
-            tracing::warn!(
+        }
+        if let Some(user) = &user {
+            context::append(&mut answer, &context::first_call(user));
+            tracing::info!(
                 tool = name,
-                backend = to,
-                ms,
-                "mcp: call answered an error: {}",
-                first_line(text)
+                client,
+                "mcp: a conversation's first call carries its context"
             );
-        } else {
-            tracing::info!(tool = name, backend = to, ms, "mcp: called");
+        }
+        let after = context::after(
+            name,
+            begins,
+            context::is_error(&answer),
+            this.route(name).is_some(),
+            this.reads_only(name),
+            user.is_some(),
+        );
+        if after.stamp {
+            this.conversations.stamp(&who, now_ms());
+        }
+        if after.record {
+            record_episode(this, call, name, args);
         }
         answer
     }

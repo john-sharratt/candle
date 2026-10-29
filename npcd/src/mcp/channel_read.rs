@@ -22,6 +22,7 @@ impl Tool for Read {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
+            "annotations": {"readOnlyHint": true},
             "description": "Read a world's channel — the group chat every bot in that world is on — \
                 as you have heard it: what was said since you joined it, oldest first. A world's id is \
                 in bot_list.",

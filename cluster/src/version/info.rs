@@ -21,10 +21,15 @@ pub const ZEND: &str = "zend";
 pub const NPCD: &str = "npcd";
 pub const MOTHERD: &str = "motherd";
 pub const AGENT: &str = "tokera-agent";
+/// The gateway and the MCP aggregator: services `keep` trials, which open no
+/// substrate and run no model.
+pub const WEB: &str = "web";
+pub const MCP: &str = "mcp";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
-    /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`] or [`AGENT`].
+    /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`], [`AGENT`], [`WEB`] or
+    /// [`MCP`].
     pub kind: String,
     pub count: u32,
     pub hash: String,

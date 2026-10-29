@@ -151,7 +151,10 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | `repo_task_stop {worker, reason?, wait_s?}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `repo_task_reply` to redirect (§6.2) | As `repo_task_wait`: `stopped` once it has |
 | `journal_read {journal, entry?, offset?, limit?}` | Without `entry`: the journal's entries, one line each, with open items. With an `entry` (or an entry address, `…#12`): pages the turns behind it | The journal as the prompt reads it, or `limit` lines from `offset` (200 by default, 400 at most) |
 | `journal_grep {journal, pattern, entry?, max_results?}` | Case-insensitive substring search of a journal's entries' turns; `journal` may be a subtree (`T:review-layers/*`) | Each hit's path, entry, turn and line; 20 hits by default, 50 at most |
-| `journal_note {journal, text}` | Records a note — a decision and its reason, what the user said — on a thread or project journal as one entry (§4) | The entry's address |
+| `journal_note {journal, text}` | Records a note — a decision and its reason, what the user said — on a thread or project journal as one entry (§4); on `U:`, the user's own journal, something they want remembered (`docs/mcp_user_context.md` §2.1) | The entry's address; on `U:`, that it is kept — its number moves as episodes come and go |
+| `journal_forget {journal: "U:", says}` | Ends the one entry of the user's own journal that says `says`; thread and project journals stay as written | The entry forgotten, or the entries a phrase matched when it matched several |
+| `get_user_context` | The user's name, kept facts, and recent episodes through this client first (`docs/mcp_user_context.md` §2.2) | The context, framed as notes |
+| `user_episode_note {tool, summary?}` | Records an episode on `U:` — called by the aggregator only; in no listing (`docs/mcp_user_context.md` §2.3) | The episode's line |
 | `thread_list {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
 | `thread_archive {thread}` | Archives a finished feature's thread | The thread's last state |
 
@@ -955,7 +958,7 @@ are Admin-only at the endpoint:
 | Tool | keep route | Class |
 |---|---|---|
 | `service_status {host}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended | Look |
-| `service_trial {host, service, artifact}` | `POST /v1/keep/trial` — the trial, run as a job: accepted at once, its outcome read with `service_status` | Care |
+| `service_trial {host, service, artifact}` | `POST /v1/keep/trial` — the trial, run as a job: accepted at once, its outcome read with `service_status`. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
 | `service_control {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |
 
 Every trial keep runs — through the cluster or its loopback switch — is on its

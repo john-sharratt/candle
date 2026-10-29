@@ -281,6 +281,10 @@ pub struct Note {
     /// The worker the entry is about, as a path.
     #[serde(default)]
     pub worker: Option<String>,
+    /// The client the entry came through (`mcp_server::Client::name`): kept
+    /// on the user's own journal, whose entries come from every client.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 pub fn thread_key(owner: &str, thread: &str) -> String {
@@ -420,10 +424,19 @@ pub fn add_note(
 
 /// The thread's journal, oldest first.
 pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Note> {
+    notes_keyed(records, owner, thread)
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect()
+}
+
+/// The thread's journal, oldest first, each entry with the record key it is
+/// kept under — what ending one names.
+pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Note)> {
     records
         .under(&note_prefix(owner, thread))
         .into_iter()
-        .filter_map(|(_, v)| decode(v))
+        .filter_map(|(k, v)| Some((k, decode(v)?)))
         .collect()
 }
 
@@ -508,6 +521,7 @@ mod tests {
             label: label.into(),
             text: text.into(),
             worker: Some("T:review/verify".into()),
+            client: None,
         };
         add_note(&r, "o", "review", &note(5, "Claude started:", "verify")).unwrap();
         add_note(&r, "o", "review", &note(5, "Task ended:", "verify — ok")).unwrap();

@@ -59,8 +59,28 @@ mod tests {
     fn every_embedded_guide_reads() {
         let library = embedded().unwrap();
         assert!(library.count() >= 40, "{} guides", library.count());
-        for name in ["thread", "delegate", "research", "verify", "deploy", "bots"] {
+        for name in [
+            "thread",
+            "delegate",
+            "research",
+            "verify",
+            "deploy",
+            "bots",
+            "guide-change",
+        ] {
             assert!(library.get(name).is_some(), "{name}");
         }
+    }
+
+    /// **Grok is given its guide first**, and it is written on a budget: it
+    /// rides the first call of every conversation
+    /// (`docs/mcp_user_context.md` §2.4).
+    #[test]
+    fn grok_has_its_own_short_guide() {
+        let library = embedded().unwrap();
+        let grok = library.for_client("grok").unwrap();
+        assert_eq!(grok.name, "grok");
+        assert!(grok.body.len() < 2_200, "{} bytes", grok.body.len());
+        assert!(library.for_client("claude-code").is_none());
     }
 }

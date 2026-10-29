@@ -195,6 +195,15 @@ pub async fn post<S: Server>(
             .and_then(|c| c.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        // What the client calls itself and the agent it sends: how a client
+        // `Client::of` does not know yet is recognised in the log.
+        tracing::info!(
+            client = client_name,
+            agent = read_header(&headers, header::USER_AGENT.as_str()).unwrap_or(""),
+            owner = %owner,
+            protocol = version,
+            "mcp: initialize"
+        );
         let opened = match store.open(&owner, Client::of(client_name), version, now) {
             Ok(opened) => opened,
             Err(e) => return failed(id, e),

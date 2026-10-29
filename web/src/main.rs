@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use cluster::handshake::GroupKey;
+use cluster::version::info::{answer_if_asked, Opens, WEB};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -72,6 +73,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // keep asks a staged build what it is before it trials it.
+    answer_if_asked(WEB, Opens::default);
     let cli = Cli::parse();
     // The `cluster` crate runs the gateway's hub, sessions and relays: its
     // warnings — a member's writer stalled, a socket ended and why — are the

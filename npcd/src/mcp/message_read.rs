@@ -22,6 +22,7 @@ impl Tool for Thread {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
+            "annotations": {"readOnlyHint": true},
             "description": "Read your message thread with a bot, oldest first: what you sent it with \
                 bot_message_send and what it replied.",
             "inputSchema": {

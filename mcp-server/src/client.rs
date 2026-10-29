@@ -1,5 +1,6 @@
 //! Which client an MCP session is for, as its `clientInfo.name` says — which
-//! bounds how long a call from it may wait.
+//! bounds how long a call from it may wait, and picks the guide a server
+//! gives it (`docs/mcp_user_context.md` §2.6).
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,9 @@ pub enum Client {
     /// given up after about 300 s with nothing delivered, so a wait holds four
     /// minutes and is called again.
     ClaudeCode,
+    /// xAI's Grok — in its apps and in the car — whose answers are spoken as
+    /// often as read. Its calls wait as `Other`'s do.
+    Grok,
     /// claude.ai, Claude Desktop, or anyone else: a call is cut off at 240 s.
     Other,
 }
@@ -19,6 +23,8 @@ impl Client {
         let name = name.to_ascii_lowercase();
         if name.contains("claude-code") || name.contains("claude code") {
             Self::ClaudeCode
+        } else if name.contains("grok") || name.contains("xai") {
+            Self::Grok
         } else {
             Self::Other
         }
@@ -28,7 +34,7 @@ impl Client {
     pub fn wait_ceiling(self) -> u64 {
         match self {
             Self::ClaudeCode => 240,
-            Self::Other => 200,
+            Self::Grok | Self::Other => 200,
         }
     }
 
@@ -37,6 +43,7 @@ impl Client {
     pub fn name(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude-code",
+            Self::Grok => "grok",
             Self::Other => "other",
         }
     }
@@ -44,6 +51,7 @@ impl Client {
     pub(crate) fn slug(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude_code",
+            Self::Grok => "grok",
             Self::Other => "other",
         }
     }
@@ -58,12 +66,23 @@ mod tests {
         assert_eq!(Client::of("claude-code").wait_ceiling(), 240);
         assert_eq!(Client::of("Claude Code").wait_ceiling(), 240);
         assert_eq!(Client::of("claude-ai").wait_ceiling(), 200);
+        assert_eq!(Client::of("grok").wait_ceiling(), 200);
         assert_eq!(Client::of("anything").wait_ceiling(), 200);
+    }
+
+    /// **Grok is known by either of its names**, in any case; nothing else is
+    /// taken for it.
+    #[test]
+    fn grok_is_known_by_its_name_or_its_makers() {
+        assert_eq!(Client::of("Grok"), Client::Grok);
+        assert_eq!(Client::of("xai-mcp-client"), Client::Grok);
+        assert_eq!(Client::of("claude-ai"), Client::Other);
+        assert_eq!(Client::of(""), Client::Other);
     }
 
     #[test]
     fn a_client_passed_on_by_name_is_read_back_as_itself() {
-        for c in [Client::ClaudeCode, Client::Other] {
+        for c in [Client::ClaudeCode, Client::Grok, Client::Other] {
             assert_eq!(Client::of(c.name()), c);
         }
     }

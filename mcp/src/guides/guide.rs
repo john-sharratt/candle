@@ -12,6 +12,10 @@ pub struct Guide {
     pub description: String,
     /// The tools it applies to, whichever backend serves them.
     pub tools: Vec<String>,
+    /// The clients it is the guide for, by `mcp_server::Client::name`: served
+    /// to a conversation through one of them before anything else
+    /// (`docs/mcp_user_context.md` §2.4). Most guides are for none.
+    pub clients: Vec<String>,
     /// The method.
     pub body: String,
 }
@@ -22,6 +26,8 @@ struct Front {
     name: String,
     description: String,
     tools: Vec<String>,
+    #[serde(default)]
+    clients: Vec<String>,
 }
 
 impl Guide {
@@ -41,6 +47,7 @@ impl Guide {
             name: front.name.trim().to_string(),
             description: front.description.trim().to_string(),
             tools: front.tools,
+            clients: front.clients,
             body,
         };
         if guide.name.is_empty() {
@@ -76,9 +83,20 @@ mod tests {
                 name: "research".into(),
                 description: "A question answered from the web.".into(),
                 tools: vec!["repo_task_start".into(), "repo_task_wait".into()],
+                clients: Vec::new(),
                 body: "# Research\n\nGather.".into(),
             }
         );
+    }
+
+    #[test]
+    fn a_guide_may_name_the_clients_it_is_for() {
+        let g = Guide::parse(
+            "---\nname: grok\ndescription: Working with the user through Grok.\n\
+             tools: [get_user_context]\nclients: [grok]\n---\n# Grok\n",
+        )
+        .unwrap();
+        assert_eq!(g.clients, ["grok"]);
     }
 
     #[test]

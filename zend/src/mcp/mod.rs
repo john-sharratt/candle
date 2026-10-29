@@ -24,6 +24,7 @@
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
 //! | [`stops`] | Claude stopping a running worker, at its next tool round |
 //! | [`threads`] | Threads, workers and the thread's journal, as records |
+//! | [`memory`] | The user's own journal, `U:`, and the context made of it |
 //! | [`names`] | Names and paths |
 //! | [`caller`] | Who is calling, and the key their records are kept under |
 //! | [`ownership`] | Who may open a worker's conversation on zend's other routes |
@@ -35,6 +36,7 @@ pub mod archiving;
 pub mod audit;
 pub mod caller;
 pub mod lineage;
+pub mod memory;
 pub mod names;
 pub mod nudges;
 pub mod ops;

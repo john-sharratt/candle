@@ -27,6 +27,7 @@ const SCAN: u64 = 20_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read what was done to the cluster, newest first, from the gateway's log of it: each \
             maintenance command a member ran, its arguments, who sent it, and how it ended, with members \
             joining, leaving, being admitted or refused, and floors raised, beside them. Replication's own \

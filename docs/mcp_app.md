@@ -113,6 +113,13 @@ all.
 backend tool some guide names gets a generated "Guides:" line on its
 description.
 
+**It serves the user's context** (`docs/mcp_user_context.md` §2): it puts the
+client's guide in front of zend's `get_user_context`, adds the same context
+after the answer of a conversation's first call, records each call that did
+something — a backend call whose tool its listing does not mark
+`readOnlyHint` — with zend's `user_episode_note`, which is in no listing, and
+passes on a Grok client as `grok`.
+
 **Every listing and call is logged**: one line each, naming the backend, the
 tool and how long it took, at `WARN` with the reason when it failed.
 

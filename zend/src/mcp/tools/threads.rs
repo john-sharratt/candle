@@ -12,6 +12,7 @@ pub const NAME: &str = "thread_list";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "List your threads, newest first: each one's path, how many tasks it has had, each \
             worker still running with what it has done so far, and any waiting on you — a question to answer, \
             or a stuck worker — with its path. Use it to find the thread of a feature you worked on before, \

@@ -28,6 +28,7 @@ const TURN_PAGE: usize = 16_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read one stored conversation — a timeline in the substrate, the store everything \
             is kept in — by the id `layer_read` lists, or a worker's own by its path \
             (`T:<thread>/<name>`): its label, layer, tokens, \

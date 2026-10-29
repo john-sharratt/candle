@@ -16,6 +16,7 @@ pub const NAME: &str = "repo_job_log";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read a job `repo_job_start` started: how it stands — running or ended, its exit code, and \
             for a job that staged a build, where the build is — then its log from byte `from` (0 by \
             default), a page of up to 256 KiB with the offset to read on from. With `grep`, only the page's \

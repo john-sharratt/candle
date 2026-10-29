@@ -16,8 +16,9 @@ pub const NAME: &str = "service_control";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Restart, stop or start a service — motherd (the daemon that runs the models) or web \
-            (the gateway) — on one machine, through keep, the supervisor that runs them. A restart runs the \
+        "description": "Restart, stop or start a service — motherd (the daemon that runs the models), web \
+            (the gateway) or mcp (this connector's own server) — on one machine, through keep, the \
+            supervisor that runs them. A restart runs the \
             installed binary again, with no trial; a start lifts a stop. A stop holds the service down until \
             it is started again — a decision: ask the user, and pass `confirm: \"approved by the user\"` only \
             with their approval. Admins only.",
@@ -25,7 +26,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "The machine, as `cluster_status` names it."},
-                "service": {"type": "string", "enum": ["motherd", "web"]},
+                "service": {"type": "string", "enum": ["motherd", "web", "mcp"]},
                 "action": {"type": "string", "enum": ["restart", "stop", "start"]},
                 "confirm": {"type": "string", "description": "`approved by the user`, for a stop."}
             },

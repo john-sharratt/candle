@@ -26,6 +26,7 @@ const LINE_CHARS: usize = 400;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Search the logs of the cluster's members — the machines running the motherd daemon — for \
             what they say about a symptom: every member's matching lines, oldest first, each under its member, \
             each cut at 400 characters. `grep` is a regular expression found anywhere in a line; narrow with \

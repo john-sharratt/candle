@@ -19,6 +19,7 @@ const STEPS_SHOWN: usize = 12;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read how a maintenance job stands — the job `cluster_command` started on a member: \
             whether it is running, done or failed, its last steps, and its result or error. Waits up to \
             `wait_s` for it to end, answering as it stands then. A job lives in its member's memory: one lost \

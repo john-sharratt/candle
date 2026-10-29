@@ -42,9 +42,15 @@ pub fn check(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The path of the caller's own journal (`docs/mcp_user_context.md` §2.1).
+pub const USER: &str = "U:";
+
 /// A journal or conversation `/mcp` addresses by path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Path {
+    /// `U:`: the caller's own journal — what they asked to be kept, and what
+    /// was done for them — whichever client they spoke through.
+    User,
     /// `P:<repo>`: a project's standing rules, which every task inherits.
     Project(String),
     /// `T:<thread>`.
@@ -57,6 +63,9 @@ pub enum Path {
 impl Path {
     /// Read `text` as a path, refusing anything that is not one.
     pub fn parse(text: &str) -> Result<Self, String> {
+        if text == USER {
+            return Ok(Self::User);
+        }
         if let Some(repo) = text.strip_prefix("P:") {
             let named = !repo.is_empty()
                 && repo
@@ -72,7 +81,8 @@ impl Path {
         }
         let Some(rest) = text.strip_prefix("T:") else {
             return Err(format!(
-                "`{text}` is not a path: a project's journal is `P:<repository>`, a thread \
+                "`{text}` is not a path: the user's own journal is `U:`, a project's \
+                 `P:<repository>`, a thread \
                  `T:<name>`, a worker under it `T:<thread>/<name>`, and a part under a worker \
                  `T:<thread>/<worker>/<name>`"
             ));
@@ -101,6 +111,7 @@ impl Path {
     /// The path as it is printed.
     pub fn text(&self) -> String {
         match self {
+            Self::User => USER.to_string(),
             Self::Project(repo) => format!("P:{repo}"),
             Self::Thread(t) => format!("T:{t}"),
             Self::Worker { thread, worker } => format!("T:{thread}/{worker}"),
@@ -253,6 +264,15 @@ mod tests {
         ] {
             assert!(Path::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// **`U:` is the caller's own journal**, named by nothing after it.
+    #[test]
+    fn the_users_journal_is_u_alone() {
+        assert_eq!(Path::parse("U:").unwrap(), Path::User);
+        assert_eq!(Path::User.text(), "U:");
+        assert!(Path::parse("U:someone").is_err());
+        assert!(Path::parse("U").is_err());
     }
 
     #[test]

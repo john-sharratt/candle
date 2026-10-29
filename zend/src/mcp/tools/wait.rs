@@ -17,6 +17,7 @@ pub const STILL_RUNNING: &str = "Still running:";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Wait on running workers, by the paths `repo_task_start` answered (`T:<thread>/<name>`). \
             Answers as soon as any one stops running — done, failed, asking you a question, or stuck — with a \
             line for each still running. So start every task first and wait on them all, handle the one that \

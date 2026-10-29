@@ -56,6 +56,7 @@ tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline
 | `name` | What `guide_read` takes; equals the file's stem |
 | `description` | One line, "use when…": shown in the catalogue and on each listed tool |
 | `tools` | The tools this guide applies to — any backend's |
+| `clients` | Optional: the clients (`mcp_server::Client::name`) this is the guide for, served first in their user context (`docs/mcp_user_context.md` §2.4); one guide per client |
 | body | The method itself |
 
 ### 2.2 Compiled in

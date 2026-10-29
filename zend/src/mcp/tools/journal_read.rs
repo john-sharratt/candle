@@ -9,8 +9,10 @@ use serde_json::{json, Value};
 use zend_tools::tools::journal::address;
 
 use super::{string, Answer, Ctx, LOADING};
-use crate::mcp::names::Path;
+use crate::mcp::memory;
+use crate::mcp::names::{Path, USER};
 use crate::mcp::threads::{self, project_journal, Note};
+use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "journal_read";
 
@@ -21,6 +23,7 @@ const DEFAULT_LINES: u64 = 200;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read a journal: a thread's, a worker's or a project's. `journal` names it — \
             `\"self\"` or `T:<thread>` for a thread (every task started on it, how each ended, and the notes on \
             it); `T:<thread>/<name>` for a worker (the entries it wrote about its work); `P:<repository>` for a \
@@ -28,11 +31,12 @@ pub fn definition() -> Value {
             one entry instead: a thread's or project's note, or — for a worker — the turns behind that entry, \
             `limit` lines from `offset`, which are the evidence for what it claims. Read the entry first and its \
             turns only where a claim needs checking. Re-read the thread's journal after your context is \
-            compacted.",
+            compacted. `U:` is the user's own journal: everything kept for them and done for them, from \
+            every client — what to read when they ask what you remember.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, `T:<thread>/<name>` or `P:<repository>` — or an entry's address, `T:<thread>/<name>#12`."},
+                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>` or `U:` — or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
                 "offset": {"type": "integer", "minimum": 1, "description": "The first line of a worker entry's page (1 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."}
@@ -83,6 +87,13 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let owner = ctx.caller.key();
     match path {
+        Path::User => {
+            let notes = memory::entries(&records, &owner);
+            match args.get("entry").and_then(Value::as_u64) {
+                None => Answer::ok(memory::render(&notes, now_ms())),
+                Some(n) => notes_answer(USER, &notes, Some(n)),
+            }
+        }
         Path::Project(repo) => {
             let journal = project_journal(&repo);
             let notes = threads::notes(&records, &owner, &journal);
@@ -217,12 +228,14 @@ mod tests {
                 text: "verify the expiry".into(),
                 at_ms: 0,
                 worker: None,
+                client: None,
             },
             Note {
                 label: "Decided:".into(),
                 text: "parts cite their files".into(),
                 at_ms: 1,
                 worker: None,
+                client: None,
             },
         ];
         assert_eq!(

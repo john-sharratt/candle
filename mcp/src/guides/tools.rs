@@ -78,6 +78,7 @@ mod tests {
             name: "research".into(),
             description: "A question answered from the web.".into(),
             tools: vec!["repo_task_start".into()],
+            clients: Vec::new(),
             body: "# Research\n\nGather.".into(),
         }])
         .unwrap()

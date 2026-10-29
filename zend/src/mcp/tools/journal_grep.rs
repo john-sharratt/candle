@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx, LOADING};
-use crate::mcp::names::Path;
+use crate::mcp::names::{Path, USER};
 use crate::mcp::threads::{self, project_journal, Worker};
 
 pub const NAME: &str = "journal_grep";
@@ -18,16 +18,18 @@ const DEFAULT_HITS: u64 = 20;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Search journals for a word or phrase (case-insensitive substring), to find the \
             evidence behind a claim without paging through it. `journal` names where to search: a worker \
             (`T:<thread>/<name>`), through the turns behind its entries, or behind one `entry`; every worker \
             on a thread (`T:<thread>/*`), when you do not know which one learned it; a thread's own journal \
-            (`\"self\"` or `T:<thread>`); or a project's standing rules (`P:<repository>`). Each hit names its \
+            (`\"self\"` or `T:<thread>`); a project's standing rules (`P:<repository>`); or the user's own \
+            journal (`U:`), for what was kept or done for them in any earlier conversation. Each hit names its \
             journal, entry, turn and line; read around one with `journal_read` and the entry.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
+                "journal": {"type": "string", "description": "`T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>`, `U:` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}
@@ -64,6 +66,7 @@ fn scope(ctx: &Ctx, journal: &str) -> Result<Scope, String> {
         };
     }
     Ok(match Path::parse(journal)? {
+        Path::User => Scope::Notes(USER.into(), USER.into()),
         Path::Project(repo) => Scope::Notes(project_journal(&repo), project_journal(&repo)),
         Path::Thread(t) => thread(t),
         Path::Worker { thread, worker } => Scope::Worker(thread, worker),

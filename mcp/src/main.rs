@@ -13,9 +13,10 @@
 //! | [`caller`] | Who is calling, from the believed headers |
 //! | [`presence`] | The cluster socket: joining as `mcp`, and serving its streams |
 //! | [`guides`] | The guide library: the methods for using the tools, served as tools |
+//! | [`context`] | The user's context: the client's guide, the first call's context, episodes |
 //! | [`config`] | Each machine's file, and the `served` file they share |
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use axum::routing::post;
 use axum::Router;
 use clap::Parser;
 use cluster::upgrade::switch::PROOF;
+use cluster::version::info::{answer_if_asked, Opens, MCP};
 use mcp_server::http;
 use mcp_server::SealedStore;
 use tokio::net::TcpListener;
@@ -39,6 +41,7 @@ mod backend;
 mod believed;
 mod caller;
 mod config;
+mod context;
 mod guides;
 mod last_listed;
 mod presence;
@@ -47,6 +50,7 @@ mod sse;
 use app::App;
 use backend::{Backend, Link};
 use config::Config;
+use context::Conversations;
 use last_listed::LastListed;
 
 #[derive(Parser)]
@@ -61,6 +65,8 @@ const LOG_NAME: &str = "mcp.log";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // keep asks a staged build what it is before it trials it.
+    answer_if_asked(MCP, Opens::default);
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     // Stderr, which a trial's file captures, and `mcp.log` in the state
@@ -98,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
         routes: RwLock::new(HashMap::new()),
         last_listed: LastListed::default(),
         library: guides::embedded()?,
+        read_only: RwLock::new(BTreeSet::new()),
+        conversations: Conversations::default(),
     });
     tracing::info!(guides = app.library.count(), "guides loaded");
     let gateways: Arc<[IpAddr]> = config.trusted_gateways.clone().into();

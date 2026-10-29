@@ -17,19 +17,31 @@ pub struct Library {
     guides: BTreeMap<String, Guide>,
     /// The guides each tool is listed by, in name order.
     by_tool: BTreeMap<String, Vec<String>>,
+    /// The guide each client is given first, by the client's name.
+    by_client: BTreeMap<String, String>,
 }
 
 impl Library {
-    /// The library `guides` make; a name given twice is refused.
+    /// The library `guides` make; a name given twice, or a client two guides
+    /// are for, is refused.
     pub fn new(guides: Vec<Guide>) -> anyhow::Result<Self> {
         let mut by_name = BTreeMap::new();
         let mut by_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_client = BTreeMap::new();
         for g in guides {
             for tool in &g.tools {
                 by_tool
                     .entry(tool.clone())
                     .or_default()
                     .push(g.name.clone());
+            }
+            for client in &g.clients {
+                if let Some(other) = by_client.insert(client.clone(), g.name.clone()) {
+                    anyhow::bail!(
+                        "two guides are for the client `{client}`: `{other}` and `{}`",
+                        g.name
+                    );
+                }
             }
             if let Some(twice) = by_name.insert(g.name.clone(), g) {
                 anyhow::bail!("two guides are named `{}`", twice.name);
@@ -41,7 +53,13 @@ impl Library {
         Ok(Self {
             guides: by_name,
             by_tool,
+            by_client,
         })
+    }
+
+    /// The guide for `client`, by its name, if one is for it.
+    pub fn for_client(&self, client: &str) -> Option<&Guide> {
+        self.guides.get(self.by_client.get(client)?)
     }
 
     /// How many guides it holds.
@@ -136,7 +154,15 @@ mod tests {
             name: name.into(),
             description: format!("{name} work."),
             tools: tools.iter().map(|t| t.to_string()).collect(),
+            clients: Vec::new(),
             body: format!("# {name}"),
+        }
+    }
+
+    fn for_clients(name: &str, clients: &[&str]) -> Guide {
+        Guide {
+            clients: clients.iter().map(|c| c.to_string()).collect(),
+            ..guide(name, &["t"])
         }
     }
 
@@ -144,6 +170,28 @@ mod tests {
     fn a_name_given_twice_is_refused() {
         let twice = Library::new(vec![guide("a", &["t"]), guide("a", &["u"])]).unwrap_err();
         assert_eq!(twice.to_string(), "two guides are named `a`");
+    }
+
+    /// **A client has one guide, found by its name**; a client no guide is for
+    /// has none, and two guides for one client are refused.
+    #[test]
+    fn a_client_is_given_the_one_guide_that_is_for_it() {
+        let l = Library::new(vec![
+            for_clients("grok", &["grok"]),
+            guide("research", &["t"]),
+        ])
+        .unwrap();
+        assert_eq!(l.for_client("grok").unwrap().name, "grok");
+        assert!(l.for_client("other").is_none());
+        let twice = Library::new(vec![
+            for_clients("a", &["grok"]),
+            for_clients("b", &["grok"]),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            twice.to_string(),
+            "two guides are for the client `grok`: `a` and `b`"
+        );
     }
 
     #[test]

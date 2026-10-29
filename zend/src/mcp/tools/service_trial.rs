@@ -19,7 +19,8 @@ pub const NAME: &str = "service_trial";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Try a new build of a service — motherd or web — on one machine. keep, the supervisor \
+        "description": "Try a new build of a service — motherd, web (the gateway) or mcp (this connector's \
+            own server, which serves the guides) — on one machine. keep, the supervisor \
             that runs the machine's services, starts the build in place of the installed one and keeps it \
             once it reports it is serving, within ten minutes; otherwise it puts the previous binary back. \
             Answers at once; read the outcome with `service_status`. Only a build of a commit on origin/main \
@@ -29,7 +30,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "The machine, as `cluster_status` names it."},
-                "service": {"type": "string", "enum": ["motherd", "web"]},
+                "service": {"type": "string", "enum": ["motherd", "web", "mcp"]},
                 "artifact": {"type": "string", "description": "The staged executable's path on that machine."}
             },
             "required": ["host", "service", "artifact"],

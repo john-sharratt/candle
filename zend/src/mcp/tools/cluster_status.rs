@@ -16,6 +16,7 @@ pub const NAME: &str = "cluster_status";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "How the cluster stands: each member — a machine running the motherd daemon — with \
             its machine name, node id, build, state, when it started, and how each app it hosts stands; and, \
             for an Admin, the gateway's view: each app's floor (the oldest \

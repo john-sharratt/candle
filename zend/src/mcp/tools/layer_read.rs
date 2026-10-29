@@ -16,6 +16,7 @@ const MAX_LIMIT: usize = 500;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
+        "annotations": {"readOnlyHint": true},
         "description": "Read what one of the projection layers holds. A layer is one kind of analysis kept \
             about the repositories — `repo_map`, `code_reading`, `dependency_analysis`, `code_review`, \
             `security_review`, `dialogue` — and workers read from it; each piece of it is a stored \

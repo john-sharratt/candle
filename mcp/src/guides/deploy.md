@@ -6,7 +6,8 @@ tools: [repo_job_start, repo_job_log, service_trial, service_status, cluster_sta
 # Deploying to one machine
 
 **keep** is the supervisor on each machine that runs its services — motherd
-(the daemon that runs the models) and web (the gateway). A **trial** starts a new build in place
+(the daemon that runs the models), web (the gateway) and mcp (this connector's
+own server, on blackworld and whiteworld). A **trial** starts a new build in place
 of the installed one and keeps it only if it reports serving within ten
 minutes; otherwise it puts the previous binary back. Admins only.
 
@@ -31,7 +32,8 @@ minutes; otherwise it puts the previous binary back. Admins only.
    `repo_job_start {node: <that machine's agent>, repo, branch: "main",
    program: "cargo", args: ["build", "--release", "-p", "motherd"],
    stage: "target/release/motherd.exe", timeout_s: 3600}`
-   (`web` the same way: `-p web`, `target/release/web.exe`).
+   (`web` and `mcp` the same way: `-p web`, `target/release/web.exe`;
+   `-p mcp`, `target/release/mcp.exe`).
 2. **Wait for it**: `repo_job_log {node, job}` until it has ended; its
    answer says where it was staged — use that path, never a guessed one: it
    differs from machine to machine. A failure: report the build error
@@ -41,8 +43,9 @@ minutes; otherwise it puts the previous binary back. Admins only.
 4. **Watch**: `service_status {host}` every few minutes until the trial has
    ended: proven or rolled back.
 5. **Confirm**: `cluster_status` — the member started after the trial, ready,
-   on the new build. A gateway (`web`) has no member line: confirm it with
-   `service_status`, whose trial line says proven.
+   on the new build. A gateway (`web`) and the connector (`mcp`) have no
+   member line: confirm them with `service_status`, whose trial line says
+   proven.
 
 ## Report
 

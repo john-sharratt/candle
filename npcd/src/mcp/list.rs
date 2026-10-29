@@ -21,6 +21,7 @@ impl Tool for List {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
+            "annotations": {"readOnlyHint": true},
             "description": "List your bots — autonomous agents, each living in a world and acting on \
                 its own: each one's id (what the other bot_* tools name it by), name, world, state and \
                 mood. The state (active, idle, asleep, suspended) is the standing its owner set; it \

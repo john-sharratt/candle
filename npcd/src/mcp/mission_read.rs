@@ -22,6 +22,7 @@ impl Tool for Mission {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
+            "annotations": {"readOnlyHint": true},
             "description": "Read a bot's missions: the one it is carrying — its brief, each step and \
                 whether it was achieved or thwarted — and the last one it finished, with its answer and \
                 its report (pass or fail, and its account), and how many more are queued for it. Call \
