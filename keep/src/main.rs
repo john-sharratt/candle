@@ -840,12 +840,17 @@ mod tests {
     use super::*;
 
     use cluster::upgrade::switch::STABLE_DIR;
+    use cluster_dial::Target;
 
     #[test]
     fn the_shipped_config_joins_the_cluster_as_keep() {
         let cfg: Config = serde_yaml::from_str(include_str!("../keep.yaml")).unwrap();
         let cluster = cfg.cluster.expect("keep.yaml names its gateway");
-        assert_eq!(cluster.url, "https://gateway.tokera.com:9443");
+        assert_eq!(
+            cluster.url,
+            "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+        );
+        Target::parse(&cluster.url, Some(&cluster.name)).expect("the URLs dial");
         assert_eq!(cluster.name, "tokera.com");
         assert_eq!(cluster.host, "blackworld");
         assert_eq!(cfg.services.len(), 3);

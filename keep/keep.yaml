@@ -9,8 +9,12 @@ state: keep/state
 # Listed on the gateway's cluster page as the app keep, and reached there by an
 # Admin's operations tools: its state, a trial, a service's restart, stop or
 # start (docs/claude_zend_gateway.md §8.4). No rollout.
+#
+# The gateway's socket URLs, space-separated, best first, as motherd's and
+# mcp's: from this machine the public name hairpins out through the router and
+# never reaches the gateway beside it, so the LAN name comes first.
 cluster:
-  url: https://gateway.tokera.com:9443
+  url: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld
