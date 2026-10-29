@@ -231,6 +231,18 @@ end of candle/candle-nn/src/kv_cache/chunked/backing.rs page 1 of 3 — next: pa
   file sets its units apart there (always, in prose); a delete takes the blank
   line after it, so no double gap is left. Line endings and a missing final
   newline are the file's own and stay so.
+- **In prose, an edit writes only the part it names.** A replace or an insert
+  whose `text` holds a unit that already stands in the document — outside the
+  span it replaces, whitespace aside — is refused, naming that unit's anchor:
+  *"that text holds Qm7x, which already stands in it as it is; an edit writes
+  only the part it names — give that part's new words alone, or, to write the
+  whole of it again, replace from its first part `to` its last"*. A Maker
+  replaced one paragraph of a story with the whole story, heading and all, on
+  edit after edit: each pasted every other paragraph back in, until each
+  sentence stood eight times and the story ran to 5,474 words against 1,300.
+  Replacing a paragraph with itself and more is allowed (the copy is inside the
+  span), and so is rewriting the whole document from its first unit `to` its
+  last. Code is left alone: two scopes of one text are its author's to want.
 
 ### The grammar
 
@@ -405,6 +417,9 @@ Unit tests beside the code, asserting raw values:
   `to` are the piece's own anchors.
 - **Ranges and moves**: `to` before `at` refused; a move into its own span
   refused; a moved unit keeps its anchor.
+- **Pasting a part in again**: a prose replace or insert whose text holds a unit
+  standing elsewhere is refused with the exact message above; a replace with
+  itself and more, a whole rewrite first `to` last, and code are not.
 - **Grep**: a hit names its unit's anchor and page, and that anchor then edits
   the unit with no read in between.
 - **Mending**: a `mend` is read from its call and made edit by edit; an edit on

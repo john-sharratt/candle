@@ -11,7 +11,13 @@
 //! insert brings a blank line where its neighbours are set apart by one (and
 //! always, in prose, where paragraphs are), a delete takes the separator with
 //! the unit so no double gap is left behind.
+//!
+//! **In prose, an edit writes the part it names and nothing already there**
+//! ([`copies_a_part`]). A Maker replaced one paragraph of a story with the whole
+//! story, heading and all, again and again: each edit pasted every other
+//! paragraph back in, until each sentence stood eight times.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::Doc;
@@ -140,6 +146,7 @@ pub fn apply(doc: &Doc, edit: &Edit) -> Result<Applied, EditError> {
             let (a, b) = span(doc, at, to.as_deref())?;
             let new = text_lines(text, eol(doc))
                 .ok_or_else(|| empty("replace", "to take a part out, delete it"))?;
+            copies_a_part(doc, text, Some((a, b)))?;
             let (start, end) = (doc.units()[a].start, doc.units()[b].end);
             let n = new.len();
             (
@@ -151,6 +158,7 @@ pub fn apply(doc: &Doc, edit: &Edit) -> Result<Applied, EditError> {
         Op::Insert { place, text } => {
             let i = find(doc, at)?;
             let new = text_lines(text, eol(doc)).ok_or_else(|| empty("insert", ""))?;
+            copies_a_part(doc, text, None)?;
             let (lines, region) = insert(doc, i, *place, new);
             (lines, region, format!("Inserted {} {at}.", place.word()))
         }
@@ -211,6 +219,34 @@ pub fn apply(doc: &Doc, edit: &Edit) -> Result<Applied, EditError> {
         summary,
         broke,
     })
+}
+
+/// Refuse a prose edit whose `text` holds a part that already stands in `doc`
+/// outside the units it replaces (`span`, `None` for an insert): written in,
+/// it would stand twice. Parts are compared whitespace aside. Code is left
+/// alone — two scopes of the same text are its author's to want.
+fn copies_a_part(doc: &Doc, text: &str, span: Option<(usize, usize)>) -> Result<(), EditError> {
+    if !doc.language().is_prose() {
+        return Ok(());
+    }
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let written = Doc::of(doc.language(), text);
+    let parts: HashSet<String> = (0..written.units().len())
+        .map(|i| norm(&written.unit_text(i)))
+        .filter(|p| !p.is_empty())
+        .collect();
+    let standing = (0..doc.units().len())
+        .filter(|i| span.is_none_or(|(a, b)| !(a..=b).contains(i)))
+        .find(|&i| parts.contains(&norm(&doc.unit_text(i))));
+    match standing {
+        None => Ok(()),
+        Some(i) => Err(EditError::Invalid(format!(
+            "that text holds {}, which already stands in it as it is; an edit writes only the \
+             part it names — give that part's new words alone, or, to write the whole of it \
+             again, replace from its first part `to` its last",
+            doc.units()[i].anchor
+        ))),
+    }
 }
 
 fn find(doc: &Doc, anchor: &str) -> Result<usize, EditError> {
@@ -726,6 +762,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(done.doc.text(), "One.\n\nTwo.\n\nThree.");
+    }
+
+    /// **A paragraph replaced with the whole story is refused**, naming the
+    /// part it would paste in again; replacing a paragraph with new words, or
+    /// with itself and more, is not.
+    #[test]
+    fn a_prose_edit_may_not_paste_in_a_part_already_there() {
+        let d = doc("# The Marker\n\nThe bay was warm.\n\nThe order came down.\n");
+        let whole = "# The Marker\n\nThe bay was warm.\n\nThe order came down, again.";
+        assert_eq!(
+            apply(&d, &replace(&a(&d, 2), whole)).unwrap_err(),
+            EditError::Invalid(format!(
+                "that text holds {}, which already stands in it as it is; an edit writes only \
+                 the part it names — give that part's new words alone, or, to write the whole \
+                 of it again, replace from its first part `to` its last",
+                a(&d, 0)
+            ))
+        );
+        let insert = Edit {
+            at: a(&d, 2),
+            op: Op::Insert {
+                place: Place::After,
+                text: "The bay was  warm.".into(),
+            },
+        };
+        assert!(matches!(apply(&d, &insert), Err(EditError::Invalid(_))));
+        assert!(apply(&d, &replace(&a(&d, 2), "The order never came.")).is_ok());
+        assert_eq!(
+            apply(
+                &d,
+                &replace(&a(&d, 2), "The order came down.\n\nNobody moved.")
+            )
+            .unwrap()
+            .doc
+            .text(),
+            "# The Marker\n\nThe bay was warm.\n\nThe order came down.\n\nNobody moved.\n"
+        );
+        // Written whole, first part to last, it is the author's to rewrite.
+        let rewrite = Edit {
+            at: a(&d, 0),
+            op: Op::Replace {
+                text: whole.into(),
+                old: None,
+                to: Some(a(&d, 2)),
+            },
+        };
+        assert!(apply(&d, &rewrite).is_ok());
+    }
+
+    /// Code may repeat itself: the guard is prose's.
+    #[test]
+    fn code_may_hold_a_scope_twice() {
+        let d = Doc::new("x.rs", "fn one() {}\n\nfn two() {}\n");
+        let edit = Edit {
+            at: a(&d, 1),
+            op: Op::Insert {
+                place: Place::After,
+                text: "fn one() {}".into(),
+            },
+        };
+        assert!(apply(&d, &edit).is_ok());
     }
 
     #[test]

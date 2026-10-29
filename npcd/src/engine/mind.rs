@@ -2302,6 +2302,30 @@ struct Recalled {
     top: Option<u64>,
 }
 
+/// The longest one answer a character is handed, in characters: above a page
+/// of any document read whole, and a fraction of what a turn can hold. One
+/// table's refusal of a story pasted into itself ran to 412,000 characters, was
+/// handed back on every turn after, and grew one Maker's turn to 2.2 GB of KV
+/// on its card; what any one answer may carry is bounded here, whatever made
+/// it.
+const ANSWER_MAX_CHARS: usize = 40_000;
+
+/// `answer` as it is handed over: whole within [`ANSWER_MAX_CHARS`], cut at
+/// a character boundary past it, saying how much was left out.
+fn bounded(answer: &str) -> String {
+    let answer = answer.trim();
+    match answer.char_indices().nth(ANSWER_MAX_CHARS) {
+        None => answer.to_string(),
+        Some((cut, _)) => {
+            let left = answer[cut..].chars().count();
+            format!(
+                "{}\n[cut: {left} more characters of this answer are not shown]",
+                &answer[..cut]
+            )
+        }
+    }
+}
+
 fn compose_narrated(answers: &[String], narration: &str) -> String {
     let mut s = String::new();
     for a in answers {
@@ -2309,7 +2333,7 @@ fn compose_narrated(answers: &[String], narration: &str) -> String {
         // a sentence, not a JSON scalar — the same allowance zend's
         // `format_tool_responses` makes for an already-rendered result.
         s.push_str("<tool_response>\n");
-        s.push_str(a.trim());
+        s.push_str(&bounded(a));
         s.push_str("\n</tool_response>\n");
     }
     // One blank line between the answers and the narration, so the two are
@@ -2474,6 +2498,27 @@ mod tests {
     #[test]
     fn an_empty_turn_composes_to_nothing() {
         assert_eq!(compose_narrated(&[], ""), "");
+    }
+
+    /// **No answer is handed over past its bound**, however it was made: one
+    /// within it is untouched, one past it is cut at a character and says how
+    /// much more there was — counted in characters, not bytes.
+    #[test]
+    fn an_answer_is_bounded_however_it_was_made() {
+        let within = "é".repeat(ANSWER_MAX_CHARS);
+        assert_eq!(bounded(&within), within);
+        let past = format!("{}{}", "é".repeat(ANSWER_MAX_CHARS), "x".repeat(7));
+        assert_eq!(
+            bounded(&past),
+            format!(
+                "{}\n[cut: 7 more characters of this answer are not shown]",
+                "é".repeat(ANSWER_MAX_CHARS)
+            )
+        );
+        let turn = compose_narrated(&[past], "");
+        assert!(turn.ends_with(
+            "[cut: 7 more characters of this answer are not shown]\n</tool_response>\n"
+        ));
     }
 
     /// A restart mid-day opens a second timeline, and it must carry the same

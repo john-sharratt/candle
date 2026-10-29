@@ -60,6 +60,15 @@ const STORY_MAX_WORDS: usize = 1300;
 const PARAGRAPH_MAX_WORDS: usize = 160;
 /// How often one phrase of four words may come back before it is a refrain.
 const PHRASE_MAX: usize = 3;
+/// The most faults of one kind — long paragraphs, sentences said twice,
+/// refrains — the gate names one by one; the rest it counts. A draft that had
+/// grown by pasting itself back into its own paragraphs held hundreds of
+/// repeats, each named and quoted whole: its refusal ran to 412,000
+/// characters, the compass carried it again on every turn after, and one
+/// Maker's turn took 2.2 GB of KV on its card.
+const NAMED: usize = 5;
+/// The most words of a repeated sentence the gate quotes in naming it.
+const QUOTE_WORDS: usize = 12;
 
 /// Who a document is told as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,38 +379,60 @@ pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<Fault> {
         _ => {}
     }
 
-    for para in body
+    let long: Vec<(&str, usize)> = body
         .split("\n\n")
         .map(str::trim)
         .filter(|p| !p.starts_with('#'))
-    {
-        let n = para.split_whitespace().count();
-        if n > PARAGRAPH_MAX_WORDS {
-            faults.push(Fault::new(
-                PARAGRAPHS,
-                format!(
-                    "The paragraph beginning \"{}\" runs {n} words; no paragraph may run past \
-                     {PARAGRAPH_MAX_WORDS}. Break it where the scene moves, and cut what it \
-                     repeats.",
-                    opening(para)
-                ),
-            ));
-        }
-    }
-
-    for sentence in repeated_sentences(&body) {
+        .map(|p| (p, p.split_whitespace().count()))
+        .filter(|(_, n)| *n > PARAGRAPH_MAX_WORDS)
+        .collect();
+    for (para, n) in long.iter().take(NAMED) {
         faults.push(Fault::new(
-            SAID_TWICE,
-            format!("\"{sentence}\" is said twice. Say it once."),
+            PARAGRAPHS,
+            format!(
+                "The paragraph beginning \"{}\" runs {n} words; no paragraph may run past \
+                 {PARAGRAPH_MAX_WORDS}. Break it where the scene moves, and cut what it repeats.",
+                opening(para)
+            ),
         ));
     }
-    for (phrase, n) in refrains(&body) {
+    if let Some(more) = long.len().checked_sub(NAMED).filter(|m| *m > 0) {
+        faults.push(Fault::new(
+            PARAGRAPHS,
+            format!("{more} more paragraphs run past {PARAGRAPH_MAX_WORDS} words; break each."),
+        ));
+    }
+
+    let repeated = repeated_sentences(&body);
+    for sentence in repeated.iter().take(NAMED) {
+        faults.push(Fault::new(
+            SAID_TWICE,
+            format!("\"{}\" is said twice. Say it once.", quote(sentence)),
+        ));
+    }
+    if let Some(more) = repeated.len().checked_sub(NAMED).filter(|m| *m > 0) {
+        faults.push(Fault::new(
+            SAID_TWICE,
+            format!(
+                "{more} more sentences are said more than once. Cut every repeat, not only these: \
+                 what it says once it has said."
+            ),
+        ));
+    }
+    let refrains = refrains(&body);
+    for (phrase, n) in refrains.iter().take(NAMED) {
         faults.push(Fault::new(
             REFRAINS,
             format!(
                 "\"{phrase}\" comes {n} times. Keep the one that matters and say the rest another \
                  way, or not at all."
             ),
+        ));
+    }
+    if let Some(more) = refrains.len().checked_sub(NAMED).filter(|m| *m > 0) {
+        faults.push(Fault::new(
+            REFRAINS,
+            format!("{more} more phrases come back more than {PHRASE_MAX} times."),
         ));
     }
 
@@ -451,6 +482,17 @@ fn opening(para: &str) -> String {
     format!("{} …", w.join(" "))
 }
 
+/// A repeated sentence as the gate names it: whole up to [`QUOTE_WORDS`]
+/// words, its opening past that. A "sentence" with no stop in it runs as long
+/// as its paragraph.
+fn quote(sentence: &str) -> String {
+    let w: Vec<&str> = sentence.split_whitespace().collect();
+    match w.len() > QUOTE_WORDS {
+        true => format!("{} …", w[..QUOTE_WORDS].join(" ")),
+        false => w.join(" "),
+    }
+}
+
 /// Sentences of six words or more that the text holds twice.
 fn repeated_sentences(text: &str) -> Vec<String> {
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -491,7 +533,8 @@ fn refrains(text: &str) -> Vec<(String, usize)> {
         .into_iter()
         .filter(|(_, n)| *n > PHRASE_MAX)
         .collect();
-    out.sort();
+    // The most frequent first, so the ones named are the ones that matter.
+    out.sort_by(|(pa, na), (pb, nb)| nb.cmp(na).then_with(|| pa.cmp(pb)));
     out
 }
 
@@ -609,6 +652,68 @@ mod tests {
         assert!(f
             .iter()
             .any(|x| x.starts_with("\"silent tower watched the\" comes 4 times.")));
+    }
+
+    /// **A draft pasted into itself is refused in a few lines, not hundreds.**
+    /// A Maker replaced a paragraph with the whole story, again and again,
+    /// until each sentence stood eight times; its refusal named every one,
+    /// quoted whole, and ran to 412,000 characters. The gate names five of
+    /// each kind, quotes a long sentence by its opening, and counts the rest.
+    #[test]
+    fn a_draft_pasted_into_itself_is_refused_briefly() {
+        let mut sentences = Vec::new();
+        for i in 0..40 {
+            sentences.push(format!(
+                "The surveyor checked marker number {i} against the grid and wrote the bearing \
+                 down in the log beside it"
+            ));
+        }
+        let story = sentences.join(". ") + ".";
+        let paragraphs: Vec<String> = (0..8).map(|_| story.clone()).collect();
+        let text = format!("# The Marker\n\n{}", paragraphs.join("\n\n"));
+        let f = said(check("layers/stories/the-marker.md", &text, None));
+
+        let named = |end: &str| f.iter().filter(|x| x.ends_with(end)).count();
+        assert_eq!(named("is said twice. Say it once."), NAMED);
+        assert!(f.contains(
+            &"35 more sentences are said more than once. Cut every repeat, not only these: what \
+              it says once it has said."
+                .to_string()
+        ));
+        assert!(f.contains(
+            &"\"The surveyor checked marker number 0 against the grid and wrote the …\" is said \
+              twice. Say it once."
+                .to_string()
+        ));
+        assert_eq!(
+            f.iter()
+                .filter(|x| x.starts_with("The paragraph beginning"))
+                .count(),
+            NAMED
+        );
+        assert!(f.contains(&"3 more paragraphs run past 160 words; break each.".to_string()));
+        assert_eq!(
+            f.iter()
+                .filter(|x| x.contains("comes") && x.contains("times. Keep"))
+                .count(),
+            NAMED
+        );
+        assert!(f
+            .iter()
+            .any(|x| x.ends_with("more phrases come back more than 3 times.")));
+        let whole: usize = f.iter().map(String::len).sum();
+        assert!(whole < 4_000, "the refusal ran {whole} characters");
+    }
+
+    /// A short repeated sentence is quoted whole; a long one by its first
+    /// twelve words.
+    #[test]
+    fn a_long_repeat_is_quoted_by_its_opening() {
+        assert_eq!(quote("The tower held"), "The tower held");
+        assert_eq!(
+            quote("one two three four five six seven eight nine ten eleven twelve thirteen"),
+            "one two three four five six seven eight nine ten eleven twelve …"
+        );
     }
 
     #[test]
