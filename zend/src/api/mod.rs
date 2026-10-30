@@ -5,8 +5,9 @@
 //! `conversations`, `projections` (one projection point in full, for the
 //! projection panel), `files` (conversation-attached uploads), `models`,
 //! `repo_map`, `substrate` (zend's layer/timeline inspection and projection
-//! debug, under `/v1/substrate/zend/`), and `agents` (the machines its
-//! commands run on, watched and switched by an admin).
+//! debug, under `/v1/substrate/zend/`), `agents` (the machines its commands
+//! run on, watched and switched by an admin), and `journals` (the memory's
+//! journals, read and edited by the person they belong to).
 //!
 //! What both daemons serve — status, identity, telemetry, memory, the log
 //! stream, the tool catalog, the substrate overview — is the host's, served
@@ -31,6 +32,7 @@ mod compressed;
 pub mod conversations;
 pub mod files;
 pub mod journal;
+pub mod journals;
 pub mod models;
 pub mod projections;
 pub mod prompt_tokens;
@@ -267,6 +269,31 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             get(journal::turns),
         )
+        // The memory's journals (`journals`): the caller's, read and written
+        // as their AIs read and write them, by the role table's people as
+        // `/v1/mcp`'s tools are. A member that does not serve the memory
+        // answers 503 and the client asks again, as the aggregator does of
+        // the tools; the store keeps the members in step through origin.
+        .route(
+            "/v1/journals",
+            Role::User,
+            Dispatch::Any,
+            get(journals::read::read)
+                .post(journals::write::write)
+                .body_limit(journals::write::BODY_LIMIT),
+        )
+        .route(
+            "/v1/journals/tree",
+            Role::User,
+            Dispatch::Any,
+            get(journals::read::tree),
+        )
+        .route(
+            "/v1/journals/grep",
+            Role::User,
+            Dispatch::Any,
+            get(journals::read::grep),
+        )
         // zend's MCP server (`crate::mcp::server`). Open, because the server
         // names its own caller from the gateway's identity and refuses nobody
         // with the challenge that starts a sign-in at the gateway. What it
@@ -326,6 +353,9 @@ mod tests {
                 ("/v1/conversations/:id/journal/draft", "user"),
                 ("/v1/conversations/:id/journal/:eid", "user"),
                 ("/v1/conversations/:id/journal/:eid/turns", "user"),
+                ("/v1/journals", "user"),
+                ("/v1/journals/tree", "user"),
+                ("/v1/journals/grep", "user"),
                 ("/v1/mcp", "unauthenticated"),
             ]
         );
@@ -388,6 +418,10 @@ mod tests {
                 Dispatch::Any,
             ),
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
+            ("GET", "/v1/journals", Dispatch::Any),
+            ("POST", "/v1/journals", Dispatch::Any),
+            ("GET", "/v1/journals/tree", Dispatch::Any),
+            ("GET", "/v1/journals/grep", Dispatch::Any),
             ("POST", "/v1/mcp", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("POST", "/v1/substrate/zend/scan", Dispatch::Best),

@@ -230,9 +230,14 @@ impl Store {
                 None => set.delete(path)?,
             }
         }
+        // The author's time is when the write is recorded as happening; the
+        // committer's is when this service committed it, so history orders
+        // by when things reached the repository whatever a write says of
+        // itself.
         let writer = actor.writer().name();
         let author = Signature::new(writer, &format!("{writer}@journals.tokera"), git_time(now))?;
-        let committer = Signature::new("journal service", "journals@tokera", git_time(now))?;
+        let committer =
+            Signature::new("journal service", "journals@tokera", git_time(Stamp::now()))?;
         let msg = message(&applied.subject, actor, op, now, applied.line.as_ref());
         let new = self
             .repo

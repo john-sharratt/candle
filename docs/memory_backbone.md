@@ -344,7 +344,8 @@ current tree (§8), and the tool's answer says so.
 
 ## 4. Windowing
 
-Every journal shows a **window**: its newest 50 lines. Older lines fold by
+Every journal shows a **window**: its newest 50 lines, oldest first — a line
+recorded as made earlier (§6.7) takes its place in time. Older lines fold by
 period, as `journal-core` folds a worker's journal today (Step → Day → Week →
 Month → Year): the background thread (§5.3) writes one `fold` line for the
 period, citing the lines in it, and moves them to `archive/<period>.yaml` — one
@@ -461,7 +462,8 @@ job merges reaches the service at its next fetch, checked as it loads (§3.3).
 The agent runs inside its host's process (motherd's `host.agent`), so the
 memory is served there: zend, beside the agent, opens the store on the flagged
 checkout at start (`zend/src/mcp/memory/`) and serves it through the
-`journal_*` tools it already had, on `/v1/mcp` — no new app, no new route. An
+`journal_*` tools it already had, on `/v1/mcp`, and to a person editing by
+hand through `/v1/journals` (§6.7) — no new app. An
 agent's own routes are members' only and carry no person's identity, which is
 why the memory is a host's and not the agent's to serve. Any machine whose
 agent holds the checkout and runs zend serves the memory; the gateway deals
@@ -563,6 +565,48 @@ A caller is a person by their account's key; an account's first call binds
 it by the email the gateway names, which is taken as verified (the operator's
 decision, 2026-10-30).
 
+### 6.7 By hand: `/v1/journals`
+
+The same journals over HTTP, on zend (`zend/src/api/journals/`), for a person
+editing their own by hand or a program writing many lines at once. Every
+request is the signed-in caller's, as the gateway names them — listed in the
+estate's roles, as `/v1/mcp` requires — and reads and writes exactly what their
+AIs may (§7.2). Requests are dealt round robin like the tools' calls: a member
+that does not serve the memory answers 503 with `Retry-After`, and the client
+asks again; a member reads what another wrote after its next fetch, within
+seconds.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/journals?journal=&lines=` | a journal opened (`~` by default) as JSON — summary, sub-journals, its newest lines by address, archives, readers, and the text `journal_read` shows; or one line, for `<path>#<line id>` |
+| `GET /v1/journals/tree?under=` | every journal under `under`, or under `~` and each family, folded ones too |
+| `GET /v1/journals/grep?pattern=&under=&max=` | the hits `journal_grep` finds, newest first, at most 50 |
+| `POST /v1/journals` | `{client?, ops: [...]}` — up to 500 operations, applied in order |
+
+Every answer that carries what was written carries the framing every frame does:
+notes, not instructions. An operation names its journals by memory path, as the
+tools do: `note {journal, text, at?}`, `edit {line, text}`, `forget {line}` or
+`{journal, says}`, `create {under, name, cue, at?}`, `fold` / `unfold
+{journal}`, `merge {journal, into}`, `share {journal, into?, name?}`, `accept
+{line}`. A note's or a journal's `at` is when it is recorded as made — a fact
+written down after it was learned keeps the day it was learned, as moved `U:`
+notes do (§6.6) — and is the commit's author time; the commit itself is dated
+when the service makes it. It is never before 1970, nor more than a minute
+ahead of the member's clock; the other operations act on things as they stand
+and take none. A journal's `at` is its `created`, which the eleventh-child rule
+ranks it by (§2.3). `client` names who the person speaks through (`other` when
+absent): the lines are theirs, "John via Claude Code".
+
+The whole batch is read, then applied in order to a copy of the tree, before
+anything is committed: a malformed operation, or one the rules refuse, keeps
+nothing, and the answer names it by its index. Each operation is then its own
+commit; only the journals moving between that check and the commits can stop a
+batch partway, and the answer names those kept. Refusals are `{error, message}`
+under a status that says what to do: 400 malformed, 401 signed out, 403 not the
+caller's to change or an account in no family, 404 no such journal or line, 409
+a conflict or a broken file, 422 the rules refuse it (an eleventh sub-journal, a
+cap), 503 the memory not served on that member yet.
+
 ## 7. Writers
 
 ### 7.1 Who wrote it
@@ -582,7 +626,10 @@ Journal-Tool: journal_note
 ```
 
 An `episode` is the server's; a `note` is a model's claim — what a voice model
-says the driver said, the service cannot check — and is shown as such.
+says the driver said, the service cannot check — and is shown as such. The
+person and account are the gateway's, verified; the client is what the
+caller's connection names itself — an MCP session's `clientInfo`, an HTTP
+request's `client` (§6.7) — which the service records but cannot check.
 
 ### 7.2 Who may write where
 

@@ -13,7 +13,9 @@ use journals::view::who::name_of;
 use mcp_server::Client as McpClient;
 
 use super::Ctx;
+use crate::mcp::caller::Caller;
 use crate::mcp::memory::{conversations, moved, who, Memory};
+use crate::session::ZendSession;
 
 pub struct Mem {
     pub memory: Arc<Memory>,
@@ -27,21 +29,12 @@ pub fn client_of(c: McpClient) -> Client {
     Client::parse(c.name()).unwrap_or(Client::Other)
 }
 
-/// The caller as a person: bound at their account's first call, their old
-/// notes moved onto the tree once, and their conversation's clock moved on.
+/// The caller as a person, through an MCP session: [`Mem::of`], and their
+/// conversation's clock moved on.
 pub fn open(ctx: &Ctx) -> Result<Mem, String> {
-    let memory = Arc::clone(ctx.session.mcp().memory());
-    let person = who::person(&memory, &ctx.caller)?;
-    if let Some(records) = ctx.session.shared_substrate() {
-        moved::once(&memory, records, &ctx.caller.key(), &person);
-    }
-    conversations::touch(&memory, &ctx.mcp_id);
-    Ok(Mem {
-        tree: memory.tree()?,
-        memory,
-        person,
-        client: client_of(ctx.mcp.client),
-    })
+    let m = Mem::of(&ctx.session, &ctx.caller, client_of(ctx.mcp.client))?;
+    conversations::touch(&m.memory, &ctx.mcp_id);
+    Ok(m)
 }
 
 /// Whether what [`open`] answered stays true however often it is asked —
@@ -54,6 +47,23 @@ pub fn lasting(why: &str) -> bool {
 }
 
 impl Mem {
+    /// `caller` as a person on `session`'s memory, speaking through `client`:
+    /// bound at their account's first call, and their old notes moved onto
+    /// the tree once.
+    pub fn of(session: &ZendSession, caller: &Caller, client: Client) -> Result<Mem, String> {
+        let memory = Arc::clone(session.mcp().memory());
+        let person = who::person(&memory, caller)?;
+        if let Some(records) = session.shared_substrate() {
+            moved::once(&memory, records, &caller.key(), &person);
+        }
+        Ok(Mem {
+            tree: memory.tree()?,
+            memory,
+            person,
+            client,
+        })
+    }
+
     /// The caller's AI, as a writer.
     pub fn actor(&self) -> Actor {
         Actor::Person {

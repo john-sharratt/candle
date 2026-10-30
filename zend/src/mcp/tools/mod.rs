@@ -55,7 +55,7 @@ mod journal_read;
 mod journal_share;
 mod layer_read;
 mod layer_toggle;
-mod mem;
+pub mod mem;
 mod nudge;
 mod reply;
 mod repo_job;

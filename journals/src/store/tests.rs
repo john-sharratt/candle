@@ -153,6 +153,25 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
     assert!(log.contains("Journal-Op: {\"op\":\"note\""), "{log}");
 }
 
+/// **A write recorded in the past is committed now**: the author's time is
+/// what the write says, the committer's the service's clock.
+#[test]
+fn a_backdated_write_keeps_its_time_as_the_author_and_is_committed_now() {
+    let r = Repos::new();
+    let dir = r.clone("a");
+    let mut s = Store::open(&dir).unwrap();
+    let before = Stamp::now().secs();
+    let then = Stamp::parse("2025-03-01T08:00:00Z").unwrap();
+    s.write(&yen(), &note("Recorded later."), then).unwrap();
+    let times = git(
+        &dir,
+        &["log", "-1", "--format=%at %ct", "refs/journal/head"],
+    );
+    let (author, committer) = times.split_once(' ').unwrap();
+    assert_eq!(author.parse::<i64>().unwrap(), then.secs());
+    assert!(committer.parse::<i64>().unwrap() >= before, "{times}");
+}
+
 #[test]
 fn two_agents_writing_at_once_both_land() {
     let r = Repos::new();
@@ -320,14 +339,16 @@ fn a_restart_behind_a_moved_origin_replays_what_it_held() {
         .unwrap();
     b.sync().unwrap();
     let mut s = Store::open(&dir).unwrap();
+    // Replayed on top of origin, the offline line keeps its time, which is
+    // the earlier of the two, so it takes its place before the other.
     assert_eq!(
         texts(s.tree(), "topics"),
-        ["pushed meanwhile", "written offline"]
+        ["written offline", "pushed meanwhile"]
     );
     s.sync().unwrap();
     assert_eq!(
         texts(&r.origin_tree("check"), "topics"),
-        ["pushed meanwhile", "written offline"]
+        ["written offline", "pushed meanwhile"]
     );
 }
 

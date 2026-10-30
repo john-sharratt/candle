@@ -81,7 +81,11 @@ fn append(
     };
     line.check().map_err(Error::Invalid)?;
     let id = line.id.clone();
-    j.window.push(line);
+    // A window runs oldest to newest, so its tail is what is newest: a line
+    // recorded as made in the past takes its place in time, after any line
+    // of the same moment.
+    let at = j.window.partition_point(|l| l.at <= line.at);
+    j.window.insert(at, line);
     let what = match (kind, proposed) {
         (Kind::Note, true) => "Proposal on",
         (Kind::Note, false) => "Note on",
@@ -165,6 +169,39 @@ mod tests {
         let b = apply(&mut t, &john(), &op, now()).unwrap().line.unwrap();
         assert_ne!(a, b);
         assert_eq!(t.get(&path).unwrap().window.len(), 2);
+    }
+
+    /// **A line recorded in the past takes its place in time**, so the
+    /// window's tail is still its newest lines.
+    #[test]
+    fn a_backdated_line_takes_its_place_in_time() {
+        let mut t = sharratt();
+        let path = p("~");
+        for (at, text) in [
+            (0, "first"),
+            (120, "third"),
+            (60, "second"),
+            (120, "fourth"),
+        ] {
+            apply(
+                &mut t,
+                &john(),
+                &Op::Note {
+                    path: path.clone(),
+                    text: text.into(),
+                },
+                now().plus(at),
+            )
+            .unwrap();
+        }
+        let texts: Vec<&str> = t
+            .get(&path)
+            .unwrap()
+            .window
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(texts, ["first", "second", "third", "fourth"]);
     }
 
     #[test]
