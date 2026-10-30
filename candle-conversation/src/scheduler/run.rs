@@ -541,6 +541,9 @@ impl Scheduler {
     /// nothing queued, and the ingest relief self-gates on `ingest_timelines`
     /// (a no-op outside a workspace ingest).
     fn mid_wave_admission(&mut self) -> bool {
+        // Read once a step: a decode phase's held prompts age by the step, and
+        // the phase that admits them must open on the step their limit falls.
+        self.advance_grouping();
         if !self.rx.is_empty() {
             // Flag the drain so the assembler attributes its sub-timers to the
             // drain buckets and `apply_projection` DEFERS its gap-fills into the
@@ -913,6 +916,7 @@ impl Scheduler {
             {
                 let _g = profile::span("loop:promote_new_prefills");
                 let t_promote = Instant::now();
+                self.advance_grouping();
                 self.promote_new_prefills();
                 self.step_census
                     .spend(super::step_census::Activity::Promote, t_promote.elapsed());
@@ -1457,6 +1461,7 @@ impl Scheduler {
                     },
                     self.wave_rate.as_mut().map(|r| r.take_trades()),
                     self.model.recurrent_census(),
+                    (self.grouping.phase(), self.grouping.resident()),
                 );
                 self.report_waiting_submits();
                 // Same cadence: publish the full memory report (global slot for

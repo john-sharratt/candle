@@ -42,6 +42,8 @@ mod first_sample;
 mod gallery_sweep;
 mod gang;
 mod graph_window;
+mod grouping;
+mod grouping_ground;
 mod guest_room;
 mod high_drain;
 mod injected_piece;
@@ -2712,6 +2714,7 @@ impl WaveStats {
         graphs: Option<CaptureStats>,
         trades: Option<admit::rate::TradeWindow>,
         stores: (usize, usize),
+        grouping: (grouping::Phase, Option<f64>),
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2875,8 +2878,18 @@ impl WaveStats {
         } else {
             String::new()
         };
+        // The grouping phase the window ended in and the residency it reads,
+        // on a card that groups (`grouping`).
+        let grouping_str = match grouping {
+            (grouping::Phase::Off, _) => String::new(),
+            (phase, resident) => format!(
+                " | group={} res={}",
+                phase.name(),
+                resident.map_or("-".to_owned(), |r| format!("{:.0}%", r * 100.0)),
+            ),
+        };
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}{stores_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}{stores_str}{grouping_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
@@ -3396,6 +3409,9 @@ pub(crate) struct Scheduler {
     /// Starts `true`: nothing has completed on a fresh engine, and one that
     /// waited for a completion before its first admission would never take one.
     pub(super) settled_since_admit: bool,
+    /// Which kind of work admission takes on a card holding few of the
+    /// experts — see [`grouping`].
+    grouping: grouping::Grouping,
     /// Whether forwards have run since the device was last settled
     /// ([`Self::settle_device`]). The idle branch settles once when it is set,
     /// so the weight side grows back into what the finished work left behind
@@ -4185,6 +4201,7 @@ impl Scheduler {
             waiting_told: None,
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
+            grouping: grouping::Grouping::default(),
             settle_owed: false,
             settle_waiters: Vec::new(),
             norm_warm: NormWarm::default(),
