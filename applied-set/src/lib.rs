@@ -155,6 +155,29 @@ impl OriginApplied {
             .any(|(s, e)| !other.contains_range(s, e))
     }
 
+    /// The parts of `start..=end` this coverage does not cover, in order, as
+    /// inclusive `(start, end)`.
+    pub fn uncovered(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut next = start.max(self.through.saturating_add(1));
+        for (s, e) in self.ranges_above() {
+            if next > end {
+                break;
+            }
+            if e < next {
+                continue;
+            }
+            if s > next {
+                out.push((next, end.min(s - 1)));
+            }
+            next = e.saturating_add(1);
+        }
+        if next <= end {
+            out.push((next, end));
+        }
+        out
+    }
+
     /// Whether every `oseq` in `start..=end` is covered.
     pub fn contains_range(&self, start: u64, end: u64) -> bool {
         if start > end || end <= self.through {
@@ -275,6 +298,20 @@ mod tests {
         assert!(o.insert(3));
         assert_eq!(parts(&o), (5, vec![]));
         assert!(!o.insert(4), "already covered");
+    }
+
+    /// What a range leaves uncovered: below `through` nothing, then each gap
+    /// between the covered ranges, clipped to the range asked about.
+    #[test]
+    fn the_uncovered_parts_of_a_range_are_its_gaps() {
+        let o = OriginApplied::from_parts(10, [(15, 20), (30, 40)]);
+        assert_eq!(o.uncovered(1, 10), vec![]);
+        assert_eq!(o.uncovered(5, 50), vec![(11, 14), (21, 29), (41, 50)]);
+        assert_eq!(o.uncovered(16, 35), vec![(21, 29)]);
+        assert_eq!(o.uncovered(12, 13), vec![(12, 13)]);
+        assert_eq!(o.uncovered(15, 20), vec![]);
+        assert_eq!(o.uncovered(41, 41), vec![(41, 41)]);
+        assert_eq!(OriginApplied::default().uncovered(3, 7), vec![(3, 7)]);
     }
 
     /// Ranges merge with every range they touch, and one that reaches

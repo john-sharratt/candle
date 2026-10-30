@@ -51,6 +51,35 @@ pub fn completeness(substrate_dir: &Path, kv_layers: usize) -> Result<()> {
             .with_context(|| format!("opening {} read-only", substrate_dir.display()))?;
     let local = persistence.minter().node();
 
+    // Every chunk the stream index holds, asked of the listing a catch-up
+    // answer is built from (§7.2): one it reports gone is one an answer tells
+    // every other member is gone, and none of them asks for it again.
+    let mut listed = 0usize;
+    let mut listed_gone: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut gone_samples: Vec<(u64, u64, u64)> = Vec::new();
+    for (key, stream) in substrate.all_physical_streams() {
+        for (&idx, id) in stream.ids.chunks.iter() {
+            if id.is_none() {
+                continue;
+            }
+            if persistence.list(id.origin, id.oseq, id.oseq).records.is_empty() {
+                *listed_gone.entry(id.origin).or_default() += 1;
+                if gone_samples.len() < 8 {
+                    gone_samples.push((key.stream_id.0, idx, id.oseq));
+                }
+            } else {
+                listed += 1;
+            }
+        }
+    }
+    println!("\nheld chunks as a catch-up answer lists them: {listed} listed");
+    for (origin, n) in &listed_gone {
+        println!("  {n} of origin {origin:016x} held but listed GONE");
+    }
+    for (stream, idx, oseq) in &gone_samples {
+        println!("  e.g. stream {stream:#018x} chunk {idx}: oseq {oseq}");
+    }
+
     let mut by_writer: BTreeMap<u64, Tally> = BTreeMap::new();
     for (_, stream) in substrate.all_streams() {
         let Some(StreamDecl::Turn(decl)) = stream.decl.as_ref() else {

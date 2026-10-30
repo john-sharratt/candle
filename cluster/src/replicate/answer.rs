@@ -38,18 +38,32 @@ pub fn complete_ranges(mine: &OriginApplied, since: u64) -> Vec<(u64, u64)> {
 /// The `(origin, from, to)` each `HEADERS` of one answer to `since` lists,
 /// each spanning at most [`HEADERS_PER_FRAME`] `oseq`s, in origin order, and
 /// at most [`FRAMES_PER_ANSWER`] of them.
+///
+/// **Only what the requester lacks.** `since` is the requester's whole applied
+/// set, not its `through` alone: a range it already covers above a gap is
+/// skipped, so a bounded answer reaches the requester's gaps however much it
+/// holds above its first one. Listed from `through`, an answer re-listed the
+/// same first 131,072 `oseq`s of held records every time, and nothing above
+/// them was ever fetched — WhiteWorld held its `through` at a hole in
+/// BlackWorld's own set while 45 million `oseq`s above it went unasked.
 pub fn answer_ranges(mine: &AppliedSet, since: &AppliedSet) -> Vec<(u64, u64, u64)> {
     let mut out = Vec::new();
     for (origin, applied) in mine.origins() {
-        for (from, to) in complete_ranges(applied, since.through(origin)) {
-            let mut at = from;
-            while at <= to {
-                if out.len() == FRAMES_PER_ANSWER {
-                    return out;
+        let lacking = |from: u64, to: u64| match since.origin(origin) {
+            Some(theirs) => theirs.uncovered(from, to),
+            None => vec![(from, to)],
+        };
+        for (complete_from, complete_to) in complete_ranges(applied, since.through(origin)) {
+            for (from, to) in lacking(complete_from, complete_to) {
+                let mut at = from;
+                while at <= to {
+                    if out.len() == FRAMES_PER_ANSWER {
+                        return out;
+                    }
+                    let end = to.min(at + HEADERS_PER_FRAME - 1);
+                    out.push((origin, at, end));
+                    at = end + 1;
                 }
-                let end = to.min(at + HEADERS_PER_FRAME - 1);
-                out.push((origin, at, end));
-                at = end + 1;
             }
         }
     }
@@ -115,5 +129,24 @@ mod tests {
                 (9, 1, 3),
             ]
         );
+    }
+
+    /// **A requester stuck below a hole still gets its gaps listed.** It holds
+    /// everything to 10 and a whole answer's worth above the hole at 11, and
+    /// lacks a range far above that: the answer skips what it holds and lists
+    /// the range it lacks, where listed from `through` it re-listed the held
+    /// range and never reached it.
+    #[test]
+    fn an_answer_skips_what_the_requester_holds_above_its_gap() {
+        let n = HEADERS_PER_FRAME;
+        let held_to = 11 + 17 * n;
+        let lacked = (held_to + 1, held_to + 100);
+        let mut mine = AppliedSet::default();
+        mine.insert_range(4, 1, 10);
+        mine.insert_range(4, 12, lacked.1);
+        let mut since = AppliedSet::default();
+        since.insert_range(4, 1, 10);
+        since.insert_range(4, 12, held_to);
+        assert_eq!(answer_ranges(&mine, &since), vec![(4, lacked.0, lacked.1)]);
     }
 }
