@@ -44,29 +44,45 @@ const EXCERPT: usize = 600;
 /// How much of an excerpt comes before the match.
 const LEAD: usize = 160;
 
-/// A named journal whose own name or written cue holds `want`, a lowercase
-/// phrase — its name also with its hyphens read as spaces, so "cpu experts"
-/// finds `experts/cpu-experts`. Only its last segment counts, and never a
-/// fixed journal's cue, which every folder shares: a phrase naming a parent,
-/// an owner or a section finds no journal beneath it.
-fn names(path: &JournalPath, j: &Journal, want: &str) -> bool {
+/// A named journal whose own name or written cue holds `want`, a folded
+/// phrase. Only its last segment counts, and never a fixed journal's cue,
+/// which every folder shares: a phrase naming a parent, an owner or a
+/// section finds no journal beneath it.
+fn names(path: &JournalPath, j: &Journal, want: &[char]) -> bool {
     if j.is_fixed() {
         return false;
     }
-    let name = path
-        .last()
-        .map(|s| s.as_str().to_lowercase())
-        .unwrap_or_default();
-    let cue = j.cue().unwrap_or_default().to_lowercase();
-    name.contains(want) || name.replace('-', " ").contains(want) || cue.contains(want)
+    path.last().is_some_and(|s| holds(s.as_str(), want))
+        || j.cue().is_some_and(|cue| holds(&cue, want))
 }
 
-/// Each char lowercased to one char, so a place in the lowercase is the
-/// same place in the text.
+/// Each char lowercased to one char, and a hyphen read as a space, so a
+/// place in the fold is the same place in the text, and "cpu experts" finds
+/// `cpu-experts` and "environment variable" finds "environment-variable".
 fn fold(s: &str) -> Vec<char> {
     s.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .map(|c| match c {
+            '-' => ' ',
+            c => c.to_lowercase().next().unwrap_or(c),
+        })
         .collect()
+}
+
+/// What `phrase` asks for: folded, then trimmed, so a phrase of hyphens is
+/// as empty as one of spaces.
+fn wanted(phrase: &str) -> Vec<char> {
+    let folded = fold(phrase);
+    let first = folded.iter().position(|c| !c.is_whitespace());
+    let last = folded.iter().rposition(|c| !c.is_whitespace());
+    match (first, last) {
+        (Some(a), Some(b)) => folded[a..=b].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// `text`, folded, holds `want`, a folded phrase that is not empty.
+fn holds(text: &str, want: &[char]) -> bool {
+    fold(text).windows(want.len()).any(|w| w == want)
 }
 
 /// `text` cut to about [`EXCERPT`] characters around the first place
@@ -79,7 +95,7 @@ fn excerpt(text: &str, phrase: &str) -> String {
     // Text and phrase folded alike, char by char: the match is found where
     // it is, else the excerpt starts at the text's start.
     let lower = fold(text);
-    let want = fold(phrase.trim());
+    let want = wanted(phrase);
     let at = (0..=lower.len().saturating_sub(want.len()))
         .find(|&i| lower[i..].starts_with(&want))
         .unwrap_or(0);
@@ -107,7 +123,7 @@ pub fn grep(
     under: Option<&JournalPath>,
     limit: usize,
 ) -> (Vec<Hit>, usize) {
-    let want = phrase.trim().to_lowercase();
+    let want = wanted(phrase);
     if want.is_empty() {
         return (Vec::new(), 0);
     }
@@ -134,7 +150,7 @@ pub fn grep(
             render_line(tree, &cut)
         };
         for l in &j.window {
-            if l.text.to_lowercase().contains(&want) {
+            if holds(&l.text, &want) {
                 hits.push(Hit {
                     path: path.clone(),
                     found: Found::Window,
@@ -146,7 +162,7 @@ pub fn grep(
         }
         for (period, lines) in &j.archives {
             for l in lines {
-                if l.text.to_lowercase().contains(&want) {
+                if holds(&l.text, &want) {
                     hits.push(Hit {
                         path: path.clone(),
                         found: Found::Archive(*period),
@@ -159,11 +175,7 @@ pub fn grep(
         }
         if let Some(s) = j.summary() {
             let text = s.text();
-            if text.to_lowercase().contains(&want)
-                || s.digest
-                    .as_deref()
-                    .is_some_and(|d| d.to_lowercase().contains(&want))
-            {
+            if holds(&text, &want) || s.digest.as_deref().is_some_and(|d| holds(d, &want)) {
                 hits.push(Hit {
                     path: path.clone(),
                     found: Found::Summary,
@@ -390,6 +402,47 @@ mod tests {
         assert_eq!(journals("topics"), 0);
         assert_eq!(journals(Section::Topics.cue()), 0);
         assert_eq!(journals("~"), 0);
+    }
+
+    /// **A hyphen and a space match each other**, either way round.
+    #[test]
+    fn a_hyphen_matches_a_space() {
+        let mut t = sharratt();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                path: p("topics"),
+                text: "No environment-variable feature flags.".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        for phrase in [
+            "environment variable",
+            "ENVIRONMENT-VARIABLE",
+            "feature-flags",
+        ] {
+            assert_eq!(grep(&t, &slug("john"), phrase, None, 10).1, 1, "{phrase}");
+        }
+        assert_eq!(
+            grep(&t, &slug("john"), "environmentvariable", None, 10).1,
+            0
+        );
+        for empty in ["-", " - ", "--"] {
+            assert_eq!(grep(&t, &slug("john"), empty, None, 10).1, 0, "{empty:?}");
+        }
+        assert_eq!(
+            excerpt(
+                &format!("{} a-b {}", "x".repeat(800), "y".repeat(800)),
+                "A B"
+            ),
+            format!(
+                "…{} a-b {}…",
+                "x".repeat(LEAD - 1),
+                "y".repeat(EXCERPT - LEAD - 4)
+            )
+        );
     }
 
     #[test]

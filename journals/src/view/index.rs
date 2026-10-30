@@ -10,6 +10,14 @@ use crate::tree::fingerprint::is_dirty;
 use crate::tree::{Journal, Tree};
 use crate::view::who::ago;
 
+/// `j`'s live children with something written in or below them, by name.
+fn written(j: &Journal) -> Vec<(&str, &Journal)> {
+    j.live()
+        .filter(|(_, c)| !c.is_blank())
+        .map(|(n, c)| (n.as_str(), c))
+        .collect()
+}
+
 /// `path`'s line in its parent's index.
 pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
     let mut out = path.show();
@@ -23,23 +31,30 @@ pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
         return out;
     }
     let lines = j.all_lines().count();
-    // Named, so a reader goes a level deeper by name rather than by a guess
-    // or a grep; at most ten, so the line stays short.
-    let names: Vec<&str> = j
-        .live()
-        .filter(|(_, c)| !c.is_blank())
-        .map(|(n, _)| n.as_str())
+    // Named two levels down, so a reader goes deeper by name rather than by
+    // a guess or a grep; at most ten a level, so the line stays bounded.
+    let below: Vec<(&str, Vec<&str>)> = written(j)
+        .into_iter()
+        .map(|(n, c)| (n, written(c).into_iter().map(|(m, _)| m).collect()))
         .collect();
     let mut facts = vec![format!("{lines} line{}", if lines == 1 { "" } else { "s" })];
-    if !names.is_empty() {
+    if !below.is_empty() {
+        let deep = below.iter().any(|(_, under)| !under.is_empty());
+        let listed: Vec<String> = below
+            .iter()
+            .map(|(n, under)| match under.is_empty() {
+                true => n.to_string(),
+                false => format!("{n}: {}", under.join(", ")),
+            })
+            .collect();
         facts.push(format!(
             "{} sub-journal{} ({})",
-            names.len(),
-            if names.len() == 1 { "" } else { "s" },
-            names.join(", ")
+            below.len(),
+            if below.len() == 1 { "" } else { "s" },
+            listed.join(if deep { "; " } else { ", " })
         ));
     }
-    let live = names.len();
+    let live = below.len();
     let state = match j.summary() {
         None if lines == 0 && live == 0 => "empty".to_string(),
         None => "no summary yet".to_string(),
@@ -160,6 +175,26 @@ mod tests {
                  sub-journals (budget, trip); no summary yet",
                 "bots, projects, threads: nothing written yet",
             ]
+        );
+        // A level further down is named under its parent.
+        for name in ["flights", "hotels"] {
+            apply(
+                &mut t,
+                &john(),
+                &Op::Create {
+                    under: p("topics/trip"),
+                    name: slug(name),
+                    cue: format!("open for the {name}"),
+                    on_taken: OnTaken::Refuse,
+                },
+                now(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            index(&root, t.get(&root).unwrap(), now())[0],
+            "@sharratt/topics — open for themes that span conversations. 0 lines, 2 \
+             sub-journals (budget; trip: flights, hotels); no summary yet"
         );
     }
 

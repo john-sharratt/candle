@@ -479,16 +479,18 @@ another member's work for their own. A summary over its cap is an error
 
 ### 5.2 The index
 
-A journal's live children, one line each — at most 10, so a parent's index is
-always small enough to read whole:
+A journal's live children, one line each — at most 10, each naming at most 10
+of its own and theirs, so a parent's index is bounded:
 
 ```
-@sharratt/projects/candle — open for the inference engine, its releases and cluster. 412 lines, 4 sub-journals; summary 2 h old (+3)
-@sharratt/topics/house-build — open for the extension: builder, permits, budget. 61 lines, 2 sub-journals; current
+@sharratt/projects/candle — open for the inference engine, its releases and cluster. 412 lines, 4 sub-journals (cluster: keep, releases; models: deepseek-v4; papers; zen); summary 2 h old (+3)
+@sharratt/topics/house-build — open for the extension: builder, permits, budget. 61 lines, 2 sub-journals (builder, permits); current
 … and 37 folded
 ```
 
-`(+3)`: lines newer than the summary. `~`'s index lists its two personal
+`(+3)`: lines newer than the summary. Sub-journals are named two levels down
+— a child's own children after a colon — so a reader opens a journal two
+levels below by name. `~`'s index lists its two personal
 sections and then each group the person is in, its name, kind, and whether it
 opens every conversation:
 
@@ -643,7 +645,7 @@ is the caller's default group's.
 | `get_user_context` | the frame for this conversation |
 | `journal_open {path}` | a journal: its summary (and staleness), its index, its window, how much is folded |
 | `journal_read {address}` | one line; for a worker, the turns behind one of its entries |
-| `journal_grep {pattern, under?}` | case-insensitive substring over every named journal's own name and written cue (the name's hyphens also read as spaces; parents, owners and fixed journals' shared cues are not matched) and every line, archive and summary of a subtree — everything the caller may read by default. Journals the phrase names come first, then lines newest first; a line of up to 600 characters is shown whole, a longer one cut around the match |
+| `journal_grep {pattern, under?}` | case-insensitive substring, a hyphen and a space matching each other, over every named journal's own name and written cue (parents, owners and fixed journals' shared cues are not matched) and every line, archive and summary of a subtree — everything the caller may read by default. Journals the phrase names come first, then lines newest first; a line of up to 600 characters is shown whole, a longer one cut around the match |
 | `journal_note {path, text}` | a `note` line |
 | `journal_edit {address, text}` | edits a line: a commit |
 | `journal_create {under, name, cue}` | a named sub-journal, where the section allows (§2.3) |
