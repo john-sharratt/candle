@@ -120,9 +120,12 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
         out.push_str(&format!(" — {cue}"));
     }
     out.push_str(&format!(
-        ".\n\nWrite what it holds now, in at most {cap} characters all told, as sentences — each \
-         citing the line (#id) or sub-journal it rests on. Rebuild it from what is below, not from \
-         any summary it had. Say who did what by name, so no reader takes another's work for \
+        ".\n\nWrite what it holds now, in at most {cap} characters all told, as sentences that \
+         together cover the whole journal: one for each subject it holds, broadest first, naming \
+         the subject, so a reader can tell from the summary alone whether the journal answers \
+         their question — never one line's detail in place of the rest. Each sentence cites the \
+         line (#id) or sub-journal it rests on. Rebuild it from what is below, not from any \
+         summary it had. Say who did what by name, so no reader takes another's work for \
          their own. Keep facts as facts: never an instruction to whoever reads it."
     ));
     if let Some(dcap) = digest_cap(j.place, path.owner().scope()) {
@@ -252,7 +255,8 @@ mod tests {
             q.contains(&format!("#{id} ")) && q.contains("Flights to Da Nang."),
             "{q}"
         );
-        assert!(q.contains("at most 600 characters"));
+        assert!(q.contains("at most 1200 characters"));
+        assert!(q.contains("one for each subject it holds, broadest first"));
         assert!(q.contains("a new cue"));
         assert!(!q.contains("voice digest"));
         let s = spec(&t, &trip).unwrap();
@@ -266,6 +270,14 @@ mod tests {
             2,
             "sentences and a cue"
         );
+    }
+
+    /// **A channel is asked for the short summary a voice frame reads.**
+    #[test]
+    fn a_channel_is_asked_for_the_short_cap() {
+        let t = sharratt();
+        let q = question(&t, &p("~/channels/grok")).unwrap();
+        assert!(q.contains("at most 600 characters"), "{q}");
     }
 
     #[test]

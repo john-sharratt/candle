@@ -470,8 +470,12 @@ folding only changes what a reader sees by default.
 | `~` | 1,500 chars, and a 600-char **voice digest** (§6.4) |
 | a group root | 1,500 chars, and a 400-char voice digest |
 | a section | 1,000 chars |
-| any other | 600 chars |
+| a channel and each conversation under it | 600 chars — read aloud in a voice frame (§6.4) |
+| any other named journal (a project, topic, person, thread or bot journal) | 1,200 chars |
 
+A summary covers the whole journal: a sentence for each subject it holds,
+broadest first, naming the subject, so a reader can tell from the summary
+alone whether to open it — never one line's detail in place of the rest.
 Every sentence cites the lines or child journals it rests on, and a shared
 summary names who did what ("Yen booked the builder"), so no reader takes
 another member's work for their own. A summary over its cap is an error

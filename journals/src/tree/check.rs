@@ -8,7 +8,7 @@ use crate::error::Problem;
 use crate::files::{entry_file, AccountKey, Email, Who};
 use crate::line::{Folds, LineId};
 use crate::path::{JournalPath, Owner, Place};
-use crate::scope::{is_dated, Naming, Scope};
+use crate::scope::{is_dated, Naming, Scope, Section};
 use crate::slug::Slug;
 use crate::tree::load::{ARCHIVE_DIR, JOURNAL_FILE};
 use crate::tree::{Journal, Tree, MAX_CHILDREN};
@@ -18,7 +18,15 @@ pub fn summary_cap(place: Place) -> usize {
     match place {
         Place::Root => 1_500,
         Place::Section(_) => 1_000,
-        Place::Channel(_) | Place::Named { .. } => 600,
+        // A conversation's summary is read aloud in a voice frame (§6.4), so
+        // a channel and its conversations stay short; a project, topic or
+        // person journal holds many subjects, and its summary names each.
+        Place::Channel(_)
+        | Place::Named {
+            section: Section::Channels,
+            ..
+        } => 600,
+        Place::Named { .. } => 1_200,
     }
 }
 
@@ -581,10 +589,24 @@ mod tests {
             digest_on_section
         )]))
         .contains("only a root"));
-        let leaf = format!("{}{}", named("permits", "x"), summary(601, None));
+        let leaf = |len| format!("{}{}", named("permits", "x"), summary(len, None));
+        assert_eq!(
+            all_problems(&tree(&[(
+                "groups/sharratt/topics/permits/journal.yaml",
+                leaf(1200)
+            )])),
+            Vec::<String>::new()
+        );
         assert!(one_problem(&tree(&[(
             "groups/sharratt/topics/permits/journal.yaml",
-            leaf
+            leaf(1201)
+        )]))
+        .contains("cap of 1200"));
+        // A conversation is read aloud, so it keeps the short cap.
+        let conversation = format!("{}{}", named("2026-10-30-0910", "x"), summary(601, None));
+        assert!(one_problem(&tree(&[(
+            "persons/john/channels/claude-code/2026-10-30-0910/journal.yaml",
+            conversation
         )]))
         .contains("cap of 600"));
     }
