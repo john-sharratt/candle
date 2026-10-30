@@ -21,3 +21,6 @@ checkouts:
   - name: battle-mind
     dir: D:/agent/battle-mind
     push: true
+  - name: journals
+    dir: D:/agent/journals
+    push: true
