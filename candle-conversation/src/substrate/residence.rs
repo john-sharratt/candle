@@ -965,31 +965,47 @@ mod tests {
         assert!(!slab.get(idx[1]).has_warm());
     }
 
-    /// Two threads installing and taking one residence's hot copy concurrently
-    /// leave membership exactly matching the cell.
+    /// **A hot cell is always a member**, however installs and takes of one
+    /// residence interleave (`docs/substrate_lock_free.md` §5.2): a residence
+    /// leaves the hot set only when its cell is empty, and is put back when an
+    /// install lands between a take's swap and its removal. Checked once both
+    /// threads have stopped — a take mid-flight removes the member before it
+    /// re-reads the cell and puts it back — over many rounds, each of which can
+    /// end on a different interleaving.
+    ///
+    /// The set is a superset and no more ([`ResidenceSlab::hot_members`]): an
+    /// install whose insert lands after a take's removal leaves a member whose
+    /// cell is empty, which every reader of the set tolerates by reading the
+    /// cell. Asserted exact, this failed one run in a few.
     #[test]
-    fn concurrent_install_and_take_keep_membership_exact() {
+    fn concurrent_install_and_take_never_lose_a_hot_member() {
         let slab = Arc::new(ResidenceSlab::default());
         let r = slab.alloc(StreamId(1), None, 0);
-        let installer = {
-            let slab = Arc::clone(&slab);
-            std::thread::spawn(move || {
-                for _ in 0..20_000 {
-                    slab.install_hot(r, vec![seq()]);
-                }
-            })
-        };
-        let taker = {
-            let slab = Arc::clone(&slab);
-            std::thread::spawn(move || {
-                for _ in 0..20_000 {
-                    slab.take_hot(r);
-                }
-            })
-        };
-        installer.join().unwrap();
-        taker.join().unwrap();
-        let member = slab.hot_members().contains(&r);
-        assert_eq!(member, slab.get(r).has_hot(), "the set and the cell agree");
+        for round in 0..200 {
+            let installer = {
+                let slab = Arc::clone(&slab);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        slab.install_hot(r, vec![seq()]);
+                    }
+                })
+            };
+            let taker = {
+                let slab = Arc::clone(&slab);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        slab.take_hot(r);
+                    }
+                })
+            };
+            installer.join().unwrap();
+            taker.join().unwrap();
+            if slab.get(r).has_hot() {
+                assert!(
+                    slab.hot_members().contains(&r),
+                    "round {round}: a hot cell is in the hot set"
+                );
+            }
+        }
     }
 }
