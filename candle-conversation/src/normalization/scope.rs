@@ -1,8 +1,8 @@
 //! One scope's normalization state: a hit level per child, plus the read
 //! (`normalize_with_floors`) and write (`observe`) operations over them.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use super::hit_level::HitLevel;
 use super::{ChildKey, NormConfig};
@@ -23,8 +23,9 @@ fn to_ref(raw: f32, probe_tokens: usize, cfg: &NormConfig) -> f32 {
     raw * (cfg.probe_t_ref as f32 / probe_tokens.max(1) as f32)
 }
 
-/// Per-child hit levels for a single budget scope.
-#[derive(Default)]
+/// Per-child hit levels for a single budget scope. Immutable once shared: an
+/// observe edits a copy ([`super::cache::NormalizationCache::observe`]).
+#[derive(Default, Clone)]
 pub(super) struct ScopeState {
     children: HashMap<ChildKey, HitLevel>,
     /// Evidence already folded into this scope, so folding it again is a no-op
@@ -38,7 +39,7 @@ pub(super) struct ScopeState {
     /// per call sorted ~1,000 levels ~1,000 times a scan: 9.7 ms of a live
     /// reprojection's belief scan (`.5`, 2026-10-17). Only [`Self::observe`]
     /// changes a level, and it clears this.
-    floor: Cell<Option<f32>>,
+    floor: OnceLock<f32>,
 }
 
 impl ScopeState {
@@ -96,7 +97,7 @@ impl ScopeState {
         cfg: &NormConfig,
         probe_tokens: usize,
     ) {
-        self.floor.set(None);
+        self.floor = OnceLock::new();
         for (k, r) in raw {
             self.children
                 .entry(k.clone())
@@ -111,12 +112,7 @@ impl ScopeState {
     /// Floors compare against reference-scaled scores (see [`to_ref`]) because
     /// that is what the levels now hold, so nothing here needs its own scaling.
     fn floor(&self, cfg: &NormConfig) -> f32 {
-        if let Some(floor) = self.floor.get() {
-            return floor;
-        }
-        let floor = self.compute_floor(cfg);
-        self.floor.set(Some(floor));
-        floor
+        *self.floor.get_or_init(|| self.compute_floor(cfg))
     }
 
     /// [`Self::floor`] from the levels as they stand.
@@ -173,7 +169,7 @@ mod tests {
         );
         let probe = raw(&[(1, 50.0), (2, 50.0), (3, 50.0), (4, 50.0)]);
         let first = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
-        assert_eq!(scope.floor.get(), Some(scope.compute_floor(&cfg)));
+        assert_eq!(scope.floor.get().copied(), Some(scope.compute_floor(&cfg)));
         let again = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
         assert_eq!(
             first, again,
@@ -191,7 +187,7 @@ mod tests {
         }
         assert_eq!(scope.floor.get(), None, "an observe drops the kept floor");
         let after = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
-        assert_eq!(scope.floor.get(), Some(scope.compute_floor(&cfg)));
+        assert_eq!(scope.floor.get().copied(), Some(scope.compute_floor(&cfg)));
         let fresh = ScopeState {
             children: scope.children.clone(),
             ..ScopeState::default()

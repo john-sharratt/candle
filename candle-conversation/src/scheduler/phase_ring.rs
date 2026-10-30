@@ -17,8 +17,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwapOption;
+
+use super::rates_store;
 
 pub use candle_nn::kv_cache::VramBands;
 
@@ -530,7 +535,7 @@ pub struct LearnedRates {
 }
 
 /// The newest [`LearnedRates`] the scheduler published, and when.
-static LEARNED: OnceLock<Mutex<Option<(Instant, LearnedRates)>>> = OnceLock::new();
+static LEARNED: ArcSwapOption<(Instant, LearnedRates)> = ArcSwapOption::const_empty();
 
 /// How often the published rates are read, as the reader registered it.
 static RATES_READ_EVERY: OnceLock<Duration> = OnceLock::new();
@@ -551,16 +556,19 @@ pub fn rates_read_period() -> Option<Duration> {
 /// Publish what the rate model holds now. The scheduler calls this as it
 /// runs; a reader takes the newest.
 pub fn publish_learned_rates(rates: LearnedRates) {
-    let cell = LEARNED.get_or_init(|| Mutex::new(None));
-    if let Ok(mut c) = cell.lock() {
-        *c = Some((Instant::now(), rates));
-    }
+    LEARNED.store(Some(Arc::new((Instant::now(), rates))));
     save_learned_rates(&rates);
 }
 
-/// Where the published rates are kept across restarts, and when they were last
-/// written there.
-static LEARNED_STORE: OnceLock<Mutex<(PathBuf, Option<Instant>)>> = OnceLock::new();
+/// Where the published rates are kept across restarts.
+static LEARNED_STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// When the rates were last written to their store, in milliseconds after
+/// [`STORE_CLOCK`]'s base; `u64::MAX` before the first write.
+static LEARNED_SAVED_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The base [`LEARNED_SAVED_MS`] counts from.
+static STORE_CLOCK: OnceLock<Instant> = OnceLock::new();
 
 /// How often the published rates are written to their store: a figure a
 /// minute old is as good a start as one a second old, and the rates publish on
@@ -589,37 +597,26 @@ pub fn keep_learned_rates_at(path: PathBuf) {
         .ok()
         .and_then(|s| parse_learned_rates(&s))
     {
-        let cell = LEARNED.get_or_init(|| Mutex::new(None));
-        if let Ok(mut c) = cell.lock() {
-            if c.is_none() {
-                *c = Some((Instant::now(), rates));
-            }
-        }
+        LEARNED.compare_and_swap(&None::<Arc<_>>, Some(Arc::new((Instant::now(), rates))));
     }
-    let store = LEARNED_STORE.get_or_init(|| Mutex::new((path.clone(), None)));
-    if let Ok(mut s) = store.lock() {
-        s.0 = path;
-    }
+    // The first store named holds: one card, one model, one path.
+    let _ = LEARNED_STORE.set(path);
 }
 
 /// Where the learned model is kept: beside the published rates, under its own
 /// name. `None` with no store.
 fn learned_model_path() -> Option<PathBuf> {
-    let store = LEARNED_STORE.get()?;
-    let s = store.lock().ok()?;
-    Some(s.0.with_file_name("learned_model"))
+    Some(LEARNED_STORE.get()?.with_file_name("learned_model"))
 }
 
 /// Keep the rate model's learned state (`WaveRate::export_learned`) for the
-/// next start. Best effort, like the rates beside it.
+/// next start, written on the store's own thread. Best effort, like the rates
+/// beside it.
 pub fn keep_learned_model(text: &str) {
     let Some(path) = learned_model_path() else {
         return;
     };
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    rates_store::write_behind(path, text.to_string());
 }
 
 /// The learned state a previous run kept, for the rate model to start from.
@@ -627,28 +624,25 @@ pub fn kept_learned_model() -> Option<String> {
     std::fs::read_to_string(learned_model_path()?).ok()
 }
 
-/// Write `rates` to the store, once a [`LEARNED_SAVE_EVERY`]; nothing without
-/// one. Best effort: a store that cannot be written costs the next start its
-/// head start, not this run anything.
+/// Write `rates` to the store, once a [`LEARNED_SAVE_EVERY`], on the store's
+/// own thread; nothing without one. Best effort: a store that cannot be
+/// written costs the next start its head start, not this run anything.
 fn save_learned_rates(rates: &LearnedRates) {
-    let Some(store) = LEARNED_STORE.get() else {
+    let Some(path) = LEARNED_STORE.get() else {
         return;
     };
-    let Ok(mut s) = store.lock() else {
-        return;
-    };
-    let now = Instant::now();
-    if s.1
-        .is_some_and(|at| now.saturating_duration_since(at) < LEARNED_SAVE_EVERY)
+    let base = *STORE_CLOCK.get_or_init(Instant::now);
+    let now = base.elapsed().as_millis() as u64;
+    let last = LEARNED_SAVED_MS.load(Ordering::Relaxed);
+    let due = last == u64::MAX || now.saturating_sub(last) >= LEARNED_SAVE_EVERY.as_millis() as u64;
+    if !due
+        || LEARNED_SAVED_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
     {
         return;
     }
-    s.1 = Some(now);
-    let text = format_learned_rates(rates);
-    let tmp = s.0.with_extension("tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &s.0);
-    }
+    rates_store::write_behind(path.clone(), format_learned_rates(rates));
 }
 
 /// The store's form: one `key value` a line, so a figure added later reads as
@@ -697,8 +691,7 @@ fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
 /// The rates the scheduler last published, and how old they are in seconds —
 /// `None` before its rate model has learned from a forward.
 pub fn learned_rates() -> Option<(LearnedRates, f64)> {
-    let c = LEARNED.get()?.lock().ok()?;
-    let (at, rates) = (*c)?;
+    let (at, rates) = *LEARNED.load_full()?;
     Some((
         rates,
         Instant::now().saturating_duration_since(at).as_secs_f64(),

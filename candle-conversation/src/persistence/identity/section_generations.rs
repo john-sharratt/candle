@@ -86,6 +86,11 @@ impl SectionGenerations {
     pub fn generation(&self, stream_id: u64) -> Option<u64> {
         self.live.get(&stream_id).copied()
     }
+
+    /// Every section being written, with its generation.
+    pub fn live(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.live.iter().map(|(s, o)| (*s, *o))
+    }
 }
 
 #[cfg(test)]

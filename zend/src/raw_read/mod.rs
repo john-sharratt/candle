@@ -14,7 +14,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
 
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
@@ -198,7 +197,7 @@ fn ingest_raw_into_sink<S: InsertTurnSink>(
 /// daemon so its sealed K/V stays reachable by dialogue retrieval) and the
 /// per-file [`RawState`] for the refresh path.
 pub fn ingest_raw(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     proj_builder: projection::Builder,
     root: &Path,
     config: SequenceConfig,
@@ -213,10 +212,9 @@ pub fn ingest_raw(
         .id_for_group(group_name)
         .ok_or_else(|| anyhow::anyhow!("projection schema missing '{group_name}' group"))?;
     let system_prompt = shared_system_prompt(&proj_builder, layer_name, &config);
-    // Lock only to mint the sequence; the prefill below runs on the sequence's
-    // own handle, lock-free, so concurrent engine consumers keep running.
+    // The prefill below runs on the sequence's own handle, so concurrent
+    // engine consumers keep running.
     let mut sequence = {
-        let engine = engine.lock().unwrap();
         engine
             .new_conversation_with_projection(
                 &system_prompt,
@@ -273,7 +271,7 @@ pub fn refresh_raw(
     let system_prompt = shared_system_prompt(&ctx.proj_builder, layer_name, &ctx.config);
 
     let mut new_sequence = {
-        let engine = ctx.engine.lock().unwrap();
+        let engine = ctx.engine;
         engine
             .new_conversation_with_projection(
                 &system_prompt,
@@ -302,7 +300,7 @@ pub fn refresh_raw(
     }
 
     {
-        let engine = ctx.engine.lock().unwrap();
+        let engine = ctx.engine;
         engine
             .tombstone_timeline(old_timeline)
             .map_err(|e| anyhow::anyhow!("raw refresh: tombstone old timeline: {e}"))?;

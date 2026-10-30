@@ -23,9 +23,12 @@
 //! can come to hold a different page. A record with no identity (written before
 //! identities existed) cannot be told from another, and is never held.
 //!
+//! Shared by every thread that projects, and lock-free: a concurrent map
+//! whose sweep any inserter may run.
+//!
 //! [`IndexPage::Stored`]: crate::substrate::IndexPage::Stored
 
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::index_pages::StoredPages;
@@ -39,15 +42,15 @@ const FIRST_SWEEP_AT: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct HeldIndexPages {
-    pages: HashMap<StreamId, (RecordIdentity, Weak<StoredPages>)>,
-    sweep_at: usize,
+    pages: papaya::HashMap<StreamId, (RecordIdentity, Weak<StoredPages>)>,
+    sweep_at: AtomicUsize,
 }
 
 impl Default for HeldIndexPages {
     fn default() -> Self {
         Self {
-            pages: HashMap::new(),
-            sweep_at: FIRST_SWEEP_AT,
+            pages: papaya::HashMap::new(),
+            sweep_at: AtomicUsize::new(FIRST_SWEEP_AT),
         }
     }
 }
@@ -58,7 +61,8 @@ impl HeldIndexPages {
         if id.is_none() {
             return None;
         }
-        let (held_id, page) = self.pages.get(&stream_id)?;
+        let pages = self.pages.pin();
+        let (held_id, page) = pages.get(&stream_id)?;
         if *held_id != id {
             return None;
         }
@@ -67,26 +71,30 @@ impl HeldIndexPages {
 
     /// Remember `page` as what record `id` of `stream_id` holds. Nothing is
     /// kept alive by this: the entry answers only while a caller holds `page`.
-    pub(crate) fn hold(
-        &mut self,
-        stream_id: StreamId,
-        id: RecordIdentity,
-        page: &Arc<StoredPages>,
-    ) {
+    pub(crate) fn hold(&self, stream_id: StreamId, id: RecordIdentity, page: &Arc<StoredPages>) {
         if id.is_none() {
             return;
         }
-        self.pages.insert(stream_id, (id, Arc::downgrade(page)));
-        if self.pages.len() >= self.sweep_at {
-            self.pages.retain(|_, (_, page)| page.strong_count() > 0);
-            self.sweep_at = (self.pages.len() * 2).max(FIRST_SWEEP_AT);
+        let pages = self.pages.pin();
+        pages.insert(stream_id, (id, Arc::downgrade(page)));
+        let at = self.sweep_at.load(Ordering::Acquire);
+        // One inserter sweeps a given threshold: the one whose CAS moves it on.
+        if pages.len() >= at
+            && self
+                .sweep_at
+                .compare_exchange(at, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            pages.retain(|_, (_, page)| page.strong_count() > 0);
+            self.sweep_at
+                .store((pages.len() * 2).max(FIRST_SWEEP_AT), Ordering::Release);
         }
     }
 
     /// Entries in the map, live or not yet swept.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.pages.len()
+        self.pages.pin().len()
     }
 }
 
@@ -112,7 +120,7 @@ mod tests {
     /// the very allocation, not a copy.
     #[test]
     fn a_held_page_is_found_by_its_record() {
-        let mut held = HeldIndexPages::default();
+        let held = HeldIndexPages::default();
         let p = page(b"rows");
         held.hold(StreamId(1), id(5), &p);
         let found = held.get(StreamId(1), id(5)).expect("held");
@@ -124,7 +132,7 @@ mod tests {
     /// read from the log again.
     #[test]
     fn a_page_no_slot_holds_is_not_found() {
-        let mut held = HeldIndexPages::default();
+        let held = HeldIndexPages::default();
         let p = page(b"rows");
         held.hold(StreamId(1), id(5), &p);
         drop(p);
@@ -135,7 +143,7 @@ mod tests {
     /// handed out for it, though a slot still holds them.
     #[test]
     fn a_new_record_for_the_stream_does_not_find_the_old_page() {
-        let mut held = HeldIndexPages::default();
+        let held = HeldIndexPages::default();
         let old = page(b"old rows");
         held.hold(StreamId(1), id(5), &old);
         assert!(held.get(StreamId(1), id(6)).is_none());
@@ -146,7 +154,7 @@ mod tests {
     /// such record, so it is never held.
     #[test]
     fn a_record_without_an_identity_is_never_held() {
-        let mut held = HeldIndexPages::default();
+        let held = HeldIndexPages::default();
         let p = page(b"rows");
         held.hold(StreamId(1), RecordIdentity::NONE, &p);
         assert_eq!(held.len(), 0);
@@ -157,7 +165,7 @@ mod tests {
     /// working set rather than every page ever read.
     #[test]
     fn dead_entries_are_swept_as_the_map_grows() {
-        let mut held = HeldIndexPages::default();
+        let held = HeldIndexPages::default();
         let live = page(b"live");
         held.hold(StreamId(0), id(1), &live);
         for s in 1..(FIRST_SWEEP_AT as u64 * 4) {

@@ -13,7 +13,6 @@
 //! file's key is its blob.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
@@ -50,7 +49,7 @@ pub fn stale(
 /// differ from `live` (unit key → the branches holding it, in walk order).
 /// Returns how many were rewritten.
 pub fn retie(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     layer: &str,
     committed: &[Committed],
     live: &HashMap<&str, &[String]>,
@@ -59,7 +58,7 @@ pub fn retie(
         .iter()
         .map(|(key, names)| (*key, branches_value(names)))
         .collect();
-    let e = engine.lock().unwrap();
+    let e = engine;
     let recorded: HashMap<TimelineId, Option<String>> = committed
         .iter()
         .map(|c| {
@@ -110,12 +109,12 @@ pub fn without_commit(
 /// Write [`COMMIT_KEY`] on each of `committed` that has none, from `found`
 /// (unit key → a commit holding that version). Returns how many were written.
 pub fn backfill_commits(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     layer: &str,
     committed: &[Committed],
     found: &HashMap<&str, String>,
 ) -> usize {
-    let e = engine.lock().unwrap();
+    let e = engine;
     let recorded: HashMap<TimelineId, Option<String>> = committed
         .iter()
         .map(|c| {

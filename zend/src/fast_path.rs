@@ -32,7 +32,6 @@ pub mod coverage;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::working_set::WorkingSetConfig;
@@ -102,7 +101,7 @@ pub struct Served {
 /// What one screening consults: the conversation, its view of every
 /// repository, and the working set a read locks into.
 pub struct Screen<'a> {
-    pub engine: &'a Mutex<ConversationEngine>,
+    pub engine: &'a ConversationEngine,
     pub target: TimelineId,
     pub workspace: &'a Workspace,
     pub files: &'a RepoFiles,
@@ -230,13 +229,12 @@ impl Screen<'_> {
     /// in front of it.
     fn read_hit(&self, key: String, repo: &str, rel: &str, page: u64) -> Option<Hit> {
         let locked = {
-            let e = self.engine.lock().unwrap();
-            // Locked BEFORE answering, under the same engine lock: a read the
-            // working set refuses is not in the projection, so claiming it
-            // would be a lie.
-            file_conversation(&e, self.files, self.coverage, repo, rel)
+            let e = self.engine;
+            // Locked BEFORE answering: a read the working set refuses is not in
+            // the projection, so claiming it would be a lie.
+            file_conversation(e, self.files, self.coverage, repo, rel)
                 .filter(|&(_, pages)| (1..=u64::from(pages)).contains(&page))
-                .filter(|&(tl, _)| self.lock(&e, tl, &key))
+                .filter(|&(tl, _)| self.lock(e, tl, &key))
         };
         let Some((timeline, pages)) = locked else {
             tracing::debug!(

@@ -43,7 +43,7 @@
 //! (the pool is unbounded and never evicts), so a concurrent compaction that
 //! deletes a sealed segment cannot fail a later read of it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -729,6 +729,12 @@ impl SegmentedLog {
         self.active.direct_file()
     }
 
+    /// A shared owner of the active segment's direct-I/O handle set, kept open
+    /// for as long as a cold load holds it.
+    pub fn active_shared_direct(&self) -> Arc<DirectFile> {
+        self.active.shared_direct()
+    }
+
     /// A direct-I/O handle set on a sealed segment that the caller owns for
     /// the duration of one cold-load. Unlike the CPU read path (which borrows
     /// a pooled handle via `&mut self`), the GPU cold-load pipeline holds
@@ -809,17 +815,30 @@ impl SegmentedLog {
 
     /// Replace the whole segment set with a freshly-written compacted segment.
     /// `new_active` is an open handle on `scratch` (a non-segment scratch file
-    /// the compactor wrote the live records into).
+    /// the compactor wrote the live records into). Returns the ids of the
+    /// segments it replaced, which stay on disk until
+    /// [`Self::unlink_replaced`]: the substrate still names them until the
+    /// rewrite's re-apply moves its locations, and a reader holding one of
+    /// those reads it in the meantime.
     ///
     /// **Crash-safe ordering:** the scratch is renamed into place as a **fresh
-    /// highest-id** active segment *first*, then the old segments are deleted.
-    /// A crash between the two leaves the old segments plus the new one; the new
-    /// (highest-id) wins by id-order on recovery — its compacted records are a
-    /// superset of the live set — and the stale old segments are reclaimed by
-    /// the next maintenance pass. So the compacted data is never the only copy
-    /// under a name that recovery would discard. The `new_active` handle follows
-    /// the rename (Rust opens with `FILE_SHARE_DELETE`).
-    pub fn adopt_compacted(&mut self, new_active: LogFile, scratch: &Path) -> Result<()> {
+    /// highest-id** active segment *first*, and the old segments are deleted
+    /// later. A crash between the two leaves the old segments plus the new one;
+    /// every record in the new one carries the identity of its old copy, so a
+    /// recovery that walks both applies each value once, and the stale old
+    /// segments are reclaimed by the next maintenance pass. So the compacted
+    /// data is never the only copy under a name that recovery would discard.
+    /// The `new_active` handle follows the rename (Rust opens with
+    /// `FILE_SHARE_DELETE`).
+    ///
+    /// The previous active becomes readable through a [`SealedReader`] once the
+    /// new one is published: everything in it was committed before the rewrite
+    /// read it, and nothing is ever written to it again.
+    pub fn adopt_compacted(
+        &mut self,
+        new_active: LogFile,
+        scratch: &Path,
+    ) -> Result<HashSet<SegmentId>> {
         if self.read_only {
             return Err(PersistenceError::ReadOnly);
         }
@@ -828,40 +847,49 @@ impl SegmentedLog {
         let new_id = self.active_id.next();
 
         // Swap in the compacted active + close old handles so the old files are
-        // deletable (Windows).
+        // deletable (Windows) once their time comes.
         let old_active = std::mem::replace(&mut self.active, new_active);
         drop(old_active);
         self.pool.open.clear();
 
-        // 1. Rename the scratch into place as the fresh active FIRST — now the
-        //    compacted data is a real, highest-id segment. A crash here leaves
-        //    old + new; recovery keeps new, maintenance reclaims old.
+        // Rename the scratch into place as the fresh active FIRST — now the
+        // compacted data is a real, highest-id segment.
         let keep = segment_name(new_id);
         fs::rename(scratch, self.dir.join(&keep))?;
+        let mut replaced: HashSet<SegmentId> = self.sealed.iter().copied().collect();
+        replaced.insert(self.active_id);
         self.active_id = new_id;
+        self.sealed.clear();
+        self.active_published.publish(new_id);
+        Ok(replaced)
+    }
 
-        // 2. Delete every OTHER segment file (the old ones). The just-renamed new
-        //    active is skipped.
+    /// Delete the segment files a compaction replaced
+    /// ([`Self::adopt_compacted`]), and any legacy single-file active beside
+    /// them. Called once the substrate names none of them. A file that will not
+    /// go now is left for the next maintenance pass, which reclaims stale
+    /// segments.
+    pub fn unlink_replaced(&mut self, replaced: &HashSet<SegmentId>) -> Result<()> {
+        if self.read_only {
+            return Err(PersistenceError::ReadOnly);
+        }
+        let keep = segment_name(self.active_id);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            if name_str != keep
-                && (parse_segment(name_str).is_some() || parse_legacy_active(name_str).is_some())
-            {
+            if name_str == keep {
+                continue;
+            }
+            let ours = parse_segment(name_str).is_some_and(|id| replaced.contains(&id))
+                || parse_legacy_active(name_str).is_some();
+            if ours {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        self.sealed.clear();
-        // Published last, after the old segments are gone. The previous active is
-        // one of them, and it was never sealed — so it must not become readable
-        // through a `SealedReader` in the window between the rename and the
-        // delete. Published here, a reader holding a stale location into any of
-        // them finds the file missing and re-reads a location that already
-        // points into the new active.
-        self.active_published.publish(new_id);
+        self.pool.open.clear();
         Ok(())
     }
 

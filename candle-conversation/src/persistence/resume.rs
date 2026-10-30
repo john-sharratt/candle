@@ -1305,16 +1305,13 @@ mod tests {
             // A section registered under this stream must be found before
             // repair …
             let section_id = SectionId::new(1);
-            substrate
-                .set_section_full(
-                    section_id,
-                    stream_id,
-                    34,
-                    std::sync::Arc::new(Vec::new()),
-                    |_| Ok(Vec::new()),
-                    std::sync::Arc::new(vec![1, 2, 3]),
-                )
-                .unwrap();
+            substrate.set_section_full(
+                section_id,
+                stream_id,
+                34,
+                Vec::new(),
+                std::sync::Arc::new(vec![1, 2, 3]),
+            );
             assert!(substrate.section_exists(section_id));
             assert!(!substrate.is_section_tombstoned(stream_id));
 

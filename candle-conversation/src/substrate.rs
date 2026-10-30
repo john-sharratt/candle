@@ -40,16 +40,18 @@
 //! return a plain `f32`). Scores default to zero until the reprojection's belief
 //! scan populates them.
 
+mod compacted;
 mod deleted_set;
 mod dominance;
 mod ended_sections;
 mod label_records;
 mod lock;
-mod mutation_queue;
 #[cfg(test)]
 mod order_independence_tests;
+pub mod pcoll;
 mod pending;
 mod replicated_state;
+pub mod residence;
 mod stamps;
 mod stream_index;
 mod supersession;
@@ -57,13 +59,11 @@ mod tag_index;
 mod tombstones;
 mod turn_placement;
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use ahash::{AHashMap, AHashSet};
-use candle_nn::kv_cache::{
-    rewrite_sealed, try_hold_chunk_locations, FormatCensus, QuantFormat, SealedSequence, Sweep,
-};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList};
+use candle_nn::kv_cache::{rewrite_sealed, FormatCensus, QuantFormat, SealedSequence, Sweep};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -106,8 +106,11 @@ use crate::ConversationError;
 use deleted_set::DeletedSet;
 use ended_sections::EndedSections;
 use label_records::label_records;
-pub use lock::{SubstrateLock, SubstrateReadGuard, SubstrateWriteGuard};
+pub use lock::{SubstrateLock, SubstrateReadGuard};
+use pcoll::{arc_mut, ord_arc_mut, PMap, POrdMap, POrdSet, PSet, PVec};
 use pending::{PendingChild, PendingChildren};
+pub use residence::{HotKv, Residence, ResidenceSlab};
+use residence::{COLD_PENDING, EVICT_WHEN_COLD, NO_COLD_PERSIST, PENDING_QUANTIZE, SPLICE_SOURCE};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
 use stream_index::{Declared, StreamIndex};
@@ -123,12 +126,10 @@ pub use turn_placement::RestoredTurn;
 /// and deduped, and per section collection the section its latest projection
 /// that chose one in that collection selected.
 #[derive(Debug, Default)]
-struct EventsDigest {
+pub struct EventsDigest {
     seams: Arc<Vec<usize>>,
     selected: HashMap<String, String>,
 }
-
-type EventsCache = HashMap<StreamId, Arc<EventsDigest>>;
 
 /// The digest of a turn's projection events, in their recorded order.
 fn digest_events(events: &[ProjectionEvent]) -> EventsDigest {
@@ -160,36 +161,33 @@ fn digest_events(events: &[ProjectionEvent]) -> EventsDigest {
 ///
 /// The substrate is the workspace-shared directory of *what* turns exist —
 /// timelines, indices, role/text/tokens/sigs — plus the per-turn
-/// [`SequenceResidence`] that records *where* each turn's KV bytes live
-/// right now. Sections are pinned (no LRU) and held in their own table.
+/// [`Residence`] that records *where* each turn's KV bytes live right now.
+/// Sections are held in their own table.
 ///
-/// # Residence layout
+/// # Versions and residences
 ///
-/// [`Self::residence`] is a `Vec<SequenceResidence>` slab. Each
-/// [`TurnEntryData`] and [`SectionEntryData`] carries a
-/// [`ResidenceIndex`] into that slab — there is exactly one slot per
-/// turn / per section, allocated at append time and never moved.
+/// A `Substrate` value is one **version**: every field but the residence slab
+/// is a persistent collection, so cloning one is O(1) and an edit copies only
+/// what it changes. [`SubstrateLock`] publishes versions — a reader holds one
+/// for as long as it reads, a writer edits a clone of the latest and swaps it
+/// in (`docs/substrate_lock_free.md` §3).
 ///
-/// LRU is tracked by two [`std::collections::LinkedList`] of
-/// [`ResidenceIndex`] values — [`Self::hot_lru`] and
-/// [`Self::warm_lru`]. MRU is at the front; eviction pops the back.
-/// A residence appears on the hot list iff `hot.is_some()`, ditto
-/// warm. Position in the list **is** the recency information — no
-/// timestamps, no clock.
-#[derive(Debug, Default)]
+/// The residences are not versioned. [`ResidenceSlab`] is shared by every
+/// version; each [`TurnEntryData`] and [`SectionEntryData`] carries the
+/// [`ResidenceIndex`] its KV lives at, allocated before the commit that names
+/// it and never moved, and every tier transition is an atomic step on that
+/// residence alone (§5).
+#[derive(Debug, Default, Clone)]
 pub struct Substrate {
-    /// Per-turn KV residence slab. Indexed by [`ResidenceIndex`];
-    /// [`TurnEntryData::residence`] and [`SectionEntryData::residence`]
-    /// hold the index for their owning entity. Slots are never moved
-    /// or removed from the middle so indices stay stable for the
-    /// lifetime of the substrate (between [`Self::reset`] calls).
-    residence: Vec<SequenceResidence>,
+    /// Every residence's KV across hot, warm and cold — shared by every
+    /// version of the substrate.
+    residences: Arc<ResidenceSlab>,
 
     /// Per-timeline directory — projection target, sidebar label,
     /// conv_id, and per-turn metadata (token counts, sig entries,
     /// role, text, token ids). Does **not** hold KV bytes; those live
-    /// in [`Self::residence`] addressed by [`TurnEntryData::residence`].
-    timelines: HashMap<TimelineId, TimelineEntry>,
+    /// in [`Self::residences`] addressed by [`TurnEntryData::residence`].
+    timelines: PMap<TimelineId, Arc<TimelineEntry>>,
     /// The creation rank given to a conversation named by a record that
     /// carries no identity — one written before identities existed — counted
     /// in the order the walk meets them, which for such a log is the order they
@@ -206,24 +204,24 @@ pub struct Substrate {
 
     /// Inverse index: every timeline registered against a given group.
     /// Maintained in lockstep with [`Self::timelines`].
-    timelines_by_group: HashMap<GroupId, Vec<TimelineId>>,
+    timelines_by_group: PMap<GroupId, PVec<TimelineId>>,
 
     /// Per-timeline KV-compression override (set from the conversation's
     /// `SequenceConfig` at creation). Copied onto each turn residence at
     /// alloc time so the persistence thread can quantize different
     /// conversations at different levels. Absent ⇒ engine-wide turn policy.
-    timeline_compression: HashMap<TimelineId, ConvCompression>,
+    timeline_compression: PMap<TimelineId, ConvCompression>,
 
     /// Pinned section entries (system prompts, tool catalogs). Sections
     /// do not pass through LRU eviction — once ingested they stay hot
     /// for the session.
-    sections: AHashMap<SectionId, SectionEntryData>,
+    sections: PMap<SectionId, SectionEntryData>,
 
     /// Running per-timeline sum of turn token counts — the O(1) corpus-size
     /// counter behind `total_token_count`. Maintained on turn append/extend
     /// (turns are append-only, so this only grows until `reset`), keeping the
     /// "materialized / N tokens" denominator off the O(corpus) hot path.
-    timeline_token_totals: HashMap<TimelineId, usize>,
+    timeline_token_totals: PMap<TimelineId, usize>,
     /// Running global sum of ingested section token counts (the shared
     /// workspace corpus). Maintained on section install (overwrite-aware).
     section_token_total: usize,
@@ -233,13 +231,13 @@ pub struct Substrate {
     /// (`docs/zend_working_set.md`). In-memory only: the locks are rebuilt
     /// from the marks on the dialogue's own turns and the momentum from the
     /// belief scan.
-    working_sets: HashMap<TimelineId, WorkingSet>,
+    working_sets: PMap<TimelineId, Arc<WorkingSet>>,
 
     /// Each calibrated conversation's calibrations, by the timeline each
     /// names under [`Self::CALIBRATES_KEY`] — kept as that metadata is applied,
     /// so a scan reads a unit's calibrations without walking every timeline.
     /// Tombstoned calibrations stay listed and are filtered at the read.
-    calibrations_of: HashMap<TimelineId, Vec<TimelineId>>,
+    calibrations_of: PMap<TimelineId, PVec<TimelineId>>,
 
     /// Groups whose conversations are offered to a projection only as its
     /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
@@ -247,69 +245,18 @@ pub struct Substrate {
     /// only right for a conversation whose own files hold the same, so such a
     /// group offers nothing a target was not given. In-memory only, marked
     /// once at engine setup.
-    scoped_groups: HashSet<GroupId>,
+    scoped_groups: PSet<GroupId>,
 
     /// Which share of a dialogue's working-set budget each working-set group's
     /// conversations draw on — the schema's `selection: { kind: working_set,
     /// share }`. A conversation in no such group is never a working-set
     /// member. In-memory only, set once at engine setup.
-    working_set_shares: HashMap<GroupId, WorkingSetShare>,
+    working_set_shares: PMap<GroupId, WorkingSetShare>,
 
     /// Per target, per scoped group, the conversations that group may offer
     /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
     /// the embedder sets it before each turn from the target's own files.
-    retrieval_scopes: HashMap<TimelineId, HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
-
-    /// Hot-tier LRU list, most-recently-used at the front.
-    /// `front()` = MRU, `back()` = next eviction victim. Membership
-    /// mirrors `residence[idx].hot.is_some()` for every index in the
-    /// list; the list and the `Option<Vec<…>>` flag are maintained
-    /// together on every tier transition.
-    hot_lru: LinkedList<ResidenceIndex>,
-
-    /// Warm-tier LRU list, most-recently-used at the front. Same
-    /// membership invariant as [`Self::hot_lru`] but tracking
-    /// `residence[idx].warm`.
-    warm_lru: LinkedList<ResidenceIndex>,
-
-    /// Residences the scheduler is **actively using in the current wave's
-    /// projection** — the union of every live slot's working set plus the
-    /// units of an in-flight elevate. Published by
-    /// [`Self::set_working_set_pins`] under the write lock at elevate time and
-    /// honoured by the `evict_when_cold` hot-drop paths
-    /// ([`Self::install_warm_and_evict_hot`], [`Self::install_cold`],
-    /// [`Self::mark_timeline_evict_when_cold`]): a pinned residence keeps its
-    /// hot copy even when flagged, so the persistence thread can't yank a turn
-    /// out from under a forward that is about to attend it. The drop is merely
-    /// deferred — the `evict_when_cold` flag stays set, so the residence still
-    /// sheds hot on a later pass (or via `demote_cold_ingest`, already
-    /// keep-set-aware) once it leaves the working set. Transient — never
-    /// written to the redo log, rebuilt each wave from live scheduler state.
-    ///
-    /// This closes the invariant the multi-timeline belief scan broke: pre-scan
-    /// a selected turn was always the (hot) target timeline; now selection
-    /// reaches completed-file turns flagged `evict_when_cold`, which the
-    /// persistence thread would otherwise evict mid-wave (free-under-read on the
-    /// shared stream). See `active_timelines_for_group` in `score_belief_groups`.
-    working_set_pins: HashSet<ResidenceIndex>,
-
-    /// Monotonic wave counter behind the idle demote's last-touch stamp
-    /// (`docs/vram_governor_design.md` §8.1), bumped by
-    /// [`Self::set_working_set_pins`].
-    ///
-    /// **Per-substrate, deliberately not a global.** A process-wide counter
-    /// couples independent substrates: one engine's waves age out another's
-    /// residences, so what the demote does to a conversation depends on
-    /// unrelated activity elsewhere in the process. Benign with a single engine
-    /// and wrong in principle — and it showed up immediately as two tier tests
-    /// that passed alone and failed in parallel. Keeping the clock beside the
-    /// residences it stamps also removes the static, the atomic, and the epoch
-    /// argument every caller would otherwise have to thread through.
-    ///
-    /// Starts at `Default`'s zero, which is safe because `alloc_residence`
-    /// stamps every residence as born-now: no residence is ever stale from
-    /// birth, so the counter's origin carries no meaning of its own.
-    wave_epoch: u64,
+    retrieval_scopes: PMap<TimelineId, PMap<GroupId, Arc<HashSet<TimelineId>>>>,
 
     /// Per-stream in-RAM index of where each chunk / tokens record /
     /// committed-through watermark sits on disk, kept per writer and read
@@ -347,18 +294,11 @@ pub struct Substrate {
     /// (`docs/gallery_residency.md` §3); see [`Self::tombstone_epoch`].
     tombstone_epoch: u64,
 
-    /// Interior-mutable per-stream memo of what the belief scans read from a
-    /// turn's projection-events blob — its seams and its selections — decoded
-    /// from the JSON once per session instead of on every scan and every
-    /// gallery assembly. Invalidated per-stream on an events-blob write. See
-    /// [`Self::decoded_seams`] and [`Self::last_selected_in`].
-    events_cache: Mutex<EventsCache>,
-
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
     /// Provides O(1) lookup for the test-harness `find_or_create`
     /// pattern (§10.4 of `docs/archived/infinite_conversations.md`).
-    timeline_by_debug_id: HashMap<String, TimelineId>,
+    timeline_by_debug_id: PMap<String, TimelineId>,
 
     /// Records about a timeline that is not registered yet — its label, state,
     /// summary nodes, debug id and couplings — held with their identities until
@@ -373,11 +313,11 @@ pub struct Substrate {
     reload_due: bool,
     /// The record behind each snapshot stream's tail, retracted or not — a
     /// retraction is a record and outranks the snapshot it withdraws.
-    snapshot_ids: HashMap<StreamId, RecordIdentity>,
+    snapshot_ids: PMap<StreamId, RecordIdentity>,
     /// The record behind each prompt branch's checkpoint.
-    branch_checkpoint_ids: HashMap<StreamId, RecordIdentity>,
+    branch_checkpoint_ids: PMap<StreamId, RecordIdentity>,
     /// The record behind each custom object, by its key's hash.
-    custom_object_ids: HashMap<u64, RecordIdentity>,
+    custom_object_ids: PMap<u64, RecordIdentity>,
 
     /// Timelines flagged by [`RecordType::Tombstone`] as logically
     /// deleted.  [`Self::active_timelines_for_group`] filters them
@@ -390,7 +330,7 @@ pub struct Substrate {
     ///
     /// A timeline whose tombstone expired stays here: its entry in
     /// [`Self::deleted`] dominates exactly as the tombstone did.
-    tombstoned_timelines: HashSet<TimelineId>,
+    tombstoned_timelines: PSet<TimelineId>,
     /// The deleted set: every timeline whose tombstone expired, and the
     /// tombstones a complete compaction has run past (§6.8). Rebuilt from the
     /// `Deleted` record each walk; like the tombstones it extends, never
@@ -401,13 +341,13 @@ pub struct Substrate {
     /// resume, never inverted from the id). Location only: the payload stays
     /// on disk until a resume materializes it, exactly like `Tokens`.
     /// Last-writer-wins by walk/append order — the single tail.
-    recurrent_snapshots: HashMap<StreamId, RecordLoc>,
+    recurrent_snapshots: PMap<StreamId, RecordLoc>,
     /// The snapshot streams of every timeline tombstoned or distilled: their
     /// tail is gone, and a snapshot for one that arrives later — replicated
     /// late, or met after the marker in a walk — is refused rather than
     /// installed again (§6.5). The tombstone and distill markers that fill it
     /// outlive every rewrite, so like them it is never cleared.
-    retired_snapshots: HashSet<StreamId>,
+    retired_snapshots: PSet<StreamId>,
     /// The live recurrent checkpoint per **prompt branch**
     /// (`branch_checkpoint_stream_id(content prefix)`). Same single-tail rule
     /// and same location-only storage as `recurrent_snapshots`, kept separate
@@ -421,31 +361,31 @@ pub struct Substrate {
     /// supersedes one when the prompt changes — the key is the old content —
     /// and no timeline tombstone names it, so without a bound they accumulate
     /// one orphan per prompt edit at ~63 MiB each.
-    branch_checkpoints: HashMap<StreamId, RecordLoc>,
+    branch_checkpoints: PMap<StreamId, RecordLoc>,
     /// Timelines whose KV **no reader will ever need from disk**, so the
     /// persistence thread never writes it to cold. Residences are flagged
-    /// [`SequenceResidence::no_cold_persist`]; see
+    /// [`residence::NO_COLD_PERSIST`]; see
     /// [`Self::mark_timeline_transient`] for the two users and why each
     /// qualifies. In-memory only — the flag is re-derived on load, never a
     /// redo-log marker.
-    transient_timelines: HashSet<TimelineId>,
+    transient_timelines: PSet<TimelineId>,
     /// Timelines that keep their KV but are **never resumed**, so they keep no
     /// recurrent snapshot — see [`Self::mark_timeline_unresumed`]. In-memory
     /// only: what made the mark durable is the empty snapshot written with it.
-    unresumed_timelines: HashSet<TimelineId>,
+    unresumed_timelines: PSet<TimelineId>,
     /// Timelines whose turns are **splice sources** — code_read scope forks,
     /// whose sealed turns `adopt_turn` re-records onto the file timeline by
-    /// reference. Residences are flagged [`SequenceResidence::splice_source`];
+    /// reference. Residences are flagged [`residence::SPLICE_SOURCE`];
     /// see [`Self::mark_timeline_splice_source`]. In-memory only: a fork is
     /// tombstoned at its splice and never reloaded.
-    splice_source_timelines: HashSet<TimelineId>,
+    splice_source_timelines: PSet<TimelineId>,
     /// Sections whose KV **no reader will ever need from disk** — the frame of
     /// a conversation opened for one job and thrown away. Their residences are
-    /// flagged [`SequenceResidence::no_cold_persist`] at install, the
+    /// flagged [`residence::NO_COLD_PERSIST`] at install, the
     /// scheduler's seal writes neither their stream declaration nor their
     /// tokens, and [`Self::retire_section`] removes them outright. See
     /// [`Self::mark_section_transient`]. In-memory only.
-    transient_sections: HashSet<SectionId>,
+    transient_sections: PSet<SectionId>,
     /// Sections each conversation added at runtime, and the id counter they
     /// draw from. A timeline tombstone releases what its timeline owns.
     /// The registry is in-memory only: the owner re-submits after a restart and
@@ -474,21 +414,21 @@ pub struct Substrate {
     /// the belief galleries and group-default tag resolution skip it, and
     /// compaction sheds its bulk records while keeping its `StreamDecl` +
     /// re-emitting the tombstone.
-    tombstoned_turns: HashSet<TurnMark>,
+    tombstoned_turns: PSet<TurnMark>,
     /// Per-layer policy for an unrecoverable turn on reload
     /// ([`CorruptTurnPolicy`]), resolved from the projection schema at engine
     /// setup. Absent → the default [`CorruptTurnPolicy::DropConversation`].
-    layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
+    layer_corrupt_turn: PMap<LayerId, CorruptTurnPolicy>,
     /// Timelines marked for distillation, each with the [`DistillMode`] degree
     /// its turns shed to at compaction. Same replay-order-independence as
     /// tombstones.
-    distilled_timelines: HashMap<TimelineId, DistillMode>,
+    distilled_timelines: PMap<TimelineId, DistillMode>,
 
     /// Generic keyed objects ([`RecordType::CustomObject`]), keyed by the stable
     /// hash of their string key so a re-write with the same key supersedes the
     /// old one (last-writer-wins). Held in RAM and re-emitted on compaction, the
     /// same survival the other resident metadata gets.
-    custom_objects: HashMap<u64, CustomObjectPayload>,
+    custom_objects: PMap<u64, Arc<CustomObjectPayload>>,
     /// Moves whenever a custom object is taken or dropped
     /// ([`Self::custom_objects_version`]).
     custom_objects_version: u64,
@@ -498,7 +438,7 @@ pub struct Substrate {
     /// [`crate::projection::layer_toggle`]). This substrate's own, so a toggle in
     /// one tenant never reaches another tenant's layer of the same name. Never
     /// persisted.
-    disabled_layers: HashSet<String>,
+    disabled_layers: PSet<String>,
 
     /// Layers whose conversations are **append-only ingest trunks** (code_reading,
     /// repo_map) rather than interactive dialogue. A projection whose *target* is
@@ -511,7 +451,7 @@ pub struct Substrate {
     /// Transient (rebuilt from the ingest setup each session), never redo-logged.
     /// Marked via [`Self::mark_layer_append_only`]; NOT keyed on `summarize`, which
     /// `--disable-summariser` also clears on dialogue.
-    append_only_layers: HashSet<LayerId>,
+    append_only_layers: PSet<LayerId>,
 
     /// Groups of LOWER layers an append-only layer's projections still score
     /// and select across conversations — the layers it compounds on. An ingest
@@ -520,14 +460,14 @@ pub struct Substrate {
     /// same layer is never retrieved into it. A layer absent here is wholly
     /// self-local, as every append-only layer was before. Transient, set from
     /// the ingest setup each session ([`Self::set_ingest_sees`]).
-    ingest_sees: HashMap<LayerId, HashSet<GroupId>>,
+    ingest_sees: PMap<LayerId, Arc<HashSet<GroupId>>>,
 
     /// Per belief group, the gallery chunks cut from its live scans — those
     /// that win votes on every file's questions
     /// (`crate::provenance::chunk_exclusion`). Transient: learned from the
     /// group's calibration questions once an ingest pass
     /// ([`Self::set_chunk_exclusion`]), never redo-logged.
-    chunk_exclusion: HashMap<GroupId, Arc<ChunkExclusion>>,
+    chunk_exclusion: PMap<GroupId, Arc<ChunkExclusion>>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -551,6 +491,9 @@ pub struct Substrate {
 /// reasoning about waves while the clock actually ran on publishes, which made
 /// the window unreachable and the demote silently inert.
 pub const IDLE_DEMOTE_GRACE_EPOCHS: u64 = 16;
+
+/// The scheduler's publisher id for [`ResidenceSlab::publish_pins`].
+const SCHEDULER_PINS: u64 = 0;
 
 /// Epochs elapsed since `last_used`, saturating.
 ///
@@ -579,33 +522,6 @@ pub fn file_store_key(timeline: TimelineId) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResidenceIndex(pub usize);
 
-/// A turn's KV residence across hot (VRAM), warm (RAM), and cold (disk).
-///
-/// A turn can live in **multiple tiers simultaneously** during promotion
-/// windows — e.g. a turn just promoted warm→hot retains its warm copy
-/// until pressure forces it out, so the next eviction is free (no copy).
-///
-/// [`Vec<SealedSequence>`] is the canonical KV shape for both hot and
-/// warm copies. The difference between them is purely the device backing
-/// of the chunks: `hot` chunks point into GPU arenas, `warm` chunks into
-/// host (CPU-resident) memory. The type is device-agnostic; callers
-/// maintain the invariant via the tier they place the bytes in.
-///
-/// [`Vec<StoredSequence>`] is the canonical cold (on-disk) shape — one
-/// `StoredSequence` per layer, mirroring the per-layer shape of `hot`
-/// and `warm`. Each chunk inside it is a reference into the redo log,
-/// not arena GIDs. `cold` is `Option<…>` because the redo-log write
-/// is **asynchronous**: a freshly-sealed turn is hot immediately but
-/// `cold = None` until the persistence callback confirms its chunks
-/// are durably appended and fills in the per-layer references.
-///
-/// # LRU membership
-///
-/// The hot/warm LRU position is **not** stored on the residence — it
-/// lives in [`Substrate::hot_lru`] / [`Substrate::warm_lru`]. A
-/// residence appears in the hot list iff `hot.is_some()`, and in the
-/// warm list iff `warm.is_some()`. Tier transition methods on
-/// `Substrate` enforce that invariant.
 /// Per-conversation KV-compression override, resolved from the owning
 /// timeline's [`SequenceConfig`] at residence-allocation time and read by
 /// the persistence thread's hot→warm quantize pass. `None` on a residence
@@ -632,97 +548,6 @@ pub struct ConvCompression {
     pub force_k: Option<QuantFormat>,
     /// V counterpart to [`Self::force_k`].
     pub force_v: Option<QuantFormat>,
-}
-
-#[derive(Debug)]
-pub struct SequenceResidence {
-    /// Persistence-layer stream identity for this residence. Set at
-    /// allocation time, immutable. Turns derive it from
-    /// `turn_stream_id(timeline, index)`; sections that don't persist
-    /// to disk use [`StreamId::default()`] (the reserved sentinel).
-    pub stream_id: StreamId,
-    /// Per-conversation compression override inherited from the owning
-    /// timeline at alloc time (turns only; sections are `None`). The
-    /// persistence thread groups residences by this when quantizing
-    /// hot→warm so different conversations can target different levels.
-    pub compression: Option<ConvCompression>,
-    /// VRAM-resident sealed chunks. `None` ⇒ not in VRAM.
-    pub hot: Option<Vec<SealedSequence>>,
-    /// `true` while the scheduler still owes this section a quantize
-    /// pass.  Sections are ingested with their native (prefill-output)
-    /// K/V installed in `hot`; the scheduler later replaces `hot` with
-    /// the quantized form at the next turn-seal boundary.  Until that
-    /// drain runs, `hot` is the *interim* native form — disk
-    /// persistence must skip the residence (a cold copy of native
-    /// would diverge from the final in-memory Q form after the drain,
-    /// and the daemon would resume in an inconsistent state on
-    /// restart).  Cleared by the same drain that does the swap.
-    pub pending_quantize: bool,
-    /// RAM-resident sealed chunks. `None` ⇒ not in RAM.
-    pub warm: Option<Vec<SealedSequence>>,
-    /// Cold-tier references — one [`StoredSequence`] per layer. `None`
-    /// until the async redo-log write for this turn lands.
-    pub cold: Option<Vec<StoredSequence>>,
-    /// Byte size of this sequence's sealed KV payload — the per-tier
-    /// memory cost of holding it hot or warm (a turn resident in both
-    /// pays the cost twice, once per tier). Set when the first bytes
-    /// arrive (`install_hot` / `install_section_hot`) and stays constant
-    /// across tier transitions since the payload itself doesn't change.
-    /// `0` for a freshly-allocated residence with no bytes anywhere.
-    pub byte_size: u64,
-    /// Wave epoch at which a forward last resolved this residence's hot KV —
-    /// the last-touch stamp the idle demote reads
-    /// (`docs/vram_governor_design.md` §8.1).
-    ///
-    /// Written by the consumer at the moment of use, which is what makes the
-    /// demote safe: anything the current forward touched carries the current
-    /// epoch and so cannot satisfy the staleness predicate. The active set is
-    /// excluded arithmetically rather than by a filter someone can forget, and
-    /// there is no window between deciding a residence is idle and acting on it
-    /// — the alternative, assembling a live set of active KV per scan, has both
-    /// problems and allocates on the hot path besides.
-    ///
-    /// Initialised to the epoch current at `alloc_residence` — a residence is
-    /// born "now", never at zero. It is installed *before* the wave that will
-    /// attend it publishes its pins, so a zero stamp would make it stale from
-    /// birth and let the demote take it before its first use.
-    pub last_used_epoch: u64,
-    /// When `true`, the persistence thread fully offloads this residence as its
-    /// KV becomes durable — freeing `hot` (VRAM) the moment a warm/cold copy
-    /// exists and `warm` (RAM) the moment the cold copy lands (`install_cold`),
-    /// leaving it cold-only on NVMe. `elevate_to_hot` pulls it back on demand.
-    /// Set for two offload-only cases:
-    ///   - **collection-member** sections (prefix-transparent: nothing attends
-    ///     back over them during the build; hot→cold, no warm), and
-    ///   - **completed-ingest** turns (e.g. a code_read file's turns, spliced
-    ///     and sealed, not attended again until retrieval; hot→warm→cold).
-    /// Live dialogue turns and boundary sections leave this `false` and stay
-    /// resident.
-    pub evict_when_cold: bool,
-    /// `true` while this residence's warm→cold redo-log write is in flight on the
-    /// off-thread [`crate::persistence::writer::SubstrateWriter`] (set at enqueue,
-    /// cleared by `install_cold`). [`Self::snapshot_pending_cold`] skips it so the
-    /// persistence thread doesn't re-gather + double-write the same turn while its
-    /// first write is still queued. Distinct from `cold.is_some()`, which only
-    /// becomes true once that write lands.
-    pub cold_pending: bool,
-    /// When `true`, the persistence thread NEVER writes this residence to cold
-    /// ([`Self::snapshot_pending_cold`] and [`Self::pending_cold_count`] skip it).
-    /// Set for residences on a transient (scratch-fork) timeline: their KV is
-    /// spliced by reference onto a durable file timeline, so a cold copy would only
-    /// strand an unreconstructable orphan (decl dropped at tombstone, chunks left
-    /// behind). Hot/warm are still allowed — `adopt_turn` needs the fork hot — and
-    /// the warm RAM is freed at `tombstone_timeline` since no cold copy will land.
-    pub no_cold_persist: bool,
-    /// `true` for a turn on a splice-source timeline (a code_read scope fork)
-    /// until the fork is tombstoned. `adopt_turn` splices from the HOT copy and
-    /// nothing else, so no automatic hot-drop may take it: not the migrate's
-    /// install, the cold-land offload, the idle demote, working-set turnover,
-    /// budget relief, or the ingest demotes. The fork's tombstone — which clears
-    /// this flag — is what frees it. Without the flag, a fork whose warm copy had
-    /// landed lost its hot copy to relief between its seal and its splice, and
-    /// the splice failed with "source K/V not hot".
-    pub splice_source: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -871,9 +696,8 @@ pub struct ColdRecall {
 /// The elevation orchestrator produces one of these per turn already
 /// resident in the warm tier: `migrate_sealed_to_gpu_batch_async`
 /// scatters the warm payload into fresh VRAM arena chunks. Only hot
-/// is installed — the warm copy stays in place under its existing
-/// `warm_lru` entry, so the residence stays dual-tier without any
-/// extra substrate writes.
+/// is installed — the warm copy stays in place, so the residence stays
+/// dual-tier.
 ///
 /// Conceptually a *lift*: a short PCIe hop from the RAM cache to
 /// VRAM, paying nothing on NVMe. Pairs with [`ColdRecall`].
@@ -1205,18 +1029,6 @@ impl TurnPartWrite {
     }
 }
 
-/// Total VRAM byte footprint of a sealed Arc — sums `byte_size`
-/// across every layer's chunks. `SealedChunk.byte_size` is cached at
-/// snapshot time (see `record_turn` in `candle-nn`), so this is pure
-/// iteration with no per-call computation.
-fn sealed_bytes(sealed: &[SealedSequence]) -> usize {
-    sealed
-        .iter()
-        .flat_map(|seq| seq.chunks.iter())
-        .map(|c| c.byte_size as usize)
-        .sum()
-}
-
 // ── ContentResolver trait ─────────────────────────────────────────────────────
 
 /// Supplies dynamic content metadata to the projection engine.
@@ -1522,7 +1334,7 @@ pub struct TimelineEntry {
     /// (last-write-wins per key) on update. Used as a content-addressed
     /// cache index by utility ingests; searchable via
     /// [`Substrate::timelines_with_metadata`].
-    pub custom: BTreeMap<String, String>,
+    pub custom: POrdMap<String, String>,
     /// Conversation lifecycle: `true` once the user has closed
     /// (archived) the conversation. The sidebar filters archived
     /// entries out by default; the "show archived" checkbox toggles
@@ -1532,7 +1344,7 @@ pub struct TimelineEntry {
     /// The branch this conversation works on in each repository, keyed by
     /// the repository's workspace name. Persisted with `archived` in the same
     /// `RecordType::ConvState` record — see [`ConvState`].
-    pub branches: BTreeMap<String, String>,
+    pub branches: POrdMap<String, String>,
     /// Last-use rank, stamped from [`Substrate::conv_active_counter`] each time
     /// the conversation is used; higher = used more recently, `0` = not used
     /// since the rank was kept. Persisted with `archived` in the `ConvState`
@@ -1541,12 +1353,12 @@ pub struct TimelineEntry {
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
-    pub turns: BTreeMap<TurnIndex, TurnEntryData>,
+    pub turns: POrdMap<TurnIndex, Arc<TurnEntryData>>,
     /// The indices of `turns` that hold an empty placeholder for a position no
     /// turn here fills yet — a declaration lost in a crash, or another
     /// member's turn still arriving (§6.5). A turn completed later takes its
     /// gap in place, so the turns above it never move.
-    pub gaps: BTreeSet<TurnIndex>,
+    pub gaps: POrdSet<TurnIndex>,
     /// Per-turn tree metadata for the immutable summary forest
     /// (`docs/archived/immutable_summary_forest.md`).  Parallel to `turns`: every
     /// recorded turn carries exactly one [`TreeNodeMeta`] entry (defaults to a
@@ -1554,7 +1366,7 @@ pub struct TimelineEntry {
     /// `SummaryOfTurns` / `SummaryOfSummaries` by the async summariser thread
     /// after the §6 probe runs.  The peak set (window entry points) is derived
     /// from this map — see [`Substrate::peaks_of`].
-    pub tree_meta: BTreeMap<TurnIndex, TreeNodeMeta>,
+    pub tree_meta: POrdMap<TurnIndex, TreeNodeMeta>,
     /// Turns coupled to the tool response that follows them — the two halves of
     /// one tool round-trip (`RecordType::TurnCoupling`). `from ∈ set` reads as
     /// "turn `from + 1` is the tool response to turn `from`". Replayed as a set
@@ -1572,7 +1384,7 @@ pub struct TimelineEntry {
     /// summariser thread has not yet produced or extended a
     /// `SummaryOfTurns` leaf covering them).  Drained in FIFO order by
     /// the summariser's `pop_pending_turn` API.
-    pub pending_summary_queue: std::collections::VecDeque<TurnIndex>,
+    pub pending_summary_queue: PVec<TurnIndex>,
     /// Whether this timeline's turns are fed to the summariser at all.
     ///
     /// **Currently `false` for every timeline — the AVL summariser is
@@ -1608,7 +1420,7 @@ pub struct TimelineEntry {
     /// returns, this holds the final selection that produced the
     /// model's response.  Test-harness diagnostic only; production
     /// daemons can ignore it.
-    pub last_selection: Option<SelectionDiagnostics>,
+    pub last_selection: Option<Arc<SelectionDiagnostics>>,
     /// The record behind each of this timeline's replicated values.
     pub ids: TimelineIds,
 }
@@ -1654,7 +1466,7 @@ impl TreeNodeMeta {
 /// Smallest Normal-turn index covered by `idx` within a timeline's `tree_meta`.
 /// Defines the chronological order of peaks (and of any subtree): a node sorts
 /// by the oldest content beneath it.
-fn leftmost_normal_in(tree_meta: &BTreeMap<TurnIndex, TreeNodeMeta>, idx: TurnIndex) -> u32 {
+fn leftmost_normal_in(tree_meta: &POrdMap<TurnIndex, TreeNodeMeta>, idx: TurnIndex) -> u32 {
     match tree_meta.get(&idx) {
         None => idx.0,
         Some(meta) => match meta.kind {
@@ -1687,7 +1499,7 @@ pub struct StreamRuntime {
     /// The decoded stream declaration (`StreamDecl` record).
     pub decl: Option<StreamDecl>,
     /// Live chunk locations by chunk index — last-writer-wins.
-    pub chunks: BTreeMap<u64, ChunkLoc>,
+    pub chunks: POrdMap<u64, ChunkLoc>,
     /// Latest `Tokens` record for the stream.
     pub tokens: Option<RecordLoc>,
     /// Latest `ProjectionEvents` record payload (opaque JSON bytes — the
@@ -1726,6 +1538,11 @@ pub struct StreamRuntime {
     pub committed_through: Option<u64>,
     /// The record behind each of the values above.
     pub ids: StreamIds,
+    /// What the belief scans read from `projection_events` — its seams and its
+    /// selections — decoded once from these bytes. Derived from this runtime's
+    /// own blob alone, so every version sharing the runtime shares a correct
+    /// digest; a write of the blob makes a new runtime with an empty one.
+    pub events_digest: OnceLock<Arc<EventsDigest>>,
 }
 
 /// Where a turn's or section's QSA index page is: its bytes, held, or the
@@ -1831,15 +1648,15 @@ impl TimelineEntry {
             label: None,
             conv_id: None,
             order: 0,
-            custom: BTreeMap::new(),
+            custom: POrdMap::new(),
             archived: false,
-            branches: BTreeMap::new(),
+            branches: POrdMap::new(),
             active: 0,
-            turns: BTreeMap::new(),
-            gaps: BTreeSet::new(),
-            tree_meta: BTreeMap::new(),
+            turns: POrdMap::new(),
+            gaps: POrdSet::new(),
+            tree_meta: POrdMap::new(),
             debug_id: None,
-            pending_summary_queue: std::collections::VecDeque::new(),
+            pending_summary_queue: PVec::new(),
             // The summariser is disconnected: no timeline enqueues.
             summarize: false,
             needs_reconcile: false,
@@ -1860,43 +1677,34 @@ impl Substrate {
         Self::default()
     }
 
-    /// Allocate a fresh slot in the residence slab. Used by every
-    /// turn/section insert path so each owning entry has a stable
-    /// [`ResidenceIndex`] to address its KV state.
+    /// The residence slab every version of this substrate shares.
+    pub fn residences(&self) -> &Arc<ResidenceSlab> {
+        &self.residences
+    }
+
+    /// The residence at `idx`.
+    pub fn residence(&self, idx: ResidenceIndex) -> &Residence {
+        self.residences.get(idx)
+    }
+
+    /// Allocate a fresh turn residence. Used by every turn insert path so each
+    /// owning entry has a stable [`ResidenceIndex`] to address its KV state.
     ///
-    /// The new slot starts with `hot = None`, `warm = None`, and
-    /// `cold = None`. The cold reference is filled in later by the
-    /// persistence callback once the turn's chunks are durably on
-    /// disk; until then any cold-load attempt errors out. The LRU
-    /// lists ignore the slot until the tier-transition methods put
-    /// bytes into hot or warm.
+    /// The slot starts empty in every tier. Allocation happens inside the
+    /// version edit that names the residence: an edit retried against a newer
+    /// version names a fresh one, and the lost attempt's is discarded
+    /// ([`residence::begin_attempt`]).
     fn alloc_residence(
-        &mut self,
+        &self,
         stream_id: StreamId,
         compression: Option<ConvCompression>,
     ) -> ResidenceIndex {
-        let idx = ResidenceIndex(self.residence.len());
-        self.residence.push(SequenceResidence {
-            stream_id,
-            compression,
-            hot: None,
-            pending_quantize: false,
-            warm: None,
-            cold: None,
-            byte_size: 0,
-            // **Born now, not at zero.** A residence is installed before the
-            // wave that will attend it publishes its pins, so a zero stamp would
-            // make it stale from birth and let the demote take it *before its
-            // first use* — the whole grace window exists to prevent exactly
-            // that. Stamping at creation gives every residence a full window to
-            // be attended in.
-            last_used_epoch: self.wave_epoch,
-            evict_when_cold: false,
-            cold_pending: false,
-            no_cold_persist: false,
-            splice_source: false,
-        });
-        idx
+        self.residences.alloc(stream_id, compression, 0)
+    }
+
+    /// [`Self::alloc_residence`] for a prompt section.
+    fn alloc_section_residence(&self, stream_id: StreamId) -> ResidenceIndex {
+        self.residences.alloc(stream_id, None, residence::SECTION)
     }
 
     /// Set (or clear) the per-conversation compression override for
@@ -1923,7 +1731,7 @@ impl Substrate {
     /// turns never enter the summariser's pending queue. Must run after the
     /// timeline is registered and before its first turn seals.
     pub fn set_timeline_summarize(&mut self, timeline: TimelineId, summarize: bool) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
             tl.summarize = summarize;
         }
     }
@@ -1964,7 +1772,7 @@ impl Substrate {
         if groups.is_empty() {
             self.ingest_sees.remove(&layer);
         } else {
-            self.ingest_sees.insert(layer, groups);
+            self.ingest_sees.insert(layer, Arc::new(groups));
         }
     }
 
@@ -1979,79 +1787,64 @@ impl Substrate {
                 .is_some_and(|groups| groups.contains(&group))
     }
 
-    /// Place `sealed` into the residence slot's hot tier and push the
-    /// slot onto the hot-LRU front (MRU). Used by every code path that
-    /// brings KV bytes into VRAM — fresh seal, cold→hot promotion,
-    /// post-cold-load materialisation.
+    /// Place `sealed` into the residence's hot tier, most recently used. Used
+    /// by every code path that brings KV bytes into VRAM — fresh seal, cold→hot
+    /// promotion, post-cold-load materialisation. A dead residence takes
+    /// nothing. Turns and sections alike: a section's [`residence::SECTION`]
+    /// flag is what keeps the recency-ordered evictions off it.
     ///
-    /// Caller invariant: `sealed` is non-empty. An empty `Vec` would
-    /// represent a "cold marker" — under the new design that's the
-    /// `hot = None` state, reached by [`Self::clear_hot`], not by
-    /// installing an empty Vec.
-    fn install_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
-        debug_assert!(!sealed.is_empty(), "install_hot called with empty Vec");
-        let bytes = sealed_bytes(&sealed) as u64;
-        let slot = &mut self.residence[residence.0];
-        slot.byte_size = bytes;
-        slot.hot = Some(sealed);
-        self.hot_lru.push_front(residence);
+    /// Caller invariant: `sealed` is non-empty.
+    fn install_hot(&self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) -> bool {
+        self.residences.install_hot(residence, sealed)
     }
 
-    /// Section variant of [`Self::install_hot`]. A section does **not** join
-    /// [`Self::hot_lru`], so the LRU eviction paths never reach it: a section is
-    /// shared prompt content that a projection re-reads constantly, and ranking
-    /// it against dialogue turns by recency would evict the catalog under load.
-    ///
-    /// It is not, however, permanently resident. [`Self::demote_idle_hot`]
-    /// scans sections explicitly — by age and working-set pin rather than by
-    /// LRU position — because `elevate_to_hot` lifts sections and had no
-    /// counterpart (`docs/vram_governor_design.md` §8.1). Absence from the list
-    /// is a statement about *which* policy may take it, not about whether any
-    /// policy may.
-    fn install_section_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
-        debug_assert!(
-            !sealed.is_empty(),
-            "install_section_hot called with empty Vec"
-        );
-        let bytes = sealed_bytes(&sealed) as u64;
-        let slot = &mut self.residence[residence.0];
-        slot.byte_size = bytes;
-        slot.hot = Some(sealed);
+    /// The hot residences of turns, oldest first — what the recency-ordered
+    /// evictions walk. Sections are not among them.
+    fn hot_turns_oldest_first(&self) -> Vec<ResidenceIndex> {
+        let mut hot: Vec<(u64, ResidenceIndex)> = self
+            .residences
+            .hot_members()
+            .into_iter()
+            .filter_map(|idx| {
+                let r = self.residences.try_get(idx)?;
+                (r.has_hot() && !r.has_flag(residence::SECTION)).then(|| (r.touched(), idx))
+            })
+            .collect();
+        hot.sort_unstable_by_key(|&(t, idx)| (t, idx.0));
+        hot.into_iter().map(|(_, idx)| idx).collect()
     }
 
-    /// Remove the first occurrence of `target` from `list`. O(n) find +
-    /// O(1) splice — no allocations, the existing list nodes are
-    /// re-linked around the removed one via [`LinkedList::split_off`] +
-    /// [`LinkedList::append`].
-    ///
-    /// Free function (rather than `&mut self`) so it can be reused
-    /// against either `hot_lru` or `warm_lru` without borrow-checker
-    /// gymnastics over two `&mut self.field`s on the same struct.
-    fn remove_from_lru(list: &mut LinkedList<ResidenceIndex>, target: ResidenceIndex) {
-        if let Some(pos) = list.iter().position(|&v| v == target) {
-            let mut tail = list.split_off(pos);
-            tail.pop_front();
-            list.append(&mut tail);
-        }
+    /// The residences holding a warm copy, oldest first.
+    fn warm_oldest_first(&self) -> Vec<ResidenceIndex> {
+        let mut warm: Vec<(u64, ResidenceIndex)> = self
+            .residences
+            .warm_members()
+            .into_iter()
+            .filter_map(|idx| {
+                let r = self.residences.try_get(idx)?;
+                r.has_warm().then(|| (r.touched(), idx))
+            })
+            .collect();
+        warm.sort_unstable_by_key(|&(t, idx)| (t, idx.0));
+        warm.into_iter().map(|(_, idx)| idx).collect()
     }
 
     // ── Tier transitions (persistence-thread API) ───────────────────────────
 
-    /// Install RAM-resident sealed chunks into a residence slot and
-    /// push the slot onto the warm-LRU front. Called by the persistence
-    /// thread after `migrate_sealed_to_cpu` produces a CPU copy.
+    /// Install RAM-resident sealed chunks as a residence's warm copy. Called
+    /// by the persistence thread after `migrate_sealed_to_cpu` produces a CPU
+    /// copy.
     ///
-    /// Caller invariant: `warm` is non-empty and the residence currently
-    /// has `warm = None`. Re-install on an already-warm slot is a bug
-    /// (would duplicate the entry in the warm LRU).
-    pub fn install_warm(&mut self, residence: ResidenceIndex, warm: Vec<SealedSequence>) {
-        debug_assert!(!warm.is_empty(), "install_warm called with empty Vec");
-        debug_assert!(
-            self.residence[residence.0].warm.is_none(),
-            "install_warm on already-warm residence"
-        );
-        self.residence[residence.0].warm = Some(warm);
-        self.warm_lru.push_front(residence);
+    /// Caller invariant: `warm` is non-empty.
+    pub fn install_warm(&self, residence: ResidenceIndex, warm: Vec<SealedSequence>) {
+        self.residences.install_warm(residence, warm);
+    }
+
+    /// Whether an automatic drop may take `residence`'s resident copies: no
+    /// working set holds it and it is not a splice source.
+    fn may_shed(&self, residence: ResidenceIndex) -> bool {
+        let r = self.residences.get(residence);
+        !r.is_pinned() && !r.has_flag(SPLICE_SOURCE)
     }
 
     /// Install warm AND atomically drop hot — the production
@@ -2068,26 +1861,17 @@ impl Substrate {
     ///
     /// Tests that need the "hot + warm coexist" intermediate state
     /// should call [`Self::install_warm`] directly.
-    pub fn install_warm_and_evict_hot(
-        &mut self,
-        residence: ResidenceIndex,
-        warm: Vec<SealedSequence>,
-    ) {
+    pub fn install_warm_and_evict_hot(&self, residence: ResidenceIndex, warm: Vec<SealedSequence>) {
         self.install_warm(residence, warm);
-        // Working-set pin DEFERS the hot-drop. The scheduler is attending this
+        // A working-set pin DEFERS the hot-drop. The scheduler is attending this
         // residence in the current wave (a cross-timeline belief pick that
-        // `elevate_projection_working_set` just lifted), so keep hot — the
-        // residence now holds hot+warm dual residency and sheds hot on a later
-        // pass, once it leaves the working set (the `evict_when_cold` flag stays
-        // set). Dropping it here is a free-under-read against the in-flight
-        // forward on the shared stream. See [`Self::working_set_pins`].
-        // A splice source keeps hot until its fork's tombstone — see
-        // [`SequenceResidence::splice_source`].
-        if self.working_set_pins.contains(&residence) || self.residence[residence.0].splice_source {
-            return;
-        }
-        if self.residence[residence.0].hot.take().is_some() {
-            Self::remove_from_lru(&mut self.hot_lru, residence);
+        // `elevate_projection_working_set` just lifted), so it keeps hot+warm
+        // and sheds hot on a later pass, once it leaves the working set (the
+        // `EVICT_WHEN_COLD` flag stays set). A splice source keeps hot until its
+        // fork's tombstone — see [`residence::SPLICE_SOURCE`]. The dropped copy
+        // is freed on the device's thread, after any forward still reading it.
+        if self.may_shed(residence) {
+            self.residences.take_hot(residence);
         }
     }
 
@@ -2107,19 +1891,30 @@ impl Substrate {
     /// native one held a pinned turn at three times its stored size. The flag
     /// stands, and [`Self::demote_idle_hot`] sheds the hot copy once the
     /// residence leaves the working set.
+    ///
+    /// **Only over the copy it was made from.** `migrated` is the hot copy the
+    /// migrate read; when the residence no longer holds it — killed, or taken
+    /// since — nothing is installed, and `false` says so: the copies were made
+    /// from state that has moved on.
     pub fn install_migrated(
-        &mut self,
+        &self,
         residence: ResidenceIndex,
+        migrated: &Arc<HotKv>,
         hot: Vec<SealedSequence>,
         warm: Vec<SealedSequence>,
-    ) {
-        if self.residence[residence.0].evict_when_cold
-            && !self.working_set_pins.contains(&residence)
-        {
-            self.install_warm_and_evict_hot(residence, warm);
-        } else {
-            self.install_warm_and_hot(residence, hot, warm);
+    ) -> bool {
+        let r = self.residences.get(residence);
+        if r.hot().is_none_or(|now| !Arc::ptr_eq(&now, migrated)) {
+            return false;
         }
+        if r.has_flag(EVICT_WHEN_COLD) && !r.is_pinned() {
+            self.install_warm_and_evict_hot(residence, warm);
+            return true;
+        }
+        if !self.residences.replace_hot(residence, migrated, hot) {
+            return false;
+        }
+        self.residences.install_warm(residence, warm)
     }
 
     /// Atomic dual install: replace the residence's hot AND install
@@ -2142,7 +1937,7 @@ impl Substrate {
     /// kernel wrote** with no intervening `kv_migrate` scatter — the
     /// same invariant the perf test relies on.
     pub fn install_warm_and_hot(
-        &mut self,
+        &self,
         residence: ResidenceIndex,
         hot: Vec<SealedSequence>,
         warm: Vec<SealedSequence>,
@@ -2151,123 +1946,89 @@ impl Substrate {
             !hot.is_empty(),
             "install_warm_and_hot called with empty hot"
         );
-        debug_assert!(
-            !warm.is_empty(),
-            "install_warm_and_hot called with empty warm"
-        );
-        // Replace hot. The LRU entry stays (residence is still hot).
-        self.residence[residence.0].hot = Some(hot);
-        if !self.hot_lru.contains(&residence) {
-            self.hot_lru.push_front(residence);
-        }
-        // Install warm. Mirror install_warm's invariant — caller is
-        // expected to call this when warm is currently None (first
-        // persist of this turn). A second persist pass on the same
-        // residence would be a redo-log duplication bug; we don't
-        // guard against it here.
-        debug_assert!(
-            self.residence[residence.0].warm.is_none(),
-            "install_warm_and_hot on already-warm residence"
-        );
-        self.residence[residence.0].warm = Some(warm);
-        self.warm_lru.push_front(residence);
+        // Hot first: a reader that finds warm and not hot would lift a copy the
+        // install is about to land.
+        self.residences.install_hot(residence, hot);
+        self.residences.install_warm(residence, warm);
     }
 
-    /// Install the cold-tier references for a residence slot — called
-    /// by the persistence thread after writing the turn's chunks to
-    /// the redo log. Cold has no LRU (it's already the cheapest tier).
-    pub fn install_cold(&mut self, residence: ResidenceIndex, cold: Vec<StoredSequence>) {
+    /// Install the cold-tier references for a residence — called by the
+    /// persistence thread after writing the turn's chunks to the redo log.
+    pub fn install_cold(&self, residence: ResidenceIndex, cold: Vec<StoredSequence>) {
         debug_assert!(!cold.is_empty(), "install_cold called with empty Vec");
-        // Working-set pin defers the resident-tier drop below (same reason as
-        // `install_warm_and_evict_hot`): a pinned residence keeps hot+warm even
-        // once cold lands. The `evict_when_cold` flag stays set, so a later
-        // `install_cold`/demote sheds it once it leaves the working set.
-        let pinned = self.working_set_pins.contains(&residence);
-        let slot = &mut self.residence[residence.0];
-        slot.cold = Some(cold);
-        // The async write landed — clear the in-flight flag so a re-gather is
-        // gated by `cold.is_some()` from here on.
-        slot.cold_pending = false;
+        self.residences.install_cold(residence, cold);
         // Offload-as-we-go: the (quantized) bytes are now durable on disk, so
         // free EVERY resident tier and let `elevate_to_hot` pull the residence
         // back from cold (NVMe) on demand if a later projection re-selects it.
-        //   - Sections are hot→cold (no warm): the `warm` drop is a no-op.
+        //   - Sections are hot→cold (no warm): the `warm` take finds nothing.
         //   - Completed-ingest turns are hot→warm→cold: `hot` was already freed
-        //     at warm-land (see the migrate install loop), and dropping `warm`
-        //     here reclaims the RAM copy too — leaving the turn cold-only, off
-        //     both the VRAM and RAM tiers.
-        // The drop returns arena chunks to the pool / frees the CPU copy. Runs
-        // under the persistence thread's substrate write lock (Phase 2.5), so
-        // the arena free is serialised with the scheduler's allocations.
-        if !slot.evict_when_cold || pinned || slot.splice_source {
+        //     at warm-land, and taking `warm` here reclaims the RAM copy too —
+        //     leaving the turn cold-only, off both the VRAM and RAM tiers.
+        // A pinned residence keeps both (same reason as
+        // `install_warm_and_evict_hot`); the flag stays set, so the idle demote
+        // sheds them once it leaves the working set. The hot copy is freed on
+        // the device's thread, never here, so a compaction relocating chunks is
+        // never raced.
+        if !self.residences.get(residence).has_flag(EVICT_WHEN_COLD) || !self.may_shed(residence) {
             return;
         }
-        // Freed on the writer thread, so only while no compaction is relocating —
-        // see `try_hold_chunk_locations`. Refused, both tiers stay and the flag
-        // stays set: `demote_idle_hot` sheds them on the persistence thread's next
-        // pass.
-        let Some(_hold) = try_hold_chunk_locations() else {
-            return;
-        };
-        let had_hot = slot.hot.take().is_some();
-        let had_warm = slot.warm.take().is_some();
-        if had_hot {
-            Self::remove_from_lru(&mut self.hot_lru, residence);
-        }
-        if had_warm {
-            Self::remove_from_lru(&mut self.warm_lru, residence);
-        }
+        self.residences.take_hot(residence);
+        self.residences.take_warm(residence);
     }
 
     /// Flag a section residence so the persistence thread frees its `hot` the
-    /// moment a cold copy lands — see [`SequenceResidence::evict_when_cold`].
-    /// Set by the scheduler's collection-member quantize drain.
-    pub fn mark_section_evict_when_cold(&mut self, residence: ResidenceIndex) {
-        self.residence[residence.0].evict_when_cold = true;
+    /// moment a cold copy lands — see [`residence::EVICT_WHEN_COLD`]. Set by
+    /// the scheduler's collection-member quantize drain.
+    pub fn mark_section_evict_when_cold(&self, residence: ResidenceIndex) {
+        self.residences.get(residence).set_flag(EVICT_WHEN_COLD);
     }
 
     /// Publish the scheduler's live working set as the eviction keep-set —
     /// resolving `keep_turns` / `keep_sections` (the union of every live slot's
     /// projection plus any in-flight elevate) to their residence indices and
-    /// replacing [`Self::working_set_pins`] wholesale. Called under the write
-    /// lock at elevate time, before any KV is attended, so the persistence
-    /// thread's `evict_when_cold` hot-drops honour it for the whole wave.
+    /// replacing the scheduler's previous publication wholesale. Called at
+    /// elevate time, before any KV is attended, so every automatic drop honours
+    /// it for the whole wave. Touches residences only: it commits no substrate
+    /// version and never waits.
     ///
     /// Wholesale replace (not merge) is correct: the union is recomputed from
     /// current scheduler state each call, so a residence that has left every
-    /// working set drops out of the pin set and becomes evictable again. Mirrors
-    /// the protected-set resolution in [`Self::demote_cold_ingest`].
+    /// working set loses its pin and becomes evictable again. Mirrors the
+    /// protected-set resolution in [`Self::demote_cold_ingest`].
+    ///
     /// **Also the last-touch stamp point** (`docs/vram_governor_design.md` §8.1).
-    /// The pin set *is* the active set, so `epoch` is written onto exactly the
-    /// residences this wave will attend, under the same write lock that
-    /// publishes the pins. Stamping here rather than at some later consumer is
-    /// what makes the idle demote safe by construction: a residence the current
-    /// wave touched carries the current epoch, so
-    /// [`Self::demote_idle_hot`] cannot select it — the active set is
-    /// excluded arithmetically, not by a filter that could drift out of sync
-    /// with this one.
-    pub fn set_working_set_pins(&mut self, keep_turns: &[TurnKey], keep_sections: &[SectionId]) {
-        // Stamps, never advances: the clock belongs to the persistence pass that
-        // reads it (see [`Self::demote_idle_hot`]). Publishes are far too
-        // coarse to be a clock — a whole session may do only a handful — so
-        // ticking here made the grace window unreachable and the demote inert.
-        let epoch = self.wave_epoch;
-        let mut pins: HashSet<ResidenceIndex> =
+    /// The pin set *is* the active set, so the current epoch is written onto
+    /// exactly the residences this wave will attend, in the same publication.
+    /// Stamping here rather than at some later consumer is what makes the idle
+    /// demote safe by construction: a residence the current wave touched carries
+    /// the current epoch, so [`Self::demote_idle_hot`] cannot select it — the
+    /// active set is excluded arithmetically, not by a filter that could drift
+    /// out of sync with this one. The stamp never advances the clock: that
+    /// belongs to the persistence pass that reads it.
+    pub fn set_working_set_pins(&self, keep_turns: &[TurnKey], keep_sections: &[SectionId]) {
+        let mut pins: HashSet<usize> =
             HashSet::with_capacity(keep_turns.len() + keep_sections.len());
         for &key in keep_turns {
             if let Some(e) = self.turn(key.timeline, key.index) {
-                pins.insert(e.content.residence);
+                pins.insert(e.content.residence.0);
             }
         }
         for &sid in keep_sections {
             if let Some(e) = self.sections.get(&sid) {
-                pins.insert(e.residence);
+                pins.insert(e.residence.0);
             }
         }
-        for &idx in &pins {
-            self.residence[idx.0].last_used_epoch = epoch;
-        }
-        self.working_set_pins = pins;
+        self.residences.publish_pins(SCHEDULER_PINS, pins);
+    }
+
+    /// Release every working set's pins — the shutdown drain's final pass.
+    pub fn release_working_set_pins(&self) {
+        self.residences.release_all_pins();
+    }
+
+    /// Whether a working set holds `residence`.
+    pub fn is_pinned(&self, residence: ResidenceIndex) -> bool {
+        self.residences.get(residence).is_pinned()
     }
 
     /// Drop the hot copy of residences that no wave has attended for `grace`
@@ -2291,80 +2052,59 @@ impl Substrate {
     /// one-way, because the give-back needs a floor move that is refused while
     /// any region above it is live.
     ///
-    /// **Why it cannot take live KV.** Three independent barriers, the first
-    /// structural: a residence the current wave attends was stamped `epoch` by
-    /// [`Self::set_working_set_pins`] and so fails the staleness test outright;
-    /// `working_set_pins` excludes it again; and the drop itself runs only on
-    /// the persistence thread's between-wave pass, past a device sync, with no
-    /// wave in flight — and only ever onto a residence whose warm copy already
-    /// holds the same bytes.
+    /// **Why it cannot take live KV.** Two independent barriers, the first
+    /// structural: a residence the current wave attends was stamped with the
+    /// current epoch by [`Self::set_working_set_pins`] and so fails the
+    /// staleness test outright, and its pin excludes it again. The drop itself
+    /// only takes the residence's reference — a forward still reading the copy
+    /// holds its own, and the chunks are freed on the device's thread once the
+    /// last reference is gone — and only ever from a residence whose warm copy
+    /// already holds the same bytes.
     ///
-    /// `pending_quantize` residences are skipped: their `hot` is the interim
+    /// `PENDING_QUANTIZE` residences are skipped: their `hot` is the interim
     /// native form the scheduler still owes a quantize, and persisting that
     /// would diverge from the final Q form.
     ///
-    /// **Also the retry for a deferred offload.** A residence flagged
-    /// `evict_when_cold` has its resident tiers dropped the moment a lower tier
-    /// lands — hot once warm holds it, warm too once cold does — but those drops
-    /// run off the compacting thread and so stand aside while a compaction holds
-    /// chunk locations ([`try_hold_chunk_locations`]). One that stood aside is
-    /// shed here, whatever its age: the flag already says it is not wanted resident.
-    /// This pass stands aside on the same terms.
-    pub fn demote_idle_hot(&mut self, grace: u64) -> usize {
+    /// **Also the sweep for an offload a pin deferred.** A residence flagged
+    /// `EVICT_WHEN_COLD` has its resident tiers dropped the moment a lower tier
+    /// lands — hot once warm holds it, warm too once cold does — unless a
+    /// working set holds it then. One that was held is shed here once it is
+    /// not, whatever its age: the flag already says it is not wanted resident.
+    pub fn demote_idle_hot(&self, grace: u64) -> usize {
         // **The pass is the clock.** One tick per call, from the persistence
         // thread's between-forward pass, which wakes on every seal/flush trigger
         // and otherwise on its own 5 s tick. That makes an epoch track real work
         // — pressure ages residences sooner, which is the direction we want —
         // while the idle floor still retires a dormant conversation that
         // generates no traffic at all.
-        self.wave_epoch = self.wave_epoch.wrapping_add(1);
-        let epoch = self.wave_epoch;
-        let Some(_hold) = try_hold_chunk_locations() else {
-            return 0;
-        };
-        // **Sections as well as turns, and sections are NOT on `hot_lru`.**
-        // `install_section_hot` sets `hot` without touching the list, so a scan
-        // over `hot_lru` alone reaches only turn residences — which would make
-        // this miss precisely the case it was built for: nothing demoted a
-        // section once `elevate_to_hot` lifted it, and `elevate_to_hot` takes
-        // both lists. Dropping a section from `hot_lru` afterwards is a harmless
-        // no-op for the same reason it is absent here.
-        let candidates: Vec<ResidenceIndex> = self
-            .hot_lru
-            .iter()
-            .copied()
-            .chain(self.sections.values().map(|e| e.residence))
-            .collect();
-        let stale: Vec<ResidenceIndex> = candidates
-            .into_iter()
-            .filter(|idx| !self.working_set_pins.contains(idx))
-            .filter(|idx| {
-                let slot = &self.residence[idx.0];
-                // `warm.is_some()` is the safety condition AND the whole
-                // mechanism: the copy the drop falls back on must already exist.
-                // A residence without one is simply left for a later pass, by
-                // which time the migrate will have made it.
-                let offload = slot.evict_when_cold && (slot.warm.is_some() || slot.cold.is_some());
-                slot.hot.is_some()
-                    && !slot.pending_quantize
-                    && !slot.splice_source
-                    && (offload
-                        || (slot.warm.is_some() && idle_for(slot.last_used_epoch, epoch) > grace))
-            })
-            .collect();
-        for idx in &stale {
-            let slot = &mut self.residence[idx.0];
-            slot.hot = None;
-            // A flagged residence whose cold copy has landed sheds warm as well —
-            // what `install_cold` would have done had it not stood aside.
-            let shed_warm =
-                slot.evict_when_cold && slot.cold.is_some() && slot.warm.take().is_some();
-            Self::remove_from_lru(&mut self.hot_lru, *idx);
-            if shed_warm {
-                Self::remove_from_lru(&mut self.warm_lru, *idx);
+        let epoch = self.residences.tick_epoch();
+        let mut shed = 0usize;
+        // Sections as well as turns: nothing else demotes a section once
+        // `elevate_to_hot` lifted it.
+        for idx in self.residences.hot_members() {
+            let Some(r) = self.residences.try_get(idx) else {
+                continue;
+            };
+            // `has_warm()` is the safety condition AND the whole mechanism: the
+            // copy the drop falls back on must already exist. A residence without
+            // one is simply left for a later pass, by which time the migrate will
+            // have made it.
+            let offload = r.has_flag(EVICT_WHEN_COLD) && (r.has_warm() || r.has_cold());
+            let take = r.has_hot()
+                && !r.is_pinned()
+                && !r.has_flag(PENDING_QUANTIZE | SPLICE_SOURCE)
+                && (offload || (r.has_warm() && idle_for(r.last_used_epoch(), epoch) > grace));
+            if !take || self.residences.take_hot(idx).is_none() {
+                continue;
             }
+            // A flagged residence whose cold copy has landed sheds warm as well —
+            // what `install_cold` would have done had a pin not deferred it.
+            if r.has_flag(EVICT_WHEN_COLD) && r.has_cold() {
+                self.residences.take_warm(idx);
+            }
+            shed += 1;
         }
-        stale.len()
+        shed
     }
 
     /// Rewrite every resident sequence's gids through a KV compaction's map.
@@ -2380,21 +2120,31 @@ impl Substrate {
     /// stale — and the map's own two-level lookup rejects anything from an untouched
     /// arena, so a host chunk simply misses.
     ///
-    /// Returns how many sequences were rewritten, for the pass's log line.
-    pub fn rewrite_for_compaction(&mut self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
+    /// Each copy is replaced against the one it was rewritten from, and
+    /// rewritten again from the newer one when an install landed in between, so
+    /// no copy installed during the sweep keeps a stale gid.
+    ///
+    /// Returns how many residences were rewritten, for the pass's log line.
+    pub fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
         let mut rewritten = 0usize;
-        for res in self.residence.iter_mut() {
+        for (idx, r) in self.residences.iter() {
             let mut any = false;
-            if let Some(hot) = res.hot.as_ref() {
-                if let Some(next) = rewrite_sealed(hot, sweep)? {
-                    res.hot = Some(next);
+            while let Some(hot) = r.hot() {
+                let Some(next) = rewrite_sealed(&hot, sweep)? else {
+                    break;
+                };
+                if self.residences.replace_hot(idx, &hot, next) || r.is_dead() {
                     any = true;
+                    break;
                 }
             }
-            if let Some(warm) = res.warm.as_ref() {
-                if let Some(next) = rewrite_sealed(warm, sweep)? {
-                    res.warm = Some(next);
+            while let Some(warm) = r.warm() {
+                let Some(next) = rewrite_sealed(&warm, sweep)? else {
+                    break;
+                };
+                if self.residences.replace_warm(idx, &warm, next) {
                     any = true;
+                    break;
                 }
             }
             if any {
@@ -2405,7 +2155,7 @@ impl Substrate {
     }
 
     /// Flag every turn residence of `timeline` for full eviction the moment its
-    /// KV is durable on disk (see [`SequenceResidence::evict_when_cold`]): the
+    /// KV is durable on disk (see [`residence::EVICT_WHEN_COLD`]): the
     /// hot→warm install frees VRAM as warm lands, then `install_cold` frees the
     /// warm RAM copy as cold lands, leaving each turn cold-only on NVMe.
     ///
@@ -2424,42 +2174,27 @@ impl Substrate {
     /// else drops their hot until the async, possibly-lagging cold write lands.
     /// Without this, completed files' hot KV piles up and fills the card mid-ingest.
     ///
-    /// Immediately unless a compaction holds chunk locations: the drop runs on the
-    /// caller's thread, and freeing a chunk under a pass wastes the pass. Then the
-    /// flag alone is set and [`Self::demote_idle_hot`] sheds the hot copy on the
-    /// persistence thread's next pass.
-    pub fn mark_timeline_evict_when_cold(&mut self, timeline: TimelineId) -> usize {
+    /// The dropped copy is freed on the device's thread once the last forward
+    /// reading it lets go, so the drop is safe from any thread.
+    pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
         let Some(entry) = self.timelines.get(&timeline) else {
             return 0;
         };
-        let residences: Vec<ResidenceIndex> =
-            entry.turns.values().map(|t| t.content.residence).collect();
-        // The immediate hot-drops below run on the caller's thread, so only while
-        // no compaction is relocating — see `try_hold_chunk_locations`. Refused,
-        // every residence is still flagged and `demote_idle_hot` sheds it next pass.
-        let hold = try_hold_chunk_locations();
-        for r in &residences {
-            self.residence[r.0].evict_when_cold = true;
+        let mut n = 0usize;
+        for t in entry.turns.values() {
+            let idx = t.content.residence;
+            let r = self.residences.get(idx);
+            r.set_flag(EVICT_WHEN_COLD);
             // Immediate hot-drop for already-warm turns (VRAM back now, warm kept)
-            // — UNLESS the residence is pinned into the current wave's working
-            // set (a concurrent slot selected this just-completed file), in which
-            // case defer: the flag stays set and a later pass sheds it once it
-            // leaves the working set. See [`Self::working_set_pins`].
-            let (has_hot, has_warm) = {
-                let slot = &self.residence[r.0];
-                (slot.hot.is_some(), slot.warm.is_some())
-            };
-            if hold.is_some()
-                && has_hot
-                && has_warm
-                && !self.working_set_pins.contains(r)
-                && !self.residence[r.0].splice_source
-            {
-                self.residence[r.0].hot = None;
-                Self::remove_from_lru(&mut self.hot_lru, *r);
+            // — UNLESS a working set holds the residence (a concurrent slot
+            // selected this just-completed file), in which case defer: the flag
+            // stays set and the idle demote sheds it once it leaves the set.
+            if r.has_hot() && r.has_warm() && self.may_shed(idx) {
+                self.residences.take_hot(idx);
             }
+            n += 1;
         }
-        residences.len()
+        n
     }
 
     /// How many of `timeline`'s turn residences still hold a device (hot) copy.
@@ -2473,7 +2208,7 @@ impl Substrate {
             entry
                 .turns
                 .values()
-                .filter(|t| self.residence[t.content.residence.0].hot.is_some())
+                .filter(|t| self.residences.get(t.content.residence).has_hot())
                 .count()
         })
     }
@@ -2487,9 +2222,9 @@ impl Substrate {
     /// time, and the file timeline is NOT in the scheduler's `ingest_timelines`,
     /// so the gentle demote never covers it — without this its migrated Q hot
     /// copy accumulates and climbs the card (`quant_live` leak).
-    pub fn mark_turn_evict_when_cold(&mut self, timeline: TimelineId, idx: TurnIndex) {
+    pub fn mark_turn_evict_when_cold(&self, timeline: TimelineId, idx: TurnIndex) {
         if let Some(r) = self.turn(timeline, idx).map(|t| t.content.residence) {
-            self.residence[r.0].evict_when_cold = true;
+            self.residences.get(r).set_flag(EVICT_WHEN_COLD);
         }
     }
 
@@ -2506,7 +2241,7 @@ impl Substrate {
         &self,
     ) -> Vec<(ResidenceIndex, Vec<SealedSequence>, Option<ConvCompression>)> {
         self.pending_warm()
-            .map(|(idx, hot, cc)| (idx, hot.clone(), cc))
+            .map(|(idx, hot, cc)| (idx, hot.to_vec(), cc))
             .collect()
     }
 
@@ -2529,30 +2264,25 @@ impl Substrate {
     pub fn snapshot_pending_warm_for(
         &self,
         policy: Option<ConvCompression>,
-    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+    ) -> Vec<(ResidenceIndex, Arc<HotKv>)> {
         self.pending_warm()
             .filter(|(_, _, cc)| *cc == policy)
-            .map(|(idx, hot, _)| (idx, hot.clone()))
+            .map(|(idx, hot, _)| (idx, hot))
             .collect()
     }
 
-    /// Every hot residence awaiting a warm copy, with its hot bytes and its
-    /// compression override — what the hot→warm phase works through.
+    /// Every turn's hot residence awaiting a warm copy, with its hot bytes and
+    /// its compression override — what the hot→warm phase works through.
+    /// Sections go hot→cold and never take a warm copy.
     fn pending_warm(
         &self,
-    ) -> impl Iterator<
-        Item = (
-            ResidenceIndex,
-            &Vec<SealedSequence>,
-            Option<ConvCompression>,
-        ),
-    > + '_ {
-        self.hot_lru.iter().filter_map(|&idx| {
-            let slot = &self.residence[idx.0];
-            if slot.warm.is_some() || self.pin_defers_warm(idx) {
+    ) -> impl Iterator<Item = (ResidenceIndex, Arc<HotKv>, Option<ConvCompression>)> + '_ {
+        self.hot_turns_oldest_first().into_iter().filter_map(|idx| {
+            let r = self.residences.get(idx);
+            if r.has_warm() || self.pin_defers_warm(idx) {
                 return None;
             }
-            slot.hot.as_ref().map(|hot| (idx, hot, slot.compression))
+            r.hot().map(|hot| (idx, hot, r.compression))
         })
     }
 
@@ -2575,8 +2305,8 @@ impl Substrate {
     /// 8.1 KB/token. It is migrated once, as any seal is; it then has a warm
     /// copy, so it is never a candidate again.
     fn pin_defers_warm(&self, idx: ResidenceIndex) -> bool {
-        let slot = &self.residence[idx.0];
-        self.working_set_pins.contains(&idx) && (slot.cold.is_some() || slot.cold_pending)
+        let r = self.residences.get(idx);
+        r.is_pinned() && (r.has_cold() || r.has_flag(COLD_PENDING))
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -2587,19 +2317,12 @@ impl Substrate {
     /// backpressure off a *leading* signal (drain deficit) rather than the
     /// lagging VRAM-pressure trip.
     pub fn pending_warm_bytes(&self) -> u64 {
-        self.hot_lru
-            .iter()
-            .filter_map(|&idx| {
-                let slot = &self.residence[idx.0];
-                // Match `snapshot_pending_warm`'s pin skip: a deferred residence
-                // is NOT drainable this pass, so counting it would report a
-                // backlog the drain intentionally never clears — the admission
-                // backpressure would then throttle forever on a phantom deficit.
-                if self.pin_defers_warm(idx) {
-                    return None;
-                }
-                (slot.hot.is_some() && slot.warm.is_none()).then_some(slot.byte_size)
-            })
+        // Matches `snapshot_pending_warm`'s pin skip: a deferred residence is
+        // NOT drainable this pass, so counting it would report a backlog the
+        // drain intentionally never clears — the admission backpressure would
+        // then throttle forever on a phantom deficit.
+        self.pending_warm()
+            .map(|(idx, _, _)| self.residences.get(idx).byte_size())
             .sum()
     }
 
@@ -2608,7 +2331,11 @@ impl Substrate {
     /// on this being non-zero, so a workspace with nothing warm never pays the
     /// OS memory query.
     pub fn warm_resident_count(&self) -> usize {
-        self.warm_lru.len()
+        self.residences
+            .warm_members()
+            .into_iter()
+            .filter(|&idx| self.residences.get(idx).has_warm())
+            .count()
     }
 
     /// Total bytes held by warm (host RAM) copies — the byte size of the purge
@@ -2616,9 +2343,12 @@ impl Substrate {
     /// actually shrink, so the memory report needs it in bytes, not just as a
     /// residence count. O(warm residences), taken once per persistence pass.
     pub fn warm_resident_bytes(&self) -> u64 {
-        self.warm_lru
-            .iter()
-            .map(|idx| self.residence[idx.0].byte_size)
+        self.residences
+            .warm_members()
+            .into_iter()
+            .map(|idx| self.residences.get(idx))
+            .filter(|r| r.has_warm())
+            .map(|r| r.byte_size())
             .sum()
     }
 
@@ -2644,13 +2374,7 @@ impl Substrate {
     /// already-warm, skip the pinned working set), so the shutdown drain can poll
     /// convergence without allocating the whole work list each pass.
     pub fn pending_warm_count(&self) -> usize {
-        self.hot_lru
-            .iter()
-            .filter(|&&idx| {
-                let slot = &self.residence[idx.0];
-                slot.warm.is_none() && slot.hot.is_some() && !self.pin_defers_warm(idx)
-            })
-            .count()
+        self.pending_warm().count()
     }
 
     /// The VRAM-resident KV by storage format: every residence holding a hot
@@ -2658,8 +2382,10 @@ impl Substrate {
     /// ([`FormatCensus`]).
     pub fn hot_format_census(&self) -> FormatCensus {
         let mut census = FormatCensus::default();
-        for hot in self.residence.iter().filter_map(|r| r.hot.as_deref()) {
-            census.add_layers(hot);
+        for idx in self.residences.hot_members() {
+            if let Some(hot) = self.residences.get(idx).hot() {
+                census.add_layers(&hot);
+            }
         }
         census
     }
@@ -2672,17 +2398,17 @@ impl Substrate {
     /// falls is a genuine drain that the migrate can't keep up with.
     pub fn warm_backlog_split(&self) -> (usize, u64, usize, u64) {
         let (mut dc, mut db, mut pc, mut pb) = (0usize, 0u64, 0usize, 0u64);
-        for &idx in &self.hot_lru {
-            let slot = &self.residence[idx.0];
-            if slot.hot.is_none() || slot.warm.is_some() {
+        for idx in self.hot_turns_oldest_first() {
+            let r = self.residences.get(idx);
+            if !r.has_hot() || r.has_warm() {
                 continue;
             }
             if self.pin_defers_warm(idx) {
                 pc += 1;
-                pb += slot.byte_size;
+                pb += r.byte_size();
             } else {
                 dc += 1;
-                db += slot.byte_size;
+                db += r.byte_size();
             }
         }
         (dc, db, pc, pb)
@@ -2703,11 +2429,10 @@ impl Substrate {
         for (&timeline, entry) in &self.timelines {
             let (mut turns, mut bytes) = (0usize, 0u64);
             for t in entry.turns.values() {
-                let r = t.content.residence;
-                let slot = &self.residence[r.0];
-                if slot.hot.is_some() && self.working_set_pins.contains(&r) {
+                let r = self.residences.get(t.content.residence);
+                if r.has_hot() && r.is_pinned() {
                     turns += 1;
-                    bytes += slot.byte_size;
+                    bytes += r.byte_size();
                 }
             }
             if turns > 0 {
@@ -2717,15 +2442,15 @@ impl Substrate {
         }
         by_timeline.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.raw().cmp(&b.0.raw())));
         by_timeline.truncate(top);
-        let pinned_bytes: u64 = self
-            .working_set_pins
+        let pinned = self.residences.pinned();
+        let pinned_bytes: u64 = pinned
             .iter()
-            .map(|r| &self.residence[r.0])
-            .filter(|slot| slot.hot.is_some())
-            .map(|slot| slot.byte_size)
+            .map(|&idx| self.residences.get(idx))
+            .filter(|r| r.has_hot())
+            .map(|r| r.byte_size())
             .sum();
         PinnedHot {
-            pins: self.working_set_pins.len(),
+            pins: pinned.len(),
             pinned_bytes,
             turn_bytes,
             by_timeline,
@@ -2737,24 +2462,20 @@ impl Substrate {
     /// index with the slot's [`StreamId`] and a clone of its **warm** bytes (the
     /// authoritative stored form: in the quantize-on-evict path warm holds the
     /// compressed chunks while hot still holds the source floats, so the redo log
-    /// must capture warm — see the in-body note). Iterates `warm_lru`, so hot
+    /// must capture warm — see the in-body note). Walks the warm set, so hot
     /// residency is irrelevant here: a warm-only slot whose hot was evicted is
     /// STILL captured (this is why the shutdown drain reaches every warm turn).
     /// Skips slots pinned into the in-flight decode's working set and slots whose
-    /// cold copy already landed or is queued (`cold_pending`).
+    /// cold copy already landed or is queued (`COLD_PENDING`).
     pub fn snapshot_pending_cold(&self) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
-        // We persist the **warm** tier, not hot. In the legacy
-        // format-preserving migration path warm and hot carry the
-        // same bytes, so this doesn't change behavior. In the
-        // quantize-on-evict path warm holds the compressed chunks
-        // and hot still holds the source floats; reading warm is
-        // the only way the redo log captures the actual stored
-        // form. `warm_lru` only contains residences with warm
-        // installed, so unwrapping `slot.warm` is sound here.
-        self.warm_lru
-            .iter()
-            .filter_map(|&idx| {
-                let slot = &self.residence[idx.0];
+        // We persist the **warm** tier, not hot. In the quantize-on-evict path
+        // warm holds the compressed chunks and hot still holds the source
+        // floats; reading warm is the only way the redo log captures the actual
+        // stored form.
+        self.warm_oldest_first()
+            .into_iter()
+            .filter_map(|idx| {
+                let slot = self.residences.get(idx);
                 // Skip the in-flight decode's pinned working set — the warm→cold
                 // analogue of the hot→warm skip in `snapshot_pending_warm` (the fix
                 // 47a9c5ba applied only to the hot→warm leg). A just-cold-recalled
@@ -2767,26 +2488,28 @@ impl Substrate {
                 // "layer gap index diverged". Durability is only deferred: the hot +
                 // warm copies stay resident while pinned, and the next unpinned pass
                 // writes cold.
-                if self.working_set_pins.contains(&idx) {
+                if !self.cold_pending(idx) {
                     return None;
                 }
-                // Skip a turn whose cold copy already landed OR whose async cold
-                // write is still queued on the writer — re-selecting the latter
-                // would double-write the same KV.
-                if slot.cold.is_some() || slot.cold_pending {
-                    return None;
-                }
-                // Transient (scratch-fork) residence: never cold-persist. Its KV is
-                // spliced by reference onto a durable file timeline, so a cold copy
-                // would only strand an orphan when the fork's decl drops at tombstone.
-                if slot.no_cold_persist {
-                    return None;
-                }
-                slot.warm
-                    .as_ref()
-                    .map(|warm| (idx, slot.stream_id, warm.clone()))
+                slot.warm()
+                    .map(|warm| (idx, slot.stream_id, (*warm).clone()))
             })
             .collect()
+    }
+
+    /// Whether `idx` is a warm residence the warm→cold phase may write now.
+    fn cold_pending(&self, idx: ResidenceIndex) -> bool {
+        let r = self.residences.get(idx);
+        // Skip a turn whose cold copy already landed OR whose async cold write
+        // is still queued on the writer — re-selecting the latter would
+        // double-write the same KV. A transient (scratch-fork) residence never
+        // cold-persists: its KV is spliced by reference onto a durable file
+        // timeline, so a cold copy would only strand an orphan when the fork's
+        // decl drops at tombstone.
+        r.has_warm()
+            && !r.is_pinned()
+            && !r.has_cold()
+            && !r.has_flag(COLD_PENDING | NO_COLD_PERSIST)
     }
 
     /// Count of warm residences awaiting a cold write — the cheap COUNT companion
@@ -2795,24 +2518,18 @@ impl Substrate {
     /// working set, skip slots already cold or with a queued cold write), so the
     /// shutdown drain can poll convergence without cloning the work list.
     pub fn pending_cold_count(&self) -> usize {
-        self.warm_lru
-            .iter()
-            .filter(|&&idx| {
-                let slot = &self.residence[idx.0];
-                slot.warm.is_some()
-                    && slot.cold.is_none()
-                    && !slot.cold_pending
-                    && !slot.no_cold_persist
-                    && !self.working_set_pins.contains(&idx)
-            })
+        self.residences
+            .warm_members()
+            .into_iter()
+            .filter(|&idx| self.cold_pending(idx))
             .count()
     }
 
     /// Flag a residence's warm→cold write as in flight on the off-thread writer,
     /// so [`Self::snapshot_pending_cold`] won't re-gather it before the write lands
     /// (which clears the flag via `install_cold`). Set at enqueue.
-    pub fn mark_cold_pending(&mut self, residence: ResidenceIndex) {
-        self.residence[residence.0].cold_pending = true;
+    pub fn mark_cold_pending(&self, residence: ResidenceIndex) {
+        self.residences.get(residence).set_flag(COLD_PENDING);
     }
 
     /// Classify a batch of items (sections + turns) by what work
@@ -2862,24 +2579,24 @@ impl Substrate {
         residence: ResidenceIndex,
         plan: &mut PromotionPlan,
     ) {
-        let slot = &self.residence[residence.0];
-        if slot.hot.is_some() {
+        let slot = self.residences.get(residence);
+        if slot.has_hot() {
             plan.already_hot.push(kind);
             return;
         }
-        if let Some(warm) = &slot.warm {
+        if let Some(warm) = slot.warm() {
             plan.warm_to_hot.push(WarmToHotEntry {
                 kind,
                 residence,
-                warm: warm.clone(),
+                warm: (*warm).clone(),
             });
             return;
         }
-        if let Some(cold) = &slot.cold {
+        if let Some(cold) = slot.cold() {
             plan.cold_to_hot.push(ColdToHotEntry {
                 kind,
                 residence,
-                cold: cold.clone(),
+                cold: (*cold).clone(),
                 stream_id: slot.stream_id,
             });
             return;
@@ -2893,50 +2610,31 @@ impl Substrate {
         plan.tier_less.push(kind);
     }
 
-    /// Bulk install of freshly-promoted bytes — both elevation legs
-    /// together under a single write lock.
+    /// Bulk install of freshly-promoted bytes — both elevation legs.
     ///
-    /// `recalls` lands turns pulled out of cold storage (full
-    /// rehydration): warm goes in first, then hot. `lifts` lands
-    /// turns lifted from the warm cache: hot only, warm is already
-    /// in place. Section installs do **not** enter `hot_lru`
-    /// (pinned); turn installs push to the front (MRU).
+    /// `recalls` lands residences pulled out of cold storage: hot only, since
+    /// the cold record already makes them durable and the persistence thread
+    /// produces the warm copy off this path. `lifts` lands residences lifted
+    /// from the warm cache: hot only, warm is already in place.
     ///
-    /// One method call per batch keeps lock churn at the substrate
-    /// write-lock boundary down. Empty `hot` payloads are skipped
-    /// (defensive: a phase that produced nothing usable shouldn't
-    /// leave a half-populated residence).
-    pub fn install_promoted(&mut self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) {
-        for recall in recalls {
-            if recall.hot.is_empty() {
-                continue;
-            }
-            // Hot only: the cold record already makes it durable, and the
-            // persistence thread produces the warm copy off this path.
-            match recall.kind {
-                PromotionItemKind::Section(_) => {
-                    self.install_section_hot(recall.residence, recall.hot);
-                }
-                PromotionItemKind::Turn(_) => {
-                    self.install_hot(recall.residence, recall.hot);
-                }
+    /// **A promotion lands only on an empty, live cell.** Two elevations of one
+    /// residence built two copies; the second finds the first installed and
+    /// drops its own, so copies never stack. A residence whose owner was
+    /// tombstoned while its copy was being built takes nothing. Empty payloads
+    /// are skipped: a phase that produced nothing usable leaves the residence
+    /// as it was. Returns how many were installed.
+    pub fn install_promoted(&self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) -> usize {
+        let mut installed = 0usize;
+        let promoted = recalls
+            .into_iter()
+            .map(|r| (r.residence, r.hot))
+            .chain(lifts.into_iter().map(|l| (l.residence, l.hot)));
+        for (residence, hot) in promoted {
+            if !hot.is_empty() && self.residences.install_hot_if_absent(residence, hot) {
+                installed += 1;
             }
         }
-        for lift in lifts {
-            if lift.hot.is_empty() {
-                continue;
-            }
-            // Warm already exists on the residence (that's what made
-            // this a lift, not a recall) — just install hot.
-            match lift.kind {
-                PromotionItemKind::Section(_) => {
-                    self.install_section_hot(lift.residence, lift.hot);
-                }
-                PromotionItemKind::Turn(_) => {
-                    self.install_hot(lift.residence, lift.hot);
-                }
-            }
-        }
+        installed
     }
 
     /// Test/integration helper: the residence-slab index that a turn
@@ -2963,7 +2661,7 @@ impl Substrate {
     pub fn section_stream(&self, section: SectionId) -> Option<StreamId> {
         self.sections
             .get(&section)
-            .map(|e| self.residence[e.residence.0].stream_id)
+            .map(|e| self.residences.get(e.residence).stream_id)
     }
 
     /// Every section id currently registered in the substrate, in
@@ -2982,12 +2680,16 @@ impl Substrate {
     /// fired) still survive the filter and reach `elevate_to_hot`.
     pub fn turn_tier_state(&self, timeline: TimelineId, index: TurnIndex) -> Option<TierState> {
         let residence = self.turn(timeline, index).map(|e| e.content.residence)?;
-        let slot = &self.residence[residence.0];
-        Some(TierState {
-            hot: slot.hot.is_some(),
-            warm: slot.warm.is_some(),
-            cold: slot.cold.is_some(),
-        })
+        Some(self.tier_state(residence))
+    }
+
+    fn tier_state(&self, residence: ResidenceIndex) -> TierState {
+        let r = self.residences.get(residence);
+        TierState {
+            hot: r.has_hot(),
+            warm: r.has_warm(),
+            cold: r.has_cold(),
+        }
     }
 
     /// Section counterpart of [`Self::turn_tier_state`].  Sections
@@ -2998,12 +2700,7 @@ impl Substrate {
     /// `None` for unknown section ids.
     pub fn section_tier_state(&self, section: SectionId) -> Option<TierState> {
         let residence = self.sections.get(&section).map(|e| e.residence)?;
-        let slot = &self.residence[residence.0];
-        Some(TierState {
-            hot: slot.hot.is_some(),
-            warm: slot.warm.is_some(),
-            cold: slot.cold.is_some(),
-        })
+        Some(self.tier_state(residence))
     }
 
     /// Ceiling on warm bytes one [`Self::purge_warm_to_target`] call may free.
@@ -3035,11 +2732,10 @@ impl Substrate {
     /// unit-testable.
     ///
     /// **Invariants:**
-    /// - Only warm bytes are freed (`residence.warm = None`); hot and
-    ///   cold are untouched. A purged residence that's also hot stays
-    ///   in `hot_lru`; its next hot eviction will need a fresh
-    ///   hot→warm DMA.
-    /// - LRU-ordered: pops from the back of `warm_lru`.
+    /// - Only warm copies are taken; hot and cold are untouched. A purged
+    ///   residence that's also hot stays hot; its next hot eviction will need a
+    ///   fresh hot→warm DMA.
+    /// - Recency-ordered: the least recently touched warm copy goes first.
     /// - Single batch: no intermediate work between victims.
     /// - **Bounded**: at most [`WARM_PURGE_MAX_BYTES_PER_PASS`] per call.
     ///
@@ -3055,17 +2751,13 @@ impl Substrate {
     ///
     /// Returns a [`PurgeReport`] with `count` victims and `bytes`
     /// freed (sum of `residence.byte_size`).
-    pub fn purge_warm_to_budget(&mut self, warm_budget: u64, incoming_bytes: u64) -> PurgeReport {
+    pub fn purge_warm_to_budget(&self, warm_budget: u64, incoming_bytes: u64) -> PurgeReport {
         // Room the incoming install needs comes out of the same budget.
         let target: u64 = warm_budget.saturating_sub(incoming_bytes);
         let mut warm_now: u64 = self.warm_resident_bytes();
         let mut freed_bytes: u64 = 0;
         let mut count: usize = 0;
-        // Residences popped off the LRU tail that we must NOT drop (their warm
-        // copy is the turn's only surviving copy). Restored to the LRU after the
-        // loop so a later pass reclaims them once a lower tier lands.
-        let mut skipped: Vec<ResidenceIndex> = Vec::new();
-        loop {
+        for idx in self.warm_oldest_first() {
             if warm_now <= target {
                 break;
             }
@@ -3074,14 +2766,11 @@ impl Substrate {
             if freed_bytes >= Self::WARM_PURGE_MAX_BYTES_PER_PASS {
                 break;
             }
-            // Pop LRU off the back of the warm list.
-            let Some(idx) = self.warm_lru.pop_back() else {
-                break;
-            };
             // Only drop warm when the data survives elsewhere — hot in VRAM or
             // cold on disk. A warm-only residence (its cold write hasn't landed,
             // or failed) is its turn's ONLY copy; dropping it would lose the K/V.
-            // Set it aside (restored below) rather than free it.
+            // It is passed over, and a later pass reclaims it once a lower tier
+            // lands.
             //
             // **Except when its cold copy is never coming.** `no_cold_persist`
             // says this K/V is disposable and will not be written to disk — a
@@ -3094,36 +2783,29 @@ impl Substrate {
             //
             // The pin check replaces the safety the copy rule was providing.
             // Warm-only means the residence is not on the GPU and so is not
-            // being attended, but `elevate_to_hot` stamps pins under the write
-            // lock before it reads warm to build hot — and this purge is the one
-            // warm-dropping path that does not otherwise consult them.
-            let slot = &self.residence[idx.0];
-            if slot.warm.is_some() && slot.cold.is_none() && slot.hot.is_none() {
-                let disposable = slot.no_cold_persist && !self.working_set_pins.contains(&idx);
+            // being attended, but `elevate_to_hot` publishes pins before it
+            // reads warm to build hot — and this purge is the one warm-dropping
+            // path that does not otherwise consult them. A lift that read warm
+            // before the take holds its own reference to it.
+            let slot = self.residences.get(idx);
+            if slot.has_warm() && !slot.has_cold() && !slot.has_hot() {
+                let disposable = slot.has_flag(NO_COLD_PERSIST) && !slot.is_pinned();
                 if !disposable {
-                    skipped.push(idx);
                     continue;
                 }
             }
-            let slot = &mut self.residence[idx.0];
-            if slot.warm.take().is_some() {
-                freed_bytes = freed_bytes.saturating_add(slot.byte_size);
-                warm_now = warm_now.saturating_sub(slot.byte_size);
+            if self.residences.take_warm(idx).is_some() {
+                let bytes = slot.byte_size();
+                freed_bytes = freed_bytes.saturating_add(bytes);
+                warm_now = warm_now.saturating_sub(bytes);
                 count += 1;
                 tracing::trace!(
                     target: "candle_conversation::persistence::tier",
                     residence = idx.0,
-                    bytes = slot.byte_size,
+                    bytes,
                     "purged warm (RAM headroom)"
                 );
             }
-            // If warm was None, the slot was stale in the LRU; just
-            // discard the index and keep looking.
-        }
-        // Restore the residences we couldn't safely drop; they remain valid warm
-        // entries and rejoin the LRU tail in their original relative order.
-        for idx in skipped {
-            self.warm_lru.push_back(idx);
         }
         if count > 0 {
             tracing::trace!(
@@ -3155,60 +2837,36 @@ impl Substrate {
     /// real residence anyway).
     ///
     /// Invariants:
-    /// - Only `hot.is_some() && warm.is_some()` slots are eligible.
-    /// - Sections are pinned and never appear on `hot_lru`, so this
-    ///   only ever touches turn residences.
-    /// - Returned [`EvictionReport`] sums the dropped slots.
+    /// - Only residences holding both a hot and a warm copy are eligible.
+    /// - Sections are never taken: this only ever touches turn residences.
+    /// - Returned [`EvictionReport`] sums the dropped residences.
     ///
     /// Emits one `tracing::debug!` per evicted residence and an
     /// aggregate `tracing::info!` at the end, both on the
     /// `candle_conversation::persistence::tier` target.
     pub fn evict_hot_except(
-        &mut self,
+        &self,
         keep_sections: &[SectionId],
         keep_turns: &[TurnKey],
     ) -> EvictionReport {
-        // Resolve keep-items → ResidenceIndex set. Items the substrate
-        // doesn't know about are silently dropped — they can't match
-        // a live `hot_lru` entry anyway.
-        let mut keep: std::collections::HashSet<ResidenceIndex> =
-            std::collections::HashSet::with_capacity(keep_sections.len() + keep_turns.len());
-        for &sid in keep_sections {
-            if let Some(e) = self.sections.get(&sid) {
-                keep.insert(e.residence);
+        let keep = self.keep_residences(keep_sections, keep_turns);
+        let (mut count, mut bytes) = (0usize, 0u64);
+        for idx in self.hot_turns_oldest_first() {
+            if keep.contains(&idx) || !self.evictable_hot(idx) {
+                continue;
             }
-        }
-        for &key in keep_turns {
-            if let Some(e) = self.turn(key.timeline, key.index) {
-                keep.insert(e.content.residence);
+            if self.residences.take_hot(idx).is_none() {
+                continue;
             }
-        }
-
-        let victims: Vec<(ResidenceIndex, u64)> = self
-            .hot_lru
-            .iter()
-            .copied()
-            .filter_map(|idx| {
-                if keep.contains(&idx) {
-                    return None;
-                }
-                let slot = &self.residence[idx.0];
-                (slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source)
-                    .then_some((idx, slot.byte_size))
-            })
-            .collect();
-
-        let count = victims.len();
-        let bytes: u64 = victims.iter().map(|(_, b)| *b).sum();
-        for (idx, b) in &victims {
+            let b = self.residences.get(idx).byte_size();
             tracing::debug!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
-                bytes = *b,
+                bytes = b,
                 "evicted hot (working-set turnover)"
             );
-            self.residence[idx.0].hot = None;
-            Self::remove_from_lru(&mut self.hot_lru, *idx);
+            count += 1;
+            bytes += b;
         }
         if count > 0 {
             tracing::info!(
@@ -3223,23 +2881,23 @@ impl Substrate {
     }
 
     /// Budget-aware hot eviction: evict the **least-recently-promoted** hot
-    /// turns (oldest at the back of `hot_lru`) to warm, stopping as soon as
+    /// turns to warm, stopping as soon as
     /// `target_bytes` of VRAM has been freed. Unlike [`Self::evict_hot_except`]
     /// (which drops the entire non-selected working set every reproject), this
     /// keeps the recent working set resident and only frees what the incoming
     /// cold-load actually needs.
     ///
-    /// Scoped to **this** conversation's residence (`self.hot_lru`) — it can
-    /// never touch another conversation's hot KV. The selection
-    /// (`keep_sections` / `keep_turns`) and sections (never on `hot_lru`) are
-    /// always protected. Only items with both a hot and a warm copy are evicted,
-    /// so eviction is hot→warm (the warm copy survives for a fast reload).
+    /// The selection (`keep_sections` / `keep_turns`) and sections are always
+    /// protected. Only items with both a hot and a warm copy are evicted, so
+    /// eviction is hot→warm (the warm copy survives for a fast reload).
     ///
-    /// **Every dialogue's pinned working set is protected too**, not only the
-    /// projection being elevated: a pinned item is content a model was told it
-    /// has, and one dialogue's elevation must not evict another's promise.
+    /// **Every live working set and every dialogue's pinned working set are
+    /// protected too**, not only the projection being elevated: a residence
+    /// another slot's wave attends is in use, and a pinned item is content a
+    /// model was told it has — one dialogue's elevation must not evict
+    /// another's promise.
     pub fn evict_hot_to_free(
-        &mut self,
+        &self,
         keep_sections: &[SectionId],
         keep_turns: &[TurnKey],
         target_bytes: u64,
@@ -3257,7 +2915,7 @@ impl Substrate {
     /// draw: on WhiteWorld (2026-10-27 09:37) one dialogue's 16 GB working set
     /// left a draw 6.8 GB short with nothing in flight, and the draw failed.
     pub fn evict_hot_for_guest(
-        &mut self,
+        &self,
         keep_sections: &[SectionId],
         keep_turns: &[TurnKey],
         target_bytes: u64,
@@ -3266,7 +2924,7 @@ impl Substrate {
     }
 
     fn evict_hot_inner(
-        &mut self,
+        &self,
         keep_sections: &[SectionId],
         keep_turns: &[TurnKey],
         target_bytes: u64,
@@ -3275,19 +2933,12 @@ impl Substrate {
         if target_bytes == 0 {
             return EvictionReport { count: 0, bytes: 0 };
         }
-        let mut keep: std::collections::HashSet<ResidenceIndex> =
-            std::collections::HashSet::with_capacity(keep_sections.len() + keep_turns.len());
-        for &sid in keep_sections {
-            if let Some(e) = self.sections.get(&sid) {
-                keep.insert(e.residence);
-            }
-        }
-        for &key in keep_turns {
-            if let Some(e) = self.turn(key.timeline, key.index) {
-                keep.insert(e.content.residence);
-            }
-        }
+        let mut keep = self.keep_residences(keep_sections, keep_turns);
         if protect_pinned {
+            // Every live working set, not only the projection being elevated:
+            // a residence another slot's wave attends is as much in use as this
+            // one's.
+            keep.extend(self.residences.pinned());
             for timeline in self.pinned_anywhere() {
                 if let Some(entry) = self.timelines.get(&timeline) {
                     keep.extend(entry.turns.values().map(|t| t.content.residence));
@@ -3295,29 +2946,21 @@ impl Substrate {
             }
         }
 
-        // Walk oldest→newest (back of the install/promote-ordered LRU first),
-        // collecting victims until we've freed enough. `byte_size` is the VRAM
-        // the hot copy holds, which `hot = None` releases.
+        // Walk oldest→newest, taking victims until we've freed enough.
+        // `byte_size` is the VRAM the hot copy holds.
         let mut freed: u64 = 0;
-        let mut victims: Vec<ResidenceIndex> = Vec::new();
-        for idx in self.hot_lru.iter().rev().copied() {
+        let mut count = 0usize;
+        for idx in self.hot_turns_oldest_first() {
             if freed >= target_bytes {
                 break;
             }
-            if keep.contains(&idx) {
+            if keep.contains(&idx) || !self.evictable_hot(idx) {
                 continue;
             }
-            let slot = &self.residence[idx.0];
-            if slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source {
-                freed += slot.byte_size;
-                victims.push(idx);
+            if self.residences.take_hot(idx).is_some() {
+                freed += self.residences.get(idx).byte_size();
+                count += 1;
             }
-        }
-
-        let count = victims.len();
-        for idx in &victims {
-            self.residence[idx.0].hot = None;
-            Self::remove_from_lru(&mut self.hot_lru, *idx);
         }
         if count > 0 {
             tracing::info!(
@@ -3341,7 +2984,45 @@ impl Substrate {
     /// the eviction checks them.
     pub fn hot_census(&self, keep_sections: &[SectionId], keep_turns: &[TurnKey]) -> HotCensus {
         let mut census = HotCensus::default();
-        let mut keep: HashSet<ResidenceIndex> = HashSet::new();
+        let keep = self.keep_residences(keep_sections, keep_turns);
+        let mut pinned: HashSet<ResidenceIndex> = self.residences.pinned().into_iter().collect();
+        for timeline in self.pinned_anywhere() {
+            if let Some(entry) = self.timelines.get(&timeline) {
+                pinned.extend(entry.turns.values().map(|t| t.content.residence));
+            }
+        }
+        for e in self.sections.values() {
+            let r = self.residences.get(e.residence);
+            if r.has_hot() {
+                census.sections += r.byte_size();
+            }
+        }
+        for idx in self.hot_turns_oldest_first() {
+            let r = self.residences.get(idx);
+            let b = r.byte_size();
+            if keep.contains(&idx) {
+                census.attended += b;
+            } else if pinned.contains(&idx) {
+                census.pinned += b;
+            } else if !r.has_warm() {
+                census.unwarmed += b;
+            } else if r.has_flag(SPLICE_SOURCE) {
+                census.splice += b;
+            } else {
+                census.evictable += b;
+            }
+        }
+        census
+    }
+
+    /// The residences of `keep_sections` and `keep_turns`. Items the substrate
+    /// doesn't know are dropped — they can't match a live residence anyway.
+    fn keep_residences(
+        &self,
+        keep_sections: &[SectionId],
+        keep_turns: &[TurnKey],
+    ) -> HashSet<ResidenceIndex> {
+        let mut keep = HashSet::with_capacity(keep_sections.len() + keep_turns.len());
         for &sid in keep_sections {
             if let Some(e) = self.sections.get(&sid) {
                 keep.insert(e.residence);
@@ -3352,37 +3033,14 @@ impl Substrate {
                 keep.insert(e.content.residence);
             }
         }
-        let mut pinned: HashSet<ResidenceIndex> = HashSet::new();
-        for timeline in self.pinned_anywhere() {
-            if let Some(entry) = self.timelines.get(&timeline) {
-                pinned.extend(entry.turns.values().map(|t| t.content.residence));
-            }
-        }
-        for e in self.sections.values() {
-            let slot = &self.residence[e.residence.0];
-            if slot.hot.is_some() {
-                census.sections += slot.byte_size;
-            }
-        }
-        for idx in self.hot_lru.iter().copied() {
-            let slot = &self.residence[idx.0];
-            if slot.hot.is_none() {
-                continue;
-            }
-            let b = slot.byte_size;
-            if keep.contains(&idx) {
-                census.attended += b;
-            } else if pinned.contains(&idx) {
-                census.pinned += b;
-            } else if slot.warm.is_none() {
-                census.unwarmed += b;
-            } else if slot.splice_source {
-                census.splice += b;
-            } else {
-                census.evictable += b;
-            }
-        }
-        census
+        keep
+    }
+
+    /// Whether a recency-ordered eviction may take `idx`'s hot copy: it holds a
+    /// warm one to fall back on and is not a splice source.
+    fn evictable_hot(&self, idx: ResidenceIndex) -> bool {
+        let r = self.residences.get(idx);
+        r.has_hot() && r.has_warm() && !r.has_flag(SPLICE_SOURCE)
     }
 
     /// Drop the hot copy of each of `turns` that also holds a warm copy, keeping
@@ -3395,7 +3053,7 @@ impl Substrate {
     /// elevation churn can't accumulate hot residency and exhaust the card.
     /// Turns that are cold-only or hot-without-warm are left untouched (dropping
     /// hot without a warm copy would lose their K/V). Returns the number demoted.
-    pub fn demote_turns_to_warm(&mut self, turns: &[TurnKey]) -> usize {
+    pub fn demote_turns_to_warm(&self, turns: &[TurnKey]) -> usize {
         let mut demoted = 0;
         for &key in turns {
             let Some(residence) = self
@@ -3404,13 +3062,7 @@ impl Substrate {
             else {
                 continue;
             };
-            let (has_hot, has_warm) = {
-                let slot = &self.residence[residence.0];
-                (slot.hot.is_some(), slot.warm.is_some())
-            };
-            if has_hot && has_warm && !self.residence[residence.0].splice_source {
-                self.residence[residence.0].hot = None;
-                Self::remove_from_lru(&mut self.hot_lru, residence);
+            if self.evictable_hot(residence) && self.residences.take_hot(residence).is_some() {
                 demoted += 1;
             }
         }
@@ -3430,43 +3082,29 @@ impl Substrate {
     ///    timeline (what the NEXT scope's projection will re-gather). This must
     ///    cover the projection's gather width or the demote fights it.
     ///
-    /// Everything else is walked oldest-first off `hot_lru` (least-recently
-    /// promoted ≈ least-recently active) and demoted until `target_bytes` is met —
-    /// so a settled conversation's cold tail is shed before an active one's window.
+    /// Everything else is walked least recently touched first and demoted until
+    /// `target_bytes` is met — so a settled conversation's cold tail is shed
+    /// before an active one's window.
     ///
-    /// **The hot copies are handed back, not dropped.** A demote runs on
-    /// whichever thread applies it (`docs/substrate_mutation_queue.md` §2), and
-    /// a device chunk freed off the scheduler thread can land inside a KV
-    /// compaction pass; the caller returns them to the scheduler, which drops
-    /// them on its own thread.
+    /// Safe from any thread: a taken copy is freed on the device's thread once
+    /// the last forward reading it lets go ([`residence::drain_reclaimed`]).
     pub fn demote_cold_ingest(
-        &mut self,
-        ingest_timelines: &std::collections::HashSet<TimelineId>,
+        &self,
+        ingest_timelines: &HashSet<TimelineId>,
         keep_turns: &[TurnKey],
         keep_sections: &[SectionId],
         keep_recent: usize,
         target_bytes: u64,
-    ) -> (EvictionReport, Vec<Vec<SealedSequence>>) {
+    ) -> EvictionReport {
         if target_bytes == 0 {
-            return (EvictionReport { count: 0, bytes: 0 }, Vec::new());
+            return EvictionReport { count: 0, bytes: 0 };
         }
         // Protected residence: live working sets + each ingest timeline's rolling
         // window. Also collect which residence belongs to an ingest timeline —
         // only those are evictable here (zero reload cost).
-        let mut protected: std::collections::HashSet<ResidenceIndex> =
-            std::collections::HashSet::new();
-        for &key in keep_turns {
-            if let Some(e) = self.turn(key.timeline, key.index) {
-                protected.insert(e.content.residence);
-            }
-        }
-        for &sid in keep_sections {
-            if let Some(e) = self.sections.get(&sid) {
-                protected.insert(e.residence);
-            }
-        }
-        let mut ingest_residence: std::collections::HashSet<ResidenceIndex> =
-            std::collections::HashSet::new();
+        let mut protected = self.keep_residences(keep_sections, keep_turns);
+        protected.extend(self.residences.pinned());
+        let mut ingest_residence: HashSet<ResidenceIndex> = HashSet::new();
         // Driven by the ingest set, not by a scan of every registered timeline.
         // The old form walked the whole timeline map to pick out the ingest ones,
         // so the cost grew with the size of the substrate rather than with the
@@ -3488,28 +3126,24 @@ impl Substrate {
                 }
             }
         }
-        // Walk `hot_lru` oldest→newest (back is oldest), demoting warm-backed
-        // ingest KV that isn't protected, until we've freed `target_bytes`.
+        // Walk oldest→newest, demoting warm-backed ingest KV that isn't
+        // protected, until we've freed `target_bytes`.
         let mut freed: u64 = 0;
-        let mut victims: Vec<ResidenceIndex> = Vec::new();
-        for idx in self.hot_lru.iter().rev().copied() {
+        let mut count = 0usize;
+        for idx in self.hot_turns_oldest_first() {
             if freed >= target_bytes {
                 break;
             }
-            if !ingest_residence.contains(&idx) || protected.contains(&idx) {
+            if !ingest_residence.contains(&idx)
+                || protected.contains(&idx)
+                || !self.evictable_hot(idx)
+            {
                 continue;
             }
-            let slot = &self.residence[idx.0];
-            if slot.hot.is_some() && slot.warm.is_some() && !slot.splice_source {
-                freed += slot.byte_size;
-                victims.push(idx);
+            if self.residences.take_hot(idx).is_some() {
+                freed += self.residences.get(idx).byte_size();
+                count += 1;
             }
-        }
-        let count = victims.len();
-        let mut taken: Vec<Vec<SealedSequence>> = Vec::with_capacity(count);
-        for idx in &victims {
-            taken.extend(self.residence[idx.0].hot.take());
-            Self::remove_from_lru(&mut self.hot_lru, *idx);
         }
         if count > 0 {
             tracing::info!(
@@ -3521,13 +3155,10 @@ impl Substrate {
                 "demote_cold_ingest (gentle-early, LRU) complete"
             );
         }
-        (
-            EvictionReport {
-                count,
-                bytes: freed,
-            },
-            taken,
-        )
+        EvictionReport {
+            count,
+            bytes: freed,
+        }
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -3541,11 +3172,11 @@ impl Substrate {
             return;
         }
         self.timelines
-            .insert(timeline, TimelineEntry::new(layer, group));
+            .insert(timeline, Arc::new(TimelineEntry::new(layer, group)));
         self.timelines_by_group
             .entry(group)
             .or_default()
-            .push(timeline);
+            .push_back(timeline);
         // Apply every record that arrived before this timeline registered —
         // the sidebar listing depends on the conv_id landing on the entry.
         // Each goes through the same stamped apply it would have met on
@@ -3593,7 +3224,7 @@ impl Substrate {
     /// Flip the diagnostic toggle on layer `name`; returns the new state
     /// (`true` = now excluded from projection assembly).
     pub fn toggle_layer(&mut self, name: &str) -> bool {
-        if self.disabled_layers.remove(name) {
+        if self.disabled_layers.remove(name).is_some() {
             false
         } else {
             self.disabled_layers.insert(name.to_string());
@@ -3613,7 +3244,7 @@ impl Substrate {
 
     /// Every layer currently toggled out.
     pub fn disabled_layers(&self) -> HashSet<String> {
-        self.disabled_layers.clone()
+        self.disabled_layers.iter().cloned().collect()
     }
 
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
@@ -3623,25 +3254,22 @@ impl Substrate {
     /// Borrow a timeline's full entry — projection target plus optional
     /// sidebar metadata. Used by the daemon's sidebar listing.
     pub fn timeline_entry(&self, timeline: TimelineId) -> Option<&TimelineEntry> {
-        self.timelines.get(&timeline)
+        self.timelines.get(&timeline).map(|e| &**e)
     }
 
-    /// Borrow a single turn by `(timeline, index)`. Two HashMap/BTreeMap
-    /// hops since turns now live inside their owning [`TimelineEntry`] —
-    /// both O(1) and the second is a tiny BTreeMap (one turn per index
-    /// in the timeline), so the hot path is not measurably slower than
-    /// the old flat AHashMap keyed by `(TimelineId, TurnIndex)`.
+    /// Borrow a single turn by `(timeline, index)`: two map hops, since turns
+    /// live inside their owning [`TimelineEntry`].
     fn turn(&self, timeline: TimelineId, index: TurnIndex) -> Option<&TurnEntryData> {
         self.timelines
             .get(&timeline)
             .and_then(|t| t.turns.get(&index))
+            .map(|t| &**t)
     }
 
-    /// Mutable variant of [`Self::turn`].
+    /// Mutable variant of [`Self::turn`]: this version's own copy of the
+    /// timeline and the turn, so older versions keep theirs.
     fn turn_mut(&mut self, timeline: TimelineId, index: TurnIndex) -> Option<&mut TurnEntryData> {
-        self.timelines
-            .get_mut(&timeline)
-            .and_then(|t| t.turns.get_mut(&index))
+        arc_mut(&mut self.timelines, &timeline).and_then(|t| ord_arc_mut(&mut t.turns, &index))
     }
 
     pub fn timelines_for_group(&self, group: GroupId) -> impl Iterator<Item = TimelineId> + '_ {
@@ -3798,7 +3426,13 @@ impl Substrate {
 
     /// `target`'s working set, when it has one.
     pub fn working_set(&self, target: TimelineId) -> Option<&WorkingSet> {
-        self.working_sets.get(&target)
+        self.working_sets.get(&target).map(|ws| &**ws)
+    }
+
+    /// `target`'s working set in this version, made if absent — this
+    /// version's own copy, so older versions keep theirs.
+    fn working_set_mut(&mut self, target: TimelineId) -> &mut WorkingSet {
+        Arc::make_mut(self.working_sets.entry(target).or_default())
     }
 
     /// Record which share of the working-set budget `group`'s conversations
@@ -3842,9 +3476,7 @@ impl Substrate {
         let candidate = self
             .working_set_candidate(target, timeline)
             .ok_or(Refusal::Gone)?;
-        self.working_sets
-            .entry(target)
-            .or_default()
+        self.working_set_mut(target)
             .lock(timeline, candidate, limits)
     }
 
@@ -3858,9 +3490,7 @@ impl Substrate {
             return false;
         };
         let tokens = self.timeline_token_total(timeline);
-        self.working_sets
-            .entry(target)
-            .or_default()
+        self.working_set_mut(target)
             .restore_lock(timeline, tokens, share);
         true
     }
@@ -3882,17 +3512,16 @@ impl Substrate {
                 None => refused.push(timeline),
             }
         }
-        refused.extend(self.working_sets.entry(target).or_default().seed(
-            &admissible,
-            limits,
-            momentum,
-        ));
+        refused.extend(
+            self.working_set_mut(target)
+                .seed(&admissible, limits, momentum),
+        );
         refused
     }
 
     /// Release `target`'s locks into provenance at `released` momentum.
     pub fn working_set_release(&mut self, target: TimelineId, released: f32) {
-        if let Some(ws) = self.working_sets.get_mut(&target) {
+        if let Some(ws) = arc_mut(&mut self.working_sets, &target) {
             ws.release(released);
         }
     }
@@ -3905,9 +3534,7 @@ impl Substrate {
         read: TimelineId,
         released: f32,
     ) -> bool {
-        self.working_sets
-            .get_mut(&target)
-            .is_some_and(|ws| ws.release_one(read, released))
+        arc_mut(&mut self.working_sets, &target).is_some_and(|ws| ws.release_one(read, released))
     }
 
     /// Fold one reprojection's per-file fresh scores into `target`'s working
@@ -3921,11 +3548,15 @@ impl Substrate {
         limits: Limits,
         max_admits: NonZeroUsize,
     ) {
-        let mut ws = self.working_sets.remove(&target).unwrap_or_default();
+        let mut ws = self
+            .working_sets
+            .remove(&target)
+            .map(Arc::unwrap_or_clone)
+            .unwrap_or_default();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate(target, timeline)
         });
-        self.working_sets.insert(target, ws);
+        self.working_sets.insert(target, Arc::new(ws));
     }
 
     /// Drop `target`'s working set — the conversation is going away, or its
@@ -4084,7 +3715,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        let Some(tl) = self.timelines.get_mut(&timeline) else {
+        let Some(tl) = arc_mut(&mut self.timelines, &timeline) else {
             self.pending.hold(
                 payload.timeline_id,
                 PendingChild::Coupling(payload.from_turn),
@@ -4131,7 +3762,7 @@ impl Substrate {
     /// same key; clears the old mapping if the timeline already had a
     /// different debug_id.
     fn index_debug_id(&mut self, timeline: TimelineId, id: String) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
             if let Some(old) = tl.debug_id.take() {
                 if old != id {
                     self.timeline_by_debug_id.remove(&old);
@@ -4176,7 +3807,7 @@ impl Substrate {
         meta: TreeNodeMeta,
         id: RecordIdentity,
     ) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
             if take_keyed(&mut tl.ids.tree_meta, idx, id) {
                 tl.tree_meta.insert(idx, meta);
             }
@@ -4282,7 +3913,7 @@ impl Substrate {
 
     /// Set/clear the reconcile hint.
     pub fn set_needs_reconcile(&mut self, timeline: TimelineId, v: bool) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
             tl.needs_reconcile = v;
         }
     }
@@ -4292,7 +3923,7 @@ impl Substrate {
     /// superseded AVL code) so the ternary canonical nodes can be rebuilt, and
     /// arm the reconcile hint when the forest isn't already whole.
     pub fn mark_for_reconcile(&mut self, timeline: TimelineId) {
-        let Some(tl) = self.timelines.get_mut(&timeline) else {
+        let Some(tl) = arc_mut(&mut self.timelines, &timeline) else {
             return;
         };
         let noncanonical: Vec<TurnIndex> = tl
@@ -4320,9 +3951,7 @@ impl Substrate {
     /// FIFO pop: next pending turn for the summariser to absorb, or
     /// `None` if the queue is empty.
     pub fn pop_pending_summary(&mut self, timeline: TimelineId) -> Option<TurnIndex> {
-        self.timelines
-            .get_mut(&timeline)
-            .and_then(|tl| tl.pending_summary_queue.pop_front())
+        arc_mut(&mut self.timelines, &timeline).and_then(|tl| tl.pending_summary_queue.pop_front())
     }
 
     /// Push a turn onto the pending-summary queue.  Used during
@@ -4340,7 +3969,7 @@ impl Substrate {
         // One map lookup: the entry carries its layer, so the per-timeline
         // flag and the append-only-layer refusal read off the same borrow
         // (`append_only_layers` is a disjoint field).
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
             if !tl.summarize || self.append_only_layers.contains(&tl.layer) {
                 return;
             }
@@ -4361,8 +3990,8 @@ impl Substrate {
     /// last-write-wins across re-projections within a turn.  Pure
     /// test-harness instrumentation — production daemons can ignore.
     pub fn set_last_selection(&mut self, timeline: TimelineId, diag: SelectionDiagnostics) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
-            tl.last_selection = Some(diag);
+        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+            tl.last_selection = Some(Arc::new(diag));
         }
     }
 
@@ -4372,7 +4001,7 @@ impl Substrate {
     pub fn last_selection_of(&self, timeline: TimelineId) -> Option<&SelectionDiagnostics> {
         self.timelines
             .get(&timeline)
-            .and_then(|tl| tl.last_selection.as_ref())
+            .and_then(|tl| tl.last_selection.as_deref())
     }
 
     /// Chronologically-ordered `SummaryOfTurns` leaf turn indices for
@@ -4550,28 +4179,27 @@ impl Substrate {
             .cloned()
     }
 
+    /// The stream's decoded events, memoized on the stream itself
+    /// ([`StreamRuntime::events_digest`]). The memo belongs to the blob it was
+    /// decoded from: a write of the blob replaces the stream's runtime with an
+    /// empty memo, so a reader of any version reads the digest of exactly the
+    /// blob that version holds. Two readers racing on the first decode both
+    /// decode and one value is kept — the values are identical.
     fn events_digest(&self, stream_id: StreamId) -> Arc<EventsDigest> {
-        {
-            let cache = self.events_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(hit) = cache.get(&stream_id) {
-                return hit.clone();
-            }
-        }
-        // Decode OUTSIDE the lock so a slow decode never blocks another reader's
-        // hit: a concurrent miss on the same stream just decodes twice —
-        // harmless, the value is identical.
-        let events = self
-            .streams
-            .get(stream_id)
-            .and_then(|e| e.projection_events.as_deref())
-            .map(decode_events)
-            .unwrap_or_default();
-        let digest = Arc::new(digest_events(&events));
-        self.events_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(stream_id, digest.clone());
-        digest
+        let Some(stream) = self.streams.get(stream_id) else {
+            return Arc::default();
+        };
+        stream
+            .events_digest
+            .get_or_init(|| {
+                let events = stream
+                    .projection_events
+                    .as_deref()
+                    .map(decode_events)
+                    .unwrap_or_default();
+                Arc::new(digest_events(&events))
+            })
+            .clone()
     }
 
     /// True iff `stream_id` names a stream the substrate holds a record of.
@@ -4619,57 +4247,6 @@ impl Substrate {
             .count()
     }
 
-    /// Clear every per-entity collection populated from redo-log
-    /// records — used by `compact()` after the active log swap to
-    /// re-walk the freshly-compacted log into substrate state with
-    /// updated offsets.  Singleton-style state (timeline registrations,
-    /// per-turn KV residence slots) is preserved.
-    pub fn clear_walker_state(&mut self) {
-        self.streams.clear();
-        self.tagged_turns.clear();
-        self.gallery_epoch += 1;
-        self.timeline_by_debug_id.clear();
-        // The two indexes compaction can *shrink* — an entry whose record was
-        // dropped would otherwise survive here pointing into a segment that no
-        // longer exists, and the replay only ever ADDS. Clearing lets it
-        // rebuild exactly the set that was carried forward.
-        //
-        // Branch checkpoints shrink because compaction caps them. Recurrent
-        // snapshots shrink because it drops a DISTILLED timeline's — and a
-        // distilled timeline is not tombstoned, so nothing else removes its
-        // entry (`apply_distill` only marks the timeline). A stale snapshot loc
-        // is worse than a stale checkpoint one: `SnapshotPayload` has no
-        // leading magic (unlike `BranchCheckpointPayload`'s `BRCK`), so
-        // arbitrary bytes at the reused offset can decode as a plausible
-        // payload and install a foreign recurrent state, and maintenance's
-        // relocation walk can match the entry too.
-        self.branch_checkpoints.clear();
-        self.recurrent_snapshots.clear();
-        // The identities go with the values: the replay re-applies every carried
-        // record under the identity it kept, so each value and its identity come
-        // back together. Records held for an unregistered timeline are carried
-        // too, and the replay holds them again.
-        self.snapshot_ids.clear();
-        self.branch_checkpoint_ids.clear();
-        self.custom_object_ids.clear();
-        // An expired keyed tombstone is not carried (§6.8), so the objects
-        // shrink as well, and are rebuilt from what was.
-        self.custom_objects.clear();
-        self.custom_objects_version += 1;
-        self.pending.clear();
-        for tl in self.timelines.values_mut() {
-            tl.label = None;
-            tl.conv_id = None;
-            tl.archived = false;
-            tl.branches.clear();
-            tl.debug_id = None;
-            tl.tree_meta.clear();
-            tl.pending_summary_queue.clear();
-            tl.needs_reconcile = false;
-            tl.ids = TimelineIds::default();
-        }
-    }
-
     /// Every timeline's label as the `Label` records that hold it — one per
     /// winning identity, with the fields it won ([`label_records`]). Used by
     /// both rewrite paths to re-emit live `Label` records; the `ConvState` side
@@ -4679,7 +4256,8 @@ impl Substrate {
     /// of the substrate, so two compactions of one store write the same file. A
     /// timeline with no label fields writes nothing.
     pub fn live_label_records(&self) -> Vec<(u64, ConvMeta, RecordIdentity)> {
-        let mut timelines: Vec<(&TimelineId, &TimelineEntry)> = self.timelines.iter().collect();
+        let mut timelines: Vec<(&TimelineId, &TimelineEntry)> =
+            self.timelines.iter().map(|(t, e)| (t, &**e)).collect();
         timelines.sort_by_key(|(tid, tl)| (tl.order, tid.raw()));
         timelines
             .into_iter()
@@ -4813,11 +4391,9 @@ impl Substrate {
         if section && !id.is_none() && self.ended_sections.is_ended(stream_id, generation) {
             return;
         }
-        let Some(Declared {
-            changed: mut moved,
-            displaced,
-        }) = self.streams.declare(key, decl, id)
-        else {
+        // A memo lives on the physical stream it was decoded from, so a
+        // declaration moving a turn's position leaves nothing stale behind.
+        let Some(Declared { displaced, .. }) = self.streams.declare(key, decl, id) else {
             return;
         };
         if let Some(timeline) = self
@@ -4835,15 +4411,12 @@ impl Substrate {
         if section {
             if id.is_none() {
                 self.ended_sections.lift_unstamped(stream_id);
-            } else if self
-                .streams
-                .prune(key, |held| held.epoch >= generation.oseq)
-            {
-                moved.push(stream_id);
+            } else {
+                self.streams
+                    .prune(key, |held| held.epoch >= generation.oseq);
             }
         }
         self.tagged_turns.set(key, &turn_tags);
-        self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
 
@@ -4869,21 +4442,6 @@ impl Substrate {
                 ..
             }) if !ids.decl.is_none() => id.epoch >= ids.decl.oseq,
             _ => true,
-        }
-    }
-
-    /// Drop the decoded memos of `ids`: what they name has changed, by a
-    /// declaration placing a turn there or moving one away.
-    fn forget_memos(&mut self, ids: &[StreamId]) {
-        if ids.is_empty() {
-            return;
-        }
-        let events = self
-            .events_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner());
-        for sid in ids {
-            events.remove(sid);
         }
     }
 
@@ -5000,7 +4558,7 @@ impl Substrate {
     /// goes, and no snapshot of it is installed again, whenever it arrives.
     fn retire_snapshot_stream(&mut self, timeline: TimelineId) {
         let stream_id = snapshot_stream_id(timeline.raw());
-        if self.retired_snapshots.insert(stream_id) {
+        if self.retired_snapshots.insert(stream_id).is_none() {
             // Named, so a slot that later finds its record gone can be traced
             // to what retired it from the log alone.
             tracing::info!(
@@ -5118,14 +4676,10 @@ impl Substrate {
             return;
         }
         entry.projection_events = Some(payload.into());
+        // The memo belonged to the blob just replaced. `entry` is this
+        // version's own copy of the runtime, so older versions keep theirs.
+        entry.events_digest = OnceLock::new();
         self.gallery_epoch += 1;
-        // Drop this stream's memoized seams so an apply after the seam cache
-        // warmed cannot serve stale ones.
-        let logical = self.streams.logical_id(key);
-        self.events_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&logical);
     }
 
     /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
@@ -5205,7 +4759,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             self.pending
                 .hold(timeline_raw, PendingChild::Label(meta.clone()), id);
             return;
@@ -5237,7 +4791,7 @@ impl Substrate {
     /// Move `calibration` in `index` from the unit `before` named to the one
     /// `now` names.
     fn index_calibration(
-        index: &mut HashMap<TimelineId, Vec<TimelineId>>,
+        index: &mut PMap<TimelineId, PVec<TimelineId>>,
         calibration: TimelineId,
         before: Option<&str>,
         now: &str,
@@ -5287,7 +4841,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             self.pending
                 .hold(timeline_raw, PendingChild::State(state), id);
             return;
@@ -5299,9 +4853,9 @@ impl Substrate {
 
     /// Install `state` as `timeline`'s whole conversation state.
     fn replace_conv_state(&mut self, timeline: TimelineId, state: ConvState) {
-        if let Some(entry) = self.timelines.get_mut(&timeline) {
+        if let Some(entry) = arc_mut(&mut self.timelines, &timeline) {
             entry.archived = state.archived;
-            entry.branches = state.branches;
+            entry.branches = state.branches.into_iter().collect();
             entry.active = state.active;
             self.conv_active_counter = self.conv_active_counter.max(state.active);
         }
@@ -5347,7 +4901,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             self.pending.hold(
                 payload.timeline_id,
                 PendingChild::DebugId(payload.debug_id.clone()),
@@ -5366,7 +4920,7 @@ impl Substrate {
     pub fn apply_custom_object(&mut self, obj: CustomObjectPayload, id: RecordIdentity) {
         let key = obj.stream_id();
         if take(self.custom_object_ids.entry(key).or_default(), id) {
-            self.custom_objects.insert(key, obj);
+            self.custom_objects.insert(key, Arc::new(obj));
             self.custom_objects_version += 1;
         }
     }
@@ -5384,6 +4938,7 @@ impl Substrate {
     pub fn custom_object(&self, key: &str) -> Option<&CustomObjectPayload> {
         self.custom_objects
             .get(&CustomObjectPayload::stream_id_for(key))
+            .map(|obj| &**obj)
             .filter(|obj| !obj.ceased)
     }
 
@@ -5402,7 +4957,7 @@ impl Substrate {
     pub fn blob_tombstones(&self) -> Vec<BlobKey> {
         self.custom_objects
             .values()
-            .filter_map(retired_blob)
+            .filter_map(|obj| retired_blob(obj))
             .collect()
     }
 
@@ -5413,7 +4968,7 @@ impl Substrate {
             .custom_objects
             .iter()
             .filter(|(_, obj)| !obj.ceased && obj.key.starts_with(prefix))
-            .map(|(key, obj)| (obj.clone(), self.custom_object_id(*key)))
+            .map(|(key, obj)| ((**obj).clone(), self.custom_object_id(*key)))
             .collect();
         out.sort_by(|a, b| a.0.key.cmp(&b.0.key));
         out
@@ -5431,7 +4986,7 @@ impl Substrate {
     pub fn held_custom_objects(&self) -> Vec<(CustomObjectPayload, RecordIdentity)> {
         self.custom_objects
             .iter()
-            .map(|(key, obj)| (obj.clone(), self.custom_object_id(*key)))
+            .map(|(key, obj)| ((**obj).clone(), self.custom_object_id(*key)))
             .collect()
     }
 
@@ -5569,11 +5124,7 @@ impl Substrate {
         self.tombstoned_turns.insert(mark);
         self.gallery_epoch += 1;
         self.tombstone_epoch += 1;
-        let (residence, retired_tokens) = match self
-            .timelines
-            .get_mut(&timeline)
-            .and_then(|t| t.turns.get_mut(&TurnIndex(turn_index)))
-        {
+        let (residence, retired_tokens) = match self.turn_mut(timeline, TurnIndex(turn_index)) {
             Some(entry) => {
                 let retired_tokens = entry.content.token_count;
                 entry.content.layout = TurnLayout::new(Vec::new());
@@ -5636,26 +5187,16 @@ impl Substrate {
     /// anyway. Without this, the orphaned hot copies — which nothing else
     /// evicts, their owner being tombstoned and never demoted — accumulate on
     /// the card through a bulk ingest (the `quant_live` climb).
-    fn release_dead_residence(&mut self, r: ResidenceIndex) {
-        // No longer a splice source: whatever was going to adopt from it has,
-        // or never will. Cleared before the hot drop so a late migrate install
-        // on this residence drops the hot copy it re-adds instead of keeping it.
-        self.residence[r.0].splice_source = false;
-        // Flag evict_when_cold BEFORE dropping hot: it closes the race where the
-        // persistence thread snapshotted this residence's hot before the
-        // tombstone and installs it after — `install_warm_and_evict_hot` (which
-        // the flag selects) then drops that re-added Q copy instead of keeping it.
-        self.residence[r.0].evict_when_cold = true;
-        if self.residence[r.0].hot.take().is_some() {
-            Self::remove_from_lru(&mut self.hot_lru, r);
-        }
-        // A transient (scratch-fork) residence will never get a cold copy
-        // (`no_cold_persist`), so `evict_when_cold`'s warm-drop-on-cold-land never
-        // fires — its warm RAM is dead the moment it's tombstoned. Free it here.
-        // A normal tombstone leaves warm for any holder / cold-land reclaim.
-        if self.residence[r.0].no_cold_persist && self.residence[r.0].warm.take().is_some() {
-            Self::remove_from_lru(&mut self.warm_lru, r);
-        }
+    ///
+    /// A kill ([`ResidenceSlab::kill`]): the residence is marked dead, so a
+    /// migrate or a lift that built a copy before the tombstone and installs it
+    /// after takes nothing — the install sees the mark, whichever order the two
+    /// ran in. A transient (scratch-fork) residence never gets a cold copy, so
+    /// its warm RAM is dead the moment it's tombstoned and goes too; a normal
+    /// tombstone leaves warm for any holder / cold-land reclaim. Idempotent, so
+    /// a version edit that is retried kills it again harmlessly.
+    fn release_dead_residence(&self, r: ResidenceIndex) {
+        self.residences.kill(r);
     }
 
     /// Whether the turn at `turn_index` of `timeline` was dropped by a
@@ -5708,8 +5249,8 @@ impl Substrate {
         // Nor carries anything, nor is carried: a pinned item whose turns are
         // gone would keep emitting a promise nothing can deliver.
         self.working_sets.remove(&timeline);
-        for ws in self.working_sets.values_mut() {
-            ws.remove(timeline);
+        for (_, ws) in self.working_sets.iter_mut() {
+            Arc::make_mut(ws).remove(timeline);
         }
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
@@ -5743,7 +5284,7 @@ impl Substrate {
             .sections
             .values()
             .map(|e| e.residence)
-            .filter(|&r| self.residence[r.0].stream_id == stream_id)
+            .filter(|&r| self.residences.get(r).stream_id == stream_id)
             .collect();
         for r in residences {
             self.release_dead_residence(r);
@@ -5847,7 +5388,6 @@ impl Substrate {
     /// unstamped stream as the log stands at that point, and the next
     /// unstamped declaration starts the stream again.
     fn end_section(&mut self, stream_id: StreamId, generation: Option<SectionGeneration>) {
-        let mut moved = vec![stream_id];
         match generation {
             Some(g) => {
                 self.ended_sections.end(stream_id, g);
@@ -5860,7 +5400,7 @@ impl Substrate {
                         && rt.ids.decl.oseq == g.oseq
                 });
                 if declared_here {
-                    moved.extend(self.streams.undeclare(key));
+                    self.streams.undeclare(key);
                 }
                 self.streams.prune(key, |held| held.epoch != g.oseq);
             }
@@ -5870,11 +5410,10 @@ impl Substrate {
                     stream_id,
                     writer: 0,
                 };
-                moved.extend(self.streams.remove_writer(key));
+                self.streams.remove_writer(key);
                 self.tagged_turns.remove(key);
             }
         }
-        self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
 
@@ -5918,7 +5457,7 @@ impl Substrate {
             None => return,
         };
         for r in residences {
-            self.residence[r.0].no_cold_persist = true;
+            self.residences.get(r).set_flag(NO_COLD_PERSIST);
         }
     }
 
@@ -5951,11 +5490,6 @@ impl Substrate {
         self.unresumed_timelines.contains(&timeline)
     }
 
-    /// Mark `timeline` as a **splice source**: its turns keep their hot copy
-    /// until the timeline is tombstoned (see [`SequenceResidence::splice_source`]).
-    /// Call it right after minting a code_read scope fork, before its first turn
-    /// seals — like [`Self::mark_timeline_transient`], it flags the residences
-    /// already allocated and every later one.
     /// Whether `timeline` is declared a **file store** — its whole content file
     /// events, with no conversation registered on it — by a live custom object
     /// under [`file_store_key`]. A rewrite of the log carries a store's events
@@ -5969,6 +5503,11 @@ impl Substrate {
         self.custom_object(&file_store_key(timeline)).is_some()
     }
 
+    /// Mark `timeline` as a **splice source**: its turns keep their hot copy
+    /// until the timeline is tombstoned (see [`residence::SPLICE_SOURCE`]).
+    /// Call it right after minting a code_read scope fork, before its first turn
+    /// seals — like [`Self::mark_timeline_transient`], it flags the residences
+    /// already allocated and every later one.
     pub fn mark_timeline_splice_source(&mut self, timeline: TimelineId) {
         self.splice_source_timelines.insert(timeline);
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
@@ -5976,7 +5515,7 @@ impl Substrate {
             None => return,
         };
         for r in residences {
-            self.residence[r.0].splice_source = true;
+            self.residences.get(r).set_flag(SPLICE_SOURCE);
         }
     }
 
@@ -5986,7 +5525,7 @@ impl Substrate {
     /// The section counterpart of [`Self::mark_timeline_transient`], for the
     /// same reason: nothing will read it back from disk, so writing it costs a
     /// redo-log write compaction would only have to take back. Its residence is
-    /// flagged [`SequenceResidence::no_cold_persist`] — now when it is already
+    /// flagged [`residence::NO_COLD_PERSIST`] — now when it is already
     /// installed, at install otherwise — the scheduler's seal skips its stream
     /// declaration and token record, and [`Self::retire_section`] removes it
     /// once its last user is done.
@@ -5996,7 +5535,9 @@ impl Substrate {
     pub fn mark_section_transient(&mut self, section: SectionId) {
         self.transient_sections.insert(section);
         if let Some(entry) = self.sections.get(&section) {
-            self.residence[entry.residence.0].no_cold_persist = true;
+            self.residences
+                .get(entry.residence)
+                .set_flag(NO_COLD_PERSIST);
         }
     }
 
@@ -6017,20 +5558,18 @@ impl Substrate {
     /// section's injected copy keeps its own until the slot is freed — dropping
     /// the substrate's reference releases nothing another holder is using.
     pub fn retire_section(&mut self, section: SectionId) -> bool {
-        if !self.transient_sections.remove(&section) {
+        if self.transient_sections.remove(&section).is_none() {
             return false;
         }
         let Some(entry) = self.sections.remove(&section) else {
             return false;
         };
         self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
-        let r = entry.residence;
-        if self.residence[r.0].hot.take().is_some() {
-            Self::remove_from_lru(&mut self.hot_lru, r);
-        }
-        if self.residence[r.0].warm.take().is_some() {
-            Self::remove_from_lru(&mut self.warm_lru, r);
-        }
+        // Transient, so never cold-persisted: the kill takes warm as well.
+        self.residences
+            .get(entry.residence)
+            .set_flag(NO_COLD_PERSIST);
+        self.residences.kill(entry.residence);
         true
     }
 
@@ -6134,10 +5673,7 @@ impl Substrate {
         let generation = self.tombstone_section(stream);
         let entry = self.sections.remove(&section)?;
         self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
-        let r = entry.residence;
-        if self.residence[r.0].warm.take().is_some() {
-            Self::remove_from_lru(&mut self.warm_lru, r);
-        }
+        self.residences.take_warm(entry.residence);
         Some((stream, generation))
     }
 
@@ -6149,7 +5685,7 @@ impl Substrate {
     /// Direct read of the tombstoned-timeline set.  Used by the
     /// compactor to filter dead records out of the next compacted
     /// log.
-    pub fn tombstoned_timelines(&self) -> &HashSet<TimelineId> {
+    pub fn tombstoned_timelines(&self) -> &PSet<TimelineId> {
         &self.tombstoned_timelines
     }
 
@@ -6235,25 +5771,21 @@ impl Substrate {
         };
         let mut released = 0usize;
         for r in residences {
-            let slot = &self.residence[r.0];
+            let slot = self.residences.get(r);
             // The same two exclusions every hot-drop path honours: a residence
             // the current wave is attending, and one whose `hot` is the interim
             // native form a quantize drain still owes. The second is rare here —
             // a case is marked only once archived — and the compactor reclaims
             // anything this pass skips, exactly as it did before.
-            if self.working_set_pins.contains(&r) || slot.pending_quantize {
+            if slot.is_pinned() || slot.has_flag(PENDING_QUANTIZE) {
                 continue;
             }
-            if slot.hot.is_some() || slot.warm.is_some() {
+            let hot = self.residences.take_hot(r).is_some();
+            let warm = self.residences.take_warm(r).is_some();
+            if hot || warm {
                 released += 1;
             }
-            if self.residence[r.0].hot.take().is_some() {
-                Self::remove_from_lru(&mut self.hot_lru, r);
-            }
-            if self.residence[r.0].warm.take().is_some() {
-                Self::remove_from_lru(&mut self.warm_lru, r);
-            }
-            self.residence[r.0].cold = None;
+            self.residences.set_cold(r, None);
         }
         released
     }
@@ -6270,7 +5802,7 @@ impl Substrate {
 
     /// Direct read of the distilled-timeline map — the compactor uses it to shed
     /// each timeline's turns to its [`DistillMode`].
-    pub fn distilled_timelines(&self) -> &HashMap<TimelineId, DistillMode> {
+    pub fn distilled_timelines(&self) -> &PMap<TimelineId, DistillMode> {
         &self.distilled_timelines
     }
 
@@ -6308,7 +5840,7 @@ impl Substrate {
     /// The turns dead by turn-scoped tombstones — consulted by compaction,
     /// which sheds their bulk records while re-emitting the tombstone itself
     /// (the reload's placeholder logic needs it).
-    pub fn tombstoned_turns(&self) -> &HashSet<TurnMark> {
+    pub fn tombstoned_turns(&self) -> &PSet<TurnMark> {
         &self.tombstoned_turns
     }
 
@@ -6326,46 +5858,53 @@ impl Substrate {
     /// tombstoned stream's records were dropped from the compacted log
     /// but its turns are filtered from every projection, so its stale
     /// references are never followed.
-    pub fn refresh_cold_refs(&mut self) {
-        let streams = &self.streams;
-        for slot in &mut self.residence {
-            Self::refresh_slot_cold_refs(streams, slot);
+    ///
+    /// Read against this version's stream index: the caller refreshes from the
+    /// version that holds the relocated locations.
+    pub fn refresh_cold_refs(&self) {
+        for (idx, r) in self.residences.iter() {
+            self.refresh_slot_cold_refs(idx, r);
         }
     }
 
-    /// One residence's cold references, re-read from its stream's index.
-    fn refresh_slot_cold_refs(streams: &StreamIndex, slot: &mut SequenceResidence) {
-        let Some(cold) = &mut slot.cold else { return };
-        let Some(stream) = streams.get(slot.stream_id) else {
+    /// One residence's cold references, re-read from its stream's index. The
+    /// refreshed references replace the ones they were read from; a residence
+    /// whose cold references changed in between is refreshed again from the
+    /// newer ones.
+    fn refresh_slot_cold_refs(&self, idx: ResidenceIndex, r: &Residence) {
+        let Some(stream) = self.streams.get(r.stream_id) else {
             return;
         };
-        let n_layers = cold.len();
-        let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
-        if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
-            return;
-        }
-        for (layer, seq) in cold.iter_mut().enumerate() {
-            for (c, chunk) in seq.chunks.iter_mut().enumerate() {
-                let flat = (layer * chunks_per_layer + c) as u64;
-                if let Some(loc) = stream.chunks.get(&flat) {
-                    chunk.log_offset = loc.offset;
-                    chunk.record_len = loc.record_size;
-                    chunk.token_count = loc.token_count as u16;
+        while let Some(held) = r.cold() {
+            let n_layers = held.len();
+            let chunks_per_layer = held.first().map_or(0, |s| s.chunks.len());
+            if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
+                return;
+            }
+            let mut cold = (*held).clone();
+            for (layer, seq) in cold.iter_mut().enumerate() {
+                for (c, chunk) in seq.chunks.iter_mut().enumerate() {
+                    let flat = (layer * chunks_per_layer + c) as u64;
+                    if let Some(loc) = stream.chunks.get(&flat) {
+                        chunk.log_offset = loc.offset;
+                        chunk.record_len = loc.record_size;
+                        chunk.token_count = loc.token_count as u16;
+                    }
                 }
+            }
+            if self.residences.replace_cold(idx, &held, cold) {
+                return;
             }
         }
     }
 
     /// [`Self::refresh_cold_refs`] for the residences of `moved` alone — what
     /// a maintenance op that relocated those streams' chunks has to refresh.
-    /// Every other residence's references are untouched by the op, and
-    /// walking every chunk of every residence held the substrate write lock
-    /// ~0.4 s per op on BlackWorld's 357 GB store (2026-10-27).
-    pub fn refresh_cold_refs_of(&mut self, moved: &HashSet<StreamId>) {
-        let streams = &self.streams;
-        for slot in &mut self.residence {
-            if moved.contains(&slot.stream_id) {
-                Self::refresh_slot_cold_refs(streams, slot);
+    /// Every other residence's references are untouched by the op.
+    pub fn refresh_cold_refs_of(&self, moved: &HashSet<StreamId>) {
+        for (idx, r) in self.residences.iter() {
+            if moved.contains(&r.stream_id) {
+                self.refresh_slot_cold_refs(idx, r);
             }
         }
     }
@@ -6648,10 +6187,10 @@ impl Substrate {
         // range, but holds no sealed KV — the residence stays cold
         // (`hot = None`) until an elevate / restore_turn install
         // puts bytes in.
-        let tl = self.timelines.get_mut(&timeline).unwrap();
+        let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
         tl.turns.insert(
             idx,
-            TurnEntryData {
+            Arc::new(TurnEntryData {
                 block_range: (block_start, block_end),
                 content: TurnPart {
                     layout: TurnLayout::default(),
@@ -6659,7 +6198,7 @@ impl Substrate {
                     token_ids: TokenBuffer::default(),
                     residence,
                 },
-            },
+            }),
         );
         *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         // Every persisted turn carries a parallel `TreeNodeMeta`.  New
@@ -6735,19 +6274,19 @@ impl Substrate {
         // is spliced by reference onto a durable file timeline, so a cold copy would
         // only strand an orphan. See `mark_timeline_transient` / `no_cold_persist`.
         if self.transient_timelines.contains(&timeline) {
-            self.residence[residence.0].no_cold_persist = true;
+            self.residences.get(residence).set_flag(NO_COLD_PERSIST);
         }
         if self.splice_source_timelines.contains(&timeline) {
-            self.residence[residence.0].splice_source = true;
+            self.residences.get(residence).set_flag(SPLICE_SOURCE);
         }
         let block_start = write.block_start;
         let block_end = write.block_end;
         let token_count = write.token_count;
         {
-            let tl = self.timelines.get_mut(&timeline).unwrap();
+            let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
             tl.turns.insert(
                 idx,
-                TurnEntryData {
+                Arc::new(TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
                         layout: write.layout,
@@ -6755,7 +6294,7 @@ impl Substrate {
                         token_ids: write.token_ids,
                         residence,
                     },
-                },
+                }),
             );
             tl.tree_meta.insert(idx, TreeNodeMeta::default());
             if tl.summarize {
@@ -6801,10 +6340,10 @@ impl Substrate {
         let compression = self.timeline_compression.get(&timeline).copied();
         let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         {
-            let tl = self.timelines.get_mut(&timeline).unwrap();
+            let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
             tl.turns.insert(
                 idx,
-                TurnEntryData {
+                Arc::new(TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
                         layout,
@@ -6812,7 +6351,7 @@ impl Substrate {
                         token_ids,
                         residence,
                     },
-                },
+                }),
             );
             // Tree metadata: the `TreeMetadata` redo-log records were
             // already replayed during the walker's open pass (see
@@ -6832,64 +6371,47 @@ impl Substrate {
         *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         if let Some(cold_seqs) = cold {
             if !cold_seqs.is_empty() {
-                // Sum cold record bytes into residence.byte_size so
-                // the purge accounting + telemetry has a real number
-                // before any hot/warm elevate fires.
-                let total_bytes: u64 = cold_seqs
-                    .iter()
-                    .flat_map(|s| s.chunks.iter())
-                    .map(|c| c.record_len)
-                    .sum();
-                self.residence[residence.0].byte_size = total_bytes;
+                // The install sums the cold record bytes into the residence's
+                // `byte_size`, so the purge accounting + telemetry has a real
+                // number before any hot/warm elevate fires.
                 self.install_cold(residence, cold_seqs);
             }
         }
         idx
     }
 
-    /// Drop a turn's hot residence, freeing its VRAM arena chunks
-    /// (the inner `Arc<ChunkGid>`s reach refcount 0 once any live
-    /// borrowers release them). Removes the slot from the hot LRU.
+    /// Drop a turn's hot copy, freeing its VRAM arena chunks once any live
+    /// borrowers release them.
     ///
-    /// Returns `true` if the residence had hot bytes that were
-    /// dropped; `false` when the turn isn't tracked or was already
-    /// cold-marker. Callers use the boolean to decide whether to
-    /// charge eviction accounting — they never need the dropped
-    /// bytes themselves (the residence's warm/cold tiers hold the
-    /// canonical copies if any future re-elevation needs them).
-    /// Drop the hot residences of both halves of the turn.  Returns
-    /// `true` if either half had hot bytes to drop.
-    pub fn clear_turn_sealed(&mut self, timeline: TimelineId, index: TurnIndex) -> bool {
+    /// Returns `true` if the residence had hot bytes that were dropped;
+    /// `false` when the turn isn't tracked or was already cold-marker. Callers
+    /// use the boolean to decide whether to charge eviction accounting — they
+    /// never need the dropped bytes themselves (the residence's warm/cold tiers
+    /// hold the canonical copies if any future re-elevation needs them).
+    pub fn clear_turn_sealed(&self, timeline: TimelineId, index: TurnIndex) -> bool {
         let Some(residence) = self.turn(timeline, index).map(|e| e.content.residence) else {
             return false;
         };
-        if self.residence[residence.0].hot.take().is_some() {
-            Self::remove_from_lru(&mut self.hot_lru, residence);
-            true
-        } else {
-            false
-        }
+        self.residences.take_hot(residence).is_some()
     }
 
-    /// Sum of bytes across every hot-resident turn. Walks
-    /// [`Self::hot_lru`] directly — exactly the set of turns whose
-    /// residence carries hot bytes — and reads each residence's cached
-    /// `byte_size`. O(N_hot) integer sum, no chunk-walking.
+    /// Sum of bytes across every hot-resident turn, from each residence's
+    /// cached `byte_size`. O(N_hot) integer sum, no chunk-walking.
     pub fn hot_turn_bytes(&self) -> usize {
-        self.hot_lru
-            .iter()
-            .map(|idx| self.residence[idx.0].byte_size as usize)
+        self.hot_turns_oldest_first()
+            .into_iter()
+            .map(|idx| self.residences.get(idx).byte_size() as usize)
             .sum()
     }
 
-    /// Sum of bytes across all pinned sections — the system-prompt /
-    /// catalog KV the substrate never evicts. Counts toward the same
-    /// VRAM budget hot-tier eviction uses.
+    /// Sum of bytes across every hot section — the system-prompt / catalog
+    /// KV. Counts toward the same VRAM budget hot-tier eviction uses.
     pub fn section_bytes(&self) -> usize {
         self.sections
             .values()
-            .filter(|e| self.residence[e.residence.0].hot.is_some())
-            .map(|e| self.residence[e.residence.0].byte_size as usize)
+            .map(|e| self.residences.get(e.residence))
+            .filter(|r| r.has_hot())
+            .map(|r| r.byte_size() as usize)
             .sum()
     }
 
@@ -6897,29 +6419,8 @@ impl Substrate {
     /// `None` for unknown turns or turns with no hot bytes.
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
         let entry = self.turn(timeline, index)?;
-        let residence = &self.residence[entry.content.residence.0];
-        residence.hot.as_ref().map(|_| residence.byte_size as usize)
-    }
-
-    /// FIFO-oldest hot-resident turn, skipping `except`. "FIFO" =
-    /// insertion order within each timeline's tail; timelines are
-    /// scanned in registration order. Adequate eviction heuristic
-    /// (oldest persisted turn = least likely to be re-touched);
-    /// upgradeable to true LRU later by walking [`Self::hot_lru`]
-    /// from the back instead.
-    pub fn oldest_hot_turn_except(&self, except: TurnKey) -> Option<TurnKey> {
-        for (&timeline, tl) in self.timelines.iter() {
-            for (&index, entry) in tl.turns.iter() {
-                let key = TurnKey::new(timeline, index);
-                if key == except {
-                    continue;
-                }
-                if self.residence[entry.content.residence.0].hot.is_some() {
-                    return Some(key);
-                }
-            }
-        }
-        None
+        let r = self.residences.get(entry.content.residence);
+        r.has_hot().then(|| r.byte_size() as usize)
     }
 
     /// The user's message text for this turn — exactly as
@@ -7052,8 +6553,8 @@ impl Substrate {
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
         let residence = self.turn(timeline, index)?.content.residence;
-        let hot = self.residence[residence.0].hot.as_ref()?;
-        Some(Arc::new(hot.clone()))
+        let hot = self.residences.get(residence).hot()?;
+        Some(Arc::new(hot.to_vec()))
     }
 
     /// Sealed K/V for the turn's *user-message body* `[user_start, user_end)`
@@ -7369,8 +6870,17 @@ impl Substrate {
     }
 
     /// The `custom` metadata bag for `timeline`, or `None` if unregistered.
-    pub fn custom_of(&self, timeline: TimelineId) -> Option<&BTreeMap<String, String>> {
+    pub fn custom_of(&self, timeline: TimelineId) -> Option<&POrdMap<String, String>> {
         self.timelines.get(&timeline).map(|e| &e.custom)
+    }
+
+    /// Whether a record `id` would set `key` of `timeline`'s `custom` metadata:
+    /// nothing set it yet, or `id` supersedes the record that did.
+    pub fn custom_field_takes(&self, timeline: TimelineId, key: &str, id: RecordIdentity) -> bool {
+        self.timelines
+            .get(&timeline)
+            .and_then(|e| e.ids.custom.get(key))
+            .is_none_or(|held| id.supersedes(held))
     }
 
     /// Metadata key a **calibration** conversation carries: the raw timeline
@@ -7528,8 +7038,8 @@ impl Substrate {
             if turn.block_range.1 <= turn.block_range.0 {
                 return true;
             }
-            let slot = &self.residence[turn.content.residence.0];
-            slot.hot.is_some() || slot.warm.is_some() || slot.cold.is_some()
+            let slot = self.residences.get(turn.content.residence);
+            slot.has_hot() || slot.has_warm() || slot.has_cold()
         })
     }
 
@@ -7558,7 +7068,7 @@ impl Substrate {
     /// the daemon uses this to skip the persistence write when the
     /// caller is just re-asserting the current state.
     pub fn set_archived(&mut self, timeline: TimelineId, archived: bool) -> bool {
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         if entry.archived == archived {
@@ -7578,7 +7088,11 @@ impl Substrate {
     pub fn conv_state(&self, timeline: TimelineId) -> Option<ConvState> {
         self.timelines.get(&timeline).map(|e| ConvState {
             archived: e.archived,
-            branches: e.branches.clone(),
+            branches: e
+                .branches
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             active: e.active,
         })
     }
@@ -7587,7 +7101,7 @@ impl Substrate {
     /// it outranks every conversation used before it. Returns `false` for an
     /// unregistered timeline, which has no state to write.
     pub fn touch_conversation(&mut self, timeline: TimelineId) -> bool {
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         self.conv_active_counter += 1;
@@ -7599,7 +7113,7 @@ impl Substrate {
     /// isn't registered. Returns `true` when the branch actually changed, so
     /// the caller can skip the persistence write when nothing did.
     pub fn set_branch(&mut self, timeline: TimelineId, repo: &str, branch: &str) -> bool {
-        let Some(entry) = self.timelines.get_mut(&timeline) else {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         if entry.branches.get(repo).map(String::as_str) == Some(branch) {
@@ -7614,7 +7128,7 @@ impl Substrate {
     /// [`Self::set_branch`], is carried by `ConvState` record `id` — minted
     /// for the change, so it outranks every state the timeline held.
     pub fn stamp_conv_state(&mut self, timeline: TimelineId, id: RecordIdentity) {
-        if let Some(entry) = self.timelines.get_mut(&timeline) {
+        if let Some(entry) = arc_mut(&mut self.timelines, &timeline) {
             take(&mut entry.ids.state, id);
         }
     }
@@ -7810,9 +7324,9 @@ impl Substrate {
 
     /// Create a section entry atomically with all data including sealed KV.
     ///
-    /// `sealed_gpu` is the GPU-resident snapshot; `migrate_to_cpu` converts it
-    /// to CPU warm-tier storage inside this call.  GPU chunks are released when
-    /// the caller's `sealed_gpu` Arc drops.
+    /// `sealed` is the K/V the section's hot tier takes — the caller's
+    /// migration of its GPU snapshot, done before the version edit so a
+    /// retried edit never runs it twice.
     ///
     /// `block_start`/`block_end` are omitted — written later by
     /// `set_section_block_range` when the section is injected.
@@ -7822,22 +7336,19 @@ impl Substrate {
     /// for the residence so the persistence thread's section-persist
     /// pass picks the section up by snapshotting hot bytes for any
     /// section residence whose `stream_id != default && cold == None`.
-    #[allow(clippy::too_many_arguments)]
     pub fn set_section_full(
         &mut self,
         section: SectionId,
         stream_id: StreamId,
         token_count: usize,
-        sealed_gpu: Arc<Vec<SealedSequence>>,
-        migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
         tokens: Arc<Vec<u32>>,
-    ) -> candle::Result<()> {
-        let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
-        let residence = self.alloc_residence(stream_id, None);
+    ) -> ResidenceIndex {
+        let residence = self.alloc_section_residence(stream_id);
         // A throwaway conversation's frame never reaches the cold tier — see
         // `mark_section_transient`.
         if self.transient_sections.contains(&section) {
-            self.residence[residence.0].no_cold_persist = true;
+            self.residences.get(residence).set_flag(NO_COLD_PERSIST);
         }
         let entry = SectionEntryData {
             token_count,
@@ -7850,10 +7361,10 @@ impl Substrate {
             .insert(section, entry)
             .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
-        if !sealed_cpu.is_empty() {
-            self.install_section_hot(residence, sealed_cpu);
+        if !sealed.is_empty() {
+            self.install_hot(residence, sealed);
         }
-        Ok(())
+        residence
     }
 
     /// Section variant of [`Self::restore_turn`] — install a section
@@ -7875,8 +7386,8 @@ impl Substrate {
         cold: Vec<StoredSequence>,
         tokens: Arc<Vec<u32>>,
     ) {
-        let residence = self.alloc_residence(stream_id, None);
-        self.residence[residence.0].cold = Some(cold);
+        let residence = self.alloc_section_residence(stream_id);
+        self.residences.set_cold(residence, Some(cold));
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
@@ -7889,7 +7400,7 @@ impl Substrate {
             .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_hot.is_empty() {
-            self.install_section_hot(residence, sealed_hot);
+            self.install_hot(residence, sealed_hot);
         }
     }
 
@@ -7898,7 +7409,7 @@ impl Substrate {
     /// avoid re-prefilling sections that recovered from the redo log.
     pub fn section_is_hot(&self, section: SectionId) -> bool {
         match self.sections.get(&section) {
-            Some(entry) => self.residence[entry.residence.0].hot.is_some(),
+            Some(entry) => self.residences.get(entry.residence).has_hot(),
             None => false,
         }
     }
@@ -7919,7 +7430,9 @@ impl Substrate {
     /// path, which re-prefills fresh and overwrites the tombstoned entry.
     pub fn section_exists(&self, section: SectionId) -> bool {
         match self.sections.get(&section) {
-            Some(entry) => !self.is_section_tombstoned(self.residence[entry.residence.0].stream_id),
+            Some(entry) => {
+                !self.is_section_tombstoned(self.residences.get(entry.residence).stream_id)
+            }
             None => false,
         }
     }
@@ -7929,7 +7442,7 @@ impl Substrate {
     /// skip path for the per-section block-count diagnostic.
     pub fn section_block_count(&self, section: SectionId) -> Option<usize> {
         let entry = self.sections.get(&section)?;
-        let hot = self.residence[entry.residence.0].hot.as_ref()?;
+        let hot = self.residences.get(entry.residence).hot()?;
         hot.first().map(|s| s.chunks.len())
     }
 
@@ -7951,7 +7464,7 @@ impl Substrate {
     /// `stream_id` → `PromptSection.debug_name`. Used by the promote tracker.
     pub fn section_debug_name(&self, id: SectionId) -> Option<String> {
         let entry = self.sections.get(&id)?;
-        let stream_id = self.residence[entry.residence.0].stream_id;
+        let stream_id = self.residences.get(entry.residence).stream_id;
         self.all_streams().find_map(|(sid, entry)| {
             if sid != stream_id {
                 return None;
@@ -7978,7 +7491,7 @@ impl Substrate {
         // slab — the residence holds the stream id we installed at
         // ingest time.
         self.sections.iter().find_map(|(sid, entry)| {
-            if self.residence[entry.residence.0].stream_id == stream_id {
+            if self.residences.get(entry.residence).stream_id == stream_id {
                 Some(*sid)
             } else {
                 None
@@ -7986,49 +7499,56 @@ impl Substrate {
         })
     }
 
-    /// Replace a section residence's hot bytes with `new_hot`.  Used
-    /// by the persistence thread's section-persist pass after it
-    /// quantizes the section's K/V to the section-compression policy
-    /// (C0 by default) — the new Q-format sequences land here so
-    /// subsequent in-session reads see the same bytes the cold tier
-    /// will reproduce on the next reload.
-    pub fn replace_section_hot(&mut self, residence: ResidenceIndex, new_hot: Vec<SealedSequence>) {
+    /// Replace a section residence's hot bytes with `new_hot`, the quantized
+    /// form of `native` — only while the residence still holds `native`;
+    /// `false` when it does not (retired or replaced since), and nothing is
+    /// installed. Used by the scheduler's section-quantize drain after it
+    /// quantizes the section's K/V to the section-compression policy (C0 by
+    /// default) — the new Q-format sequences land here so subsequent
+    /// in-session reads see the same bytes the cold tier will reproduce on
+    /// the next reload.
+    pub fn replace_section_hot(
+        &self,
+        residence: ResidenceIndex,
+        native: &Arc<HotKv>,
+        new_hot: Vec<SealedSequence>,
+    ) -> bool {
         debug_assert!(
             !new_hot.is_empty(),
             "replace_section_hot called with empty Vec"
         );
-        let bytes = sealed_bytes(&new_hot) as u64;
-        let slot = &mut self.residence[residence.0];
-        slot.byte_size = bytes;
-        slot.hot = Some(new_hot);
+        self.residences.replace_hot(residence, native, new_hot)
     }
 
     /// Snapshot the section residences that have hot bytes installed
     /// but haven't been written to the cold tier yet — the work list
     /// for the persistence thread's section-persist pass.  Mirrors
-    /// [`Self::snapshot_pending_cold`] but walks the `sections` map
-    /// rather than `warm_lru` (sections are pinned and never appear on
-    /// the LRUs).  Skips sentinel-stream residences (sections still
-    /// using the legacy `StreamId::default()` path won't try to
-    /// persist).
+    /// [`Self::snapshot_pending_cold`] but walks the `sections` map,
+    /// since sections go hot→cold without a warm copy.  Skips
+    /// sentinel-stream residences (`StreamId::default()` is never
+    /// persisted).
     pub fn snapshot_pending_section_cold(
         &self,
     ) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
         self.sections
             .values()
             .filter_map(|entry| {
-                let slot = &self.residence[entry.residence.0];
-                if slot.cold.is_some()
-                    || slot.stream_id == StreamId::default()
-                    || slot.pending_quantize
-                {
+                let slot = self.residences.get(entry.residence);
+                if !Self::section_cold_pending(slot) {
                     return None;
                 }
-                slot.hot
-                    .as_ref()
-                    .map(|hot| (entry.residence, slot.stream_id, hot.clone()))
+                slot.hot()
+                    .map(|hot| (entry.residence, slot.stream_id, hot.to_vec()))
             })
             .collect()
+    }
+
+    /// Whether a section residence awaits its redo-log write.
+    fn section_cold_pending(slot: &Residence) -> bool {
+        slot.has_hot()
+            && !slot.has_cold()
+            && slot.stream_id != StreamId::default()
+            && !slot.has_flag(PENDING_QUANTIZE)
     }
 
     /// Count of section residences awaiting their redo-log write — the COUNT
@@ -8038,13 +7558,7 @@ impl Substrate {
     pub fn pending_section_cold_count(&self) -> usize {
         self.sections
             .values()
-            .filter(|entry| {
-                let slot = &self.residence[entry.residence.0];
-                slot.hot.is_some()
-                    && slot.cold.is_none()
-                    && slot.stream_id != StreamId::default()
-                    && !slot.pending_quantize
-            })
+            .filter(|entry| Self::section_cold_pending(self.residences.get(entry.residence)))
             .count()
     }
 
@@ -8055,16 +7569,16 @@ impl Substrate {
     /// `snapshot_pending_section_cold` ignores the residence — the
     /// persistence thread holds off on writing native bytes that the
     /// scheduler is about to replace with their quantized form.
-    pub fn mark_section_pending_quantize(&mut self, residence: ResidenceIndex) {
-        self.residence[residence.0].pending_quantize = true;
+    pub fn mark_section_pending_quantize(&self, residence: ResidenceIndex) {
+        self.residences.get(residence).set_flag(PENDING_QUANTIZE);
     }
 
     /// Clear the pending-quantize flag — called from the same drain
     /// that calls `replace_section_hot`.  After this the persistence
     /// thread is free to gather the residence's (now final) hot bytes
     /// and persist them.
-    pub fn clear_section_pending_quantize(&mut self, residence: ResidenceIndex) {
-        self.residence[residence.0].pending_quantize = false;
+    pub fn clear_section_pending_quantize(&self, residence: ResidenceIndex) {
+        self.residences.get(residence).clear_flag(PENDING_QUANTIZE);
     }
 
     pub fn set_section_block_range(
@@ -8080,8 +7594,8 @@ impl Substrate {
 
     pub fn section_sealed_of(&self, section: SectionId) -> Option<Arc<Vec<SealedSequence>>> {
         let residence = self.sections.get(&section)?.residence;
-        let hot = self.residence[residence.0].hot.as_ref()?;
-        Some(Arc::new(hot.clone()))
+        let hot = self.residences.get(residence).hot()?;
+        Some(Arc::new(hot.to_vec()))
     }
 
     pub fn section_tokens_of(&self, section: SectionId) -> Arc<Vec<u32>> {
@@ -8339,7 +7853,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
 /// [`super::resolver::Conversation::read_scored`]; the bare
 /// [`super::resolver::Conversation::read`] returns the unscored variant.
 pub struct SubstrateRead<'a> {
-    pub(super) guard: SubstrateReadGuard<'a>,
+    pub(super) guard: SubstrateReadGuard,
     pub(super) scores: Option<&'a ProjectionScores>,
 }
 
@@ -8452,25 +7966,6 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.guard.pending_summary_len(timeline)
-    }
-}
-
-/// Write guard over a [`Substrate`] inside a [`super::resolver::Conversation`].
-/// Holds the lock; drop to release.
-pub struct SubstrateWrite<'a> {
-    pub(super) guard: SubstrateWriteGuard<'a>,
-}
-
-impl<'a> std::ops::Deref for SubstrateWrite<'a> {
-    type Target = Substrate;
-    fn deref(&self) -> &Substrate {
-        &self.guard
-    }
-}
-
-impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
-    fn deref_mut(&mut self) -> &mut Substrate {
-        &mut self.guard
     }
 }
 
@@ -9332,7 +8827,7 @@ mod tests {
             force_k: None,
             force_v: None,
         };
-        let mut sub = Substrate::new();
+        let sub = Substrate::new();
         let plain = sub.alloc_residence(StreamId(1), None);
         let exact = sub.alloc_residence(StreamId(2), Some(lossless));
         let warm = sub.alloc_residence(StreamId(3), None);
@@ -9341,8 +8836,9 @@ mod tests {
             sub.install_hot(r, vec![minimal_sealed_layer()]);
         }
         sub.install_warm(warm, vec![minimal_sealed_layer()]);
-        sub.residence[pinned.0].cold_pending = true;
-        sub.working_set_pins.insert(pinned);
+        sub.residence(pinned).set_flag(COLD_PENDING);
+        sub.residences
+            .publish_pins(SCHEDULER_PINS, [pinned.0].into_iter().collect());
 
         let mut policies = sub.pending_warm_policies();
         policies.sort_by_key(|p| p.is_some());
@@ -9487,11 +8983,11 @@ mod tests {
 
         // The fork turn's residence is flagged; the normal one is not.
         assert!(
-            !sub.residence[n_res.0].no_cold_persist,
+            !sub.residence(n_res).has_flag(NO_COLD_PERSIST),
             "a normal turn cold-persists"
         );
         assert!(
-            sub.residence[f_res.0].no_cold_persist,
+            sub.residence(f_res).has_flag(NO_COLD_PERSIST),
             "a transient fork turn is flagged no_cold_persist"
         );
 
@@ -9519,7 +9015,7 @@ mod tests {
         // `evict_when_cold`'s warm-drop-on-cold-land never fires.
         sub.tombstone_timeline(fork_tl);
         assert!(
-            sub.residence[f_res.0].warm.is_none(),
+            !sub.residence(f_res).has_warm(),
             "transient fork's warm freed at tombstone"
         );
     }
@@ -9566,8 +9062,8 @@ mod tests {
         let f_idx = sub.append_complete(fork_tl, write(), migrate).unwrap();
         let n_res = sub.turn_residence(normal_tl, n_idx).unwrap();
         let f_res = sub.turn_residence(fork_tl, f_idx).unwrap();
-        assert!(sub.residence[f_res.0].splice_source);
-        assert!(!sub.residence[n_res.0].splice_source);
+        assert!(sub.residence(f_res).has_flag(SPLICE_SOURCE));
+        assert!(!sub.residence(n_res).has_flag(SPLICE_SOURCE));
 
         // Both warm-backed, so every hot-drop path's precondition holds.
         sub.install_warm(n_res, vec![minimal_sealed_layer(), minimal_sealed_layer()]);
@@ -9603,7 +9099,7 @@ mod tests {
             sub.turn_sealed_of(fork_tl, f_idx).is_none(),
             "the fork's tombstone frees its hot copy"
         );
-        assert!(!sub.residence[f_res.0].splice_source);
+        assert!(!sub.residence(f_res).has_flag(SPLICE_SOURCE));
     }
 
     /// `append_complete` calls the migration closure and installs the
@@ -9648,23 +9144,20 @@ mod tests {
         assert_eq!(stored.len(), 2, "two layers installed");
     }
 
-    /// `set_section_full` calls the migration closure and installs
-    /// the result into the section residence's hot tier.
+    /// `set_section_full` installs the sealed layers into the section
+    /// residence's hot tier.
     #[test]
-    fn set_section_full_stores_migrated_result() {
+    fn set_section_full_stores_its_sealed_layers() {
         let mut sub = Substrate::new();
         let section = SectionId::new(42);
 
-        let sealed_gpu = Arc::new(vec![minimal_sealed_layer(), minimal_sealed_layer()]);
         sub.set_section_full(
             section,
             StreamId::default(),
             10,
-            sealed_gpu,
-            identity_migrate,
+            vec![minimal_sealed_layer(), minimal_sealed_layer()],
             Arc::new(vec![1u32, 2, 3]),
-        )
-        .unwrap();
+        );
 
         let stored = sub.section_sealed_of(section).expect("hot installed");
         assert_eq!(stored.len(), 2, "two layers installed");
@@ -9676,16 +9169,13 @@ mod tests {
 
     /// Install `section` with one hot and one warm layer.
     fn install_section_hot_and_warm(sub: &mut Substrate, section: SectionId) -> ResidenceIndex {
-        sub.set_section_full(
+        let r = sub.set_section_full(
             section,
             StreamId::default(),
             10,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32]),
-        )
-        .unwrap();
-        let r = sub.section_residence(section).unwrap();
+        );
         sub.install_warm(r, vec![minimal_sealed_layer()]);
         r
     }
@@ -9701,8 +9191,8 @@ mod tests {
         let kept_r = install_section_hot_and_warm(&mut sub, kept);
         let scratch_r = install_section_hot_and_warm(&mut sub, scratch);
 
-        assert!(!sub.residence[kept_r.0].no_cold_persist);
-        assert!(sub.residence[scratch_r.0].no_cold_persist);
+        assert!(!sub.residence(kept_r).has_flag(NO_COLD_PERSIST));
+        assert!(sub.residence(scratch_r).has_flag(NO_COLD_PERSIST));
         assert_eq!(
             sub.pending_cold_count(),
             1,
@@ -9718,7 +9208,7 @@ mod tests {
         let s = SectionId::new(9);
         let r = install_section_hot_and_warm(&mut sub, s);
         sub.mark_section_transient(s);
-        assert!(sub.residence[r.0].no_cold_persist);
+        assert!(sub.residence(r).has_flag(NO_COLD_PERSIST));
     }
 
     /// **Retiring a transient section removes it and frees its KV**; a
@@ -9740,10 +9230,10 @@ mod tests {
 
         assert!(sub.retire_section(scratch));
         assert!(!sub.section_exists(scratch));
-        assert!(sub.residence[r.0].hot.is_none() && sub.residence[r.0].warm.is_none());
+        assert!(!sub.residence(r).has_hot() && !sub.residence(r).has_warm());
         assert!(
-            !sub.warm_lru.contains(&r),
-            "its warm copy left the LRU with it"
+            !sub.residences.warm_members().contains(&r),
+            "its warm copy left the warm set with it"
         );
         assert!(!sub.is_section_transient(scratch));
         assert_eq!(sub.section_token_total, 10, "its tokens left the total");
@@ -9762,16 +9252,13 @@ mod tests {
     ) -> (SectionId, ResidenceIndex) {
         let section = sub.allocate_owned_section().unwrap();
         sub.register_owned_section(owner, name, section);
-        sub.set_section_full(
+        let r = sub.set_section_full(
             section,
             StreamId(stream),
             10,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32]),
-        )
-        .unwrap();
-        let r = sub.section_residence(section).unwrap();
+        );
         sub.install_warm(r, vec![minimal_sealed_layer()]);
         (section, r)
     }
@@ -9799,14 +9286,17 @@ mod tests {
 
         assert!(!sub.section_exists(a));
         assert!(sub.is_section_tombstoned(StreamId(101)));
-        assert!(sub.residence[ra.0].hot.is_none() && sub.residence[ra.0].warm.is_none());
-        assert!(!sub.warm_lru.contains(&ra) && !sub.hot_lru.contains(&ra));
+        assert!(!sub.residence(ra).has_hot() && !sub.residence(ra).has_warm());
+        assert!(
+            !sub.residences.warm_members().contains(&ra)
+                && !sub.residences.hot_members().contains(&ra)
+        );
         assert_eq!(sub.section_token_total, 10);
         assert!(sub.owned_sections_of(mine).is_empty());
 
         assert!(sub.section_exists(b), "another owner's section survives");
         assert!(!sub.is_section_tombstoned(StreamId(102)));
-        assert!(sub.residence[rb.0].hot.is_some() && sub.residence[rb.0].warm.is_some());
+        assert!(sub.residence(rb).has_hot() && sub.residence(rb).has_warm());
         assert_eq!(sub.owned_section_named(theirs, "b"), Some(b));
     }
 
@@ -9975,11 +9465,9 @@ mod tests {
             SectionId::new(7),
             StreamId::default(),
             10,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32, 2, 3]),
-        )
-        .unwrap();
+        );
         assert_eq!(sub.total_token_count(timeline), 30 + 12 + 10);
     }
 
@@ -10002,22 +9490,18 @@ mod tests {
             SectionId::new(9),
             StreamId::default(),
             100,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32]),
-        )
-        .unwrap();
+        );
         assert_eq!(sub.total_token_count(timeline), 120);
         // Re-ingest the SAME section smaller — replaces its 100 with 60.
         sub.set_section_full(
             SectionId::new(9),
             StreamId::default(),
             60,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32]),
-        )
-        .unwrap();
+        );
         assert_eq!(sub.total_token_count(timeline), 80);
         // Extend the turn by 5 tokens.
         sub.extend_turn(timeline, TurnIndex(0), 5, 2);
@@ -10086,10 +9570,10 @@ mod tests {
         let residence = sub.turn_residence(timeline, idx).unwrap();
         // Drop hot, install a marker warm payload, set byte_size for
         // accounting. The actual SealedSequence content doesn't matter
-        // for the purge — purge_warm_to_budget counts `residence.
-        // byte_size`, not the warm vec's bytes.
-        sub.residence[residence.0].hot = None;
-        sub.residence[residence.0].byte_size = bytes;
+        // for the purge — purge_warm_to_budget counts the residence's
+        // byte size, not the warm vec's bytes.
+        sub.residences.take_hot(residence);
+        sub.residence(residence).set_byte_size(bytes);
         // A non-empty placeholder so the warm slot is `Some`.
         let placeholder = vec![SealedSequence {
             chunks: Vec::new(),
@@ -10141,8 +9625,8 @@ mod tests {
         let r = sub.purge_warm_to_budget(500_000_000, 500_000_000);
         assert_eq!(r.count, 2, "both warm residences should be popped");
         assert_eq!(r.bytes, 1_000_000_000);
-        assert!(sub.residence[a.0].warm.is_none(), "a (LRU) dropped first");
-        assert!(sub.residence[b.0].warm.is_none(), "b also dropped");
+        assert!(!sub.residence(a).has_warm(), "a (LRU) dropped first");
+        assert!(!sub.residence(b).has_warm(), "b also dropped");
     }
 
     /// A warm residence with NO lower-tier backup (its cold write hasn't landed,
@@ -10163,20 +9647,17 @@ mod tests {
         assert_eq!(r.count, 1, "only the cold-backed warm is purgeable");
         assert_eq!(r.bytes, 500_000_000);
         assert!(
-            sub.residence[a.0].warm.is_some(),
+            sub.residence(a).has_warm(),
             "un-backed warm must be kept (its K/V would otherwise be lost)"
         );
-        assert!(
-            sub.residence[b.0].warm.is_none(),
-            "cold-backed warm dropped"
-        );
+        assert!(!sub.residence(b).has_warm(), "cold-backed warm dropped");
     }
 
     /// Empty warm LRU → purge exits gracefully without panicking even
     /// when the threshold can't be met.
     #[test]
-    fn purge_handles_empty_warm_lru() {
-        let mut sub = Substrate::new();
+    fn purge_handles_empty_warm_set() {
+        let sub = Substrate::new();
         // No warm residences exist; warm_now = 0 <= any target → no-op even at
         // a zero budget with a large incoming reservation.
         let r = sub.purge_warm_to_budget(0, 10 * 1024 * 1024 * 1024);
@@ -10292,7 +9773,7 @@ mod tests {
             )
             .unwrap();
         let residence = sub.turn_residence(timeline, idx).unwrap();
-        sub.residence[residence.0].byte_size = bytes;
+        sub.residence(residence).set_byte_size(bytes);
         sub.install_warm(residence, vec![minimal_sealed_layer()]);
         (idx, residence)
     }
@@ -10316,15 +9797,12 @@ mod tests {
         assert_eq!(report.count, 2, "a + b cover the 150 MB target");
         assert_eq!(report.bytes, 200_000_000);
         // Evicted turns: hot dropped, warm KEPT (the fast-reload backup).
-        assert!(sub.residence[a.0].hot.is_none(), "a hot evicted");
-        assert!(
-            sub.residence[a.0].warm.is_some(),
-            "a warm KEPT (→warm not →cold)"
-        );
-        assert!(sub.residence[b.0].hot.is_none(), "b hot evicted");
-        assert!(sub.residence[b.0].warm.is_some(), "b warm KEPT");
+        assert!(sub.residence(a).hot().is_none(), "a hot evicted");
+        assert!(sub.residence(a).has_warm(), "a warm KEPT (→warm not →cold)");
+        assert!(sub.residence(b).hot().is_none(), "b hot evicted");
+        assert!(sub.residence(b).has_warm(), "b warm KEPT");
         // Newest turn untouched — the working set stays resident.
-        assert!(sub.residence[c.0].hot.is_some(), "c (newest) still hot");
+        assert!(sub.residence(c).has_hot(), "c (newest) still hot");
     }
 
     /// The selection (keep set) is never evicted, even when it's the oldest
@@ -10343,8 +9821,8 @@ mod tests {
         }];
         let report = sub.evict_hot_to_free(&[], &keep, 100_000_000);
         assert_eq!(report.count, 1);
-        assert!(sub.residence[a.0].hot.is_some(), "a protected by keep set");
-        assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
+        assert!(sub.residence(a).has_hot(), "a protected by keep set");
+        assert!(sub.residence(b).hot().is_none(), "b evicted instead");
     }
 
     /// A conversation pinned in ANY dialogue's working set is protected, not
@@ -10364,11 +9842,8 @@ mod tests {
 
         let report = sub.evict_hot_to_free(&[], &[], 100_000_000);
         assert_eq!(report.count, 1);
-        assert!(
-            sub.residence[a.0].hot.is_some(),
-            "the pinned file stays hot"
-        );
-        assert!(sub.residence[b.0].hot.is_none(), "the unpinned one goes");
+        assert!(sub.residence(a).has_hot(), "the pinned file stays hot");
+        assert!(sub.residence(b).hot().is_none(), "the unpinned one goes");
     }
 
     /// A guest's drain takes a pinned working set too, and still spares the
@@ -10387,9 +9862,9 @@ mod tests {
 
         let report = sub.evict_hot_for_guest(&[], &[TurnKey::new(other, b_idx)], u64::MAX);
         assert_eq!(report.count, 1);
-        assert!(sub.residence[a.0].hot.is_none(), "the pinned file goes");
-        assert!(sub.residence[a.0].warm.is_some(), "and keeps its warm copy");
-        assert!(sub.residence[b.0].hot.is_some(), "the kept turn stays");
+        assert!(sub.residence(a).hot().is_none(), "the pinned file goes");
+        assert!(sub.residence(a).has_warm(), "and keeps its warm copy");
+        assert!(sub.residence(b).has_hot(), "the kept turn stays");
         let _ = a_idx;
     }
 
@@ -10410,7 +9885,7 @@ mod tests {
         let census = sub.hot_census(&[], &[]);
         assert_eq!(census.pinned, 100_000_000);
         assert_eq!(census.evictable, 50_000_000);
-        assert!(sub.residence[a.0].hot.is_some() && sub.residence[b.0].hot.is_some());
+        assert!(sub.residence(a).has_hot() && sub.residence(b).has_hot());
         assert_eq!(
             sub.evict_hot_to_free(&[], &[], u64::MAX).bytes,
             census.evictable
@@ -10439,14 +9914,11 @@ mod tests {
             },
         ]);
         assert_eq!(demoted, 2, "a + b demoted");
-        assert!(sub.residence[a.0].hot.is_none(), "a hot dropped");
-        assert!(
-            sub.residence[a.0].warm.is_some(),
-            "a warm KEPT (cheap reload)"
-        );
-        assert!(sub.residence[b.0].hot.is_none(), "b hot dropped");
-        assert!(sub.residence[b.0].warm.is_some(), "b warm KEPT");
-        assert!(sub.residence[c.0].hot.is_some(), "c (unnamed) still hot");
+        assert!(sub.residence(a).hot().is_none(), "a hot dropped");
+        assert!(sub.residence(a).has_warm(), "a warm KEPT (cheap reload)");
+        assert!(sub.residence(b).hot().is_none(), "b hot dropped");
+        assert!(sub.residence(b).has_warm(), "b warm KEPT");
+        assert!(sub.residence(c).has_hot(), "c (unnamed) still hot");
 
         // Idempotent: a is now warm-only, so re-demoting it frees nothing.
         assert_eq!(
@@ -10459,7 +9931,7 @@ mod tests {
         );
 
         // A hot turn with NO warm copy is left hot — dropping it would lose K/V.
-        sub.residence[c.0].warm = None;
+        sub.residences.take_warm(c);
         assert_eq!(
             sub.demote_turns_to_warm(&[TurnKey {
                 timeline,
@@ -10468,10 +9940,7 @@ mod tests {
             0,
             "hot-without-warm is not demotable"
         );
-        assert!(
-            sub.residence[c.0].hot.is_some(),
-            "c hot-without-warm untouched"
-        );
+        assert!(sub.residence(c).has_hot(), "c hot-without-warm untouched");
     }
 
     /// Gentle-early ingest demotion drops the hot copy of an ingest timeline's
@@ -10488,7 +9957,7 @@ mod tests {
         let (_, t3) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
         let (_, t4) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
         // The newest turn is the active writer: hot-only (no warm copy yet).
-        sub.residence[t4.0].warm = None;
+        sub.residences.take_warm(t4);
 
         let mut ingest = std::collections::HashSet::new();
         ingest.insert(timeline);
@@ -10496,36 +9965,26 @@ mod tests {
         // keep_recent = 2 → protect t3, t4 (the rolling window); no live working
         // set; unbounded target → demote the whole LRU tail t0, t1, t2 (all
         // warm-backed), oldest-first.
-        let (report, taken) = sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX);
-        assert_eq!(
-            taken.len(),
-            report.count,
-            "every demoted hot copy is handed back"
-        );
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX);
         assert_eq!(report.count, 3, "t0,t1,t2 demoted; t3,t4 window kept");
         assert_eq!(report.bytes, 300_000_000);
         for r in [t0, t1, t2] {
             assert!(
-                sub.residence[r.0].hot.is_none(),
+                sub.residence(r).hot().is_none(),
                 "older ingest turn demoted"
             );
-            assert!(
-                sub.residence[r.0].warm.is_some(),
-                "warm KEPT (cheap reload)"
-            );
+            assert!(sub.residence(r).has_warm(), "warm KEPT (cheap reload)");
         }
-        assert!(sub.residence[t3.0].hot.is_some(), "window turn stays hot");
+        assert!(sub.residence(t3).has_hot(), "window turn stays hot");
         assert!(
-            sub.residence[t4.0].hot.is_some(),
+            sub.residence(t4).has_hot(),
             "hot-without-warm writer stays hot"
         );
 
         // Idempotent: the demoted turns are now warm-only, so a second pass frees
         // nothing.
         assert_eq!(
-            sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX)
-                .0
-                .count,
+            sub.demote_cold_ingest(&ingest, &[], &[], 2, u64::MAX).count,
             0,
             "already demoted"
         );
@@ -10548,19 +10007,13 @@ mod tests {
         // keep_recent = 0 (nothing protected), target = 150 MB → the walk frees t0
         // (100 MB, still < target) then t1 (200 MB, ≥ target) and stops. t2, t3 stay
         // hot.
-        let (report, _) = sub.demote_cold_ingest(&ingest, &[], &[], 0, 150_000_000);
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, 150_000_000);
         assert_eq!(report.count, 2, "only the two oldest shed to meet target");
         assert_eq!(report.bytes, 200_000_000);
-        assert!(sub.residence[t0.0].hot.is_none(), "oldest demoted");
-        assert!(sub.residence[t1.0].hot.is_none(), "second-oldest demoted");
-        assert!(
-            sub.residence[t2.0].hot.is_some(),
-            "target met → t2 kept hot"
-        );
-        assert!(
-            sub.residence[t3.0].hot.is_some(),
-            "target met → t3 kept hot"
-        );
+        assert!(sub.residence(t0).hot().is_none(), "oldest demoted");
+        assert!(sub.residence(t1).hot().is_none(), "second-oldest demoted");
+        assert!(sub.residence(t2).has_hot(), "target met → t2 kept hot");
+        assert!(sub.residence(t3).has_hot(), "target met → t3 kept hot");
     }
 
     /// An ingest timeline that was never registered must be skipped, not
@@ -10582,10 +10035,10 @@ mod tests {
         // Never registered on this substrate.
         ingest.insert(TimelineId::from_raw(4242).unwrap());
 
-        let (report, _) = sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
+        let report = sub.demote_cold_ingest(&ingest, &[], &[], 0, u64::MAX);
         assert_eq!(report.count, 2, "the registered ingest turns still demote");
         for r in [a, b] {
-            assert!(sub.residence[r.0].hot.is_none(), "demoted");
+            assert!(sub.residence(r).hot().is_none(), "demoted");
         }
     }
 
@@ -10600,14 +10053,11 @@ mod tests {
 
         // Empty ingest set → this timeline is not an ingest timeline, so even an
         // unbounded target frees nothing.
-        let (report, _) =
+        let report =
             sub.demote_cold_ingest(&std::collections::HashSet::new(), &[], &[], 0, u64::MAX);
         assert_eq!(report.count, 0);
         for r in [a, b, c] {
-            assert!(
-                sub.residence[r.0].hot.is_some(),
-                "non-ingest timeline untouched"
-            );
+            assert!(sub.residence(r).has_hot(), "non-ingest timeline untouched");
         }
     }
 
@@ -10618,17 +10068,13 @@ mod tests {
     fn install_cold_frees_section_hot_only_when_evict_flagged() {
         let mut sub = Substrate::new();
         let install = |sub: &mut Substrate, id: u32| {
-            let sealed = Arc::new(vec![minimal_sealed_layer()]);
             sub.set_section_full(
                 SectionId::new(id),
                 StreamId::default(),
                 32,
-                sealed,
-                identity_migrate,
+                vec![minimal_sealed_layer()],
                 Arc::new(vec![]),
             )
-            .unwrap();
-            sub.section_residence(SectionId::new(id)).unwrap()
         };
         let cold = || {
             vec![StoredSequence {
@@ -10643,8 +10089,8 @@ mod tests {
 
         let member = install(&mut sub, 1);
         let boundary = install(&mut sub, 2);
-        assert!(sub.residence[member.0].hot.is_some());
-        assert!(sub.residence[boundary.0].hot.is_some());
+        assert!(sub.residence(member).has_hot());
+        assert!(sub.residence(boundary).has_hot());
 
         // Only the collection member is flagged for offload-on-persist.
         sub.mark_section_evict_when_cold(member);
@@ -10654,16 +10100,16 @@ mod tests {
 
         // Flagged member: cold copy lands AND hot VRAM is freed.
         assert!(
-            sub.residence[member.0].hot.is_none(),
+            sub.residence(member).hot().is_none(),
             "flagged member: VRAM offloaded once cold lands"
         );
-        assert!(sub.residence[member.0].cold.is_some());
+        assert!(sub.residence(member).has_cold());
         // Boundary section: cold copy lands but it stays hot for the build.
         assert!(
-            sub.residence[boundary.0].hot.is_some(),
+            sub.residence(boundary).has_hot(),
             "boundary section stays hot"
         );
-        assert!(sub.residence[boundary.0].cold.is_some());
+        assert!(sub.residence(boundary).has_cold());
     }
 
     /// A completed-ingest turn flagged `evict_when_cold` is fully evicted from
@@ -10688,23 +10134,32 @@ mod tests {
 
         // One turn is a completed-ingest residence flagged for full eviction; the
         // other stays live. Both start hot + warm (on both LRUs).
-        sub.residence[flagged.0].evict_when_cold = true;
-        assert!(sub.hot_lru.contains(&flagged) && sub.warm_lru.contains(&flagged));
+        sub.residence(flagged).set_flag(EVICT_WHEN_COLD);
+        assert!(
+            sub.residences.hot_members().contains(&flagged)
+                && sub.residences.warm_members().contains(&flagged)
+        );
 
         sub.install_cold(flagged, cold());
         sub.install_cold(kept, cold());
 
         // Flagged: cold durable, and BOTH resident tiers freed + off both LRUs.
-        assert!(sub.residence[flagged.0].cold.is_some(), "cold durable");
-        assert!(sub.residence[flagged.0].hot.is_none(), "VRAM reclaimed");
-        assert!(sub.residence[flagged.0].warm.is_none(), "RAM reclaimed");
-        assert!(!sub.hot_lru.contains(&flagged), "off hot_lru");
-        assert!(!sub.warm_lru.contains(&flagged), "off warm_lru");
+        assert!(sub.residence(flagged).has_cold(), "cold durable");
+        assert!(sub.residence(flagged).hot().is_none(), "VRAM reclaimed");
+        assert!(sub.residence(flagged).warm().is_none(), "RAM reclaimed");
+        assert!(
+            !sub.residences.hot_members().contains(&flagged),
+            "off the hot set"
+        );
+        assert!(
+            !sub.residences.warm_members().contains(&flagged),
+            "off the warm set"
+        );
 
         // Unflagged: cold lands but the turn stays fully resident.
-        assert!(sub.residence[kept.0].cold.is_some());
-        assert!(sub.residence[kept.0].hot.is_some(), "kept stays hot");
-        assert!(sub.residence[kept.0].warm.is_some(), "kept stays warm");
+        assert!(sub.residence(kept).has_cold());
+        assert!(sub.residence(kept).has_hot(), "kept stays hot");
+        assert!(sub.residence(kept).has_warm(), "kept stays warm");
     }
 
     /// `mark_timeline_evict_when_cold` flags every turn residence of exactly the
@@ -10727,18 +10182,21 @@ mod tests {
 
         let n = sub.mark_timeline_evict_when_cold(ingest);
         assert_eq!(n, 2, "both ingest turns flagged");
-        assert!(sub.residence[a.0].evict_when_cold);
-        assert!(sub.residence[b.0].evict_when_cold);
+        assert!(sub.residence(a).has_flag(EVICT_WHEN_COLD));
+        assert!(sub.residence(b).has_flag(EVICT_WHEN_COLD));
         assert!(
-            !sub.residence[c.0].evict_when_cold,
+            !sub.residence(c).has_flag(EVICT_WHEN_COLD),
             "the other timeline's turn is untouched"
         );
         // Already-warm ingest turns get their hot copy dropped immediately (VRAM
         // reclaimed now) while warm is kept; the other timeline stays fully hot.
-        assert!(sub.residence[a.0].hot.is_none() && sub.residence[a.0].warm.is_some());
-        assert!(sub.residence[b.0].hot.is_none() && sub.residence[b.0].warm.is_some());
-        assert!(!sub.hot_lru.contains(&a) && !sub.hot_lru.contains(&b));
-        assert!(sub.residence[c.0].hot.is_some() && sub.residence[c.0].warm.is_some());
+        assert!(sub.residence(a).hot().is_none() && sub.residence(a).has_warm());
+        assert!(sub.residence(b).hot().is_none() && sub.residence(b).has_warm());
+        assert!(
+            !sub.residences.hot_members().contains(&a)
+                && !sub.residences.hot_members().contains(&b)
+        );
+        assert!(sub.residence(c).has_hot() && sub.residence(c).has_warm());
 
         // Unknown timeline → no-op.
         assert_eq!(sub.mark_timeline_evict_when_cold(alloc.next()), 0);
@@ -10790,8 +10248,8 @@ mod tests {
         };
 
         // Both are completed-ingest residences flagged for full eviction.
-        sub.residence[pinned.0].evict_when_cold = true;
-        sub.residence[unpinned.0].evict_when_cold = true;
+        sub.residence(pinned).set_flag(EVICT_WHEN_COLD);
+        sub.residence(unpinned).set_flag(EVICT_WHEN_COLD);
         // Only the first is in the scheduler's live working set.
         sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
 
@@ -10799,21 +10257,24 @@ mod tests {
         sub.install_cold(unpinned, cold());
 
         // Pinned: cold durable, but hot+warm KEPT (deferred), flag still set.
-        assert!(sub.residence[pinned.0].cold.is_some(), "cold durable");
-        assert!(sub.residence[pinned.0].hot.is_some(), "pinned keeps hot");
-        assert!(sub.residence[pinned.0].warm.is_some(), "pinned keeps warm");
-        assert!(sub.hot_lru.contains(&pinned) && sub.warm_lru.contains(&pinned));
+        assert!(sub.residence(pinned).has_cold(), "cold durable");
+        assert!(sub.residence(pinned).has_hot(), "pinned keeps hot");
+        assert!(sub.residence(pinned).has_warm(), "pinned keeps warm");
         assert!(
-            sub.residence[pinned.0].evict_when_cold,
+            sub.residences.hot_members().contains(&pinned)
+                && sub.residences.warm_members().contains(&pinned)
+        );
+        assert!(
+            sub.residence(pinned).has_flag(EVICT_WHEN_COLD),
             "flag stays set — eviction is deferred, not cancelled"
         );
         // Unpinned: evicted from both resident tiers as usual.
         assert!(
-            sub.residence[unpinned.0].hot.is_none(),
+            sub.residence(unpinned).hot().is_none(),
             "unpinned VRAM reclaimed"
         );
         assert!(
-            sub.residence[unpinned.0].warm.is_none(),
+            sub.residence(unpinned).warm().is_none(),
             "unpinned RAM reclaimed"
         );
     }
@@ -10855,18 +10316,18 @@ mod tests {
         sub.install_warm_and_evict_hot(unpinned, vec![minimal_sealed_layer()]);
 
         // Pinned: hot KEPT (now dual hot+warm); unpinned: hot dropped, warm only.
-        assert!(sub.residence[pinned.0].hot.is_some(), "pinned keeps hot");
-        assert!(sub.residence[pinned.0].warm.is_some(), "pinned gained warm");
-        assert!(sub.hot_lru.contains(&pinned));
+        assert!(sub.residence(pinned).has_hot(), "pinned keeps hot");
+        assert!(sub.residence(pinned).has_warm(), "pinned gained warm");
+        assert!(sub.residences.hot_members().contains(&pinned));
         assert!(
-            sub.residence[unpinned.0].hot.is_none(),
+            sub.residence(unpinned).hot().is_none(),
             "unpinned hot dropped"
         );
         assert!(
-            sub.residence[unpinned.0].warm.is_some(),
+            sub.residence(unpinned).has_warm(),
             "unpinned warm installed"
         );
-        assert!(!sub.hot_lru.contains(&unpinned));
+        assert!(!sub.residences.hot_members().contains(&unpinned));
     }
 
     /// **A migrate's quantized hot copy replaces the native one wherever hot
@@ -10893,8 +10354,8 @@ mod tests {
         let (_, plain) = fresh(&mut sub);
         let (_, flagged) = fresh(&mut sub);
         let (pinned_idx, flagged_pinned) = fresh(&mut sub);
-        sub.residence[flagged.0].evict_when_cold = true;
-        sub.residence[flagged_pinned.0].evict_when_cold = true;
+        sub.residence(flagged).set_flag(EVICT_WHEN_COLD);
+        sub.residence(flagged_pinned).set_flag(EVICT_WHEN_COLD);
         sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
         // The migrate's quantized copy, told apart from the native one by its
         // token count.
@@ -10905,31 +10366,68 @@ mod tests {
             }]
         };
         for r in [plain, flagged, flagged_pinned] {
-            sub.install_migrated(r, quantized(), vec![minimal_sealed_layer()]);
+            let from = sub.residence(r).hot().expect("hot before the migrate");
+            assert!(sub.install_migrated(r, &from, quantized(), vec![minimal_sealed_layer()]));
         }
-        let hot_tokens = |sub: &Substrate, r: ResidenceIndex| {
-            sub.residence[r.0].hot.as_ref().map(|h| h[0].token_count)
-        };
+        let hot_tokens =
+            |sub: &Substrate, r: ResidenceIndex| sub.residence(r).hot().map(|h| h[0].token_count);
 
         assert_eq!(hot_tokens(&sub, plain), Some(7));
-        assert!(sub.residence[plain.0].warm.is_some());
+        assert!(sub.residence(plain).has_warm());
 
         assert_eq!(
             hot_tokens(&sub, flagged),
             None,
             "flagged, unpinned: hot goes"
         );
-        assert!(sub.residence[flagged.0].warm.is_some());
+        assert!(sub.residence(flagged).has_warm());
 
         assert_eq!(
             hot_tokens(&sub, flagged_pinned),
             Some(7),
             "flagged and pinned: the quantized copy stays, not the native one"
         );
-        assert!(sub.residence[flagged_pinned.0].warm.is_some());
+        assert!(sub.residence(flagged_pinned).has_warm());
         assert!(
-            sub.residence[flagged_pinned.0].evict_when_cold,
+            sub.residence(flagged_pinned).has_flag(EVICT_WHEN_COLD),
             "the flag stands"
+        );
+    }
+
+    /// **A migrate's copies land only over the hot copy they were made from.**
+    /// A residence killed while it migrated, or whose hot copy was taken and
+    /// replaced, takes neither tier: the copies describe state that has moved
+    /// on.
+    #[test]
+    fn a_migrate_over_a_residence_that_moved_on_installs_nothing() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, killed) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residences.take_warm(killed);
+        let from_killed = sub.residence(killed).hot().unwrap();
+        sub.residences.kill(killed);
+        assert!(!sub.install_migrated(
+            killed,
+            &from_killed,
+            vec![minimal_sealed_layer()],
+            vec![minimal_sealed_layer()]
+        ));
+        assert!(!sub.residence(killed).has_hot() && !sub.residence(killed).has_warm());
+
+        let (_, replaced) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residences.take_warm(replaced);
+        let stale = sub.residence(replaced).hot().unwrap();
+        sub.residences.take_hot(replaced);
+        sub.residences
+            .install_hot(replaced, vec![minimal_sealed_layer()]);
+        assert!(!sub.install_migrated(
+            replaced,
+            &stale,
+            vec![minimal_sealed_layer()],
+            vec![minimal_sealed_layer()]
+        ));
+        assert!(
+            !sub.residence(replaced).has_warm(),
+            "no warm copy of the bytes the residence no longer holds"
         );
     }
 
@@ -10970,16 +10468,16 @@ mod tests {
                 token_count: 32,
             }]
         };
-        sub.residence[recalled.0].cold = Some(cold());
-        sub.residence[unpinned_recall.0].cold = Some(cold());
-        sub.residence[writing.0].cold_pending = true;
+        sub.residences.set_cold(recalled, Some(cold()));
+        sub.residences.set_cold(unpinned_recall, Some(cold()));
+        sub.residence(writing).set_flag(COLD_PENDING);
         for (r, bytes) in [
             (fresh, 1_000),
             (recalled, 200),
             (writing, 30),
             (unpinned_recall, 4),
         ] {
-            sub.residence[r.0].byte_size = bytes;
+            sub.residence(r).set_byte_size(bytes);
         }
         sub.set_working_set_pins(
             &[
@@ -11017,18 +10515,18 @@ mod tests {
         assert_eq!(n, 2, "both turns flagged");
 
         // Both flagged; the immediate hot-drop fires only for the unpinned turn.
-        assert!(sub.residence[pinned.0].evict_when_cold);
-        assert!(sub.residence[unpinned.0].evict_when_cold);
+        assert!(sub.residence(pinned).has_flag(EVICT_WHEN_COLD));
+        assert!(sub.residence(unpinned).has_flag(EVICT_WHEN_COLD));
         assert!(
-            sub.residence[pinned.0].hot.is_some(),
+            sub.residence(pinned).has_hot(),
             "pinned keeps hot (deferred)"
         );
-        assert!(sub.hot_lru.contains(&pinned));
+        assert!(sub.residences.hot_members().contains(&pinned));
         assert!(
-            sub.residence[unpinned.0].hot.is_none(),
+            sub.residence(unpinned).hot().is_none(),
             "unpinned hot dropped now"
         );
-        assert!(!sub.hot_lru.contains(&unpinned));
+        assert!(!sub.residences.hot_members().contains(&unpinned));
     }
 
     /// **The idle demote cannot take KV the current wave is using.**
@@ -11055,14 +10553,14 @@ mod tests {
         }
         assert_eq!(shed, 1, "only the idle residence is shed");
         assert!(
-            sub.residence[active.0].hot.is_some(),
+            sub.residence(active).has_hot(),
             "a residence the current wave is attending must keep its hot copy"
         );
         assert!(
-            sub.residence[idle.0].hot.is_none(),
+            sub.residence(idle).hot().is_none(),
             "the idle one's hot is dropped, since warm already exists"
         );
-        assert!(!sub.hot_lru.contains(&idle));
+        assert!(!sub.residences.hot_members().contains(&idle));
         // **Shedding hot is not a verdict on the residence's kind.** The demote
         // must leave `evict_when_cold` exactly as it found it: the flag says a
         // residence's cold copy is disposable (a transient timeline), it is
@@ -11072,7 +10570,7 @@ mod tests {
         // one quiet minute.
         for idx in [active, idle] {
             assert!(
-                !sub.residence[idx.0].evict_when_cold,
+                !sub.residence(idx).has_flag(EVICT_WHEN_COLD),
                 "the idle demote must not latch evict_when_cold on a durable residence"
             );
         }
@@ -11108,7 +10606,7 @@ mod tests {
     fn idle_demote_skips_residences_pending_quantize() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[r.0].pending_quantize = true;
+        sub.residence(r).set_flag(PENDING_QUANTIZE);
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
             shed += sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS);
@@ -11118,7 +10616,7 @@ mod tests {
             shed, 0,
             "a pending-quantize residence is not the demote's to take"
         );
-        assert!(sub.residence[r.0].hot.is_some());
+        assert!(sub.residence(r).has_hot());
     }
 
     /// **The demote is the retry for an offload that stood aside for a compaction.**
@@ -11130,13 +10628,13 @@ mod tests {
     fn a_deferred_offload_is_shed_by_the_next_demote_whatever_its_age() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[r.0].evict_when_cold = true;
+        sub.residence(r).set_flag(EVICT_WHEN_COLD);
 
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
-        assert!(sub.residence[r.0].hot.is_none(), "the hot copy is shed");
-        assert!(!sub.hot_lru.contains(&r));
+        assert!(sub.residence(r).hot().is_none(), "the hot copy is shed");
+        assert!(!sub.residences.hot_members().contains(&r));
         assert!(
-            sub.residence[r.0].warm.is_some(),
+            sub.residence(r).has_warm(),
             "warm stays until cold lands — it is the only durable-in-session copy"
         );
     }
@@ -11148,52 +10646,56 @@ mod tests {
     fn a_deferred_cold_offload_sheds_both_resident_tiers() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[r.0].evict_when_cold = true;
-        sub.residence[r.0].cold = Some(vec![StoredSequence {
-            chunks: vec![StoredChunk {
-                log_offset: 0,
-                record_len: 1024,
+        sub.residence(r).set_flag(EVICT_WHEN_COLD);
+        sub.residences.set_cold(
+            r,
+            Some(vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
                 token_count: 32,
-            }],
-            token_count: 32,
-        }]);
+            }]),
+        );
 
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
-        assert!(sub.residence[r.0].hot.is_none(), "VRAM reclaimed");
-        assert!(sub.residence[r.0].warm.is_none(), "RAM reclaimed");
-        assert!(!sub.hot_lru.contains(&r) && !sub.warm_lru.contains(&r));
-        assert!(sub.residence[r.0].cold.is_some(), "cold durable");
+        assert!(sub.residence(r).hot().is_none(), "VRAM reclaimed");
+        assert!(sub.residence(r).warm().is_none(), "RAM reclaimed");
+        assert!(
+            !sub.residences.hot_members().contains(&r)
+                && !sub.residences.warm_members().contains(&r)
+        );
+        assert!(sub.residence(r).has_cold(), "cold durable");
     }
 
-    /// **The idle demote reaches SECTIONS, which are not on `hot_lru`.**
+    /// **The idle demote reaches SECTIONS, which the recency order of turns
+    /// leaves out.**
     ///
     /// `elevate_to_hot` lifts sections and turns alike, and §8.1 of
     /// `docs/vram_governor_design.md` names "nothing demoted a section once it
-    /// was elevated" as the gap this closes. A scan over `hot_lru` alone reaches
-    /// only turns — `install_section_hot` deliberately keeps sections off that
-    /// list — so it would miss the very case it was written for.
+    /// was elevated" as the gap this closes. A walk of the turns oldest-first
+    /// reaches only turns — sections are deliberately not ranked against them —
+    /// so it would miss the very case it was written for.
     #[test]
     fn idle_demote_reaches_sections_not_only_turns() {
         let mut sub = Substrate::new();
         let section = SectionId::new(42);
-        sub.set_section_full(
+        let r = sub.set_section_full(
             section,
             StreamId::default(),
             10,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32, 2, 3]),
-        )
-        .unwrap();
-        let r = sub.section_residence(section).expect("section installed");
+        );
         // A warm copy must exist for the demote to have something to fall back
         // on — the same condition it applies to turns.
         sub.install_warm(r, vec![minimal_sealed_layer()]);
-        assert!(sub.residence[r.0].hot.is_some());
+        assert!(sub.residence(r).has_hot());
         assert!(
-            !sub.hot_lru.contains(&r),
-            "sections are deliberately off the LRU — that is what makes this test \
-             about the scan rather than about the list",
+            !sub.hot_turns_oldest_first().contains(&r),
+            "sections are deliberately not in the turns' recency order — that is \
+             what makes this test about the scan rather than about the order",
         );
 
         let mut shed = 0;
@@ -11203,13 +10705,10 @@ mod tests {
 
         assert_eq!(shed, 1, "the idle section is shed");
         assert!(
-            sub.residence[r.0].hot.is_none(),
+            sub.residence(r).hot().is_none(),
             "an idle section must give its VRAM back like any other residence",
         );
-        assert!(
-            sub.residence[r.0].warm.is_some(),
-            "warm survives the demote"
-        );
+        assert!(sub.residence(r).has_warm(), "warm survives the demote");
     }
 
     /// …but a section the current wave is attending is untouchable, exactly as
@@ -11218,16 +10717,13 @@ mod tests {
     fn idle_demote_never_takes_a_pinned_section() {
         let mut sub = Substrate::new();
         let section = SectionId::new(7);
-        sub.set_section_full(
+        let r = sub.set_section_full(
             section,
             StreamId::default(),
             10,
-            Arc::new(vec![minimal_sealed_layer()]),
-            identity_migrate,
+            vec![minimal_sealed_layer()],
             Arc::new(vec![1u32, 2, 3]),
-        )
-        .unwrap();
-        let r = sub.section_residence(section).expect("section installed");
+        );
         sub.install_warm(r, vec![minimal_sealed_layer()]);
 
         let mut shed = 0;
@@ -11238,7 +10734,7 @@ mod tests {
 
         assert_eq!(shed, 0);
         assert!(
-            sub.residence[r.0].hot.is_some(),
+            sub.residence(r).has_hot(),
             "a pinned section is part of the live projection and must stay hot",
         );
     }
@@ -11255,20 +10751,19 @@ mod tests {
         let (_j, transient) = install_hot_and_warm(&mut sub, timeline, 4096);
         // Both warm-only: no hot, no cold.
         for idx in [durable, transient] {
-            sub.residence[idx.0].hot = None;
-            Substrate::remove_from_lru(&mut sub.hot_lru, idx);
+            sub.residences.take_hot(idx);
         }
-        sub.residence[transient.0].no_cold_persist = true;
+        sub.residence(transient).set_flag(NO_COLD_PERSIST);
 
         // A budget of zero asks the purge to shed everything it safely can.
         let report = sub.purge_warm_to_budget(0, 0);
 
         assert!(
-            sub.residence[durable.0].warm.is_some(),
+            sub.residence(durable).has_warm(),
             "a durable warm-only residence is its turn's last copy and must survive",
         );
         assert!(
-            sub.residence[transient.0].warm.is_none(),
+            sub.residence(transient).warm().is_none(),
             "a transient warm-only residence has no cold copy coming, so holding \
              it is holding it forever",
         );
@@ -11282,15 +10777,14 @@ mod tests {
     fn the_warm_purge_never_sheds_a_pinned_transient() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (idx, r) = install_hot_and_warm(&mut sub, timeline, 4096);
-        sub.residence[r.0].hot = None;
-        Substrate::remove_from_lru(&mut sub.hot_lru, r);
-        sub.residence[r.0].no_cold_persist = true;
+        sub.residences.take_hot(r);
+        sub.residence(r).set_flag(NO_COLD_PERSIST);
         sub.set_working_set_pins(&[TurnKey::new(timeline, idx)], &[]);
 
         sub.purge_warm_to_budget(0, 0);
 
         assert!(
-            sub.residence[r.0].warm.is_some(),
+            sub.residence(r).has_warm(),
             "elevate stamps pins before it reads warm to build hot; the purge \
              must not pull those bytes out from under it",
         );
@@ -11307,21 +10801,21 @@ mod tests {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, a) = install_hot_and_warm(&mut sub, timeline, 10);
         let (_j, b) = install_hot_and_warm(&mut sub, timeline, 10);
-        assert!(sub.residence[a.0].hot.is_some() && sub.residence[a.0].warm.is_some());
+        assert!(sub.residence(a).has_hot() && sub.residence(a).has_warm());
 
         sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
 
         for idx in [a, b] {
             assert!(
-                sub.residence[idx.0].hot.is_none(),
+                sub.residence(idx).hot().is_none(),
                 "a distilled turn must not keep hot K/V",
             );
             assert!(
-                sub.residence[idx.0].warm.is_none(),
+                sub.residence(idx).warm().is_none(),
                 "a distilled turn must not keep warm K/V — this is the 7.2 GiB",
             );
-            assert!(!sub.hot_lru.contains(&idx));
-            assert!(!sub.warm_lru.contains(&idx));
+            assert!(!sub.residences.hot_members().contains(&idx));
+            assert!(!sub.residences.warm_members().contains(&idx));
         }
         // The mark itself still stands: the compactor sheds the record and the
         // cold copy, and the signature keeps answering the belief scan.
@@ -11338,8 +10832,8 @@ mod tests {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
         sub.distill_timeline(timeline, DistillMode::TextOnly);
-        assert!(sub.residence[r.0].hot.is_none());
-        assert!(sub.residence[r.0].warm.is_none());
+        assert!(sub.residence(r).hot().is_none());
+        assert!(sub.residence(r).warm().is_none());
     }
 
     /// The release honours the working set, like every other drop path: a
@@ -11356,11 +10850,11 @@ mod tests {
         sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
 
         assert!(
-            sub.residence[active.0].hot.is_some(),
+            sub.residence(active).has_hot(),
             "a pinned residence keeps its K/V through a distill mark",
         );
-        assert!(sub.residence[idle.0].hot.is_none());
-        assert!(sub.residence[idle.0].warm.is_none());
+        assert!(sub.residence(idle).hot().is_none());
+        assert!(sub.residence(idle).warm().is_none());
     }
 
     /// A residence still owed a quantize keeps its K/V: its `hot` is the interim
@@ -11370,10 +10864,10 @@ mod tests {
     fn distillation_skips_residences_pending_quantize() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[r.0].pending_quantize = true;
+        sub.residence(r).set_flag(PENDING_QUANTIZE);
         sub.distill_timeline(timeline, DistillMode::ProvenanceOnly);
-        assert!(sub.residence[r.0].hot.is_some());
-        assert!(sub.residence[r.0].warm.is_some());
+        assert!(sub.residence(r).has_hot());
+        assert!(sub.residence(r).has_warm());
     }
 
     /// **Hot is only dropped where warm already holds the bytes.** The demote
@@ -11385,7 +10879,7 @@ mod tests {
     fn idle_demote_never_takes_the_last_copy() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_i, r) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[r.0].warm = None;
+        sub.residences.take_warm(r);
 
         let mut shed = 0;
         for _ in 0..(IDLE_DEMOTE_GRACE_EPOCHS + 8) {
@@ -11393,7 +10887,7 @@ mod tests {
         }
 
         assert_eq!(shed, 0, "a hot-only residence is not the demote's to take");
-        assert!(sub.residence[r.0].hot.is_some());
+        assert!(sub.residence(r).has_hot());
     }
 
     /// A stamp that runs ahead of the scan's epoch reads as "just used", never
@@ -11417,7 +10911,7 @@ mod tests {
         let (_, _, timeline, mut sub) = make_timeline();
         let (a_idx, a) = install_hot_and_warm(&mut sub, timeline, 10);
         let (b_idx, _b) = install_hot_and_warm(&mut sub, timeline, 10);
-        sub.residence[a.0].evict_when_cold = true;
+        sub.residence(a).set_flag(EVICT_WHEN_COLD);
 
         // Wave 1 pins A; wave 2 pins only B → A is no longer protected.
         sub.set_working_set_pins(&[TurnKey::new(timeline, a_idx)], &[]);
@@ -11433,7 +10927,7 @@ mod tests {
         }];
         sub.install_cold(a, cold);
         assert!(
-            sub.residence[a.0].hot.is_none(),
+            sub.residence(a).hot().is_none(),
             "A left the working set → eviction resumes"
         );
     }
@@ -11500,9 +10994,9 @@ mod tests {
     /// `release_distilled_kv` leaves behind: a turn with token_ids and a block
     /// range and no chunks anywhere.
     fn reclaim_all_tiers(sub: &mut Substrate, residence: ResidenceIndex) {
-        sub.residence[residence.0].hot = None;
-        sub.residence[residence.0].warm = None;
-        sub.residence[residence.0].cold = None;
+        sub.residences.take_hot(residence);
+        sub.residences.take_warm(residence);
+        sub.residences.set_cold(residence, None);
     }
 
     /// The resume cache is a claim about a stored ANSWER, not just about the
@@ -11679,7 +11173,7 @@ mod tests {
         let report = sub.evict_hot_to_free(&[], &[], 0);
         assert_eq!(report.count, 0);
         assert_eq!(report.bytes, 0);
-        assert!(sub.residence[a.0].hot.is_some());
+        assert!(sub.residence(a).has_hot());
     }
 
     /// On reload, `TreeMetadata` records are replayed (summary-node kinds set)
@@ -11767,14 +11261,15 @@ mod tests {
             1,
         );
         let residence = sub.turn_residence(timeline, idx).unwrap();
-        assert!(sub.residence[residence.0].cold.is_some(), "cold installed");
+        assert!(sub.residence(residence).has_cold(), "cold installed");
         assert!(
-            sub.residence[residence.0].hot.is_none(),
+            sub.residence(residence).hot().is_none(),
             "hot empty (cold-marker)"
         );
-        assert!(sub.residence[residence.0].warm.is_none(), "warm empty");
+        assert!(sub.residence(residence).warm().is_none(), "warm empty");
         assert_eq!(
-            sub.residence[residence.0].byte_size, 1024,
+            sub.residence(residence).byte_size(),
+            1024,
             "byte_size summed from cold record_len"
         );
 
@@ -11789,9 +11284,9 @@ mod tests {
             0,
         );
         let r2 = sub.turn_residence(timeline, idx2).unwrap();
-        assert!(sub.residence[r2.0].cold.is_none());
-        assert!(sub.residence[r2.0].hot.is_none());
-        assert!(sub.residence[r2.0].warm.is_none());
+        assert!(sub.residence(r2).cold().is_none());
+        assert!(sub.residence(r2).hot().is_none());
+        assert!(sub.residence(r2).warm().is_none());
     }
 
     /// Compaction moves every record to a new offset and re-walks the
@@ -11881,7 +11376,7 @@ mod tests {
         sub.refresh_cold_refs();
 
         let residence = sub.turn_residence(timeline, idx).unwrap();
-        let cold = sub.residence[residence.0].cold.as_ref().unwrap();
+        let cold = sub.residence(residence).cold().unwrap();
         for (l, seq) in cold.iter().enumerate() {
             for (c, chunk) in seq.chunks.iter().enumerate() {
                 let flat = (l * chunks_per_layer + c) as u64;
@@ -11891,7 +11386,7 @@ mod tests {
             }
         }
         let other_res = sub.turn_residence(other_timeline, other_idx).unwrap();
-        let other_cold = sub.residence[other_res.0].cold.as_ref().unwrap();
+        let other_cold = sub.residence(other_res).cold().unwrap();
         assert_eq!(
             other_cold[0].chunks[0].log_offset, 777_216,
             "residence without an active-index stream stays untouched"
@@ -11947,7 +11442,7 @@ mod tests {
 
         let offset_of = |sub: &Substrate, timeline, idx| {
             let r = sub.turn_residence(timeline, idx).unwrap();
-            sub.residence[r.0].cold.as_ref().unwrap()[0].chunks[0].log_offset
+            sub.residence(r).cold().unwrap()[0].chunks[0].log_offset
         };
         assert_eq!(offset_of(&sub, first, moved_idx), 100_000);
         assert_eq!(
@@ -12441,8 +11936,8 @@ mod tests {
         moved(&sub, "a timeline tombstone");
         sub.reset();
         moved(&sub, "a reset");
-        sub.clear_walker_state();
-        moved(&sub, "clearing the streams");
+        sub.drop_locations_into(&HashSet::new());
+        moved(&sub, "dropping a rewrite's stale locations");
     }
 
     /// **A turn's events digest to its seams and, per collection, the section
@@ -12500,8 +11995,8 @@ mod tests {
     /// **The tagged-turn index follows every declaration.** A turn in a gather
     /// scope enters it; a dialogue turn, a turn carrying only working-set marks,
     /// and a non-turn stay out; a redeclaration moves a stream in or out; and a
-    /// stream removed or cleared leaves it — so a tagged gallery drawn from the
-    /// index is the one a walk of every stream would draw.
+    /// stream ended or dropped by a rewrite leaves it — so a tagged gallery
+    /// drawn from the index is the one a walk of every stream would draw.
     #[test]
     fn the_tagged_turn_index_follows_every_declaration() {
         let decl = |tl: u64, tags: &[&str]| {
@@ -12545,7 +12040,8 @@ mod tests {
         sub.end_section(chat, None);
         assert!(tagged(&sub).is_empty());
         sub.apply_stream_decl(tool, decl(1, &["tool"]), none);
-        sub.clear_walker_state();
+        assert_eq!(tagged(&sub), vec![tool]);
+        sub.forget_dropped_stream(StreamKey::of(tool, &none), none);
         assert!(tagged(&sub).is_empty());
     }
 
@@ -12901,7 +12397,7 @@ mod tests {
             (meta("", Some(("k", "v2"))), at(3, 30)),
             (meta("stale", None), at(1, 15)),
         ];
-        let mut first: Option<(Option<String>, BTreeMap<String, String>)> = None;
+        let mut first: Option<(Option<String>, POrdMap<String, String>)> = None;
         for perm in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]] {
             let mut sub = Substrate::new();
             sub.register_timeline(tl, layer, group);

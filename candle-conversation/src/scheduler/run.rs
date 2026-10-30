@@ -3,6 +3,7 @@ use super::creep_slice::next_layer_row_cost;
 use super::prefill::{VramPhase, LOAD_TARGET};
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
+use crate::substrate::residence::{drain_reclaimed, own_device_frees};
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
 use candle_nn::kv_cache::{
@@ -736,6 +737,10 @@ impl Scheduler {
     /// wait a whole decode slice when there's no decode work yet.
     pub fn run(&mut self) {
         tracing::info!("scheduler started");
+        // This thread owns the device's KV allocations and compacts them, so
+        // hot KV let go of anywhere else is handed here to be freed
+        // (`substrate::residence`).
+        own_device_frees();
         // **A seed, deliberately not the measurement.**
         //
         // The figure is exact only with nothing in flight, and the idle branch
@@ -1281,8 +1286,10 @@ impl Scheduler {
                 t_gpu.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            // A freed slot's pins, owed while its substrate's lock was held.
-            self.settle_owed_pins();
+            // Free the hot KV other threads let go of since the last wave — an
+            // eviction, a tombstone, a demote — here on the device's own thread,
+            // where no compaction pass is mid-relocation.
+            drain_reclaimed();
             // Closed BEFORE the flush block: the flush is the window boundary
             // itself, and its own cost is already accounted (eviction/sync carve
             // out of the remainder), so folding it in here would double-count.

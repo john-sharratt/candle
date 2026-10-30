@@ -9,7 +9,6 @@
 //! conversation has since changed.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::working_set::WorkingSetConfig;
@@ -51,7 +50,7 @@ pub fn parse(path: &str) -> Option<Seed<'_>> {
 
 /// What resolving a dialogue's seeds consults.
 pub struct Seeding<'a> {
-    pub engine: &'a Mutex<ConversationEngine>,
+    pub engine: &'a ConversationEngine,
     pub files: &'a RepoFiles,
     pub folder_of: FolderOf<'a>,
     pub coverage: &'a Coverage,
@@ -65,13 +64,8 @@ impl Seeding<'_> {
     /// not fit, or has no recorded size, is left out with a warning naming it.
     /// Returns how many were seeded.
     pub fn apply(&self, target: TimelineId, config: &WorkingSetConfig) -> usize {
-        let lineage: HashSet<TimelineId> = self
-            .engine
-            .lock()
-            .unwrap()
-            .inherited_chain(target)
-            .into_iter()
-            .collect();
+        let lineage: HashSet<TimelineId> =
+            self.engine.inherited_chain(target).into_iter().collect();
         let mut resolved: Vec<(TimelineId, &str)> = Vec::new();
         for path in &config.seeds {
             match self.resolve(path) {
@@ -85,7 +79,7 @@ impl Seeding<'_> {
             }
         }
         let candidates: Vec<TimelineId> = resolved.iter().map(|(tl, _)| *tl).collect();
-        let refused = self.engine.lock().unwrap().working_set_seed(
+        let refused = self.engine.working_set_seed(
             target,
             &candidates,
             config.limits(),
@@ -112,13 +106,12 @@ impl Seeding<'_> {
     fn resolve(&self, path: &str) -> Option<TimelineId> {
         match parse(path)? {
             Seed::Folder { repo, inner } => {
-                // The lookup takes the engine lock itself.
                 let unit = (self.folder_of)(repo, inner)?;
-                chain_finished(&self.engine.lock().unwrap(), unit).then_some(unit)
+                chain_finished(self.engine, unit).then_some(unit)
             }
             Seed::File { repo, rel } => {
-                let e = self.engine.lock().unwrap();
-                file_conversation(&e, self.files, self.coverage, repo, rel).map(|(tl, _)| tl)
+                file_conversation(self.engine, self.files, self.coverage, repo, rel)
+                    .map(|(tl, _)| tl)
             }
         }
     }

@@ -1,12 +1,12 @@
 //! Where a reprojection placed each turn and section, held until the walk ends
-//! and written back to the substrate under one write lock.
+//! and written back to the substrate in one edit.
 //!
-//! Writing each range as its piece was placed took a write lock per turn —
-//! forty-odd a rebuild, each queued behind whatever reader held the substrate.
-//! Held here instead, they are written once the walk ends ([`PendingRanges::flush`])
-//! — and on the way out of a walk that stops early with an error too, by
-//! [`Drop`]: the slot already holds the pieces placed before the error, and
-//! the substrate must say where they are, as it did when each was written at once.
+//! Writing each range as its piece was placed published a version per turn —
+//! forty-odd a rebuild. Held here instead, they are written once the walk ends
+//! ([`PendingRanges::flush`]) — and on the way out of a walk that stops early
+//! with an error too, by [`Drop`]: the slot already holds the pieces placed
+//! before the error, and the substrate must say where they are, as it did when
+//! each was written at once.
 
 use crate::projection::{Conversation, SectionId, TimelineId, TurnIndex};
 
@@ -18,19 +18,20 @@ pub(super) type SectionRange = (SectionId, u64, u64);
 
 /// Where placements are written: the substrate, in production.
 pub(super) trait RangeSink {
-    /// Write every placement, under one lock.
+    /// Write every placement, in one edit.
     fn write_ranges(&self, turns: &[TurnRange], sections: &[SectionRange]);
 }
 
 impl RangeSink for Conversation {
     fn write_ranges(&self, turns: &[TurnRange], sections: &[SectionRange]) {
-        let mut substrate = self.write();
-        for &(timeline, index, start, end) in turns {
-            substrate.set_block_range(timeline, index, start, end);
-        }
-        for &(sid, start, end) in sections {
-            substrate.set_section_block_range(sid, start, end);
-        }
+        self.update(|substrate| {
+            for &(timeline, index, start, end) in turns {
+                substrate.set_block_range(timeline, index, start, end);
+            }
+            for &(sid, start, end) in sections {
+                substrate.set_section_block_range(sid, start, end);
+            }
+        });
     }
 }
 
@@ -58,8 +59,8 @@ impl<'c, S: RangeSink + ?Sized> PendingRanges<'c, S> {
         self.sections.push(range);
     }
 
-    /// Write what is recorded, under one lock, and forget it. Nothing
-    /// recorded takes no lock.
+    /// Write what is recorded, in one edit, and forget it. Nothing recorded
+    /// edits nothing.
     pub(super) fn flush(&mut self) {
         if self.turns.is_empty() && self.sections.is_empty() {
             return;
@@ -143,7 +144,7 @@ mod tests {
         );
     }
 
-    /// A walk that placed nothing takes no lock.
+    /// A walk that placed nothing writes nothing.
     #[test]
     fn nothing_placed_writes_nothing() {
         let sink = Recorder::default();

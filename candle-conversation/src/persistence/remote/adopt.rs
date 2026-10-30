@@ -6,6 +6,9 @@
 //! its `Chunk` records, and its K/V loads on first use like any turn a reload
 //! restored. A position below it that holds nothing yet is a gap, filled when
 //! its own turn completes.
+//!
+//! In two steps: the plan reads what the turn needs off the log, and changes
+//! nothing; the placing is a substrate edit, which may run more than once.
 
 use std::collections::BTreeSet;
 
@@ -18,14 +21,36 @@ use crate::substrate::{RestoredTurn, StreamKey, Substrate};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::TurnLayout;
 
-/// Adopt every turn of `keys` that is another member's, complete, live and
-/// not held here yet. Returns where each adopted turn was placed.
-pub(super) fn adopt_complete_turns(
+/// One turn to adopt, read off the log and ready to place.
+pub(super) struct Adoption {
+    timeline: TimelineId,
+    target: Option<(LayerId, GroupId)>,
+    index: TurnIndex,
+    turn: RestoredTurn,
+}
+
+impl Adoption {
+    /// Register the turn's timeline and place the turn — `None` when a turn
+    /// already holds its position. Edits only `substrate`, so it can run again
+    /// on a newer version.
+    pub(super) fn place(&self, substrate: &mut Substrate) -> Option<(TimelineId, TurnIndex)> {
+        if let Some((layer, group)) = self.target {
+            substrate.register_timeline(self.timeline, layer, group);
+        }
+        substrate
+            .place_turn(self.timeline, self.index, self.turn.clone())
+            .then_some((self.timeline, self.index))
+    }
+}
+
+/// Plan the adoption of every turn of `keys` that is another member's,
+/// complete, live and not held here yet.
+pub(super) fn plan_adoptions(
     p: &mut SubstratePersistence,
-    substrate: &mut Substrate,
+    substrate: &Substrate,
     keys: &BTreeSet<StreamKey>,
     n_layers: usize,
-) -> Result<Vec<(TimelineId, TurnIndex)>> {
+) -> Result<Vec<Adoption>> {
     let mut adopted = Vec::new();
     for &key in keys {
         let Some((timeline, decl)) = adoptable(substrate, key, n_layers) else {
@@ -47,24 +72,20 @@ pub(super) fn adopt_complete_turns(
         // The turn's `Tokens` may have arrived in this very batch, still staged.
         p.flush_staged()?;
         let meta = recover_turn_meta(p, substrate, &decl)?;
-        if let (Some(layer), Some(group)) = (
-            LayerId::from_raw(decl.layer_id),
-            GroupId::from_raw(decl.group_id),
-        ) {
-            substrate.register_timeline(timeline, layer, group);
-        }
-        let index = TurnIndex(decl.turn_index);
-        let turn = RestoredTurn {
-            layout: TurnLayout::new(decl.segments),
-            token_ids: TokenBuffer::from(meta.token_ids),
-            token_count: meta.token_count,
-            cold,
-            block_start: decl.block_start,
-            block_end: decl.block_end,
-        };
-        if substrate.place_turn(timeline, index, turn) {
-            adopted.push((timeline, index));
-        }
+        let target = LayerId::from_raw(decl.layer_id).zip(GroupId::from_raw(decl.group_id));
+        adopted.push(Adoption {
+            timeline,
+            target,
+            index: TurnIndex(decl.turn_index),
+            turn: RestoredTurn {
+                layout: TurnLayout::new(decl.segments),
+                token_ids: TokenBuffer::from(meta.token_ids),
+                token_count: meta.token_count,
+                cold,
+                block_start: decl.block_start,
+                block_end: decl.block_end,
+            },
+        });
     }
     Ok(adopted)
 }

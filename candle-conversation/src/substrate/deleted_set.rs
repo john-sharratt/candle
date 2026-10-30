@@ -3,23 +3,27 @@
 //! conditions for a tombstone to expire. An expired tombstone leaves nothing
 //! behind.
 
-use std::collections::BTreeSet;
-
 use crate::persistence::deleted::DeletedPayload;
 
-/// See the module documentation.
-#[derive(Debug, Default)]
+use super::pcoll::POrdSet;
+
+/// See the module documentation. Persistent: a clone is O(1).
+#[derive(Debug, Default, Clone)]
 pub struct DeletedSet {
-    swept: BTreeSet<u64>,
-    swept_keys: BTreeSet<u64>,
+    swept: POrdSet<u64>,
+    swept_keys: POrdSet<u64>,
 }
 
 impl DeletedSet {
     /// Take in a `Deleted` record: its swept tombstones join what is held. The
     /// sets only grow, so the order records arrive in does not matter.
     pub fn apply(&mut self, payload: &DeletedPayload) {
-        self.swept.extend(payload.swept.iter().copied());
-        self.swept_keys.extend(payload.swept_keys.iter().copied());
+        for &t in &payload.swept {
+            self.swept.insert(t);
+        }
+        for &k in &payload.swept_keys {
+            self.swept_keys.insert(k);
+        }
     }
 
     /// Whether a complete compaction has run past `timeline`'s tombstone.

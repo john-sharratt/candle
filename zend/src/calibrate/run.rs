@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_conversation::chain_health::chain_break;
@@ -97,7 +97,7 @@ pub struct Report {
 pub struct Layer<'a> {
     pub spec: &'a CalibrateSpec,
     pub group: GroupId,
-    pub base: &'a Mutex<Sequence>,
+    pub base: &'a Sequence,
 }
 
 /// Where calibrations are prefilled: the system prompt every conversation
@@ -114,20 +114,20 @@ pub struct Frame<'a> {
 /// its ingest did not calibrate as it committed them ([`calibrate_committed`])
 /// — and retire every calibration of a unit no longer there.
 pub fn calibrate_layer(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     layer: &Layer<'_>,
     frame: &Frame<'_>,
 ) -> Report {
     let spec = layer.spec;
     let mut report = Report::default();
     let todo = {
-        let e = engine.lock().unwrap();
+        let e = engine;
         for (tl, of) in e.conversations_with_metadata_key(DRAFT_KEY) {
             if of == spec.layer && e.tombstone_timeline(tl).is_ok() {
                 report.retired += 1;
             }
         }
-        let units = units(&e, layer);
+        let units = units(e, layer);
         let priors: Vec<(TimelineId, String, bool)> = e
             .conversations_with_metadata_key(MARKER_KEY)
             .into_iter()
@@ -282,7 +282,7 @@ fn draft_selection() -> SelectionState {
 pub fn calibrate_committed(
     ctx: &RefreshContext<'_>,
     spec: &CalibrateSpec,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     timeline: TimelineId,
     subject: &str,
     key: &str,
@@ -305,9 +305,9 @@ pub fn calibrate_committed(
 /// Ask `unit` for its questions — holding one of `drafts`, when given, while
 /// it does — and calibrate them.
 fn calibrate_one(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     spec: &CalibrateSpec,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     frame: &Frame<'_>,
     drafts: Option<&Permits>,
     unit: &Unit,
@@ -338,8 +338,6 @@ fn calibrate_one(
     // The exemplars' prefill and seal, the calibration's archive and distill.
     let t_exemplars = Instant::now();
     let mut conv = engine
-        .lock()
-        .unwrap()
         .new_reserved_conversation(
             frame.system_prompt,
             Reserved::Calibration,
@@ -350,11 +348,7 @@ fn calibrate_one(
     let timeline = conv.timeline_id();
     // Its K/V is dropped at the distill; written cold, it would be bytes
     // the next compaction deletes.
-    engine
-        .lock()
-        .unwrap()
-        .conversation()
-        .mark_timeline_transient(timeline);
+    engine.conversation().mark_timeline_transient(timeline);
     let mut meta = BTreeMap::new();
     meta.insert("kind".to_string(), TAG.to_string());
     meta.insert(MARKER_KEY.to_string(), unit.marker.clone());
@@ -382,7 +376,7 @@ fn calibrate_one(
                 .map_err(|e| anyhow::anyhow!("seal: {e}"))?;
             Ok(())
         });
-    let e = engine.lock().unwrap();
+    let e = engine;
     if let Err(err) = sealed {
         let _ = e.tombstone_timeline(timeline);
         return Err(err);
@@ -426,7 +420,7 @@ fn thinking_selection() -> SelectionState {
 /// before it was done: on BlackWorld (2026-10-29) a hundred finished questions
 /// at a time, ~15 GiB of state beside a dozen running ones.
 fn thoughts(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     frame: &Frame<'_>,
     spec: &CalibrateSpec,
     questions: &[String],
@@ -434,7 +428,7 @@ fn thoughts(
     let mut asked: Vec<Option<Sequence>> = Vec::with_capacity(questions.len());
     let mut timelines: Vec<TimelineId> = Vec::with_capacity(questions.len());
     let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
-        let e = engine.lock().unwrap();
+        let e = engine;
         let conv = e
             .new_reserved_conversation(
                 frame.system_prompt,
@@ -489,7 +483,7 @@ fn thoughts(
                         )
                     })
                 });
-            let _ = engine.lock().unwrap().tombstone_timeline(timelines[i]);
+            let _ = engine.tombstone_timeline(timelines[i]);
             drop(conv);
             out[i] = Some(thought?);
         }
@@ -498,7 +492,7 @@ fn thoughts(
             .map(|t| t.expect("every turn finished"))
             .collect())
     });
-    let e = engine.lock().unwrap();
+    let e = engine;
     for (conv, timeline) in asked.iter().zip(&timelines) {
         if conv.is_some() {
             let _ = e.tombstone_timeline(*timeline);
@@ -510,19 +504,17 @@ fn thoughts(
 /// The unit's answer to its layer's calibration prompt, asked in a draft
 /// whose lineage is the unit; the draft is tombstoned either way.
 fn draft(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     spec: &CalibrateSpec,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     unit: &Unit,
 ) -> anyhow::Result<String> {
     let mut conv = base
-        .lock()
-        .unwrap()
         .fork()
         .map_err(|e| anyhow::anyhow!("draft conversation: {e}"))?;
     let timeline = conv.timeline_id();
     let named = {
-        let e = engine.lock().unwrap();
+        let e = engine;
         e.conversation().mark_timeline_transient(timeline);
         e.set_timeline_summarize(timeline, false);
         e.set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
@@ -554,7 +546,7 @@ fn draft(
             .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
         answer
     });
-    let _ = engine.lock().unwrap().tombstone_timeline(timeline);
+    let _ = engine.tombstone_timeline(timeline);
     answer
 }
 
@@ -612,7 +604,7 @@ mod tests {
         let current = KEY_VERSION;
         answered(whole);
         keyed(whole, "candle/a.rs", &reading("candle/a.rs", current));
-        conv.write().restore_gap_turn(gappy);
+        conv.update(|s| s.restore_gap_turn(gappy));
         answered(gappy);
         keyed(gappy, "candle/b.rs", &reading("candle/b.rs", current));
         answered(cal);

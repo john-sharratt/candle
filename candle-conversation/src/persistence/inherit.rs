@@ -7,20 +7,19 @@
 //! by canonical path, so a common base is loaded **once** and shared by
 //! `Arc` across every child that inherits it.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use super::log_file::LogSource;
-use super::log_file::{read_record_at, LogFile};
+use super::log_file::LogFile;
 use super::manifest::Manifest;
-use super::record::Record;
+use super::record::{decode_record, verify_record_crc, Record};
 use super::recovery;
 use super::segment::FIRST_SEGMENT;
 use super::streams::StreamId;
-use super::Result;
+use super::{PersistenceError, Result};
 use crate::substrate::Substrate;
-use candle::direct_io::DirectFile;
+use candle::direct_io::{AlignedScratch, DirectFile};
+use candle::direct_write::{Access, UnbufferedFile};
 
 /// A loaded, read-only inherited substrate log.
 pub struct InheritedSubstrate {
@@ -36,9 +35,9 @@ pub struct InheritedSubstrate {
     /// inherited (read-only) ancestor.  Cold-load consumers query
     /// `inherited.substrate()` instead of `inherited.manifest().streams`.
     substrate: Substrate,
-    /// The open file, for reading inherited records on demand. Behind a
-    /// `Mutex` because reads seek and the substrate is shared.
-    file: Mutex<LogFile>,
+    /// The open file, for reading inherited records on demand: positioned
+    /// reads of a file nothing writes, so any thread reads it at once.
+    file: UnbufferedFile,
     /// Cache-bypassing handle for the cold-load fast path. Independent
     /// of `file` — positioned reads via `pread`/`ReadFile`+`OVERLAPPED`
     /// are thread-safe so this is shared without a lock.
@@ -72,16 +71,30 @@ impl InheritedSubstrate {
     /// is the padded on-disk size from the stream-index entry —
     /// captured at walk time. Single read.
     pub fn read_record(&self, offset: u64, record_size: u64) -> Result<Record> {
-        let mut file = self.file.lock().unwrap();
-        read_record_at(&mut *file, offset, record_size)
+        let mut bytes = vec![0u8; record_size as usize];
+        self.read_into(offset, &mut bytes)?;
+        let (header, payload, _) = decode_record(&bytes)?;
+        verify_record_crc(&header, payload)?;
+        Ok(Record {
+            header,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Read `dest.len()` bytes at `offset` from the inherited log
     /// directly into `dest`. Used by the batched cold-read path so a
     /// single caller-provided scratch absorbs a whole turn's records.
     pub fn read_into(&self, offset: u64, dest: &mut [u8]) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
-        LogSource::read_into(&mut *file, offset, dest)
+        let need = dest.len();
+        self.file
+            .read_span(offset, dest, &mut AlignedScratch::new())
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    PersistenceError::Truncated { need, have: 0 }
+                } else {
+                    PersistenceError::Io(e)
+                }
+            })
     }
 
     /// The cache-bypassing read handle on this inherited log. Used by
@@ -92,9 +105,9 @@ impl InheritedSubstrate {
     }
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, Arc<InheritedSubstrate>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<InheritedSubstrate>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn cache() -> &'static papaya::HashMap<PathBuf, Arc<InheritedSubstrate>> {
+    static CACHE: OnceLock<papaya::HashMap<PathBuf, Arc<InheritedSubstrate>>> = OnceLock::new();
+    CACHE.get_or_init(papaya::HashMap::new)
 }
 
 impl InheritedSubstrate {
@@ -103,17 +116,13 @@ impl InheritedSubstrate {
     /// common base substrate exists once in memory.
     pub fn load(path: &Path) -> Result<Arc<InheritedSubstrate>> {
         let canonical = path.canonicalize()?;
-        {
-            let cache = cache().lock().unwrap();
-            if let Some(existing) = cache.get(&canonical) {
-                return Ok(Arc::clone(existing));
-            }
+        if let Some(existing) = cache().pin().get(&canonical) {
+            return Ok(Arc::clone(existing));
         }
-        // Recover outside the cache lock so a slow load does not block
-        // other paths.  The walker drives both the manifest's
-        // singleton offsets AND the substrate's per-entity state in a
-        // single pass — recovery::recover_with_sink dispatches each
-        // record through `substrate.apply_walker_entry`.
+        // The walker drives both the manifest's singleton offsets AND the
+        // substrate's per-entity state in a single pass —
+        // recovery::recover_with_sink dispatches each record through
+        // `substrate.apply_walker_entry`.
         let mut file = LogFile::open(&canonical)?;
         let hint = file.superblock().last_index;
         let mut substrate = Substrate::new();
@@ -123,26 +132,27 @@ impl InheritedSubstrate {
         let recovered = recovery::recover_with_sink(&mut file, FIRST_SEGMENT, hint, |entry| {
             substrate.apply_walker_entry(entry)
         })?;
+        drop(file);
         let direct = DirectFile::open(&canonical)?;
         let loaded = Arc::new(InheritedSubstrate {
             path: canonical.clone(),
             manifest: recovered.manifest,
             substrate,
-            file: Mutex::new(file),
+            file: UnbufferedFile::open(&canonical, Access::ReadOnly)?,
             direct,
         });
 
-        let mut cache = cache().lock().unwrap();
         // Another thread may have loaded it while we recovered — honour the
         // first one to win so the `Arc` stays unique per path.
-        Ok(Arc::clone(cache.entry(canonical).or_insert(loaded)))
+        let cache = cache().pin();
+        Ok(Arc::clone(cache.get_or_insert(canonical, loaded)))
     }
 
     /// Drop a path from the shared cache (used by tests).
     #[cfg(test)]
     pub fn forget(path: &Path) {
         if let Ok(canonical) = path.canonicalize() {
-            cache().lock().unwrap().remove(&canonical);
+            cache().pin().remove(&canonical);
         }
     }
 }

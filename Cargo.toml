@@ -62,6 +62,17 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 ahash = "0.8"
 ab_glyph = "0.2.23"
+# The substrate's published root and per-residence payload cells
+# (docs/substrate_lock_free.md §3).
+arc-swap = "1.7"
+# Persistent, structurally shared collections behind the substrate's
+# multi-version root: a write copies only the path it changes.
+imbl = "5"
+# Lock-free concurrent map/set: residence tier membership and memos.
+papaya = "0.2"
+# Lock-free append-only vector: the residence slab, whose indices are stable
+# and handed out before any substrate commit.
+boxcar = "0.2"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"

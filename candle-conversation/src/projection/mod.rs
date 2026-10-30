@@ -246,7 +246,7 @@ mod working_set_tests;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
-pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
+pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead};
 pub use adaptive::{
     attention_mass, AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig,
     MemberBudgetAdaptive, ScanCases, ScanPolicy,

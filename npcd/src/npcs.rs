@@ -262,22 +262,22 @@ impl Npcs {
     /// record is not the one it was read from is read again. Returns the ids
     /// whose record changed.
     pub fn refresh(&mut self) -> Vec<u64> {
-        let mut p = self
-            .shared
-            .persistence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let current: Vec<(u64, RecordIdentity)> = p
-            .npc_locs()
-            .iter()
-            .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
-            .collect();
+        let read_as = &self.read_as;
+        let fresh = self.shared.persistence.call(|p| {
+            let current: Vec<(u64, RecordIdentity)> = p
+                .npc_locs()
+                .iter()
+                .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
+                .collect();
+            current
+                .into_iter()
+                .filter(|(id, identity)| read_as.get(id) != Some(identity))
+                .map(|(id, identity)| (id, identity, p.read_npc(id)))
+                .collect::<Vec<_>>()
+        });
         let mut changed = Vec::new();
-        for (id, identity) in current {
-            if self.read_as.get(&id) == Some(&identity) {
-                continue;
-            }
-            match p.read_npc(id) {
+        for (id, identity, read) in fresh {
+            match read {
                 Ok(Some(npc)) => {
                     if self.by_id.get(&id) != Some(&npc) {
                         self.by_id.insert(id, npc);
@@ -324,14 +324,10 @@ impl Npcs {
         }
         let mut npc = npc.clone();
         npc.mood = Some(mood.to_string());
-        let write = {
-            let mut p = self
-                .shared
-                .persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            p.write_npc(&npc).and_then(|_| p.commit())
-        };
+        let write = self
+            .shared
+            .persistence
+            .call(|p| p.write_npc(&npc).and_then(|_| p.commit()));
         if let Err(e) = write {
             // Not fatal and not propagated, for the reason a place checkpoint
             // is not: soft state on a driver thread with nobody to report to.
@@ -960,18 +956,13 @@ impl Npcs {
     /// conversation/belief/dream history the wipe cleared. One fsync covers the
     /// batch. Returns how many were written.
     pub fn import(&mut self, payloads: Vec<NpcPayload>) -> Result<usize, NpcError> {
-        {
-            let mut p = self
-                .shared
-                .persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+        self.shared.persistence.call(|p| {
             for npc in &payloads {
                 p.write_npc(npc)
                     .map_err(|e| NpcError::Persist(e.to_string()))?;
             }
-            p.commit().map_err(|e| NpcError::Persist(e.to_string()))?;
-        }
+            p.commit().map_err(|e| NpcError::Persist(e.to_string()))
+        })?;
         let n = payloads.len();
         for npc in payloads {
             self.by_id.insert(npc.npc_id, npc);
@@ -986,28 +977,23 @@ impl Npcs {
     /// memory, vanishes on restart, and is never written again because nothing
     /// knows it is missing.
     fn commit(&mut self, npc: NpcPayload, owner: &str) -> Result<Value, NpcError> {
-        {
-            // The engine holds this same lock for its own appends, which is the
-            // point: one cursor, one `npc_locs`, so a compaction on the engine's
-            // side sees this character. Held across both calls so nothing
-            // interleaves between the append and its fsync.
-            let mut p = self
-                .shared
-                .persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+        // The engine appends through this same owner, which is the point: one
+        // cursor, one `npc_locs`, so a compaction on the engine's side sees
+        // this character. One call, so nothing interleaves between the append
+        // and its fsync.
+        self.shared.persistence.call(|p| {
             p.write_npc(&npc)
                 .map_err(|e| NpcError::Persist(e.to_string()))?;
             // Flush and fsync before returning. `write_npc` only *stages* the
             // record, and a staged record is lost on a crash — which for a
-            // character somebody just created means the API said "created" about
-            // something that never existed.
+            // character somebody just created means the API said "created"
+            // about something that never existed.
             //
             // Group-committing instead would be the right call for a hot write
             // path; this one is a person pressing save, so the fsync is both
             // affordable and what they are entitled to assume happened.
-            p.commit().map_err(|e| NpcError::Persist(e.to_string()))?;
-        }
+            p.commit().map_err(|e| NpcError::Persist(e.to_string()))
+        })?;
         let view = wire(&npc, owner);
         self.by_id.insert(npc.npc_id, npc);
         Ok(view)
@@ -1455,11 +1441,11 @@ mod tests {
             let created = n.create(&ident("u1"), ME, &body("Wyneth"), 1_000).unwrap();
 
             // The engine's routine compaction, on the handle it was handed.
-            {
-                let mut p = engine.persistence.lock().unwrap();
-                let mut s = engine.substrate.write().unwrap();
-                p.compact(&mut s, None).unwrap();
-            }
+            let substrate = &engine.substrate;
+            engine
+                .persistence
+                .call(|p| p.compact_shared(substrate, None))
+                .unwrap();
             nid(&created)
         };
 

@@ -13,9 +13,9 @@
 //!   conversation, or its own — `docs/gallery_residency.md`), and the layer and
 //!   group it was written to — summed into rows. Reading every resident turn's stream is a
 //!   walk of the residency map and a lookup per turn, so it is taken at most
-//!   once per [`CENSUS_EVERY`] and published as it stood then; a substrate
-//!   whose lock a writer holds is skipped and counted rather than waited on,
-//!   so the census never stalls a wave.
+//!   once per [`CENSUS_EVERY`] and published as it stood then. Each substrate
+//!   is read as one version, without waiting, so the census never stalls a
+//!   wave.
 //! - **Recurrent state** ([`RecurrentBreakdown`]): stores live and parked, what
 //!   one costs, and the live slots by the layer and group they serve. Taken at
 //!   every publish, naming each slot's group from its substrate's names as the
@@ -117,9 +117,6 @@ pub struct GalleryCensus {
     /// the next keep trade gives back.
     pub idle_past_keep_turns: usize,
     pub idle_past_keep_bytes: u64,
-    /// Substrates whose lock a writer held when the census looked: their turns
-    /// are counted [`TurnStatus::Absent`].
-    pub substrates_skipped: usize,
     /// Largest first.
     pub rows: Vec<GalleryRow>,
 }
@@ -223,11 +220,10 @@ fn schema_groups(schema: &Schema) -> impl Iterator<Item = (GroupId, &str, &str)>
 }
 
 /// The gallery's census over `reads`, each with the group names of its
-/// substrate's schemas; `skipped` substrates could not be read.
+/// substrate's schemas.
 fn census_gallery(
     arena: &GalleryArena,
     reads: &[(SubstrateRead<'_>, &GroupNames)],
-    skipped: usize,
 ) -> GalleryCensus {
     let runs = arena.resident_runs();
     let keep = arena.keep_within();
@@ -270,7 +266,6 @@ fn census_gallery(
         keep_within_secs: keep.map(|k| k.as_secs()),
         idle_past_keep_turns,
         idle_past_keep_bytes,
-        substrates_skipped: skipped,
         rows: tally(&runs, class_of),
     }
 }
@@ -296,14 +291,10 @@ impl Scheduler {
 
     fn take_census(&self) -> CensusCache {
         let substrates = self.distinct_substrates();
-        let mut skipped = 0usize;
         let mut reads = Vec::new();
         let mut names = Vec::new();
         for conv in &substrates {
-            let Some(read) = conv.try_read() else {
-                skipped += 1;
-                continue;
-            };
+            let read = conv.read();
             names.push((conv.substrate_ref(), self.group_names_of(&read)));
             reads.push(read);
         }
@@ -312,7 +303,7 @@ impl Scheduler {
                 .into_iter()
                 .zip(names.iter().map(|(_, n)| n))
                 .collect();
-            census_gallery(arena, &paired, skipped)
+            census_gallery(arena, &paired)
         });
         CensusCache {
             at: Instant::now(),

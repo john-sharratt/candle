@@ -20,7 +20,6 @@ mod questions;
 mod transcript;
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use candle_conversation::projection::LayerId;
 use candle_conversation::{ConversationEngine, SequenceConfig, UnsealedAsker};
@@ -58,7 +57,7 @@ pub struct Report {
 /// conversation in view. It runs at load (`--self-check`) and as the host's
 /// `self-check` command, which is always a dry run.
 pub fn run(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     config: &SequenceConfig,
     layers: &HashSet<LayerId>,
     base: UnsealedAsker,
@@ -66,7 +65,7 @@ pub fn run(
     progress: &dyn Fn(u64, u64),
 ) -> anyhow::Result<Report> {
     let (asker, candidates) = {
-        let e = engine.lock().unwrap();
+        let e = engine;
         let resolver = e.conversation();
         let entries: Vec<Entry> = e
             .live_conversations()
@@ -79,7 +78,7 @@ pub fn run(
                 metadata: e.conversation_metadata(timeline).unwrap_or_default(),
             })
             .collect();
-        (Asker::new(&e, config, base)?, select(entries, layers))
+        (Asker::new(e, config, base)?, select(entries, layers))
     };
     let total = candidates.len() as u64;
     tracing::info!(
@@ -99,7 +98,7 @@ pub fn run(
             .map(|c| {
                 let asker = &asker;
                 async move {
-                    let record = transcript::render(&engine.lock().unwrap().turn_texts(c.timeline));
+                    let record = transcript::render(&engine.turn_texts(c.timeline));
                     let findings = asker.check(&c.subject, &record).await;
                     (c, findings)
                 }
@@ -148,7 +147,7 @@ pub fn run(
 /// Report one corrupt conversation and, outside a dry run, tombstone it.
 /// Whether it was tombstoned.
 fn act_on_corrupt(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     c: &Candidate,
     findings: &Findings,
     mode: SelfCheck,
@@ -165,7 +164,7 @@ fn act_on_corrupt(
         );
         return false;
     }
-    match engine.lock().unwrap().tombstone_timeline(c.timeline) {
+    match engine.tombstone_timeline(c.timeline) {
         Ok(()) => {
             tracing::warn!(
                 timeline = c.timeline.raw(),

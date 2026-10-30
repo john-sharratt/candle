@@ -307,7 +307,7 @@ pub fn run_pass(
                         // summary-of-summaries projection). Disarm reconcile for this
                         // timeline so we stop re-submitting a doomed probe every pass;
                         // it only re-arms on a fresh load via `mark_for_reconcile`.
-                        conversation.write().set_needs_reconcile(timeline, false);
+                        conversation.update(|s| s.set_needs_reconcile(timeline, false));
                         tracing::warn!(
                             target: "candle_conversation::summariser",
                             timeline = %timeline,
@@ -374,7 +374,7 @@ fn absorb_pending_turns(
         let mut batch: Vec<Vec<TurnIndex>> = Vec::with_capacity(max_concurrent);
         let mut deferred: Vec<TurnIndex> = Vec::new();
         while batch.len() < max_concurrent {
-            let normal_idx = match conversation.write().pop_pending_summary(timeline) {
+            let normal_idx = match conversation.update(|s| s.pop_pending_summary(timeline)) {
                 Some(idx) => idx,
                 None => break,
             };
@@ -452,10 +452,11 @@ fn absorb_pending_turns(
         // Re-enqueue deferred heads AFTER draining, so this pass can't pop the
         // same open exchange again and spin.
         if !deferred.is_empty() {
-            let mut write = conversation.write();
-            for idx in deferred {
-                write.push_pending_summary(timeline, idx);
-            }
+            conversation.update(|s| {
+                for &idx in &deferred {
+                    s.push_pending_summary(timeline, idx);
+                }
+            });
         }
         if batch.is_empty() {
             return Ok(());
@@ -509,9 +510,7 @@ fn absorb_pending_turns(
                         normal = %normal_idx,
                         "soft probe error: {msg}; re-enqueueing"
                     );
-                    conversation
-                        .write()
-                        .push_pending_summary(timeline, normal_idx);
+                    conversation.update(|s| s.push_pending_summary(timeline, normal_idx));
                     soft_failed = true;
                 }
                 Err(ProbeError::Permanent(msg)) => {
@@ -623,7 +622,7 @@ fn reconcile_pass(
         return Ok(());
     }
     let Some(children) = conversation.read().reconcile_next(timeline) else {
-        conversation.write().set_needs_reconcile(timeline, false);
+        conversation.update(|s| s.set_needs_reconcile(timeline, false));
         return Ok(());
     };
     let level = conversation
@@ -799,12 +798,9 @@ impl ProbeRunner for MockProbeRunner {
         // its kind to `SummaryOfTurns` / `SummaryOfSummaries`).  Don't
         // pop here — the queue is FIFO and popping would steal the
         // wrong entry.
-        let idx = self.conversation.write().append_with_blocks(
-            request.timeline,
-            self.summary_tokens,
-            0,
-            0,
-        );
+        let idx = self
+            .conversation
+            .update(|s| s.append_with_blocks(request.timeline, self.summary_tokens, 0, 0));
         Ok(ProbeResponse { sealed_turn: idx })
     }
 }
@@ -828,22 +824,27 @@ mod tests {
         let group = GroupId::for_test(1);
         let alloc = TimelineAllocator::new();
         let timeline = alloc.next();
-        conversation
-            .write()
-            .register_timeline(timeline, layer, group);
         // The summariser is disconnected in production, so no timeline enqueues
         // by default. These tests cover the machinery itself, which is retained
         // — they turn the gate on for their own timeline.
-        conversation.write().set_timeline_summarize(timeline, true);
+        conversation.update(|s| {
+            s.register_timeline(timeline, layer, group);
+            s.set_timeline_summarize(timeline, true);
+        });
         (conversation, timeline)
+    }
+
+    /// Append a ten-token turn over blocks `[start, end)`.
+    fn append(conv: &Conversation, timeline: TimelineId, start: u64, end: u64) -> TurnIndex {
+        conv.update(|s| s.append_with_blocks(timeline, 10, start, end))
     }
 
     #[test]
     fn mock_runner_produces_a_fresh_turn_index() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let normal = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        let _ = conv.write().pop_pending_summary(timeline); // drain
+        let normal = append(&conv, timeline, 0, 1);
+        let _ = conv.update(|s| s.pop_pending_summary(timeline)); // drain
         let runner = MockProbeRunner::new(conv.clone());
         let resp = runner
             .run(ProbeRequest {
@@ -884,11 +885,11 @@ mod tests {
     fn absorb_mid_batch_soft_failure_does_not_orphan_successes() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
-        let n2 = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        let n0 = append(&conv, timeline, 0, 1);
+        let n1 = append(&conv, timeline, 1, 2);
+        let n2 = append(&conv, timeline, 2, 3);
         // A trailing turn so n2 is settled (not the deferred frontier exchange).
-        let _sentinel = conv.write().append_with_blocks(timeline, 10, 3, 4);
+        let _sentinel = append(&conv, timeline, 3, 4);
         assert_eq!(conv.pending_summary_len(timeline), 4);
 
         let runner = FailOnChildRunner {
@@ -921,7 +922,7 @@ mod tests {
 
         // The failed turn is back on the pending queue for a later pass.
         let mut requeued_n1 = false;
-        while let Some(idx) = conv.write().pop_pending_summary(timeline) {
+        while let Some(idx) = conv.update(|s| s.pop_pending_summary(timeline)) {
             if idx == n1 {
                 requeued_n1 = true;
             }
@@ -949,12 +950,14 @@ mod tests {
         let conv0 = Conversation::ephemeral();
         let alloc = crate::projection::TimelineAllocator::new();
         let bare = alloc.next();
-        conv0.write().register_timeline(
-            bare,
-            crate::projection::LayerId::for_test(1),
-            crate::projection::GroupId::for_test(1),
-        );
-        let _b0 = conv0.write().append_with_blocks(bare, 10, 0, 1);
+        conv0.update(|s| {
+            s.register_timeline(
+                bare,
+                crate::projection::LayerId::for_test(1),
+                crate::projection::GroupId::for_test(1),
+            )
+        });
+        let _b0 = append(&conv0, bare, 0, 1);
         assert_eq!(
             conv0.pending_summary_len(bare),
             0,
@@ -963,8 +966,8 @@ mod tests {
 
         // Explicitly off stays off.
         let (conv, timeline) = fresh_conversation(tmp.path());
-        conv.write().set_timeline_summarize(timeline, false);
-        let _n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        conv.update(|s| s.set_timeline_summarize(timeline, false));
+        let _n0 = append(&conv, timeline, 0, 1);
         assert_eq!(
             conv.pending_summary_len(timeline),
             0,
@@ -973,7 +976,7 @@ mod tests {
 
         // Explicitly on enqueues — the mechanism is retained, not removed.
         let (conv2, timeline2) = fresh_conversation(tmp.path());
-        let _m0 = conv2.write().append_with_blocks(timeline2, 10, 0, 1);
+        let _m0 = append(&conv2, timeline2, 0, 1);
         assert_eq!(
             conv2.pending_summary_len(timeline2),
             1,
@@ -985,10 +988,10 @@ mod tests {
     fn absorb_pending_creates_leaf_with_normal_child() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let _normal0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        let _normal0 = append(&conv, timeline, 0, 1);
         // A trailing turn settles #0's exchange (making it sealable); the trailing
         // turn itself stays the deferred frontier.
-        let _normal1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let _normal1 = append(&conv, timeline, 1, 2);
         assert_eq!(conv.pending_summary_len(timeline), 2);
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
@@ -1027,13 +1030,12 @@ mod tests {
     fn a_coupled_round_trip_seals_one_leaf_over_both_turns() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        conv.write()
-            .couple_turn(timeline, call.0, RecordIdentity::NONE);
-        let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let call = append(&conv, timeline, 0, 1);
+        conv.update(|s| s.couple_turn(timeline, call.0, RecordIdentity::NONE));
+        let response = append(&conv, timeline, 1, 2);
         // A trailing turn settles the [call, response] exchange (otherwise it is
         // the deferred frontier).
-        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        let _sentinel = append(&conv, timeline, 2, 3);
         assert_eq!(conv.pending_summary_len(timeline), 3);
 
         let runner = MockProbeRunner::new(conv.clone());
@@ -1066,9 +1068,8 @@ mod tests {
     fn an_open_exchange_defers_instead_of_sealing_half() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        conv.write()
-            .couple_turn(timeline, call.0, RecordIdentity::NONE);
+        let call = append(&conv, timeline, 0, 1);
+        conv.update(|s| s.couple_turn(timeline, call.0, RecordIdentity::NONE));
         // The response turn does not exist yet — the tools are still running.
         assert_eq!(conv.pending_summary_len(timeline), 1);
 
@@ -1087,14 +1088,14 @@ mod tests {
 
         // The response lands, but [call, response] is now the frontier, so it
         // still defers - the fabrication guard holds until a later turn settles it.
-        let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let response = append(&conv, timeline, 1, 2);
         absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         assert!(
             leaf_children(&conv, timeline).is_empty(),
             "the round-trip is still the frontier - not yet sealed"
         );
         // A later turn settles it -> seals as ONE leaf over both halves.
-        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        let _sentinel = append(&conv, timeline, 2, 3);
         absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         assert_eq!(
             leaf_children(&conv, timeline),
@@ -1109,10 +1110,10 @@ mod tests {
     fn uncoupled_turns_still_seal_one_leaf_each() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let n0 = append(&conv, timeline, 0, 1);
+        let n1 = append(&conv, timeline, 1, 2);
         // A trailing turn so both n0 and n1 are settled (non-frontier).
-        let _sentinel = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        let _sentinel = append(&conv, timeline, 2, 3);
 
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
@@ -1145,10 +1146,9 @@ mod tests {
 
         // A short conversation: every turn is inside the tail. Nothing absorbs,
         // everything stays pending for a later pass.
-        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        for i in 1..4u32 {
-            conv.write()
-                .append_with_blocks(timeline, 10, i as u64, i as u64 + 1);
+        let n0 = append(&conv, timeline, 0, 1);
+        for i in 1..4u64 {
+            append(&conv, timeline, i, i + 1);
         }
         absorb_pending_turns(&conv, &runner, timeline, 4, RAW_TAIL_TURNS).expect("absorb ok");
         assert!(
@@ -1159,9 +1159,8 @@ mod tests {
 
         // The conversation grows past the tail: the oldest turns become
         // absorbable, the newest eight stay raw.
-        for i in 4..12u32 {
-            conv.write()
-                .append_with_blocks(timeline, 10, i as u64, i as u64 + 1);
+        for i in 4..12u64 {
+            append(&conv, timeline, i, i + 1);
         }
         absorb_pending_turns(&conv, &runner, timeline, 16, RAW_TAIL_TURNS).expect("absorb ok");
         let absorbed: Vec<TurnIndex> = leaf_children(&conv, timeline).concat();
@@ -1176,7 +1175,7 @@ mod tests {
         );
 
         // Archived → terminal: the tail exemption ends and everything seals.
-        conv.write().set_archived(timeline, true);
+        conv.update(|s| s.set_archived(timeline, true));
         absorb_pending_turns(&conv, &runner, timeline, 16, RAW_TAIL_TURNS).expect("absorb ok");
         let absorbed: Vec<TurnIndex> = leaf_children(&conv, timeline).concat();
         assert!(
@@ -1190,8 +1189,8 @@ mod tests {
     fn archiving_seals_the_deferred_frontier_exchange() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let n0 = append(&conv, timeline, 0, 1);
+        let n1 = append(&conv, timeline, 1, 2);
         let runner = MockProbeRunner::new(conv.clone());
 
         // Live: n0 settles (n1 is its successor); n1 is the frontier and defers.
@@ -1204,7 +1203,7 @@ mod tests {
         );
 
         // Archive → a finalising pass seals the frontier n1 too.
-        conv.write().set_archived(timeline, true);
+        conv.update(|s| s.set_archived(timeline, true));
         absorb_pending_turns(&conv, &runner, timeline, 4, 0).expect("absorb ok");
         let leaves = leaf_children(&conv, timeline);
         assert_eq!(leaves.len(), 2, "archived: frontier sealed");
@@ -1226,7 +1225,7 @@ mod tests {
         // MERGE_FANOUT turns to carry, plus a trailing turn so the last of them is
         // settled rather than the deferred frontier.
         for i in 0..MERGE_FANOUT as u64 + 1 {
-            conv.write().append_with_blocks(timeline, 10, i, i + 1);
+            append(&conv, timeline, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, MERGE_FANOUT * 2, 0).expect("absorb ok");
@@ -1257,7 +1256,7 @@ mod tests {
         // extra so the (F+1)-th is settled rather than the deferred frontier.
         let sealed = MERGE_FANOUT as u64 + 1;
         for i in 0..sealed + 1 {
-            conv.write().append_with_blocks(timeline, 10, i, i + 1);
+            append(&conv, timeline, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, (sealed as usize + 1) * 2, 0)

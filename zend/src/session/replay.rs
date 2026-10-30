@@ -34,7 +34,6 @@
 //! A turn that differs there is not the context the recorded decode read, so a
 //! replay that passes where the recording failed points at that turn.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context};
@@ -295,10 +294,7 @@ impl ZendSession {
     ) -> anyhow::Result<ReplayReport> {
         let state = self
             .inference
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
+            .load_full()
             .context("the model is not loaded")?;
         let turns = self.recorded_conversation(&spec.conv_id)?;
         let Some(resume) = turns.get(spec.resume_turn) else {
@@ -309,11 +305,7 @@ impl ZendSession {
                 spec.resume_turn
             );
         };
-        let recorded = state
-            .base_conv
-            .lock()
-            .unwrap()
-            .sealed_turns(timeline_for(&spec.conv_id));
+        let recorded = state.base_conv.sealed_turns(timeline_for(&spec.conv_id));
         let decode = |ids: &[u32]| {
             state
                 .tokenizer
@@ -329,8 +321,6 @@ impl ZendSession {
             let timeline = timeline_for(&replay_id);
             let mut conv = state
                 .base_conv
-                .lock()
-                .unwrap()
                 .fork_resuming(timeline)
                 .with_context(|| format!("forking run {run}'s conversation"))?;
             conv.set_projection(turn_projection(&state, &replay_id, None, spec.tools_mode));
@@ -422,8 +412,6 @@ impl ZendSession {
                 .with_context(|| format!("sealing run {run}"))?;
             state
                 .engine
-                .lock()
-                .unwrap()
                 .tombstone_timeline(timeline)
                 .with_context(|| format!("retiring run {run}'s timeline"))?;
             let outcome = ReplayOutcome {

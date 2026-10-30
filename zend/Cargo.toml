@@ -65,6 +65,10 @@ doc-units           = { path = "../doc-units" }
 journal-core        = { path = "../journal-core" }
 regex               = "1"
 tokenizers          = { workspace = true }
+# The resident conversations, keyed without a lock (`resident`).
+papaya              = { workspace = true }
+# The loaded inference state, published once and read by every request.
+arc-swap            = { workspace = true }
 
 # Workspace scanning: `ignore` is ripgrep's git-aware file walker. The
 # per-language syntax trees code is carved by live in `doc-units`.

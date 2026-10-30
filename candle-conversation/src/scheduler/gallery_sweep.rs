@@ -91,19 +91,13 @@ impl Scheduler {
         {
             return;
         }
-        // Even the look costs a lock attempt per substrate, so it is paced too.
         self.gallery_sweep.last = Some(Instant::now());
-        // Which substrates have tombstoned something since the last read. A
-        // substrate whose lock a writer holds is skipped now and read later.
+        // Which substrates have tombstoned something since the last read.
         let substrates = self.distinct_substrates();
         let mut moved = false;
         let mut epochs = Vec::with_capacity(substrates.len());
         for conv in &substrates {
-            let Some(read) = conv.try_read() else {
-                moved = true;
-                continue;
-            };
-            let epoch = read.tombstone_epoch();
+            let epoch = conv.read().tombstone_epoch();
             let seen = self
                 .gallery_sweep
                 .tombstones_seen
@@ -119,20 +113,17 @@ impl Scheduler {
         let runs = arena.resident_runs();
         let loaded: HashSet<TimelineId> = self.slot_targets.values().map(|t| t.timeline).collect();
         let doom = if moved {
-            let reads: Vec<_> = substrates.iter().filter_map(|c| c.try_read()).collect();
-            let judge_absent = reads.len() == substrates.len();
+            // Every substrate is read — a read never waits — so a turn found
+            // in none of them is judged absent.
+            let reads: Vec<_> = substrates.iter().map(|c| c.read()).collect();
             let status_of = |sid: StreamId| {
                 reads
                     .iter()
                     .find_map(|read| turn_in(read, sid))
                     .map_or(TurnStatus::Absent, |(status, _)| status)
             };
-            let doom = doomed(&runs, &loaded, Some(&status_of), judge_absent);
-            // Seen only what every substrate was read for: one skipped is
-            // looked at again on the next sweep.
-            if judge_absent {
-                self.gallery_sweep.tombstones_seen = epochs;
-            }
+            let doom = doomed(&runs, &loaded, Some(&status_of), true);
+            self.gallery_sweep.tombstones_seen = epochs;
             doom
         } else {
             doomed(&runs, &loaded, None, false)

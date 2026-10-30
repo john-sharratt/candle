@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
 
     // The production module — the thing under test.
     let scope = ScopeKey::turn_group(1, 1);
-    let mut cache = NormalizationCache::new(cfg);
+    let cache = NormalizationCache::new(cfg);
     let child_keys: Vec<ChildKey> = names.iter().map(ChildKey::named).collect();
 
     let mut raw_mean = vec![0.0f32; n]; // diagnostics only (loudest clusters)

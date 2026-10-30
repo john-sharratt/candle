@@ -77,7 +77,7 @@ pub fn run(files: &[File], targets: &[String], daemon: &Daemon) -> anyhow::Resul
     let pairs = |scores: &[f32]| -> Vec<(ChildKey, f32)> {
         child.iter().cloned().zip(scores.iter().copied()).collect()
     };
-    let mut cache = NormalizationCache::default();
+    let cache = NormalizationCache::default();
     for (p, scores) in scaled.iter().enumerate() {
         cache.observe(&scope, p as u64, &pairs(scores), t_ref);
     }

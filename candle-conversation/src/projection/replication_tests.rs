@@ -98,12 +98,11 @@ fn a_long_range_lists_every_record_staged_or_written() {
             .unwrap();
     }
     let node = conv.node();
-    let top = {
-        let mut p = conv.persistence.lock().unwrap();
+    let top = conv.persistence.call(|p| {
         p.append_record(RecordType::Tokens, 0, 9, 0, 0, 0, &[1, 2, 3])
             .unwrap();
         p.applied_through(node)
-    };
+    });
     let held = conv.list_held(node, 1, top);
     assert_eq!(
         held.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),

@@ -7,8 +7,10 @@ use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 mod maintenance_op;
 pub use maintenance_op::MaintenanceOp;
@@ -54,9 +56,9 @@ use crate::persistence::resume::{
 use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
-use crate::persistence::writer::{SubstrateWriter, WriteJob};
+use crate::persistence::writer::WriteJob;
 use crate::persistence::{
-    PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
+    PersistenceOwner, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
 };
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{
@@ -69,8 +71,8 @@ use crate::provenance::{
 };
 use crate::scheduler::profile;
 use crate::substrate::{
-    ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, RestoredTurn, StoredSequence,
-    Substrate, SubstrateLock, SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite,
+    ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, ResidenceSlab, RestoredTurn,
+    StoredSequence, Substrate, SubstrateLock, SubstrateRead, TreeNodeMeta, TurnPartWrite,
     TurnStream,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
@@ -78,7 +80,7 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::turn_layout::TurnLayout;
+use crate::turn_layout::{TurnLayout, TurnSegment};
 use crate::working_set::marks::is_dialogue;
 use candle_nn::kv_cache::SealedSequence;
 
@@ -340,23 +342,19 @@ impl SubstrateRef {
 
 // ── Conversation ──────────────────────────────────────────────────────────────
 
-/// Workspace-shared, lock-protected handle to the per-turn record store.
+/// Workspace-shared handle to the per-turn record store.
 ///
 /// Multiple conversations in the same workspace clone this handle; they all
-/// see (and write into) the same underlying [`Substrate`].  Locking is
-/// coarse-grained — one `RwLock` over the whole resolver — but scans and
-/// mutations are short, so contention is minimal in practice — and a hold
-/// that is not, or a wait behind one, is logged with its site
-/// ([`SubstrateLock`]).
+/// see (and write into) the same underlying [`Substrate`], which holds no lock
+/// (`docs/substrate_lock_free.md`):
 ///
-/// # Phase 4 substrate semantics
-///
-/// - **Append (write)** — at seal time, each conversation appends its new
-///   turn into the shared store.  Index allocation is per-group, monotonic,
-///   under the resolver's lock.
-/// - **Read** — projection takes a read guard for the duration of a single
-///   `project()` call via [`Conversation::read`].  Returns a
-///   [`SubstrateRead`] that implements [`ContentResolver`].
+/// - **Read** — projection reads one version of the substrate for the
+///   duration of a single `project()` call via [`Conversation::read`], never
+///   waiting. Returns a [`SubstrateRead`] that implements [`ContentResolver`].
+/// - **Edit** — at seal time, each conversation edits its new turn into the
+///   shared store ([`Conversation::update`]), publishing a new version.
+/// - **Durable writes** — go to the log's owner thread ([`PersistenceOwner`]):
+///   queued and forgotten, or called and waited for alone.
 /// - **Reset** — does *not* clear the shared store (other conversations
 ///   would lose their history).  Sequence-level reset only drops local
 ///   KV state via the scheduler.
@@ -375,43 +373,35 @@ pub struct Conversation {
     /// ([`crate::tenant_rank`]).
     tenant_rank: TenantRank,
     /// The mandatory persistence layer — every turn is recorded into its
-    /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
-    pub(super) persistence: Arc<PersistenceLock>,
+    /// redo log (`docs/archived/kv_tier_migration.md` §13.6), by the thread
+    /// that owns it. Every redo-log append is queued here
+    /// ([`PersistenceOwner::enqueue`]), so a seal on the inference thread never
+    /// waits on the disk. Shared across clones; the last drop drains, commits
+    /// and joins the owner.
+    pub(super) persistence: Arc<PersistenceOwner>,
     /// The substrate's identity minter, shared with `persistence`. A write
-    /// that changes the substrate in memory and hands its record to the writer
-    /// thread mints here first, so the value and its record carry one identity
-    /// (`docs/replicated_substrate.md` §6.2) — and minting never waits on the
-    /// persistence lock a compaction may hold.
-    minter: Minter,
+    /// that changes the substrate in memory and hands its record to the owner
+    /// mints here first, so the value and its record carry one identity
+    /// (`docs/replicated_substrate.md` §6.2).
+    pub(super) minter: Minter,
     /// Runtime, in-memory score normalization (per-scope hit levels). NOT
     /// persisted — rebuilt from the substrate's existing turns on first use, then
     /// evolved as new turns seal. Shared across clones of this handle so learning
     /// pools over all sessions. See `docs/provenance_score_normalization.md`.
-    normalization: Arc<Mutex<NormalizationCache>>,
+    normalization: Arc<NormalizationCache>,
     /// Whether the dialogue warm-up replay has been handed out since it was last
     /// armed — once per process, and again after each
     /// [`Self::reset_normalization_warm`]. See [`Self::take_warm_replay`].
     normalization_warm: Arc<AtomicBool>,
-    /// Cached `(segment_count, last_op)` for the `/v1/status` maintenance
-    /// indicator — refreshed by the persistence thread after each maintenance
-    /// pass. Read through this **separate** lock so the status endpoint never
-    /// blocks on `persistence` (which a compaction holds across its I/O).
-    /// GUI compaction-indicator cache: `(segment_count, last_op, running)`.
-    /// `running` is `true` only while a maintenance op's relocation I/O is in
-    /// flight, so the sidebar can show a live spinner (vs. a settled ✓ for the
-    /// last completed op). Refreshed by the persistence thread each pass; read
-    /// by `/v1/status` off this separate lock so it never blocks on compaction.
-    maintenance: Arc<Mutex<(usize, Option<(String, u64)>, bool)>>,
-    /// Off-thread substrate writer: the redo-log append for every turn/section
-    /// stream-decl is enqueued here and drained by a dedicated thread, so a seal on
-    /// the inference thread never blocks on the persistence lock (which a
-    /// compaction can hold across its relocation I/O). Shared across clones; the
-    /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
-    pub(super) writer: Arc<SubstrateWriter>,
-    /// Reads records out of sealed segments without `persistence`'s mutex — the
-    /// read-side twin of `writer`. A compaction holds that mutex across its
-    /// relocation I/O, and the recurrent-snapshot read at every hybrid-model
-    /// admission used to queue behind it on the scheduler thread. Taken once at
+    /// The `/v1/status` maintenance indicator: `(segment_count, last_op,
+    /// running)`. `running` is `true` only while a maintenance op's relocation
+    /// is in flight, so the sidebar can show a live spinner (vs. a settled ✓
+    /// for the last completed op). Refreshed by the persistence thread each
+    /// pass and read with one atomic load, so the status endpoint never waits
+    /// on the log's owner.
+    maintenance: Arc<ArcSwap<MaintenanceStatus>>,
+    /// Reads durable records without the owner — the recurrent-snapshot read
+    /// at every hybrid-model admission, a cold load. Taken once at
     /// construction; see [`SealedReader`].
     sealed: SealedReader,
     /// The most recently read prompt-branch checkpoint, held decoded and keyed
@@ -428,7 +418,7 @@ pub struct Conversation {
     /// One entry is the right size. The key is a content hash, so a branch
     /// change misses and refills exactly once, and the phases that open many
     /// conversations all open them on a single shared prompt branch.
-    branch_checkpoint: Arc<Mutex<Option<(ContentHash, Arc<BranchCheckpointPayload>)>>>,
+    branch_checkpoint: Arc<ArcSwapOption<(ContentHash, Arc<BranchCheckpointPayload>)>>,
     /// Each collection's assembled belief gallery, with the substrate's
     /// [`Substrate::gallery_epoch`] it was assembled at.
     ///
@@ -437,10 +427,10 @@ pub struct Conversation {
     /// tool catalog on a 10M-token substrate, against a 4 ms scan. Keyed on the
     /// epoch, it reruns only when a stream, blob or tombstone actually changed —
     /// about once per sealed turn.
-    gallery_cache: Arc<Mutex<HashMap<GalleryKey, (u64, BeliefGallery)>>>,
+    gallery_cache: Arc<papaya::HashMap<GalleryKey, Arc<(u64, BeliefGallery)>>>,
     /// The index pages a live slot holds, found again by their record rather
     /// than read off the log at every reprojection — see [`HeldIndexPages`].
-    held_index_pages: Arc<Mutex<HeldIndexPages>>,
+    held_index_pages: Arc<HeldIndexPages>,
     /// How this workspace's prompt sections came to be resident since it was
     /// opened: restored from the redo log, or prefilled. A restart on an
     /// unchanged prompt restores every one; a prefill there is a section the
@@ -454,14 +444,6 @@ pub struct Conversation {
     /// turn or chunk stays RAM-resident. Read once from the handle at
     /// construction; a handle's mode never changes.
     read_only: bool,
-    /// Serialises conversation-state writes, from the in-RAM change to the
-    /// enqueue of the record carrying it. A `ConvState` record holds the whole
-    /// state, so two updates enqueued in the opposite order to the one they
-    /// changed RAM in would leave the older state winning on replay — a
-    /// branch set, then lost to an archive that read the state before it.
-    /// Held only by these writes, never by the writer thread, so holding it
-    /// across an enqueue that waits on backpressure cannot deadlock.
-    conv_state_writes: Arc<Mutex<()>>,
     /// The throwaway directory an [`Self::ephemeral`] conversation's log lives
     /// in, removed when the last clone of that conversation drops.
     ///
@@ -479,17 +461,22 @@ pub struct Conversation {
     /// delete the directory the original is still writing to.
     ///
     /// **Declared last on purpose.** Rust drops fields in declaration order, so
-    /// `writer` above goes first — draining, fsyncing and joining the writer
-    /// thread — and only then does this remove the directory. Windows refuses to
-    /// delete a directory holding an open file, so a guard that ran before the
-    /// writer released its handles would silently fail and leave the 64 MiB
-    /// behind, which is the bug it exists to fix.
+    /// `persistence` above goes first — draining, committing and joining the
+    /// log's owner thread, which closes every file — and only then does this
+    /// remove the directory. Windows refuses to delete a directory holding an
+    /// open file, so a guard that ran before the owner released its handles
+    /// would silently fail and leave the 64 MiB behind, which is the bug it
+    /// exists to fix.
     ///
     /// Never read, and that is the point: the whole of its behaviour is in
     /// `Drop`. Holding it is the feature.
     #[allow(dead_code)]
     ephemeral_dir: Option<Arc<TempDirGuard>>,
 }
+
+/// The maintenance indicator: `(segment_count, last_op, running)` — see the
+/// `maintenance` field of [`Conversation`].
+pub type MaintenanceStatus = (usize, Option<(String, u64)>, bool);
 
 /// Running totals behind [`Conversation::section_loads`].
 #[derive(Default)]
@@ -573,33 +560,12 @@ impl Conversation {
         let mut substrate = Substrate::new();
         let persistence = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
             .expect("ephemeral SubstratePersistence");
-        let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
-        let sealed = persistence.sealed_reader();
-        let minter = persistence.minter();
-        let inner = Arc::new(SubstrateLock::new(substrate));
-        let persistence = Arc::new(PersistenceLock::new(persistence));
-        let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
+        let conversation = Self::from_parts(substrate, persistence);
         Self {
-            inner,
-            allocator: process_timeline_allocator(),
-            cancel: CancelToken::new(),
-            tenant_rank: TenantRank::FIRST,
-            maintenance,
-            persistence,
-            minter,
-            normalization: Arc::new(Mutex::new(NormalizationCache::default())),
-            normalization_warm: Arc::new(AtomicBool::new(false)),
-            writer,
-            sealed,
-            branch_checkpoint: Arc::new(Mutex::new(None)),
-            gallery_cache: Arc::new(Mutex::new(HashMap::new())),
-            held_index_pages: Arc::default(),
-            section_loads: Arc::default(),
-            read_only: false,
-            conv_state_writes: Arc::default(),
             // The directory goes when the last clone of this conversation does.
             // See the field's own note for what it cost not to have this.
             ephemeral_dir: Some(Arc::new(TempDirGuard::new(dir))),
+            ..conversation
         }
     }
 
@@ -623,17 +589,8 @@ impl Conversation {
             substrate: inner,
             persistence,
         } = shared;
-        let (segments, read_only, sealed, minter) = {
-            let p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                p.segment_count(),
-                p.is_read_only(),
-                p.sealed_reader(),
-                p.minter(),
-            )
-        };
-        let maintenance = Arc::new(Mutex::new((segments, None, false)));
-        let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
+        let segments = persistence.call(|p| p.segment_count());
+        let maintenance = Arc::new(ArcSwap::from_pointee((segments, None, false)));
         Self {
             // **No guard.** This conversation's log lives in a directory the
             // caller chose — a workspace, someone's `--data`. Removing it on
@@ -644,18 +601,16 @@ impl Conversation {
             cancel: CancelToken::new(),
             tenant_rank: TenantRank::FIRST,
             maintenance,
+            read_only: persistence.is_read_only(),
+            sealed: persistence.sealed_reader(),
+            minter: persistence.minter(),
             persistence,
-            minter,
-            normalization: Arc::new(Mutex::new(NormalizationCache::default())),
+            normalization: Arc::new(NormalizationCache::default()),
             normalization_warm: Arc::new(AtomicBool::new(false)),
-            writer,
-            sealed,
-            branch_checkpoint: Arc::new(Mutex::new(None)),
-            gallery_cache: Arc::new(Mutex::new(HashMap::new())),
+            branch_checkpoint: Arc::new(ArcSwapOption::empty()),
+            gallery_cache: Arc::new(papaya::HashMap::new()),
             held_index_pages: Arc::default(),
             section_loads: Arc::default(),
-            read_only,
-            conv_state_writes: Arc::default(),
         }
     }
 
@@ -728,75 +683,58 @@ impl Conversation {
 
     /// Every timeline this substrate holds.
     pub fn timeline_ids(&self) -> Vec<TimelineId> {
-        self.inner.read().unwrap().timeline_ids()
-    }
-
-    /// The persistence handle for a best-effort durable write — the reload's
-    /// repair tombstones — or `None` when there is nothing to write to: a
-    /// read-only substrate, or a poisoned lock. The in-RAM change the write
-    /// would have mirrored is made by the caller either way.
-    fn writable_persistence(&self) -> Option<MutexGuard<'_, SubstratePersistence>> {
-        if self.read_only {
-            return None;
-        }
-        self.persistence.lock().ok()
+        self.inner.read().timeline_ids()
     }
 
     /// Apply a batch of records other members wrote
-    /// ([`SubstratePersistence::apply_remote`], `docs/replicated_substrate.md`
-    /// §6.5). Takes the persistence lock and then the substrate's write lock —
-    /// the order a reload takes them in — once each for the whole batch, so a
-    /// projection sees the batch whole or not at all and no read nests inside
-    /// the held guard.
+    /// ([`SubstratePersistence::apply_remote_shared`],
+    /// `docs/replicated_substrate.md` §6.5): decided and appended on the log's
+    /// owner, then published in one edit, so a projection sees the batch whole
+    /// or not at all.
     ///
-    /// **Every record is checked before either lock is taken.** The check
-    /// reads every payload byte and touches no state; run under the write
-    /// lock, it held every projection behind a full pass over the batch.
+    /// **Every record is checked on this thread first.** The check reads every
+    /// payload byte and touches no state; on the owner it would hold every
+    /// write behind a full pass over the batch.
     pub fn apply_remote(
         &self,
         records: &[&[u8]],
         n_layers: usize,
     ) -> PersistenceResult<RemoteBatch> {
         let checks = SubstratePersistence::check_remote(records);
-        let mut p = self.persistence.lock().unwrap();
-        let mut view = self.write();
-        p.apply_remote_checked(&mut view, records, &checks, n_layers)
+        self.persistence
+            .call(|p| p.apply_remote_shared(&self.inner, records, &checks, n_layers))
     }
 
     /// Allocate a fresh [`TimelineId`] and register it against
     /// `(layer, group)` on the substrate.
     pub fn mint_timeline(&self, layer: LayerId, group: GroupId) -> TimelineId {
-        let mut view = self.inner.write().unwrap();
-        view.mint_timeline(layer, group, &self.allocator)
+        let id = self.allocator.next();
+        self.register_timeline(id, layer, group);
+        id
     }
 
-    /// Mint `n` timelines under ONE write-lock acquisition.
-    ///
-    /// A batch create previously called [`Self::mint_timeline`] per conversation,
-    /// taking the substrate's exclusive lock once each — profiled as ~600
-    /// contended-lock samples, on the path that opens conversations in bursts.
-    /// Minting is pure allocator bookkeeping, so the whole burst fits in a single
-    /// span and every reader waits once instead of `n` times.
+    /// Mint `n` timelines in one version edit — a batch create opens
+    /// conversations in bursts, and one edit publishes them together.
     pub fn mint_timelines(&self, layer: LayerId, group: GroupId, n: usize) -> Vec<TimelineId> {
-        let mut view = self.inner.write().unwrap();
-        (0..n)
-            .map(|_| view.mint_timeline(layer, group, &self.allocator))
-            .collect()
+        let ids: Vec<TimelineId> = (0..n).map(|_| self.allocator.next()).collect();
+        self.update(|s| {
+            for &id in &ids {
+                s.register_timeline(id, layer, group);
+            }
+        });
+        ids
     }
 
     /// Look up `(layer, group)` for a previously-minted timeline.
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
-        self.inner.read().unwrap().timeline_target(timeline)
+        self.inner.read().timeline_target(timeline)
     }
 
     /// Register a specific [`TimelineId`] against `(layer, group)` —
     /// idempotent. Used by the resume path to bind a conversation to a
     /// timeline recovered from the redo log instead of minting a fresh one.
     pub fn register_timeline(&self, timeline: TimelineId, layer: LayerId, group: GroupId) {
-        self.inner
-            .write()
-            .unwrap()
-            .register_timeline(timeline, layer, group);
+        self.update(|s| s.register_timeline(timeline, layer, group));
     }
 
     /// Set (or clear) the per-conversation KV-compression override for
@@ -808,10 +746,7 @@ impl Conversation {
         timeline: TimelineId,
         compression: Option<crate::substrate::ConvCompression>,
     ) {
-        self.inner
-            .write()
-            .unwrap()
-            .set_timeline_compression(timeline, compression);
+        self.update(|s| s.set_timeline_compression(timeline, compression));
     }
 
     /// Set whether `timeline`'s turns are summarised. `false` for append-only
@@ -819,24 +754,21 @@ impl Conversation {
     /// enter the summariser. Called at conversation creation, before the first
     /// turn seals.
     pub fn set_timeline_summarize(&self, timeline: TimelineId, summarize: bool) {
-        self.inner
-            .write()
-            .unwrap()
-            .set_timeline_summarize(timeline, summarize);
+        self.update(|s| s.set_timeline_summarize(timeline, summarize));
     }
 
     /// Mark `layer` as an append-only ingest layer (code_reading/repo_map) so
     /// projections targeting it score/select self-local. See
     /// [`crate::substrate::Substrate::mark_layer_append_only`].
     pub fn mark_layer_append_only(&self, layer: LayerId) {
-        self.inner.write().unwrap().mark_layer_append_only(layer);
+        self.update(|s| s.mark_layer_append_only(layer));
     }
 
     /// Let projections targeting the append-only `layer` draw `groups` of the
     /// layers below it across conversations. See
     /// [`crate::substrate::Substrate::set_ingest_sees`].
     pub fn set_ingest_sees(&self, layer: LayerId, groups: HashSet<GroupId>) {
-        self.inner.write().unwrap().set_ingest_sees(layer, groups);
+        self.update(|s| s.set_ingest_sees(layer, groups.clone()));
     }
 
     /// Register a layer's [`CorruptTurnPolicy`] (from the projection schema),
@@ -844,41 +776,47 @@ impl Conversation {
     /// conversation or just the turn. See
     /// [`crate::substrate::Substrate::set_layer_corrupt_turn_policy`].
     pub fn set_layer_corrupt_turn_policy(&self, layer: LayerId, policy: CorruptTurnPolicy) {
-        self.inner
-            .write()
-            .unwrap()
-            .set_layer_corrupt_turn_policy(layer, policy);
+        self.update(|s| s.set_layer_corrupt_turn_policy(layer, policy));
     }
 
-    /// Acquire an unscored read guard.  The returned guard implements
-    /// [`ContentResolver`] but every score lookup returns zero —
+    /// The latest version of the substrate, unscored. The returned guard
+    /// implements [`ContentResolver`] but every score lookup returns zero —
     /// appropriate for callers reading structural fields (turn counts,
-    /// sealed pointers) without projection.
+    /// sealed pointers) without projection. Never waits.
     ///
     /// Use [`Self::read_scored`] when projecting against a freshly-built
     /// [`ProjectionScores`] from the wide-Q belief scan.
-    ///
-    /// Every acquisition here is timed against its caller's site
-    /// (`#[track_caller]` through to [`SubstrateLock`]).
-    #[track_caller]
     pub fn read(&self) -> SubstrateRead<'_> {
         SubstrateRead {
-            guard: self.inner.read().unwrap(),
+            guard: self.inner.read(),
             scores: None,
         }
     }
 
-    /// Acquire a read guard bound to an externally-owned
+    /// The latest version, bound to an externally-owned
     /// [`ProjectionScores`]. The scores are transient per-projection state —
     /// populated by the reprojection's wide-Q belief scan on the call site's
     /// stack and dropped at end of scope. They are **not** held by the
     /// substrate.
-    #[track_caller]
     pub fn read_scored<'a>(&'a self, scores: &'a ProjectionScores) -> SubstrateRead<'a> {
         SubstrateRead {
-            guard: self.inner.read().unwrap(),
+            guard: self.inner.read(),
             scores: Some(scores),
         }
+    }
+
+    /// Edit the substrate: `edit` runs on the latest version and its result
+    /// is published — see [`SubstrateLock::update`], whose rules bind `edit`
+    /// (it may run more than once, and changes nothing outside the version).
+    #[track_caller]
+    pub fn update<R>(&self, edit: impl FnMut(&mut Substrate) -> R) -> R {
+        self.inner.update(edit)
+    }
+
+    /// The residences every version shares — for KV tier transitions, which
+    /// publish no version.
+    pub fn residences(&self) -> Arc<ResidenceSlab> {
+        self.inner.residences()
     }
 
     /// Acquire a target-aware read guard.  The returned [`TargetedRead`]
@@ -915,7 +853,7 @@ impl Conversation {
         window_turns: usize,
         total_blocks: usize,
     ) -> Vec<(usize, usize)> {
-        let sub = self.inner.read().unwrap();
+        let sub = self.inner.read();
         let turn_count = sub.turn_count(timeline);
         // Per-turn start block in the sealed block grid the view borrow indexes.
         // `block_range_of` is `(start, end)`; the system prompt is the blocks
@@ -930,49 +868,6 @@ impl Conversation {
             total_blocks,
             window_turns,
         )
-    }
-
-    /// Send `mutation` to the substrate and return at once — see
-    /// [`SubstrateLock::send`]. For a thread that must not wait for the lock,
-    /// making a mutation whose result it does not read back.
-    pub fn send(&self, mutation: impl FnOnce(&mut Substrate) + Send + 'static) {
-        self.inner.send(mutation);
-    }
-
-    /// Acquire a write guard for mutating operations (append, set_*).
-    #[track_caller]
-    pub fn write(&self) -> SubstrateWrite<'_> {
-        SubstrateWrite {
-            guard: self.inner.write().unwrap(),
-        }
-    }
-
-    /// [`Self::write`] when the lock is free now, and `None` rather than a
-    /// wait when it is not — for a write that can be owed and retried, where
-    /// waiting out another holder (a maintenance op's plan or apply) would
-    /// stall the caller's thread for nothing.
-    /// [`Self::read`] without waiting: `None` while a writer holds the lock, for
-    /// a reader that may look again later rather than stall its thread behind
-    /// a write.
-    #[track_caller]
-    pub fn try_read(&self) -> Option<SubstrateRead<'_>> {
-        match self.inner.try_read() {
-            Ok(guard) => Some(SubstrateRead {
-                guard,
-                scores: None,
-            }),
-            Err(TryLockError::WouldBlock) => None,
-            Err(TryLockError::Poisoned(e)) => panic!("the substrate lock is poisoned: {e}"),
-        }
-    }
-
-    #[track_caller]
-    pub fn try_write(&self) -> Option<SubstrateWrite<'_>> {
-        match self.inner.try_write() {
-            Ok(guard) => Some(SubstrateWrite { guard }),
-            Err(TryLockError::WouldBlock) => None,
-            Err(TryLockError::Poisoned(e)) => panic!("the substrate lock is poisoned: {e}"),
-        }
     }
 
     /// Assemble the belief gallery for a section `collection`: every in-scope
@@ -996,9 +891,9 @@ impl Conversation {
     /// residency in the GPU gallery arena.
     ///
     /// Reused while [`Substrate::gallery_epoch`] is unchanged — see
-    /// `gallery_cache`. The epoch is read under the same read lock the
-    /// assembly runs under, so a cached gallery is always the one this state
-    /// would assemble.
+    /// `gallery_cache`. The epoch is read from the same version the assembly
+    /// reads, so a cached gallery is always the one that version would
+    /// assemble.
     pub fn belief_gallery(
         &self,
         collection: &str,
@@ -1006,12 +901,12 @@ impl Conversation {
         members: &[String],
     ) -> BeliefGallery {
         let slot_of = |name: &str| members.iter().position(|m| m == name);
-        let sub = self.inner.read().unwrap();
+        let sub = self.inner.read();
         let epoch = sub.gallery_epoch();
         let key: GalleryKey = (collection.to_string(), tags.to_vec(), members.to_vec());
-        if let Some((at, gallery)) = self.gallery_cache.lock().unwrap().get(&key) {
-            if *at == epoch {
-                return gallery.clone();
+        if let Some(held) = self.gallery_cache.pin().get(&key) {
+            if held.0 == epoch {
+                return held.1.clone();
             }
         }
         let mut windows: Vec<SigWindow> = Vec::new();
@@ -1065,10 +960,15 @@ impl Conversation {
             sids.push(sid);
         }
         let gallery = (windows, slots, sids);
-        self.gallery_cache
-            .lock()
-            .unwrap()
-            .insert(key, (epoch, gallery.clone()));
+        // Two assemblies of one key race only to store equal galleries of one
+        // epoch, or the later epoch's over the earlier — never the reverse,
+        // which would serve a stale gallery as fresh: an older epoch does not
+        // replace a newer one.
+        let fresh = Arc::new((epoch, gallery.clone()));
+        let _ = self.gallery_cache.pin().compute(key, |held| match held {
+            Some((_, held)) if held.0 > epoch => papaya::Operation::Abort(()),
+            _ => papaya::Operation::Insert(Arc::clone(&fresh)),
+        });
         gallery
     }
 
@@ -1126,7 +1026,7 @@ impl Conversation {
         };
         let mut preload = GalleryPreload::default();
         {
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             let shared = schema
                 .layers
                 .iter()
@@ -1286,12 +1186,11 @@ impl Conversation {
                 // fires en masse. WARN once per collection (the actionable
                 // signal), then demote repeats to TRACE so they don't bury the log
                 // during calibration; steady-state behaviour is unchanged.
-                static EMPTY_GALLERY_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+                static EMPTY_GALLERY_WARNED: OnceLock<papaya::HashSet<String>> = OnceLock::new();
                 let first = EMPTY_GALLERY_WARNED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .map(|mut seen| seen.insert(coll.name.clone()))
-                    .unwrap_or(false);
+                    .get_or_init(papaya::HashSet::new)
+                    .pin()
+                    .insert(coll.name.clone());
                 if first {
                     tracing::warn!(
                         target: "candle_conversation::belief",
@@ -1474,7 +1373,7 @@ impl Conversation {
             let t_tail = probe.len();
             let t_q = probe_q.map_or(1, |q| q.len());
             let (normed, normed_q) = {
-                let mut cache = self.normalization.lock().unwrap();
+                let cache = &*self.normalization;
                 let normed = cache.normalize(&scope, &raw_pairs, t_tail);
                 let normed_q = fresh_q
                     .as_deref()
@@ -1571,14 +1470,16 @@ impl Conversation {
             return;
         };
         let fresh = working_set_fresh(schema, candidates);
-        self.inner.write().unwrap().working_set_observe(
-            target.timeline,
-            &fresh,
-            cfg.beta,
-            cfg.min_momentum,
-            cfg.limits(),
-            cfg.max_admits,
-        );
+        self.update(|s| {
+            s.working_set_observe(
+                target.timeline,
+                &fresh,
+                cfg.beta,
+                cfg.min_momentum,
+                cfg.limits(),
+                cfg.max_admits,
+            )
+        });
     }
 
     /// Score every belief node the projection will consult: the **target
@@ -1720,12 +1621,7 @@ impl Conversation {
         // during corpus load the corpus is still moving, and a replay then warms
         // levels the next file retires. A real query projects against a
         // non-append-only (dialogue) target, by which point it is stable.
-        if self
-            .inner
-            .read()
-            .unwrap()
-            .is_append_only_layer(target.layer)
-        {
+        if self.inner.read().is_append_only_layer(target.layer) {
             return None;
         }
         // Fire once, but RE-ARMABLE: `reset_normalization_warm` clears the flag after
@@ -1737,7 +1633,7 @@ impl Conversation {
             return None;
         }
         let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             sub.all_turn_streams()
                 .filter_map(|turn| {
                     if !is_dialogue(&turn.decl.tags) {
@@ -1897,7 +1793,7 @@ impl Conversation {
             // exactly the turns the plan keeps — the cap does not pay to decode
             // signatures it discards.
             let plan = {
-                let sub = self.inner.read().unwrap();
+                let sub = self.inner.read();
                 let decls = sub.all_turn_streams().map(|turn| {
                     (
                         turn.decl.tags.as_slice(),
@@ -1917,7 +1813,7 @@ impl Conversation {
             // order the levels fold them in, which the asymmetric EWMA is not
             // indifferent to.
             let probes: Vec<(u64, Vec<WideQSig>)> = {
-                let sub = self.inner.read().unwrap();
+                let sub = self.inner.read();
                 plan.iter()
                     .flat_map(|(_, keys)| keys.iter())
                     .filter_map(|(tl, idx)| {
@@ -2092,7 +1988,7 @@ impl Conversation {
             }
         };
         let scope = ScopeKey::collection(taught.id.raw() as u64, taught.name.as_str());
-        let mut cache = self.normalization.lock().unwrap();
+        let cache = &*self.normalization;
         for ((source, probe), scores) in probes.iter().zip(&raw) {
             let pairs: Vec<(ChildKey, f32)> = taught
                 .sections
@@ -2160,7 +2056,7 @@ impl Conversation {
             // loop body below is unreached otherwise, so this is the real
             // filter; a leftover `!layer.gathered` check used to sit ahead of
             // it and is deliberately gone (see below).
-            let is_ingest = self.inner.read().unwrap().is_append_only_layer(layer.id);
+            let is_ingest = self.inner.read().is_append_only_layer(layer.id);
             if !is_ingest {
                 continue;
             }
@@ -2181,7 +2077,6 @@ impl Conversation {
                 let timelines: Vec<TimelineId> = self
                     .inner
                     .read()
-                    .unwrap()
                     .active_timelines_for_group(group.id)
                     .collect();
                 work.push((layer.id, group.id, timelines));
@@ -2239,7 +2134,6 @@ impl Conversation {
         let timelines: Vec<TimelineId> = self
             .inner
             .read()
-            .unwrap()
             .active_timelines_for_group(group.id)
             .collect();
         self.warm_timelines(group, layer.gather_scope, &timelines, None)
@@ -2312,7 +2206,7 @@ impl Conversation {
         // short-lived read lock, released before any scoring.
         let (sigs, files) = {
             let _g = profile::span("warm:assemble");
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             let count = sub.turn_count(tl);
             // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
             // 0.30) is ~94% converged after 8 observes, and each already scores
@@ -2348,7 +2242,7 @@ impl Conversation {
         let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
         let child_of =
             |slot: usize| ChildKey::turn(file.arc_turn[file.ex_ranges[slot].start].0 as u64);
-        let mut cache = self.normalization.lock().unwrap();
+        let cache = &*self.normalization;
         for ((source, probe), per_file) in probes.iter().zip(&scanned) {
             // Self-match: the probe is this group's own turn, so it is inside
             // the scope by construction.
@@ -2440,11 +2334,7 @@ impl Conversation {
         // only its own scope (mirror of the `TargetedRead::group_turns` selection
         // mask). Dialogue targets are never append-only, so cross-file scoring
         // there is untouched.
-        let self_local = self
-            .inner
-            .read()
-            .unwrap()
-            .is_append_only_layer(target.layer);
+        let self_local = self.inner.read().is_append_only_layer(target.layer);
         for group in &layer.groups {
             if !group.is_scanned() {
                 continue;
@@ -2458,7 +2348,7 @@ impl Conversation {
             // outside whichever one it is. Timed per group so the group that
             // grew is named, not just the layer.
             let t_select = Instant::now();
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             // Score EVERY conversation in the group, not just the first. A belief
             // group like `code_reading` declares one timeline per file; scoring
             // only the first-registered timeline left every other file at score 0
@@ -2621,7 +2511,7 @@ impl Conversation {
                 let t_tail = probe.len();
                 let t_q = probe_q.map_or(1, |q| q.len());
                 let (normed, normed_q) = {
-                    let mut cache = self.normalization.lock().unwrap();
+                    let cache = &*self.normalization;
                     let normed = cache.normalize_with_floors(&scope, &raw_pairs, &floors, t_tail);
                     let normed_q = fresh_q_per_file.as_ref().map(|per_file| {
                         let fq = &per_file[fi];
@@ -2683,12 +2573,8 @@ impl Conversation {
                 group_raw.extend_from_slice(&mass_base_per_file[fi]);
             }
             if let (false, Some(source)) = (pool_raw.is_empty(), observe.source()) {
-                self.normalization.lock().unwrap().observe(
-                    &pool_scope,
-                    source,
-                    &pool_raw,
-                    probe.len(),
-                );
+                self.normalization
+                    .observe(&pool_scope, source, &pool_raw, probe.len());
             }
             if cands.is_empty() {
                 continue;
@@ -2786,37 +2672,67 @@ impl Conversation {
         // provenance gallery's `tags:` scoping.
         let segments = write.layout.segments.clone();
         let tags = write.tags.clone();
-        // Migrate BEFORE taking the write lock. The migration moves this turn's
-        // K/V off the device; holding the substrate's exclusive lock across it
-        // blocked every other reader and writer for the duration, once per
-        // sealed turn. The lock now covers only the insert.
+        // Migrate BEFORE the edit: it moves this turn's K/V off the device,
+        // and an edit may run more than once.
         let sealed_cpu = Substrate::migrate_sealed(&write, migrate_to_cpu)?;
-        let idx = {
-            let mut view = self.inner.write().unwrap();
-            view.append_migrated(timeline, write, sealed_cpu)?
-        };
-        // Record the turn's structure into the redo log.
-        let (layer_id, group_id) = self
+        let identity = self.minter.mint(0);
+        let role = Self::decl_role(role);
+        // **The turn and its declaration land in one edit** (R1): a reader sees
+        // the turn with its declaration, tags and layout, or neither.
+        let (idx, decl) = self.update(|s| {
+            let idx = s.append_migrated(timeline, write.clone(), sealed_cpu.clone())?;
+            let decl = Self::turn_decl(
+                s,
+                timeline,
+                idx,
+                role,
+                (block_start, block_end),
+                &segments,
+                &tags,
+            );
+            s.apply_stream_decl(decl.stream_id(), decl.clone(), identity);
+            Ok::<_, candle::Error>((idx, decl))
+        })?;
+        self.persistence.enqueue(WriteJob::StreamDecl {
+            stream_id: decl.stream_id().0,
+            payload: decl.encode(),
+            identity,
+        });
+        Ok(idx)
+    }
+
+    /// The declaration of turn `idx` of `timeline` — the turn's structure as
+    /// the redo log records it, so reload can reconstruct `TurnPart::layout`
+    /// (per-half text + spans + `/no_think`) without re-tokenising, and re-tag
+    /// the turn for the provenance gallery's `tags:` scoping.
+    fn turn_decl(
+        s: &Substrate,
+        timeline: TimelineId,
+        idx: TurnIndex,
+        role: u8,
+        (block_start, block_end): (u64, u64),
+        segments: &[TurnSegment],
+        tags: &[String],
+    ) -> StreamDecl {
+        let (layer_id, group_id) = s
             .timeline_target(timeline)
             .map(|(l, g)| (l.raw(), g.raw()))
             .unwrap_or((0, 0));
-        let decl = StreamDecl::Turn(TurnDecl {
+        StreamDecl::Turn(TurnDecl {
             timeline_id: timeline.raw(),
             turn_index: idx.0,
             turn_id_day: 0,
             turn_id_seq: idx.0 + 1,
-            role: Self::decl_role(role),
+            role,
             block_start,
             block_end,
             layer_id,
             group_id,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            segments,
-            tags,
-        });
-        self.declare_and_mirror(decl, "persist turn")?;
-        Ok(idx)
+            segments: segments.to_vec(),
+            tags: tags.to_vec(),
+        })
     }
 
     /// Ordered-merge splice for parallel code_read: re-record a turn from
@@ -2895,10 +2811,10 @@ impl Conversation {
         // is targeted to the code_read splice path (unlike a `summarize`-based
         // marker, which `--disable-summariser` would spuriously set on dialogue).
         // The source fork's turns are freed by `tombstone_timeline` at splice.
-        self.write().mark_turn_evict_when_cold(to_tl, idx);
+        self.read().mark_turn_evict_when_cold(to_tl, idx);
         let stream_id = turn_stream_id(to_tl.raw(), idx.0);
-        // Off-thread writer (never the persistence lock) so a compaction can't
-        // stall the parallel code_read splice.
+        // Queued to the log's owner, so the parallel code_read splice never
+        // waits on the disk.
         self.enqueue_tokens(stream_id, token_ids.clone());
         if let Some(blob) = sigs_blob {
             self.enqueue_wide_q_sigs(stream_id, blob);
@@ -2920,15 +2836,14 @@ impl Conversation {
     /// section-by-name lookups — consult the in-memory decls, so a stream
     /// declared in the current session (every calibration turn or section on
     /// a fresh substrate) must be visible to them without a restart.
-    fn declare_and_mirror(&self, decl: StreamDecl, _err_ctx: &str) -> candle::Result<StreamId> {
+    fn declare_and_mirror(&self, decl: StreamDecl) -> StreamId {
         // The stream id is a PURE function of the decl (`turn_stream_id` /
         // `section_stream_id`), so compute it locally, apply the decl in-memory
         // synchronously (projection needs it this instant), and hand ONLY the
-        // durable redo-log append to the off-thread writer. The inference thread
-        // never takes the persistence lock, so a segment compaction holding it
-        // can't block the seal. Reconstruct is order-independent + per-turn
-        // fault-isolated, so the async append is crash-safe: worst case a decl
-        // lost on crash yields an absent turn, never corruption.
+        // durable redo-log append to the log's owner. Reconstruct is
+        // order-independent + per-turn fault-isolated, so the queued append is
+        // crash-safe: worst case a decl lost on crash yields an absent turn,
+        // never corruption.
         let stream_id = decl.stream_id();
         let payload = decl.encode();
         let identity = self.minter.mint(0);
@@ -2937,13 +2852,13 @@ impl Conversation {
         if matches!(decl, StreamDecl::PromptSection(_)) {
             self.minter.start_section(stream_id.0, identity.oseq);
         }
-        self.write().apply_stream_decl(stream_id, decl, identity);
-        self.writer.enqueue(WriteJob::StreamDecl {
+        self.update(|s| s.apply_stream_decl(stream_id, decl.clone(), identity));
+        self.persistence.enqueue(WriteJob::StreamDecl {
             stream_id: stream_id.0,
             payload,
             identity,
         });
-        Ok(stream_id)
+        stream_id
     }
 
     /// Union of the gather-scope tags on `children`'s TurnDecls, dedup'd
@@ -2955,7 +2870,7 @@ impl Conversation {
     /// of its children's.
     pub fn union_turn_tags(&self, timeline: TimelineId, children: &[TurnIndex]) -> Vec<String> {
         use crate::persistence::content_hash::turn_stream_id;
-        let read = self.inner.read().unwrap();
+        let read = self.inner.read();
         let mut tags: Vec<String> = Vec::new();
         for c in children {
             let sid = turn_stream_id(timeline.raw(), c.0);
@@ -2993,32 +2908,20 @@ impl Conversation {
         timeline: TimelineId,
         token_count: usize,
     ) -> candle::Result<TurnIndex> {
-        let idx = {
-            let mut view = self.inner.write().unwrap();
-            let idx = view.append_with_blocks(timeline, token_count, 0, 0);
-            view.pop_pending_summary(timeline);
-            idx
-        };
-        let (layer_id, group_id) = self
-            .timeline_target(timeline)
-            .map(|(l, g)| (l.raw(), g.raw()))
-            .unwrap_or((0, 0));
-        let decl = StreamDecl::Turn(TurnDecl {
-            timeline_id: timeline.raw(),
-            turn_index: idx.0,
-            turn_id_day: 0,
-            turn_id_seq: idx.0 + 1,
-            role: 2,
-            block_start: 0,
-            block_end: 0,
-            layer_id,
-            group_id,
-            anchored_prefix: Vec::new(),
-            view: Vec::new(),
-            segments: Vec::new(),
-            tags: Vec::new(),
+        let identity = self.minter.mint(0);
+        // The turn and its declaration in one edit, as `record_turn`'s.
+        let (idx, decl) = self.update(|s| {
+            let idx = s.append_with_blocks(timeline, token_count, 0, 0);
+            s.pop_pending_summary(timeline);
+            let decl = Self::turn_decl(s, timeline, idx, 2, (0, 0), &[], &[]);
+            s.apply_stream_decl(decl.stream_id(), decl.clone(), identity);
+            (idx, decl)
         });
-        self.declare_and_mirror(decl, "persist summary turn")?;
+        self.persistence.enqueue(WriteJob::StreamDecl {
+            stream_id: decl.stream_id().0,
+            payload: decl.encode(),
+            identity,
+        });
         Ok(idx)
     }
 
@@ -3034,16 +2937,50 @@ impl Conversation {
         if self.read().turn_count(timeline) >= decl.turn_index {
             return;
         }
-        let mut view = self.write();
-        if let (Some(layer), Some(group)) = (
-            LayerId::from_raw(decl.layer_id),
-            GroupId::from_raw(decl.group_id),
-        ) {
-            view.register_timeline(timeline, layer, group);
-        }
-        while view.turn_count(timeline) < decl.turn_index {
-            view.restore_gap_turn(timeline);
-        }
+        self.update(|view| {
+            if let (Some(layer), Some(group)) = (
+                LayerId::from_raw(decl.layer_id),
+                GroupId::from_raw(decl.group_id),
+            ) {
+                view.register_timeline(timeline, layer, group);
+            }
+            while view.turn_count(timeline) < decl.turn_index {
+                view.restore_gap_turn(timeline);
+            }
+        });
+    }
+
+    /// Restore `turn` at the position `decl` names in `timeline`, registering
+    /// the timeline first — one edit, as a reload reads the turn.
+    fn restore_turn_at(&self, timeline: TimelineId, decl: &TurnDecl, turn: RestoredTurn) {
+        self.update(|view| {
+            if let (Some(layer), Some(group)) = (
+                LayerId::from_raw(decl.layer_id),
+                GroupId::from_raw(decl.group_id),
+            ) {
+                view.register_timeline(timeline, layer, group);
+            }
+            view.reload_turn(timeline, TurnIndex(decl.turn_index), turn.clone());
+        });
+    }
+
+    /// Occupy the position `decl` names with an empty placeholder, so the
+    /// timeline's later turns keep their persisted indices: `restore_turn`
+    /// assigns densely, and a bare skip renumbers them away from their stream
+    /// ids. Never selected (no content), never materialisable (no cold refs).
+    fn restore_placeholder(&self, timeline: TimelineId, decl: &TurnDecl) {
+        self.restore_turn_at(
+            timeline,
+            decl,
+            RestoredTurn {
+                layout: TurnLayout::new(Vec::new()),
+                token_ids: TokenBuffer::default(),
+                token_count: 0,
+                cold: None,
+                block_start: decl.block_start,
+                block_end: decl.block_end,
+            },
+        );
     }
 
     /// Whether `decl`'s turn, at the position its `turn_index` names, is
@@ -3071,18 +3008,19 @@ impl Conversation {
         let Some(timeline) = TimelineId::from_raw(decl.timeline_id) else {
             return;
         };
-        let mut view = self.write();
-        if let (Some(layer), Some(group)) = (
-            LayerId::from_raw(decl.layer_id),
-            GroupId::from_raw(decl.group_id),
-        ) {
-            view.register_timeline(timeline, layer, group);
-        }
-        // Its position, as a gap, unless something holds it already: a runtime
-        // reload finds the gap a live adoption left there.
-        while view.turn_count(timeline) <= decl.turn_index {
-            view.restore_gap_turn(timeline);
-        }
+        self.update(|view| {
+            if let (Some(layer), Some(group)) = (
+                LayerId::from_raw(decl.layer_id),
+                GroupId::from_raw(decl.group_id),
+            ) {
+                view.register_timeline(timeline, layer, group);
+            }
+            // Its position, as a gap, unless something holds it already: a
+            // runtime reload finds the gap a live adoption left there.
+            while view.turn_count(timeline) <= decl.turn_index {
+                view.restore_gap_turn(timeline);
+            }
+        });
     }
 
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
@@ -3171,25 +3109,7 @@ impl Conversation {
                     continue;
                 }
                 if self.read().is_turn_tombstoned(tl, decl.turn_index) {
-                    let mut view = self.write();
-                    if let (Some(layer), Some(group)) = (
-                        LayerId::from_raw(decl.layer_id),
-                        GroupId::from_raw(decl.group_id),
-                    ) {
-                        view.register_timeline(tl, layer, group);
-                    }
-                    view.reload_turn(
-                        tl,
-                        TurnIndex(decl.turn_index),
-                        RestoredTurn {
-                            layout: TurnLayout::new(Vec::new()),
-                            token_ids: TokenBuffer::default(),
-                            token_count: 0,
-                            cold: None,
-                            block_start: decl.block_start,
-                            block_end: decl.block_end,
-                        },
-                    );
+                    self.restore_placeholder(tl, &decl);
                     continue;
                 }
             }
@@ -3213,9 +3133,8 @@ impl Conversation {
             // is independent.  Log the failure and tombstone the
             // corrupt turn's timeline so the next reload doesn't
             // re-encounter it.
-            let recover_result = {
-                let mut p = self.persistence.lock().unwrap();
-                let substrate_read = self.read();
+            let substrate_read = self.read();
+            let recover_result = self.persistence.call(|p| {
                 // **A distilled timeline's shed records are absent, not
                 // corrupt.** Its K/V was declared disposable when it was marked,
                 // and the compactor drops the chunks — and, provenance-only, the
@@ -3233,18 +3152,17 @@ impl Conversation {
                 // token count. The turn's KV payload bytes stay on disk; a
                 // later projection reads them via the cold→hot elevation
                 // (`recover_turn_grid`).
-                let r =
-                    crate::persistence::resume::recover_turn_meta(&mut p, &substrate_read, &decl)
-                        .or_else(|e| {
-                            if distilled {
-                                Ok(RecoveredTurnMeta {
-                                    token_ids: Vec::new(),
-                                    token_count: 0,
-                                })
-                            } else {
-                                Err(e)
-                            }
-                        });
+                let r = crate::persistence::resume::recover_turn_meta(p, &substrate_read, &decl)
+                    .or_else(|e| {
+                        if distilled {
+                            Ok(RecoveredTurnMeta {
+                                token_ids: Vec::new(),
+                                token_count: 0,
+                            })
+                        } else {
+                            Err(e)
+                        }
+                    });
                 let cr = if distilled {
                     Ok(None)
                 } else if r.is_ok() {
@@ -3257,7 +3175,8 @@ impl Conversation {
                     Ok(Default::default())
                 };
                 r.and_then(|recovered| cr.map(|cold_refs| (recovered, cold_refs)))
-            };
+            });
+            drop(substrate_read);
             let (recovered, cold_refs) = match recover_result {
                 Ok(pair) => pair,
                 // Another member's turn that cannot be read here is this
@@ -3299,9 +3218,11 @@ impl Conversation {
                                 // file back to the background refresh to re-ingest
                                 // (absent from `content_sha256` → flagged changed →
                                 // `process_one_file` rebuilds it).
-                                self.write().tombstone_timeline(timeline);
-                                if let Some(mut p) = self.writable_persistence() {
-                                    match p.write_repair_tombstone(timeline.raw(), &reason) {
+                                self.update(|s| s.tombstone_timeline(timeline));
+                                if !self.read_only {
+                                    match self.persistence.call(|p| {
+                                        p.write_repair_tombstone(timeline.raw(), &reason)
+                                    }) {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
                                             turn_index = decl.turn_index,
@@ -3320,9 +3241,13 @@ impl Conversation {
                             CorruptTurnPolicy::DropTurn => {
                                 // Dialogue: drop only the corrupt turn, keeping the
                                 // rest of the conversation live.
-                                let mark = self.write().tombstone_turn(timeline, decl.turn_index);
-                                if let Some(mut p) = self.writable_persistence() {
-                                    match p.write_repair_turn_tombstone(mark, &reason) {
+                                let mark =
+                                    self.update(|s| s.tombstone_turn(timeline, decl.turn_index));
+                                if !self.read_only {
+                                    match self
+                                        .persistence
+                                        .call(|p| p.write_repair_turn_tombstone(mark, &reason))
+                                    {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
                                             turn_index = decl.turn_index,
@@ -3343,25 +3268,7 @@ impl Conversation {
                                 // densely; a bare skip renumbers them away from
                                 // their stream ids and the next appended turn
                                 // collides with an existing turn's records).
-                                let mut view = self.write();
-                                if let (Some(layer), Some(group)) = (
-                                    LayerId::from_raw(decl.layer_id),
-                                    GroupId::from_raw(decl.group_id),
-                                ) {
-                                    view.register_timeline(timeline, layer, group);
-                                }
-                                view.reload_turn(
-                                    timeline,
-                                    TurnIndex(decl.turn_index),
-                                    RestoredTurn {
-                                        layout: TurnLayout::new(Vec::new()),
-                                        token_ids: TokenBuffer::default(),
-                                        token_count: 0,
-                                        cold: None,
-                                        block_start: decl.block_start,
-                                        block_end: decl.block_end,
-                                    },
-                                );
+                                self.restore_placeholder(timeline, &decl);
                             }
                         }
                     }
@@ -3407,9 +3314,12 @@ impl Conversation {
                             decl.turn_index,
                             verdict.describe()
                         );
-                        self.write().tombstone_timeline(timeline);
-                        if let Some(mut p) = self.writable_persistence() {
-                            match p.write_repair_tombstone(timeline.raw(), &reason) {
+                        self.update(|s| s.tombstone_timeline(timeline));
+                        if !self.read_only {
+                            match self
+                                .persistence
+                                .call(|p| p.write_repair_tombstone(timeline.raw(), &reason))
+                            {
                                 Ok(_) => tracing::info!(
                                     timeline_id = decl.timeline_id,
                                     turn_index = decl.turn_index,
@@ -3441,13 +3351,6 @@ impl Conversation {
                 }
             }
             let token_count = recovered.token_count;
-            let mut view = self.write();
-            if let (Some(layer), Some(group)) = (
-                LayerId::from_raw(decl.layer_id),
-                GroupId::from_raw(decl.group_id),
-            ) {
-                view.register_timeline(timeline, layer, group);
-            }
             // Cold-marker sealed: an empty `Vec<SealedSequence>` flags the
             // turn as on-disk-only. The runtime inject path detects the
             // empty sealed and routes through the engine's `ensure_hot`
@@ -3463,18 +3366,15 @@ impl Conversation {
             // a recoverable-token-only turn (no persisted chunks) —
             // the substrate keeps it discoverable but it stays unable
             // to materialise KV.
-            view.reload_turn(
-                timeline,
-                TurnIndex(decl.turn_index),
-                RestoredTurn {
-                    layout: TurnLayout::new(std::mem::take(&mut decl.segments)),
-                    token_ids: TokenBuffer::from(recovered.token_ids),
-                    token_count,
-                    cold: cold_refs,
-                    block_start: decl.block_start,
-                    block_end: decl.block_end,
-                },
-            );
+            let turn = RestoredTurn {
+                layout: TurnLayout::new(std::mem::take(&mut decl.segments)),
+                token_ids: TokenBuffer::from(recovered.token_ids),
+                token_count,
+                cold: cold_refs,
+                block_start: decl.block_start,
+                block_end: decl.block_end,
+            };
+            self.restore_turn_at(timeline, &decl, turn);
             restored += 1;
         }
         // Arm low-priority reconciliation per timeline. The summary forest is
@@ -3488,13 +3388,12 @@ impl Conversation {
         // healthy restart does zero probe work. Reconcile is strictly
         // lower-priority than live turns, so it never floods startup the way the
         // old "re-enqueue the orphan tail" sweep did.
-        {
-            let timelines: Vec<TimelineId> = self.read().all_timeline_ids().collect();
-            let mut view = self.write();
+        self.update(|view| {
+            let timelines: Vec<TimelineId> = view.all_timeline_ids().collect();
             for tl in timelines {
                 view.mark_for_reconcile(tl);
             }
-        }
+        });
         if let Some(p) = progress {
             p(total, total);
         }
@@ -3547,13 +3446,10 @@ impl Conversation {
         n_layers: usize,
     ) -> candle::Result<Option<crate::persistence::resume::TurnChunkGrid>> {
         use crate::persistence::resume::{recover_turn_grid, recovered_turn_decls};
-        let mut p = self.persistence.lock().unwrap();
         // We need the turn's `StreamDecl` to drive `recover_turn_grid`.
         // Walk the substrate's persisted decls and pick the one matching
         // this (timeline, index). The decl set is small and rebuilt once
-        // at restart, so a linear scan is fine. One read guard serves both:
-        // a second read of the same lock while this one is held waits behind
-        // any queued writer, which is waiting for this guard.
+        // at restart, so a linear scan is fine.
         let substrate = self.read();
         let decls = recovered_turn_decls(&substrate);
         let decl = match decls
@@ -3563,7 +3459,9 @@ impl Conversation {
             Some(d) => d,
             None => return Ok(None),
         };
-        let grid = recover_turn_grid(&mut p, &substrate, &decl, n_layers)
+        let grid = self
+            .persistence
+            .call(|p| recover_turn_grid(p, &substrate, &decl, n_layers))
             .map_err(|e| candle::Error::Msg(format!("recover_turn_chunks: {e}")))?;
         if grid.is_empty() {
             return Ok(None);
@@ -3571,13 +3469,11 @@ impl Conversation {
         Ok(Some(grid))
     }
 
-    /// Batched cold→hot load. Loads every key in `keys`, taking the
-    /// persistence + substrate locks **once** and scanning the recovered
-    /// turn-decl table **once** for the whole batch. `recovered_turn_decls`
-    /// walks every stream (O(total streams)); doing that per cold turn would
-    /// make the elevate cold-load loop O(cold_turns × total_streams), quadratic
-    /// in a deep conversation. Returns one `(key, result)` per input key, in
-    /// the same order, so the caller can pair each result with its plan entry.
+    /// Batched cold→hot load. Loads every key in `keys` against one version of
+    /// the substrate and one call to the log's owner, which plans every turn's
+    /// read and hands over what it reads through; the reads and the uploads
+    /// run here. Returns one `(key, result)` per input key, in the same order,
+    /// so the caller can pair each result with its plan entry.
     pub fn cold_load_turns_into_hot(
         &self,
         keys: &[TurnKey],
@@ -3587,33 +3483,25 @@ impl Conversation {
     ) -> Vec<(TurnKey, candle::Result<Option<(Vec<SealedSequence>, u64)>>)> {
         use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::streams::StreamDecl;
-        use crate::persistence::transfer::load_turn_into_hot;
+        use crate::persistence::transfer::{cold_buffer_size, load_turn_into_hot};
 
         // Nothing cold, nothing to read: an elevate calls this whether or not
-        // its plan holds a cold turn, and taking the persistence lock for an
-        // empty batch queued a warm-only lift behind whatever held it — a
-        // segment relocation, 37 s.
+        // its plan holds a cold turn.
         if keys.is_empty() {
             return Vec::new();
         }
-        let lock_wait = profile::span("cold:persistence_lock");
-        let mut p = self.persistence.lock().unwrap();
-        lock_wait.end();
         let substrate = self.read();
-        keys.iter()
+        // Resolve each turn's decl by its deterministic stream id — an O(1)
+        // `streams` map hit. The stream that carries the decl is the same one
+        // whose chunks the load reads, so one `stream_of` serves both. This
+        // keeps the cold-load O(keys), not O(turns-ingested-so-far).
+        let turns: Vec<Option<(TurnDecl, u64)>> = keys
+            .iter()
             .map(|&key| {
-                // Resolve each turn's decl by its deterministic stream id — an
-                // O(1) `streams` map hit — rather than scanning, cloning, and
-                // sorting every turn decl in the whole substrate. The stream that
-                // carries the decl is the same one whose chunks the load reads, so
-                // one `stream_of` serves both. This keeps the cold-load O(keys),
-                // not O(turns-ingested-so-far).
-                let stream_id = turn_stream_id(key.timeline.raw(), key.index.0);
-                let Some(stream) = substrate.stream_of(stream_id) else {
-                    return (key, Ok(None));
-                };
+                let stream =
+                    substrate.stream_of(turn_stream_id(key.timeline.raw(), key.index.0))?;
                 let Some(StreamDecl::Turn(decl)) = &stream.decl else {
-                    return (key, Ok(None));
+                    return None;
                 };
                 // The load addresses the turn by its index, and the decl
                 // carries the index its writer gave it, which another
@@ -3623,9 +3511,38 @@ impl Conversation {
                     ..decl.clone()
                 };
                 let kv_bytes_total: u64 = stream.chunks.values().map(|loc| loc.payload_len).sum();
-                let result =
-                    load_turn_into_hot(backings, device, &mut p, &substrate, &decl, stager)
-                        .map(|sealed| Some((sealed, kv_bytes_total)));
+                Some((decl, kv_bytes_total))
+            })
+            .collect();
+        let buffer_size = cold_buffer_size(stager);
+        let owner_wait = profile::span("cold:persistence_owner");
+        let reads: Vec<Option<PersistenceResult<_>>> = self.persistence.call(|p| {
+            turns
+                .iter()
+                .map(|turn| {
+                    turn.as_ref().map(|(decl, _)| {
+                        p.cold_read(
+                            &substrate,
+                            turn_stream_id(decl.timeline_id, decl.turn_index),
+                            buffer_size,
+                        )
+                    })
+                })
+                .collect()
+        });
+        owner_wait.end();
+        keys.iter()
+            .zip(turns.iter().zip(reads))
+            .map(|(&key, (turn, read))| {
+                let (Some((decl, kv_bytes_total)), Some(read)) = (turn, read) else {
+                    return (key, Ok(None));
+                };
+                let result = read
+                    .map_err(|e| candle::Error::Msg(format!("cold-load plan: {e}")))
+                    .and_then(|(plan, source)| {
+                        load_turn_into_hot(backings, device, &plan, &source, decl, stager)
+                    })
+                    .map(|sealed| Some((sealed, *kv_bytes_total)));
                 (key, result)
             })
             .collect()
@@ -3635,7 +3552,7 @@ impl Conversation {
     /// dropping its ChunkGid Arcs. Returns `true` if hot bytes were
     /// dropped (see [`Substrate::clear_turn_sealed`]).
     pub fn clear_turn_sealed(&self, timeline: TimelineId, index: TurnIndex) -> bool {
-        self.write().clear_turn_sealed(timeline, index)
+        self.read().clear_turn_sealed(timeline, index)
     }
 
     /// Hot-tier VRAM byte snapshot (sum across every turn whose `sealed`
@@ -3653,11 +3570,6 @@ impl Conversation {
     /// accounting). `None` if cold or unknown.
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
         self.read().turn_hot_bytes(timeline, index)
-    }
-
-    /// FIFO-oldest hot-resident turn excluding `except`.
-    pub fn oldest_hot_turn_except(&self, except: TurnKey) -> Option<TurnKey> {
-        self.read().oldest_hot_turn_except(except)
     }
 
     /// The sidebar label for `timeline`, or `None` if no label has been
@@ -3684,8 +3596,8 @@ impl Conversation {
         }
         let payload = manifest::encode_label_payload(timeline.raw(), "", label, &BTreeMap::new());
         let identity = self.minter.mint(0);
-        self.write().set_label(timeline, label, identity);
-        self.writer.enqueue(WriteJob::ConvMeta {
+        self.update(|s| s.set_label(timeline, label, identity));
+        self.persistence.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
             identity,
@@ -3725,15 +3637,15 @@ impl Conversation {
         if kv.is_empty() {
             return Ok(());
         }
-        // Encode on this thread, append on the writer's. The record is small,
+        // Encode on this thread, append on the owner's. The record is small,
         // so it carries the same crash-loss window as every other enqueued
         // metadata record: the in-RAM merge below is what this session reads,
         // and a record that never lands leaves the tag absent on the next load
         // rather than wrong.
         let payload = manifest::encode_label_payload(timeline.raw(), "", "", kv);
         let identity = self.minter.mint(0);
-        self.write().merge_custom(timeline, kv, identity);
-        self.writer.enqueue(WriteJob::ConvMeta {
+        self.update(|s| s.merge_custom(timeline, kv, identity));
+        self.persistence.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
             identity,
@@ -3741,12 +3653,74 @@ impl Conversation {
         Ok(())
     }
 
+    /// Rewrite `key` of `timeline`'s `custom` metadata from the value it holds,
+    /// as one step: `next` is handed the substrate and the current value and
+    /// returns the one to store, or `None` to leave it as it is — a decision
+    /// it makes from anything else the substrate holds is part of the same
+    /// step. Returns what was stored.
+    ///
+    /// A plain read then [`Self::set_conversation_metadata`] loses an update
+    /// made between them — two uploads each reading the list and writing it
+    /// back with one file added keep one file. Here the read and the write are
+    /// one substrate edit, and the write's identity is minted before the edit,
+    /// so an edit that read a value set by a later identity than its own would
+    /// lose to it field by field: it starts again under a fresh identity. An
+    /// identity that writes nothing is marked never-coming, so no peer waits
+    /// on it. `next` may run more than once and must not act on anything.
+    pub fn update_conversation_metadata(
+        &self,
+        timeline: TimelineId,
+        key: &str,
+        mut next: impl FnMut(&Substrate, Option<&str>) -> Option<String>,
+    ) -> Option<String> {
+        enum Edit {
+            Stored(String),
+            Unchanged,
+            Overtaken,
+        }
+        loop {
+            let identity = self.minter.mint(0);
+            let edit = self.update(|s| {
+                if !s.custom_field_takes(timeline, key, identity) {
+                    return Edit::Overtaken;
+                }
+                let current = s.custom_of(timeline).and_then(|m| m.get(key).cloned());
+                match next(s, current.as_deref()) {
+                    Some(value) => {
+                        let kv = BTreeMap::from([(key.to_string(), value.clone())]);
+                        s.merge_custom(timeline, &kv, identity);
+                        Edit::Stored(value)
+                    }
+                    None => Edit::Unchanged,
+                }
+            });
+            match edit {
+                Edit::Stored(value) => {
+                    let kv = BTreeMap::from([(key.to_string(), value.clone())]);
+                    self.persistence.enqueue(WriteJob::ConvMeta {
+                        record: RecordType::Label,
+                        payload: manifest::encode_label_payload(timeline.raw(), "", "", &kv),
+                        identity,
+                    });
+                    return Some(value);
+                }
+                Edit::Unchanged => {
+                    self.persistence.enqueue(WriteJob::Abandoned { identity });
+                    return None;
+                }
+                Edit::Overtaken => self.persistence.enqueue(WriteJob::Abandoned { identity }),
+            }
+        }
+    }
+
     /// `timeline`'s `custom` metadata bag, or `None` if unregistered.
     pub fn conversation_metadata(
         &self,
         timeline: TimelineId,
     ) -> Option<std::collections::BTreeMap<String, String>> {
-        self.read().custom_of(timeline).cloned()
+        self.read()
+            .custom_of(timeline)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 
     /// One value of `timeline`'s `custom` metadata — `None` when it is
@@ -3804,8 +3778,8 @@ impl Conversation {
         }
         let payload = manifest::encode_label_payload(timeline.raw(), conv_id, "", &BTreeMap::new());
         let identity = self.minter.mint(0);
-        self.write().set_conv_id(timeline, conv_id, identity);
-        self.writer.enqueue(WriteJob::ConvMeta {
+        self.update(|s| s.set_conv_id(timeline, conv_id, identity));
+        self.persistence.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
             identity,
@@ -3884,16 +3858,16 @@ impl Conversation {
                 "write_conversation_files: the substrate is read-only".to_string(),
             ));
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_vfs(timeline.raw(), write)
+        self.persistence
+            .call(|p| p.write_vfs(timeline.raw(), write))
             .map_err(|e| candle::Error::Msg(format!("write_conversation_files: {e}")))
     }
 
     /// Every live event of `timeline`'s files, read back in
     /// `(repo, key, seq)` order.
     pub fn conversation_files(&self, timeline: TimelineId) -> candle::Result<Vec<VfsEventPayload>> {
-        let mut p = self.persistence.lock().unwrap();
-        p.vfs_events(timeline.raw())
+        self.persistence
+            .call(|p| p.vfs_events(timeline.raw()))
             .map_err(|e| candle::Error::Msg(format!("conversation_files: {e}")))
     }
 
@@ -3908,32 +3882,39 @@ impl Conversation {
     ///
     /// Every record carries the complete state, so replay is last-writer-wins
     /// on the whole of it and a later compaction keeps one record per
-    /// timeline. The state is read in the same write-lock hold that changed
-    /// it, and `conv_state_writes` keeps the enqueue order equal to that
-    /// order — see the field.
-    fn update_conv_state(&self, timeline: TimelineId, change: impl FnOnce(&mut Substrate) -> bool) {
-        let _ordered = self
-            .conv_state_writes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (state, identity) = {
-            let mut sub = self.write();
-            if !change(&mut sub) {
-                return;
-            }
-            // Minted only for a change that will be written: an identity minted
-            // and never written is a hole in this node's sequence.
-            let identity = self.minter.mint(0);
-            sub.stamp_conv_state(timeline, identity);
-            (sub.conv_state(timeline), identity)
-        };
+    /// timeline.
+    ///
+    /// **The state written is read after the identity is minted.** Two
+    /// changes made at once would otherwise each write the state as their own
+    /// edit left it, and the greater identity could carry the older state — a
+    /// branch set, then lost to an archive that read the state before it. So
+    /// the change is published first, the identity minted after, and the state
+    /// read in a second edit that stamps it: whichever writer minted last read
+    /// a state holding every change published before its mint, and every
+    /// change's own mint follows its publication — so the record with the
+    /// greatest identity holds them all.
+    fn update_conv_state(
+        &self,
+        timeline: TimelineId,
+        mut change: impl FnMut(&mut Substrate) -> bool,
+    ) {
+        if !self.update(|s| change(s)) {
+            return;
+        }
+        // Minted only for a change that will be written: an identity minted
+        // and never written is a hole in this node's sequence.
+        let identity = self.minter.mint(0);
+        let state = self.update(|s| {
+            s.stamp_conv_state(timeline, identity);
+            s.conv_state(timeline)
+        });
         let Some(state) = state else {
             return;
         };
         if self.read_only {
             return;
         }
-        self.writer.enqueue(WriteJob::ConvState {
+        self.persistence.enqueue(WriteJob::ConvState {
             timeline: timeline.raw(),
             payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
             identity,
@@ -3957,14 +3938,12 @@ impl Conversation {
     /// Sections the timeline owns ([`Self::release_owned_sections`]) go with it.
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
         self.release_owned_sections(timeline)?;
-        self.write().tombstone_timeline(timeline);
+        self.update(|s| s.tombstone_timeline(timeline));
         if self.read_only {
             return Ok(());
         }
-        // The append runs on the writer. The caller — retention, a character
-        // retiring yesterday's conversation — holds the engine mutex, so this
-        // returns without waiting on the persistence lock.
-        self.writer.enqueue(WriteJob::TimelineTombstone {
+        // The append runs on the log's owner; this returns without waiting.
+        self.persistence.enqueue(WriteJob::TimelineTombstone {
             timeline_id: timeline.raw(),
             reason: None,
         });
@@ -3986,11 +3965,11 @@ impl Conversation {
         stream_id: StreamId,
         reason: Option<&str>,
     ) -> candle::Result<()> {
-        let generation = self.write().tombstone_section(stream_id);
+        let generation = self.update(|s| s.tombstone_section(stream_id));
         if self.read_only {
             return Ok(());
         }
-        self.writer.enqueue(WriteJob::SectionTombstone {
+        self.persistence.enqueue(WriteJob::SectionTombstone {
             stream_id: stream_id.0,
             generation,
             reason: reason.map(str::to_string),
@@ -4009,11 +3988,11 @@ impl Conversation {
         stream_id: StreamId,
         reason: &str,
     ) -> candle::Result<()> {
-        let generation = self.write().retire_section_generation(stream_id);
+        let generation = self.update(|s| s.retire_section_generation(stream_id));
         if self.read_only {
             return Ok(());
         }
-        self.writer.enqueue(WriteJob::SectionTombstone {
+        self.persistence.enqueue(WriteJob::SectionTombstone {
             stream_id: stream_id.0,
             generation,
             reason: Some(reason.to_string()),
@@ -4046,9 +4025,10 @@ impl Conversation {
         stream_id: StreamId,
         n_layers: usize,
     ) -> candle::Result<Option<WindowDivergence>> {
-        let mut p = self.persistence.lock().unwrap();
         let substrate = self.read();
-        let windows = read_persisted_section_windows(&mut p, &substrate, stream_id, n_layers)
+        let windows = self
+            .persistence
+            .call(|p| read_persisted_section_windows(p, &substrate, stream_id, n_layers))
             .map_err(|e| candle::Error::Msg(format!("check_section_window_integrity: {e}")))?;
         Ok(windows.and_then(|w| first_divergent_chunk(&w)))
     }
@@ -4069,14 +4049,13 @@ impl Conversation {
     /// that stay live forever never make it dead. Retiring the tail past a depth
     /// is what turns an unbounded log into a bounded one.
     pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> candle::Result<()> {
-        let mark = self.write().tombstone_turn(timeline, turn_index);
+        let mark = self.update(|s| s.tombstone_turn(timeline, turn_index));
         if self.read_only {
             return Ok(());
         }
-        // Retention calls this in a loop of up to a few hundred turns while
-        // holding the engine mutex, so the append is the writer's and this
-        // returns without taking the persistence lock.
-        self.writer.enqueue(WriteJob::TurnTombstone {
+        // Retention calls this in a loop of up to a few hundred turns, so the
+        // append is the owner's and this returns without waiting.
+        self.persistence.enqueue(WriteJob::TurnTombstone {
             mark,
             reason: Some("retention".to_string()),
         });
@@ -4096,20 +4075,20 @@ impl Conversation {
     /// only (a transient fork is never reloaded), so unlike [`Self::tombstone_timeline`]
     /// there is no redo-log record.
     pub fn mark_timeline_transient(&self, timeline: TimelineId) {
-        self.write().mark_timeline_transient(timeline);
+        self.update(|s| s.mark_timeline_transient(timeline));
     }
 
     /// Mark a code_read scope fork's timeline as a **splice source**: its turns
     /// keep their hot copy — the only copy [`Self::adopt_turn`] reads — until the
     /// fork is tombstoned. See `Substrate::mark_timeline_splice_source`.
     pub fn mark_timeline_splice_source(&self, timeline: TimelineId) {
-        self.write().mark_timeline_splice_source(timeline);
+        self.update(|s| s.mark_timeline_splice_source(timeline));
     }
 
     /// Mark a throwaway conversation's frame as transient — see
     /// [`crate::substrate::Substrate::mark_section_transient`]. In-memory only.
     pub fn mark_section_transient(&self, section: SectionId) {
-        self.write().mark_section_transient(section);
+        self.update(|s| s.mark_section_transient(section));
     }
 
     /// Whether a section is transient — see
@@ -4121,18 +4100,18 @@ impl Conversation {
     /// Remove a transient section — see
     /// [`crate::substrate::Substrate::retire_section`].
     pub fn retire_section(&self, section: SectionId) -> bool {
-        self.write().retire_section(section)
+        self.update(|s| s.retire_section(section))
     }
 
     /// The next unused id for a section a conversation adds at runtime — see
     /// [`crate::substrate::Substrate::allocate_owned_section`].
     pub fn allocate_owned_section(&self) -> Option<SectionId> {
-        self.write().allocate_owned_section()
+        self.update(|s| s.allocate_owned_section())
     }
 
     /// Record that `owner` owns `section` under `name`.
     pub fn register_owned_section(&self, owner: TimelineId, name: &str, section: SectionId) {
-        self.write().register_owned_section(owner, name, section);
+        self.update(|s| s.register_owned_section(owner, name, section));
     }
 
     /// The sections `owner` owns, in submission order.
@@ -4154,7 +4133,7 @@ impl Conversation {
         owner: TimelineId,
         section: SectionId,
     ) -> candle::Result<()> {
-        let stream = self.write().release_owned_section(owner, section);
+        let stream = self.update(|s| s.release_owned_section(owner, section));
         self.write_owned_tombstones(stream)
     }
 
@@ -4162,15 +4141,14 @@ impl Conversation {
     /// returning the ids, so the caller can clear the scheduler's tables keyed
     /// by them.
     pub fn release_owned_sections(&self, owner: TimelineId) -> candle::Result<Vec<SectionId>> {
-        let (ids, streams) = {
-            let mut sub = self.write();
+        let (ids, streams): (Vec<SectionId>, _) = self.update(|sub| {
             let ids = sub
                 .owned_sections_of(owner)
                 .into_iter()
                 .map(|o| o.section)
                 .collect();
             (ids, sub.release_owned_sections(owner))
-        };
+        });
         self.write_owned_tombstones(streams)?;
         self.release_persisted_owned_sections(owner, None, None)?;
         Ok(ids)
@@ -4212,7 +4190,7 @@ impl Conversation {
             return Ok(());
         }
         for (stream, generation) in streams {
-            self.writer.enqueue(WriteJob::SectionTombstone {
+            self.persistence.enqueue(WriteJob::SectionTombstone {
                 stream_id: stream.0,
                 generation,
                 reason: Some("owner released".to_string()),
@@ -4231,12 +4209,12 @@ impl Conversation {
     /// over it. On a read-only substrate the in-RAM coupling is all there is.
     pub fn couple_turn(&self, timeline: TimelineId, from_turn: u32) -> candle::Result<()> {
         let identity = self.minter.mint(0);
-        self.write().couple_turn(timeline, from_turn, identity);
+        self.update(|s| s.couple_turn(timeline, from_turn, identity));
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_turn_coupling(timeline.raw(), from_turn, identity)
+        self.persistence
+            .call(|p| p.write_turn_coupling(timeline.raw(), from_turn, identity))
             .map_err(|e| candle::Error::Msg(format!("write_turn_coupling: {e}")))?;
         Ok(())
     }
@@ -4252,13 +4230,13 @@ impl Conversation {
     /// survives reload). Its turns shed content at the next compaction. A later
     /// call may upgrade the mode (e.g. provenance-only → text-only on archive).
     pub fn distill_timeline(&self, timeline: TimelineId, mode: DistillMode) -> candle::Result<()> {
-        self.write().distill_timeline(timeline, mode);
+        self.update(|s| s.distill_timeline(timeline, mode));
         let payload = DistillPayload {
             timeline_id: timeline.raw(),
             mode,
         }
         .encode();
-        self.writer.enqueue(WriteJob::ConvMeta {
+        self.persistence.enqueue(WriteJob::ConvMeta {
             record: RecordType::Distilled,
             payload,
             identity: self.minter.mint(0),
@@ -4277,7 +4255,7 @@ impl Conversation {
     /// compaction forever).
     pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
         use crate::persistence::content_hash::turn_stream_id;
-        let sub = self.inner.read().unwrap();
+        let sub = self.inner.read();
         // Scope to this timeline's own turn streams — O(turns), not a scan of the
         // whole stream table.
         for idx in 0..sub.turn_count(timeline) {
@@ -4295,7 +4273,7 @@ impl Conversation {
     /// The persistence pipeline then frees the turns' VRAM (at warm-land) and
     /// RAM (at cold-land), leaving them cold-only. Returns the count flagged.
     pub fn mark_timeline_evict_when_cold(&self, timeline: TimelineId) -> usize {
-        self.write().mark_timeline_evict_when_cold(timeline)
+        self.read().mark_timeline_evict_when_cold(timeline)
     }
 
     /// How many of `timeline`'s turns still hold a device copy — see
@@ -4308,15 +4286,17 @@ impl Conversation {
     /// substrate's half of the sweep. See
     /// [`crate::substrate::Substrate::rewrite_for_compaction`].
     ///
-    /// Holds the substrate write lock for the whole rewrite, which is what makes it
-    /// atomic with respect to a projection reading residences: a reader must see
-    /// either every old gid or every new one, never a mixture, because a mixture is
-    /// one turn's KV read through another turn's addresses.
+    /// Run by the thread compacting the device's KV, inside the window the
+    /// compaction holds chunk locations frozen: a reader on another thread that
+    /// resolves gids to device addresses holds them first
+    /// (`candle_nn::kv_cache::try_hold_chunk_locations`), so it sees every old
+    /// gid or every new one, never a mixture — a mixture is one turn's KV read
+    /// through another turn's addresses.
     pub fn rewrite_for_compaction(
         &self,
         sweep: &mut candle_nn::kv_cache::Sweep<'_>,
     ) -> candle::Result<usize> {
-        self.write().rewrite_for_compaction(sweep)
+        self.read().rewrite_for_compaction(sweep)
     }
 
     /// Whether `self` and `other` are handles on the same substrate.
@@ -4345,12 +4325,12 @@ impl Conversation {
             return Ok(());
         }
         let identity = self.minter.mint(0);
-        self.write().set_debug_id(timeline, debug_id, identity);
+        self.update(|s| s.set_debug_id(timeline, debug_id, identity));
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_debug_id(timeline.raw(), debug_id, identity)
+        self.persistence
+            .call(|p| p.write_debug_id(timeline.raw(), debug_id, identity))
             .map_err(|e| candle::Error::Msg(format!("write_debug_id: {e}")))?;
         Ok(())
     }
@@ -4399,12 +4379,12 @@ impl Conversation {
             children: meta.children.iter().map(|c| c.0).collect(),
         };
         let identity = self.minter.mint(0);
-        self.write().set_tree_meta(timeline, idx, meta, identity);
+        self.update(|s| s.set_tree_meta(timeline, idx, meta.clone(), identity));
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_tree_metadata(payload, identity)
+        self.persistence
+            .call(|p| p.write_tree_metadata(payload, identity))
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
     }
 
@@ -4419,8 +4399,8 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        crate::persistence::resume::persist_turn_chunks(&mut p, stream_id, layers)
+        self.persistence
+            .call(|p| crate::persistence::resume::persist_turn_chunks(p, stream_id, layers))
             .map_err(|e| candle::Error::Msg(format!("persist turn chunks: {e}")))
     }
 
@@ -4440,24 +4420,21 @@ impl Conversation {
         if self.read_only {
             return Ok(Vec::new());
         }
-        let (stored, locs) = {
-            let mut p = self.persistence.lock().unwrap();
-            crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
-                .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))?
-        };
+        let (stored, locs) = self
+            .persistence
+            .call(|p| crate::persistence::resume::persist_turn_chunks_capture(p, stream_id, layers))
+            .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))?;
         // Fold the freshly-written chunk locations into the substrate's
         // authoritative chunk index so an in-process cold→hot elevation
         // (eviction then re-access without a daemon restart) can locate them
         // via `plan_chunked_read`. The redo-log walker only repopulates
         // `stream.chunks` on reload; without this the index stays empty until
-        // then, and the cold-load pipeline plans zero records. The persistence
-        // lock is released above so we never hold it across the substrate write.
-        {
-            let mut view = self.write();
-            for (flat, loc) in locs {
+        // then, and the cold-load pipeline plans zero records.
+        self.update(|view| {
+            for &(flat, loc) in &locs {
                 view.apply_chunk_loc(stream_id, flat, loc.value, loc.id);
             }
-        }
+        });
         Ok(stored)
     }
 
@@ -4474,17 +4451,16 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        // Append (persistence lock) then register the location in the substrate
-        // index (substrate lock), taken non-nested — persistence released first.
-        // The `apply_tokens_loc` is REQUIRED: without it `entry.tokens` is `None`
-        // and the maintenance/compaction relocation drops the tokens on the next
-        // pass (see `crate::persistence::resume::persist_tokens_only`).
-        let loc = {
-            let mut p = self.persistence.lock().unwrap();
-            crate::persistence::resume::persist_tokens_only(&mut p, stream_id, token_ids)
-                .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))?
-        };
-        self.write().apply_tokens_loc(stream_id, loc.value, loc.id);
+        // Append on the log's owner, then register the location in the
+        // substrate index. The `apply_tokens_loc` is REQUIRED: without it
+        // `entry.tokens` is `None` and the maintenance/compaction relocation
+        // drops the tokens on the next pass (see
+        // `crate::persistence::resume::persist_tokens_only`).
+        let loc = self
+            .persistence
+            .call(|p| crate::persistence::resume::persist_tokens_only(p, stream_id, token_ids))
+            .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))?;
+        self.update(|s| s.apply_tokens_loc(stream_id, loc.value, loc.id));
         Ok(())
     }
 
@@ -4506,24 +4482,22 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let commit = {
-            let mut p = self.persistence.lock().unwrap();
-            p.commit_stream(stream_id, through_index)
-                .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))?
-        };
-        self.write()
-            .apply_commit_through(stream_id, through_index, commit);
+        let commit = self
+            .persistence
+            .call(|p| p.commit_stream(stream_id, through_index))
+            .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))?;
+        self.update(|s| s.apply_commit_through(stream_id, through_index, commit));
         Ok(())
     }
 
-    /// Enqueue a warm→cold KV migration onto the off-thread writer (phase 2). The
-    /// caller (persistence thread) has already gathered `grid` off the GPU; the
-    /// writer appends the chunks, folds their locations into the substrate index,
-    /// marks the stream durable, and `install_cold`s (drops hot) — all AFTER the
-    /// append. So the persistence thread's hot→warm VRAM-relief drain is never
-    /// blocked by cold-write disk I/O, and `slot.cold` is only ever set on durable
-    /// data, keeping the `purge_warm` RAM-unload invariant intact. Bounded by the
-    /// writer's dual-cap backpressure.
+    /// Enqueue a warm→cold KV migration onto the log's owner. The caller
+    /// (persistence thread) has already gathered `grid` off the GPU; the owner
+    /// appends the chunks, folds their locations into the substrate index,
+    /// marks the stream durable, and `install_cold`s — all AFTER the append. So
+    /// the persistence thread's hot→warm VRAM-relief drain is never blocked by
+    /// cold-write disk I/O, and a cold copy is only ever installed on durable
+    /// data, keeping the `purge_warm` RAM-unload invariant intact. Bounded by
+    /// the owner's dual-cap backpressure.
     ///
     /// On a read-only substrate no cold write is coming, so the residence is
     /// left as it is — not flagged as having one in flight — and stays warm.
@@ -4538,9 +4512,9 @@ impl Conversation {
         }
         // Flag the write in flight BEFORE enqueuing so the next persistence pass's
         // `snapshot_pending_cold` skips this residence until `install_cold` (on the
-        // writer) clears it — no double gather/write.
-        self.write().mark_cold_pending(residence);
-        self.writer.enqueue(WriteJob::KvCold {
+        // owner) clears it — no double gather/write.
+        self.read().mark_cold_pending(residence);
+        self.persistence.enqueue(WriteJob::KvCold {
             residence,
             stream_id,
             grid,
@@ -4555,15 +4529,16 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        let wrote = p
-            .set_template(template)
-            .map_err(|e| candle::Error::Msg(format!("persist template: {e}")))?;
-        if wrote {
-            p.commit()
-                .map_err(|e| candle::Error::Msg(format!("commit template: {e}")))?;
-        }
-        Ok(())
+        self.persistence.call(|p| {
+            let wrote = p
+                .set_template(template)
+                .map_err(|e| candle::Error::Msg(format!("persist template: {e}")))?;
+            if wrote {
+                p.commit()
+                    .map_err(|e| candle::Error::Msg(format!("commit template: {e}")))?;
+            }
+            Ok(())
+        })
     }
 
     /// Persist a turn's projection-event timeline to the redo log — the
@@ -4573,8 +4548,8 @@ impl Conversation {
     /// restart.
     /// Mirror a turn's projection-event trajectory into the in-RAM substrate
     /// (the GUI replay and any same-session read want it now) and enqueue the
-    /// durable append onto the off-thread writer, so the caller never blocks on
-    /// the persistence lock. Same crash-safety as [`Self::enqueue_tokens`]: the
+    /// durable append onto the log's owner, so the caller never waits on the
+    /// disk. Same crash-safety as [`Self::enqueue_tokens`]: the
     /// record is last-writer-wins per stream, and one that never lands leaves
     /// the turn without its replay trajectory rather than corrupting it.
     ///
@@ -4584,9 +4559,8 @@ impl Conversation {
         let identity = self
             .minter
             .mint_for(RecordType::ProjectionEvents, stream_id.0);
-        self.write()
-            .apply_projection_events(stream_id, payload.clone(), identity);
-        self.writer.enqueue(WriteJob::ProjectionEvents {
+        self.update(|s| s.apply_projection_events(stream_id, payload.clone(), identity));
+        self.persistence.enqueue(WriteJob::ProjectionEvents {
             stream_id,
             payload,
             identity,
@@ -4598,13 +4572,12 @@ impl Conversation {
     /// substrate under the same identity.
     pub fn persist_wide_q_sigs(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
         let identity = self.minter.mint_for(RecordType::WideQSig, stream_id.0);
-        self.write()
-            .apply_wide_q_sigs(stream_id, payload.to_vec(), identity);
+        self.update(|s| s.apply_wide_q_sigs(stream_id, payload.to_vec(), identity));
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.append_wide_q_sigs(stream_id, payload, identity)
+        self.persistence
+            .call(|p| p.append_wide_q_sigs(stream_id, payload, identity))
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
     }
 
@@ -4617,34 +4590,32 @@ impl Conversation {
     /// index.
     pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
         let identity = self.minter.mint_for(RecordType::TurnIndexPage, stream_id.0);
-        self.write().apply_index_page(stream_id, payload, identity);
+        self.update(|s| s.apply_index_page(stream_id, payload, identity));
         if self.read_only {
             return Ok(());
         }
         let loc = self
             .persistence
-            .lock()
-            .unwrap()
-            .append_turn_index_page(stream_id, payload, identity)
+            .call(|p| p.append_turn_index_page(stream_id, payload, identity))
             .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))?;
         // Durable: the substrate holds where it is, not its bytes.
-        self.write().settle_index_page(stream_id, loc, identity);
+        self.update(|s| s.settle_index_page(stream_id, loc, identity));
         Ok(())
     }
 
-    /// Enqueue a turn/section `Tokens` record onto the off-thread writer — the
+    /// Enqueue a turn/section `Tokens` record onto the log's owner — the
     /// durable copy for reload. The in-memory token buffer is already set at
-    /// record time, so this NEVER blocks the seal on the persistence lock (which a
-    /// compaction holds across its whole relocation I/O). Metadata-class: exempt
-    /// from the writer's KV byte cap, so a warm→cold backlog can't stall it either.
-    /// Async loss window: a `Tokens` record that never lands (hard kill before the
-    /// writer drains) does NOT remove the turn — reconstruct restores it from its
+    /// record time, so this NEVER makes the seal wait on the disk.
+    /// Metadata-class: exempt from the owner's KV byte cap, so a warm→cold
+    /// backlog can't stall it either. Async loss window: a `Tokens` record that
+    /// never lands (hard kill before the owner drains) does NOT remove the
+    /// turn — reconstruct restores it from its
     /// decl with an empty token buffer, since the layout text, KV chunks, and sigs
     /// persist through their own channels. The startup integrity check
     /// (`persistence::integrity`) then repairs regenerable layers by re-ingest;
     /// dialogue turns restore with a warning and render from layout text.
     pub fn enqueue_tokens(&self, stream_id: StreamId, token_ids: Vec<u32>) {
-        self.writer.enqueue(WriteJob::Tokens {
+        self.persistence.enqueue(WriteJob::Tokens {
             stream_id,
             token_ids,
         });
@@ -4652,13 +4623,12 @@ impl Conversation {
 
     /// Mirror a turn's wide-Q signature into the in-RAM substrate synchronously
     /// (the same-session provenance scan reads it back immediately) and enqueue
-    /// the durable redo-log append onto the off-thread writer — so the seal never
-    /// blocks on the persistence lock. Same crash-safety as [`Self::enqueue_tokens`].
+    /// the durable redo-log append onto the log's owner — so the seal never
+    /// waits on the disk. Same crash-safety as [`Self::enqueue_tokens`].
     pub fn enqueue_wide_q_sigs(&self, stream_id: StreamId, payload: Vec<u8>) {
         let identity = self.minter.mint_for(RecordType::WideQSig, stream_id.0);
-        self.write()
-            .apply_wide_q_sigs(stream_id, payload.clone(), identity);
-        self.writer.enqueue(WriteJob::WideQSigs {
+        self.update(|s| s.apply_wide_q_sigs(stream_id, payload.clone(), identity));
+        self.persistence.enqueue(WriteJob::WideQSigs {
             stream_id,
             payload,
             identity,
@@ -4670,9 +4640,8 @@ impl Conversation {
     /// borrow the piece immediately.
     pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
         let identity = self.minter.mint_for(RecordType::TurnIndexPage, stream_id.0);
-        self.write()
-            .apply_index_page(stream_id, payload.as_slice(), identity);
-        self.writer.enqueue(WriteJob::TurnIndexPage {
+        self.update(|s| s.apply_index_page(stream_id, payload.as_slice(), identity));
+        self.persistence.enqueue(WriteJob::TurnIndexPage {
             stream_id,
             payload,
             identity,
@@ -4710,7 +4679,7 @@ impl Conversation {
             }
         }
         let stream_id = snapshot_stream_id(timeline.raw());
-        self.writer
+        self.persistence
             .enqueue(WriteJob::Snapshot { stream_id, payload });
     }
 
@@ -4731,7 +4700,7 @@ impl Conversation {
     pub fn mark_timeline_unresumed(&self, timeline: TimelineId) {
         self.note_timeline_unresumed(timeline);
         let stream_id = snapshot_stream_id(timeline.raw());
-        self.writer.enqueue(WriteJob::Snapshot {
+        self.persistence.enqueue(WriteJob::Snapshot {
             stream_id,
             payload: SnapshotPayload::retired(timeline.raw()),
         });
@@ -4740,7 +4709,7 @@ impl Conversation {
     /// [`Self::mark_timeline_unresumed`] without the retiring write: the flag
     /// alone, for a timeline whose tail is already retired or absent.
     pub fn note_timeline_unresumed(&self, timeline: TimelineId) {
-        self.write().mark_timeline_unresumed(timeline);
+        self.update(|s| s.mark_timeline_unresumed(timeline));
     }
 
     /// Bytes of the recurrent snapshot `timeline` keeps, if any — a retired
@@ -4765,7 +4734,7 @@ impl Conversation {
         payload: Arc<BranchCheckpointPayload>,
     ) {
         let stream_id = branch_checkpoint_stream_id(prefix);
-        self.writer
+        self.persistence
             .enqueue(WriteJob::BranchCheckpoint { stream_id, payload });
     }
 
@@ -4783,24 +4752,21 @@ impl Conversation {
         // Served decoded when this is the branch we last read — see
         // `branch_checkpoint`. The hash key makes the hit exact: a different
         // branch misses and refills rather than installing the wrong state.
-        if let Ok(memo) = self.branch_checkpoint.lock() {
-            if let Some((cached, payload)) = memo.as_ref() {
-                if *cached == prefix {
-                    return Ok(Some(Arc::clone(payload)));
-                }
+        if let Some(memo) = self.branch_checkpoint.load_full() {
+            if memo.0 == prefix {
+                return Ok(Some(Arc::clone(&memo.1)));
             }
         }
-        let Some(loc) = self
-            .read()
-            .branch_checkpoint_loc(branch_checkpoint_stream_id(prefix))
-        else {
+        let stream_id = branch_checkpoint_stream_id(prefix);
+        let Some(loc) = self.read().branch_checkpoint_loc(stream_id) else {
             return Ok(None);
         };
         let bytes = self
-            .persistence
-            .lock()
-            .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
-            .read_record_payload(&loc)
+            .read_located(loc, |stale| {
+                self.read()
+                    .branch_checkpoint_loc(stream_id)
+                    .filter(|now| *now != stale)
+            })
             .map_err(|e| {
                 ConversationError::Channel(format!(
                     "branch checkpoint {prefix:?} is indexed but unreadable: {e}"
@@ -4834,9 +4800,8 @@ impl Conversation {
         prefix: ContentHash,
         payload: &Arc<BranchCheckpointPayload>,
     ) {
-        if let Ok(mut memo) = self.branch_checkpoint.lock() {
-            *memo = Some((prefix, Arc::clone(payload)));
-        }
+        self.branch_checkpoint
+            .store(Some(Arc::new((prefix, Arc::clone(payload)))));
     }
 
     /// The live recurrent-state snapshot location for `timeline`, if one is
@@ -4859,67 +4824,72 @@ impl Conversation {
         &self,
         timeline: TimelineId,
     ) -> Result<Option<SnapshotPayload>, ConversationError> {
-        let Some(mut loc) = self.recurrent_snapshot_loc(timeline) else {
+        let Some(loc) = self.recurrent_snapshot_loc(timeline) else {
             return Ok(None);
         };
-        // **A sealed snapshot is read without the persistence mutex.** The
-        // scheduler calls this at every admission of a hybrid-model turn, and a
-        // compaction holds that mutex across its whole relocation — measured at
-        // 16.5 s mean, 31 s worst — so the read used to stall admission, and
-        // with it every decode, for as long as the compaction ran.
-        //
-        // A stale location is the one thing to handle, on either path:
-        // compaction relocates the record, repoints the index, and only then
-        // unlinks the old segment — and a whole-store compaction deletes the
-        // segment the active one was. So after **any** failed read the location
-        // is read again, and the read is retried only if the index moved: what
-        // the error says varies by platform (a file pending deletion on Windows
-        // fails to open with `PermissionDenied`, not `NotFound`), whether the
-        // record moved does not. A record that is unreadable where the index
-        // still points is reported on its first failure. Bounded, because each
-        // retry follows a completed relocation; the bound only protects against
-        // a store that keeps compacting under the read.
+        // The scheduler calls this at every admission of a hybrid-model turn,
+        // so a durable snapshot is read without the log's owner at all.
+        let bytes = self
+            .read_located(loc, |stale| self.moved_snapshot_loc(timeline, stale))
+            .map_err(|e| {
+                ConversationError::Channel(format!(
+                    "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
+                    timeline.raw()
+                ))
+            })?;
+        Self::decode_kept_snapshot(timeline, &bytes)
+    }
+
+    /// The payload of the record at `loc`, wherever compaction has moved it
+    /// since: `moved` answers where the index names the record now, given the
+    /// location a read failed at.
+    ///
+    /// **A durable record is read without the log's owner** ([`SealedReader`]);
+    /// one past the active segment's last commit, which may still be staged in
+    /// RAM, is read by the owner.
+    ///
+    /// A stale location is the one thing to handle, on either path: compaction
+    /// relocates the record, repoints the index, and only then unlinks the old
+    /// segment. So after **any** failed read the location is read again, and
+    /// the read is retried only if the index moved: what the error says varies
+    /// by platform (a file pending deletion on Windows fails to open with
+    /// `PermissionDenied`, not `NotFound`), whether the record moved does not.
+    /// A record that is unreadable where the index still points is reported on
+    /// its first failure. Bounded, because each retry follows a completed
+    /// relocation; the bound only protects against a store that keeps
+    /// compacting under the read.
+    fn read_located(
+        &self,
+        mut loc: RecordLoc,
+        moved: impl Fn(RecordLoc) -> Option<RecordLoc>,
+    ) -> PersistenceResult<Vec<u8>> {
         for _ in 0..SEALED_READ_ATTEMPTS {
-            let Some(read) = self.sealed.read_record_payload(&loc) else {
-                // Past the active segment's last commit, where records may
-                // still be staged in RAM: only the locked read can see them.
+            let read_span = profile::span("record:sealed_read");
+            let read = self.sealed.read_record_payload(&loc);
+            read_span.end();
+            let Some(read) = read else {
                 break;
             };
             match read {
-                Ok(bytes) => return Self::decode_kept_snapshot(timeline, &bytes),
-                // Unmoved — a torn or corrupt record, or one the index names in
-                // a missing file: the locked read reports it, with the same
-                // message it always gave.
-                Err(_) => match self.moved_snapshot_loc(timeline, loc) {
-                    Some(moved) => loc = moved,
+                Ok(bytes) => return Ok(bytes),
+                Err(_) => match moved(loc) {
+                    Some(now) => loc = now,
                     None => break,
                 },
             }
         }
-        // The locked read. The location was fetched before the mutex, and the
-        // wait for it can span a compaction, so it gets the same re-read. The
-        // index is consulted with the persistence guard already dropped: the
-        // writer takes these two locks one after the other, never nested, and
-        // so does this.
         let mut attempt = 0;
         loop {
-            let read = self
-                .persistence
-                .lock()
-                .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
-                .read_record_payload(&loc);
+            let read_span = profile::span("record:owner_read");
+            let read = self.persistence.call(|p| p.read_record_payload(&loc));
+            read_span.end();
             match read {
-                Ok(bytes) => return Self::decode_kept_snapshot(timeline, &bytes),
+                Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     attempt += 1;
-                    match self.moved_snapshot_loc(timeline, loc) {
-                        Some(moved) if attempt < SEALED_READ_ATTEMPTS => loc = moved,
-                        _ => {
-                            return Err(ConversationError::Channel(format!(
-                                "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
-                                timeline.raw()
-                            )))
-                        }
+                    match moved(loc) {
+                        Some(now) if attempt < SEALED_READ_ATTEMPTS => loc = now,
+                        _ => return Err(e),
                     }
                 }
             }
@@ -4941,10 +4911,10 @@ impl Conversation {
     /// [`Self::turn_index_page`] for any stream — a prompt section's by its
     /// content-addressed id.
     ///
-    /// **Read the way a snapshot is** ([`Self::read_recurrent_snapshot`]):
-    /// without the persistence mutex where the record is sealed, and read again
-    /// at the index's new location whenever a read fails because compaction
-    /// moved it. The substrate goes on naming only where the page is; the bytes
+    /// **Read the way a snapshot is** ([`Self::read_located`]): without the
+    /// log's owner where the record is durable, and read again at the index's
+    /// new location whenever a read fails because compaction moved it. The
+    /// substrate goes on naming only where the page is; the bytes
     /// are the caller's for as long as it keeps the `Arc`, and while any caller
     /// does, a read of the same record finds them without the log
     /// ([`HeldIndexPages`]).
@@ -4957,12 +4927,7 @@ impl Conversation {
             Some((IndexPage::Resident(pages), _)) => return Ok(Some(pages)),
             Some((IndexPage::Stored(loc), id)) => (loc, id),
         };
-        let held = self
-            .held_index_pages
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(stream_id, id);
-        if let Some(page) = held {
+        if let Some(page) = self.held_index_pages.get(stream_id, id) {
             return Ok(Some(page));
         }
         let page = Arc::new(StoredPages::new(
@@ -4976,10 +4941,7 @@ impl Conversation {
             .index_page_record_of(stream_id)
             .is_some_and(|(_, now)| now == id);
         if still {
-            self.held_index_pages
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .hold(stream_id, id, &page);
+            self.held_index_pages.hold(stream_id, id, &page);
         }
         Ok(Some(page))
     }
@@ -4989,64 +4951,30 @@ impl Conversation {
     fn read_stored_index_page(
         &self,
         stream_id: StreamId,
-        mut loc: RecordLoc,
+        loc: RecordLoc,
     ) -> Result<Vec<u8>, ConversationError> {
-        let moved = |stale: RecordLoc| {
+        self.read_located(loc, |stale| {
             self.read()
                 .index_page_of(stream_id)
                 .and_then(|p| p.stored())
                 .filter(|now| *now != stale)
-        };
-        for _ in 0..SEALED_READ_ATTEMPTS {
-            let read_span = profile::span("index_page:sealed_read");
-            let read = self.sealed.read_record_payload(&loc);
-            read_span.end();
-            let Some(read) = read else {
-                break;
-            };
-            match read {
-                Ok(bytes) => return Ok(bytes),
-                Err(_) => match moved(loc) {
-                    Some(now) => loc = now,
-                    None => break,
-                },
-            }
-        }
-        let mut attempt = 0;
-        loop {
-            let read_span = profile::span("index_page:persistence_read");
-            let read = self
-                .persistence
-                .lock()
-                .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
-                .read_record_payload(&loc);
-            read_span.end();
-            match read {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => {
-                    attempt += 1;
-                    match moved(loc) {
-                        Some(now) if attempt < SEALED_READ_ATTEMPTS => loc = now,
-                        _ => {
-                            return Err(ConversationError::Channel(format!(
-                                "QSA index page of stream {} is indexed but unreadable: {e}",
-                                stream_id.0
-                            )))
-                        }
-                    }
-                }
-            }
-        }
+        })
+        .map_err(|e| {
+            ConversationError::Channel(format!(
+                "QSA index page of stream {} is indexed but unreadable: {e}",
+                stream_id.0
+            ))
+        })
     }
 
     /// Every recurrent snapshot whose record became durable since the last
     /// call, as `(timeline, turn index)` — the cue for a slot holding exactly
     /// that state to release it, since [`Self::read_recurrent_snapshot`] now
-    /// reads the record back without the persistence lock. Lock-free: it waits
-    /// on neither the writer, the persistence lock nor the substrate. A
-    /// snapshot appended but not yet committed is reported by a later call.
+    /// reads the record back without the log's owner. Lock-free: it waits on
+    /// neither the owner nor the substrate. A snapshot appended but not yet
+    /// committed is reported by a later call.
     pub fn drain_durable_snapshots(&self) -> Vec<(TimelineId, u32)> {
-        self.writer
+        self.persistence
             .written_snapshots()
             .take_durable(|loc| self.sealed.is_durable(loc))
             .into_iter()
@@ -5098,7 +5026,7 @@ impl Conversation {
             address,
             debug_name: debug_name.to_string(),
         });
-        self.declare_and_mirror(decl, "declare section stream")
+        Ok(self.declare_and_mirror(decl))
     }
 
     /// True when the workspace's manifest already holds durable
@@ -5114,7 +5042,6 @@ impl Conversation {
     /// restored again, so the triage that reads this must see "not
     /// persisted" and fall through to a fresh prefill instead.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
-        drop(self.persistence.lock().unwrap());
         let view = self.read();
         if view.is_section_tombstoned(stream_id) {
             return false;
@@ -5155,14 +5082,18 @@ impl Conversation {
         device: &candle::Device,
         stager: &mut crate::persistence::cold_load::ColdLoadStager,
     ) -> candle::Result<Vec<SealedSequence>> {
-        use crate::persistence::transfer::load_stream_into_hot;
-        let mut p = self.persistence.lock().unwrap();
+        use crate::persistence::transfer::{cold_buffer_size, load_stream_into_hot};
         let substrate = self.read();
+        let buffer_size = cold_buffer_size(stager);
+        let (plan, source) = self
+            .persistence
+            .call(|p| p.cold_read(&substrate, stream_id, buffer_size))
+            .map_err(|e| candle::Error::Msg(format!("cold_load_section_into_hot: {e}")))?;
         load_stream_into_hot(
             backings,
             device,
-            &mut p,
-            &substrate,
+            &plan,
+            &source,
             stream_id,
             chunks_per_layer,
             stager,
@@ -5196,21 +5127,21 @@ impl Conversation {
     /// `fsync`s every staged record so an in-flight turn survives a crash.
     pub fn commit_persistence(&self) -> candle::Result<()> {
         self.persistence
-            .lock()
-            .unwrap()
-            .commit()
+            .call(|p| p.commit())
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))
     }
 
-    /// Drain the off-thread [`SubstrateWriter`]: append every queued durable
-    /// write (warm→cold KV, tokens, sigs, stream-decls), `fsync`, and join the
-    /// writer thread. Idempotent; the writer is unusable afterward, so this is a
-    /// **terminal** shutdown step — call it once, after every enqueuer (the
-    /// scheduler, the persistence thread's final drain, the summariser) has
-    /// stopped. Without it, the daemon's `process::exit` would skip the writer's
-    /// `Drop` and drop everything still queued (the whole point of the drain).
+    /// Drain the log's owner: append every queued durable write (warm→cold
+    /// KV, tokens, sigs, stream-decls) and commit — the point a shutdown waits
+    /// for, after every enqueuer (the scheduler, the persistence thread's final
+    /// drain, the summariser) has stopped. Without it, the daemon's
+    /// `process::exit` would drop everything still queued (the whole point of
+    /// the drain). The owner keeps serving calls afterward.
     pub fn flush_writer(&self) {
-        self.writer.shutdown();
+        self.persistence.wait_written(self.persistence.ticket());
+        if let Err(e) = self.commit_persistence() {
+            tracing::error!("persist commit at the writer flush failed: {e}");
+        }
     }
 
     /// Give the substrate directory up to the next writer
@@ -5220,9 +5151,7 @@ impl Conversation {
     /// [`Self::flush_writer`].
     pub fn release_writer(&self) -> candle::Result<()> {
         self.persistence
-            .lock()
-            .unwrap()
-            .release_writer()
+            .call(|p| p.release_writer())
             .map_err(|e| candle::Error::Msg(format!("persist release: {e}")))
     }
 
@@ -5232,9 +5161,7 @@ impl Conversation {
     /// workspace doesn't issue pointless syscalls.
     pub fn commit_persistence_if_pending(&self) -> candle::Result<bool> {
         self.persistence
-            .lock()
-            .unwrap()
-            .commit_if_pending()
+            .call(|p| p.commit_if_pending())
             .map_err(|e| candle::Error::Msg(format!("persist commit_if_pending: {e}")))
     }
 
@@ -5244,15 +5171,20 @@ impl Conversation {
     /// phase progress (0..=5) for the loading screen. A read-only substrate
     /// is never compacted — the store belongs to the process that writes it —
     /// so this returns without touching it.
-    pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> candle::Result<()> {
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> candle::Result<()> {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.commit()
-            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        let mut substrate = self.write();
-        p.compact(&mut substrate, progress)
+        // Behind every write already queued, so the rewrite carries every
+        // record whose in-memory change came before it.
+        self.persistence
+            .call_after_writes(|p| {
+                p.commit()?;
+                p.compact_shared(&self.inner, progress)
+            })
             .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))
     }
 
@@ -5299,45 +5231,43 @@ impl Conversation {
     /// `POST /v1/substrate/zend/maintenance` trigger. Seals the active segment first, so a
     /// conversation just archived/distilled this session (whose now-dead records
     /// sit in the active, which maintenance never touches) moves into a sealed
-    /// segment and gets compacted away. Uses the same phased locking, so it never
-    /// holds the substrate write lock across the relocation I/O — background
-    /// decode keeps running. Returns whether an op ran.
+    /// segment and gets compacted away. Runs in the same steps, so decode keeps
+    /// running through the relocation. Returns whether an op ran.
     pub fn force_compact_persistence(&self) -> candle::Result<bool> {
-        {
-            let mut p = self.persistence.lock().unwrap();
+        self.persistence.call(|p| {
             p.commit()
                 .map_err(|e| candle::Error::Msg(format!("substrate maintenance commit: {e}")))?;
             p.seal_active()
-                .map_err(|e| candle::Error::Msg(format!("substrate maintenance seal: {e}")))?;
-        }
+                .map_err(|e| candle::Error::Msg(format!("substrate maintenance seal: {e}")))
+        })?;
         self.run_maintenance_pass(Pass::Forced)
     }
 
-    /// Run one step of a maintenance op under its own hold of the persistence
-    /// lock, adding the time the lock was held to `held`. A step that fails
-    /// ends the op's relocation watch, since no later step of it will run.
+    /// Run one step of a maintenance op on the log's owner as background work,
+    /// adding the time the step took to `held`. A step that fails ends the
+    /// op's relocation watch, since no later step of it will run.
     ///
-    /// Taken behind any foreground caller waiting for the lock — a cold load, a
-    /// seal write — so between two steps the op lets them in rather than
-    /// re-taking the lock first (see [`PersistenceLock`]).
-    fn maintenance_hold<T>(
+    /// Background, so every call and write waiting on the owner — a cold load,
+    /// a seal write — goes ahead of the next step.
+    fn maintenance_hold<T: Send>(
         &self,
         held: &mut Duration,
-        step: impl FnOnce(&mut SubstratePersistence) -> PersistenceResult<T>,
+        step: impl FnOnce(&mut SubstratePersistence) -> PersistenceResult<T> + Send,
     ) -> candle::Result<T> {
-        let mut p = self.persistence.lock_behind_waiters().unwrap();
-        let t = Instant::now();
-        let out = step(&mut p);
-        *held += t.elapsed();
-        if out.is_err() {
-            p.end_relocation_watch();
-        }
+        let (out, took) = self.persistence.call_behind(|p| {
+            let t = Instant::now();
+            let out = step(p);
+            if out.is_err() {
+                p.end_relocation_watch();
+            }
+            (out, t.elapsed())
+        });
+        *held += took;
         out.map_err(|e| candle::Error::Msg(format!("substrate maintenance exec: {e}")))
     }
 
-    /// One maintenance op run to the end under phased locking, so the slow
-    /// relocation I/O never holds the substrate write lock (which would stall
-    /// every decode `read()`) — see [`MaintenanceOp`]. A forced pass waives the
+    /// One maintenance op run to the end in steps, so the slow relocation I/O
+    /// never makes a decode wait — see [`MaintenanceOp`]. A forced pass waives the
     /// age/ratio gates (`pick_maintenance_op`); a drop-only pass relocates
     /// nothing (`pick_drop`). Returns whether an op ran.
     fn run_maintenance_pass(&self, pass: Pass) -> candle::Result<bool> {
@@ -5351,33 +5281,29 @@ impl Conversation {
     /// compaction indicator: `(segment_count, last_op, running)` where `last_op`
     /// is `(label, unix_secs)` of the most recent drop/compact/combine this
     /// session (or `None`) and `running` is `true` while an op's I/O is in
-    /// flight. Read from the **cache** — never takes the persistence lock — so
-    /// `/v1/status` stays responsive while a compaction runs.
-    pub fn maintenance_status(&self) -> (usize, Option<(String, u64)>, bool) {
-        self.maintenance.lock().unwrap().clone()
+    /// flight. One atomic load, so `/v1/status` never waits on the log's owner.
+    pub fn maintenance_status(&self) -> MaintenanceStatus {
+        MaintenanceStatus::clone(&self.maintenance.load())
     }
 
     /// The redo log's dead-byte ratio as the last liveness scan found it — the
     /// measure the auto-compaction trigger and maintenance's plan read — for a
-    /// viewer. Takes no substrate lock: the scan walks the whole substrate under
-    /// it, up to 0.86 s on BlackWorld, and a viewer polling it was a hold every
-    /// writer waited out. `try_lock`s the persistence layer so it never stalls
-    /// behind a compaction holding that across I/O; `None` when it is
-    /// contended, or before the first scan.
+    /// viewer. Reads what the scan left rather than scanning again: the scan
+    /// walks the whole substrate, up to 0.86 s on BlackWorld. `None` before the
+    /// first scan.
     pub fn dead_ratio(&self) -> Option<f32> {
-        self.persistence.try_lock().ok()?.scanned_dead_ratio()
+        self.persistence.call(|p| p.scanned_dead_ratio())
     }
 
-    /// Run `f` against the persistence layer's current manifest snapshot.
-    /// Read-only accessor for callers that need to inspect the redo
-    /// log's stream/chunk locations (sizes, formats, offsets) without
+    /// Run `f` against the persistence layer's current manifest snapshot, on
+    /// the log's owner. Read-only accessor for callers that need to inspect
+    /// the redo log's stream/chunk locations (sizes, formats, offsets) without
     /// rebuilding the whole substrate boundary.
-    pub fn with_persistence_manifest<R>(
+    pub fn with_persistence_manifest<R: Send>(
         &self,
-        f: impl FnOnce(&crate::persistence::manifest::Manifest) -> R,
+        f: impl FnOnce(&crate::persistence::manifest::Manifest) -> R + Send,
     ) -> R {
-        let p = self.persistence.lock().unwrap();
-        f(p.manifest())
+        self.persistence.call(|p| f(p.manifest()))
     }
 }
 
@@ -5735,12 +5661,11 @@ mod tests {
         for tl in [grandparent, parent, child] {
             conv.register_timeline(tl, layer, group);
         }
-        {
-            let mut w = conv.write();
+        conv.update(|w| {
             w.append_with_blocks(grandparent, 8, 0, 1);
             w.append_with_blocks(parent, 8, 1, 2);
             w.append_with_blocks(child, 8, 2, 3);
-        }
+        });
         for (c, p) in [(child, parent), (parent, grandparent)] {
             conv.set_conversation_metadata(c, Substrate::FORKED_FROM_KEY, &p.raw().to_string())
                 .expect("record lineage");
@@ -5777,11 +5702,10 @@ mod tests {
         let sibling = TimelineId::from_raw(32).expect("timeline id");
         conv.register_timeline(mine, layer, group);
         conv.register_timeline(sibling, layer, group);
-        {
-            let mut w = conv.write();
+        conv.update(|w| {
             w.append_with_blocks(mine, 8, 0, 1);
             w.append_with_blocks(sibling, 8, 1, 2);
-        }
+        });
 
         let read = conv.read_for(ProjectionTarget {
             layer,
@@ -6704,7 +6628,7 @@ layers:
             .unwrap();
 
         let files = {
-            let sub = conv.inner.read().unwrap();
+            let sub = conv.inner.read();
             assemble_file_scans(&sub, vec![x, y]).0
         };
         assert_eq!(files.len(), 2);
@@ -6960,8 +6884,7 @@ mod recurrent_snapshot_read_tests {
         assert!(conv.read_recurrent_snapshot(timeline).unwrap().is_some());
 
         let stream = snapshot_stream_id(timeline.raw());
-        let loc = {
-            let mut p = conv.persistence.lock().expect("persistence");
+        let loc = conv.persistence.call(|p| {
             let loc = p
                 .write_snapshot(
                     stream,
@@ -6970,18 +6893,17 @@ mod recurrent_snapshot_read_tests {
                 .expect("append");
             p.commit().expect("commit");
             loc
-        };
-        conv.write().apply_snapshot_loc(stream, loc.value, loc.id);
+        });
+        conv.update(|s| s.apply_snapshot_loc(stream, loc.value, loc.id));
         assert!(conv.read_recurrent_snapshot(timeline).unwrap().is_none());
     }
 
-    /// Store a snapshot exactly as the writer thread does — append under the
-    /// persistence lock, then register the location under the substrate lock,
-    /// never nested — and optionally seal the segment it landed in.
+    /// Store a snapshot exactly as the writer does — append on the persistence
+    /// owner, then publish the location in a substrate edit — and optionally
+    /// seal the segment it landed in.
     fn store(conv: &Conversation, timeline: TimelineId, turn_index: u32, seal: bool) {
         let stream = snapshot_stream_id(timeline.raw());
-        let loc = {
-            let mut p = conv.persistence.lock().expect("persistence");
+        let loc = conv.persistence.call(|p| {
             let loc = p
                 .write_snapshot(stream, &payload(timeline, turn_index).parts().slices())
                 .expect("append");
@@ -6990,23 +6912,40 @@ mod recurrent_snapshot_read_tests {
                 p.seal_active().expect("seal");
             }
             loc
-        };
-        conv.write().apply_snapshot_loc(stream, loc.value, loc.id);
+        });
+        conv.update(|s| s.apply_snapshot_loc(stream, loc.value, loc.id));
     }
 
-    /// **The admission read completes while a compaction holds the persistence
-    /// mutex.** That hold is what stalled the scheduler: a mean of 16.5 s per
-    /// maintenance op, measured, with every decode waiting behind the snapshot
-    /// read at admission. The mutex is held here for the whole read, as the
-    /// relocation phase holds it, and the read runs against a deadline.
+    /// Occupy the persistence owner inside a call, as a compaction's relocation
+    /// phase does, until the returned sender is dropped or sent to.
+    fn hold_owner(conv: &Conversation) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, released) = mpsc::channel::<()>();
+        let (entered, is_entered) = mpsc::channel::<()>();
+        let owner = conv.persistence.clone();
+        let holder = std::thread::spawn(move || {
+            owner.call(move |_| {
+                entered.send(()).expect("signal entry");
+                let _ = released.recv();
+            });
+        });
+        is_entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the owner took the holding call");
+        (release, holder)
+    }
+
+    /// **The admission read completes while a compaction occupies the
+    /// persistence owner.** That hold is what stalled the scheduler: a mean of
+    /// 16.5 s per maintenance op, measured, with every decode waiting behind the
+    /// snapshot read at admission. The owner is held here for the whole read,
+    /// as the relocation phase holds it, and the read runs against a deadline.
     #[test]
     fn a_sealed_snapshot_reads_while_persistence_is_held() {
         let conv = Conversation::ephemeral();
         let timeline = TimelineId::for_test(41);
         store(&conv, timeline, 3, true);
 
-        let held = conv.persistence.clone();
-        let _compaction = held.lock().expect("hold persistence");
+        let (release, holder) = hold_owner(&conv);
         let reader = conv.clone();
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -7018,24 +6957,25 @@ mod recurrent_snapshot_read_tests {
             .expect("readable")
             .expect("present");
         worker.join().expect("worker");
+        drop(release);
+        holder.join().expect("holder");
         assert_eq!(got.turn_index, 3);
         assert_eq!(got.schedule_hash, 0xC0FF_EE00);
         assert_eq!(got.timeline_id, timeline.raw());
     }
 
     /// **A committed snapshot still in the active segment reads while the
-    /// persistence mutex is held, too.** The snapshot a seal just wrote is the
-    /// one the next admission reads back, and it is nearly always still in the
-    /// active segment: once committed it is as final as a sealed record, so
-    /// the read takes no lock.
+    /// persistence owner is occupied, too.** The snapshot a seal just wrote is
+    /// the one the next admission reads back, and it is nearly always still in
+    /// the active segment: once committed it is as final as a sealed record, so
+    /// the read does not go through the owner.
     #[test]
     fn a_committed_active_snapshot_reads_while_persistence_is_held() {
         let conv = Conversation::ephemeral();
         let timeline = TimelineId::for_test(42);
         store(&conv, timeline, 5, false);
 
-        let held = conv.persistence.clone();
-        let _compaction = held.lock().expect("hold persistence");
+        let (release, holder) = hold_owner(&conv);
         let reader = conv.clone();
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -7047,6 +6987,8 @@ mod recurrent_snapshot_read_tests {
             .expect("readable")
             .expect("present");
         worker.join().expect("worker");
+        drop(release);
+        holder.join().expect("holder");
         assert_eq!(got.turn_index, 5);
     }
 
@@ -7083,8 +7025,8 @@ mod recurrent_snapshot_read_tests {
 
     /// **The writer reports a snapshot once its record is durable, once.** A
     /// slot holding the state of a sealed turn may release it when this says
-    /// so, because the read above then serves the record without a lock. The
-    /// report is the timeline and turn the snapshot was taken at; a second
+    /// so, because the read above then serves the record without the owner.
+    /// The report is the timeline and turn the snapshot was taken at; a second
     /// drain has nothing new.
     #[test]
     fn a_written_snapshot_is_reported_once_it_is_durable() {
@@ -7106,8 +7048,7 @@ mod recurrent_snapshot_read_tests {
         assert_eq!(reported, vec![(timeline, 6)]);
         assert!(conv.drain_durable_snapshots().is_empty(), "reported once");
 
-        let held = conv.persistence.clone();
-        let _compaction = held.lock().expect("hold persistence");
+        let (release, holder) = hold_owner(&conv);
         let reader = conv.clone();
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -7115,16 +7056,18 @@ mod recurrent_snapshot_read_tests {
         });
         let got = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("a reported snapshot reads without the lock")
+            .expect("a reported snapshot reads without the owner")
             .expect("readable")
             .expect("present");
         worker.join().expect("worker");
+        drop(release);
+        holder.join().expect("holder");
         assert_eq!(got.turn_index, 6);
     }
 
     /// **An index naming a segment that is gone is still an error.** The
-    /// lock-free read re-reads the location on a missing file, and when the
-    /// index still names that file it hands over to the locked read — which
+    /// direct read re-reads the location on a missing file, and when the
+    /// index still names that file it hands over to the owner's read — which
     /// reports it rather than answering `None`. A missing snapshot that reads as
     /// "no snapshot" is the silent amnesia this path exists to prevent.
     #[test]
@@ -7133,17 +7076,14 @@ mod recurrent_snapshot_read_tests {
         let timeline = TimelineId::for_test(43);
         store(&conv, timeline, 7, true);
         let loc = conv.recurrent_snapshot_loc(timeline).expect("indexed");
-        let file = {
-            let p = conv.persistence.lock().expect("persistence");
-            segment_path(p.dir(), loc.segment)
-        };
+        let file = segment_path(conv.persistence.dir(), loc.segment);
         std::fs::remove_file(&file).expect("remove the segment");
         let err = conv
             .read_recurrent_snapshot(timeline)
             .expect_err("a vanished snapshot is not an absent one");
         assert!(
             err.to_string().contains("indexed but unreadable"),
-            "the locked read's own report: {err}"
+            "the owner's read's own report: {err}"
         );
     }
 

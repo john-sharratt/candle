@@ -35,13 +35,17 @@
 //! `docs/archived/arena_unification.md` §5 (audit A4).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Migrates currently copying residences.
 static MIGRATE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// [`CHUNK_LOCATIONS`]' frozen bit: a compaction is relocating chunks.
+const FROZEN: usize = 1 << (usize::BITS - 1);
+
 /// Held shared by a migrate for as long as it is acting on captured chunk
-/// addresses, and exclusively by a KV compaction while it relocates them.
+/// addresses, and exclusively by a KV compaction while it relocates them: the
+/// count of shared holders, with [`FROZEN`] set while a compaction holds it.
+/// Every step is one compare-and-swap; nothing waits on it.
 ///
 /// # Why an exclusion is back, when the header says it went away
 ///
@@ -62,14 +66,39 @@ static MIGRATE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// # Neither side ever blocks
 ///
-/// Both use the `try_` form and defer. That is not an optimisation, it is what
-/// makes the pair free of lock ordering: a migrate holds substrate and block-table
-/// locks while it works, and so does a compaction's sweep, so *either* side waiting
-/// on the other would need those orders to agree. Neither waits, so there is
-/// nothing to agree about. Compaction retries on its next wave, a migrate on the
-/// persistence thread's next pass; both are periodic and neither is on a critical
-/// path.
-static CHUNK_LOCATIONS: RwLock<()> = RwLock::new(());
+/// Both ask and defer when refused. That is not an optimisation: either side
+/// waiting on the other would put a wait on a path that has none. Compaction
+/// retries on its next wave, a migrate on the persistence thread's next pass;
+/// both are periodic and neither is on a critical path.
+static CHUNK_LOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// A shared hold on [`CHUNK_LOCATIONS`], or `None` while a compaction holds it.
+fn try_share() -> Option<Shared> {
+    let mut state = CHUNK_LOCATIONS.load(Ordering::SeqCst);
+    loop {
+        if state & FROZEN != 0 {
+            return None;
+        }
+        match CHUNK_LOCATIONS.compare_exchange_weak(
+            state,
+            state + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return Some(Shared),
+            Err(now) => state = now,
+        }
+    }
+}
+
+/// One shared hold on [`CHUNK_LOCATIONS`], released on drop.
+struct Shared;
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        CHUNK_LOCATIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// RAII marker: a migrate is copying residences until this drops. Drop-based so
 /// an early return or an error still clears the count.
@@ -77,7 +106,7 @@ static CHUNK_LOCATIONS: RwLock<()> = RwLock::new(());
 pub struct MigrateFlight {
     /// Keeps a compaction from relocating the chunks whose addresses this migrate
     /// has captured. See [`CHUNK_LOCATIONS`].
-    _locations: RwLockReadGuard<'static, ()>,
+    _locations: Shared,
 }
 
 impl Drop for MigrateFlight {
@@ -113,7 +142,7 @@ pub fn try_migrate_flight() -> Option<MigrateFlight> {
     if COMPACTION_WAITING.load(Ordering::SeqCst) {
         return None;
     }
-    let locations = CHUNK_LOCATIONS.try_read().ok()?;
+    let locations = try_share()?;
     MIGRATE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
     Some(MigrateFlight {
         _locations: locations,
@@ -124,7 +153,7 @@ pub fn try_migrate_flight() -> Option<MigrateFlight> {
 /// off the thread that compacts — see [`try_hold_chunk_locations`].
 #[must_use = "the hold lifts on drop; bind it for the free's scope"]
 pub struct LocationHold {
-    _locations: RwLockReadGuard<'static, ()>,
+    _locations: Shared,
 }
 
 /// Hold chunk locations still while dropping device chunks on a thread other than
@@ -151,15 +180,15 @@ pub struct LocationHold {
 /// it goes back — the persistence thread's section persist, ~180,000 slots a pass on
 /// the Qwen3-30B while the tool catalog reached the log.
 ///
-/// The same lock and the same rule as [`try_migrate_flight`] — shared, never waits,
-/// defers to a waiting pass — without the in-flight count, which is a statement
-/// about migrate work. A caller that is refused keeps the chunks and lets a later
-/// pass of its own drop or read them.
+/// The same word and the same rule as [`try_migrate_flight`] — shared, never
+/// waits, defers to a waiting pass — without the in-flight count, which is a
+/// statement about migrate work. A caller that is refused keeps the chunks and
+/// lets a later pass of its own drop or read them.
 pub fn try_hold_chunk_locations() -> Option<LocationHold> {
     if COMPACTION_WAITING.load(Ordering::SeqCst) {
         return None;
     }
-    let locations = CHUNK_LOCATIONS.try_read().ok()?;
+    let locations = try_share()?;
     Some(LocationHold {
         _locations: locations,
     })
@@ -170,18 +199,20 @@ pub fn try_hold_chunk_locations() -> Option<LocationHold> {
 ///
 /// Never blocks, for the reason on [`CHUNK_LOCATIONS`].
 #[must_use = "the freeze lifts on drop; bind it for the compaction's scope"]
-pub struct LocationFreeze {
-    _locations: RwLockWriteGuard<'static, ()>,
+pub struct LocationFreeze(());
+
+impl Drop for LocationFreeze {
+    fn drop(&mut self) {
+        CHUNK_LOCATIONS.fetch_and(!FROZEN, Ordering::SeqCst);
+    }
 }
 
 pub fn try_freeze_chunk_locations() -> Option<LocationFreeze> {
-    match CHUNK_LOCATIONS.try_write() {
-        Ok(locations) => {
+    match CHUNK_LOCATIONS.compare_exchange(0, FROZEN, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {
             // In, so stop holding migrates off — the freeze itself does that now.
             COMPACTION_WAITING.store(false, Ordering::SeqCst);
-            Some(LocationFreeze {
-                _locations: locations,
-            })
+            Some(LocationFreeze(()))
         }
         Err(_) => {
             // Refused. Say so, so the next migrate that would have renewed the hold

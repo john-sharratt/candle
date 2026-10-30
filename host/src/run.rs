@@ -466,8 +466,13 @@ async fn serve_tenants(
                 stops.push((name, started.stop));
             }
             // The tenants already started are stopped, not left mid-load
-            // when the process exits.
+            // when the process exits. One still loading waits at the slot
+            // for this tenant, and its stop waits for its load, so this one
+            // is withdrawn first — without it the stop never returns and the
+            // error is never said.
             Err(e) => {
+                tracing::error!("{name}: start failed: {e:#}");
+                slot.withdraw(name);
                 stop_all(stops).await;
                 return Err(e.context(format!("{name}: start")));
             }

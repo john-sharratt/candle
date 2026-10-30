@@ -1424,7 +1424,7 @@ fn r5(f: &Fixture) {
         // turns' seal observes.
         for self_warm in [true, false] {
             let scope = ScopeKey::turn_group(0, 0);
-            let mut cache = NormalizationCache::new(NormConfig::default());
+            let cache = NormalizationCache::new(NormConfig::default());
             if self_warm {
                 for (i, s) in slots.iter().enumerate() {
                     let w = s.windows[0];

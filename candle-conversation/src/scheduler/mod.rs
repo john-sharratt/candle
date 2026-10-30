@@ -44,7 +44,6 @@ mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
-mod ingest_demote;
 mod injected_piece;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -52,7 +51,6 @@ pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
 mod norm_warm;
-mod owed_pins;
 mod paused_creep;
 mod pending_ranges;
 pub mod phase_ring;
@@ -65,6 +63,7 @@ mod prefill_wait;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod projection_identity;
+mod rates_store;
 mod recurrent_park;
 pub mod relief_trace;
 mod reproject_abandon;
@@ -99,7 +98,6 @@ use phase_split::cobatched_step_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
-use self::owed_pins::OwedPins;
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
 use self::request_laps::RequestLaps;
@@ -149,7 +147,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{ProjectionScores, ResidenceIndex, TurnPartWrite};
+use crate::substrate::{HotKv, ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -3788,9 +3786,6 @@ pub(crate) struct Scheduler {
     /// RAM at ~50% capacity — long before the near-cap eviction ladder — keeping
     /// only a small rolling hot window resident during a bulk repo ingest.
     ingest_timelines: HashSet<TimelineId>,
-    /// The ingest demotes sent to the substrates, and what the applied ones
-    /// shed — dropped on this thread (`ingest_demote`).
-    ingest_demotes: ingest_demote::IngestDemotes,
 
     /// Set while `drain_submissions` runs: `apply_projection` defers each
     /// no-deferred-user gap-fill (ingest / compression) into `deferred_glue_fires`
@@ -3876,9 +3871,6 @@ pub(crate) struct Scheduler {
     /// The steps of the request in hand, named in the log when it holds the
     /// wave thread long ([`Self::handle_request`]).
     request_laps: RequestLaps,
-    /// The substrates owed a working-set pin republish that found the write
-    /// lock held ([`Self::republish_pins`]).
-    owed_pins: OwedPins,
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
@@ -4254,7 +4246,6 @@ impl Scheduler {
             promote_ok_tokens_seen: 0,
             promote_last_progress: None,
             ingest_timelines: HashSet::new(),
-            ingest_demotes: ingest_demote::IngestDemotes::default(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
             gallery_misses_seen: None,
@@ -4279,7 +4270,6 @@ impl Scheduler {
             paused_creep: None,
             prefill_gang: Vec::new(),
             request_laps: RequestLaps::default(),
-            owed_pins: OwedPins::default(),
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
             prefill_waits: prefill_wait::PrefillWaits::default(),
@@ -5630,7 +5620,7 @@ impl Scheduler {
                 // caller-side before this request, so this thread never blocks on
                 // the persistence pass.
                 let demoted = {
-                    let mut view = conversation.write();
+                    let view = conversation.read();
                     let keys: Vec<TurnKey> = timelines
                         .iter()
                         .flat_map(|&tl| {
@@ -6174,7 +6164,7 @@ impl Scheduler {
                 // Setup failed before decode, so `complete_compression_pass` (which
                 // normally demotes) never runs — demote the just-lifted children
                 // here too, else they linger hot until ordinary eviction.
-                conv.write().demote_turns_to_warm(&child_keys);
+                conv.read().demote_turns_to_warm(&child_keys);
                 return Err(e);
             }
         }
@@ -6354,7 +6344,7 @@ impl Scheduler {
         // persist thread's hot→warm migrate then can't get scratch and OOMs.
         // Cheap: no migrate, the warm copy already exists from before the lift.
         if !children.is_empty() {
-            let demoted = conversation.write().demote_turns_to_warm(&children);
+            let demoted = conversation.read().demote_turns_to_warm(&children);
             if demoted > 0 {
                 tracing::trace!(
                     target: "candle_conversation::persistence::tier",
@@ -7315,7 +7305,7 @@ impl Scheduler {
                 // Lifted to hot only for this pass, as in
                 // `complete_compression_pass`.
                 if !job.children.is_empty() {
-                    job.conversation.write().demote_turns_to_warm(&job.children);
+                    job.conversation.read().demote_turns_to_warm(&job.children);
                 }
                 let _ = job.response_tx.send(Err(ProbeError::Soft(
                     "SubmitSummaryProbe: the summary decode ended on a fault".to_string(),
@@ -8690,14 +8680,16 @@ impl Scheduler {
         let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
         let chunks_per_layer = cold_refs.first().map(|s| s.chunks.len()).unwrap_or(0);
         let tokens_arc = Arc::new(tokens[..].to_vec());
-        conversation.write().restore_section(
-            section_id,
-            stream_id,
-            token_count,
-            Vec::new(),
-            cold_refs,
-            tokens_arc,
-        );
+        conversation.update(|substrate| {
+            substrate.restore_section(
+                section_id,
+                stream_id,
+                token_count,
+                Vec::new(),
+                cold_refs.clone(),
+                Arc::clone(&tokens_arc),
+            )
+        });
         if let Some(page) = page {
             self.section_positional
                 .insert(stream_id, conversation, page);
@@ -9350,14 +9342,16 @@ impl Scheduler {
         // unlocked.  Pending list is partitioned into (residence,
         // sealed, in_collection); the per-layer loop below groups by
         // in_collection so each policy gets its own batched launch.
-        let pending: Vec<(SectionId, ResidenceIndex, Vec<SealedSequence>, bool)> = {
+        // Each section's native hot copy as the drain reads it: what it
+        // quantizes, and what its install replaces only while still there.
+        let pending: Vec<(SectionId, ResidenceIndex, Arc<HotKv>, bool)> = {
             let view = conversation.read();
             pending_list
                 .into_iter()
                 .filter_map(|p| {
                     let residence = view.section_residence(p.section_id)?;
-                    let sealed = view.section_sealed_of(p.section_id)?;
-                    Some((p.section_id, residence, (*sealed).clone(), p.in_collection))
+                    let native = view.residence(residence).hot()?;
+                    Some((p.section_id, residence, native, p.in_collection))
                 })
                 .collect()
         };
@@ -9447,17 +9441,15 @@ impl Scheduler {
             .synchronize()
             .map_err(|e| ConversationError::Channel(format!("section quantize sync: {e}")))?;
 
-        // Atomic swap: take the substrate write lock once, replace every
-        // pending residence's hot with its quantized form, clear the
-        // pending-quantize flag (so the persistence thread can now
-        // gather and write the final bytes), then release.  Dropping
-        // the (in-Vec) native SealedSequences after the lock is
-        // released decrements the source chunks' refcounts to zero;
-        // their arena slots return to the pool for reuse by the next
-        // prefill.
+        // Replace every pending residence's hot with its quantized form —
+        // each only over the native copy it was made from — and clear the
+        // pending-quantize flag, so the persistence thread can now gather and
+        // write the final bytes. Dropping the native copies afterwards
+        // decrements the source chunks' refcounts to zero; their arena slots
+        // return to the pool for reuse by the next prefill.
         {
-            let mut view = conversation.write();
-            for ((_, residence, _native, _in_collection), q_per_layer) in
+            let view = conversation.read();
+            for ((_, residence, native, _in_collection), q_per_layer) in
                 pending.into_iter().zip(quantized_per_section)
             {
                 if q_per_layer.len() != n_layers {
@@ -9469,7 +9461,11 @@ impl Scheduler {
                     );
                     continue;
                 }
-                view.replace_section_hot(residence, q_per_layer);
+                if !view.replace_section_hot(residence, &native, q_per_layer) {
+                    // Retired or replaced while it quantized: the quantized
+                    // copy is of bytes the section no longer holds.
+                    continue;
+                }
                 view.clear_section_pending_quantize(residence);
                 // Collection-member path: free this section's VRAM as soon as
                 // the persistence thread lands its cold copy.
@@ -10187,23 +10183,22 @@ impl Scheduler {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 let stream_id = section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
-                {
-                    let mut view = conversation.write();
-                    view.set_section_full(
+                // The pending-quantize flag is raised inside the edit that
+                // installs the residence, so no version publishes the section
+                // hot without it and the persistence thread never writes the
+                // interim native bytes.
+                conversation.update(|substrate| {
+                    let residence = substrate.set_section_full(
                         *section_id,
                         stream_id,
                         turn_token_count,
-                        Arc::new(delta_gpu),
-                        |seqs| Ok(seqs.to_vec()),
+                        delta_gpu.clone(),
                         Arc::clone(tokens),
-                    )
-                    .map_err(ConversationError::Model)?;
+                    );
                     if policy_active {
-                        if let Some(residence) = view.section_residence(*section_id) {
-                            view.mark_section_pending_quantize(residence);
-                        }
+                        substrate.mark_section_pending_quantize(residence);
                     }
-                }
+                });
                 // Queue the section for quantization at the next safe
                 // boundary (end of `PrimingProjection` for sections
                 // ingested during a base-conv build, or `SealAction::
@@ -11241,7 +11236,7 @@ impl Scheduler {
             return crate::substrate::EvictionReport { count: 0, bytes: 0 };
         }
         conversation
-            .write()
+            .read()
             .evict_hot_to_free(sections, turns, needed)
     }
 
@@ -11260,13 +11255,15 @@ impl Scheduler {
     /// `apply_projection: ... dropping it` symptom.
     /// Publish the union of every live slot's projection working set — plus the
     /// `extra_sections` / `extra_turns` an in-flight elevate is about to lift —
-    /// as the substrate's eviction keep-set (`Substrate::working_set_pins`). A
-    /// pinned residence is protected from the persistence thread's
-    /// `evict_when_cold` hot-drop for the duration of the wave, closing the
-    /// free-under-read the multi-timeline belief scan opened (it can now select
-    /// completed-file turns whose KV the persistence thread would otherwise
-    /// evict mid-forward). Recomputed wholesale each call, so residences that
-    /// have left every working set drop out and become evictable again.
+    /// as the substrate's eviction keep-set (`Substrate::set_working_set_pins`).
+    /// A pinned residence is protected from every automatic hot-drop for the
+    /// duration of the wave, closing the free-under-read the multi-timeline
+    /// belief scan opened (it can now select completed-file turns whose KV the
+    /// persistence thread would otherwise evict mid-forward). Recomputed
+    /// wholesale each call, so residences that have left every working set
+    /// lose their pin and become evictable again. Pins are counts on the
+    /// residences themselves: publishing waits on nothing and publishes no
+    /// substrate version.
     fn publish_working_set_pins(
         &mut self,
         conversation: &Conversation,
@@ -11276,39 +11273,17 @@ impl Scheduler {
         let (mut keep_sections, mut keep_turns) = self.live_working_sets();
         keep_sections.extend(extra_sections.iter().copied());
         keep_turns.extend(extra_turns.iter().copied());
-        // The publish advances the substrate's own wave clock and stamps the
-        // active set in the same write — see `Substrate::set_working_set_pins`.
+        // The publish stamps the active set with the substrate's wave clock —
+        // see `Substrate::set_working_set_pins`.
         conversation
-            .write()
+            .read()
             .set_working_set_pins(&keep_turns, &keep_sections);
-        // The whole live set, so a republish this substrate was owed is in it.
-        self.owed_pins.settled(conversation);
     }
 
     /// Republish `conversation`'s substrate's keep-set — the live working sets
-    /// alone — if its write lock is free now, and owe it otherwise
-    /// ([`OwedPins`]): what a slot's retirement does, which only takes pins
-    /// away and so can wait a wave rather than hold the wave thread behind a
-    /// maintenance op. [`Self::settle_owed_pins`] retries what is owed.
+    /// alone: what a slot's retirement does.
     fn republish_pins(&mut self, conversation: &Conversation) {
-        let (keep_sections, keep_turns) = self.live_working_sets();
-        match conversation.try_write() {
-            Some(mut substrate) => {
-                substrate.set_working_set_pins(&keep_turns, &keep_sections);
-                drop(substrate);
-                self.owed_pins.settled(conversation);
-            }
-            None => self.owed_pins.owe(conversation),
-        }
-    }
-
-    /// Retry every owed republish ([`Self::republish_pins`]); those still
-    /// locked stay owed. Once a wave, so a pin outlives its slot by about the
-    /// length of the hold that blocked it.
-    pub(super) fn settle_owed_pins(&mut self) {
-        for conversation in self.owed_pins.take() {
-            self.republish_pins(&conversation);
-        }
+        self.publish_working_set_pins(conversation, &[], &[]);
     }
 
     /// Drop `slot`'s projection working set and republish the keep-set without
@@ -11340,9 +11315,7 @@ impl Scheduler {
     /// This is the only place [`Self::slot_projection_state`] is removed from,
     /// which is what makes "a removal is always followed by a republish" hold
     /// by construction rather than by every caller remembering. Keep it that
-    /// way: a bare `remove` elsewhere re-opens the wedge silently. The
-    /// republish runs now when the substrate's write lock is free and is owed
-    /// to the next wave when it is not ([`Self::republish_pins`]).
+    /// way: a bare `remove` elsewhere re-opens the wedge silently.
     fn retire_slot_projection_state(
         &mut self,
         slot: SequenceId,
@@ -14567,14 +14540,16 @@ mod tests {
         // is what the pages are keyed by.
         let conversation = Conversation::new();
         for (section, stream) in [(good, 11), (stale, 12), (missing, 13)] {
-            conversation.write().restore_section(
-                section,
-                StreamId(stream),
-                0,
-                Vec::new(),
-                Vec::new(),
-                Arc::new(Vec::new()),
-            );
+            conversation.update(|substrate| {
+                substrate.restore_section(
+                    section,
+                    StreamId(stream),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    Arc::new(Vec::new()),
+                )
+            });
         }
         let seq = SequenceId(5);
         sched.slot_conversations.insert(seq, conversation.clone());

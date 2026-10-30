@@ -401,7 +401,8 @@ pub async fn sweeping(session: Weak<ZendSession>) {
         if !session.is_loaded() {
             continue;
         }
-        // Archiving takes the engine's lock: off the runtime's threads.
+        // Archiving writes through the persistence owner, whose flow control
+        // can wait for room: off the runtime's threads.
         let swept = tokio::task::spawn_blocking(move || {
             let records = session.shared_substrate()?;
             Some(sweep(&records, &distil_with(&session), now_ms()))

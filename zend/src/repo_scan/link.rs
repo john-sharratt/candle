@@ -4,7 +4,6 @@
 //! before the next link's reading starts.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::{ConversationEngine, Sequence};
@@ -26,16 +25,18 @@ use crate::refresh_ctx::RefreshContext;
 /// holds.
 pub(crate) fn ingest_link(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     layer_name: &str,
     job: &UnitJob,
     live: &HashSet<String>,
     parent: Option<TimelineId>,
 ) -> anyhow::Result<Option<TimelineId>> {
     if let Some(held) = holder(ctx.engine, &job.unit.key) {
-        repoint(&ctx.engine.lock().unwrap(), held, parent)
-            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?;
-        return Ok(Some(held));
+        if repoint(ctx.engine, held, parent)
+            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?
+        {
+            return Ok(Some(held));
+        }
     }
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let link_ctx = RefreshContext {
@@ -59,10 +60,8 @@ pub(crate) fn ingest_link(
 }
 
 /// The committed conversation holding the folder key `key`.
-fn holder(engine: &Mutex<ConversationEngine>, key: &str) -> Option<TimelineId> {
+fn holder(engine: &ConversationEngine, key: &str) -> Option<TimelineId> {
     engine
-        .lock()
-        .unwrap()
         .find_conversations_by_metadata(CONTENT_KEY, key)
         .into_iter()
         .next()

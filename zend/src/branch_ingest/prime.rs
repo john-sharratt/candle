@@ -31,7 +31,8 @@
 use std::collections::HashSet;
 
 use candle_conversation::projection::TimelineId;
-use candle_conversation::ConversationEngine;
+use candle_conversation::substrate::Substrate;
+use candle_conversation::{ConversationEngine, ConversationError};
 use zend_vfs::Workspace;
 
 use super::walk::{walk, FileItem, UnitItem};
@@ -108,15 +109,28 @@ pub fn links<'a>(
 /// drops whatever it recorded before: a stale parent kept there is a link
 /// that may now come after it, and the next link re-pointed at it would close
 /// a cycle.
+///
+/// `false` when `held` was tombstoned since it was found: nothing is written,
+/// and the caller reads the unit again rather than chain onto a dead link.
+/// The check, the cycle check and the write are one step.
 pub(crate) fn repoint(
     engine: &ConversationEngine,
     held: TimelineId,
     parent: Option<TimelineId>,
-) -> candle_conversation::Result<()> {
-    match parent {
-        Some(parent) => engine.set_forked_from(held, parent),
-        None => engine.clear_forked_from(held),
+) -> candle_conversation::Result<bool> {
+    let (mut dead, mut cycle) = (false, false);
+    engine.update_conversation_metadata(held, Substrate::FORKED_FROM_KEY, |s, _| {
+        dead = s.is_tombstoned(held);
+        cycle = parent.is_some_and(|p| s.lineage_contains(p, held));
+        (!dead && !cycle).then(|| parent.map_or_else(String::new, |p| p.raw().to_string()))
+    });
+    if cycle {
+        return Err(ConversationError::ForkCycle {
+            child: held.raw(),
+            parent: parent.map_or(0, |p| p.raw()),
+        });
     }
+    Ok(!dead)
 }
 
 impl BranchIngest {

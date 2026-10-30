@@ -7,7 +7,7 @@
 //! walked map, prior state, old timeline id, progress sink) remain
 //! explicit parameters because they vary per call.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_conversation::projection::{Builder, GroupId, TimelineId};
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
@@ -27,7 +27,7 @@ use crate::types::ToolMode;
 /// so the helpers clone what they consume per-call.
 #[derive(Clone)]
 pub struct RefreshContext<'a> {
-    pub engine: &'a Mutex<ConversationEngine>,
+    pub engine: &'a ConversationEngine,
     pub proj_builder: Builder,
     pub config: SequenceConfig,
     /// The dialect-formatted system-prompt prelude every REAL conversation

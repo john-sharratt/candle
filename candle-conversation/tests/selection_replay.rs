@@ -426,7 +426,7 @@ fn production_pipeline_scores(
     // turn itself is excluded — live, a turn's seal observe fires AFTER the
     // selections it is being scored for.
     let scope = ScopeKey::turn_group(0, 0);
-    let mut cache = NormalizationCache::new(NormConfig::default());
+    let cache = NormalizationCache::new(NormConfig::default());
     let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
     dialogue.sort_unstable();
     for (dtl, didx) in dialogue {

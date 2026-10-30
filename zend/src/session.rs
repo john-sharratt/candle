@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::client::Agents;
 use agent::jobs::Jobs;
+use arc_swap::ArcSwapOption;
 use cluster::member::{AppMember, ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
@@ -43,6 +44,7 @@ use candle_conversation::provenance::FOLD_GROUPS;
 use candle_conversation::stencil::{
     compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
+use candle_conversation::substrate::pcoll::POrdMap;
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::working_set::marks::RELEASE_TAG;
@@ -94,7 +96,7 @@ use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
-use crate::conv_sweep::{self, Sweep, CONV_IDLE_TTL, CONV_SWEEP_EVERY};
+use crate::conv_sweep::{CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::deletions::Deletions;
 use crate::engine_asks;
 use crate::fast_path::coverage::Coverage;
@@ -124,6 +126,7 @@ use crate::repeat_guard::{self, RepeatGuard, Verdict};
 use crate::repo_ads::repo_ads;
 use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
+use crate::resident::Resident;
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
 use crate::self_check::{self, Report as SelfCheckReport};
@@ -272,7 +275,7 @@ pub const CLOSED_BY_CLAUDE: &str = "stopped";
 /// shows it — the summariser's ghost summary turns hidden.
 fn dialogue_history(state: &InferenceState, conv_id: &str) -> Vec<RecoveredMessage> {
     let timeline = timeline_for(conv_id);
-    let base = state.base_conv.lock().unwrap();
+    let base = &state.base_conv;
     base.recovered_history(timeline, false)
 }
 
@@ -640,26 +643,23 @@ fn render_held_tail(held: &str) -> Option<String> {
 struct InferenceState {
     decoder: TokenDecoder,
     /// Owns the scheduler `JoinHandle` (conversations hold cloned
-    /// `scheduler_tx` senders) and the substrate persistence handle —
-    /// locked for the per-turn group-commit and for shutdown checkpointing.
-    engine: Mutex<ConversationEngine>,
-    /// The substrate, cloned out of the engine when it was built. `/v1/status`
-    /// reads maintenance from this handle and does not take `engine`: that
-    /// mutex is held across scheduler waits, and a page poll blocked on it is
-    /// the console sitting on "Reconnecting".
+    /// `scheduler_tx` senders) and the substrate persistence handle. Every
+    /// engine method takes `&self` and no reader waits on another, so it is
+    /// shared bare.
+    engine: ConversationEngine,
+    /// The substrate, cloned out of the engine when it was built — what
+    /// `/v1/status` reads maintenance from.
     substrate: Conversation,
-    /// Per-conversation state, keyed by the client-supplied conv_id string.
-    ///
-    /// The outer map lock is a std mutex held only to look an entry up; the
-    /// per-conversation lock is async, and the inference task holds it across
-    /// its decode awaits DELIBERATELY — that guard is the per-conversation
-    /// in-flight exclusivity, and an async lock is what lets it live across an
-    /// await without pinning a thread.
-    conversations: Mutex<HashMap<String, Arc<ConvLock<ConvState>>>>,
-    /// When each resident conversation was last used, keyed like
-    /// `conversations` — what the idle sweep releases them by
+    /// Per-conversation state, keyed by the client-supplied conv_id string, with
+    /// when each was last used — what the idle sweep releases them by
     /// ([`InferenceState::sweep_idle_conversations`]).
-    conv_used: Mutex<HashMap<String, Instant>>,
+    ///
+    /// The map takes no lock (`crate::resident`). The per-conversation lock is
+    /// async, and the inference task holds it across its decode awaits
+    /// DELIBERATELY — that guard is the per-conversation in-flight
+    /// exclusivity, and an async lock is what lets it live across an await
+    /// without pinning a thread.
+    conversations: Resident<ConvLock<ConvState>>,
     /// The tools mode last applied to each conversation's projection, keyed like
     /// `conversations` and set at the start of every turn. The projection panel
     /// reads it to show the tool summary that was actually injected — the
@@ -669,11 +669,10 @@ struct InferenceState {
     /// reading the mode through it waited for the turn to finish.
     tool_modes: Mutex<HashMap<String, ToolMode>>,
     /// System-prompt already prefilled; all new conversations fork from this.
-    base_conv: Mutex<Sequence>,
+    /// Every read and every fork takes it by `&self`.
+    base_conv: Sequence,
     /// The layer `base_conv` targets, named once at boot — what the substrate
-    /// views report as the target. Read through `base_conv` it waited out
-    /// that lock's holders: a calibration draft holds it across its fork,
-    /// which the scheduler parks until the base's turn ends.
+    /// views report as the target.
     target_layer: String,
     /// One prefilled template per `Folders`/`Files` ingest layer (`repo_map`,
     /// `code_reading`), keyed by layer name — `base_conv`'s exact counterpart
@@ -690,7 +689,7 @@ struct InferenceState {
     /// layers are excluded: they only ever prefill records and never decode,
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
-    ingest_bases: HashMap<String, Mutex<Sequence>>,
+    ingest_bases: HashMap<String, Sequence>,
     /// The priming chain's final link (`BranchIngest::prime`, built once per
     /// boot before `ready`): `base_conv`'s parent, and the parent every ingest
     /// unit's conversation records before its reading starts. `None` when
@@ -1198,12 +1197,7 @@ impl InferenceState {
     /// next turn served here resumes from the substrate, which does. A turn
     /// still holding the state keeps its own reference to it.
     fn forget_conversation(&self, key: &str) {
-        let released = {
-            let mut map = self.conversations.lock().unwrap();
-            self.conv_used.lock().unwrap().remove(key);
-            map.remove(key)
-        };
-        drop(released);
+        drop(self.conversations.remove(key));
         // Its next turn may be another member's, so its journal is read again
         // from the record when this member next holds it.
         self.journals.forget(key);
@@ -1211,30 +1205,7 @@ impl InferenceState {
     }
 
     fn sweep_idle_conversations(&self, now: Instant) -> usize {
-        let mut released: Vec<(String, Arc<ConvLock<ConvState>>)> = Vec::new();
-        {
-            let mut map = self.conversations.lock().unwrap();
-            let mut used = self.conv_used.lock().unwrap();
-            map.retain(|conv_id, conv| {
-                let last = *used.entry(conv_id.clone()).or_insert(now);
-                // The map's own reference is the only one when nothing holds it.
-                let held = Arc::strong_count(conv) > 1;
-                match conv_sweep::sweep(last, now, CONV_IDLE_TTL, held) {
-                    Sweep::Keep => true,
-                    Sweep::Touch => {
-                        used.insert(conv_id.clone(), now);
-                        true
-                    }
-                    Sweep::Release => {
-                        released.push((conv_id.clone(), Arc::clone(conv)));
-                        false
-                    }
-                }
-            });
-            // A clock outlives its conversation when the conversation leaves
-            // the map another way — deleted, or evicted after a failed turn.
-            used.retain(|conv_id, _| map.contains_key(conv_id));
-        }
+        let released = self.conversations.sweep(now, CONV_IDLE_TTL);
         // A released conversation's slot goes with it, and so does the asker a
         // draft would have put its questions through.
         for (conv_id, _) in &released {
@@ -1271,7 +1242,7 @@ impl InferenceState {
         cluster: Option<Join>,
         status_tx: watch::Sender<String>,
         progress: Arc<LoadProgress>,
-        loading_substrate: Arc<RwLock<Option<Conversation>>>,
+        loading_substrate: Arc<OnceLock<Conversation>>,
         parts: Arc<dyn SubagentRunner>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
@@ -1657,7 +1628,7 @@ impl InferenceState {
         );
         // Replayed: the substrate views can read it from here, while the rest of
         // the load runs (`ZendSession::substrate_for_views`).
-        *loading_substrate.write().unwrap() = Some(engine.conversation());
+        let _ = loading_substrate.set(engine.conversation());
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
@@ -2682,15 +2653,10 @@ impl InferenceState {
             );
         }
 
-        // Wrap the engine in its session Mutex now: every ingest pass takes the
-        // shared `&Mutex<ConversationEngine>` handle (folder scans lock briefly to
-        // mint their sequence; the per-file pool holds the lock only for the quick
-        // create/tombstone ops and releases it across each decode), so the loop
-        // below is uniform across injection types and refresh stays non-blocking.
-        // The substrate handle comes out first. Status reads it without this
-        // mutex, which later callers hold across a scheduler wait.
+        // Every ingest pass takes the shared `&ConversationEngine`, so the loop
+        // below is uniform across injection types. The substrate handle status
+        // reads comes out first.
         let substrate = engine.conversation();
-        let engine = Mutex::new(engine);
 
         // Structure-derived ingestion. The load plan is derived from the declared
         // schema (see `crate::ingest`), not annotated in it: each turn-sink layer
@@ -2737,7 +2703,7 @@ impl InferenceState {
         // from on the first upload. `Raw` is excluded — it
         // only ever prefills records and never decodes, so it has no reasoning
         // to protect and stays on `raw_read::ingest_raw`'s existing construction.
-        let mut ingest_bases: HashMap<String, Mutex<Sequence>> = HashMap::new();
+        let mut ingest_bases: HashMap<String, Sequence> = HashMap::new();
         for il in &ingest_layers {
             if il.mode == IngestMode::Raw {
                 continue;
@@ -2749,8 +2715,6 @@ impl InferenceState {
                 .id_for_group(&il.group)
                 .ok_or_else(|| anyhow::anyhow!("projection schema missing '{}' group", il.group))?;
             let base = engine
-                .lock()
-                .unwrap()
                 .new_conversation_with_projection(
                     &formatted_prompt,
                     proj_builder_refresh.clone(),
@@ -2763,9 +2727,9 @@ impl InferenceState {
                     utility_config(conv_config.clone()),
                 )
                 .map_err(|e| anyhow::anyhow!("{} ingest base create: {e}", il.name))?;
-            ingest_bases.insert(il.name.clone(), Mutex::new(base));
+            ingest_bases.insert(il.name.clone(), base);
         }
-        if load_stopped(&engine.lock().unwrap(), "the ingest bases") {
+        if load_stopped(&engine, "the ingest bases") {
             return Ok(None);
         }
 
@@ -2795,7 +2759,7 @@ impl InferenceState {
         // Ingest conversations are read, never continued: retire the recurrent
         // snapshot tails they kept from before the mark existed, and mark each
         // so no later seal writes another (`crate::ingest_snapshots`).
-        let retired = crate::ingest_snapshots::retire_finished(&engine.lock().unwrap());
+        let retired = crate::ingest_snapshots::retire_finished(&engine);
         if retired > 0 {
             tracing::info!(
                 retired,
@@ -2807,7 +2771,7 @@ impl InferenceState {
                 continue;
             }
             if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
-                engine.lock().unwrap().mark_layer_append_only(layer_id);
+                engine.mark_layer_append_only(layer_id);
             }
             // Retire crashed partials before any pool starts — a half-built chain
             // still carries its `WideQSig`s, so until it is tombstoned it competes
@@ -2838,8 +2802,8 @@ impl InferenceState {
                     IngestMode::Folders => crate::repo_scan::wipe_layer(&engine),
                     IngestMode::Files => crate::code_read::wipe_layer(&engine),
                     IngestMode::Derived => {
-                        let e = engine.lock().unwrap();
-                        let all = crate::layers::run::all_of(&e, &il.name);
+                        let e = &engine;
+                        let all = crate::layers::run::all_of(e, &il.name);
                         let wiped = all
                             .iter()
                             .filter(|tl| e.tombstone_timeline(**tl).is_ok())
@@ -2875,10 +2839,7 @@ impl InferenceState {
             .flat_map(|l| l.groups.iter())
         {
             if let SelectionRule::WorkingSet { share } = group.selection {
-                engine
-                    .lock()
-                    .unwrap()
-                    .set_working_set_share(group.id, share);
+                engine.set_working_set_share(group.id, share);
             }
         }
 
@@ -2899,7 +2860,7 @@ impl InferenceState {
                 .as_ref()
                 .is_none_or(|s| s.unit == crate::layers::UnitKind::File);
             if of_files {
-                engine.lock().unwrap().mark_group_scoped(group);
+                engine.mark_group_scoped(group);
             }
             if disabled_layers.contains(&il.name) {
                 continue;
@@ -2933,7 +2894,7 @@ impl InferenceState {
             ) else {
                 continue;
             };
-            engine.lock().unwrap().set_ingest_sees(layer, groups);
+            engine.set_ingest_sees(layer, groups);
         }
         let layer_sees: HashMap<String, Vec<(String, GroupId)>> = layer_sees
             .into_iter()
@@ -2961,7 +2922,7 @@ impl InferenceState {
             tracing::warn!(
                 "shutdown during startup ingest — draining the engine on the loader thread"
             );
-            if let Err(e) = engine.lock().unwrap().shutdown() {
+            if let Err(e) = engine.shutdown() {
                 tracing::error!("shutdown-during-ingest drain failed: {e}");
             }
             return Ok(None);
@@ -2993,18 +2954,16 @@ impl InferenceState {
         // Every conversation keeps its own branch per repository; one with none
         // yet starts on the repository's base.
         let base_branches = conv_branches::base_branches(&workspace);
-        let seeded =
-            conv_branches::seed_live(&engine.lock().unwrap(), &base_branches, titler_timeline);
+        let seeded = conv_branches::seed_live(&engine, &base_branches, titler_timeline);
         tracing::info!(seeded, "conversations given their base branches");
         let state = Arc::new(Self {
             decoder,
             engine,
             substrate,
-            conversations: Mutex::new(HashMap::new()),
-            conv_used: Mutex::new(HashMap::new()),
+            conversations: Resident::default(),
             tool_modes: Mutex::new(HashMap::new()),
             target_layer: base_conv.target_layer_name(),
-            base_conv: Mutex::new(base_conv),
+            base_conv,
             ingest_bases,
             chain_end: Mutex::new(None),
             titler_tx,
@@ -3059,7 +3018,7 @@ impl InferenceState {
         state.prime(&progress)?;
         // The chain stops between links on a stop; the links it read are
         // committed, and the next start reads only the rest.
-        if load_stopped(&state.engine.lock().unwrap(), "priming") {
+        if load_stopped(&state.engine, "priming") {
             return Ok(None);
         }
         let worker_state = Arc::clone(&state);
@@ -3186,10 +3145,8 @@ impl InferenceState {
             self.branch_ingest
                 .prime(&self.refresh_ctx(), &self.workspace, &passes, progress)?;
         if let Some(end) = end {
-            let base = self.base_conv.lock().unwrap().timeline_id();
+            let base = self.base_conv.timeline_id();
             self.engine
-                .lock()
-                .unwrap()
                 .set_forked_from(base, end)
                 .map_err(|e| anyhow::anyhow!("base_conv priming-chain parent: {e}"))?;
         }
@@ -3319,7 +3276,7 @@ impl InferenceState {
                 GroupSet::weighed(&policy.calibration_layer_weights, FOLD_GROUPS),
                 policy.scan.calibration_gallery_keep,
             );
-            let scanner = self.engine.lock().unwrap().group_scanner();
+            let scanner = self.engine.group_scanner();
             match scanner.learn_chunk_exclusion(
                 group,
                 EXCLUSION_QUESTIONS_PER_FILE,
@@ -3352,7 +3309,7 @@ impl InferenceState {
     /// their own conversation from — see [`InferenceState::ingest_bases`].
     /// `Err` only for a layer name that isn't one of those two modes (a
     /// caller bug: `ingest_bases` is built for every such layer at boot).
-    fn ingest_base(&self, layer_name: &str) -> anyhow::Result<&Mutex<Sequence>> {
+    fn ingest_base(&self, layer_name: &str) -> anyhow::Result<&Sequence> {
         self.ingest_bases
             .get(layer_name)
             .ok_or_else(|| anyhow::anyhow!("no ingest base built for layer '{layer_name}'"))
@@ -3484,12 +3441,7 @@ impl InferenceState {
     pub(crate) fn saved_files(&self, conv_id: &str) -> Arc<RepoFiles> {
         let files = self.tool_host.conversation_files();
         let mirror = Mutex::new(Mirror::unread());
-        conv_overlay::restore(
-            &self.engine.lock().unwrap(),
-            timeline_for(conv_id),
-            &files,
-            &mirror,
-        );
+        conv_overlay::restore(&self.engine, timeline_for(conv_id), &files, &mirror);
         files
     }
 
@@ -3503,16 +3455,11 @@ impl InferenceState {
         conv_id: &str,
         change: impl FnOnce(&RepoFiles) -> T,
     ) -> T {
-        let open = self.conversations.lock().unwrap().get(conv_id).cloned();
+        let open = self.conversations.get(conv_id);
         if let Some(conv) = open {
             let cs = conv.lock_owned().await;
             let out = change(&cs.files);
-            conv_overlay::save(
-                &self.engine.lock().unwrap(),
-                timeline_for(conv_id),
-                &cs.files,
-                &cs.mirror,
-            );
+            conv_overlay::save(&self.engine, timeline_for(conv_id), &cs.files, &cs.mirror);
             return out;
         }
         self.change_saved(conv_id, change)
@@ -3525,12 +3472,12 @@ impl InferenceState {
         let files = self.tool_host.conversation_files();
         let mirror = Mutex::new(Mirror::unread());
         {
-            let engine = self.engine.lock().unwrap();
-            conv_branches::seed(&engine, timeline, &self.base_branches);
-            conv_overlay::restore(&engine, timeline, &files, &mirror);
+            let engine = &self.engine;
+            conv_branches::seed(engine, timeline, &self.base_branches);
+            conv_overlay::restore(engine, timeline, &files, &mirror);
         }
         let out = change(&files);
-        conv_overlay::save(&self.engine.lock().unwrap(), timeline, &files, &mirror);
+        conv_overlay::save(&self.engine, timeline, &files, &mirror);
         out
     }
 
@@ -3573,27 +3520,21 @@ impl InferenceState {
             });
             all_held &= moved.len() == wanted;
             let timeline = timeline_for(&conv_id);
-            let engine = self.engine.lock().unwrap();
-            let mut records: Vec<UploadInfo> = engine
-                .conversation_metadata(timeline)
-                .and_then(|m| m.get("uploads").cloned())
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            for (old, new) in &moved {
-                match records.iter_mut().find(|r| r.id == *old) {
-                    Some(r) => {
-                        r.id = new.id;
-                        r.path = new.path.clone();
-                        r.name = new.name.clone();
+            let written = edit_upload_records(&self.engine, timeline, |records| {
+                for (old, new) in &moved {
+                    match records.iter_mut().find(|r| r.id == *old) {
+                        Some(r) => {
+                            r.id = new.id;
+                            r.path = new.path.clone();
+                            r.name = new.name.clone();
+                        }
+                        None => records.push(new.clone()),
                     }
-                    None => records.push(new.clone()),
                 }
-            }
-            if let Ok(json) = serde_json::to_string(&records) {
-                if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
-                    tracing::warn!(conv_id = %conv_id, "an old upload's record was not moved: {e}");
-                    all_held = false;
-                }
+            });
+            if !written {
+                tracing::warn!(conv_id = %conv_id, "an old upload's record was not moved");
+                all_held = false;
             }
         }
         if !all_held {
@@ -3622,7 +3563,7 @@ impl InferenceState {
     ///
     /// Runs at startup, to retire uploads deleted since the last one.
     pub(crate) fn reconcile_uploaded_files(&self) {
-        let engine = self.engine.lock().unwrap();
+        let engine = &self.engine;
         let held: HashSet<String> = engine
             .conversations_with_metadata_key("uploads")
             .into_iter()
@@ -3962,99 +3903,99 @@ fn run_inference_stream(
         );
 
         let timeline = timeline_for(&conv_id);
-        // Read any stored identity BEFORE locking the conversations map (so the
-        // engine lock is never nested inside the map lock). Only a freshly-forked
-        // conv uses it; a reused conv keeps its in-memory identity.
+        // Only a freshly-forked conv uses the stored identity; a reused conv
+        // keeps its in-memory identity.
         let stored_identity = state
             .engine
-            .lock()
-            .unwrap()
             .conversation_metadata(timeline)
             .and_then(|m| m.get("identity").cloned());
-        // The map and base-conv guards live inside this block, fully released
-        // before the error path's send await below.
+        // What the fork that mints this conversation hands back beside it: the
+        // per-conversation exclusivity guard, and the file stores and mirror
+        // that are restored from its events once it is open.
         //
-        // Set when this request is the one that actually mints the
-        // conversation, so its lineage is recorded once, after the guard drops.
-        let mut minted = false;
-        // A minted conversation's file stores and their mirror, restored from
-        // its events once the map guard is released.
-        let mut minted_files: Option<(Arc<RepoFiles>, Arc<Mutex<Mirror>>)> = None;
-        // The per-conversation exclusivity guard, for the minting branch only
-        // — acquired here, inside the map's still-held lock, BEFORE the
-        // `map.insert` below makes this conv_id findable by any other
-        // request. `try_lock_owned` cannot contend: nothing else can hold a
-        // clone of `arc` before it exists in the map, and it does not exist
-        // in the map until the line after this succeeds. Without this, a
-        // second request for the same, not-yet-resident conv_id could find
-        // the map entry, win the race to lock it, and run a full turn against
-        // a `ConvState` whose files are not yet restored from the substrate
-        // (`upper.base` still unset) — and then have that turn's writes
-        // silently overwritten when this request's own restore, below,
-        // finally replaces the store's contents wholesale. See the note where
-        // this guard is picked back up, and `zend_run_iteration_traps.md`
-        // for the trace that found this.
-        let mut minted_guard: Option<OwnedMutexGuard<ConvState>> = None;
-        state
-            .conv_used
-            .lock()
-            .unwrap()
-            .insert(conv_id.clone(), Instant::now());
-        let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
-            let mut map = state.conversations.lock().unwrap();
-            if let Some(existing) = map.get(&conv_id) {
-                tracing::debug!(conv_id = %conv_id, "reusing existing conv");
-                Ok(Arc::clone(existing))
-            } else {
-                tracing::info!(conv_id = %conv_id, "forking new conv from base");
-                // Fork onto the timeline derived from `conv_id` — a stable
-                // hash, so a daemon restart reconnects the client to the
-                // turns the substrate reload recovered for this conversation
-                // (§16.12). An unknown conv_id simply forks empty.
-                match state.base_conv.lock().unwrap().fork_resuming(timeline) {
-                    Ok(conv) => {
-                        let files = state.tool_host.conversation_files();
-                        let mirror = Arc::new(Mutex::new(Mirror::unread()));
-                        minted_files = Some((Arc::clone(&files), Arc::clone(&mirror)));
-                        let arc = Arc::new(ConvLock::new(ConvState {
-                            conv,
-                            identity: stored_identity.clone(),
-                            files,
-                            mirror,
-                            // An earlier run may have left this conversation's
-                            // sections: the first reconcile looks for them.
-                            journal: Carried::new(false),
-                            promise_marks: Vec::new(),
-                        }));
-                        minted_guard = Some(Arc::clone(&arc).try_lock_owned().expect(
-                            "a freshly minted conversation's lock cannot be held by \
-                                 anything else yet",
-                        ));
-                        map.insert(conv_id.clone(), Arc::clone(&arc));
-                        minted = true;
-                        Ok(arc)
-                    }
-                    Err(e) => Err(anyhow::anyhow!("{e}")),
+        // The guard is taken inside the fork, before `conversations` hands the
+        // new state to anyone: a second request for the same, not-yet-resident
+        // conv_id awaits the fork and then parks on this guard. Without it, that
+        // request could run a full turn against a `ConvState` whose files are
+        // not yet restored from the substrate (`upper.base` still unset) — and
+        // then have that turn's writes silently overwritten when this request's
+        // own restore, below, replaces the store's contents wholesale. See the
+        // note where the guard is picked back up, and
+        // `zend_run_iteration_traps.md` for the trace that found this.
+        type Minted = (
+            OwnedMutexGuard<ConvState>,
+            (Arc<RepoFiles>, Arc<Mutex<Mirror>>),
+        );
+        let (minted_tx, mut minted_rx) = mpsc::unbounded_channel::<Minted>();
+        let forked = state
+            .conversations
+            .get_or_try_init(&conv_id, Instant::now(), || {
+                let (state, minted_tx) = (Arc::clone(&state), minted_tx.clone());
+                let (conv_id, identity) = (conv_id.clone(), stored_identity.clone());
+                async move {
+                    tracing::info!(conv_id = %conv_id, "forking new conv from base");
+                    // Fork onto the timeline derived from `conv_id` — a stable
+                    // hash, so a daemon restart reconnects the client to the
+                    // turns the substrate reload recovered for this
+                    // conversation (§16.12). An unknown conv_id simply forks
+                    // empty. On a blocking thread: the fork is a scheduler
+                    // round-trip.
+                    let fork_state = Arc::clone(&state);
+                    let conv = tokio::task::spawn_blocking(move || {
+                        fork_state.base_conv.fork_resuming(timeline)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("fork task: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let files = state.tool_host.conversation_files();
+                    let mirror = Arc::new(Mutex::new(Mirror::unread()));
+                    let arc = Arc::new(ConvLock::new(ConvState {
+                        conv,
+                        identity,
+                        files: Arc::clone(&files),
+                        mirror: Arc::clone(&mirror),
+                        // An earlier run may have left this conversation's
+                        // sections: the first reconcile looks for them.
+                        journal: Carried::new(false),
+                        promise_marks: Vec::new(),
+                    }));
+                    let guard = Arc::clone(&arc)
+                        .try_lock_owned()
+                        .expect("a conversation nothing has been handed yet is locked by nothing");
+                    let _ = minted_tx.send((guard, (files, mirror)));
+                    Ok::<_, anyhow::Error>(arc)
                 }
+            })
+            .await;
+        // The last fork this request ran is the one it minted (an earlier one
+        // was dropped for an entry that won the key).
+        let mut minted_by_us: Option<Minted> = None;
+        while let Ok(m) = minted_rx.try_recv() {
+            minted_by_us = Some(m);
+        }
+        let (forked, minted) = match forked {
+            Ok((arc, minted)) => {
+                if !minted {
+                    tracing::debug!(conv_id = %conv_id, "reusing existing conv");
+                }
+                (Ok(arc), minted)
             }
+            Err(e) => (Err(e), false),
         };
-        // Record the fork's lineage — AFTER the map guard above is released,
-        // because the engine lock is never nested inside the map lock (see the
-        // ordering note above this block). `base_conv` is itself parented onto
-        // the priming chain, so this one hop is what puts the anchor documents
-        // in front of a brand new conversation — nothing is copied, and the
+        let (minted_guard, minted_files) = match minted_by_us.filter(|_| minted) {
+            Some((guard, files)) => (Some(guard), Some(files)),
+            None => (None, None),
+        };
+        // Record the fork's lineage. `base_conv` is itself parented onto the
+        // priming chain, so this one hop is what puts the anchor documents in
+        // front of a brand new conversation — nothing is copied, and the
         // pointer is persisted metadata, so it survives a restart.
         //
         // Best-effort: a conversation that answers without its inherited
         // context is far better than one that refuses to open.
         if minted {
-            let base_timeline = state.base_conv.lock().unwrap().timeline_id();
-            if let Err(e) = state
-                .engine
-                .lock()
-                .unwrap()
-                .set_forked_from(timeline, base_timeline)
-            {
+            let base_timeline = state.base_conv.timeline_id();
+            if let Err(e) = state.engine.set_forked_from(timeline, base_timeline) {
                 tracing::warn!(
                     conv_id = %conv_id,
                     "recording fork lineage failed, conversation starts unprimed: {e}",
@@ -4073,10 +4014,10 @@ fn run_inference_stream(
         // the per-conversation in-flight exclusivity — a second submit for
         // the same conv_id parks here until this turn loop finishes.
         //
-        // For a minted conversation this is `minted_guard`, already held from
-        // before this conv_id existed in `state.conversations` (see the note
-        // there) — never re-acquired here, only picked back up, so there is
-        // no gap between "findable" and "exclusive" for anything freshly
+        // For a minted conversation this is `minted_guard`, taken inside the
+        // fork before `state.conversations` handed the state to anyone (see the
+        // note there) — never re-acquired here, only picked back up, so there
+        // is no gap between "findable" and "exclusive" for anything freshly
         // minted. A reused conversation had no reason to hold anything
         // earlier, so it acquires its own guard here — which is, as it always
         // was, the first moment this codepath asks for one.
@@ -4130,14 +4071,14 @@ fn run_inference_stream(
         // conversation until the next daemon restart. Idempotent on
         // repeat calls (no-op when the substrate already has it).
         {
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             if let Err(e) = engine.set_conversation_conv_id(timeline, &conv_id) {
                 tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
             }
             // A new conversation — or one unarchived since startup — starts on
             // each repository's base; one already working somewhere keeps it,
             // and then this writes nothing.
-            conv_branches::seed(&engine, timeline, &state.base_branches);
+            conv_branches::seed(engine, timeline, &state.base_branches);
             // A turn is a use: the sidebar lists this conversation first.
             engine.touch_conversation(timeline);
         }
@@ -4146,7 +4087,7 @@ fn run_inference_stream(
             // A conversation built again — after an eviction, after a restart
             // — reads each repository through its own branch, and gets back
             // the changes its tool rounds made there.
-            conv_overlay::restore(&state.engine.lock().unwrap(), timeline, &files, &mirror);
+            conv_overlay::restore(&state.engine, timeline, &files, &mirror);
             // Its working set is in-memory and did not survive. The seeds
             // resolve again on its own branch and enter provenance at the
             // seeding momentum; the locks come back from the marks its turns
@@ -4157,8 +4098,6 @@ fn run_inference_stream(
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     open_state
                         .engine
-                        .lock()
-                        .unwrap()
                         .working_set_clear(timeline);
                     // Scope it first. A seed or a restored lock is admitted only
                     // as the conversation's scope offers it, and the scope is
@@ -4170,7 +4109,7 @@ fn run_inference_stream(
                         .retrieval_scope
                         .apply(&open_state.engine, timeline, &files);
                     let seeded = seed_working_set(&open_state, timeline, &files, &config);
-                    let restored = restore_locks(&open_state.engine.lock().unwrap(), timeline);
+                    let restored = restore_locks(&open_state.engine, timeline);
                     tracing::info!(
                         target: "zend::working_set",
                         timeline = timeline.raw(),
@@ -4201,8 +4140,6 @@ fn run_inference_stream(
             if changed {
                 if let Err(e) = state
                     .engine
-                    .lock()
-                    .unwrap()
                     .set_conversation_metadata(timeline, "identity", &req_id)
                 {
                     tracing::warn!(conv_id = %conv_id, "persist identity failed: {e}");
@@ -4216,7 +4153,7 @@ fn run_inference_stream(
         // `identity` is — otherwise every turn costs a metadata record.
         {
             let dials = dials_metadata(&selection, tools_mode);
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             let stored = engine.conversation_metadata(timeline).unwrap_or_default();
             if dials.iter().any(|(k, v)| stored.get(k) != Some(v)) {
                 if let Err(e) = engine.set_conversation_metadata_many(timeline, &dials) {
@@ -4230,7 +4167,7 @@ fn run_inference_stream(
         // gets full-resolution keys. Set before the first turn's residence is
         // allocated so the hot→warm migration inherits it.
         if lossless_kv {
-            state.engine.lock().unwrap().set_timeline_compression(
+            state.engine.set_timeline_compression(
                 timeline,
                 Some(candle_conversation::substrate::ConvCompression {
                     lossless: true,
@@ -4248,12 +4185,7 @@ fn run_inference_stream(
         // field of the same Label record). The decode runs in the background,
         // batched alongside the main decode. Enqueue is non-blocking: a full
         // queue or in-progress shutdown drops the job (labels are best-effort).
-        let already_labelled = state
-            .engine
-            .lock()
-            .unwrap()
-            .conversation_label_of(timeline)
-            .is_some();
+        let already_labelled = state.engine.conversation_label_of(timeline).is_some();
         if !already_labelled
             && !user_message.is_empty()
             && !state.shutting_down.load(Ordering::Relaxed)
@@ -4328,7 +4260,7 @@ fn run_inference_stream(
             let calls = resumed_calls(&cs.conv, &conv_id, timeline, call_turn);
             let n_calls = calls.len();
             if calls.is_empty() {
-                resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                resume::clear_call_turn(&state.engine, timeline);
                 return;
             }
             // The round is finished over the conversation's own files, under
@@ -4342,12 +4274,7 @@ fn run_inference_stream(
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
-            conv_overlay::save(
-                &state.engine.lock().unwrap(),
-                timeline,
-                &cs.files,
-                &cs.mirror,
-            );
+            conv_overlay::save(&state.engine, timeline, &cs.files, &cs.mirror);
             let results = match dispatched {
                 Ok(results) => results,
                 Err(e) => {
@@ -4356,7 +4283,7 @@ fn run_inference_stream(
                         call_turn,
                         "resume: tool dispatch panicked: {e}",
                     );
-                    resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                    resume::clear_call_turn(&state.engine, timeline);
                     return;
                 }
             };
@@ -4371,7 +4298,7 @@ fn run_inference_stream(
                     n_calls,
                     "resume: the re-issued round produced no response text",
                 );
-                resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+                resume::clear_call_turn(&state.engine, timeline);
                 return;
             }
             // The one window in which the coupling is knowable: the tools have
@@ -4441,12 +4368,7 @@ fn run_inference_stream(
             // come back: its K/V is dead to the compactor, which unlinks the
             // segments holding it, and every further round would reproject turns
             // whose chunks are gone.
-            if state
-                .engine
-                .lock()
-                .unwrap()
-                .is_timeline_tombstoned(timeline)
-            {
+            if state.engine.is_timeline_tombstoned(timeline) {
                 tracing::info!(
                     conv_id = %conv_id,
                     iteration,
@@ -4587,8 +4509,6 @@ fn run_inference_stream(
                         Ok(()) = deletions.changed() => {
                             if state
                                 .engine
-                                .lock()
-                                .unwrap()
                                 .is_timeline_tombstoned(timeline)
                             {
                                 deleted = true;
@@ -4795,7 +4715,7 @@ fn run_inference_stream(
                 );
                 // As a turn that ended without its Done: the scope it was given
                 // goes with it.
-                state.engine.lock().unwrap().clear_retrieval_scope(timeline);
+                state.engine.clear_retrieval_scope(timeline);
                 break;
             }
 
@@ -4831,9 +4751,9 @@ fn run_inference_stream(
                     // The scope it was given goes with it: the next request
                     // sets its own before its first turn.
                     drop(cs);
-                    state.conversations.lock().unwrap().remove(&conv_id);
+                    state.conversations.remove(&conv_id);
                     state.journals.closed(&conv_id);
-                    state.engine.lock().unwrap().clear_retrieval_scope(timeline);
+                    state.engine.clear_retrieval_scope(timeline);
                     return;
                 }
             };
@@ -4920,7 +4840,7 @@ fn run_inference_stream(
             if let (Some(e), Some(turn)) =
                 (&turn_error, resp.seal.as_ref().and_then(|s| s.turn_index))
             {
-                if let Err(err) = state.engine.lock().unwrap().set_conversation_metadata(
+                if let Err(err) = state.engine.set_conversation_metadata(
                     timeline,
                     &turn_error_key(turn),
                     &e.to_string(),
@@ -4953,10 +4873,10 @@ fn run_inference_stream(
                 selected_turns.as_deref(),
                 resp.seal.as_ref().and_then(|s| s.turn_index),
             ) {
-                let engine = state.engine.lock().unwrap();
-                let gone = promises::departed(&engine, timeline, selected, current);
+                let engine = &state.engine;
+                let gone = promises::departed(engine, timeline, selected, current);
                 cs.promise_marks.extend(promises::release(
-                    &engine,
+                    engine,
                     timeline,
                     &gone,
                     config.released_momentum(),
@@ -4982,19 +4902,15 @@ fn run_inference_stream(
             // the round.
             if !is_final {
                 if let Some(call_idx) = resp.seal.as_ref().and_then(|s| s.turn_index) {
-                    resume::mark_call_turn(&state.engine.lock().unwrap(), timeline, call_idx);
+                    resume::mark_call_turn(&state.engine, timeline, call_idx);
                 }
             }
 
             // Group-commit the substrate redo log: the just-sealed turn is
             // now durable on disk, so a crash or restart resumes it intact.
-            //
-            // Through a cloned handle, with the engine lock already released:
-            // the commit waits for the persistence lock, which a segment
-            // compaction holds batch by batch, and holding the engine lock
-            // across that wait stalled every reader of it — `/v1/status` and
-            // the conversation fetch a page reload makes among them.
-            let conversation = state.engine.lock().unwrap().conversation();
+            // The commit waits for the writes queued before it, and nothing
+            // else waits on the commit.
+            let conversation = state.engine.conversation();
             if let Err(e) = conversation.commit_persistence() {
                 tracing::warn!(conv_id = %conv_id, "persistence commit error: {e}");
             }
@@ -5109,12 +5025,7 @@ fn run_inference_stream(
             );
             let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
             // Whatever the round changed outlives this conversation's state.
-            conv_overlay::save(
-                &state.engine.lock().unwrap(),
-                timeline,
-                &cs.files,
-                &cs.mirror,
-            );
+            conv_overlay::save(&state.engine, timeline, &cs.files, &cs.mirror);
             let mut results = match ran {
                 Ok(r) => r,
                 Err(e) => {
@@ -5163,8 +5074,7 @@ fn run_inference_stream(
             }
             // A worker `/mcp` started reads what Claude sent it — a stop, a
             // nudge — at this boundary, never mid-decode.
-            let from_claude =
-                owner_of(&conv_id).map(|_| state.engine.lock().unwrap().conversation().shared());
+            let from_claude = owner_of(&conv_id).map(|_| state.engine.conversation().shared());
             // Claude stopping it closes the loop here, as the cap does. A
             // round the guard or the cap closed too is still Claude's stop,
             // so the worker settles stopped. A round that ran nothing has no
@@ -5251,7 +5161,7 @@ fn run_inference_stream(
         // means "tools are in flight", so it goes now. A crash before this
         // reaches disk is covered by the scan's own check: an entry whose turn
         // arrived is tombstoned rather than acted on.
-        resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+        resume::clear_call_turn(&state.engine, timeline);
 
         // Title generation has already been fired in parallel from
         // `submit_with_sampling` — it doesn't depend on the main
@@ -5280,13 +5190,13 @@ async fn end_written_promises(
             vec![RELEASE_TAG.to_string()]
         }
         Release::Files(files) => {
-            // On the blocking pool, as every release is: the engine lock can be
-            // held by a wave.
+            // On the blocking pool, as every release is: it writes through the
+            // persistence owner, whose flow control can wait for room.
             let state = Arc::clone(state);
             tokio::task::spawn_blocking(move || {
-                let engine = state.engine.lock().unwrap();
-                let held = promises::holding(&engine, timeline, &files);
-                promises::release(&engine, timeline, &held, config.released_momentum())
+                let engine = &state.engine;
+                let held = promises::holding(engine, timeline, &files);
+                promises::release(engine, timeline, &held, config.released_momentum())
             })
             .await
             .unwrap_or_else(|e| {
@@ -5302,11 +5212,7 @@ async fn end_written_promises(
 
 /// The journal `timeline`'s metadata records, if it records one.
 fn journal_record(state: &InferenceState, timeline: TimelineId) -> Option<Kept> {
-    let metadata = state
-        .engine
-        .lock()
-        .unwrap()
-        .conversation_metadata(timeline)?;
+    let metadata = state.engine.conversation_metadata(timeline)?;
     kept_in(&metadata)
 }
 
@@ -5407,7 +5313,7 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
     let Some((owner, thread, name)) = conv_names(conv_id) else {
         return Vec::new();
     };
-    let records = state.engine.lock().unwrap().conversation().shared();
+    let records = state.engine.conversation().shared();
     let mut nearest_first = Vec::new();
     let mut above = names::parent_of(name);
     while !above.is_empty() {
@@ -5550,11 +5456,7 @@ fn begin_journal_draft(
         }
         held.journal().covered_to()
     };
-    let history = state
-        .base_conv
-        .lock()
-        .unwrap()
-        .recovered_history(timeline, false);
+    let history = state.base_conv.recovered_history(timeline, false);
     let newest = match cadence {
         Cadence::Due { newest, .. } => newest,
         Cadence::Now => history
@@ -5563,7 +5465,7 @@ fn begin_journal_draft(
             .max()
             .ok_or(NoDraft::NothingNew)?,
     };
-    let written = state.engine.lock().unwrap().timeline_turn_wall_ms(timeline);
+    let written = state.engine.timeline_turn_wall_ms(timeline);
     let parts = origin::parts_after(&history, &written, covered);
     let span = {
         // Under the same lock as the begin: a draft that started since the
@@ -5614,7 +5516,7 @@ fn journal_desk(
             .map(|spec| serde_json::from_value(spec.clone()))
             .collect::<Result<Vec<ToolSpec>, _>>()?;
         let tree = compile_action_loop(&specs, &env, 1, &close, None)?;
-        let compiled = compiling.engine.lock().unwrap().compile_stencil(&tree)?;
+        let compiled = compiling.engine.compile_stencil(&tree)?;
         Ok(Arc::new(compiled))
     });
     let mut sampling = state.refresh_config.sampling.clone();
@@ -5622,13 +5524,8 @@ fn journal_desk(
     let recording = Arc::clone(state);
     let record: Record = Box::new(
         move |prompt: &JournalPrompt, filed: Option<&Filed>, ceased: &[u64]| {
-            // The engine's lock is held only to take the handles: the
-            // substrate writes below wait on persistence, and every reader of
-            // the engine would wait behind them.
-            let (conversation, shared) = {
-                let engine = recording.engine.lock().unwrap();
-                (engine.conversation(), engine.conversation().shared())
-            };
+            let conversation = recording.engine.conversation();
+            let shared = conversation.shared();
             let text = JournalText::of(shared, timeline);
             if let Some(filed) = filed {
                 text.file(filed)?;
@@ -5681,7 +5578,7 @@ fn cease_journal_text(
 
 /// `timeline`'s journal text: the turns behind its entries.
 fn journal_text(state: &InferenceState, timeline: TimelineId) -> JournalText {
-    let shared = state.engine.lock().unwrap().conversation().shared();
+    let shared = state.engine.conversation().shared();
     JournalText::of(shared, timeline)
 }
 
@@ -5761,7 +5658,7 @@ fn spawn_journal_draft(
 /// A conversation busy in a round is left to that round's own reconcile, which
 /// does the same.
 async fn reconcile_journal_now(state: &Arc<InferenceState>, conv_id: &str, timeline: TimelineId) {
-    let held = state.conversations.lock().unwrap().get(conv_id).cloned();
+    let held = state.conversations.get(conv_id);
     if let Some(conversation) = held {
         if let Ok(mut cs) = conversation.try_lock() {
             let mut unused = SelectionState::default();
@@ -5856,7 +5753,8 @@ fn spawn_journal_folds(
 /// Release `timeline`'s working-set locks into provenance
 /// (`docs/zend_working_set.md` §4.6). The seeds are not touched: they entered
 /// provenance when the conversation opened and fade there like any other file.
-/// On the blocking pool: the engine lock can be held by a wave.
+/// On the blocking pool: it writes through the persistence owner, whose flow
+/// control can wait for room.
 async fn release_working_set(state: &Arc<InferenceState>, timeline: TimelineId) {
     let Some(config) = state.working_set.clone() else {
         return;
@@ -5865,8 +5763,6 @@ async fn release_working_set(state: &Arc<InferenceState>, timeline: TimelineId) 
     if let Err(e) = tokio::task::spawn_blocking(move || {
         state
             .engine
-            .lock()
-            .unwrap()
             .working_set_release(timeline, config.released_momentum());
     })
     .await
@@ -5970,7 +5866,7 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
         // tombstoned timelines. An ingest layer carries no `conv_id` at all and
         // is never listed here to begin with.
         let candidates: Vec<(TimelineId, String)> = {
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             let titler = state.titler_timeline;
             engine
                 .known_conversations()
@@ -5984,14 +5880,11 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
 
         let mut resumed = 0usize;
         for (timeline, conv_id) in candidates {
-            // Decided with the engine lock held and dropped before the decode
-            // below: a `std` guard across an await would make this task
-            // non-`Send`.
             let unfinished = {
-                let engine = state.engine.lock().unwrap();
-                match resume::marked_call_turn(&engine, timeline) {
+                let engine = &state.engine;
+                match resume::marked_call_turn(engine, timeline) {
                     // The round's response turn never arrived — finish it.
-                    Some(call_turn) if !resume::round_answered(&engine, timeline, call_turn) => {
+                    Some(call_turn) if !resume::round_answered(engine, timeline, call_turn) => {
                         Some(call_turn)
                     }
                     // The turn after it is in the substrate, so the round
@@ -6002,7 +5895,7 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                             call_turn,
                             "resume: the round completed before the daemon stopped — entry retired",
                         );
-                        resume::clear_call_turn(&engine, timeline);
+                        resume::clear_call_turn(engine, timeline);
                         None
                     }
                     // No entry, so nothing was mid-round here. A turn killed
@@ -6068,8 +5961,8 @@ async fn run_passthrough(
         // Free the stale conversation's slot before opening another.
         *conv = None;
         let opened = {
-            let engine = state.engine.lock().unwrap();
-            passthrough::open(&engine, state.refresh_config.clone(), &transcript)
+            let engine = &state.engine;
+            passthrough::open(engine, state.refresh_config.clone(), &transcript)
         };
         match opened {
             Ok(live) => *conv = Some(live),
@@ -6179,7 +6072,7 @@ async fn passthrough_turn(
             let event = tokio::select! {
                 event = stream.next() => event,
                 Ok(()) = deletions.changed() => {
-                    if state.engine.lock().unwrap().is_timeline_tombstoned(timeline) {
+                    if state.engine.is_timeline_tombstoned(timeline) {
                         // Deleted under the reply: dropping the handle withdraws it
                         // from the engine, and the turn never seals.
                         tracing::info!(key, "passthrough: conversation deleted mid-reply");
@@ -6248,8 +6141,8 @@ async fn passthrough_turn(
     if let Err(e) = live.seq.finish_turn(handle, &resp) {
         tracing::warn!(key, "passthrough: finish_turn: {e}");
     }
-    // Outside the engine lock — see the dialogue path's commit.
-    let conversation = state.engine.lock().unwrap().conversation();
+    // See the dialogue path's commit.
+    let conversation = state.engine.conversation();
     if let Err(e) = conversation.commit_persistence() {
         tracing::warn!(key, "passthrough: persistence commit: {e}");
     }
@@ -6337,7 +6230,7 @@ async fn generate_one_title(
     // (`Conversation::submit_ingest_summary`) and the tree compressor's probe
     // after it (`SubmitSummaryProbe`) — the titler was the one left behind.
     let triggers = {
-        let en = state.engine.lock().unwrap();
+        let en = &state.engine;
         match en.compile_think_steering() {
             // No `<think>`/`</think>` token in this vocabulary, so there is no
             // block to steer and nothing to bind to; `compile_think_steering`
@@ -6410,11 +6303,7 @@ async fn generate_one_title(
     }
 
     // Write the label via the engine's substrate-shared handle.
-    let result = state
-        .engine
-        .lock()
-        .unwrap()
-        .set_conversation_label(timeline, &title);
+    let result = state.engine.set_conversation_label(timeline, &title);
     match result {
         Ok(()) => tracing::info!("conversation labelled: \"{title}\""),
         Err(e) => tracing::warn!("set_conversation_label failed: {e}"),
@@ -6453,11 +6342,11 @@ pub struct ZendSession {
     /// re-fetch the conversations list.
     started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
-    inference: Arc<RwLock<Option<Arc<InferenceState>>>>,
+    inference: Arc<ArcSwapOption<InferenceState>>,
     /// The substrate, published by the load once its redo log has replayed —
     /// long before the engine is: what the substrate views read while zend is
     /// still loading (`substrate_for_views`).
-    loading_substrate: Arc<RwLock<Option<Conversation>>>,
+    loading_substrate: Arc<OnceLock<Conversation>>,
     /// Handle to the `zend-loader` thread. [`Self::shutdown`] joins it so an
     /// in-progress load has broken its ingest and drained the engine (on the
     /// loader thread, which owns it) before the process exits.
@@ -6506,6 +6395,25 @@ pub struct UploadStats {
     pub ingest_tokens: u64,
     /// Wall-clock of the read_file ingest (phase 2).
     pub ingest_ms: u64,
+}
+
+/// Rewrite `timeline`'s upload records with `edit`, as one step against the
+/// records it holds — two uploads, or an upload and a delete, each landing
+/// whole whatever order they race in. Whether the records were written.
+fn edit_upload_records(
+    engine: &ConversationEngine,
+    timeline: TimelineId,
+    mut edit: impl FnMut(&mut Vec<UploadInfo>),
+) -> bool {
+    engine
+        .update_conversation_metadata(timeline, "uploads", |_, current| {
+            let mut records: Vec<UploadInfo> = current
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            edit(&mut records);
+            serde_json::to_string(&records).ok()
+        })
+        .is_some()
 }
 
 /// One uploaded file recorded against a conversation — the substrate
@@ -6599,8 +6507,8 @@ impl ZendSession {
     /// A handle that scores probes raw on the scheduler's GPU gallery arena
     /// without holding the engine, or `None` until the model is loaded.
     pub fn group_scanner(&self) -> Option<GroupScanner> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let scanner = state.engine.lock().unwrap().group_scanner();
+        let state = self.inference.load_full()?;
+        let scanner = state.engine.group_scanner();
         Some(scanner)
     }
 
@@ -6642,8 +6550,8 @@ impl ZendSession {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Self {
-            inference: Arc::new(RwLock::new(None)),
-            loading_substrate: Arc::new(RwLock::new(None)),
+            inference: Arc::new(ArcSwapOption::empty()),
+            loading_substrate: Arc::new(OnceLock::new()),
             config,
             projection_builder,
             ready_tx,
@@ -6659,7 +6567,7 @@ impl ZendSession {
     }
 
     fn loaded(&self) -> Option<Arc<InferenceState>> {
-        self.inference.read().unwrap().as_ref().map(Arc::clone)
+        self.inference.load_full()
     }
 
     /// What `/mcp` holds in memory.
@@ -6670,10 +6578,10 @@ impl ZendSession {
     /// The substrate the model's conversations live in, for records kept
     /// beside them (`crate::mcp::records`). The load publishes the engine's
     /// conversation handle as soon as the redo log has replayed and keeps it
-    /// for the process's life, so this never takes the engine lock, and a
-    /// caller can read while zend is still loading. `None` before that.
+    /// for the process's life, so a caller can read while zend is still
+    /// loading. `None` before that.
     pub fn shared_substrate(&self) -> Option<SharedSubstrate> {
-        let conv = self.loading_substrate.read().unwrap().clone()?;
+        let conv = self.loading_substrate.get().cloned()?;
         Some(conv.shared())
     }
 
@@ -6764,17 +6672,10 @@ impl ZendSession {
                 }
             })
             .await;
-        let kept: Vec<UploadInfo> = self
-            .conversation_uploads(conv_id)
-            .into_iter()
-            .filter(|u| u.id != id)
-            .collect();
-        let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
-        if let Ok(json) = serde_json::to_string(&kept) {
-            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
-                tracing::warn!(conv_id = %conv_id, "forgetting an upload failed: {e}");
-            }
+        if !edit_upload_records(&state.engine, timeline_for(conv_id), |records| {
+            records.retain(|u| u.id != id)
+        }) {
+            tracing::warn!(conv_id = %conv_id, "forgetting an upload failed");
         }
         Some(true)
     }
@@ -6807,8 +6708,8 @@ impl ZendSession {
     /// progress for it, and records nothing about it. A no-op when the model
     /// isn't loaded (the periodic tick picks the work up once it is).
     pub fn kick_summariser(&self) {
-        if let Some(state) = self.inference.read().unwrap().as_ref() {
-            state.engine.lock().unwrap().trigger_summariser();
+        if let Some(state) = self.inference.load_full() {
+            state.engine.trigger_summariser();
         }
     }
 
@@ -6858,7 +6759,7 @@ impl ZendSession {
     /// — for the `/v1/status` compaction indicator. `None` until the engine is
     /// loaded.
     pub fn substrate_maintenance(&self) -> Option<MaintenanceStatus> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         Some(state.substrate.maintenance_status())
     }
 
@@ -6866,8 +6767,8 @@ impl ZendSession {
     /// prefilled — counted since the engine was built. `None` until the model is
     /// loaded.
     pub fn section_loads(&self) -> Option<SectionLoads> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let state = self.inference.load_full()?;
+        let conv = { state.engine.conversation() };
         Some(conv.section_loads())
     }
 
@@ -6875,8 +6776,8 @@ impl ZendSession {
     /// commands run on. A cloned handle, taken without holding the engine
     /// lock past the clone, so a command never blocks a turn's commits.
     pub fn conversation(&self) -> Option<Conversation> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conv = state.engine.lock().unwrap().conversation();
+        let state = self.inference.load_full()?;
+        let conv = state.engine.conversation();
         Some(conv)
     }
 
@@ -6888,7 +6789,7 @@ impl ZendSession {
         &self,
         progress: &dyn Fn(u64, u64),
     ) -> Option<anyhow::Result<SelfCheckReport>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let mut layers: HashSet<LayerId> = state
             .ingest_layers
             .iter()
@@ -6898,7 +6799,7 @@ impl ZendSession {
         if let Some(dialogue) = state.refresh_builder.id_for_layer("dialogue") {
             layers.insert(dialogue);
         }
-        let base = state.base_conv.lock().unwrap().unsealed_asker();
+        let base = state.base_conv.unsealed_asker();
         Some(self_check::run(
             &state.engine,
             &state.refresh_config,
@@ -6914,30 +6815,23 @@ impl ZendSession {
     /// still loading the substrate the load published once its redo log
     /// replayed, with no titler or target layer built yet. `None` before the
     /// replay has finished.
-    ///
-    /// Takes neither the engine's lock nor a conversation's: the substrate is
-    /// the handle cloned out at build, as `/v1/status` reads it. The engine
-    /// mutex is held across scheduler round trips — every calibration question
-    /// opens its conversation under it — and the views waited 9–16 s for it on
-    /// BlackWorld (2026-10-29); the base conversation's is held across a
-    /// calibration draft's fork.
     fn substrate_for_views(&self) -> Option<(Conversation, Option<TimelineId>, String)> {
-        if let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) {
+        if let Some(state) = self.inference.load_full() {
             return Some((
                 state.substrate.clone(),
                 Some(state.titler_timeline),
                 state.target_layer.clone(),
             ));
         }
-        let conv = self.loading_substrate.read().unwrap().clone()?;
+        let conv = self.loading_substrate.get().cloned()?;
         Some((conv, None, String::new()))
     }
 
     /// `GET /v1/substrate` — a structural snapshot of the live substrate for the
     /// viewer: on-disk size, live counts, and the projection hierarchy (layers →
     /// conversations). Reads the shared `Substrate` through a cloned
-    /// `Conversation` handle (engine lock released immediately, only the
-    /// substrate read guard held for the walk), never a rebuild from the log.
+    /// `Conversation` handle (one version of it, held for the walk), never a
+    /// rebuild from the log.
     /// Answers while zend is still loading, once its substrate has replayed.
     pub fn substrate_overview(&self) -> Option<SubstrateOverview> {
         let (conv, titler, target_layer) = self.substrate_for_views()?;
@@ -7023,8 +6917,8 @@ impl ZendSession {
         if !known {
             return None;
         }
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let state = self.inference.load_full()?;
+        let conv = { state.engine.conversation() };
         Some(conv.toggle_layer(name))
     }
 
@@ -7185,7 +7079,10 @@ impl ZendSession {
             layer,
             group,
             total_tokens: s.timeline_token_total(tl),
-            custom: s.custom_of(tl).cloned().unwrap_or_default(),
+            custom: s
+                .custom_of(tl)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default(),
             inherited_chain: s
                 .inherited_chain(tl)
                 .into_iter()
@@ -7210,13 +7107,9 @@ impl ZendSession {
     /// nothing here survives a restart. See
     /// `ConversationEngine::last_selection_diagnostics`.
     pub fn substrate_selection(&self, tl_raw: u64) -> Option<SelectionView> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let tl = projection::TimelineId::from_raw(tl_raw)?;
-        let diag = state
-            .engine
-            .lock()
-            .unwrap()
-            .last_selection_diagnostics(tl)?;
+        let diag = state.engine.last_selection_diagnostics(tl)?;
         Some(SelectionView {
             selected: diag
                 .selected_nodes
@@ -7239,7 +7132,7 @@ impl ZendSession {
     /// belief mutation), then resolves the selected turns + scored section members
     /// into score-sorted tiles. `None` until the model is loaded.
     pub fn substrate_project(&self, text: &str) -> Option<ProjectView> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         if text.trim().is_empty() {
             return Some(ProjectView {
                 query_tokens: 0,
@@ -7252,7 +7145,7 @@ impl ZendSession {
         // and scores it — writing NOTHING to the substrate. Snapshot the handles
         // under a brief `base_conv` lock, then run the GPU-bound probe UNLOCKED so
         // the fork source isn't held across a full turn round-trip.
-        let ctx = { state.base_conv.lock().unwrap().probe_ctx() };
+        let ctx = { state.base_conv.probe_ctx() };
         let (event, query_tokens) = match ctx.probe(text) {
             Ok(r) => r,
             Err(e) => {
@@ -7265,7 +7158,7 @@ impl ZendSession {
         };
 
         // Resolve tile labels + bodies from the substrate (read lock only).
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let conv = { state.engine.conversation() };
         let read = conv.read();
         let s = &*read;
 
@@ -7444,14 +7337,14 @@ impl ZendSession {
             return Vec::new();
         }
 
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return Vec::new();
         };
-        // Polled every few seconds by every open tab, under the engine lock, so
-        // it reads what each listed conversation holds and nothing more: a turn
+        // Polled every few seconds by every open tab, so it reads what each
+        // listed conversation holds and nothing more: a turn
         // count is its own timeline's, never a walk of every turn the substrate
         // holds (the ingest layers are most of them).
-        let engine = state.engine.lock().unwrap();
+        let engine = &state.engine;
         let titler_timeline = state.titler_timeline;
         let known = engine.known_conversations();
         let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
@@ -7509,8 +7402,8 @@ impl ZendSession {
     /// yet.
     pub fn archive_conversation(&self, conv_id: &str) -> Option<EngineResult<()>> {
         let (state, timeline, distilled) = self.distill_archived(conv_id)?;
-        let engine = state.engine.lock().unwrap();
-        Some(distilled.and_then(|()| cease_journal_text(&engine, timeline)))
+        let engine = &state.engine;
+        Some(distilled.and_then(|()| cease_journal_text(engine, timeline)))
     }
 
     /// Archive a worker `/mcp` started (`crate::mcp::workers`): distilled like
@@ -7530,7 +7423,7 @@ impl ZendSession {
     /// model isn't loaded.
     pub fn set_decode_band(&self, conv_id: &str, band: DecodePriority) -> Option<EngineResult<()>> {
         let state = self.loaded()?;
-        let engine = state.engine.lock().unwrap();
+        let engine = &state.engine;
         Some(engine.set_conversation_metadata(
             conversation_timeline(conv_id),
             DecodePriority::METADATA_KEY,
@@ -7544,10 +7437,10 @@ impl ZendSession {
         &self,
         conv_id: &str,
     ) -> Option<(Arc<InferenceState>, TimelineId, EngineResult<()>)> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         let distilled = {
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             engine
                 .set_conversation_archived(timeline, true)
                 .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
@@ -7563,16 +7456,16 @@ impl ZendSession {
     /// drops the conversation from the in-RAM map so it vanishes from the sidebar
     /// at once. Returns `None` when the model isn't loaded yet.
     pub fn tombstone_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         let result = {
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             engine
                 .tombstone_timeline(timeline)
-                .and_then(|()| cease_journal_text(&engine, timeline))
+                .and_then(|()| cease_journal_text(engine, timeline))
         };
         if result.is_ok() {
-            state.conversations.lock().unwrap().remove(conv_id);
+            state.conversations.remove(conv_id);
             state.journals.forget(conv_id);
             // After the tombstone, so a turn woken by it finds its timeline
             // tombstoned.
@@ -7586,7 +7479,7 @@ impl ZendSession {
     /// A conversation that has written nothing has an empty one. `None` while
     /// the model is not loaded.
     pub fn journal(&self, conv_id: &str) -> Option<Value> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         let view = match state.journals.get(conv_id) {
             Some(journal) => {
@@ -7607,7 +7500,7 @@ impl ZendSession {
     /// Answers the stretch it covers; how it ends shows in the journal's
     /// drafts. `None` while the model is not loaded.
     pub fn journal_draft(&self, conv_id: &str) -> Option<Result<Value, NoDraft>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         Some(
             begin_journal_draft(&state, conv_id, timeline, Cadence::Now).map(|span| {
@@ -7631,7 +7524,7 @@ impl ZendSession {
         from: usize,
         lines: usize,
     ) -> Option<Result<Page, Miss>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         Some(journal_text(&state, timeline).read(entry, from, lines))
     }
@@ -7646,7 +7539,7 @@ impl ZendSession {
         entry: Option<u64>,
         max: usize,
     ) -> Option<Result<Hits, Miss>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         Some(journal_text(&state, timeline).grep(pattern, entry, max))
     }
@@ -7656,8 +7549,8 @@ impl ZendSession {
     /// is not open on this member, or does not reproject; `None` while the model
     /// is not loaded. Waits for a round in flight to end.
     pub async fn prompt_dump(&self, conv_id: &str) -> Option<Option<PromptDump>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let held = state.conversations.lock().unwrap().get(conv_id).cloned();
+        let state = self.inference.load_full()?;
+        let held = state.conversations.get(conv_id);
         let Some(conversation) = held else {
             return Some(None);
         };
@@ -7675,7 +7568,7 @@ impl ZendSession {
         conv_id: &str,
         entry: u64,
     ) -> Option<anyhow::Result<Option<Value>>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         let journal = state
             .journals
@@ -7688,7 +7581,7 @@ impl ZendSession {
             held.journal().prompt(held.style())
         };
         let recorded = {
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             engine
                 .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
                 .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
@@ -7714,9 +7607,9 @@ impl ZendSession {
     /// `None` when the model is not loaded or `raw` is not a valid timeline id
     /// (zero) — the same shape the sibling routes return.
     pub fn tombstone_timeline_raw(&self, raw: u64) -> Option<candle_conversation::Result<()>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = projection::TimelineId::from_raw(raw)?;
-        let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
+        let result = state.engine.tombstone_timeline(timeline);
         Some(result)
     }
 
@@ -7733,8 +7626,8 @@ impl ZendSession {
     ///
     /// `None` when the model is not loaded.
     pub fn retire_system_prompt(&self) -> Option<candle::Result<SystemPromptRetired>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let state = self.inference.load_full()?;
+        let conv = { state.engine.conversation() };
         let summaries = ToolMode::ALL
             .into_iter()
             .filter_map(tool_summary_section)
@@ -7775,10 +7668,10 @@ impl ZendSession {
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
     pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<RecoveredMessage>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         if let Some(timeline) = passthrough::timeline_of(conv_id) {
             // A passthrough conversation's turns are the client's exchanges.
-            let engine = state.engine.lock().unwrap();
+            let engine = &state.engine;
             // One exchange per turn, in turn order.
             let bubble = |role, text, turn: usize| RecoveredMessage {
                 role,
@@ -7789,7 +7682,7 @@ impl ZendSession {
                 tool_tokens: Vec::new(),
             };
             return Some(
-                passthrough::held_history(&engine, timeline)
+                passthrough::held_history(engine, timeline)
                     .into_iter()
                     .enumerate()
                     .flat_map(|(turn, e)| {
@@ -7816,27 +7709,21 @@ impl ZendSession {
     /// Why each of the conversation's failed turns stopped, by the turn's
     /// substrate index — recorded as the turn sealed (`turn_error_key`).
     pub fn conversation_turn_errors(&self, conv_id: &str) -> BTreeMap<u32, String> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return BTreeMap::new();
         };
         let timeline = conversation_timeline(conv_id);
         let meta = state
             .engine
-            .lock()
-            .unwrap()
             .conversation_metadata(timeline)
             .unwrap_or_default();
         turn_errors(&meta)
     }
 
     pub fn conversation_dials(&self, conv_id: &str) -> Option<ConversationDials> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
-        let meta = state
-            .engine
-            .lock()
-            .unwrap()
-            .conversation_metadata(timeline)?;
+        let meta = state.engine.conversation_metadata(timeline)?;
         let level = |key: &str, options: &[&str]| -> Option<u8> {
             let id = meta.get(key)?;
             options.iter().position(|o| o == id).map(|i| i as u8)
@@ -7879,13 +7766,9 @@ impl ZendSession {
     /// upload gave it. `None` when the model isn't loaded or nothing has
     /// labelled the conversation yet.
     pub fn conversation_label(&self, conv_id: &str) -> Option<String> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
-        let label = state
-            .engine
-            .lock()
-            .unwrap()
-            .conversation_label_of(timeline)?;
+        let label = state.engine.conversation_label_of(timeline)?;
         (!label.is_empty()).then_some(label)
     }
 
@@ -7893,11 +7776,11 @@ impl ZendSession {
     /// name — see [`conv_branches`]. Empty when the model isn't loaded or the
     /// conversation is unknown.
     pub fn conversation_branches(&self, conv_id: &str) -> BTreeMap<String, String> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return BTreeMap::new();
         };
         let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
-        let state = state.engine.lock().unwrap().conversation_state(timeline);
+        let state = state.engine.conversation_state(timeline);
         state.map(|s| s.branches).unwrap_or_default()
     }
 
@@ -7912,11 +7795,11 @@ impl ZendSession {
         if files.is_empty() {
             return;
         }
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return;
         };
         let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
+        let engine = &state.engine;
         // Register the conv_id so an upload-only conversation (one started by
         // dropping a file on the home page, which may never submit a chat turn)
         // is a *listed* conversation: `known_conversations` — and thus the
@@ -7928,7 +7811,7 @@ impl ZendSession {
         if let Err(e) = engine.set_conversation_conv_id(timeline, conv_id) {
             tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
         }
-        conv_branches::seed(&engine, timeline, &state.base_branches);
+        conv_branches::seed(engine, timeline, &state.base_branches);
         engine.touch_conversation(timeline);
         // Give it a provisional label from the file(s) if it has none yet, so it
         // shows a sensible name in the sidebar before any chat turn — the titler
@@ -7951,24 +7834,18 @@ impl ZendSession {
         // runs between turns (the user drops a file, then sends), so every
         // prior turn is sealed and visible in `recovered_history`.
         let turn_index = {
-            let base = state.base_conv.lock().unwrap();
+            let base = &state.base_conv;
             base.recovered_history(timeline, false).len() as u32
         };
-        // Read the current uploads array, append the new files, write it back.
-        let mut arr: Vec<UploadInfo> = engine
-            .conversation_metadata(timeline)
-            .and_then(|m| m.get("uploads").cloned())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        for f in files {
-            let mut f = f.clone();
-            f.turn_index = turn_index;
-            arr.push(f);
-        }
-        if let Ok(json) = serde_json::to_string(&arr) {
-            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
-                tracing::warn!(conv_id = %conv_id, "record_uploads write failed: {e}");
+        // Append the new files to the uploads array it holds.
+        if !edit_upload_records(engine, timeline, |records| {
+            for f in files {
+                let mut f = f.clone();
+                f.turn_index = turn_index;
+                records.push(f);
             }
+        }) {
+            tracing::warn!(conv_id = %conv_id, "record_uploads write failed");
         }
     }
 
@@ -7981,25 +7858,17 @@ impl ZendSession {
         if ids.is_empty() {
             return;
         }
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return;
         };
-        let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
-        let mut arr: Vec<UploadInfo> = engine
-            .conversation_metadata(timeline)
-            .and_then(|m| m.get("uploads").cloned())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        for entry in &mut arr {
-            if ids.contains(&entry.id) {
-                entry.stats = Some(stats.clone());
+        if !edit_upload_records(&state.engine, timeline_for(conv_id), |records| {
+            for entry in records.iter_mut() {
+                if ids.contains(&entry.id) {
+                    entry.stats = Some(stats.clone());
+                }
             }
-        }
-        if let Ok(json) = serde_json::to_string(&arr) {
-            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
-                tracing::warn!(conv_id = %conv_id, "record_upload_stats write failed: {e}");
-            }
+        }) {
+            tracing::warn!(conv_id = %conv_id, "record_upload_stats write failed");
         }
     }
 
@@ -8007,11 +7876,11 @@ impl ZendSession {
     /// backs both the files pane and the inline history tiles on resume.
     /// Empty when the model isn't loaded or nothing was uploaded.
     pub fn conversation_uploads(&self, conv_id: &str) -> Vec<UploadInfo> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return Vec::new();
         };
         let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
+        let engine = &state.engine;
         engine
             .conversation_metadata(timeline)
             .and_then(|m| m.get("uploads").cloned())
@@ -8023,12 +7892,12 @@ impl ZendSession {
     /// point light, without the selection and spine only the projection panel
     /// reads, under a fresh display id. One bucket per assistant turn, in order.
     pub fn conversation_spans(&self, conv_id: &str) -> Vec<Vec<ProjectionSpanOut>> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return Vec::new();
         };
         let timeline = timeline_for(conv_id);
         let raw = {
-            let base = state.base_conv.lock().unwrap();
+            let base = &state.base_conv;
             base.recovered_projection_points(timeline)
         };
         raw.into_iter()
@@ -8051,12 +7920,12 @@ impl ZendSession {
     /// browser reload. Empty when the conversation isn't resident (e.g. it was
     /// recovered from disk but hasn't been chatted with since startup).
     pub fn conversation_projections(&self, conv_id: &str) -> Vec<Vec<ProjectionEventOut>> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.inference.load_full() else {
             return Vec::new();
         };
         let timeline = timeline_for(conv_id);
         let raw = {
-            let base = state.base_conv.lock().unwrap();
+            let base = &state.base_conv;
             base.recovered_projection_events(timeline)
         };
         // Re-attach the display id/region/step the wire shape needs (these are
@@ -8080,9 +7949,9 @@ impl ZendSession {
     /// demand, never stored in the projection event. The schema is workspace-wide;
     /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
     pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let state = self.inference.load_full()?;
         let mut out = {
-            let base = state.base_conv.lock().unwrap();
+            let base = &state.base_conv;
             base.section_contents()
         };
         // The `tools` collection's summary section is generated at runtime (not a
@@ -8113,8 +7982,8 @@ impl ZendSession {
 
     /// The target (dialogue) layer's name, for the panel's conversation prefix.
     pub fn target_layer_name(&self) -> Option<String> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
+        let state = self.inference.load_full()?;
+        let base = &state.base_conv;
         Some(base.target_layer_name())
     }
 
@@ -8128,8 +7997,8 @@ impl ZendSession {
         timeline: candle_conversation::projection::TimelineId,
         index: u32,
     ) -> Option<(String, String)> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
+        let state = self.inference.load_full()?;
+        let base = &state.base_conv;
         base.resolve_turn_text(timeline, index)
     }
 
@@ -8141,8 +8010,8 @@ impl ZendSession {
         timeline: candle_conversation::projection::TimelineId,
         index: u32,
     ) -> Option<String> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
+        let state = self.inference.load_full()?;
+        let base = &state.base_conv;
         base.resolve_turn_full_text(timeline, index)
     }
 
@@ -8154,16 +8023,16 @@ impl ZendSession {
         timeline: candle_conversation::projection::TimelineId,
         index: u32,
     ) -> Option<candle_conversation::turn_layout::TurnLayout> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
+        let state = self.inference.load_full()?;
+        let base = &state.base_conv;
         base.turn_layout(timeline, index)
     }
 
     /// The dialect's framing markers — the glue wrapped around the system prompt
     /// and each turn. The projection panel renders these between sections/turns.
     pub fn glue_markers(&self) -> Option<GlueMarkers> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
+        let state = self.inference.load_full()?;
+        let base = &state.base_conv;
         Some(base.glue_markers())
     }
 
@@ -8315,7 +8184,7 @@ impl ZendSession {
                     parts,
                 ) {
                     Ok(Some(state)) => {
-                        *slot.write().unwrap() = Some(Arc::clone(&state));
+                        slot.store(Some(Arc::clone(&state)));
                         tracing::info!("inference engine ready");
                         // A stop asked since the load's last boundary: the engine
                         // is published, so `ZendSession::shutdown` drains it —
@@ -8331,18 +8200,14 @@ impl ZendSession {
                         // levels — and no live turn competes with the warm-up.
                         load_progress.set_step(LoadStep::Normalizing);
                         let schema = state.refresh_builder.schema().clone();
-                        state
-                            .engine
-                            .lock()
-                            .unwrap()
-                            .warm_collection_normalization(&schema);
+                        state.engine.warm_collection_normalization(&schema);
                         if crate::ingest_cancel::cancelled() {
                             ready_tx.send(true).ok();
                             return;
                         }
                         load_progress.set_step(LoadStep::Preloading);
                         let t_preload = Instant::now();
-                        let preload = state.engine.lock().unwrap().preload_galleries(&schema);
+                        let preload = state.engine.preload_galleries(&schema);
                         tracing::info!(
                             turns = preload.turns,
                             resident = preload.resident,
@@ -8409,13 +8274,10 @@ impl ZendSession {
                                     // freezes the scheduler). Covers the
                                     // first-run ingest and every restart's
                                     // reconcile. It scores on the scheduler's GPU
-                                    // arena a slice of files at a time; the
-                                    // warmer is a handle, so the engine lock is
-                                    // not held while it runs. The tool catalog's
-                                    // own levels are already warmed by the load's
-                                    // `Normalizing` step, before ready.
-                                    let warmer =
-                                        { warm_state.engine.lock().unwrap().ingest_warmer() };
+                                    // arena a slice of files at a time. The tool
+                                    // catalog's own levels are already warmed by
+                                    // the load's `Normalizing` step, before ready.
+                                    let warmer = warm_state.engine.ingest_warmer();
                                     let schema = warm_state.refresh_builder.schema().clone();
                                     warmer.run(&schema);
                                 });
@@ -8573,8 +8435,7 @@ impl ZendSession {
         //    wakes a worker being stopped, and no import writes past the drain;
         //    the round in flight finishes first. A load that never
         //    published its state dropped its repositories, which stops theirs.
-        let followed: Option<Arc<InferenceState>> =
-            { self.inference.read().unwrap().as_ref().map(Arc::clone) };
+        let followed = self.inference.load_full();
         if let Some(state) = followed {
             let _ = tokio::task::spawn_blocking(move || {
                 if let Some(repositories) = state.repositories.as_ref() {
@@ -8603,8 +8464,7 @@ impl ZendSession {
         //    (step 2), `inference` is still `None` and there is nothing left to do.
         //    Exactly-once: the drain runs either on the loader thread OR here, never
         //    both.
-        let state: Option<Arc<InferenceState>> =
-            { self.inference.read().unwrap().as_ref().map(Arc::clone) };
+        let state = self.inference.load_full();
         let Some(state) = state else {
             tracing::info!(
                 "shutdown: loader drained mid-ingest (or model never loaded) — nothing more to persist"
@@ -8621,7 +8481,7 @@ impl ZendSession {
             // Passthrough conversations hold scheduler slots; free them while
             // the scheduler still answers.
             engine_state.passthrough.clear();
-            let engine = engine_state.engine.lock().unwrap();
+            let engine = &engine_state.engine;
             match engine.commit_persistence() {
                 Ok(()) => tracing::info!("shutdown: substrate committed"),
                 Err(e) => tracing::error!("shutdown: commit failed: {e}"),
@@ -8670,7 +8530,7 @@ impl ZendSession {
             loop {
                 // Loaded, or the load is over without an engine (a stop): the
                 // read below tells the two apart.
-                let loaded = inference.read().unwrap().is_some();
+                let loaded = inference.load().is_some();
                 if loaded || *ready_rx.borrow_and_update() {
                     break;
                 }
@@ -8678,7 +8538,7 @@ impl ZendSession {
                     return;
                 }
             }
-            let state = { inference.read().unwrap().as_ref().map(Arc::clone) };
+            let state = { inference.load_full() };
             let Some(state) = state else {
                 return;
             };
@@ -8762,7 +8622,7 @@ impl ZendSession {
 
         tokio::spawn(async move {
             // Phase 1 — emit status updates while model is loading.
-            if inference.read().unwrap().is_none() {
+            if inference.load().is_none() {
                 let cur = status_rx.borrow_and_update().clone();
                 if !cur.is_empty() && tx.send(Ok(StreamItem::Status(cur))).await.is_err() {
                     return;
@@ -8800,8 +8660,7 @@ impl ZendSession {
             // parallel — all in the right order so the in-RAM substrate
             // sees both the timeline registration and the conv_id by
             // the time the next sidebar refresh runs.
-            let state: Option<Arc<InferenceState>> =
-                { inference.read().unwrap().as_ref().map(Arc::clone) };
+            let state = inference.load_full();
             if let Some(state) = state {
                 let history_before = dialogue_history(&state, &conv_id).len();
                 // The conversation stays this member's until the turn's last
@@ -8923,7 +8782,7 @@ fn layer_totals(
 /// reading by its path, a folder's by its folder, a layer's unit by its
 /// subject — the file or folder it analyses. `None` for a conversation that is
 /// no committed unit.
-fn committed_unit_key(meta: &BTreeMap<String, String>) -> Option<&String> {
+fn committed_unit_key(meta: &POrdMap<String, String>) -> Option<&String> {
     meta.get(PATH_KEY)
         .or_else(|| meta.get(DIR_KEY))
         .or_else(|| meta.get(SUBJECT_KEY))
@@ -9648,11 +9507,11 @@ mod turn_cap_tests {
 
 #[cfg(test)]
 mod unit_key_tests {
-    use std::collections::BTreeMap;
+    use candle_conversation::substrate::pcoll::POrdMap;
 
     use super::committed_unit_key;
 
-    fn meta(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn meta(pairs: &[(&str, &str)]) -> POrdMap<String, String> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

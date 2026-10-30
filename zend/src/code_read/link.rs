@@ -27,7 +27,7 @@ use crate::refresh_ctx::RefreshContext;
 /// is given them.
 pub(crate) fn ingest_link(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     file: &FileJob,
     live: &HashSet<String>,
     binary: &Mutex<HashSet<String>>,
@@ -35,9 +35,11 @@ pub(crate) fn ingest_link(
 ) -> anyhow::Result<Option<TimelineId>> {
     let key = file.key();
     if let Some(held) = holder(ctx.engine, &key) {
-        repoint(&ctx.engine.lock().unwrap(), held, parent)
-            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", file.path))?;
-        return Ok(Some(held));
+        if repoint(ctx.engine, held, parent)
+            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", file.path))?
+        {
+            return Ok(Some(held));
+        }
     }
     let link_ctx = RefreshContext {
         chain_end: parent,
@@ -75,9 +77,9 @@ pub(crate) fn ingest_link(
 }
 
 /// The conversation holding the file key `key` whose reading finished.
-fn holder(engine: &Mutex<ConversationEngine>, key: &str) -> Option<TimelineId> {
-    let e = engine.lock().unwrap();
-    e.find_conversations_by_metadata(CONTENT_KEY, key)
+fn holder(engine: &ConversationEngine, key: &str) -> Option<TimelineId> {
+    engine
+        .find_conversations_by_metadata(CONTENT_KEY, key)
         .into_iter()
-        .find(|&tl| chain_finished(&e, tl))
+        .find(|&tl| chain_finished(engine, tl))
 }

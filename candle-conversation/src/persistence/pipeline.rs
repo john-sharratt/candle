@@ -51,11 +51,9 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
 use super::cold_load::ColdLoadStager;
+use super::cold_source::ColdSource;
 use super::record::{decode_record, ChunkPayload};
-use super::segment::SegmentId;
-use super::SubstratePersistence;
 use crate::scheduler::profile;
-use candle::direct_io::DirectFile;
 
 /// Cross-thread raw pointer to the pinned scratch's base. Bundled into
 /// a `Send + Sync` wrapper because the bare `*mut u8` would block the
@@ -226,8 +224,7 @@ pub struct PipelineStats {
 /// chunk batch has completed and the pinned scratch is free for reuse
 /// by the next batch).
 pub fn run_pipeline(
-    persistence: &SubstratePersistence,
-    sealed: &std::collections::HashMap<SegmentId, Arc<DirectFile>>,
+    source: &ColdSource,
     backings: &[ChunkedKvBacking],
     device: &Device,
     chunk_batch: &ChunkBatch,
@@ -297,7 +294,7 @@ pub fn run_pipeline(
     drop(work_tx);
 
     let t_total = Instant::now();
-    let n_readers = persistence.active_direct_file().n_handles();
+    let n_readers = source.readers();
 
     // Shared "wall-clock time of the latest read completion across all
     // 16 reader threads". Each reader does `fetch_max` after sending
@@ -317,25 +314,19 @@ pub fn run_pipeline(
             let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
             s.spawn(move || {
                 while let Ok(work) = work_rx.recv() {
-                    let direct = match work.source {
-                        SourceLog::Active => persistence.active_direct_file(),
-                        SourceLog::Sealed(id) => match sealed.get(&id) {
-                            Some(d) => d.as_ref(),
-                            // Every `Sealed(id)` in the plan gets a handle
-                            // opened up front by `load_stream_into_hot`; a
-                            // miss is a bug, but propagate it as a read
-                            // error rather than panicking the reader thread.
-                            None => {
-                                let _ = done_tx.send(UnitDone {
-                                    unit_idx: work.unit_idx,
-                                    error: Some(candle::Error::Msg(format!(
-                                        "pipeline: no open handle for sealed segment {id}"
-                                    ))),
-                                });
-                                continue;
-                            }
-                        },
-                        SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
+                    // Every source in the plan gets a handle when the plan is
+                    // made (`SubstratePersistence::cold_read`); a miss is a
+                    // bug, but propagate it as a read error rather than
+                    // panicking the reader thread.
+                    let Some(direct) = source.direct(work.source) else {
+                        let _ = done_tx.send(UnitDone {
+                            unit_idx: work.unit_idx,
+                            error: Some(candle::Error::Msg(format!(
+                                "pipeline: no open handle for {:?}",
+                                work.source
+                            ))),
+                        });
+                        continue;
                     };
                     // SAFETY: per-unit dest regions are disjoint
                     // (units are byte ranges, not overlapping). No

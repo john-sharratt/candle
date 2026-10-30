@@ -28,7 +28,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use candle::Device;
@@ -245,41 +245,34 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // ingestion", exactly mirroring `dialogue` above.
     let repo_map_layer = proj_builder_repo_map.id_for_layer("repo_map").unwrap();
     let repo_map_group = proj_builder_repo_map.id_for_group("structure").unwrap();
-    let repo_map_base = Mutex::new(
-        engine
-            .new_conversation_with_projection(
-                &formatted_prompt,
-                proj_builder_repo_map.clone(),
-                repo_map_layer,
-                repo_map_group,
-                conv_config.clone(),
-            )
-            .expect("new repo_map ingest base"),
-    );
+    let repo_map_base = engine
+        .new_conversation_with_projection(
+            &formatted_prompt,
+            proj_builder_repo_map.clone(),
+            repo_map_layer,
+            repo_map_group,
+            conv_config.clone(),
+        )
+        .expect("new repo_map ingest base");
     let code_read_layer = proj_builder_code_read.id_for_layer("code_reading").unwrap();
     let code_read_group = proj_builder_code_read.id_for_group("scopes").unwrap();
-    let code_read_base = Mutex::new(
-        engine
-            .new_conversation_with_projection(
-                &formatted_prompt,
-                proj_builder_code_read.clone(),
-                code_read_layer,
-                code_read_group,
-                conv_config.clone(),
-            )
-            .expect("new code_reading ingest base"),
-    );
+    let code_read_base = engine
+        .new_conversation_with_projection(
+            &formatted_prompt,
+            proj_builder_code_read.clone(),
+            code_read_layer,
+            code_read_group,
+            conv_config.clone(),
+        )
+        .expect("new code_reading ingest base");
 
     let progress = Arc::new(LoadProgress::new());
-    // The pass locks the engine for its brief create/tombstone ops, so it
-    // takes a `&Mutex<ConversationEngine>` via `RefreshContext`. Mirror the
-    // daemon: both layers' groups scoped, one pass of the branch ingest over
-    // both layers — exactly as the worker's first pass runs it on a fresh
-    // install — then the dialogue's scope set from its own files before it
-    // is asked anything.
+    // The pass takes the engine via `RefreshContext`. Mirror the daemon: both
+    // layers' groups scoped, one pass of the branch ingest over both layers —
+    // exactly as the worker's first pass runs it on a fresh install — then the
+    // dialogue's scope set from its own files before it is asked anything.
     engine.mark_group_scoped(repo_map_group);
     engine.mark_group_scoped(code_read_group);
-    let engine = Mutex::new(engine);
     let scope = IngestScope::new("", None);
     let retrieval =
         RetrievalScope::new(Some(code_read_group), Some((repo_map_group, scope.clone())));
@@ -332,7 +325,6 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         dialogue.timeline_id(),
         &tool_host.conversation_files(),
     );
-    let engine = engine.into_inner().expect("engine mutex not poisoned");
 
     LoadedDaemon { engine, dialogue }
 }

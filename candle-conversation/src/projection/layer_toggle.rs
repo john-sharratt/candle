@@ -24,7 +24,7 @@ impl Conversation {
     /// Flip the diagnostic toggle on layer `name` for this substrate; returns
     /// the new state (`true` = now excluded from projection assembly).
     pub fn toggle_layer(&self, name: &str) -> bool {
-        self.write().toggle_layer(name)
+        self.update(|s| s.toggle_layer(name))
     }
 
     /// Whether layer `name` is toggled out on this substrate.

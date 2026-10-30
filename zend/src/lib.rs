@@ -56,6 +56,7 @@ pub mod repeat_guard;
 pub mod repo_ads;
 pub mod repo_path;
 pub mod repo_scan;
+pub mod resident;
 pub mod response_section;
 pub mod resume;
 pub mod retrieval_scope;

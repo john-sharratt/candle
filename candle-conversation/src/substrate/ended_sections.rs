@@ -13,16 +13,16 @@
 //! starts the stream again — the append-order rule every unstamped record
 //! keeps.
 
-use std::collections::BTreeSet;
-
 use crate::persistence::record::SectionGeneration;
 use crate::persistence::streams::StreamId;
 
-/// See the module documentation.
-#[derive(Debug, Default)]
+use super::pcoll::POrdSet;
+
+/// See the module documentation. Persistent: a clone is O(1).
+#[derive(Debug, Default, Clone)]
 pub struct EndedSections {
-    generations: BTreeSet<(StreamId, SectionGeneration)>,
-    unstamped: BTreeSet<StreamId>,
+    generations: POrdSet<(StreamId, SectionGeneration)>,
+    unstamped: POrdSet<StreamId>,
 }
 
 impl EndedSections {

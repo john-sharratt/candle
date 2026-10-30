@@ -117,7 +117,7 @@ impl FileJob {
 /// bare key would announce the file as queued and then skip it as present,
 /// which reports recovery that never happens — or, for the fast path, hands the
 /// unfinished chain to a live conversation as a file it has read.
-pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
+pub fn committed(engine: &ConversationEngine) -> Vec<Committed> {
     let scan = scan_ingest_chains(engine);
     // One line per unfinished chain per pass. A handful is ordinary recovery; a
     // corpus-wide sweep of them means the decode budget or the opening prompt
@@ -148,17 +148,14 @@ struct IngestChains {
 
 /// Every keyed `code_reading` conversation, uploads included, sorted by
 /// whether the chain that wrote it finished ([`chain_break`]).
-fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
-    let eng = engine.lock().unwrap();
+fn scan_ingest_chains(engine: &ConversationEngine) -> IngestChains {
+    let eng = engine;
     let keys: HashMap<TimelineId, String> = eng
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
-    // Both lookups lock the substrate themselves, so they are taken before
-    // the read guard below: a second read of the same lock while one is held
-    // waits behind any queued writer, which is waiting for this guard.
     let paths = eng.conversations_with_metadata_key(PATH_KEY);
-    let quants = quant_tags(&eng);
+    let quants = quant_tags(eng);
     let conv = eng.conversation();
     let substrate = conv.read();
     let mut out = IngestChains {
@@ -191,7 +188,7 @@ fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
 /// Replaces a bare sweep of every content key, which counted an unfinished
 /// chain's key as present and so skipped the very file the plan had just
 /// queued for rebuild.
-fn finished_content_keys(engine: &Mutex<ConversationEngine>) -> HashSet<String> {
+fn finished_content_keys(engine: &ConversationEngine) -> HashSet<String> {
     scan_ingest_chains(engine)
         .finished
         .into_iter()
@@ -392,7 +389,7 @@ pub fn ingest_files(
     rel_paths: &[String],
     progress: &Arc<LoadProgress>,
     layer_name: &str,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<(bool, usize)> {
     let uploads = ctx.tool_ctx.files.repo(UPLOADS_REPO)?;
@@ -431,7 +428,7 @@ pub fn ingest_files(
     // scored/selected self-local (belief groups masked to the fork's own
     // timeline) so its answer is grounded in its own file, not derailed by
     // cross-file retrieval.
-    ctx.engine.lock().unwrap().mark_layer_append_only(layer);
+    ctx.engine.mark_layer_append_only(layer);
 
     let live: HashSet<String> = jobs.iter().map(FileJob::key).collect();
     let n_failed = ingest_jobs(
@@ -479,8 +476,8 @@ pub(crate) fn is_upload_path(path: &str) -> bool {
 /// named by `--disable-layer`, before any pool or upload runs. Never called
 /// from [`ingest_jobs`]: a pass can overlap a live pool, and an in-flight file
 /// is indistinguishable from a crashed one by metadata alone.
-pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
-    let e = engine.lock().unwrap();
+pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
+    let e = engine;
     let mut retired = 0usize;
     for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         let committed = e
@@ -521,8 +518,8 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
 /// worker's first pass — which then finds nothing committed and reads every
 /// file as new, exactly as it would on a truly fresh install. Unlike
 /// `--wipe-substrate`, every other layer's content survives untouched.
-pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
-    let e = engine.lock().unwrap();
+pub(crate) fn wipe_layer(engine: &ConversationEngine) {
+    let e = engine;
     let mut wiped = 0usize;
     for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         if is_upload_path(&path) {
@@ -568,7 +565,7 @@ pub fn ingest_jobs(
     jobs: &[FileJob],
     live: &HashSet<String>,
     progress: &Arc<LoadProgress>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     binary: &Mutex<HashSet<String>>,
     calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<usize> {
@@ -724,7 +721,7 @@ fn file_tools(tools: &ToolContext, file: &FileJob) -> Option<ToolContext> {
 /// turns + tags persist in the substrate).
 fn process_one_file(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     job: &Job<'_>,
     present_keys: &HashSet<String>,
     failures: &Failures,
@@ -788,7 +785,7 @@ fn process_one_file(
             );
             job.binary.lock().unwrap().insert(job.key.to_string());
             // Recorded, so no later pass, restart or member plans it again.
-            let conversation = ctx.engine.lock().unwrap().conversation();
+            let conversation = ctx.engine.conversation();
             if let Err(e) = binary_mark::record(&conversation, job.key) {
                 tracing::warn!(
                     target: "zend::code_read::ingest",
@@ -829,10 +826,8 @@ fn process_one_file(
     //     as another branch holds it, and is left alone too — an attempt
     //     that fails retires its own, and a crash's are retired at boot
     //     ([`retire_crashed_partials`]).
-    // The engine lock covers only these quick ops and is released before the
-    // decode-heavy body below.
     let (mut conv, superseded) = {
-        let e = ctx.engine.lock().unwrap();
+        let e = ctx.engine;
         let superseded: Vec<TimelineId> = e
             .find_conversations_by_metadata(PATH_KEY, &file.path)
             .into_iter()
@@ -854,10 +849,7 @@ fn process_one_file(
         // conversation was measured losing track of its own turns after being
         // built this way, and stopped doing so once it forked `base_conv`
         // like every dialogue turn already did.
-        drop(e);
         let conv = base
-            .lock()
-            .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
         // The priming chain is this conversation's parent, recorded BEFORE its
@@ -867,7 +859,7 @@ fn process_one_file(
         // warm or cold is elevated by the ordinary working-set path when it is
         // selected.
         {
-            let e = ctx.engine.lock().unwrap();
+            let e = ctx.engine;
             if let Some(parent) = ctx.chain_end {
                 e.set_forked_from(conv.timeline_id(), parent)
                     .map_err(|err| anyhow::anyhow!("code_reading priming-chain parent: {err}"))?;
@@ -876,8 +868,7 @@ fn process_one_file(
         }
         // Now that the lineage is on record, take the recurrent memory of the
         // conversation this one continues — the slot was seeded from its own
-        // (empty) timeline when the fork returned. Outside the engine lock: it
-        // waits on a scheduler round-trip that other workers' mints need.
+        // (empty) timeline when the fork returned.
         if ctx.chain_end.is_some() {
             if let Err(err) = conv.seed_recurrent_from_lineage() {
                 tracing::warn!(
@@ -930,7 +921,7 @@ fn process_one_file(
             // nothing. Drop only THIS attempt's partial; the retry re-mints
             // cleanly.
             {
-                let e2 = ctx.engine.lock().unwrap();
+                let e2 = ctx.engine;
                 if let Err(err) = e2.tombstone_timeline(conv.timeline_id()) {
                     tracing::warn!(
                         target: "zend::code_read::ingest",
@@ -1012,12 +1003,7 @@ fn process_one_file(
             file = %file.path,
             "failed to tag conversation metadata (content key): {err:#}",
         );
-        if let Err(err) = ctx
-            .engine
-            .lock()
-            .unwrap()
-            .tombstone_timeline(conv.timeline_id())
-        {
+        if let Err(err) = ctx.engine.tombstone_timeline(conv.timeline_id()) {
             tracing::warn!(
                 target: "zend::code_read::ingest",
                 file = %file.path,
@@ -1034,7 +1020,7 @@ fn process_one_file(
 
     // Deferred tombstone ACTIVATES, now that the new generation is committed.
     if !superseded.is_empty() {
-        let e = ctx.engine.lock().unwrap();
+        let e = ctx.engine;
         for tl in &superseded {
             if let Err(err) = e.tombstone_timeline(*tl) {
                 tracing::warn!(
@@ -1074,10 +1060,10 @@ fn process_one_file(
     // actually reclaims the space; `elevate_to_hot` pulls the file back from cold
     // on demand if reselected.
     let flagged = {
-        let e = ctx.engine.lock().unwrap();
+        let e = ctx.engine;
         // Read once, never continued: it keeps its turns and no recurrent
         // snapshot (`crate::ingest_snapshots`).
-        finished(&e, conv.timeline_id(), Unit::File(&file.path));
+        finished(e, conv.timeline_id(), Unit::File(&file.path));
         e.evict_ingest_timeline(conv.timeline_id())
     };
     tracing::debug!(

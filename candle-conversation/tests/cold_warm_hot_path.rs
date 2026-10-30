@@ -33,6 +33,7 @@ use candle::{DType, Device, Tensor};
 use candle_conversation::persistence::cold_load::ColdLoadStager;
 use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::persistence::elevate::{elevate_to_hot, evict_from_hot};
+use candle_conversation::persistence::streams::StreamId;
 use candle_conversation::persistence::thread::PersistenceThread;
 use candle_conversation::persistence::transfer::seal_to_chunk_images;
 use candle_conversation::projection::{
@@ -238,16 +239,16 @@ fn seed_section(
         backing.set_len(slot, N_TOKENS_PER_TURN);
         sealed_per_layer.push(backing.record_turn(slot).unwrap());
     }
-    conv.write()
-        .set_section_full(
+    let tokens = Arc::new(vec![0u32; N_TOKENS_PER_TURN]);
+    conv.update(|s| {
+        s.set_section_full(
             section,
-            candle_conversation::persistence::streams::StreamId::default(),
+            StreamId::default(),
             N_TOKENS_PER_TURN,
-            Arc::new(sealed_per_layer),
-            |seqs| Ok(seqs.to_vec()),
-            Arc::new(vec![0u32; N_TOKENS_PER_TURN]),
+            sealed_per_layer.clone(),
+            Arc::clone(&tokens),
         )
-        .unwrap();
+    });
 }
 
 /// Gather a turn's hot-tier bytes per layer via the same path
@@ -339,7 +340,7 @@ fn install_warm_from_hot(
         })
         .collect();
     stream.synchronize().expect("the migrate's copies land");
-    conv.write().install_warm(residence, warm);
+    conv.read().install_warm(residence, warm);
 }
 
 fn section_state(conv: &Conversation, section: SectionId) -> TierState {
@@ -3010,7 +3011,7 @@ fn seed_section_with_format(
     backings: &[ChunkedKvBacking],
     device: &Device,
     section: SectionId,
-    stream_id: candle_conversation::persistence::streams::StreamId,
+    stream_id: StreamId,
     head_dim: usize,
     n_tokens: usize,
     pattern_base: u32,
@@ -3040,19 +3041,16 @@ fn seed_section_with_format(
         }
         sealed_per_layer.push(sealed);
     }
-    conv.write()
-        .set_section_full(
+    let tokens = Arc::new(vec![0u32; n_tokens]);
+    conv.update(|s| {
+        s.set_section_full(
             section,
             stream_id,
             n_tokens,
-            Arc::new(sealed_per_layer),
-            |seqs| Ok(seqs.to_vec()),
-            Arc::new(vec![0u32; n_tokens]),
+            sealed_per_layer.clone(),
+            Arc::clone(&tokens),
         )
-        .unwrap();
-    conv.read()
-        .section_residence(section)
-        .expect("section just installed must have a residence")
+    })
 }
 
 /// Re-gather a section's hot bytes per layer via `seal_to_chunk_images`
@@ -3208,8 +3206,13 @@ fn drive_section_round_trip<F>(
     // section's hot tier holds the bytes that will go to disk.
     let main_stream = cuda_stream(&device);
     if let Some(quantize_fn) = apply_quantize {
+        let native = conv
+            .read()
+            .residence(residence)
+            .hot()
+            .expect("the section is hot before its quantize");
         let new_hot = quantize_fn(&conv, &backings, &device, &main_stream, section);
-        conv.write().replace_section_hot(residence, new_hot);
+        assert!(conv.read().replace_section_hot(residence, &native, new_hot));
     }
 
     // Capture the canonical reference: what's in hot right now is
@@ -3246,7 +3249,7 @@ fn drive_section_round_trip<F>(
     let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
     let through = (total_chunks.max(1) - 1) as u64;
     conv.commit_stream_through(stream_id, through).unwrap();
-    conv.write().install_cold(residence, stored);
+    conv.read().install_cold(residence, stored);
     conv.commit_persistence().unwrap();
 
     // Verify the section is now hot+cold (warm is N/A for sections).

@@ -80,7 +80,7 @@ fn re_observing_the_same_evidence_changes_nothing() {
     const TURN: u64 = 7;
     let scope = ScopeKey::turn_group(1, 1);
     let cc = ChildKey::named("cc");
-    let mut cache = NormalizationCache::default();
+    let cache = NormalizationCache::default();
 
     cache.observe(&scope, TURN, &[(cc.clone(), 1000.0)], T_REF);
     let level = cache.level_of(&scope, &cc).unwrap();
@@ -261,7 +261,7 @@ fn deterministic() {
     let seq = [10.0f32, 900.0, 30.0, 500.0, 5.0];
 
     let run = || {
-        let mut c = NormalizationCache::default();
+        let c = NormalizationCache::default();
         // Distinct source per step: the sequence is the thing under test, and a
         // fresh cache must fold all of it.
         for (i, &r) in seq.iter().enumerate() {
@@ -577,7 +577,7 @@ fn the_write_path_learns_a_rate_not_a_total() {
     let from_long = ScopeKey::turn_group(11, 11);
     let from_short = ScopeKey::turn_group(12, 12);
     let x = ChildKey::named("x");
-    let mut cache = NormalizationCache::default();
+    let cache = NormalizationCache::default();
 
     // Same rate, four-fold different probe lengths.
     cache.observe(&from_long, 1, &[(x.clone(), 600.0)], 256);

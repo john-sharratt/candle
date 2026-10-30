@@ -3340,8 +3340,11 @@ Also fixed: the write-half of a forked recurrent state was zeroed
 state and belief through the `create_sequence` funnel (`StateSeed::Neutral`
 now says a timeline can be an *address* rather than a history to continue);
 the branch checkpoint was read and decoded twice per conversation open; and
-`clear_walker_state` cleared the branch-checkpoint index but not the
-recurrent-snapshot one, which compaction had just been taught to shrink.
+the compactor's index reset cleared the branch-checkpoint index but not the
+recurrent-snapshot one, which compaction had just been taught to shrink. A
+rewrite now re-applies what it carried and drops every location still into a
+replaced segment (`Substrate::drop_locations_into`), so both indexes shrink by
+the same rule.
 
 ## 12. References
 

@@ -9,7 +9,7 @@
 //! out of time is planned again from the bottom next pass.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::{ConversationEngine, Sequence};
@@ -55,7 +55,7 @@ impl Ground {
 /// One layer for [`pass_layer`].
 pub struct LayerRun<'a> {
     pub spec: &'a LayerSpec,
-    pub base: &'a Mutex<Sequence>,
+    pub base: &'a Sequence,
     /// How the layer's units are calibrated as they commit, for a layer that
     /// declares a `calibrate:` block.
     pub calibrate: Option<&'a CalibrateSpec>,
@@ -259,7 +259,7 @@ fn read_queued(
                 UnitKind::File => spec.file_prompt(&b.subject),
                 UnitKind::Day => {
                     let transcript = match by_day.get(b.key.as_str()) {
-                        Some(day) => transcript(&ctx.engine.lock().unwrap(), day),
+                        Some(day) => transcript(ctx.engine, day),
                         None => String::new(),
                     };
                     spec.day_prompt(&b.subject, &transcript)
@@ -294,12 +294,7 @@ fn read_queued(
 }
 
 /// Plan the layer against `below` and tombstone what the plan lets go.
-fn settle(
-    engine: &Mutex<ConversationEngine>,
-    spec: &LayerSpec,
-    below: &[Below],
-    ground: &Ground,
-) -> Plan {
+fn settle(engine: &ConversationEngine, spec: &LayerSpec, below: &[Below], ground: &Ground) -> Plan {
     let (done, broken) = committed(engine, &spec.layer);
     let in_scope = |b: &Below| match spec.unit {
         UnitKind::File => b
@@ -326,7 +321,7 @@ fn settle(
     let mut gone: Vec<TimelineId> = p.tombstone.clone();
     gone.extend(broken.iter().copied().filter(|tl| is_keyed(engine, *tl)));
     if !gone.is_empty() {
-        let e = engine.lock().unwrap();
+        let e = engine;
         for tl in &gone {
             if let Err(err) = e.tombstone_timeline(*tl) {
                 tracing::warn!(
@@ -353,10 +348,8 @@ fn settle(
 
 /// Whether `timeline` carries a content key — committed, so a stopped chain
 /// and not a unit another member is reading.
-fn is_keyed(engine: &Mutex<ConversationEngine>, timeline: TimelineId) -> bool {
+fn is_keyed(engine: &ConversationEngine, timeline: TimelineId) -> bool {
     engine
-        .lock()
-        .unwrap()
         .conversation_metadata(timeline)
         .is_some_and(|m| m.contains_key(super::keys::CONTENT_KEY))
 }
@@ -448,7 +441,7 @@ fn dialogue_days(ctx: &RefreshContext<'_>) -> Vec<DaySource> {
     let Some((group, titler)) = ctx.dialogue else {
         return Vec::new();
     };
-    let e = ctx.engine.lock().unwrap();
+    let e = ctx.engine;
     let convs: Vec<_> = e
         .group_conversations(group)
         .into_iter()
@@ -461,7 +454,6 @@ fn dialogue_days(ctx: &RefreshContext<'_>) -> Vec<DaySource> {
             (tl, turns)
         })
         .collect();
-    drop(e);
     closed_days(&convs, &day_of(now_ms()))
 }
 

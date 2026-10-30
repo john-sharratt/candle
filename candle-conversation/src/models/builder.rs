@@ -1096,9 +1096,7 @@ impl ModelBuilder {
         if let Some(retention) = self.tombstone_retention {
             shared
                 .persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_tombstone_retention(retention);
+                .call(|p| p.set_tombstone_retention(retention));
         }
         BoundSubstrate::bind(shared, identity).map_err(|e| ConversationError::Other(e.to_string()))
     }

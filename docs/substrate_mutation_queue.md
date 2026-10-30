@@ -1,5 +1,8 @@
 # The substrate without a waiting writer
 
+> **Superseded by `docs/substrate_lock_free.md`**, which removes the lock this
+> document only routes around. The queue below is deleted in its step 4.
+
 Every reader and writer of a substrate shares one lock (`SubstrateLock`,
 `candle-conversation/src/substrate/lock.rs`). This document is how the threads
 that must never stall stop waiting for it — the scheduler first — and how the

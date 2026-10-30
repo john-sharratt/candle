@@ -376,13 +376,10 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     })
     .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
     starting.set_step("starting", "Starting");
+    let retention = Duration::from_secs(args.tombstone_retention.saturating_mul(SECONDS_PER_DAY));
     npcs.substrate()
         .persistence
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_tombstone_retention(Duration::from_secs(
-            args.tombstone_retention.saturating_mul(SECONDS_PER_DAY),
-        ));
+        .call(|p| p.set_tombstone_retention(retention));
 
     // Accounts are records in the substrate, replicated but never published:
     // one carries a real email address and a provider subject id.

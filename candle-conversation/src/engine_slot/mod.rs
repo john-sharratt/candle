@@ -77,6 +77,13 @@ impl EngineSlot {
             requires,
         }
     }
+
+    /// Tenant `name` will never arrive: its start failed before it took a
+    /// ticket, or after. The others build or attach without it instead of
+    /// waiting for it.
+    pub fn withdraw(&self, name: &'static str) {
+        self.rendezvous.withdraw(name);
+    }
 }
 
 /// One tenant's way to its engine. Cloned freely; each load takes an

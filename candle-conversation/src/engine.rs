@@ -34,7 +34,7 @@ use crate::stencil::{
 use crate::tenant_rank::TenantRank;
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner.
-use crate::substrate::ConvCompression;
+use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
@@ -445,18 +445,19 @@ impl ConversationEngine {
         // before loading it.
         let shared = config.substrate.shared().clone();
         {
-            let persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
+            let (log_bytes, records, indexed) = shared.persistence.call(|p| {
+                (
+                    p.write_offset(),
+                    p.recovered_record_count(),
+                    p.last_index().is_some(),
+                )
+            });
             tracing::info!(
-                read_only = persistence.is_read_only(),
-                log_bytes = persistence.write_offset(),
-                records = persistence.recovered_record_count(),
-                indexed = persistence.last_index().is_some(),
-                streams = shared
-                    .substrate
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .all_streams()
-                    .count(),
+                read_only = shared.persistence.is_read_only(),
+                log_bytes,
+                records,
+                indexed,
+                streams = shared.substrate.read().all_streams().count(),
                 "substrate attached"
             );
         }
@@ -1220,25 +1221,47 @@ impl ConversationEngine {
     /// with [`ConversationError::ForkCycle`]: the lineage would loop, and
     /// every projection of a timeline on the loop would lose the ancestors
     /// past it.
+    ///
+    /// The cycle check and the write are one step, so two forks recorded at
+    /// once cannot each pass the check against the lineage the other is
+    /// about to change.
     pub fn set_forked_from(&self, child: TimelineId, parent: TimelineId) -> crate::Result<()> {
-        if self.conversation.read().lineage_contains(parent, child) {
+        let mut cycle = false;
+        self.conversation.update_conversation_metadata(
+            child,
+            Substrate::FORKED_FROM_KEY,
+            |s, _| {
+                cycle = s.lineage_contains(parent, child);
+                (!cycle).then(|| parent.raw().to_string())
+            },
+        );
+        if cycle {
             return Err(ConversationError::ForkCycle {
                 child: child.raw(),
                 parent: parent.raw(),
             });
         }
-        self.set_conversation_metadata(
-            child,
-            crate::substrate::Substrate::FORKED_FROM_KEY,
-            &parent.raw().to_string(),
-        )
+        Ok(())
+    }
+
+    /// Rewrite `key` of `timeline`'s `custom` metadata from the value it
+    /// holds, as one step — see
+    /// [`Conversation::update_conversation_metadata`]. Returns what was stored.
+    pub fn update_conversation_metadata(
+        &self,
+        timeline: TimelineId,
+        key: &str,
+        next: impl FnMut(&Substrate, Option<&str>) -> Option<String>,
+    ) -> Option<String> {
+        self.conversation
+            .update_conversation_metadata(timeline, key, next)
     }
 
     /// Record that `timeline` continues nothing: whatever parent it recorded
     /// before is dropped, and its projection inherits no ancestor. The empty
     /// value reads as absent ([`Substrate::parent_timeline`](crate::substrate::Substrate::parent_timeline)).
     pub fn clear_forked_from(&self, timeline: TimelineId) -> crate::Result<()> {
-        self.set_conversation_metadata(timeline, crate::substrate::Substrate::FORKED_FROM_KEY, "")
+        self.set_conversation_metadata(timeline, Substrate::FORKED_FROM_KEY, "")
     }
 
     /// Every live conversation whose `custom` metadata contains `key == value`.
@@ -1265,16 +1288,14 @@ impl ConversationEngine {
         limits: Limits,
     ) -> Result<(), Refusal> {
         self.conversation
-            .write()
-            .working_set_lock(target, read, limits)
+            .update(|s| s.working_set_lock(target, read, limits))
     }
 
     /// Put back a lock `target`'s own history records as served. `false` when
     /// the conversation it names can no longer deliver anything.
     pub fn working_set_restore_lock(&self, target: TimelineId, read: TimelineId) -> bool {
         self.conversation
-            .write()
-            .working_set_restore_lock(target, read)
+            .update(|s| s.working_set_restore_lock(target, read))
     }
 
     /// Seed `target`'s provenance with `candidates` at `momentum`, in list
@@ -1288,15 +1309,13 @@ impl ConversationEngine {
         momentum: f32,
     ) -> Vec<TimelineId> {
         self.conversation
-            .write()
-            .working_set_seed(target, candidates, limits, momentum)
+            .update(|s| s.working_set_seed(target, candidates, limits, momentum))
     }
 
     /// Release `target`'s locks into provenance at `released` momentum.
     pub fn working_set_release(&self, target: TimelineId, released: f32) {
         self.conversation
-            .write()
-            .working_set_release(target, released);
+            .update(|s| s.working_set_release(target, released));
     }
 
     /// Release `read`'s lock alone in `target`'s working set at `released`
@@ -1308,8 +1327,7 @@ impl ConversationEngine {
         released: f32,
     ) -> bool {
         self.conversation
-            .write()
-            .working_set_release_one(target, read, released)
+            .update(|s| s.working_set_release_one(target, read, released))
     }
 
     /// A copy of `target`'s working set, when it has one.
@@ -1320,7 +1338,7 @@ impl ConversationEngine {
     /// Forget `target`'s working set, so it is rebuilt from the conversation's
     /// own history.
     pub fn working_set_clear(&self, target: TimelineId) {
-        self.conversation.write().working_set_clear(target);
+        self.conversation.update(|s| s.working_set_clear(target));
     }
 
     /// Every turn's tags on `timeline`, oldest first — the record the working
@@ -1376,7 +1394,7 @@ impl ConversationEngine {
     /// content that is only right for a conversation whose own files hold the
     /// same. Idempotent; in-memory, so it is marked at every setup.
     pub fn mark_group_scoped(&self, group: GroupId) {
-        self.conversation.write().mark_group_scoped(group);
+        self.conversation.update(|s| s.mark_group_scoped(group));
     }
 
     /// Record which share of a dialogue's working-set budget `group`'s
@@ -1385,8 +1403,7 @@ impl ConversationEngine {
     /// member. Idempotent; in-memory, so it is set at every setup.
     pub fn set_working_set_share(&self, group: GroupId, share: WorkingSetShare) {
         self.conversation
-            .write()
-            .set_working_set_share(group, share);
+            .update(|s| s.set_working_set_share(group, share));
     }
 
     /// Name the conversations the scoped `group` may offer `target`, replacing
@@ -1398,13 +1415,13 @@ impl ConversationEngine {
         allowed: Arc<HashSet<TimelineId>>,
     ) {
         self.conversation
-            .write()
-            .set_retrieval_scope(target, group, allowed);
+            .update(|s| s.set_retrieval_scope(target, group, Arc::clone(&allowed)));
     }
 
     /// Forget every scope `target` was given.
     pub fn clear_retrieval_scope(&self, target: TimelineId) {
-        self.conversation.write().clear_retrieval_scope(target);
+        self.conversation
+            .update(|s| s.clear_retrieval_scope(target));
     }
 
     /// [`Self::find_conversations_by_metadata`] plus tombstoned conversations
@@ -2303,7 +2320,16 @@ impl ConversationEngine {
         group: GroupId,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
-        if !self.is_timeline_free(timeline) {
+        // Claimed in the same edit that finds it free, so two opens of one
+        // derived id cannot both take it.
+        let claimed = self.conversation.update(|s| {
+            let free = s.timeline_target(timeline).is_none() && !s.is_tombstoned(timeline);
+            if free {
+                s.register_timeline(timeline, layer, group);
+            }
+            free
+        });
+        if !claimed {
             return Err(ConversationError::Channel(format!(
                 "cannot open a new conversation on timeline {timeline}: it is in use or deleted",
             )));
@@ -2313,9 +2339,6 @@ impl ConversationEngine {
                 tracing::warn!("persist projection template failed: {e}");
             }
         }
-        self.conversation
-            .write()
-            .register_timeline(timeline, layer, group);
         self.bind_slot_to_timeline(
             timeline,
             Resumed::No,
@@ -2885,7 +2908,10 @@ impl ConversationEngine {
     /// timelines. The persistence thread also compacts automatically when
     /// the dead-byte ratio crosses the threshold. `progress` reports coarse
     /// phase progress (0..=5) for the loading screen.
-    pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> crate::Result<()> {
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> crate::Result<()> {
         Ok(self.conversation.compact_substrate(progress)?)
     }
 

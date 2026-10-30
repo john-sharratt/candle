@@ -108,7 +108,7 @@ fn unlink_tokens(conv: &Conversation, sid: StreamId, node: u64) {
         payload_len: 8,
         record_size: 4096,
     };
-    conv.write().apply_tokens_loc(sid, loc, at(node, 1_000));
+    conv.update(|s| s.apply_tokens_loc(sid, loc, at(node, 1_000)));
 }
 
 /// **A deleted conversation is not recovered by a runtime reload**: its
@@ -131,7 +131,7 @@ fn a_runtime_reload_leaves_a_tombstoned_timeline_alone() {
     let tl = TimelineId::from_raw(TL).unwrap();
     assert_eq!(conv.read().turn_count(tl), 2);
 
-    conv.write().tombstone_timeline(tl);
+    conv.update(|s| s.tombstone_timeline(tl));
     unlink_tokens(&conv, sid, node);
     conv.reconstruct_from_log(1, None).unwrap();
     assert!(
@@ -209,9 +209,10 @@ fn a_runtime_reload_restores_a_distilled_turn_without_its_shed_records() {
         token_count: 2,
         format: 4,
     };
-    conv.write().apply_chunk_loc(sid, 0, chunk, at(node, 900));
-    conv.write()
-        .distill_timeline(tl, DistillMode::ProvenanceOnly);
+    conv.update(|s| {
+        s.apply_chunk_loc(sid, 0, chunk, at(node, 900));
+        s.distill_timeline(tl, DistillMode::ProvenanceOnly);
+    });
     unlink_tokens(&conv, sid, node);
 
     conv.reconstruct_from_log(1, None).unwrap();

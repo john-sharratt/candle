@@ -3,8 +3,8 @@
 //! persistence together. The cluster's protocol is the host's; this is the
 //! substrate it drives.
 //!
-//! Locks are taken in the order a reload takes them — persistence, then the
-//! substrate — and never nested the other way.
+//! What touches the log runs on the log's owner; answering a peer runs there
+//! as background work, behind every call and write of the member's own.
 
 use std::io;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use crate::persistence::listing::ListedRecord;
 use crate::persistence::record::{decode_header, CustomObjectPayload};
 use crate::persistence::replica::AppliedSet;
 use crate::persistence::streams::StreamDecl;
-use crate::persistence::{Result as PersistenceResult, Tap};
+use crate::persistence::{PersistenceError, Result as PersistenceResult, Tap};
 
 /// The keys consensus decisions and `max_members` are kept under (§5.9).
 pub const CLUSTER_PREFIX: &str = "cluster/";
@@ -46,20 +46,20 @@ impl Conversation {
     /// Tell `tap` the `oseq` of every record this substrate writes that may be
     /// sent (§6.3).
     pub fn set_replication_tap(&self, tap: Tap) {
-        self.persistence.lock().unwrap().set_tap(tap);
+        self.persistence.call(|p| p.set_tap(tap));
     }
 
     /// What this member holds of every origin, its own written records
     /// included (§7.2, §7.5).
     pub fn applied_set(&self) -> AppliedSet {
-        self.persistence.lock().unwrap().applied_set()
+        self.persistence.call(|p| p.applied_set())
     }
 
-    /// Every own `oseq` up to this one is written and may be sent: the top of
-    /// this member's own written set, whatever gaps a purge left below it
-    /// (§7.8).
+    /// Every own `oseq` up to this one is written and may be sent, whatever
+    /// gaps a purge left below it (§7.8) — and never past one still on its way
+    /// to the log ([`crate::persistence::SubstratePersistence::own_sendable_through`]).
     pub fn own_through(&self) -> u64 {
-        self.persistence.lock().unwrap().own_written().top()
+        self.persistence.call(|p| p.own_sendable_through())
     }
 
     /// This member is joined and caught up now: an open after a long absence
@@ -136,16 +136,12 @@ impl Conversation {
     /// unpadded — from wherever maintenance moved it, or `None` when this
     /// member does not hold it.
     ///
-    /// Read behind the waiters, as [`Self::list_held`] lists: every caller is
+    /// Read as background work, as [`Self::list_held`] lists: every caller is
     /// replication — this member's own sends and the records a peer's catch-up
-    /// fetches — and a fetch reads one record off disk after another, so
-    /// foreground holds would keep the scheduler out for the whole fetch.
+    /// fetches — and a fetch reads one record off disk after another, so the
+    /// member's own calls and writes go first.
     pub fn read_event(&self, origin: u64, oseq: u64) -> Option<Vec<u8>> {
-        let read = self
-            .persistence
-            .lock_behind_waiters()
-            .unwrap()
-            .read_event(origin, oseq);
+        let read = self.persistence.call_behind(|p| p.read_event(origin, oseq));
         let mut bytes = match read {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return None,
@@ -164,23 +160,23 @@ impl Conversation {
     }
 
     /// [`Self::read_event`] for each of `oseqs`, in order, read off disk
-    /// without the persistence lock.
+    /// without the log's owner.
     ///
-    /// A peer's fetch read one record a hold, each hold waiting its turn
-    /// behind the scheduler's — answering ran at the pace of the lock, not the
-    /// disk (about 9 MB/s to a member catching up while `.5` ingested). Now one
-    /// short hold, memory only, takes every record's location and whether any
-    /// rebase exists; the records are read from their sealed segments with no
-    /// lock (`SealedReader`), so the scheduler waits on no fetch's I/O. A
-    /// record the lock-free read cannot vouch for — in the active segment,
-    /// moved since its location was taken, or detached while a rebase exists —
-    /// is read the locked way, as before.
+    /// A peer's fetch read one record per turn on the log, each waiting behind
+    /// the scheduler's — answering ran at the pace of the log, not the disk
+    /// (about 9 MB/s to a member catching up while `.5` ingested). Now one
+    /// short background call, memory only, takes every record's location and
+    /// whether any rebase exists; the records are read from their sealed
+    /// segments without the owner (`SealedReader`), so the scheduler waits on
+    /// no fetch's I/O. A record that read cannot vouch for — in the active
+    /// segment, moved since its location was taken, or detached while a rebase
+    /// exists — is read by the owner, as before.
     pub fn read_events(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
-        let (reader, places, no_rebases) = {
-            let p = self.persistence.lock_behind_waiters().unwrap();
+        let reader = self.persistence.sealed_reader();
+        let (places, no_rebases) = self.persistence.call_behind(|p| {
             let places: Vec<_> = oseqs.iter().map(|oseq| p.locate(origin, *oseq)).collect();
-            (p.sealed_reader(), places, p.no_rebases())
-        };
+            (places, p.no_rebases())
+        });
         oseqs
             .iter()
             .zip(places)
@@ -200,7 +196,7 @@ impl Conversation {
                     });
                 match read {
                     Some(bytes) => Some(bytes),
-                    // Never located, or not vouched for: the locked read
+                    // Never located, or not vouched for: the owner's read
                     // decides, as it did for every record before.
                     None if place.is_some() => self.read_event(origin, oseq),
                     None => None,
@@ -212,16 +208,11 @@ impl Conversation {
     /// What this member holds of `origin`'s `from..=to`, a range it covers
     /// completely.
     ///
-    /// Listed from memory (`persistence::listing`) under one short hold of the
-    /// persistence lock, taken behind the waiters (`lock_behind_waiters`):
-    /// answering a peer is background work, and the scheduler's writes go
-    /// first.
+    /// Listed from memory (`persistence::listing`) in one short background
+    /// call on the log's owner: answering a peer is background work, and the
+    /// scheduler's writes go first.
     pub fn list_held(&self, origin: u64, from: u64, to: u64) -> HeldRange {
-        let listing = self
-            .persistence
-            .lock_behind_waiters()
-            .unwrap()
-            .list(origin, from, to);
+        let listing = self.persistence.call_behind(|p| p.list(origin, from, to));
         HeldRange {
             records: listing.records,
             gone: listing.gone,
@@ -230,56 +221,52 @@ impl Conversation {
 
     /// `oseq`s of `origin` a catch-up learned are gone (§7.2).
     pub fn record_gone(&self, origin: u64, gone: &[u64]) {
-        let mut p = self.persistence.lock().unwrap();
-        for oseq in gone {
-            p.mark_gone(origin, *oseq, *oseq);
-        }
+        self.persistence.call(|p| {
+            for oseq in gone {
+                p.mark_gone(origin, *oseq, *oseq);
+            }
+        });
     }
 
-    /// A position in the substrate writer's queue.
+    /// A position in the log owner's write queue.
     pub fn write_ticket(&self) -> u64 {
-        self.writer.ticket()
+        self.persistence.ticket()
     }
 
-    /// Block until every write at or below `ticket` is in the log.
+    /// Wait until every write at or below `ticket` is in the log.
     pub fn wait_written(&self, ticket: u64) {
-        self.writer.wait_written(ticket);
+        self.persistence.wait_written(ticket);
     }
 
     /// Cut off from every cluster: what this substrate writes from here on is
     /// detached (§6.7).
     pub fn detach(&self) {
-        self.persistence.lock().unwrap().detach();
+        self.persistence.call(|p| p.detach());
     }
 
     /// Whether it holds records written cut off that no rejoin has fixed.
     pub fn holds_detached(&self) -> bool {
-        self.persistence
-            .lock()
-            .unwrap()
-            .origination()
-            .detached_range()
-            .is_some()
+        self.minter.origination().detached_range().is_some()
     }
 
     /// Rejoined under generation `gen`, decided by the group: what was written
-    /// cut off is fixed to it, after the writer has drained, and minted under
-    /// it from here on. The caller reloads.
+    /// cut off is fixed to it, after the queued writes have landed, and minted
+    /// under it from here on. The caller reloads.
     pub fn rejoin_at(&self, gen: u64) -> PersistenceResult<()> {
-        self.writer.wait_written(self.writer.ticket());
-        self.persistence.lock().unwrap().rejoin(&Decided(gen))?;
+        self.persistence
+            .call_after_writes(|p| p.rejoin(&Decided(gen)))?;
         Ok(())
     }
 
     /// The directory the substrate's log is in — where its member keeps its
     /// vote journal (§5.9).
     pub fn substrate_dir(&self) -> PathBuf {
-        self.persistence.lock().unwrap().dir().to_path_buf()
+        self.persistence.dir().to_path_buf()
     }
 
     /// The generation this substrate writes under.
     pub fn generation(&self) -> u64 {
-        self.persistence.lock().unwrap().origination().gen()
+        self.minter.origination().gen()
     }
 
     /// Every live custom object under [`CLUSTER_PREFIX`], with the stamp of the
@@ -297,14 +284,13 @@ impl Conversation {
     pub fn put_cluster_object(&self, key: &str, blob: Value) -> PersistenceResult<()> {
         debug_assert!(key.starts_with(CLUSTER_PREFIX));
         let obj = CustomObjectPayload::new(key, blob);
-        let id = {
-            let mut p = self.persistence.lock().unwrap();
+        let id = self.persistence.call(|p| {
             let id = p.mint();
             p.write_custom_object(&obj, id)?;
             p.commit()?;
-            id
-        };
-        self.write().apply_custom_object(obj, id);
+            Ok::<_, PersistenceError>(id)
+        })?;
+        self.update(|s| s.apply_custom_object(obj.clone(), id));
         Ok(())
     }
 }

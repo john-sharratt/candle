@@ -6,13 +6,14 @@ use std::collections::BTreeSet;
 use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePayload};
 use super::super::replica::DeferredRecord;
+use super::super::rewritten::Rewritten;
 use super::super::streams::{StreamDecl, StreamId};
 use super::super::walker::WalkEntry;
 use super::super::{blob, record_snapshot_loc, vfs, Result, SubstratePersistence};
-use super::adopt::adopt_complete_turns;
+use super::adopt::plan_adoptions;
 use super::incoming::Incoming;
 use super::outcome::{Checked, Refusal, RemoteBatch, RemoteOutcome};
-use crate::substrate::{StreamKey, Substrate};
+use crate::substrate::{StreamKey, Substrate, SubstrateLock};
 
 /// Whether the record declares a turn. A turn's declaration is written even
 /// when a tombstone here covers it, dead at read like the rest of its
@@ -23,6 +24,15 @@ use crate::substrate::{StreamKey, Substrate};
 fn declares_turn(h: &RecordHeader, payload: &[u8]) -> bool {
     h.record_type == RecordType::StreamDecl
         && matches!(StreamDecl::decode(payload), Ok(StreamDecl::Turn(_)))
+}
+
+/// What deciding a batch came to: each record's outcome, the turns its
+/// records may have completed, and every record written, as the substrate
+/// applies it.
+struct Decided {
+    outcomes: Vec<RemoteOutcome>,
+    turns: BTreeSet<StreamKey>,
+    applied: Vec<WalkEntry>,
 }
 
 /// Whether a record of type `rt` is one of a turn's own: the pieces whose
@@ -36,9 +46,8 @@ fn completes_turns(rt: RecordType) -> bool {
 
 impl SubstratePersistence {
     /// Apply `records`, each the bytes of one record another member wrote, to
-    /// this store and to `substrate` — under the substrate's write lock, which
-    /// the caller holds for the whole batch, so a projection sees the batch
-    /// whole or not at all.
+    /// this store and to `substrate`, which no other thread edits meanwhile —
+    /// [`Self::apply_remote_shared`] applies a batch to a shared root.
     ///
     /// Each record is decided in turn: a type this build does not decode is
     /// deferred; one applied already is a duplicate; one a tombstone here
@@ -55,9 +64,9 @@ impl SubstratePersistence {
     /// A refused record leaves the batch going; an error writing one stops
     /// it.
     ///
-    /// The checks of [`Self::check_remote`] run first; a caller holding locks
-    /// readers wait on runs them before it takes them and hands them to
-    /// [`Self::apply_remote_checked`].
+    /// The checks of [`Self::check_remote`] run first; a caller that wants
+    /// them off the log's owner runs them itself and hands them to
+    /// [`Self::apply_remote_checked`] or [`Self::apply_remote_shared`].
     pub fn apply_remote(
         &mut self,
         substrate: &mut Substrate,
@@ -70,9 +79,9 @@ impl SubstratePersistence {
 
     /// Whether each of `records` is what its writer wrote — its digest, and
     /// its CRC for any type but a chunk ([`Incoming::verify`]). Reads every
-    /// payload byte and touches no state, so it needs no lock: verifying
-    /// under the substrate's write lock held every reader of the substrate
-    /// behind a full pass over every byte the batch carried.
+    /// payload byte and touches no state, so it runs on the caller's thread:
+    /// on the log's owner it would hold every write behind a full pass over
+    /// every byte the batch carried.
     pub fn check_remote(records: &[&[u8]]) -> Vec<Checked> {
         records
             .iter()
@@ -88,6 +97,9 @@ impl SubstratePersistence {
     /// failed its check is refused where the check stands in the decision —
     /// after the duplicate, dominated and superseded cases, which hold
     /// whatever its bytes — so the outcomes are what checking in place gave.
+    ///
+    /// For a substrate no other thread edits; [`Self::apply_remote_shared`]
+    /// is the same batch against a shared root.
     pub fn apply_remote_checked(
         &mut self,
         substrate: &mut Substrate,
@@ -95,23 +107,84 @@ impl SubstratePersistence {
         checks: &[Checked],
         n_layers: usize,
     ) -> Result<RemoteBatch> {
-        debug_assert_eq!(records.len(), checks.len());
-        let mut outcomes = Vec::with_capacity(records.len());
-        let mut turns = BTreeSet::new();
-        for (bytes, checked) in records.iter().zip(checks) {
-            outcomes.push(self.apply_one(substrate, bytes, checked, &mut turns)?);
-        }
+        let decided = self.decide_remote(substrate, records, checks)?;
         let reload = substrate.take_reload_due();
         let adopted = if reload {
             Vec::new()
         } else {
-            adopt_complete_turns(self, substrate, &turns, n_layers)?
+            plan_adoptions(self, substrate, &decided.turns, n_layers)?
+                .iter()
+                .filter_map(|a| a.place(substrate))
+                .collect()
         };
         Ok(RemoteBatch {
-            outcomes,
+            outcomes: decided.outcomes,
             adopted,
             reload,
         })
+    }
+
+    /// [`Self::apply_remote_checked`] against a shared root. Each record is
+    /// decided — and the ones written appended — against a private copy of the
+    /// latest version, which the decisions after it in the batch read; then one
+    /// edit applies every written record and places every turn the batch
+    /// completed, so a projection sees the batch whole or not at all. Each
+    /// record's apply holds in any order and again, so the edit is right on
+    /// whatever version it lands on.
+    pub fn apply_remote_shared(
+        &mut self,
+        lock: &SubstrateLock,
+        records: &[&[u8]],
+        checks: &[Checked],
+        n_layers: usize,
+    ) -> Result<RemoteBatch> {
+        let mut work = Substrate::clone(&lock.read());
+        let decided = self.decide_remote(&mut work, records, checks)?;
+        let planned_reload = work.take_reload_due();
+        let plans = if planned_reload {
+            Vec::new()
+        } else {
+            plan_adoptions(self, &work, &decided.turns, n_layers)?
+        };
+        drop(work);
+        let (adopted, reload) = lock.update(|s| {
+            for entry in &decided.applied {
+                s.apply_walker_entry(entry);
+            }
+            let reload = s.take_reload_due() || planned_reload;
+            let adopted: Vec<_> = if reload {
+                Vec::new()
+            } else {
+                plans.iter().filter_map(|a| a.place(s)).collect()
+            };
+            (adopted, reload)
+        });
+        Ok(RemoteBatch {
+            outcomes: decided.outcomes,
+            adopted,
+            reload,
+        })
+    }
+
+    /// Decide every record of the batch against `substrate`, applying each one
+    /// written to it as the walk would.
+    fn decide_remote(
+        &mut self,
+        substrate: &mut Substrate,
+        records: &[&[u8]],
+        checks: &[Checked],
+    ) -> Result<Decided> {
+        debug_assert_eq!(records.len(), checks.len());
+        let mut decided = Decided {
+            outcomes: Vec::with_capacity(records.len()),
+            turns: BTreeSet::new(),
+            applied: Vec::new(),
+        };
+        for (bytes, checked) in records.iter().zip(checks) {
+            let outcome = self.apply_one(substrate, bytes, checked, &mut decided)?;
+            decided.outcomes.push(outcome);
+        }
+        Ok(decided)
     }
 
     fn apply_one(
@@ -119,7 +192,7 @@ impl SubstratePersistence {
         substrate: &mut Substrate,
         bytes: &[u8],
         checked: &Checked,
-        turns: &mut BTreeSet<StreamKey>,
+        decided: &mut Decided,
     ) -> Result<RemoteOutcome> {
         let incoming = match Incoming::parse(bytes) {
             Ok(incoming) => incoming,
@@ -198,8 +271,11 @@ impl SubstratePersistence {
             blob::forget_if_retired(&mut self.blob_index, &mut self.accounting, substrate, key);
         }
         if completes_turns(h.record_type) {
-            turns.insert(StreamKey::of(StreamId(h.stream_id), &id));
+            decided
+                .turns
+                .insert(StreamKey::of(StreamId(h.stream_id), &id));
         }
+        decided.applied.push(Rewritten::keep(&entry));
         Ok(RemoteOutcome::Written(at))
     }
 

@@ -18,7 +18,9 @@
 //!   tombstone releases everything it owns, so the cascade needs no handle to the
 //!   conversation that submitted them.
 
-use std::collections::HashMap;
+use std::sync::Arc;
+
+use imbl::shared_ptr::DefaultSharedPtr;
 
 use super::plain_prompt::TRANSIENT_FLOOR;
 use super::{Reserved, SectionId, TimelineId};
@@ -50,11 +52,17 @@ pub struct OwnedSection {
 }
 
 /// The owned-section id counter and the per-timeline ownership registry.
-#[derive(Debug, Default)]
+/// Persistent: a clone is O(1), as the substrate's versioned root needs.
+#[derive(Debug, Default, Clone)]
 pub struct OwnedSections {
     /// Ids handed out so far.
     issued: u32,
-    by_owner: HashMap<TimelineId, Vec<OwnedSection>>,
+    by_owner: imbl::GenericHashMap<
+        TimelineId,
+        Arc<Vec<OwnedSection>>,
+        ahash::RandomState,
+        DefaultSharedPtr,
+    >,
 }
 
 impl OwnedSections {
@@ -72,7 +80,7 @@ impl OwnedSections {
     /// Record that `owner` owns `section` under `name`. A second section under
     /// the same name replaces the first's entry; the caller releases the first.
     pub fn register(&mut self, owner: TimelineId, name: &str, section: SectionId) {
-        let owned = self.by_owner.entry(owner).or_default();
+        let owned = Arc::make_mut(self.by_owner.entry(owner).or_default());
         owned.retain(|o| o.name != name);
         owned.push(OwnedSection {
             section,
@@ -82,7 +90,7 @@ impl OwnedSections {
 
     /// What `owner` owns, in submission order.
     pub fn of(&self, owner: TimelineId) -> &[OwnedSection] {
-        self.by_owner.get(&owner).map_or(&[], Vec::as_slice)
+        self.by_owner.get(&owner).map_or(&[], |o| o.as_slice())
     }
 
     /// The section `owner` owns under `name`.
@@ -100,7 +108,7 @@ impl OwnedSections {
 
     /// Forget `owner`'s claim on `section`. Returns whether it held one.
     pub fn release(&mut self, owner: TimelineId, section: SectionId) -> bool {
-        let Some(owned) = self.by_owner.get_mut(&owner) else {
+        let Some(owned) = self.by_owner.get_mut(&owner).map(Arc::make_mut) else {
             return false;
         };
         let before = owned.len();
@@ -115,12 +123,15 @@ impl OwnedSections {
     /// Forget every owner's claims. The counter keeps its place, so ids issued
     /// before the clear are not issued again.
     pub fn clear_ownership(&mut self) {
-        self.by_owner.clear();
+        self.by_owner = Default::default();
     }
 
     /// Forget everything `owner` owns, returning it.
     pub fn release_all(&mut self, owner: TimelineId) -> Vec<OwnedSection> {
-        self.by_owner.remove(&owner).unwrap_or_default()
+        self.by_owner
+            .remove(&owner)
+            .map(Arc::unwrap_or_clone)
+            .unwrap_or_default()
     }
 }
 

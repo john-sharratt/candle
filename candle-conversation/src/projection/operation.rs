@@ -24,37 +24,38 @@ impl Conversation {
     /// Whether a write has failed for lack of space since the last
     /// [`Self::test_write`] succeeded.
     pub fn out_of_space(&self) -> bool {
-        self.persistence.lock().unwrap().out_of_space()
+        self.persistence.call(|p| p.out_of_space())
     }
 
     /// A test append and commit, as leaving fault mode needs (§7.7).
     pub fn test_write(&self) -> PersistenceResult<()> {
-        self.persistence.lock().unwrap().test_write()
+        self.persistence.call(|p| p.test_write())
     }
 
     /// The bytes of live records in the log — what a full compaction copies,
     /// and so needs free beside it.
     pub fn live_bytes(&self) -> u64 {
-        let p = self.persistence.lock().unwrap();
         let view = self.read();
-        p.segment_liveness(&view).values().sum()
+        self.persistence
+            .call(|p| p.segment_liveness(&view).values().sum())
     }
 
     /// Every record type the substrate holds, by tag: what a build replacing
     /// this one must decode (§3.9).
     pub fn held_record_tags(&self) -> Vec<u8> {
-        self.persistence.lock().unwrap().held_record_tags()
+        self.persistence.call(|p| p.held_record_tags())
     }
 
     /// Records held back because this build does not decode their type, by
     /// type and origin, with how many of each (§6.5).
     pub fn deferred_records(&self) -> BTreeMap<(String, u64), usize> {
-        let p = self.persistence.lock().unwrap();
-        let mut counts = BTreeMap::new();
-        for d in &p.replica().deferred {
-            *counts.entry((d.record_type.clone(), d.origin)).or_insert(0) += 1;
-        }
-        counts
+        self.persistence.call(|p| {
+            let mut counts = BTreeMap::new();
+            for d in &p.replica().deferred {
+                *counts.entry((d.record_type.clone(), d.origin)).or_insert(0) += 1;
+            }
+            counts
+        })
     }
 
     /// The timeline tombstones held, and how many of them a complete
@@ -71,8 +72,7 @@ impl Conversation {
     /// The read-only liveness audit: what maintenance counts as live against
     /// what it carries. Changes nothing.
     pub fn liveness_audit(&self) -> PersistenceResult<LivenessAudit> {
-        let p = self.persistence.lock().unwrap();
         let view = self.read();
-        p.liveness_audit(&view)
+        self.persistence.call(|p| p.liveness_audit(&view))
     }
 }

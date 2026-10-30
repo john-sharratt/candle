@@ -16,24 +16,19 @@
 //! all assume a CUDA device.
 
 mod cuda_impl {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle::direct_io::DirectFile;
     use candle::{Device, Result};
     use candle_nn::kv_cache::{
         gather_sealed_chunks, kv_migrate, ArenaLocation, ChunkedKvBacking, GatheredChunk,
         MigrationPlan, SealedSequence,
     };
 
+    use crate::persistence::chunk_plan::ChunkedReadPlan;
     use crate::persistence::cold_load::{ColdLoadStager, PINNED_PREALLOC_BYTES};
+    use crate::persistence::cold_source::ColdSource;
     use crate::persistence::resume::ChunkImage;
-    use crate::persistence::segment::SegmentId;
     use crate::persistence::streams::{StreamId, TurnDecl};
-    use crate::persistence::SubstratePersistence;
     use crate::scheduler::profile;
-    use crate::substrate::Substrate;
 
     fn cuda_device(device: &Device) -> Result<&candle::CudaDevice> {
         match device {
@@ -281,11 +276,15 @@ mod cuda_impl {
     /// independent of turn size.
     ///
     /// Returns one `SealedSequence` per layer; the order matches `backings`.
+    ///
+    /// `plan` and `source` are the cold read the log's owner planned for the
+    /// turn's stream ([`SubstratePersistence::cold_read`], sized by
+    /// [`cold_buffer_size`]); everything here runs on the caller's threads.
     pub fn load_turn_into_hot(
         backings: &[ChunkedKvBacking],
         device: &Device,
-        persistence: &mut SubstratePersistence,
-        substrate: &Substrate,
+        plan: &ChunkedReadPlan,
+        source: &ColdSource,
         decl: &TurnDecl,
         stager: &mut ColdLoadStager,
     ) -> Result<Vec<SealedSequence>> {
@@ -295,12 +294,28 @@ mod cuda_impl {
         load_stream_into_hot(
             backings,
             device,
-            persistence,
-            substrate,
+            plan,
+            source,
             stream_id,
             chunks_per_layer,
             stager,
         )
+    }
+
+    /// The batch size a cold read for `stager` is planned at: its pinned
+    /// buffer's actual capacity, so large turns (>64 MB) partition into
+    /// batches that each fit. `0` means the buffer is not yet allocated
+    /// (unit-test `::new()` path): plan for the prealloc size the first
+    /// `buffer_mut()` will lazily allocate.
+    ///
+    /// NB: a `.max(1 << 30)` here once planned 1 GB batches against a fixed
+    /// 64 MB buffer, so any turn over 64 MB became one oversized batch and
+    /// overflowed `buffer_mut` (the chunked-read assert).
+    pub fn cold_buffer_size(stager: &ColdLoadStager) -> usize {
+        match stager.capacity() {
+            0 => PINNED_PREALLOC_BYTES,
+            cap => cap,
+        }
     }
 
     /// Load any persisted stream (turn or section) from cold storage
@@ -312,8 +327,8 @@ mod cuda_impl {
     pub fn load_stream_into_hot(
         backings: &[ChunkedKvBacking],
         device: &Device,
-        persistence: &mut SubstratePersistence,
-        substrate: &Substrate,
+        plan: &ChunkedReadPlan,
+        source: &ColdSource,
         stream_id: StreamId,
         chunks_per_layer: usize,
         stager: &mut ColdLoadStager,
@@ -329,21 +344,6 @@ mod cuda_impl {
         // The whole stream, so the gap between it and its pipeline runs is the
         // per-stream cost: planning, slots, segment handles, the final record.
         let _stream_span = profile::span("cold:stream");
-
-        // Build the chunk plan up front, sized to the stager's ACTUAL pinned
-        // buffer so large turns (>64 MB) partition into batches that each fit —
-        // the `for batch in &plan.chunks` loop below streams them. `0` means the
-        // buffer is not yet allocated (unit-test `::new()` path): plan for the
-        // prealloc size the first `buffer_mut()` will lazily allocate.
-        //
-        // NB: the previous `.max(1 << 30)` planned 1 GB batches against a fixed
-        // 64 MB buffer, so any turn over 64 MB became one oversized batch and
-        // overflowed `buffer_mut` (the chunked-read assert).
-        let buffer_size = match stager.capacity() {
-            0 => PINNED_PREALLOC_BYTES,
-            cap => cap,
-        };
-        let plan = persistence.plan_chunked_read(substrate, stream_id, buffer_size);
 
         // Empty turn — no chunks. Build empty sealed sequences per
         // layer (matches the `recover_turn_grid` + `load_to_hot`
@@ -404,27 +404,12 @@ mod cuda_impl {
         let mut register_us_total: u64 = 0;
         let mut gpu_push_us_total: u64 = 0;
 
-        // Open a direct-I/O handle set for every sealed segment this turn's
-        // chunks span (a turn that straddles a seal reads part of its records
-        // from a sealed segment). The active and inherited handles come from
-        // `persistence`; the sealed ones are owned here for the cold-load's
-        // duration so the pipeline's reader threads can borrow them by id.
-        let mut sealed_handles: HashMap<SegmentId, Arc<DirectFile>> = HashMap::new();
-        for batch in &plan.chunks {
-            if let crate::persistence::chunk_plan::SourceLog::Sealed(id) = batch.source {
-                if let std::collections::hash_map::Entry::Vacant(e) = sealed_handles.entry(id) {
-                    let handle = persistence.open_sealed_direct(id).map_err(|e| {
-                        candle::Error::Msg(format!("cold-load: open sealed segment {id}: {e}"))
-                    })?;
-                    e.insert(handle);
-                }
-            }
-        }
-
+        // Every source the plan reads — the active segment, each sealed one a
+        // turn that straddles a seal spans, each inherited log — was opened
+        // with the plan (`SubstratePersistence::cold_read`).
         for batch in &plan.chunks {
             let stats = crate::persistence::pipeline::run_pipeline(
-                persistence,
-                &sealed_handles,
+                source,
                 backings,
                 device,
                 batch,
@@ -1272,5 +1257,6 @@ mod cuda_impl {
 }
 
 pub use cuda_impl::{
-    gather_chunks, load_stream_into_hot, load_turn_into_hot, scatter_chunks, seal_to_chunk_images,
+    cold_buffer_size, gather_chunks, load_stream_into_hot, load_turn_into_hot, scatter_chunks,
+    seal_to_chunk_images,
 };

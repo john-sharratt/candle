@@ -11,16 +11,18 @@
 //! A turn's tags are its gather tags: a working-set mark puts no turn in a
 //! scope (`working_set::marks`), so a turn carrying only marks is not here.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use super::pcoll::{PMap, POrdSet};
 use super::stream_index::StreamKey;
 use crate::working_set::marks::gather_tags;
 
-/// See the module documentation.
-#[derive(Debug, Default)]
+/// See the module documentation. Persistent: a clone is O(1).
+#[derive(Debug, Default, Clone)]
 pub struct TagIndex {
-    by_tag: HashMap<String, BTreeSet<StreamKey>>,
-    tags_of: HashMap<StreamKey, Vec<String>>,
+    by_tag: PMap<String, POrdSet<StreamKey>>,
+    tags_of: PMap<StreamKey, Arc<Vec<String>>>,
 }
 
 impl TagIndex {
@@ -35,7 +37,7 @@ impl TagIndex {
         for tag in &gather {
             self.by_tag.entry(tag.clone()).or_default().insert(key);
         }
-        self.tags_of.insert(key, gather);
+        self.tags_of.insert(key, Arc::new(gather));
     }
 
     /// `key` is no longer declared a turn.
@@ -43,19 +45,14 @@ impl TagIndex {
         let Some(tags) = self.tags_of.remove(&key) else {
             return;
         };
-        for tag in tags {
-            if let Some(keys) = self.by_tag.get_mut(&tag) {
+        for tag in tags.iter() {
+            if let Some(keys) = self.by_tag.get_mut(tag) {
                 keys.remove(&key);
                 if keys.is_empty() {
-                    self.by_tag.remove(&tag);
+                    self.by_tag.remove(tag);
                 }
             }
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.by_tag.clear();
-        self.tags_of.clear();
     }
 
     /// Every turn carrying one of `tags`, each once, in key order — the order
@@ -66,7 +63,7 @@ impl TagIndex {
             (None, _) => Vec::new(),
             (Some(one), None) => one.iter().copied().collect(),
             (Some(a), Some(b)) => {
-                let mut all: BTreeSet<StreamKey> = a.union(b).copied().collect();
+                let mut all: BTreeSet<StreamKey> = a.iter().chain(b.iter()).copied().collect();
                 for s in sets {
                     all.extend(s.iter().copied());
                 }
@@ -133,10 +130,6 @@ mod tests {
         idx.set(key(2), &tags(&["tool"]));
         idx.remove(key(2));
         idx.remove(key(9));
-        assert_eq!(idx.with_any(&tags(&["tool"])), Vec::<StreamKey>::new());
-
-        idx.set(key(3), &tags(&["tool"]));
-        idx.clear();
         assert_eq!(idx.with_any(&tags(&["tool"])), Vec::<StreamKey>::new());
     }
 }

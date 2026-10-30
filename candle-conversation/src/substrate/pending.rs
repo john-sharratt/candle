@@ -12,8 +12,6 @@
 //! The records waiting here are durable state like any other, so a rewrite of
 //! the log carries them ([`PendingChildren::records`]).
 
-use std::collections::HashMap;
-
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{
     encode_conv_state_payload, encode_label_payload, ConvMeta, ConvState,
@@ -21,6 +19,8 @@ use crate::persistence::manifest::{
 use crate::persistence::record::{
     DebugIdPayload, RecordType, TreeMetadataPayload, TurnCouplingPayload,
 };
+
+use super::pcoll::{PMap, PVec};
 
 /// One record waiting for its timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +68,7 @@ impl PendingChild {
 /// The records waiting, by the raw id of the timeline they name.
 #[derive(Debug, Clone, Default)]
 pub struct PendingChildren {
-    by_timeline: HashMap<u64, Vec<(PendingChild, RecordIdentity)>>,
+    by_timeline: PMap<u64, PVec<(PendingChild, RecordIdentity)>>,
 }
 
 impl PendingChildren {
@@ -80,12 +80,15 @@ impl PendingChildren {
         if !id.is_none() && waiting.iter().any(|(_, held)| *held == id) {
             return;
         }
-        waiting.push((child, id));
+        waiting.push_back((child, id));
     }
 
     /// Everything waiting for `timeline`, which it now takes.
     pub fn release(&mut self, timeline: u64) -> Vec<(PendingChild, RecordIdentity)> {
-        self.by_timeline.remove(&timeline).unwrap_or_default()
+        self.by_timeline
+            .remove(&timeline)
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Every waiting record as a rewrite writes it back: `(timeline, type,
@@ -101,10 +104,6 @@ impl PendingChildren {
             }
         }
         out
-    }
-
-    pub fn clear(&mut self) {
-        self.by_timeline.clear();
     }
 }
 

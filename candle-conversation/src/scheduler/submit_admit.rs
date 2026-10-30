@@ -216,16 +216,14 @@ impl Scheduler {
             ..
         } = pending;
         let parent_id = work.sequence_id;
-        // Read guard dropped above when the projection block
-        // exited; now safe to take a write guard for the
-        // diagnostic side-channel.  No-op when projection used
+        // The diagnostic side-channel.  No-op when projection used
         // the rule-based path (no tree on the target timeline).
         // Ephemeral probe slots write NOTHING to the substrate — not even
         // this diagnostic side-channel on the (shared) target timeline.
         if let Some((timeline, diag)) = diag_to_write {
             if !self.ephemeral_slots.contains(&parent_id) {
                 if let Some(conv) = self.slot_conversations.get(&parent_id) {
-                    conv.write().set_last_selection(timeline, diag);
+                    conv.update(|s| s.set_last_selection(timeline, diag.clone()));
                 }
             }
         }

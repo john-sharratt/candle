@@ -28,15 +28,18 @@
 //! id with different bytes. Both are kept, and the id resolves to the
 //! declaration with the greatest stamp.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::identity::{RecordIdentity, VersionStamp};
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::projection::TurnIndex;
 
+use super::pcoll::{PMap, POrdMap};
 use super::stamps::take;
-use super::StreamRuntime;
+use super::{IndexPage, StreamRuntime};
+use crate::persistence::segment::SegmentId;
 
 /// A declared turn's stream, as callers address it.
 #[derive(Debug, Clone, Copy)]
@@ -95,19 +98,20 @@ pub struct Declared {
     pub displaced: Vec<u32>,
 }
 
-/// See the module documentation.
-#[derive(Debug, Default)]
+/// See the module documentation. Persistent throughout: a clone is O(1) and
+/// shares every stream with the version it was taken from.
+#[derive(Debug, Default, Clone)]
 pub struct StreamIndex {
     /// Every stream, by id and then by writer.
-    streams: HashMap<StreamId, BTreeMap<u64, StreamRuntime>>,
+    streams: PMap<StreamId, POrdMap<u64, Arc<StreamRuntime>>>,
     /// Each timeline's declared turns, in rank order.
-    timelines: HashMap<u64, BTreeMap<TurnRank, StreamKey>>,
+    timelines: PMap<u64, POrdMap<TurnRank, StreamKey>>,
     /// The timeline and rank of every declared turn.
-    ranks: HashMap<StreamKey, (u64, TurnRank)>,
+    ranks: PMap<StreamKey, (u64, TurnRank)>,
     /// Where every declared turn sits in its timeline.
-    positions: HashMap<StreamKey, u32>,
+    positions: PMap<StreamKey, u32>,
     /// The stream id of each turn position, to the stream at that position.
-    logical: HashMap<StreamId, StreamKey>,
+    logical: PMap<StreamId, StreamKey>,
 }
 
 impl StreamIndex {
@@ -139,16 +143,30 @@ impl StreamIndex {
 
     /// One writer's stream.
     pub fn physical(&self, key: StreamKey) -> Option<&StreamRuntime> {
-        self.streams.get(&key.stream_id)?.get(&key.writer)
+        self.streams
+            .get(&key.stream_id)?
+            .get(&key.writer)
+            .map(|rt| &**rt)
     }
 
-    /// One writer's stream, created empty if the index has none.
+    /// One writer's stream, created empty if the index has none — unshared for
+    /// editing, so an older version keeps the stream as it was.
     pub fn entry(&mut self, key: StreamKey) -> &mut StreamRuntime {
+        Arc::make_mut(
+            self.streams
+                .entry(key.stream_id)
+                .or_default()
+                .entry(key.writer)
+                .or_default(),
+        )
+    }
+
+    /// One writer's stream for editing, when the index holds it.
+    fn physical_mut(&mut self, key: StreamKey) -> Option<&mut StreamRuntime> {
         self.streams
-            .entry(key.stream_id)
-            .or_default()
-            .entry(key.writer)
-            .or_default()
+            .get_mut(&key.stream_id)
+            .and_then(|w| w.get_mut(&key.writer))
+            .map(Arc::make_mut)
     }
 
     /// Install `decl` on `key`'s stream, written as record `id`, when it
@@ -200,11 +218,7 @@ impl StreamIndex {
         if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
             changed.extend(self.place(timeline, rank, &mut Vec::new()));
         }
-        if let Some(rt) = self
-            .streams
-            .get_mut(&key.stream_id)
-            .and_then(|w| w.get_mut(&key.writer))
-        {
+        if let Some(rt) = self.physical_mut(key) {
             rt.decl = None;
             rt.ids.decl = RecordIdentity::NONE;
         }
@@ -218,11 +232,7 @@ impl StreamIndex {
     /// declaration aside — and the stream itself once it holds nothing.
     /// Returns whether anything was dropped.
     pub fn prune(&mut self, key: StreamKey, keep: impl Fn(&RecordIdentity) -> bool) -> bool {
-        let Some(rt) = self
-            .streams
-            .get_mut(&key.stream_id)
-            .and_then(|w| w.get_mut(&key.writer))
-        else {
+        let Some(rt) = self.physical_mut(key) else {
             return false;
         };
         let mut dropped = false;
@@ -245,6 +255,7 @@ impl StreamIndex {
         }
         if rt.projection_events.is_some() && !keep(&ids.projection_events) {
             rt.projection_events = None;
+            rt.events_digest = OnceLock::new();
             ids.projection_events = RecordIdentity::NONE;
             dropped = true;
         }
@@ -267,15 +278,61 @@ impl StreamIndex {
         dropped
     }
 
+    /// Drop every chunk, tokens and index-page location that lies in one of
+    /// `old`'s segments, with the identity it was held under, and each stream
+    /// left holding nothing. What a rewrite does with whatever it did not
+    /// carry forward ([`crate::persistence::rewritten::Rewritten::settle`]).
+    pub fn drop_segments(&mut self, old: &HashSet<SegmentId>) {
+        let in_old = |rt: &StreamRuntime| {
+            rt.chunks.values().any(|l| old.contains(&l.segment))
+                || rt.tokens.is_some_and(|l| old.contains(&l.segment))
+                || rt
+                    .index_page
+                    .as_ref()
+                    .and_then(IndexPage::stored)
+                    .is_some_and(|l| old.contains(&l.segment))
+        };
+        let touched: Vec<StreamKey> = self
+            .iter_physical()
+            .filter(|(_, rt)| in_old(rt))
+            .map(|(key, _)| key)
+            .collect();
+        for key in touched {
+            if let Some(rt) = self.physical_mut(key) {
+                let gone: Vec<u64> = rt
+                    .chunks
+                    .iter()
+                    .filter(|(_, l)| old.contains(&l.segment))
+                    .map(|(i, _)| *i)
+                    .collect();
+                for i in gone {
+                    rt.chunks.remove(&i);
+                    rt.ids.chunks.remove(&i);
+                }
+                if rt.tokens.is_some_and(|l| old.contains(&l.segment)) {
+                    rt.tokens = None;
+                    rt.ids.tokens = RecordIdentity::NONE;
+                }
+                let page_in_old = rt
+                    .index_page
+                    .as_ref()
+                    .and_then(IndexPage::stored)
+                    .is_some_and(|l| old.contains(&l.segment));
+                if page_in_old {
+                    rt.index_page = None;
+                    rt.ids.index_page = RecordIdentity::NONE;
+                }
+            }
+            self.drop_if_empty(key);
+        }
+    }
+
     /// Forget `key`'s stream when it holds nothing at all.
     fn drop_if_empty(&mut self, key: StreamKey) {
         let Some(writers) = self.streams.get_mut(&key.stream_id) else {
             return;
         };
-        if writers
-            .get(&key.writer)
-            .is_some_and(StreamRuntime::is_empty)
-        {
+        if writers.get(&key.writer).is_some_and(|rt| rt.is_empty()) {
             writers.remove(&key.writer);
         }
         if writers.is_empty() {
@@ -337,7 +394,9 @@ impl StreamIndex {
     /// constant work.
     fn place(&mut self, timeline: u64, from: TurnRank, displaced: &mut Vec<u32>) -> Vec<StreamId> {
         let mut changed = Vec::new();
-        let Some(order) = self.timelines.get(&timeline) else {
+        // A clone of the order, so the walk can update the position maps as it
+        // goes: O(1), sharing every node with the index's own.
+        let Some(order) = self.timelines.get(&timeline).cloned() else {
             return changed;
         };
         let mut next: u32 = order
@@ -427,7 +486,7 @@ impl StreamIndex {
                         stream_id: *sid,
                         writer: *writer,
                     },
-                    rt,
+                    &**rt,
                 )
             })
         })
@@ -442,15 +501,6 @@ impl StreamIndex {
             }
             (self.resolve(key.stream_id) == Some(key)).then_some((key.stream_id, rt))
         })
-    }
-
-    /// Forget everything.
-    pub fn clear(&mut self) {
-        self.streams.clear();
-        self.timelines.clear();
-        self.ranks.clear();
-        self.positions.clear();
-        self.logical.clear();
     }
 }
 

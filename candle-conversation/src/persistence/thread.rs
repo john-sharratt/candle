@@ -26,12 +26,13 @@
 //! ```
 //!
 //! The thread holds a [`Conversation`] handle so it shares the same
-//! `Arc<SubstrateLock>` and `Arc<Mutex<SubstratePersistence>>` the
-//! rest of the engine uses. Read locks are held only long enough to
-//! snapshot the work list — the slow CUDA-side migrations and
-//! gather/write work happen unlocked. Write locks are taken briefly
-//! per residence to install the new tier.
+//! substrate and log the rest of the engine uses. It reads a version of
+//! the substrate to snapshot the work list; the slow CUDA-side migrations
+//! and gather/write work run against nothing shared; and each new tier is
+//! installed on its residence directly, which publishes no version and
+//! waits on no one.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -57,7 +58,7 @@ use crate::scheduler::phase_ring::{
     migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
 };
 use crate::scheduler::relief_trace;
-use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
+use crate::substrate::{ConvCompression, HotKv, ResidenceIndex, StoredSequence};
 use sysinfo::System;
 
 /// How often the loop wakes up on its own when no triggers arrive.
@@ -491,7 +492,7 @@ fn run_loop(
             // be drainable — otherwise a pinned turn stays hot-only and un-durable.
             // Shutdown drain: an empty keep-set stamps nothing, which is right —
             // nothing is attending, so every residence should age out.
-            conversation.write().set_working_set_pins(&[], &[]);
+            conversation.read().release_working_set_pins();
             // Loop hot→warm→cold (maintenance off) until nothing is left hot
             // without warm, warm without cold, or a sealed section without its
             // redo-log copy — the next boot restores sections from that copy. One `run_pass` moves a turn all
@@ -686,24 +687,37 @@ fn await_owed_arenas(backings: &[ChunkedKvBacking], within: Duration) -> bool {
     }
 }
 
-/// Install one fenced group's `(idx, new_hot, new_warm)` triples under a single
-/// substrate write lock. Returns the warm bytes and the residence count.
+/// Install one fenced group's `(idx, new_hot, new_warm)` triples on their
+/// residences, each only over the hot copy in `migrated` it was made from.
+/// Returns the warm bytes and the count installed.
 fn install_hot_to_warm(
     conversation: &Conversation,
+    migrated: &HashMap<ResidenceIndex, Arc<HotKv>>,
     installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
 ) -> (u64, usize) {
     if installs.is_empty() {
         return (0, 0);
     }
     let mut total_bytes = 0u64;
-    let count = installs.len();
-    let mut view = conversation.write();
+    let mut count = 0usize;
+    let view = conversation.read();
     for (idx, hot, warm) in installs {
+        let Some(from) = migrated.get(&idx) else {
+            continue;
+        };
         let bytes: u64 = warm
             .iter()
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.byte_size)
             .sum();
+        if !view.install_migrated(idx, from, hot, warm) {
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                residence = idx.0,
+                "hot → warm dropped: the residence moved on during the migrate"
+            );
+            continue;
+        }
         tracing::trace!(
             target: "candle_conversation::persistence::tier",
             residence = idx.0,
@@ -711,7 +725,7 @@ fn install_hot_to_warm(
             "cached hot → warm (with hot Q-format replace)"
         );
         total_bytes = total_bytes.saturating_add(bytes);
-        view.install_migrated(idx, hot, warm);
+        count += 1;
     }
     (total_bytes, count)
 }
@@ -1098,7 +1112,7 @@ fn run_pass(
     // expert-weight ground, which is one-way.
     {
         let shed = conversation
-            .write()
+            .read()
             .demote_idle_hot(crate::substrate::IDLE_DEMOTE_GRACE_EPOCHS);
         if shed > 0 {
             tracing::debug!(
@@ -1178,7 +1192,7 @@ fn run_pass(
                 deferred_groups += 1;
                 continue 'policies;
             };
-            let mut group: Vec<(ResidenceIndex, Vec<SealedSequence>)> = conversation
+            let mut read: Vec<(ResidenceIndex, Arc<HotKv>)> = conversation
                 .read()
                 .snapshot_pending_warm_for(cc)
                 .into_iter()
@@ -1192,8 +1206,13 @@ fn run_pass(
                     whole
                 })
                 .collect();
-            let more = group.len() > MAX_GROUP_RESIDENCES;
-            group.truncate(MAX_GROUP_RESIDENCES);
+            let more = read.len() > MAX_GROUP_RESIDENCES;
+            read.truncate(MAX_GROUP_RESIDENCES);
+            let group: Vec<(ResidenceIndex, Vec<SealedSequence>)> =
+                read.iter().map(|(idx, hot)| (*idx, hot.to_vec())).collect();
+            // The hot copies the migrate reads, which its installs replace only
+            // while the residences still hold them.
+            let migrated: HashMap<ResidenceIndex, Arc<HotKv>> = read.into_iter().collect();
             let effective = if single_latent {
                 None
             } else {
@@ -1242,11 +1261,13 @@ fn run_pass(
                 // nothing more behind a device that is not answering.
                 drop(installs);
                 drop(group);
+                drop(migrated);
                 drop(group_guard);
                 break 'policies;
             }
             let t_install = std::time::Instant::now();
-            let (bytes, count) = install_hot_to_warm(conversation, installs);
+            let (bytes, count) = install_hot_to_warm(conversation, &migrated, installs);
+            drop(migrated);
             install_ms += t_install.elapsed().as_millis() as u64;
             hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
             hot_to_warm_count += count;
@@ -1552,12 +1573,6 @@ fn run_pass(
     // move. Gating on the warm population instead costs one OS query per pass
     // whenever anything is warm, and `purge_warm_to_budget` is a no-op while warm
     // is comfortable.
-    // Bound to a local so the read guard is unambiguously dropped before the
-    // block below takes the WRITE side. An `if` condition is a temporary scope so
-    // the inline form is also correct — but `match`/`if let` scrutinees are NOT,
-    // and that one-word difference is exactly what produced the recursive-read
-    // self-deadlock in `inject_sealed_turn`. Too sharp an edge to leave implicit
-    // directly above a `conversation.write()`.
     let (warm_resident, warm_bytes, held) = {
         let read = conversation.read();
         let held = read.held_payload_bytes();
@@ -1578,7 +1593,7 @@ fn run_pass(
         // batch summary (see substrate.rs).
         let budget = candle::vram::host_ram_budget(sys.total_memory());
         let _ = conversation
-            .write()
+            .read()
             .purge_warm_to_budget(budget.kv_warm_budget_bytes, 0);
     }
 
@@ -1688,7 +1703,7 @@ fn persist_section_group(
     let mut bytes = 0u64;
     let count = installs.len();
     if !installs.is_empty() {
-        let mut view = conversation.write();
+        let view = conversation.read();
         for (idx, stored, b) in installs {
             bytes = bytes.saturating_add(b);
             view.install_cold(idx, stored);

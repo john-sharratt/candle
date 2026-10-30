@@ -2694,7 +2694,7 @@ fn belief_eval(
             .split(',')
             .map(|p| ScopeKey::collection(0, format!("{tag}/{}", p.trim())))
             .collect();
-        let mut cache = NormalizationCache::new(NormConfig::default());
+        let cache = NormalizationCache::new(NormConfig::default());
         let mut out = Vec::with_capacity(probes.len());
         for (k, &pi) in probes.iter().enumerate() {
             let mut fused = vec![f32::MIN; n_slots];
@@ -3625,7 +3625,7 @@ fn belief_sweep(
     // learned from earlier rows only, then its own-match observed.
     let matrix: Vec<(usize, Vec<f32>, usize)> = if normalize {
         let scope = ScopeKey::collection(0, tag);
-        let mut cache = NormalizationCache::new(NormConfig::default());
+        let cache = NormalizationCache::new(NormConfig::default());
         let mut out = Vec::with_capacity(matrix.len());
         for (row, (gt, fresh, t_probe)) in matrix.iter().enumerate() {
             let raw: Vec<(ChildKey, f32)> = (0..n_slots)

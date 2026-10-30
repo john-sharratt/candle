@@ -80,7 +80,7 @@ pub(crate) enum TaskPoll {
 /// - `abort()` is idempotent: safe to call multiple times.
 /// - Once `poll()` returns `Ready`, `Aborted`, or `Failed`, the task is done.
 ///   Further calls to `poll()` are unspecified but safe.
-pub(crate) trait CognitiveTask: Send {
+pub(crate) trait CognitiveTask: Send + Sync {
     /// What kind of background work this task represents.
     #[allow(dead_code)]
     fn kind(&self) -> TaskKind;

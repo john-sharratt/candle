@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::manifest::ChunkLoc;
 use super::segment::SegmentId;
+use crate::substrate::pcoll::POrdMap;
 
 /// Identifies which log file a record's bytes live in. The orchestrator
 /// uses this to pick the correct [`candle::direct_io::DirectFile`]
@@ -119,8 +120,8 @@ pub struct ChunkedReadPlan {
 /// empty turn yields an empty plan.
 pub fn plan_chunked_read(
     active_id: SegmentId,
-    active_chunks: Option<&BTreeMap<u64, ChunkLoc>>,
-    inherited_chunks: &[Option<&BTreeMap<u64, ChunkLoc>>],
+    active_chunks: Option<&POrdMap<u64, ChunkLoc>>,
+    inherited_chunks: &[Option<&POrdMap<u64, ChunkLoc>>],
     buffer_size: usize,
 ) -> ChunkedReadPlan {
     let mut seen: HashSet<u64> = HashSet::new();
@@ -165,7 +166,7 @@ pub fn plan_chunked_read(
 }
 
 fn collect_records(
-    chunks: Option<&std::collections::BTreeMap<u64, ChunkLoc>>,
+    chunks: Option<&POrdMap<u64, ChunkLoc>>,
     source: SourceLog,
     seen: &mut HashSet<u64>,
 ) -> Vec<RawRecord> {

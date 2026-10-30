@@ -11,7 +11,6 @@ use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
 use super::gang;
-use super::ingest_demote::{ColdDemoted, DemoteOrder};
 use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
@@ -20,6 +19,7 @@ use super::*;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
+use crate::substrate::residence::{drain_reclaimed, rewrite_reclaimed};
 use crate::substrate::EvictionReport;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{
@@ -1521,6 +1521,10 @@ impl Scheduler {
         let Some((shape, FrontierPass::Kv)) = goal.pass(self) else {
             return Some(PackPass::default());
         };
+        // Free first what other threads let go of: a chunk freed while the pass
+        // relocates would leave its slot neither where the pass found it nor
+        // where it put it.
+        drain_reclaimed();
 
         // **Every registered conversation, not one.** Conversations in a workspace
         // share a substrate, so sweeping one sweeps all its residences — but the
@@ -1573,6 +1577,9 @@ impl Scheduler {
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
                 }
+                // Last, so a hot copy any thread let go of while the residences
+                // were walked is still named by the sweep.
+                swept += rewrite_reclaimed(sweep)?;
                 Ok(())
             })
         };
@@ -2886,7 +2893,7 @@ impl Scheduler {
                 break;
             }
             let r = conv
-                .write()
+                .read()
                 .evict_hot_for_guest(&keep_sections, &keep_turns, remaining);
             remaining = remaining.saturating_sub(r.bytes);
             report.count += r.count;
@@ -2946,7 +2953,7 @@ impl Scheduler {
                 break;
             }
             let r = conv
-                .write()
+                .read()
                 .evict_hot_to_free(&keep_sections, &keep_turns, remaining);
             remaining = remaining.saturating_sub(r.bytes);
             report.count += r.count;
@@ -2983,11 +2990,7 @@ impl Scheduler {
     /// of how much ingest is resident. Occupancy of the KV span is the same
     /// question asked of the right counter.
     pub(super) fn demote_cold_ingest_if_pressured(&mut self) {
-        // What the demotes sent earlier shed, first: their hot copies are
-        // dropped here, on the scheduler thread, before this wave prices its
-        // pressure against regions they still held.
-        self.settle_ingest_demotes();
-        if self.ingest_timelines.is_empty() || self.ingest_demotes.in_flight() {
+        if self.ingest_timelines.is_empty() {
             return;
         }
         let Some(stats) = self.kv_regions() else {
@@ -3012,38 +3015,27 @@ impl Scheduler {
         // so the demote sheds the least-recently-active ingest tail just enough to
         // clear the pressure, never the whole hot working set.
         let target_bytes = used.saturating_sub(watermark) as u64;
-        // Shed whatever is already warm-backed — free, no migration. Sent, not
-        // applied here: see `ingest_demote`. What it shed is settled when it
-        // comes back.
+        // Shed whatever is already warm-backed — free, no migration. A demote
+        // takes hot copies off their residences directly and waits on nothing,
+        // so it runs here, every wave it is due; this is the device's own
+        // thread, so the copies no forward still holds are freed at once.
         tracing::trace!(
             target: "candle_conversation::scheduler::vram_relief",
             used_mib = used / (1 << 20),
             watermark_mib = watermark / (1 << 20),
             target_mib = target_bytes >> 20,
             window,
-            "cold-ingest demote sent"
+            "cold-ingest demote"
         );
-        self.send_ingest_demote(window, target_bytes);
-    }
-
-    /// Settle every ingest demote applied since the last wave: drop the hot
-    /// copies it took out of the substrate, feed the phase timeline, release
-    /// the arenas it emptied, and nudge the persistence drain when it could
-    /// not shed its target.
-    fn settle_ingest_demotes(&mut self) {
-        for demoted in self.ingest_demotes.landed() {
-            let ColdDemoted {
-                report,
-                target,
-                took,
-                hot,
-            } = demoted;
-            drop(hot);
-            // Feed the GUI's phase timeline: the gentle-rung ingest demotion.
-            self.wave_stats
-                .add_evict(report.bytes, report.count as u64, took.as_millis() as u64);
-            self.nudge_if_warm_starved(report, target);
-        }
+        let t = Instant::now();
+        let report = self.demote_ingest(window, target_bytes);
+        // Feed the GUI's phase timeline: the gentle-rung ingest demotion.
+        self.wave_stats.add_evict(
+            report.bytes,
+            report.count as u64,
+            t.elapsed().as_millis() as u64,
+        );
+        self.nudge_if_warm_starved(report, target_bytes);
     }
 
     /// After a demote that shed `report` toward `target_bytes`: nudge the
@@ -3203,16 +3195,16 @@ impl Scheduler {
         }
     }
 
-    /// Send one LRU-smart cold-ingest demote, toward `target_bytes`, to every
-    /// live substrate (`ingest_demote`). `demote_cold_ingest` self-filters to
-    /// the timelines a substrate owns (a non-matching id is a no-op), walks its
-    /// `hot_lru` oldest-first so the least-recently-active tail sheds before an
-    /// active window, and is idempotent (already-demoted turns have `hot = None`
-    /// and are skipped). The working-set protect-list is every live slot's —
-    /// mirrors [`Self::evict_cold_tail`] — and only ever matches a substrate's
-    /// own attended turns. Each substrate gets the whole target: ingest
+    /// One LRU-smart cold-ingest demote, toward `target_bytes`, on every live
+    /// substrate. `demote_cold_ingest` self-filters to the timelines a
+    /// substrate owns (a non-matching id is a no-op), walks its hot turns
+    /// least recently touched first so the least-recently-active tail sheds
+    /// before an active window, and is idempotent (already-demoted turns hold
+    /// no hot copy and are skipped). The protect-list is every live slot's
+    /// working set — mirrors [`Self::evict_cold_tail`] — and every residence a
+    /// working set pins. Each substrate gets the whole target: ingest
     /// timelines are one tenant's, so in practice one substrate sheds.
-    fn send_ingest_demote(&mut self, window: usize, target_bytes: u64) {
+    fn demote_ingest(&self, window: usize, target_bytes: u64) -> EvictionReport {
         // Protect the active working set of every live slot (what in-flight
         // prefills/decodes are attending) — the same union `evict_cold_tail`
         // builds, so an actively-ingesting conversation's gathered turns are never
@@ -3223,18 +3215,19 @@ impl Scheduler {
             keep_sections.extend(st.working_set.sections.iter().copied());
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
+        let mut report = EvictionReport { count: 0, bytes: 0 };
         for conv in self.distinct_substrates() {
-            self.ingest_demotes.send(
-                &conv,
-                DemoteOrder {
-                    ingest: self.ingest_timelines.clone(),
-                    keep_turns: keep_turns.clone(),
-                    keep_sections: keep_sections.clone(),
-                    window,
-                    target: target_bytes,
-                },
+            let r = conv.read().demote_cold_ingest(
+                &self.ingest_timelines,
+                &keep_turns,
+                &keep_sections,
+                window,
+                target_bytes,
             );
+            report.count += r.count;
+            report.bytes += r.bytes;
         }
+        report
     }
 
     /// Every `High` prompt outstanding — prefilling or still queued — as its

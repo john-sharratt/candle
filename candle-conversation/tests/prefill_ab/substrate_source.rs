@@ -29,7 +29,7 @@ use crate::harness::{
 use candle::{DType, Device, Result, Tensor};
 use candle_conversation::persistence::cold_load::ColdLoadStager;
 use candle_conversation::persistence::resume::recovered_turn_decls;
-use candle_conversation::persistence::transfer::load_turn_into_hot;
+use candle_conversation::persistence::transfer::{cold_buffer_size, load_turn_into_hot};
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::substrate::Substrate;
 use candle_nn::kv_cache::ChunkedKvBacking;
@@ -96,15 +96,11 @@ pub fn load_largest_turn(dir: &std::path::Path, device: &Device) -> Result<Recov
     }
 
     let mut stager = ColdLoadStager::new();
-    let sealed = load_turn_into_hot(
-        &backings,
-        device,
-        &mut persistence,
-        &substrate,
-        &decl,
-        &mut stager,
-    )
-    .map_err(|e| candle::Error::Msg(format!("load_turn_into_hot: {e}")))?;
+    let (plan, source) = persistence
+        .cold_read(&substrate, stream_id, cold_buffer_size(&stager))
+        .map_err(|e| candle::Error::Msg(format!("cold_read: {e}")))?;
+    let sealed = load_turn_into_hot(&backings, device, &plan, &source, &decl, &mut stager)
+        .map_err(|e| candle::Error::Msg(format!("load_turn_into_hot: {e}")))?;
 
     let mut prefix_len = 0usize;
     for (li, seq) in sealed.iter().enumerate() {

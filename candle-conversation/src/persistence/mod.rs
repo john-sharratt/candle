@@ -34,6 +34,7 @@ pub mod blob;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
 pub mod cold_load;
+pub mod cold_source;
 pub mod compaction;
 pub mod content_hash;
 #[cfg(test)]
@@ -61,9 +62,9 @@ pub mod maintenance;
 pub mod manifest;
 mod model_binding;
 pub mod open_progress;
+pub mod owner;
 pub mod payload_parts;
 pub mod pipeline;
-pub mod priority_lock;
 pub mod rebase;
 #[cfg(test)]
 mod rebase_tests;
@@ -75,6 +76,7 @@ pub mod replica;
 #[cfg(test)]
 mod replica_tests;
 pub mod resume;
+pub mod rewritten;
 pub mod sealed_reader;
 pub mod segment;
 pub mod segmented_log;
@@ -106,13 +108,13 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::projection::TimelineId;
+use crate::substrate::pcoll::POrdMap;
 use crate::substrate::{file_store_key, Substrate, SubstrateLock, TurnMark};
 
 use accounting::RecordAccounting;
 use adoption::Adoption;
 use appended::Appended;
 use blob::{retired_blob, BlobIndex, BlobKey};
-use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use compaction::Housekeeping;
 use content_hash::snapshot_stream_id;
@@ -128,7 +130,7 @@ use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
 use open_progress::MibMeter;
 pub use open_progress::{OpenProgress, OpenProgressHook, OpenStage};
-pub use priority_lock::PersistenceLock;
+pub use owner::PersistenceOwner;
 use rebase::{RebaseEntry, RebaseMap};
 use record::verify_record_crc;
 use record::{
@@ -139,6 +141,7 @@ use record::{
 };
 use relocation_watch::RelocationWatch;
 use replica::{AppliedSet, DeferredRecord, Located, LocationIndex, OriginApplied, ReplicaPayload};
+use rewritten::Rewritten;
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::{store_mib, SegmentedLog};
@@ -302,36 +305,33 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 #[derive(Clone)]
 pub struct SharedSubstrate {
     pub substrate: Arc<SubstrateLock>,
-    pub persistence: Arc<PersistenceLock>,
+    pub persistence: Arc<PersistenceOwner>,
 }
 
 /// Names the directory rather than the contents. A substrate's interesting
 /// state is megabytes of index and arena bookkeeping, and this appears inside
 /// the `Debug` for a whole engine config — the useful fact at that scale is
-/// *which* log it is, and taking the lock to say more would let a stray
-/// `{:?}` deadlock against a writer.
+/// *which* log it is.
 impl std::fmt::Debug for SharedSubstrate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let dir = self
-            .persistence
-            .try_lock()
-            .ok()
-            .map(|p| p.dir().to_path_buf());
-        match dir {
-            Some(d) => f.debug_tuple("SharedSubstrate").field(&d).finish(),
-            None => f.write_str("SharedSubstrate(<in use>)"),
-        }
+        f.debug_tuple("SharedSubstrate")
+            .field(&self.persistence.dir())
+            .finish()
     }
 }
 
 impl SharedSubstrate {
-    /// Wrap a freshly-opened pair. The caller does the walk — typically through
+    /// Wrap a freshly-opened pair: the substrate's versioned root, and the log
+    /// handed to a thread of its own ([`PersistenceOwner`]). The caller does the
+    /// walk — typically through
     /// [`SubstratePersistence::open_in_with_substrate_and_sink`], so its own
     /// record classes are collected in the same pass.
     pub fn new(substrate: Substrate, persistence: SubstratePersistence) -> Self {
+        let substrate = Arc::new(SubstrateLock::new(substrate));
+        let persistence = PersistenceOwner::spawn(persistence, Arc::clone(&substrate));
         Self {
-            substrate: Arc::new(SubstrateLock::new(substrate)),
-            persistence: Arc::new(PersistenceLock::new(persistence)),
+            substrate,
+            persistence,
         }
     }
 
@@ -385,31 +385,31 @@ impl SharedSubstrate {
     /// ([`BlobKey::tombstone_key`], ceased) retires the blob here at once.
     pub fn put_custom_object(&self, obj: CustomObjectPayload) -> Result<()> {
         let retires = retired_blob(&obj);
-        let id = {
-            let mut p = self.persistence.lock().unwrap();
+        let id = self.persistence.call(|p| {
             let id = p.mint();
             p.write_custom_object(&obj, id)?;
             p.commit()?;
-            id
-        };
-        self.substrate.write().unwrap().apply_custom_object(obj, id);
+            Ok::<_, PersistenceError>(id)
+        })?;
+        self.substrate
+            .update(|s| s.apply_custom_object(obj.clone(), id));
         self.forget_retired_blobs(retires);
         Ok(())
     }
 
     /// Forget each of `keys` whose tombstone now outranks the blob held —
-    /// after the tombstones are durable and applied, so the commit's flush
-    /// holds no substrate lock.
+    /// after the tombstones are durable and applied.
     fn forget_retired_blobs(&self, keys: impl IntoIterator<Item = BlobKey>) {
-        let mut keys = keys.into_iter().peekable();
-        if keys.peek().is_none() {
+        let keys: Vec<BlobKey> = keys.into_iter().collect();
+        if keys.is_empty() {
             return;
         }
-        let mut p = self.persistence.lock().unwrap();
-        let s = self.substrate.read().unwrap();
-        for key in keys {
-            p.forget_retired_blob(&s, key);
-        }
+        let s = self.substrate.read();
+        self.persistence.call(|p| {
+            for key in keys {
+                p.forget_retired_blob(&s, key);
+            }
+        });
     }
 
     /// Retire the blob `sha256` names: write its tombstone
@@ -427,7 +427,7 @@ impl SharedSubstrate {
     /// ever written, or its winning record is its tombstone
     /// ([`CustomObjectPayload::ceased`]).
     pub fn custom_object(&self, key: &str) -> Option<CustomObjectPayload> {
-        self.substrate.read().unwrap().custom_object(key).cloned()
+        self.substrate.read().custom_object(key).cloned()
     }
 
     /// Store `objs` — values and tombstones alike — under the lease epoch
@@ -442,8 +442,7 @@ impl SharedSubstrate {
         if objs.is_empty() {
             return Ok(());
         }
-        let ids = {
-            let mut p = self.persistence.lock().unwrap();
+        let ids = self.persistence.call(|p| {
             let mut ids = Vec::with_capacity(objs.len());
             for obj in &objs {
                 let id = p.mint_under(epoch);
@@ -451,15 +450,14 @@ impl SharedSubstrate {
                 ids.push(id);
             }
             p.commit()?;
-            ids
-        };
+            Ok::<_, PersistenceError>(ids)
+        })?;
         let retires: Vec<BlobKey> = objs.iter().filter_map(retired_blob).collect();
-        {
-            let mut s = self.substrate.write().unwrap();
-            for (obj, id) in objs.into_iter().zip(ids) {
-                s.apply_custom_object(obj, id);
+        self.substrate.update(|s| {
+            for (obj, &id) in objs.iter().zip(&ids) {
+                s.apply_custom_object(obj.clone(), id);
             }
-        }
+        });
         self.forget_retired_blobs(retires);
         Ok(())
     }
@@ -469,7 +467,6 @@ impl SharedSubstrate {
     pub fn custom_objects_under(&self, prefix: &str) -> Vec<(CustomObjectPayload, VersionStamp)> {
         self.substrate
             .read()
-            .unwrap()
             .custom_objects_under(prefix)
             .into_iter()
             .map(|(obj, id)| (obj, id.stamp()))
@@ -479,34 +476,34 @@ impl SharedSubstrate {
     /// A count that moves whenever a custom object changes: read a prefix
     /// again only when it has.
     pub fn custom_objects_version(&self) -> u64 {
-        self.substrate.read().unwrap().custom_objects_version()
+        self.substrate.read().custom_objects_version()
     }
 
     /// Write `write` as `timeline`'s file events, then its tombstones, in
     /// one commit; the ids the events took (`docs/zend_vfs_events.md`).
     pub fn write_vfs(&self, timeline: u64, write: &VfsWrite) -> Result<Vec<VfsEventId>> {
-        let mut p = self.persistence.lock().unwrap();
-        let ids = p.write_vfs(timeline, write)?;
-        p.commit()?;
-        Ok(ids)
+        self.persistence.call(|p| {
+            let ids = p.write_vfs(timeline, write)?;
+            p.commit()?;
+            Ok(ids)
+        })
     }
 
     /// Every live file event of `timeline`, in `(repo, key)` order and within
     /// a key in stamp order.
     pub fn vfs_events(&self, timeline: u64) -> Result<Vec<VfsEventPayload>> {
-        self.persistence.lock().unwrap().vfs_events(timeline)
+        self.persistence.call(|p| p.vfs_events(timeline))
     }
 
     /// Every timeline holding file events or tombstones, in id order.
     pub fn vfs_timelines(&self) -> Vec<u64> {
-        self.persistence
-            .lock()
-            .unwrap()
-            .vfs_index()
-            .timelines()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
+        self.persistence.call(|p| {
+            p.vfs_index()
+                .timelines()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        })
     }
 
     /// Declare `timeline` a file store, so every rewrite of the log carries its
@@ -514,7 +511,7 @@ impl SharedSubstrate {
     /// ([`Substrate::is_file_store`]) — once: a store already declared writes
     /// nothing.
     pub fn declare_file_store(&self, timeline: TimelineId) -> Result<()> {
-        if self.substrate.read().unwrap().is_file_store(timeline) {
+        if self.substrate.read().is_file_store(timeline) {
             return Ok(());
         }
         self.put_custom_object(CustomObjectPayload::new(
@@ -526,22 +523,23 @@ impl SharedSubstrate {
     /// Keep `bytes` as a blob, durably, unless one of their hash is already
     /// held; their SHA-256 either way (`docs/replicated_substrate.md` §10.3).
     pub fn put_blob(&self, bytes: Vec<u8>) -> Result<[u8; 32]> {
-        let mut p = self.persistence.lock().unwrap();
-        let sha256 = p.write_blob(bytes)?;
-        p.commit_if_pending()?;
-        Ok(sha256)
+        self.persistence.call(|p| {
+            let sha256 = p.write_blob(bytes)?;
+            p.commit_if_pending()?;
+            Ok(sha256)
+        })
     }
 
     /// The bytes named `sha256`, or `None` when no blob of that hash is held.
     pub fn blob(&self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        self.persistence.lock().unwrap().blob(sha256)
+        self.persistence.call(|p| p.blob(sha256))
     }
 
     /// Whether a blob of `sha256` is held, without reading it: a pack of
     /// 64 MiB is known to have arrived without being read
     /// (`docs/substrate_git.md` §4.1).
     pub fn has_blob(&self, sha256: &[u8; 32]) -> bool {
-        self.persistence.lock().unwrap().has_blob(sha256)
+        self.persistence.call(|p| p.has_blob(sha256))
     }
 }
 
@@ -712,6 +710,13 @@ pub struct SubstratePersistence {
     /// what it wrote cut off and no rejoin has fixed. A rewrite or relocation
     /// of a record already here is not tapped again.
     own_written: OriginApplied,
+    /// The top of `own_written` when the log was opened. A gap at or below it
+    /// is one a purge left; one above it is a record this process minted that
+    /// has not reached the log yet ([`Self::own_sendable_through`]).
+    open_top: u64,
+    /// `oseq`s this process minted whose append failed: never coming, so no
+    /// hold on [`Self::own_sendable_through`].
+    own_unwritten: OriginApplied,
     /// A write failed for lack of space (§7.7) — see [`space`].
     out_of_space: bool,
 }
@@ -1429,6 +1434,8 @@ impl SubstratePersistence {
             rebases,
             unstamped,
             tap: None,
+            open_top: own_written.top(),
+            own_unwritten: OriginApplied::default(),
             own_written,
             out_of_space: false,
         };
@@ -1546,26 +1553,6 @@ impl SubstratePersistence {
         self.segments.close_for_writing();
         self.writer_lock = None;
         Ok(())
-    }
-
-    /// The cache-bypassing read handles for the active segment — exposed
-    /// for the pipelined cold-load reader pool.
-    pub(super) fn active_direct_file(&self) -> &DirectFile {
-        self.segments.active_direct_file()
-    }
-
-    /// A direct-I/O handle set on sealed `segment`, shared with the caller for
-    /// the duration of one cold-load. The GPU pipeline holds several of these
-    /// at once (a turn spanning a seal), so it takes shared ownership rather
-    /// than borrowing from the read pool — see
-    /// [`SegmentedLog::open_sealed_direct`].
-    pub(super) fn open_sealed_direct(&self, segment: SegmentId) -> Result<Arc<DirectFile>> {
-        self.segments.open_sealed_direct(segment)
-    }
-
-    /// The cache-bypassing read handles for the `i`-th inherited log.
-    pub(super) fn inherited_direct_file(&self, i: usize) -> &DirectFile {
-        self.inherited[i].direct_file()
     }
 
     /// Number of inherited logs.
@@ -1960,7 +1947,7 @@ impl SubstratePersistence {
 
     /// Tell `tap` the `oseq` of every record this node writes from now on that
     /// may be sent, as it is appended — and of what it wrote cut off, when a
-    /// rejoin fixes it (§6.3, §6.7). It is called under the persistence lock,
+    /// rejoin fixes it (§6.3, §6.7). It is called on the log's owner thread,
     /// so it must not block.
     pub fn set_tap(&mut self, tap: Tap) {
         self.tap = Some(tap);
@@ -1970,6 +1957,35 @@ impl SubstratePersistence {
     /// of itself.
     pub fn own_written(&self) -> &OriginApplied {
         &self.own_written
+    }
+
+    /// Every own `oseq` up to this one is written, or known gone: what this
+    /// member may tell another it holds of itself (§7.8, R10).
+    ///
+    /// Not [`OriginApplied::top`]. A record is stamped when its value changes
+    /// and appended when the log's owner reaches its job, so this node's
+    /// `oseq`s reach the log out of order, and the top can stand above a record
+    /// still queued — a peer told it held the top would take that record for
+    /// gone. A gap a purge left at open is gone for good and holds nothing back;
+    /// a gap above what the log held at open is a record still on its way, and
+    /// what may be told stops below it. A record whose append failed is never
+    /// coming ([`Self::mark_unwritten`]), so it does not hold the count back.
+    pub fn own_sendable_through(&self) -> u64 {
+        let written = &self.own_written;
+        written
+            .gaps()
+            .into_iter()
+            .filter(|&(start, _)| start > self.open_top)
+            .find(|&(start, end)| !self.own_unwritten.contains_range(start, end))
+            .map_or(written.top(), |(start, _)| start - 1)
+    }
+
+    /// `id`, minted by this node, will never be written: its append failed.
+    /// It holds nothing back ([`Self::own_sendable_through`]).
+    pub fn mark_unwritten(&mut self, id: RecordIdentity) {
+        if id.origin == self.node() && id.oseq > 0 {
+            self.own_unwritten.insert(id.oseq);
+        }
     }
 
     /// What this member holds of every origin, its own written records
@@ -2966,7 +2982,7 @@ impl SubstratePersistence {
         buffer_size: usize,
     ) -> ChunkedReadPlan {
         let active_chunks = substrate.stream_of(stream_id).map(|s| &s.chunks);
-        let inherited_chunks: Vec<Option<&std::collections::BTreeMap<u64, ChunkLoc>>> = self
+        let inherited_chunks: Vec<Option<&POrdMap<u64, ChunkLoc>>> = self
             .inherited
             .iter()
             .map(|i| i.substrate().stream_of(stream_id).map(|s| &s.chunks))
@@ -3314,12 +3330,47 @@ impl SubstratePersistence {
     ///
     /// `progress` is told the records written of the live set — `(0, 0)` while
     /// that set is still being collected.
+    ///
+    /// For a substrate no other thread edits; [`Self::compact_shared`] is the
+    /// same rewrite against a root other threads edit while it runs.
     pub fn compact(
         &mut self,
         substrate: &mut Substrate,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
-        self.rewrite(substrate, progress, None)
+        let rewritten = self.rewrite(substrate, progress, None)?;
+        rewritten.apply_to(substrate);
+        self.unlink_rewritten(&rewritten)
+    }
+
+    /// [`Self::compact`] against a shared root: the rewrite reads one version,
+    /// and its re-apply is a run of ordinary edits ([`Rewritten::batches`]), so
+    /// every edit another thread publishes meanwhile survives it. The old
+    /// segments are unlinked once the last edit is published.
+    pub fn compact_shared(
+        &mut self,
+        substrate: &SubstrateLock,
+        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> Result<()> {
+        let read = substrate.read();
+        let progress = progress.map(|p| p as &dyn Fn(usize, usize));
+        let rewritten = self.rewrite(&read, progress, None)?;
+        drop(read);
+        for batch in rewritten.batches() {
+            substrate.update(|s| {
+                for entry in batch {
+                    s.apply_walker_entry(entry);
+                }
+            });
+        }
+        substrate.update(|s| rewritten.settle(s));
+        self.unlink_rewritten(&rewritten)
+    }
+
+    /// Unlink the segments `rewritten` replaced: the substrate names none of
+    /// them any more.
+    fn unlink_rewritten(&mut self, rewritten: &Rewritten) -> Result<()> {
+        self.segments.unlink_replaced(rewritten.old_segments())
     }
 
     /// Adopt a store written before identities (§6.2, [`adoption`]): one
@@ -3340,18 +3391,23 @@ impl SubstratePersistence {
              with every record stamped as this node's own"
         );
         let mut adoption = Adoption::new(self.minter.clone());
-        self.rewrite(substrate, Some(progress), Some(&mut adoption))?;
+        let rewritten = self.rewrite(substrate, Some(progress), Some(&mut adoption))?;
+        // The caller opens the adopted store again into a fresh substrate, so
+        // this one is not re-applied.
+        self.unlink_rewritten(&rewritten)?;
         self.unstamped = RecordCensus::new();
         Ok(())
     }
 
-    /// [`Self::compact`], stamping as it writes when `adoption` is given.
+    /// The log rewrite behind [`Self::compact`], stamping as it writes when
+    /// `adoption` is given. Reads `substrate` and changes nothing in it: what
+    /// the substrate has to do about the rewrite comes back as a [`Rewritten`].
     fn rewrite(
         &mut self,
-        substrate: &mut Substrate,
+        substrate: &Substrate,
         progress: Option<&dyn Fn(usize, usize)>,
         adoption: Option<&mut Adoption>,
-    ) -> Result<()> {
+    ) -> Result<Rewritten> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -3448,7 +3504,7 @@ impl SubstratePersistence {
                 &mut |done| report(done, total),
             )?
         };
-        self.segments.adopt_compacted(new_log, &scratch)?;
+        let old_segments = self.segments.adopt_compacted(new_log, &scratch)?;
 
         // 4. Adopt the compacted manifest and refresh the metadata caches.
         //    `write_compacted_log` stamped every singleton with `FIRST_SEGMENT`,
@@ -3495,13 +3551,11 @@ impl SubstratePersistence {
                 Ok::<_, PersistenceError>(sha256(&r.payload))
             })
             .transpose()?;
-        // 5. The substrate's stream / timeline state still holds offsets into
-        //    the OLD segments. Reset the walker-built collections and replay
-        //    the compacted segment to rebuild them with the new offsets.
-        //    Per-turn KV residence and timeline registrations survive (not
-        //    walker-built). The dead-weight accounting restarts from the fresh
-        //    segment in the same pass (a just-compacted store is all-live).
-        substrate.clear_walker_state();
+        // 5. The substrate still holds offsets into the OLD segments. The walk
+        //    of the compacted segment below is kept for the caller to re-apply
+        //    ([`Rewritten`]), which moves each value to its new offset. The
+        //    dead-weight accounting restarts from the fresh segment in the same
+        //    pass (a just-compacted store is all-live).
         self.accounting.reset();
         // Metadata and snapshot locations point at the OLD segments; rebuild
         // them from the freshly-compacted segment in the same recovery pass
@@ -3534,6 +3588,7 @@ impl SubstratePersistence {
         // The carried record's own entry is `own_written` as it stands, which
         // this handle already holds.
         let mut own_kept = None;
+        let mut walked: Vec<WalkEntry> = Vec::with_capacity(total);
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             let fixed = fix_walked(entry, rebases);
             let entry = fixed.as_ref();
@@ -3552,19 +3607,14 @@ impl SubstratePersistence {
             record_npc_loc(npc_locs, entry);
             vfs::record_vfs_loc(vfs_index, accounting, entry);
             blob::record_blob_loc(blob_index, entry);
-            substrate.apply_walker_entry(entry);
+            walked.push(Rewritten::keep(entry));
         })?;
-        substrate.forget_expired_tombstones(&expired);
         // The compacted segment carries a fresh index chain; chain the next
         // flush onto it.
         self.last_index = last_index;
         self.pending_index = tail_digests;
-        // 6. Every residence's cold tier still references the OLD offsets.
-        //    Re-point them at the rebuilt stream index so a mid-session
-        //    cold→hot elevation reads the right bytes.
-        substrate.refresh_cold_refs();
         report(total, total);
-        Ok(())
+        Ok(Rewritten::new(walked, old_segments, substrate, expired))
     }
 }
 
@@ -4068,18 +4118,17 @@ mod tests {
         let engine = shared.clone();
 
         // Runtime: a character is created, through the registry's side.
-        {
-            let mut p = shared.persistence.lock().unwrap();
+        shared.persistence.call(|p| {
             p.write_npc(&test_npc(2, "Wyneth")).unwrap();
             p.commit().unwrap();
-        }
+        });
 
-        // The engine compacts — the same lock, the same view.
-        {
-            let mut p = engine.persistence.lock().unwrap();
-            let mut s = engine.substrate.write().unwrap();
-            p.compact(&mut s, None).unwrap();
-        }
+        // The engine compacts — the same owner, the same view.
+        let substrate = &engine.substrate;
+        engine
+            .persistence
+            .call(|p| p.compact_shared(substrate, None))
+            .unwrap();
         drop(shared);
         drop(engine);
 
@@ -4144,11 +4193,11 @@ mod tests {
             );
 
             // Compact against this view, then confirm the winner survived.
-            {
-                let mut p = shared.persistence.lock().unwrap();
-                let mut s = shared.substrate.write().unwrap();
-                p.compact(&mut s, None).unwrap();
-            }
+            let substrate = &shared.substrate;
+            shared
+                .persistence
+                .call(|p| p.compact_shared(substrate, None))
+                .unwrap();
         }
 
         // Reopen after compaction: only the last value is present, and the

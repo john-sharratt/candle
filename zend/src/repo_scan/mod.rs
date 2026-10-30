@@ -564,15 +564,15 @@ pub struct UnitJob {
 /// other conversation of its folder whose key is not in it is tombstoned,
 /// and one whose key is — the folder as another branch lists it — is left.
 ///
-/// The engine mutex is taken only for the quick create/tombstone ops inside the
-/// pool — never across a decode — so chat consumers keep running throughout.
+/// Chat consumers keep running throughout: the pool's create/tombstone ops wait
+/// on nothing a decode holds.
 pub fn ingest_units(
     ctx: &RefreshContext<'_>,
     jobs: &[UnitJob],
     live: &HashSet<String>,
     progress: &Arc<LoadProgress>,
     layer_name: &str,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
 ) -> anyhow::Result<IngestReport> {
     tracing::info!(
         n_units = jobs.len(),
@@ -604,7 +604,7 @@ struct IngestPlan {
 
 impl IngestPlan {
     fn new(
-        engine: &Mutex<ConversationEngine>,
+        engine: &ConversationEngine,
         proj_builder: &projection::Builder,
         config: &SequenceConfig,
         layer_name: &str,
@@ -616,7 +616,7 @@ impl IngestPlan {
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
         let triggers = {
-            let en = engine.lock().unwrap();
+            let en = engine;
             en.compile_think_steering()?
                 .map(|ts| ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off))
                 // No single `<think>`/`</think>` token in this vocabulary, so
@@ -625,7 +625,7 @@ impl IngestPlan {
                 // `apply_think_mode` still runs.
                 .unwrap_or_else(|| Arc::new(TriggerRegistry::new()))
         };
-        engine.lock().unwrap().mark_layer_append_only(layer);
+        engine.mark_layer_append_only(layer);
         let envelope = ToolCallEnvelope::for_dialect(&config.dialect);
         Ok(Self { triggers, envelope })
     }
@@ -665,8 +665,8 @@ impl IngestPlan {
 /// metadata alone — both carry `dir` with no key — so sweeping there would
 /// tombstone the conversation a worker is still building. The pre-loop runs
 /// before the background ingest worker is even woken, so nothing is in flight.
-pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
-    let e = engine.lock().unwrap();
+pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
+    let e = engine;
     let mut retired = 0usize;
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
         if e.conversation_metadata(tl)
@@ -704,8 +704,8 @@ pub(crate) fn retire_crashed_partials(engine: &Mutex<ConversationEngine>) {
 /// "test the background ingest end to end without deleting the whole
 /// substrate" tool: unlike `--wipe-substrate`, every other layer's content
 /// (dialogue, `code_reading` unless it too is named) survives untouched.
-pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
-    let e = engine.lock().unwrap();
+pub(crate) fn wipe_layer(engine: &ConversationEngine) {
+    let e = engine;
     let mut wiped = 0usize;
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
         match e.tombstone_timeline(tl) {
@@ -749,13 +749,13 @@ pub(crate) const DIR_KEY: &str = "dir";
 /// what the pass plans against. Read from the substrate, never from what a
 /// pass attempted: a unit whose ingest failed wrote no key, so it is not
 /// committed and is queued again.
-pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
-    let e = engine.lock().unwrap();
+pub fn committed(engine: &ConversationEngine) -> Vec<Committed> {
+    let e = engine;
     let keys: HashMap<TimelineId, String> = e
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
-    let quants = crate::branch_ingest::keys::quant_tags(&e);
+    let quants = crate::branch_ingest::keys::quant_tags(e);
     let conv = e.conversation();
     let substrate = conv.read();
     e.conversations_with_metadata_key(DIR_KEY)
@@ -780,7 +780,7 @@ pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
 /// first hard error stops the rest).
 fn run_dir_pool(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     plan: &IngestPlan,
     jobs: &[UnitJob],
     live: &HashSet<String>,
@@ -794,10 +794,7 @@ fn run_dir_pool(
     anchor_scan_kv_baseline();
     // One snapshot of the committed keys: a unit another pass committed since
     // this one planned is not ingested twice.
-    let present_keys = engine
-        .lock()
-        .unwrap()
-        .conversation_metadata_values(CONTENT_KEY);
+    let present_keys = engine.conversation_metadata_values(CONTENT_KEY);
 
     // The GUI's merged background-ingest bar (`crate::ingest_backlog`) counts
     // only units that will REALLY run. Counted from the same snapshot the
@@ -895,8 +892,6 @@ fn run_dir_pool(
                             Share::Mine(hold) => {
                                 let already = hold.recheck()
                                     && engine
-                                        .lock()
-                                        .unwrap()
                                         .conversation_metadata_values(CONTENT_KEY)
                                         .contains(&job.unit.key);
                                 if already {
@@ -1000,7 +995,7 @@ fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
 /// the unit is queued again next pass.
 fn process_one_dir(
     ctx: &RefreshContext<'_>,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     plan: &IngestPlan,
     job: &UnitJob,
     live: &HashSet<String>,
@@ -1048,7 +1043,7 @@ fn process_one_dir(
     // that fails retires its own; a crash's are retired at boot
     // ([`retire_crashed_partials`]).
     let (mut conv, superseded) = {
-        let e = engine.lock().unwrap();
+        let e = engine;
         let superseded: Vec<TimelineId> = e
             .find_conversations_by_metadata(DIR_KEY, &unit.dir)
             .into_iter()
@@ -1058,7 +1053,6 @@ fn process_one_dir(
                     .is_some_and(|key| !live.contains(&key))
             })
             .collect();
-        drop(e);
         // Forks off `base` — this layer's prefilled template, `base_conv`'s
         // exact counterpart for ingestion (see `InferenceState::ingest_bases`)
         // — so this conversation shares the SAME already-computed prefix a
@@ -1066,8 +1060,6 @@ fn process_one_dir(
         // independently re-running the schema's "eager section ingestion"
         // under concurrent load.
         let conv = base
-            .lock()
-            .unwrap()
             .fork()
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
         // The priming chain is this conversation's parent, recorded BEFORE its
@@ -1076,8 +1068,6 @@ fn process_one_dir(
         // only: nothing is copied, and the parent needs no residency of its own.
         if let Some(parent) = ctx.chain_end {
             engine
-                .lock()
-                .unwrap()
                 .set_forked_from(conv.timeline_id(), parent)
                 .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;
             // The fork seeded the recurrent slot before this pointer existed,
@@ -1090,7 +1080,7 @@ fn process_one_dir(
                 );
             }
         }
-        let e = engine.lock().unwrap();
+        let e = engine;
         // The folder's closing turn is its own decoded summary, so the AVL
         // summariser must not compress these turns into a second summary tree.
         e.set_timeline_summarize(conv.timeline_id(), false);
@@ -1145,7 +1135,7 @@ fn process_one_dir(
             // this failed attempt invalidates nothing. Drop only THIS attempt's
             // partial; the retry re-mints cleanly.
             {
-                let en = engine.lock().unwrap();
+                let en = engine;
                 if let Err(err) = en.tombstone_timeline(conv.timeline_id()) {
                     tracing::warn!(
                         target: "zend::repo_scan",
@@ -1214,7 +1204,7 @@ fn process_one_dir(
     // the unit retry, exactly like a decode failure.
     if let Err(e) = conv.set_metadata_many(&tags) {
         {
-            let en = engine.lock().unwrap();
+            let en = engine;
             if let Err(err) = en.tombstone_timeline(conv.timeline_id()) {
                 tracing::warn!(
                     target: "zend::repo_scan",
@@ -1249,7 +1239,7 @@ fn process_one_dir(
     // projection saw the prior generation (stale but present); from here it
     // sees this one, and only this one.
     if !superseded.is_empty() {
-        let e = engine.lock().unwrap();
+        let e = engine;
         for tl in &superseded {
             if let Err(err) = e.tombstone_timeline(*tl) {
                 tracing::warn!(
@@ -1267,10 +1257,10 @@ fn process_one_dir(
     // demand. `FreeSequence` on drop only releases the batch slot, not the sealed
     // KV, so this is what actually reclaims the space across a large scan.
     {
-        let e = engine.lock().unwrap();
+        let e = engine;
         // Read once, never continued: it keeps its turns and no recurrent
         // snapshot (`crate::ingest_snapshots`).
-        finished(&e, conv.timeline_id(), Unit::Folder(&unit.dir));
+        finished(e, conv.timeline_id(), Unit::Folder(&unit.dir));
         e.evict_ingest_timeline(conv.timeline_id());
     }
     tracing::debug!(

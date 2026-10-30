@@ -90,7 +90,7 @@ impl Conversation {
         arena: &GalleryArena,
     ) -> candle::Result<GroupVotes> {
         let (files, _) = {
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
             assemble_file_scans(&sub, timelines)
         };

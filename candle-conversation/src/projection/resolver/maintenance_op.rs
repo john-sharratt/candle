@@ -1,8 +1,8 @@
 //! A segment-maintenance op run in steps, so the persistence thread can serve a
 //! flush between them.
 //!
-//! An op relocates one batch at a time under its own hold of the persistence
-//! lock, so a seal write or a cold load waits for at most one batch. A flush is
+//! An op relocates one batch at a time as background work on the log's owner,
+//! so a seal write or a cold load waits for at most one batch. A flush is
 //! different: it is work for the persistence thread itself — the hot→warm
 //! migration that lets relief evict — and the thread that would do it is the
 //! one running the op. Run to the end in one call, an op made relief's flush
@@ -19,6 +19,7 @@
 //! between batches, and a paused op is that, for longer.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::Conversation;
@@ -61,17 +62,16 @@ pub struct MaintenanceOp {
 }
 
 impl Conversation {
-    /// Plan an op of the kind `pass` allows and start it, in two brief read +
-    /// persistence holds: the liveness scan that chooses the op, then the
+    /// Plan an op of the kind `pass` allows and start it, in two background
+    /// steps on the log's owner, each against a version of the substrate it
+    /// reads without waiting: the liveness scan that chooses the op, then the
     /// gather of what it relocates, with the relocation watch started in that
-    /// second hold so every write after the plan is known to the relocation.
-    /// Each hold is about half a second on a large store, and a substrate
-    /// writer — the wave thread republishing its pins, an elevate — waits out
-    /// one of them rather than both: held together they were 1.1 s every 15 s
-    /// (BlackWorld, 2026-10-27).
+    /// second step so every write after the plan is known to the relocation.
+    /// Each step is about half a second on a large store; every call and write
+    /// waiting on the owner goes ahead of each.
     ///
     /// `None` when there is nothing to do, or an op is already in flight — an
-    /// op releases the lock between its batches, so a second pass (the forced
+    /// op runs in batches, so a second pass (the forced
     /// `POST /v1/substrate/zend/maintenance` beside the background thread's)
     /// can arrive mid-op. It plans nothing and leaves the status alone: the op
     /// in flight owns `running`.
@@ -83,38 +83,50 @@ impl Conversation {
                 "a maintenance op is already relocating — this pass plans none"
             );
         };
-        let chosen = {
-            let p = self.persistence.lock_behind_waiters().unwrap();
+        let substrate = self.read();
+        let chosen = self.persistence.call_behind(|p| {
             if p.relocation_in_flight() {
-                in_flight();
-                return Ok(None);
+                return Ok(Err(()));
             }
-            let substrate = self.read();
             match pass {
                 Pass::Gated => p.choose_maintenance(&substrate, false),
                 Pass::Forced => p.choose_maintenance(&substrate, true),
                 Pass::DropOnly => p.choose_drop(&substrate),
             }
+            .map(Ok)
+        });
+        let chosen = match chosen
             .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
+        {
+            Err(()) => {
+                in_flight();
+                return Ok(None);
+            }
+            Ok(chosen) => chosen,
         };
         let Some(chosen) = chosen else {
             self.refresh_maintenance_status();
             return Ok(None);
         };
-        let (plan, dir) = {
-            let mut p = self.persistence.lock_behind_waiters().unwrap();
+        // The plan reads the latest version: the scan's took a while.
+        let substrate = self.read();
+        let planned = self.persistence.call_behind(|p| {
             if p.relocation_in_flight() {
-                in_flight();
-                return Ok(None);
+                return None;
             }
-            let substrate = self.read();
             let plan = p.plan_chosen(&substrate, chosen);
             p.watch_relocation();
-            (plan, p.dir().to_path_buf())
+            Some((plan, p.dir().to_path_buf()))
+        });
+        drop(substrate);
+        let Some((plan, dir)) = planned else {
+            in_flight();
+            return Ok(None);
         };
         let plan_ms = t_plan.elapsed().as_millis() as u64;
         // "In progress" for the GUI's spinner, across every pass the op spans.
-        self.maintenance.lock().unwrap().2 = true;
+        self.maintenance
+            .rcu(|status| (status.0, status.1.clone(), true));
         let mut held = Duration::ZERO;
         let run = match self.maintenance_hold(&mut held, |p| p.begin_maintenance(&plan)) {
             Ok(run) => run,
@@ -142,15 +154,13 @@ impl Conversation {
     /// to the index and its sources unlinked. An op that errs has ended (each
     /// step ends the relocation watch on failure) and is not run again.
     ///
-    /// Relocation runs under the persistence lock only — the substrate lock is
-    /// released, so decode's in-RAM projection proceeds during the read,
-    /// re-append and fsync — and the lock is taken per batch: the resident
-    /// re-emit, the chunks, and the tail, each `RELOCATION_BATCH_BYTES` at a
-    /// time. Held across a whole phase it stalled what waited for it: a 3.6 GB
-    /// segment's chunks stalled an elevate — and the decode behind it — for
-    /// 37 s, and a ~35,700-record re-emit held every finishing turn's token
-    /// write for 44–52 s. Only the time the lock is actually held is charged
-    /// to the scheduler's Sync bucket.
+    /// Relocation runs on the log's owner as background work, one batch per
+    /// step: the resident re-emit, the chunks, and the tail, each
+    /// `RELOCATION_BATCH_BYTES` at a time. Run as one phase it stalled what
+    /// waited for it: a 3.6 GB segment's chunks stalled an elevate — and the
+    /// decode behind it — for 37 s, and a ~35,700-record re-emit held every
+    /// finishing turn's token write for 44–52 s. Only the time a step actually
+    /// runs is charged to the scheduler's Sync bucket.
     pub fn advance_maintenance(
         &self,
         op: &mut MaintenanceOp,
@@ -177,7 +187,7 @@ impl Conversation {
     /// thread shutting down, whose drain must not queue behind the op.
     pub fn abandon_maintenance(&self, op: MaintenanceOp) {
         drop(op);
-        self.persistence.lock().unwrap().end_relocation_watch();
+        self.persistence.call(|p| p.end_relocation_watch());
         self.refresh_maintenance_status();
     }
 
@@ -212,35 +222,28 @@ impl Conversation {
         }
     }
 
-    /// Repoint the index at the relocated records under a brief write lock,
-    /// then unlink the drained sources under the persistence lock, and log the
-    /// op's timings.
+    /// Repoint the index at the relocated records in one substrate edit, then
+    /// unlink the drained sources on the log's owner, and log the op's timings.
     fn complete_maintenance_op(&self, op: &mut MaintenanceOp) -> candle::Result<()> {
         let result = op.run.take_result();
         note_persistence_maint_us(op.held.as_micros() as u64);
         let exec_ms = op.started.elapsed().as_millis() as u64;
         let t_apply = Instant::now();
-        {
-            let mut substrate = self.write();
-            result.apply_to_substrate(&mut substrate);
-        }
+        // Guarded per record (`MaintenanceResult::apply_to_substrate`), so the
+        // edit is right on whatever version it lands on.
+        self.update(|s| result.apply_to_substrate(s));
         let apply_ms = t_apply.elapsed().as_millis() as u64;
         let t_finish = Instant::now();
-        {
-            let mut p = self.persistence.lock_behind_waiters().unwrap();
-            p.finish_maintenance(&op.plan)
-                .map_err(|e| candle::Error::Msg(format!("substrate maintenance drop: {e}")))?;
-        }
+        self.persistence
+            .call_behind(|p| p.finish_maintenance(&op.plan))
+            .map_err(|e| candle::Error::Msg(format!("substrate maintenance drop: {e}")))?;
         let finish_ms = t_finish.elapsed().as_millis() as u64;
-        // **Every phase's hold, not only the relocation's.** The plan holds the
-        // persistence lock and a substrate read lock together; the apply holds
-        // the substrate write lock; the finish holds the persistence lock across
-        // the unlinks. Any of them stalls a seal behind it, and
-        // `longest_hold_ms` covers only the relocation batches. At `info`, once
-        // per op beside the plan's own line: an op that stalls the tenants
-        // behind it is named by its slow phase here, and a process hosting
-        // several substrates says whose it was. `exec_ms` runs from the op's
-        // start to the end of its relocation, pauses for flushes included.
+        // **Every phase's time, not only the relocation's.** `longest_hold_ms`
+        // covers only the relocation batches. At `info`, once per op beside
+        // the plan's own line: an op whose slow phase delays the writes queued
+        // behind it is named here, and a process hosting several substrates
+        // says whose it was. `exec_ms` runs from the op's start to the end of
+        // its relocation, pauses for flushes included.
         tracing::info!(
             target: "candle_conversation::persistence::maintenance",
             dir = %op.dir.display(),
@@ -251,23 +254,20 @@ impl Conversation {
             longest_hold_ms = op.longest.as_millis() as u64,
             apply_ms,
             finish_ms,
-            "segment-maintenance: plan under both locks, relocation one batch \
-             at a time, apply under the substrate write lock, finish under the \
-             persistence lock"
+            "segment-maintenance: plan, relocation one batch at a time, apply in \
+             one substrate edit, finish on the log's owner"
         );
         Ok(())
     }
 
-    /// Refresh the status cache from the persistence layer — this also clears
-    /// `running`. The persistence lock is held only for two O(1) reads (never
-    /// across I/O); the status endpoint reads the separate `maintenance` lock,
-    /// so it never blocks on a compaction.
+    /// Refresh the status cell from the persistence layer — this also clears
+    /// `running`. Two O(1) reads on the owner; the status endpoint reads the
+    /// cell, so it never waits on the owner.
     fn refresh_maintenance_status(&self) {
-        let view = {
-            let p = self.persistence.lock().unwrap();
-            (p.segment_count(), p.last_maintenance(), false)
-        };
-        *self.maintenance.lock().unwrap() = view;
+        let view = self
+            .persistence
+            .call(|p| (p.segment_count(), p.last_maintenance(), false));
+        self.maintenance.store(Arc::new(view));
     }
 }
 

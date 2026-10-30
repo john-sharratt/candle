@@ -187,20 +187,20 @@ impl BoundSubstrate {
     /// record the key on one no model has, and embed the model's
     /// `tokenizer.json` so the log detokenizes offline.
     pub fn bind(shared: SharedSubstrate, identity: &ModelIdentity) -> Result<Self> {
-        {
-            let mut persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = shared.persistence.call(|persistence| {
             let binding = persistence.bind_model(identity.key())?;
             let wrote_tokenizer = persistence.set_tokenizer(identity.tokenizer_json())?;
             if binding != ModelBinding::Same || wrote_tokenizer {
                 persistence.commit()?;
             }
-            tracing::info!(
-                ?binding,
-                model = %identity.key().describe(),
-                dir = %persistence.dir().display(),
-                "substrate bound to its model"
-            );
-        }
+            Ok::<_, PersistenceError>(binding)
+        })?;
+        tracing::info!(
+            ?binding,
+            model = %identity.key().describe(),
+            dir = %shared.persistence.dir().display(),
+            "substrate bound to its model"
+        );
         Ok(Self {
             shared,
             key: identity.key().clone(),
@@ -219,12 +219,7 @@ impl BoundSubstrate {
 
     /// The directory the substrate lives in.
     pub fn dir(&self) -> PathBuf {
-        self.shared
-            .persistence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .dir()
-            .to_path_buf()
+        self.shared.persistence.dir().to_path_buf()
     }
 }
 

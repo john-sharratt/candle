@@ -14,8 +14,6 @@
 //! reading goes. What stays is the answer's own K/V, a small part of the
 //! reading's.
 
-use std::sync::Mutex;
-
 use candle_conversation::Sequence;
 
 use super::run::{mint_unit, UnitJob};
@@ -43,7 +41,7 @@ pub fn rewrite(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     job: &UnitJob,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     answer: &str,
 ) -> anyhow::Result<Sequence> {
     let mut conv = mint_unit(ctx, spec, job, base)?;
@@ -55,11 +53,7 @@ pub fn rewrite(
         )
         .map_err(|e| anyhow::anyhow!("writing the unit's exchange: {e}"));
     if let Err(e) = prefilled {
-        let _ = ctx
-            .engine
-            .lock()
-            .unwrap()
-            .tombstone_timeline(conv.timeline_id());
+        let _ = ctx.engine.tombstone_timeline(conv.timeline_id());
         return Err(e);
     }
     Ok(conv)

@@ -14,9 +14,9 @@
 //!   empties on restart.
 //!
 //! All read the daemon's live `Substrate` through a cloned `Conversation` handle
-//! (engine lock released immediately, only the substrate read guard held for the
-//! walk), never a rebuild from the multi-GB redo log, and return `503` until the
-//! model is loaded.
+//! (one version of it, held for the walk, which waits on no writer), never a
+//! rebuild from the multi-GB redo log, and return `503` until the model is
+//! loaded.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

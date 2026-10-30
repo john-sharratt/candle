@@ -64,7 +64,7 @@ pub struct LayerPass<'a> {
     pub mode: IngestMode,
     pub scope: IngestScope,
     /// The layer's prefilled template its units' conversations fork from.
-    pub base: &'a Mutex<Sequence>,
+    pub base: &'a Sequence,
     /// How a [`IngestMode::Derived`] layer's units are read.
     pub spec: Option<&'a LayerSpec>,
     /// How the layer's units are calibrated as they commit
@@ -91,7 +91,7 @@ impl BranchIngest {
     /// member before a restart, or on another member, whose verdict arrived
     /// with replication.
     fn known_binary(&self, ctx: &RefreshContext<'_>) -> HashSet<String> {
-        let conversation = ctx.engine.lock().unwrap().conversation();
+        let conversation = ctx.engine.conversation();
         let mut binary = self.binary.lock().unwrap();
         binary.extend(code_read::binary_mark::recorded(&conversation));
         binary.clone()
@@ -475,11 +475,11 @@ fn in_repos(subject: &str, repos: &[&str]) -> bool {
     repos.contains(&repo)
 }
 
-fn tombstone(engine: &Mutex<ConversationEngine>, layer: &str, timelines: &[TimelineId]) {
+fn tombstone(engine: &ConversationEngine, layer: &str, timelines: &[TimelineId]) {
     if timelines.is_empty() {
         return;
     }
-    let e = engine.lock().unwrap();
+    let e = engine;
     for &tl in timelines {
         if let Err(err) = e.tombstone_timeline(tl) {
             tracing::warn!(

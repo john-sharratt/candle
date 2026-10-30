@@ -8,10 +8,10 @@
 //! compaction or a maintenance re-emission writes the record back under the
 //! identity it had.
 
-use std::collections::BTreeMap;
-
 use crate::persistence::identity::RecordIdentity;
 use crate::projection::TurnIndex;
+
+use super::pcoll::POrdMap;
 
 /// The records behind one stream's keyed values.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub struct StreamIds {
     pub index_page: RecordIdentity,
     /// The `Commit` that set `committed_through`, the greatest.
     pub commit: RecordIdentity,
-    pub chunks: BTreeMap<u64, RecordIdentity>,
+    pub chunks: POrdMap<u64, RecordIdentity>,
 }
 
 /// The records behind one timeline's keyed values.
@@ -35,7 +35,7 @@ pub struct StreamIds {
 pub struct TimelineIds {
     pub conv_id: RecordIdentity,
     pub label: RecordIdentity,
-    pub custom: BTreeMap<String, RecordIdentity>,
+    pub custom: POrdMap<String, RecordIdentity>,
     /// The least record that named a `conv_id` — the conversation's place in
     /// creation order — and the `conv_id` it named. A rewrite writes it back
     /// even when a greater record holds the field, so the order survives.
@@ -43,9 +43,9 @@ pub struct TimelineIds {
     pub named_conv_id: String,
     pub state: RecordIdentity,
     pub debug_id: RecordIdentity,
-    pub tree_meta: BTreeMap<TurnIndex, RecordIdentity>,
+    pub tree_meta: POrdMap<TurnIndex, RecordIdentity>,
     /// Each coupling's record, the greatest that stated it.
-    pub couplings: BTreeMap<u32, RecordIdentity>,
+    pub couplings: POrdMap<u32, RecordIdentity>,
 }
 
 /// Put `id` in `slot` when it supersedes what the slot holds; answers whether
@@ -60,8 +60,8 @@ pub fn take(slot: &mut RecordIdentity, id: RecordIdentity) -> bool {
 }
 
 /// [`take`] for a keyed slot that may not exist yet.
-pub fn take_keyed<K: Ord>(
-    map: &mut BTreeMap<K, RecordIdentity>,
+pub fn take_keyed<K: Ord + Clone>(
+    map: &mut POrdMap<K, RecordIdentity>,
     key: K,
     id: RecordIdentity,
 ) -> bool {
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn a_keyed_slot_starts_with_the_first_record() {
-        let mut map = BTreeMap::new();
+        let mut map = POrdMap::new();
         assert!(take_keyed(&mut map, 4u64, id(2)));
         assert!(!take_keyed(&mut map, 4u64, id(1)));
         assert_eq!(map[&4], id(2));

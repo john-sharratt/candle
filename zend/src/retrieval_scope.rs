@@ -131,21 +131,21 @@ impl RetrievalScope {
     }
 
     /// Rebuild the index now — at load, and once an upload commits.
-    pub fn refresh(&self, engine: &Mutex<ConversationEngine>) {
+    pub fn refresh(&self, engine: &ConversationEngine) {
         let mut rebuilt = self.rebuilt.lock().unwrap();
         self.rebuild(&mut rebuilt, Instant::now(), |generation| {
-            IngestIndex::read(&engine.lock().unwrap(), generation)
+            IngestIndex::read(engine, generation)
         });
     }
 
     /// `target`'s scope from its files, set on the engine for each scoped
     /// group.
-    pub fn apply(&self, engine: &Mutex<ConversationEngine>, target: TimelineId, files: &RepoFiles) {
+    pub fn apply(&self, engine: &ConversationEngine, target: TimelineId, files: &RepoFiles) {
         let index = self.current(Instant::now(), |generation| {
-            IngestIndex::read(&engine.lock().unwrap(), generation)
+            IngestIndex::read(engine, generation)
         });
         let scope = self.scope_of(&index, files);
-        let e = engine.lock().unwrap();
+        let e = engine;
         if let Some(group) = self.files_group {
             e.set_retrieval_scope(target, group, scope.files);
         }
@@ -163,13 +163,13 @@ impl RetrievalScope {
     /// place of a `file_list`.
     pub fn folder_unit(
         &self,
-        engine: &Mutex<ConversationEngine>,
+        engine: &ConversationEngine,
         files: &RepoFiles,
         repo: &str,
         inner: &str,
     ) -> Option<TimelineId> {
         let index = self.current(Instant::now(), |generation| {
-            IngestIndex::read(&engine.lock().unwrap(), generation)
+            IngestIndex::read(engine, generation)
         });
         self.folder_in(&index, files, repo, inner)
     }

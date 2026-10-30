@@ -988,7 +988,6 @@ mod tests {
                     keep_within_secs: Some(14_069),
                     idle_past_keep_turns: 0,
                     idle_past_keep_bytes: 0,
-                    substrates_skipped: 0,
                     rows: vec![GalleryRow {
                         status: TurnStatus::Live,
                         holder: HolderKind::Shared,

@@ -3,8 +3,15 @@
 //! In-memory and **not persisted** — it is derived from query traffic and rebuilt
 //! empty each process load (see the module docs). `normalize` is the read path
 //! (every reprojection); `observe` is the sole writer (once per turn at seal).
+//!
+//! Shared by every thread that scores, and held by none: each scope's state is
+//! one immutable value behind an atomic cell. A read loads it and normalizes
+//! against exactly what it loaded; an observe folds into a copy and swaps it
+//! in, folding again on the newer state when another observe swapped first.
 
-use std::collections::HashMap;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use super::scope::ScopeState;
 use super::{ChildKey, NormConfig, ScopeKey};
@@ -14,15 +21,20 @@ use super::{ChildKey, NormConfig, ScopeKey};
 #[derive(Default)]
 pub struct NormalizationCache {
     cfg: NormConfig,
-    scopes: HashMap<ScopeKey, ScopeState>,
+    scopes: papaya::HashMap<ScopeKey, ArcSwap<ScopeState>>,
 }
 
 impl NormalizationCache {
     pub fn new(cfg: NormConfig) -> Self {
         NormalizationCache {
             cfg,
-            scopes: HashMap::new(),
+            scopes: papaya::HashMap::new(),
         }
+    }
+
+    /// `scope`'s state as it stands, if it has ever been observed.
+    fn state(&self, scope: &ScopeKey) -> Option<Arc<ScopeState>> {
+        self.scopes.pin().get(scope).map(|s| s.load_full())
     }
 
     pub fn config(&self) -> &NormConfig {
@@ -55,7 +67,7 @@ impl NormalizationCache {
         floors: &[f32],
         probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
-        match self.scopes.get(scope) {
+        match self.state(scope) {
             Some(s) => s.normalize_with_floors(raw, floors, &self.cfg, probe_tokens),
             None => {
                 ScopeState::default().normalize_with_floors(raw, floors, &self.cfg, probe_tokens)
@@ -84,7 +96,7 @@ impl NormalizationCache {
         min_observations: u32,
         probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
-        let Some(state) = self.scopes.get(scope) else {
+        let Some(state) = self.state(scope) else {
             return self.normalize_with_floors(parent, raw, floors, probe_tokens);
         };
         let (mut warm, mut cold): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
@@ -165,26 +177,32 @@ impl NormalizationCache {
     /// one probe length and a query measured at another is the unit mismatch this
     /// carries the length to avoid. See [`NormConfig::probe_t_ref`].
     pub fn observe(
-        &mut self,
+        &self,
         scope: &ScopeKey,
         source: u64,
         raw: &[(ChildKey, f32)],
         probe_tokens: usize,
     ) {
-        let state = self.scopes.entry(scope.clone()).or_default();
-        if !state.mark_observed(source) {
-            return;
-        }
-        state.observe(raw, &self.cfg, probe_tokens);
+        let scopes = self.scopes.pin();
+        let cell = scopes.get_or_insert_with(scope.clone(), || {
+            ArcSwap::from_pointee(ScopeState::default())
+        });
+        cell.rcu(|current| {
+            let mut next = ScopeState::clone(current);
+            if next.mark_observed(source) {
+                next.observe(raw, &self.cfg, probe_tokens);
+            }
+            next
+        });
     }
 
     #[cfg(test)]
     pub(super) fn level_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<f32> {
-        self.scopes.get(scope).and_then(|s| s.level_of(child))
+        self.state(scope).and_then(|s| s.level_of(child))
     }
 
     #[cfg(test)]
     pub(super) fn count_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<u32> {
-        self.scopes.get(scope).and_then(|s| s.count_of(child))
+        self.state(scope).and_then(|s| s.count_of(child))
     }
 }

@@ -126,7 +126,7 @@ impl Conversation {
         // measured on BlackWorld (2026-10-28), 39 s for a `code_reading` of
         // 2,387 files that kept its exclusion.
         let (files, probes, asked) = {
-            let sub = self.inner.read().unwrap();
+            let sub = self.inner.read();
             let standing = sub.chunk_exclusion(group);
             let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
             let asked: usize = timelines
@@ -223,10 +223,7 @@ impl Conversation {
             // Learned from the count the next pass's keep check reads.
             ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut)).learned_from(asked)
         };
-        self.inner
-            .write()
-            .unwrap()
-            .set_chunk_exclusion(group, exclusion);
+        self.update(|s| s.set_chunk_exclusion(group, exclusion.clone()));
         Ok(report)
     }
 }

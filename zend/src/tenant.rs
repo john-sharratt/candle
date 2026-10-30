@@ -145,10 +145,10 @@ impl ZendReports {
         Self { session }
     }
 
-    /// Run `read` on the blocking pool. Each read takes the engine's lock,
-    /// which the loader holds through its warm-up, and `/v1/status` is polled
-    /// by every open page of every console — on a runtime worker those polls
-    /// would park the workers the other tenant's requests need.
+    /// Run `read` on the blocking pool. A report walks the substrate, which on
+    /// a large store is real work, and `/v1/status` is polled by every open
+    /// page of every console — on a runtime worker those walks would occupy
+    /// the workers the other tenant's requests need.
     async fn off_runtime<T: Send + 'static>(
         &self,
         read: impl FnOnce(&ZendSession) -> T + Send + 'static,

@@ -390,15 +390,15 @@ pub fn elevate_to_hot(
         }
     }
 
-    // ── Phase 4: install (one substrate write) ─────────────────────────
+    // ── Phase 4: install ────────────────────────────────────────────────
     //
-    // Both elevation legs land under a single write lock. `recalls`
-    // installs warm + hot per item; `lifts` installs hot only (warm
-    // was already present on the residence pre-promotion).
+    // Both elevation legs land on the residences directly — no substrate
+    // version is published. Each lands only on an empty, live residence
+    // (`Substrate::install_promoted`).
     let warm_hot_ms = t_warm_hot.elapsed().as_millis() as u64;
     let t_install = Instant::now();
     if !recalls.is_empty() || !lifts.is_empty() {
-        conversation.write().install_promoted(recalls, lifts);
+        conversation.read().install_promoted(recalls, lifts);
     }
     // Where a lift's time went, phase by phase: a dialogue's projection waits
     // on all of it, and the phases move different bytes over different paths.
@@ -465,16 +465,15 @@ pub fn elevate_to_hot(
 ///
 /// The actual filtered eviction happens inside
 /// [`crate::substrate::Substrate::evict_hot_except`], which resolves
-/// section / turn keys to residence indices and walks `hot_lru`
-/// under a single write lock. This top-level function is a thin
-/// orchestrator preserved for call-site symmetry with
-/// `elevate_to_hot`.
+/// section / turn keys to residence indices and takes each victim's hot
+/// copy off its residence. This top-level function is a thin
+/// orchestrator kept for call-site symmetry with `elevate_to_hot`.
 pub fn evict_from_hot(
     conversation: &Conversation,
     sections: &[SectionId],
     turns: &[TurnKey],
 ) -> EvictionReport {
-    conversation.write().evict_hot_except(sections, turns)
+    conversation.read().evict_hot_except(sections, turns)
 }
 
 #[cfg(test)]
@@ -695,10 +694,10 @@ mod tests {
         // — drop it so install_warm + eviction don't see a phantom
         // borrower.
         drop(hot_arc);
-        conv.write().install_warm(residence, warm);
+        conv.read().install_warm(residence, warm);
 
         // Drop hot — turn is now warm-only.
-        let evicted = conv.write().evict_hot_except(&[], &[]);
+        let evicted = conv.read().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 1);
         assert!(evicted.bytes > 0, "evicted bytes must be non-zero");
         assert!(
@@ -759,13 +758,13 @@ mod tests {
             let warm =
                 migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
             drop(hot_arc);
-            conv.write().install_warm(residence, warm);
+            conv.read().install_warm(residence, warm);
         }
 
         // Budget-aware evict, protecting the newer turn via the keep set: only
         // the older (a) is dropped from hot, and its warm copy is preserved.
         let evicted =
-            conv.write()
+            conv.read()
                 .evict_hot_to_free(&[], &[TurnKey::new(timeline, idx_b)], u64::MAX);
         assert_eq!(evicted.count, 1, "a (not in keep set) evicted; b kept");
         assert!(
@@ -818,7 +817,7 @@ mod tests {
         let warm =
             migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
         drop(hot_arc);
-        conv.write().install_warm(residence, warm);
+        conv.read().install_warm(residence, warm);
 
         // Bogus key — missing bucket.
         let missing = TurnKey::new(TimelineId::for_test(999), TurnIndex(42));
@@ -828,7 +827,7 @@ mod tests {
         // `evict_hot_except(&[], &[])` is the unfiltered case: only
         // entries where BOTH hot is some AND warm is some are
         // eligible. Turn 0 has warm=None, so it stays hot.
-        let evicted = conv.write().evict_hot_except(&[], &[]);
+        let evicted = conv.read().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 1, "only warm-backed turn 1 should evict");
 
         let report = elevate_to_hot(
@@ -895,7 +894,7 @@ mod tests {
         let hot_arc = conv.read().turn_sealed_of(timeline, idx).unwrap();
         let warm = migrate_layers_to_cpu(backings, device, copy_stream, pinned, &hot_arc);
         drop(hot_arc);
-        conv.write().install_warm(residence, warm);
+        conv.read().install_warm(residence, warm);
         idx
     }
 
@@ -1090,7 +1089,7 @@ mod tests {
         let warm_clone =
             migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
         drop(hot_arc);
-        conv.write().clear_turn_sealed(timeline, idx);
+        conv.read().clear_turn_sealed(timeline, idx);
         assert!(conv.read().turn_sealed_of(timeline, idx).is_none());
 
         let recall = ColdRecall {
@@ -1098,20 +1097,20 @@ mod tests {
             residence,
             hot: hot_clone,
         };
-        conv.write().install_promoted(vec![recall], Vec::new());
+        conv.read().install_promoted(vec![recall], Vec::new());
 
         let tiers = conv.read().turn_tier_state(timeline, idx).unwrap();
         assert!(
             tiers.hot && !tiers.warm,
             "a recall lands hot only: {tiers:?}"
         );
-        let evicted = conv.write().evict_hot_except(&[], &[]);
+        let evicted = conv.read().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 0, "no warm backup yet → nothing evicted");
         assert!(conv.read().turn_sealed_of(timeline, idx).is_some());
 
         // The persistence side's warm copy makes it evictable.
-        conv.write().install_warm(residence, warm_clone);
-        let evicted = conv.write().evict_hot_except(&[], &[]);
+        conv.read().install_warm(residence, warm_clone);
+        let evicted = conv.read().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 1, "warm backup present → eviction drops hot");
         assert!(conv.read().turn_sealed_of(timeline, idx).is_none());
     }

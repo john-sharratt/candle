@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     // WARM the hit levels from non-focus dialogue turns (a focus turn isn't sealed
     // when its own reprojections fire live, so it shouldn't warm its own test).
     let scope = ScopeKey::turn_group(1, 1);
-    let mut cache = NormalizationCache::new(cfg);
+    let cache = NormalizationCache::new(cfg);
     for (sid, _, _, sig) in &dialogue {
         if focus_probes.contains(sid) {
             continue;

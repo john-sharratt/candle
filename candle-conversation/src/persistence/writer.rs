@@ -1,71 +1,37 @@
-//! Off-thread substrate writer (`docs/archived/kv_tier_migration.md`).
+//! The substrate's queued redo-log writes (`docs/archived/kv_tier_migration.md`,
+//! `docs/substrate_lock_free.md` §9.1).
 //!
-//! Every redo-log append that would otherwise block a caller on the persistence
-//! lock (which a segment compaction can hold across its whole relocation I/O) is
-//! enqueued here and drained by a dedicated writer thread. Two producers feed it:
+//! A write that does not need its result back is queued to the log's owner
+//! ([`super::owner::PersistenceOwner::enqueue`]) and the caller goes on. Two
+//! producers feed it:
 //!
-//! - **Phase 1 — stream-decl mirrors** (`WriteJob::StreamDecl`), from the
-//!   inference thread's seal path. The stream id is a pure function of the decl
-//!   (`decl.stream_id()`), so the enqueuer applies the decl in-memory
-//!   synchronously and hands only the durable append here — the inference thread
-//!   never touches the persistence lock.
-//! - **Phase 2 — warm→cold KV writes** (`WriteJob::KvCold`), from the persistence
-//!   thread. The GPU gather stays there; only the redo-log append + the
-//!   `install_cold` bookkeeping move here. Crucially `install_cold` (which sets
-//!   `slot.cold` and drops `hot`) runs on the writer AFTER the bytes are appended,
-//!   so `slot.cold` only becomes true once the data is durable — `purge_warm`
-//!   never drops the last copy of an un-written turn (the RAM-unload invariant).
+//! - **Stream-decl mirrors and the seal's metadata**, from the inference
+//!   thread's seal path. The enqueuer applies each value in memory first and
+//!   hands only the durable append here, so the inference thread never waits on
+//!   the disk.
+//! - **Warm→cold KV writes** (`WriteJob::KvCold`), from the persistence thread.
+//!   The GPU gather stays there; the append and the `install_cold` bookkeeping
+//!   run here, AFTER the bytes are appended, so a residence's cold copy only
+//!   exists once the data is durable — `purge_warm` never drops the last copy
+//!   of an un-written turn (the RAM-unload invariant).
 //!
-//! A DUAL-CAP bounded queue (pending events AND pending bytes) applies BLOCKING
-//! backpressure: `enqueue` blocks when either cap trips, so the writer can never
-//! fall so far behind that a crash loses an unbounded tail. The single writer
-//! drains FIFO. Crash safety is unchanged: the reconstruct walker is
-//! order-independent and per-turn fault-isolated (see `reconstruct_from_log`), so
-//! an async / out-of-order / lost-on-crash write only ever yields an ABSENT turn,
-//! never corruption; the bounded queue caps that window.
-//!
-//! Over a **read-only** substrate there is nothing to append to: no writer
-//! thread is spawned and every job is dropped at enqueue. The enqueuers have
-//! already made their in-memory change, which is all a read-only substrate
-//! keeps; nothing is ever committed.
+//! Every job is appended and then indexed in the substrate before the owner
+//! takes the next one, so a record is indexed before its segment can seal.
+//! Crash safety is unchanged: the reconstruct walker is order-independent and
+//! per-turn fault-isolated (see `reconstruct_from_log`), so a lost-on-crash
+//! write only ever yields an ABSENT turn, never corruption; the owner's
+//! bounded queue caps that window.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use crossbeam::channel::{self, Receiver, Sender};
+use std::sync::Arc;
 
 use super::identity::{RecordIdentity, Stamped};
 use super::manifest::RecordLoc;
 use super::record::{BranchCheckpointPayload, RecordType, SectionGeneration, SnapshotPayload};
 use super::resume::{self, TurnChunkGrid};
 use super::written_snapshots::{WrittenSnapshot, WrittenSnapshots};
-use super::{PersistenceError, PersistenceLock, Result};
+use super::{PersistenceError, Result, SubstratePersistence};
 use crate::persistence::streams::StreamId;
 use crate::substrate::{ResidenceIndex, SubstrateLock, TurnMark};
-
-/// Max pending write EVENTS before an enqueue blocks. Sized to absorb a full
-/// segment-compaction's worth of seal decls (the writer stalls on the persistence
-/// lock for the compaction's whole relocation) without back-pressuring producers
-/// in the common case.
-const MAX_PENDING_EVENTS: usize = 16_384;
-/// Max pending write BYTES before an enqueue blocks — the second cap, so a burst
-/// of large payloads can't balloon host RAM even under the event cap. One cap for
-/// every bulk job ([`WriteJob::is_bulk`]): a KV-cold backlog may hold as much host
-/// memory as a snapshot cohort, which on the smallest dev box (32 GB) is 1.6%.
-///
-/// **Sized to hold a cohort's recurrent snapshots.** A recurrent model seals its
-/// whole state with every turn — ~65 MB on the Qwen3.6-35B-A3B, fixed per sequence
-/// whatever the turn's length — and a decode cohort finishes together, so it seals
-/// together. At 256 MiB the cap held under four of them, and the scheduler's loop
-/// thread, which is the enqueuer, waited on the disk for the rest of an
-/// eight-turn cohort, ~50 ms a turn. 512 MiB holds that cohort; sustained load is
-/// still paced by how fast the writer drains, which is the writer's to keep up.
-const MAX_PENDING_BYTES: u64 = 512 * 1024 * 1024;
-/// Upper bound on jobs drained before a group fsync, so a sustained burst still
-/// yields the persistence lock to the persistence thread's other work regularly.
-const MAX_BATCH: usize = 512;
 
 /// A queued redo-log write.
 ///
@@ -74,26 +40,25 @@ const MAX_BATCH: usize = 512;
 /// record is written with it, so the value and its record never disagree on
 /// which write they are. A job whose value lands in the substrate only after
 /// the append (`Tokens`, the recurrent records, KV-cold chunks) is stamped by
-/// the append, and the writer applies it under that stamp.
+/// the append, and the owner applies it under that stamp.
 pub(crate) enum WriteJob {
-    /// Phase 1: a stream-decl (turn / section) metadata mirror. `stream_id` is the
-    /// pure `decl.stream_id().0`, `payload` is `decl.encode()`; already applied
+    /// A stream-decl (turn / section) metadata mirror. `stream_id` is the pure
+    /// `decl.stream_id().0`, `payload` is `decl.encode()`; already applied
     /// in-memory by the enqueuer.
     StreamDecl {
         stream_id: u64,
         payload: Vec<u8>,
         identity: RecordIdentity,
     },
-    /// Phase 1: a turn/section `Tokens` record. Disk-only — the in-memory token
-    /// buffer is already set at record time, so this is purely the durable copy
-    /// for reload. Enqueued from the seal path so it never blocks on the
-    /// persistence lock (which a compaction holds across its whole relocation).
+    /// A turn/section `Tokens` record. Disk-only — the in-memory token buffer
+    /// is already set at record time, so this is purely the durable copy for
+    /// reload.
     Tokens {
         stream_id: StreamId,
         token_ids: Vec<u32>,
     },
-    /// Phase 1: a turn's wide-Q provenance signature (`WideQSig` record). The
-    /// in-RAM blob is mirrored synchronously by the enqueuer (the same-session
+    /// A turn's wide-Q provenance signature (`WideQSig` record). The in-RAM
+    /// blob is mirrored synchronously by the enqueuer (the same-session
     /// provenance scan needs it now); this appends only the durable copy.
     WideQSigs {
         stream_id: StreamId,
@@ -108,23 +73,23 @@ pub(crate) enum WriteJob {
         payload: Vec<u8>,
         identity: RecordIdentity,
     },
-    /// Phase 2: a warm→cold KV migration. The GPU gather already produced `grid`;
-    /// the writer appends its chunks, folds their locations into the substrate
-    /// index, marks the stream durable-through, then `install_cold`s (drops hot)
-    /// — all AFTER the append, so `slot.cold` is only ever set on durable data.
+    /// A warm→cold KV migration. The GPU gather already produced `grid`; the
+    /// owner appends its chunks, folds their locations into the substrate
+    /// index, marks the stream durable-through, then `install_cold`s — all
+    /// AFTER the append, so a cold copy is only ever installed on durable data.
     KvCold {
         residence: ResidenceIndex,
         stream_id: StreamId,
         grid: TurnChunkGrid,
     },
-    /// A conversation's recurrent-state snapshot at a turn seal
-    /// (`Snapshot` record — the Gated DeltaNet matrices + conv tails). The
-    /// newest supersedes all previous for the stream (single tail); the
-    /// writer registers the fresh location in the substrate index after the
-    /// append, `Tokens`-style.
+    /// A conversation's recurrent-state snapshot at a turn seal (`Snapshot`
+    /// record — the Gated DeltaNet matrices + conv tails). The newest
+    /// supersedes all previous for the stream (single tail); the owner
+    /// registers the fresh location in the substrate index after the append,
+    /// `Tokens`-style.
     ///
-    /// **Carried decoded and encoded here, on the writer's thread.** The encode is
-    /// a ~65 MB copy per turn on a recurrent model, and its enqueuer is the
+    /// **Carried decoded and encoded on the owner's thread.** The encode is a
+    /// ~65 MB copy per turn on a recurrent model, and its enqueuer is the
     /// scheduler's loop thread: encoding there put that copy between the decode
     /// steps of every turn still running. The queue is FIFO, so the record still
     /// lands before the turn's `Tokens`, exactly as the seal orders them.
@@ -135,10 +100,9 @@ pub(crate) enum WriteJob {
     /// A prompt branch's recurrent checkpoint (`BranchCheckpoint` record).
     /// Same single-tail append as [`Self::Snapshot`] and the same byte-cap
     /// class; a separate job because the record type is what tells compaction
-    /// this one is a cache it may reclaim.
-    /// Shared with the substrate's in-RAM memo of the same checkpoint, and
-    /// written from its parts, so neither the queue nor the append copies the
-    /// state.
+    /// this one is a cache it may reclaim. Shared with the substrate's in-RAM
+    /// memo of the same checkpoint, and written from its parts, so neither the
+    /// queue nor the append copies the state.
     BranchCheckpoint {
         stream_id: StreamId,
         payload: Arc<BranchCheckpointPayload>,
@@ -154,13 +118,7 @@ pub(crate) enum WriteJob {
     /// A pre-encoded conversation-metadata record — `Label` (the fields of a
     /// ConvMeta the write sets: conv_id, label, custom keys) or `Distilled`.
     /// Both are small and need no index registration after the append, so one
-    /// job kind carries either.
-    ///
-    /// The payload is encoded by the enqueuer, which is the point: these used to
-    /// be written by taking the persistence mutex on the calling thread and
-    /// encoding inside it. Every conversation created or archived therefore
-    /// serialised against the writer and against a compaction holding that mutex
-    /// across its relocation I/O.
+    /// job kind carries either. Encoded by the enqueuer.
     ConvMeta {
         record: RecordType,
         payload: Vec<u8>,
@@ -175,17 +133,14 @@ pub(crate) enum WriteJob {
         identity: RecordIdentity,
     },
     /// A timeline tombstone. The enqueuer has already marked the timeline in
-    /// RAM; the writer appends the record and drops the persistence-side
-    /// snapshot and file index. The append runs here so a caller that holds
-    /// the engine mutex does not wait on the persistence lock.
+    /// RAM; the owner appends the record and drops the persistence-side
+    /// snapshot and file index.
     TimelineTombstone {
         timeline_id: u64,
         reason: Option<String>,
     },
     /// A turn tombstone. Same split as [`Self::TimelineTombstone`]: the
-    /// substrate mark is synchronous, the append is the writer's. Retention
-    /// retires up to a few hundred turns while its caller holds the engine
-    /// mutex, so the append cannot take the persistence lock on that caller.
+    /// substrate mark is synchronous, the append is the owner's.
     TurnTombstone {
         mark: TurnMark,
         reason: Option<String>,
@@ -197,12 +152,15 @@ pub(crate) enum WriteJob {
         generation: Option<SectionGeneration>,
         reason: Option<String>,
     },
-    /// Drain everything queued, fsync, ack, and stop the thread.
-    Shutdown(Sender<()>),
+    /// An identity this node minted for a write it then did not make — a
+    /// read-modify-write that found nothing to change, or found its read
+    /// overtaken. Marked never-coming in queue order, so it holds back no
+    /// record written after it ([`SubstratePersistence::own_sendable_through`]).
+    Abandoned { identity: RecordIdentity },
 }
 
 impl WriteJob {
-    fn byte_size(&self) -> u64 {
+    pub(super) fn byte_size(&self) -> u64 {
         match self {
             WriteJob::StreamDecl { payload, .. } => payload.len() as u64,
             WriteJob::Tokens { token_ids, .. } => (token_ids.len() * 4) as u64,
@@ -219,19 +177,16 @@ impl WriteJob {
             WriteJob::Snapshot { payload, .. } => payload.encoded_len() as u64,
             WriteJob::BranchCheckpoint { payload, .. } => payload.parts().byte_len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
-            WriteJob::Shutdown(_) => 0,
+            WriteJob::Abandoned { .. } => 0,
         }
     }
 
     /// Whether this job counts against the BYTE cap. Only the large payloads do —
     /// KV-cold grids and recurrent snapshots and checkpoints; the small metadata
     /// records (stream-decl / tokens / sigs) are gated by the EVENT cap alone, so
-    /// a bulk backlog (e.g. the writer stalled behind a compaction holding the
-    /// persistence lock) can never block the scheduler's latency-critical seal
+    /// a bulk backlog can never block the scheduler's latency-critical seal
     /// metadata behind the byte cap.
-    fn is_bulk(&self) -> bool {
-        // Snapshots are multi-MB state blobs: byte-capped with the KV so a
-        // backlog can never crowd out the small seal metadata.
+    pub(super) fn is_bulk(&self) -> bool {
         matches!(
             self,
             WriteJob::KvCold { .. } | WriteJob::Snapshot { .. } | WriteJob::BranchCheckpoint { .. }
@@ -239,270 +194,20 @@ impl WriteJob {
     }
 }
 
-/// Dual-cap backpressure accounting shared between enqueuers and the writer.
-struct Backpressure {
-    /// `(pending_events, pending_bytes)`; `below_cap` wakes blocked enqueuers when
-    /// the writer drains back under both caps.
-    state: Mutex<(usize, u64)>,
-    below_cap: Condvar,
-}
-
-impl Backpressure {
-    /// Reserve queue capacity for one job, blocking under backpressure. `bulk`
-    /// (KV-cold, snapshot and branch-checkpoint jobs — see [`WriteJob::is_bulk`])
-    /// additionally honors the byte cap; metadata jobs are gated by the event cap
-    /// alone so they never block behind a bulk byte backlog.
-    fn acquire(&self, bytes: u64, bulk: bool) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Block until there's room. The `g.0 > 0` guard guarantees a single
-        // in-flight job always makes progress even if it alone exceeds the byte cap
-        // (an oversized payload must still drain, not deadlock).
-        while g.0 >= MAX_PENDING_EVENTS || (bulk && g.0 > 0 && g.1 + bytes > MAX_PENDING_BYTES) {
-            g = self.below_cap.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-        g.0 += 1;
-        g.1 += bytes;
-    }
-
-    fn release(&self, bytes: u64) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        g.0 = g.0.saturating_sub(1);
-        g.1 = g.1.saturating_sub(bytes);
-        self.below_cap.notify_all();
-    }
-}
-
-/// How far the writer has come: jobs queued, and jobs written — for a caller
-/// that waits until what it queued is in the log, as a request's response does
-/// before it ends (`docs/replicated_substrate.md` §6.4).
-#[derive(Default)]
-struct Progress {
-    queued: AtomicU64,
-    written: Mutex<u64>,
-    advanced: Condvar,
-}
-
-impl Progress {
-    fn wrote_one(&self) {
-        *self.written.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.advanced.notify_all();
-    }
-}
-
-/// How long [`SubstrateWriter::wait_written`] waits before giving up on a
-/// writer that has stopped.
-const WAIT_WRITTEN: Duration = Duration::from_secs(10);
-
-/// The off-thread substrate writer: a bounded queue + a drainer thread.
-pub struct SubstrateWriter {
-    tx: Sender<(WriteJob, u64)>,
-    backpressure: Arc<Backpressure>,
-    progress: Arc<Progress>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    /// The persistence handle was opened read-only: no thread runs, and
-    /// [`Self::enqueue`] drops every job.
-    read_only: bool,
-    /// Every recurrent snapshot this writer appended, for the state's owner to
-    /// release once the record is durable ([`WrittenSnapshots`]).
-    written_snapshots: Arc<WrittenSnapshots>,
-}
-
-impl SubstrateWriter {
-    /// Spawn the writer thread over the shared substrate + persistence handles.
-    /// It holds the raw Arcs (never a `Conversation`) so there is no Arc cycle —
-    /// the last `Conversation` drop releases the writer, whose `Drop` drains + joins.
-    ///
-    /// Over a read-only persistence handle no thread is spawned: there is
-    /// nothing to append to and nothing to commit.
-    pub fn spawn(substrate: Arc<SubstrateLock>, persistence: Arc<PersistenceLock>) -> Self {
-        let (tx, rx) = channel::unbounded::<(WriteJob, u64)>();
-        let backpressure = Arc::new(Backpressure {
-            state: Mutex::new((0, 0)),
-            below_cap: Condvar::new(),
-        });
-        let read_only = persistence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_read_only();
-        let progress = Arc::new(Progress::default());
-        let written_snapshots = Arc::new(WrittenSnapshots::default());
-        if read_only {
-            return Self {
-                tx,
-                backpressure,
-                progress,
-                handle: Mutex::new(None),
-                read_only,
-                written_snapshots,
-            };
-        }
-        let bp = backpressure.clone();
-        let written = progress.clone();
-        let snapshots = written_snapshots.clone();
-        let handle = std::thread::Builder::new()
-            .name("substrate-writer".into())
-            .spawn(move || writer_loop(rx, substrate, persistence, bp, written, snapshots))
-            .expect("spawn substrate-writer thread");
-        Self {
-            tx,
-            backpressure,
-            progress,
-            handle: Mutex::new(Some(handle)),
-            read_only,
-            written_snapshots,
-        }
-    }
-
-    /// The recurrent snapshots this writer has appended — see
-    /// [`WrittenSnapshots`].
-    pub fn written_snapshots(&self) -> &WrittenSnapshots {
-        &self.written_snapshots
-    }
-
-    /// A position in the queue: every job enqueued before this call is at or
-    /// below it.
-    pub fn ticket(&self) -> u64 {
-        self.progress.queued.load(Ordering::SeqCst)
-    }
-
-    /// Block until every job at or below `ticket` has been appended — or the
-    /// writer has stopped, which gives up after [`WAIT_WRITTEN`]. Over a
-    /// read-only substrate nothing is queued, so it returns at once.
-    pub fn wait_written(&self, ticket: u64) {
-        let deadline = Instant::now() + WAIT_WRITTEN;
-        let mut written = self
-            .progress
-            .written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        while *written < ticket {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                tracing::warn!(
-                    target: "candle_conversation::persistence::writer",
-                    ticket,
-                    written = *written,
-                    "gave up waiting for the substrate writer"
-                );
-                return;
-            }
-            written = self
-                .progress
-                .advanced
-                .wait_timeout(written, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-
-    /// Enqueue a durable write. Blocks (backpressure) if the queue is at either
-    /// cap — the enqueuer keeps the in-memory substrate consistent while the disk
-    /// catches up.
-    ///
-    /// Over a read-only substrate the job is dropped here, before a queue slot
-    /// is reserved, so there is no permit to give back; a `Shutdown` job's ack
-    /// sender drops with it, which wakes whoever waits on the ack.
-    pub(crate) fn enqueue(&self, job: WriteJob) {
-        if self.read_only {
-            return;
-        }
-        let bytes = job.byte_size();
-        self.backpressure.acquire(bytes, job.is_bulk());
-        // `send` only fails once the writer thread is gone (post-shutdown). Release
-        // the reservation and drop the write: in-memory is still consistent, and on
-        // next boot the turn is simply absent — which reconstruct tolerates.
-        if self.tx.send((job, bytes)).is_err() {
-            self.backpressure.release(bytes);
-        } else {
-            self.progress.queued.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Drain all pending writes, fsync, and stop the thread. Idempotent.
-    pub fn shutdown(&self) {
-        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let Some(handle) = handle else { return };
-        let (ack_tx, ack_rx) = channel::bounded::<()>(1);
-        self.enqueue(WriteJob::Shutdown(ack_tx));
-        let _ = ack_rx.recv(); // wait for drain + fsync before joining
-        let _ = handle.join();
-    }
-}
-
-impl Drop for SubstrateWriter {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Drainer loop: process a job, coalesce a burst, group-fsync once, repeat.
-fn writer_loop(
-    rx: Receiver<(WriteJob, u64)>,
-    substrate: Arc<SubstrateLock>,
-    persistence: Arc<PersistenceLock>,
-    bp: Arc<Backpressure>,
-    progress: Arc<Progress>,
-    snapshots: Arc<WrittenSnapshots>,
-) {
-    while let Ok((first, first_bytes)) = rx.recv() {
-        let t_process = std::time::Instant::now();
-        let mut ack = process_one(first, &substrate, &persistence, &snapshots);
-        bp.release(first_bytes);
-        progress.wrote_one();
-        let mut n = 1;
-        let mut batch_bytes = first_bytes;
-        while ack.is_none() && n < MAX_BATCH {
-            match rx.try_recv() {
-                Ok((job, bytes)) => {
-                    ack = process_one(job, &substrate, &persistence, &snapshots);
-                    bp.release(bytes);
-                    progress.wrote_one();
-                    n += 1;
-                    batch_bytes += bytes;
-                }
-                Err(_) => break,
-            }
-        }
-        let process_ms = t_process.elapsed().as_secs_f64() * 1e3;
-        // Group-commit (fsync) the burst.
-        let t_commit = std::time::Instant::now();
-        commit(&persistence);
-        // The writer's throughput is what the byte cap's backpressure waits on, so
-        // the split between preparing records and making them durable is what says
-        // which of the two a stalled enqueuer is actually waiting for.
-        tracing::debug!(
-            target: "candle_conversation::persistence::writer",
-            jobs = n,
-            mib = batch_bytes as f64 / (1 << 20) as f64,
-            process_ms,
-            commit_ms = t_commit.elapsed().as_secs_f64() * 1e3,
-            "writer batch committed"
-        );
-        if let Some(ack) = ack {
-            let _ = ack.send(());
-            return;
-        }
-    }
-    // All senders dropped without an explicit Shutdown — flush the tail.
-    commit(&persistence);
-}
-
-/// Apply one job. Returns the shutdown ack when the job is `Shutdown` (the caller
-/// commits + acks + exits), else `None`.
-fn process_one(
+/// Append one job, then index what it appended in the substrate. Run by the
+/// log's owner, which holds `p` alone.
+pub(super) fn process(
     job: WriteJob,
     substrate: &Arc<SubstrateLock>,
-    persistence: &Arc<PersistenceLock>,
+    p: &mut SubstratePersistence,
     snapshots: &WrittenSnapshots,
-) -> Option<Sender<()>> {
+) {
     match job {
-        WriteJob::Shutdown(ack) => return Some(ack),
         WriteJob::StreamDecl {
             stream_id,
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.append_carried(
                 RecordType::StreamDecl,
                 0,
@@ -513,6 +218,7 @@ fn process_one(
                 &payload,
                 identity,
             ) {
+                p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     "stream-decl append failed: {e}"
@@ -536,22 +242,13 @@ fn process_one(
                     stream_id = stream_id.0,
                     "FAULT INJECTION: dropping Tokens record"
                 );
-                return None;
+                return;
             }
-            // Append under the persistence lock, then register the record's
-            // location in the substrate index under the substrate lock — taken
-            // NON-nested, persistence released first (same order as the KV-cold
-            // path). Without the `apply_tokens_loc`, maintenance/compaction can't
-            // see the tokens and reclaim them (see `persist_tokens_only`).
-            let loc = {
-                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-                resume::persist_tokens_only(&mut p, stream_id, &token_ids)
-            };
-            match loc {
-                Ok(loc) => substrate
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .apply_tokens_loc(stream_id, loc.value, loc.id),
+            // Register the record's location in the substrate index after the
+            // append. Without the `apply_tokens_loc`, maintenance/compaction
+            // can't see the tokens and reclaim them (see `persist_tokens_only`).
+            match resume::persist_tokens_only(p, stream_id, &token_ids) {
+                Ok(loc) => substrate.update(|s| s.apply_tokens_loc(stream_id, loc.value, loc.id)),
                 Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -564,8 +261,8 @@ fn process_one(
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.append_wide_q_sigs(stream_id, &payload, identity) {
+                p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -578,26 +275,20 @@ fn process_one(
             payload,
             identity,
         } => {
-            // Append under the persistence lock, then settle the substrate's held
-            // copy to the record's location under the substrate lock — never
-            // nested, the `Snapshot` discipline. From here the page is read
-            // from the log when a projection takes it, not held for the life of
-            // the process.
-            let appended = persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .append_turn_index_page(stream_id, &payload, identity);
-            match appended {
-                Ok(loc) => substrate
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .settle_index_page(stream_id, loc, identity),
-                Err(e) => tracing::error!(
-                    target: "candle_conversation::persistence::writer",
-                    stream_id = stream_id.0,
-                    "index page append failed: {e} — this turn or section will be \
-                     borrowable but unindexable after a restart"
-                ),
+            // Settle the substrate's held copy to the record's location after
+            // the append. From here the page is read from the log when a
+            // projection takes it, not held for the life of the process.
+            match p.append_turn_index_page(stream_id, &payload, identity) {
+                Ok(loc) => substrate.update(|s| s.settle_index_page(stream_id, loc, identity)),
+                Err(e) => {
+                    p.mark_unwritten(identity);
+                    tracing::error!(
+                        target: "candle_conversation::persistence::writer",
+                        stream_id = stream_id.0,
+                        "index page append failed: {e} — this turn or section will be \
+                         borrowable but unindexable after a restart"
+                    )
+                }
             }
         }
         WriteJob::ProjectionEvents {
@@ -605,8 +296,8 @@ fn process_one(
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.append_projection_events(stream_id, &payload, identity) {
+                p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -619,8 +310,8 @@ fn process_one(
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.append_carried(record, 0, 0, 0, 0, 0, &payload, identity) {
+                p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     ?record,
@@ -633,7 +324,6 @@ fn process_one(
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.append_carried(
                 RecordType::ConvState,
                 0,
@@ -644,6 +334,7 @@ fn process_one(
                 &payload,
                 identity,
             ) {
+                p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     timeline,
@@ -655,7 +346,6 @@ fn process_one(
             timeline_id,
             reason,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.write_tombstone(timeline_id, reason.as_deref()) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
@@ -665,7 +355,6 @@ fn process_one(
             }
         }
         WriteJob::TurnTombstone { mark, reason } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.write_turn_tombstone(mark, reason.as_deref()) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
@@ -680,7 +369,6 @@ fn process_one(
             generation,
             reason,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = p.write_section_tombstone(stream_id, generation, reason.as_deref()) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
@@ -690,19 +378,16 @@ fn process_one(
             }
         }
         WriteJob::Snapshot { stream_id, payload } => {
-            // Append under the persistence lock, then register the fresh
-            // location under the substrate lock — non-nested, persistence
-            // first, the `Tokens` discipline. The old location is simply
-            // overwritten in the index; its bytes were already credited dead
-            // by the accounting layer inside the append. Written from the
-            // payload's parts: the state blobs go from the conversation's own
-            // buffers to the file with no intermediate copy.
-            match append_snapshot(persistence, stream_id, &payload) {
+            // Register the fresh location after the append, the `Tokens`
+            // discipline. The old location is simply overwritten in the index;
+            // its bytes were already credited dead by the accounting layer
+            // inside the append. Written from the payload's parts: the state
+            // blobs go from the conversation's own buffers to the file with no
+            // intermediate copy.
+            match append_snapshot(p, stream_id, &payload) {
                 Ok(loc) => {
-                    let tail = substrate
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .apply_snapshot_loc(stream_id, loc.value, loc.id);
+                    let tail =
+                        substrate.update(|s| s.apply_snapshot_loc(stream_id, loc.value, loc.id));
                     // Reported only when it became the stream's tail — what a
                     // read of the timeline's snapshot then serves. One the index
                     // declined (the stream retired, or a newer record held)
@@ -715,22 +400,16 @@ fn process_one(
                         });
                     }
                 }
-                Err(e) => retract_failed_snapshot(substrate, persistence, stream_id, &e),
+                Err(e) => retract_failed_snapshot(substrate, p, stream_id, &e),
             }
         }
         WriteJob::BranchCheckpoint { stream_id, payload } => {
             // Same append-then-register discipline as `Snapshot`, into the
             // branch index, and written from the parts the same way.
             let parts = payload.parts();
-            let loc = {
-                let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-                p.write_branch_checkpoint(stream_id, &parts.slices())
-            };
-            match loc {
+            match p.write_branch_checkpoint(stream_id, &parts.slices()) {
                 Ok(loc) => substrate
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .apply_branch_checkpoint_loc(stream_id, loc.value, loc.id),
+                    .update(|s| s.apply_branch_checkpoint_loc(stream_id, loc.value, loc.id)),
                 Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -743,7 +422,7 @@ fn process_one(
             stream_id,
             grid,
         } => {
-            if let Err(e) = write_kv_cold(substrate, persistence, residence, stream_id, &grid) {
+            if let Err(e) = write_kv_cold(substrate, p, residence, stream_id, &grid) {
                 tracing::warn!(
                     target: "candle_conversation::persistence::writer",
                     residence = residence.0,
@@ -751,50 +430,44 @@ fn process_one(
                 );
             }
         }
+        WriteJob::Abandoned { identity } => p.mark_unwritten(identity),
     }
-    None
 }
 
-/// Append a turn's gathered KV chunks, fold their locations into the substrate
-/// index, mark the stream durable-through, then `install_cold` (drop hot). The
-/// locks are taken NON-nested and in the same order as the original synchronous
-/// path (`persist_turn_chunks_capture` + `commit_stream_through` + `install_cold`):
-/// persistence for the append/durability mark, then substrate for the index +
-/// hot-drop — so `slot.cold` is set only after the bytes are appended.
+/// Append a turn's gathered KV chunks, mark the stream durable-through, fold
+/// their locations into the substrate index, then `install_cold` — so a
+/// residence's cold copy is set only after the bytes are appended.
 fn write_kv_cold(
     substrate: &Arc<SubstrateLock>,
-    persistence: &Arc<PersistenceLock>,
+    p: &mut SubstratePersistence,
     residence: ResidenceIndex,
     stream_id: StreamId,
     grid: &TurnChunkGrid,
 ) -> Result<()> {
-    let (stored, locs, through, commit) = {
-        let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-        let (stored, locs) = resume::persist_turn_chunks_capture(&mut p, stream_id, grid)?;
-        if stored.is_empty() {
-            return Ok(());
-        }
-        // Mark durable through the last-written chunk BEFORE the hot-drop, so a
-        // crash after the drop still knows the turn's chunks landed.
-        let through = (stored.iter().map(|s| s.chunks.len()).sum::<usize>().max(1) - 1) as u64;
-        let commit = p.commit_stream(stream_id, through)?;
-        (stored, locs, through, commit)
-    };
-    let mut view = substrate.write().unwrap_or_else(|e| e.into_inner());
-    for (flat, loc) in locs {
-        view.apply_chunk_loc(stream_id, flat, loc.value, loc.id);
+    let (stored, locs) = resume::persist_turn_chunks_capture(p, stream_id, grid)?;
+    if stored.is_empty() {
+        return Ok(());
     }
-    // The index holds the commit as well as the log: maintenance rewrites a
-    // `Commit` from `committed_through`, so one only the log knows is lost
-    // with the first rewrite of its segment.
-    view.apply_commit_through(stream_id, through, commit);
-    view.install_cold(residence, stored);
+    // Mark durable through the last-written chunk BEFORE the cold install, so
+    // a crash after a resident tier is dropped still knows the chunks landed.
+    let through = (stored.iter().map(|s| s.chunks.len()).sum::<usize>().max(1) - 1) as u64;
+    let commit = p.commit_stream(stream_id, through)?;
+    substrate.update(|view| {
+        for &(flat, loc) in &locs {
+            view.apply_chunk_loc(stream_id, flat, loc.value, loc.id);
+        }
+        // The index holds the commit as well as the log: maintenance rewrites
+        // a `Commit` from `committed_through`, so one only the log knows is
+        // lost with the first rewrite of its segment.
+        view.apply_commit_through(stream_id, through, commit);
+    });
+    substrate.read().install_cold(residence, stored);
     Ok(())
 }
 
-/// Append a snapshot from its parts under the persistence lock.
+/// Append a snapshot from its parts.
 fn append_snapshot(
-    persistence: &Arc<PersistenceLock>,
+    p: &mut SubstratePersistence,
     stream_id: StreamId,
     payload: &SnapshotPayload,
 ) -> Result<Stamped<RecordLoc>> {
@@ -807,7 +480,6 @@ fn append_snapshot(
             "fault injection: the snapshot append failed".into(),
         ));
     }
-    let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
     // Fault injection (test-helpers): a stream armed via
     // [`fault::garble_next_snapshot`] lands bytes no decoder accepts in place of
     // this payload — a record that is present, checksummed and undecodable.
@@ -827,24 +499,18 @@ fn append_snapshot(
 /// recomputes instead.
 fn retract_failed_snapshot(
     substrate: &Arc<SubstrateLock>,
-    persistence: &Arc<PersistenceLock>,
+    p: &mut SubstratePersistence,
     stream_id: StreamId,
     error: &PersistenceError,
 ) {
-    let retracted = persistence
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retract_snapshot(stream_id);
+    let retracted = p.retract_snapshot(stream_id);
     // Dropped from the in-RAM index whether or not the retraction landed: the
     // tail is stale either way. When it landed, its identity also refuses any
     // older snapshot that reaches the substrate later.
-    {
-        let mut sub = substrate.write().unwrap_or_else(|e| e.into_inner());
-        match &retracted {
-            Ok(id) => sub.retract_snapshot(stream_id, *id),
-            Err(_) => sub.drop_snapshot_loc(stream_id),
-        }
-    }
+    substrate.update(|sub| match &retracted {
+        Ok(id) => sub.retract_snapshot(stream_id, *id),
+        Err(_) => sub.drop_snapshot_loc(stream_id),
+    });
     match retracted {
         Ok(_) => tracing::error!(
             target: "candle_conversation::persistence::writer",
@@ -862,62 +528,73 @@ fn retract_failed_snapshot(
     }
 }
 
-fn commit(persistence: &Arc<PersistenceLock>) {
-    if let Ok(mut p) = persistence.lock() {
-        if let Err(e) = p.commit() {
-            tracing::error!(
-                target: "candle_conversation::persistence::writer",
-                "substrate writer commit failed: {e}"
-            );
-        }
-    }
-}
-
 /// Deterministic fault injection for the durable write path — the enablement
 /// the torn-seal oracles (catalogue D2/D3) are blocked on. Not a behaviour
 /// switch: production code never arms a fault; a test arms a specific stream
-/// and the writer drops exactly that one record, reproducing the one tear the
+/// and the owner drops exactly that one record, reproducing the one tear the
 /// §4.1 write ordering permits (snapshot landed, tokens lost) without needing
 /// to crash the process at a precise instant.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod fault {
-    use std::sync::Mutex;
+    use crossbeam::queue::SegQueue;
 
     use crate::persistence::streams::StreamId;
 
-    static DROP_TOKENS: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+    /// The streams armed for one fault each. Lock-free: armed by a test,
+    /// consumed by the owner thread.
+    pub struct Armed(SegQueue<StreamId>);
+
+    impl Armed {
+        const fn new() -> Self {
+            Armed(SegQueue::new())
+        }
+
+        fn arm(&self, stream: StreamId) {
+            self.0.push(stream);
+        }
+
+        /// Consume an armed fault for `stream`, if any, leaving every other.
+        fn take(&self, stream: StreamId) -> bool {
+            let mut found = false;
+            for _ in 0..self.0.len() {
+                let Some(s) = self.0.pop() else { break };
+                if !found && s == stream {
+                    found = true;
+                } else {
+                    self.0.push(s);
+                }
+            }
+            found
+        }
+    }
+
+    static DROP_TOKENS: Armed = Armed::new();
 
     /// Arm: the next `Tokens` record for `stream` is silently dropped instead
     /// of appended. One-shot per call — the arm is consumed when it fires.
     pub fn drop_next_tokens(stream: StreamId) {
-        DROP_TOKENS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(stream);
+        DROP_TOKENS.arm(stream);
     }
 
     /// Consume an armed drop for `stream`, if any.
     pub(super) fn take_drop_tokens(stream: StreamId) -> bool {
-        take(&DROP_TOKENS, stream)
+        DROP_TOKENS.take(stream)
     }
 
-    static FAIL_SNAPSHOT: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+    static FAIL_SNAPSHOT: Armed = Armed::new();
 
     /// Arm: the next `Snapshot` append for `stream` fails, as a full or failing
     /// disk would fail it. One-shot per call, like [`drop_next_tokens`].
     pub fn fail_next_snapshot(stream: StreamId) {
-        FAIL_SNAPSHOT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(stream);
+        FAIL_SNAPSHOT.arm(stream);
     }
 
     /// Consume an armed snapshot failure for `stream`, if any.
     pub(super) fn take_fail_snapshot(stream: StreamId) -> bool {
-        take(&FAIL_SNAPSHOT, stream)
+        FAIL_SNAPSHOT.take(stream)
     }
 
-    static GARBLE_SNAPSHOT: Mutex<Vec<StreamId>> = Mutex::new(Vec::new());
+    static GARBLE_SNAPSHOT: Armed = Armed::new();
 
     /// What a garbled snapshot lands: too short for any version word and field
     /// that follows it, so every decode refuses it.
@@ -926,25 +603,12 @@ pub mod fault {
     /// Arm: the next `Snapshot` append for `stream` lands [`GARBLED_SNAPSHOT`]
     /// instead of its payload. One-shot per call, like [`drop_next_tokens`].
     pub fn garble_next_snapshot(stream: StreamId) {
-        GARBLE_SNAPSHOT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(stream);
+        GARBLE_SNAPSHOT.arm(stream);
     }
 
     /// Consume an armed garble for `stream`, if any.
     pub(super) fn take_garble_snapshot(stream: StreamId) -> bool {
-        take(&GARBLE_SNAPSHOT, stream)
-    }
-
-    fn take(armed: &Mutex<Vec<StreamId>>, stream: StreamId) -> bool {
-        let mut armed = armed.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = armed.iter().position(|s| *s == stream) {
-            armed.remove(pos);
-            true
-        } else {
-            false
-        }
+        GARBLE_SNAPSHOT.take(stream)
     }
 }
 
@@ -952,12 +616,13 @@ pub mod fault {
 mod tests {
     use std::sync::Arc;
 
-    use super::{fault, SubstrateLock, SubstrateWriter, WriteJob};
+    use super::{fault, WriteJob};
     use crate::persistence::identity::RecordIdentity;
+    use crate::persistence::owner::PersistenceOwner;
     use crate::persistence::record::{RecordType, SnapshotPayload};
     use crate::persistence::streams::StreamId;
-    use crate::persistence::{dir_fingerprint, PersistenceLock, SubstratePersistence};
-    use crate::substrate::Substrate;
+    use crate::persistence::{dir_fingerprint, SubstratePersistence};
+    use crate::substrate::{Substrate, SubstrateLock};
 
     fn snapshot_at(turn_index: u32) -> SnapshotPayload {
         SnapshotPayload {
@@ -967,6 +632,10 @@ mod tests {
             layers: Vec::new(),
             aux: vec![turn_index as u8; 64],
         }
+    }
+
+    fn written(owner: &PersistenceOwner) {
+        owner.wait_written(owner.ticket());
     }
 
     /// **A snapshot that fails to land retracts the one before it.** That one
@@ -983,40 +652,30 @@ mod tests {
         let mut substrate = Substrate::new();
         let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
         let substrate = Arc::new(SubstrateLock::new(substrate));
-        let persistence = Arc::new(PersistenceLock::new(p));
-        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        let owner = PersistenceOwner::spawn(p, substrate.clone());
 
         for stream_id in [failed, other] {
-            writer.enqueue(WriteJob::Snapshot {
+            owner.enqueue(WriteJob::Snapshot {
                 stream_id,
                 payload: snapshot_at(0),
             });
         }
         // Both turn-0 snapshots land before the fault is armed, so it can only
-        // fire on the turn-1 append — a second writer over the same handles.
-        writer.shutdown();
-        drop(writer);
-        assert!(substrate
-            .read()
-            .unwrap()
-            .recurrent_snapshot_loc(failed)
-            .is_some());
-        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        // fire on the turn-1 append.
+        written(&owner);
+        assert!(substrate.read().recurrent_snapshot_loc(failed).is_some());
         fault::fail_next_snapshot(failed);
-        writer.enqueue(WriteJob::Snapshot {
+        owner.enqueue(WriteJob::Snapshot {
             stream_id: failed,
             payload: snapshot_at(1),
         });
-        writer.shutdown();
-        drop(writer);
+        written(&owner);
 
-        let kept = substrate.read().unwrap().recurrent_snapshot_loc(other);
+        let kept = substrate.read().recurrent_snapshot_loc(other);
         assert!(kept.is_some());
-        assert_eq!(
-            substrate.read().unwrap().recurrent_snapshot_loc(failed),
-            None
-        );
-        drop(persistence);
+        assert_eq!(substrate.read().recurrent_snapshot_loc(failed), None);
+        owner.shutdown();
+        drop(owner);
 
         let mut reloaded = Substrate::new();
         let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
@@ -1025,17 +684,15 @@ mod tests {
 
         // The next seal's snapshot is the stream's tail again, on reload too.
         let substrate = Arc::new(SubstrateLock::new(reloaded));
-        let persistence = Arc::new(PersistenceLock::new(p));
-        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
-        writer.enqueue(WriteJob::Snapshot {
+        let owner = PersistenceOwner::spawn(p, substrate.clone());
+        owner.enqueue(WriteJob::Snapshot {
             stream_id: failed,
             payload: snapshot_at(2),
         });
-        writer.shutdown();
-        drop(writer);
-        let fresh = substrate.read().unwrap().recurrent_snapshot_loc(failed);
+        owner.shutdown();
+        drop(owner);
+        let fresh = substrate.read().recurrent_snapshot_loc(failed);
         assert!(fresh.is_some());
-        drop(persistence);
         let mut reloaded = Substrate::new();
         let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
         assert_eq!(reloaded.recurrent_snapshot_loc(failed), fresh);
@@ -1052,46 +709,40 @@ mod tests {
         let mut substrate = Substrate::new();
         let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
         let substrate = Arc::new(SubstrateLock::new(substrate));
-        let persistence = Arc::new(PersistenceLock::new(p));
-        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        let owner = PersistenceOwner::spawn(p, substrate.clone());
         let mut full = snapshot_at(0);
         full.aux = vec![9u8; 1 << 16];
-        writer.enqueue(WriteJob::Snapshot {
+        owner.enqueue(WriteJob::Snapshot {
             stream_id,
             payload: full,
         });
-        writer.enqueue(WriteJob::Snapshot {
+        owner.enqueue(WriteJob::Snapshot {
             stream_id,
             payload: SnapshotPayload::retired(7),
         });
-        writer.shutdown();
-        drop(writer);
+        written(&owner);
 
         let tail = substrate
             .read()
-            .unwrap()
             .recurrent_snapshot_loc(stream_id)
             .expect("the retired tail is indexed");
         assert!(tail.payload_len < 4096, "the tail is the empty record");
-        let bytes = persistence
-            .lock()
-            .unwrap()
-            .read_record_payload(&tail)
-            .unwrap();
+        let bytes = owner.call(|p| p.read_record_payload(&tail)).unwrap();
         assert!(SnapshotPayload::decode(&bytes).unwrap().is_retired());
-        drop(persistence);
+        owner.shutdown();
+        drop(owner);
 
         let mut reloaded = Substrate::new();
         let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
         assert_eq!(reloaded.recurrent_snapshot_loc(stream_id), Some(tail));
     }
 
-    /// **A read-only writer drops every job and touches no file.** Metadata,
+    /// **A read-only owner drops every write and touches no file.** Metadata,
     /// tokens and a bulk snapshot are all dropped before they take a queue
     /// slot, no location is registered for a record that was never written,
     /// shutdown returns without a commit, and the store is byte-identical.
     #[test]
-    fn a_read_only_writer_drops_every_job_and_touches_no_file() {
+    fn a_read_only_owner_drops_every_write_and_touches_no_file() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1109,24 +760,23 @@ mod tests {
         let p =
             SubstratePersistence::open_in_with_substrate_read_only(&dir, &mut substrate).unwrap();
         let substrate = Arc::new(SubstrateLock::new(substrate));
-        let persistence = Arc::new(PersistenceLock::new(p));
-        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        let owner = PersistenceOwner::spawn(p, substrate.clone());
         let stream = StreamId(42);
-        writer.enqueue(WriteJob::StreamDecl {
+        owner.enqueue(WriteJob::StreamDecl {
             stream_id: stream.0,
             payload: vec![1, 2, 3],
             identity: RecordIdentity::NONE,
         });
-        writer.enqueue(WriteJob::Tokens {
+        owner.enqueue(WriteJob::Tokens {
             stream_id: stream,
             token_ids: vec![7, 8, 9],
         });
-        writer.enqueue(WriteJob::ConvMeta {
+        owner.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload: vec![4, 5],
             identity: RecordIdentity::NONE,
         });
-        writer.enqueue(WriteJob::Snapshot {
+        owner.enqueue(WriteJob::Snapshot {
             stream_id: stream,
             payload: SnapshotPayload {
                 timeline_id: 7,
@@ -1136,18 +786,15 @@ mod tests {
                 aux: vec![0u8; 4096],
             },
         });
-        assert_eq!(*writer.backpressure.state.lock().unwrap(), (0, 0));
-        writer.shutdown();
-        drop(writer);
-
+        assert_eq!(owner.ticket(), 0, "nothing took a queue slot");
         assert!(substrate
             .read()
-            .unwrap()
             .stream_of(stream)
             .and_then(|s| s.tokens)
             .is_none());
-        assert_eq!(persistence.lock().unwrap().pending_bytes(), 0);
-        drop(persistence);
+        assert_eq!(owner.call(|p| p.pending_bytes()), 0);
+        owner.shutdown();
+        drop(owner);
         drop(substrate);
         assert_eq!(dir_fingerprint(&dir), before);
         std::fs::remove_dir_all(&dir).ok();

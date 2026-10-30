@@ -1,249 +1,148 @@
-//! The substrate's lock, timed.
+//! The substrate's versioned root (`docs/substrate_lock_free.md` §3).
 //!
 //! Every reader and writer of a substrate — the scheduler's projections, the
 //! persistence thread, the redo-log writer, the ingest workers, the API's
-//! views — shares one `RwLock`. A view that answers in milliseconds waited
-//! 13–18 s for it on BlackWorld (2026-10-29), and nothing said who held it.
-//! [`SubstrateLock`] is that lock with the caller of every acquisition recorded
-//! (`#[track_caller]`): a wait for it, or a hold of it, longer than [`SLOW`] is
-//! logged with the site, so the holder names itself when it lets go and every
-//! caller queued behind it says how long it stood there.
+//! views — shares one [`SubstrateLock`]. It holds no lock. It holds the latest
+//! **version**: an `Arc<Substrate>` built of persistent collections, so a clone
+//! is O(1) and an edit copies only the paths it changes.
 //!
-//! The shape is `RwLock`'s — `read`, `write`, `try_read`, `try_write`, each a
-//! `LockResult` whose poison carries the guard — so a caller written against
-//! the std lock reads the same against this one.
+//! - **A read never waits.** [`SubstrateLock::read`] loads the latest version
+//!   and hands it out; the reader holds that version for as long as it reads,
+//!   whatever commits after, and never sees a half-made edit.
+//! - **A write never waits either.** [`SubstrateLock::update`] edits a clone of
+//!   the latest version and publishes it by compare-and-swap. When another
+//!   writer published first, the edit is run again on the newer version — so an
+//!   edit is a pure function of the version it is handed, and does nothing
+//!   outside it but allocate residences (whose attempt is tracked, and
+//!   discarded when lost — [`residence::begin_attempt`]).
+//! - **Residences are outside the version.** KV tier transitions are atomic
+//!   steps on the shared [`ResidenceSlab`] and commit nothing.
 //!
-//! It also carries the substrate's [`MutationQueue`]: a mutation sent with
-//! [`SubstrateLock::send`] is applied by the next write acquisition, which
-//! drains the queue before handing out its guard
-//! (`docs/substrate_mutation_queue.md` §2).
+//! The substrate is an order-independent fold of stamped records, so the edits
+//! that race here commute: a retry re-applies the same records to a version
+//! that holds more of them, and arrives where either order would have.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::panic::Location;
-use std::sync::{
-    Arc, LockResult, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
-    TryLockResult,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::mutation_queue::{Mutation, MutationQueue};
+use arc_swap::ArcSwap;
+
+use super::residence::{self, ResidenceSlab};
 use super::Substrate;
 
-/// A wait for the lock, or a hold of it, at least this long is logged.
+/// An edit that took at least this long, or was retried at least
+/// [`RETRIES_NOTED`] times, is logged with the site that made it.
 pub const SLOW: Duration = Duration::from_millis(250);
+
+/// See [`SLOW`].
+pub const RETRIES_NOTED: u32 = 8;
 
 /// See the module documentation.
 pub struct SubstrateLock {
-    lock: RwLock<Substrate>,
-    queue: MutationQueue,
+    root: ArcSwap<Substrate>,
 }
 
-/// Which side of the lock an acquisition took.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Read,
-    Write,
+/// One version of the substrate, held for as long as the reader reads.
+pub struct SubstrateReadGuard {
+    version: Arc<Substrate>,
 }
 
-impl Side {
-    fn as_str(self) -> &'static str {
-        match self {
-            Side::Read => "read",
-            Side::Write => "write",
-        }
-    }
+/// Ends a version edit's residence attempt, lost unless marked committed —
+/// so an edit that panics discards what it allocated.
+struct Attempt<'a> {
+    slab: &'a ResidenceSlab,
+    committed: bool,
 }
 
-/// A shared hold of the substrate, timed from acquisition to drop.
-pub struct SubstrateReadGuard<'a> {
-    guard: RwLockReadGuard<'a, Substrate>,
-    held: Held,
-}
-
-/// An exclusive hold of the substrate, timed from acquisition to drop.
-pub struct SubstrateWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, Substrate>,
-    held: Held,
-}
-
-/// Where and since when a guard holds the lock.
-struct Held {
-    side: Side,
-    site: &'static Location<'static>,
-    since: Instant,
-}
-
-impl Drop for Held {
+impl Drop for Attempt<'_> {
     fn drop(&mut self) {
-        let held = self.since.elapsed();
-        if held >= SLOW {
-            tracing::warn!(
-                target: "candle_conversation::substrate::lock",
-                side = self.side.as_str(),
-                site = %self.site,
-                held_ms = held.as_millis() as u64,
-                "the substrate lock was held long: every reader and writer behind it waited"
-            );
-        }
-    }
-}
-
-/// Log a wait of `waited` for `side` at `site` when it was slow.
-fn note_wait(side: Side, site: &'static Location<'static>, waited: Duration) {
-    if waited >= SLOW {
-        tracing::warn!(
-            target: "candle_conversation::substrate::lock",
-            side = side.as_str(),
-            site = %site,
-            waited_ms = waited.as_millis() as u64,
-            "waited long for the substrate lock"
-        );
-    }
-}
-
-/// `result` with its guard, poisoned or not, wrapped by `wrap`.
-fn wrap_lock<G, T>(result: LockResult<G>, wrap: impl FnOnce(G) -> T) -> LockResult<T> {
-    match result {
-        Ok(guard) => Ok(wrap(guard)),
-        Err(poisoned) => Err(PoisonError::new(wrap(poisoned.into_inner()))),
-    }
-}
-
-/// [`wrap_lock`] for a try, which may also have found the lock taken.
-fn wrap_try<G, T>(result: TryLockResult<G>, wrap: impl FnOnce(G) -> T) -> TryLockResult<T> {
-    match result {
-        Ok(guard) => Ok(wrap(guard)),
-        Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
-        Err(TryLockError::Poisoned(poisoned)) => Err(TryLockError::Poisoned(PoisonError::new(
-            wrap(poisoned.into_inner()),
-        ))),
+        residence::end_attempt(self.slab, self.committed);
     }
 }
 
 impl SubstrateLock {
     pub fn new(substrate: Substrate) -> Self {
         SubstrateLock {
-            lock: RwLock::new(substrate),
-            queue: MutationQueue::default(),
+            root: ArcSwap::from_pointee(substrate),
         }
     }
 
-    /// Send `mutation` to the substrate and return at once: it is applied, in
-    /// order with every other, by the next write acquisition or the substrate's
-    /// applier thread. For a mutation whose result its sender does not read
-    /// back — a read before it is applied sees the substrate without it.
-    pub fn send(self: &Arc<Self>, mutation: impl FnOnce(&mut Substrate) + Send + 'static) {
-        let mutation: Mutation = Box::new(mutation);
-        self.queue.send(self, mutation);
+    /// The latest version. Never waits.
+    pub fn read(&self) -> SubstrateReadGuard {
+        SubstrateReadGuard {
+            version: self.root.load_full(),
+        }
     }
 
-    /// Whether a sent mutation is waiting to be applied.
-    pub fn has_pending(&self) -> bool {
-        self.queue.is_pending()
+    /// The residences every version shares — for tier transitions, which
+    /// commit no version.
+    pub fn residences(&self) -> Arc<ResidenceSlab> {
+        Arc::clone(self.root.load().residences())
     }
 
-    /// A shared hold, waiting for it; the wait and the hold are timed against
-    /// the caller's site.
+    /// Apply `edit` to the latest version and publish the result, returning
+    /// what the publishing run of `edit` returned.
+    ///
+    /// `edit` may run more than once: each time another writer publishes
+    /// between this one's load and its swap, it is run again on the newer
+    /// version. It must therefore read only the version it is handed and
+    /// change nothing outside it — no I/O, no channel sends, no shared
+    /// counters. Work with an effect outside the substrate is done by the
+    /// caller, after `update` returns.
     #[track_caller]
-    pub fn read(&self) -> LockResult<SubstrateReadGuard<'_>> {
+    pub fn update<R>(&self, mut edit: impl FnMut(&mut Substrate) -> R) -> R {
         let site = Location::caller();
-        let asked = Instant::now();
-        let result = self.lock.read();
-        note_wait(Side::Read, site, asked.elapsed());
-        wrap_lock(result, |guard| SubstrateReadGuard {
-            guard,
-            held: Held {
-                side: Side::Read,
-                site,
-                since: Instant::now(),
-            },
-        })
-    }
-
-    /// An exclusive hold, waiting for it; the wait and the hold are timed
-    /// against the caller's site. Every mutation sent before it is applied
-    /// before the guard is handed out.
-    #[track_caller]
-    pub fn write(&self) -> LockResult<SubstrateWriteGuard<'_>> {
-        let site = Location::caller();
-        let asked = Instant::now();
-        let result = self.lock.write();
-        note_wait(Side::Write, site, asked.elapsed());
-        wrap_lock(result, |guard| self.drained(guard, site))
-    }
-
-    /// A shared hold if one is free now; the hold is timed.
-    #[track_caller]
-    pub fn try_read(&self) -> TryLockResult<SubstrateReadGuard<'_>> {
-        let site = Location::caller();
-        wrap_try(self.lock.try_read(), |guard| SubstrateReadGuard {
-            guard,
-            held: Held {
-                side: Side::Read,
-                site,
-                since: Instant::now(),
-            },
-        })
-    }
-
-    /// An exclusive hold if one is free now; the hold is timed, and every
-    /// mutation sent before it is applied before the guard is handed out.
-    #[track_caller]
-    pub fn try_write(&self) -> TryLockResult<SubstrateWriteGuard<'_>> {
-        let site = Location::caller();
-        wrap_try(self.lock.try_write(), |guard| self.drained(guard, site))
-    }
-
-    /// `guard` with the sent mutations applied, timed from now.
-    fn drained<'a>(
-        &self,
-        mut guard: RwLockWriteGuard<'a, Substrate>,
-        site: &'static Location<'static>,
-    ) -> SubstrateWriteGuard<'a> {
-        let since = Instant::now();
-        self.queue.drain(&mut guard);
-        SubstrateWriteGuard {
-            guard,
-            held: Held {
-                side: Side::Write,
-                site,
-                since,
-            },
+        let started = Instant::now();
+        let mut current = self.root.load_full();
+        let mut retries = 0u32;
+        loop {
+            let mut next = (*current).clone();
+            let mut attempt = Attempt {
+                slab: current.residences(),
+                committed: false,
+            };
+            residence::begin_attempt();
+            let out = edit(&mut next);
+            let prev = self.root.compare_and_swap(&current, Arc::new(next));
+            if Arc::ptr_eq(&prev, &current) {
+                attempt.committed = true;
+                drop(attempt);
+                note_edit(site, started.elapsed(), retries);
+                return out;
+            }
+            drop(attempt);
+            retries += 1;
+            current = arc_swap::Guard::into_inner(prev);
         }
     }
 }
 
-impl SubstrateReadGuard<'_> {
-    /// The site that took this hold.
-    pub fn site(&self) -> &'static Location<'static> {
-        self.held.site
+/// Log an edit at `site` that was slow or retried often.
+fn note_edit(site: &'static Location<'static>, took: Duration, retries: u32) {
+    if took >= SLOW || retries >= RETRIES_NOTED {
+        tracing::warn!(
+            target: "candle_conversation::substrate::lock",
+            site = %site,
+            took_ms = took.as_millis() as u64,
+            retries,
+            "a substrate edit was slow or contended: split it, or move work out of it"
+        );
     }
 }
 
-impl SubstrateWriteGuard<'_> {
-    /// The site that took this hold.
-    pub fn site(&self) -> &'static Location<'static> {
-        self.held.site
+impl SubstrateReadGuard {
+    /// The version, to keep beyond this guard.
+    pub fn version(&self) -> Arc<Substrate> {
+        Arc::clone(&self.version)
     }
 }
 
-impl Deref for SubstrateReadGuard<'_> {
+impl Deref for SubstrateReadGuard {
     type Target = Substrate;
     fn deref(&self) -> &Substrate {
-        &self.guard
-    }
-}
-
-impl Deref for SubstrateWriteGuard<'_> {
-    type Target = Substrate;
-    fn deref(&self) -> &Substrate {
-        &self.guard
-    }
-}
-
-impl DerefMut for SubstrateWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Substrate {
-        &mut self.guard
+        &self.version
     }
 }
 
@@ -253,94 +152,91 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::persistence::streams::StreamId;
 
-    /// **A hold names the line that took it**, whichever side: the site is the
-    /// caller's, not this module's.
+    /// **A reader keeps its version**: an edit published after the read is
+    /// not in it, and the next read has it.
     #[test]
-    fn a_hold_names_the_line_that_took_it() {
+    fn a_reader_keeps_the_version_it_read() {
         let lock = SubstrateLock::new(Substrate::new());
-        let line = line!() + 1;
-        let read = lock.read().unwrap();
-        assert_eq!(read.site().file(), file!());
-        assert_eq!(read.site().line(), line);
-        drop(read);
-        let line = line!() + 1;
-        let write = lock.try_write().unwrap();
-        assert_eq!(write.site().line(), line);
+        let before = lock.read();
+        lock.update(|s| s.toggle_layer("code"));
+        assert!(!before.is_layer_disabled("code"));
+        assert!(lock.read().is_layer_disabled("code"));
     }
 
-    /// **A writer waits out a reader, and a try finds the lock taken**: the
-    /// timing wraps the std lock without changing what it excludes.
+    /// **No edit is lost under contention**: every one of many concurrent
+    /// edits lands, each exactly once in the published result.
     #[test]
-    fn the_lock_excludes_as_the_std_lock_does() {
+    fn concurrent_edits_all_land() {
         let lock = Arc::new(SubstrateLock::new(Substrate::new()));
-        let read = lock.read().unwrap();
-        assert!(matches!(lock.try_write(), Err(TryLockError::WouldBlock)));
-        assert!(lock.try_read().is_ok(), "readers share");
-        let (got, wrote) = flume::bounded(1);
-        let writer = {
-            let lock = Arc::clone(&lock);
-            thread::spawn(move || {
-                drop(lock.write().unwrap());
-                got.send(()).unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let lock = Arc::clone(&lock);
+                thread::spawn(move || {
+                    for i in 0..200 {
+                        let name = format!("w{w}-{i}");
+                        lock.update(|s| {
+                            s.toggle_layer(&name);
+                        });
+                    }
+                })
             })
-        };
-        thread::sleep(Duration::from_millis(50));
-        assert!(wrote.try_recv().is_err(), "the writer got past a reader");
-        drop(read);
-        wrote.recv().unwrap();
-        writer.join().unwrap();
-    }
-
-    /// **A write sees every mutation sent before it, applied in the order
-    /// sent** — whether the applier took some of them first or the write
-    /// drains them itself — so a synchronous writer never overtakes a message.
-    #[test]
-    fn a_write_sees_every_message_sent_before_it_in_order() {
-        let lock = Arc::new(SubstrateLock::new(Substrate::new()));
-        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        for i in 0..100u32 {
-            let order = Arc::clone(&order);
-            lock.send(move |_| order.lock().unwrap().push(i));
+            .collect();
+        for w in writers {
+            w.join().unwrap();
         }
-        drop(lock.write().unwrap());
-        assert_eq!(*order.lock().unwrap(), (0..100).collect::<Vec<u32>>());
-        assert!(!lock.has_pending());
+        let s = lock.read();
+        for w in 0..8 {
+            for i in 0..200 {
+                assert!(s.is_layer_disabled(&format!("w{w}-{i}")));
+            }
+        }
     }
 
-    /// **A message is applied with no other writer**: the applier takes the
-    /// lock for it. And it waits out a reader rather than skipping — the
-    /// message lands once the read lets go.
+    /// **A lost attempt's residences are discarded**: an edit that allocates
+    /// and installs, then loses its swap, leaves the losing residence dead and
+    /// empty, and the winner's alive.
     #[test]
-    fn the_applier_applies_a_message_once_a_reader_lets_go() {
-        let lock = Arc::new(SubstrateLock::new(Substrate::new()));
-        let (applied, done) = flume::bounded(1);
-        let read = lock.read().unwrap();
-        lock.send(move |_| applied.send(()).unwrap());
+    fn a_lost_attempt_discards_its_residences() {
+        let lock = SubstrateLock::new(Substrate::new());
+        let mut allocated = Vec::new();
+        let mut raced = false;
+        lock.update(|s| {
+            let idx = s.alloc_residence(StreamId(7), None);
+            allocated.push(idx);
+            if !raced {
+                raced = true;
+                // Another writer publishes between this attempt's load and swap.
+                thread::scope(|t| {
+                    t.spawn(|| lock.update(|o| o.toggle_layer("other")));
+                });
+            }
+        });
+        assert_eq!(allocated.len(), 2, "the edit ran again");
+        let slab = lock.residences();
         assert!(
-            done.recv_timeout(Duration::from_millis(300)).is_err(),
-            "applied under a reader"
+            slab.get(allocated[0]).is_dead(),
+            "the lost attempt's residence"
         );
-        drop(read);
-        done.recv_timeout(Duration::from_secs(10))
-            .expect("the applier never applied the message");
-        assert!(!lock.has_pending());
+        assert!(!slab.get(allocated[1]).is_dead(), "the published one's");
     }
 
-    /// **A poisoned lock hands back its guard**, as the std lock does, so a
-    /// caller that recovers with `into_inner` still holds a timed guard.
+    /// **An edit that panics publishes nothing** and leaves the next edit free
+    /// to run.
     #[test]
-    fn a_poisoned_lock_hands_back_its_guard() {
+    fn a_panicking_edit_publishes_nothing() {
         let lock = Arc::new(SubstrateLock::new(Substrate::new()));
-        let poisoner = Arc::clone(&lock);
+        let l = Arc::clone(&lock);
         let _ = thread::spawn(move || {
-            let _held = poisoner.write().unwrap();
-            panic!("poison the lock");
+            l.update(|s| {
+                s.toggle_layer("half");
+                panic!("mid-edit");
+            })
         })
         .join();
-        let recovered = lock.read().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(recovered.site().file(), file!());
-        drop(recovered);
-        assert!(matches!(lock.try_write(), Err(TryLockError::Poisoned(_))));
+        assert!(!lock.read().is_layer_disabled("half"));
+        lock.update(|s| s.toggle_layer("after"));
+        assert!(lock.read().is_layer_disabled("after"));
     }
 }

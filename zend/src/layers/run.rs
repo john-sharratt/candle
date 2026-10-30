@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::projection::{
@@ -76,12 +76,12 @@ pub struct UnitJob {
 /// Every unit `layer` holds that finished, and the conversations of it that
 /// did not — begun and never committed, or committed by a chain that stopped
 /// part-way — which no pass will finish.
-pub fn committed(engine: &Mutex<ConversationEngine>, layer: &str) -> (Vec<Done>, Vec<TimelineId>) {
-    let e = engine.lock().unwrap();
+pub fn committed(engine: &ConversationEngine, layer: &str) -> (Vec<Done>, Vec<TimelineId>) {
+    let e = engine;
     let timelines = e.find_conversations_by_metadata(LAYER_KEY, layer);
     let metas: Vec<(TimelineId, BTreeMap<String, String>, Option<u64>)> = timelines
         .into_iter()
-        .filter_map(|tl| Some((tl, e.conversation_metadata(tl)?, built_ms(&e, tl))))
+        .filter_map(|tl| Some((tl, e.conversation_metadata(tl)?, built_ms(e, tl))))
         .collect();
     let conv = e.conversation();
     let substrate = conv.read();
@@ -141,8 +141,8 @@ pub fn all_of(engine: &ConversationEngine, layer: &str) -> Vec<TimelineId> {
 /// crash leaves. Called once per boot, before any pass runs, as
 /// `code_read::retire_crashed_partials` is: a pass can overlap a pool, and an
 /// in-flight unit is indistinguishable from a crashed one by metadata alone.
-pub fn retire_crashed_partials(engine: &Mutex<ConversationEngine>, layer: &str) {
-    let e = engine.lock().unwrap();
+pub fn retire_crashed_partials(engine: &ConversationEngine, layer: &str) {
+    let e = engine;
     let mut retired = 0usize;
     for tl in e.find_conversations_by_metadata(LAYER_KEY, layer) {
         let committed = e
@@ -176,7 +176,7 @@ pub fn ingest_units(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     jobs: &[UnitJob],
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     files: Option<&EdgeFiles<'_>>,
     calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<IngestReport> {
@@ -263,7 +263,7 @@ fn read_one(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     job: &UnitJob,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
     files: Option<&EdgeFiles<'_>>,
     calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<()> {
@@ -278,11 +278,7 @@ fn read_one(
     let answer = match ask(ctx, spec, job, &mut reading) {
         Ok(answer) => answer,
         Err(e) => {
-            let _ = ctx
-                .engine
-                .lock()
-                .unwrap()
-                .tombstone_timeline(reading.timeline_id());
+            let _ = ctx.engine.tombstone_timeline(reading.timeline_id());
             return Err(e);
         }
     };
@@ -290,11 +286,7 @@ fn read_one(
     // and the reading goes — first, so a worker holds one conversation at a
     // time. A unit that cannot be written again is not committed as the
     // reading: it is read again next pass.
-    let _ = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .tombstone_timeline(reading.timeline_id());
+    let _ = ctx.engine.tombstone_timeline(reading.timeline_id());
     drop(reading);
     let conv = super::compact::rewrite(ctx, spec, job, base, &answer)?;
     let timeline = conv.timeline_id();
@@ -369,7 +361,7 @@ fn read_one(
         tags.insert(QUANT_KEY.to_string(), bits.to_string());
     }
     if let Err(err) = conv.set_metadata_many(&tags) {
-        let _ = ctx.engine.lock().unwrap().tombstone_timeline(timeline);
+        let _ = ctx.engine.tombstone_timeline(timeline);
         anyhow::bail!("the content key was not written: {err:#}");
     }
     ctx.retrieval.mark_stale();
@@ -386,8 +378,8 @@ fn read_one(
             );
         }
     }
-    let e = ctx.engine.lock().unwrap();
-    finished(&e, timeline, Unit::Layer(&job.subject));
+    let e = ctx.engine;
+    finished(e, timeline, Unit::Layer(&job.subject));
     e.evict_ingest_timeline(timeline);
     tracing::debug!(
         target: "zend::layers",
@@ -411,17 +403,15 @@ pub(super) fn mint_unit(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     job: &UnitJob,
-    base: &Mutex<Sequence>,
+    base: &Sequence,
 ) -> anyhow::Result<Sequence> {
     let conv = base
-        .lock()
-        .unwrap()
         .fork()
         .map_err(|e| anyhow::anyhow!("{} unit conversation: {e}", spec.layer))?;
     let timeline = conv.timeline_id();
     let named = (|| {
         {
-            let e = ctx.engine.lock().unwrap();
+            let e = ctx.engine;
             if let Some(parent) = job.parent.or(ctx.chain_end) {
                 e.set_forked_from(timeline, parent)
                     .map_err(|err| anyhow::anyhow!("{} unit lineage: {err}", spec.layer))?;
@@ -447,7 +437,7 @@ pub(super) fn mint_unit(
             .map_err(|e| anyhow::anyhow!("naming the unit: {e}"))
     })();
     if let Err(e) = named {
-        let _ = ctx.engine.lock().unwrap().tombstone_timeline(timeline);
+        let _ = ctx.engine.tombstone_timeline(timeline);
         return Err(e);
     }
     Ok(conv)
@@ -456,8 +446,8 @@ pub(super) fn mint_unit(
 /// Whether a unit leased under `key` is committed — under that key, or, for
 /// an edges layer, under the key of what it depended on, which records the
 /// lease's as [`JOB_KEY`].
-fn is_committed(engine: &Mutex<ConversationEngine>, key: &str) -> bool {
-    let e = engine.lock().unwrap();
+fn is_committed(engine: &ConversationEngine, key: &str) -> bool {
+    let e = engine;
     [CONTENT_KEY, JOB_KEY].iter().any(|field| {
         e.find_conversations_by_metadata(field, key)
             .iter()
@@ -539,8 +529,6 @@ fn unit_triggers(
         return Ok(triggers);
     }
     ctx.engine
-        .lock()
-        .unwrap()
         .holding_tools(&triggers, &spec.tools)
         .map_err(|e| anyhow::anyhow!("layer `{}`: {e}", spec.layer))
 }
@@ -752,14 +740,14 @@ const THINK_CLOSE: &str = "</think>";
 /// lineage — the units of other files (or days) its provenance brought in —
 /// by layer and subject, with the tokens they cost.
 fn log_provenance(
-    engine: &Mutex<ConversationEngine>,
+    engine: &ConversationEngine,
     spec: &LayerSpec,
     job: &UnitJob,
     timeline: TimelineId,
     event: &candle_conversation::ProjectionEvent,
     candidates: &[(TimelineId, f32)],
 ) {
-    let e = engine.lock().unwrap();
+    let e = engine;
     let lineage: HashSet<u64> = e
         .conversation()
         .read()
