@@ -46,11 +46,20 @@ another character's turn.
   writer between the read a write is computed from and the record it lands.
 
 The ordering is the one `Npcs` always kept, now enforced by where it runs
-rather than by a guard: **the record is durable before memory says so.** A
-failed append or fsync publishes nothing, so the daemon's view still matches
-the log. Replay keeps the newest record per character, and the newest record
-is always the one the newest published cast holds, because the cast is
-published in the same step that appends it.
+rather than by a guard: **the record is durable before memory says so, and
+memory says whatever is durable.** A refused edit publishes nothing. An append
+that fails partway through a batch (`import`, `repoint_portraits`) commits and
+publishes the records staged before it and returns the error, so the daemon's
+view never disagrees with the log. Replay keeps the newest record per
+character, and the newest record is always the one the newest published cast
+holds, because the cast is published in the same step that appends it. Each
+published record is also the one its character is *read as*, so a refresh does
+not read the daemon's own writes again.
+
+A writer waits on the owner for its own append and fsync. Called from an async
+task on a multi-threaded runtime, that wait is taken off the worker
+(`block_in_place`), so writes from many tasks at once never park every worker
+the readers need.
 
 ### 2.1 A write computed from what it writes
 
@@ -84,6 +93,10 @@ built from the snapshot.
 |---|---|
 | the persistence owner's queue | a write waits for its own append and fsync, which it always did; no reader waits on it |
 | `Npcs` itself | `Arc<Npcs>`, shared; nothing in it is locked |
+
+At shutdown nothing waits for the cast: a write in flight is a call queued on
+the owner, and the owner serves every queued call before it stops
+(`docs/substrate_lock_free.md` §9.1).
 
 ## 4. Tests
 

@@ -211,11 +211,9 @@ impl Cast {
     /// The character, if the caller owns it. Every authoring write starts here:
     /// ownership is authorization (§8.2), and a role cannot express "yours".
     pub(super) fn owned(&self, npc_id: u64, owner: &str) -> Result<NpcPayload, NpcError> {
-        let npc = self.visible_to(npc_id, owner).ok_or(NpcError::NotFound)?;
-        if npc.owner_id != owner {
-            return Err(NpcError::NotFound);
-        }
-        Ok(npc.clone())
+        self.visible_to(npc_id, owner)
+            .cloned()
+            .ok_or(NpcError::NotFound)
     }
 
     /// A fresh id, unique across the whole cast including tombstoned ones.

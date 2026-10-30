@@ -339,19 +339,9 @@ impl SubstrateRef {
         self.0.strong_count() == 0
     }
 
-    /// Rewrite the substrate's residences through a compaction's sweep while
-    /// any handle keeps it alive — see [`Conversation::rewrite_for_compaction`].
-    ///
-    /// A detached tenant's substrate is out of the scheduler's attached set
-    /// but goes on holding its resident KV until its last handle goes, so it
-    /// is a holder the sweep must reach. Once gone it holds nothing: the copies
-    /// its residences dropped wait on the reclaim queue, which the sweep visits
-    /// on its own.
-    pub(crate) fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
-        match self.0.upgrade() {
-            Some(substrate) => substrate.read().rewrite_for_compaction(sweep),
-            None => Ok(0),
-        }
+    /// The substrate, while any handle keeps it alive.
+    pub(crate) fn upgrade(&self) -> Option<Arc<SubstrateLock>> {
+        self.0.upgrade()
     }
 }
 

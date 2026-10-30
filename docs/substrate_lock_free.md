@@ -249,10 +249,13 @@ local zend run, reported by the pass's `unwitnessed` count.
 A detached tenant's substrate is a holder in the same way. A detach takes it out
 of the scheduler's attached set, but its residences keep their resident copies
 until its last handle goes — a tenant's shutdown drops those handles after the
-detach, not at it. So the sweep visits every detached substrate still alive
-(`Detached::rewrite_for_compaction`, through the weak reference the scheduler
-already keeps of each) before the reclaim queue; one that has gone holds
-nothing, its dropped copies being in the queue. Without it, a pass that ran in
+detach, not at it. So the sweep visits every detached substrate still alive,
+before the reclaim queue; one that has gone holds nothing, its dropped copies
+being in the queue. Each is upgraded from the weak reference the scheduler
+already keeps of it once, before the pass (`Detached::alive`), and let go after
+the pass returns: upgraded inside the pass, a tenant dropping its last handle
+meanwhile would leave the pass's upgrade as the last, and the substrate would
+free its chunks into the pool mid-relocation. Without it, a pass that ran in
 that window found most of the arena unnamed: measured on WhiteWorld at a member
 shutdown, 39,321 of 94,936 and then 55,981 of 137,287 relocated slots, in the
 two passes that ran between npcd's detach and the engine's shutdown.
@@ -358,6 +361,13 @@ between their step and their check, so a request that kept its handle was
 counted, a removed entry has no request holding it, and no second fork starts
 under the key while a request holds the first.
 
+A removed entry is freed by the map only in a batch, once enough entries have
+been retired, so the entry's value is a slot (`ArcSwapOption`) emptied as the
+entry leaves the map — by `remove` and by the sweep. The released conversation,
+with its scheduler slot and resident KV, goes when its last holder lets it go;
+the map's retired copy holds nothing. npcd's live characters
+(`engine/mind.rs`) are held the same way.
+
 ### 8.3 Read-modify-writes
 
 | Sequence | Implementation |
@@ -399,6 +409,11 @@ it work over three lock-free queues:
 A call from the owner's own thread would wait for itself and panics. A call's
 closure borrows from its caller's frame; the caller waits for the owner to run
 and drop it before the frame returns.
+
+A shutdown serves every call already queued before it commits the tail and
+acknowledges: each is a caller blocked on its answer, and the owner's wait,
+picking among ready queues, may take the shutdown first. A call sent after the
+owner has stopped panics its caller, as it always did.
 
 ### 9.2 Readers
 
@@ -469,10 +484,10 @@ no reader sees half a batch and nothing waits on the batch.
 | a reader keeps its version; concurrent edits all land; a lost attempt's residences are discarded; a panicking edit publishes nothing | `substrate/lock.rs` |
 | a dead residence keeps no payload; lifts never stack; a replace expects its copy; membership follows the cells; pins count per publisher; a lift is a use | `substrate/residence.rs` |
 | a migrate over a residence that moved on installs nothing | `substrate.rs` |
-| calls return and borrow; a call's panic unwinds into its caller; writes land in order; calls from many threads are each served; calls go ahead of background work; shutdown drains, including behind a burst | `persistence/owner.rs` |
+| calls return and borrow; a call's panic unwinds into its caller; writes land in order; calls from many threads are each served; calls go ahead of background work; shutdown drains, including behind a burst; a call queued beside a shutdown is answered | `persistence/owner.rs` |
 | concurrent mints are unique and ordered | `persistence/identity/minter.rs` |
 | every permutation of a record set yields the same substrate | `substrate::order_independence_tests` |
-| one fork per key; a failed fork is retried; the sweep releases only what nothing holds; no request keeps a released value; a lock taken in the fork is held before anyone sees the value | `zend/src/resident.rs` |
+| one fork per key; a failed fork is retried; the sweep releases only what nothing holds; no request keeps a released value; a lock taken in the fork is held before anyone sees the value; a released value is dropped with its last handle | `zend/src/resident.rs` |
 | chunk locations: migrates compose, a compaction excludes them, a refused pass is waited for | `migrate_flight.rs` |
 | a queued reclaim payload and a detached substrate still alive are holders the sweep rewrites | `substrate/residence.rs`, `scheduler/detached.rs` |
 

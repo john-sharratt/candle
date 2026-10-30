@@ -21,12 +21,26 @@
 //! by nothing else the sweep reaches.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use candle_nn::kv_cache::Sweep;
 
 use super::SchedulerRequest;
 use crate::projection::{Conversation, SubstrateRef};
 use crate::sequence_handle::SequenceId;
+use crate::substrate::SubstrateLock;
+
+/// A detached substrate held alive for one compaction pass — see
+/// [`Detached::alive`].
+pub(super) struct Swept(Arc<SubstrateLock>);
+
+impl Swept {
+    /// Rewrite its residences through the pass's sweep, returning how many
+    /// were rewritten.
+    pub(super) fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
+        self.0.read().rewrite_for_compaction(sweep)
+    }
+}
 
 /// The slots and substrates detached from this scheduler.
 #[derive(Default)]
@@ -50,16 +64,21 @@ impl Detached {
         self.slots.extend(slots);
     }
 
-    /// Rewrite every detached substrate still alive through a compaction's
-    /// sweep — a detached tenant's residences hold resident KV until its last
-    /// handle goes, and nothing else the sweep visits names them. Returns how
-    /// many residences were rewritten.
-    pub(super) fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
-        let mut rewritten = 0;
-        for substrate in &self.substrates {
-            rewritten += substrate.rewrite_for_compaction(sweep)?;
-        }
-        Ok(rewritten)
+    /// Every detached substrate still alive, held for a compaction pass — a
+    /// detached tenant's residences hold resident KV until its last handle
+    /// goes, and nothing else the sweep visits names them.
+    ///
+    /// Held for the whole pass and let go after it, never upgraded inside it:
+    /// a tenant dropping its last handle mid-pass would otherwise leave the
+    /// pass's own upgrade as the last, and the substrate would free its chunks
+    /// into the pool the pass is relocating, on the thread that is relocating
+    /// them.
+    pub(super) fn alive(&self) -> Vec<Swept> {
+        self.substrates
+            .iter()
+            .filter_map(SubstrateRef::upgrade)
+            .map(Swept)
+            .collect()
     }
 
     /// `conversation`'s substrate attached again: its requests are live.
@@ -257,9 +276,30 @@ mod tests {
         map.insert(src, ChunkGid::detached(dst), 0x4000);
         let mut sweep = Sweep::new(&map);
 
-        assert_eq!(detached.rewrite_for_compaction(&mut sweep).unwrap(), 1);
+        let held = detached.alive();
+        assert_eq!(held.len(), 1, "the gone one is not held");
+        let rewritten: usize = held
+            .iter()
+            .map(|s| s.rewrite_for_compaction(&mut sweep).unwrap())
+            .sum();
+        assert_eq!(rewritten, 1);
         assert_eq!(hot_raw(&alive, residence), dst);
         assert_eq!(sweep.allocations_rewritten(), 1);
+    }
+
+    /// **A detached substrate held for a pass outlives its last handle until
+    /// the pass lets it go**, so it is never freed inside the pass.
+    #[test]
+    fn a_held_substrate_outlives_its_last_handle_until_released() {
+        own_device_frees();
+        let (substrate, _) = hot_at((3 * GID_STRIDE + 1) as i64);
+        let mut detached = Detached::default();
+        detached.record(&substrate, []);
+        let held = detached.alive();
+        drop(substrate);
+        assert_eq!(detached.alive().len(), 1, "the pass's hold keeps it alive");
+        drop(held);
+        assert!(detached.alive().is_empty(), "let go once the pass is over");
     }
 
     fn free(slot: usize) -> SchedulerRequest {

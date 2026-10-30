@@ -265,7 +265,13 @@ pub struct Minds {
     /// Each character's conversation, behind its own async lock so a decode
     /// holds only the character that is thinking — see the module's *Locking*
     /// note.
-    live: LockFreeMap<u64, Arc<Resident>>,
+    ///
+    /// Each value is a slot, emptied the moment its entry is removed or
+    /// replaced: the map frees what it retires only in batches, and a retired
+    /// entry still holding its `Resident` would keep the conversation — its
+    /// scheduler slot and its resident KV — alive long after the character let
+    /// it go.
+    live: LockFreeMap<u64, ArcSwapOption<Resident>>,
     /// The system prompt each character's latest turn was made under, laid out
     /// from that turn's projection. Held apart from the conversation so reading
     /// it never waits on a decode.
@@ -683,7 +689,13 @@ impl Minds {
     /// This character's live conversation, if it has one — cloned out of the
     /// map, so holding it holds nothing else.
     fn resident_of(&self, npc_id: u64) -> Option<Arc<Resident>> {
-        self.live.pin().get(&npc_id).cloned()
+        self.live.pin().get(&npc_id)?.load_full()
+    }
+
+    /// Take this character's conversation out of the map, emptying the entry's
+    /// slot so the map's retired copy holds nothing — see [`Self::live`].
+    fn release(&self, npc_id: u64) -> Option<Arc<Resident>> {
+        self.live.pin().remove(&npc_id)?.swap(None)
     }
 
     /// The tokens this character would be given if it decoded this instant —
@@ -1647,7 +1659,7 @@ impl Minds {
                     }
                     // Tombstone, not delete. The turns stay in the redo log;
                     // what changes is that they stop being selected by default.
-                    let gone = self.live.pin().remove(&npc_id).cloned();
+                    let gone = self.release(npc_id);
                     if let Some(l) = gone {
                         retire(&self.engine, &*l.conversation.lock().await);
                     }
@@ -2005,7 +2017,7 @@ impl Minds {
     pub async fn retire_npc(&self, npc_id: u64) {
         // Taken out of the map first, then locked: a character mid-decode is
         // awaited rather than tombstoned underneath.
-        let gone = self.live.pin().remove(&npc_id).cloned();
+        let gone = self.release(npc_id);
         if let Some(l) = gone {
             retire(&self.engine, &*l.conversation.lock().await);
         }
@@ -2018,7 +2030,10 @@ impl Minds {
             asker: live.sequence.unsealed_asker(),
             conversation: ConversationLock::new(live),
         });
-        self.live.pin().insert(npc_id, Arc::clone(&opened));
+        let slot = ArcSwapOption::from(Some(Arc::clone(&opened)));
+        if let Some(replaced) = self.live.pin().insert(npc_id, slot) {
+            replaced.store(None);
+        }
         opened
     }
 }

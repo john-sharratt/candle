@@ -1548,6 +1548,10 @@ impl Scheduler {
         // reached — and the reason a compaction could poison a sequence that was not
         // even resident when it ran.
         let mut projections = std::mem::take(&mut self.slot_projection_state);
+        // A detached tenant's substrate, out of the attached set but still
+        // holding its resident KV until its last handle goes — held alive for
+        // the pass and let go after it (`Detached::alive`).
+        let detached = self.detached.alive();
         // The closure receives the pass's OWN `Sweep`, already carrying whatever the
         // backings rewrote. Sharing it is what makes an allocation held by both a
         // block table and a residence come back as one replacement.
@@ -1577,15 +1581,18 @@ impl Scheduler {
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
                 }
-                // A detached tenant's substrate, out of the attached set but
-                // still holding its resident KV until its last handle goes.
-                swept += self.detached.rewrite_for_compaction(sweep)?;
+                for substrate in &detached {
+                    swept += substrate.rewrite_for_compaction(sweep)?;
+                }
                 // Last, so a hot copy any thread let go of while the residences
                 // were walked is still named by the sweep.
                 swept += rewrite_reclaimed(sweep)?;
                 Ok(())
             })
         };
+        // The pass is over: a detached substrate whose last handle went while it
+        // ran is freed here, outside it.
+        drop(detached);
         self.slot_projection_state = projections;
         // **The interval is stamped by a pass that ran, never by one that was
         // refused.** `MIN_INTERVAL` exists to bound the census, and a contended pass

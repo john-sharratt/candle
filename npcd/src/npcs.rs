@@ -41,6 +41,7 @@
 mod cast;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -56,6 +57,8 @@ use candle_conversation::persistence::{
 use candle_conversation::substrate::Substrate;
 use host::MODEL;
 use serde_json::{json, Value};
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::block_in_place;
 
 use web::auth::session::Identity;
 
@@ -208,8 +211,20 @@ pub struct Npcs {
 }
 
 /// A record the log would not take, as the error every write returns.
-fn persist(e: impl std::fmt::Display) -> NpcError {
+fn persist(e: impl Display) -> NpcError {
     NpcError::Persist(e.to_string())
+}
+
+/// Run `f`, which blocks on the persistence owner, without holding an async
+/// runtime's worker: on a multi-threaded runtime the worker's other tasks move
+/// to another thread for the length of it. A write waits for its own append
+/// and fsync, behind whatever the owner is serving, and a cast written by many
+/// tasks at once would otherwise park a worker per writer.
+fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => block_in_place(f),
+        _ => f(),
+    }
 }
 
 /// One superseding record and what the caller is shown of it.
@@ -306,8 +321,12 @@ impl Npcs {
     /// thread, so every write is ordered after the one before it and computed
     /// from what that one published (`docs/npcd_cast_lock_free.md` §2).
     ///
-    /// Nothing is published unless the records are durable: a refused edit or a
-    /// failed append leaves the cast exactly as it was. An edit that returns no
+    /// Nothing is published unless it is durable, and everything durable is
+    /// published: a refused edit leaves the cast exactly as it was, and when an
+    /// append fails partway through a batch, the records staged before it are
+    /// committed and published and the error returned — so the cast never
+    /// disagrees with the log. Each published record is the one its character
+    /// is read as, so a refresh does not read it again. An edit that returns no
     /// records writes nothing. `edit` runs on the owner's thread, so it must be
     /// pure over the cast it is handed (§2.3).
     fn write<R: Send>(
@@ -315,26 +334,42 @@ impl Npcs {
         edit: impl FnOnce(&Cast) -> Result<(Vec<NpcPayload>, R), NpcError> + Send,
     ) -> Result<R, NpcError> {
         let current = &self.current;
-        self.shared.persistence.call(|p| {
-            let cast = current.load_full();
-            let (records, out) = edit(&cast)?;
-            if records.is_empty() {
-                return Ok(out);
-            }
-            for npc in &records {
-                p.write_npc(npc).map_err(persist)?;
-            }
-            // Flush and fsync before publishing. `write_npc` only *stages* the
-            // record, and a staged record is lost on a crash — which for a
-            // character somebody just created means the API said "created"
-            // about something that never existed.
-            p.commit().map_err(persist)?;
-            let mut next = Cast::clone(&cast);
-            for npc in records {
-                next.by_id.insert(npc.npc_id, npc);
-            }
-            current.store(Arc::new(next));
-            Ok(out)
+        off_the_runtime(|| {
+            self.shared.persistence.call(|p| {
+                let cast = current.load_full();
+                let (records, out) = edit(&cast)?;
+                if records.is_empty() {
+                    return Ok(out);
+                }
+                let mut staged = Vec::with_capacity(records.len());
+                let mut refused = None;
+                for npc in records {
+                    match p.write_npc(&npc) {
+                        Ok(identity) => staged.push((npc, identity)),
+                        Err(e) => {
+                            refused = Some(persist(e));
+                            break;
+                        }
+                    }
+                }
+                // Flush and fsync before publishing. `write_npc` only *stages*
+                // the record, and a staged record is lost on a crash — which for
+                // a character somebody just created means the API said "created"
+                // about something that never existed.
+                p.commit().map_err(persist)?;
+                if !staged.is_empty() {
+                    let mut next = Cast::clone(&cast);
+                    for (npc, identity) in staged {
+                        next.read_as.insert(npc.npc_id, identity);
+                        next.by_id.insert(npc.npc_id, npc);
+                    }
+                    current.store(Arc::new(next));
+                }
+                match refused {
+                    Some(e) => Err(e),
+                    None => Ok(out),
+                }
+            })
         })
     }
 
@@ -350,6 +385,11 @@ impl Npcs {
     /// §2.2).
     pub fn refresh(&self) -> Vec<u64> {
         let current = &self.current;
+        off_the_runtime(|| self.refresh_on(current))
+    }
+
+    /// [`Self::refresh`]'s one step on the owner's thread.
+    fn refresh_on(&self, current: &ArcSwap<Cast>) -> Vec<u64> {
         self.shared.persistence.call(|p| {
             let cast = current.load_full();
             let moved: Vec<(u64, RecordIdentity)> = p
