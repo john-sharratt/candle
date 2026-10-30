@@ -1,15 +1,20 @@
-//! `get_user_context`: who the user is, what they and their groups are working
-//! on, and what was done for them lately — this conversation first, then up to
-//! the person and each group they frame — within the client's budget
-//! (`docs/memory_backbone.md` §6.4, §6.5). The aggregator puts the client's
-//! guide in front of the answer, and gives the same answer to the first call of
-//! a conversation, whatever tool it is (`docs/mcp_user_context.md` §2.5).
+//! `get_user_context`: the frame for this conversation — the group's master,
+//! who it could be talking to, this conversation and its focus, the journals
+//! the focus names, the last conversation on this channel and the cues below
+//! — within the client's budget (`docs/memory_backbone.md` §6.4–§6.6). Its
+//! first call opens the conversation's journal. A guest is given `@guest`'s.
+//! The aggregator puts the client's guide in front of the answer, and gives
+//! the same answer to the first call of a conversation, whatever tool it is
+//! (`docs/mcp_user_context.md` §2.5).
 
+use journals::actor::GUEST;
+use journals::slug::Slug;
 use journals::time::Stamp;
 use serde_json::{json, Value};
 
 use super::{mem, Answer, Ctx};
-use crate::mcp::memory::{context, conversations};
+use crate::mcp::memory::context;
+use crate::mcp::memory::who::Who;
 
 pub const NAME: &str = "get_user_context";
 
@@ -17,19 +22,20 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Who this user is, what they asked you to remember, what they and their family or \
-            other groups are working on, and what you did together in recent conversations — pictures drawn, bots given \
-            missions, work started — in this app first, then in their others; and how to work with them \
-            here. Call this before answering anything from this user, especially anything that assumes \
-            shared history: \"again\", \"last time\", \"like before\", \"my\", \"our\". It answers at once.",
+        "description": "Zen's memory, as this conversation starts from it: the master — what the group is and \
+            the few things that last — who you could be talking to, this conversation's own journal and what \
+            it has worked out so far (who is speaking, what it is about), the journals that names, where the \
+            last conversation in this app left off, and every topic by its cue; and how to work with the \
+            journals. Call this before answering anything, especially anything that assumes shared history: \
+            \"again\", \"last time\", \"like before\", \"my\", \"our\". It answers at once.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
     })
 }
 
 /// The context when nothing is remembered for this caller and nothing will
-/// be until an owner adds them: an answer, not an error — the aggregator asks
-/// again for every call an error leaves without its context. A passing
-/// failure stays an error, so it is asked again.
+/// be until an owner adds them to a group: an answer, not an error — the
+/// aggregator asks again for every call an error leaves without its context.
+/// A passing failure stays an error, so it is asked again.
 pub fn nothing_kept(why: &str) -> String {
     format!("Nothing is remembered for this user here: {why}. Answer from this conversation alone.")
 }
@@ -37,17 +43,22 @@ pub fn nothing_kept(why: &str) -> String {
 pub fn call(ctx: &Ctx, _args: &Value) -> Answer {
     let m = match mem::open(ctx) {
         Ok(m) => m,
-        Err(e) if mem::lasting(&e) => return Answer::ok(nothing_kept(&e)),
         Err(e) => return Answer::error(e),
     };
-    // Only found, never opened: a conversation that only reads leaves no
-    // journal behind. Its first episode opens one.
-    let here = conversations::existing(&m.memory, &ctx.mcp_id);
+    let guest = m.who == Who::Guest;
+    let Some(group) = m.group.as_ref() else {
+        return Answer::ok(nothing_kept(&m.why_no_here()));
+    };
+    let guests = Slug::parse(GUEST).expect("a name");
+    if guest && m.tree.root(&guests).is_none() {
+        return Answer::ok(nothing_kept("this account is mapped to no one"));
+    }
     Answer::ok(context::render(
         &m.tree,
-        &m.person,
-        here.as_ref(),
+        group,
+        m.here.as_ref(),
         m.channel,
+        guest,
         Stamp::now(),
     ))
 }
@@ -59,8 +70,8 @@ mod tests {
     #[test]
     fn a_caller_with_no_memory_is_told_so_in_an_answer() {
         assert_eq!(
-            nothing_kept("this account is in no group yet"),
-            "Nothing is remembered for this user here: this account is in no group yet. Answer from this conversation alone."
+            nothing_kept("you are in no group yet"),
+            "Nothing is remembered for this user here: you are in no group yet. Answer from this conversation alone."
         );
     }
 }

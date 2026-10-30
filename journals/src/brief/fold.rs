@@ -14,8 +14,7 @@ use crate::tree::window::{inside, PeriodFold};
 use crate::tree::Tree;
 use crate::view::who::render_line;
 
-/// The call a period's fold is written as — not the `journal_fold` tool,
-/// which folds a sub-journal into its parent's index.
+/// The call a period's fold is written as.
 pub const NAME: &str = "journal_period_fold";
 
 /// The longest a fold's text is asked to be.
@@ -89,39 +88,40 @@ mod tests {
     use crate::actor::Actor;
     use crate::brief::call_of;
     use crate::ops::apply;
-    use crate::ops::fixture::{john, p, sharratt};
+    use crate::ops::fixture::{john, p, zen};
     use crate::testing::at;
     use crate::tree::window::next_fold;
     use crate::tree::WINDOW;
 
     #[test]
     fn a_closed_day_is_asked_for_and_folded_by_its_answer() {
-        let mut t = sharratt();
+        let mut t = zen();
         let t0 = at("2026-10-01T00:00:00Z");
         for i in 0..=WINDOW {
             apply(
                 &mut t,
                 &john(),
                 &Op::Note {
-                    path: p("~"),
+                    path: p("people"),
                     text: format!("n{i}"),
+                    speaker: None,
                 },
                 t0.plus(3600 * i as i64),
             )
             .unwrap();
         }
         let now = at("2026-10-03T12:00:00Z");
-        let plan = next_fold(t.get(&p("~")).unwrap(), now).unwrap();
-        let Ask { question: q, over } = ask(&t, &p("~"), &plan).unwrap();
+        let plan = next_fold(t.get(&p("people")).unwrap(), now).unwrap();
+        let Ask { question: q, over } = ask(&t, &p("people"), &plan).unwrap();
         assert!(
-            q.starts_with("2026-10-01 is over: its lines in ~ move"),
+            q.starts_with("2026-10-01 is over: its lines in @zen/people move"),
             "{q}"
         );
         assert_eq!(q.matches("\n#").count(), 24);
-        assert_eq!(over, lines_over(t.get(&p("~")).unwrap(), &plan.ids));
+        assert_eq!(over, lines_over(t.get(&p("people")).unwrap(), &plan.ids));
         assert_eq!(spec()["name"], "journal_period_fold");
         let op = op(
-            &p("~"),
+            &p("people"),
             &plan,
             &over,
             json!({"text": " The first day. "}).as_object().unwrap(),
@@ -129,13 +129,20 @@ mod tests {
         .unwrap();
         let element =
             "<function=journal_period_fold>\n<parameter=text>3.10</parameter>\n</function>";
-        let numeric = super::op(&p("~"), &plan, &over, &call_of(element, NAME).unwrap());
+        let numeric = super::op(&p("people"), &plan, &over, &call_of(element, NAME).unwrap());
         assert!(matches!(numeric, Ok(Op::FoldPeriod { text, .. }) if text == "3.10"));
         apply(&mut t, &Actor::Zend, &op, now).unwrap();
-        assert_eq!(t.get(&p("~")).unwrap().window[0].text, "The first day.");
-        assert_eq!(ask(&t, &p("~"), &plan), None, "folded: nothing left to ask");
+        assert_eq!(
+            t.get(&p("people")).unwrap().window[0].text,
+            "The first day."
+        );
+        assert_eq!(
+            ask(&t, &p("people"), &plan),
+            None,
+            "folded: nothing left to ask"
+        );
         assert!(super::op(
-            &p("~"),
+            &p("people"),
             &plan,
             &over,
             json!({"text": "  "}).as_object().unwrap()

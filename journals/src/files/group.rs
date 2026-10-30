@@ -1,51 +1,15 @@
-//! `groups/<group>/group.yaml` (§3.5): what kind of group it is, who is in
-//! it, and as what. A member is a person, or a bot that reads the group's
-//! journals and nothing else.
+//! `groups/<group>/group.yaml` (§3.5): what the group is for, who is in it,
+//! and as what. A member is a person, who reads the whole group, or a bot,
+//! which reads only the subtrees its `reads` grants.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::error::Problem;
+use crate::path::Below;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::yaml::{item_line, parse_doc, scalar, text_field, Fields};
-
-/// What a group is, for whoever reads about it. Every kind has the same
-/// sections and the same rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Kind {
-    /// A household.
-    Family,
-    /// People working together.
-    Team,
-    /// A game's world: its people, and the bots that live in it.
-    World,
-}
-
-impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Family, Kind::Team, Kind::World];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Family => "family",
-            Self::Team => "team",
-            Self::World => "world",
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<Kind, String> {
-        Self::ALL
-            .into_iter()
-            .find(|k| k.name() == s)
-            .ok_or_else(|| format!("`{s}` is not a kind of group: family, team or world"))
-    }
-}
-
-impl fmt::Display for Kind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
+use crate::yaml::{item_line, parse_doc, scalar, scalar_list, text_field, Fields};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
@@ -53,7 +17,7 @@ pub enum Role {
     Owner,
     /// Reads and writes the group's journals; edits and forgets their own lines.
     Member,
-    /// Reads the group's journals and writes nothing: every bot's role.
+    /// Reads what it is granted and writes nothing: every bot's role.
     Reader,
 }
 
@@ -103,13 +67,15 @@ pub struct Member {
     pub who: Who,
     pub role: Role,
     pub joined: Stamp,
+    /// A bot's grants: the subtrees it reads. A person reads the whole group
+    /// and has none.
+    pub reads: Vec<Below>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupFile {
     pub group: Slug,
     pub name: String,
-    pub kind: Kind,
     /// What the group is for, as its README and every frame open with it.
     pub about: Option<String>,
     pub members: Vec<Member>,
@@ -165,12 +131,21 @@ impl GroupFile {
             if !seen.insert(&m.who) {
                 return Err(format!("{} is a member twice", m.who));
             }
-            if matches!(m.who, Who::Bot(_)) && m.role != Role::Reader {
-                return Err(format!(
-                    "{} is a {}: a bot is only ever a reader",
-                    m.who,
-                    m.role.name()
-                ));
+            match &m.who {
+                Who::Bot(_) if m.role != Role::Reader => {
+                    return Err(format!(
+                        "{} is a {}: a bot is only ever a reader",
+                        m.who,
+                        m.role.name()
+                    ))
+                }
+                Who::Person(_) if !m.reads.is_empty() => {
+                    return Err(format!(
+                        "{} has `reads`: a person reads the whole group, and only a bot is granted part of it",
+                        m.who
+                    ))
+                }
+                _ => {}
             }
         }
         if self.owners().next().is_none() {
@@ -182,7 +157,6 @@ impl GroupFile {
     pub fn render(&self) -> String {
         let mut out = format!("group: {}\n", scalar(self.group.as_str()));
         out.push_str(&text_field("", "name", &self.name));
-        out.push_str(&format!("kind: {}\n", self.kind.name()));
         if let Some(a) = &self.about {
             out.push_str(&text_field("", "about", a));
         }
@@ -197,6 +171,10 @@ impl GroupFile {
                 m.role.name(),
                 m.joined
             ));
+            if !m.reads.is_empty() {
+                let reads: Vec<String> = m.reads.iter().map(Below::to_string).collect();
+                out.push_str(&format!("    reads: {}\n", scalar_list(&reads)));
+            }
         }
         out
     }
@@ -206,7 +184,6 @@ impl GroupFile {
         let mut f = Fields::of(&v, file, None, Some(text))?;
         let group = f.parsed("group", Slug::parse)?;
         let name = f.str("name")?;
-        let kind = f.parsed("kind", Kind::parse)?;
         let about = f.opt_str("about")?;
         let mut members = Vec::new();
         for (i, m) in f.opt_seq("members")?.into_iter().flatten().enumerate() {
@@ -227,13 +204,24 @@ impl GroupFile {
             };
             let role = mf.parsed("role", Role::parse)?;
             let joined = mf.parsed("joined", Stamp::parse)?;
+            let reads = mf
+                .opt_strs("reads")?
+                .unwrap_or_default()
+                .iter()
+                .map(|s| Below::parse(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|why| mf.problem("reads", format!("`reads`: {why}")))?;
             mf.done()?;
-            members.push(Member { who, role, joined });
+            members.push(Member {
+                who,
+                role,
+                joined,
+                reads,
+            });
         }
         let out = GroupFile {
             group,
             name,
-            kind,
             about,
             members,
         };
@@ -257,70 +245,71 @@ mod tests {
             who: Who::Person(slug(p)),
             role,
             joined: joined(),
+            reads: vec![],
         }
     }
 
-    fn sharratt() -> GroupFile {
+    fn zen() -> GroupFile {
         GroupFile {
-            group: slug("sharratt"),
-            name: "Sharratt".into(),
-            kind: Kind::Family,
+            group: slug("zen"),
+            name: "Zen".into(),
             about: None,
             members: vec![
                 person("john", Role::Owner),
                 person("yen", Role::Owner),
                 person("thanhlong", Role::Member),
-                person("yen-nhi", Role::Member),
+                person("zen", Role::Member),
             ],
         }
     }
 
     #[test]
     fn group_yaml_is_written_exactly_and_read_back() {
-        let g = sharratt();
+        let g = zen();
         assert_eq!(
             g.render(),
-            "group: sharratt\nname: Sharratt\nkind: family\nmembers:\n\
+            "group: zen\nname: Zen\nmembers:\n\
              \x20 - person: john\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
              \x20 - person: yen\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
              \x20 - person: thanhlong\n    role: member\n    joined: 2026-10-30T00:00:00Z\n\
-             \x20 - person: yen-nhi\n    role: member\n    joined: 2026-10-30T00:00:00Z\n"
+             \x20 - person: zen\n    role: member\n    joined: 2026-10-30T00:00:00Z\n"
         );
         assert_eq!(
-            GroupFile::read("groups/sharratt/group.yaml", &g.render()).unwrap(),
+            GroupFile::read("groups/zen/group.yaml", &g.render()).unwrap(),
             g
         );
         assert_eq!(g.owners().count(), 2);
-        assert_eq!(g.member(&slug("yen-nhi")).unwrap().role, Role::Member);
+        assert_eq!(g.member(&slug("zen")).unwrap().role, Role::Member);
         assert!(g.member(&slug("stranger")).is_none());
     }
 
-    /// **A world holds its bots as readers**, beside the people who run it.
+    /// **A bot reads only what its group grants it.**
     #[test]
-    fn a_world_holds_bots_as_readers() {
+    fn a_bot_is_a_reader_of_its_grants() {
         let g = GroupFile {
             group: slug("battle-cities"),
             name: "Battle Cities".into(),
-            kind: Kind::World,
-            about: Some("The world of the Battle Cities game, its people and its bots.".into()),
+            about: Some("The game's world: its canon, its economy, its NPCs.".into()),
             members: vec![
                 person("john", Role::Owner),
                 Member {
                     who: Who::Bot(slug("c3f1a07e")),
                     role: Role::Reader,
                     joined: joined(),
+                    reads: vec![Below::parse("topics/canon").unwrap()],
                 },
             ],
         };
         assert_eq!(
             g.render(),
-            "group: battle-cities\nname: Battle Cities\nkind: world\n\
-             about: The world of the Battle Cities game, its people and its bots.\nmembers:\n\
+            "group: battle-cities\nname: Battle Cities\n\
+             about: \"The game's world: its canon, its economy, its NPCs.\"\nmembers:\n\
              \x20 - person: john\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
-             \x20 - bot: c3f1a07e\n    role: reader\n    joined: 2026-10-30T00:00:00Z\n"
+             \x20 - bot: c3f1a07e\n    role: reader\n    joined: 2026-10-30T00:00:00Z\n\
+             \x20   reads: [topics/canon]\n"
         );
         assert_eq!(GroupFile::read("f", &g.render()).unwrap(), g);
-        assert_eq!(g.bot(&slug("c3f1a07e")).unwrap().role, Role::Reader);
+        assert_eq!(g.bot(&slug("c3f1a07e")).unwrap().reads.len(), 1);
         assert!(g.member(&slug("c3f1a07e")).is_none(), "a bot is no person");
         assert_eq!(g.persons().count(), 1);
         assert!(!Role::Reader.writes());
@@ -329,7 +318,7 @@ mod tests {
 
     #[test]
     fn names_yaml_would_misread_round_trip() {
-        let mut g = sharratt();
+        let mut g = zen();
         g.group = slug("null");
         g.members[2].who = Who::Person(slug("true"));
         g.members[3].who = Who::Person(slug("1e3"));
@@ -338,7 +327,7 @@ mod tests {
 
     #[test]
     fn the_rules_of_a_group_are_errors_naming_the_line() {
-        let good = sharratt().render();
+        let good = zen().render();
         for (from, to, line, says) in [
             (
                 "  - person: yen\n",
@@ -349,46 +338,46 @@ mod tests {
             (
                 "  - person: thanhlong\n    role: member",
                 "  - person: thanhlong\n    role: chief",
-                Some(11),
+                Some(10),
                 "`chief` is not a role: owner, member or reader",
             ),
             (
                 "    joined: 2026-10-30T00:00:00Z\n",
                 "    joined: today\n",
-                Some(5),
+                Some(4),
                 "not a time",
             ),
             (
                 "  - person: john\n",
                 "  - who: x\n    person: john\n",
-                Some(5),
+                Some(4),
                 "`who` is not a field",
             ),
             (
                 "  - person: john\n",
                 "  - person: john\n    bot: b1\n",
-                Some(5),
+                Some(4),
                 "a member is a `person` or a `bot`, one of the two",
             ),
             (
-                "  - person: john\n    role: owner",
-                "  - role: owner",
-                Some(5),
-                "a member is a `person` or a `bot`, one of the two",
-            ),
-            (
-                "  - person: yen-nhi\n",
+                "  - person: zen\n",
                 "  - bot: b1\n",
                 None,
                 "bot b1 is a member: a bot is only ever a reader",
             ),
             (
-                "kind: family",
-                "kind: clan",
+                "  - person: zen\n    role: member\n    joined: 2026-10-30T00:00:00Z\n",
+                "  - person: zen\n    role: member\n    joined: 2026-10-30T00:00:00Z\n    reads: [topics]\n",
                 None,
-                "`clan` is not a kind of group: family, team or world",
+                "zen has `reads`: a person reads the whole group",
             ),
-            ("name: Sharratt", "name: \"\"", None, "`name` is empty"),
+            (
+                "  - person: zen\n    role: member\n    joined: 2026-10-30T00:00:00Z\n",
+                "  - bot: b1\n    role: reader\n    joined: 2026-10-30T00:00:00Z\n    reads: [Topics]\n",
+                Some(13),
+                "`reads`: `Topics` is not a path below a group",
+            ),
+            ("name: Zen", "name: \"\"", None, "`name` is empty"),
         ] {
             assert!(good.contains(from), "{from}");
             let err = GroupFile::read("group.yaml", &good.replacen(from, to, 1)).unwrap_err();
@@ -402,10 +391,11 @@ mod tests {
             .unwrap_err()
             .what
             .contains("no member is an owner"));
-        let no_kind = good.replace("kind: family\n", "");
-        assert!(GroupFile::read("f", &no_kind)
+        // A group has no kind: it is what `about` says.
+        let kind = good.replacen("name: Zen\n", "name: Zen\nkind: family\n", 1);
+        assert!(GroupFile::read("f", &kind)
             .unwrap_err()
             .what
-            .contains("`kind`"));
+            .contains("`kind` is not a field"));
     }
 }

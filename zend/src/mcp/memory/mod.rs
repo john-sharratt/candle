@@ -5,9 +5,9 @@
 //!
 //! | Module | |
 //! |---|---|
-//! | [`who`] | which person a caller is, binding a new account by its email |
-//! | [`conversations`] | the journal each conversation's episodes go on |
-//! | [`moved`] | a person's old `U:` notes, moved onto their tree once |
+//! | [`who`] | who a caller is — a person, binding a new account by its email, or a guest |
+//! | [`conversations`] | each conversation's own journal, opened at its first call |
+//! | [`moved`] | a person's old `U:` notes, moved onto their own journal once |
 //! | [`context`] | `get_user_context`: the frame, within the client's budget |
 //!
 //! Reads answer from a published snapshot of the tree and never take the
@@ -31,7 +31,7 @@ use std::time::Duration;
 use journals::actor::{need_read, Actor};
 use journals::error::Error;
 use journals::ops::{Applied, Op};
-use journals::path::JournalPath;
+use journals::path::{JournalPath, HERE};
 use journals::scope::Section;
 use journals::store::{Store, StoreError};
 use journals::time::Stamp;
@@ -267,11 +267,15 @@ impl Memory {
     }
 }
 
-/// A journal path written the memory's way rather than a thread's: `~`, `@`,
-/// or one of the sections.
+/// A journal path written the memory's way rather than a thread's: `@group`,
+/// `here`, or one of the sections — and `~`, which the memory's reader
+/// answers with where a person's own journal now is.
 pub fn is_memory_path(text: &str) -> bool {
     let first = text.split(['/', '#']).next().unwrap_or_default();
-    text.starts_with('~') || text.starts_with('@') || Section::parse(first).is_some()
+    text.starts_with('~')
+        || text.starts_with('@')
+        || first == HERE
+        || Section::parse(first).is_some()
 }
 
 #[cfg(test)]

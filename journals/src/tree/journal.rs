@@ -20,7 +20,7 @@ pub const WINDOW: usize = 50;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
     pub place: Place,
-    /// `journal.yaml`. A fixed journal — a root, section or channel — may have
+    /// `journal.yaml`. A fixed journal — a master or a section — may have
     /// none until it has a summary; a named journal always has one, and is
     /// broken without it.
     pub meta: Option<Meta>,
@@ -71,7 +71,6 @@ impl Journal {
     pub fn cue(&self) -> Option<String> {
         match self.place {
             Place::Section(s) => Some(s.cue().into()),
-            Place::Channel(c) => Some(c.cue().into()),
             Place::Root => None,
             Place::Named { .. } => self.meta.as_ref().and_then(|m| m.cue.clone()),
         }
@@ -232,10 +231,8 @@ mod tests {
         assert!(j.writable("x").is_ok());
         j.problems.push(Problem::new("f", Some(2), "bad"));
         assert_eq!(
-            j.writable("@sharratt/topics/permits")
-                .unwrap_err()
-                .to_string(),
-            "@sharratt/topics/permits cannot be written until its files are fixed: f:2: bad"
+            j.writable("@zen/topics/permits").unwrap_err().to_string(),
+            "@zen/topics/permits cannot be written until its files are fixed: f:2: bad"
         );
     }
 

@@ -2,29 +2,30 @@
 //! through, kept in step with origin.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use journals::actor::viewer;
 use journals::error::Problem;
 use journals::files::{Cite, Sentence};
-use journals::path::Owner;
 use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::tree::fingerprint::fingerprint;
 use tempfile::TempDir;
 
+use super::who::Who;
 use super::*;
 
 #[test]
 fn memory_paths_are_told_from_thread_paths() {
     for memory in [
-        "~",
-        "~/channels/grok",
-        "@sharratt/topics",
+        "@zen",
+        "@zen/topics",
         "topics/house",
-        "projects",
-        "~#2026-10-30-0912-7e3a",
+        "people/yen",
+        "here",
+        "here#2026-10-30-0912-7e3a",
+        "conversations",
+        "~",
     ] {
         assert!(is_memory_path(memory), "{memory}");
     }
@@ -39,7 +40,8 @@ fn a_memory_with_no_checkout_says_so() {
     assert!(!m.serves(), "no checkout, no writer");
     assert_eq!(m.tree().unwrap_err(), NO_MEMORY);
     let op = Op::MarkStale {
-        path: JournalPath::root(Owner::Person(Slug::parse("x").unwrap())),
+        path: JournalPath::root(Slug::parse("x").unwrap()),
+        why: "over its cap".into(),
     };
     let e = m.write(&Actor::Zend, &op).unwrap_err();
     assert_eq!(e.to_string(), NO_MEMORY);
@@ -48,11 +50,23 @@ fn a_memory_with_no_checkout_says_so() {
         "absent is passing"
     );
     let broken = WriteError::Store(StoreError::Journal(Error::Broken(Problem::new(
-        "persons/john/lines.yaml",
+        "groups/zen/journal.yaml",
         Some(3),
         "`text` is missing",
     ))));
     assert!(broken.is_broken() && !broken.is_refusal() && !broken.is_conflict());
+}
+
+fn zen() -> Slug {
+    Slug::parse("zen").unwrap()
+}
+
+fn john() -> Slug {
+    Slug::parse("john").unwrap()
+}
+
+fn johns_journal() -> JournalPath {
+    moved::own_journal(&zen(), &john()).unwrap()
 }
 
 /// **A write's error says what it is by its type**: a summary built over a
@@ -62,25 +76,25 @@ fn a_memory_with_no_checkout_says_so() {
 fn a_write_error_is_told_by_its_kind() {
     let (_root, dir) = repo();
     let m = opened(dir);
-    let john = Slug::parse("john").unwrap();
-    let root = JournalPath::root(Owner::Person(john.clone()));
+    let own = johns_journal();
     let actor = Actor::Person {
-        person: john,
+        person: john(),
         channel: Channel::Grok,
         admin: false,
     };
     let note = |text: &str| Op::Note {
-        path: root.clone(),
+        path: own.clone(),
         text: text.into(),
+        speaker: None,
     };
     let id = m
         .write(&actor, &note("Prefers tea."))
         .unwrap()
         .line
         .unwrap();
-    let over = fingerprint(m.tree().unwrap().get(&root).unwrap());
+    let over = fingerprint(m.tree().unwrap().get(&own).unwrap());
     let summary = |text: &str| Op::Summarize {
-        path: root.clone(),
+        path: own.clone(),
         over: over.clone(),
         sentences: vec![Sentence {
             text: text.into(),
@@ -102,7 +116,16 @@ fn a_write_error_is_told_by_its_kind() {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = git_run(dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_run(dir: &Path, args: &[&str]) -> Output {
+    Command::new("git")
         .current_dir(dir)
         .args([
             "-c",
@@ -114,15 +137,11 @@ fn git(dir: &Path, args: &[&str]) {
         ])
         .args(args)
         .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .expect("git runs")
 }
 
-/// A bare origin seeded with one group and its owner, and a clone of it.
+/// A bare origin seeded with the group Zen, its owner John and his own
+/// journal, and a clone of it.
 pub(crate) fn repo() -> (TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let origin = root.path().join("origin.git");
@@ -134,8 +153,9 @@ pub(crate) fn repo() -> (TempDir, PathBuf) {
     );
     let seed = root.path().join("seed");
     for (file, text) in [
-        ("persons/john/person.yaml", "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n"),
-        ("groups/sharratt/group.yaml", "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n"),
+        ("persons/john/person.yaml", "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [zen]\ndefault_group: zen\n"),
+        ("groups/zen/group.yaml", "group: zen\nname: \"Zen\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n"),
+        ("groups/zen/people/john/journal.yaml", "name: john\ncue: \"open for John\"\ncreated: 2026-10-30T00:00:00Z\nfolded: false\n"),
     ] {
         let at = seed.join(file);
         std::fs::create_dir_all(at.parent().unwrap()).unwrap();
@@ -172,49 +192,54 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
     let (_root, dir) = repo();
     let m = opened(dir.clone());
     let tree = m.tree().unwrap();
-    let (john, bind) = who::known(&tree, "154797f34c5a6ca6", "John@Example.com").unwrap();
-    assert_eq!(john.as_str(), "john");
+    let (who, bind) = who::known(&tree, "154797f34c5a6ca6", "John@Example.com").unwrap();
+    assert_eq!(who, Who::Person(john()));
     m.write(&Actor::System, &bind.unwrap()).unwrap();
     let (again, bind) = who::known(&m.tree().unwrap(), "154797f34c5a6ca6", "").unwrap();
     assert_eq!(
         (again, bind),
-        (john.clone(), None),
+        (Who::Person(john()), None),
         "the account is bound now"
     );
-    let conv = conversations::of(&m, &john, Channel::Grok, "session-1").unwrap();
-    assert!(conv.show().starts_with("~/channels/grok/"), "{conv}");
+    let conv = conversations::of(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap();
+    assert!(conv.show().starts_with("@zen/conversations/"), "{conv}");
+    assert!(conv.show().ends_with("-grok"), "{conv}");
     assert_eq!(
-        conversations::of(&m, &john, Channel::Grok, "session-1").unwrap(),
+        conversations::of(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap(),
         conv,
         "one journal a session"
     );
-    let root = JournalPath::root(Owner::Person(john.clone()));
+    let own = johns_journal();
     let actor = Actor::Person {
-        person: john.clone(),
+        person: john(),
         channel: Channel::Grok,
         admin: false,
     };
     m.write(
         &actor,
         &Op::Note {
-            path: root.clone(),
+            path: own.clone(),
             text: "Prefers short answers.".into(),
+            speaker: Some(john()),
         },
     )
     .unwrap();
     let text = context::render(
         &m.tree().unwrap(),
-        &john,
+        &zen(),
         Some(&conv),
         Channel::ClaudeCode,
+        false,
         Stamp::now(),
     );
     assert!(text.contains("This conversation"), "{text}");
-    // The sync thread pushes it: a fresh clone of origin reads it.
+    // The sync thread pushes it: a fresh clone of origin reads it. A clone
+    // made while a push is landing can find origin's objects locked, which
+    // is the push not being there yet.
     let until = Instant::now() + Duration::from_secs(30);
     for attempt in 0.. {
         let check = dir.parent().unwrap().join(format!("check-{attempt}"));
-        git(
+        let cloned = git_run(
             dir.parent().unwrap(),
             &[
                 "clone",
@@ -222,12 +247,15 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
                 dir.parent().unwrap().join("origin.git").to_str().unwrap(),
                 check.file_name().unwrap().to_str().unwrap(),
             ],
-        );
-        let pushed = Store::open(&check).is_ok_and(|s| {
-            s.shared()
-                .get(&root)
-                .is_some_and(|j| j.window.iter().any(|l| l.text == "Prefers short answers."))
-        });
+        )
+        .status
+        .success();
+        let pushed = cloned
+            && Store::open(&check).is_ok_and(|s| {
+                s.shared()
+                    .get(&own)
+                    .is_some_and(|j| j.window.iter().any(|l| l.text == "Prefers short answers."))
+            });
         if pushed {
             break;
         }
@@ -236,11 +264,11 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
     }
 }
 
-/// **A person's old `U:` notes move onto their tree**: kept facts onto `~`,
-/// episodes onto their channel's journal, each ended in the substrate once
-/// moved; a second move finds nothing left.
+/// **A person's old `U:` notes move onto their own journal**: kept facts
+/// and episodes alike, each ended in the substrate once moved; a second move
+/// finds nothing left.
 #[test]
-fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
+fn old_notes_move_onto_their_journal_and_leave_the_substrate() {
     use crate::mcp::records::MemRecords;
     use crate::mcp::threads::{self, Note};
 
@@ -266,43 +294,27 @@ fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
         )
         .unwrap();
     }
-    let john = Slug::parse("john").unwrap();
-    moved::move_all(&m, &records, "owner", &john);
+    moved::move_all(&m, &records, "owner", &zen(), &john());
     let tree = m.tree().unwrap();
-    let texts = |p: &str| -> Vec<String> {
-        tree.get(&path_of(&tree, &john, p))
-            .unwrap()
-            .window
-            .iter()
-            .map(|l| l.text.clone())
-            .collect()
-    };
-    assert_eq!(texts("~"), ["the cat is Miso"]);
-    assert_eq!(texts("~/channels/grok"), ["image_generate — a cat"]);
-    assert_eq!(
-        tree.get(&path_of(&tree, &john, "~")).unwrap().window[0]
-            .at
-            .to_string(),
-        "2026-10-30T09:10:02Z"
-    );
+    let own = tree.get(&johns_journal()).unwrap();
+    let texts: Vec<&str> = own.window.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts.len(), 2);
+    assert!(texts.contains(&"the cat is Miso") && texts.contains(&"image_generate — a cat"));
+    assert_eq!(own.window[0].at.to_string(), "2026-10-30T09:10:02Z");
     assert!(
         threads::notes(&records, "owner", "U:").is_empty(),
         "moved notes leave the substrate"
     );
-    moved::move_all(&m, &records, "owner", &john);
+    moved::move_all(&m, &records, "owner", &zen(), &john());
     assert_eq!(
         m.tree()
             .unwrap()
-            .get(&path_of(&tree, &john, "~"))
+            .get(&johns_journal())
             .unwrap()
             .window
             .len(),
-        1
+        2
     );
-}
-
-fn path_of(tree: &Tree, person: &Slug, text: &str) -> JournalPath {
-    viewer(tree, person).parse(text).unwrap()
 }
 
 /// **Reads never wait for the store**: a tree is read while a write holds it.

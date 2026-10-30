@@ -21,9 +21,7 @@ pub mod summary;
 use journal_core::tools::arguments;
 use serde_json::{Map, Value};
 
-use crate::path::{JournalPath, Owner, Place};
-use crate::scope::{Channel, Section};
-use crate::slug::Slug;
+use crate::path::{JournalPath, Place};
 use crate::time::Stamp;
 use crate::tree::fingerprint::dirty;
 use crate::tree::window::{next_fold, PeriodFold};
@@ -42,12 +40,9 @@ pub const NEW_LINES: usize = 20;
 /// One rebuild to make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
-    /// A conversation quiet past the gap: closed, so its summary is its last.
-    Close {
-        path: JournalPath,
-        person: Slug,
-        channel: Channel,
-    },
+    /// A conversation quiet past the gap: closed by zend, so its summary is
+    /// its last.
+    Close { path: JournalPath },
     /// A window over its size with a closed period to fold.
     Fold { path: JournalPath, plan: PeriodFold },
     /// A dirty journal: its [`summary::plan`] is read when the job runs, from
@@ -59,7 +54,7 @@ impl Job {
     /// The journal it is for.
     pub fn path(&self) -> &JournalPath {
         match self {
-            Job::Close { path, .. } | Job::Fold { path, .. } | Job::Summary { path } => path,
+            Job::Close { path } | Job::Fold { path, .. } | Job::Summary { path } => path,
         }
     }
 }
@@ -73,18 +68,9 @@ pub fn call_of(answer: &str, name: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// The channel a conversation's journal is under, when `path` is one.
-fn conversation_of(path: &JournalPath) -> Option<(Slug, Channel)> {
-    match (path.owner(), path.place().ok()?) {
-        (
-            Owner::Person(p),
-            Place::Named {
-                section: Section::Channels,
-                depth: 2,
-            },
-        ) => Some((p.clone(), Channel::parse(path.names()[1].as_str())?)),
-        _ => None,
-    }
+/// `path` is a conversation's journal.
+fn is_conversation(path: &JournalPath) -> bool {
+    path.place().is_ok_and(Place::is_conversation)
 }
 
 /// A conversation's journal still open and quiet past the gap at `now`:
@@ -104,14 +90,8 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
         if !j.problems.is_empty() {
             continue;
         }
-        if let Some((person, channel)) = conversation_of(&path) {
-            if gone_quiet(j, now) {
-                closes.push(Job::Close {
-                    path: path.clone(),
-                    person,
-                    channel,
-                });
-            }
+        if is_conversation(&path) && gone_quiet(j, now) {
+            closes.push(Job::Close { path: path.clone() });
         }
         if let Some(plan) = next_fold(j, now) {
             folds.push(Job::Fold { path, plan });
@@ -130,55 +110,52 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
 mod tests {
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{john, p, sharratt};
+    use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, OnTaken, Op};
+    use crate::scope::Channel;
     use crate::testing::{at, slug};
     use crate::tree::WINDOW;
 
-    #[test]
-    fn a_new_line_is_summarised_once_it_has_been_quiet() {
-        let mut t = sharratt();
-        let t0 = at("2026-10-30T12:00:00Z");
+    fn noted(t: &mut Tree, path: &str, text: &str, at: Stamp) {
         apply(
-            &mut t,
+            t,
             &john(),
             &Op::Note {
-                path: p("topics"),
-                text: "Builder starts Monday.".into(),
+                path: p(path),
+                text: text.into(),
+                speaker: None,
             },
-            t0,
+            at,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_new_line_is_summarised_once_it_has_been_quiet() {
+        let mut t = zen();
+        let t0 = at("2026-10-30T12:00:00Z");
+        noted(&mut t, "topics", "Builder starts Monday.", t0);
         assert_eq!(due(&t, t0.plus(QUIET_SECS - 1)), vec![]);
         let jobs = due(&t, t0.plus(QUIET_SECS));
         assert!(
-            matches!(&jobs[..], [Job::Summary { path, .. }] if path.show() == "@sharratt/topics"),
+            matches!(&jobs[..], [Job::Summary { path, .. }] if path.show() == "@zen/topics"),
             "{jobs:?}"
         );
     }
 
     #[test]
     fn many_new_lines_are_summarised_without_waiting() {
-        let mut t = sharratt();
+        let mut t = zen();
         let t0 = at("2026-10-30T12:00:00Z");
         for i in 0..NEW_LINES {
-            apply(
-                &mut t,
-                &john(),
-                &Op::Note {
-                    path: p("topics"),
-                    text: format!("n{i}"),
-                },
-                t0,
-            )
-            .unwrap();
+            noted(&mut t, "topics", &format!("n{i}"), t0);
         }
         assert_eq!(due(&t, t0).len(), 1);
     }
 
     #[test]
     fn a_quiet_conversation_is_closed_and_a_live_one_is_not() {
-        let mut t = sharratt();
+        let mut t = zen();
         let server = Actor::Server {
             person: slug("john"),
             channel: Channel::Grok,
@@ -188,8 +165,8 @@ mod tests {
             &mut t,
             &server,
             &Op::Create {
-                under: p("~/channels/grok"),
-                name: slug("2026-10-30-1200"),
+                under: p("conversations"),
+                name: slug("2026-10-30-1200-grok"),
                 cue: "x".into(),
                 on_taken: OnTaken::Number,
             },
@@ -209,17 +186,10 @@ mod tests {
         assert!(!gone_quiet(j, t0.plus(CONVERSATION_GAP_SECS - 1)));
         assert!(gone_quiet(j, t0.plus(CONVERSATION_GAP_SECS)));
         let jobs = due(&t, t0.plus(CONVERSATION_GAP_SECS));
-        assert_eq!(
-            jobs[0],
-            Job::Close {
-                path: c.clone(),
-                person: slug("john"),
-                channel: Channel::Grok
-            }
-        );
+        assert_eq!(jobs[0], Job::Close { path: c.clone() });
         apply(
             &mut t,
-            &server,
+            &Actor::Zend,
             &Op::Close { path: c },
             t0.plus(CONVERSATION_GAP_SECS),
         )
@@ -229,24 +199,15 @@ mod tests {
 
     #[test]
     fn a_full_window_with_a_closed_day_folds_before_any_summary() {
-        let mut t = sharratt();
+        let mut t = zen();
         let t0 = at("2026-10-01T00:00:00Z");
         for i in 0..=WINDOW {
-            apply(
-                &mut t,
-                &john(),
-                &Op::Note {
-                    path: p("~"),
-                    text: format!("n{i}"),
-                },
-                t0.plus(3600 * i as i64),
-            )
-            .unwrap();
+            noted(&mut t, "people", &format!("n{i}"), t0.plus(3600 * i as i64));
         }
         let jobs = due(&t, at("2026-10-04T00:00:00Z"));
         assert!(matches!(jobs.first(), Some(Job::Fold { .. })), "{jobs:?}");
         assert!(matches!(jobs.last(), Some(Job::Summary { .. })), "{jobs:?}");
-        assert!(jobs.iter().all(|j| j.path() == &p("~")));
+        assert!(jobs.iter().all(|j| j.path() == &p("people")));
     }
 
     #[test]

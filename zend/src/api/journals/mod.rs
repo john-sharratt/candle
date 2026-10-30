@@ -3,7 +3,8 @@
 //! program writing many lines at once. Every request is the signed-in
 //! caller's, as the gateway names them — listed in the estate's roles, as
 //! `/v1/mcp` requires — and reads and writes exactly what their AIs may
-//! (§7.2): their own folder and their groups'.
+//! (§7.2): all of each group they are in; a guest reads `@guest` and writes
+//! nothing.
 //!
 //! | Module | |
 //! |---|---|
@@ -15,9 +16,10 @@
 //!
 //! Every refusal is `{error, message}` under the status that says what to do
 //! about it: 400 malformed, 401 signed out, 403 not the caller's to change or
-//! an account in no group, 404 no such journal or line, 409 a conflict or a
-//! broken file, 422 the rules refuse it, 503 the memory not served here yet —
-//! asked again, it may be answered by another member.
+//! any write by a guest, 404 no such journal or line, 409 a conflict, a broken
+//! file or an account the tree cannot tell, 422 the rules refuse it, 503 the
+//! memory not served here yet — asked again, it may be answered by another
+//! member.
 
 pub mod import;
 pub mod ops;
@@ -38,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::mcp::caller::Caller;
 use crate::mcp::memory::WriteError;
-use crate::mcp::tools::mem::{lasting, Mem};
+use crate::mcp::tools::mem::Mem;
 use crate::session::ZendSession;
 
 /// What a route answers: a status and a body.
@@ -92,18 +94,11 @@ pub fn status_of(e: &WriteError) -> (StatusCode, &'static str) {
     }
 }
 
-/// Why the memory has no person for a caller: an account in no group, which
-/// stays true however often it is asked, or the memory not served here yet.
-pub fn no_person(why: String) -> Answer {
-    if lasting(&why) {
-        refusal(StatusCode::FORBIDDEN, "stranger", &why)
-    } else {
-        refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &why)
-    }
-}
-
-/// The caller as a person, through `channel`; or why not.
-pub fn person(session: &ZendSession, headers: &HeaderMap, channel: Channel) -> Result<Mem, Answer> {
+/// The signed-in caller through `channel` — a person, or a guest, who reads
+/// `@guest` and whose every write is refused (§3.6); or why not: the memory
+/// not served here yet, which another member may answer, or an account the
+/// tree cannot tell, which stays so until a commit mends it.
+pub fn caller(session: &ZendSession, headers: &HeaderMap, channel: Channel) -> Result<Mem, Answer> {
     let caller = Caller::of(headers, session.roles()).ok_or_else(|| {
         refusal(
             StatusCode::UNAUTHORIZED,
@@ -111,7 +106,12 @@ pub fn person(session: &ZendSession, headers: &HeaderMap, channel: Channel) -> R
             "sign in at the gateway: the journals are a person's",
         )
     })?;
-    Mem::of(session, &caller, channel).map_err(no_person)
+    session
+        .mcp()
+        .memory()
+        .tree()
+        .map_err(|why| refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &why))?;
+    Mem::of(session, &caller, channel).map_err(|why| refusal(StatusCode::CONFLICT, "account", &why))
 }
 
 /// `f` on the blocking pool: a caller's first call binds their account, and
@@ -131,8 +131,6 @@ mod tests {
     use journals::error::Problem;
 
     use super::*;
-    use crate::mcp::memory::who::STRANGER;
-    use crate::mcp::memory::NO_MEMORY;
 
     /// **Each refusal answers its own status**, so a program tells a
     /// conflict it may retry from a refusal it must not.
@@ -164,26 +162,6 @@ mod tests {
         assert_eq!(
             status_of(&WriteError::Store(StoreError::Repository("x".into()))),
             (StatusCode::INTERNAL_SERVER_ERROR, "store")
-        );
-    }
-
-    /// **An account in no group is told so for good**; a memory not served
-    /// here yet is asked again.
-    #[test]
-    fn a_stranger_is_forbidden_and_a_memory_not_served_is_unavailable() {
-        assert_eq!(
-            no_person(STRANGER.into()),
-            (
-                StatusCode::FORBIDDEN,
-                json!({"error": "stranger", "message": STRANGER})
-            )
-        );
-        assert_eq!(
-            no_person(NO_MEMORY.into()),
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "unavailable", "message": NO_MEMORY})
-            )
         );
     }
 

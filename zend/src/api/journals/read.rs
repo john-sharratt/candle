@@ -1,10 +1,11 @@
 //! The read routes (`docs/memory_backbone.md` §6.7):
 //!
-//! `GET /v1/journals?journal=&lines=` — one journal opened (`~` when none is
-//!   named): its summary, sub-journals, newest `lines` (50 by default), what is
-//!   archived and who reads it; or, for `<path>#<line id>`, that one line.
-//! `GET /v1/journals/tree?under=` — every journal under `under`, or under `~`
-//!   and each of the caller's groups, folded ones too.
+//! `GET /v1/journals?journal=&lines=` — one journal opened (the caller's
+//!   group's master when none is named): its summary, focus, references,
+//!   sub-journals, newest `lines` (50 by default), what is archived and who
+//!   reads it; or, for `<path>#<line id>`, that one line.
+//! `GET /v1/journals/tree?under=` — every journal under `under`, or under
+//!   each of the caller's groups' masters, folded ones too.
 //! `GET /v1/journals/grep?pattern=&under=&max=` — the lines, archives and
 //!   summaries that hold `pattern`, newest first, at most `max` (20 by
 //!   default, 50 at most, as `journal_grep` answers).
@@ -26,8 +27,8 @@ use journals::view::grep::grep as search;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{blocking, malformed, person, refusal, view, Answer};
-use crate::mcp::tools::mem::Mem;
+use super::{blocking, caller, malformed, refusal, view, Answer};
+use crate::mcp::tools::mem::{Mem, Miss};
 use crate::session::ZendSession;
 
 /// The most hits one search answers, as `journal_grep` allows.
@@ -42,13 +43,25 @@ fn not_found(e: &str) -> Answer {
     refusal(StatusCode::NOT_FOUND, "not_found", e)
 }
 
-/// The journal or line `journal` names, opened for `m`'s caller.
+/// A path that missed: malformed, or naming nothing the caller reads.
+fn missed(m: Miss) -> Answer {
+    match m {
+        Miss::Malformed(e) => invalid(&e),
+        Miss::Absent(e) => not_found(&e),
+    }
+}
+
+/// The journal or line `journal` names, opened for `m`'s caller: their
+/// group's master when it names none.
 pub fn opened(m: &Mem, journal: Option<&str>, lines: Option<usize>, now: Stamp) -> Answer {
-    let journal = journal.unwrap_or("~");
+    let master = m.group.as_ref().map(|g| format!("@{g}"));
+    let Some(journal) = journal.or(master.as_deref()) else {
+        return invalid("you are in no group: name the `journal`, `@group/…`");
+    };
     if journal.contains('#') {
-        let address = match m.address(journal) {
+        let address = match m.find_address(journal) {
             Ok(a) => a,
-            Err(e) => return invalid(&e),
+            Err(e) => return missed(e),
         };
         return match view::readable(m, &address.path) {
             Ok(j) => match j.line(&address.id) {
@@ -58,9 +71,9 @@ pub fn opened(m: &Mem, journal: Option<&str>, lines: Option<usize>, now: Stamp) 
             Err(e) => not_found(&e),
         };
     }
-    let path = match m.path(journal) {
+    let path = match m.find(journal) {
         Ok(p) => p,
-        Err(e) => return invalid(&e),
+        Err(e) => return missed(e),
     };
     let lines = lines.unwrap_or(WINDOW).clamp(1, WINDOW);
     match view::readable(m, &path) {
@@ -73,9 +86,9 @@ pub fn opened(m: &Mem, journal: Option<&str>, lines: Option<usize>, now: Stamp) 
 pub fn listed(m: &Mem, under: Option<&str>) -> Answer {
     let roots: Vec<JournalPath> = match under {
         None => view::roots(m),
-        Some(u) => match m.path(u) {
+        Some(u) => match m.find(u) {
             Ok(p) => vec![p],
-            Err(e) => return invalid(&e),
+            Err(e) => return missed(e),
         },
     };
     let mut rows = Vec::new();
@@ -92,16 +105,16 @@ pub fn listed(m: &Mem, under: Option<&str>) -> Answer {
 pub fn searched(m: &Mem, pattern: &str, under: Option<&str>, max: Option<usize>) -> Answer {
     let under = match under {
         None => None,
-        Some(u) => match m.path(u) {
+        Some(u) => match m.find(u) {
             Ok(p) => match view::readable(m, &p) {
                 Ok(_) => Some(p),
                 Err(e) => return not_found(&e),
             },
-            Err(e) => return invalid(&e),
+            Err(e) => return missed(e),
         },
     };
     let max = max.unwrap_or(DEFAULT_HITS).clamp(1, MAX_HITS);
-    let (hits, total) = search(&m.tree, &m.person, pattern, under.as_ref(), max);
+    let (hits, total) = search(&m.tree, &m.actor(), pattern, under.as_ref(), max);
     (StatusCode::OK, view::hits(&hits, total))
 }
 
@@ -120,7 +133,7 @@ pub async fn read(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Channel::Other) {
+    blocking(move || match caller(&session, &headers, Channel::Other) {
         Ok(m) => opened(&m, q.journal.as_deref(), q.lines, Stamp::now()),
         Err(a) => a,
     })
@@ -141,7 +154,7 @@ pub async fn tree(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Channel::Other) {
+    blocking(move || match caller(&session, &headers, Channel::Other) {
         Ok(m) => listed(&m, q.under.as_deref()),
         Err(a) => a,
     })
@@ -164,7 +177,7 @@ pub async fn grep(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Channel::Other) {
+    blocking(move || match caller(&session, &headers, Channel::Other) {
         Ok(m) => searched(&m, &q.pattern, q.under.as_deref(), q.max),
         Err(a) => a,
     })
@@ -183,7 +196,8 @@ mod tests {
         Stamp::parse(s).unwrap()
     }
 
-    /// John's tree with a topic holding one note, and the note's address.
+    /// `person`'s view of Zen with a topic and a note on the master, and the
+    /// note's address.
     fn written(person: &str) -> (Mem, String) {
         let mut m = mem(person);
         let mut tree = (*m.tree).clone();
@@ -200,21 +214,21 @@ mod tests {
             at("2026-10-29T10:00:00Z"),
         )
         .unwrap();
+        let master = john.path("@zen").unwrap();
         apply(
             &mut tree,
             &john.actor(),
             &Op::Note {
-                path: john.path("~").unwrap(),
-                text: "Prefers tea.".into(),
+                path: master.clone(),
+                text: "Everyone drinks tea.".into(),
+                speaker: None,
             },
             at("2026-10-29T10:01:00Z"),
         )
         .unwrap();
-        let id = tree.get(&john.path("~").unwrap()).unwrap().window[0]
-            .id
-            .clone();
+        let id = tree.get(&master).unwrap().window[0].id.clone();
         m.tree = tree.into();
-        (m, format!("~#{}", id.as_str()))
+        (m, format!("@zen#{}", id.as_str()))
     }
 
     #[test]
@@ -222,17 +236,17 @@ mod tests {
         let (m, address) = written("john");
         let (status, body) = opened(&m, None, None, at("2026-10-30T00:00:00Z"));
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["journal"], "~");
+        assert_eq!(body["journal"], "@zen", "the master when none is named");
         assert_eq!(body["lines"][0]["line"], address.as_str());
         let (status, body) = opened(&m, Some(&address), None, at("2026-10-30T00:00:00Z"));
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["line"]["text"], "Prefers tea.");
-        let missing = "~#2026-01-01-0000-0000";
+        assert_eq!(body["line"]["text"], "Everyone drinks tea.");
+        let missing = "@zen#2026-01-01-0000-0000";
         assert_eq!(
             opened(&m, Some(missing), None, at("2026-10-30T00:00:00Z")),
             (
                 StatusCode::NOT_FOUND,
-                json!({"error": "not_found", "message": "~#2026-01-01-0000-0000 is no line"})
+                json!({"error": "not_found", "message": "@zen#2026-01-01-0000-0000 is no line"})
             )
         );
         assert_eq!(
@@ -241,26 +255,29 @@ mod tests {
         );
         assert_eq!(
             opened(&m, Some("topics/none"), None, at("2026-10-30T00:00:00Z")),
-            (
-                StatusCode::NOT_FOUND,
-                json!({"error": "not_found", "message": "there is no journal @sharratt/topics/none"})
-            )
+            not_found(&m.path("topics/none").unwrap_err())
+        );
+        assert_eq!(
+            opened(&mem("solo"), None, None, at("2026-10-30T00:00:00Z")),
+            invalid("you are in no group: name the `journal`, `@group/…`")
         );
     }
 
-    /// **Another person's `~` is their own**: Yen's `~` is Yen's, and John's
-    /// line is no line of hers.
+    /// **A group the caller is outside is never read**: a guest finds no
+    /// line of Zen's, by address or by search.
     #[test]
-    fn a_line_of_someone_elses_folder_is_never_read() {
-        let (yen, address) = written("yen");
-        let (status, _) = opened(&yen, Some(&address), None, at("2026-10-30T00:00:00Z"));
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let (_, body) = searched(&yen, "tea", None, None);
+    fn a_line_of_a_group_the_caller_is_outside_is_never_read() {
+        let (guest, address) = written("guest");
+        assert_eq!(
+            opened(&guest, Some(&address), None, at("2026-10-30T00:00:00Z")),
+            not_found("there is no journal @zen")
+        );
+        let (_, body) = searched(&guest, "tea", None, None);
         assert_eq!(body["total"], 0);
     }
 
     #[test]
-    fn the_tree_lists_the_callers_roots_or_one_subtree() {
+    fn the_tree_lists_the_callers_groups_or_one_subtree() {
         let (m, _) = written("john");
         let (status, body) = listed(&m, None);
         assert_eq!(status, StatusCode::OK);
@@ -273,18 +290,13 @@ mod tests {
         assert_eq!(
             names,
             [
-                "~",
-                "~/channels",
-                "~/channels/claude-code",
-                "~/channels/grok",
-                "~/channels/other",
-                "~/people",
-                "@sharratt",
-                "@sharratt/bots",
-                "@sharratt/projects",
-                "@sharratt/threads",
-                "@sharratt/topics",
-                "@sharratt/topics/trip",
+                "@zen",
+                "@zen/bots",
+                "@zen/conversations",
+                "@zen/people",
+                "@zen/threads",
+                "@zen/topics",
+                "@zen/topics/trip",
             ]
         );
         let (_, body) = listed(&m, Some("topics"));

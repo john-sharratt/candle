@@ -42,20 +42,19 @@ mod cluster_logs;
 mod cluster_status;
 mod gateway_command;
 pub mod group_add;
-mod group_create;
+pub mod group_create;
+pub mod group_default;
 pub mod group_describe;
-pub mod group_frame;
 mod group_remove;
 mod journal_accept;
 mod journal_create;
 mod journal_edit;
-mod journal_fold;
+mod journal_focus;
 mod journal_forget;
 mod journal_grep;
-mod journal_merge;
+mod journal_link;
 mod journal_note;
 mod journal_read;
-mod journal_share;
 mod layer_read;
 mod layer_toggle;
 pub mod mem;
@@ -158,18 +157,17 @@ pub fn definitions() -> Value {
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
+        journal_focus::definition(),
         journal_edit::definition(),
         journal_forget::definition(),
         journal_create::definition(),
-        journal_fold::definition(),
-        journal_merge::definition(),
-        journal_share::definition(),
+        journal_link::definition(),
         journal_accept::definition(),
         group_create::definition(),
         group_describe::definition(),
         group_add::definition(),
         group_remove::definition(),
-        group_frame::definition(),
+        group_default::definition(),
         threads::definition(),
         archive::definition(),
         cluster_status::definition(),
@@ -206,16 +204,15 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         journal_note::NAME => journal_note::call(ctx, args),
         journal_grep::NAME => journal_grep::call(ctx, args),
         journal_edit::NAME => journal_edit::call(ctx, args),
+        journal_focus::NAME => journal_focus::call(ctx, args),
         journal_create::NAME => journal_create::call(ctx, args),
-        journal_fold::NAME => journal_fold::call(ctx, args),
-        journal_merge::NAME => journal_merge::call(ctx, args),
-        journal_share::NAME => journal_share::call(ctx, args),
+        journal_link::NAME => journal_link::call(ctx, args),
         journal_accept::NAME => journal_accept::call(ctx, args),
         group_create::NAME => group_create::call(ctx, args),
         group_describe::NAME => group_describe::call(ctx, args),
         group_add::NAME => group_add::call(ctx, args),
         group_remove::NAME => group_remove::call(ctx, args),
-        group_frame::NAME => group_frame::call(ctx, args),
+        group_default::NAME => group_default::call(ctx, args),
         threads::NAME => threads::call(ctx, args),
         archive::NAME => archive::call(ctx, args),
         cluster_status::NAME => cluster_status::call(ctx, args).await,
@@ -316,18 +313,17 @@ mod tests {
                 "journal_read",
                 "journal_grep",
                 "journal_note",
+                "journal_focus",
                 "journal_edit",
                 "journal_forget",
                 "journal_create",
-                "journal_fold",
-                "journal_merge",
-                "journal_share",
+                "journal_link",
                 "journal_accept",
                 "group_create",
                 "group_describe",
                 "group_add",
                 "group_remove",
-                "group_frame",
+                "group_default",
                 "thread_list",
                 "thread_archive",
                 "cluster_status",

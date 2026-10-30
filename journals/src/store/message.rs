@@ -66,17 +66,19 @@ pub fn read(message: &str) -> Result<Recorded> {
 mod tests {
     use super::*;
     use crate::ops::fixture::{now, p, yen};
+    use crate::testing::slug;
 
     #[test]
     fn a_message_reads_back_as_what_it_recorded() {
         let op = Op::Note {
             path: p("topics"),
             text: "Builder starts Monday.\nBring keys.".into(),
+            speaker: Some(slug("john")),
         };
         let id = LineId::parse("2026-10-30-1200-7e3a").unwrap();
-        let m = message("Note on @sharratt/topics", &yen(), &op, now(), Some(&id));
+        let m = message("Note on @zen/topics", &yen(), &op, now(), Some(&id));
         assert!(m.starts_with(
-            "Note on @sharratt/topics\n\nJournal-Writer: grok\nJournal-Person: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
+            "Note on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
         ), "{m}");
         assert_eq!(
             read(&m).unwrap(),

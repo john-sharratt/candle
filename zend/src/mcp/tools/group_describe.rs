@@ -15,13 +15,13 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Say what one of the user's groups is for, in a sentence or two — what its journals \
-            hold and who it is — as an owner of it asks. Every conversation that opens the group, and its \
-            README, starts with this. `group` is the group, the user's default when absent.",
+            hold and who it is — as an owner of it asks. Every conversation in the group, and its README, \
+            starts with this. `group` is the group, the conversation's when absent.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "about": {"type": "string", "description": "What the group is for, such as `John's company: the candle engine, Zen Code and their papers.`"},
-                "group": {"type": "string", "description": "The group, such as `@tokera`; the user's default when absent."}
+                "about": {"type": "string", "description": "What the group is for, such as `Zen: the family, the candle engine, Zen Code and the papers.`"},
+                "group": {"type": "string", "description": "The group, such as `@battle-cities`; the conversation's when absent."}
             },
             "required": ["about"],
             "additionalProperties": false
@@ -63,17 +63,21 @@ mod tests {
     fn a_description_names_its_group_or_the_default() {
         let m = mem("john");
         assert_eq!(
-            plan(&m, &json!({"about": "The family."})).unwrap(),
+            plan(&m, &json!({"about": "Zen."})).unwrap(),
             Op::DescribeGroup {
-                group: Slug::parse("sharratt").unwrap(),
-                about: "The family.".into(),
+                group: Slug::parse("zen").unwrap(),
+                about: "Zen.".into(),
             }
         );
         assert_eq!(
-            plan(&m, &json!({"about": "Work.", "group": "@tokera"})).unwrap(),
+            plan(
+                &m,
+                &json!({"about": "The game.", "group": "@battle-cities"})
+            )
+            .unwrap(),
             Op::DescribeGroup {
-                group: Slug::parse("tokera").unwrap(),
-                about: "Work.".into(),
+                group: Slug::parse("battle-cities").unwrap(),
+                about: "The game.".into(),
             }
         );
         assert!(plan(&m, &json!({})).is_err());

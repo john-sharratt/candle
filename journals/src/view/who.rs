@@ -1,5 +1,6 @@
-//! How a line's writer and time read: "Yen via grok", "the server for John
-//! via grok", "zend" — and how long ago.
+//! How a line's writer and time read: "Yen via Grok on John's account",
+//! "John via Claude Code", "the server for John via Grok", "Zen" — and how
+//! long ago.
 
 use crate::line::{Line, Writer};
 use crate::slug::Slug;
@@ -13,19 +14,26 @@ pub fn name_of(tree: &Tree, person: &Slug) -> String {
         .unwrap_or_else(|| person.to_string())
 }
 
-/// Who wrote `line`, for whom, through what.
+/// Who wrote `line`, for whom, through what. The speaker is named first when
+/// the focus had one; the account it came through is said when it is
+/// someone else's (§3.2).
 pub fn who(tree: &Tree, line: &Line) -> String {
-    let person = line.person.as_ref().map(|p| name_of(tree, p));
-    match (line.by, person) {
-        (Writer::Channel(c), Some(p)) => format!("{p} via {c}"),
-        (Writer::Channel(c), None) => c.to_string(),
-        (Writer::Server, Some(p)) => match line.channel {
-            Some(c) => format!("the server for {p} via {c}"),
-            None => format!("the server for {p}"),
+    let account = line.account.as_ref().map(|p| name_of(tree, p));
+    let speaker = line.speaker.as_ref().map(|p| name_of(tree, p));
+    match (line.by, account) {
+        (Writer::Channel(c), account) => match (speaker, account) {
+            (Some(s), Some(a)) if s != a => format!("{s} via {} on {a}'s account", c.spoken()),
+            (Some(s), _) | (None, Some(s)) => format!("{s} via {}", c.spoken()),
+            (None, None) => c.spoken().to_string(),
         },
-        (Writer::Worker, Some(p)) => format!("a worker for {p}"),
-        (Writer::Npcd, Some(p)) => format!("npcd for {p}"),
-        (w, _) => w.name().to_string(),
+        (Writer::Server, Some(a)) => match line.channel {
+            Some(c) => format!("the server for {a} via {}", c.spoken()),
+            None => format!("the server for {a}"),
+        },
+        (Writer::Worker, Some(a)) => format!("a worker for {a}"),
+        (Writer::Npcd, Some(a)) => format!("npcd for {a}"),
+        (Writer::Zend, _) => "Zen".to_string(),
+        (w, None) => w.name().to_string(),
     }
 }
 
@@ -46,7 +54,7 @@ pub fn minute(at: Stamp) -> String {
     format!("{} {}", &s[..10], &s[11..16])
 }
 
-/// One line as a reader sees it: `#id 2026-10-30 09:12 note, Yen via grok: text`.
+/// One line as a reader sees it: `#id 2026-10-30 09:12 note, Yen via Grok: text`.
 pub fn render_line(tree: &Tree, line: &Line) -> String {
     let kind = if line.proposed {
         "proposal"
@@ -65,25 +73,35 @@ pub fn render_line(tree: &Tree, line: &Line) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::fixture::sharratt;
+    use crate::ops::fixture::zen;
     use crate::scope::Channel;
     use crate::testing::{at, note, slug};
 
     #[test]
     fn writers_read_as_who_they_are() {
-        let t = sharratt();
+        let t = zen();
         let mut l = note("2026-10-30T09:12:00Z", "x");
-        assert_eq!(who(&t, &l), "john via claude-code");
+        assert_eq!(who(&t, &l), "john via Claude Code");
+        l.speaker = Some(slug("john"));
+        assert_eq!(who(&t, &l), "john via Claude Code", "his own account");
+        l.by = Writer::Channel(Channel::Grok);
+        l.speaker = Some(slug("yen"));
+        assert_eq!(who(&t, &l), "yen via Grok on john's account");
+        l.account = None;
+        assert_eq!(who(&t, &l), "yen via Grok");
+        l.speaker = None;
+        assert_eq!(who(&t, &l), "Grok");
         l.by = Writer::Server;
+        l.account = Some(slug("john"));
         l.channel = Some(Channel::Grok);
-        assert_eq!(who(&t, &l), "the server for john via grok");
+        assert_eq!(who(&t, &l), "the server for john via Grok");
         l.by = Writer::Zend;
-        l.person = None;
-        assert_eq!(who(&t, &l), "zend");
+        l.account = None;
+        assert_eq!(who(&t, &l), "Zen");
         l.by = Writer::Worker;
-        l.person = Some(slug("yen"));
+        l.account = Some(slug("yen"));
         assert_eq!(who(&t, &l), "a worker for yen");
-        l.person = Some(slug("nobody"));
+        l.account = Some(slug("nobody"));
         assert_eq!(who(&t, &l), "a worker for nobody");
     }
 
@@ -104,13 +122,13 @@ mod tests {
 
     #[test]
     fn a_line_reads_on_one_line() {
-        let t = sharratt();
+        let t = zen();
         let mut l = note("2026-10-30T09:12:40Z", "Prefers tea.");
         l.proposed = true;
         assert_eq!(
             render_line(&t, &l),
             format!(
-                "#{} 2026-10-30 09:12 proposal, john via claude-code: Prefers tea.",
+                "#{} 2026-10-30 09:12 proposal, john via Claude Code: Prefers tea.",
                 l.id
             )
         );

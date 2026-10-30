@@ -1,10 +1,15 @@
-//! `journal.yaml`: a journal's name, cue, dates, state and summary (§3.2). It
-//! merges as git always does, so two rebuilds of one summary conflict.
+//! `journal.yaml`: a journal's name, cue, dates, state, repository,
+//! references, focus and summary (§3.2). It merges as git always does, so two
+//! rebuilds of one summary conflict.
 
 use crate::error::Problem;
+use crate::files::focus::{Focus, MAX_ABOUT};
+use crate::files::reference::{Ref, MAX_REFS};
 use crate::files::summary::Summary;
+use crate::path::Below;
+use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::yaml::{parse_doc, scalar, text_field, Fields};
+use crate::yaml::{item_line, parse_doc, scalar, scalar_list, text_field, Fields};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -18,8 +23,12 @@ pub struct Meta {
     pub closed: Option<Stamp>,
     /// Left out of its parent's live index (§2.3).
     pub folded: bool,
-    /// The group journal it was shared into, written `@group/path`.
-    pub shared: Option<String>,
+    /// The repository a topic is, for a Zen worker's frame (§2.2).
+    pub repo: Option<Slug>,
+    /// Its references to other journals of the group (§2.5).
+    pub refs: Vec<Ref>,
+    /// A conversation's focus: who is speaking, and what it is about (§2.4).
+    pub focus: Option<Focus>,
     pub summary: Option<Summary>,
 }
 
@@ -31,7 +40,9 @@ impl Meta {
             created,
             closed: None,
             folded: false,
-            shared: None,
+            repo: None,
+            refs: Vec::new(),
+            focus: None,
             summary: None,
         }
     }
@@ -46,8 +57,26 @@ impl Meta {
             out.push_str(&format!("closed: {c}\n"));
         }
         out.push_str(&format!("folded: {}\n", self.folded));
-        if let Some(s) = &self.shared {
-            out.push_str(&format!("shared: {}\n", scalar(s)));
+        if let Some(r) = &self.repo {
+            out.push_str(&format!("repo: {}\n", scalar(r.as_str())));
+        }
+        if !self.refs.is_empty() {
+            out.push_str("refs:\n");
+            for r in &self.refs {
+                out.push_str(&format!("  - name: {}\n", scalar(r.name.as_str())));
+                out.push_str(&format!("    to: {}\n", scalar(&r.to.to_string())));
+                out.push_str(&text_field("    ", "cue", &r.cue));
+            }
+        }
+        if let Some(f) = self.focus.as_ref().filter(|f| !f.is_empty()) {
+            out.push_str("focus:\n");
+            if let Some(s) = &f.speaker {
+                out.push_str(&format!("  speaker: {}\n", scalar(s.as_str())));
+            }
+            if !f.about.is_empty() {
+                let about: Vec<String> = f.about.iter().map(Below::to_string).collect();
+                out.push_str(&format!("  about: {}\n", scalar_list(&about)));
+            }
         }
         if let Some(s) = &self.summary {
             s.render(&mut out);
@@ -68,10 +97,53 @@ impl Meta {
         let folded = f
             .opt_bool("folded")?
             .ok_or_else(|| f.problem("folded", "`folded` is missing"))?;
-        let shared = f.opt_str("shared")?;
-        if shared.as_deref().is_some_and(|s| !s.starts_with('@')) {
-            return Err(f.problem("shared", "`shared` names a group journal, `@group/path`"));
+        let repo = f.opt_parsed("repo", Slug::parse)?;
+        let mut refs: Vec<Ref> = Vec::new();
+        for (i, rv) in f.opt_seq("refs")?.into_iter().flatten().enumerate() {
+            let mut rf = Fields::of(rv, file, item_line(text, "refs", i), None)?;
+            let name = rf.parsed("name", Slug::parse)?;
+            let to = rf.parsed("to", Below::parse)?;
+            let cue = rf.str("cue")?;
+            if cue.trim().is_empty() {
+                return Err(rf.problem("cue", "a reference's `cue` is empty"));
+            }
+            if refs.iter().any(|r| r.name == name) {
+                return Err(rf.problem("name", format!("the reference {name} is listed twice")));
+            }
+            rf.done()?;
+            refs.push(Ref { name, to, cue });
         }
+        if refs.len() > MAX_REFS {
+            return Err(f.problem(
+                "refs",
+                format!("{} references: at most {MAX_REFS}", refs.len()),
+            ));
+        }
+        let focus = match f.opt_map("focus")? {
+            None => None,
+            Some(fv) => {
+                let mut ff = Fields::of(fv, file, None, Some(text))?;
+                let speaker = ff.opt_parsed("speaker", Slug::parse)?;
+                let about = ff
+                    .opt_strs("about")?
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| Below::parse(s))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|why| ff.problem("about", format!("`about`: {why}")))?;
+                if about.len() > MAX_ABOUT {
+                    return Err(ff.problem(
+                        "about",
+                        format!(
+                            "a focus is about at most {MAX_ABOUT} journals, not {}",
+                            about.len()
+                        ),
+                    ));
+                }
+                ff.done()?;
+                Some(Focus { speaker, about })
+            }
+        };
         let summary = match f.opt_map("summary")? {
             None => None,
             Some(sv) => {
@@ -88,7 +160,9 @@ impl Meta {
             created,
             closed,
             folded,
-            shared,
+            repo,
+            refs,
+            focus,
             summary,
         })
     }
@@ -112,7 +186,23 @@ mod tests {
             created: at("2026-10-30T09:10:02Z"),
             closed: Some(at("2026-10-31T01:00:00Z")),
             folded: true,
-            shared: Some("@sharratt/topics/candle".into()),
+            repo: Some(slug("candle")),
+            refs: vec![
+                Ref {
+                    name: slug("wasmer"),
+                    to: Below::parse("topics/wasmer").unwrap(),
+                    cue: "open for the WebAssembly work the engine's sandboxing came from".into(),
+                },
+                Ref {
+                    name: slug("john"),
+                    to: Below::parse("people/john").unwrap(),
+                    cue: "open for who leads it".into(),
+                },
+            ],
+            focus: Some(Focus {
+                speaker: Some(slug("yen")),
+                about: vec![Below::parse("topics/house-extension/permits").unwrap()],
+            }),
             summary: Some(Summary {
                 over: Fingerprint::of_bytes(b"inputs"),
                 built: at("2026-10-30T11:02:40Z"),
@@ -146,7 +236,17 @@ mod tests {
                  created: 2026-10-30T09:10:02Z\n\
                  closed: 2026-10-31T01:00:00Z\n\
                  folded: true\n\
-                 shared: \"@sharratt/topics/candle\"\n\
+                 repo: candle\n\
+                 refs:\n\
+                 \x20 - name: wasmer\n\
+                 \x20   to: topics/wasmer\n\
+                 \x20   cue: open for the WebAssembly work the engine's sandboxing came from\n\
+                 \x20 - name: john\n\
+                 \x20   to: people/john\n\
+                 \x20   cue: open for who leads it\n\
+                 focus:\n\
+                 \x20 speaker: yen\n\
+                 \x20 about: [topics/house-extension/permits]\n\
                  summary:\n  over: {}\n  built: 2026-10-30T11:02:40Z\n  lines: 12\n  children: 2\n  stale: true\n\
                  \x20 digest: \"Candle: releases go through keep.\"\n  sentences:\n\
                  \x20   - text: Releases go through keep trials on BlackWorld, then roll out.\n\
@@ -171,8 +271,42 @@ mod tests {
             "name: permits\ncue: open for council permits\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n"
         );
         assert_eq!(Meta::read("j", &m.render()).unwrap(), m);
-        let fixed = Meta::new("projects", None, at("2026-10-30T09:10:02Z"));
+        let fixed = Meta::new("topics", None, at("2026-10-30T09:10:02Z"));
         assert_eq!(Meta::read("j", &fixed.render()).unwrap(), fixed);
+    }
+
+    /// **A focus writes only what it has**: a speaker alone, or journals
+    /// alone; an empty one writes nothing.
+    #[test]
+    fn a_focus_writes_only_what_it_has() {
+        let mut m = Meta::new(
+            "2026-10-31-0712-grok",
+            Some("open for a drive".into()),
+            at("2026-10-31T07:12:04Z"),
+        );
+        m.focus = Some(Focus {
+            speaker: Some(slug("john")),
+            about: vec![],
+        });
+        assert!(
+            m.render()
+                .ends_with("folded: false\nfocus:\n  speaker: john\n"),
+            "{}",
+            m.render()
+        );
+        assert_eq!(Meta::read("j", &m.render()).unwrap(), m);
+        m.focus = Some(Focus {
+            speaker: None,
+            about: vec![Below::parse("topics/candle").unwrap()],
+        });
+        assert!(
+            m.render().ends_with("focus:\n  about: [topics/candle]\n"),
+            "{}",
+            m.render()
+        );
+        assert_eq!(Meta::read("j", &m.render()).unwrap(), m);
+        m.focus = Some(Focus::default());
+        assert!(m.render().ends_with("folded: false\n"));
     }
 
     #[test]
@@ -180,6 +314,8 @@ mod tests {
         for name in ["true", "null", "1e3", "0x1f", "0123"] {
             let mut m = full();
             m.name = name.into();
+            m.repo = Some(slug(name));
+            m.refs[0].name = slug(name);
             m.summary.as_mut().unwrap().over = Fingerprint::parse("1234567890123e45").unwrap();
             assert_eq!(Meta::read("j", &m.render()).unwrap(), m, "{name}");
         }
@@ -213,27 +349,30 @@ mod tests {
                 1,
                 "`colour` is not a field",
             ),
+            ("repo: candle", "repo: Candle", 6, "not a name"),
             (
-                "shared: \"@sharratt/topics/candle\"",
-                "shared: \"topics/candle\"",
-                6,
-                "`@group/path`",
+                "to: topics/wasmer",
+                "to: topics/Wasmer",
+                8,
+                "not a path below a group",
             ),
-            ("over: ", "over: xyz", 8, "not a fingerprint"),
-            ("lines: 12", "lines: many", 10, "not a count"),
             (
-                "[\"#2026-10-29-0410-a3b4\"]",
-                "[\"#bad\"]",
-                15,
-                "not a line id",
+                "    to: people/john\n",
+                "    to: people/john\n    via: x\n",
+                0,
+                "`via` is not a field",
             ),
-            ("[user-context]", "[User Context]", 17, "cites neither"),
+            ("name: john", "name: wasmer", 11, "listed twice"),
+            ("speaker: yen", "speaker: Yen", 0, "not a name"),
             (
-                "The connector now remembers its user.",
-                "\"  \"",
-                17,
-                "a sentence is empty",
+                "about: [topics/house-extension/permits]",
+                "about: [a, b, c, d]",
+                0,
+                "at most 3 journals, not 4",
             ),
+            ("over: ", "over: xyz", 0, "not a fingerprint"),
+            ("lines: 12", "lines: many", 0, "not a count"),
+            ("[user-context]", "[User Context]", 0, "cites neither"),
             (
                 "cue: open for the inference engine, its releases and cluster",
                 "cue: \"\"",
@@ -243,11 +382,25 @@ mod tests {
         ] {
             assert!(good.contains(from), "{from}");
             let bad = good.replacen(from, to, 1);
-            let err = Meta::read("projects/candle/journal.yaml", &bad).unwrap_err();
+            let err = Meta::read("topics/candle/journal.yaml", &bad).unwrap_err();
             assert!(err.what.contains(says), "{from}: {err}");
             if line > 0 {
                 assert_eq!(err.line, Some(line), "{from}: {err}");
             }
         }
+        // Everything in a group is shared: no journal says it was.
+        let err = Meta::read("j", &format!("{good}shared: \"@zen/topics/x\"\n")).unwrap_err();
+        assert!(err.what.contains("`shared` is not a field"), "{err}");
+        let eleven = (0..11)
+            .map(|i| format!("  - name: r{i}\n    to: topics/x\n    cue: c\n"))
+            .collect::<String>();
+        let err = Meta::read(
+            "j",
+            &format!(
+                "name: x\ncue: c\ncreated: 2026-10-30T09:10:02Z\nfolded: false\nrefs:\n{eleven}"
+            ),
+        )
+        .unwrap_err();
+        assert!(err.what.contains("11 references: at most 10"), "{err}");
     }
 }

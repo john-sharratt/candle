@@ -82,6 +82,37 @@ pub struct Sentence {
     pub cites: Vec<Cite>,
 }
 
+/// `text` without the bracketed lists of line ids a model writes into a
+/// sentence — "rules (#2026-05-21-2027-8abb, #2026-08-08-1233-e017)." — which
+/// a sentence's cites carry, checked. A bracket is dropped only when every
+/// part of it is a `#<line id>`, so "(#4021)" or "(see #a)" stays.
+pub fn unmarked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let Some(len) = rest[open..].find(')') else {
+            break;
+        };
+        let inner = &rest[open + 1..open + len];
+        let ids = inner
+            .split([',', ';'])
+            .map(str::trim)
+            .all(|p| matches!(Cite::parse(p), Ok(Cite::Line(_))));
+        let after = &rest[open + len + 1..];
+        if ids {
+            out.push_str(rest[..open].trim_end());
+            if after.starts_with(char::is_alphanumeric) {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(&rest[..=open + len]);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
     pub over: Fingerprint,
@@ -99,11 +130,13 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// The summary as one text: its sentences, space-joined.
+    /// The summary as one text: its sentences, space-joined, without the id
+    /// lists a sentence's cites carry ([`unmarked`]) — so a summary written
+    /// with them measures as one written without.
     pub fn text(&self) -> String {
         self.sentences
             .iter()
-            .map(|s| s.text.trim())
+            .map(|s| unmarked(s.text.trim()).trim().to_string())
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -228,6 +261,56 @@ mod tests {
             ],
         };
         assert_eq!(s.text(), "One. Two.");
+        assert_eq!(s.len(), 9);
+    }
+
+    /// **A sentence's text loses the line-id lists its cites carry**, and
+    /// keeps every other bracket; a summary measures without them.
+    #[test]
+    fn inline_line_id_lists_are_dropped_and_nothing_else() {
+        for (text, is) in [
+            (
+                "No stubs are committed (#2026-05-21-2027-8abb, #2026-05-21-2027-8abc). \
+                 Tests assert bytes (#2026-04-20-0000-c207).",
+                "No stubs are committed. Tests assert bytes.",
+            ),
+            (
+                "Kept (#2026-05-21-2027-8abb; #2026-05-21-2027-8abc) here",
+                "Kept here",
+            ),
+            ("rules (#2026-05-21-2027-8abb)and more", "rules and more"),
+            ("Fixed upstream (#4021).", "Fixed upstream (#4021)."),
+            (
+                "A short id (#2026-05-21-8eca).",
+                "A short id (#2026-05-21-8eca).",
+            ),
+            (
+                "Serially (one cargo at a time; #x).",
+                "Serially (one cargo at a time; #x).",
+            ),
+            (
+                "Mixed (#2026-05-21-2027-8abb, topics).",
+                "Mixed (#2026-05-21-2027-8abb, topics).",
+            ),
+            ("Open (#2026-05-21-2027-8abb", "Open (#2026-05-21-2027-8abb"),
+            ("(#2026-05-21-2027-8abb) Rules hold.", " Rules hold."),
+            ("Empty () stays.", "Empty () stays."),
+        ] {
+            assert_eq!(unmarked(text), is, "{text}");
+        }
+        let s = Summary {
+            over: Fingerprint::of_bytes(b"x"),
+            built: Stamp::from_secs(0),
+            lines: 0,
+            children: 0,
+            stale: false,
+            digest: None,
+            sentences: vec![Sentence {
+                text: "No stubs (#2026-05-21-2027-8abb, #2026-05-21-2027-8abc).".into(),
+                cites: vec![],
+            }],
+        };
+        assert_eq!(s.text(), "No stubs.");
         assert_eq!(s.len(), 9);
     }
 }

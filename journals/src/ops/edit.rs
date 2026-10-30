@@ -17,7 +17,7 @@ pub fn edit(tree: &mut Tree, address: &Address, text: &str) -> Result<Applied> {
         .ok_or_else(|| Error::not_found(format!("{address} is no line")))?;
     if line.kind == Kind::Fold {
         return Err(Error::refused(format!(
-            "{address} is a fold, which zend writes; unfold it, or edit the lines it folded"
+            "{address} is a fold, which zend writes; edit the lines it folded"
         )));
     }
     if line.text == text {
@@ -34,21 +34,22 @@ pub fn edit(tree: &mut Tree, address: &Address, text: &str) -> Result<Applied> {
 mod tests {
     use super::*;
     use crate::line::{Folds, LineId};
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::period::Period;
     use crate::testing::note;
 
     #[test]
     fn an_edit_changes_the_text_and_nothing_else() {
-        let mut t = sharratt();
-        let path = p("~");
+        let mut t = zen();
+        let path = p("people");
         let id = apply(
             &mut t,
             &john(),
             &Op::Note {
                 path: path.clone(),
                 text: "Prefers tea.".into(),
+                speaker: None,
             },
             now(),
         )
@@ -70,7 +71,7 @@ mod tests {
             now().plus(60),
         )
         .unwrap();
-        assert_eq!(a.subject, format!("Edit of ~#{id}"));
+        assert_eq!(a.subject, format!("Edit of @zen/people#{id}"));
         let after = &t.get(&path).unwrap().window[0];
         assert_eq!(after.text, "Prefers green tea.");
         assert_eq!(
@@ -93,8 +94,8 @@ mod tests {
 
     #[test]
     fn an_archived_line_is_edited_where_it_is() {
-        let mut t = sharratt();
-        let path = p("~");
+        let mut t = zen();
+        let path = p("people");
         let line = note("2026-09-01T10:00:00Z", "old");
         let period = Period::parse("2026-09-01").unwrap();
         t.get_mut(&path)
@@ -122,8 +123,8 @@ mod tests {
 
     #[test]
     fn no_such_line_and_folds_are_refused() {
-        let mut t = sharratt();
-        let path = p("~");
+        let mut t = zen();
+        let path = p("people");
         let id = LineId::parse("2026-10-30-0912-7e3a").unwrap();
         assert!(matches!(
             apply(

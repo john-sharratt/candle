@@ -1,20 +1,20 @@
 //! A person's notes from before the memory backbone — the flat `U:` journal
-//! zend kept in its substrate — moved onto their tree the first time they
-//! call: what they asked to be kept onto `~`, what was done for them onto
-//! their channel's journal, each at the time it was written. A moved note
-//! leaves the substrate; one the tree refuses stays there and is logged.
+//! zend kept in its substrate — moved onto their own journal in their home
+//! group, `people/<person>`, the first time they call: what they asked to be
+//! kept as notes, what was done for them as episodes, each at the time it was
+//! written. A moved note leaves the substrate; one the tree refuses stays
+//! there and is logged.
 
 use std::sync::Arc;
 use std::thread;
 
 use journals::actor::Actor;
 use journals::ops::Op;
-use journals::path::{JournalPath, Owner};
+use journals::path::JournalPath;
 use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::time::Stamp;
 
-use super::conversations::channel_journal;
 use super::{held, Memory};
 use crate::mcp::records::Records;
 use crate::mcp::threads::{self, Note};
@@ -24,8 +24,13 @@ const OLD_JOURNAL: &str = "U:";
 /// How the old journal labelled what a person asked to be kept.
 const KEPT: &str = "Noted:";
 
-/// The write that moves `note` onto `person`'s tree.
-pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
+/// `person`'s own journal in `group`, when their slug can name one.
+pub fn own_journal(group: &Slug, person: &Slug) -> Result<JournalPath, String> {
+    JournalPath::person(group, person).map_err(|e| e.to_string())
+}
+
+/// The write that moves `note` onto `person`'s journal at `path`.
+pub fn move_of(path: JournalPath, person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
     let channel = note
         .client
         .as_deref()
@@ -40,8 +45,9 @@ pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
                 admin: false,
             },
             Op::Note {
-                path: JournalPath::root(Owner::Person(person.clone())),
+                path,
                 text: note.text.clone(),
+                speaker: Some(person.clone()),
             },
             at,
         )
@@ -52,42 +58,60 @@ pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
                 channel,
             },
             Op::Episode {
-                path: channel_journal(person, channel),
+                path,
                 text: note.text.clone(),
+                speaker: None,
             },
             at,
         )
     }
 }
 
-/// Move `owner`'s old notes onto `person`'s tree, once per process, on a
-/// thread of its own: a person with hundreds of old notes is not kept waiting
-/// for the commits on their first call.
-pub fn once<R: Records + 'static>(memory: &Arc<Memory>, records: R, owner: &str, person: &Slug) {
-    if !held(&memory.moved).insert(owner.to_string()) {
+/// Move `owner`'s old notes onto `person`'s journal in `group`, once per
+/// process, on a thread of its own: a person with hundreds of old notes is
+/// not kept waiting for the commits on their first call. Until that journal
+/// is there the notes have nowhere to go, and a later call moves them.
+pub fn once<R: Records + 'static>(
+    memory: &Arc<Memory>,
+    records: R,
+    owner: &str,
+    group: &Slug,
+    person: &Slug,
+) {
+    let there =
+        own_journal(group, person).is_ok_and(|p| memory.tree().is_ok_and(|t| t.get(&p).is_some()));
+    if !there || !held(&memory.moved).insert(owner.to_string()) {
         return;
     }
     let memory = Arc::clone(memory);
     let owner = owner.to_string();
+    let group = group.clone();
     let person = person.clone();
     let spawned = thread::Builder::new()
         .name("journal-move".into())
-        .spawn(move || move_all(&memory, &records, &owner, &person));
+        .spawn(move || move_all(&memory, &records, &owner, &group, &person));
     if let Err(e) = spawned {
         tracing::warn!("journals: the old notes' move did not start: {e}");
     }
 }
 
-/// Every one of `owner`'s old notes onto `person`'s tree, each ended in the
-/// substrate once it is on the tree.
-pub fn move_all(memory: &Memory, records: &dyn Records, owner: &str, person: &Slug) {
+/// Every one of `owner`'s old notes onto `person`'s journal in `group`, each
+/// ended in the substrate once it is on the tree.
+pub fn move_all(memory: &Memory, records: &dyn Records, owner: &str, group: &Slug, person: &Slug) {
     let old = threads::notes_keyed(records, owner, OLD_JOURNAL);
     if old.is_empty() {
         return;
     }
+    let path = match own_journal(group, person) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(person = %person, "journals: old notes stay where they were: {e}");
+            return;
+        }
+    };
     let mut moved = 0usize;
     for (key, note) in &old {
-        let (actor, op, at) = move_of(person, note);
+        let (actor, op, at) = move_of(path.clone(), person, note);
         match memory.write_at(&actor, &op, at) {
             Ok(_) => match records.cease(key) {
                 Ok(()) => moved += 1,
@@ -118,9 +142,11 @@ mod tests {
     }
 
     #[test]
-    fn kept_notes_go_to_the_root_and_episodes_to_their_channel() {
+    fn kept_notes_and_episodes_go_to_their_own_journal() {
         let john = Slug::parse("john").unwrap();
-        let (actor, op, at) = move_of(&john, &note("Noted:", Some("grok")));
+        let zen = Slug::parse("zen").unwrap();
+        let own = own_journal(&zen, &john).unwrap();
+        let (actor, op, at) = move_of(own.clone(), &john, &note("Noted:", Some("grok")));
         assert_eq!(
             actor,
             Actor::Person {
@@ -129,9 +155,11 @@ mod tests {
                 admin: false,
             }
         );
-        assert!(matches!(&op, Op::Note { path, .. } if path.show() == "~"));
+        assert!(
+            matches!(&op, Op::Note { path, speaker: Some(s), .. } if path.show() == "@zen/people/john" && s == &john)
+        );
         assert_eq!(at.to_string(), "2026-10-30T09:10:02Z");
-        let (actor, op, _) = move_of(&john, &note("Done:", None));
+        let (actor, op, _) = move_of(own, &john, &note("Done:", None));
         assert_eq!(
             actor,
             Actor::Server {
@@ -139,6 +167,7 @@ mod tests {
                 channel: Channel::Other
             }
         );
-        assert!(matches!(&op, Op::Episode { path, .. } if path.show() == "~/channels/other"));
+        assert!(matches!(&op, Op::Episode { path, .. } if path.show() == "@zen/people/john"));
+        assert!(own_journal(&zen, &Slug::parse("archive").unwrap()).is_err());
     }
 }

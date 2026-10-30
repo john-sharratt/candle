@@ -1,17 +1,18 @@
 //! Groups (§3.5): making one, who is in it and as what, and which accounts
-//! are a person (§3.4).
+//! are a person (§3.4). Every person in a group has their own journal in it,
+//! `people/<person>`, opened when they join.
 
 use crate::error::{Error, Result};
 use crate::files::{
-    Account, AccountKey, Email, GroupFile, Kind, Member, PersonFile, Role, Who, MAX_FRAMED,
-    MAX_GROUPS,
+    Account, AccountKey, Email, GroupFile, Member, Meta, PersonFile, Role, Who, MAX_GROUPS,
 };
-use crate::ops::Applied;
-use crate::path::Owner;
-use crate::scope::Scope;
+use crate::ops::fold::fold_child;
+use crate::ops::{Applied, OwnerFile};
+use crate::path::{Below, JournalPath};
+use crate::scope::Section;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::tree::{skeleton, Group, Person, Tree};
+use crate::tree::{skeleton, Group, Journal, Person, Tree, MAX_CHILDREN};
 
 fn group_file<'a>(tree: &'a mut Tree, group: &Slug) -> Result<&'a mut GroupFile> {
     let g = tree
@@ -75,14 +76,100 @@ fn join(file: &mut PersonFile, group: &Slug) -> Result<()> {
     Ok(())
 }
 
-/// A new group, `creator` its first owner. What it is for is said after,
-/// [`describe_group`].
+/// What opening a member's own journal touched.
+#[derive(Default)]
+struct Opened {
+    /// Their journal, when this opened it.
+    journal: Option<JournalPath>,
+    /// The journal folded to make room for it.
+    folded: Option<JournalPath>,
+}
+
+impl Opened {
+    /// Into `applied`: each journal whose files changed, and the fold.
+    fn record(self, applied: &mut Applied) {
+        if let Some(f) = self.folded {
+            applied
+                .touched
+                .push(f.parent().expect("a fold is below its section"));
+            applied.touched.push(f.clone());
+            applied.folded.push(f);
+        }
+        applied.touched.extend(self.journal);
+    }
+}
+
+/// `person`'s own journal in `group`, `people/<person>`, opened if it is not
+/// there yet. `people` takes it as it takes any journal — written, and not
+/// over a reference's name — except that a full `people` folds the idlest
+/// journal of someone who is not a member, so every member has theirs
+/// (§2.3).
+fn open_person(
+    tree: &mut Tree,
+    group: &Slug,
+    person: &Slug,
+    name: &str,
+    now: Stamp,
+) -> Result<Opened> {
+    let people = JournalPath::of_section(group, Section::People);
+    let path = people.child(person.clone())?;
+    let members: Vec<Slug> = tree
+        .group_file(group)
+        .map(|f| f.persons().map(|(p, _)| p.clone()).collect())
+        .unwrap_or_default();
+    let section = tree.need_mut(&people)?;
+    if section.children.contains_key(person) {
+        return Ok(Opened::default());
+    }
+    section.writable(&people.show())?;
+    if let Some(r) = section
+        .meta
+        .iter()
+        .flat_map(|m| &m.refs)
+        .find(|r| &r.name == person)
+    {
+        return Err(Error::refused(format!(
+            "{path} is a reference already, to {}: restructuring {people} is a coding task on \
+             the journals repository",
+            r.to
+        )));
+    }
+    let mut folded = None;
+    if section.live_count() >= MAX_CHILDREN {
+        let victim = section
+            .live()
+            .filter(|(n, _)| !members.contains(n))
+            .min_by_key(|(n, j)| (j.last_active(), (*n).clone()))
+            .map(|(n, _)| n.clone())
+            .ok_or_else(|| {
+                Error::refused(format!(
+                    "{people} holds {MAX_CHILDREN} members' journals, so {person} has no room \
+                     for theirs; restructuring it is a coding task on the journals repository"
+                ))
+            })?;
+        folded = Some(fold_child(section, &people, &victim, now)?);
+    }
+    let cue = format!("open for {name}: who they are, what they want, what they are working on");
+    section.children.insert(
+        person.clone(),
+        Journal::new(
+            path.place()?,
+            Some(Meta::new(person.as_str(), Some(cue), now)),
+        ),
+    );
+    Ok(Opened {
+        journal: Some(path),
+        folded,
+    })
+}
+
+/// A new group, `creator` its first owner, with their own journal in it.
 pub fn create_group(
     tree: &mut Tree,
     creator: &Slug,
     group: &Slug,
     name: &str,
-    kind: Kind,
+    about: Option<&str>,
     now: Stamp,
 ) -> Result<Applied> {
     if tree.groups.contains_key(group) {
@@ -90,16 +177,15 @@ pub fn create_group(
             "@{group} exists already: pick another name"
         )));
     }
-    let name = name.trim();
     let file = GroupFile {
         group: group.clone(),
-        name: name.to_string(),
-        kind,
-        about: None,
+        name: name.trim().to_string(),
+        about: about.map(str::trim).map(String::from),
         members: vec![Member {
             who: Who::Person(creator.clone()),
             role: Role::Owner,
             joined: now,
+            reads: vec![],
         }],
     };
     file.check().map_err(Error::Invalid)?;
@@ -107,24 +193,30 @@ pub fn create_group(
         .ok_or_else(|| Error::not_found(format!("there is no person {creator}")))?;
     join(person, group)?;
     // A group they make is one they chose: it is their default if they have
-    // none, and room is left for one beside those they frame.
-    if person.default_group.is_none() && person.framed.len() < MAX_FRAMED {
+    // none.
+    if person.default_group.is_none() {
         person.default_group = Some(group.clone());
     }
     person.check().map_err(Error::Invalid)?;
+    let creator_name = person.name.clone();
     tree.groups.insert(
         group.clone(),
         Group {
             file: Ok(file),
-            root: skeleton(Scope::Group),
+            root: skeleton(),
             problems: Vec::new(),
         },
     );
-    Ok(Applied {
-        subject: format!("Create @{group}, a {kind}"),
-        owners: vec![Owner::Group(group.clone()), Owner::Person(creator.clone())],
+    let mut applied = Applied {
+        subject: format!("Create @{group}"),
+        owners: vec![
+            OwnerFile::Group(group.clone()),
+            OwnerFile::Person(creator.clone()),
+        ],
         ..Applied::default()
-    })
+    };
+    open_person(tree, group, creator, &creator_name, now)?.record(&mut applied);
+    Ok(applied)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,7 +234,7 @@ pub fn add_member(
         free_email(tree, person, e)?;
     }
     let mut changed = false;
-    match person_file(tree, person)? {
+    let their_name = match person_file(tree, person)? {
         None => {
             let name = name
                 .map(str::trim)
@@ -163,18 +255,17 @@ pub fn add_member(
                 accounts,
                 groups: vec![group.clone()],
                 default_group: Some(group.clone()),
-                framed: vec![],
             };
             file.check().map_err(Error::Invalid)?;
             tree.persons.insert(
                 person.clone(),
                 Person {
                     file: Ok(file),
-                    root: skeleton(Scope::Personal),
                     problems: Vec::new(),
                 },
             );
             changed = true;
+            name.to_string()
         }
         Some(file) => {
             // Their first account makes them someone who can sign in, and the
@@ -204,11 +295,11 @@ pub fn add_member(
             }
             if first_account {
                 file.default_group = Some(group.clone());
-                file.framed.clear();
             }
             file.check().map_err(Error::Invalid)?;
+            file.name.clone()
         }
-    }
+    };
     let g = group_file(tree, group)?;
     let at = g
         .members
@@ -229,6 +320,7 @@ pub fn add_member(
                 who: Who::Person(person.clone()),
                 role,
                 joined: now,
+                reads: vec![],
             });
             changed = true;
             format!("Add {person} to @{group} as {}", role.name())
@@ -241,11 +333,16 @@ pub fn add_member(
         )));
     }
     g.check().map_err(Error::Invalid)?;
-    Ok(Applied {
+    let mut applied = Applied {
         subject,
-        owners: vec![Owner::Group(group.clone()), Owner::Person(person.clone())],
+        owners: vec![
+            OwnerFile::Group(group.clone()),
+            OwnerFile::Person(person.clone()),
+        ],
         ..Applied::default()
-    })
+    };
+    open_person(tree, group, person, &their_name, now)?.record(&mut applied);
+    Ok(applied)
 }
 
 /// `group`'s `about`: what it is for, as its README and its frames say.
@@ -264,30 +361,50 @@ pub fn describe_group(tree: &mut Tree, group: &Slug, about: &str) -> Result<Appl
     g.check().map_err(Error::Invalid)?;
     Ok(Applied {
         subject: format!("Describe @{group}"),
-        owners: vec![Owner::Group(group.clone())],
+        owners: vec![OwnerFile::Group(group.clone())],
         ..Applied::default()
     })
 }
 
-/// `bot` joins `group` as a reader of its journals.
-pub fn add_bot(tree: &mut Tree, group: &Slug, bot: &Slug, now: Stamp) -> Result<Applied> {
+/// `bot` joins `group` as a reader of the subtrees `reads` grants it.
+pub fn add_bot(
+    tree: &mut Tree,
+    group: &Slug,
+    bot: &Slug,
+    reads: &[Below],
+    now: Stamp,
+) -> Result<Applied> {
+    for r in reads {
+        r.at(group)?;
+    }
     let g = group_file(tree, group)?;
     if g.bot(bot).is_some() {
-        return Err(Error::refused(format!("bot {bot} reads @{group} already")));
+        return Err(Error::refused(format!("bot {bot} is in @{group} already")));
     }
     g.members.push(Member {
         who: Who::Bot(bot.clone()),
         role: Role::Reader,
         joined: now,
+        reads: reads.to_vec(),
     });
     g.check().map_err(Error::Invalid)?;
+    let granted: Vec<String> = reads.iter().map(Below::to_string).collect();
     Ok(Applied {
-        subject: format!("Add bot {bot} to @{group} as reader"),
-        owners: vec![Owner::Group(group.clone())],
+        subject: format!(
+            "Add bot {bot} to @{group}, reading {}",
+            if granted.is_empty() {
+                "nothing".to_string()
+            } else {
+                granted.join(", ")
+            }
+        ),
+        owners: vec![OwnerFile::Group(group.clone())],
         ..Applied::default()
     })
 }
 
+/// `who` out of `group`. A person's own journal there stays, with their
+/// lines, as everything they wrote does; they read the group no longer.
 pub fn remove_member(tree: &mut Tree, group: &Slug, who: &Who) -> Result<Applied> {
     let g = group_file(tree, group)?;
     let i = g
@@ -301,23 +418,17 @@ pub fn remove_member(tree: &mut Tree, group: &Slug, who: &Who) -> Result<Applied
         }
     }
     g.members.remove(i);
-    let mut owners = vec![Owner::Group(group.clone())];
+    let mut owners = vec![OwnerFile::Group(group.clone())];
     if let Who::Person(person) = who {
         if let Some(file) = person_file(tree, person)? {
             file.groups.retain(|x| x != group);
-            file.framed.retain(|x| x != group);
+            // Out of their default, they have none: any other group they are
+            // in may be one an owner added them to, and would put their
+            // writes where that owner chose.
             if file.default_group.as_ref() == Some(group) {
-                // A group they framed is one they chose to have in front of
-                // them, so it takes the default's place; failing that, none
-                // does. Any other group they are in may be one an owner added
-                // them to, and would put their writes where that owner chose.
-                file.default_group = file.framed.first().cloned();
-                if let Some(d) = &file.default_group {
-                    let d = d.clone();
-                    file.framed.retain(|x| x != &d);
-                }
+                file.default_group = None;
             }
-            owners.push(Owner::Person(person.clone()));
+            owners.push(OwnerFile::Person(person.clone()));
         }
     }
     Ok(Applied {
@@ -327,34 +438,20 @@ pub fn remove_member(tree: &mut Tree, group: &Slug, who: &Who) -> Result<Applied
     })
 }
 
-/// `person`'s choice of default group, when given, and of the others framed.
-pub fn choose_groups(
-    tree: &mut Tree,
-    person: &Slug,
-    default: Option<&Slug>,
-    framed: &[Slug],
-) -> Result<Applied> {
+/// `person`'s choice of the group their conversations open in.
+pub fn choose_default(tree: &mut Tree, person: &Slug, group: &Slug) -> Result<Applied> {
     let file = person_file(tree, person)?
         .ok_or_else(|| Error::not_found(format!("there is no person {person}")))?;
-    let before = (file.default_group.clone(), file.framed.clone());
-    if let Some(d) = default {
-        file.default_group = Some(d.clone());
-    }
-    file.framed = framed.to_vec();
-    file.check().map_err(Error::Invalid)?;
-    if (file.default_group.clone(), file.framed.clone()) == before {
+    if file.default_group.as_ref() == Some(group) {
         return Err(Error::refused(format!(
-            "{person}'s groups open as chosen already"
+            "{person}'s conversations open in @{group} already"
         )));
     }
-    let shown: Vec<String> = file
-        .framed_groups()
-        .iter()
-        .map(|g| format!("@{g}"))
-        .collect();
+    file.default_group = Some(group.clone());
+    file.check().map_err(Error::Invalid)?;
     Ok(Applied {
-        subject: format!("{person} opens with {}", shown.join(", ")),
-        owners: vec![Owner::Person(person.clone())],
+        subject: format!("{person}'s conversations open in @{group}"),
+        owners: vec![OwnerFile::Person(person.clone())],
         ..Applied::default()
     })
 }
@@ -383,7 +480,7 @@ pub fn bind(tree: &mut Tree, person: &Slug, email: &Email, key: &AccountKey) -> 
     account.key = Some(key.clone());
     Ok(Applied {
         subject: format!("Bind {email} to {person}"),
-        owners: vec![Owner::Person(person.clone())],
+        owners: vec![OwnerFile::Person(person.clone())],
         ..Applied::default()
     })
 }
@@ -391,15 +488,15 @@ pub fn bind(tree: &mut Tree, person: &Slug, email: &Email, key: &AccountKey) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{bot_may_read, may_read, viewer, Actor};
-    use crate::ops::fixture::{john, now, sharratt, stranger, yen};
-    use crate::ops::{apply, Op};
+    use crate::actor::{bot_may_read, home_group, may_read, Actor};
+    use crate::ops::fixture::{john, now, p, stranger, yen, zen};
+    use crate::ops::{apply, OnTaken, Op};
     use crate::testing::slug;
     use crate::tree::check::check;
 
     fn add(person: &str, name: Option<&str>, emails: &[&str], role: Role) -> Op {
         Op::AddMember {
-            group: slug("sharratt"),
+            group: slug("zen"),
             person: slug(person),
             name: name.map(Into::into),
             emails: emails.iter().map(|e| Email::parse(e).unwrap()).collect(),
@@ -409,8 +506,16 @@ mod tests {
 
     fn remove(person: &str) -> Op {
         Op::RemoveMember {
-            group: slug("sharratt"),
+            group: slug("zen"),
             who: Who::Person(slug(person)),
+        }
+    }
+
+    fn make(group: &str) -> Op {
+        Op::CreateGroup {
+            group: slug(group),
+            name: group.into(),
+            about: None,
         }
     }
 
@@ -428,7 +533,8 @@ mod tests {
         assert!(
             c.problems.is_empty()
                 && c.persons.values().all(|p| p.problems.is_empty())
-                && c.groups.values().all(|g| g.problems.is_empty()),
+                && c.groups.values().all(|g| g.problems.is_empty())
+                && c.journals().iter().all(|(_, j)| j.problems.is_empty()),
             "{:?} {:?}",
             c.problems,
             c.groups.values().map(|g| &g.problems).collect::<Vec<_>>()
@@ -436,45 +542,47 @@ mod tests {
     }
 
     #[test]
-    fn a_new_group_is_made_with_its_creator_as_owner() {
-        let mut t = sharratt();
+    fn a_new_group_is_made_with_its_creator_as_owner_and_their_journal() {
+        let mut t = zen();
         let op = Op::CreateGroup {
             group: slug("battle-cities"),
             name: "Battle Cities".into(),
-            kind: Kind::World,
+            about: Some("The game's world.".into()),
         };
         let a = apply(&mut t, &john(), &op, now()).unwrap();
-        assert_eq!(a.subject, "Create @battle-cities, a world");
+        assert_eq!(a.subject, "Create @battle-cities");
         assert_eq!(
             a.owners,
             vec![
-                Owner::Group(slug("battle-cities")),
-                Owner::Person(slug("john"))
+                OwnerFile::Group(slug("battle-cities")),
+                OwnerFile::Person(slug("john"))
             ]
         );
+        assert_eq!(a.touched, vec![p("@battle-cities/people/john")]);
         let g = t.group_file(&slug("battle-cities")).unwrap();
-        assert_eq!(g.kind, Kind::World);
+        assert_eq!(g.about.as_deref(), Some("The game's world."));
         assert_eq!(g.owners().collect::<Vec<_>>(), [&slug("john")]);
-        let p = t.person_file(&slug("john")).unwrap();
-        assert_eq!(p.groups, [slug("sharratt"), slug("battle-cities")]);
-        assert_eq!(p.default_group, Some(slug("sharratt")), "the default stays");
-        assert!(may_read(
-            &t,
-            &slug("john"),
-            &Owner::Group(slug("battle-cities"))
-        ));
+        let pf = t.person_file(&slug("john")).unwrap();
+        assert_eq!(
+            pf.groups,
+            [slug("zen"), slug("guest"), slug("battle-cities")]
+        );
+        assert_eq!(pf.default_group, Some(slug("zen")), "the default stays");
+        assert!(may_read(&t, &slug("john"), &p("@battle-cities")));
+        assert_eq!(
+            t.get(&p("@battle-cities/people/john"))
+                .unwrap()
+                .cue()
+                .as_deref(),
+            Some("open for john: who they are, what they want, what they are working on")
+        );
         clean(&t);
         assert_eq!(
             apply(&mut t, &yen(), &op, now()).unwrap_err().to_string(),
             "@battle-cities exists already: pick another name"
         );
         // A person in no group makes their first, and it is their default.
-        let mine = Op::CreateGroup {
-            group: slug("solo-team"),
-            name: "Solo".into(),
-            kind: Kind::Team,
-        };
-        apply(&mut t, &stranger(), &mine, now()).unwrap();
+        apply(&mut t, &stranger(), &make("solo-team"), now()).unwrap();
         assert_eq!(
             t.person_file(&slug("stranger")).unwrap().default_group,
             Some(slug("solo-team"))
@@ -483,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn a_new_person_is_made_and_joined_in_one_change() {
-        let mut t = sharratt();
+    fn a_new_person_is_made_joined_and_given_their_journal_in_one_change() {
+        let mut t = zen();
         let a = apply(
             &mut t,
             &john(),
@@ -497,20 +605,21 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(a.subject, "Add yen-nhi to @sharratt as member");
+        assert_eq!(a.subject, "Add yen-nhi to @zen as member");
         assert_eq!(
             a.owners,
             vec![
-                Owner::Group(slug("sharratt")),
-                Owner::Person(slug("yen-nhi"))
+                OwnerFile::Group(slug("zen")),
+                OwnerFile::Person(slug("yen-nhi"))
             ]
         );
-        let p = t.person_file(&slug("yen-nhi")).unwrap();
-        assert_eq!(p.groups, vec![slug("sharratt")]);
-        assert_eq!(p.default_group, Some(slug("sharratt")));
-        assert_eq!(p.accounts[0].email.as_str(), "yen.nhi@example.com");
+        assert_eq!(a.touched, vec![p("people/yen-nhi")]);
+        let pf = t.person_file(&slug("yen-nhi")).unwrap();
+        assert_eq!(pf.groups, vec![slug("zen")]);
+        assert_eq!(pf.default_group, Some(slug("zen")));
+        assert_eq!(pf.accounts[0].email.as_str(), "yen.nhi@example.com");
         assert_eq!(
-            t.group_file(&slug("sharratt"))
+            t.group_file(&slug("zen"))
                 .unwrap()
                 .member(&slug("yen-nhi"))
                 .unwrap()
@@ -518,16 +627,15 @@ mod tests {
             now()
         );
         assert_eq!(
-            t.persons[&slug("yen-nhi")].root.children.len(),
-            2,
-            "with their fixed sections"
+            t.get(&p("people/yen-nhi")).unwrap().cue().as_deref(),
+            Some("open for Yen Nhi: who they are, what they want, what they are working on")
         );
         clean(&t);
     }
 
     #[test]
     fn a_new_person_needs_a_name_and_free_emails() {
-        let mut t = sharratt();
+        let mut t = zen();
         assert_eq!(
             apply(&mut t, &john(), &add("x", None, &[], Role::Member), now())
                 .unwrap_err()
@@ -549,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_second_account_is_added_to_an_existing_person() {
-        let mut t = sharratt();
+        let mut t = zen();
         let a = apply(
             &mut t,
             &john(),
@@ -557,7 +665,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(a.subject, "yen in @sharratt");
+        assert_eq!(a.subject, "yen in @zen");
         assert_eq!(t.person_file(&slug("yen")).unwrap().accounts.len(), 2);
         assert_eq!(
             apply(
@@ -568,13 +676,13 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "yen is in @sharratt as owner already"
+            "yen is in @zen as owner already"
         );
     }
 
     #[test]
     fn roles_change_but_the_last_owner_stays() {
-        let mut t = sharratt();
+        let mut t = zen();
         let a = apply(
             &mut t,
             &john(),
@@ -582,7 +690,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(a.subject, "thanhlong is now @sharratt's owner");
+        assert_eq!(a.subject, "thanhlong is now @zen's owner");
         apply(&mut t, &john(), &add("yen", None, &[], Role::Member), now()).unwrap();
         apply(
             &mut t,
@@ -600,76 +708,86 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "john is @sharratt's last owner"
+            "john is @zen's last owner"
         );
         assert_eq!(
             apply(&mut t, &john(), &remove("john"), now())
                 .unwrap_err()
                 .to_string(),
-            "john is @sharratt's last owner"
+            "john is @zen's last owner"
         );
     }
 
-    /// **A removed member reads the group no longer**, and their default
-    /// moves to the next group they are in.
+    /// **A removed member reads the group no longer**, and leaving their
+    /// default leaves them none; their journal and lines stay.
     #[test]
     fn a_removed_member_reads_the_group_no_longer() {
-        let mut t = sharratt();
+        let mut t = zen();
         let a = apply(&mut t, &yen(), &remove("thanhlong"), now()).unwrap();
-        assert_eq!(a.subject, "Remove thanhlong from @sharratt");
-        let p = t.person_file(&slug("thanhlong")).unwrap();
-        assert!(p.groups.is_empty() && p.default_group.is_none());
-        assert!(!may_read(
-            &t,
-            &slug("thanhlong"),
-            &Owner::Group(slug("sharratt"))
-        ));
+        assert_eq!(a.subject, "Remove thanhlong from @zen");
+        let pf = t.person_file(&slug("thanhlong")).unwrap();
+        assert!(pf.groups.is_empty() && pf.default_group.is_none());
+        assert!(!may_read(&t, &slug("thanhlong"), &p("@zen")));
         assert_eq!(
             apply(&mut t, &yen(), &remove("thanhlong"), now())
                 .unwrap_err()
                 .to_string(),
-            "thanhlong is not in @sharratt"
+            "thanhlong is not in @zen"
         );
         clean(&t);
-        let mut t = sharratt();
-        for g in ["work", "club"] {
-            let op = Op::CreateGroup {
-                group: slug(g),
-                name: g.into(),
-                kind: Kind::Team,
-            };
-            apply(&mut t, &yen(), &op, now()).unwrap();
+    }
+
+    /// **A member always has their journal**: joining a full `people` folds
+    /// the idlest journal of someone who is not a member, never a member's.
+    #[test]
+    fn a_full_people_makes_room_for_a_new_member() {
+        let mut t = zen();
+        let people = p("people");
+        for i in 0.. {
+            let made = apply(
+                &mut t,
+                &john(),
+                &Op::Create {
+                    under: people.clone(),
+                    name: slug(&format!("friend{i}")),
+                    cue: "open for a friend".into(),
+                    on_taken: OnTaken::Refuse,
+                },
+                now().plus(i),
+            );
+            if made.is_err() {
+                break;
+            }
         }
-        t.persons
-            .get_mut(&slug("yen"))
-            .unwrap()
-            .file
-            .as_mut()
-            .unwrap()
-            .framed = vec![slug("club")];
-        apply(&mut t, &john(), &remove("yen"), now()).unwrap();
-        let p = t.person_file(&slug("yen")).unwrap();
-        assert_eq!(
-            p.default_group,
-            Some(slug("club")),
-            "the group they framed, before the first they joined"
-        );
-        assert!(p.framed.is_empty(), "the new default is framed by being it");
+        assert_eq!(t.get(&people).unwrap().live_count(), MAX_CHILDREN);
+        let a = apply(
+            &mut t,
+            &john(),
+            &Op::AddMember {
+                group: slug("zen"),
+                person: slug("newcomer"),
+                name: Some("Newcomer".into()),
+                emails: vec![],
+                role: Role::Member,
+            },
+            now().plus(100),
+        )
+        .unwrap();
+        assert_eq!(a.folded.len(), 1);
+        let gone = a.folded[0].last().unwrap().as_str().to_string();
+        assert!(gone.starts_with("friend"), "a non-member's: {gone}");
+        assert!(t.get(&p("people/newcomer")).is_some_and(|j| !j.is_folded()));
+        assert_eq!(t.get(&people).unwrap().live_count(), MAX_CHILDREN);
         clean(&t);
     }
 
     /// **An owner taken out of their default by another owner is left with
     /// no default**, never handed the group that owner left them in — Yen
-    /// adds John to a group of hers, then takes him out of @sharratt.
+    /// adds John to a group of hers, then takes him out of @zen.
     #[test]
     fn an_owner_cannot_steer_where_another_writes() {
-        let mut t = sharratt();
-        let evil = Op::CreateGroup {
-            group: slug("evil"),
-            name: "Evil".into(),
-            kind: Kind::Team,
-        };
-        apply(&mut t, &yen(), &evil, now()).unwrap();
+        let mut t = zen();
+        apply(&mut t, &yen(), &make("evil"), now()).unwrap();
         let add_john = Op::AddMember {
             group: slug("evil"),
             person: slug("john"),
@@ -680,88 +798,45 @@ mod tests {
         apply(&mut t, &yen(), &add_john, now()).unwrap();
         assert_eq!(
             t.person_file(&slug("john")).unwrap().default_group,
-            Some(slug("sharratt")),
+            Some(slug("zen")),
             "joining decides nothing about the default"
         );
         apply(&mut t, &yen(), &remove("john"), now()).unwrap();
-        let p = t.person_file(&slug("john")).unwrap();
-        assert_eq!(p.groups, [slug("evil")]);
-        assert_eq!(p.default_group, None);
-        assert_eq!(viewer(&t, &slug("john")).default_group, None);
+        let pf = t.person_file(&slug("john")).unwrap();
+        assert_eq!(pf.groups, [slug("guest"), slug("evil")]);
+        assert_eq!(pf.default_group, None);
+        assert_eq!(
+            home_group(&t, &slug("john")),
+            None,
+            "two groups, none chosen"
+        );
+        // Left in @evil alone, he is still not opened there.
+        let mut alone = t.clone();
+        let guest = alone.groups.get_mut(&slug("guest")).unwrap();
+        guest
+            .file
+            .as_mut()
+            .unwrap()
+            .members
+            .retain(|m| m.who != Who::Person(slug("john")));
+        assert_eq!(home_group(&alone, &slug("john")), None, "alone in @evil");
         clean(&t);
-        // Leaving on his own, the same: @evil is Yen's pick, not his.
-        let mut t = sharratt();
-        apply(&mut t, &yen(), &evil, now()).unwrap();
-        apply(&mut t, &yen(), &add_john, now()).unwrap();
-        let leave = Op::RemoveMember {
-            group: slug("sharratt"),
-            who: Who::Person(slug("john")),
-        };
-        apply(&mut t, &john(), &leave, now()).unwrap();
-        assert_eq!(t.person_file(&slug("john")).unwrap().default_group, None);
         // A group he makes himself is his own choice, and becomes it.
-        let mine = Op::CreateGroup {
-            group: slug("johns"),
-            name: "John's".into(),
-            kind: Kind::Team,
-        };
-        apply(&mut t, &john(), &mine, now()).unwrap();
+        apply(&mut t, &john(), &make("johns"), now()).unwrap();
         assert_eq!(
             t.person_file(&slug("john")).unwrap().default_group,
             Some(slug("johns"))
         );
         clean(&t);
-        // Framing three already, no default fits beside them: the group is
-        // made, and the default left for him to choose.
-        let f = t
-            .persons
-            .get_mut(&slug("john"))
-            .unwrap()
-            .file
-            .as_mut()
-            .unwrap();
-        f.framed = vec![slug("evil"), slug("johns")];
-        f.default_group = None;
-        for g in ["third", "fourth"] {
-            let op = Op::CreateGroup {
-                group: slug(g),
-                name: g.into(),
-                kind: Kind::Team,
-            };
-            apply(&mut t, &john(), &op, now()).unwrap();
-        }
-        let f = t
-            .persons
-            .get_mut(&slug("john"))
-            .unwrap()
-            .file
-            .as_mut()
-            .unwrap();
-        assert_eq!(f.default_group, Some(slug("third")));
-        f.default_group = None;
-        f.framed = vec![slug("evil"), slug("johns"), slug("third")];
-        let fifth = Op::CreateGroup {
-            group: slug("fifth"),
-            name: "fifth".into(),
-            kind: Kind::Team,
-        };
-        apply(&mut t, &john(), &fifth, now()).unwrap();
-        assert_eq!(t.person_file(&slug("john")).unwrap().default_group, None);
-        clean(&t);
     }
 
     /// **Whoever made a person before their first account chose nothing for
     /// them**: Stranger makes "mum" in a group of theirs; the admin listing
-    /// her account through @sharratt makes @sharratt her default.
+    /// her account through @zen makes @zen her default.
     #[test]
     fn a_first_account_starts_them_where_the_admin_lists_it() {
-        let mut t = sharratt();
-        let evil = Op::CreateGroup {
-            group: slug("evil"),
-            name: "Evil".into(),
-            kind: Kind::Team,
-        };
-        apply(&mut t, &stranger(), &evil, now()).unwrap();
+        let mut t = zen();
+        apply(&mut t, &stranger(), &make("evil"), now()).unwrap();
         let squat = Op::AddMember {
             group: slug("evil"),
             person: slug("mum"),
@@ -781,157 +856,102 @@ mod tests {
             now(),
         )
         .unwrap();
-        let p = t.person_file(&slug("mum")).unwrap();
-        assert_eq!(p.groups, [slug("evil"), slug("sharratt")]);
-        assert_eq!(p.default_group, Some(slug("sharratt")));
-        assert!(p.framed.is_empty());
+        let pf = t.person_file(&slug("mum")).unwrap();
+        assert_eq!(pf.groups, [slug("evil"), slug("zen")]);
+        assert_eq!(pf.default_group, Some(slug("zen")));
+        assert!(t.get(&p("people/mum")).is_some(), "her journal in @zen");
         clean(&t);
     }
 
-    /// **A person chooses their own default and framed groups**, within the
-    /// rules of person.yaml.
+    /// **A person chooses where their conversations open**, among their
+    /// groups.
     #[test]
-    fn a_person_chooses_which_groups_open_their_conversations() {
-        let mut t = sharratt();
-        for g in ["work", "club"] {
-            let op = Op::CreateGroup {
-                group: slug(g),
-                name: g.into(),
-                kind: Kind::Team,
-            };
-            apply(&mut t, &john(), &op, now()).unwrap();
-        }
-        let a = apply(
-            &mut t,
-            &john(),
-            &Op::ChooseGroups {
-                default: Some(slug("work")),
-                framed: vec![slug("sharratt")],
-            },
-            now(),
-        )
-        .unwrap();
-        assert_eq!(a.subject, "john opens with @work, @sharratt");
-        assert_eq!(a.owners, vec![Owner::Person(slug("john"))]);
-        let p = t.person_file(&slug("john")).unwrap();
-        assert_eq!(p.default_group, Some(slug("work")));
-        assert_eq!(p.framed, [slug("sharratt")]);
-        let keep = Op::ChooseGroups {
-            default: None,
-            framed: vec![],
-        };
+    fn a_person_chooses_their_default_group() {
+        let mut t = zen();
+        apply(&mut t, &john(), &make("work"), now()).unwrap();
+        let choose = |g: &str| Op::ChooseDefault { group: slug(g) };
+        let a = apply(&mut t, &john(), &choose("work"), now()).unwrap();
+        assert_eq!(a.subject, "john's conversations open in @work");
+        assert_eq!(a.owners, vec![OwnerFile::Person(slug("john"))]);
+        assert_eq!(home_group(&t, &slug("john")), Some(slug("work")));
         assert_eq!(
-            apply(&mut t, &john(), &keep, now()).unwrap().subject,
-            "john opens with @work"
-        );
-        assert_eq!(
-            apply(&mut t, &john(), &keep, now())
+            apply(&mut t, &john(), &choose("work"), now())
                 .unwrap_err()
                 .to_string(),
-            "john's groups open as chosen already"
+            "john's conversations open in @work already"
         );
         assert_eq!(
-            apply(
-                &mut t,
-                &john(),
-                &Op::ChooseGroups {
-                    default: Some(slug("nowhere")),
-                    framed: vec![],
-                },
-                now()
-            )
-            .unwrap_err()
-            .to_string(),
+            apply(&mut t, &john(), &choose("nowhere"), now())
+                .unwrap_err()
+                .to_string(),
             "`default_group` is nowhere, which is not one of their groups"
         );
         clean(&t);
     }
 
-    /// **A bot joins as a reader and leaves alone**: no person.yaml is
-    /// touched either way.
+    /// **A bot joins as a reader of what it is granted and leaves alone**:
+    /// no person.yaml is touched either way.
     #[test]
-    fn a_bot_joins_as_a_reader_and_leaves() {
-        let mut t = sharratt();
-        let a = apply(
-            &mut t,
-            &john(),
-            &Op::AddBot {
-                group: slug("sharratt"),
-                bot: slug("d00d"),
-            },
-            now(),
-        )
-        .unwrap();
-        assert_eq!(a.subject, "Add bot d00d to @sharratt as reader");
-        assert_eq!(a.owners, vec![Owner::Group(slug("sharratt"))]);
-        assert!(bot_may_read(
-            &t,
-            &slug("d00d"),
-            &Owner::Group(slug("sharratt"))
-        ));
+    fn a_bot_joins_as_a_reader_of_its_grants_and_leaves() {
+        let mut t = zen();
+        let add_bot = |reads: &[&str]| Op::AddBot {
+            group: slug("zen"),
+            bot: slug("d00d"),
+            reads: reads.iter().map(|r| Below::parse(r).unwrap()).collect(),
+        };
+        let a = apply(&mut t, &john(), &add_bot(&["topics/game"]), now()).unwrap();
+        assert_eq!(a.subject, "Add bot d00d to @zen, reading topics/game");
+        assert_eq!(a.owners, vec![OwnerFile::Group(slug("zen"))]);
+        assert!(bot_may_read(&t, &slug("d00d"), &p("topics/game/canon")));
+        assert!(!bot_may_read(&t, &slug("d00d"), &p("people")));
         assert_eq!(
-            apply(
-                &mut t,
-                &john(),
-                &Op::AddBot {
-                    group: slug("sharratt"),
-                    bot: slug("d00d"),
-                },
-                now()
-            )
-            .unwrap_err()
-            .to_string(),
-            "bot d00d reads @sharratt already"
+            apply(&mut t, &john(), &add_bot(&[]), now())
+                .unwrap_err()
+                .to_string(),
+            "bot d00d is in @zen already"
         );
         let gone = apply(
             &mut t,
             &john(),
             &Op::RemoveMember {
-                group: slug("sharratt"),
+                group: slug("zen"),
                 who: Who::Bot(slug("d00d")),
             },
             now(),
         )
         .unwrap();
-        assert_eq!(gone.subject, "Remove bot d00d from @sharratt");
-        assert_eq!(gone.owners, vec![Owner::Group(slug("sharratt"))]);
-        assert!(!bot_may_read(
-            &t,
-            &slug("d00d"),
-            &Owner::Group(slug("sharratt"))
-        ));
+        assert_eq!(gone.subject, "Remove bot d00d from @zen");
+        assert_eq!(gone.owners, vec![OwnerFile::Group(slug("zen"))]);
+        assert!(!bot_may_read(&t, &slug("d00d"), &p("topics/game")));
+        assert!(apply(&mut t, &john(), &add_bot(&["channels/grok"]), now())
+            .unwrap_err()
+            .to_string()
+            .contains("`channels` is not a section"));
         clean(&t);
     }
 
     #[test]
     fn an_eleventh_group_is_refused() {
-        let mut t = sharratt();
-        for i in 0..9 {
-            let op = Op::CreateGroup {
-                group: slug(&format!("g{i}")),
-                name: format!("G{i}"),
-                kind: Kind::Team,
-            };
-            apply(&mut t, &john(), &op, now()).unwrap();
+        let mut t = zen();
+        // John is in @zen and @guest already.
+        for i in 0..8 {
+            apply(&mut t, &john(), &make(&format!("g{i}")), now()).unwrap();
         }
-        let op = Op::CreateGroup {
-            group: slug("g9"),
-            name: "G9".into(),
-            kind: Kind::Team,
-        };
         assert_eq!(
-            apply(&mut t, &john(), &op, now()).unwrap_err().to_string(),
+            apply(&mut t, &john(), &make("g8"), now())
+                .unwrap_err()
+                .to_string(),
             "john belongs to 10 groups already: at most 10"
         );
         assert!(
-            !t.groups.contains_key(&slug("g9")),
+            !t.groups.contains_key(&slug("g8")),
             "a refusal makes nothing"
         );
     }
 
     #[test]
     fn an_account_binds_once_to_its_email() {
-        let mut t = sharratt();
+        let mut t = zen();
         let key = AccountKey::parse("154797f34c5a6ca6").unwrap();
         let email = Email::parse("john@example.com").unwrap();
         let op = Op::Bind {

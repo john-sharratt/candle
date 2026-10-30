@@ -11,9 +11,9 @@ pub const NAME: &str = "journal_accept";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Accept a note a Zen worker proposed for the user's memory — journal_read shows it as a \
-            `proposal` — once the user agrees it is true; `journal` is its address, `<path>#<line id>`. A \
-            proposal they reject is forgotten with journal_forget.",
+        "description": "Accept a note a Zen worker proposed for the group's memory — journal_read shows it as a \
+            `proposal` — once the person speaking agrees it is true; `journal` is its address, \
+            `<path>#<line id>`. A proposal they reject is forgotten with journal_forget.",
         "inputSchema": {
             "type": "object",
             "properties": {

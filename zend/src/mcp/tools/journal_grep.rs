@@ -9,6 +9,7 @@ use journals::view::grep::{grep, render};
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 
+use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
@@ -24,19 +25,20 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Search journals for a word or phrase (case-insensitive substring), to find something \
-            without paging through it. In the memory: `*` searches everything the user reads — their own \
-            journals and their groups', windows, archives and summaries, folded journals too; a path such as \
-            `~` or `@sharratt/topics` searches below it. Each hit names its journal and line; read it with \
-            `journal_read`. In Zen's work: a worker (`T:<thread>/<name>`), through the turns behind its \
-            entries, or behind one `entry`; every worker on a thread (`T:<thread>/*`), when you do not know \
-            which one learned it; a thread's own journal (`\"self\"` or `T:<thread>`); a project's standing \
-            rules (`P:<repository>`). Each hit names its journal, entry, turn and line; read around one with \
-            `journal_read` and the entry.",
+        "description": format!("Search journals for a word or phrase (case-insensitive substring; a hyphen \
+            matches a space), to find something without walking or paging to it. In the memory: `*` searches \
+            everything the caller reads — every journal's name and cue, and every line, archive and summary; \
+            a path such as `topics` or `people/yen` searches below it. Journals the phrase names come first, \
+            then lines, newest first; read one with `journal_read`. Use it when the cues do not say where \
+            something is, such as which conversation it came up in. {PATHS} In Zen's work: a worker \
+            (`T:<thread>/<name>`), through the turns behind its entries, or behind one `entry`; every worker \
+            on a thread (`T:<thread>/*`), when you do not know which one learned it; a thread's own journal \
+            (`\"self\"` or `T:<thread>`); a project's standing rules (`P:<repository>`). Each hit names its \
+            journal, entry, turn and line; read around one with `journal_read` and the entry."),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`*`, `~`, `@<group>` or a memory path; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
+                "journal": {"type": "string", "description": "`*`, `@<group>` or a memory path such as `topics`; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}
@@ -212,7 +214,7 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
             Err(e) => return Answer::error(e),
         },
     };
-    let (hits, total) = grep(&m.tree, &m.person, pattern, under.as_ref(), max);
+    let (hits, total) = grep(&m.tree, &m.actor(), pattern, under.as_ref(), max);
     if hits.is_empty() {
         return Answer::ok(render(&hits, total));
     }

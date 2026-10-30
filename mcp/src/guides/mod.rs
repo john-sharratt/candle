@@ -74,13 +74,27 @@ mod tests {
 
     /// **Grok is given its guide first**, and it is written on a budget: it
     /// rides the first call of every conversation
-    /// (`docs/mcp_user_context.md` §2.4).
+    /// (`docs/mcp_user_context.md` §2.4). Every other client is given the
+    /// memory's (`docs/memory_backbone.md` §6.9).
     #[test]
-    fn grok_has_its_own_short_guide() {
+    fn each_client_is_given_its_guide_to_the_memory() {
         let library = embedded().unwrap();
         let grok = library.for_client("grok").unwrap();
         assert_eq!(grok.name, "grok");
         assert!(grok.body.len() < 2_200, "{} bytes", grok.body.len());
-        assert!(library.for_client("claude-code").is_none());
+        for client in ["claude-code", "other"] {
+            assert_eq!(library.for_client(client).unwrap().name, "memory");
+        }
+        // Both say how a topic is added and who restructures the tree.
+        for guide in [grok, library.get("memory").unwrap()] {
+            for says in [
+                "journal_focus",
+                "journal_create",
+                "repo_task_start",
+                "`journals` checkout",
+            ] {
+                assert!(guide.body.contains(says), "{}: {says}", guide.name);
+            }
+        }
     }
 }

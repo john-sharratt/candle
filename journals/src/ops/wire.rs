@@ -3,18 +3,18 @@
 //! from them onto what origin holds (§6.3), and history reads as what each
 //! change meant, not only what it did to the files.
 //!
-//! Paths are written as folders — `groups/sharratt/topics/permits` — which
-//! name a journal whoever reads them.
+//! Paths are written as folders — `groups/zen/topics/permits` — which name a
+//! journal whoever reads them.
 
 use serde_json::{json, Map, Value};
 
 use crate::actor::Actor;
 use crate::error::{Error, Result};
 use crate::files::summary::{Cite, Fingerprint, Sentence};
-use crate::files::{AccountKey, Email, Kind, Role, Who};
+use crate::files::{AccountKey, Email, Role, Who};
 use crate::line::LineId;
 use crate::ops::{OnTaken, Op, Which};
-use crate::path::{Address, JournalPath, Owner};
+use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::scope::Channel;
 use crate::slug::Slug;
@@ -25,17 +25,14 @@ pub fn path_to_wire(p: &JournalPath) -> String {
 
 pub fn path_from_wire(s: &str) -> Result<JournalPath> {
     let mut parts = s.split('/');
-    let kind = parts.next().unwrap_or_default();
-    let slug = Slug::parse(parts.next().unwrap_or_default()).map_err(Error::Invalid)?;
-    let owner = match kind {
-        "persons" => Owner::Person(slug),
-        "groups" => Owner::Group(slug),
-        _ => return Err(Error::invalid(format!("`{s}` is not a journal's folder"))),
-    };
+    if parts.next() != Some("groups") {
+        return Err(Error::invalid(format!("`{s}` is not a journal's folder")));
+    }
+    let group = Slug::parse(parts.next().unwrap_or_default()).map_err(Error::Invalid)?;
     let names = parts
         .map(|n| Slug::parse(n).map_err(Error::Invalid))
         .collect::<Result<Vec<_>>>()?;
-    JournalPath::new(owner, names)
+    JournalPath::new(group, names)
 }
 
 pub fn actor_to_wire(a: &Actor) -> Value {
@@ -54,6 +51,7 @@ pub fn actor_to_wire(a: &Actor) -> Value {
         Actor::Worker { person } => json!({"kind": "worker", "person": person.as_str()}),
         Actor::Npcd { person } => json!({"kind": "npcd", "person": person.as_str()}),
         Actor::Bot { bot } => json!({"kind": "bot", "bot": bot.as_str()}),
+        Actor::Guest { channel } => json!({"kind": "guest", "channel": channel.name()}),
         Actor::System => json!({"kind": "system"}),
     }
 }
@@ -102,12 +100,25 @@ impl<'a> Obj<'a> {
             .collect()
     }
 
+    fn opt_strs(&self, k: &str) -> Result<Option<Vec<&'a str>>> {
+        match self.0.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(_) => self.strs(k).map(Some),
+        }
+    }
+
     fn path(&self, k: &str) -> Result<JournalPath> {
         path_from_wire(self.str(k)?)
     }
 
     fn slug(&self, k: &str) -> Result<Slug> {
         Slug::parse(self.str(k)?).map_err(Error::Invalid)
+    }
+
+    fn opt_slug(&self, k: &str) -> Result<Option<Slug>> {
+        self.opt_str(k)?
+            .map(|s| Slug::parse(s).map_err(Error::Invalid))
+            .transpose()
     }
 
     fn id(&self, k: &str) -> Result<LineId> {
@@ -142,6 +153,9 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
         "bot" => Actor::Bot {
             bot: o.slug("bot")?,
         },
+        "guest" => Actor::Guest {
+            channel: o.channel()?,
+        },
         "system" => Actor::System,
         k => return Err(Error::invalid(format!("`{k}` is not an actor"))),
     })
@@ -149,9 +163,18 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
 
 pub fn op_to_wire(op: &Op) -> Value {
     let p = path_to_wire;
+    let slug = |s: &Option<Slug>| s.as_ref().map(Slug::as_str).map(str::to_string);
     match op {
-        Op::Note { path, text } => json!({"op": "note", "path": p(path), "text": text}),
-        Op::Episode { path, text } => json!({"op": "episode", "path": p(path), "text": text}),
+        Op::Note {
+            path,
+            text,
+            speaker,
+        } => json!({"op": "note", "path": p(path), "text": text, "speaker": slug(speaker)}),
+        Op::Episode {
+            path,
+            text,
+            speaker,
+        } => json!({"op": "episode", "path": p(path), "text": text, "speaker": slug(speaker)}),
         Op::Edit { address, text } => {
             json!({"op": "edit", "path": p(&address.path), "id": address.id.as_str(), "text": text})
         }
@@ -175,10 +198,23 @@ pub fn op_to_wire(op: &Op) -> Value {
             "op": "create", "under": p(under), "name": name.as_str(), "cue": cue,
             "on_taken": match on_taken { OnTaken::Number => "number", OnTaken::Refuse => "refuse" },
         }),
+        Op::Link {
+            under,
+            name,
+            to,
+            cue,
+        } => {
+            json!({"op": "link", "under": p(under), "name": name.as_str(), "to": p(to), "cue": cue})
+        }
+        Op::Focus {
+            path,
+            speaker,
+            about,
+        } => json!({
+            "op": "focus", "path": p(path), "speaker": slug(speaker),
+            "about": about.as_ref().map(|a| a.iter().map(p).collect::<Vec<_>>()),
+        }),
         Op::Close { path } => json!({"op": "close", "path": p(path)}),
-        Op::Fold { path } => json!({"op": "fold", "path": p(path)}),
-        Op::Unfold { path } => json!({"op": "unfold", "path": p(path)}),
-        Op::Merge { from, into } => json!({"op": "merge", "from": p(from), "into": p(into)}),
         Op::Summarize {
             path,
             over,
@@ -193,7 +229,7 @@ pub fn op_to_wire(op: &Op) -> Value {
             })).collect::<Vec<_>>(),
             "digest": digest, "cue": cue,
         }),
-        Op::MarkStale { path } => json!({"op": "mark_stale", "path": p(path)}),
+        Op::MarkStale { path, why } => json!({"op": "mark_stale", "path": p(path), "why": why}),
         Op::FoldPeriod {
             path,
             period,
@@ -205,11 +241,8 @@ pub fn op_to_wire(op: &Op) -> Value {
             "ids": ids.iter().map(LineId::as_str).collect::<Vec<_>>(), "over": over.as_str(),
             "text": text,
         }),
-        Op::Share { from, into, name } => {
-            json!({"op": "share", "from": p(from), "into": p(into), "name": name.as_ref().map(Slug::as_str)})
-        }
-        Op::CreateGroup { group, name, kind } => {
-            json!({"op": "create_group", "group": group.as_str(), "name": name, "kind": kind.name()})
+        Op::CreateGroup { group, name, about } => {
+            json!({"op": "create_group", "group": group.as_str(), "name": name, "about": about})
         }
         Op::DescribeGroup { group, about } => {
             json!({"op": "describe_group", "group": group.as_str(), "about": about})
@@ -224,13 +257,11 @@ pub fn op_to_wire(op: &Op) -> Value {
             "op": "add_member", "group": group.as_str(), "person": person.as_str(), "name": name,
             "emails": emails.iter().map(Email::as_str).collect::<Vec<_>>(), "role": role.name(),
         }),
-        Op::ChooseGroups { default, framed } => json!({
-            "op": "choose_groups", "default": default.as_ref().map(Slug::as_str),
-            "framed": framed.iter().map(Slug::as_str).collect::<Vec<_>>(),
+        Op::ChooseDefault { group } => json!({"op": "choose_default", "group": group.as_str()}),
+        Op::AddBot { group, bot, reads } => json!({
+            "op": "add_bot", "group": group.as_str(), "bot": bot.as_str(),
+            "reads": reads.iter().map(Below::to_string).collect::<Vec<_>>(),
         }),
-        Op::AddBot { group, bot } => {
-            json!({"op": "add_bot", "group": group.as_str(), "bot": bot.as_str()})
-        }
         Op::RemoveMember {
             group,
             who: Who::Person(person),
@@ -260,10 +291,12 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
         "note" => Op::Note {
             path: o.path("path")?,
             text: text()?,
+            speaker: o.opt_slug("speaker")?,
         },
         "episode" => Op::Episode {
             path: o.path("path")?,
             text: text()?,
+            speaker: o.opt_slug("speaker")?,
         },
         "edit" => Op::Edit {
             address: address()?,
@@ -289,18 +322,26 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
                 t => return Err(Error::invalid(format!("`{t}` is not number or refuse"))),
             },
         },
+        "link" => Op::Link {
+            under: o.path("under")?,
+            name: o.slug("name")?,
+            to: o.path("to")?,
+            cue: o.str("cue")?.into(),
+        },
+        "focus" => Op::Focus {
+            path: o.path("path")?,
+            speaker: o.opt_slug("speaker")?,
+            about: o
+                .opt_strs("about")?
+                .map(|a| {
+                    a.into_iter()
+                        .map(path_from_wire)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?,
+        },
         "close" => Op::Close {
             path: o.path("path")?,
-        },
-        "fold" => Op::Fold {
-            path: o.path("path")?,
-        },
-        "unfold" => Op::Unfold {
-            path: o.path("path")?,
-        },
-        "merge" => Op::Merge {
-            from: o.path("from")?,
-            into: o.path("into")?,
         },
         "summarize" => {
             let sentences =
@@ -330,6 +371,7 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
         }
         "mark_stale" => Op::MarkStale {
             path: o.path("path")?,
+            why: o.str("why")?.into(),
         },
         "fold_period" => Op::FoldPeriod {
             path: o.path("path")?,
@@ -342,18 +384,10 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             over: Fingerprint::parse(o.str("over")?).map_err(Error::Invalid)?,
             text: text()?,
         },
-        "share" => Op::Share {
-            from: o.path("from")?,
-            into: o.path("into")?,
-            name: o
-                .opt_str("name")?
-                .map(|n| Slug::parse(n).map_err(Error::Invalid))
-                .transpose()?,
-        },
         "create_group" => Op::CreateGroup {
             group: o.slug("group")?,
             name: o.str("name")?.into(),
-            kind: Kind::parse(o.str("kind")?).map_err(Error::Invalid)?,
+            about: o.opt_str("about")?.map(Into::into),
         },
         "describe_group" => Op::DescribeGroup {
             group: o.slug("group")?,
@@ -370,20 +404,17 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
                 .collect::<Result<_>>()?,
             role: Role::parse(o.str("role")?).map_err(Error::Invalid)?,
         },
-        "choose_groups" => Op::ChooseGroups {
-            default: o
-                .opt_str("default")?
-                .map(|d| Slug::parse(d).map_err(Error::Invalid))
-                .transpose()?,
-            framed: o
-                .strs("framed")?
-                .into_iter()
-                .map(|g| Slug::parse(g).map_err(Error::Invalid))
-                .collect::<Result<_>>()?,
+        "choose_default" => Op::ChooseDefault {
+            group: o.slug("group")?,
         },
         "add_bot" => Op::AddBot {
             group: o.slug("group")?,
             bot: o.slug("bot")?,
+            reads: o
+                .strs("reads")?
+                .into_iter()
+                .map(|r| Below::parse(r).map_err(Error::Invalid))
+                .collect::<Result<_>>()?,
         },
         "remove_member" => Op::RemoveMember {
             group: o.slug("group")?,
@@ -417,12 +448,19 @@ mod tests {
         let id = LineId::parse("2026-10-30-0912-7e3a").unwrap();
         let ops = vec![
             Op::Note {
-                path: p("~"),
+                path: p("people/yen"),
                 text: "a \"quoted\"\nline".into(),
+                speaker: Some(slug("yen")),
+            },
+            Op::Note {
+                path: p("@zen"),
+                text: "x".into(),
+                speaker: None,
             },
             Op::Episode {
-                path: p("~/channels/grok"),
+                path: p("conversations/2026-10-31-0712-grok"),
                 text: "x".into(),
+                speaker: None,
             },
             Op::Edit {
                 address: Address {
@@ -441,7 +479,7 @@ mod tests {
             },
             Op::Accept {
                 address: Address {
-                    path: p("projects"),
+                    path: p("topics"),
                     id: id.clone(),
                 },
             },
@@ -452,63 +490,67 @@ mod tests {
                 on_taken: OnTaken::Refuse,
             },
             Op::Create {
-                under: p("~/channels/grok"),
-                name: slug("c.2"),
+                under: p("conversations"),
+                name: slug("2026-10-31-0712-grok.2"),
                 cue: "c".into(),
                 on_taken: OnTaken::Number,
+            },
+            Op::Link {
+                under: p("topics/candle"),
+                name: slug("wasmer"),
+                to: p("topics/wasmer"),
+                cue: "c".into(),
+            },
+            Op::Focus {
+                path: p("conversations/c"),
+                speaker: Some(slug("yen")),
+                about: None,
+            },
+            Op::Focus {
+                path: p("conversations/c"),
+                speaker: None,
+                about: Some(vec![p("topics/candle"), p("people/yen")]),
             },
             Op::Close {
                 path: p("threads/t"),
             },
-            Op::Fold {
-                path: p("topics/trip"),
-            },
-            Op::Unfold {
-                path: p("topics/trip"),
-            },
-            Op::Merge {
-                from: p("topics/a"),
-                into: p("topics/b"),
-            },
             Op::Summarize {
-                path: p("~"),
+                path: p("@zen"),
                 over: Fingerprint::of_bytes(b"x"),
                 sentences: vec![Sentence {
                     text: "S.".into(),
-                    cites: vec![Cite::Line(id.clone()), Cite::Child(slug("channels"))],
+                    cites: vec![Cite::Line(id.clone()), Cite::Child(slug("topics"))],
                 }],
                 digest: Some("d".into()),
                 cue: None,
             },
-            Op::MarkStale { path: p("~") },
+            Op::MarkStale {
+                path: p("@zen"),
+                why: "over its cap: \"x\"\nthen".into(),
+            },
             Op::FoldPeriod {
-                path: p("~"),
+                path: p("@zen"),
                 period: Period::parse("2026-W44").unwrap(),
                 ids: vec![id.clone()],
                 over: Fingerprint::of_bytes(b"w"),
                 text: "w".into(),
             },
-            Op::Share {
-                from: p("~/people/x"),
-                into: p("topics"),
-                name: None,
-            },
-            Op::Share {
-                from: p("~/people/x"),
-                into: p("topics"),
-                name: Some(slug("y")),
-            },
             Op::CreateGroup {
                 group: slug("battle-cities"),
                 name: "Battle Cities".into(),
-                kind: Kind::World,
+                about: Some("The game's world.".into()),
+            },
+            Op::CreateGroup {
+                group: slug("x"),
+                name: "X".into(),
+                about: None,
             },
             Op::DescribeGroup {
                 group: slug("battle-cities"),
                 about: "The game's world.".into(),
             },
             Op::AddMember {
-                group: slug("sharratt"),
+                group: slug("zen"),
                 person: slug("yen"),
                 name: Some("Yen".into()),
                 emails: vec![Email::parse("yen@example.com").unwrap()],
@@ -517,17 +559,13 @@ mod tests {
             Op::AddBot {
                 group: slug("battle-cities"),
                 bot: slug("c3f1a07e"),
+                reads: vec![Below::parse("topics/canon").unwrap()],
             },
-            Op::ChooseGroups {
-                default: Some(slug("battle-cities")),
-                framed: vec![slug("sharratt")],
-            },
-            Op::ChooseGroups {
-                default: None,
-                framed: vec![],
+            Op::ChooseDefault {
+                group: slug("battle-cities"),
             },
             Op::RemoveMember {
-                group: slug("sharratt"),
+                group: slug("zen"),
                 who: Who::Person(slug("yen")),
             },
             Op::RemoveMember {
@@ -564,7 +602,7 @@ mod tests {
             },
             Actor::Server {
                 person: slug("john"),
-                channel: Channel::ClaudeCode,
+                channel: Channel::Other,
             },
             Actor::Zend,
             Actor::Worker {
@@ -575,6 +613,9 @@ mod tests {
             },
             Actor::Bot {
                 bot: slug("c3f1a07e"),
+            },
+            Actor::Guest {
+                channel: Channel::Other,
             },
             Actor::System,
         ] {
@@ -588,11 +629,17 @@ mod tests {
             json!(1),
             json!({"op": "teleport"}),
             json!({"op": "note", "path": "elsewhere/x", "text": "t"}),
-            json!({"op": "note", "path": "persons/john/projects", "text": "t"}),
-            json!({"op": "note", "path": "persons/john"}),
-            json!({"op": "create", "under": "groups/sharratt/topics", "name": "x", "cue": "c", "on_taken": "maybe"}),
-            json!({"op": "note", "path": "families/sharratt/topics", "text": "t"}),
-            json!({"op": "create_group", "group": "g", "name": "G", "kind": "clan"}),
+            json!({"op": "note", "path": "persons/john", "text": "t"}),
+            json!({"op": "note", "path": "groups/zen/projects", "text": "t"}),
+            json!({"op": "note", "path": "groups/zen"}),
+            json!({"op": "create", "under": "groups/zen/topics", "name": "x", "cue": "c", "on_taken": "maybe"}),
+            json!({"op": "fold", "path": "groups/zen/topics/x"}),
+            json!({"op": "merge", "from": "groups/zen/topics/a", "into": "groups/zen/topics/b"}),
+            json!({"op": "share", "from": "groups/zen/topics/a", "into": "groups/zen/topics/b"}),
+            json!({"op": "choose_groups", "framed": []}),
+            json!({"op": "mark_stale", "path": "groups/zen"}),
+            json!({"op": "add_bot", "group": "g", "bot": "b1"}),
+            json!({"op": "focus", "path": "groups/zen/conversations/c", "about": ["topics/x"]}),
             json!({"op": "remove_member", "group": "g", "person": "yen", "bot": "b1"}),
             json!({"op": "remove_member", "group": "g"}),
         ] {
@@ -608,9 +655,6 @@ mod tests {
                 .to_string(),
             "`admin` is missing or not true or false"
         );
-        assert_eq!(
-            path_from_wire("groups/sharratt").unwrap().show(),
-            "@sharratt"
-        );
+        assert_eq!(path_from_wire("groups/zen").unwrap().show(), "@zen");
     }
 }

@@ -68,14 +68,14 @@ pub fn forget(tree: &mut Tree, path: &JournalPath, which: &Which) -> Result<Appl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::period::Period;
     use crate::testing::note;
 
     fn seeded() -> (Tree, JournalPath) {
-        let mut t = sharratt();
-        let path = p("~");
+        let mut t = zen();
+        let path = p("people");
         for text in [
             "Prefers tea.",
             "Drives a Model Y.",
@@ -87,6 +87,7 @@ mod tests {
                 &Op::Note {
                     path: path.clone(),
                     text: text.into(),
+                    speaker: None,
                 },
                 now(),
             )
@@ -116,7 +117,7 @@ mod tests {
             .map(|l| l.text.as_str())
             .collect();
         assert_eq!(left, ["Prefers tea.", "Prefers short answers."]);
-        assert!(a.subject.starts_with("Forget ~#"));
+        assert!(a.subject.starts_with("Forget @zen/people#"));
     }
 
     #[test]
@@ -134,7 +135,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.starts_with("2 lines of ~ say “prefers” — name one: #"),
+            msg.starts_with("2 lines of @zen/people say “prefers” — name one: #"),
             "{msg}"
         );
         assert!(
@@ -170,8 +171,8 @@ mod tests {
 
     #[test]
     fn forgetting_an_archives_last_line_removes_the_archive() {
-        let mut t = sharratt();
-        let path = p("~");
+        let mut t = zen();
+        let path = p("people");
         let old = note("2026-09-01T10:00:00Z", "old");
         let period = Period::parse("2026-09-01").unwrap();
         t.get_mut(&path)

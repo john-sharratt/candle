@@ -3,9 +3,9 @@
 //!
 //! `journal` is `"self"` — the attached thread — or a path: a thread's journal
 //! is the entries the server wrote as Claude delegated (§4); a worker's is the
-//! journal its own conversation kept. A memory path — `~/…`, `@group/…` —
-//! opens one of the memory's journals (`docs/memory_backbone.md` §6.5), or
-//! with `#<line id>` reads one line of it.
+//! journal its own conversation kept. A memory path — `@group/…`, a section,
+//! `here` — opens one of the memory's journals (`docs/memory_backbone.md`
+//! §6.5), or with `#<line id>` reads one line of it.
 
 use journals::time::Stamp;
 use journals::tree::WINDOW;
@@ -15,6 +15,7 @@ use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 use zend_tools::tools::journal::address;
 
+use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
 use crate::mcp::names::Path;
@@ -30,22 +31,22 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Read a journal. The memory's: `~` is the user's own — who they are, and an index of \
-            their conversations and the people in their life; `@<group>` one of their groups' — their \
-            family's, a team's, a game world's: projects, topics, threads and bots every member shares; any \
-            journal below either by path, such as `~/channels/grok` or `@sharratt/topics/house-build`. Each opens with its summary, its sub-journals \
-            and its newest lines; `<path>#<line id>` reads one line. Read the memory when the user asks what \
-            you remember. Zen's: `\"self\"` or `T:<thread>` for a thread (every task started on it, how each \
-            ended, and the notes on it); `T:<thread>/<name>` for a worker (the entries it wrote about its \
-            work); `P:<repository>` for a project (its standing rules). With `entry`, or an address such as \
-            `T:<thread>/<name>#12`, it reads one entry instead: a thread's or project's note, or — for a \
-            worker — the turns behind that entry, `limit` lines from `offset`, which are the evidence for \
-            what it claims. Read the entry first and its turns only where a claim needs checking. Re-read the \
-            thread's journal after your context is compacted.",
+        "description": format!("Read a journal. The memory's: `@<group>` is the master — what the group is, \
+            who is in it, the few things that last; below it `people/<person>` (each member, Zen among them), \
+            `topics/<topic>` (projects and subjects, broken down into sub-topics), `conversations/<began>-<channel>` \
+            and `here`, this conversation. Each opens with its summary, its references, its sub-journals by cue \
+            and its newest lines; walk down by cue to the journal a question is about, and read one line \
+            with `<path>#<line id>`. {PATHS} Zen's: `\"self\"` or `T:<thread>` for a thread (every task started \
+            on it, how each ended, and the notes on it); `T:<thread>/<name>` for a worker (the entries it \
+            wrote about its work); `P:<repository>` for a project (its standing rules). With `entry`, or an \
+            address such as `T:<thread>/<name>#12`, it reads one entry instead: a thread's or project's note, \
+            or — for a worker — the turns behind that entry, `limit` lines from `offset`, which are the \
+            evidence for what it claims. Read the entry first and its turns only where a claim needs \
+            checking. Re-read the thread's journal after your context is compacted."),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`~`, `@<group>`, a memory path or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
+                "journal": {"type": "string", "description": "`@<group>`, a memory path such as `topics/candle` or `here`, or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
                 "offset": {"type": "integer", "minimum": 1, "description": "The first line of a worker entry's page (1 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."}

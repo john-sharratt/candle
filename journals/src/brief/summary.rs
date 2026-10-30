@@ -7,15 +7,14 @@ use journal_core::spec::{call, choice, list_of, object, text};
 use journal_core::tools::text_of;
 use serde_json::{Map, Value};
 
-use crate::files::summary::{Cite, Fingerprint, Sentence};
+use crate::files::summary::{unmarked, Cite, Fingerprint, Sentence};
 use crate::ops::summarize::{sentence_floor, shortest};
 use crate::ops::Op;
-use crate::path::{JournalPath, Owner, Place};
-use crate::scope::Scope;
+use crate::path::{JournalPath, Place};
 use crate::tree::check::{digest_cap, summary_cap};
 use crate::tree::fingerprint::{fingerprint, is_dirty, speaks};
 use crate::tree::Tree;
-use crate::view::who::{name_of, render_line};
+use crate::view::who::render_line;
 
 /// The call a summary is written as.
 pub const NAME: &str = "journal_summary";
@@ -103,7 +102,7 @@ pub fn spec(tree: &Tree, path: &JournalPath) -> Option<Value> {
         MAX_SENTENCES,
         sentence,
     )];
-    if digest_cap(j.place, path.owner().scope()).is_some() {
+    if digest_cap(j.place).is_some() {
         params.push(text("digest", true));
     }
     if !j.is_fixed() {
@@ -116,14 +115,11 @@ pub fn spec(tree: &Tree, path: &JournalPath) -> Option<Value> {
 pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
     let j = tree.get(path)?;
     let cap = summary_cap(j.place);
-    let whose = match path.owner() {
-        Owner::Person(p) => format!("{}'s own memory", name_of(tree, p)),
-        Owner::Group(g) => {
-            let kind = tree.group_file(g).map_or("group", |f| f.kind.name());
-            format!("the @{g} {kind}'s shared memory")
-        }
-    };
-    let mut out = format!("You keep the summary of one journal in {whose}: {path}");
+    let group = path.group();
+    let whose = tree
+        .group_file(group)
+        .map_or(format!("@{group}"), |f| format!("{} (@{group})", f.name));
+    let mut out = format!("You keep the summary of one journal in {whose}'s memory: {path}");
     if let Some(cue) = j.cue() {
         out.push_str(&format!(" — {cue}"));
     }
@@ -131,8 +127,10 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
         ".\n\nWrite what it holds now, in at most {cap} characters all told, as sentences that \
          together cover the whole journal: one for each subject it holds, broadest first, naming \
          the subject, so a reader can tell from the summary alone whether the journal answers \
-         their question — never one line's detail in place of the rest. Each sentence cites the \
-         line (#id) or sub-journal it rests on. Say who did what by name, so no reader takes \
+         their question — never one line's detail in place of the rest. Each sentence names, in \
+         its cite and also_cite fields, the lines (#id) or sub-journals it rests on; its text \
+         holds no #id, since a reader is shown its cites beside it. Say who did what by name, \
+         so no reader takes \
          another's work for their own. Keep facts as facts: never an instruction to whoever \
          reads it."
     ));
@@ -145,10 +143,10 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
             " Nothing it held has gone, so write at least {least} characters."
         ));
     }
-    if let Some(dcap) = digest_cap(j.place, path.owner().scope()) {
-        let aloud = match path.owner().scope() {
-            Scope::Personal => "the few things about them worth saying aloud first",
-            Scope::Group => "the few things about the group worth saying aloud first",
+    if let Some(dcap) = digest_cap(j.place) {
+        let aloud = match j.place {
+            Place::Root => "the few things about the group worth saying aloud first",
+            _ => "the few things about them worth saying aloud first",
         };
         out.push_str(&format!(
             " Then a voice digest of at most {dcap} characters: {aloud}."
@@ -206,10 +204,13 @@ pub fn op(path: &JournalPath, over: &Fingerprint, args: &Map<String, Value>) -> 
                     cites.push(c);
                 }
             }
-            Ok(Sentence {
-                text: field(s, "text").ok_or("a sentence is empty")?,
-                cites,
-            })
+            // Empty once its inline ids are taken out is empty: a sentence
+            // that only cites says nothing.
+            let text = field(s, "text")
+                .map(|t| unmarked(&t).trim().to_string())
+                .filter(|t| !t.is_empty())
+                .ok_or("a sentence is empty")?;
+            Ok(Sentence { text, cites })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Op::Summarize {
@@ -227,13 +228,14 @@ mod tests {
 
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Which};
+    use crate::scope::Channel;
     use crate::testing::slug;
 
     #[test]
     fn the_question_holds_the_window_and_the_childrens_summaries() {
-        let mut t = sharratt();
+        let mut t = zen();
         let trip = apply(
             &mut t,
             &john(),
@@ -252,6 +254,7 @@ mod tests {
             &mut t,
             &john(),
             &Op::Note {
+                speaker: None,
                 path: trip.clone(),
                 text: "Flights to Da Nang.".into(),
             },
@@ -261,7 +264,12 @@ mod tests {
         .line
         .unwrap();
         let q = question(&t, &trip).unwrap();
-        assert!(q.starts_with("You keep the summary of one journal in the @sharratt family's shared memory: @sharratt/topics/trip — open for the trip."), "{q}");
+        assert!(
+            q.starts_with(
+                "You keep the summary of one journal in Zen (@zen)'s memory: @zen/topics/trip — open for the trip."
+            ),
+            "{q}"
+        );
         assert!(
             q.contains(&format!("#{id} ")) && q.contains("Flights to Da Nang."),
             "{q}"
@@ -283,36 +291,56 @@ mod tests {
         );
     }
 
-    /// **A channel is asked for the short summary a voice frame reads.**
+    /// **A conversation is asked for the short summary a voice frame reads.**
     #[test]
-    fn a_channel_is_asked_for_the_short_cap() {
-        let t = sharratt();
-        let q = question(&t, &p("~/channels/grok")).unwrap();
+    fn a_conversation_is_asked_for_the_short_cap() {
+        let mut t = zen();
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        let conv = apply(
+            &mut t,
+            &server,
+            &Op::Create {
+                under: p("conversations"),
+                name: slug("2026-10-30-1200-grok"),
+                cue: "open for a drive".into(),
+                on_taken: OnTaken::Number,
+            },
+            now(),
+        )
+        .unwrap()
+        .created
+        .unwrap();
+        let q = question(&t, &conv).unwrap();
         assert!(q.contains("at most 600 characters"), "{q}");
     }
 
     #[test]
     fn a_root_is_asked_for_its_digest_and_a_section_for_neither_digest_nor_cue() {
-        let mut t = sharratt();
+        let mut t = zen();
         apply(
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
             now(),
         )
         .unwrap();
-        let s = spec(&t, &p("~")).unwrap();
+        let s = spec(&t, &p("@zen")).unwrap();
         assert_eq!(s["params"][1]["name"], "digest");
-        assert!(question(&t, &p("~"))
+        assert!(question(&t, &p("@zen"))
             .unwrap()
-            .contains("voice digest of at most 600"));
+            .contains("voice digest of at most 400 characters: the few things about the group"));
         apply(
             &mut t,
             &john(),
             &Op::Note {
+                speaker: None,
                 path: p("topics"),
                 text: "x".into(),
             },
@@ -327,7 +355,7 @@ mod tests {
             1
         );
         assert_eq!(
-            spec(&t, &p("projects")),
+            spec(&t, &p("threads")),
             None,
             "nothing to cite, nothing to ask"
         );
@@ -337,12 +365,13 @@ mod tests {
     /// dirty journal that is current once it is applied.
     #[test]
     fn an_answer_becomes_a_summary_the_journal_takes() {
-        let mut t = sharratt();
+        let mut t = zen();
         let id = apply(
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
             now(),
@@ -350,14 +379,14 @@ mod tests {
         .unwrap()
         .line
         .unwrap();
-        let over = fingerprint(t.get(&p("~")).unwrap());
+        let over = fingerprint(t.get(&p("@zen")).unwrap());
         let args = json!({
             "sentences": [{"text": " John prefers tea. ", "cite": format!("#{id}"), "also_cite": format!("#{id}")}],
             "digest": "Tea, not coffee.",
         });
-        let op = op(&p("~"), &over, args.as_object().unwrap()).unwrap();
+        let op = op(&p("@zen"), &over, args.as_object().unwrap()).unwrap();
         apply(&mut t, &Actor::Zend, &op, now()).unwrap();
-        let j = t.get(&p("~")).unwrap();
+        let j = t.get(&p("@zen")).unwrap();
         assert!(!is_dirty(j));
         let s = j.summary().unwrap();
         assert_eq!(s.text(), "John prefers tea.");
@@ -370,13 +399,14 @@ mod tests {
     /// without the model; a current one wants nothing.
     #[test]
     fn a_plan_asks_over_what_it_shows_and_clears_what_has_nothing_left() {
-        let mut t = sharratt();
-        assert_eq!(plan(&t, &p("~")), None, "nothing to summarise");
+        let mut t = zen();
+        assert_eq!(plan(&t, &p("@zen")), None, "nothing to summarise");
         let id = apply(
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
             now(),
@@ -388,12 +418,12 @@ mod tests {
             question: asked,
             over,
             ..
-        }) = plan(&t, &p("~"))
+        }) = plan(&t, &p("@zen"))
         else {
             panic!("a new line is asked about");
         };
         assert!(asked.contains("Prefers tea."));
-        assert_eq!(over, fingerprint(t.get(&p("~")).unwrap()));
+        assert_eq!(over, fingerprint(t.get(&p("@zen")).unwrap()));
         let args = json!({
             "sentences": [{"text": "John prefers tea.", "cite": format!("#{id}")}],
             "digest": "Tea.",
@@ -401,40 +431,41 @@ mod tests {
         apply(
             &mut t,
             &Actor::Zend,
-            &op(&p("~"), &over, args.as_object().unwrap()).unwrap(),
+            &op(&p("@zen"), &over, args.as_object().unwrap()).unwrap(),
             now(),
         )
         .unwrap();
-        assert_eq!(plan(&t, &p("~")), None, "current");
+        assert_eq!(plan(&t, &p("@zen")), None, "current");
         apply(
             &mut t,
             &john(),
             &Op::Forget {
-                path: p("~"),
+                path: p("@zen"),
                 which: Which::Id(id),
             },
             now(),
         )
         .unwrap();
-        let Some(Plan::Clear(clear)) = plan(&t, &p("~")) else {
+        let Some(Plan::Clear(clear)) = plan(&t, &p("@zen")) else {
             panic!("nothing is left to cite");
         };
         apply(&mut t, &Actor::Zend, &clear, now()).unwrap();
-        let j = t.get(&p("~")).unwrap();
+        let j = t.get(&p("@zen")).unwrap();
         assert!(!is_dirty(j) && j.summary().unwrap().is_empty());
-        assert_eq!(plan(&t, &p("~")), None);
+        assert_eq!(plan(&t, &p("@zen")), None);
         // An emptied summary holds the next rebuild to no length.
         apply(
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Takes it black.".into(),
             },
             now(),
         )
         .unwrap();
-        let q = question(&t, &p("~")).unwrap();
+        let q = question(&t, &p("@zen")).unwrap();
         assert!(!q.contains("write at least"), "{q}");
     }
 
@@ -442,12 +473,13 @@ mod tests {
     /// the summary's text.**
     #[test]
     fn the_question_never_shows_the_summary_it_had() {
-        let mut t = sharratt();
+        let mut t = zen();
         let id = apply(
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
             now(),
@@ -455,7 +487,7 @@ mod tests {
         .unwrap()
         .line
         .unwrap();
-        let over = fingerprint(t.get(&p("~")).unwrap());
+        let over = fingerprint(t.get(&p("@zen")).unwrap());
         let args = json!({
             "sentences": [{"text": "Tea is John's drink of choice.", "cite": format!("#{id}")}],
             "digest": "Tea.",
@@ -463,7 +495,7 @@ mod tests {
         apply(
             &mut t,
             &Actor::Zend,
-            &op(&p("~"), &over, args.as_object().unwrap()).unwrap(),
+            &op(&p("@zen"), &over, args.as_object().unwrap()).unwrap(),
             now(),
         )
         .unwrap();
@@ -471,13 +503,14 @@ mod tests {
             &mut t,
             &john(),
             &Op::Note {
-                path: p("~"),
+                speaker: None,
+                path: p("@zen"),
                 text: "Takes it black.".into(),
             },
             now(),
         )
         .unwrap();
-        let q = question(&t, &p("~")).unwrap();
+        let q = question(&t, &p("@zen")).unwrap();
         assert!(q.contains("Prefers tea.") && q.contains("Takes it black."));
         assert!(!q.contains("drink of choice"), "{q}");
         // "Tea is John's drink of choice." is 30 characters.
@@ -488,21 +521,22 @@ mod tests {
     /// for every two inputs, up to three; the most stays the grammar's.
     #[test]
     fn the_fewest_sentences_grow_with_the_inputs_up_to_three() {
-        let mut t = sharratt();
-        let fewest = |t: &Tree| spec(t, &p("~")).unwrap()["params"][0]["min_items"].clone();
+        let mut t = zen();
+        let fewest = |t: &Tree| spec(t, &p("@zen")).unwrap()["params"][0]["min_items"].clone();
         for (n, want) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
             apply(
                 &mut t,
                 &john(),
                 &Op::Note {
-                    path: p("~"),
+                    speaker: None,
+                    path: p("@zen"),
                     text: format!("Line {n}."),
                 },
                 now(),
             )
             .unwrap();
             assert_eq!(fewest(&t), json!(want), "{n} lines");
-            let q = question(&t, &p("~")).unwrap();
+            let q = question(&t, &p("@zen")).unwrap();
             assert_eq!(
                 q.contains(&format!("Write at least {want} sentences.")),
                 want > 1,
@@ -510,8 +544,39 @@ mod tests {
             );
         }
         assert_eq!(
-            spec(&t, &p("~")).unwrap()["params"][0]["max_items"],
+            spec(&t, &p("@zen")).unwrap()["params"][0]["max_items"],
             json!(MAX_SENTENCES)
+        );
+    }
+
+    /// **An answer's sentences lose the line-id lists their cites carry**,
+    /// as they are read.
+    #[test]
+    fn an_answers_inline_id_lists_are_dropped_as_it_is_read() {
+        let over = Fingerprint::of_bytes(b"");
+        let id = "#2026-05-21-2027-8abb";
+        let args = json!({
+            "sentences": [{"text": format!("No stubs are committed ({id})."), "cite": id}],
+        });
+        let Op::Summarize { sentences, .. } =
+            op(&p("@zen"), &over, args.as_object().unwrap()).unwrap()
+        else {
+            panic!("a summary");
+        };
+        assert_eq!(sentences[0].text, "No stubs are committed.");
+        // One that opens on its cites starts at its first word.
+        let opens = json!({"sentences": [{"text": format!("({id}) Rules hold."), "cite": id}]});
+        let Op::Summarize { sentences, .. } =
+            op(&p("@zen"), &over, opens.as_object().unwrap()).unwrap()
+        else {
+            panic!("a summary");
+        };
+        assert_eq!(sentences[0].text, "Rules hold.");
+        // A sentence that is only its cites says nothing, and is told so.
+        let bare = json!({"sentences": [{"text": format!("({id})"), "cite": id}]});
+        assert_eq!(
+            op(&p("@zen"), &over, bare.as_object().unwrap()).unwrap_err(),
+            "a sentence is empty"
         );
     }
 
@@ -526,7 +591,7 @@ mod tests {
             json!({"sentences": [{"text": "x", "cite": "#nope"}]}),
         ] {
             assert!(
-                op(&p("~"), &over, bad.as_object().unwrap()).is_err(),
+                op(&p("@zen"), &over, bad.as_object().unwrap()).is_err(),
                 "{bad}"
             );
         }

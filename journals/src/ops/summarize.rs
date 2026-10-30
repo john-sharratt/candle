@@ -17,12 +17,12 @@ use crate::tree::check::{digest_cap, summary_cap};
 use crate::tree::fingerprint::{fingerprint, has_inputs, speaks};
 use crate::tree::{Journal, Tree};
 
-/// The name a fixed journal's `journal.yaml` says.
-fn fixed_name(path: &JournalPath, j: &Journal) -> String {
+/// The name a journal's `journal.yaml` says: a master's its group's, a
+/// section's its own, a named journal's its folder's.
+pub(crate) fn fixed_name(path: &JournalPath, j: &Journal) -> String {
     match j.place {
-        Place::Root => path.owner().slug().to_string(),
+        Place::Root => path.group().to_string(),
         Place::Section(s) => s.name().into(),
-        Place::Channel(c) => c.name().into(),
         Place::Named { .. } => path.last().map(|s| s.to_string()).unwrap_or_default(),
     }
 }
@@ -54,11 +54,10 @@ pub fn sentence_floor(j: &Journal) -> usize {
     let inputs = j.window.len() + speaking(j);
     let conversation = matches!(
         j.place,
-        Place::Channel(_)
-            | Place::Named {
-                section: Section::Channels,
-                ..
-            }
+        Place::Named {
+            section: Section::Conversations,
+            ..
+        }
     );
     match inputs {
         0 => 0,
@@ -142,7 +141,6 @@ pub fn summarize(
     cue: Option<&str>,
     now: Stamp,
 ) -> Result<Applied> {
-    let scope = path.owner().scope();
     let j = tree.need_mut(path)?;
     j.writable(&path.show())?;
     let current = fingerprint(j);
@@ -165,12 +163,12 @@ pub fn summarize(
         lines: j.window.len(),
         children: speaking(j),
         stale: false,
-        digest: match (digest.map(str::trim), digest_cap(j.place, scope)) {
+        digest: match (digest.map(str::trim), digest_cap(j.place)) {
             (None, _) => None,
             (Some(""), _) => return Err(Error::invalid("the digest is empty")),
             (Some(_), None) => {
                 return Err(Error::invalid(format!(
-                    "{path} has no voice digest: only a root does"
+                    "{path} has no voice digest: only the master and a person's own journal do"
                 )))
             }
             (Some(d), Some(cap)) if d.chars().count() > cap => {
@@ -215,17 +213,25 @@ pub fn summarize(
     ))
 }
 
-pub fn mark_stale(tree: &mut Tree, path: &JournalPath) -> Result<Applied> {
+/// The most of a refusal a stale summary's commit subject keeps.
+const WHY_CHARS: usize = 240;
+
+/// Marks `path`'s summary stale, its commit naming `why` — the refusal that
+/// left it standing — on one line of at most [`WHY_CHARS`].
+pub fn mark_stale(tree: &mut Tree, path: &JournalPath, why: &str) -> Result<Applied> {
     let j = tree.need_mut(path)?;
     j.writable(&path.show())?;
     match j.meta.as_mut().and_then(|m| m.summary.as_mut()) {
         Some(s) if s.stale => Err(Error::refused(format!("{path}'s summary is stale already"))),
         Some(s) => {
             s.stale = true;
-            Ok(Applied::touching(
-                format!("Stale summary of {path}"),
-                vec![path.clone()],
-            ))
+            let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut subject = format!("Stale summary of {path}");
+            if !why.is_empty() {
+                subject.push_str(": ");
+                subject.extend(why.chars().take(WHY_CHARS));
+            }
+            Ok(Applied::touching(subject, vec![path.clone()]))
         }
         None => Err(Error::refused(format!(
             "{path} has no summary to mark stale"
@@ -238,8 +244,9 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::line::LineId;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op, Which};
+    use crate::scope::Channel;
     use crate::testing::slug;
     use crate::tree::fingerprint::is_dirty;
 
@@ -258,6 +265,7 @@ mod tests {
             &Op::Note {
                 path: path.clone(),
                 text: text.into(),
+                speaker: None,
             },
             now(),
         )
@@ -290,28 +298,28 @@ mod tests {
 
     #[test]
     fn a_summary_built_over_the_journal_as_it_stands_is_kept() {
-        let mut t = sharratt();
-        let (path, cite) = noted(&mut t, "~", "Prefers tea.");
+        let mut t = zen();
+        let (path, cite) = noted(&mut t, "@zen", "Zen is the household's memory.");
         assert!(is_dirty(t.get(&path).unwrap()));
         let a = summarise(
             &mut t,
             &path,
-            vec![s("Likes tea.", vec![cite])],
-            Some("Tea drinker."),
+            vec![s("Zen remembers for the household.", vec![cite])],
+            Some("The household's memory."),
         )
         .unwrap();
-        assert_eq!(a.subject, "Summary of ~");
+        assert_eq!(a.subject, "Summary of @zen");
         let j = t.get(&path).unwrap();
         assert!(!is_dirty(j));
         let meta = j.meta.as_ref().unwrap();
         assert_eq!(
-            meta.name, "john",
+            meta.name, "zen",
             "a fixed journal's file is made with its fixed name"
         );
         let sum = meta.summary.as_ref().unwrap();
-        // Its two fixed sections are live children, but say nothing yet.
+        // Its five fixed sections are live children, but say nothing yet.
         assert_eq!((sum.lines, sum.children, sum.built), (1, 0, now()));
-        assert_eq!(sum.digest.as_deref(), Some("Tea drinker."));
+        assert_eq!(sum.digest.as_deref(), Some("The household's memory."));
     }
 
     /// **A child gone silent is a child gone**: once its lines are forgotten
@@ -319,7 +327,7 @@ mod tests {
     /// too, not refused as a shrink with nothing gone.
     #[test]
     fn a_parent_over_a_child_gone_silent_is_emptied() {
-        let mut t = sharratt();
+        let mut t = zen();
         let trip = apply(
             &mut t,
             &john(),
@@ -366,19 +374,10 @@ mod tests {
 
     #[test]
     fn a_summary_built_over_what_has_changed_is_a_conflict() {
-        let mut t = sharratt();
-        let (path, cite) = noted(&mut t, "~", "Prefers tea.");
+        let mut t = zen();
+        let (path, cite) = noted(&mut t, "people", "Prefers tea.");
         let over = fingerprint(t.get(&path).unwrap());
-        apply(
-            &mut t,
-            &john(),
-            &Op::Note {
-                path: path.clone(),
-                text: "Now coffee.".into(),
-            },
-            now(),
-        )
-        .unwrap();
+        noted(&mut t, "people", "Now coffee.");
         let op = Op::Summarize {
             path: path.clone(),
             over,
@@ -395,7 +394,7 @@ mod tests {
 
     #[test]
     fn sentences_cite_only_what_is_there() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, cite) = noted(&mut t, "topics", "x");
         // A live child with nothing to say yet is no input either.
         apply(
@@ -419,7 +418,7 @@ mod tests {
             ),
             (
                 vec![s("A.", vec![Cite::Child(slug("trip"))])],
-                "which is not one of @sharratt/topics's inputs",
+                "which is not one of @zen/topics's inputs",
             ),
             (vec![s("A.", vec![])], "cites nothing"),
             (vec![s("  ", vec![cite.clone()])], "not one line"),
@@ -437,7 +436,7 @@ mod tests {
     /// writes it: one for every two inputs, up to three.
     #[test]
     fn a_summary_below_its_sentence_floor_is_refused() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, a) = noted(&mut t, "topics", "a");
         let (_, b) = noted(&mut t, "topics", "b");
         let (_, c) = noted(&mut t, "topics", "c");
@@ -446,7 +445,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             Error::invalid(
-                "@sharratt/topics's inputs ask for at least 2 sentences in its summary, not 1"
+                "@zen/topics's inputs ask for at least 2 sentences in its summary, not 1"
             )
             .to_string()
         );
@@ -457,14 +456,31 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sentence_floor(t.get(&p("projects")).unwrap()), 0);
-        let (grok, _) = noted(&mut t, "~/channels/grok", "a");
-        noted(&mut t, "~/channels/grok", "b");
-        noted(&mut t, "~/channels/grok", "c");
+        assert_eq!(sentence_floor(t.get(&p("threads")).unwrap()), 0);
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        apply(
+            &mut t,
+            &server,
+            &Op::Create {
+                under: p("conversations"),
+                name: slug("2026-10-30-1200-grok"),
+                cue: "open for a drive".into(),
+                on_taken: OnTaken::Number,
+            },
+            now(),
+        )
+        .unwrap();
+        let drive = "conversations/2026-10-30-1200-grok";
+        let (conversation, _) = noted(&mut t, drive, "a");
+        noted(&mut t, drive, "b");
+        noted(&mut t, drive, "c");
         assert_eq!(
-            sentence_floor(t.get(&grok).unwrap()),
+            sentence_floor(t.get(&conversation).unwrap()),
             1,
-            "a channel says its exchange in one"
+            "a conversation says its exchange in one"
         );
     }
 
@@ -472,7 +488,7 @@ mod tests {
     /// many lines replaced it: the rebuild may shrink.
     #[test]
     fn a_cited_line_forgotten_lets_the_summary_shrink() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, a) = noted(&mut t, "topics", "a");
         summarise(&mut t, &path, vec![s(&"long ".repeat(40), vec![a])], None).unwrap();
         assert_eq!(shortest(t.get(&path).unwrap()), Some((199, 100)));
@@ -494,7 +510,7 @@ mod tests {
 
     #[test]
     fn caps_digests_and_cues_are_held() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, cite) = noted(&mut t, "topics", "x");
         let long = "w".repeat(1001);
         assert!(
@@ -507,9 +523,9 @@ mod tests {
             summarise(&mut t, &path, vec![s("A.", vec![cite.clone()])], Some("d"))
                 .unwrap_err()
                 .to_string()
-                .contains("only a root")
+                .contains("only the master and a person's own journal do")
         );
-        let (root, rcite) = noted(&mut t, "@sharratt", "family");
+        let (root, rcite) = noted(&mut t, "@zen", "family");
         assert!(summarise(
             &mut t,
             &root,
@@ -535,7 +551,7 @@ mod tests {
 
     #[test]
     fn a_second_rebuild_over_the_same_journal_is_dropped() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, cite) = noted(&mut t, "topics", "x");
         summarise(&mut t, &path, vec![s("First.", vec![cite.clone()])], None).unwrap();
         let err = summarise(&mut t, &path, vec![s("Second.", vec![cite])], None).unwrap_err();
@@ -545,7 +561,7 @@ mod tests {
 
     #[test]
     fn a_named_journal_can_take_a_new_cue_with_its_summary() {
-        let mut t = sharratt();
+        let mut t = zen();
         let path = apply(
             &mut t,
             &john(),
@@ -566,6 +582,7 @@ mod tests {
             &Op::Note {
                 path: path.clone(),
                 text: "Flights to Da Nang.".into(),
+                speaker: None,
             },
             now(),
         )
@@ -589,7 +606,7 @@ mod tests {
 
     #[test]
     fn a_summary_that_halves_with_nothing_gone_is_refused_and_marked_stale() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, cite) = noted(&mut t, "topics", "x");
         summarise(
             &mut t,
@@ -601,39 +618,56 @@ mod tests {
         noted(&mut t, "topics", "y");
         let err = summarise(&mut t, &path, vec![s("short", vec![cite])], None).unwrap_err();
         assert!(err.to_string().contains("shrinks from 199 to 5"), "{err}");
-        apply(
-            &mut t,
-            &Actor::Zend,
-            &Op::MarkStale { path: path.clone() },
-            now(),
-        )
-        .unwrap();
+        let stale = |path: &JournalPath| Op::MarkStale {
+            path: path.clone(),
+            why: format!("{err}\n  (asked again when it changes)"),
+        };
+        let a = apply(&mut t, &Actor::Zend, &stale(&path), now()).unwrap();
+        assert_eq!(
+            a.subject,
+            "Stale summary of @zen/topics: the summary shrinks from 199 to 5 characters \
+             with nothing gone from @zen/topics (asked again when it changes)",
+            "the refusal, on one line"
+        );
         assert!(t.get(&path).unwrap().summary().unwrap().stale);
-        assert!(apply(
-            &mut t,
-            &Actor::Zend,
-            &Op::MarkStale { path: path.clone() },
-            now()
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("stale already"));
-        assert!(apply(
-            &mut t,
-            &Actor::Zend,
-            &Op::MarkStale {
-                path: p("projects")
-            },
-            now()
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("no summary"));
+        // An empty refusal leaves the subject bare; a long one is cut at
+        // 240 characters, counted in characters.
+        let mut fresh = zen();
+        let (q, qc) = noted(&mut fresh, "topics", "q");
+        summarise(&mut fresh, &q, vec![s("Q.", vec![qc])], None).unwrap();
+        let bare = Op::MarkStale {
+            path: q.clone(),
+            why: "  \n ".into(),
+        };
+        assert_eq!(
+            apply(&mut fresh.clone(), &Actor::Zend, &bare, now())
+                .unwrap()
+                .subject,
+            "Stale summary of @zen/topics"
+        );
+        let long = Op::MarkStale {
+            path: q,
+            why: "é".repeat(300),
+        };
+        assert_eq!(
+            apply(&mut fresh, &Actor::Zend, &long, now())
+                .unwrap()
+                .subject,
+            format!("Stale summary of @zen/topics: {}", "é".repeat(240))
+        );
+        assert!(apply(&mut t, &Actor::Zend, &stale(&path), now())
+            .unwrap_err()
+            .to_string()
+            .contains("stale already"));
+        assert!(apply(&mut t, &Actor::Zend, &stale(&p("threads")), now())
+            .unwrap_err()
+            .to_string()
+            .contains("no summary"));
     }
 
     #[test]
     fn a_summary_may_shrink_when_lines_are_gone() {
-        let mut t = sharratt();
+        let mut t = zen();
         let (path, a) = noted(&mut t, "topics", "a");
         let (_, b) = noted(&mut t, "topics", "b");
         summarise(

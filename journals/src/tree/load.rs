@@ -7,9 +7,8 @@ use std::collections::BTreeMap;
 
 use crate::error::Problem;
 use crate::files::{entry_id, in_order, read_entry, GroupFile, Meta, PersonFile, README};
-use crate::path::{JournalPath, Owner};
+use crate::path::JournalPath;
 use crate::period::Period;
-use crate::scope::Scope;
 use crate::slug::Slug;
 use crate::tree::check::check;
 use crate::tree::{skeleton, Group, Journal, Person, Tree};
@@ -24,124 +23,106 @@ pub const GROUP_FILE: &str = "group.yaml";
 pub const JOURNAL_FILE: &str = "journal.yaml";
 pub const ARCHIVE_DIR: &str = "archive";
 
-/// One owner's files, by path below the owner's folder.
-type OwnerFiles<'a> = BTreeMap<Vec<&'a str>, (&'a str, &'a [u8])>;
+/// One group's files, by path below the group's folder.
+type GroupFiles<'a> = BTreeMap<Vec<&'a str>, (&'a str, &'a [u8])>;
 
 /// Read every file of the repository — `path → bytes`, `/`-separated — into
 /// a tree, and check it.
 pub fn load(files: &BTreeMap<String, Vec<u8>>) -> Tree {
     let mut tree = Tree::default();
-    let mut owners: BTreeMap<Owner, OwnerFiles<'_>> = BTreeMap::new();
+    let mut groups: BTreeMap<Slug, GroupFiles<'_>> = BTreeMap::new();
     for (path, bytes) in files {
         let segs: Vec<&str> = path.split('/').collect();
         if segs.len() == 1 && TOP_FILES.contains(&segs[0]) {
             continue;
         }
-        let kind = match segs[0] {
-            PERSONS => Some(Owner::Person as fn(Slug) -> Owner),
-            GROUPS => Some(Owner::Group as fn(Slug) -> Owner),
-            _ => None,
-        };
-        let (Some(kind), true) = (kind, segs.len() >= 3) else {
+        if segs.len() < 3 || ![PERSONS, GROUPS].contains(&segs[0]) {
             tree.problems.push(Problem::new(
                 path.as_str(),
                 None,
                 "is no part of the layout: the top holds persons/, groups/, .gitattributes and README.md",
             ));
             continue;
-        };
-        match Slug::parse(segs[1]) {
-            Ok(slug) => {
-                owners
-                    .entry(kind(slug))
-                    .or_default()
-                    .insert(segs[2..].to_vec(), (path.as_str(), bytes.as_slice()));
+        }
+        let slug = match Slug::parse(segs[1]) {
+            Ok(s) => s,
+            Err(why) => {
+                tree.problems.push(Problem::new(path.as_str(), None, why));
+                continue;
             }
-            Err(why) => tree.problems.push(Problem::new(path.as_str(), None, why)),
+        };
+        if segs[0] == GROUPS {
+            groups
+                .entry(slug)
+                .or_default()
+                .insert(segs[2..].to_vec(), (path.as_str(), bytes.as_slice()));
+        } else if segs[2..] == [PERSON_FILE] {
+            let file = text(path, bytes).and_then(|t| PersonFile::read(path, t));
+            tree.persons.insert(
+                slug,
+                Person {
+                    file,
+                    problems: Vec::new(),
+                },
+            );
+        } else {
+            tree.problems.push(Problem::new(
+                path.as_str(),
+                None,
+                format!("persons/{slug}/ holds person.yaml alone: a person's journals are their groups'"),
+            ));
         }
     }
-    for (owner, files) in owners {
-        load_owner(&mut tree, owner, files);
+    for (group, files) in groups {
+        load_group(&mut tree, group, files);
     }
     check(&mut tree);
     tree
 }
 
-fn load_owner(tree: &mut Tree, owner: Owner, files: OwnerFiles<'_>) {
-    let mut root = skeleton(owner.scope());
-    let (own_name, other_name) = match owner.scope() {
-        Scope::Personal => (PERSON_FILE, GROUP_FILE),
-        Scope::Group => (GROUP_FILE, PERSON_FILE),
-    };
-    let folder = owner.folder();
+fn load_group(tree: &mut Tree, group: Slug, files: GroupFiles<'_>) {
+    let mut root = skeleton();
+    let folder = format!("{GROUPS}/{group}");
     let mut own: Option<(&str, &[u8])> = None;
     for (rel, (path, bytes)) in &files {
-        if rel.len() == 1 && rel[0] == own_name {
+        if rel.len() == 1 && rel[0] == GROUP_FILE {
             own = Some((path, bytes));
             continue;
         }
-        if rel.len() == 1 && rel[0] == other_name {
+        if rel.len() == 1 && rel[0] == PERSON_FILE {
             root.problems.push(Problem::new(
                 *path,
                 None,
-                format!(
-                    "{other_name} belongs under {}/",
-                    if other_name == PERSON_FILE {
-                        PERSONS
-                    } else {
-                        GROUPS
-                    }
-                ),
+                format!("{PERSON_FILE} belongs under {PERSONS}/"),
             ));
             continue;
         }
-        // The service writes the owner's README from its own file; what a
+        // The service writes the group's README from its own file; what a
         // hand edit left there is written over, never read.
         if rel.len() == 1 && rel[0] == README {
             continue;
         }
-        if let Err(p) = place_file(&mut root, &owner, rel, path, bytes) {
+        if let Err(p) = place_file(&mut root, &group, rel, path, bytes) {
             tree.problems.push(p);
         }
     }
     order(&mut root);
-    let missing = || {
-        Problem::new(
-            format!("{folder}/{own_name}"),
+    let file = match own {
+        Some((path, bytes)) => text(path, bytes).and_then(|t| GroupFile::read(path, t)),
+        None => Err(Problem::new(
+            format!("{folder}/{GROUP_FILE}"),
             None,
-            format!("{folder} has no {own_name}"),
-        )
+            format!("{folder} has no {GROUP_FILE}"),
+        )),
     };
-    match owner {
-        Owner::Person(p) => {
-            let file = match own {
-                Some((path, bytes)) => text(path, bytes).and_then(|t| PersonFile::read(path, t)),
-                None => Err(missing()),
-            };
-            tree.persons.insert(
-                p,
-                Person {
-                    file,
-                    root,
-                    problems: Vec::new(),
-                },
-            );
-        }
-        Owner::Group(g) => {
-            let file = match own {
-                Some((path, bytes)) => text(path, bytes).and_then(|t| GroupFile::read(path, t)),
-                None => Err(missing()),
-            };
-            tree.groups.insert(
-                g,
-                Group {
-                    file,
-                    root,
-                    problems: Vec::new(),
-                },
-            );
-        }
-    }
+    tree.groups.insert(
+        group,
+        Group {
+            file,
+            root,
+            problems: Vec::new(),
+        },
+    );
 }
 
 fn text<'a>(path: &str, bytes: &'a [u8]) -> Result<&'a str, Problem> {
@@ -175,7 +156,7 @@ const HOLDS: &str = "a journal's folder holds journal.yaml, an entry per \
 /// returned problem; a fault in the file is kept on its journal.
 fn place_file(
     root: &mut Journal,
-    owner: &Owner,
+    group: &Slug,
     rel: &[&str],
     path: &str,
     bytes: &[u8],
@@ -192,7 +173,7 @@ fn place_file(
         .map(|d| Slug::parse(d))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|why| Problem::new(path, None, format!("its folder is no journal: {why}")))?;
-    let jpath = JournalPath::new(owner.clone(), names)
+    let jpath = JournalPath::new(group.clone(), names)
         .map_err(|e| Problem::new(path, None, format!("its folder is no journal: {e}")))?;
     let journal = node(root, &jpath);
     let read = text(path, bytes);
@@ -237,7 +218,7 @@ fn node<'a>(root: &'a mut Journal, path: &JournalPath) -> &'a mut Journal {
     let mut j = root;
     for depth in 0..path.names().len() {
         let name = &path.names()[depth];
-        let place = JournalPath::new(path.owner().clone(), path.names()[..=depth].to_vec())
+        let place = JournalPath::new(path.group().clone(), path.names()[..=depth].to_vec())
             .and_then(|p| p.place())
             .expect("a prefix of a place is a place");
         j = j
@@ -262,8 +243,8 @@ mod tests {
             .collect()
     }
 
-    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n";
-    const SHARRATT: &str = "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
+    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [zen]\ndefault_group: zen\n";
+    const ZEN: &str = "group: zen\nname: \"Zen\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
 
     #[test]
     fn a_seeded_repository_loads_clean() {
@@ -271,15 +252,15 @@ mod tests {
             (".gitattributes", "*.yaml text eol=lf\n"),
             ("README.md", "# journals\n"),
             ("persons/john/person.yaml", JOHN),
-            ("groups/sharratt/group.yaml", SHARRATT),
+            ("groups/zen/group.yaml", ZEN),
         ]));
         assert_eq!(tree.problems, vec![]);
         assert!(tree.person_file(&slug("john")).is_some());
-        assert!(tree.group_file(&slug("sharratt")).is_some());
+        assert!(tree.group_file(&slug("zen")).is_some());
         let all = tree.journals();
         assert!(all.iter().all(|(_, j)| j.problems.is_empty()));
-        // Root, channels and its three channels, people; root and four sections.
-        assert_eq!(all.len(), 6 + 5);
+        // The master and its five sections; a person has no journals.
+        assert_eq!(all.len(), 6);
     }
 
     #[test]
@@ -289,33 +270,27 @@ mod tests {
         let early = note("2026-10-30T09:10:02Z", "Workers push branches.");
         let late = note("2026-10-30T09:10:59Z", "Merging is the user's decision.");
         let old = note("2026-10-29T08:00:00Z", "archived");
-        let at = |l: &Line| format!("groups/sharratt/projects/candle/{}", entry_file(&l.id));
+        let at = |l: &Line| format!("groups/zen/topics/candle/{}", entry_file(&l.id));
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("persons/john/README.md", "# anything a hand left\n"),
-            ("groups/sharratt/group.yaml", SHARRATT),
+            ("groups/zen/README.md", "# anything a hand left\n"),
+            ("groups/zen/group.yaml", ZEN),
             (
-                "groups/sharratt/projects/candle/journal.yaml",
+                "groups/zen/topics/candle/journal.yaml",
                 "name: candle\ncue: \"open for the engine\"\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n",
             ),
             (&at(&late), &late.render()),
             (&at(&early), &early.render()),
             (
                 &format!(
-                    "groups/sharratt/projects/candle/archive/2026-10-29/{}",
+                    "groups/zen/topics/candle/archive/2026-10-29/{}",
                     entry_file(&old.id)
                 ),
                 &old.render(),
             ),
         ]));
         let candle = tree
-            .get(
-                &JournalPath::new(
-                    Owner::Group(slug("sharratt")),
-                    vec![slug("projects"), slug("candle")],
-                )
-                .unwrap(),
-            )
+            .get(&JournalPath::new(slug("zen"), vec![slug("topics"), slug("candle")]).unwrap())
             .unwrap();
         assert_eq!(candle.window, vec![early, late]);
         assert_eq!(
@@ -331,17 +306,17 @@ mod tests {
     fn every_stray_is_a_problem_and_the_rest_still_loads() {
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("groups/sharratt/group.yaml", SHARRATT),
+            ("groups/zen/group.yaml", ZEN),
             ("notes.txt", "x"),
             ("families/sharratt/family.yaml", "x"),
             ("persons/README.md", "x"),
             ("persons/John/person.yaml", JOHN),
-            ("groups/sharratt/channels/grok/lines.yaml", ""),
-            ("persons/john/projects/candle/lines.yaml", ""),
-            ("persons/john/notes/lines.yaml", ""),
-            ("persons/john/channels/tesla/lines.yaml", ""),
-            ("persons/john/people/Yen/lines.yaml", ""),
-            ("persons/john/people/archive/lines.yaml", ""),
+            ("persons/john/journal.yaml", "x"),
+            ("persons/john/channels/grok/journal.yaml", "x"),
+            ("groups/zen/channels/grok/lines.yaml", ""),
+            ("groups/zen/projects/candle/lines.yaml", ""),
+            ("groups/zen/people/Yen/lines.yaml", ""),
+            ("groups/zen/people/archive/lines.yaml", ""),
         ]));
         let mut stray: Vec<&str> = tree.problems.iter().map(|p| p.file.as_str()).collect();
         stray.sort_unstable();
@@ -349,20 +324,22 @@ mod tests {
             stray,
             [
                 "families/sharratt/family.yaml",
-                "groups/sharratt/channels/grok/lines.yaml",
+                "groups/zen/channels/grok/lines.yaml",
+                "groups/zen/people/Yen/lines.yaml",
+                "groups/zen/projects/candle/lines.yaml",
                 "notes.txt",
                 "persons/John/person.yaml",
                 "persons/README.md",
-                "persons/john/channels/tesla/lines.yaml",
-                "persons/john/notes/lines.yaml",
-                "persons/john/people/Yen/lines.yaml",
-                "persons/john/projects/candle/lines.yaml",
+                "persons/john/channels/grok/journal.yaml",
+                "persons/john/journal.yaml",
             ]
         );
+        assert!(tree.problems.iter().any(|p| p.what
+            == "persons/john/ holds person.yaml alone: a person's journals are their groups'"));
         assert!(tree.person_file(&slug("john")).is_some());
         // `people/archive/lines.yaml` sits straight under the archive folder
         // of `people`, where a folder per period belongs.
-        let people = &tree.persons[&slug("john")].root.children[&slug("people")];
+        let people = &tree.groups[&slug("zen")].root.children[&slug("people")];
         assert!(
             people.problems[0].what.contains("straight under archive/"),
             "{:?}",
@@ -373,39 +350,36 @@ mod tests {
     #[test]
     fn a_broken_file_is_kept_on_its_journal() {
         let tree = load(&files(&[
-            ("persons/john/person.yaml", JOHN),
+            ("groups/zen/group.yaml", ZEN),
             (
-                "persons/john/channels/grok/2026-10-30-0910-0001.yaml",
+                "groups/zen/conversations/2026-10-30-0910-0001.yaml",
                 "at: yesterday\nkind: note\nby: grok\ntext: x\n",
             ),
-            ("persons/john/channels/other/journal.yaml", "name: [\n"),
+            ("groups/zen/topics/journal.yaml", "name: [\n"),
+            ("groups/zen/threads/2026-10-30-0910-0002.yaml", "\u{0}"),
+            ("groups/zen/people/lines.yaml", "- {id: x}\n"),
+            ("groups/zen/people/archive/2026-10/notes.md", "x"),
             (
-                "persons/john/channels/claude-code/2026-10-30-0910-0002.yaml",
-                "\u{0}",
-            ),
-            ("persons/john/people/lines.yaml", "- {id: x}\n"),
-            ("persons/john/people/archive/2026-10/notes.md", "x"),
-            (
-                "persons/john/channels/grok/archive/someday/2026-10-30-0910-0003.yaml",
+                "groups/zen/conversations/archive/someday/2026-10-30-0910-0003.yaml",
                 "x",
             ),
         ]));
-        let channels = &tree.persons[&slug("john")].root.children[&slug("channels")];
-        let grok = &channels.children[&slug("grok")];
+        let root = &tree.groups[&slug("zen")].root;
+        let conversations = &root.children[&slug("conversations")];
         assert_eq!(
-            grok.problems[0].to_string(),
-            "persons/john/channels/grok/2026-10-30-0910-0001.yaml:1: `at`: `yesterday` is not a time written 2026-10-30T09:10:02Z"
+            conversations.problems[0].to_string(),
+            "groups/zen/conversations/2026-10-30-0910-0001.yaml:1: `at`: `yesterday` is not a time written 2026-10-30T09:10:02Z"
         );
         assert!(
-            grok.problems[1].what.contains("not a period"),
+            conversations.problems[1].what.contains("not a period"),
             "{:?}",
-            grok.problems
+            conversations.problems
         );
-        assert!(channels.children[&slug("other")].problems[0]
+        assert!(root.children[&slug("topics")].problems[0]
             .what
             .starts_with("not valid YAML"));
-        assert!(!channels.children[&slug("claude-code")].problems.is_empty());
-        let people = &tree.persons[&slug("john")].root.children[&slug("people")];
+        assert!(!root.children[&slug("threads")].problems.is_empty());
+        let people = &root.children[&slug("people")];
         assert!(people.problems[0]
             .what
             .starts_with("`notes.md` is no entry"));
@@ -417,39 +391,39 @@ mod tests {
 
     #[test]
     fn non_utf8_and_missing_owner_files_are_problems() {
-        let mut f = files(&[("groups/sharratt/projects/journal.yaml", "x")]);
+        let mut f = files(&[("groups/zen/topics/journal.yaml", "x")]);
         f.insert("persons/john/person.yaml".into(), vec![0xff, 0xfe]);
         let tree = load(&f);
         let err = tree.persons[&slug("john")].file.as_ref().unwrap_err();
         assert!(err.what.contains("not UTF-8"), "{err}");
-        let err = tree.groups[&slug("sharratt")].file.as_ref().unwrap_err();
+        let err = tree.groups[&slug("zen")].file.as_ref().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "groups/sharratt/group.yaml: groups/sharratt has no group.yaml"
+            "groups/zen/group.yaml: groups/zen has no group.yaml"
         );
     }
 
     #[test]
-    fn an_owner_file_in_the_wrong_kind_of_folder_is_a_problem() {
+    fn a_person_file_in_a_group_folder_is_a_problem() {
         let tree = load(&files(&[
-            ("persons/john/person.yaml", JOHN),
-            ("persons/john/group.yaml", SHARRATT),
+            ("groups/zen/group.yaml", ZEN),
+            ("groups/zen/person.yaml", JOHN),
         ]));
-        let root = &tree.persons[&slug("john")].root;
-        assert_eq!(root.problems[0].what, "group.yaml belongs under groups/");
+        let root = &tree.groups[&slug("zen")].root;
+        assert_eq!(root.problems[0].what, "person.yaml belongs under persons/");
     }
 
     #[test]
     fn intermediate_named_folders_without_metadata_are_broken() {
         let tree = load(&files(&[
-            ("persons/john/person.yaml", JOHN),
+            ("groups/zen/group.yaml", ZEN),
             (
-                "persons/john/people/family/yen/journal.yaml",
+                "groups/zen/people/family/yen/journal.yaml",
                 "name: yen\ncue: \"open for Yen\"\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n",
             ),
         ]));
         let family =
-            &tree.persons[&slug("john")].root.children[&slug("people")].children[&slug("family")];
+            &tree.groups[&slug("zen")].root.children[&slug("people")].children[&slug("family")];
         assert!(
             family
                 .problems

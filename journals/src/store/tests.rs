@@ -8,11 +8,12 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use super::*;
-use crate::files::{entry_file, Email, Kind, Role};
+use crate::files::{entry_file, Email, Role};
 use crate::line::Writer;
-use crate::ops::fixture::{john, now, p, sharratt, yen};
+use crate::ops::fixture::{john, now, p, yen, zen};
 use crate::ops::{OnTaken, Which};
 use crate::path::Address;
+use crate::path::Below;
 use crate::scope::Channel;
 use crate::testing::{note as testing_note, slug};
 use crate::tree::render::render_all;
@@ -57,7 +58,7 @@ impl Repos {
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let seed = path.join("seed");
         git(&path, &["clone", "-q", origin.to_str().unwrap(), "seed"]);
-        for (file, bytes) in render_all(&sharratt()) {
+        for (file, bytes) in render_all(&zen()) {
             let at = seed.join(&file);
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             std::fs::write(at, bytes).unwrap();
@@ -100,9 +101,14 @@ impl Repos {
 }
 
 fn note(text: &str) -> Op {
+    note_on("topics", text)
+}
+
+fn note_on(path: &str, text: &str) -> Op {
     Op::Note {
-        path: p("topics"),
+        path: p(path),
         text: text.into(),
+        speaker: None,
     }
 }
 
@@ -128,7 +134,7 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
     assert!(s.unpushed());
     assert_eq!(texts(s.tree(), "topics"), ["The builder starts Monday."]);
     // The checkout's own branch and working tree are the jobs'; untouched.
-    assert!(!dir.join("groups/sharratt/topics/lines.yaml").exists());
+    assert!(!dir.join("groups/zen/topics/lines.yaml").exists());
     let synced = s.sync().unwrap();
     assert_eq!(
         (synced.pushed, synced.replayed, synced.fetched),
@@ -144,7 +150,7 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
         &dir,
         &["log", "-1", "--format=%an%n%B", "refs/journal/head"],
     );
-    assert!(log.starts_with("grok\nNote on @sharratt/topics\n\nJournal-Writer: grok\nJournal-Person: yen\nJournal-Channel: grok\n"), "{log}");
+    assert!(log.starts_with("grok\nNote on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\n"), "{log}");
     assert!(log.contains("Journal-Op: {\"op\":\"note\""), "{log}");
 }
 
@@ -291,7 +297,7 @@ fn a_write_the_newer_origin_refuses_is_dropped_and_reported() {
     assert_eq!(synced.replayed, 0);
     assert_eq!(synced.dropped.len(), 1);
     assert!(
-        synced.dropped[0].0.starts_with("Edit of @sharratt/topics#"),
+        synced.dropped[0].0.starts_with("Edit of @zen/topics#"),
         "{:?}",
         synced.dropped
     );
@@ -357,7 +363,7 @@ fn an_admins_write_replays_as_an_admins() {
     {
         let mut s = Store::open(&dir).unwrap();
         let add = Op::AddMember {
-            group: slug("sharratt"),
+            group: slug("zen"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![Email::parse("yen.nhi@example.com").unwrap()],
@@ -394,7 +400,7 @@ fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
     let line = testing_note("2026-10-30T09:00:00Z", "written by hand");
     r.hand_edit(
         "hand",
-        &format!("groups/sharratt/topics/{}", entry_file(&line.id)),
+        &format!("groups/zen/topics/{}", entry_file(&line.id)),
         &line.render(),
     );
     let synced = s.sync().unwrap();
@@ -406,7 +412,7 @@ fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
 fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
     let r = Repos::new();
     let mut s = Store::open(&r.clone("a")).unwrap();
-    let entry = "groups/sharratt/topics/2026-10-30-0900-0001.yaml";
+    let entry = "groups/zen/topics/2026-10-30-0900-0001.yaml";
     r.hand_edit(
         "hand",
         entry,
@@ -423,15 +429,7 @@ fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
         Err(StoreError::Journal(Error::Refused(_)))
     ));
     // Other journals are untouched by it.
-    s.write(
-        &yen(),
-        &Op::Note {
-            path: p("projects"),
-            text: "fine".into(),
-        },
-        now(),
-    )
-    .unwrap();
+    s.write(&yen(), &note_on("people", "fine"), now()).unwrap();
     r.hand_edit(
         "fix",
         entry,
@@ -440,7 +438,7 @@ fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
     s.sync().unwrap();
     assert!(s.tree().get(&p("topics")).unwrap().problems.is_empty());
     assert_eq!(texts(s.tree(), "topics"), ["mended"]);
-    assert_eq!(texts(s.tree(), "projects"), ["fine"]);
+    assert_eq!(texts(s.tree(), "people"), ["fine"]);
 }
 
 #[test]
@@ -454,29 +452,33 @@ fn every_kind_of_write_lands_on_origin_as_its_files() {
             cue: "open for the trip".into(),
             on_taken: OnTaken::Refuse,
         },
-        Op::Note {
-            path: p("topics/trip"),
-            text: "Flights.".into(),
-        },
+        note_on("topics/trip", "Flights."),
         Op::Create {
             under: p("topics/trip"),
             name: slug("hotels"),
             cue: "open for hotels".into(),
             on_taken: OnTaken::Refuse,
         },
-        Op::Note {
-            path: p("topics/trip/hotels"),
-            text: "Hoi An.".into(),
+        note_on("topics/trip/hotels", "Hoi An."),
+        Op::Link {
+            under: p("topics/trip"),
+            name: slug("yen"),
+            to: p("people"),
+            cue: "open for who is going".into(),
         },
-        Op::Merge {
-            from: p("topics/trip/hotels"),
-            into: p("topics/trip"),
+        Op::Create {
+            under: p("conversations"),
+            name: slug("2026-10-30-1200-claude-code"),
+            cue: "open for planning the trip".into(),
+            on_taken: OnTaken::Number,
         },
-        Op::Fold {
-            path: p("topics/trip"),
+        Op::Focus {
+            path: p("conversations/2026-10-30-1200-claude-code"),
+            speaker: None,
+            about: Some(vec![p("topics/trip/hotels")]),
         },
         Op::AddMember {
-            group: slug("sharratt"),
+            group: slug("zen"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![],
@@ -485,11 +487,12 @@ fn every_kind_of_write_lands_on_origin_as_its_files() {
         Op::CreateGroup {
             group: slug("battle-cities"),
             name: "Battle Cities".into(),
-            kind: Kind::World,
+            about: Some("The game's world.".into()),
         },
         Op::AddBot {
             group: slug("battle-cities"),
             bot: slug("c3f1a07e"),
+            reads: vec![Below::parse("topics/canon").unwrap()],
         },
     ];
     for op in &ops {
@@ -498,7 +501,9 @@ fn every_kind_of_write_lands_on_origin_as_its_files() {
     s.sync().unwrap();
     let mine = s.tree().clone();
     assert_eq!(r.origin_tree("check"), mine);
-    assert_eq!(texts(&mine, "topics/trip"), ["Flights.", "Hoi An."]);
+    assert_eq!(texts(&mine, "topics/trip"), ["Flights."]);
+    assert_eq!(texts(&mine, "topics/trip/hotels"), ["Hoi An."]);
+    assert_eq!(mine.resolve(&p("topics/trip/yen")).unwrap(), p("people"));
     assert!(mine.person_file(&slug("yen-nhi")).is_some());
     assert!(mine
         .group_file(&slug("battle-cities"))
@@ -510,16 +515,7 @@ fn a_write_the_rules_refuse_commits_nothing() {
     let r = Repos::new();
     let mut s = Store::open(&r.clone("a")).unwrap();
     let head = s.head().clone();
-    assert!(s
-        .write(
-            &john(),
-            &Op::Note {
-                path: p("bots"),
-                text: "x".into()
-            },
-            now()
-        )
-        .is_err());
+    assert!(s.write(&john(), &note_on("bots", "x"), now()).is_err());
     assert_eq!(s.head(), &head);
     assert!(!s.unpushed());
 }

@@ -335,17 +335,9 @@ impl Writer {
     /// What `job` comes to, asked over `tree`.
     async fn answer(&mut self, state: &Arc<InferenceState>, tree: &Tree, job: &Job) -> Outcome {
         match job {
-            Job::Close {
-                path,
-                person,
-                channel,
-            } if tree.get(path).is_some_and(|j| gone_quiet(j, Stamp::now())) => Outcome::Write(
-                Actor::Server {
-                    person: person.clone(),
-                    channel: *channel,
-                },
-                Op::Close { path: path.clone() },
-            ),
+            Job::Close { path } if tree.get(path).is_some_and(|j| gone_quiet(j, Stamp::now())) => {
+                Outcome::Write(Actor::Zend, Op::Close { path: path.clone() })
+            }
             // Spoken in again since the pass was planned.
             Job::Close { .. } => Outcome::Moot,
             Job::Fold { path, plan } => {
@@ -400,7 +392,7 @@ impl Writer {
             return Done::Next;
         };
         let what = match &job {
-            Job::Close { path, .. } => format!("close of {path}"),
+            Job::Close { path } => format!("close of {path}"),
             Job::Fold { path, plan } => format!("fold of {} in {path}", plan.period),
             Job::Summary { path } => format!("summary of {path}"),
         };
@@ -437,7 +429,10 @@ impl Writer {
         self.held.refused(&tree, &job);
         if let Job::Summary { path } = &job {
             if tree.get(path).is_some_and(|j| j.summary().is_some()) {
-                let stale = Op::MarkStale { path: path.clone() };
+                let stale = Op::MarkStale {
+                    path: path.clone(),
+                    why: unusable,
+                };
                 if let Err(e) = write(&self.memory, Actor::Zend, stale).await {
                     tracing::debug!("journals: {path} not marked stale: {e}");
                 }
@@ -517,7 +512,7 @@ mod tests {
 
     use journals::error::{Error, Problem};
     use journals::ops::apply;
-    use journals::path::{JournalPath, Owner};
+    use journals::path::JournalPath;
     use journals::scope::Channel;
     use journals::slug::Slug;
     use journals::store::StoreError;
@@ -529,13 +524,20 @@ mod tests {
     /// own call form: a summary's, with its guided cites, and a fold's.
     #[test]
     fn the_writers_calls_build_as_grammars() {
-        let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
-            "persons/john/person.yaml".to_string(),
-            b"person: john\nname: \"John\"\naccounts: []\ngroups: []\n".to_vec(),
-        )]);
+        let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([
+            (
+                "persons/john/person.yaml".to_string(),
+                b"person: john\nname: \"John\"\naccounts: []\ngroups: [zen]\ndefault_group: zen\n"
+                    .to_vec(),
+            ),
+            (
+                "groups/zen/group.yaml".to_string(),
+                b"group: zen\nname: \"Zen\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n".to_vec(),
+            ),
+        ]);
         let mut tree = load(&files);
         let john = Slug::parse("john").unwrap();
-        let root = JournalPath::root(Owner::Person(john.clone()));
+        let root = JournalPath::root(Slug::parse("zen").unwrap());
         apply(
             &mut tree,
             &Actor::Person {
@@ -545,7 +547,8 @@ mod tests {
             },
             &Op::Note {
                 path: root.clone(),
-                text: "Prefers tea.".into(),
+                text: "Everyone drinks tea.".into(),
+                speaker: None,
             },
             Stamp::now(),
         )
@@ -566,10 +569,10 @@ mod tests {
         let journal = |e: Error| Err(WriteError::Store(StoreError::Journal(e)));
         assert_eq!(
             settle(Ok(Applied {
-                subject: "Summary of ~".into(),
+                subject: "Summary of @zen".into(),
                 ..Applied::default()
             })),
-            Settled::Written("Summary of ~".into())
+            Settled::Written("Summary of @zen".into())
         );
         assert_eq!(
             settle(journal(Error::conflict("moved"))),

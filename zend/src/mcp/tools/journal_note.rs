@@ -2,12 +2,14 @@
 //! journal — a decision and its reason, what the user said, a standing rule —
 //! as one entry, written by the server in Claude's words
 //! (`docs/claude_zend_gateway.md` §4, §5.1, §5.3); or on one of the memory's
-//! journals — the user's own, `~/…`, or a group's of theirs, `@group/…` — a line
-//! every later conversation reads (`docs/memory_backbone.md` §6.5).
+//! journals, stamped with the speaker the conversation's focus names — a line
+//! every later conversation in the group reads (`docs/memory_backbone.md`
+//! §6.5).
 
 use journals::ops::Op;
 use serde_json::{json, Value};
 
+use super::mem::{APPEND_ONLY, PATHS};
 use super::{mem, string, Answer, Ctx};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
@@ -22,20 +24,20 @@ const MAX_NOTE: usize = 2_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Record a note on a journal. Something the user wants remembered next time — a \
-            preference, a name, what they are working towards — goes on their own memory, `~`, which every \
-            new conversation of theirs starts with, in any client; something a group of theirs shares — \
-            their family, a team, a game's world: a plan, a project, a topic — goes on that group's journal, \
-            `@<group>/topics/<topic>` (or `topics/…` for their default group), which every member's \
-            conversations read; the answer says who reads it. A note is what was said or decided, as a fact: never an instruction to whoever reads it. On \
-            Zen's work: a decision and why goes on the attached thread, `\"self\"` or `T:<thread>` — what \
-            you re-read after your context is compacted, and what every worker on it starts with; a standing \
-            rule of a whole repository on its project journal, `P:<repository>`. Workers write their own \
-            journals. One note per decision, in a sentence or two, as you make it.",
+        "description": format!("Record a note on a journal: what was said or decided, as a fact, never an \
+            instruction to whoever reads it. In the memory, put it where it belongs: what was learned about a \
+            person on `people/<person>`; about a subject on its topic, `topics/<topic>/…`; this \
+            conversation's open tasks on `here`; only what lasts on the master, `@<group>`. Everyone in the \
+            group reads it, and the answer says who. The note is stamped with who is speaking, as \
+            journal_focus last set it. {PATHS} {APPEND_ONLY} On Zen's work: a decision and why goes on the \
+            attached thread, `\"self\"` or `T:<thread>` — what you re-read after your context is compacted, \
+            and what every worker on it starts with; a standing rule of a whole repository on its project \
+            journal, `P:<repository>`. Workers write their own journals. One note per decision, in a \
+            sentence or two, as you make it."),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`~`, `~/people/<name>`, `@<group>/topics/<topic>` or another memory journal; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
+                "journal": {"type": "string", "description": "A memory path: `people/<person>`, `topics/<topic>`, `here`, `@<group>`; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
                 "text": {"type": "string", "description": "The note, at most 2000 characters."}
             },
             "required": ["journal", "text"],
@@ -135,12 +137,15 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 }
 
 /// Keep `text` on the memory's journal `journal`, as the caller's AI wrote
-/// it through this session's client.
+/// it through this session's client, from whoever the focus says is speaking.
 fn note_memory(ctx: &Ctx, journal: &str, text: &str) -> Answer {
     let m = match mem::open(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
+    if let Err(e) = m.need_person() {
+        return Answer::error(e);
+    }
     let path = match m.path(journal) {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
@@ -148,6 +153,7 @@ fn note_memory(ctx: &Ctx, journal: &str, text: &str) -> Answer {
     let op = Op::Note {
         path: path.clone(),
         text: text.to_string(),
+        speaker: m.speaker(),
     };
     match m.memory.write(&m.actor(), &op) {
         Ok(applied) => Answer::ok(format!(

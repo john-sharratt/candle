@@ -104,7 +104,7 @@ pub fn dirty(tree: &Tree) -> Vec<Dirty> {
 mod tests {
     use super::*;
     use crate::files::{Meta, Sentence, Summary};
-    use crate::ops::fixture::{p, sharratt};
+    use crate::ops::fixture::{p, zen};
     use crate::path::Place;
     use crate::scope::Section;
     use crate::testing::{at, note, slug};
@@ -156,19 +156,19 @@ mod tests {
 
     #[test]
     fn an_empty_tree_is_clean_and_summaries_run_from_the_leaves_up() {
-        let mut tree = sharratt();
+        let mut tree = zen();
         assert_eq!(dirty(&tree), vec![]);
-        let grok = p("~/channels/grok");
-        tree.get_mut(&grok)
+        let topics = p("topics");
+        tree.get_mut(&topics)
             .unwrap()
             .window
             .push(note("2026-10-30T10:00:00Z", "a cat"));
         let d: Vec<String> = dirty(&tree).iter().map(|d| d.path.show()).collect();
-        assert_eq!(d, ["~/channels/grok"], "its parents wait for its summary");
-        let j = tree.get_mut(&grok).unwrap();
+        assert_eq!(d, ["@zen/topics"], "its master waits for its summary");
+        let j = tree.get_mut(&topics).unwrap();
         *j = summarised(j.clone(), "Drew a cat.");
         let d: Vec<String> = dirty(&tree).iter().map(|d| d.path.show()).collect();
-        assert_eq!(d, ["~/channels"]);
+        assert_eq!(d, ["@zen"]);
     }
 
     #[test]
