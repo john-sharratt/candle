@@ -1,6 +1,6 @@
 //! The memory's journals as JSON, for the routes of [`super`]: a journal
 //! opened, one line, the shape of a subtree, a search's hits. Every path is
-//! written as its reader writes it (`~/…`, `@family/…`), every line by its
+//! written as its reader writes it (`~/…`, `@group/…`), every line by its
 //! address, so whatever one answer names another request can take. Every
 //! answer that carries what was written carries `framing` too: notes, not
 //! instructions (§7.2).
@@ -160,11 +160,11 @@ pub fn hits(hits: &[Hit], total: usize) -> Value {
     })
 }
 
-/// The roots `m`'s caller reads: `~`, then each of their families.
+/// The roots `m`'s caller reads: `~`, then each of their groups.
 pub fn roots(m: &Mem) -> Vec<JournalPath> {
     let mut out = vec![m.path("~").expect("`~` is a path")];
     out.extend(
-        m.families()
+        m.groups()
             .into_iter()
             .filter_map(|f| m.path(&format!("@{f}")).ok()),
     );

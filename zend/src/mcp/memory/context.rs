@@ -1,5 +1,5 @@
 //! `get_user_context` (§6.4, §6.5): the frame for this conversation — its
-//! own journal, each journal above it, the person, each family — within the
+//! own journal, each journal above it, the person, each group it frames — within the
 //! client's budget, and how to keep and forget something.
 
 use journals::path::JournalPath;
@@ -20,7 +20,7 @@ pub fn budget(client: Client) -> Budget {
 /// The tools' own words, after the frame.
 pub const HOW: &str =
     "To keep something for next time: journal_note {journal: \"~\", text} — or a \
-     family journal, `@family/topics/…`, which every member's conversations read. To forget one: \
+     group's journal, `@group/topics/…`, which every member's conversations read. To forget one: \
      journal_forget {journal, says}. journal_read and journal_grep reach everything they read.";
 
 pub fn render(
@@ -51,7 +51,7 @@ mod tests {
         assert_eq!(budget(Client::ClaudeCode), Budget::Chat);
         let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
             "persons/john/person.yaml".to_string(),
-            b"person: john\nname: \"John\"\naccounts: []\nfamilies: []\n".to_vec(),
+            b"person: john\nname: \"John\"\naccounts: []\ngroups: []\n".to_vec(),
         )]);
         let t = load(&files);
         let text = render(

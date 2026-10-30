@@ -1,5 +1,5 @@
 //! The operations `POST /v1/journals` takes. Each is a JSON object naming its
-//! journals by memory path, as the tools write them — `~/…`, `@family/…`, a
+//! journals by memory path, as the tools write them — `~/…`, `@group/…`, a
 //! bare section — read for the caller into the journals crate's [`Op`] and
 //! the time it is recorded at.
 //!
@@ -13,6 +13,13 @@
 //! | `merge` | `journal`, `into` |
 //! | `share` | `journal`, `into` (`topics` when absent), `name`? |
 //! | `accept` | `line` |
+//! | `create_group` | `group`, `name`, `kind` |
+//! | `add_member` | `person`, `name`?, `emails`?, `role`?, `group`? |
+//! | `add_bot` | `bot`, `group`? |
+//! | `remove_member` | `person` or `bot`, `group`? |
+//! | `choose_groups` | `framed`, `default`? |
+//!
+//! A group a call leaves unnamed is the caller's default.
 //!
 //! `at`, `2026-10-30T09:10:02Z`, is when a note or a journal is recorded as
 //! made — the day a remembered fact was learned, for one written down later.
@@ -22,11 +29,15 @@
 //! line or a journal as it stands, now, and take no `at`. A field an operation
 //! does not take is refused, so a misspelt one is never silently dropped.
 
+use journals::files::Kind as GroupKind;
 use journals::ops::{OnTaken, Op, Which};
+use journals::path::Place;
 use journals::slug::Slug;
 use journals::time::Stamp;
 use serde_json::{Map, Value};
 
+use crate::mcp::tools::group_add::{self, group_of};
+use crate::mcp::tools::group_frame;
 use crate::mcp::tools::mem::Mem;
 use crate::mcp::tools::string;
 
@@ -53,6 +64,11 @@ enum Kind {
     Merge,
     Share,
     Accept,
+    CreateGroup,
+    AddMember,
+    AddBot,
+    RemoveMember,
+    ChooseGroups,
 }
 
 impl Kind {
@@ -67,6 +83,11 @@ impl Kind {
             "merge" => Kind::Merge,
             "share" => Kind::Share,
             "accept" => Kind::Accept,
+            "create_group" => Kind::CreateGroup,
+            "add_member" => Kind::AddMember,
+            "add_bot" => Kind::AddBot,
+            "remove_member" => Kind::RemoveMember,
+            "choose_groups" => Kind::ChooseGroups,
             _ => return None,
         })
     }
@@ -82,6 +103,11 @@ impl Kind {
             Kind::Merge => &["journal", "into"],
             Kind::Share => &["journal", "into", "name"],
             Kind::Accept => &["line"],
+            Kind::CreateGroup => &["group", "name", "kind"],
+            Kind::AddMember => &["person", "name", "emails", "role", "group"],
+            Kind::AddBot => &["bot", "group"],
+            Kind::RemoveMember => &["person", "bot", "group"],
+            Kind::ChooseGroups => &["default", "framed"],
         }
     }
 }
@@ -128,12 +154,21 @@ pub fn plan(m: &Mem, v: &Value, now: Stamp) -> Result<Planned, String> {
             },
             _ => return Err("`forget` names a `line`, or a `journal` and what it `says`".into()),
         },
-        Kind::Create => Op::Create {
-            under: path("under")?,
-            name: Slug::parse(string(v, "name")?)?,
-            cue: string(v, "cue")?.to_string(),
-            on_taken: OnTaken::Refuse,
-        },
+        Kind::Create => {
+            let under = path("under")?;
+            // A conversation's name recurs as conversations do, numbered; a
+            // topic's or a project's is refused the second time.
+            let on_taken = match under.place().map_err(|e| e.to_string())? {
+                Place::Client(_) => OnTaken::Number,
+                _ => OnTaken::Refuse,
+            };
+            Op::Create {
+                under,
+                name: Slug::parse(string(v, "name")?)?,
+                cue: string(v, "cue")?.to_string(),
+                on_taken,
+            }
+        }
         Kind::Fold => Op::Fold {
             path: path("journal")?,
         },
@@ -158,6 +193,17 @@ pub fn plan(m: &Mem, v: &Value, now: Stamp) -> Result<Planned, String> {
         Kind::Accept => Op::Accept {
             address: address()?,
         },
+        Kind::CreateGroup => Op::CreateGroup {
+            group: Slug::parse(string(v, "group")?.trim_start_matches('@'))?,
+            name: string(v, "name")?.to_string(),
+            kind: GroupKind::parse(string(v, "kind")?)?,
+        },
+        Kind::AddMember | Kind::AddBot => group_add::plan(v, group_of(m, v)?)?,
+        Kind::RemoveMember => Op::RemoveMember {
+            group: group_of(m, v)?,
+            who: group_add::whom(v)?,
+        },
+        Kind::ChooseGroups => group_frame::plan(v)?,
     };
     Ok(Planned { op, at })
 }
@@ -182,6 +228,7 @@ fn at_of(obj: &Map<String, Value>, now: Stamp) -> Result<Stamp, String> {
 
 #[cfg(test)]
 mod tests {
+    use journals::files::Who;
     use journals::line::LineId;
     use journals::path::{Address, JournalPath};
     use serde_json::json;
@@ -373,6 +420,78 @@ mod tests {
         assert_eq!(
             op(json!({"op": "accept", "line": "~#20261030-0912-7e3a"})),
             Op::Accept { address: line() }
+        );
+    }
+
+    /// **A conversation recorded by hand is numbered when its name recurs**;
+    /// anything else is refused the second time.
+    #[test]
+    fn a_conversation_is_created_numbered() {
+        assert_eq!(
+            op(
+                json!({"op": "create", "under": "~/clients/claude-code", "name": "2026-10-30-0910", "cue": "c"})
+            ),
+            Op::Create {
+                under: path("~/clients/claude-code"),
+                name: Slug::parse("2026-10-30-0910").unwrap(),
+                cue: "c".into(),
+                on_taken: OnTaken::Number,
+            }
+        );
+    }
+
+    /// **Groups are managed as the tools manage them**; a group unnamed is
+    /// the caller's default.
+    #[test]
+    fn group_operations_read_as_their_tools_do() {
+        let s = |x: &str| Slug::parse(x).unwrap();
+        assert_eq!(
+            op(
+                json!({"op": "create_group", "group": "@battle-cities", "name": "Battle Cities", "kind": "world"})
+            ),
+            Op::CreateGroup {
+                group: s("battle-cities"),
+                name: "Battle Cities".into(),
+                kind: GroupKind::World,
+            }
+        );
+        assert_eq!(
+            op(json!({"op": "add_bot", "bot": "c3f1a07e"})),
+            Op::AddBot {
+                group: s("sharratt"),
+                bot: s("c3f1a07e"),
+            }
+        );
+        assert_eq!(
+            op(json!({"op": "remove_member", "bot": "c3f1a07e", "group": "@sharratt"})),
+            Op::RemoveMember {
+                group: s("sharratt"),
+                who: Who::Bot(s("c3f1a07e")),
+            }
+        );
+        assert_eq!(
+            op(json!({"op": "choose_groups", "framed": []})),
+            Op::ChooseGroups {
+                default: None,
+                framed: vec![],
+            }
+        );
+        assert!(matches!(
+            op(json!({"op": "add_member", "person": "friend", "name": "Friend"})),
+            Op::AddMember { .. }
+        ));
+        assert_eq!(
+            planned(json!({"op": "add_bot", "bot": "b1", "role": "owner"})).unwrap_err(),
+            "`role` is not a field of `add_bot`"
+        );
+        assert_eq!(
+            planned(json!({"op": "add_member", "bot": "b1"})).unwrap_err(),
+            "`bot` is not a field of `add_member`"
+        );
+        assert_eq!(
+            planned(json!({"op": "create_group", "group": "g", "name": "G", "kind": "clan"}))
+                .unwrap_err(),
+            GroupKind::parse("clan").unwrap_err()
         );
     }
 

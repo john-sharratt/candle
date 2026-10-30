@@ -1,5 +1,6 @@
 //! `persons/<person>/person.yaml` (§3.4): the accounts that are one person,
-//! and the families they belong to.
+//! the groups they belong to, and which of those every conversation of
+//! theirs begins with.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -8,8 +9,13 @@ use crate::error::Problem;
 use crate::slug::Slug;
 use crate::yaml::{item_line, parse_doc, quote, scalar, scalar_list, Fields};
 
-/// The most families a person may belong to (§3.5).
-pub const MAX_FAMILIES: usize = 3;
+/// The most groups a person may belong to, as many as a journal has live
+/// children, so `~`'s index of them stays whole (§3.5).
+pub const MAX_GROUPS: usize = 10;
+
+/// The most groups whose summaries open every conversation of a person's,
+/// their default group among them (§6.4).
+pub const MAX_FRAMED: usize = 3;
 
 /// One sign-in at the gateway: zend's owner key, `sha256(provider \0 sub)` as
 /// 16 lowercase hex digits.
@@ -101,8 +107,19 @@ pub struct PersonFile {
     pub person: Slug,
     pub name: String,
     pub accounts: Vec<Account>,
-    pub families: Vec<Slug>,
-    pub default_family: Option<Slug>,
+    pub groups: Vec<Slug>,
+    /// Where a bare shared section and a new shared journal go; always framed.
+    pub default_group: Option<Slug>,
+    /// The other groups whose summaries open every conversation of theirs.
+    pub framed: Vec<Slug>,
+}
+
+impl PersonFile {
+    /// The groups whose summaries open every conversation of theirs: the
+    /// default first, then the others framed, in the file's order.
+    pub fn framed_groups(&self) -> Vec<&Slug> {
+        self.default_group.iter().chain(&self.framed).collect()
+    }
 }
 
 impl PersonFile {
@@ -123,25 +140,49 @@ impl PersonFile {
                 }
             }
         }
-        if self.families.len() > MAX_FAMILIES {
+        if self.groups.len() > MAX_GROUPS {
             return Err(format!(
-                "{} families: a person belongs to at most {MAX_FAMILIES}",
-                self.families.len()
+                "{} groups: a person belongs to at most {MAX_GROUPS}",
+                self.groups.len()
             ));
         }
-        let unique: BTreeSet<&Slug> = self.families.iter().collect();
-        if unique.len() != self.families.len() {
-            return Err("a family is listed twice".into());
+        let unique: BTreeSet<&Slug> = self.groups.iter().collect();
+        if unique.len() != self.groups.len() {
+            return Err("a group is listed twice".into());
         }
-        match &self.default_family {
-            Some(d) if !self.families.contains(d) => Err(format!(
-                "`default_family` is {d}, which is not one of their families"
-            )),
-            None if !self.families.is_empty() => {
-                Err("`default_family` is missing: they belong to a family".into())
+        // No default is a person's to fix by choosing one: taken out of
+        // their default by an owner, they are left without one rather than
+        // given whichever group that owner left them in.
+        if let Some(d) = &self.default_group {
+            if !self.groups.contains(d) {
+                return Err(format!(
+                    "`default_group` is {d}, which is not one of their groups"
+                ));
             }
-            _ => Ok(()),
         }
+        let mut framed = BTreeSet::new();
+        for g in &self.framed {
+            if !self.groups.contains(g) {
+                return Err(format!(
+                    "`framed` names {g}, which is not one of their groups"
+                ));
+            }
+            if Some(g) == self.default_group.as_ref() {
+                return Err(format!(
+                    "`framed` names {g}, their default group, which is always framed"
+                ));
+            }
+            if !framed.insert(g) {
+                return Err(format!("`framed` names {g} twice"));
+            }
+        }
+        if self.framed_groups().len() > MAX_FRAMED {
+            return Err(format!(
+                "{} groups framed with the default: at most {MAX_FRAMED} open every conversation",
+                self.framed_groups().len()
+            ));
+        }
+        Ok(())
     }
 
     pub fn render(&self) -> String {
@@ -165,10 +206,14 @@ impl PersonFile {
                 }
             }
         }
-        let fams: Vec<&str> = self.families.iter().map(Slug::as_str).collect();
-        out.push_str(&format!("families: {}\n", scalar_list(&fams)));
-        if let Some(d) = &self.default_family {
-            out.push_str(&format!("default_family: {}\n", scalar(d.as_str())));
+        let groups: Vec<&str> = self.groups.iter().map(Slug::as_str).collect();
+        out.push_str(&format!("groups: {}\n", scalar_list(&groups)));
+        if let Some(d) = &self.default_group {
+            out.push_str(&format!("default_group: {}\n", scalar(d.as_str())));
+        }
+        if !self.framed.is_empty() {
+            let framed: Vec<&str> = self.framed.iter().map(Slug::as_str).collect();
+            out.push_str(&format!("framed: {}\n", scalar_list(&framed)));
         }
         out
     }
@@ -186,20 +231,24 @@ impl PersonFile {
             af.done()?;
             accounts.push(Account { email, key });
         }
-        let families = f
-            .opt_strs("families")?
-            .unwrap_or_default()
-            .iter()
-            .map(|s| Slug::parse(s))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|why| f.problem("families", format!("`families`: {why}")))?;
-        let default_family = f.opt_parsed("default_family", Slug::parse)?;
+        let mut slugs = |key: &str| {
+            f.opt_strs(key)?
+                .unwrap_or_default()
+                .iter()
+                .map(|s| Slug::parse(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|why| f.problem(key, format!("`{key}`: {why}")))
+        };
+        let groups = slugs("groups")?;
+        let framed = slugs("framed")?;
+        let default_group = f.opt_parsed("default_group", Slug::parse)?;
         let out = PersonFile {
             person,
             name,
             accounts,
-            families,
-            default_family,
+            groups,
+            default_group,
+            framed,
         };
         out.check().map_err(|why| f.problem("person", why))?;
         f.done()?;
@@ -226,8 +275,9 @@ mod tests {
                     key: None,
                 },
             ],
-            families: vec![slug("sharratt")],
-            default_family: Some(slug("sharratt")),
+            groups: vec![slug("sharratt")],
+            default_group: Some(slug("sharratt")),
+            framed: vec![],
         }
     }
 
@@ -239,7 +289,7 @@ mod tests {
             "person: yen\nname: \"Yen\"\naccounts:\n\
              \x20 - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n\
              \x20 - {email: \"yen.other@example.net\"}\n\
-             families: [sharratt]\ndefault_family: sharratt\n"
+             groups: [sharratt]\ndefault_group: sharratt\n"
         );
         assert_eq!(
             PersonFile::read("persons/yen/person.yaml", &p.render()).unwrap(),
@@ -247,28 +297,61 @@ mod tests {
         );
     }
 
+    /// **The default group is always framed**; `framed` names the others
+    /// that open every conversation too.
     #[test]
-    fn a_person_in_no_family_with_no_accounts_round_trips() {
+    fn framed_groups_are_the_default_then_the_ones_named() {
+        let mut p = yen();
+        p.groups = vec![slug("sharratt"), slug("battle-cities"), slug("work")];
+        p.framed = vec![slug("work")];
+        assert_eq!(
+            p.render(),
+            "person: yen\nname: \"Yen\"\naccounts:\n\
+             \x20 - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n\
+             \x20 - {email: \"yen.other@example.net\"}\n\
+             groups: [sharratt, battle-cities, work]\ndefault_group: sharratt\nframed: [work]\n"
+        );
+        assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
+        assert_eq!(p.framed_groups(), [&slug("sharratt"), &slug("work")]);
+    }
+
+    #[test]
+    fn a_person_in_no_group_with_no_accounts_round_trips() {
         let p = PersonFile {
             person: slug("solo"),
             name: "Solo".into(),
             accounts: vec![],
-            families: vec![],
-            default_family: None,
+            groups: vec![],
+            default_group: None,
+            framed: vec![],
         };
         assert_eq!(
             p.render(),
-            "person: solo\nname: \"Solo\"\naccounts: []\nfamilies: []\n"
+            "person: solo\nname: \"Solo\"\naccounts: []\ngroups: []\n"
         );
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
+        assert!(p.framed_groups().is_empty());
+    }
+
+    /// **Groups without a default are theirs to choose from**: an owner
+    /// taking them out of their default leaves them so.
+    #[test]
+    fn a_person_in_groups_with_no_default_round_trips() {
+        let mut p = yen();
+        p.groups = vec![slug("work")];
+        p.default_group = None;
+        assert!(p.render().ends_with("groups: [work]\n"), "{}", p.render());
+        assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
+        assert!(p.framed_groups().is_empty());
     }
 
     #[test]
     fn names_and_keys_yaml_would_misread_round_trip() {
         let mut p = yen();
         p.person = slug("0123");
-        p.families = vec![slug("true"), slug("null")];
-        p.default_family = Some(slug("null"));
+        p.groups = vec![slug("true"), slug("null")];
+        p.default_group = Some(slug("null"));
+        p.framed = vec![slug("true")];
         p.accounts[0].key = Some(AccountKey::parse("1234567890123e45").unwrap());
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
     }
@@ -306,24 +389,39 @@ mod tests {
             ("3b1f09c2d47e8a60", "3B1F", "not an account key"),
             ("yen.other@example.net", "yen@example.com", "listed twice"),
             (
-                "families: [sharratt]",
-                "families: [sharratt, sharratt]",
-                "a family is listed twice",
+                "groups: [sharratt]",
+                "groups: [sharratt, sharratt]",
+                "a group is listed twice",
             ),
             (
-                "families: [sharratt]",
-                "families: [a, b, c, d]",
-                "at most 3",
+                "groups: [sharratt]",
+                "groups: [sharratt, a, b, c, d, e, f, g, h, i, j]",
+                "11 groups: a person belongs to at most 10",
             ),
             (
-                "default_family: sharratt",
-                "default_family: other",
-                "not one of their families",
+                "default_group: sharratt",
+                "default_group: other",
+                "`default_group` is other, which is not one of their groups",
             ),
             (
-                "default_family: sharratt\n",
-                "",
-                "`default_family` is missing",
+                "default_group: sharratt\n",
+                "default_group: sharratt\nframed: [work]\n",
+                "`framed` names work, which is not one of their groups",
+            ),
+            (
+                "default_group: sharratt\n",
+                "default_group: sharratt\nframed: [sharratt]\n",
+                "`framed` names sharratt, their default group, which is always framed",
+            ),
+            (
+                "groups: [sharratt]\ndefault_group: sharratt\n",
+                "groups: [sharratt, a]\ndefault_group: sharratt\nframed: [a, a]\n",
+                "`framed` names a twice",
+            ),
+            (
+                "groups: [sharratt]\ndefault_group: sharratt\n",
+                "groups: [sharratt, a, b, c]\ndefault_group: sharratt\nframed: [a, b, c]\n",
+                "4 groups framed with the default: at most 3 open every conversation",
             ),
             ("name: \"Yen\"", "name: \"  \"", "`name` is empty"),
             ("person: yen", "person: Yen", "not a name"),
@@ -332,10 +430,11 @@ mod tests {
                 "{email: \"yen.other@example.net\", phone: 1}",
                 "`phone` is not a field",
             ),
+            ("groups:", "colour: red\ngroups:", "`colour` is not a field"),
             (
-                "families:",
-                "colour: red\nfamilies:",
-                "`colour` is not a field",
+                "groups: [sharratt]\ndefault_group: sharratt\n",
+                "families: [sharratt]\ndefault_family: sharratt\n",
+                "`families` is not a field",
             ),
         ] {
             assert!(good.contains(from), "{from}");

@@ -18,7 +18,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "The journal, such as `@family/topics/house-build/permits`."},
+                "journal": {"type": "string", "description": "The journal, such as `@sharratt/topics/house-build/permits`."},
                 "unfold": {"type": "boolean", "description": "Bring it back instead (false by default)."}
             },
             "required": ["journal"],

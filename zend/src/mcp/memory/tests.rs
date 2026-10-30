@@ -67,6 +67,7 @@ fn a_write_error_is_told_by_its_kind() {
     let actor = Actor::Person {
         person: john,
         client: Client::Grok,
+        admin: false,
     };
     let note = |text: &str| Op::Note {
         path: root.clone(),
@@ -121,7 +122,7 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-/// A bare origin seeded with one family and its owner, and a clone of it.
+/// A bare origin seeded with one group and its owner, and a clone of it.
 fn repo() -> (TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let origin = root.path().join("origin.git");
@@ -133,8 +134,8 @@ fn repo() -> (TempDir, PathBuf) {
     );
     let seed = root.path().join("seed");
     for (file, text) in [
-        ("persons/john/person.yaml", "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\nfamilies: [sharratt]\ndefault_family: sharratt\n"),
-        ("families/sharratt/family.yaml", "family: sharratt\nname: \"Sharratt\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n"),
+        ("persons/john/person.yaml", "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n"),
+        ("groups/sharratt/group.yaml", "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n"),
     ] {
         let at = seed.join(file);
         std::fs::create_dir_all(at.parent().unwrap()).unwrap();
@@ -191,6 +192,7 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
     let actor = Actor::Person {
         person: john.clone(),
         client: Client::Grok,
+        admin: false,
     };
     m.write(
         &actor,

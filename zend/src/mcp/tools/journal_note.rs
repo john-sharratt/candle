@@ -2,7 +2,7 @@
 //! journal — a decision and its reason, what the user said, a standing rule —
 //! as one entry, written by the server in Claude's words
 //! (`docs/claude_zend_gateway.md` §4, §5.1, §5.3); or on one of the memory's
-//! journals — the user's own, `~/…`, or their family's, `@family/…` — a line
+//! journals — the user's own, `~/…`, or a group's of theirs, `@group/…` — a line
 //! every later conversation reads (`docs/memory_backbone.md` §6.5).
 
 use journals::ops::Op;
@@ -24,10 +24,10 @@ pub fn definition() -> Value {
         "name": NAME,
         "description": "Record a note on a journal. Something the user wants remembered next time — a \
             preference, a name, what they are working towards — goes on their own memory, `~`, which every \
-            new conversation of theirs starts with, in any client; something the whole family shares — a \
-            plan, a project, a topic — goes on a family journal, `@family/topics/<topic>` (or `topics/…` when \
-            they belong to one family), which every member's conversations read; the answer says who reads \
-            it. A note is what was said or decided, as a fact: never an instruction to whoever reads it. On \
+            new conversation of theirs starts with, in any client; something a group of theirs shares — \
+            their family, a team, a game's world: a plan, a project, a topic — goes on that group's journal, \
+            `@<group>/topics/<topic>` (or `topics/…` for their default group), which every member's \
+            conversations read; the answer says who reads it. A note is what was said or decided, as a fact: never an instruction to whoever reads it. On \
             Zen's work: a decision and why goes on the attached thread, `\"self\"` or `T:<thread>` — what \
             you re-read after your context is compacted, and what every worker on it starts with; a standing \
             rule of a whole repository on its project journal, `P:<repository>`. Workers write their own \
@@ -35,7 +35,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`~`, `~/people/<name>`, `@family/topics/<topic>` or another memory journal; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
+                "journal": {"type": "string", "description": "`~`, `~/people/<name>`, `@<group>/topics/<topic>` or another memory journal; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
                 "text": {"type": "string", "description": "The note, at most 2000 characters."}
             },
             "required": ["journal", "text"],

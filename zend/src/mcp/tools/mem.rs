@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use journals::actor::{families_of, viewer, Actor};
+use journals::actor::{groups_of, viewer, Actor};
+use journals::files::Who;
 use journals::path::{Address, JournalPath, Owner};
 use journals::scope::Client;
 use journals::slug::Slug;
@@ -22,6 +23,9 @@ pub struct Mem {
     pub tree: Arc<Tree>,
     pub person: Slug,
     pub client: Client,
+    /// The estate's role table names the caller an admin: they list
+    /// accounts' emails.
+    pub admin: bool,
 }
 
 /// The journal client an MCP session's client is.
@@ -38,7 +42,7 @@ pub fn open(ctx: &Ctx) -> Result<Mem, String> {
 }
 
 /// Whether what [`open`] answered stays true however often it is asked —
-/// this account is in no family — rather than passing: the repository still
+/// this account is in no group — rather than passing: the repository still
 /// being read, this member holding no journal checkout while another may.
 /// A lasting answer is given as an answer; a passing one as an error, which
 /// the aggregator asks again.
@@ -61,7 +65,20 @@ impl Mem {
             memory,
             person,
             client,
+            admin: caller.is_admin(),
         })
+    }
+
+    /// The same caller, reading `tree`: a batch's operations, each seen
+    /// against the tree as the ones before it leave it.
+    pub fn seeing(&self, tree: Arc<Tree>) -> Mem {
+        Mem {
+            memory: Arc::clone(&self.memory),
+            tree,
+            person: self.person.clone(),
+            client: self.client,
+            admin: self.admin,
+        }
     }
 
     /// The caller's AI, as a writer.
@@ -69,6 +86,7 @@ impl Mem {
         Actor::Person {
             person: self.person.clone(),
             client: self.client,
+            admin: self.admin,
         }
     }
 
@@ -85,34 +103,57 @@ impl Mem {
             .map_err(|e| e.to_string())
     }
 
-    /// Who reads what is under `path`: the caller alone, or their family.
+    /// Who reads what is under `path`: the caller alone, or their group's
+    /// other people and its bots.
     pub fn readers(&self, path: &JournalPath) -> String {
         match path.owner() {
             Owner::Person(_) => "only you read it".into(),
-            Owner::Family(f) => {
-                let others: Vec<String> = self
-                    .tree
-                    .family_file(f)
-                    .map(|file| {
-                        file.members
-                            .iter()
-                            .filter(|m| m.person != self.person)
-                            .map(|m| name_of(&self.tree, &m.person))
+            Owner::Group(g) => {
+                let file = self.tree.group_file(g);
+                let others: Vec<String> = file
+                    .map(|f| {
+                        f.persons()
+                            .filter(|(p, _)| *p != &self.person)
+                            .map(|(p, _)| name_of(&self.tree, p))
                             .collect()
                     })
                     .unwrap_or_default();
-                match others.as_slice() {
-                    [] => format!("shared with @{f}, which has no other member yet"),
+                let bots = file.map_or(0, |f| {
+                    f.members
+                        .iter()
+                        .filter(|m| matches!(m.who, Who::Bot(_)))
+                        .count()
+                });
+                let people = match others.as_slice() {
+                    [] if bots == 0 => {
+                        return format!("shared with @{g}, which has no other member yet")
+                    }
+                    [] => String::new(),
                     [one] => format!("shared with {one}"),
                     [rest @ .., last] => format!("shared with {} and {last}", rest.join(", ")),
+                };
+                let bots = match bots {
+                    0 => String::new(),
+                    1 => "read by its bot".to_string(),
+                    n => format!("read by its {n} bots"),
+                };
+                match (people.is_empty(), bots.is_empty()) {
+                    (false, false) => format!("{people}, and {bots}"),
+                    (false, true) => people,
+                    _ => format!("{bots} only"),
                 }
             }
         }
     }
 
-    /// The families the caller belongs to.
-    pub fn families(&self) -> Vec<Slug> {
-        families_of(&self.tree, &self.person)
+    /// The groups the caller belongs to.
+    pub fn groups(&self) -> Vec<Slug> {
+        groups_of(&self.tree, &self.person)
+    }
+
+    /// The caller's default group: where a bare shared section is.
+    pub fn default_group(&self) -> Option<Slug> {
+        viewer(&self.tree, &self.person).default_group
     }
 }
 
@@ -120,30 +161,32 @@ impl Mem {
 pub(crate) mod tests {
     use std::collections::BTreeMap;
 
+    use journals::files::{Member, Role};
+    use journals::time::Stamp;
     use journals::tree::load::load;
     use serde_json::json;
 
     use super::*;
-    use crate::mcp::tools::family_add::family_of;
+    use crate::mcp::tools::group_add::group_of;
 
     /// The Sharratts: John and Yen owners, Thanh Long a member; `solo` in no
-    /// family.
+    /// group. John is the estate's admin.
     pub(crate) fn mem(person: &str) -> Mem {
-        let p = |slug: &str, name: &str, fams: &str| {
+        let p = |slug: &str, name: &str, groups: &str| {
             (
                 format!("persons/{slug}/person.yaml"),
-                format!("person: {slug}\nname: \"{name}\"\naccounts: []\n{fams}").into_bytes(),
+                format!("person: {slug}\nname: \"{name}\"\naccounts: []\n{groups}").into_bytes(),
             )
         };
-        let fam = "families: [sharratt]\ndefault_family: sharratt\n";
+        let sharratt = "groups: [sharratt]\ndefault_group: sharratt\n";
         let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([
-            p("john", "John", fam),
-            p("yen", "Yen", fam),
-            p("thanhlong", "Thanh Long", fam),
-            p("solo", "Solo", "families: []\n"),
+            p("john", "John", sharratt),
+            p("yen", "Yen", sharratt),
+            p("thanhlong", "Thanh Long", sharratt),
+            p("solo", "Solo", "groups: []\n"),
             (
-                "families/sharratt/family.yaml".into(),
-                b"family: sharratt\nname: \"Sharratt\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: thanhlong, role: member, joined: 2026-10-30T00:00:00Z}\n".to_vec(),
+                "groups/sharratt/group.yaml".into(),
+                b"group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: thanhlong, role: member, joined: 2026-10-30T00:00:00Z}\n".to_vec(),
             ),
         ]);
         Mem {
@@ -151,6 +194,7 @@ pub(crate) mod tests {
             tree: Arc::new(load(&files)),
             person: Slug::parse(person).unwrap(),
             client: Client::Grok,
+            admin: person == "john",
         }
     }
 
@@ -182,21 +226,22 @@ pub(crate) mod tests {
         );
         assert!(m.address("~").is_err());
         let solo = mem("solo");
-        assert!(solo
-            .path("topics")
-            .unwrap_err()
-            .contains("belong to no family"));
+        assert_eq!(
+            solo.path("topics").unwrap_err(),
+            "`topics` is shared, and you have no default group: name one, as `@group/topics`"
+        );
         assert_eq!(
             m.actor(),
             Actor::Person {
                 person: Slug::parse("john").unwrap(),
-                client: Client::Grok
+                client: Client::Grok,
+                admin: true,
             }
         );
         assert_eq!(client_of(McpClient::ClaudeCode), Client::ClaudeCode);
     }
 
-    /// **Only a caller in no family is a lasting answer**; the memory still
+    /// **Only a caller in no group is a lasting answer**; the memory still
     /// opening, or held on another member, is asked again.
     #[test]
     fn only_a_stranger_is_answered_as_lasting() {
@@ -209,17 +254,39 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_family_is_named_or_the_callers_only_one() {
+    fn a_group_is_named_or_the_callers_default() {
         let m = mem("john");
-        assert_eq!(m.families(), [Slug::parse("sharratt").unwrap()]);
-        assert_eq!(family_of(&m, &json!({})).unwrap().as_str(), "sharratt");
+        assert_eq!(m.groups(), [Slug::parse("sharratt").unwrap()]);
+        assert_eq!(group_of(&m, &json!({})).unwrap().as_str(), "sharratt");
         assert_eq!(
-            family_of(&m, &json!({"family": "@work"})).unwrap().as_str(),
+            group_of(&m, &json!({"group": "@work"})).unwrap().as_str(),
             "work"
         );
         assert_eq!(
-            family_of(&mem("solo"), &json!({})).unwrap_err(),
-            "you belong to no family"
+            group_of(&mem("solo"), &json!({})).unwrap_err(),
+            "you have no default group: name the `group`"
+        );
+    }
+
+    /// **A write into a group says who else reads it**, its bots included.
+    #[test]
+    fn a_groups_readers_include_its_bots() {
+        let mut m = mem("john");
+        let mut tree = (*m.tree).clone();
+        let g = tree
+            .groups
+            .get_mut(&Slug::parse("sharratt").unwrap())
+            .unwrap();
+        let file = g.file.as_mut().unwrap();
+        file.members.push(Member {
+            who: Who::Bot(Slug::parse("c3f1a07e").unwrap()),
+            role: Role::Reader,
+            joined: Stamp::parse("2026-10-30T00:00:00Z").unwrap(),
+        });
+        m.tree = Arc::new(tree);
+        assert_eq!(
+            m.readers(&m.path("topics").unwrap()),
+            "shared with Yen and Thanh Long, and read by its bot"
         );
     }
 }

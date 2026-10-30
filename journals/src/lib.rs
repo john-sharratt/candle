@@ -1,5 +1,5 @@
 //! The memory backbone (`docs/memory_backbone.md`): every person's journal
-//! tree and their families', kept as YAML in one git repository and read and
+//! tree and their groups', kept as YAML in one git repository and read and
 //! written by every AI on the estate.
 //!
 //! | Module | |

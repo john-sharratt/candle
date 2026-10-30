@@ -18,7 +18,7 @@ pub struct Meta {
     pub closed: Option<Stamp>,
     /// Left out of its parent's live index (§2.3).
     pub folded: bool,
-    /// The family journal it was shared into, written `@family/path`.
+    /// The group journal it was shared into, written `@group/path`.
     pub shared: Option<String>,
     pub summary: Option<Summary>,
 }
@@ -70,7 +70,7 @@ impl Meta {
             .ok_or_else(|| f.problem("folded", "`folded` is missing"))?;
         let shared = f.opt_str("shared")?;
         if shared.as_deref().is_some_and(|s| !s.starts_with('@')) {
-            return Err(f.problem("shared", "`shared` names a family journal, `@family/path`"));
+            return Err(f.problem("shared", "`shared` names a group journal, `@group/path`"));
         }
         let summary = match f.opt_map("summary")? {
             None => None,
@@ -215,7 +215,7 @@ mod tests {
                 "shared: \"@sharratt/topics/candle\"",
                 "shared: \"topics/candle\"",
                 6,
-                "`@family/path`",
+                "`@group/path`",
             ),
             ("over: ", "over: xyz", 8, "not a fingerprint"),
             ("lines: 12", "lines: many", 10, "not a count"),

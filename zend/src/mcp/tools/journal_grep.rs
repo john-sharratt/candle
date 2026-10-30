@@ -26,8 +26,8 @@ pub fn definition() -> Value {
         "annotations": {"readOnlyHint": true},
         "description": "Search journals for a word or phrase (case-insensitive substring), to find something \
             without paging through it. In the memory: `*` searches everything the user reads — their own \
-            journals and their family's, windows, archives and summaries, folded journals too; a path such as \
-            `~` or `@family/topics` searches below it. Each hit names its journal and line; read it with \
+            journals and their groups', windows, archives and summaries, folded journals too; a path such as \
+            `~` or `@sharratt/topics` searches below it. Each hit names its journal and line; read it with \
             `journal_read`. In Zen's work: a worker (`T:<thread>/<name>`), through the turns behind its \
             entries, or behind one `entry`; every worker on a thread (`T:<thread>/*`), when you do not know \
             which one learned it; a thread's own journal (`\"self\"` or `T:<thread>`); a project's standing \
@@ -36,7 +36,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`*`, `~`, `@family` or a memory path; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
+                "journal": {"type": "string", "description": "`*`, `~`, `@<group>` or a memory path; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}

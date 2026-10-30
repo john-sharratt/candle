@@ -1,5 +1,5 @@
 //! The store against real repositories: a bare origin seeded with the
-//! fixture family, and clones of it standing for the agents that hold it.
+//! fixture group, and clones of it standing for the agents that hold it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use super::*;
-use crate::files::{render_lines, Role};
+use crate::files::{render_lines, Email, Kind, Role};
 use crate::line::Writer;
 use crate::ops::fixture::{john, now, p, sharratt, yen};
 use crate::ops::{OnTaken, Which};
@@ -133,7 +133,7 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
     assert!(s.unpushed());
     assert_eq!(texts(s.tree(), "topics"), ["The builder starts Monday."]);
     // The checkout's own branch and working tree are the jobs'; untouched.
-    assert!(!dir.join("families/sharratt/topics/lines.yaml").exists());
+    assert!(!dir.join("groups/sharratt/topics/lines.yaml").exists());
     let synced = s.sync().unwrap();
     assert_eq!(
         (synced.pushed, synced.replayed, synced.fetched),
@@ -352,6 +352,46 @@ fn a_restart_behind_a_moved_origin_replays_what_it_held() {
     );
 }
 
+/// **A replayed write is checked as its caller was**: John listed Yen Nhi's
+/// account as an admin, and the commit says so, so it is kept on top of an
+/// origin that moved meanwhile.
+#[test]
+fn an_admins_write_replays_as_an_admins() {
+    let r = Repos::new();
+    let dir = r.clone("a");
+    {
+        let mut s = Store::open(&dir).unwrap();
+        let add = Op::AddMember {
+            group: slug("sharratt"),
+            person: slug("yen-nhi"),
+            name: Some("Yen Nhi".into()),
+            emails: vec![Email::parse("yen.nhi@example.com").unwrap()],
+            role: Role::Member,
+        };
+        s.write(&john(), &add, now()).unwrap();
+    }
+    let log = git(&dir, &["log", "-1", "--format=%B", "refs/journal/head"]);
+    assert!(
+        log.contains(
+            "Journal-Actor: {\"kind\":\"person\",\"person\":\"john\",\"client\":\"claude-code\",\"admin\":true}"
+        ),
+        "{log}"
+    );
+    let mut b = Store::open(&r.clone("b")).unwrap();
+    b.write(&yen(), &note("pushed meanwhile"), now().plus(1))
+        .unwrap();
+    b.sync().unwrap();
+    let mut s = Store::open(&dir).unwrap();
+    let p = s.tree().person_file(&slug("yen-nhi")).unwrap();
+    assert_eq!(p.accounts[0].email.as_str(), "yen.nhi@example.com");
+    let synced = s.sync().unwrap();
+    assert_eq!(synced.dropped, vec![]);
+    assert!(r
+        .origin_tree("check")
+        .person_file(&slug("yen-nhi"))
+        .is_some());
+}
+
 #[test]
 fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
     let r = Repos::new();
@@ -359,7 +399,7 @@ fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
     let line = testing_note("2026-10-30T09:00:00Z", "written by hand");
     r.hand_edit(
         "hand",
-        "families/sharratt/topics/lines.yaml",
+        "groups/sharratt/topics/lines.yaml",
         &render_lines(&[line]),
     );
     let synced = s.sync().unwrap();
@@ -373,12 +413,12 @@ fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
     let mut s = Store::open(&r.clone("a")).unwrap();
     r.hand_edit(
         "hand",
-        "families/sharratt/topics/lines.yaml",
+        "groups/sharratt/topics/lines.yaml",
         "- {id: nope}\n",
     );
     s.sync().unwrap();
     let topics = s.tree().get(&p("topics")).unwrap();
-    assert_eq!(topics.problems[0].to_string(), "families/sharratt/topics/lines.yaml:1: `id`: `nope` is not a line id, written 20261030-0912-7e3a");
+    assert_eq!(topics.problems[0].to_string(), "groups/sharratt/topics/lines.yaml:1: `id`: `nope` is not a line id, written 20261030-0912-7e3a");
     assert!(matches!(
         s.write(&yen(), &note("x"), now()),
         Err(StoreError::Journal(Error::Refused(_)))
@@ -393,7 +433,7 @@ fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
         now(),
     )
     .unwrap();
-    r.hand_edit("fix", "families/sharratt/topics/lines.yaml", "");
+    r.hand_edit("fix", "groups/sharratt/topics/lines.yaml", "");
     s.sync().unwrap();
     assert!(s.tree().get(&p("topics")).unwrap().problems.is_empty());
     assert_eq!(texts(s.tree(), "projects"), ["fine"]);
@@ -432,11 +472,20 @@ fn every_kind_of_write_lands_on_origin_as_its_files() {
             path: p("topics/trip"),
         },
         Op::AddMember {
-            family: slug("sharratt"),
+            group: slug("sharratt"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![],
             role: Role::Member,
+        },
+        Op::CreateGroup {
+            group: slug("battle-cities"),
+            name: "Battle Cities".into(),
+            kind: Kind::World,
+        },
+        Op::AddBot {
+            group: slug("battle-cities"),
+            bot: slug("c3f1a07e"),
         },
     ];
     for op in &ops {
@@ -447,6 +496,9 @@ fn every_kind_of_write_lands_on_origin_as_its_files() {
     assert_eq!(r.origin_tree("check"), mine);
     assert_eq!(texts(&mine, "topics/trip"), ["Flights.", "Hoi An."]);
     assert!(mine.person_file(&slug("yen-nhi")).is_some());
+    assert!(mine
+        .group_file(&slug("battle-cities"))
+        .is_some_and(|g| g.bot(&slug("c3f1a07e")).is_some()));
 }
 
 #[test]

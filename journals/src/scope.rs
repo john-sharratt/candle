@@ -8,8 +8,9 @@ use std::fmt;
 pub enum Scope {
     /// The person's own folder, `persons/<person>/`: read by their AIs alone.
     Personal,
-    /// A family's folder, `families/<family>/`: read by every member's AIs.
-    Family,
+    /// A group's folder, `groups/<group>/`: read by every member's AIs, and
+    /// its bots.
+    Group,
 }
 
 /// The sections: the journals directly under a root.
@@ -25,7 +26,7 @@ pub enum Section {
     Threads,
     /// Themes of life and work that span conversations.
     Topics,
-    /// The family's bots, and what each did.
+    /// The group's bots, and what each did.
     Bots,
 }
 
@@ -42,7 +43,7 @@ impl Section {
     pub fn scope(self) -> Scope {
         match self {
             Self::Clients | Self::People => Scope::Personal,
-            Self::Projects | Self::Threads | Self::Topics | Self::Bots => Scope::Family,
+            Self::Projects | Self::Threads | Self::Topics | Self::Bots => Scope::Group,
         }
     }
 
@@ -76,7 +77,7 @@ impl Section {
             Self::Projects => "open for repositories and durable projects",
             Self::Threads => "open for Zen feature threads, their workers and parts",
             Self::Topics => "open for themes that span conversations",
-            Self::Bots => "open for the family's bots and what each did",
+            Self::Bots => "open for the group's bots and what each did",
         }
     }
 
@@ -166,7 +167,7 @@ mod tests {
             [Section::Clients, Section::People]
         );
         assert_eq!(
-            Section::of(Scope::Family).collect::<Vec<_>>(),
+            Section::of(Scope::Group).collect::<Vec<_>>(),
             [
                 Section::Projects,
                 Section::Threads,

@@ -13,8 +13,8 @@ use super::Memory;
 use crate::mcp::caller::Caller;
 
 /// What a caller no person lists is told.
-pub const STRANGER: &str = "this account is in no family yet, so nothing is remembered for it: \
-     an owner of a family adds it with family_add";
+pub const STRANGER: &str = "this account is in no group yet, so nothing is remembered for it: \
+     an estate admin lists it with group_add";
 
 /// The person `key` and `email` are, from `tree` alone: who, and the bind to
 /// make first when the account is new.
@@ -63,7 +63,7 @@ mod tests {
     fn tree() -> Tree {
         let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
             "persons/yen/person.yaml".to_string(),
-            b"person: yen\nname: \"Yen\"\naccounts:\n  - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n  - {email: \"yensharratt@hotmail.com\"}\nfamilies: []\n".to_vec(),
+            b"person: yen\nname: \"Yen\"\naccounts:\n  - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n  - {email: \"yensharratt@hotmail.com\"}\ngroups: []\n".to_vec(),
         )]);
         load(&files)
     }

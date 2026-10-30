@@ -118,7 +118,7 @@ mod tests {
         );
         assert_eq!(
             ch.keys().collect::<Vec<_>>(),
-            ["families/sharratt/topics/lines.yaml"]
+            ["groups/sharratt/topics/lines.yaml"]
         );
     }
 
@@ -146,7 +146,7 @@ mod tests {
         );
         assert_eq!(
             ch,
-            Changes::from([("families/sharratt/topics/lines.yaml".to_string(), None)])
+            Changes::from([("groups/sharratt/topics/lines.yaml".to_string(), None)])
         );
     }
 
@@ -184,16 +184,10 @@ mod tests {
                 into: p("topics/a"),
             },
         );
-        assert_eq!(
-            ch.get("families/sharratt/topics/b/journal.yaml"),
-            Some(&None)
-        );
-        assert_eq!(
-            ch.get("families/sharratt/topics/b/c/lines.yaml"),
-            Some(&None)
-        );
+        assert_eq!(ch.get("groups/sharratt/topics/b/journal.yaml"), Some(&None));
+        assert_eq!(ch.get("groups/sharratt/topics/b/c/lines.yaml"), Some(&None));
         assert!(matches!(
-            ch.get("families/sharratt/topics/a/c/lines.yaml"),
+            ch.get("groups/sharratt/topics/a/c/lines.yaml"),
             Some(Some(_))
         ));
     }
@@ -202,7 +196,7 @@ mod tests {
     fn adding_a_member_writes_both_owner_files() {
         let t = sharratt();
         let op = Op::AddMember {
-            family: slug("sharratt"),
+            group: slug("sharratt"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![],
@@ -211,10 +205,7 @@ mod tests {
         let ch = holds(&t, &op);
         assert_eq!(
             ch.keys().collect::<Vec<_>>(),
-            [
-                "families/sharratt/family.yaml",
-                "persons/yen-nhi/person.yaml"
-            ]
+            ["groups/sharratt/group.yaml", "persons/yen-nhi/person.yaml"]
         );
     }
 

@@ -110,7 +110,10 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
     let cap = summary_cap(j.place);
     let whose = match path.owner() {
         Owner::Person(p) => format!("{}'s own memory", name_of(tree, p)),
-        Owner::Family(f) => format!("the @{f} family's shared memory"),
+        Owner::Group(g) => {
+            let kind = tree.group_file(g).map_or("group", |f| f.kind.name());
+            format!("the @{g} {kind}'s shared memory")
+        }
     };
     let mut out = format!("You keep the summary of one journal in {whose}: {path}");
     if let Some(cue) = j.cue() {
@@ -125,7 +128,7 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
     if let Some(dcap) = digest_cap(j.place, path.owner().scope()) {
         let aloud = match path.owner().scope() {
             Scope::Personal => "the few things about them worth saying aloud first",
-            Scope::Family => "the few things about the family worth saying aloud first",
+            Scope::Group => "the few things about the group worth saying aloud first",
         };
         out.push_str(&format!(
             " Then a voice digest of at most {dcap} characters: {aloud}."

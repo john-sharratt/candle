@@ -1,6 +1,6 @@
-//! `get_user_context`: who the user is, what they and their family are working
+//! `get_user_context`: who the user is, what they and their groups are working
 //! on, and what was done for them lately — this conversation first, then up to
-//! the person and each family — within the client's budget
+//! the person and each group they frame — within the client's budget
 //! (`docs/memory_backbone.md` §6.4, §6.5). The aggregator puts the client's
 //! guide in front of the answer, and gives the same answer to the first call of
 //! a conversation, whatever tool it is (`docs/mcp_user_context.md` §2.5).
@@ -17,8 +17,8 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Who this user is, what they asked you to remember, what they and their family are \
-            working on, and what you did together in recent conversations — pictures drawn, bots given \
+        "description": "Who this user is, what they asked you to remember, what they and their family or \
+            other groups are working on, and what you did together in recent conversations — pictures drawn, bots given \
             missions, work started — in this app first, then in their others; and how to work with them \
             here. Call this before answering anything from this user, especially anything that assumes \
             shared history: \"again\", \"last time\", \"like before\", \"my\", \"our\". It answers at once.",
@@ -59,8 +59,8 @@ mod tests {
     #[test]
     fn a_caller_with_no_memory_is_told_so_in_an_answer() {
         assert_eq!(
-            nothing_kept("this account is in no family yet"),
-            "Nothing is remembered for this user here: this account is in no family yet. Answer from this conversation alone."
+            nothing_kept("this account is in no group yet"),
+            "Nothing is remembered for this user here: this account is in no group yet. Answer from this conversation alone."
         );
     }
 }

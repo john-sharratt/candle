@@ -3,7 +3,7 @@
 //! from them onto what origin holds (§6.3), and history reads as what each
 //! change meant, not only what it did to the files.
 //!
-//! Paths are written as folders — `families/sharratt/topics/permits` — which
+//! Paths are written as folders — `groups/sharratt/topics/permits` — which
 //! name a journal whoever reads them.
 
 use serde_json::{json, Map, Value};
@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use crate::actor::Actor;
 use crate::error::{Error, Result};
 use crate::files::summary::{Cite, Fingerprint, Sentence};
-use crate::files::{AccountKey, Email, Role};
+use crate::files::{AccountKey, Email, Kind, Role, Who};
 use crate::line::LineId;
 use crate::ops::{OnTaken, Op, Which};
 use crate::path::{Address, JournalPath, Owner};
@@ -29,7 +29,7 @@ pub fn path_from_wire(s: &str) -> Result<JournalPath> {
     let slug = Slug::parse(parts.next().unwrap_or_default()).map_err(Error::Invalid)?;
     let owner = match kind {
         "persons" => Owner::Person(slug),
-        "families" => Owner::Family(slug),
+        "groups" => Owner::Group(slug),
         _ => return Err(Error::invalid(format!("`{s}` is not a journal's folder"))),
     };
     let names = parts
@@ -40,8 +40,12 @@ pub fn path_from_wire(s: &str) -> Result<JournalPath> {
 
 pub fn actor_to_wire(a: &Actor) -> Value {
     match a {
-        Actor::Person { person, client } => {
-            json!({"kind": "person", "person": person.as_str(), "client": client.name()})
+        Actor::Person {
+            person,
+            client,
+            admin,
+        } => {
+            json!({"kind": "person", "person": person.as_str(), "client": client.name(), "admin": admin})
         }
         Actor::Server { person, client } => {
             json!({"kind": "server", "person": person.as_str(), "client": client.name()})
@@ -49,6 +53,7 @@ pub fn actor_to_wire(a: &Actor) -> Value {
         Actor::Zend => json!({"kind": "zend"}),
         Actor::Worker { person } => json!({"kind": "worker", "person": person.as_str()}),
         Actor::Npcd { person } => json!({"kind": "npcd", "person": person.as_str()}),
+        Actor::Bot { bot } => json!({"kind": "bot", "bot": bot.as_str()}),
         Actor::System => json!({"kind": "system"}),
     }
 }
@@ -67,6 +72,13 @@ impl<'a> Obj<'a> {
             .get(k)
             .and_then(Value::as_str)
             .ok_or_else(|| Error::invalid(format!("`{k}` is missing or not text")))
+    }
+
+    fn bool(&self, k: &str) -> Result<bool> {
+        self.0
+            .get(k)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::invalid(format!("`{k}` is missing or not true or false")))
     }
 
     fn opt_str(&self, k: &str) -> Result<Option<&'a str>> {
@@ -114,6 +126,7 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
         "person" => Actor::Person {
             person: o.slug("person")?,
             client: o.client()?,
+            admin: o.bool("admin")?,
         },
         "server" => Actor::Server {
             person: o.slug("person")?,
@@ -125,6 +138,9 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
         },
         "npcd" => Actor::Npcd {
             person: o.slug("person")?,
+        },
+        "bot" => Actor::Bot {
+            bot: o.slug("bot")?,
         },
         "system" => Actor::System,
         k => return Err(Error::invalid(format!("`{k}` is not an actor"))),
@@ -192,19 +208,36 @@ pub fn op_to_wire(op: &Op) -> Value {
         Op::Share { from, into, name } => {
             json!({"op": "share", "from": p(from), "into": p(into), "name": name.as_ref().map(Slug::as_str)})
         }
+        Op::CreateGroup { group, name, kind } => {
+            json!({"op": "create_group", "group": group.as_str(), "name": name, "kind": kind.name()})
+        }
         Op::AddMember {
-            family,
+            group,
             person,
             name,
             emails,
             role,
         } => json!({
-            "op": "add_member", "family": family.as_str(), "person": person.as_str(), "name": name,
+            "op": "add_member", "group": group.as_str(), "person": person.as_str(), "name": name,
             "emails": emails.iter().map(Email::as_str).collect::<Vec<_>>(), "role": role.name(),
         }),
-        Op::RemoveMember { family, person } => {
-            json!({"op": "remove_member", "family": family.as_str(), "person": person.as_str()})
+        Op::ChooseGroups { default, framed } => json!({
+            "op": "choose_groups", "default": default.as_ref().map(Slug::as_str),
+            "framed": framed.iter().map(Slug::as_str).collect::<Vec<_>>(),
+        }),
+        Op::AddBot { group, bot } => {
+            json!({"op": "add_bot", "group": group.as_str(), "bot": bot.as_str()})
         }
+        Op::RemoveMember {
+            group,
+            who: Who::Person(person),
+        } => {
+            json!({"op": "remove_member", "group": group.as_str(), "person": person.as_str()})
+        }
+        Op::RemoveMember {
+            group,
+            who: Who::Bot(bot),
+        } => json!({"op": "remove_member", "group": group.as_str(), "bot": bot.as_str()}),
         Op::Bind { person, email, key } => {
             json!({"op": "bind", "person": person.as_str(), "email": email.as_str(), "key": key.as_str()})
         }
@@ -314,8 +347,13 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
                 .map(|n| Slug::parse(n).map_err(Error::Invalid))
                 .transpose()?,
         },
+        "create_group" => Op::CreateGroup {
+            group: o.slug("group")?,
+            name: o.str("name")?.into(),
+            kind: Kind::parse(o.str("kind")?).map_err(Error::Invalid)?,
+        },
         "add_member" => Op::AddMember {
-            family: o.slug("family")?,
+            group: o.slug("group")?,
             person: o.slug("person")?,
             name: o.opt_str("name")?.map(Into::into),
             emails: o
@@ -325,9 +363,32 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
                 .collect::<Result<_>>()?,
             role: Role::parse(o.str("role")?).map_err(Error::Invalid)?,
         },
+        "choose_groups" => Op::ChooseGroups {
+            default: o
+                .opt_str("default")?
+                .map(|d| Slug::parse(d).map_err(Error::Invalid))
+                .transpose()?,
+            framed: o
+                .strs("framed")?
+                .into_iter()
+                .map(|g| Slug::parse(g).map_err(Error::Invalid))
+                .collect::<Result<_>>()?,
+        },
+        "add_bot" => Op::AddBot {
+            group: o.slug("group")?,
+            bot: o.slug("bot")?,
+        },
         "remove_member" => Op::RemoveMember {
-            family: o.slug("family")?,
-            person: o.slug("person")?,
+            group: o.slug("group")?,
+            who: match (o.opt_str("bot")?, o.opt_str("person")?) {
+                (Some(_), None) => Who::Bot(o.slug("bot")?),
+                (None, Some(_)) => Who::Person(o.slug("person")?),
+                _ => {
+                    return Err(Error::invalid(
+                        "`remove_member` names a `person` or a `bot`, one of them",
+                    ))
+                }
+            },
         },
         "bind" => Op::Bind {
             person: o.slug("person")?,
@@ -430,16 +491,37 @@ mod tests {
                 into: p("topics"),
                 name: Some(slug("y")),
             },
+            Op::CreateGroup {
+                group: slug("battle-cities"),
+                name: "Battle Cities".into(),
+                kind: Kind::World,
+            },
             Op::AddMember {
-                family: slug("sharratt"),
+                group: slug("sharratt"),
                 person: slug("yen"),
                 name: Some("Yen".into()),
                 emails: vec![Email::parse("yen@example.com").unwrap()],
                 role: Role::Owner,
             },
+            Op::AddBot {
+                group: slug("battle-cities"),
+                bot: slug("c3f1a07e"),
+            },
+            Op::ChooseGroups {
+                default: Some(slug("battle-cities")),
+                framed: vec![slug("sharratt")],
+            },
+            Op::ChooseGroups {
+                default: None,
+                framed: vec![],
+            },
             Op::RemoveMember {
-                family: slug("sharratt"),
-                person: slug("yen"),
+                group: slug("sharratt"),
+                who: Who::Person(slug("yen")),
+            },
+            Op::RemoveMember {
+                group: slug("battle-cities"),
+                who: Who::Bot(slug("c3f1a07e")),
             },
             Op::Bind {
                 person: slug("yen"),
@@ -462,6 +544,12 @@ mod tests {
             Actor::Person {
                 person: slug("yen"),
                 client: Client::Grok,
+                admin: false,
+            },
+            Actor::Person {
+                person: slug("john"),
+                client: Client::ClaudeCode,
+                admin: true,
             },
             Actor::Server {
                 person: slug("john"),
@@ -473,6 +561,9 @@ mod tests {
             },
             Actor::Npcd {
                 person: slug("thanhlong"),
+            },
+            Actor::Bot {
+                bot: slug("c3f1a07e"),
             },
             Actor::System,
         ] {
@@ -488,16 +579,26 @@ mod tests {
             json!({"op": "note", "path": "elsewhere/x", "text": "t"}),
             json!({"op": "note", "path": "persons/john/projects", "text": "t"}),
             json!({"op": "note", "path": "persons/john"}),
-            json!({"op": "create", "under": "families/sharratt/topics", "name": "x", "cue": "c", "on_taken": "maybe"}),
+            json!({"op": "create", "under": "groups/sharratt/topics", "name": "x", "cue": "c", "on_taken": "maybe"}),
+            json!({"op": "note", "path": "families/sharratt/topics", "text": "t"}),
+            json!({"op": "create_group", "group": "g", "name": "G", "kind": "clan"}),
+            json!({"op": "remove_member", "group": "g", "person": "yen", "bot": "b1"}),
+            json!({"op": "remove_member", "group": "g"}),
         ] {
             assert!(op_from_wire(&bad).is_err(), "{bad}");
         }
-        assert!(
-            actor_from_wire(&json!({"kind": "person", "person": "john", "client": "tesla"}))
-                .is_err()
+        assert!(actor_from_wire(
+            &json!({"kind": "person", "person": "john", "client": "tesla", "admin": false})
+        )
+        .is_err());
+        assert_eq!(
+            actor_from_wire(&json!({"kind": "person", "person": "john", "client": "grok"}))
+                .unwrap_err()
+                .to_string(),
+            "`admin` is missing or not true or false"
         );
         assert_eq!(
-            path_from_wire("families/sharratt").unwrap().show(),
+            path_from_wire("groups/sharratt").unwrap().show(),
             "@sharratt"
         );
     }

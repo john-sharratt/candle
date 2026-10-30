@@ -1,13 +1,14 @@
 //! A conversation's frame (§6.4, §6.5): what it is given at its first call —
 //! its own journal, each journal above it to the person, the person, and
-//! each family — nearest first, within its client's budget.
+//! each group they frame — nearest first, within its client's budget. A
+//! bot's frame is the groups that list it, and nothing of anyone's own.
 
-use crate::actor::families_of;
+use crate::actor::{framed_groups, groups_of_bot};
 use crate::path::{JournalPath, Owner};
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
-use crate::view::index::index;
+use crate::view::index::{group_lines, index};
 use crate::view::who::render_line;
 use crate::view::NOT_INSTRUCTIONS;
 
@@ -86,23 +87,16 @@ fn digest_of(j: &Journal) -> Option<String> {
         .or_else(|| summary_of(j))
 }
 
-/// The person's families, their default first.
-fn families(tree: &Tree, person: &Slug) -> Vec<Slug> {
-    let mut fams = families_of(tree, person);
-    if let Some(d) = tree
-        .person_file(person)
-        .and_then(|f| f.default_family.clone())
-    {
-        if let Some(i) = fams.iter().position(|f| f == &d) {
-            let d = fams.remove(i);
-            fams.insert(0, d);
-        }
+/// How a frame names a group to its reader: "Your family @sharratt".
+fn group_label(tree: &Tree, group: &Slug) -> String {
+    match tree.group_file(group) {
+        Some(f) => format!("Your {} @{group}", f.kind),
+        None => format!("Your group @{group}"),
     }
-    fams
 }
 
 /// The frame for `person` at `at` — a conversation or a worker's journal —
-/// with `also` (a worker's workspace projects) after the families.
+/// with `also` (a worker's workspace projects) after the groups.
 pub fn frame(
     tree: &Tree,
     person: &Slug,
@@ -152,18 +146,45 @@ pub fn frame(
         }
     }
     if let Some(root) = tree.get(&me) {
-        root_block(&mut f, &me, root, "You", now);
+        let mut block = vec![match summary_of(root) {
+            Some(s) => format!("You ({me}): {s}"),
+            None => format!("You ({me}): nothing summarised yet."),
+        }];
+        block.extend(
+            index(&me, root, now)
+                .into_iter()
+                .map(|l| format!("  - {l}")),
+        );
+        block.extend(
+            group_lines(tree, person)
+                .into_iter()
+                .map(|l| format!("  - {l}")),
+        );
+        f.push(&block.join("\n"));
     }
-    for fam in families(tree, person) {
-        let path = JournalPath::root(Owner::Family(fam.clone()));
+    for group in framed_groups(tree, person) {
+        let path = JournalPath::root(Owner::Group(group.clone()));
         if let Some(root) = tree.get(&path) {
-            root_block(&mut f, &path, root, &format!("Your family @{fam}"), now);
+            root_block(&mut f, &path, root, &group_label(tree, &group), now);
         }
     }
     for p in also {
         if let Some(j) = tree.get(p) {
             let s = summary_of(j).unwrap_or_else(|| "no summary yet".into());
             f.push(&format!("{p}: {s}"));
+        }
+    }
+    f.out
+}
+
+/// The frame for `bot`: each group that lists it, its summary and index.
+pub fn bot_frame(tree: &Tree, bot: &Slug, budget: Budget, now: Stamp) -> String {
+    let mut f = Filler::new(budget.chars());
+    f.push(NOT_INSTRUCTIONS);
+    for group in groups_of_bot(tree, bot) {
+        let path = JournalPath::root(Owner::Group(group.clone()));
+        if let Some(root) = tree.get(&path) {
+            root_block(&mut f, &path, root, &group_label(tree, &group), now);
         }
     }
     f.out
@@ -187,10 +208,11 @@ fn voice(tree: &Tree, f: &mut Filler, person: &Slug, me: &JournalPath, at: Optio
     if let Some(d) = tree.get(me).and_then(digest_of) {
         f.push(&format!("You: {d}"));
     }
-    if let Some(fam) = families(tree, person).first() {
-        let path = JournalPath::root(Owner::Family(fam.clone()));
+    if let Some(group) = framed_groups(tree, person).first() {
+        let path = JournalPath::root(Owner::Group(group.clone()));
         if let Some(d) = tree.get(&path).and_then(digest_of) {
-            f.push(&format!("Your family: {d}"));
+            let kind = tree.group_file(group).map_or("group", |g| g.kind.name());
+            f.push(&format!("Your {kind}: {d}"));
         }
     }
     let Some(at) = at else { return };
@@ -220,7 +242,8 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::files::summary::{Cite, Sentence};
-    use crate::ops::fixture::{now, p, sharratt};
+    use crate::files::Kind;
+    use crate::ops::fixture::{john, now, p, sharratt};
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Client;
     use crate::testing::slug;
@@ -302,7 +325,7 @@ mod tests {
         );
         apply(
             &mut t,
-            &crate::ops::fixture::john(),
+            &john(),
             &Op::Note {
                 path: p("~"),
                 text: "Prefers short answers.".into(),
@@ -318,7 +341,7 @@ mod tests {
         );
         apply(
             &mut t,
-            &crate::ops::fixture::john(),
+            &john(),
             &Op::Note {
                 path: p("@sharratt"),
                 text: "Building an extension.".into(),
@@ -398,7 +421,7 @@ mod tests {
                 f.chars().count()
             );
         }
-        // A family block too big for what is left is cut, and ends the frame.
+        // A group block too big for what is left is cut, and ends the frame.
         let mut fl = Filler::new(40);
         fl.push("0123456789");
         fl.push(&"x".repeat(100));
@@ -408,11 +431,67 @@ mod tests {
     }
 
     #[test]
-    fn a_person_alone_has_a_frame_with_no_family() {
+    fn a_person_alone_has_a_frame_with_no_group() {
         let t = sharratt();
         let f = frame(&t, &slug("stranger"), None, &[], Budget::Chat, now());
         assert!(f.contains("You (~): nothing summarised yet."));
         assert!(!f.contains("@sharratt"));
+    }
+
+    /// **Only framed groups open a conversation**: the default, and those
+    /// `framed` names; another group is read when it is opened.
+    #[test]
+    fn a_group_opens_the_frame_only_when_framed() {
+        let (mut t, here) = drive();
+        apply(
+            &mut t,
+            &john(),
+            &Op::CreateGroup {
+                group: slug("battle-cities"),
+                name: "Battle Cities".into(),
+                kind: Kind::World,
+            },
+            now(),
+        )
+        .unwrap();
+        let chat = |t: &Tree| frame(t, &slug("john"), Some(&here), &[], Budget::Chat, now());
+        let unframed = chat(&t);
+        assert!(
+            !unframed.contains("Your world @battle-cities"),
+            "{unframed}"
+        );
+        assert!(
+            unframed.contains("  - @battle-cities — Battle Cities, a world; opened when needed"),
+            "known, though not opened: {unframed}"
+        );
+        t.persons
+            .get_mut(&slug("john"))
+            .unwrap()
+            .file
+            .as_mut()
+            .unwrap()
+            .framed = vec![slug("battle-cities")];
+        let f = chat(&t);
+        let family = f.find("Your family @sharratt").unwrap();
+        let world = f
+            .find("Your world @battle-cities (@battle-cities): nothing summarised yet.")
+            .unwrap_or_else(|| panic!("{f}"));
+        assert!(family < world, "the default first");
+    }
+
+    /// **A bot's frame is its groups and nothing of anyone's own**.
+    #[test]
+    fn a_bots_frame_is_its_groups_alone() {
+        let (t, _) = drive();
+        let f = bot_frame(&t, &slug("c3f1a07e"), Budget::Chat, now());
+        assert!(f.starts_with(&format!(
+            "{NOT_INSTRUCTIONS}\nYour family @sharratt (@sharratt): The Sharratts are extending the house."
+        )));
+        assert!(!f.contains("~"), "no one's own folder: {f}");
+        assert_eq!(
+            bot_frame(&t, &slug("b9"), Budget::Chat, now()),
+            NOT_INSTRUCTIONS
+        );
     }
 
     #[test]

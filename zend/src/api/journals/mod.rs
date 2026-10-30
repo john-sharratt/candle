@@ -3,7 +3,7 @@
 //! program writing many lines at once. Every request is the signed-in
 //! caller's, as the gateway names them — listed in the estate's roles, as
 //! `/v1/mcp` requires — and reads and writes exactly what their AIs may
-//! (§7.2): their own folder and their families'.
+//! (§7.2): their own folder and their groups'.
 //!
 //! | Module | |
 //! |---|---|
@@ -14,7 +14,7 @@
 //!
 //! Every refusal is `{error, message}` under the status that says what to do
 //! about it: 400 malformed, 401 signed out, 403 not the caller's to change or
-//! an account in no family, 404 no such journal or line, 409 a conflict or a
+//! an account in no group, 404 no such journal or line, 409 a conflict or a
 //! broken file, 422 the rules refuse it, 503 the memory not served here yet —
 //! asked again, it may be answered by another member.
 
@@ -90,7 +90,7 @@ pub fn status_of(e: &WriteError) -> (StatusCode, &'static str) {
     }
 }
 
-/// Why the memory has no person for a caller: an account in no family, which
+/// Why the memory has no person for a caller: an account in no group, which
 /// stays true however often it is asked, or the memory not served here yet.
 pub fn no_person(why: String) -> Answer {
     if lasting(&why) {
@@ -165,7 +165,7 @@ mod tests {
         );
     }
 
-    /// **An account in no family is told so for good**; a memory not served
+    /// **An account in no group is told so for good**; a memory not served
     /// here yet is asked again.
     #[test]
     fn a_stranger_is_forbidden_and_a_memory_not_served_is_unavailable() {

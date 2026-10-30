@@ -6,21 +6,21 @@
 use std::collections::BTreeMap;
 
 use crate::error::Problem;
-use crate::files::{read_lines, FamilyFile, Meta, PersonFile};
+use crate::files::{read_lines, GroupFile, Meta, PersonFile};
 use crate::path::{JournalPath, Owner};
 use crate::period::Period;
 use crate::scope::Scope;
 use crate::slug::Slug;
 use crate::tree::check::check;
-use crate::tree::{skeleton, Family, Journal, Person, Tree};
+use crate::tree::{skeleton, Group, Journal, Person, Tree};
 
 /// Files at the top of the repository that are not journals.
 pub const TOP_FILES: &[&str] = &[".gitattributes", "README.md"];
 
 const PERSONS: &str = "persons";
-const FAMILIES: &str = "families";
+const GROUPS: &str = "groups";
 pub const PERSON_FILE: &str = "person.yaml";
-pub const FAMILY_FILE: &str = "family.yaml";
+pub const GROUP_FILE: &str = "group.yaml";
 pub const JOURNAL_FILE: &str = "journal.yaml";
 pub const LINES_FILE: &str = "lines.yaml";
 pub const ARCHIVE_DIR: &str = "archive";
@@ -40,14 +40,14 @@ pub fn load(files: &BTreeMap<String, Vec<u8>>) -> Tree {
         }
         let kind = match segs[0] {
             PERSONS => Some(Owner::Person as fn(Slug) -> Owner),
-            FAMILIES => Some(Owner::Family as fn(Slug) -> Owner),
+            GROUPS => Some(Owner::Group as fn(Slug) -> Owner),
             _ => None,
         };
         let (Some(kind), true) = (kind, segs.len() >= 3) else {
             tree.problems.push(Problem::new(
                 path.as_str(),
                 None,
-                "is no part of the layout: the top holds persons/, families/, .gitattributes and README.md",
+                "is no part of the layout: the top holds persons/, groups/, .gitattributes and README.md",
             ));
             continue;
         };
@@ -71,8 +71,8 @@ pub fn load(files: &BTreeMap<String, Vec<u8>>) -> Tree {
 fn load_owner(tree: &mut Tree, owner: Owner, files: OwnerFiles<'_>) {
     let mut root = skeleton(owner.scope());
     let (own_name, other_name) = match owner.scope() {
-        Scope::Personal => (PERSON_FILE, FAMILY_FILE),
-        Scope::Family => (FAMILY_FILE, PERSON_FILE),
+        Scope::Personal => (PERSON_FILE, GROUP_FILE),
+        Scope::Group => (GROUP_FILE, PERSON_FILE),
     };
     let folder = owner.folder();
     let mut own: Option<(&str, &[u8])> = None;
@@ -90,7 +90,7 @@ fn load_owner(tree: &mut Tree, owner: Owner, files: OwnerFiles<'_>) {
                     if other_name == PERSON_FILE {
                         PERSONS
                     } else {
-                        FAMILIES
+                        GROUPS
                     }
                 ),
             ));
@@ -122,14 +122,14 @@ fn load_owner(tree: &mut Tree, owner: Owner, files: OwnerFiles<'_>) {
                 },
             );
         }
-        Owner::Family(f) => {
+        Owner::Group(g) => {
             let file = match own {
-                Some((path, bytes)) => text(path, bytes).and_then(|t| FamilyFile::read(path, t)),
+                Some((path, bytes)) => text(path, bytes).and_then(|t| GroupFile::read(path, t)),
                 None => Err(missing()),
             };
-            tree.families.insert(
-                f,
-                Family {
+            tree.groups.insert(
+                g,
+                Group {
                     file,
                     root,
                     problems: Vec::new(),
@@ -236,8 +236,8 @@ mod tests {
             .collect()
     }
 
-    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\nfamilies: [sharratt]\ndefault_family: sharratt\n";
-    const SHARRATT: &str = "family: sharratt\nname: \"Sharratt\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
+    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n";
+    const SHARRATT: &str = "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
 
     #[test]
     fn a_seeded_repository_loads_clean() {
@@ -245,11 +245,11 @@ mod tests {
             (".gitattributes", "lines.yaml merge=union\n"),
             ("README.md", "# journals\n"),
             ("persons/john/person.yaml", JOHN),
-            ("families/sharratt/family.yaml", SHARRATT),
+            ("groups/sharratt/group.yaml", SHARRATT),
         ]));
         assert_eq!(tree.problems, vec![]);
         assert!(tree.person_file(&slug("john")).is_some());
-        assert!(tree.family_file(&slug("sharratt")).is_some());
+        assert!(tree.group_file(&slug("sharratt")).is_some());
         let all = tree.journals();
         assert!(all.iter().all(|(_, j)| j.problems.is_empty()));
         // Root, clients and its three clients, people; root and four sections.
@@ -261,18 +261,18 @@ mod tests {
         let line = note("2026-10-30T09:10:02Z", "Workers push branches.");
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("families/sharratt/family.yaml", SHARRATT),
+            ("groups/sharratt/group.yaml", SHARRATT),
             (
-                "families/sharratt/projects/candle/journal.yaml",
+                "groups/sharratt/projects/candle/journal.yaml",
                 "name: candle\ncue: \"open for the engine\"\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n",
             ),
-            ("families/sharratt/projects/candle/lines.yaml", &render_lines(std::slice::from_ref(&line))),
-            ("families/sharratt/projects/candle/archive/2026-10-29.yaml", ""),
+            ("groups/sharratt/projects/candle/lines.yaml", &render_lines(std::slice::from_ref(&line))),
+            ("groups/sharratt/projects/candle/archive/2026-10-29.yaml", ""),
         ]));
         let candle = tree
             .get(
                 &JournalPath::new(
-                    Owner::Family(slug("sharratt")),
+                    Owner::Group(slug("sharratt")),
                     vec![slug("projects"), slug("candle")],
                 )
                 .unwrap(),
@@ -288,11 +288,12 @@ mod tests {
     fn every_stray_is_a_problem_and_the_rest_still_loads() {
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("families/sharratt/family.yaml", SHARRATT),
+            ("groups/sharratt/group.yaml", SHARRATT),
             ("notes.txt", "x"),
+            ("families/sharratt/family.yaml", "x"),
             ("persons/README.md", "x"),
             ("persons/John/person.yaml", JOHN),
-            ("families/sharratt/clients/grok/lines.yaml", ""),
+            ("groups/sharratt/clients/grok/lines.yaml", ""),
             ("persons/john/projects/candle/lines.yaml", ""),
             ("persons/john/notes/lines.yaml", ""),
             ("persons/john/clients/tesla/lines.yaml", ""),
@@ -304,7 +305,8 @@ mod tests {
         assert_eq!(
             stray,
             [
-                "families/sharratt/clients/grok/lines.yaml",
+                "families/sharratt/family.yaml",
+                "groups/sharratt/clients/grok/lines.yaml",
                 "notes.txt",
                 "persons/John/person.yaml",
                 "persons/README.md",
@@ -348,15 +350,15 @@ mod tests {
 
     #[test]
     fn non_utf8_and_missing_owner_files_are_problems() {
-        let mut f = files(&[("families/sharratt/projects/journal.yaml", "x")]);
+        let mut f = files(&[("groups/sharratt/projects/journal.yaml", "x")]);
         f.insert("persons/john/person.yaml".into(), vec![0xff, 0xfe]);
         let tree = load(&f);
         let err = tree.persons[&slug("john")].file.as_ref().unwrap_err();
         assert!(err.what.contains("not UTF-8"), "{err}");
-        let err = tree.families[&slug("sharratt")].file.as_ref().unwrap_err();
+        let err = tree.groups[&slug("sharratt")].file.as_ref().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "families/sharratt/family.yaml: families/sharratt has no family.yaml"
+            "groups/sharratt/group.yaml: groups/sharratt has no group.yaml"
         );
     }
 
@@ -364,10 +366,10 @@ mod tests {
     fn an_owner_file_in_the_wrong_kind_of_folder_is_a_problem() {
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("persons/john/family.yaml", SHARRATT),
+            ("persons/john/group.yaml", SHARRATT),
         ]));
         let root = &tree.persons[&slug("john")].root;
-        assert!(root.problems[0].what.contains("belongs under families/"));
+        assert_eq!(root.problems[0].what, "group.yaml belongs under groups/");
     }
 
     #[test]

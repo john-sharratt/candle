@@ -30,7 +30,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
-    // A caller in no family is an answer, not an error: the aggregator tries
+    // A caller in no group is an answer, not an error: the aggregator tries
     // a failed record again for minutes, and that will not change in them. A
     // passing failure — the repository still being read — stays an error, and
     // the record is tried again until it lands.

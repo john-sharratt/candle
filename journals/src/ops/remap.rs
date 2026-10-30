@@ -47,7 +47,10 @@ pub fn remap(op: &mut Op, renamed: &BTreeMap<LineId, LineId>) {
         | Op::Merge { .. }
         | Op::MarkStale { .. }
         | Op::Share { .. }
+        | Op::CreateGroup { .. }
+        | Op::ChooseGroups { .. }
         | Op::AddMember { .. }
+        | Op::AddBot { .. }
         | Op::RemoveMember { .. }
         | Op::Bind { .. } => {}
     }

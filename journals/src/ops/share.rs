@@ -1,4 +1,4 @@
-//! Sharing a personal journal into a family (§3.6): a copy under a shared
+//! Sharing a personal journal into a group (§3.6): a copy under a shared
 //! section, with its lines and everything below it; the personal one is
 //! marked as shared and folded. Nothing moves the other way.
 
@@ -12,7 +12,7 @@ use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 
-/// A `shared:` mark says where a personal journal went; copied into a family,
+/// A `shared:` mark says where a personal journal went; copied into a group,
 /// a journal is no personal one and carries none (§3.3).
 fn forget_shares(j: &mut Journal) {
     if let Some(m) = j.meta.as_mut() {

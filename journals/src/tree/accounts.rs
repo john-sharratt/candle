@@ -74,7 +74,7 @@ mod tests {
             .map(|(p, accounts)| {
                 (
                     format!("persons/{p}/person.yaml"),
-                    format!("person: {p}\nname: \"{p}\"\naccounts:\n{accounts}families: []\n")
+                    format!("person: {p}\nname: \"{p}\"\naccounts:\n{accounts}groups: []\n")
                         .into_bytes(),
                 )
             })

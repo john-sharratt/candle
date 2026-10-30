@@ -30,7 +30,7 @@ pub const CONVERSATION_GAP_MS: u64 = 30 * 60 * 1000;
 const CLOCKS_KEPT: usize = 4096;
 
 /// The memory's own tools: what they do is the memory, never an episode.
-const MEMORY: [&str; 12] = [
+const MEMORY: [&str; 14] = [
     GET,
     EPISODE,
     "journal_note",
@@ -41,8 +41,10 @@ const MEMORY: [&str; 12] = [
     "journal_merge",
     "journal_share",
     "journal_accept",
-    "family_add",
-    "family_remove",
+    "group_create",
+    "group_add",
+    "group_remove",
+    "group_frame",
 ];
 
 /// The longest summary an episode is sent with, as the memory keeps it.

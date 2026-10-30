@@ -2,8 +2,9 @@
 //! [...]}`, at most [`MAX_OPS`] operations of [`super::ops`], applied in
 //! order as the caller, each its own commit.
 //!
-//! The whole batch is read and then applied, in order, to a copy of the tree
-//! before anything is committed, so an operation the rules refuse — a line
+//! The whole batch is read and applied, in order, to a copy of the tree before
+//! anything is committed — each operation read as the ones before it leave
+//! the tree — so an operation malformed or refused by the rules — a line
 //! too long, an eleventh sub-journal, a line not the caller's to edit — is
 //! answered with nothing kept. Only the journals changing between that check
 //! and the commits — another writer, a fetch — can stop a batch partway, and
@@ -128,28 +129,31 @@ pub fn batch(
     now: Stamp,
     mut commit: impl FnMut(&Actor, &Op, Stamp) -> Result<Applied, WriteError>,
 ) -> Answer {
+    let actor = m.actor();
+    let mut tree = Arc::clone(&m.tree);
     let mut planned: Vec<Planned> = Vec::with_capacity(ops.len());
     for (i, v) in ops.iter().enumerate() {
-        match plan(m, v, now) {
-            Ok(p) => planned.push(p),
+        // Read against the tree as the operations before it leave it: a
+        // group an earlier one made the default is where a bare path goes.
+        let p = match plan(&m.seeing(Arc::clone(&tree)), v, now) {
+            Ok(p) => p,
             Err(e) => return stopped(StatusCode::BAD_REQUEST, "invalid", i, e, Vec::new()),
-        }
-    }
-    let actor = m.actor();
-    let mut tree = (*m.tree).clone();
-    for (i, p) in planned.iter().enumerate() {
+        };
         match applied_to(&tree, &actor, &p.op, p.at, None) {
-            Ok((next, _)) => tree = next,
+            Ok((next, _)) => tree = Arc::new(next),
             Err(e) => {
                 let (status, code) = status_of_journal(&e);
                 return stopped(status, code, i, e.to_string(), Vec::new());
             }
         }
+        planned.push(p);
     }
+    // Who reads a journal is told as the batch leaves the groups.
+    let after = m.seeing(tree);
     let mut applied = Vec::with_capacity(planned.len());
     for (i, p) in planned.iter().enumerate() {
         match commit(&actor, &p.op, p.at) {
-            Ok(a) => applied.push(kept(m, i, &p.op, &a)),
+            Ok(a) => applied.push(kept(&after, i, &p.op, &a)),
             Err(e) => {
                 let (status, code) = status_of(&e);
                 return stopped(status, code, i, e.to_string(), applied);
@@ -203,7 +207,11 @@ mod tests {
     /// `ops` as John, committed by applying each to a tree of the test's own,
     /// as the store would; and that tree after.
     fn run(ops: Value) -> (Answer, Tree) {
-        let m = mem("john");
+        run_as("john", ops)
+    }
+
+    fn run_as(person: &str, ops: Value) -> (Answer, Tree) {
+        let m = mem(person);
         let mut tree = (*m.tree).clone();
         let answer = batch(&m, ops.as_array().unwrap(), now(), |actor, op, at| {
             apply(&mut tree, actor, op, at).map_err(|e| WriteError::Store(StoreError::Journal(e)))
@@ -316,8 +324,55 @@ mod tests {
         );
     }
 
+    /// **Only an estate admin lists an email, over HTTP too**: Yen owns
+    /// @sharratt, and her batch that gives a newcomer an account keeps none
+    /// of its operations; John's, the same batch, keeps them all.
     #[test]
-    fn a_malformed_operation_is_named_before_anything_is_checked() {
+    fn a_non_admin_owner_lists_no_email_in_a_batch() {
+        let ops = json!([
+            {"op": "note", "journal": "~", "text": "Adding Yen Nhi."},
+            {"op": "add_member", "person": "yen-nhi", "name": "Yen Nhi", "emails": ["yen.nhi@example.com"]},
+        ]);
+        let (answer, tree) = run_as("yen", ops.clone());
+        assert_eq!(
+            answer,
+            (
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": "forbidden",
+                    "index": 1,
+                    "message": "a person's AI may not list yen-nhi's accounts or rename them: only an estate admin does",
+                    "applied": [],
+                })
+            )
+        );
+        assert!(!tree.persons.contains_key(&Slug::parse("yen-nhi").unwrap()));
+        let (answer, tree) = run(ops);
+        assert_eq!(answer.0, StatusCode::OK);
+        assert!(tree.persons.contains_key(&Slug::parse("yen-nhi").unwrap()));
+    }
+
+    /// **A group named the default earlier in a batch is where its later
+    /// bare paths go.**
+    #[test]
+    fn a_default_chosen_in_a_batch_holds_for_the_rest_of_it() {
+        let (answer, tree) = run(json!([
+            {"op": "create_group", "group": "tokera", "name": "Tokera", "kind": "team"},
+            {"op": "choose_groups", "default": "tokera", "framed": []},
+            {"op": "create", "under": "projects", "name": "candle", "cue": "open for candle"},
+            {"op": "add_bot", "bot": "b1"},
+        ]));
+        assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
+        let applied = answer.1["applied"].as_array().unwrap();
+        assert_eq!(applied[2]["journal"], "@tokera/projects/candle");
+        // Told as the batch leaves the group: its bot, added after.
+        assert_eq!(applied[2]["readers"], "read by its bot only");
+        let tokera = tree.group_file(&Slug::parse("tokera").unwrap()).unwrap();
+        assert!(tokera.bot(&Slug::parse("b1").unwrap()).is_some());
+    }
+
+    #[test]
+    fn a_malformed_operation_is_named_and_nothing_kept() {
         let (answer, _) = run(json!([
             {"op": "note", "journal": "~", "text": "fine"},
             {"op": "note", "journal": "~"},

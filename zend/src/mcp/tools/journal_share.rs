@@ -1,5 +1,5 @@
 //! `journal_share {journal, into?, name?}`: copy one of the user's own
-//! journals into their family (`docs/memory_backbone.md` §3.6). Nothing moves
+//! journals into a group of theirs (`docs/memory_backbone.md` §3.6). Nothing moves
 //! the other way.
 
 use journals::ops::Op;
@@ -14,15 +14,15 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Share one of the user's own journals — a conversation, a journal under `~/people` — \
-            with their family: it is copied, with everything below it, into the family's `topics` (or \
-            `into` another place under `topics` or `projects`), every member's conversations read it from \
-            then on, and the user's own is folded. Only on their word: a shared journal cannot be unshared, \
-            only forgotten line by line, and the family's history keeps it.",
+            with a group of theirs: it is copied, with everything below it, into their default group's \
+            `topics` (or `into` another place under a group's `topics` or `projects`), every member's \
+            conversations read it from then on, and the user's own is folded. Only on their word: a shared \
+            journal cannot be unshared, only forgotten line by line, and the group's history keeps it.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "journal": {"type": "string", "description": "The user's own journal, such as `~/clients/grok/2026-10-30-2105`."},
-                "into": {"type": "string", "description": "Where it goes in the family: `topics` by default, or `projects`, or a journal below either."},
+                "into": {"type": "string", "description": "Where it goes: `topics` by default, `projects`, `@<group>/topics`, or a journal below one."},
                 "name": {"type": "string", "description": "Its name there, when not its own."}
             },
             "required": ["journal"],

@@ -1,6 +1,6 @@
 //! Grep (§6.5 `journal_grep`): a case-insensitive phrase over every line,
 //! archive and summary a person may read — their own folder and their
-//! families' — or one subtree of it. Folded journals are searched too:
+//! groups' — or one subtree of it. Folded journals are searched too:
 //! folding changes what is shown by default, never what is found.
 
 use crate::actor::may_read;

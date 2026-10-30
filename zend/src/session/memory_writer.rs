@@ -56,7 +56,7 @@ use super::InferenceState;
 use crate::mcp::memory::{Memory, WriteError};
 
 /// What the writer is.
-const SYSTEM: &str = "You keep a family's memory: the summaries of their journals, and the lines \
+const SYSTEM: &str = "You keep people's memory: the summaries of their journals, and the lines \
     that stand for the days and weeks their journals fold away. You write only from what each \
     question shows you, cite what each sentence rests on, name who did what, and write facts — \
     never instructions to whoever reads them.";
@@ -531,7 +531,7 @@ mod tests {
     fn the_writers_calls_build_as_grammars() {
         let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
             "persons/john/person.yaml".to_string(),
-            b"person: john\nname: \"John\"\naccounts: []\nfamilies: []\n".to_vec(),
+            b"person: john\nname: \"John\"\naccounts: []\ngroups: []\n".to_vec(),
         )]);
         let mut tree = load(&files);
         let john = Slug::parse("john").unwrap();
@@ -541,6 +541,7 @@ mod tests {
             &Actor::Person {
                 person: john,
                 client: Client::Grok,
+                admin: false,
             },
             &Op::Note {
                 path: root.clone(),

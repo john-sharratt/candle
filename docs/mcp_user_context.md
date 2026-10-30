@@ -30,10 +30,10 @@ the context over on whatever tool the model calls first.
 
 | Piece | Where | What |
 |---|---|---|
-| The user's memory, `~` and `@family` | zend | The memory backbone's tree (`docs/memory_backbone.md`): the person's own journals and their family's, beside every thread's and project's. Needs no attach. |
-| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `~/…` and `@family/…` beside `T:` and `P:`. |
+| The user's memory, `~` and `@group` | zend | The memory backbone's tree (`docs/memory_backbone.md`): the person's own journals and their groups', beside every thread's and project's. Needs no attach. |
+| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `~/…` and `@group/…` beside `T:` and `P:`. |
 | `journal_forget {journal, says}` | zend | Removes the one line of a memory journal that says `says`. Thread and project journals stay append-only. |
-| `get_user_context` | zend, decorated by the aggregator | The conversation's frame: its own journal, each above it, the person, each family — within the client's budget. The aggregator puts the client's guide in front of it. |
+| `get_user_context` | zend, decorated by the aggregator | The conversation's frame: its own journal, each above it, the person, each group they frame — within the client's budget. The aggregator puts the client's guide in front of it. |
 | `user_episode_note` | zend, called by the aggregator only | Records one episode on the conversation's journal: a tool call that did something. In no listing; the aggregator refuses it from a client. |
 | `readOnlyHint` | zend, npcd | The MCP annotation on every tool that only reads: what the aggregator tells an episode by. |
 | The client's guide | aggregator (`clients:` in a guide's frontmatter) | The client's "system prompt addition": how to work with the user there — in the car, spoken answers. |
@@ -44,12 +44,12 @@ the context over on whatever tool the model calls first.
 
 The memory is the backbone's tree (`docs/memory_backbone.md` §2): the person's
 own journals under `~` — their profile, a journal per client and per
-conversation, the people in their life — and their family's under `@family`.
+conversation, the people in their life — and each group's under `@<group>`.
 Its lines are of two kinds, set by who writes:
 
 - **notes** — a fact the model was asked to keep, or judged worth keeping:
   "the cat's name is Miso", "prefers watercolour". Written with
-  `journal_note {journal: "~", text}` from any client, or onto a family journal
+  `journal_note {journal: "~", text}` from any client, or onto a group's journal
   every member reads. Removed only by `journal_forget`, which names a line by
   what it says or by its address.
 - **episodes** — one tool call that changed something, recorded by the server
@@ -62,7 +62,7 @@ what lets the context put this client's history first.
 
 zend's answer is the conversation's frame (`docs/memory_backbone.md` §6.5):
 this conversation's journal, each journal above it, the person's root and
-index, then each family's — nearest first, within the client's budget (1,600
+index, then each group's it frames — nearest first, within the client's budget (1,600
 characters for Grok's voice, 6,000 for a chat client). It opens with the
 framing that keeps a remembered prompt injection from being replayed as an
 order (§4), and ends with how to keep and forget something.
@@ -86,7 +86,7 @@ drawn while zend is down is still remembered once it is back.
 Not recorded: a tool its listing marks `annotations.readOnlyHint` — the MCP
 annotation every tool that only reads carries, in zend and npcd alike — the
 memory's own tools (`get_user_context`, `user_episode_note`, and every
-`journal_*` and `family_*` tool that writes the memory), and the guide tools. `user_episode_note` is in no listing,
+`journal_*` and `group_*` tool that writes the memory), and the guide tools. `user_episode_note` is in no listing,
 and the aggregator refuses it from a client, so no model is offered it.
 
 ### 2.4 The client's guide

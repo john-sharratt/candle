@@ -14,7 +14,7 @@ pub fn definition() -> Value {
         "name": NAME,
         "description": "Merge one memory journal into another when they turn out to be about the same thing: \
             its lines join the other's in time order, its sub-journals move under it, and the merged one is \
-            gone (history keeps it). Both are in the same place — the user's own, or one family's — under \
+            gone (history keeps it). Both are in the same place — the user's own, or one group's — under \
             `topics`, `projects` or `~/people`.",
         "inputSchema": {
             "type": "object",

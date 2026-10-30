@@ -4,7 +4,7 @@
 //!   named): its summary, sub-journals, newest `lines` (50 by default), what is
 //!   archived and who reads it; or, for `<path>#<line id>`, that one line.
 //! `GET /v1/journals/tree?under=` — every journal under `under`, or under `~`
-//!   and each of the caller's families, folded ones too.
+//!   and each of the caller's groups, folded ones too.
 //! `GET /v1/journals/grep?pattern=&under=&max=` — the lines, archives and
 //!   summaries that hold `pattern`, newest first, at most `max` (20 by
 //!   default, 50 at most, as `journal_grep` answers).

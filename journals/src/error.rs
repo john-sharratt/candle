@@ -95,8 +95,8 @@ mod tests {
             "projects/candle/lines.yaml:3: `text` is missing"
         );
         assert_eq!(
-            Problem::new("family.yaml", None, "no member is an owner").to_string(),
-            "family.yaml: no member is an owner"
+            Problem::new("group.yaml", None, "no member is an owner").to_string(),
+            "group.yaml: no member is an owner"
         );
         assert_eq!(
             Error::from(Problem::new("a", Some(1), "b")).to_string(),

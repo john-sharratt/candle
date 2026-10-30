@@ -1,4 +1,4 @@
-//! A name in the tree (§2.2): a person, a family, or a journal below the
+//! A name in the tree (§2.2): a person, a group, a bot, or a journal below the
 //! fixed levels. Kebab-case, at most 40 characters, optionally numbered
 //! `.2`, `.3` … when a name recurs among siblings.
 

@@ -43,8 +43,8 @@ pub fn check(name: &str) -> Result<(), String> {
 }
 
 /// A thread's or project's journal, or a conversation, `/mcp` addresses by
-/// path. The person's own and their family's journals are the memory's
-/// (`crate::mcp::memory`), written `~/…` and `@family/…`.
+/// path. The person's own and their groups' journals are the memory's
+/// (`crate::mcp::memory`), written `~/…` and `@group/…`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Path {
     /// `P:<repo>`: a project's standing rules, which every task inherits.
@@ -77,7 +77,7 @@ impl Path {
                 "`{text}` is not a path: a project's journal is `P:<repository>`, a thread \
                  `T:<name>`, a worker under it `T:<thread>/<name>`, and a part under a worker \
                  `T:<thread>/<worker>/<name>`; the user's own journals are `~/…` and their \
-                 family's `@family/…`"
+                 groups' `@group/…`"
             ));
         };
         match rest.split_once('/') {

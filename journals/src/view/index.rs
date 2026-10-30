@@ -1,10 +1,13 @@
 //! A journal's index (§5.2): its live children, one line each — at most ten,
-//! so a parent's index is always small enough to read whole.
+//! so a parent's index is always small enough to read whole; and for a
+//! person's root, the groups they belong to.
 
+use crate::actor::{framed_groups, role_in, viewer};
 use crate::path::JournalPath;
+use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::fingerprint::is_dirty;
-use crate::tree::Journal;
+use crate::tree::{Journal, Tree};
 use crate::view::who::ago;
 
 /// `path`'s line in its parent's index.
@@ -52,6 +55,34 @@ pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
         out.push_str("; closed");
     }
     out
+}
+
+/// Every group `person` belongs to, one line each, as `~`'s index lists them
+/// after its sections: so a group that does not open their conversations is
+/// still one they know to open.
+pub fn group_lines(tree: &Tree, person: &Slug) -> Vec<String> {
+    let Some(file) = tree.person_file(person) else {
+        return Vec::new();
+    };
+    let framed = framed_groups(tree, person);
+    let default = viewer(tree, person).default_group;
+    file.groups
+        .iter()
+        .filter(|g| role_in(tree, person, g).is_some())
+        .map(|g| {
+            let (name, kind) = tree.group_file(g).map_or((g.to_string(), "group"), |f| {
+                (f.name.clone(), f.kind.name())
+            });
+            let opens = if default.as_ref() == Some(g) {
+                "their default, in every conversation"
+            } else if framed.contains(g) {
+                "in every conversation"
+            } else {
+                "opened when needed"
+            };
+            format!("@{g} — {name}, a {kind}; {opens}")
+        })
+        .collect()
 }
 
 /// The index of `j` at `path`: each live child, then how many are folded.

@@ -2,18 +2,23 @@
 //!
 //! | Actor | May |
 //! |---|---|
-//! | a person's AI | read their folder and their families'; note anywhere they read but `bots`; edit, forget and accept their own lines — an owner, any in the family; create, fold, unfold and merge in `topics`, `people` and `projects`; share their own journals into a family; an owner adds and removes members |
+//! | a person's AI | read their folder and their groups'; note anywhere they read but `bots`; edit, forget and accept their own lines — an owner, any in the group; create, fold, unfold and merge in `topics`, `people` and `projects`; share their own journals into a group; make a group, choose their default and framed groups, leave a group; an owner adds and removes members — someone already a person here only when they share a group the owner owns; an estate admin lists accounts' emails and renames people |
 //! | the server | episodes anywhere its person reads but `bots`; create and close conversations under its own client |
 //! | zend | summaries, period folds, stale marks; episodes anywhere; notes, journals and closes under `threads` |
 //! | a worker | notes to its thread; to `~`, `projects` and `topics` only as proposals |
-//! | npcd | notes, episodes, journals and closes under a family's `bots` |
+//! | npcd | notes, episodes, journals and closes under a group's `bots` |
+//! | a bot | nothing: it reads the groups that list it |
 //! | the system | binding an account |
+//!
+//! Whoever writes for a person, a group in which that person is a reader is
+//! read and never written.
 
-use crate::actor::{need_read, owns_family, Actor};
+use crate::actor::{groups_of, need_read, owns_group, role_in, Actor};
 use crate::error::{Error, Result};
+use crate::files::{Role, Who};
 use crate::ops::forget::find_line;
 use crate::ops::guard::refuse_instructions;
-use crate::ops::Op;
+use crate::ops::{OnTaken, Op};
 use crate::path::{JournalPath, Owner, Place};
 use crate::scope::Section;
 use crate::slug::Slug;
@@ -29,6 +34,7 @@ fn no(actor: &Actor, what: &str) -> Error {
         Actor::Zend => "zend",
         Actor::Worker { .. } => "a worker",
         Actor::Npcd { .. } => "npcd",
+        Actor::Bot { .. } => "a bot",
         Actor::System => "the system",
     };
     Error::forbidden(format!("{who} may not {what}"))
@@ -39,7 +45,7 @@ fn in_sections(path: &JournalPath, sections: &[Section]) -> bool {
 }
 
 /// The line at `path` named by the op was written for this actor's person —
-/// or the actor owns the family, or the journal is their own.
+/// or the actor owns the group, or the journal is their own.
 fn may_change_line(
     tree: &Tree,
     actor: &Actor,
@@ -48,10 +54,19 @@ fn may_change_line(
 ) -> bool {
     match path.owner() {
         Owner::Person(_) => true,
-        Owner::Family(_) => {
-            owns_family(tree, actor, path)
+        Owner::Group(_) => {
+            owns_group(tree, actor, path)
                 || (written_for.is_some() && written_for == actor.person())
         }
+    }
+}
+
+/// The group `path` is in, when the actor's person reads it and writes
+/// nothing there.
+fn read_only<'a>(tree: &Tree, actor: &Actor, path: &'a JournalPath) -> Option<&'a Slug> {
+    match (actor.person(), path.owner()) {
+        (Some(p), Owner::Group(g)) if role_in(tree, p, g).is_some_and(|r| !r.writes()) => Some(g),
+        _ => None,
     }
 }
 
@@ -76,7 +91,10 @@ fn texts(op: &Op) -> Vec<&str> {
             .chain(cue.as_deref())
             .collect(),
         Op::AddMember { name, .. } => name.as_deref().into_iter().collect(),
-        Op::Forget { .. }
+        Op::CreateGroup { name, .. } => vec![name],
+        Op::ChooseGroups { .. }
+        | Op::AddBot { .. }
+        | Op::Forget { .. }
         | Op::Accept { .. }
         | Op::Close { .. }
         | Op::Fold { .. }
@@ -92,6 +110,17 @@ fn texts(op: &Op) -> Vec<&str> {
 pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
     for path in paths(op) {
         need_read(tree, actor, path)?;
+        if let Some(g) = read_only(tree, actor, path) {
+            return Err(Error::forbidden(format!(
+                "@{g} is theirs to read: a reader writes nothing there"
+            )));
+        }
+    }
+    if matches!(actor, Actor::Bot { .. }) {
+        return Err(no(
+            actor,
+            "write journals: it reads the groups that list it",
+        ));
     }
     // Whoever writes it — a person's AI, a worker, the server recording a
     // model's arguments, zend writing a model's summary — what reaches
@@ -185,6 +214,20 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
         }
 
         // Journals.
+        (
+            Actor::Person { person, .. },
+            Op::Create {
+                under,
+                on_taken: OnTaken::Number,
+                ..
+            },
+        ) if matches!(under.place()?, Place::Client(_))
+            && under.owner() == &Owner::Person(person.clone()) =>
+        {
+            // A conversation of their own, recorded by hand — one the server
+            // never saw open, or one from before it kept them.
+            Ok(())
+        }
         (Actor::Person { .. }, Op::Create { under, .. }) => {
             if in_sections(under, &ORGANISED) {
                 Ok(())
@@ -255,14 +298,14 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
 
         (Actor::Person { person, .. }, Op::Share { from, into, .. }) => {
             match (from.owner(), into.owner()) {
-                (Owner::Person(p), Owner::Family(_))
+                (Owner::Person(p), Owner::Group(_))
                     if p == person && in_sections(into, &[Section::Topics, Section::Projects]) =>
                 {
                     Ok(())
                 }
                 _ => Err(no(
                     actor,
-                    "share anything but their own journal into their family's topics or projects",
+                    "share anything but their own journal into a group's topics or projects",
                 )),
             }
         }
@@ -276,16 +319,85 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
             Err(no(actor, "write summaries or folds: zend rebuilds them"))
         }
 
-        // Families.
-        (Actor::Person { .. }, Op::AddMember { family, .. } | Op::RemoveMember { family, .. }) => {
-            let root = JournalPath::root(Owner::Family(family.clone()));
-            if owns_family(tree, actor, &root) {
+        // Groups.
+        (Actor::Person { .. }, Op::CreateGroup { .. }) => Ok(()),
+        (_, Op::CreateGroup { .. }) => Err(no(actor, "make groups: a person does")),
+        (Actor::Person { .. }, Op::ChooseGroups { .. }) => Ok(()),
+        (_, Op::ChooseGroups { .. }) => Err(no(actor, "choose a person's groups: they do")),
+        // Leaving: a person takes themselves out of a group.
+        (
+            Actor::Person { person: me, .. },
+            Op::RemoveMember {
+                who: Who::Person(p),
+                ..
+            },
+        ) if p == me => Ok(()),
+        (
+            Actor::Person {
+                person: me, admin, ..
+            },
+            Op::AddMember {
+                group,
+                person,
+                name,
+                emails,
+                role,
+            },
+        ) => {
+            // An account is whoever signs in as them, so who may list one is
+            // who may become them: only an estate admin lists an email, for a
+            // newcomer or for anyone already here, and only an admin renames
+            // someone already here.
+            let file = tree.person_file(person);
+            let new_email = emails
+                .iter()
+                .any(|e| file.is_none_or(|f| f.accounts.iter().all(|a| &a.email != e)));
+            let renames = name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|n| !n.is_empty() && file.is_some_and(|f| f.name != n));
+            // An owner changes who is in the group and as what. An admin who
+            // is no owner of it does one thing there: lists an account of, or
+            // renames, someone already in it, as they are — a newcomer an
+            // owner made without an email. Joining, or changing a role, stays
+            // the group's owners'.
+            let root = JournalPath::root(Owner::Group(group.clone()));
+            let lists_only =
+                *admin && (new_email || renames) && role_in(tree, person, group) == Some(*role);
+            if !owns_group(tree, actor, &root) && !lists_only {
+                return Err(no(actor, "add or remove members: only an owner does"));
+            }
+            if (new_email || renames) && !admin {
+                return Err(no(
+                    actor,
+                    &format!("list {person}'s accounts or rename them: only an estate admin does"),
+                ));
+            }
+            // Someone who is already a person here joins a group only through
+            // an owner who already shares one with them, or an admin — or any
+            // person could make a group and pull another into it.
+            if file.is_some() && person != me && !admin {
+                let shares = groups_of(tree, person)
+                    .iter()
+                    .any(|g| role_in(tree, me, g) == Some(Role::Owner));
+                if !shares {
+                    return Err(no(
+                        actor,
+                        &format!("add {person}: they are in no group of which you are an owner"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        (Actor::Person { .. }, Op::AddBot { group, .. } | Op::RemoveMember { group, .. }) => {
+            let root = JournalPath::root(Owner::Group(group.clone()));
+            if owns_group(tree, actor, &root) {
                 Ok(())
             } else {
                 Err(no(actor, "add or remove members: only an owner does"))
             }
         }
-        (_, Op::AddMember { .. } | Op::RemoveMember { .. }) => {
+        (_, Op::AddMember { .. } | Op::AddBot { .. } | Op::RemoveMember { .. }) => {
             Err(no(actor, "add or remove members"))
         }
     }
@@ -306,7 +418,12 @@ fn paths(op: &Op) -> Vec<&JournalPath> {
         Op::Edit { address, .. } | Op::Accept { address } => vec![&address.path],
         Op::Create { under, .. } => vec![under],
         Op::Merge { from, into } | Op::Share { from, into, .. } => vec![from, into],
-        Op::AddMember { .. } | Op::RemoveMember { .. } | Op::Bind { .. } => vec![],
+        Op::CreateGroup { .. }
+        | Op::ChooseGroups { .. }
+        | Op::AddMember { .. }
+        | Op::AddBot { .. }
+        | Op::RemoveMember { .. }
+        | Op::Bind { .. } => vec![],
     }
 }
 
@@ -315,8 +432,8 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::files::summary::{Cite, Fingerprint, Sentence};
-    use crate::files::{AccountKey, Email, Role};
-    use crate::ops::fixture::{john, now, p, p_as, sharratt, stranger, thanhlong, yen};
+    use crate::files::{AccountKey, Email, Kind, Role, Who};
+    use crate::ops::fixture::{bot, john, now, p, p_as, sharratt, stranger, thanhlong, yen};
     use crate::ops::{apply, OnTaken, Which};
     use crate::path::Address;
     use crate::period::Period;
@@ -331,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn a_person_reads_and_notes_their_own_and_their_familys() {
+    fn a_person_reads_and_notes_their_own_and_their_groups() {
         let t = sharratt();
         assert!(check(&t, &john(), &note(p("~"))).is_ok());
         assert!(check(&t, &john(), &note(p("projects"))).is_ok());
@@ -342,10 +459,10 @@ mod tests {
             check(&t, &john(), &note(yens)).unwrap_err().to_string(),
             "there is no journal ~/people"
         );
-        // Stranger belongs to no family.
-        let family = p("topics");
+        // Stranger belongs to no group.
+        let group = p("topics");
         assert!(matches!(
-            check(&t, &stranger(), &note(family)),
+            check(&t, &stranger(), &note(group)),
             Err(Error::NotFound(_))
         ));
         assert!(check(&t, &john(), &note(p("bots")))
@@ -484,7 +601,18 @@ mod tests {
         assert!(check(&t, &server, &create("~/clients/grok")).is_ok());
         assert!(check(&t, &server, &create("~/clients/claude-code")).is_err());
         assert!(check(&t, &server, &create("topics")).is_err());
-        assert!(check(&t, &john(), &create("~/clients/grok")).is_err());
+        // A person records a conversation of their own by hand, under any of
+        // their clients; never as a refusing name, never elsewhere.
+        assert!(check(&t, &john(), &create("~/clients/grok")).is_ok());
+        assert!(check(&t, &john(), &create("~/clients/claude-code")).is_ok());
+        let refusing = Op::Create {
+            under: p("~/clients/grok"),
+            name: slug("2026-10-30-2105"),
+            cue: "x".into(),
+            on_taken: OnTaken::Refuse,
+        };
+        assert!(check(&t, &john(), &refusing).is_err());
+        assert!(check(&t, &john(), &create("~/clients")).is_err());
         assert!(check(&t, &john(), &create("topics")).is_ok());
         assert!(check(&t, &john(), &create("threads")).is_err());
         assert!(check(&t, &Actor::Zend, &create("threads")).is_ok());
@@ -528,6 +656,7 @@ mod tests {
         let other_member = Actor::Person {
             person: slug("thanhlong"),
             client: Client::Grok,
+            admin: false,
         };
         assert!(
             check(&t, &other_member, &forget).is_ok(),
@@ -562,27 +691,317 @@ mod tests {
     }
 
     #[test]
-    fn only_owners_change_the_family() {
+    fn only_owners_change_the_group_and_any_person_makes_one() {
         let t = sharratt();
         let add = Op::AddMember {
-            family: slug("sharratt"),
+            group: slug("sharratt"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![],
             role: Role::Member,
         };
-        assert!(check(&t, &john(), &add).is_ok());
-        assert!(check(&t, &yen(), &add).is_ok());
-        assert!(check(&t, &thanhlong(), &add)
-            .unwrap_err()
-            .to_string()
-            .contains("only an owner"));
-        assert!(check(&t, &stranger(), &add).is_err());
-        assert!(check(&t, &Actor::Zend, &add).is_err());
+        let add_bot = Op::AddBot {
+            group: slug("sharratt"),
+            bot: slug("b2"),
+        };
+        let remove_bot = Op::RemoveMember {
+            group: slug("sharratt"),
+            who: Who::Bot(slug("c3f1a07e")),
+        };
+        for op in [&add, &add_bot, &remove_bot] {
+            assert!(check(&t, &john(), op).is_ok(), "{op:?}");
+            assert!(check(&t, &yen(), op).is_ok(), "{op:?}");
+            assert_eq!(
+                check(&t, &thanhlong(), op).unwrap_err().to_string(),
+                "a person's AI may not add or remove members: only an owner does"
+            );
+            assert!(check(&t, &stranger(), op).is_err());
+            assert!(check(&t, &Actor::Zend, op).is_err());
+        }
+        let make = Op::CreateGroup {
+            group: slug("battle-cities"),
+            name: "Battle Cities".into(),
+            kind: Kind::World,
+        };
+        assert!(check(&t, &thanhlong(), &make).is_ok());
+        assert!(check(&t, &stranger(), &make).is_ok());
+        assert_eq!(
+            check(&t, &Actor::Zend, &make).unwrap_err().to_string(),
+            "zend may not make groups: a person does"
+        );
+    }
+
+    /// **No one pulls another person into a group of their own**: making a
+    /// group and adding someone already a person here needs an owner who
+    /// already shares a group with them, or an admin.
+    #[test]
+    fn an_existing_person_is_added_only_by_an_owner_who_shares_a_group() {
+        let mut t = sharratt();
+        apply(
+            &mut t,
+            &thanhlong(),
+            &Op::CreateGroup {
+                group: slug("mine"),
+                name: "Mine".into(),
+                kind: Kind::Team,
+            },
+            now(),
+        )
+        .unwrap();
+        let grab = Op::AddMember {
+            group: slug("mine"),
+            person: slug("stranger"),
+            name: None,
+            emails: vec![],
+            role: Role::Member,
+        };
+        assert_eq!(
+            check(&t, &thanhlong(), &grab).unwrap_err().to_string(),
+            "a person's AI may not add stranger: they are in no group of which you are an owner"
+        );
+        // A newcomer is theirs to add, and an owner of the family adds its
+        // members anywhere they own.
+        let newcomer = Op::AddMember {
+            group: slug("mine"),
+            person: slug("friend"),
+            name: Some("Friend".into()),
+            emails: vec![],
+            role: Role::Member,
+        };
+        assert!(check(&t, &thanhlong(), &newcomer).is_ok());
+        apply(
+            &mut t,
+            &john(),
+            &Op::CreateGroup {
+                group: slug("work"),
+                name: "Work".into(),
+                kind: Kind::Team,
+            },
+            now(),
+        )
+        .unwrap();
+        let join = Op::AddMember {
+            group: slug("work"),
+            person: slug("thanhlong"),
+            name: None,
+            emails: vec![],
+            role: Role::Member,
+        };
+        assert!(check(&t, &john(), &join).is_ok());
+        // So does a co-owner who is no admin, by the group she shares with
+        // them — and no further.
+        apply(
+            &mut t,
+            &yen(),
+            &Op::CreateGroup {
+                group: slug("yens"),
+                name: "Yen's".into(),
+                kind: Kind::Team,
+            },
+            now(),
+        )
+        .unwrap();
+        let yens = |person: &str| Op::AddMember {
+            group: slug("yens"),
+            person: slug(person),
+            name: None,
+            emails: vec![],
+            role: Role::Member,
+        };
+        assert!(check(&t, &yen(), &yens("thanhlong")).is_ok());
+        assert_eq!(
+            check(&t, &yen(), &yens("stranger"))
+                .unwrap_err()
+                .to_string(),
+            "a person's AI may not add stranger: they are in no group of which you are an owner"
+        );
+        // An admin brings in anyone already here.
+        let admin_join = Op::AddMember {
+            group: slug("work"),
+            person: slug("stranger"),
+            name: None,
+            emails: vec![],
+            role: Role::Member,
+        };
+        assert!(check(&t, &john(), &admin_join).is_ok());
+    }
+
+    /// **Only an estate admin lists an email or renames someone**: an account
+    /// is whoever signs in as them, so a co-owner adding an email of hers to
+    /// John would read John's own folder through it — and the same holds for
+    /// a newcomer's first account.
+    #[test]
+    fn only_an_admin_lists_accounts() {
+        let t = sharratt();
+        let alt = |person: &str, emails: &[&str], name: Option<&str>| Op::AddMember {
+            group: slug("sharratt"),
+            person: slug(person),
+            name: name.map(Into::into),
+            emails: emails.iter().map(|e| Email::parse(e).unwrap()).collect(),
+            role: Role::Owner,
+        };
+        let refused = |person: &str| {
+            format!(
+                "a person's AI may not list {person}'s accounts or rename them: \
+                 only an estate admin does"
+            )
+        };
+        let add_email = alt("john", &["yen.alt@example.com"], None);
+        assert_eq!(
+            check(&t, &yen(), &add_email).unwrap_err().to_string(),
+            refused("john")
+        );
+        let rename = alt("john", &[], Some("Johnny"));
+        assert_eq!(
+            check(&t, &yen(), &rename).unwrap_err().to_string(),
+            refused("john")
+        );
+        let own = alt("yen", &["yen.alt@example.com"], None);
+        assert_eq!(
+            check(&t, &yen(), &own).unwrap_err().to_string(),
+            refused("yen")
+        );
+        let newcomer = alt("yen-nhi", &["yen-nhi@example.com"], Some("Yen Nhi"));
+        assert_eq!(
+            check(&t, &yen(), &newcomer).unwrap_err().to_string(),
+            refused("yen-nhi")
+        );
+        for op in [&add_email, &rename, &own, &newcomer] {
+            assert!(check(&t, &john(), op).is_ok(), "{op:?}");
+        }
+        // A role change, or naming what is already there, lists nothing.
+        let unchanged = alt("john", &["john@example.com"], Some("john"));
+        assert!(check(&t, &yen(), &unchanged).is_ok());
+        let demote = Op::AddMember {
+            group: slug("sharratt"),
+            person: slug("thanhlong"),
+            name: None,
+            emails: vec![],
+            role: Role::Reader,
+        };
+        assert!(check(&t, &yen(), &demote).is_ok());
+    }
+
+    /// **An admin in no part of a group only lists accounts there**: of a
+    /// newcomer its owner made, as they are. Joining it, or changing a role
+    /// in it, stays its owners'.
+    #[test]
+    fn an_admin_lists_accounts_in_a_group_of_others_and_nothing_more() {
+        let mut t = sharratt();
+        apply(
+            &mut t,
+            &thanhlong(),
+            &Op::CreateGroup {
+                group: slug("x"),
+                name: "X".into(),
+                kind: Kind::Team,
+            },
+            now(),
+        )
+        .unwrap();
+        let in_x = |person: &str, emails: &[&str], role: Role| Op::AddMember {
+            group: slug("x"),
+            person: slug(person),
+            name: Some("Friend".into()),
+            emails: emails.iter().map(|e| Email::parse(e).unwrap()).collect(),
+            role,
+        };
+        let made = in_x("friend", &[], Role::Member);
+        apply(&mut t, &thanhlong(), &made, now()).unwrap();
+        let listed = in_x("friend", &["friend@example.com"], Role::Member);
+        assert!(check(&t, &john(), &listed).is_ok());
+        let only_owner = "a person's AI may not add or remove members: only an owner does";
+        for op in [
+            in_x("friend", &["friend@example.com"], Role::Owner),
+            in_x("friend", &[], Role::Reader),
+            in_x("john", &[], Role::Owner),
+            in_x("newcomer", &["new@example.com"], Role::Member),
+        ] {
+            assert_eq!(
+                check(&t, &john(), &op).unwrap_err().to_string(),
+                only_owner,
+                "{op:?}"
+            );
+        }
+    }
+
+    /// **A person leaves a group on their own**; taking out anyone else is
+    /// an owner's.
+    #[test]
+    fn a_member_leaves_on_their_own() {
+        let t = sharratt();
+        let leave = Op::RemoveMember {
+            group: slug("sharratt"),
+            who: Who::Person(slug("thanhlong")),
+        };
+        assert!(check(&t, &thanhlong(), &leave).is_ok());
+        let other = Op::RemoveMember {
+            group: slug("sharratt"),
+            who: Who::Person(slug("yen")),
+        };
+        assert!(check(&t, &thanhlong(), &other).is_err());
+        let choose = Op::ChooseGroups {
+            default: None,
+            framed: vec![],
+        };
+        assert!(check(&t, &thanhlong(), &choose).is_ok());
+        assert_eq!(
+            check(&t, &Actor::Zend, &choose).unwrap_err().to_string(),
+            "zend may not choose a person's groups: they do"
+        );
+    }
+
+    /// **A reader reads and writes nothing**: a person a group lists as a
+    /// reader, through any of their clients; and every bot, everywhere.
+    #[test]
+    fn readers_and_bots_write_nothing() {
+        let mut t = sharratt();
+        apply(
+            &mut t,
+            &john(),
+            &Op::AddMember {
+                group: slug("sharratt"),
+                person: slug("thanhlong"),
+                name: None,
+                emails: vec![],
+                role: Role::Reader,
+            },
+            now(),
+        )
+        .unwrap();
+        let topics = p_as("thanhlong", "topics");
+        assert!(need_read(&t, &thanhlong(), &topics).is_ok());
+        assert_eq!(
+            check(&t, &thanhlong(), &note(topics.clone()))
+                .unwrap_err()
+                .to_string(),
+            "@sharratt is theirs to read: a reader writes nothing there"
+        );
+        let server = Actor::Server {
+            person: slug("thanhlong"),
+            client: Client::Grok,
+        };
+        let ep = Op::Episode {
+            path: topics.clone(),
+            text: "x".into(),
+        };
+        assert!(matches!(check(&t, &server, &ep), Err(Error::Forbidden(_))));
+        // Their own folder is still theirs to write.
+        assert!(check(&t, &thanhlong(), &note(p_as("thanhlong", "~"))).is_ok());
+        assert_eq!(
+            check(&t, &bot(), &note(p("topics")))
+                .unwrap_err()
+                .to_string(),
+            "a bot may not write journals: it reads the groups that list it"
+        );
+        assert!(matches!(
+            check(&t, &bot(), &note(p("~"))),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]
-    fn sharing_goes_from_ones_own_folder_into_a_family() {
+    fn sharing_goes_from_ones_own_folder_into_a_group() {
         let t = sharratt();
         let share = |from: JournalPath, into: JournalPath| Op::Share {
             from,

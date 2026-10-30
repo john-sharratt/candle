@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::iter;
 
 use crate::error::Problem;
-use crate::files::{AccountKey, Email};
+use crate::files::{AccountKey, Email, Who};
 use crate::line::{Folds, LineId};
 use crate::path::{JournalPath, Owner, Place};
 use crate::scope::Scope;
@@ -27,7 +27,7 @@ pub fn summary_cap(place: Place) -> usize {
 pub fn digest_cap(place: Place, scope: Scope) -> Option<usize> {
     match (place, scope) {
         (Place::Root, Scope::Personal) => Some(600),
-        (Place::Root, Scope::Family) => Some(400),
+        (Place::Root, Scope::Group) => Some(400),
         _ => None,
     }
 }
@@ -39,7 +39,7 @@ pub fn check(tree: &mut Tree) {
         .persons
         .keys()
         .map(|p| Owner::Person(p.clone()))
-        .chain(tree.families.keys().map(|f| Owner::Family(f.clone())))
+        .chain(tree.groups.keys().map(|g| Owner::Group(g.clone())))
         .collect();
     for owner in owners {
         let root = tree.root_mut(&owner).expect("listed above");
@@ -47,13 +47,16 @@ pub fn check(tree: &mut Tree) {
     }
 }
 
+/// Each `person.yaml` and `group.yaml` against the others: a person lists a
+/// group exactly when the group lists them. A bot is listed by its group
+/// alone.
 fn check_owners(tree: &mut Tree) {
-    let lists_family = |tree: &Tree, person: &Slug, family: &Slug| {
+    let lists_group = |tree: &Tree, person: &Slug, group: &Slug| {
         tree.person_file(person)
-            .is_some_and(|f| f.families.contains(family))
+            .is_some_and(|f| f.groups.contains(group))
     };
-    let lists_member = |tree: &Tree, family: &Slug, person: &Slug| {
-        tree.family_file(family)
+    let lists_member = |tree: &Tree, group: &Slug, person: &Slug| {
+        tree.group_file(group)
             .is_some_and(|f| f.member(person).is_some())
     };
     let mut person_problems: BTreeMap<Slug, Vec<Problem>> = BTreeMap::new();
@@ -70,11 +73,11 @@ fn check_owners(tree: &mut Tree) {
                     format!("says it is {}, but it is in persons/{slug}/", file.person),
                 ));
         }
-        for fam in &file.families {
-            let why = if !tree.families.contains_key(fam) {
-                format!("lists the family {fam}, which there is no folder for")
-            } else if !lists_member(tree, fam, slug) {
-                format!("lists the family {fam}, which does not list {slug}")
+        for group in &file.groups {
+            let why = if !tree.groups.contains_key(group) {
+                format!("lists the group {group}, which there is no folder for")
+            } else if !lists_member(tree, group, slug) {
+                format!("lists the group {group}, which does not list {slug}")
             } else {
                 continue;
             };
@@ -84,29 +87,32 @@ fn check_owners(tree: &mut Tree) {
                 .push(Problem::new(&at, None, why));
         }
     }
-    let mut family_problems: BTreeMap<Slug, Vec<Problem>> = BTreeMap::new();
-    for (slug, family) in &tree.families {
-        let Ok(file) = &family.file else { continue };
-        let at = format!("families/{slug}/family.yaml");
-        if &file.family != slug {
-            family_problems
+    let mut group_problems: BTreeMap<Slug, Vec<Problem>> = BTreeMap::new();
+    for (slug, group) in &tree.groups {
+        let Ok(file) = &group.file else { continue };
+        let at = format!("groups/{slug}/group.yaml");
+        if &file.group != slug {
+            group_problems
                 .entry(slug.clone())
                 .or_default()
                 .push(Problem::new(
                     &at,
                     Some(1),
-                    format!("says it is {}, but it is in families/{slug}/", file.family),
+                    format!("says it is {}, but it is in groups/{slug}/", file.group),
                 ));
         }
         for m in &file.members {
-            let why = if !tree.persons.contains_key(&m.person) {
-                format!("lists {}, who has no folder under persons/", m.person)
-            } else if !lists_family(tree, &m.person, slug) {
-                format!("lists {}, whose person.yaml does not list {slug}", m.person)
+            let Who::Person(person) = &m.who else {
+                continue;
+            };
+            let why = if !tree.persons.contains_key(person) {
+                format!("lists {person}, who has no folder under persons/")
+            } else if !lists_group(tree, person, slug) {
+                format!("lists {person}, whose person.yaml does not list {slug}")
             } else {
                 continue;
             };
-            family_problems
+            group_problems
                 .entry(slug.clone())
                 .or_default()
                 .push(Problem::new(&at, None, why));
@@ -119,8 +125,8 @@ fn check_owners(tree: &mut Tree) {
             .problems
             .extend(ps);
     }
-    for (slug, ps) in family_problems {
-        tree.families
+    for (slug, ps) in group_problems {
+        tree.groups
             .get_mut(&slug)
             .expect("from the map")
             .problems
@@ -327,20 +333,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::files::render_lines;
-    use crate::scope::Section;
     use crate::testing::{note, slug};
     use crate::tree::load::load;
     use crate::tree::Tree;
 
-    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\nfamilies: [sharratt]\ndefault_family: sharratt\n";
-    const YEN: &str = "person: yen\nname: \"Yen\"\naccounts:\n  - {email: \"yen@example.com\"}\nfamilies: [sharratt]\ndefault_family: sharratt\n";
-    const SHARRATT: &str = "family: sharratt\nname: \"Sharratt\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n";
+    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n";
+    const YEN: &str = "person: yen\nname: \"Yen\"\naccounts:\n  - {email: \"yen@example.com\"}\ngroups: [sharratt]\ndefault_group: sharratt\n";
+    const SHARRATT: &str = "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n  - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n";
 
     fn tree(extra: &[(&str, String)]) -> Tree {
         let mut files: BTreeMap<String, Vec<u8>> = [
             ("persons/john/person.yaml", JOHN),
             ("persons/yen/person.yaml", YEN),
-            ("families/sharratt/family.yaml", SHARRATT),
+            ("groups/sharratt/group.yaml", SHARRATT),
         ]
         .into_iter()
         .map(|(p, t)| (p.to_string(), t.as_bytes().to_vec()))
@@ -360,8 +365,8 @@ mod tests {
         for p in t.persons.values() {
             out.extend(p.problems.iter().map(ToString::to_string));
         }
-        for f in t.families.values() {
-            out.extend(f.problems.iter().map(ToString::to_string));
+        for g in t.groups.values() {
+            out.extend(g.problems.iter().map(ToString::to_string));
         }
         for (_, j) in t.journals() {
             out.extend(j.problems.iter().map(ToString::to_string));
@@ -376,41 +381,62 @@ mod tests {
     }
 
     #[test]
-    fn the_family_and_its_people_agree() {
+    fn the_group_and_its_people_agree() {
         assert_eq!(all_problems(&tree(&[])), Vec::<String>::new());
     }
 
     #[test]
-    fn a_person_and_a_family_that_disagree_are_both_named() {
+    fn a_person_and_a_group_that_disagree_are_both_named() {
         let t = tree(&[(
             "persons/yen/person.yaml",
             YEN.replace(
-                "families: [sharratt]\ndefault_family: sharratt\n",
-                "families: []\n",
+                "groups: [sharratt]\ndefault_group: sharratt\n",
+                "groups: []\n",
             ),
         )]);
         assert_eq!(
             one_problem(&t),
-            "families/sharratt/family.yaml: lists yen, whose person.yaml does not list sharratt"
+            "groups/sharratt/group.yaml: lists yen, whose person.yaml does not list sharratt"
         );
         let t = tree(&[(
             "persons/thanhlong/person.yaml",
-            "person: thanhlong\nname: \"Thanh Long\"\naccounts: []\nfamilies: [sharratt]\ndefault_family: sharratt\n".into(),
+            "person: thanhlong\nname: \"Thanh Long\"\naccounts: []\ngroups: [sharratt]\ndefault_group: sharratt\n".into(),
         )]);
         assert_eq!(
             one_problem(&t),
-            "persons/thanhlong/person.yaml: lists the family sharratt, which does not list thanhlong"
+            "persons/thanhlong/person.yaml: lists the group sharratt, which does not list thanhlong"
         );
         let t = tree(&[("persons/yen/person.yaml", YEN.replace("sharratt", "work"))]);
         let all = all_problems(&t);
         assert!(
             all.contains(
-                &"persons/yen/person.yaml: lists the family work, which there is no folder for"
+                &"persons/yen/person.yaml: lists the group work, which there is no folder for"
                     .to_string()
             ),
             "{all:#?}"
         );
-        assert!(all.contains(&"families/sharratt/family.yaml: lists yen, whose person.yaml does not list sharratt".to_string()), "{all:#?}");
+        assert!(
+            all.contains(
+                &"groups/sharratt/group.yaml: lists yen, whose person.yaml does not list sharratt"
+                    .to_string()
+            ),
+            "{all:#?}"
+        );
+    }
+
+    /// **A bot is listed by its group alone**: no person.yaml answers for
+    /// it, and it needs no folder under persons/.
+    #[test]
+    fn a_bot_member_needs_no_person() {
+        let t = tree(&[(
+            "groups/sharratt/group.yaml",
+            format!(
+                "{SHARRATT}  - {{bot: c3f1a07e, role: reader, joined: 2026-10-30T00:00:00Z}}\n"
+            ),
+        )]);
+        assert_eq!(all_problems(&t), Vec::<String>::new());
+        let g = t.group_file(&slug("sharratt")).unwrap();
+        assert!(g.bot(&slug("c3f1a07e")).is_some());
     }
 
     #[test]
@@ -422,6 +448,13 @@ mod tests {
         assert!(all_problems(&t)
             .iter()
             .any(|p| p.contains("says it is john, but it is in persons/yen/")));
+        let t = tree(&[(
+            "groups/sharratt/group.yaml",
+            SHARRATT.replace("group: sharratt", "group: work"),
+        )]);
+        assert!(all_problems(&t)
+            .iter()
+            .any(|p| p.contains("says it is work, but it is in groups/sharratt/")));
     }
 
     #[test]
@@ -439,15 +472,15 @@ mod tests {
     #[test]
     fn named_journals_have_a_matching_name_and_a_cue() {
         let t = tree(&[(
-            "families/sharratt/topics/permits/journal.yaml",
+            "groups/sharratt/topics/permits/journal.yaml",
             named("budget", "x"),
         )]);
         assert_eq!(
             one_problem(&t),
-            "families/sharratt/topics/permits/journal.yaml:1: `name` is budget, but its folder is permits"
+            "groups/sharratt/topics/permits/journal.yaml:1: `name` is budget, but its folder is permits"
         );
         let t = tree(&[(
-            "families/sharratt/topics/permits/journal.yaml",
+            "groups/sharratt/topics/permits/journal.yaml",
             "name: permits\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n".into(),
         )]);
         assert!(one_problem(&t).contains("`cue` is missing"));
@@ -456,18 +489,18 @@ mod tests {
     #[test]
     fn fixed_journals_keep_their_names_and_cues() {
         let t = tree(&[(
-            "families/sharratt/topics/journal.yaml",
+            "groups/sharratt/topics/journal.yaml",
             "name: themes\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n".into(),
         )]);
         assert!(one_problem(&t).contains("`name` is themes, but this is topics"));
         let t = tree(&[(
-            "families/sharratt/topics/journal.yaml",
+            "groups/sharratt/topics/journal.yaml",
             "name: topics\ncue: \"x\"\ncreated: 2026-10-30T09:10:02Z\nfolded: true\n".into(),
         )]);
         let all = all_problems(&t);
         assert_eq!(all.len(), 2, "{all:#?}");
         let t = tree(&[(
-            "families/sharratt/journal.yaml",
+            "groups/sharratt/journal.yaml",
             "name: sharratt\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n".into(),
         )]);
         assert_eq!(all_problems(&t), Vec::<String>::new());
@@ -493,18 +526,18 @@ mod tests {
         };
         assert_eq!(
             all_problems(&tree(&[(
-                "families/sharratt/journal.yaml",
+                "groups/sharratt/journal.yaml",
                 root(summary(1500, Some(400)))
             )])),
             Vec::<String>::new()
         );
         assert!(one_problem(&tree(&[(
-            "families/sharratt/journal.yaml",
+            "groups/sharratt/journal.yaml",
             root(summary(1501, None))
         )]))
         .contains("over its cap of 1500"));
         assert!(one_problem(&tree(&[(
-            "families/sharratt/journal.yaml",
+            "groups/sharratt/journal.yaml",
             root(summary(10, Some(401)))
         )]))
         .contains("digest is 401"));
@@ -521,7 +554,7 @@ mod tests {
             summary(1001, None)
         );
         assert!(
-            one_problem(&tree(&[("families/sharratt/topics/journal.yaml", section)]))
+            one_problem(&tree(&[("groups/sharratt/topics/journal.yaml", section)]))
                 .contains("cap of 1000")
         );
         let digest_on_section = format!(
@@ -529,13 +562,13 @@ mod tests {
             summary(5, Some(5))
         );
         assert!(one_problem(&tree(&[(
-            "families/sharratt/topics/journal.yaml",
+            "groups/sharratt/topics/journal.yaml",
             digest_on_section
         )]))
         .contains("only a root"));
         let leaf = format!("{}{}", named("permits", "x"), summary(601, None));
         assert!(one_problem(&tree(&[(
-            "families/sharratt/topics/permits/journal.yaml",
+            "groups/sharratt/topics/permits/journal.yaml",
             leaf
         )]))
         .contains("cap of 600"));
@@ -546,7 +579,7 @@ mod tests {
         let mut extra = Vec::new();
         for i in 0..11 {
             extra.push((
-                format!("families/sharratt/topics/t{i}/journal.yaml"),
+                format!("groups/sharratt/topics/t{i}/journal.yaml"),
                 named(&format!("t{i}"), "x"),
             ));
         }
@@ -584,7 +617,5 @@ mod tests {
             render_lines(&[line]),
         )]);
         assert!(one_problem(&t).contains("is not inside 2026-10-28"));
-        let _ = Section::People;
-        let _ = slug("x");
     }
 }

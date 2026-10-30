@@ -37,6 +37,7 @@ pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
             Actor::Person {
                 person: person.clone(),
                 client,
+                admin: false,
             },
             Op::Note {
                 path: JournalPath::root(Owner::Person(person.clone())),
@@ -124,7 +125,8 @@ mod tests {
             actor,
             Actor::Person {
                 person: john.clone(),
-                client: Client::Grok
+                client: Client::Grok,
+                admin: false,
             }
         );
         assert!(matches!(&op, Op::Note { path, .. } if path.show() == "~"));

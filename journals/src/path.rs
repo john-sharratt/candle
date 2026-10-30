@@ -1,6 +1,6 @@
-//! Where a journal is (§6.5): its owner — a person or a family — and the names
+//! Where a journal is (§6.5): its owner — a person or a group — and the names
 //! from that owner's root down, and how a caller writes it: `~/…` and
-//! `@family/…`, or a section alone when that is unambiguous.
+//! `@group/…`, or a section alone when that is unambiguous.
 
 use std::fmt;
 
@@ -15,28 +15,28 @@ pub const MAX_DEPTH: usize = 6;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Owner {
     Person(Slug),
-    Family(Slug),
+    Group(Slug),
 }
 
 impl Owner {
     pub fn scope(&self) -> Scope {
         match self {
             Owner::Person(_) => Scope::Personal,
-            Owner::Family(_) => Scope::Family,
+            Owner::Group(_) => Scope::Group,
         }
     }
 
     pub fn slug(&self) -> &Slug {
         match self {
-            Owner::Person(s) | Owner::Family(s) => s,
+            Owner::Person(s) | Owner::Group(s) => s,
         }
     }
 
-    /// Its folder in the repository: `persons/<p>` or `families/<f>`.
+    /// Its folder in the repository: `persons/<p>` or `groups/<g>`.
     pub fn folder(&self) -> String {
         match self {
             Owner::Person(p) => format!("persons/{p}"),
-            Owner::Family(f) => format!("families/{f}"),
+            Owner::Group(g) => format!("groups/{g}"),
         }
     }
 }
@@ -99,8 +99,8 @@ impl JournalPath {
             .ok_or_else(|| Error::invalid(format!("`{first}` is not a section")))?;
         if section.scope() != self.owner.scope() {
             return Err(Error::invalid(match section.scope() {
-                Scope::Personal => format!("{section} is personal: it is under `~`, not a family"),
-                Scope::Family => format!("{section} is shared: it is under a family, not `~`"),
+                Scope::Personal => format!("{section} is personal: it is under `~`, not a group"),
+                Scope::Group => format!("{section} is shared: it is under a group, not `~`"),
             }));
         }
         let rest = &self.names[1..];
@@ -170,11 +170,11 @@ impl JournalPath {
         self.owner == other.owner && other.names.starts_with(&self.names)
     }
 
-    /// How a reader writes it: `~/…` for their own person, `@family/…`.
+    /// How a reader writes it: `~/…` for their own person, `@group/…`.
     pub fn show(&self) -> String {
         let mut out = match &self.owner {
             Owner::Person(_) => "~".to_string(),
-            Owner::Family(f) => format!("@{f}"),
+            Owner::Group(g) => format!("@{g}"),
         };
         for n in &self.names {
             out.push('/');
@@ -190,12 +190,13 @@ impl fmt::Display for JournalPath {
     }
 }
 
-/// Whom a path is read for: their person and families, which `~`, a bare
-/// personal section and a bare shared section resolve against.
+/// Whom a path is read for: their person, which `~` and a bare personal
+/// section resolve against, and their default group, which a bare shared
+/// section does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Viewer {
     pub person: Slug,
-    pub families: Vec<Slug>,
+    pub default_group: Option<Slug>,
 }
 
 impl Viewer {
@@ -213,17 +214,17 @@ impl Viewer {
             }
             (Owner::Person(self.person.clone()), rest)
         } else if let Some(rest) = text.strip_prefix('@') {
-            let (fam, rest) = rest.split_once('/').map_or((rest, ""), |(f, r)| (f, r));
-            let fam = Slug::parse(fam).map_err(Error::Invalid)?;
-            (Owner::Family(fam), rest)
+            let (group, rest) = rest.split_once('/').map_or((rest, ""), |(g, r)| (g, r));
+            let group = Slug::parse(group).map_err(Error::Invalid)?;
+            (Owner::Group(group), rest)
         } else {
             let first = text.split('/').next().unwrap_or_default();
             let owner = match Section::parse(first).map(Section::scope) {
                 Some(Scope::Personal) => Owner::Person(self.person.clone()),
-                Some(Scope::Family) => Owner::Family(self.only_family(text)?),
+                Some(Scope::Group) => Owner::Group(self.default(text)?),
                 None => {
                     return Err(Error::invalid(format!(
-                        "`{text}` starts with neither `~`, `@family` nor a section"
+                        "`{text}` starts with neither `~`, `@group` nor a section"
                     )))
                 }
             };
@@ -237,21 +238,13 @@ impl Viewer {
         JournalPath::new(owner, names)
     }
 
-    fn only_family(&self, text: &str) -> Result<Slug> {
-        match self.families.as_slice() {
-            [one] => Ok(one.clone()),
-            [] => Err(Error::invalid(format!(
-                "`{text}` is shared, and you belong to no family"
-            ))),
-            many => Err(Error::invalid(format!(
-                "`{text}` is shared and you belong to {}: write `@{}/{text}` or another",
-                many.iter()
-                    .map(|f| format!("@{f}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                many[0]
-            ))),
-        }
+    /// The group a bare shared section is in: the caller's default.
+    fn default(&self, text: &str) -> Result<Slug> {
+        self.default_group.clone().ok_or_else(|| {
+            Error::invalid(format!(
+                "`{text}` is shared, and you have no default group: name one, as `@group/{text}`"
+            ))
+        })
     }
 
     /// An address as a caller wrote it: `path#line-id`.
@@ -287,7 +280,7 @@ mod tests {
     fn john() -> Viewer {
         Viewer {
             person: slug("john"),
-            families: vec![slug("sharratt")],
+            default_group: Some(slug("sharratt")),
         }
     }
 
@@ -325,7 +318,7 @@ mod tests {
         }
         assert_eq!(
             v.parse("projects/candle").unwrap().folder(),
-            "families/sharratt/projects/candle"
+            "groups/sharratt/projects/candle"
         );
         assert_eq!(
             v.parse("~/clients").unwrap().folder(),
@@ -361,23 +354,22 @@ mod tests {
         assert!(v.parse("~/clients/grok/a/b/c/d/e/f").is_err());
     }
 
+    /// **A bare shared section is the caller's default group's**; another
+    /// group is named.
     #[test]
-    fn a_bare_shared_section_needs_exactly_one_family() {
+    fn a_bare_shared_section_is_the_default_groups() {
         let none = Viewer {
             person: slug("solo"),
-            families: vec![],
-        };
-        assert!(shown(&none, "topics/x").contains("belong to no family"));
-        assert_eq!(shown(&none, "clients/grok"), "~/clients/grok");
-        let two = Viewer {
-            person: slug("john"),
-            families: vec![slug("sharratt"), slug("work")],
+            default_group: None,
         };
         assert_eq!(
-            shown(&two, "topics/x"),
-            "error: `topics/x` is shared and you belong to @sharratt, @work: write `@sharratt/topics/x` or another"
+            shown(&none, "topics/x"),
+            "error: `topics/x` is shared, and you have no default group: name one, as `@group/topics/x`"
         );
-        assert_eq!(shown(&two, "@work/topics/x"), "@work/topics/x");
+        assert_eq!(shown(&none, "clients/grok"), "~/clients/grok");
+        let v = john();
+        assert_eq!(shown(&v, "topics/x"), "@sharratt/topics/x");
+        assert_eq!(shown(&v, "@work/topics/x"), "@work/topics/x");
     }
 
     #[test]

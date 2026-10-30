@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn an_empty_file_is_an_error() {
         assert_eq!(
-            parse_doc("family.yaml", "  \n\n").unwrap_err().to_string(),
-            "family.yaml: the file is empty"
+            parse_doc("group.yaml", "  \n\n").unwrap_err().to_string(),
+            "group.yaml: the file is empty"
         );
     }
 
@@ -113,9 +113,9 @@ mod tests {
 
     #[test]
     fn keys_and_items_are_found_by_line() {
-        let text = "family: sharratt\nmembers:\n  - {person: john}\n  - {person: yen}\n";
+        let text = "group: sharratt\nmembers:\n  - {person: john}\n  - {person: yen}\n";
         assert_eq!(key_line(text, "members"), Some(2));
-        assert_eq!(key_line(text, "family"), Some(1));
+        assert_eq!(key_line(text, "group"), Some(1));
         assert_eq!(key_line(text, "nobody"), None);
         assert_eq!(item_line(text, "members", 0), Some(3));
         assert_eq!(item_line(text, "members", 1), Some(4));

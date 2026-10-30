@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::files::render_lines;
 use crate::path::{JournalPath, Owner};
-use crate::tree::load::{ARCHIVE_DIR, FAMILY_FILE, JOURNAL_FILE, LINES_FILE, PERSON_FILE};
+use crate::tree::load::{ARCHIVE_DIR, GROUP_FILE, JOURNAL_FILE, LINES_FILE, PERSON_FILE};
 use crate::tree::{Journal, Tree};
 
 /// `path → bytes` for the files of `j` itself, at `path`.
@@ -36,16 +36,16 @@ pub fn own_files(path: &JournalPath, j: &Journal) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// The owner's own file, `person.yaml` or `family.yaml`, when it reads.
+/// The owner's own file, `person.yaml` or `group.yaml`, when it reads.
 pub fn owner_file(tree: &Tree, owner: &Owner) -> Option<(String, Vec<u8>)> {
     let folder = owner.folder();
     match owner {
         Owner::Person(p) => tree
             .person_file(p)
             .map(|f| (format!("{folder}/{PERSON_FILE}"), f.render().into_bytes())),
-        Owner::Family(f) => tree
-            .family_file(f)
-            .map(|x| (format!("{folder}/{FAMILY_FILE}"), x.render().into_bytes())),
+        Owner::Group(g) => tree
+            .group_file(g)
+            .map(|x| (format!("{folder}/{GROUP_FILE}"), x.render().into_bytes())),
     }
 }
 
@@ -56,7 +56,7 @@ pub fn render_all(tree: &Tree) -> BTreeMap<String, Vec<u8>> {
         .persons
         .keys()
         .map(|p| Owner::Person(p.clone()))
-        .chain(tree.families.keys().map(|f| Owner::Family(f.clone())));
+        .chain(tree.groups.keys().map(|g| Owner::Group(g.clone())));
     for owner in owners {
         if let Some((p, b)) = owner_file(tree, &owner) {
             out.insert(p, b);
@@ -78,18 +78,18 @@ mod tests {
     use crate::testing::{at, note, slug};
     use crate::tree::load::load;
 
-    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\", key: 154797f34c5a6ca6}\nfamilies: [sharratt]\ndefault_family: sharratt\n";
-    const SHARRATT: &str = "family: sharratt\nname: \"Sharratt\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
+    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\", key: 154797f34c5a6ca6}\ngroups: [sharratt]\ndefault_group: sharratt\n";
+    const SHARRATT: &str = "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
 
     /// A rich tree survives files → tree → files → tree unchanged, byte for byte.
     #[test]
     fn a_tree_round_trips_through_its_files() {
         let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         files.insert("persons/john/person.yaml".into(), JOHN.into());
-        files.insert("families/sharratt/family.yaml".into(), SHARRATT.into());
+        files.insert("groups/sharratt/group.yaml".into(), SHARRATT.into());
         let mut tree = load(&files);
         let candle_path = JournalPath::new(
-            Owner::Family(slug("sharratt")),
+            Owner::Group(slug("sharratt")),
             vec![slug("projects"), slug("candle")],
         )
         .unwrap();
@@ -124,14 +124,15 @@ mod tests {
         assert_eq!(
             rendered.keys().map(String::as_str).collect::<Vec<_>>(),
             [
-                "families/sharratt/family.yaml",
-                "families/sharratt/projects/candle/archive/2026-10-28.yaml",
-                "families/sharratt/projects/candle/journal.yaml",
-                "families/sharratt/projects/candle/lines.yaml",
+                "groups/sharratt/group.yaml",
+                "groups/sharratt/projects/candle/archive/2026-10-28.yaml",
+                "groups/sharratt/projects/candle/journal.yaml",
+                "groups/sharratt/projects/candle/lines.yaml",
                 "persons/john/person.yaml",
             ]
         );
         assert_eq!(rendered["persons/john/person.yaml"], JOHN.as_bytes());
+        assert_eq!(rendered["groups/sharratt/group.yaml"], SHARRATT.as_bytes());
         let reloaded = load(&rendered);
         assert_eq!(reloaded, tree);
         assert_eq!(render_all(&reloaded), rendered);
@@ -139,7 +140,7 @@ mod tests {
 
     #[test]
     fn an_empty_window_writes_no_lines_file() {
-        let path = JournalPath::root(Owner::Family(slug("sharratt")));
+        let path = JournalPath::root(Owner::Group(slug("sharratt")));
         let j = Journal::new(Place::Root, None);
         assert!(own_files(&path, &j).is_empty());
     }

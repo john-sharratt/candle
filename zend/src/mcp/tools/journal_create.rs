@@ -14,7 +14,7 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Open a new memory journal for something worth following on its own — a topic, a \
-            person in the user's life, a project or part of one — under `topics`, `projects` (the family's, \
+            person in the user's life, a project or part of one — under `topics`, `projects` (a group's, \
             shared with every member) or `~/people` (the user's own), or under a journal already there. \
             `name` is a short kebab-case slug; `cue` says in a line when to open it (\"open for the Da Nang \
             trip: flights, hotels, the itinerary\"), and is what every index shows. A journal holds at most \
@@ -22,7 +22,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "under": {"type": "string", "description": "Where it goes: `topics`, `projects`, `~/people`, or a journal below one, such as `@family/topics/house-build`."},
+                "under": {"type": "string", "description": "Where it goes: `topics`, `projects`, `~/people`, or a journal below one, such as `@sharratt/topics/house-build`."},
                 "name": {"type": "string", "description": "A kebab-case slug of at most 40 characters, such as `permits`."},
                 "cue": {"type": "string", "description": "One line: when to open it."}
             },

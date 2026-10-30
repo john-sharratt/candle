@@ -1,4 +1,4 @@
-//! The whole repository in memory: each person's tree and each family's, read
+//! The whole repository in memory: each person's tree and each group's, read
 //! from the files and written back to them.
 //!
 //! | Module | |
@@ -22,7 +22,7 @@ pub mod window;
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Problem, Result};
-use crate::files::{FamilyFile, PersonFile};
+use crate::files::{GroupFile, PersonFile};
 use crate::path::{JournalPath, Owner, Place};
 use crate::scope::{Client, Scope, Section};
 use crate::slug::Slug;
@@ -38,10 +38,10 @@ pub struct Person {
     pub problems: Vec<Problem>,
 }
 
-/// A family: its `family.yaml` (or why it cannot be read) and its tree.
+/// A group: its `group.yaml` (or why it cannot be read) and its tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Family {
-    pub file: Result<FamilyFile, Problem>,
+pub struct Group {
+    pub file: Result<GroupFile, Problem>,
     pub root: Journal,
     pub problems: Vec<Problem>,
 }
@@ -49,7 +49,7 @@ pub struct Family {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tree {
     pub persons: BTreeMap<Slug, Person>,
-    pub families: BTreeMap<Slug, Family>,
+    pub groups: BTreeMap<Slug, Group>,
     /// Files that are no part of the layout, and faults across owners.
     pub problems: Vec<Problem>,
 }
@@ -80,14 +80,14 @@ impl Tree {
     pub fn root(&self, owner: &Owner) -> Option<&Journal> {
         match owner {
             Owner::Person(p) => self.persons.get(p).map(|x| &x.root),
-            Owner::Family(f) => self.families.get(f).map(|x| &x.root),
+            Owner::Group(g) => self.groups.get(g).map(|x| &x.root),
         }
     }
 
     pub fn root_mut(&mut self, owner: &Owner) -> Option<&mut Journal> {
         match owner {
             Owner::Person(p) => self.persons.get_mut(p).map(|x| &mut x.root),
-            Owner::Family(f) => self.families.get_mut(f).map(|x| &mut x.root),
+            Owner::Group(g) => self.groups.get_mut(g).map(|x| &mut x.root),
         }
     }
 
@@ -122,8 +122,8 @@ impl Tree {
         self.persons.get(person).and_then(|p| p.file.as_ref().ok())
     }
 
-    pub fn family_file(&self, family: &Slug) -> Option<&FamilyFile> {
-        self.families.get(family).and_then(|f| f.file.as_ref().ok())
+    pub fn group_file(&self, group: &Slug) -> Option<&GroupFile> {
+        self.groups.get(group).and_then(|g| g.file.as_ref().ok())
     }
 
     /// Every journal of every owner, with its path.
@@ -133,9 +133,9 @@ impl Tree {
             .iter()
             .map(|(p, x)| (Owner::Person(p.clone()), &x.root))
             .chain(
-                self.families
+                self.groups
                     .iter()
-                    .map(|(f, x)| (Owner::Family(f.clone()), &x.root)),
+                    .map(|(g, x)| (Owner::Group(g.clone()), &x.root)),
             );
         let mut out = Vec::new();
         for (owner, root) in owners {
@@ -165,9 +165,9 @@ mod tests {
             .map(Slug::as_str)
             .collect();
         assert_eq!(clients, ["claude-code", "grok", "other"]);
-        let family = skeleton(Scope::Family);
-        let names: Vec<&str> = family.children.keys().map(Slug::as_str).collect();
+        let group = skeleton(Scope::Group);
+        let names: Vec<&str> = group.children.keys().map(Slug::as_str).collect();
         assert_eq!(names, ["bots", "projects", "threads", "topics"]);
-        assert!(family.walk().iter().all(|(_, j)| j.is_fixed()));
+        assert!(group.walk().iter().all(|(_, j)| j.is_fixed()));
     }
 }

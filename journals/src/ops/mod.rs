@@ -11,9 +11,9 @@ pub mod append;
 pub mod close;
 pub mod create;
 pub mod edit;
-pub mod family;
 pub mod fold;
 pub mod forget;
+pub mod group;
 pub mod guard;
 pub mod merge;
 pub mod period_fold;
@@ -25,8 +25,8 @@ pub mod summarize;
 pub mod wire;
 
 use crate::actor::Actor;
-use crate::error::Result;
-use crate::files::{AccountKey, Email, Fingerprint, Role, Sentence};
+use crate::error::{Error, Result};
+use crate::files::{AccountKey, Email, Fingerprint, Kind, Role, Sentence, Who};
 use crate::line::{LineId, Writer};
 use crate::path::{Address, JournalPath, Owner};
 use crate::period::Period;
@@ -115,16 +115,34 @@ pub enum Op {
         into: JournalPath,
         name: Option<Slug>,
     },
+    /// A new group, its creator its first owner.
+    CreateGroup {
+        group: Slug,
+        name: String,
+        kind: Kind,
+    },
     AddMember {
-        family: Slug,
+        group: Slug,
         person: Slug,
         name: Option<String>,
         emails: Vec<Email>,
         role: Role,
     },
+    /// The actor's person's own choice: which group is their default, and
+    /// which others open every conversation of theirs. `default` absent keeps
+    /// the one they have.
+    ChooseGroups {
+        default: Option<Slug>,
+        framed: Vec<Slug>,
+    },
+    /// A bot, as a reader of the group's journals.
+    AddBot {
+        group: Slug,
+        bot: Slug,
+    },
     RemoveMember {
-        family: Slug,
-        person: Slug,
+        group: Slug,
+        who: Who,
     },
     Bind {
         person: Slug,
@@ -142,7 +160,7 @@ pub struct Applied {
     pub touched: Vec<JournalPath>,
     /// Journals removed, with everything below them.
     pub removed: Vec<JournalPath>,
-    /// Owners whose `person.yaml` or `family.yaml` changed.
+    /// Owners whose `person.yaml` or `group.yaml` changed.
     pub owners: Vec<Owner>,
     /// The line written, edited or forgotten.
     pub line: Option<LineId>,
@@ -244,15 +262,28 @@ fn run(
             text,
         } => period_fold::fold_period(tree, path, *period, ids, over, text, now, keep),
         Op::Share { from, into, name } => share::share(tree, from, into, name.as_ref(), now),
+        Op::CreateGroup { group, name, kind } => {
+            let creator = actor
+                .person()
+                .ok_or_else(|| Error::forbidden("only a person makes a group"))?;
+            group::create_group(tree, creator, group, name, *kind, now)
+        }
         Op::AddMember {
-            family,
+            group,
             person,
             name,
             emails,
             role,
-        } => family::add_member(tree, family, person, name.as_deref(), emails, *role, now),
-        Op::RemoveMember { family, person } => family::remove_member(tree, family, person),
-        Op::Bind { person, email, key } => family::bind(tree, person, email, key),
+        } => group::add_member(tree, group, person, name.as_deref(), emails, *role, now),
+        Op::ChooseGroups { default, framed } => {
+            let person = actor
+                .person()
+                .ok_or_else(|| Error::forbidden("only a person chooses their groups"))?;
+            group::choose_groups(tree, person, default.as_ref(), framed)
+        }
+        Op::AddBot { group, bot } => group::add_bot(tree, group, bot, now),
+        Op::RemoveMember { group, who } => group::remove_member(tree, group, who),
+        Op::Bind { person, email, key } => group::bind(tree, person, email, key),
     }
 }
 

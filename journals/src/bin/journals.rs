@@ -56,7 +56,7 @@ fn main() -> ExitCode {
         }
         problems.extend(p.problems.iter().map(ToString::to_string));
     }
-    for f in tree.families.values() {
+    for f in tree.groups.values() {
         if let Err(e) = &f.file {
             problems.push(e.to_string());
         }
@@ -67,9 +67,9 @@ fn main() -> ExitCode {
         problems.extend(j.problems.iter().map(ToString::to_string));
     }
     println!(
-        "{} persons, {} families, {} journals, {} lines",
+        "{} persons, {} groups, {} journals, {} lines",
         tree.persons.len(),
-        tree.families.len(),
+        tree.groups.len(),
         journals.len(),
         journals
             .iter()
