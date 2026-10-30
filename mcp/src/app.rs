@@ -427,7 +427,8 @@ impl Server for App {
         }
         let client = call.session.client.name();
         let who = context::who(&call.caller.key(), client, &call.session_id);
-        let begins = this.conversations.begins(&who, now_ms());
+        let claim = this.conversations.claim(&who, now_ms());
+        let begins = claim.begins();
         let around = context::around(name, begins);
         // The context is read beside the call: a first call costs one backend
         // round trip, not two. Before any listing has said which backend
@@ -467,8 +468,10 @@ impl Server for App {
             this.reads_only(name),
             user.is_some(),
         );
+        // A claim not kept is given up as it drops — here, or on any way out
+        // above, the client gone included.
         if after.stamp {
-            this.conversations.stamp(&who, now_ms());
+            claim.keep(now_ms());
         }
         if after.record {
             record_episode(this, call, name, args);

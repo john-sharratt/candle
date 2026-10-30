@@ -1,7 +1,9 @@
-//! Grep (§6.5 `journal_grep`): a case-insensitive phrase over every line,
-//! archive and summary a person may read — their own folder and their
-//! groups' — or one subtree of it. Folded journals are searched too:
-//! folding changes what is shown by default, never what is found.
+//! Grep (§6.5 `journal_grep`): a case-insensitive phrase over every named
+//! journal's own name and written cue, and every line, archive and summary a
+//! person may read —
+//! their own folder and their groups' — or one subtree of it. Folded journals
+//! are searched too: folding changes what is shown by default, never what is
+//! found.
 
 use crate::actor::may_read;
 use crate::line::{Line, LineId};
@@ -9,12 +11,14 @@ use crate::path::JournalPath;
 use crate::period::Period;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::tree::Tree;
+use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
 
 /// Where a hit is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
+    /// The journal itself, by its name or its cue.
+    Journal,
     Window,
     Archive(Period),
     Summary,
@@ -25,16 +29,37 @@ pub struct Hit {
     pub path: JournalPath,
     pub found: Found,
     pub id: Option<LineId>,
+    /// When it was written; [`Stamp::MIN`] for a journal found by its name
+    /// or cue.
     pub at: Stamp,
-    /// The line as a reader sees it, or the summary's text.
+    /// The line as a reader sees it, the summary's text, or the journal's
+    /// cue.
     pub shown: String,
 }
 
-/// The most of a line's text a hit shows: around the match, so a reader
-/// scans many hits and opens the one they want by its address.
-const EXCERPT: usize = 260;
+/// The most of a line's text a hit shows. Nearly every line is shorter and
+/// is shown whole, so a hit answers without a second read; a longer one is
+/// cut around the match, and its address opens the rest.
+const EXCERPT: usize = 600;
 /// How much of an excerpt comes before the match.
-const LEAD: usize = 80;
+const LEAD: usize = 160;
+
+/// A named journal whose own name or written cue holds `want`, a lowercase
+/// phrase — its name also with its hyphens read as spaces, so "cpu experts"
+/// finds `experts/cpu-experts`. Only its last segment counts, and never a
+/// fixed journal's cue, which every folder shares: a phrase naming a parent,
+/// an owner or a section finds no journal beneath it.
+fn names(path: &JournalPath, j: &Journal, want: &str) -> bool {
+    if j.is_fixed() {
+        return false;
+    }
+    let name = path
+        .last()
+        .map(|s| s.as_str().to_lowercase())
+        .unwrap_or_default();
+    let cue = j.cue().unwrap_or_default().to_lowercase();
+    name.contains(want) || name.replace('-', " ").contains(want) || cue.contains(want)
+}
 
 /// Each char lowercased to one char, so a place in the lowercase is the
 /// same place in the text.
@@ -72,8 +97,9 @@ fn excerpt(text: &str, phrase: &str) -> String {
     out
 }
 
-/// Every hit for `phrase` that `person` may read, under `under` when given,
-/// newest first, and the count before `limit` cut it.
+/// Every hit for `phrase` that `person` may read, under `under` when given —
+/// the journals it names first, then lines and summaries newest first — and
+/// the count before `limit` cut it.
 pub fn grep(
     tree: &Tree,
     person: &Slug,
@@ -92,6 +118,15 @@ pub fn grep(
         }
         if !j.problems.is_empty() {
             continue;
+        }
+        if names(&path, j, &want) {
+            hits.push(Hit {
+                path: path.clone(),
+                found: Found::Journal,
+                id: None,
+                at: Stamp::MIN,
+                shown: j.cue().unwrap_or_default(),
+            });
         }
         let shown = |l: &Line| {
             let mut cut = l.clone();
@@ -139,7 +174,15 @@ pub fn grep(
             }
         }
     }
-    hits.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.path.cmp(&b.path)));
+    // Journals the phrase names come first, by path, then what was written,
+    // newest first.
+    let line = |h: &Hit| h.found != Found::Journal;
+    hits.sort_by(|a, b| {
+        line(a)
+            .cmp(&line(b))
+            .then_with(|| b.at.cmp(&a.at))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     let total = hits.len();
     hits.truncate(limit);
     (hits, total)
@@ -153,6 +196,7 @@ pub fn render(hits: &[Hit], total: usize) -> String {
     let mut out: Vec<String> = hits
         .iter()
         .map(|h| match &h.found {
+            Found::Journal => format!("{} (journal) {}", h.path, h.shown),
             Found::Window => format!("{} {}", h.path, h.shown),
             Found::Archive(p) => format!("{} (archive {p}) {}", h.path, h.shown),
             Found::Summary => format!("{} (summary) {}", h.path, h.shown),
@@ -172,6 +216,7 @@ mod tests {
     use super::*;
     use crate::ops::fixture::{john, now, p, p_as, sharratt, yen};
     use crate::ops::{apply, OnTaken, Op};
+    use crate::scope::Section;
     use crate::testing::{note, slug};
 
     fn seeded() -> Tree {
@@ -233,26 +278,32 @@ mod tests {
     #[test]
     fn a_long_hit_is_an_excerpt_around_its_match() {
         assert_eq!(excerpt("short line", "line"), "short line");
+        let whole = format!("{} permit", "a".repeat(EXCERPT - 7));
+        assert_eq!(
+            excerpt(&whole, "permit"),
+            whole,
+            "a line that fits is whole"
+        );
         let long = format!(
             "{} the PERMIT was granted {}",
-            "a".repeat(300),
-            "b".repeat(300)
+            "a".repeat(800),
+            "b".repeat(800)
         );
         let cut = excerpt(&long, "permit");
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
         assert!(cut.starts_with('…') && cut.ends_with('…'));
         assert!(cut.contains("the PERMIT was granted"), "{cut}");
-        let head = format!("permit {}", "x".repeat(400));
+        let head = format!("permit {}", "x".repeat(800));
         let cut = excerpt(&head, "permit");
         assert!(cut.starts_with("permit ") && cut.ends_with('…'));
         // Text whose lowercase is longer than itself is still cut at the
         // match, and so is a phrase that is.
-        let odd = format!("{} PERMİT granted {}", "İ".repeat(300), "x".repeat(300));
+        let odd = format!("{} PERMİT granted {}", "İ".repeat(800), "x".repeat(800));
         let cut = excerpt(&odd, "permİt");
         assert!(cut.contains("PERMİT granted"), "{cut}");
         assert_eq!(cut.chars().count(), EXCERPT + 2);
         // A match near the end keeps a full excerpt, cut at its start only.
-        let tail = format!("{} the end PERMIT", "y".repeat(400));
+        let tail = format!("{} the end PERMIT", "y".repeat(800));
         let cut = excerpt(&tail, "permit");
         assert!(
             cut.starts_with('…') && cut.ends_with("the end PERMIT"),
@@ -268,23 +319,77 @@ mod tests {
         let mut t = sharratt();
         let long = format!(
             "{} the builder starts Monday {}",
-            "a".repeat(300),
-            "b".repeat(300)
+            "a".repeat(800),
+            "b".repeat(800)
         );
         apply(
             &mut t,
             &john(),
             &Op::Note {
                 path: p("topics"),
-                text: long,
+                text: long.clone(),
             },
             now(),
         )
         .unwrap();
         let (hits, _) = grep(&t, &slug("john"), "builder", None, 10);
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].shown.contains("…") && hits[0].shown.contains("the builder starts Monday"));
-        assert!(hits[0].shown.chars().count() < 400, "{}", hits[0].shown);
+        let cut = excerpt(&long, "builder");
+        assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
+        assert!(cut.contains("the builder starts Monday"), "{cut}");
+        assert!(hits[0].shown.ends_with(&cut), "{}", hits[0].shown);
+    }
+
+    /// **A journal is found by its name or its cue**, ahead of every line,
+    /// its name's hyphens read as spaces.
+    #[test]
+    fn a_journal_is_found_by_its_name_and_its_cue() {
+        let mut t = seeded();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Create {
+                under: p("topics"),
+                name: slug("cpu-experts"),
+                cue: "experts computed by the host pool".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            now(),
+        )
+        .unwrap();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                path: p("topics"),
+                text: "The cpu experts pool is on by default.".into(),
+            },
+            now().plus(120),
+        )
+        .unwrap();
+        let (hits, total) = grep(&t, &slug("john"), "CPU experts", None, 10);
+        assert_eq!(total, 2);
+        assert_eq!(
+            render(&hits, total),
+            "@sharratt/topics/cpu-experts (journal) experts computed by the host pool\n\
+             @sharratt/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via claude-code: \
+             The cpu experts pool is on by default."
+        );
+        let (by_cue, _) = grep(&t, &slug("john"), "host pool", None, 10);
+        assert_eq!(by_cue[0].found, Found::Journal);
+        // A word naming its owner, its section or a fixed journal's cue
+        // finds no journal: only a named journal's own name and cue count.
+        let journals = |phrase| {
+            grep(&t, &slug("john"), phrase, None, 50)
+                .0
+                .into_iter()
+                .filter(|h| h.found == Found::Journal)
+                .count()
+        };
+        assert_eq!(journals("sharratt"), 0);
+        assert_eq!(journals("topics"), 0);
+        assert_eq!(journals(Section::Topics.cue()), 0);
+        assert_eq!(journals("~"), 0);
     }
 
     #[test]

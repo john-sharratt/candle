@@ -643,7 +643,7 @@ is the caller's default group's.
 | `get_user_context` | the frame for this conversation |
 | `journal_open {path}` | a journal: its summary (and staleness), its index, its window, how much is folded |
 | `journal_read {address}` | one line; for a worker, the turns behind one of its entries |
-| `journal_grep {pattern, under?}` | case-insensitive substring over every line, archive and summary of a subtree — everything the caller may read by default |
+| `journal_grep {pattern, under?}` | case-insensitive substring over every named journal's own name and written cue (the name's hyphens also read as spaces; parents, owners and fixed journals' shared cues are not matched) and every line, archive and summary of a subtree — everything the caller may read by default. Journals the phrase names come first, then lines newest first; a line of up to 600 characters is shown whole, a longer one cut around the match |
 | `journal_note {path, text}` | a `note` line |
 | `journal_edit {address, text}` | edits a line: a commit |
 | `journal_create {under, name, cue}` | a named sub-journal, where the section allows (§2.3) |
@@ -701,7 +701,7 @@ seconds.
 |---|---|
 | `GET /v1/journals?journal=&lines=` | a journal opened (`~` by default) as JSON — summary, sub-journals, its newest lines by address, archives, readers, and the text `journal_read` shows; or one line, for `<path>#<line id>` |
 | `GET /v1/journals/tree?under=` | every journal under `under`, or under `~` and each group, folded ones too |
-| `GET /v1/journals/grep?pattern=&under=&max=` | the hits `journal_grep` finds, newest first, at most 50 |
+| `GET /v1/journals/grep?pattern=&under=&max=` | the hits `journal_grep` finds, in its order, at most 50; a journal hit has `found: "journal"`, and no `line` or `at` |
 | `POST /v1/journals` | `{channel?, ops: [...]}` — up to 500 operations, applied in order |
 
 Every answer that carries what was written carries the framing every frame does:

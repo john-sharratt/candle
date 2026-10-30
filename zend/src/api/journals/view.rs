@@ -141,7 +141,8 @@ pub fn subtree(root: &JournalPath, j: &Journal) -> Vec<Value> {
         .collect()
 }
 
-/// A search's hits, newest first, and how many there were before the cut.
+/// A search's hits, in `journal_grep`'s order, and how many there were
+/// before the cut.
 pub fn hits(hits: &[Hit], total: usize) -> Value {
     json!({
         "framing": NOT_INSTRUCTIONS,
@@ -150,11 +151,13 @@ pub fn hits(hits: &[Hit], total: usize) -> Value {
             "journal": h.path.show(),
             "line": h.id.as_ref().map(|id| format!("{}#{}", h.path, id.as_str())),
             "found": match &h.found {
+                Found::Journal => "journal".to_string(),
                 Found::Window => "window".to_string(),
                 Found::Archive(p) => format!("archive {p}"),
                 Found::Summary => "summary".to_string(),
             },
-            "at": h.at.to_string(),
+            // A journal found by its name or cue was written at no one time.
+            "at": (h.found != Found::Journal).then(|| h.at.to_string()),
             "shown": h.shown,
         })).collect::<Vec<_>>(),
     })
@@ -358,6 +361,28 @@ mod tests {
                 "found": "window",
                 "at": "2026-10-29T10:02:00Z",
                 "shown": "shown",
+            })
+        );
+    }
+
+    #[test]
+    fn a_journal_hit_has_no_line_and_no_time() {
+        let (_, trip) = written();
+        let h = Hit {
+            path: trip,
+            found: Found::Journal,
+            id: None,
+            at: Stamp::MIN,
+            shown: "open for the trip".into(),
+        };
+        assert_eq!(
+            hits(&[h], 1)["hits"][0],
+            json!({
+                "journal": "@sharratt/topics/trip",
+                "line": null,
+                "found": "journal",
+                "at": null,
+                "shown": "open for the trip",
             })
         );
     }
