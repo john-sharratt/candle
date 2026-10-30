@@ -25,10 +25,11 @@ use crate::provenance::gallery_arena::{Holder, ResidentRun};
 /// **Ten seconds, because the walk is the whole residency map on the wave
 /// thread.** A slot is freed nearly every few seconds on a member serving
 /// characters and conversations, so the sweep is owed almost always and runs at
-/// this cadence; at two seconds, over the ~109k turns a member holds after its
-/// preload, the gallery's share of the wave thread was ~4.9 s a minute on
-/// WhiteWorld (2026-10-30) with the device waiting. A dead turn's ground waits
-/// at most this long to go, against keep times of minutes.
+/// this cadence. At two seconds — with the keep eviction below once a second —
+/// the gallery took 0.4–3.5 s of each minute of BlackWorld's wave thread
+/// (2026-10-30, ~2.0 s on average) with the device waiting; at ten and five,
+/// 0.4–1.0 s. A dead turn's ground waits at most this long to go, against keep
+/// times of minutes.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(10);
 
 /// Why a resident turn goes.

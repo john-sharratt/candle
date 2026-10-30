@@ -564,9 +564,10 @@ impl Scheduler {
         // stood minutes past its keep time while heavy-decode's opening prompts
         // were refused at the floor. Every five seconds: the pass walks every
         // resident turn under the residency lock scans take — ~109k of them on
-        // a member after its preload, where once a second put the walk among
-        // the wave thread's larger costs (WhiteWorld, 2026-10-30) — and a turn
-        // past a keep time of minutes loses nothing by going seconds later.
+        // a member after its preload — and a turn past a keep time of minutes
+        // loses nothing by going seconds later. With the dead-turn sweep
+        // (`gallery_sweep::SWEEP_EVERY`) it cost BlackWorld's wave thread ~2.0 s
+        // a minute at once a second, ~0.8 s at five (2026-10-30).
         if self
             .gallery_evicted_at
             .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(5))
