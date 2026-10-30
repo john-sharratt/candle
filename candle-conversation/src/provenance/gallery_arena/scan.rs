@@ -638,6 +638,7 @@ impl GalleryArena {
         let t_index = Instant::now();
         let gen_before = self.residency_gen();
         let fp = fingerprint_segments(segments);
+        let fingerprint_us = t_index.elapsed().as_micros() as u64;
         let weighed: Vec<GroupSet> = segments.iter().map(|s| s.groups).collect();
         let (idx, reused) = match self.reuse_index(fp, &weighed) {
             Ok(idx) => (idx, true),
@@ -679,10 +680,14 @@ impl GalleryArena {
         // conversation's. With `reused` it separates "my working set churned"
         // from "someone else's did".
         let mutations = self.residency_gen().saturating_sub(gen_before);
+        let windows: usize = segments.iter().map(|s| s.windows.len()).sum();
         scan_split::add(|s| {
             s.scans += 1;
             s.segments += segments.len() as u64;
             s.index_us += index_us;
+            s.fingerprint_us += fingerprint_us;
+            s.windows += windows as u64;
+            s.pinned += idx.pinned_sids.len() as u64;
         });
         let t_launch = Instant::now();
         let result = launch(&idx, &weighed);

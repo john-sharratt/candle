@@ -13,8 +13,10 @@
 use std::cell::OnceCell;
 use std::mem::take;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use super::adaptive::ScanCases;
+use super::belief_scan_split::add_to_split;
 use super::ids::{TimelineId, TurnIndex};
 use super::resolver::subwindow_bounds;
 use super::schema::GroupSchema;
@@ -62,7 +64,12 @@ pub(crate) fn assemble_file_scans(
 ) -> (Vec<FileScan>, usize) {
     let mut turns_walked = 0usize;
     let mut files: Vec<FileScan> = Vec::new();
+    // Where the assembly's time goes, summed over its files into the scan's
+    // split: a scan that grew is named by the phase that grew.
+    let (mut walk, mut exchange, mut cal) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut cal_turns, mut cal_kept) = (0u64, 0u64);
     for timeline in timelines {
+        let t_walk = Instant::now();
         // Enumerate the group's turns exactly as selection does — the whole
         // resolved timeline, `0..turn_count`, fetched by stream id — instead
         // of scanning `all_streams()` per group (which is O(all timelines'
@@ -117,9 +124,11 @@ pub(crate) fn assemble_file_scans(
                 }
             }
         }
+        walk += t_walk.elapsed();
         if arc_turn.is_empty() {
             continue;
         }
+        let t_exchange = Instant::now();
         // Group the kept turns into EXCHANGES before scoring. A code-read scope
         // (and any tool round-trip) is a *coupled pair* — a `<tool_call>` turn
         // and its `<tool_response>` turn joined by a `TurnCoupling` record — and
@@ -168,18 +177,22 @@ pub(crate) fn assemble_file_scans(
             }
         }
         if windows.is_empty() {
+            exchange += t_exchange.elapsed();
             continue;
         }
         let mut ex_tokens = vec![0usize; n_slots];
         for &(_, s, e, slot) in &windows {
             ex_tokens[slot] += e - s;
         }
+        exchange += t_exchange.elapsed();
+        let t_cal = Instant::now();
         // Each calibration's questions, a window apiece, for the calibration
         // competition. Counted in no exchange's size: they are not its content.
         let mut cal_windows: Vec<(usize, usize, usize)> = Vec::new();
-        for cal in sub.calibrations_of(timeline) {
-            for i in 0..sub.turn_count(cal) {
-                let sid = turn_stream_id(cal.raw(), i);
+        for c in sub.calibrations_of(timeline) {
+            for i in 0..sub.turn_count(c) {
+                cal_turns += 1;
+                let sid = turn_stream_id(c.raw(), i);
                 let Some(window) = sub.wide_sig_window(sid) else {
                     continue;
                 };
@@ -192,6 +205,8 @@ pub(crate) fn assemble_file_scans(
                 cal_windows.push((arcs_kept.len() - 1, 0, len));
             }
         }
+        cal_kept += cal_windows.len() as u64;
+        cal += t_cal.elapsed();
         files.push(FileScan {
             timeline,
             arc_turn,
@@ -204,6 +219,15 @@ pub(crate) fn assemble_file_scans(
             ex_tokens,
         });
     }
+    let kept = files.len() as u64;
+    add_to_split(|s| {
+        s.files += kept;
+        s.walk_us += walk.as_micros() as u64;
+        s.exchange_us += exchange.as_micros() as u64;
+        s.cal_turns += cal_turns;
+        s.cal_windows += cal_kept;
+        s.cal_us += cal.as_micros() as u64;
+    });
     (files, turns_walked)
 }
 
@@ -489,6 +513,7 @@ pub(crate) fn scan_file_scans(
             .collect()
     };
     let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
+        let t_segments = Instant::now();
         // Per-turn residency fingerprint: the stored window's
         // (`SigWindow::fingerprint`), which changes only when the turn's blob is
         // rewritten — so a seal re-uploads only that turn's pages, unchanged
@@ -545,6 +570,8 @@ pub(crate) fn scan_file_scans(
                 keep: group.policy.scan.calibration_gallery_keep,
             });
         }
+        let segments_us = t_segments.elapsed().as_micros() as u64;
+        add_to_split(|s| s.segments_us += segments_us);
         // `[probe][file][slot]`, the content competitions weighed by `w`, the
         // calibration competition by `cw`.
         let arena_scan = |w: &[f32], cw: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {

@@ -21,6 +21,12 @@ pub struct ArenaScanSplit {
     pub fresh_tokens: u64,
     /// Finding or building the paged index.
     pub index_us: u64,
+    /// Of `index_us`: fingerprinting the segment set, over every window.
+    pub fingerprint_us: u64,
+    /// Windows fingerprinted, over all scans.
+    pub windows: u64,
+    /// Turns the index pinned resident, over all scans.
+    pub pinned: u64,
     /// Probe upload.
     pub upload_us: u64,
     /// Enqueue to the kernel's completion on the stream — the scan shares the
@@ -41,6 +47,9 @@ thread_local! {
         segments: 0,
         fresh_tokens: 0,
         index_us: 0,
+        fingerprint_us: 0,
+        windows: 0,
+        pinned: 0,
         upload_us: 0,
         kernel_us: 0,
         readback_us: 0,

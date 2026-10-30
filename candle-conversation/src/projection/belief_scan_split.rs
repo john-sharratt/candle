@@ -30,6 +30,22 @@ pub(crate) struct GroupScanSplit {
     pub score_us: u64,
     /// Normalizing, fusing and stamping the scores.
     pub normalize_us: u64,
+    /// Files the assembly kept.
+    pub files: u64,
+    /// Of `assemble_us`: walking each file's own turns — the summary check,
+    /// the stored window and its seams per turn.
+    pub walk_us: u64,
+    /// Of `assemble_us`: grouping the turns into exchanges and flattening
+    /// their windows.
+    pub exchange_us: u64,
+    /// Calibration turns the assembly walked, over every file.
+    pub cal_turns: u64,
+    /// Calibration windows the assembly kept, over every file.
+    pub cal_windows: u64,
+    /// Of `assemble_us`: walking every file's calibrations.
+    pub cal_us: u64,
+    /// Of `score_us`: laying the windows out as the arena's segments.
+    pub segments_us: u64,
 }
 
 thread_local! {
@@ -43,7 +59,21 @@ thread_local! {
             assemble_us: 0,
             score_us: 0,
             normalize_us: 0,
+            files: 0,
+            walk_us: 0,
+            exchange_us: 0,
+            cal_turns: 0,
+            cal_windows: 0,
+            cal_us: 0,
+            segments_us: 0,
         }) };
+}
+
+/// Add to this thread's scan in progress.
+pub(crate) fn add_to_split(f: impl FnOnce(&mut GroupScanSplit)) {
+    let mut s = GROUP_SCAN_SPLIT.get();
+    f(&mut s);
+    GROUP_SCAN_SPLIT.set(s);
 }
 
 #[cfg(test)]
@@ -63,5 +93,19 @@ mod tests {
         assert_eq!(taken.scanned, 2);
         assert_eq!(taken.score_us, 7);
         assert_eq!(GROUP_SCAN_SPLIT.get(), GroupScanSplit::default());
+    }
+
+    /// What is added sums onto what the scan holds.
+    #[test]
+    fn adding_sums_onto_the_scan_in_progress() {
+        GROUP_SCAN_SPLIT.take();
+        add_to_split(|s| s.cal_turns += 24);
+        add_to_split(|s| {
+            s.cal_turns += 24;
+            s.cal_us += 9;
+        });
+        let taken = GROUP_SCAN_SPLIT.take();
+        assert_eq!(taken.cal_turns, 48);
+        assert_eq!(taken.cal_us, 9);
     }
 }

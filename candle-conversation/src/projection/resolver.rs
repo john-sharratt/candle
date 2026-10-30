@@ -1566,9 +1566,14 @@ impl Conversation {
         let us = Duration::from_micros;
         profile::record("beliefs:groups:select", us(groups.select_us));
         profile::record("beliefs:groups:assemble", us(groups.assemble_us));
+        profile::record("beliefs:groups:assemble:walk", us(groups.walk_us));
+        profile::record("beliefs:groups:assemble:exchange", us(groups.exchange_us));
+        profile::record("beliefs:groups:assemble:calibrations", us(groups.cal_us));
+        profile::record("beliefs:groups:score:segments", us(groups.segments_us));
         profile::record("beliefs:groups:score", us(groups.score_us));
         profile::record("beliefs:groups:normalize", us(groups.normalize_us));
         profile::record("beliefs:arena:index", us(arena.index_us));
+        profile::record("beliefs:arena:index:fingerprint", us(arena.fingerprint_us));
         profile::record("beliefs:arena:upload", us(arena.upload_us));
         profile::record("beliefs:arena:kernel", us(arena.kernel_us));
         profile::record("beliefs:arena:readback", us(arena.readback_us));
@@ -1586,11 +1591,21 @@ impl Conversation {
             assemble_us = groups.assemble_us,
             score_us = groups.score_us,
             normalize_us = groups.normalize_us,
+            files = groups.files,
+            walk_us = groups.walk_us,
+            exchange_us = groups.exchange_us,
+            cal_turns = groups.cal_turns,
+            cal_windows = groups.cal_windows,
+            cal_us = groups.cal_us,
+            segments_us = groups.segments_us,
             arena_scans = arena.scans,
             arena_launches = arena.launches,
             arena_segments = arena.segments,
             arena_fresh_tokens = arena.fresh_tokens,
             arena_index_us = arena.index_us,
+            arena_fingerprint_us = arena.fingerprint_us,
+            arena_windows = arena.windows,
+            arena_pinned = arena.pinned,
             arena_upload_us = arena.upload_us,
             arena_kernel_us = arena.kernel_us,
             arena_readback_us = arena.readback_us,
