@@ -185,7 +185,8 @@ queued: decode one row wide, forwards on the device ~12% of the wall clock, and
 30 folder workers finishing 0.7 folders a minute. Its measured motivation — a
 dialogue's belief-scan index invalidated by ingest uploads, its forwards widened
 by ingest rows — is a cost the throttle bounds; stopping the ingest is not the
-price of it.
+price of it. A card holding few of the experts does alternate, but every phase
+there is bounded in time, which is the difference (§3.2).
 
 **Admission is not held behind a band it outranks.** The admission floors defend
 the residency the running slots decode at, and when those slots are a lower
@@ -197,6 +198,64 @@ fourteen ingest and character slots in flight, a dialogue's two-row continuation
 was refused at the decode floor on every pass (21.5 GiB resident against a
 25.3 GiB floor), and the person's tool result waited for background work to drain
 before it was even admitted. Among equals the floors hold as before.
+
+### 3.2 Grouped phases on a streaming card
+
+Sharing assumes that a creep row's cost is mostly its own compute. On a card
+that holds a small share of the experts it is not. Every forward copies each
+non-resident expert its rows route, once per layer, however many rows ride it.
+On WhiteWorld (RTX 3090, Flash-Next, 2026-10-30), 23% of the experts were
+resident. Character turns appended 54–98 rows each and crept beside one to
+three decodes. Expert copies were 50–60% of every forward, and decode ran at
+about 10 t/s.
+
+A layer routes 10 of its 512 experts per row, so the distinct experts a group of
+`R` rows routes, `512 · (1 − (1 − 10/512)^R)`, reach 99% of the layer at about
+233 rows. Four 60-row turns swept apart copy about 1,420 experts a layer;
+swept together, about 506. Per row, a creep's copy cost is
+`(1 − hit) · copy · D(r)/r`, which at a 50% hit rate and 60 rows is about 50
+times its compute. It falls to its compute only near a 98% hit rate. So the
+grouping line sits well below that, where copies dominate on any width the
+card sees.
+
+**Below 60% resident, the engine alternates** (`scheduler/grouping.rs`, the
+phase; `scheduler/grouping_ground.rs`, what it counts and holds). Residency is
+the expert cache's resident bytes over all experts, averaged over ten seconds.
+It leaves above 70%, so a prefill phase buying its tier from the experts does
+not flip the mode.
+
+| Phase | Admission | Ends |
+|---|---|---|
+| **Mixed** | as §3.1 | a decode runs → Decode |
+| **Decode** | prompts and sections below `Urgent` are held, unless they outrank every grouped decode running | 256 prompt rows wait (after a 1 s dwell), or the phase has held a prompt 4 s → Prefill; no decode left → Mixed |
+| **Prefill** | as §3.1, and a creep does not yield to its own band's decodes (R = 1 where `High` beside `High` is 2) | fewer than 64 rows left to sweep, or a sweep's measured time (at most 6 s) → Decode, or Mixed with no decode |
+
+- **Running slots keep running in every phase.** Only what is admitted changes:
+  a prefill becoming a decode is one slot changing phase, never an admission.
+  A cohort a prefill phase left mid-sweep keeps creeping at its ratio.
+- **`Urgent` is never held and never counted.** A person is waiting on it.
+- **The keep-one-alive rule** (`force_queue_head`) does not force a held head
+  in. The engine is not stalled: its decodes step, and the phase ends on the
+  head's age.
+- **Leaving a decode phase reopens admission at once.** The held prompts are
+  offered on that pass, and form one cohort at the next sweep boundary.
+
+**Every phase ends.** This is what separates it from the pause §3.1 records. That
+pause held lower bands while any higher band had work, and never switched back
+beside characters that tick every few seconds. A decode phase here ends on its
+prompts' age, and a prefill phase on its slice. Neither waits for the other
+kind of work to stop arriving.
+
+The member's published figures need nothing new. The prefill rate it
+advertises under a backlog is the drain it measured, and its step is the step
+it measured. So time a prompt spends held is already in what the gateway places
+by.
+
+Each change of phase is logged at info on
+`candle_conversation::scheduler::grouping`, with its reason, how long the phase
+lasted, and the reading. The `wave` heartbeat ends `| group=<phase> res=<pct>`
+on a card that groups, and an admission pass that held prompts reads
+`held_for_group=true`.
 
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one
