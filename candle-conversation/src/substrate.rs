@@ -5060,6 +5060,10 @@ impl Substrate {
     pub fn forget_expired_tombstones(&mut self, expired: &Expired) {
         for tl in &expired.timelines {
             self.tombstoned_timelines.remove(tl);
+            // A throwaway timeline's mark outlives its tombstone only so a
+            // decode still winding down seals nothing to disk; an expired
+            // tombstone is long past any wind-down, so the mark goes with it.
+            self.transient_timelines.remove(tl);
         }
         for key in &expired.keys {
             if self.custom_objects.get(key).is_some_and(|obj| obj.ceased) {
@@ -11653,6 +11657,30 @@ mod tests {
             8192 + 4096,
             "only the tombstoned timeline's chunk + tokens bytes count"
         );
+    }
+
+    /// **A throwaway timeline's mark ends with its tombstone's expiry**: it
+    /// stays through the tombstone, so a decode winding down seals nothing to
+    /// disk, and is forgotten once compaction expires the tombstone — a
+    /// daemon opening one per question holds none of them for good.
+    #[test]
+    fn a_transient_mark_is_forgotten_when_its_tombstone_expires() {
+        let mut sub = Substrate::new();
+        let thrown = TimelineId::from_raw(41).unwrap();
+        let kept = TimelineId::from_raw(42).unwrap();
+        sub.mark_timeline_transient(thrown);
+        sub.mark_timeline_transient(kept);
+        sub.tombstone_timeline(thrown);
+        assert!(
+            sub.is_timeline_transient(thrown),
+            "held through the wind-down"
+        );
+        sub.forget_expired_tombstones(&Expired {
+            timelines: HashSet::from([thrown]),
+            keys: HashSet::new(),
+        });
+        assert!(!sub.is_timeline_transient(thrown));
+        assert!(sub.is_timeline_transient(kept), "a live one keeps its mark");
     }
 
     /// **A section tombstone ends a generation; the next declaration starts

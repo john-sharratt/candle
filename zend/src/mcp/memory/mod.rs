@@ -22,16 +22,18 @@ pub mod moved;
 pub mod who;
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use journals::actor::{need_read, Actor};
+use journals::error::Error;
 use journals::ops::{Applied, Op};
 use journals::path::JournalPath;
 use journals::scope::Section;
-use journals::store::Store;
+use journals::store::{Store, StoreError};
 use journals::time::Stamp;
 use journals::tree::{Journal, Tree};
 
@@ -53,6 +55,62 @@ enum Status {
     Opening,
     Failed(String),
     Open,
+}
+
+/// Why a write was not made.
+#[derive(Debug)]
+pub enum WriteError {
+    /// The memory cannot be written now: none here, or not yet read.
+    Unavailable(String),
+    /// The store refused it, or failed to commit it.
+    Store(StoreError),
+}
+
+impl WriteError {
+    /// What it was based on changed underneath it: made again over the
+    /// journal as it now stands, it may be kept.
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            WriteError::Store(StoreError::Journal(Error::Conflict(_)))
+        )
+    }
+
+    /// The rules' answer to the write as made: made again unchanged, it is
+    /// refused again.
+    pub fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            WriteError::Store(StoreError::Journal(
+                Error::Invalid(_) | Error::NotFound(_) | Error::Forbidden(_) | Error::Refused(_)
+            ))
+        )
+    }
+
+    /// A file the write touches is broken: refused until another commit
+    /// mends it, which may be a file the write's own journal does not show.
+    /// Nothing about the store as a whole.
+    pub fn is_broken(&self) -> bool {
+        matches!(
+            self,
+            WriteError::Store(StoreError::Journal(Error::Broken(_)))
+        )
+    }
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteError::Unavailable(why) => f.write_str(why),
+            WriteError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<WriteError> for String {
+    fn from(e: WriteError) -> String {
+        e.to_string()
+    }
 }
 
 pub struct Memory {
@@ -148,6 +206,15 @@ impl Memory {
         *self.tree.write().unwrap_or_else(|e| e.into_inner()) = tree;
     }
 
+    /// This zend serves the memory: its agent holds the journal checkout, and
+    /// it opened or is opening.
+    pub fn serves(&self) -> bool {
+        !matches!(
+            *self.status.read().unwrap_or_else(|e| e.into_inner()),
+            Status::Absent | Status::Failed(_)
+        )
+    }
+
     /// Why the memory cannot be used now, when it cannot.
     fn unavailable(&self) -> Option<String> {
         match &*self.status.read().unwrap_or_else(|e| e.into_inner()) {
@@ -171,20 +238,20 @@ impl Memory {
     }
 
     /// Apply `op` for `actor` now, commit it, and publish the new tree.
-    pub fn write(&self, actor: &Actor, op: &Op) -> Result<Applied, String> {
+    pub fn write(&self, actor: &Actor, op: &Op) -> Result<Applied, WriteError> {
         self.write_at(actor, op, Stamp::now())
     }
 
     /// [`Self::write`], recorded as happening at `at`.
-    pub fn write_at(&self, actor: &Actor, op: &Op, at: Stamp) -> Result<Applied, String> {
+    pub fn write_at(&self, actor: &Actor, op: &Op, at: Stamp) -> Result<Applied, WriteError> {
         if let Some(why) = self.unavailable() {
-            return Err(why);
+            return Err(WriteError::Unavailable(why));
         }
         let mut guard = held(&self.store);
         let Some(store) = guard.as_mut() else {
-            return Err(NO_MEMORY.into());
+            return Err(WriteError::Unavailable(NO_MEMORY.into()));
         };
-        let applied = store.write(actor, op, at).map_err(|e| e.to_string())?;
+        let applied = store.write(actor, op, at).map_err(WriteError::Store)?;
         self.publish(store.shared());
         Ok(applied)
     }

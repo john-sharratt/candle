@@ -3,6 +3,7 @@
 //! takes their place where the first of them stood.
 
 use crate::error::{Error, Result};
+use crate::files::Fingerprint;
 use crate::line::{Folds, Kind, Line, LineId, Writer};
 use crate::ops::append::clean;
 use crate::ops::{mint_keeping, Applied};
@@ -10,13 +11,51 @@ use crate::path::JournalPath;
 use crate::period::Period;
 use crate::time::Stamp;
 use crate::tree::window::inside;
-use crate::tree::Tree;
+use crate::tree::{Journal, Tree};
 
+/// What a fold of the window lines `ids` is written from — each line as the
+/// fold's question shows it: its time, kind, writer, the person and client it
+/// was written for, whether it is still proposed, and its text, in time order.
+/// Ids are left out, so a replay that renames a colliding id still matches;
+/// which lines are folded is checked by id on its own. The lines are taken
+/// as a set — each one's fields, the set sorted — so neither the window's
+/// order nor a tie in time can move it.
+pub fn lines_over(j: &Journal, ids: &[LineId]) -> Fingerprint {
+    let mut lines: Vec<Vec<u8>> = j
+        .window
+        .iter()
+        .filter(|l| ids.contains(&l.id))
+        .map(line_bytes)
+        .collect();
+    lines.sort();
+    Fingerprint::of_bytes(&lines.concat())
+}
+
+/// One line's fields as [`lines_over`] reads them, each closed by a NUL.
+fn line_bytes(l: &Line) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for field in [
+        l.at.to_string().as_str(),
+        l.kind.name(),
+        l.by.name(),
+        l.person.as_ref().map_or("", |p| p.as_str()),
+        l.client.map_or("", |c| c.name()),
+        if l.proposed { "proposed" } else { "" },
+        l.text.as_str(),
+    ] {
+        bytes.extend_from_slice(field.as_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn fold_period(
     tree: &mut Tree,
     path: &JournalPath,
     period: Period,
     ids: &[LineId],
+    over: &Fingerprint,
     text: &str,
     now: Stamp,
     keep: Option<&LineId>,
@@ -36,7 +75,7 @@ pub fn fold_period(
     let mut given = ids.to_vec();
     want.sort();
     given.sort();
-    if want != given {
+    if want != given || &lines_over(j, &want) != over {
         return Err(Error::conflict(format!(
             "{path}'s lines in {period} changed while the fold was written; it is folded next pass"
         )));
@@ -79,7 +118,8 @@ mod tests {
     use crate::actor::Actor;
     use crate::ops::fixture::{john, p, sharratt};
     use crate::ops::{apply, Op};
-    use crate::testing::at;
+    use crate::path::Address;
+    use crate::testing::{at, slug};
     use crate::tree::render::own_files;
     use crate::tree::window::next_fold;
     use crate::tree::WINDOW;
@@ -113,6 +153,7 @@ mod tests {
             path: path.clone(),
             period: plan.period,
             ids: plan.ids.clone(),
+            over: lines_over(t.get(&path).unwrap(), &plan.ids),
             text: "Settled in on the 1st.".into(),
         };
         let a = apply(&mut t, &Actor::Zend, &op, now).unwrap();
@@ -138,10 +179,12 @@ mod tests {
         let mut t = sharratt();
         let path = filled(&mut t);
         let plan = next_fold(t.get(&path).unwrap(), at("2026-10-03T12:00:00Z")).unwrap();
+        let over = lines_over(t.get(&path).unwrap(), &plan.ids);
         let fold = |ids: Vec<LineId>| Op::FoldPeriod {
             path: path.clone(),
             period: plan.period,
             ids,
+            over: over.clone(),
             text: "x".into(),
         };
         let early = apply(
@@ -165,6 +208,7 @@ mod tests {
             path: path.clone(),
             period: Period::parse("2025-01-01").unwrap(),
             ids: vec![],
+            over: lines_over(t.get(&path).unwrap(), &[]),
             text: "x".into(),
         };
         assert!(
@@ -172,6 +216,74 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("no lines in")
+        );
+    }
+
+    /// **A fold is written from the lines as they were shown**: one of them
+    /// edited while the fold was being written makes it a conflict, though
+    /// the same lines are there by id.
+    #[test]
+    fn a_line_edited_while_the_fold_was_written_is_a_conflict() {
+        let mut t = sharratt();
+        let path = filled(&mut t);
+        let now = at("2026-10-03T12:00:00Z");
+        let plan = next_fold(t.get(&path).unwrap(), now).unwrap();
+        let op = Op::FoldPeriod {
+            path: path.clone(),
+            period: plan.period,
+            ids: plan.ids.clone(),
+            over: lines_over(t.get(&path).unwrap(), &plan.ids),
+            text: "The first day.".into(),
+        };
+        apply(
+            &mut t,
+            &john(),
+            &Op::Edit {
+                address: Address {
+                    path: path.clone(),
+                    id: plan.ids[0].clone(),
+                },
+                text: "n0, corrected".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply(&mut t, &Actor::Zend, &op, now),
+            Err(Error::Conflict(_))
+        ));
+    }
+
+    /// The fingerprint reads what the lines say, not what they are called.
+    #[test]
+    fn what_a_fold_is_written_from_leaves_ids_out() {
+        let mut t = sharratt();
+        let path = filled(&mut t);
+        let j = t.get(&path).unwrap().clone();
+        let ids: Vec<LineId> = j.window[..2].iter().map(|l| l.id.clone()).collect();
+        let mut renamed = j.clone();
+        renamed.window[0].id = LineId::parse("20261001-0000-ffff").unwrap();
+        let renamed_ids = vec![renamed.window[0].id.clone(), ids[1].clone()];
+        assert_eq!(lines_over(&j, &ids), lines_over(&renamed, &renamed_ids));
+        let mut edited = j.clone();
+        edited.window[1].text = "other".into();
+        assert_ne!(lines_over(&j, &ids), lines_over(&edited, &ids));
+        let mut accepted = j.clone();
+        accepted.window[1].proposed = !accepted.window[1].proposed;
+        assert_ne!(lines_over(&j, &ids), lines_over(&accepted, &ids));
+        let mut reattributed = j.clone();
+        reattributed.window[1].person = match &j.window[1].person {
+            Some(_) => None,
+            None => Some(slug("yen")),
+        };
+        assert_ne!(lines_over(&j, &ids), lines_over(&reattributed, &ids));
+        assert_ne!(lines_over(&j, &ids), lines_over(&j, &ids[..1]));
+        let mut reordered = j.clone();
+        reordered.window.swap(0, 1);
+        assert_eq!(
+            lines_over(&j, &ids),
+            lines_over(&reordered, &ids),
+            "the window's order is not what the fold read"
         );
     }
 }

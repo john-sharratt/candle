@@ -61,6 +61,7 @@ use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
     ToolCallEnvelope, ToolSpec, TreeSpec,
 };
+use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{
     Carried, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence, SequenceConfig,
     TurnOptions, UnsealedAsker, Want,
@@ -92,7 +93,6 @@ use crate::engine::rendered;
 use crate::engine::retention;
 use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
-use crate::engine::throwaway::Throwaway;
 use crate::engine::tick::Due;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::Speaker;
@@ -816,7 +816,7 @@ impl Minds {
         // probe that accumulated a timeline per run would fill the log with
         // conversations nobody can attribute, and a console that stops
         // polling drops this future mid-decode, where only a drop guard runs.
-        let _retired = Throwaway::new(&self.engine, sequence.timeline_id(), "probe");
+        let _retired = Throwaway::new(Arc::clone(&self.engine), sequence.timeline_id(), "probe");
 
         // The acts this turn can take, and only those — the same set, under the
         // same mode, the grammar below is compiled from. See `compile_act_loop`.

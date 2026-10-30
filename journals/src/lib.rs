@@ -14,10 +14,12 @@
 //! | [`actor`] | who writes, and what they may read |
 //! | [`ops`] | every change to the tree, checked and applied |
 //! | [`view`] | what readers see: index, an opened journal, frames, grep |
+//! | [`brief`] | the background rebuilds: what is due, its question, its answer |
 //! | [`store`] | the repository on disk: commits, pushes, fetches, replays |
 //! | [`error`] | a broken file, a refused operation |
 
 pub mod actor;
+pub mod brief;
 pub mod error;
 pub mod files;
 pub mod line;

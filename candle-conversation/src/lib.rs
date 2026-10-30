@@ -117,6 +117,7 @@ pub mod substrate;
 pub mod summary_tree;
 pub mod tenant_rank;
 pub mod think_strip;
+pub mod throwaway;
 mod time_source;
 pub mod token_bias;
 pub mod token_buffer;

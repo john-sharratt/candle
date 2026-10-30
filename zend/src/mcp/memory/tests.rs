@@ -6,9 +6,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use journals::actor::viewer;
+use journals::error::Problem;
+use journals::files::{Cite, Sentence};
 use journals::path::Owner;
 use journals::scope::Client;
 use journals::slug::Slug;
+use journals::tree::fingerprint::fingerprint;
 use tempfile::TempDir;
 
 use super::*;
@@ -33,11 +36,68 @@ fn memory_paths_are_told_from_thread_paths() {
 #[test]
 fn a_memory_with_no_checkout_says_so() {
     let m = Memory::default();
+    assert!(!m.serves(), "no checkout, no writer");
     assert_eq!(m.tree().unwrap_err(), NO_MEMORY);
     let op = Op::MarkStale {
         path: JournalPath::root(Owner::Person(Slug::parse("x").unwrap())),
     };
-    assert_eq!(m.write(&Actor::Zend, &op).unwrap_err(), NO_MEMORY);
+    let e = m.write(&Actor::Zend, &op).unwrap_err();
+    assert_eq!(e.to_string(), NO_MEMORY);
+    assert!(
+        !e.is_conflict() && !e.is_refusal() && !e.is_broken(),
+        "absent is passing"
+    );
+    let broken = WriteError::Store(StoreError::Journal(Error::Broken(Problem::new(
+        "persons/john/lines.yaml",
+        Some(3),
+        "`text` is missing",
+    ))));
+    assert!(broken.is_broken() && !broken.is_refusal() && !broken.is_conflict());
+}
+
+/// **A write's error says what it is by its type**: a summary built over a
+/// journal that has moved on is a conflict; one the rules refuse is a
+/// refusal; the memory not being there is neither.
+#[test]
+fn a_write_error_is_told_by_its_kind() {
+    let (_root, dir) = repo();
+    let m = opened(dir);
+    let john = Slug::parse("john").unwrap();
+    let root = JournalPath::root(Owner::Person(john.clone()));
+    let actor = Actor::Person {
+        person: john,
+        client: Client::Grok,
+    };
+    let note = |text: &str| Op::Note {
+        path: root.clone(),
+        text: text.into(),
+    };
+    let id = m
+        .write(&actor, &note("Prefers tea."))
+        .unwrap()
+        .line
+        .unwrap();
+    let over = fingerprint(m.tree().unwrap().get(&root).unwrap());
+    let summary = |text: &str| Op::Summarize {
+        path: root.clone(),
+        over: over.clone(),
+        sentences: vec![Sentence {
+            text: text.into(),
+            cites: vec![Cite::Line(id.clone())],
+        }],
+        digest: None,
+        cue: None,
+    };
+    let refused = m
+        .write(&Actor::Zend, &summary(&"tea ".repeat(500)))
+        .unwrap_err();
+    assert!(refused.is_refusal() && !refused.is_conflict(), "{refused}");
+    m.write(&actor, &note("And green tea.")).unwrap();
+    let conflict = m.write(&Actor::Zend, &summary("Tea.")).unwrap_err();
+    assert!(
+        conflict.is_conflict() && !conflict.is_refusal(),
+        "{conflict}"
+    );
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -266,4 +326,5 @@ fn a_memory_that_cannot_open_says_why() {
         assert!(Instant::now() < until, "{:?}", m.tree().err());
         thread::sleep(Duration::from_millis(20));
     }
+    assert!(!m.serves(), "a memory that failed has no writer");
 }

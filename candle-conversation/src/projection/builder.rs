@@ -223,6 +223,14 @@ fn validate_selection(name: &str, rule: &SelectionRule) -> Result<(), Constructi
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
+/// The one turn group of a plain-prompt schema ([`Builder::for_plain_prompt`]
+/// and its reserved forms).
+pub const PLAIN_PROMPT_GROUP: &str = "primary_conversation";
+
+/// The tag no turn is written with, which is what a closed group admits
+/// ([`Builder::for_closed_reserved`]).
+const CLOSED_GROUP_TAG: &str = "group:closed";
+
 /// Compiled schema for the multi-layer projection substrate.
 ///
 /// Holds the immutable [`Schema`] and reverse-lookup maps from YAML string
@@ -1269,6 +1277,30 @@ impl Builder {
         )
     }
 
+    /// [`Self::for_plain_prompt_reserved`] for a conversation opened for one
+    /// job, its group **closed**: it reads its own system prompt and turns, and
+    /// none of the other conversations written to the same reserved group.
+    ///
+    /// Every job of one [`Reserved`] kind writes to that kind's one group, and a
+    /// group with no tags admits every turn in it — one job would read another's
+    /// question. Tagged with something no turn carries, it admits none of them.
+    /// The reader's own turns are always its own ([`Self::set_group_tags`]).
+    ///
+    /// [`Reserved`]: super::Reserved
+    pub fn for_closed_reserved(
+        system_prompt_text: &str,
+        kind: Reserved,
+        frame: SectionId,
+        decode_priority: DecodePriority,
+    ) -> Self {
+        let mut builder =
+            Self::for_plain_prompt_reserved(system_prompt_text, kind, frame, decode_priority);
+        builder
+            .set_group_tags(PLAIN_PROMPT_GROUP, vec![CLOSED_GROUP_TAG.to_string()])
+            .expect("a plain-prompt schema has its one group");
+        builder
+    }
+
     /// Like [`Self::for_plain_prompt_reserved`], but bases the synthetic schema's
     /// **section** ids at `section_base` instead of the single reserved-slot id.
     /// The layer and group still occupy the reserved slot — the conversation's
@@ -1394,7 +1426,7 @@ impl Builder {
                 },
                 groups: vec![GroupSchema {
                     id: group_id,
-                    name: "primary_conversation".to_string(),
+                    name: PLAIN_PROMPT_GROUP.to_string(),
                     selection: SelectionRule::AlwaysVisible,
                     score_threshold: None,
                     policy_band_declared: false,
@@ -1433,7 +1465,7 @@ impl Builder {
             .insert("dialogue".to_string(), layer_id);
         name_maps
             .group_names
-            .insert("primary_conversation".to_string(), group_id);
+            .insert(PLAIN_PROMPT_GROUP.to_string(), group_id);
         name_maps
             .section_names
             .insert((LayerId::system_prompt(), "frame".to_string()), section_id);

@@ -37,12 +37,13 @@
 //! array or object there is JSON text inside an element and the same checks run
 //! on it — [`crate::verify`] is the net either way.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::cut::close_cut;
 use crate::entry::{Item, Typed};
 use crate::journal::MAX_OPEN;
 use crate::json_repair::escape_control_in_strings;
+use crate::spec::{call, choice, list_of, object, text};
 use crate::verify::{Draft, DraftClaim, DraftOpen, Relates, MAX_CLAIMS, MAX_INTEND};
 
 /// The entry itself.
@@ -58,36 +59,6 @@ pub enum Answer {
     /// The stretch adds nothing to the journal, for this reason — empty when
     /// none was given.
     Skip(String),
-}
-
-pub(crate) fn text(name: &str, required: bool) -> Value {
-    json!({ "name": name, "type": "string", "required": required })
-}
-
-fn choice(name: &str, required: bool, values: &[String]) -> Value {
-    json!({ "name": name, "type": "string", "required": required, "enum": values })
-}
-
-/// A list of `item`, between `min_items` and `max_items` long.
-///
-/// **The most is the grammar's to hold, not only the check's.** Held only by
-/// [`crate::verify`], a writer that went on past it — a worker whose research
-/// turned up fifteen findings — had its whole entry refused, every valid claim
-/// with it, and with one round to write in, kept nothing at all. Offered no
-/// element past the most, it closes the list and keeps the entry.
-fn list_of(name: &str, required: bool, min_items: usize, max_items: usize, item: Value) -> Value {
-    json!({
-        "name": name,
-        "type": "array",
-        "required": required,
-        "min_items": min_items,
-        "max_items": max_items,
-        "items": item,
-    })
-}
-
-fn object(name: &str, required: bool, properties: Vec<Value>) -> Value {
-    json!({ "name": name, "type": "object", "required": required, "properties": properties })
 }
 
 /// The fewest claims an entry about `citable` turns is held to: one for every
@@ -162,20 +133,26 @@ pub fn write_spec(citable: &[u64], open: &[Item], claims: Claims<'_>) -> Option<
         true,
         vec![text("text", true), choice("relates", true, &relations)],
     );
-    Some(json!({
-        "name": WRITE,
-        "params": [
-            list_of("claims", true, claim_floor(citable.len()), MAX_CLAIMS, claim),
+    Some(call(
+        WRITE,
+        vec![
+            list_of(
+                "claims",
+                true,
+                claim_floor(citable.len()),
+                MAX_CLAIMS,
+                claim,
+            ),
             text("summary", true),
             list_of("intend", false, 0, MAX_INTEND, text("", true)),
             list_of("open", false, 0, MAX_OPEN, item),
         ],
-    }))
+    ))
 }
 
 /// The `journal_skip` call: one sentence on why the stretch adds nothing.
 pub fn skip_spec() -> Value {
-    json!({ "name": SKIP, "params": [text("reason", true)] })
+    call(SKIP, vec![text("reason", true)])
 }
 
 /// The calls a draft's answer may be, in the flat `{name, params}` form: the
@@ -215,8 +192,10 @@ fn json_call(answer: &str) -> Option<(String, Map<String, Value>)> {
     Some((name, args))
 }
 
-/// `<function=name>` with a `<parameter=key>` element per argument. A value that
-/// is JSON is read as JSON; anything else is the text it is.
+/// `<function=name>` with a `<parameter=key>` element per argument. A value
+/// written as a JSON array, object or quoted string is read as JSON, and
+/// `null` as no value; anything else is the text it is — `3.10` stays `3.10`,
+/// not the number 3.1, and `true` stays the word.
 fn element_call(answer: &str) -> Option<(String, Map<String, Value>)> {
     const FUNCTION: &str = "<function=";
     const PARAMETER: &str = "<parameter=";
@@ -233,15 +212,18 @@ fn element_call(answer: &str) -> Option<(String, Map<String, Value>)> {
         let body = &after[key_end + 1..];
         let end = body.find(PARAMETER_CLOSE).unwrap_or(body.len());
         let raw = body[..end].trim();
-        let value =
-            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        let value = (raw == "null" || raw.starts_with(['[', '{', '"']))
+            .then(|| serde_json::from_str::<Value>(raw).ok())
+            .flatten()
+            .unwrap_or_else(|| Value::String(raw.to_string()));
         args.insert(key, value);
         rest = &body[(end + PARAMETER_CLOSE.len()).min(body.len())..];
     }
     Some((name, args))
 }
 
-pub(crate) fn text_of(v: &Value) -> Option<String> {
+/// A text argument as written: a string, trimmed and not empty.
+pub fn text_of(v: &Value) -> Option<String> {
     let s = v.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
@@ -440,6 +422,8 @@ pub fn parse(answer: &str, may_skip: bool) -> Result<Answer, String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::entry::testing::item;
 
@@ -729,6 +713,35 @@ mod tests {
         assert_eq!(draft.claims[0].text, "The lift stopped.");
         assert_eq!(draft.claims[0].cite, vec![4]);
         assert_eq!(draft.intend, vec!["take the stairs".to_string()]);
+    }
+
+    /// **An element's text is the text written**: one that only looks like a
+    /// number or a yes-or-no stays as written, digits and all; a JSON list,
+    /// object or quoted string is read as JSON.
+    #[test]
+    fn an_element_is_read_as_the_text_written_unless_it_is_a_json_structure() {
+        let said = "<tool_call>\n<function=journal_period_fold>\n\
+            <parameter=text>3.10</parameter>\n<parameter=done>true</parameter>\n\
+            <parameter=big>12345678901234567890123</parameter>\n\
+            <parameter=list>[\"a\"]</parameter>\n<parameter=quoted>\"b\"</parameter>\n\
+            <parameter=broken>[not json</parameter>\n<parameter=none>null</parameter>\n\
+            </function>\n</tool_call>";
+        let (_, args) = arguments(said).unwrap();
+        assert_eq!(args["text"], json!("3.10"));
+        assert_eq!(args["done"], json!("true"));
+        assert_eq!(args["big"], json!("12345678901234567890123"));
+        assert_eq!(args["list"], json!(["a"]));
+        assert_eq!(args["quoted"], json!("b"));
+        assert_eq!(args["broken"], json!("[not json"));
+        assert_eq!(args["none"], Value::Null);
+        assert_eq!(text_of(&args["none"]), None, "an optional left out");
+        assert_eq!(text_of(&args["text"]).as_deref(), Some("3.10"));
+        assert_eq!(text_of(&json!("  ")), None);
+        assert_eq!(
+            text_of(&json!(2026)),
+            None,
+            "a JSON call's text is a string"
+        );
     }
 
     #[test]

@@ -106,7 +106,6 @@ pub mod sleep;
 pub mod station;
 pub mod stir;
 pub mod survey;
-pub mod throwaway;
 pub mod tick;
 pub mod tools;
 pub mod watch;

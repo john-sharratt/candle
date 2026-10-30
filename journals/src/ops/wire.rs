@@ -182,10 +182,12 @@ pub fn op_to_wire(op: &Op) -> Value {
             path,
             period,
             ids,
+            over,
             text,
         } => json!({
             "op": "fold_period", "path": p(path), "period": period.to_string(),
-            "ids": ids.iter().map(LineId::as_str).collect::<Vec<_>>(), "text": text,
+            "ids": ids.iter().map(LineId::as_str).collect::<Vec<_>>(), "over": over.as_str(),
+            "text": text,
         }),
         Op::Share { from, into, name } => {
             json!({"op": "share", "from": p(from), "into": p(into), "name": name.as_ref().map(Slug::as_str)})
@@ -301,6 +303,7 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
                 .into_iter()
                 .map(|i| LineId::parse(i).map_err(Error::Invalid))
                 .collect::<Result<_>>()?,
+            over: Fingerprint::parse(o.str("over")?).map_err(Error::Invalid)?,
             text: text()?,
         },
         "share" => Op::Share {
@@ -414,6 +417,7 @@ mod tests {
                 path: p("~"),
                 period: Period::parse("2026-W44").unwrap(),
                 ids: vec![id.clone()],
+                over: Fingerprint::of_bytes(b"w"),
                 text: "w".into(),
             },
             Op::Share {

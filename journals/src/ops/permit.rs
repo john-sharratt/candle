@@ -434,6 +434,7 @@ mod tests {
                     path: p("~"),
                     period: Period::parse("2026-10-01").unwrap(),
                     ids: vec![],
+                    over: Fingerprint::of_bytes(b""),
                     text: bad.into(),
                 },
             ),

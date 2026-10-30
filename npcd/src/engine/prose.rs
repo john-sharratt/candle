@@ -43,13 +43,13 @@ use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, compile_tool_call_tree, StencilTree,
     StencilTreeBuilder, ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
 };
+use candle_conversation::throwaway::{HeldFrame, Throwaway};
 use candle_conversation::{
     ConversationEngine, Sequence, SequenceConfig, TokenDecoder, TurnEvent, TurnOptions,
     TurnResponse,
 };
 
 use crate::engine::reflect::{plain_prose, think_off};
-use crate::engine::throwaway::Throwaway;
 use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
 
 /// How a job's system prompt is held on the engine.
@@ -316,39 +316,33 @@ async fn framed(
     // long, and stalled everything polled beside this future: the MCP stream's
     // progress ticker shares its task, so an image call went a minute without
     // a notification and its client gave it up.
-    //
-    // A transient frame is held to the end of this function, past the
-    // sequence's own drop below, so the slot reading it goes first. A kept one
-    // is never released.
-    let (_frame, mut sequence, timeline, decoder) = {
+    let (mut job, decoder) = {
         let engine = Arc::clone(engine);
         let system = system.to_string();
         let formatted = base.dialect.format_system_prompt(&system);
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let (id, frame) = match frame {
                 Frame::Transient => {
-                    let held = HeldFrame {
-                        id: engine.transient_prompt_section(&system)?,
-                        engine: Arc::clone(&engine),
-                    };
-                    (held.id, Some(held))
+                    let held = HeldFrame::take(Arc::clone(&engine), &system)?;
+                    (held.id(), Some(held))
                 }
                 Frame::Kept => (engine.plain_prompt_section(&system)?, None),
             };
-            let (builder, layer, group) = prose_projection(&system, id, band)?;
-            let seq =
+            let (builder, layer, group) = prose_projection(&system, id, band);
+            let sequence =
                 engine.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
-            let tl = seq.timeline_id();
-            engine.mark_timeline_transient(tl);
-            Ok((frame, seq, tl, engine.token_decoder()))
+            let timeline = sequence.timeline_id();
+            engine.mark_timeline_transient(timeline);
+            let job = ProseJob {
+                _retired: Throwaway::new(Arc::clone(&engine), timeline, "prose"),
+                sequence,
+                _frame: frame,
+            };
+            Ok((job, engine.token_decoder()))
         })
         .await
         .map_err(|e| anyhow::anyhow!("the prose opening did not finish: {e}"))??
     };
-    // Retired whatever happens — a job that failed half-way leaves nothing
-    // worth keeping, and a caller that drops this future mid-decode leaves
-    // only a drop guard to run the tombstone.
-    let _retired = Throwaway::new(engine, timeline, "prose");
 
     let mut sampling = match think {
         // The block is closed on its dial's budget, as an acting turn's is.
@@ -375,8 +369,8 @@ async fn framed(
         ..Default::default()
     };
 
-    let decoded = run_turn(&mut sequence, prompt, options, &decoder, on_fragment).await;
-    drop(sequence);
+    let decoded = run_turn(&mut job.sequence, prompt, options, &decoder, on_fragment).await;
+    drop(job);
 
     let r = decoded?;
     // A prefilled block may come back at the head of the text. It was the
@@ -388,21 +382,16 @@ async fn framed(
     Ok((text.to_string(), r.stats.tokens_generated as u32))
 }
 
-/// A transient frame this job holds, released when the job is done with it.
-///
-/// On every path out, because a frame never released is a section never
-/// retired. Declared ahead of the job's sequence, so the sequence — and the slot
-/// reading the frame — is dropped first. See
-/// [`ConversationEngine::transient_prompt_section`].
-struct HeldFrame {
-    engine: Arc<ConversationEngine>,
-    id: SectionId,
-}
-
-impl Drop for HeldFrame {
-    fn drop(&mut self) {
-        self.engine.release_prompt_section(self.id);
-    }
+/// A prose job's conversation and what it holds, let go in the order the
+/// fields are declared on every path out — the job done, failed, or its future
+/// dropped mid-decode: the slot, then the timeline it wrote — retired whatever
+/// happened, since nothing of a throwaway job is worth keeping — then its
+/// transient frame, which the slot was reading. A kept frame is never
+/// released.
+struct ProseJob {
+    sequence: Sequence,
+    _retired: Throwaway<Arc<ConversationEngine>>,
+    _frame: Option<HeldFrame<Arc<ConversationEngine>>>,
 }
 
 /// Submit the turn, stream its fragments, and seal it.
@@ -465,15 +454,9 @@ async fn run_turn(
     Ok(r)
 }
 
-/// The turn group of a plain-prompt schema — the one group every prose job's
-/// conversation is written to.
-const PROSE_GROUP: &str = "primary_conversation";
-
-/// The tag no turn carries, which is what a closed group admits.
-const CLOSED: &str = "prose:closed";
-
 /// The projection a prose job runs under: its own reserved layer and group, that
-/// group closed, and `frame` holding its system prompt.
+/// group closed ([`Builder::for_closed_reserved`]), and `frame` holding its
+/// system prompt.
 ///
 /// **`frame` comes from the engine, resolved from the prompt's own text.** A
 /// section the substrate already holds is reused by id without its text being
@@ -499,16 +482,12 @@ fn prose_projection(
     system: &str,
     frame: SectionId,
     band: DecodePriority,
-) -> anyhow::Result<(Builder, LayerId, GroupId)> {
-    let mut builder = Builder::for_plain_prompt_reserved(system, Reserved::Prose, frame, band);
-    builder
-        .set_group_tags(PROSE_GROUP, vec![CLOSED.to_string()])
-        .map_err(|e| anyhow::anyhow!("closing the prose group: {e}"))?;
-    Ok((
-        builder,
+) -> (Builder, LayerId, GroupId) {
+    (
+        Builder::for_closed_reserved(system, Reserved::Prose, frame, band),
         LayerId::reserved(Reserved::Prose),
         GroupId::reserved(Reserved::Prose),
-    ))
+    )
 }
 
 /// The grammar for a fixed set of answers: one branch per arm, and the turn ends
@@ -623,8 +602,7 @@ mod tests {
     fn a_prose_projection_is_reserved_and_framed_by_its_own_section() {
         let frame = SectionId::new(7_001);
         let (builder, layer, group) =
-            prose_projection("You name characters.", frame, DecodePriority::Normal)
-                .expect("the group exists to be closed");
+            prose_projection("You name characters.", frame, DecodePriority::Normal);
         assert!(
             layer.is_reserved(),
             "a prose job must not share the mind's id space"

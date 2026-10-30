@@ -30,13 +30,13 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::projection::{Builder, SelectionRule, SelectionState, TimelineId};
+use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
 
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::{plain_prose, think_off};
 use crate::engine::runtime::{drain, persist_signatures};
-use crate::engine::throwaway::Throwaway;
 
 /// The schema's dream layer, by its `name:`.
 pub const LAYER: &str = "dreams";
@@ -254,7 +254,7 @@ pub async fn dream(
     // Retired however this ends — the dream that matters is the one `keep`
     // writes, and a caller that drops this future mid-decode leaves only a
     // drop guard to run the tombstone.
-    let _retired = Throwaway::new(engine, timeline, "dream");
+    let _retired = Throwaway::new(Arc::clone(engine), timeline, "dream");
     // Each stage of a dream is logged: a dream runs with nobody waiting on it,
     // so one that stops partway is otherwise a slot held with no trace of where.
     let started = Instant::now();

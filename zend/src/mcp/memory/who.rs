@@ -47,7 +47,7 @@ pub fn person(memory: &Memory, caller: &Caller) -> Result<Slug, String> {
         }
         Err(why) => match known(memory.tree()?.as_ref(), &caller.key(), &caller.person.email)? {
             (p, None) => Ok(p),
-            (_, Some(_)) => Err(why),
+            (_, Some(_)) => Err(why.into()),
         },
     }
 }

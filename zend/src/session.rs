@@ -56,9 +56,10 @@ use candle_conversation::Result as EngineResult;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, GroupScanner,
-    Linking, OptionalState, ProjectionEvent, PromptDump, SamplingConfig, SelectionState, Sequence,
-    ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker, Want,
+    CancelToken, Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers,
+    GroupScanner, Linking, OptionalState, ProjectionEvent, PromptDump, SamplingConfig,
+    SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
+    UnsealedAsker, Want,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -146,6 +147,7 @@ use crate::working_set::seeds::Seeding;
 use crate::working_set::{dialogue_config, round_marks};
 use crate::workspace::UPLOADS_REPO;
 
+mod memory_writer;
 mod replay;
 pub use replay::{
     Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
@@ -704,6 +706,12 @@ struct InferenceState {
     /// Handle to the titler task, awaited during [`ZendSession::shutdown`]
     /// so any in-flight title turn unwinds before the process exits.
     titler_worker: Mutex<Option<TaskHandle<()>>>,
+    /// The memory's writer (`memory_writer`), awaited during
+    /// [`ZendSession::shutdown`] once `memory_stop` is requested, while the
+    /// scheduler still answers.
+    memory_writer: Mutex<Option<TaskHandle<()>>>,
+    /// What the memory's writer stops on — between jobs, and mid-turn.
+    memory_stop: CancelToken,
     /// The titler's timeline id — excluded from `list_conversations` so
     /// it doesn't show up in the user-facing sidebar.
     titler_timeline: TimelineId,
@@ -2968,6 +2976,8 @@ impl InferenceState {
             chain_end: Mutex::new(None),
             titler_tx,
             titler_worker: Mutex::new(None),
+            memory_writer: Mutex::new(None),
+            memory_stop: CancelToken::new(),
             titler_timeline,
             shutting_down: AtomicBool::new(false),
             ingest_convs: Mutex::new(ingest_convs),
@@ -8068,6 +8078,8 @@ impl ZendSession {
         let tombstone_retention = self.config.tombstone_retention;
         let cluster = self.config.cluster.clone();
         let parts: Arc<dyn SubagentRunner> = Arc::clone(self.mcp.parts()) as _;
+        // The memory its writer keeps current once the engine is up.
+        let memory = Arc::clone(self.mcp.memory());
         // Handed to both the downloader and the engine builder, so the artifact
         // fetched and the model built are the same one.
         let model = self.config.model.clone();
@@ -8225,6 +8237,22 @@ impl ZendSession {
                             "projection galleries preloaded"
                         );
                         status_tx.send(String::new()).ok();
+                        // The memory's writer, when this zend serves the
+                        // memory and may write: summaries, folds and closes,
+                        // at `Low`.
+                        // A session loaded with no runtime around it has
+                        // nothing to run the writer on, and no `/mcp` to serve
+                        // the memory through.
+                        if let Some(rt) = rt_handle.as_ref() {
+                            if memory.serves() && !read_only_substrate {
+                                let writer = rt.spawn(memory_writer::run(
+                                    Arc::downgrade(&state),
+                                    Arc::clone(&memory),
+                                    state.memory_stop.clone(),
+                                ));
+                                *state.memory_writer.lock().unwrap() = Some(writer);
+                            }
+                        }
                         // Substrate persistence runs in the engine's own
                         // thread (`PersistenceThread`) — 5 s tick + per-turn
                         // trigger from the scheduler — so no periodic-flush
@@ -8485,6 +8513,26 @@ impl ZendSession {
         // queued jobs (rather than failing each one against a dead scheduler).
         state.shutting_down.store(true, Ordering::Relaxed);
         let _ = state.titler_tx.try_send(TitleJob::Shutdown);
+        // The memory's writer stops on its token: a turn in flight — which may
+        // sit behind every other band for minutes — is abandoned at once, and
+        // what it began on the blocking pool is awaited, so its question's
+        // slot, timeline and frame are all let go while the scheduler still
+        // answers.
+        // A write waiting on the store waits for the sync thread's push or
+        // fetch; past `memory_writer::GRACE` the writer is left to the
+        // process's end rather than holding the drain.
+        state.memory_stop.request();
+        let writer = state.memory_writer.lock().unwrap().take();
+        if let Some(mut writer) = writer {
+            match tokio::time::timeout(memory_writer::GRACE, &mut writer).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => tracing::warn!("shutdown: memory writer panicked"),
+                Err(_) => {
+                    tracing::warn!("shutdown: memory writer still busy; left behind");
+                    writer.abort();
+                }
+            }
+        }
         let engine_state = Arc::clone(&state);
         let _ = tokio::task::spawn_blocking(move || {
             // Passthrough conversations hold scheduler slots; free them while

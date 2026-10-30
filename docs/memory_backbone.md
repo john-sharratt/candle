@@ -1,8 +1,9 @@
 # The memory backbone: journal trees for people and their families, in git
 
 **Status: building** (2026-10-30). Built: the `journals` crate (§14 steps 1,
-5–7), the agent's flag and zend's tools on the tree (steps 2–4). Next: zend's
-background thread (step 8), then the writers (step 9). It generalises
+5–7), the agent's flag and zend's tools on the tree (steps 2–4), and zend's
+writer (step 8: `journals::brief`, `zend/src/session/memory_writer.rs`). Next:
+the writers of step 9 — the workers' export and npcd's bot episodes. It generalises
 `docs/mcp_user_context.md` (the flat `U:` journal, `get_user_context`, the
 first-call context) and the `/mcp` journals of `docs/claude_zend_gateway.md`
 §4–§5 (threads, workers, lineage, `P:`), and extends the windowing and folding
@@ -347,8 +348,13 @@ Every journal shows a **window**: its newest 50 lines. Older lines fold by
 period, as `journal-core` folds a worker's journal today (Step → Day → Week →
 Month → Year): the background thread (§5.3) writes one `fold` line for the
 period, citing the lines in it, and moves them to `archive/<period>.yaml` — one
-commit. Every address still resolves and `journal_grep` searches archives as it
-searches windows; folding only changes what a reader sees by default.
+commit. The fold names the lines it folds by id and what they were as it was
+shown them (a fingerprint of each line's time, kind, writer, person and
+client, whether it is still proposed, and its text — ids left out so a replay
+that renames one still matches); a line edited, accepted or gone while the
+fold was being written makes it a conflict, folded again next pass. Every address
+still resolves and `journal_grep` searches archives as it searches windows;
+folding only changes what a reader sees by default.
 
 ## 5. Summaries
 
@@ -399,14 +405,26 @@ sections and then each family root.
   has 20 lines since its last build, whichever is first; at once when a
   conversation or task closes. The same thread runs the window folds (§4) and
   the eleventh-child folds (§2.3).
-- **How.** One turn on a throwaway conversation in zend's `Low` band: the
-  journal's window and each live child's summary and cue — never its own
-  previous summary, except as a guide to structure. It answers a grammar,
-  `journal_summary {sentences: [{text, cites}], cue}`, kept only if every
-  citation names one of its inputs, every cited claim is supported (the check
-  `journal-core`'s `verify` makes), it is within its cap, and it did not shrink
-  by more than half without folds or edits to explain it. A refused rebuild
-  leaves the old summary, marked stale.
+- **How.** One turn in zend's `Low` band, in a conversation opened for that
+  question alone: under the reserved `Prose` layer, its group closed to every
+  other turn, and its timeline tombstoned once the answer is read — so no
+  question ever reads another, and no person's journal reaches another's
+  summary. Its KV and frame never go to disk; its sealed turn's tokens do, as
+  every turn's do, until compaction drops the tombstoned timeline. It is shown the journal's window and each
+  live child's summary and cue — never its own previous summary, except as a
+  guide to structure — and answers a grammar,
+  `journal_summary {sentences: [{text, cite, also_cite?}], digest, cue?}` —
+  `digest` asked of a root, which alone has one, and `cue` of a named journal,
+  whose cue may drift — whose `cite` and `also_cite` are each one of its inputs
+  (a window line's `#id`, or a live child whose summary says something). Each field is bounded,
+  so a call always closes. The rebuild is kept only if it is built over the
+  journal as it stands, every sentence is one line citing one of its inputs, it
+  and its digest are within their caps, and it did not shrink by more than half
+  without lines or children gone to explain it. A journal left with nothing to
+  cite has its summary emptied without the model. A refused rebuild leaves the
+  old summary, marked stale, and any refused job — a summary, a fold — is not
+  asked again until its journal's fingerprint moves: at temperature 0 the same
+  question gets the same answer.
 - **One writer, without a lease.** A rebuild is applied only if the journal's
   fingerprint is still the one it was built over; otherwise it is refused as a
   conflict and the journal stays dirty for the next pass. Across agents, every

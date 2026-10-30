@@ -86,9 +86,9 @@ pub struct Sentence {
 pub struct Summary {
     pub over: Fingerprint,
     pub built: Stamp,
-    /// Window lines and live children it was built over, so a rebuild that
-    /// shrinks it by half with nothing gone can be told from one that lost
-    /// what was there.
+    /// Window lines, and live children with something to say, it was built
+    /// over — so a rebuild that shrinks it by half with nothing gone can be
+    /// told from one whose inputs went: a line forgotten, a child emptied.
     pub lines: usize,
     pub children: usize,
     /// The last rebuild was refused; this is the summary before it.

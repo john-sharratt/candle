@@ -21,6 +21,7 @@ pub mod record;
 pub mod repeats;
 pub mod section;
 pub mod span;
+pub mod spec;
 pub mod style;
 pub mod tools;
 pub mod transcript;

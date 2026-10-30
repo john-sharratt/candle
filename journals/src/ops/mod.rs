@@ -101,10 +101,13 @@ pub enum Op {
     MarkStale {
         path: JournalPath,
     },
+    /// `over` is [`period_fold::lines_over`] of the lines the fold was
+    /// written from: one edited meanwhile makes it a conflict.
     FoldPeriod {
         path: JournalPath,
         period: Period,
         ids: Vec<LineId>,
+        over: Fingerprint,
         text: String,
     },
     Share {
@@ -237,8 +240,9 @@ fn run(
             path,
             period,
             ids,
+            over,
             text,
-        } => period_fold::fold_period(tree, path, *period, ids, text, now, keep),
+        } => period_fold::fold_period(tree, path, *period, ids, over, text, now, keep),
         Op::Share { from, into, name } => share::share(tree, from, into, name.as_ref(), now),
         Op::AddMember {
             family,

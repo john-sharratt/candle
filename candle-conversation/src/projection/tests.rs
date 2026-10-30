@@ -11,9 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::builder::Builder;
+use super::builder::{Builder, PLAIN_PROMPT_GROUP};
 use super::error::ConstructionError;
-use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
+use super::ids::{GroupId, LayerId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
@@ -1566,6 +1566,33 @@ layers:
     assert!(b
         .set_group_selection("nowhere", SelectionRule::TopK { k: 1 })
         .is_err());
+}
+
+/// **A closed reserved conversation admits no other job's turns**: its one
+/// group is scoped to a tag no turn carries, on the reserved kind's ids.
+#[test]
+fn a_closed_reserved_schema_scopes_its_group_to_nothing() {
+    let b = Builder::for_closed_reserved(
+        "You keep summaries.",
+        Reserved::Prose,
+        SectionId::new(9_001),
+        DecodePriority::Low,
+    );
+    let layer = &b.schema().layers[0];
+    assert_eq!(layer.id, LayerId::reserved(Reserved::Prose));
+    let group = &layer.groups[0];
+    assert_eq!(
+        (group.id, group.name.as_str()),
+        (GroupId::reserved(Reserved::Prose), PLAIN_PROMPT_GROUP)
+    );
+    assert_eq!(group.policy.tags, vec!["group:closed".to_string()]);
+    let open = Builder::for_plain_prompt_reserved(
+        "You keep summaries.",
+        Reserved::Prose,
+        SectionId::new(9_001),
+        DecodePriority::Low,
+    );
+    assert!(open.schema().layers[0].groups[0].policy.tags.is_empty());
 }
 
 /// The YAML for the exchange tests: one `top_k` group over a folder-chain

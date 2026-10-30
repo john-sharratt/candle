@@ -38,12 +38,18 @@ pub fn fingerprint(j: &Journal) -> Fingerprint {
     Fingerprint::of_bytes(&bytes)
 }
 
-/// It has something to summarise: lines, or a live child with a summary. A
-/// child with none yet gives its parent nothing to say — so an empty person's
-/// root and fixed sections are never dirty, and a tree is summarised from
-/// its leaves up.
+/// It has something to summarise: lines, or a live child whose summary says
+/// something. A child with none yet — or one emptied when its lines were
+/// forgotten — gives its parent nothing to say, so an empty person's root and
+/// fixed sections are never dirty, and a tree is summarised from its leaves
+/// up.
 pub fn has_inputs(j: &Journal) -> bool {
-    !j.window.is_empty() || j.live().any(|(_, c)| c.summary().is_some())
+    !j.window.is_empty() || j.live().any(|(_, c)| speaks(c))
+}
+
+/// `j` has a summary that says something: one a parent can rest on.
+pub fn speaks(j: &Journal) -> bool {
+    j.summary().is_some_and(|s| !s.is_empty())
 }
 
 pub fn is_dirty(j: &Journal) -> bool {
@@ -218,6 +224,31 @@ mod tests {
             .window
             .push(note("2026-10-30T14:00:00Z", "y"));
         assert!(!is_dirty(&inner));
+    }
+
+    /// **An emptied child gives its parent nothing to say**: a child whose
+    /// lines were all forgotten keeps a summary of no sentences, and a parent
+    /// over it alone has no inputs.
+    #[test]
+    fn a_child_whose_summary_says_nothing_is_no_input() {
+        let child = summarised(named("permits"), "x");
+        let mut emptied = child.clone();
+        emptied
+            .meta
+            .as_mut()
+            .unwrap()
+            .summary
+            .as_mut()
+            .unwrap()
+            .sentences
+            .clear();
+        assert!(speaks(&child) && !speaks(&emptied));
+        assert!(!speaks(&named("budget")), "no summary yet");
+        let mut parent = named("house-build");
+        parent.children.insert(slug("permits"), emptied);
+        assert!(!has_inputs(&parent));
+        parent.children.insert(slug("budget"), child);
+        assert!(has_inputs(&parent));
     }
 
     #[test]

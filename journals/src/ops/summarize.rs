@@ -10,7 +10,7 @@ use crate::ops::Applied;
 use crate::path::{JournalPath, Place};
 use crate::time::Stamp;
 use crate::tree::check::{digest_cap, summary_cap};
-use crate::tree::fingerprint::{fingerprint, has_inputs};
+use crate::tree::fingerprint::{fingerprint, has_inputs, speaks};
 use crate::tree::{Journal, Tree};
 
 /// The name a fixed journal's `journal.yaml` says.
@@ -46,11 +46,11 @@ fn check_sentences(
         for c in &s.cites {
             let ok = match c {
                 Cite::Line(id) => j.has_id(id),
-                Cite::Child(name) => j.live().any(|(n, _)| n == name),
+                Cite::Child(name) => j.live().any(|(n, c)| n == name && speaks(c)),
             };
             if !ok {
                 return Err(Error::invalid(format!(
-                    "sentence {} cites {c}, which is not in {path}",
+                    "sentence {} cites {c}, which is not one of {path}'s inputs",
                     i + 1
                 )));
             }
@@ -99,7 +99,7 @@ pub fn summarize(
         over: current,
         built: now,
         lines: j.window.len(),
-        children: j.live_count(),
+        children: j.live().filter(|(_, c)| speaks(c)).count(),
         stale: false,
         digest: match (digest.map(str::trim), digest_cap(j.place, scope)) {
             (None, _) => None,
@@ -247,9 +247,59 @@ mod tests {
             "a fixed journal's file is made with its fixed name"
         );
         let sum = meta.summary.as_ref().unwrap();
-        // Its two fixed sections are live children, summarised or not.
-        assert_eq!((sum.lines, sum.children, sum.built), (1, 2, now()));
+        // Its two fixed sections are live children, but say nothing yet.
+        assert_eq!((sum.lines, sum.children, sum.built), (1, 0, now()));
         assert_eq!(sum.digest.as_deref(), Some("Tea drinker."));
+    }
+
+    /// **A child gone silent is a child gone**: once its lines are forgotten
+    /// and its summary emptied, the parent that rested on it alone is emptied
+    /// too, not refused as a shrink with nothing gone.
+    #[test]
+    fn a_parent_over_a_child_gone_silent_is_emptied() {
+        let mut t = sharratt();
+        let trip = apply(
+            &mut t,
+            &john(),
+            &Op::Create {
+                under: p("topics"),
+                name: slug("trip"),
+                cue: "open for the trip".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            now(),
+        )
+        .unwrap()
+        .created
+        .unwrap();
+        let (_, cite) = noted(&mut t, "topics/trip", "Flights to Da Nang.");
+        summarise(&mut t, &trip, vec![s("Flights booked.", vec![cite])], None).unwrap();
+        let topics = p("topics");
+        summarise(
+            &mut t,
+            &topics,
+            vec![s(
+                "A trip to Da Nang is planned.",
+                vec![Cite::Child(slug("trip"))],
+            )],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.get(&topics).unwrap().summary().unwrap().children, 1);
+        apply(
+            &mut t,
+            &john(),
+            &Op::Forget {
+                path: trip.clone(),
+                which: Which::Says("Flights to Da Nang".into()),
+            },
+            now(),
+        )
+        .unwrap();
+        summarise(&mut t, &trip, vec![], None).unwrap();
+        summarise(&mut t, &topics, vec![], None).unwrap();
+        let j = t.get(&topics).unwrap();
+        assert!(!is_dirty(j) && j.summary().unwrap().is_empty());
     }
 
     #[test]
@@ -285,12 +335,29 @@ mod tests {
     fn sentences_cite_only_what_is_there() {
         let mut t = sharratt();
         let (path, cite) = noted(&mut t, "topics", "x");
+        // A live child with nothing to say yet is no input either.
+        apply(
+            &mut t,
+            &john(),
+            &Op::Create {
+                under: path.clone(),
+                name: slug("trip"),
+                cue: "open for the trip".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            now(),
+        )
+        .unwrap();
         let bogus = Cite::Line(LineId::parse("20200101-0000-0000").unwrap());
         for (sentences, says) in [
-            (vec![s("A.", vec![bogus])], "which is not in"),
+            (vec![s("A.", vec![bogus])], "which is not one of"),
             (
                 vec![s("A.", vec![Cite::Child(slug("nobody"))])],
-                "which is not in",
+                "which is not one of",
+            ),
+            (
+                vec![s("A.", vec![Cite::Child(slug("trip"))])],
+                "which is not one of @sharratt/topics's inputs",
             ),
             (vec![s("A.", vec![])], "cites nothing"),
             (vec![s("  ", vec![cite.clone()])], "not one line"),

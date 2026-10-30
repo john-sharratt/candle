@@ -61,6 +61,7 @@ use candle_conversation::stencil::{
     compile_think_tree, compile_tool_call_tree, Param as CallParam, ParamType, StencilTree,
     ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
 };
+use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
@@ -70,7 +71,6 @@ use crate::engine::identity;
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{self, Persona, Stance};
 use crate::engine::schema::{ReflectionTurns, AXES_SLOT, DOMAIN_SLOT};
-use crate::engine::throwaway::Throwaway;
 use crate::engine::tools::{self, Availability, Mode, Param, Plane, Tool};
 
 /// How many turns of its own the reflection carries.
@@ -1141,7 +1141,7 @@ impl<'t> Reflect<'t> {
         // gather and out of `find_conversations_by_metadata`, so nothing can
         // resume or surface it. A drop guard rather than a tail call, because
         // a caller that drops this future mid-decode runs nothing else.
-        let _retired = Throwaway::new(&self.engine, timeline, "reflection");
+        let _retired = Throwaway::new(Arc::clone(&self.engine), timeline, "reflection");
 
         // **What the model actually read, not what was handed in.**
         //

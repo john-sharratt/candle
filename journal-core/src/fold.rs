@@ -12,12 +12,13 @@
 //! the detailed account kept behind that line for the journal's tools. Like the
 //! draft's calls it is only ever an answer grammar, never in a catalog.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::entry::Entry;
 use crate::period::Period;
+use crate::spec::{call, text};
 use crate::style::Style;
-use crate::tools::{arguments, text, text_of};
+use crate::tools::{arguments, text_of};
 
 /// The fold itself.
 pub const FOLD: &str = "journal_fold";
@@ -97,7 +98,7 @@ pub fn question(fold: &Fold, entries: &[Entry], style: &Style) -> String {
 /// The `journal_fold` call: the line the journal keeps and the digest behind
 /// it.
 pub fn spec() -> Value {
-    json!({ "name": FOLD, "params": [text("summary", true), text("digest", true)] })
+    call(FOLD, vec![text("summary", true), text("digest", true)])
 }
 
 /// Read one answer as `(summary, digest)`. The error is worded for the model.
@@ -145,6 +146,8 @@ pub fn entry(fold: &Fold, entries: &[Entry], summary: String, digest: String) ->
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::entry::testing::entry as step;
     use crate::style::testing::PLAIN;
