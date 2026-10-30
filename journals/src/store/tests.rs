@@ -8,12 +8,12 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use super::*;
-use crate::files::{render_lines, Email, Kind, Role};
+use crate::files::{entry_file, Email, Kind, Role};
 use crate::line::Writer;
 use crate::ops::fixture::{john, now, p, sharratt, yen};
 use crate::ops::{OnTaken, Which};
 use crate::path::Address;
-use crate::scope::Client;
+use crate::scope::Channel;
 use crate::testing::{note as testing_note, slug};
 use crate::tree::render::render_all;
 
@@ -62,11 +62,6 @@ impl Repos {
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             std::fs::write(at, bytes).unwrap();
         }
-        std::fs::write(
-            seed.join(".gitattributes"),
-            "lines.yaml merge=union\n**/archive/*.yaml merge=union\n",
-        )
-        .unwrap();
         git(&seed, &["add", "-A"]);
         git(&seed, &["commit", "-q", "-m", "seed"]);
         git(&seed, &["push", "-q", "origin", "main"]);
@@ -149,7 +144,7 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
         &dir,
         &["log", "-1", "--format=%an%n%B", "refs/journal/head"],
     );
-    assert!(log.starts_with("grok\nNote on @sharratt/topics\n\nJournal-Writer: grok\nJournal-Person: yen\nJournal-Client: grok\n"), "{log}");
+    assert!(log.starts_with("grok\nNote on @sharratt/topics\n\nJournal-Writer: grok\nJournal-Person: yen\nJournal-Channel: grok\n"), "{log}");
     assert!(log.contains("Journal-Op: {\"op\":\"note\""), "{log}");
 }
 
@@ -203,7 +198,7 @@ fn a_replayed_line_whose_id_was_taken_takes_a_new_one_and_its_edits_follow() {
     let mut b = Store::open(&r.clone("b")).unwrap();
     // Two different notes in one minute whose ids collide: a birthday
     // search over the id's sixteen bits finds a pair in a few hundred texts.
-    let by = Writer::Client(Client::ClaudeCode);
+    let by = Writer::Channel(Channel::ClaudeCode);
     let mut seen: BTreeMap<LineId, String> = BTreeMap::new();
     let (xa, xb) = (0..)
         .map(|i| format!("note {i}"))
@@ -373,7 +368,7 @@ fn an_admins_write_replays_as_an_admins() {
     let log = git(&dir, &["log", "-1", "--format=%B", "refs/journal/head"]);
     assert!(
         log.contains(
-            "Journal-Actor: {\"kind\":\"person\",\"person\":\"john\",\"client\":\"claude-code\",\"admin\":true}"
+            "Journal-Actor: {\"kind\":\"person\",\"person\":\"john\",\"channel\":\"claude-code\",\"admin\":true}"
         ),
         "{log}"
     );
@@ -399,8 +394,8 @@ fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
     let line = testing_note("2026-10-30T09:00:00Z", "written by hand");
     r.hand_edit(
         "hand",
-        "groups/sharratt/topics/lines.yaml",
-        &render_lines(&[line]),
+        &format!("groups/sharratt/topics/{}", entry_file(&line.id)),
+        &line.render(),
     );
     let synced = s.sync().unwrap();
     assert!(synced.fetched);
@@ -411,14 +406,18 @@ fn a_hand_edit_on_origin_is_read_at_the_next_sync() {
 fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
     let r = Repos::new();
     let mut s = Store::open(&r.clone("a")).unwrap();
+    let entry = "groups/sharratt/topics/2026-10-30-0900-0001.yaml";
     r.hand_edit(
         "hand",
-        "groups/sharratt/topics/lines.yaml",
-        "- {id: nope}\n",
+        entry,
+        "at: nope\nkind: note\nby: claude-code\ntext: x\n",
     );
     s.sync().unwrap();
     let topics = s.tree().get(&p("topics")).unwrap();
-    assert_eq!(topics.problems[0].to_string(), "groups/sharratt/topics/lines.yaml:1: `id`: `nope` is not a line id, written 20261030-0912-7e3a");
+    assert_eq!(
+        topics.problems[0].to_string(),
+        format!("{entry}:1: `at`: `nope` is not a time written 2026-10-30T09:10:02Z")
+    );
     assert!(matches!(
         s.write(&yen(), &note("x"), now()),
         Err(StoreError::Journal(Error::Refused(_)))
@@ -433,9 +432,14 @@ fn a_broken_hand_edit_is_answered_as_an_error_until_fixed() {
         now(),
     )
     .unwrap();
-    r.hand_edit("fix", "groups/sharratt/topics/lines.yaml", "");
+    r.hand_edit(
+        "fix",
+        entry,
+        "at: 2026-10-30T09:00:00Z\nkind: note\nby: claude-code\ntext: mended\n",
+    );
     s.sync().unwrap();
     assert!(s.tree().get(&p("topics")).unwrap().problems.is_empty());
+    assert_eq!(texts(s.tree(), "topics"), ["mended"]);
     assert_eq!(texts(s.tree(), "projects"), ["fine"]);
 }
 

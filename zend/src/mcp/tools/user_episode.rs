@@ -1,6 +1,6 @@
 //! `user_episode_note {tool, summary?}`: record on this conversation's
 //! journal that a tool did something for the user, through this session's
-//! client (`docs/mcp_user_context.md` §2.3, `docs/memory_backbone.md` §2). The
+//! channel (`docs/mcp_user_context.md` §2.3, `docs/memory_backbone.md` §2). The
 //! aggregator calls it by name after each call that changed something; it is
 //! in no listing, so no model is offered it — what was done is kept whether or
 //! not the model thought to note it.
@@ -39,7 +39,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) if mem::lasting(&e) => return Answer::ok(format!("Not recorded: {e}.")),
         Err(e) => return Answer::error(e),
     };
-    let path = match conversations::of(&m.memory, &m.person, m.client, &ctx.mcp_id) {
+    let path = match conversations::of(&m.memory, &m.person, m.channel, &ctx.mcp_id) {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
     };
@@ -54,7 +54,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let server = Actor::Server {
         person: m.person.clone(),
-        client: m.client,
+        channel: m.channel,
     };
     match m.memory.write(
         &server,

@@ -14,6 +14,7 @@
 //! | `share` | `journal`, `into` (`topics` when absent), `name`? |
 //! | `accept` | `line` |
 //! | `create_group` | `group`, `name`, `kind` |
+//! | `describe_group` | `about`, `group`? |
 //! | `add_member` | `person`, `name`?, `emails`?, `role`?, `group`? |
 //! | `add_bot` | `bot`, `group`? |
 //! | `remove_member` | `person` or `bot`, `group`? |
@@ -37,9 +38,9 @@ use journals::time::Stamp;
 use serde_json::{Map, Value};
 
 use crate::mcp::tools::group_add::{self, group_of};
-use crate::mcp::tools::group_frame;
 use crate::mcp::tools::mem::Mem;
 use crate::mcp::tools::string;
+use crate::mcp::tools::{group_describe, group_frame};
 
 /// How far ahead of this member's clock an `at` may be: members' clocks
 /// differ by a little.
@@ -65,6 +66,7 @@ enum Kind {
     Share,
     Accept,
     CreateGroup,
+    DescribeGroup,
     AddMember,
     AddBot,
     RemoveMember,
@@ -84,6 +86,7 @@ impl Kind {
             "share" => Kind::Share,
             "accept" => Kind::Accept,
             "create_group" => Kind::CreateGroup,
+            "describe_group" => Kind::DescribeGroup,
             "add_member" => Kind::AddMember,
             "add_bot" => Kind::AddBot,
             "remove_member" => Kind::RemoveMember,
@@ -104,6 +107,7 @@ impl Kind {
             Kind::Share => &["journal", "into", "name"],
             Kind::Accept => &["line"],
             Kind::CreateGroup => &["group", "name", "kind"],
+            Kind::DescribeGroup => &["about", "group"],
             Kind::AddMember => &["person", "name", "emails", "role", "group"],
             Kind::AddBot => &["bot", "group"],
             Kind::RemoveMember => &["person", "bot", "group"],
@@ -159,7 +163,7 @@ pub fn plan(m: &Mem, v: &Value, now: Stamp) -> Result<Planned, String> {
             // A conversation's name recurs as conversations do, numbered; a
             // topic's or a project's is refused the second time.
             let on_taken = match under.place().map_err(|e| e.to_string())? {
-                Place::Client(_) => OnTaken::Number,
+                Place::Channel(_) => OnTaken::Number,
                 _ => OnTaken::Refuse,
             };
             Op::Create {
@@ -198,6 +202,7 @@ pub fn plan(m: &Mem, v: &Value, now: Stamp) -> Result<Planned, String> {
             name: string(v, "name")?.to_string(),
             kind: GroupKind::parse(string(v, "kind")?)?,
         },
+        Kind::DescribeGroup => group_describe::plan(m, v)?,
         Kind::AddMember | Kind::AddBot => group_add::plan(v, group_of(m, v)?)?,
         Kind::RemoveMember => Op::RemoveMember {
             group: group_of(m, v)?,
@@ -253,7 +258,7 @@ mod tests {
     }
 
     fn id() -> LineId {
-        LineId::parse("20261030-0912-7e3a").unwrap()
+        LineId::parse("2026-10-30-0912-7e3a").unwrap()
     }
 
     #[test]
@@ -316,11 +321,11 @@ mod tests {
         for (name, v) in [
             (
                 "edit",
-                json!({"op": "edit", "line": "~#20261030-0912-7e3a", "text": "x", "at": "2026-01-01T00:00:00Z"}),
+                json!({"op": "edit", "line": "~#2026-10-30-0912-7e3a", "text": "x", "at": "2026-01-01T00:00:00Z"}),
             ),
             (
                 "forget",
-                json!({"op": "forget", "line": "~#20261030-0912-7e3a", "at": "2026-01-01T00:00:00Z"}),
+                json!({"op": "forget", "line": "~#2026-10-30-0912-7e3a", "at": "2026-01-01T00:00:00Z"}),
             ),
             (
                 "fold",
@@ -332,7 +337,7 @@ mod tests {
             ),
             (
                 "accept",
-                json!({"op": "accept", "line": "~#20261030-0912-7e3a", "at": "2026-01-01T00:00:00Z"}),
+                json!({"op": "accept", "line": "~#2026-10-30-0912-7e3a", "at": "2026-01-01T00:00:00Z"}),
             ),
         ] {
             assert_eq!(
@@ -349,14 +354,14 @@ mod tests {
             id: id(),
         };
         assert_eq!(
-            op(json!({"op": "edit", "line": "~#20261030-0912-7e3a", "text": "now"})),
+            op(json!({"op": "edit", "line": "~#2026-10-30-0912-7e3a", "text": "now"})),
             Op::Edit {
                 address: line(),
                 text: "now".into()
             }
         );
         assert_eq!(
-            op(json!({"op": "forget", "line": "~#20261030-0912-7e3a"})),
+            op(json!({"op": "forget", "line": "~#2026-10-30-0912-7e3a"})),
             Op::Forget {
                 path: path("~"),
                 which: Which::Id(id())
@@ -418,7 +423,7 @@ mod tests {
             }
         );
         assert_eq!(
-            op(json!({"op": "accept", "line": "~#20261030-0912-7e3a"})),
+            op(json!({"op": "accept", "line": "~#2026-10-30-0912-7e3a"})),
             Op::Accept { address: line() }
         );
     }
@@ -429,10 +434,10 @@ mod tests {
     fn a_conversation_is_created_numbered() {
         assert_eq!(
             op(
-                json!({"op": "create", "under": "~/clients/claude-code", "name": "2026-10-30-0910", "cue": "c"})
+                json!({"op": "create", "under": "~/channels/claude-code", "name": "2026-10-30-0910", "cue": "c"})
             ),
             Op::Create {
-                under: path("~/clients/claude-code"),
+                under: path("~/channels/claude-code"),
                 name: Slug::parse("2026-10-30-0910").unwrap(),
                 cue: "c".into(),
                 on_taken: OnTaken::Number,
@@ -516,8 +521,8 @@ mod tests {
         for v in [
             json!({"op": "forget", "journal": "~"}),
             json!({"op": "forget", "says": "x"}),
-            json!({"op": "forget", "line": "~#20261030-0912-7e3a", "says": "x"}),
-            json!({"op": "forget", "line": "~#20261030-0912-7e3a", "journal": "~"}),
+            json!({"op": "forget", "line": "~#2026-10-30-0912-7e3a", "says": "x"}),
+            json!({"op": "forget", "line": "~#2026-10-30-0912-7e3a", "journal": "~"}),
         ] {
             assert_eq!(err(v), either);
         }

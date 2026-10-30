@@ -22,7 +22,7 @@ use journal_core::tools::arguments;
 use serde_json::{Map, Value};
 
 use crate::path::{JournalPath, Owner, Place};
-use crate::scope::{Client, Section};
+use crate::scope::{Channel, Section};
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::fingerprint::dirty;
@@ -46,7 +46,7 @@ pub enum Job {
     Close {
         path: JournalPath,
         person: Slug,
-        client: Client,
+        channel: Channel,
     },
     /// A window over its size with a closed period to fold.
     Fold { path: JournalPath, plan: PeriodFold },
@@ -73,16 +73,16 @@ pub fn call_of(answer: &str, name: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// The client a conversation's journal is under, when `path` is one.
-fn conversation_of(path: &JournalPath) -> Option<(Slug, Client)> {
+/// The channel a conversation's journal is under, when `path` is one.
+fn conversation_of(path: &JournalPath) -> Option<(Slug, Channel)> {
     match (path.owner(), path.place().ok()?) {
         (
             Owner::Person(p),
             Place::Named {
-                section: Section::Clients,
+                section: Section::Channels,
                 depth: 2,
             },
-        ) => Some((p.clone(), Client::parse(path.names()[1].as_str())?)),
+        ) => Some((p.clone(), Channel::parse(path.names()[1].as_str())?)),
         _ => None,
     }
 }
@@ -104,12 +104,12 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
         if !j.problems.is_empty() {
             continue;
         }
-        if let Some((person, client)) = conversation_of(&path) {
+        if let Some((person, channel)) = conversation_of(&path) {
             if gone_quiet(j, now) {
                 closes.push(Job::Close {
                     path: path.clone(),
                     person,
-                    client,
+                    channel,
                 });
             }
         }
@@ -181,14 +181,14 @@ mod tests {
         let mut t = sharratt();
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         let t0 = at("2026-10-30T12:00:00Z");
         let c = apply(
             &mut t,
             &server,
             &Op::Create {
-                under: p("~/clients/grok"),
+                under: p("~/channels/grok"),
                 name: slug("2026-10-30-1200"),
                 cue: "x".into(),
                 on_taken: OnTaken::Number,
@@ -214,7 +214,7 @@ mod tests {
             Job::Close {
                 path: c.clone(),
                 person: slug("john"),
-                client: Client::Grok
+                channel: Channel::Grok
             }
         );
         apply(

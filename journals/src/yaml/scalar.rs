@@ -1,7 +1,7 @@
-//! Writing scalars. Free text is always double-quoted, as JSON writes a
-//! string — a JSON string is a YAML double-quoted scalar — so no text can end
-//! a flow mapping early, start a comment, or be read back as a number, a
-//! boolean or null.
+//! Writing scalars. Free text that cannot be written plain or folded
+//! ([`crate::yaml::text_field`]) is double-quoted, as JSON writes a string —
+//! a JSON string is a YAML double-quoted scalar — so no text can end a flow
+//! early, start a comment, or be read back as a number, a boolean or null.
 //!
 //! Names, times, ids, keys and fingerprints are written plain where YAML
 //! reads the plain form back as exactly that text, and quoted where it would
@@ -54,12 +54,6 @@ pub(crate) fn scalar_list<S: AsRef<str>>(items: &[S]) -> String {
     format!("[{}]", inner.join(", "))
 }
 
-/// `["a", "b"]`.
-pub(crate) fn quote_list<S: AsRef<str>>(items: &[S]) -> String {
-    let inner: Vec<String> = items.iter().map(|s| quote(s.as_ref())).collect();
-    format!("[{}]", inner.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +103,7 @@ mod tests {
             "candle",
             "2026-10-30-2105",
             "2026-10-30T09:10:02Z",
-            "20261030-0912-7e3a",
+            "2026-10-30-0912-7e3a",
             "verify.2",
             "e3b0c44298fc1c14",
             "yes",
@@ -137,11 +131,10 @@ mod tests {
             assert_eq!(v["v"].as_str(), Some(misread));
         }
         assert_eq!(scalar_list(&["sharratt", "true"]), r#"[sharratt, "true"]"#);
-    }
-
-    #[test]
-    fn lists_of_text_are_flow_sequences() {
-        assert_eq!(quote_list(&["#a", "b c"]), r##"["#a", "b c"]"##);
-        assert_eq!(quote_list::<&str>(&[]), "[]");
+        assert_eq!(
+            scalar_list(&["#2026-10-29-0410-a3b4", "user-context"]),
+            r##"["#2026-10-29-0410-a3b4", user-context]"##
+        );
+        assert_eq!(scalar_list::<&str>(&[]), "[]");
     }
 }

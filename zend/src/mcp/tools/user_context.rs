@@ -47,7 +47,7 @@ pub fn call(ctx: &Ctx, _args: &Value) -> Answer {
         &m.tree,
         &m.person,
         here.as_ref(),
-        m.client,
+        m.channel,
         Stamp::now(),
     ))
 }

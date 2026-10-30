@@ -1,16 +1,24 @@
 //! `journals check <dir>`: read a journal repository's working tree as the
 //! service would, and list every problem in it — for a hand edit or a job's
 //! refactor, before it is committed. Exits 1 when anything is wrong.
+//!
+//! `journals fmt <dir>`: the same read, then every file the tree is made of
+//! rewritten as the service writes it — for a tree written by hand, or in an
+//! older form of the files. Writes nothing when anything is wrong.
 
 use std::collections::BTreeMap;
+use std::env;
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
 use journals::tree::load::load;
+use journals::tree::render::render_all;
+use journals::tree::Tree;
 
 fn read_dir(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_name() == ".git" {
@@ -26,20 +34,64 @@ fn read_dir(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> io:
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            out.insert(rel, std::fs::read(&path)?);
+            out.insert(rel, fs::read(&path)?);
         }
     }
     Ok(())
 }
 
+/// Every problem the tree holds, in its files and its journals.
+fn problems(tree: &Tree) -> Vec<String> {
+    let mut out: Vec<String> = tree.problems.iter().map(ToString::to_string).collect();
+    for p in tree.persons.values() {
+        if let Err(e) = &p.file {
+            out.push(e.to_string());
+        }
+        out.extend(p.problems.iter().map(ToString::to_string));
+    }
+    for f in tree.groups.values() {
+        if let Err(e) = &f.file {
+            out.push(e.to_string());
+        }
+        out.extend(f.problems.iter().map(ToString::to_string));
+    }
+    for (_, j) in &tree.journals() {
+        out.extend(j.problems.iter().map(ToString::to_string));
+    }
+    out
+}
+
+/// `bytes` at `path`, put in place whole: written beside it, then renamed
+/// over it, so an interrupted write leaves the old file rather than half a
+/// new one.
+fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("yaml.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+/// Each file of `tree` that `files` holds otherwise, rewritten under `root`;
+/// how many.
+fn format(root: &Path, files: &BTreeMap<String, Vec<u8>>, tree: &Tree) -> io::Result<usize> {
+    let mut changed = 0;
+    for (rel, bytes) in render_all(tree) {
+        if files.get(&rel) != Some(&bytes) {
+            replace(&root.join(&rel), &bytes)?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let usage = "usage: journals check <dir> | journals fmt <dir>";
+    let args: Vec<String> = env::args().collect();
     let [_, cmd, dir] = args.as_slice() else {
-        eprintln!("usage: journals check <dir>");
+        eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    if cmd != "check" {
-        eprintln!("usage: journals check <dir>");
+    if cmd != "check" && cmd != "fmt" {
+        eprintln!("{usage}");
         return ExitCode::from(2);
     }
     let root = Path::new(dir);
@@ -49,23 +101,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let tree = load(&files);
-    let mut problems: Vec<String> = tree.problems.iter().map(ToString::to_string).collect();
-    for p in tree.persons.values() {
-        if let Err(e) = &p.file {
-            problems.push(e.to_string());
-        }
-        problems.extend(p.problems.iter().map(ToString::to_string));
-    }
-    for f in tree.groups.values() {
-        if let Err(e) = &f.file {
-            problems.push(e.to_string());
-        }
-        problems.extend(f.problems.iter().map(ToString::to_string));
-    }
     let journals = tree.journals();
-    for (_, j) in &journals {
-        problems.extend(j.problems.iter().map(ToString::to_string));
-    }
     println!(
         "{} persons, {} groups, {} journals, {} lines",
         tree.persons.len(),
@@ -76,13 +112,22 @@ fn main() -> ExitCode {
             .map(|(_, j)| j.all_lines().count())
             .sum::<usize>()
     );
-    if problems.is_empty() {
-        println!("no problems");
-        ExitCode::SUCCESS
-    } else {
+    let problems = problems(&tree);
+    if !problems.is_empty() {
         for p in &problems {
             println!("{p}");
         }
-        ExitCode::from(1)
+        return ExitCode::from(1);
     }
+    println!("no problems");
+    if cmd == "fmt" {
+        match format(root, &files, &tree) {
+            Ok(n) => println!("{n} files rewritten"),
+            Err(e) => {
+                eprintln!("{dir}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }

@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::line::LineId;
-use crate::scope::{Client, Scope, Section};
+use crate::scope::{Channel, Scope, Section};
 use crate::slug::Slug;
 
 /// The most levels below a section (§2.2).
@@ -42,7 +42,7 @@ impl Owner {
 }
 
 /// A journal: its owner, then the names below the owner's root — first a
-/// section, then for `clients` a client, then named journals.
+/// section, then for `channels` a channel, then named journals.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JournalPath {
     owner: Owner,
@@ -54,9 +54,9 @@ pub struct JournalPath {
 pub enum Place {
     Root,
     Section(Section),
-    Client(Client),
+    Channel(Channel),
     /// A named journal, `depth` levels below its section (1 is a section's
-    /// child; under `clients`, a client's child is depth 2).
+    /// child; under `channels`, a channel's child is depth 2).
     Named {
         section: Section,
         depth: usize,
@@ -107,11 +107,11 @@ impl JournalPath {
         if rest.is_empty() {
             return Ok(Place::Section(section));
         }
-        if section == Section::Clients {
-            let client = Client::parse(rest[0].as_str())
-                .ok_or_else(|| Error::invalid(format!("`{}` is not a client", rest[0])))?;
+        if section == Section::Channels {
+            let channel = Channel::parse(rest[0].as_str())
+                .ok_or_else(|| Error::invalid(format!("`{}` is not a channel", rest[0])))?;
             if rest.len() == 1 {
-                return Ok(Place::Client(client));
+                return Ok(Place::Channel(channel));
             }
         }
         if let Some(r) = rest.iter().find(|s| s.is_reserved()) {
@@ -209,7 +209,7 @@ impl Viewer {
         let (owner, rest) = if let Some(rest) = text.strip_prefix('~') {
             if !(rest.is_empty() || rest.starts_with('/')) {
                 return Err(Error::invalid(format!(
-                    "`{text}`: `~` is your own journal; write `~/clients/…`"
+                    "`{text}`: `~` is your own journal; write `~/channels/…`"
                 )));
             }
             (Owner::Person(self.person.clone()), rest)
@@ -297,10 +297,10 @@ mod tests {
             ("~", "~"),
             ("~/", "~"),
             (
-                "~/clients/grok/2026-10-30-2105",
-                "~/clients/grok/2026-10-30-2105",
+                "~/channels/grok/2026-10-30-2105",
+                "~/channels/grok/2026-10-30-2105",
             ),
-            ("clients/grok", "~/clients/grok"),
+            ("channels/grok", "~/channels/grok"),
             ("people/builder", "~/people/builder"),
             ("@sharratt", "@sharratt"),
             ("@sharratt/projects/candle/", "@sharratt/projects/candle"),
@@ -321,8 +321,8 @@ mod tests {
             "groups/sharratt/projects/candle"
         );
         assert_eq!(
-            v.parse("~/clients").unwrap().folder(),
-            "persons/john/clients"
+            v.parse("~/channels").unwrap().folder(),
+            "persons/john/channels"
         );
     }
 
@@ -332,11 +332,11 @@ mod tests {
         for (written, says) in [
             ("", "empty"),
             ("~/projects/candle", "projects is shared"),
-            ("@sharratt/clients/grok", "clients is personal"),
-            ("~/clients/tesla", "`tesla` is not a client"),
+            ("@sharratt/channels/grok", "channels is personal"),
+            ("~/channels/tesla", "`tesla` is not a channel"),
             ("~/notes", "`notes` is not a section"),
             ("candle", "starts with neither"),
-            ("~john/clients", "`~` is your own"),
+            ("~john/channels", "`~` is your own"),
             ("@Sharratt/projects", "not a name"),
             ("projects/House Build", "not a name"),
             ("projects/candle/archive", "reserved"),
@@ -349,9 +349,9 @@ mod tests {
             );
         }
         assert!(v.parse("projects/a/b/c/d/e/f").is_ok());
-        // Under clients the client is a level of its own.
-        assert!(v.parse("~/clients/grok/a/b/c/d/e").is_ok());
-        assert!(v.parse("~/clients/grok/a/b/c/d/e/f").is_err());
+        // Under channels the channel is a level of its own.
+        assert!(v.parse("~/channels/grok/a/b/c/d/e").is_ok());
+        assert!(v.parse("~/channels/grok/a/b/c/d/e/f").is_err());
     }
 
     /// **A bare shared section is the caller's default group's**; another
@@ -366,7 +366,7 @@ mod tests {
             shown(&none, "topics/x"),
             "error: `topics/x` is shared, and you have no default group: name one, as `@group/topics/x`"
         );
-        assert_eq!(shown(&none, "clients/grok"), "~/clients/grok");
+        assert_eq!(shown(&none, "channels/grok"), "~/channels/grok");
         let v = john();
         assert_eq!(shown(&v, "topics/x"), "@sharratt/topics/x");
         assert_eq!(shown(&v, "@work/topics/x"), "@work/topics/x");
@@ -375,21 +375,21 @@ mod tests {
     #[test]
     fn places_parents_and_children() {
         let v = john();
-        let p = v.parse("~/clients/grok/2026-10-30-2105").unwrap();
+        let p = v.parse("~/channels/grok/2026-10-30-2105").unwrap();
         assert_eq!(
             p.place().unwrap(),
             Place::Named {
-                section: Section::Clients,
+                section: Section::Channels,
                 depth: 2
             }
         );
         assert_eq!(
             p.parent().unwrap().place().unwrap(),
-            Place::Client(Client::Grok)
+            Place::Channel(Channel::Grok)
         );
         assert_eq!(
-            v.parse("~/clients").unwrap().place().unwrap(),
-            Place::Section(Section::Clients)
+            v.parse("~/channels").unwrap().place().unwrap(),
+            Place::Section(Section::Channels)
         );
         assert_eq!(v.parse("~").unwrap().place().unwrap(), Place::Root);
         assert_eq!(v.parse("~").unwrap().parent(), None);
@@ -408,14 +408,17 @@ mod tests {
     fn addresses_are_a_path_and_a_line_id() {
         let v = john();
         let a = v
-            .parse_address("projects/candle#20261030-0912-7e3a")
+            .parse_address("projects/candle#2026-10-30-0912-7e3a")
             .unwrap();
         assert_eq!(
             a.to_string(),
-            "@sharratt/projects/candle#20261030-0912-7e3a"
+            "@sharratt/projects/candle#2026-10-30-0912-7e3a"
         );
         assert_eq!(
-            v.parse_address("~#20261030-0912-7e3a").unwrap().path.show(),
+            v.parse_address("~#2026-10-30-0912-7e3a")
+                .unwrap()
+                .path
+                .show(),
             "~"
         );
         assert!(v.parse_address("projects/candle").is_err());

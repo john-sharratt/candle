@@ -1,7 +1,7 @@
 //! A person's notes from before the memory backbone — the flat `U:` journal
 //! zend kept in its substrate — moved onto their tree the first time they
 //! call: what they asked to be kept onto `~`, what was done for them onto
-//! their client's journal, each at the time it was written. A moved note
+//! their channel's journal, each at the time it was written. A moved note
 //! leaves the substrate; one the tree refuses stays there and is logged.
 
 use std::sync::Arc;
@@ -10,11 +10,11 @@ use std::thread;
 use journals::actor::Actor;
 use journals::ops::Op;
 use journals::path::{JournalPath, Owner};
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::time::Stamp;
 
-use super::conversations::client_journal;
+use super::conversations::channel_journal;
 use super::{held, Memory};
 use crate::mcp::records::Records;
 use crate::mcp::threads::{self, Note};
@@ -26,17 +26,17 @@ const KEPT: &str = "Noted:";
 
 /// The write that moves `note` onto `person`'s tree.
 pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
-    let client = note
+    let channel = note
         .client
         .as_deref()
-        .and_then(Client::parse)
-        .unwrap_or(Client::Other);
+        .and_then(Channel::parse)
+        .unwrap_or(Channel::Other);
     let at = Stamp::from_ms(note.at_ms);
     if note.label == KEPT {
         (
             Actor::Person {
                 person: person.clone(),
-                client,
+                channel,
                 admin: false,
             },
             Op::Note {
@@ -49,10 +49,10 @@ pub fn move_of(person: &Slug, note: &Note) -> (Actor, Op, Stamp) {
         (
             Actor::Server {
                 person: person.clone(),
-                client,
+                channel,
             },
             Op::Episode {
-                path: client_journal(person, client),
+                path: channel_journal(person, channel),
                 text: note.text.clone(),
             },
             at,
@@ -107,25 +107,25 @@ pub fn move_all(memory: &Memory, records: &dyn Records, owner: &str, person: &Sl
 mod tests {
     use super::*;
 
-    fn note(label: &str, client: Option<&str>) -> Note {
+    fn note(label: &str, channel: Option<&str>) -> Note {
         Note {
             at_ms: 1_793_351_402_000,
             label: label.into(),
             text: "the cat is Miso".into(),
             worker: None,
-            client: client.map(Into::into),
+            client: channel.map(Into::into),
         }
     }
 
     #[test]
-    fn kept_notes_go_to_the_root_and_episodes_to_their_client() {
+    fn kept_notes_go_to_the_root_and_episodes_to_their_channel() {
         let john = Slug::parse("john").unwrap();
         let (actor, op, at) = move_of(&john, &note("Noted:", Some("grok")));
         assert_eq!(
             actor,
             Actor::Person {
                 person: john.clone(),
-                client: Client::Grok,
+                channel: Channel::Grok,
                 admin: false,
             }
         );
@@ -136,9 +136,9 @@ mod tests {
             actor,
             Actor::Server {
                 person: john,
-                client: Client::Other
+                channel: Channel::Other
             }
         );
-        assert!(matches!(&op, Op::Episode { path, .. } if path.show() == "~/clients/other"));
+        assert!(matches!(&op, Op::Episode { path, .. } if path.show() == "~/channels/other"));
     }
 }

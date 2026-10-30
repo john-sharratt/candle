@@ -158,17 +158,17 @@ mod tests {
     fn an_empty_tree_is_clean_and_summaries_run_from_the_leaves_up() {
         let mut tree = sharratt();
         assert_eq!(dirty(&tree), vec![]);
-        let grok = p("~/clients/grok");
+        let grok = p("~/channels/grok");
         tree.get_mut(&grok)
             .unwrap()
             .window
             .push(note("2026-10-30T10:00:00Z", "a cat"));
         let d: Vec<String> = dirty(&tree).iter().map(|d| d.path.show()).collect();
-        assert_eq!(d, ["~/clients/grok"], "its parents wait for its summary");
+        assert_eq!(d, ["~/channels/grok"], "its parents wait for its summary");
         let j = tree.get_mut(&grok).unwrap();
         *j = summarised(j.clone(), "Drew a cat.");
         let d: Vec<String> = dirty(&tree).iter().map(|d| d.path.show()).collect();
-        assert_eq!(d, ["~/clients"]);
+        assert_eq!(d, ["~/channels"]);
     }
 
     #[test]

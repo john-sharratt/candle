@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Problem, Result};
 use crate::files::{GroupFile, PersonFile};
 use crate::path::{JournalPath, Owner, Place};
-use crate::scope::{Client, Scope, Section};
+use crate::scope::{Channel, Scope, Section};
 use crate::slug::Slug;
 
 pub use journal::{Held, Journal, MAX_CHILDREN, WINDOW};
@@ -54,17 +54,17 @@ pub struct Tree {
     pub problems: Vec<Problem>,
 }
 
-/// A root and its fixed sections — and under `clients`, a journal per
-/// client — with no files yet.
+/// A root and its fixed sections — and under `channels`, a journal per
+/// channel — with no files yet.
 pub fn skeleton(scope: Scope) -> Journal {
     let mut root = Journal::new(Place::Root, None);
     for section in Section::of(scope) {
         let mut s = Journal::new(Place::Section(section), None);
-        if section == Section::Clients {
-            for c in Client::ALL {
+        if section == Section::Channels {
+            for c in Channel::ALL {
                 s.children.insert(
-                    Slug::parse(c.name()).expect("a client's name is a name"),
-                    Journal::new(Place::Client(c), None),
+                    Slug::parse(c.name()).expect("a channel's name is a name"),
+                    Journal::new(Place::Channel(c), None),
                 );
             }
         }
@@ -155,16 +155,16 @@ mod tests {
     use crate::testing::slug;
 
     #[test]
-    fn a_skeleton_has_the_fixed_sections_and_clients() {
+    fn a_skeleton_has_the_fixed_sections_and_channels() {
         let person = skeleton(Scope::Personal);
         let names: Vec<&str> = person.children.keys().map(Slug::as_str).collect();
-        assert_eq!(names, ["clients", "people"]);
-        let clients: Vec<&str> = person.children[&slug("clients")]
+        assert_eq!(names, ["channels", "people"]);
+        let channels: Vec<&str> = person.children[&slug("channels")]
             .children
             .keys()
             .map(Slug::as_str)
             .collect();
-        assert_eq!(clients, ["claude-code", "grok", "other"]);
+        assert_eq!(channels, ["claude-code", "grok", "other"]);
         let group = skeleton(Scope::Group);
         let names: Vec<&str> = group.children.keys().map(Slug::as_str).collect();
         assert_eq!(names, ["bots", "projects", "threads", "topics"]);

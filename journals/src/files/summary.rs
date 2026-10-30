@@ -10,7 +10,7 @@ use crate::error::Problem;
 use crate::line::LineId;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::yaml::{item_line, quote, quote_list, scalar, Fields};
+use crate::yaml::{item_line, scalar, scalar_list, text_field, Fields};
 
 /// What a summary was built over: a hash of its journal's window and its
 /// live children's names, cues and summaries, 16 hex digits.
@@ -128,7 +128,7 @@ impl Summary {
             out.push_str("  stale: true\n");
         }
         if let Some(d) = &self.digest {
-            out.push_str(&format!("  digest: {}\n", quote(d)));
+            out.push_str(&text_field("  ", "digest", d));
         }
         if self.sentences.is_empty() {
             out.push_str("  sentences: []\n");
@@ -137,11 +137,8 @@ impl Summary {
         out.push_str("  sentences:\n");
         for s in &self.sentences {
             let cites: Vec<String> = s.cites.iter().map(Cite::to_string).collect();
-            out.push_str(&format!(
-                "    - {{text: {}, cites: {}}}\n",
-                quote(&s.text),
-                quote_list(&cites)
-            ));
+            out.push_str(&text_field("    - ", "text", &s.text));
+            out.push_str(&format!("      cites: {}\n", scalar_list(&cites)));
         }
     }
 
@@ -189,8 +186,8 @@ mod tests {
     #[test]
     fn cites_are_line_ids_or_child_names() {
         assert_eq!(
-            Cite::parse("#20261029-0410-a3b4").unwrap().to_string(),
-            "#20261029-0410-a3b4"
+            Cite::parse("#2026-10-29-0410-a3b4").unwrap().to_string(),
+            "#2026-10-29-0410-a3b4"
         );
         assert_eq!(
             Cite::parse("user-context").unwrap().to_string(),

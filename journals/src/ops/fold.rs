@@ -5,6 +5,7 @@
 //! has none yet — into its parent as a `fold` line that names it.
 
 use crate::error::{Error, Result};
+use crate::files::in_order;
 use crate::line::{Folds, Kind, Line, Writer, MAX_TEXT};
 use crate::ops::{mint, Applied};
 use crate::path::JournalPath;
@@ -48,12 +49,13 @@ pub(crate) fn fold_child(
         kind: Kind::Fold,
         by: Writer::Zend,
         person: None,
-        client: None,
+        channel: None,
         folds: Some(Folds::Journal(name.clone())),
         proposed: false,
         text,
     };
     parent.window.push(line);
+    in_order(&mut parent.window);
     parent
         .children
         .get_mut(name)

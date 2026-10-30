@@ -1,7 +1,7 @@
 //! Fixtures the tests share.
 
 use crate::line::{Kind, Line, LineId, Writer};
-use crate::scope::Client;
+use crate::scope::Channel;
 use crate::slug::Slug;
 use crate::time::Stamp;
 
@@ -16,14 +16,14 @@ pub(crate) fn slug(s: &str) -> Slug {
 /// A note John's Claude Code kept at `when`.
 pub(crate) fn note(when: &str, text: &str) -> Line {
     let at = at(when);
-    let by = Writer::Client(Client::ClaudeCode);
+    let by = Writer::Channel(Channel::ClaudeCode);
     Line {
         id: LineId::mint(at, by, text, 0),
         at,
         kind: Kind::Note,
         by,
         person: Some(slug("john")),
-        client: None,
+        channel: None,
         folds: None,
         proposed: false,
         text: text.into(),

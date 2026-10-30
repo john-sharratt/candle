@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::actor::{viewer, Actor};
 use crate::path::{JournalPath, Viewer};
-use crate::scope::Client;
+use crate::scope::Channel;
 use crate::testing::slug;
 use crate::time::Stamp;
 use crate::tree::load::load;
@@ -51,7 +51,7 @@ pub(crate) fn sharratt() -> Tree {
 pub(crate) fn john() -> Actor {
     Actor::Person {
         person: slug("john"),
-        client: Client::ClaudeCode,
+        channel: Channel::ClaudeCode,
         admin: true,
     }
 }
@@ -60,7 +60,7 @@ pub(crate) fn john() -> Actor {
 pub(crate) fn yen() -> Actor {
     Actor::Person {
         person: slug("yen"),
-        client: Client::Grok,
+        channel: Channel::Grok,
         admin: false,
     }
 }
@@ -68,7 +68,7 @@ pub(crate) fn yen() -> Actor {
 pub(crate) fn thanhlong() -> Actor {
     Actor::Person {
         person: slug("thanhlong"),
-        client: Client::Other,
+        channel: Channel::Other,
         admin: false,
     }
 }
@@ -76,7 +76,7 @@ pub(crate) fn thanhlong() -> Actor {
 pub(crate) fn stranger() -> Actor {
     Actor::Person {
         person: slug("stranger"),
-        client: Client::Other,
+        channel: Channel::Other,
         admin: false,
     }
 }

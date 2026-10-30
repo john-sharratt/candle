@@ -19,7 +19,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use journals::path::JournalPath;
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::time::Stamp;
 use journals::tree::WINDOW;
 use journals::view::grep::grep as search;
@@ -120,7 +120,7 @@ pub async fn read(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Client::Other) {
+    blocking(move || match person(&session, &headers, Channel::Other) {
         Ok(m) => opened(&m, q.journal.as_deref(), q.lines, Stamp::now()),
         Err(a) => a,
     })
@@ -141,7 +141,7 @@ pub async fn tree(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Client::Other) {
+    blocking(move || match person(&session, &headers, Channel::Other) {
         Ok(m) => listed(&m, q.under.as_deref()),
         Err(a) => a,
     })
@@ -164,7 +164,7 @@ pub async fn grep(
         Ok(q) => q,
         Err(e) => return malformed(e.body_text()),
     };
-    blocking(move || match person(&session, &headers, Client::Other) {
+    blocking(move || match person(&session, &headers, Channel::Other) {
         Ok(m) => searched(&m, &q.pattern, q.under.as_deref(), q.max),
         Err(a) => a,
     })
@@ -227,12 +227,12 @@ mod tests {
         let (status, body) = opened(&m, Some(&address), None, at("2026-10-30T00:00:00Z"));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["line"]["text"], "Prefers tea.");
-        let missing = "~#20260101-0000-0000";
+        let missing = "~#2026-01-01-0000-0000";
         assert_eq!(
             opened(&m, Some(missing), None, at("2026-10-30T00:00:00Z")),
             (
                 StatusCode::NOT_FOUND,
-                json!({"error": "not_found", "message": "~#20260101-0000-0000 is no line"})
+                json!({"error": "not_found", "message": "~#2026-01-01-0000-0000 is no line"})
             )
         );
         assert_eq!(
@@ -274,10 +274,10 @@ mod tests {
             names,
             [
                 "~",
-                "~/clients",
-                "~/clients/claude-code",
-                "~/clients/grok",
-                "~/clients/other",
+                "~/channels",
+                "~/channels/claude-code",
+                "~/channels/grok",
+                "~/channels/other",
                 "~/people",
                 "@sharratt",
                 "@sharratt/bots",

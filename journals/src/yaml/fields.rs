@@ -12,9 +12,9 @@ pub(crate) struct Fields<'a> {
     map: &'a Mapping,
     taken: BTreeSet<String>,
     file: &'a str,
-    /// The entry's own line, for a one-line entry.
+    /// The entry's own line, when its key's cannot be found.
     line: Option<usize>,
-    /// The file's text, for finding a key's line in a multi-line file.
+    /// The file's text, for finding a key's line.
     text: Option<&'a str>,
 }
 
@@ -48,9 +48,7 @@ impl<'a> Fields<'a> {
 
     /// A problem at `key`'s line, or the entry's.
     pub(crate) fn problem(&self, key: &str, what: impl Into<String>) -> Problem {
-        let line = self
-            .line
-            .or_else(|| self.text.and_then(|t| key_line(t, key)));
+        let line = self.text.and_then(|t| key_line(t, key)).or(self.line);
         Problem::new(self.file, line, what)
     }
 

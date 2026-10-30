@@ -85,15 +85,27 @@ pub fn group_lines(tree: &Tree, person: &Slug) -> Vec<String> {
         .collect()
 }
 
-/// The index of `j` at `path`: each live child, then how many are folded.
+/// The index of `j` at `path`: each live child, then the fixed ones nothing
+/// is written in yet — named on one line, so a reader knows they are there
+/// to write in — then how many are folded.
 pub fn index(path: &JournalPath, j: &Journal, now: Stamp) -> Vec<String> {
+    let blank = |c: &Journal| c.is_fixed() && c.is_blank();
     let mut out: Vec<String> = j
         .live()
+        .filter(|(_, child)| !blank(child))
         .map(|(name, child)| {
             let child_path = path.child(name.clone()).expect("a child is at a place");
             index_line(&child_path, child, now)
         })
         .collect();
+    let empty: Vec<&str> = j
+        .live()
+        .filter(|(_, child)| blank(child))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !empty.is_empty() {
+        out.push(format!("{}: nothing written yet", empty.join(", ")));
+    }
     let folded = j.children.len() - j.live_count();
     if folded > 0 {
         out.push(format!("… and {folded} folded"));
@@ -192,15 +204,15 @@ mod tests {
     #[test]
     fn a_broken_journal_reads_as_unreadable() {
         let mut t = sharratt();
-        let path = p("~/clients/grok");
+        let path = p("~/channels/grok");
         t.get_mut(&path).unwrap().problems.push(Problem::new(
-            "persons/john/clients/grok/lines.yaml",
+            "persons/john/channels/grok/lines.yaml",
             Some(3),
             "`text` is missing",
         ));
         assert_eq!(
             index_line(&path, t.get(&path).unwrap(), now()),
-            "~/clients/grok — open for their conversations with Grok, in its apps and the car. Unreadable: persons/john/clients/grok/lines.yaml:3: `text` is missing"
+            "~/channels/grok — open for their conversations with Grok, in its apps and the car. Unreadable: persons/john/channels/grok/lines.yaml:3: `text` is missing"
         );
     }
 }

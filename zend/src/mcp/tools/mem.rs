@@ -1,5 +1,5 @@
 //! What every memory tool starts from: the caller as a person on the tree,
-//! the tree as last published, the client they speak through, and how their
+//! the tree as last published, the channel they speak through, and how their
 //! paths and addresses are read.
 
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use journals::actor::{groups_of, viewer, Actor};
 use journals::files::Who;
 use journals::path::{Address, JournalPath, Owner};
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::tree::Tree;
 use journals::view::who::name_of;
@@ -22,21 +22,21 @@ pub struct Mem {
     pub memory: Arc<Memory>,
     pub tree: Arc<Tree>,
     pub person: Slug,
-    pub client: Client,
+    pub channel: Channel,
     /// The estate's role table names the caller an admin: they list
     /// accounts' emails.
     pub admin: bool,
 }
 
-/// The journal client an MCP session's client is.
-pub fn client_of(c: McpClient) -> Client {
-    Client::parse(c.name()).unwrap_or(Client::Other)
+/// The channel an MCP session's client app speaks through.
+pub fn channel_of(c: McpClient) -> Channel {
+    Channel::parse(c.name()).unwrap_or(Channel::Other)
 }
 
 /// The caller as a person, through an MCP session: [`Mem::of`], and their
 /// conversation's clock moved on.
 pub fn open(ctx: &Ctx) -> Result<Mem, String> {
-    let m = Mem::of(&ctx.session, &ctx.caller, client_of(ctx.mcp.client))?;
+    let m = Mem::of(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
     conversations::touch(&m.memory, &ctx.mcp_id);
     Ok(m)
 }
@@ -51,10 +51,10 @@ pub fn lasting(why: &str) -> bool {
 }
 
 impl Mem {
-    /// `caller` as a person on `session`'s memory, speaking through `client`:
+    /// `caller` as a person on `session`'s memory, speaking through `channel`:
     /// bound at their account's first call, and their old notes moved onto
     /// the tree once.
-    pub fn of(session: &ZendSession, caller: &Caller, client: Client) -> Result<Mem, String> {
+    pub fn of(session: &ZendSession, caller: &Caller, channel: Channel) -> Result<Mem, String> {
         let memory = Arc::clone(session.mcp().memory());
         let person = who::person(&memory, caller)?;
         if let Some(records) = session.shared_substrate() {
@@ -64,7 +64,7 @@ impl Mem {
             tree: memory.tree()?,
             memory,
             person,
-            client,
+            channel,
             admin: caller.is_admin(),
         })
     }
@@ -76,7 +76,7 @@ impl Mem {
             memory: Arc::clone(&self.memory),
             tree,
             person: self.person.clone(),
-            client: self.client,
+            channel: self.channel,
             admin: self.admin,
         }
     }
@@ -85,7 +85,7 @@ impl Mem {
     pub fn actor(&self) -> Actor {
         Actor::Person {
             person: self.person.clone(),
-            client: self.client,
+            channel: self.channel,
             admin: self.admin,
         }
     }
@@ -193,7 +193,7 @@ pub(crate) mod tests {
             memory: Arc::default(),
             tree: Arc::new(load(&files)),
             person: Slug::parse(person).unwrap(),
-            client: Client::Grok,
+            channel: Channel::Grok,
             admin: person == "john",
         }
     }
@@ -221,8 +221,8 @@ pub(crate) mod tests {
             "@sharratt/projects/candle"
         );
         assert_eq!(
-            m.address("~#20261030-0912-7e3a").unwrap().to_string(),
-            "~#20261030-0912-7e3a"
+            m.address("~#2026-10-30-0912-7e3a").unwrap().to_string(),
+            "~#2026-10-30-0912-7e3a"
         );
         assert!(m.address("~").is_err());
         let solo = mem("solo");
@@ -234,11 +234,11 @@ pub(crate) mod tests {
             m.actor(),
             Actor::Person {
                 person: Slug::parse("john").unwrap(),
-                client: Client::Grok,
+                channel: Channel::Grok,
                 admin: true,
             }
         );
-        assert_eq!(client_of(McpClient::ClaudeCode), Client::ClaudeCode);
+        assert_eq!(channel_of(McpClient::ClaudeCode), Channel::ClaudeCode);
     }
 
     /// **Only a caller in no group is a lasting answer**; the memory still

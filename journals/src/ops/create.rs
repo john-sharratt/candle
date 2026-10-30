@@ -5,7 +5,7 @@ use crate::files::Meta;
 use crate::ops::fold::fold_child;
 use crate::ops::{Applied, OnTaken};
 use crate::path::{JournalPath, Place};
-use crate::scope::Eleventh;
+use crate::scope::{is_dated, Eleventh, Naming};
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree, MAX_CHILDREN};
@@ -77,7 +77,7 @@ pub fn create(
         .eleventh(under.names().len() - 1);
     if rule == Eleventh::Fixed {
         return Err(Error::refused(format!(
-            "{under}'s journals are fixed: one per client"
+            "{under}'s journals are fixed: one per channel"
         )));
     }
     let parent = tree.need_mut(under)?;
@@ -98,6 +98,16 @@ pub fn create(
         OnTaken::Refuse => name.clone(),
     };
     let path = under.child(name.clone())?;
+    if let Place::Named { section, depth } = path.place()? {
+        if section.naming(depth) == Naming::Dated && !is_dated(name.as_str()) {
+            return Err(Error::invalid(format!(
+                "{under} holds conversations, each named for when it began: \
+                 `{}`, or `{}-<what it was about>`",
+                now.dated_minute(),
+                now.dated_minute()
+            )));
+        }
+    }
     let mut applied = Applied {
         created: Some(path.clone()),
         ..Applied::touching(format!("Create {path}"), vec![])
@@ -124,7 +134,7 @@ mod tests {
     use crate::actor::Actor;
     use crate::ops::fixture::{john, now, p, sharratt};
     use crate::ops::{apply, Op};
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::slug;
 
     fn create_op(under: &str, name: &str, on_taken: OnTaken) -> Op {
@@ -187,28 +197,48 @@ mod tests {
         .contains("exists already"));
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
+        let drive = "2026-10-30-1200-drive";
         let first = apply(
             &mut t,
             &server,
-            &create_op("~/clients/grok", "drive", OnTaken::Number),
+            &create_op("~/channels/grok", drive, OnTaken::Number),
             now(),
         )
         .unwrap();
         let second = apply(
             &mut t,
             &server,
-            &create_op("~/clients/grok", "drive", OnTaken::Number),
+            &create_op("~/channels/grok", drive, OnTaken::Number),
             now(),
         )
         .unwrap();
-        assert_eq!(first.created.unwrap().show(), "~/clients/grok/drive");
-        assert_eq!(second.created.unwrap().show(), "~/clients/grok/drive.2");
+        assert_eq!(
+            first.created.unwrap().show(),
+            format!("~/channels/grok/{drive}")
+        );
+        assert_eq!(
+            second.created.unwrap().show(),
+            format!("~/channels/grok/{drive}.2")
+        );
+        // A conversation is named for when it began.
+        assert_eq!(
+            apply(
+                &mut t,
+                &server,
+                &create_op("~/channels/grok", "drive", OnTaken::Number),
+                now()
+            )
+            .unwrap_err()
+            .to_string(),
+            "~/channels/grok holds conversations, each named for when it began: \
+             `2026-10-30-1200`, or `2026-10-30-1200-<what it was about>`"
+        );
     }
 
     #[test]
-    fn roots_and_the_clients_section_are_fixed() {
+    fn roots_and_the_channels_section_are_fixed() {
         let mut t = sharratt();
         assert!(create(
             &mut t,
@@ -223,7 +253,7 @@ mod tests {
         .contains("sections are fixed"));
         assert!(create(
             &mut t,
-            &p("~/clients"),
+            &p("~/channels"),
             &slug("tesla"),
             "x",
             OnTaken::Refuse,
@@ -231,7 +261,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
-        .contains("one per client"));
+        .contains("one per channel"));
     }
 
     #[test]
@@ -288,13 +318,17 @@ mod tests {
         let mut t = sharratt();
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         for i in 0..10 {
             apply(
                 &mut t,
                 &server,
-                &create_op("~/clients/grok", &format!("c{i}"), OnTaken::Number),
+                &create_op(
+                    "~/channels/grok",
+                    &format!("2026-10-30-12{i:02}"),
+                    OnTaken::Number,
+                ),
                 now().plus(i),
             )
             .unwrap();
@@ -302,17 +336,17 @@ mod tests {
         let a = apply(
             &mut t,
             &server,
-            &create_op("~/clients/grok", "c10", OnTaken::Number),
+            &create_op("~/channels/grok", "2026-10-30-1210", OnTaken::Number),
             now().plus(100),
         )
         .unwrap();
         assert_eq!(
             a.folded.iter().map(|p| p.show()).collect::<Vec<_>>(),
-            ["~/clients/grok/c0"]
+            ["~/channels/grok/2026-10-30-1200"]
         );
-        let grok = t.get(&p("~/clients/grok")).unwrap();
+        let grok = t.get(&p("~/channels/grok")).unwrap();
         assert_eq!(grok.live_count(), 10);
-        assert!(grok.children[&slug("c0")].is_folded());
+        assert!(grok.children[&slug("2026-10-30-1200")].is_folded());
         assert_eq!(grok.window.len(), 1, "the fold line");
     }
 

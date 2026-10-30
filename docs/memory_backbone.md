@@ -42,33 +42,37 @@ the connector.
 
 ```
 ~                                    the person (persons/<person>/)         fixed
-├── clients                          personal section                       fixed
-│   ├── grok                         one per Client                         fixed (mcp_server::Client)
-│   │   ├── 2026-10-30-2105          conversations                          named, windowed to 10
-│   │   └── 2026-10-30-1943
+├── channels                         personal section                       fixed
+│   ├── grok                         one per Channel                        fixed (mcp_server::Client)
+│   │   ├── 2026-10-30-2105          a conversation, named for its start    dated, windowed to 10
+│   │   └── 2026-10-30-1943-permits
 │   ├── claude-code
 │   └── other
 ├── people                           personal section
-│   └── builder
+│   └── builder                      a person, named for who they are       named
 └── @sharratt                        a group (groups/<group>/), a family    mounted
     ├── projects                     shared section                         fixed
     │   └── candle                   named, ≤ 10 children each
     │       ├── scheduler
     │       └── cluster
-    ├── threads
-    │   └── user-context             a Zen thread
-    │       ├── implement-memory     a worker
-    │       │   └── verify-memory    a part
-    │       └── review-memory
     ├── topics
     │   └── house-build
     │       ├── permits
     │       └── budget
-    └── bots
+    ├── threads                      written by zend
+    │   └── user-context             a Zen thread
+    │       ├── implement-memory     a worker
+    │       │   └── verify-memory    a part
+    │       └── review-memory
+    └── bots                         written by npcd
         └── c3f1a07e                 a bot of the group's
 ```
 
-### 2.1 Fixed at compile time: the scopes, the sections, the clients
+A section exists in every root, but one nothing is written in has no folder,
+and an index names it on one line — "threads, bots: nothing written yet" —
+rather than listing it (§5.2).
+
+### 2.1 Fixed at compile time: the scopes, the sections, the channels
 
 ```rust
 /// Where a section's journals live, and so who reads them.
@@ -83,16 +87,16 @@ pub enum Scope {
 /// The sections: the journals directly under a root, fixed in code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Section {
-    /// Each client the person speaks through, and its conversations.
-    Clients,
+    /// Each channel the person speaks through, and its conversations.
+    Channels,
     /// The people in the person's life, as the person sees them.
     People,
     /// Repositories and durable projects.
     Projects,
-    /// Zen feature threads, their workers and parts.
-    Threads,
     /// Themes of life and work that span conversations.
     Topics,
+    /// Zen feature threads, their workers and parts.
+    Threads,
     /// The group's bots, and what each did.
     Bots,
 }
@@ -100,8 +104,8 @@ pub enum Section {
 impl Section {
     pub fn scope(self) -> Scope {
         match self {
-            Self::Clients | Self::People => Scope::Personal,
-            Self::Projects | Self::Threads | Self::Topics | Self::Bots => Scope::Group,
+            Self::Channels | Self::People => Scope::Personal,
+            Self::Projects | Self::Topics | Self::Threads | Self::Bots => Scope::Group,
         }
     }
 }
@@ -111,7 +115,7 @@ impl Section {
 by its type, never chosen per line or per journal, so where a model writes
 decides who reads it and no model is asked to judge what is private:
 
-- **`clients`** is personal: what a person said to Grok in the car is theirs.
+- **`channels`** is personal: what a person said to Grok in the car is theirs.
   Anything in it worth sharing is shared by moving it (§3.6).
 - **`people`** is personal: a person's notes about their partner are not read
   by their partner.
@@ -119,17 +123,30 @@ decides who reads it and no model is asked to judge what is private:
   personal.
 
 A section cannot be created, renamed or removed at runtime; every tool, guide
-and permission names it by type. Under `clients`, the children are fixed too:
-one per `mcp_server::Client` variant (`grok`, `claude-code`, `other`), named by
-`Client::name`. A client added to that enum gets its journal by the same change.
-A folder at the fixed levels that is not one of these is an error (§3.3).
+and permission names it by type. Under `channels`, the children are fixed too:
+one `Channel` per client app a person speaks through (`grok`, `claude-code`,
+`other`), named as `mcp_server::Client::name` names the app. A channel added to
+that enum gets its journal by the same change. A folder at the fixed levels
+that is not one of these is an error (§3.3).
 
-### 2.2 Named below
+### 2.2 Named below, by what it is or when it began
 
 Every journal below the fixed levels is named at runtime: a kebab-case slug of
 at most 40 characters, unique among its siblings, numbered `.2`, `.3` when a
 name recurs (`names::child_name`, as workers are today). Each carries a one-line
 **cue** — "open this when…" — which its parent's index shows (§5.2).
+
+**A journal is named the way its section's journals are** (`Section::naming`):
+
+- **Dated** — a conversation, `channels/<channel>/<conversation>`, is named
+  for the minute it began, `2026-10-30-2105`, and may add what it was about,
+  `2026-10-30-2105-permits`. Its siblings then list in the order they began,
+  and the next one sorts last. Creating a conversation under any other name is
+  refused, and a folder so named is an error (§3.3).
+- **Named** — everything durable is named for what it is: a project
+  (`candle`), a topic (`house-build`), a person (`yen`), a thread, a bot.
+
+Every entry is time-bound, and named for its minute too (§3.2).
 
 - **At most 10 live sub-journals per journal**, at every depth.
 - **Depth at most 6 below a section**, so a worker's lineage — every journal
@@ -163,31 +180,39 @@ every group, each in its own folder:
 
 ```
 journals/
-  .gitattributes                         `lines.yaml` and `**/archive/*.yaml`: merge=union
   persons/<person>/                      a person's own (§3.4)
+    README.md                            what the folder is and what goes where
     person.yaml                          who they are: accounts, groups
-    journal.yaml  lines.yaml             ~ : metadata, summary; its window
-    archive/2026-10.yaml                 its folded periods (§4)
-    clients/
-      journal.yaml  lines.yaml
+    journal.yaml                         ~ : metadata and summary
+    2026-10-30-0912-7e3a.yaml            an entry of ~, one file each
+    archive/2026-10/2026-10-02-0814-11c0.yaml   an entry of a folded period (§4)
+    channels/
       grok/
-        journal.yaml  lines.yaml
-        2026-10-30-2105/journal.yaml  lines.yaml
+        journal.yaml
+        2026-10-30-2105/
+          journal.yaml
+          2026-10-30-2106-4b1c.yaml
     people/builder/…
   groups/<group>/                        a group's (§3.5)
-    group.yaml                           its kind, its members and their roles
-    journal.yaml  lines.yaml             the group root
+    README.md
+    group.yaml                           its kind, what it is for, its members and their roles
+    journal.yaml                         the group root
     projects/candle/…
-    threads/user-context/implement-memory/…
     topics/house-build/permits/…
+    threads/user-context/implement-memory/…
     bots/c3f1a07e/…
 ```
 
-A journal is its folder; its children are its subfolders. Moving or renaming a
-journal is `git mv`. Anything at the top of the repository but
-`.gitattributes`, `README.md`, `persons/` and `groups/`, or a folder
-under `persons/` without a `person.yaml` (or under `groups/` without a
-`group.yaml`), is an error (§3.3).
+A journal is its folder; its children are its subfolders, beside its own
+`journal.yaml` and entry files. Moving or renaming a journal is `git mv`.
+Anything at the top of the repository but `.gitattributes`, `README.md`,
+`persons/` and `groups/`, or a folder under `persons/` without a `person.yaml`
+(or under `groups/` without a `group.yaml`), is an error (§3.3). **Each
+owner's `README.md` is the service's**: written from `person.yaml` or
+`group.yaml` and the sections fixed in code, it says whose the folder is, who
+reads it, what each section holds and who writes it, and how a journal's
+folder is laid out — for a person or an AI opening the repository cold. A hand
+edit to it is written over.
 
 **The service is the privacy boundary.** Every agent holding the repository
 holds everyone's folders (the operator's decision, 2026-10-30: one repository,
@@ -195,14 +220,15 @@ separated by folder). Who reads what is the journal service's rule (§7.2): a
 caller's AIs read their own person's folder and their groups' folders, a bot
 reads its groups' folders, and nothing else is ever put in front of them.
 
-### 3.2 `journal.yaml` and `lines.yaml`
+### 3.2 `journal.yaml` and the entries
 
-A journal is two files, because they merge differently:
+A journal's folder holds what it is — `journal.yaml` — and what it holds — a
+file per entry, named for the entry's id — beside its sub-journals' folders:
 
 ```yaml
-# journal.yaml — metadata and summary: ordinary merge
+# projects/candle/journal.yaml — metadata and summary
 name: candle
-cue: "open for the inference engine, its releases and cluster"
+cue: open for the inference engine, its releases and cluster
 created: 2026-10-30T09:10:02Z
 folded: false
 summary:
@@ -211,47 +237,78 @@ summary:
   lines: 12                              # window lines and live children it read
   children: 2
   sentences:
-    - {text: "Releases go through keep trials on BlackWorld, then roll out.", cites: ["#20261029-0410-a3b4"]}
-    - {text: "The connector now remembers its user.", cites: ["cluster"]}
+    - text: Releases go through keep trials on BlackWorld, then roll out.
+      cites: ["#2026-10-29-0410-a3b4"]
+    - text: The connector now remembers its user.
+      cites: [cluster]
 ```
 
 ```yaml
-# lines.yaml — the window: union merge
-- {id: 20261030-0910-4b1c, at: 2026-10-30T09:10:02Z, kind: episode, by: server, person: john, client: claude-code, text: "repo_task_start — implement-user-context"}
-- {id: 20261030-0912-7e3a, at: 2026-10-30T09:12:40Z, kind: note, by: claude-code, person: john, text: "Workers push branches; merging is the user's decision."}
+# projects/candle/2026-10-30-0910-4b1c.yaml — an episode
+at: 2026-10-30T09:10:02Z
+kind: episode
+by: server
+person: john
+channel: claude-code
+text: repo_task_start — implement-user-context
 ```
 
-A cite is `#<line id>` — a line of the journal's window or archives — or a
-live child's name. Free text is always double-quoted. Names, times, ids, keys
-and fingerprints are plain — unless YAML would read the plain form as
-something else (`true`, `null`, `1e3`, `0x1f`), when they are quoted too; a
+```yaml
+# projects/candle/2026-10-30-0912-7e3a.yaml — a note
+at: 2026-10-30T09:12:40Z
+kind: note
+by: claude-code
+person: john
+text: >-
+  The candle fork powers two products: Zen Code, a persistent AI coding
+  assistant with institutional memory across sessions, and Battle Cities, an NPC
+  narrative game whose agents have unbounded memory.
+```
+
+**An entry is one file.** Its name is its id, so a journal's folder lists its
+entries in the order they were written, and the file holds the entry's fields
+— not the id, which the name already says. A journal's window is its folder's
+entries; a folded period's are under `archive/<period>/`. Two writers adding
+entries at once add two files, which never conflict however they are merged.
+
+Every file is block YAML written to be read by a person: one field to a line,
+a list's items begun `- `. **Free text** — a line, a cue, a
+sentence, a name — sits plain on its key's line when it fits within 80
+columns and YAML reads it back as itself; a longer text is a folded block
+(`>-`) wrapped within 80 columns, which reads back as the one paragraph it is.
+Text neither form holds exactly — a line break, a leading or trailing space, a
+control character, or a short text YAML would read as something else
+(`a: b`, `true`, `2026`) — is double-quoted on its key's line. Every form is
+checked against the reader as it is written. A cite is `#<line id>` — a line
+of the journal's window or archives — or a live child's name. Names, times,
+ids, keys and fingerprints are plain — unless YAML would read the plain form
+as something else (`true`, `null`, `1e3`, `0x1f`), when they are quoted too; a
 number where text belongs is an error, never read as digits. A fold line
 carries `period: "2026-10-29"` or `journal: <child>`, and a worker's
-unaccepted note `proposed: true`.
+unaccepted note `proposed: true`. A hand edit may write YAML in any form that
+reads back to the same fields — `{at: …, kind: note, text: "…"}` on one line
+reads as well — and `journals fmt <dir>` rewrites a tree as the service
+writes it.
 
-- **`journal.yaml` merges as git always does**: two agents rebuilding one
-  summary at once conflict, and the push of the second is refused (§5.3).
-  Union merge here would keep both summaries and break the file.
-- **`lines.yaml` is one line per entry**, each a flow-style mapping on one text
-  line, with `merge=union`: two writers appending to one journal at once merge
-  without conflict, git keeping both added lines. This is why entries are never
-  multi-line YAML. Two branches editing the *same* line is the one case union
-  cannot resolve: both versions are kept, and the duplicate `id` is an error
-  (§3.3) naming the line — the journal reads as unreadable until a commit
-  keeps one. The service never meets it: its own concurrent writes are
-  replayed as operations, not merged (§6.3), so it comes only from branches
-  merged by hand.
-- **`id`** is `<yyyymmdd-hhmm>-<4 hex>`, the hash of the line's time, writer,
-  text and a salt raised until it is free in its journal: stable, unique, and
-  the address a line is cited and grepped by
-  (`@sharratt/projects/candle#20261030-0912-7e3a`). Positions are never
-  addresses.
+- **Every file merges as git always does.** The service never merges: its own
+  concurrent writes are replayed as operations onto origin's tree (§6.3), and
+  two agents rebuilding one summary at once conflict, the push of the second
+  refused (§5.3). Branches merged by hand conflict only where both changed one
+  file: one summary, or one entry edited two ways. An entry left both in a
+  journal's folder and in an archive is an error (§3.3) naming it, until a
+  commit keeps one.
+- **`id`** is `<yyyy-mm-dd-hhmm>-<4 hex>`, the minute it was written and the
+  hash of its time, writer, text and a salt raised until it is free in its
+  journal: stable, unique, the name of its file, and the address a line is
+  cited and grepped by (`@sharratt/projects/candle#2026-10-30-0912-7e3a`).
+  Positions are never addresses. A journal holds its lines in the order they
+  happened — by time, then id within a second — however its files are listed.
 - **`kind`** is one of three, set by who writes:
   - `note` — a model was told or chose to keep it (today's `Noted:`);
   - `episode` — the server recorded something that happened (today's `Done:`);
   - `fold` — a folded journal or period (§2.3, §4).
-- **`by`**, **`person`** and **`client`** say who wrote it: the writer, the
-  person it wrote for, and the client they spoke through. In a shared journal a
+- **`by`**, **`person`** and **`channel`** say who wrote it: the writer, the
+  person it wrote for, and the channel they spoke through. In a shared journal a
   line reads "Yen, via Grok"; the commit says the rest (§7.1).
 - **Editing a line is a commit** that changes it. Nothing is lost: history keeps
   every version, and `git log -L` / `git blame` answer when and by whom.
@@ -261,7 +318,9 @@ unaccepted note `proposed: true`.
 A file that does not parse, a field that is wrong, an eleventh live
 sub-journal, a
 summary over its cap, a folder at the fixed levels that is not a section or
-client, a shared section in a person's folder or the reverse, an account
+channel, a conversation not named for when it began, a file in a journal's
+folder that is neither `journal.yaml` nor an entry, a shared section in a
+person's folder or the reverse, an account
 listed by two people, a person a group lists whom no `person.yaml` names, a
 group a person lists that does not list them: each is **an error,
 answered as one**. `journal_open` on that journal answers the error, naming the
@@ -393,10 +452,10 @@ Every journal shows a **window**: its newest 50 lines, oldest first — a line
 recorded as made earlier (§6.7) takes its place in time. Older lines fold by
 period, as `journal-core` folds a worker's journal today (Step → Day → Week →
 Month → Year): the background thread (§5.3) writes one `fold` line for the
-period, citing the lines in it, and moves them to `archive/<period>.yaml` — one
-commit. The fold names the lines it folds by id and what they were as it was
+period, citing the lines in it, and moves their files to `archive/<period>/` —
+one commit. The fold names the lines it folds by id and what they were as it was
 shown them (a fingerprint of each line's time, kind, writer, person and
-client, whether it is still proposed, and its text — ids left out so a replay
+channel, whether it is still proposed, and its text — ids left out so a replay
 that renames one still matches); a line edited, accepted or gone while the
 fold was being written makes it a conflict, folded again next pass. Every address
 still resolves and `journal_grep` searches archives as it searches windows;
@@ -546,9 +605,9 @@ seen at once and forgotten (§8).
 
 ### 6.4 Budgets
 
-| Client | Given at a conversation's first call |
+| Channel | Given at a conversation's first call |
 |---|---|
-| Grok (voice) | the person's voice digest, the default group's voice digest, the client's and last conversation's summaries — ≤ 1,600 chars, all already in memory |
+| Grok (voice) | the person's voice digest, the default group's voice digest, the channel's and last conversation's summaries — ≤ 1,600 chars, all already in memory |
 | claude.ai, Claude Code | the frame (§6.5) — ≤ 6,000 chars |
 | Zen worker | its frame, in its prompt — ≤ 32,000 chars, nearest first |
 | bots | each group that lists them: its summary and index (`view::frame::bot_frame`) — nothing of anyone's own |
@@ -560,18 +619,22 @@ person, then the person's root, then each group root they frame (§3.5) — the
 default first:
 
 ```
-clients/grok/2026-10-30-2105     its window
-clients/grok                     summary
-clients                          summary
+channels/grok/2026-10-30-2105    its window
+channels/grok                    summary
+channels                         summary
 ~                                summary (or voice digest) + index of its sections and groups
-@sharratt                        summary (or voice digest) + index of its four sections
+@sharratt                        what it is for + summary (or voice digest) + index of its sections
 ```
+
+A group's block opens with what `group.yaml` says it is for (`about`, written
+by its owner with `group_describe`): "Your team @tokera — John's company: the
+candle engine, Zen Code and their papers."
 
 A Zen worker's frame is its lineage extended to the root: the worker and those
 above it, the thread, `@<group>/threads`, the group root, `~`, and
 `@<group>/projects/<repo>` for each workspace repository.
 
-**Paths** start at `~` or at `@<group>`; `clients/…` and `people/…` are the
+**Paths** start at `~` or at `@<group>`; `channels/…` and `people/…` are the
 caller's own. A shared section named without a group — `projects/candle` —
 is the caller's default group's.
 
@@ -587,7 +650,8 @@ is the caller's default group's.
 | `journal_fold {path}` / `journal_unfold {path}` / `journal_merge {path, into}` | §2.3 |
 | `journal_share {path, into?}` | a personal journal into a group (§3.6) |
 | `journal_forget {address \| says}` | removes a line from the journal (§8) |
-| `group_create {group, name, kind}` | a new group, the caller its owner (§3.5) |
+| `group_create {group, name, kind, about?}` | a new group, the caller its owner (§3.5) |
+| `group_describe {about, group?}` | what a group is for, an owner's to say (§3.5) |
 | `group_add {person, name, emails, role, group?}` / `group_add {bot, group?}` / `group_remove {person \| bot, group?}` | an owner's; leaving, a person's own; `emails`, and renaming someone already here, an estate admin's (§3.5) |
 | `group_frame {default?, framed}` | which groups open every conversation (§3.5) |
 
@@ -601,7 +665,7 @@ The aggregator's backends stay `coding` and `bot` (`mcp/served.yaml`): the
 memory's tools are zend's, listed by `coding`. The aggregator keeps putting the
 client's guide in front of `get_user_context`, the first-call context after a
 conversation's first answer, and an episode after each call that did
-something — written onto the conversation's own journal, `~/clients/<client>/
+something — written onto the conversation's own journal, `~/channels/<channel>/
 <began>`, opened at its first call. The memory's own tools are never recorded
 as episodes (`mcp/src/context.rs` `MEMORY`).
 
@@ -610,9 +674,10 @@ The tools, on the journals of §6.5: `journal_note`, `journal_read`,
 section) beside the thread and project paths they always took (`self`, `T:`,
 `P:`); `journal_edit`, `journal_create`, `journal_fold` (with `unfold`),
 `journal_merge`, `journal_share`, `journal_accept`, `group_create`,
-`group_add`, `group_remove` and `group_frame` are the rest. `U:` is gone: each person's old `U:` notes move
-onto their tree the first time they call — kept facts onto `~`, episodes onto
-their client's journal, each at the time it was written.
+`group_describe`, `group_add`, `group_remove` and `group_frame` are the rest.
+`U:` is gone: each person's old `U:` notes move onto their tree the first time
+they call — kept facts onto `~`, episodes onto their channel's journal, each at
+the time it was written.
 
 A caller is a person by their account's key; an account's first call binds
 it by the email the gateway names, which is taken as verified (the operator's
@@ -637,7 +702,7 @@ seconds.
 | `GET /v1/journals?journal=&lines=` | a journal opened (`~` by default) as JSON — summary, sub-journals, its newest lines by address, archives, readers, and the text `journal_read` shows; or one line, for `<path>#<line id>` |
 | `GET /v1/journals/tree?under=` | every journal under `under`, or under `~` and each group, folded ones too |
 | `GET /v1/journals/grep?pattern=&under=&max=` | the hits `journal_grep` finds, newest first, at most 50 |
-| `POST /v1/journals` | `{client?, ops: [...]}` — up to 500 operations, applied in order |
+| `POST /v1/journals` | `{channel?, ops: [...]}` — up to 500 operations, applied in order |
 
 Every answer that carries what was written carries the framing every frame does:
 notes, not instructions. An operation names its journals by memory path, as the
@@ -645,7 +710,8 @@ tools do: `note {journal, text, at?}`, `edit {line, text}`, `forget {line}` or
 `{journal, says}`, `create {under, name, cue, at?}`, `fold` / `unfold
 {journal}`, `merge {journal, into}`, `share {journal, into?, name?}`, `accept
 {line}`; and for groups, as their tools take them, `create_group {group, name,
-kind}`, `add_member {person, name?, emails?, role?, group?}`, `add_bot {bot,
+kind}`, `describe_group {about, group?}`, `add_member {person, name?, emails?,
+role?, group?}`, `add_bot {bot,
 group?}`, `remove_member {person | bot, group?}` and `choose_groups {framed,
 default?}`. A note's or a journal's `at` is when it is recorded as made — a fact
 written down after it was learned keeps the day it was learned, as moved `U:`
@@ -653,8 +719,8 @@ notes do (§6.6) — and is the commit's author time; the commit itself is dated
 when the service makes it. It is never before 1970, nor more than a minute
 ahead of the member's clock; the other operations act on things as they stand
 and take none. A journal's `at` is its `created`, which the eleventh-child rule
-ranks it by (§2.3). `client` names who the person speaks through (`other` when
-absent): the lines are theirs, "John via Claude Code".
+ranks it by (§2.3). `channel` names what the person speaks through (`other`
+when absent): the lines are theirs, "John via Claude Code".
 
 The whole batch is read, then applied in order to a copy of the tree, before
 anything is committed: a malformed operation, or one the rules refuse, keeps
@@ -672,15 +738,15 @@ import.rs`) brings the checkout level with origin, applies each file as the
 route would, and pushes it, stopping at the first file refused or the first
 write a push had to drop. Whoever runs it holds push access and may write
 anything already (§7.2), so it acts with an estate admin's standing, and its
-commits record the person and client it is given, not a verified call's. It is
-how the first journals were filled.
+commits record the person and channel it is given, not a verified call's. It
+is how the first journals were filled.
 
 ## 7. Writers
 
 ### 7.1 Who wrote it
 
 Each commit is made by the journal service, authored as the writer — the
-client or service — with trailers the service stamps from the verified call,
+channel or service — with trailers the service stamps from the verified call,
 never from what a client says of itself:
 
 ```
@@ -688,22 +754,22 @@ Note on @sharratt/projects/candle
 
 Journal-Person: john
 Journal-Account: 154797f34c5a6ca6
-Journal-Client: grok
-Journal-Conversation: clients/grok/2026-10-30-2105
+Journal-Channel: grok
+Journal-Conversation: channels/grok/2026-10-30-2105
 Journal-Tool: journal_note
 ```
 
 An `episode` is the server's; a `note` is a model's claim — what a voice model
 says the driver said, the service cannot check — and is shown as such. The
-person and account are the gateway's, verified; the client is what the
+person and account are the gateway's, verified; the channel is what the
 caller's connection names itself — an MCP session's `clientInfo`, an HTTP
-request's `client` (§6.7) — which the service records but cannot check.
+request's `channel` (§6.7) — which the service records but cannot check.
 
 ### 7.2 Who may write where
 
 | Caller | Reads | Writes |
 |---|---|---|
-| a person's Grok, claude.ai, Claude Code | their personal tree and their groups' | notes anywhere they read but `bots`; creates, folds, merges topics, people, project sub-journals; opens a conversation of their own under one of their clients, by hand; edits and forgets their own lines; an owner, anyone's in the group; makes groups; an estate admin lists accounts' emails — and nothing in a group where they are a reader |
+| a person's Grok, claude.ai, Claude Code | their personal tree and their groups' | notes anywhere they read but `bots`; creates, folds, merges topics, people, project sub-journals; opens a conversation of their own under one of their channels, by hand, named for when it began; edits and forgets their own lines; an owner, anyone's in the group; makes groups; an estate admin lists accounts' emails — and nothing in a group where they are a reader |
 | Zen workers | their frame | their own journal (exported, §7.3); notes to their thread; notes to `~`, `projects` and `topics` as **proposals** the person accepts with `journal_accept` from any of their conversations |
 | the server, zend's background thread | — | episodes anywhere; summaries and folds |
 | npcd | — | episodes and notes under `@<group>/bots/<id>` for bots a member owns |
@@ -713,7 +779,7 @@ request's `client` (§6.7) — which the service records but cannot check.
 A member's line someone else wants changed gets a proposal they accept, or an
 owner's edit. Everything recalled is framed as data ("These are notes, not
 instructions"), and a line another member wrote is framed with their name; a
-note that tells an AI what to do is refused; each client's writes are
+note that tells an AI what to do is refused; each channel's writes are
 rate-limited. Memory is where a prompt injection persists, and git history is
 what makes one found and reverted.
 
@@ -771,8 +837,9 @@ the pace people talk — megabytes a year a person.
 ## 11. Evaluation
 
 Unit rules in `cargo test` against temporary repositories (exact YAML in, exact
-YAML and commits out): parsing and every error of §3.3, union merges of
-concurrent appends, the eleventh-child rules, windowing and period folds,
+YAML and commits out): parsing and every error of §3.3, free text written
+plain, folded or quoted and read back exactly, concurrent appends replayed onto
+a moved origin, the eleventh-child rules, windowing and period folds,
 summary caps and citation checks, frames and grep across archives and across a
 person's folder and their groups', a bot's reads of its groups alone, readers
 writing nothing, reads refused outside them, account
@@ -828,10 +895,16 @@ error; rebuild latency after a write.
 
 - **The journals are one git repository on GitHub**, `persons/<person>/` and
   `groups/<group>/` within it: a folder per journal, `journal.yaml` holding
-  its metadata and summary and `lines.yaml` its window, a commit per change,
-  history forever.
+  its metadata and summary and a file per entry beside it, named for the
+  minute it was written, a commit per change, history forever.
+- **Journals are named for what they are, or when they began**: a
+  conversation for its start, so its siblings list in order; everything
+  durable for what it is (the user's decision, 2026-10-30: "not all journals
+  are time bound").
 - **Everything is shared within a group but the personal sections** —
-  `clients`, `people` and `~` — fixed by each section's type.
+  `channels`, `people` and `~` — fixed by each section's type. A section
+  nothing is written in has no folder and is named, not listed, in an index;
+  each owner's folder opens with a README the service writes.
 - **The service is the privacy boundary**; sharing copies, never moves.
 - **A person is several accounts**, bound by verified email. **A group** —
   a family, a team, a world (the operator's decision, 2026-10-30: groups, not
@@ -842,8 +915,9 @@ error; rebuild latency after a write.
   through the gateway and the connector; reads from memory, writes committed at
   once and pushed in the background.
 - **Fixed at the top, named below**; at most 10 live sub-journals a journal.
-- **Lines are one-line YAML, merged by union**, so concurrent appends never
-  conflict; editing a line is a commit.
+- **Files are block YAML a person reads**: one field to a line, long text
+  folded within 80 columns; concurrent appends are replayed, not merged;
+  editing a line is a commit.
 - **Errors are errors**: a broken file is answered as one, naming where.
 - **Summaries are capped and cited, rebuilt from children by zend's background
   thread when dirty**; `git push` makes them single-writer.

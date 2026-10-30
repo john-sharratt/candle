@@ -18,7 +18,7 @@ fn fixed_name(path: &JournalPath, j: &Journal) -> String {
     match j.place {
         Place::Root => path.owner().slug().to_string(),
         Place::Section(s) => s.name().into(),
-        Place::Client(c) => c.name().into(),
+        Place::Channel(c) => c.name().into(),
         Place::Named { .. } => path.last().map(|s| s.to_string()).unwrap_or_default(),
     }
 }
@@ -348,7 +348,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        let bogus = Cite::Line(LineId::parse("20200101-0000-0000").unwrap());
+        let bogus = Cite::Line(LineId::parse("2020-01-01-0000-0000").unwrap());
         for (sentences, says) in [
             (vec![s("A.", vec![bogus])], "which is not one of"),
             (

@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use journals::error::Error;
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::store::StoreError;
 use serde_json::{json, Value};
 
@@ -44,7 +44,7 @@ use crate::session::ZendSession;
 /// What a route answers: a status and a body.
 pub type Answer = (StatusCode, Value);
 
-/// How long a client waits before asking again what was unavailable.
+/// How long a channel waits before asking again what was unavailable.
 const RETRY_SECS: &str = "5";
 
 /// A refusal's body.
@@ -102,8 +102,8 @@ pub fn no_person(why: String) -> Answer {
     }
 }
 
-/// The caller as a person, through `client`; or why not.
-pub fn person(session: &ZendSession, headers: &HeaderMap, client: Client) -> Result<Mem, Answer> {
+/// The caller as a person, through `channel`; or why not.
+pub fn person(session: &ZendSession, headers: &HeaderMap, channel: Channel) -> Result<Mem, Answer> {
     let caller = Caller::of(headers, session.roles()).ok_or_else(|| {
         refusal(
             StatusCode::UNAUTHORIZED,
@@ -111,7 +111,7 @@ pub fn person(session: &ZendSession, headers: &HeaderMap, client: Client) -> Res
             "sign in at the gateway: the journals are a person's",
         )
     })?;
-    Mem::of(session, &caller, client).map_err(no_person)
+    Mem::of(session, &caller, channel).map_err(no_person)
 }
 
 /// `f` on the blocking pool: a caller's first call binds their account, and

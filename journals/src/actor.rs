@@ -1,4 +1,4 @@
-//! Who is writing (§7): a person's AI through a client, the connector's
+//! Who is writing (§7): a person's AI through a channel, the connector's
 //! server, zend, a Zen worker, npcd, a bot — each with what it may read and
 //! write (§7.2). The writer a line records and the trailers a commit carries
 //! come from here, never from what a caller says of itself.
@@ -7,22 +7,22 @@ use crate::error::{Error, Result};
 use crate::files::Role;
 use crate::line::Writer;
 use crate::path::{JournalPath, Owner, Viewer};
-use crate::scope::Client;
+use crate::scope::Channel;
 use crate::slug::Slug;
 use crate::tree::Tree;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Actor {
-    /// A person's AI, through `client`. `admin` is the estate's role table
+    /// A person's AI, through `channel`. `admin` is the estate's role table
     /// naming them an admin, as the gateway's verified identity says: only
     /// an admin lists an account's email (§3.5).
     Person {
         person: Slug,
-        client: Client,
+        channel: Channel,
         admin: bool,
     },
     /// The connector's server, recording what a call of `person`'s did.
-    Server { person: Slug, client: Client },
+    Server { person: Slug, channel: Channel },
     /// zend's background thread: summaries, folds, workers' exports.
     Zend,
     /// A Zen worker of `person`'s, on its own account.
@@ -40,7 +40,7 @@ impl Actor {
     /// daemon that runs it should a refusal be logged.
     pub fn writer(&self) -> Writer {
         match self {
-            Actor::Person { client, .. } => Writer::Client(*client),
+            Actor::Person { channel, .. } => Writer::Channel(*channel),
             Actor::Server { .. } => Writer::Server,
             Actor::Zend | Actor::System => Writer::Zend,
             Actor::Worker { .. } => Writer::Worker,
@@ -58,9 +58,9 @@ impl Actor {
         }
     }
 
-    pub fn client(&self) -> Option<Client> {
+    pub fn channel(&self) -> Option<Channel> {
         match self {
-            Actor::Person { client, .. } | Actor::Server { client, .. } => Some(*client),
+            Actor::Person { channel, .. } | Actor::Server { channel, .. } => Some(*channel),
             _ => None,
         }
     }
@@ -71,8 +71,8 @@ impl Actor {
         if let Some(p) = self.person() {
             out.push(("Journal-Person", p.to_string()));
         }
-        if let Some(c) = self.client() {
-            out.push(("Journal-Client", c.name().to_string()));
+        if let Some(c) = self.channel() {
+            out.push(("Journal-Channel", c.name().to_string()));
         }
         out
     }
@@ -188,16 +188,16 @@ mod tests {
     fn each_actor_writes_as_itself_and_says_so() {
         let a = Actor::Person {
             person: slug("yen"),
-            client: Client::Grok,
+            channel: Channel::Grok,
             admin: false,
         };
-        assert_eq!(a.writer(), Writer::Client(Client::Grok));
+        assert_eq!(a.writer(), Writer::Channel(Channel::Grok));
         assert_eq!(
             a.trailers(),
             vec![
                 ("Journal-Writer", "grok".to_string()),
                 ("Journal-Person", "yen".to_string()),
-                ("Journal-Client", "grok".to_string()),
+                ("Journal-Channel", "grok".to_string()),
             ]
         );
         assert_eq!(
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(
             Actor::Server {
                 person: slug("john"),
-                client: Client::Other
+                channel: Channel::Other
             }
             .writer(),
             Writer::Server
@@ -223,7 +223,7 @@ mod tests {
             Actor::Npcd {
                 person: slug("john")
             }
-            .client(),
+            .channel(),
             None
         );
         let bot = Actor::Bot { bot: slug("b1") };

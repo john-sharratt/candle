@@ -17,9 +17,9 @@ pub fn name_of(tree: &Tree, person: &Slug) -> String {
 pub fn who(tree: &Tree, line: &Line) -> String {
     let person = line.person.as_ref().map(|p| name_of(tree, p));
     match (line.by, person) {
-        (Writer::Client(c), Some(p)) => format!("{p} via {c}"),
-        (Writer::Client(c), None) => c.to_string(),
-        (Writer::Server, Some(p)) => match line.client {
+        (Writer::Channel(c), Some(p)) => format!("{p} via {c}"),
+        (Writer::Channel(c), None) => c.to_string(),
+        (Writer::Server, Some(p)) => match line.channel {
             Some(c) => format!("the server for {p} via {c}"),
             None => format!("the server for {p}"),
         },
@@ -66,7 +66,7 @@ pub fn render_line(tree: &Tree, line: &Line) -> String {
 mod tests {
     use super::*;
     use crate::ops::fixture::sharratt;
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::{at, note, slug};
 
     #[test]
@@ -75,7 +75,7 @@ mod tests {
         let mut l = note("2026-10-30T09:12:00Z", "x");
         assert_eq!(who(&t, &l), "john via claude-code");
         l.by = Writer::Server;
-        l.client = Some(Client::Grok);
+        l.channel = Some(Channel::Grok);
         assert_eq!(who(&t, &l), "the server for john via grok");
         l.by = Writer::Zend;
         l.person = None;

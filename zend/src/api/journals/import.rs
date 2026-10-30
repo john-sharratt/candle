@@ -31,7 +31,7 @@ pub fn apply(store: &mut Store, person: &Slug, body: &Value, now: Stamp) -> Resu
         memory: Arc::default(),
         tree: store.shared(),
         person: person.clone(),
-        client: req.client,
+        channel: req.channel,
         admin: true,
     };
     let (status, answer) = batch(&m, &req.ops, now, |actor, op, at| {
@@ -67,7 +67,7 @@ mod tests {
         let answer = apply(
             &mut store,
             &john,
-            &json!({"client": "claude-code", "ops": [
+            &json!({"channel": "claude-code", "ops": [
                 {"op": "create_group", "group": "tokera", "name": "Tokera", "kind": "team"},
                 {"op": "create", "under": "@tokera/projects", "name": "candle", "cue": "open for candle", "at": "2026-05-13T12:41:14Z"},
                 {"op": "note", "journal": "@tokera/projects/candle", "text": "The candle fork serves Zen Code.", "at": "2026-05-13T12:41:14Z"},

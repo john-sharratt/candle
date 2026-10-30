@@ -6,7 +6,7 @@
 //! |---|---|
 //! | [`time`], [`period`] | instants, and the calendar stretches windows fold by |
 //! | [`slug`] | names in the tree |
-//! | [`scope`] | the fixed sections and clients, and which are personal |
+//! | [`scope`] | the fixed sections and channels, and which are personal |
 //! | [`line`] | one entry: a note, an episode, a fold |
 //! | [`files`] | each file's format, read and written exactly |
 //! | [`path`] | where a journal is, and how a caller writes it |

@@ -5,12 +5,12 @@ use std::collections::BTreeMap;
 use std::iter;
 
 use crate::error::Problem;
-use crate::files::{AccountKey, Email, Who};
+use crate::files::{entry_file, AccountKey, Email, Who};
 use crate::line::{Folds, LineId};
 use crate::path::{JournalPath, Owner, Place};
-use crate::scope::Scope;
+use crate::scope::{is_dated, Naming, Scope};
 use crate::slug::Slug;
-use crate::tree::load::{JOURNAL_FILE, LINES_FILE};
+use crate::tree::load::{ARCHIVE_DIR, JOURNAL_FILE};
 use crate::tree::{Journal, Tree, MAX_CHILDREN};
 
 /// The longest a journal's summary may be, in characters (§5.1).
@@ -18,7 +18,7 @@ pub fn summary_cap(place: Place) -> usize {
     match place {
         Place::Root => 1_500,
         Place::Section(_) => 1_000,
-        Place::Client(_) | Place::Named { .. } => 600,
+        Place::Channel(_) | Place::Named { .. } => 600,
     }
 }
 
@@ -170,13 +170,24 @@ fn check_accounts(tree: &mut Tree) {
 fn check_journal(j: &mut Journal, path: &JournalPath) {
     let folder = path.folder();
     let meta_file = format!("{folder}/{JOURNAL_FILE}");
-    let lines_file = format!("{folder}/{LINES_FILE}");
     let scope = path.owner().scope();
     let mut found = Vec::new();
+    if let (Place::Named { section, depth }, Some(name)) = (j.place, path.last()) {
+        if section.naming(depth) == Naming::Dated && !is_dated(name.as_str()) {
+            found.push(Problem::new(
+                &meta_file,
+                None,
+                format!(
+                    "`{name}` is a conversation's folder, named for when it began: \
+                     yyyy-mm-dd-hhmm, and what it was about if it says"
+                ),
+            ));
+        }
+    }
     let fixed_name = match j.place {
         Place::Root => Some(path.owner().slug().to_string()),
         Place::Section(s) => Some(s.name().to_string()),
-        Place::Client(c) => Some(c.name().to_string()),
+        Place::Channel(c) => Some(c.name().to_string()),
         Place::Named { .. } => None,
     };
     match (&j.meta, &fixed_name) {
@@ -273,22 +284,26 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
             format!("{live} live sub-journals: at most {MAX_CHILDREN}; fold or merge some"),
         ));
     }
-    // A repeat within one file is caught as that file is read, at its line;
-    // here, one id in two of the journal's files — a window and an archive,
-    // or two archives.
+    // One id in two of the journal's places — its folder and an archive, or
+    // two archives — each a file of the same name.
     let mut held: BTreeMap<&LineId, String> = BTreeMap::new();
-    let files = iter::once((LINES_FILE.to_string(), &j.window)).chain(
+    let places = iter::once((String::new(), &j.window)).chain(
         j.archives
             .iter()
-            .map(|(p, lines)| (format!("archive/{p}.yaml"), lines)),
+            .map(|(p, lines)| (format!("{ARCHIVE_DIR}/{p}/"), lines)),
     );
-    for (file, lines) in files {
+    for (dir, lines) in places {
         for line in lines {
-            if let Some(first) = held.insert(&line.id, file.clone()) {
+            if let Some(first) = held.insert(&line.id, dir.clone()) {
+                let first = if first.is_empty() {
+                    "its folder"
+                } else {
+                    &first
+                };
                 found.push(Problem::new(
-                    format!("{folder}/{file}"),
+                    format!("{folder}/{dir}{}", entry_file(&line.id)),
                     None,
-                    format!("the id {} is in {first} too; keep it in one", line.id),
+                    format!("the entry {} is in {first} too; keep it in one", line.id),
                 ));
             }
         }
@@ -297,7 +312,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
         for line in lines {
             if !period.holds(line.unit()) || line.level() >= period.level() {
                 found.push(Problem::new(
-                    format!("{folder}/archive/{period}.yaml"),
+                    format!("{folder}/{ARCHIVE_DIR}/{period}/{}", entry_file(&line.id)),
                     None,
                     format!("{} is not inside {period}", line.id),
                 ));
@@ -308,7 +323,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
         if let Some(Folds::Journal(_)) = &line.folds {
             if j.is_fixed() && matches!(j.place, Place::Root) {
                 found.push(Problem::new(
-                    &lines_file,
+                    format!("{folder}/{}", entry_file(&line.id)),
                     None,
                     format!("{}: a root's children are fixed and never fold", line.id),
                 ));
@@ -332,7 +347,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::files::render_lines;
+    use crate::files::entry_file;
     use crate::testing::{note, slug};
     use crate::tree::load::load;
     use crate::tree::Tree;
@@ -592,30 +607,69 @@ mod tests {
     }
 
     #[test]
-    fn a_line_in_two_files_and_an_archive_outside_its_period_are_problems() {
+    fn a_line_in_two_places_and_an_archive_outside_its_period_are_problems() {
         let line = note("2026-10-29T10:00:00Z", "once");
+        let file = entry_file(&line.id);
         let t = tree(&[
             (
                 "persons/john/people/journal.yaml",
                 "name: people\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n".into(),
             ),
             (
-                "persons/john/people/lines.yaml",
-                render_lines(std::slice::from_ref(&line)),
+                format!("persons/john/people/{file}").as_str(),
+                line.render(),
             ),
             (
-                "persons/john/people/archive/2026-10-29.yaml",
-                render_lines(std::slice::from_ref(&line)),
+                format!("persons/john/people/archive/2026-10-29/{file}").as_str(),
+                line.render(),
             ),
         ]);
         assert_eq!(
             one_problem(&t),
-            format!("persons/john/people/archive/2026-10-29.yaml: the id {} is in lines.yaml too; keep it in one", line.id)
+            format!(
+                "persons/john/people/archive/2026-10-29/{file}: the entry {} is in its folder too; keep it in one",
+                line.id
+            )
         );
         let t = tree(&[(
-            "persons/john/people/archive/2026-10-28.yaml",
-            render_lines(&[line]),
+            format!("persons/john/people/archive/2026-10-28/{file}").as_str(),
+            line.render(),
         )]);
         assert!(one_problem(&t).contains("is not inside 2026-10-28"));
+    }
+
+    /// **A conversation is named for when it began**; a person, a project, a
+    /// topic for what it is.
+    #[test]
+    fn a_conversation_not_named_for_its_start_is_a_problem() {
+        let conv = |name: &str| {
+            (
+                format!("persons/john/channels/grok/{name}/journal.yaml"),
+                named(name, "open for a chat"),
+            )
+        };
+        for good in [
+            "2026-10-30-2105",
+            "2026-10-30-2105-permits",
+            "2026-10-30-2105.2",
+        ] {
+            let (p, t) = conv(good);
+            assert_eq!(
+                all_problems(&tree(&[(p.as_str(), t)])),
+                Vec::<String>::new(),
+                "{good}"
+            );
+        }
+        let (p, t) = conv("permits");
+        assert_eq!(
+            one_problem(&tree(&[(p.as_str(), t)])),
+            "persons/john/channels/grok/permits/journal.yaml: `permits` is a conversation's folder, \
+             named for when it began: yyyy-mm-dd-hhmm, and what it was about if it says"
+        );
+        let t = tree(&[(
+            "persons/john/people/yen/journal.yaml",
+            named("yen", "open for Yen"),
+        )]);
+        assert_eq!(all_problems(&t), Vec::<String>::new());
     }
 }

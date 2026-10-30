@@ -31,7 +31,7 @@ mod tests {
     use crate::actor::Actor;
     use crate::ops::fixture::{now, p, sharratt};
     use crate::ops::{apply, OnTaken, Op};
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::slug;
 
     #[test]
@@ -39,13 +39,13 @@ mod tests {
         let mut t = sharratt();
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         let created = apply(
             &mut t,
             &server,
             &Op::Create {
-                under: p("~/clients/grok"),
+                under: p("~/channels/grok"),
                 name: slug("2026-10-30-2105"),
                 cue: "a drive".into(),
                 on_taken: OnTaken::Number,
@@ -72,7 +72,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("closed at"));
-        assert!(close(&mut t, &p("~/clients/grok"), now())
+        assert!(close(&mut t, &p("~/channels/grok"), now())
             .unwrap_err()
             .to_string()
             .contains("is fixed"));

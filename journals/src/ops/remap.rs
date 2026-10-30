@@ -48,6 +48,7 @@ pub fn remap(op: &mut Op, renamed: &BTreeMap<LineId, LineId>) {
         | Op::MarkStale { .. }
         | Op::Share { .. }
         | Op::CreateGroup { .. }
+        | Op::DescribeGroup { .. }
         | Op::ChooseGroups { .. }
         | Op::AddMember { .. }
         | Op::AddBot { .. }
@@ -71,9 +72,9 @@ mod tests {
 
     #[test]
     fn every_named_id_is_rewritten_and_nothing_else() {
-        let old = id("20261030-0912-aaaa");
-        let new = id("20261030-0912-bbbb");
-        let other = id("20261030-0912-cccc");
+        let old = id("2026-10-30-0912-aaaa");
+        let new = id("2026-10-30-0912-bbbb");
+        let other = id("2026-10-30-0912-cccc");
         let renamed = BTreeMap::from([(old.clone(), new.clone())]);
         let address = |i: &LineId| Address {
             path: p("topics"),
@@ -130,7 +131,7 @@ mod tests {
                     over: Fingerprint::of_bytes(b""),
                     sentences: vec![Sentence {
                         text: "s".into(),
-                        cites: vec![Cite::Line(old.clone()), Cite::Child(slug("clients"))],
+                        cites: vec![Cite::Line(old.clone()), Cite::Child(slug("channels"))],
                     }],
                     digest: None,
                     cue: None,
@@ -140,7 +141,7 @@ mod tests {
                     over: Fingerprint::of_bytes(b""),
                     sentences: vec![Sentence {
                         text: "s".into(),
-                        cites: vec![Cite::Line(new.clone()), Cite::Child(slug("clients"))],
+                        cites: vec![Cite::Line(new.clone()), Cite::Child(slug("channels"))],
                     }],
                     digest: None,
                     cue: None,

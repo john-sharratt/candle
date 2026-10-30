@@ -20,7 +20,7 @@ pub const WINDOW: usize = 50;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
     pub place: Place,
-    /// `journal.yaml`. A fixed journal — a root, section or client — may have
+    /// `journal.yaml`. A fixed journal — a root, section or channel — may have
     /// none until it has a summary; a named journal always has one, and is
     /// broken without it.
     pub meta: Option<Meta>,
@@ -71,10 +71,21 @@ impl Journal {
     pub fn cue(&self) -> Option<String> {
         match self.place {
             Place::Section(s) => Some(s.cue().into()),
-            Place::Client(c) => Some(c.cue().into()),
+            Place::Channel(c) => Some(c.cue().into()),
             Place::Root => None,
             Place::Named { .. } => self.meta.as_ref().and_then(|m| m.cue.clone()),
         }
+    }
+
+    /// Nothing is written in it or below it: a fixed journal with no summary,
+    /// no line and no named journal below. It writes no files. A named
+    /// journal is never blank: made, it is there to be found.
+    pub fn is_blank(&self) -> bool {
+        self.is_fixed()
+            && self.summary().is_none()
+            && self.window.is_empty()
+            && self.archives.is_empty()
+            && self.children.values().all(Journal::is_blank)
     }
 
     /// Its live children, by name: not folded.

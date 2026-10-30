@@ -1,4 +1,4 @@
-//! Each conversation's own journal (§2): opened under its client's at the
+//! Each conversation's own journal (§2): opened under its channel's at the
 //! conversation's first episode, named for the minute it began, and the one
 //! its episodes go on.
 //!
@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use journals::actor::Actor;
 use journals::ops::{OnTaken, Op};
 use journals::path::{JournalPath, Owner};
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::time::Stamp;
 
@@ -73,19 +73,18 @@ pub struct Conversations {
     opening: Mutex<()>,
 }
 
-/// The client's journal a person's conversations go under.
-pub fn client_journal(person: &Slug, client: Client) -> JournalPath {
-    let names = ["clients", client.name()]
+/// The channel's journal a person's conversations go under.
+pub fn channel_journal(person: &Slug, channel: Channel) -> JournalPath {
+    let names = ["channels", channel.name()]
         .iter()
-        .map(|n| Slug::parse(n).expect("a section's and a client's names are names"))
+        .map(|n| Slug::parse(n).expect("a section's and a channel's names are names"))
         .collect();
-    JournalPath::new(Owner::Person(person.clone()), names).expect("clients/<client> is a place")
+    JournalPath::new(Owner::Person(person.clone()), names).expect("channels/<channel> is a place")
 }
 
 /// The name a conversation begun at `at` takes: `2026-10-30-2105`.
 pub fn name_at(at: Stamp) -> Slug {
-    let s = at.to_string();
-    Slug::parse(&format!("{}-{}{}", &s[..10], &s[11..13], &s[14..16])).expect("a date is a name")
+    Slug::parse(&at.dated_minute()).expect("a minute is a name")
 }
 
 /// A memory call of `session` now: its conversation goes on.
@@ -107,7 +106,7 @@ pub fn existing(memory: &Memory, session: &str) -> Option<JournalPath> {
 pub fn of(
     memory: &Memory,
     person: &Slug,
-    client: Client,
+    channel: Channel,
     session: &str,
 ) -> Result<JournalPath, String> {
     let _opening = held(&memory.conversations.opening);
@@ -118,13 +117,13 @@ pub fn of(
     let now = Stamp::now();
     let server = Actor::Server {
         person: person.clone(),
-        client,
+        channel,
     };
     let began = now.to_string()[..16].replace('T', " ");
     let op = Op::Create {
-        under: client_journal(person, client),
+        under: channel_journal(person, channel),
         name: name_at(now),
-        cue: format!("open for the conversation through {client} begun {began}"),
+        cue: format!("open for the conversation through {channel} begun {began}"),
         on_taken: OnTaken::Number,
     };
     let path = memory
@@ -144,19 +143,19 @@ mod tests {
     }
 
     #[test]
-    fn a_conversation_is_named_for_its_minute_under_its_client() {
+    fn a_conversation_is_named_for_its_minute_under_its_channel() {
         let at = Stamp::parse("2026-10-30T21:05:42Z").unwrap();
         assert_eq!(name_at(at).as_str(), "2026-10-30-2105");
         assert_eq!(
-            client_journal(&john(), Client::Grok).folder(),
-            "persons/john/clients/grok"
+            channel_journal(&john(), Channel::Grok).folder(),
+            "persons/john/channels/grok"
         );
     }
 
     #[test]
     fn a_session_silent_past_the_gap_is_a_new_conversation() {
         let mut s = Sessions::default();
-        let p = client_journal(&john(), Client::Grok);
+        let p = channel_journal(&john(), Channel::Grok);
         let t = Stamp::parse("2026-10-30T12:00:00Z").unwrap();
         s.keep("s", p.clone(), t);
         assert_eq!(s.get("s", t.plus(GAP_SECS - 1)), Some(&p));
@@ -169,7 +168,7 @@ mod tests {
     #[test]
     fn a_call_moves_the_clock_on_within_the_gap() {
         let mut s = Sessions::default();
-        let p = client_journal(&john(), Client::Grok);
+        let p = channel_journal(&john(), Channel::Grok);
         let t = Stamp::parse("2026-10-30T12:00:00Z").unwrap();
         s.keep("s", p.clone(), t);
         s.touch("s", t.plus(GAP_SECS - 60));
@@ -183,7 +182,7 @@ mod tests {
     #[test]
     fn the_idlest_sessions_are_let_go_past_the_cap() {
         let mut s = Sessions::default();
-        let p = client_journal(&john(), Client::Grok);
+        let p = channel_journal(&john(), Channel::Grok);
         for i in 0..KEPT + 3 {
             s.keep(&format!("s{i}"), p.clone(), Stamp::from_secs(i as i64));
         }

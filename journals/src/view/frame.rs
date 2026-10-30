@@ -1,6 +1,6 @@
 //! A conversation's frame (§6.4, §6.5): what it is given at its first call —
 //! its own journal, each journal above it to the person, the person, and
-//! each group they frame — nearest first, within its client's budget. A
+//! each group they frame — nearest first, within its channel's budget. A
 //! bot's frame is the groups that list it, and nothing of anyone's own.
 
 use crate::actor::{framed_groups, groups_of_bot};
@@ -12,7 +12,7 @@ use crate::view::index::{group_lines, index};
 use crate::view::who::render_line;
 use crate::view::NOT_INSTRUCTIONS;
 
-/// How much a client is given (§6.4).
+/// How much a channel is given (§6.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Budget {
     /// Spoken: digests and the latest summaries, all already in memory.
@@ -88,9 +88,14 @@ fn digest_of(j: &Journal) -> Option<String> {
 }
 
 /// How a frame names a group to its reader: "Your family @sharratt".
+/// How a group's block is headed: what kind it is, and what it is for when
+/// its `group.yaml` says.
 fn group_label(tree: &Tree, group: &Slug) -> String {
     match tree.group_file(group) {
-        Some(f) => format!("Your {} @{group}", f.kind),
+        Some(f) => match &f.about {
+            Some(about) => format!("Your {} @{group} — {about}", f.kind),
+            None => format!("Your {} @{group}", f.kind),
+        },
         None => format!("Your group @{group}"),
     }
 }
@@ -216,10 +221,10 @@ fn voice(tree: &Tree, f: &mut Filler, person: &Slug, me: &JournalPath, at: Optio
         }
     }
     let Some(at) = at else { return };
-    let client = at.parent();
-    if let Some(c) = client.as_ref() {
+    let channel = at.parent();
+    if let Some(c) = channel.as_ref() {
         if let Some(s) = tree.get(c).and_then(summary_of) {
-            f.push(&format!("With this client: {s}"));
+            f.push(&format!("With this channel: {s}"));
         }
         // The last conversation before this one that has a summary.
         if let Some(cj) = tree.get(c) {
@@ -245,7 +250,7 @@ mod tests {
     use crate::files::Kind;
     use crate::ops::fixture::{john, now, p, sharratt};
     use crate::ops::{apply, OnTaken, Op};
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
 
@@ -280,7 +285,7 @@ mod tests {
         let mut t = sharratt();
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         let mut convs = Vec::new();
         for (i, (name, said)) in [
@@ -294,7 +299,7 @@ mod tests {
                 &mut t,
                 &server,
                 &Op::Create {
-                    under: p("~/clients/grok"),
+                    under: p("~/channels/grok"),
                     name: slug(name),
                     cue: "a drive".into(),
                     on_taken: OnTaken::Number,
@@ -319,7 +324,7 @@ mod tests {
         summarise(&mut t, &convs[0], "They drew a cat together.", None);
         summarise(
             &mut t,
-            &p("~/clients/grok"),
+            &p("~/channels/grok"),
             "In the car they draw and plan.",
             None,
         );
@@ -366,7 +371,7 @@ mod tests {
             f,
             format!(
                 "{NOT_INSTRUCTIONS}\nYou: Prefers short answers.\nYour family: Extending the house.\n\
-                 With this client: In the car they draw and plan.\nLast time: They drew a cat together."
+                 With this channel: In the car they draw and plan.\nLast time: They drew a cat together."
             )
         );
     }
@@ -376,13 +381,13 @@ mod tests {
         let (t, here) = drive();
         let f = frame(&t, &slug("john"), Some(&here), &[], Budget::Chat, now());
         let order = [
-            "This conversation, ~/clients/grok/2026-10-30-0800:",
+            "This conversation, ~/channels/grok/2026-10-30-0800:",
             "Asked about permits.",
-            "~/clients/grok: In the car they draw and plan.",
+            "~/channels/grok: In the car they draw and plan.",
             "You (~): John builds an inference engine",
-            "  - ~/clients — ",
+            "  - ~/channels — ",
             "Your family @sharratt (@sharratt): The Sharratts are extending the house.",
-            "  - @sharratt/bots — ",
+            "  - bots, projects, threads, topics: nothing written yet",
         ];
         let mut from = 0;
         for want in order {
@@ -403,7 +408,7 @@ mod tests {
                 &mut t,
                 &Actor::Server {
                     person: slug("john"),
-                    client: Client::Grok,
+                    channel: Channel::Grok,
                 },
                 &Op::Episode {
                     path: here.clone(),
@@ -477,6 +482,24 @@ mod tests {
             .find("Your world @battle-cities (@battle-cities): nothing summarised yet.")
             .unwrap_or_else(|| panic!("{f}"));
         assert!(family < world, "the default first");
+        // What a group is for heads its block.
+        apply(
+            &mut t,
+            &john(),
+            &Op::DescribeGroup {
+                group: slug("battle-cities"),
+                about: "The game's world and its bots.".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        let f = chat(&t);
+        assert!(
+            f.contains(
+                "Your world @battle-cities — The game's world and its bots. (@battle-cities):"
+            ),
+            "{f}"
+        );
     }
 
     /// **A bot's frame is its groups and nothing of anyone's own**.

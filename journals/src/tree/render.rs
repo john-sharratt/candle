@@ -1,15 +1,16 @@
 //! A tree back into files. A journal's own files are what its folder holds,
-//! its children aside: `journal.yaml` when it has metadata, `lines.yaml` when
-//! its window holds lines, an archive per folded period.
+//! its children aside: `journal.yaml` when it has metadata, a file per line
+//! of its window, and a folder per folded period holding a file per line.
+//! Each owner's folder opens with its owner file and a README.
 //!
 //! A journal with problems is never rendered for a write — writes to it are
 //! refused (§3.3) — so what its broken files said is never overwritten.
 
 use std::collections::BTreeMap;
 
-use crate::files::render_lines;
+use crate::files::{entry_file, group_readme, person_readme, README};
 use crate::path::{JournalPath, Owner};
-use crate::tree::load::{ARCHIVE_DIR, GROUP_FILE, JOURNAL_FILE, LINES_FILE, PERSON_FILE};
+use crate::tree::load::{ARCHIVE_DIR, GROUP_FILE, JOURNAL_FILE, PERSON_FILE};
 use crate::tree::{Journal, Tree};
 
 /// `path → bytes` for the files of `j` itself, at `path`.
@@ -19,34 +20,41 @@ pub fn own_files(path: &JournalPath, j: &Journal) -> BTreeMap<String, Vec<u8>> {
     if let Some(m) = &j.meta {
         out.insert(format!("{folder}/{JOURNAL_FILE}"), m.render().into_bytes());
     }
-    if !j.window.is_empty() {
+    for line in &j.window {
         out.insert(
-            format!("{folder}/{LINES_FILE}"),
-            render_lines(&j.window).into_bytes(),
+            format!("{folder}/{}", entry_file(&line.id)),
+            line.render().into_bytes(),
         );
     }
     for (period, lines) in &j.archives {
-        if !lines.is_empty() {
+        for line in lines {
             out.insert(
-                format!("{folder}/{ARCHIVE_DIR}/{period}.yaml"),
-                render_lines(lines).into_bytes(),
+                format!("{folder}/{ARCHIVE_DIR}/{period}/{}", entry_file(&line.id)),
+                line.render().into_bytes(),
             );
         }
     }
     out
 }
 
-/// The owner's own file, `person.yaml` or `group.yaml`, when it reads.
-pub fn owner_file(tree: &Tree, owner: &Owner) -> Option<(String, Vec<u8>)> {
+/// The owner's own files, `person.yaml` or `group.yaml` and the README
+/// written from it, when it reads.
+pub fn owner_files(tree: &Tree, owner: &Owner) -> Vec<(String, Vec<u8>)> {
     let folder = owner.folder();
-    match owner {
-        Owner::Person(p) => tree
-            .person_file(p)
-            .map(|f| (format!("{folder}/{PERSON_FILE}"), f.render().into_bytes())),
-        Owner::Group(g) => tree
-            .group_file(g)
-            .map(|x| (format!("{folder}/{GROUP_FILE}"), x.render().into_bytes())),
-    }
+    let (file, readme) = match owner {
+        Owner::Person(p) => match tree.person_file(p) {
+            Some(f) => ((PERSON_FILE, f.render()), person_readme(f)),
+            None => return Vec::new(),
+        },
+        Owner::Group(g) => match tree.group_file(g) {
+            Some(f) => ((GROUP_FILE, f.render()), group_readme(f)),
+            None => return Vec::new(),
+        },
+    };
+    vec![
+        (format!("{folder}/{}", file.0), file.1.into_bytes()),
+        (format!("{folder}/{README}"), readme.into_bytes()),
+    ]
 }
 
 /// Every file of every owner.
@@ -58,9 +66,7 @@ pub fn render_all(tree: &Tree) -> BTreeMap<String, Vec<u8>> {
         .map(|p| Owner::Person(p.clone()))
         .chain(tree.groups.keys().map(|g| Owner::Group(g.clone())));
     for owner in owners {
-        if let Some((p, b)) = owner_file(tree, &owner) {
-            out.insert(p, b);
-        }
+        out.extend(owner_files(tree, &owner));
     }
     for (path, j) in tree.journals() {
         out.extend(own_files(&path, j));
@@ -78,8 +84,8 @@ mod tests {
     use crate::testing::{at, note, slug};
     use crate::tree::load::load;
 
-    const JOHN: &str = "person: john\nname: \"John\"\naccounts:\n  - {email: \"john@example.com\", key: 154797f34c5a6ca6}\ngroups: [sharratt]\ndefault_group: sharratt\n";
-    const SHARRATT: &str = "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
+    const JOHN: &str = "person: john\nname: John\naccounts:\n  - email: john@example.com\n    key: 154797f34c5a6ca6\ngroups: [sharratt]\ndefault_group: sharratt\n";
+    const SHARRATT: &str = "group: sharratt\nname: Sharratt\nkind: family\nmembers:\n  - person: john\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n";
 
     /// A rich tree survives files → tree → files → tree unchanged, byte for byte.
     #[test]
@@ -106,7 +112,8 @@ mod tests {
         candle
             .archives
             .insert(Period::parse("2026-10-28").unwrap(), vec![old.clone()]);
-        candle.window.push(note("2026-10-30T10:00:00Z", "fresh"));
+        let fresh = note("2026-10-30T10:00:00Z", "fresh");
+        candle.window.push(fresh.clone());
         candle.meta.as_mut().unwrap().summary = Some(Summary {
             over: Fingerprint::of_bytes(b"x"),
             built: at("2026-10-30T11:00:00Z"),
@@ -124,22 +131,31 @@ mod tests {
         assert_eq!(
             rendered.keys().map(String::as_str).collect::<Vec<_>>(),
             [
-                "groups/sharratt/group.yaml",
-                "groups/sharratt/projects/candle/archive/2026-10-28.yaml",
-                "groups/sharratt/projects/candle/journal.yaml",
-                "groups/sharratt/projects/candle/lines.yaml",
-                "persons/john/person.yaml",
+                "groups/sharratt/README.md".to_string(),
+                "groups/sharratt/group.yaml".into(),
+                format!("groups/sharratt/projects/candle/{}", entry_file(&fresh.id)),
+                format!(
+                    "groups/sharratt/projects/candle/archive/2026-10-28/{}",
+                    entry_file(&old.id)
+                ),
+                "groups/sharratt/projects/candle/journal.yaml".into(),
+                "persons/john/README.md".into(),
+                "persons/john/person.yaml".into(),
             ]
         );
         assert_eq!(rendered["persons/john/person.yaml"], JOHN.as_bytes());
         assert_eq!(rendered["groups/sharratt/group.yaml"], SHARRATT.as_bytes());
+        assert!(
+            String::from_utf8_lossy(&rendered["groups/sharratt/README.md"])
+                .starts_with("# @sharratt — Sharratt\n\nA family.\n")
+        );
         let reloaded = load(&rendered);
         assert_eq!(reloaded, tree);
         assert_eq!(render_all(&reloaded), rendered);
     }
 
     #[test]
-    fn an_empty_window_writes_no_lines_file() {
+    fn an_empty_window_writes_no_files() {
         let path = JournalPath::root(Owner::Group(slug("sharratt")));
         let j = Journal::new(Place::Root, None);
         assert!(own_files(&path, &j).is_empty());

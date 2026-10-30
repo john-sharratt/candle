@@ -1,4 +1,4 @@
-//! `POST /v1/journals` (`docs/memory_backbone.md` §6.7): `{client?, ops:
+//! `POST /v1/journals` (`docs/memory_backbone.md` §6.7): `{channel?, ops:
 //! [...]}`, at most [`MAX_OPS`] operations of [`super::ops`], applied in
 //! order as the caller, each its own commit.
 //!
@@ -10,7 +10,7 @@
 //! and the commits — another writer, a fetch — can stop a batch partway, and
 //! then the answer names the operations kept.
 //!
-//! `client` names who the person speaks through, as an MCP session's client
+//! `channel` names who the person speaks through, as an MCP session's channel
 //! names itself: stated by the caller, not checked; `other` when absent. The
 //! person is the gateway's.
 
@@ -24,7 +24,7 @@ use axum::Json;
 use journals::actor::Actor;
 use journals::ops::{applied_to, Applied, Op};
 use journals::path::JournalPath;
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::time::Stamp;
 use serde_json::{json, Value};
 
@@ -44,22 +44,25 @@ pub const BODY_LIMIT: usize = 8 << 20;
 /// A write request: who it speaks through, and its operations.
 #[derive(Debug)]
 pub struct Request {
-    pub client: Client,
+    pub channel: Channel,
     pub ops: Vec<Value>,
 }
 
 pub fn request(body: &Value) -> Result<Request, String> {
     let obj = body.as_object().ok_or("the body is a JSON object")?;
-    if let Some(k) = obj.keys().find(|k| !matches!(k.as_str(), "client" | "ops")) {
+    if let Some(k) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "channel" | "ops"))
+    {
         return Err(format!(
-            "`{k}` is not a field of a request: send `client` and `ops`"
+            "`{k}` is not a field of a request: send `channel` and `ops`"
         ));
     }
-    let client = match obj.get("client") {
-        None => Client::Other,
+    let channel = match obj.get("channel") {
+        None => Channel::Other,
         Some(v) => {
-            let name = v.as_str().ok_or("`client` is a client's name")?;
-            Client::parse(name).ok_or_else(|| format!("`{name}` is not a client"))?
+            let name = v.as_str().ok_or("`channel` is a channel's name")?;
+            Channel::parse(name).ok_or_else(|| format!("`{name}` is not a channel"))?
         }
     };
     let ops = obj
@@ -73,7 +76,7 @@ pub fn request(body: &Value) -> Result<Request, String> {
         ));
     }
     Ok(Request {
-        client,
+        channel,
         ops: ops.clone(),
     })
 }
@@ -176,7 +179,7 @@ pub async fn write(
         Ok(r) => r,
         Err(e) => return malformed(e),
     };
-    blocking(move || match person(&session, &headers, req.client) {
+    blocking(move || match person(&session, &headers, req.channel) {
         Ok(m) => {
             let memory = Arc::clone(&m.memory);
             batch(&m, &req.ops, Stamp::now(), |actor, op, at| {
@@ -220,23 +223,23 @@ mod tests {
     }
 
     #[test]
-    fn a_request_names_its_client_and_holds_its_operations() {
-        let r = request(&json!({"client": "claude-code", "ops": [{"op": "note"}]})).unwrap();
-        assert_eq!(r.client, Client::ClaudeCode);
+    fn a_request_names_its_channel_and_holds_its_operations() {
+        let r = request(&json!({"channel": "claude-code", "ops": [{"op": "note"}]})).unwrap();
+        assert_eq!(r.channel, Channel::ClaudeCode);
         assert_eq!(r.ops.len(), 1);
         assert_eq!(
-            request(&json!({"ops": [{}]})).unwrap().client,
-            Client::Other
+            request(&json!({"ops": [{}]})).unwrap().channel,
+            Channel::Other
         );
         let err = |v: Value| request(&v).unwrap_err();
         assert_eq!(err(json!([])), "the body is a JSON object");
         assert_eq!(
-            err(json!({"client": "tesla", "ops": [{}]})),
-            "`tesla` is not a client"
+            err(json!({"channel": "tesla", "ops": [{}]})),
+            "`tesla` is not a channel"
         );
         assert_eq!(
-            err(json!({"client": 1, "ops": [{}]})),
-            "`client` is a client's name"
+            err(json!({"channel": 1, "ops": [{}]})),
+            "`channel` is a channel's name"
         );
         assert_eq!(err(json!({"ops": {}})), "`ops` is a list of operations");
         assert_eq!(
@@ -250,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             err(json!({"op": "note", "ops": [{}]})),
-            "`op` is not a field of a request: send `client` and `ops`"
+            "`op` is not a field of a request: send `channel` and `ops`"
         );
     }
 
@@ -407,7 +410,7 @@ mod tests {
                 Ok(Applied {
                     subject: "Note on ~".into(),
                     touched: vec![m.path("~").unwrap()],
-                    line: Some(LineId::parse("20261030-1200-0001").unwrap()),
+                    line: Some(LineId::parse("2026-10-30-1200-0001").unwrap()),
                     ..Applied::default()
                 })
             } else {
@@ -419,7 +422,7 @@ mod tests {
         assert_eq!(answer.0, StatusCode::CONFLICT);
         assert_eq!(answer.1["index"], 1);
         assert_eq!(answer.1["message"], "moved");
-        assert_eq!(answer.1["applied"][0]["line"], "~#20261030-1200-0001");
+        assert_eq!(answer.1["applied"][0]["line"], "~#2026-10-30-1200-0001");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::Problem;
-use crate::files::{read_lines, GroupFile, Meta, PersonFile};
+use crate::files::{entry_id, in_order, read_entry, GroupFile, Meta, PersonFile, README};
 use crate::path::{JournalPath, Owner};
 use crate::period::Period;
 use crate::scope::Scope;
@@ -22,7 +22,6 @@ const GROUPS: &str = "groups";
 pub const PERSON_FILE: &str = "person.yaml";
 pub const GROUP_FILE: &str = "group.yaml";
 pub const JOURNAL_FILE: &str = "journal.yaml";
-pub const LINES_FILE: &str = "lines.yaml";
 pub const ARCHIVE_DIR: &str = "archive";
 
 /// One owner's files, by path below the owner's folder.
@@ -96,10 +95,16 @@ fn load_owner(tree: &mut Tree, owner: Owner, files: OwnerFiles<'_>) {
             ));
             continue;
         }
+        // The service writes the owner's README from its own file; what a
+        // hand edit left there is written over, never read.
+        if rel.len() == 1 && rel[0] == README {
+            continue;
+        }
         if let Err(p) = place_file(&mut root, &owner, rel, path, bytes) {
             tree.problems.push(p);
         }
     }
+    order(&mut root);
     let missing = || {
         Problem::new(
             format!("{folder}/{own_name}"),
@@ -149,6 +154,23 @@ fn text<'a>(path: &str, bytes: &'a [u8]) -> Result<&'a str, Problem> {
     })
 }
 
+/// Every journal's window and archives in the order their lines happened:
+/// files are read in name order, and two lines' minutes say nothing of their
+/// seconds.
+fn order(j: &mut Journal) {
+    in_order(&mut j.window);
+    for lines in j.archives.values_mut() {
+        in_order(lines);
+    }
+    for child in j.children.values_mut() {
+        order(child);
+    }
+}
+
+/// What a journal's folder holds, as its problems say it.
+const HOLDS: &str = "a journal's folder holds journal.yaml, an entry per \
+`yyyy-mm-dd-hhmm-xxxx.yaml`, archive/<period>/ and its sub-journals' folders";
+
 /// A journal file into its place. A folder at no place in the tree is the
 /// returned problem; a fault in the file is kept on its journal.
 fn place_file(
@@ -159,9 +181,11 @@ fn place_file(
     bytes: &[u8],
 ) -> Result<(), Problem> {
     let (file, dirs) = rel.split_last().expect("a file has a name");
-    let (dirs, archive) = match dirs.split_last() {
-        Some((last, rest)) if *last == ARCHIVE_DIR => (rest, true),
-        _ => (dirs, false),
+    // `archive/<period>/<id>.yaml`, or a file straight under `archive/`.
+    let (dirs, archive) = match dirs {
+        [rest @ .., a, period] if *a == ARCHIVE_DIR => (rest, Some(Some(*period))),
+        [rest @ .., a] if *a == ARCHIVE_DIR => (rest, Some(None)),
+        _ => (dirs, None),
     };
     let names = dirs
         .iter()
@@ -172,36 +196,37 @@ fn place_file(
         .map_err(|e| Problem::new(path, None, format!("its folder is no journal: {e}")))?;
     let journal = node(root, &jpath);
     let read = text(path, bytes);
+    let entry = |name: &str| {
+        entry_id(name)
+            .ok_or_else(|| Problem::new(path, None, format!("`{name}` is no entry: {HOLDS}")))
+    };
     match (archive, *file) {
-        (true, name) => {
-            let period = name
-                .strip_suffix(".yaml")
-                .ok_or_else(|| format!("`{name}` is not an archive: archive/<period>.yaml"))
-                .and_then(Period::parse);
-            match (period, read) {
-                (Err(why), _) => journal.problems.push(Problem::new(path, None, why)),
-                (Ok(_), Err(p)) => journal.problems.push(p),
-                (Ok(period), Ok(t)) => match read_lines(path, t) {
-                    Ok(lines) => {
-                        journal.archives.insert(period, lines);
-                    }
+        (Some(None), name) => journal.problems.push(Problem::new(
+            path,
+            None,
+            format!("`{name}` is straight under archive/: an archive holds a folder per period, archive/<period>/"),
+        )),
+        (Some(Some(period)), name) => {
+            let period = Period::parse(period).map_err(|why| Problem::new(path, None, why));
+            match (period, entry(name), read) {
+                (Err(p), _, _) | (_, Err(p), _) | (_, _, Err(p)) => journal.problems.push(p),
+                (Ok(period), Ok(id), Ok(t)) => match read_entry(path, id, t) {
+                    Ok(line) => journal.archives.entry(period).or_default().push(line),
                     Err(p) => journal.problems.push(p),
                 },
             }
         }
-        (false, JOURNAL_FILE) => match read.and_then(|t| Meta::read(path, t)) {
+        (None, JOURNAL_FILE) => match read.and_then(|t| Meta::read(path, t)) {
             Ok(meta) => journal.meta = Some(meta),
             Err(p) => journal.problems.push(p),
         },
-        (false, LINES_FILE) => match read.and_then(|t| read_lines(path, t)) {
-            Ok(lines) => journal.window = lines,
-            Err(p) => journal.problems.push(p),
+        (None, name) => match (entry(name), read) {
+            (Err(p), _) | (_, Err(p)) => journal.problems.push(p),
+            (Ok(id), Ok(t)) => match read_entry(path, id, t) {
+                Ok(line) => journal.window.push(line),
+                Err(p) => journal.problems.push(p),
+            },
         },
-        (false, other) => journal.problems.push(Problem::new(
-            path,
-            None,
-            format!("`{other}` is not a journal file: journal.yaml, lines.yaml or archive/<period>.yaml"),
-        )),
     }
     Ok(())
 }
@@ -226,7 +251,8 @@ fn node<'a>(root: &'a mut Journal, path: &JournalPath) -> &'a mut Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::render_lines;
+    use crate::files::entry_file;
+    use crate::line::Line;
     use crate::testing::{note, slug};
 
     fn files(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
@@ -242,7 +268,7 @@ mod tests {
     #[test]
     fn a_seeded_repository_loads_clean() {
         let tree = load(&files(&[
-            (".gitattributes", "lines.yaml merge=union\n"),
+            (".gitattributes", "*.yaml text eol=lf\n"),
             ("README.md", "# journals\n"),
             ("persons/john/person.yaml", JOHN),
             ("groups/sharratt/group.yaml", SHARRATT),
@@ -252,22 +278,35 @@ mod tests {
         assert!(tree.group_file(&slug("sharratt")).is_some());
         let all = tree.journals();
         assert!(all.iter().all(|(_, j)| j.problems.is_empty()));
-        // Root, clients and its three clients, people; root and four sections.
+        // Root, channels and its three channels, people; root and four sections.
         assert_eq!(all.len(), 6 + 5);
     }
 
     #[test]
     fn journals_and_their_files_take_their_places() {
-        let line = note("2026-10-30T09:10:02Z", "Workers push branches.");
+        // Read in file-name order — the same minute, the later second first
+        // by id — and held in the order they happened.
+        let early = note("2026-10-30T09:10:02Z", "Workers push branches.");
+        let late = note("2026-10-30T09:10:59Z", "Merging is the user's decision.");
+        let old = note("2026-10-29T08:00:00Z", "archived");
+        let at = |l: &Line| format!("groups/sharratt/projects/candle/{}", entry_file(&l.id));
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
+            ("persons/john/README.md", "# anything a hand left\n"),
             ("groups/sharratt/group.yaml", SHARRATT),
             (
                 "groups/sharratt/projects/candle/journal.yaml",
                 "name: candle\ncue: \"open for the engine\"\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n",
             ),
-            ("groups/sharratt/projects/candle/lines.yaml", &render_lines(std::slice::from_ref(&line))),
-            ("groups/sharratt/projects/candle/archive/2026-10-29.yaml", ""),
+            (&at(&late), &late.render()),
+            (&at(&early), &early.render()),
+            (
+                &format!(
+                    "groups/sharratt/projects/candle/archive/2026-10-29/{}",
+                    entry_file(&old.id)
+                ),
+                &old.render(),
+            ),
         ]));
         let candle = tree
             .get(
@@ -278,9 +317,13 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        assert_eq!(candle.window, vec![line]);
-        assert_eq!(candle.archives.len(), 1);
+        assert_eq!(candle.window, vec![early, late]);
+        assert_eq!(
+            candle.archives[&Period::parse("2026-10-29").unwrap()],
+            vec![old]
+        );
         assert_eq!(candle.problems, vec![]);
+        assert_eq!(tree.problems, vec![]);
         assert_eq!(candle.cue().as_deref(), Some("open for the engine"));
     }
 
@@ -293,10 +336,10 @@ mod tests {
             ("families/sharratt/family.yaml", "x"),
             ("persons/README.md", "x"),
             ("persons/John/person.yaml", JOHN),
-            ("groups/sharratt/clients/grok/lines.yaml", ""),
+            ("groups/sharratt/channels/grok/lines.yaml", ""),
             ("persons/john/projects/candle/lines.yaml", ""),
             ("persons/john/notes/lines.yaml", ""),
-            ("persons/john/clients/tesla/lines.yaml", ""),
+            ("persons/john/channels/tesla/lines.yaml", ""),
             ("persons/john/people/Yen/lines.yaml", ""),
             ("persons/john/people/archive/lines.yaml", ""),
         ]));
@@ -306,22 +349,22 @@ mod tests {
             stray,
             [
                 "families/sharratt/family.yaml",
-                "groups/sharratt/clients/grok/lines.yaml",
+                "groups/sharratt/channels/grok/lines.yaml",
                 "notes.txt",
                 "persons/John/person.yaml",
                 "persons/README.md",
-                "persons/john/clients/tesla/lines.yaml",
+                "persons/john/channels/tesla/lines.yaml",
                 "persons/john/notes/lines.yaml",
                 "persons/john/people/Yen/lines.yaml",
                 "persons/john/projects/candle/lines.yaml",
             ]
         );
         assert!(tree.person_file(&slug("john")).is_some());
-        // `people/archive/lines.yaml` is the archive folder of `people` holding a
-        // file that is no period.
+        // `people/archive/lines.yaml` sits straight under the archive folder
+        // of `people`, where a folder per period belongs.
         let people = &tree.persons[&slug("john")].root.children[&slug("people")];
         assert!(
-            people.problems[0].what.contains("not a period"),
+            people.problems[0].what.contains("straight under archive/"),
             "{:?}",
             people.problems
         );
@@ -331,21 +374,45 @@ mod tests {
     fn a_broken_file_is_kept_on_its_journal() {
         let tree = load(&files(&[
             ("persons/john/person.yaml", JOHN),
-            ("persons/john/clients/grok/lines.yaml", "- {id: nope}\n"),
-            ("persons/john/clients/other/journal.yaml", "name: [\n"),
-            ("persons/john/clients/claude-code/lines.yaml", "\u{0}"),
-            ("persons/john/people/notes.md", "x"),
+            (
+                "persons/john/channels/grok/2026-10-30-0910-0001.yaml",
+                "at: yesterday\nkind: note\nby: grok\ntext: x\n",
+            ),
+            ("persons/john/channels/other/journal.yaml", "name: [\n"),
+            (
+                "persons/john/channels/claude-code/2026-10-30-0910-0002.yaml",
+                "\u{0}",
+            ),
+            ("persons/john/people/lines.yaml", "- {id: x}\n"),
+            ("persons/john/people/archive/2026-10/notes.md", "x"),
+            (
+                "persons/john/channels/grok/archive/someday/2026-10-30-0910-0003.yaml",
+                "x",
+            ),
         ]));
-        let clients = &tree.persons[&slug("john")].root.children[&slug("clients")];
-        assert!(clients.children[&slug("grok")].problems[0]
-            .what
-            .contains("not a line id"));
-        assert!(clients.children[&slug("other")].problems[0]
+        let channels = &tree.persons[&slug("john")].root.children[&slug("channels")];
+        let grok = &channels.children[&slug("grok")];
+        assert_eq!(
+            grok.problems[0].to_string(),
+            "persons/john/channels/grok/2026-10-30-0910-0001.yaml:1: `at`: `yesterday` is not a time written 2026-10-30T09:10:02Z"
+        );
+        assert!(
+            grok.problems[1].what.contains("not a period"),
+            "{:?}",
+            grok.problems
+        );
+        assert!(channels.children[&slug("other")].problems[0]
             .what
             .starts_with("not valid YAML"));
-        assert!(!clients.children[&slug("claude-code")].problems.is_empty());
+        assert!(!channels.children[&slug("claude-code")].problems.is_empty());
         let people = &tree.persons[&slug("john")].root.children[&slug("people")];
-        assert!(people.problems[0].what.contains("not a journal file"));
+        assert!(people.problems[0]
+            .what
+            .starts_with("`notes.md` is no entry"));
+        assert_eq!(
+            people.problems[1].what,
+            format!("`lines.yaml` is no entry: {HOLDS}")
+        );
     }
 
     #[test]

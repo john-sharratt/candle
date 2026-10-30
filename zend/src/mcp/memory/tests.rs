@@ -9,7 +9,7 @@ use journals::actor::viewer;
 use journals::error::Problem;
 use journals::files::{Cite, Sentence};
 use journals::path::Owner;
-use journals::scope::Client;
+use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::tree::fingerprint::fingerprint;
 use tempfile::TempDir;
@@ -20,11 +20,11 @@ use super::*;
 fn memory_paths_are_told_from_thread_paths() {
     for memory in [
         "~",
-        "~/clients/grok",
+        "~/channels/grok",
         "@sharratt/topics",
         "topics/house",
         "projects",
-        "~#20261030-0912-7e3a",
+        "~#2026-10-30-0912-7e3a",
     ] {
         assert!(is_memory_path(memory), "{memory}");
     }
@@ -66,7 +66,7 @@ fn a_write_error_is_told_by_its_kind() {
     let root = JournalPath::root(Owner::Person(john.clone()));
     let actor = Actor::Person {
         person: john,
-        client: Client::Grok,
+        channel: Channel::Grok,
         admin: false,
     };
     let note = |text: &str| Op::Note {
@@ -181,17 +181,17 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
         (john.clone(), None),
         "the account is bound now"
     );
-    let conv = conversations::of(&m, &john, Client::Grok, "session-1").unwrap();
-    assert!(conv.show().starts_with("~/clients/grok/"), "{conv}");
+    let conv = conversations::of(&m, &john, Channel::Grok, "session-1").unwrap();
+    assert!(conv.show().starts_with("~/channels/grok/"), "{conv}");
     assert_eq!(
-        conversations::of(&m, &john, Client::Grok, "session-1").unwrap(),
+        conversations::of(&m, &john, Channel::Grok, "session-1").unwrap(),
         conv,
         "one journal a session"
     );
     let root = JournalPath::root(Owner::Person(john.clone()));
     let actor = Actor::Person {
         person: john.clone(),
-        client: Client::Grok,
+        channel: Channel::Grok,
         admin: false,
     };
     m.write(
@@ -206,7 +206,7 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
         &m.tree().unwrap(),
         &john,
         Some(&conv),
-        Client::ClaudeCode,
+        Channel::ClaudeCode,
         Stamp::now(),
     );
     assert!(text.contains("This conversation"), "{text}");
@@ -223,9 +223,12 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
                 check.file_name().unwrap().to_str().unwrap(),
             ],
         );
-        if std::fs::read_to_string(check.join("persons/john/lines.yaml"))
-            .is_ok_and(|t| t.contains("Prefers short answers."))
-        {
+        let pushed = Store::open(&check).is_ok_and(|s| {
+            s.shared()
+                .get(&root)
+                .is_some_and(|j| j.window.iter().any(|l| l.text == "Prefers short answers."))
+        });
+        if pushed {
             break;
         }
         assert!(Instant::now() < until, "the note never reached origin");
@@ -234,7 +237,7 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
 }
 
 /// **A person's old `U:` notes move onto their tree**: kept facts onto `~`,
-/// episodes onto their client's journal, each ended in the substrate once
+/// episodes onto their channel's journal, each ended in the substrate once
 /// moved; a second move finds nothing left.
 #[test]
 fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
@@ -245,7 +248,7 @@ fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
     let m = opened(dir);
     let records = MemRecords::default();
     let at = 1_793_351_402_000;
-    for (label, text, client) in [
+    for (label, text, channel) in [
         ("Noted:", "the cat is Miso", "grok"),
         ("Done:", "image_generate — a cat", "grok"),
     ] {
@@ -258,7 +261,7 @@ fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
                 label: label.into(),
                 text: text.into(),
                 worker: None,
-                client: Some(client.into()),
+                client: Some(channel.into()),
             },
         )
         .unwrap();
@@ -275,7 +278,7 @@ fn old_notes_move_onto_the_tree_and_leave_the_substrate() {
             .collect()
     };
     assert_eq!(texts("~"), ["the cat is Miso"]);
-    assert_eq!(texts("~/clients/grok"), ["image_generate — a cat"]);
+    assert_eq!(texts("~/channels/grok"), ["image_generate — a cat"]);
     assert_eq!(
         tree.get(&path_of(&tree, &john, "~")).unwrap().window[0]
             .at

@@ -4,6 +4,7 @@
 //! new journal.
 
 use crate::error::{Error, Result};
+use crate::files::in_order;
 use crate::ops::place::{re_place, subtree_paths};
 use crate::ops::Applied;
 use crate::path::{JournalPath, Place};
@@ -77,11 +78,11 @@ pub fn merge(tree: &mut Tree, from: &JournalPath, into: &JournalPath) -> Result<
         ..
     } = gone;
     target.window.extend(window);
-    target.window.sort_by_key(|l| l.at);
+    in_order(&mut target.window);
     for (period, lines) in archives {
         let held = target.archives.entry(period).or_default();
         held.extend(lines);
-        held.sort_by_key(|l| l.at);
+        in_order(held);
     }
     let mut touched = vec![into.clone()];
     for (child_name, mut child) in children {

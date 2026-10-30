@@ -4,7 +4,7 @@
 use crate::error::Problem;
 use crate::files::summary::Summary;
 use crate::time::Stamp;
-use crate::yaml::{parse_doc, quote, scalar, Fields};
+use crate::yaml::{parse_doc, scalar, text_field, Fields};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -39,7 +39,7 @@ impl Meta {
     pub fn render(&self) -> String {
         let mut out = format!("name: {}\n", scalar(&self.name));
         if let Some(cue) = &self.cue {
-            out.push_str(&format!("cue: {}\n", quote(cue)));
+            out.push_str(&text_field("", "cue", cue));
         }
         out.push_str(&format!("created: {}\n", self.created));
         if let Some(c) = self.closed {
@@ -47,7 +47,7 @@ impl Meta {
         }
         out.push_str(&format!("folded: {}\n", self.folded));
         if let Some(s) = &self.shared {
-            out.push_str(&format!("shared: {}\n", quote(s)));
+            out.push_str(&format!("shared: {}\n", scalar(s)));
         }
         if let Some(s) = &self.summary {
             s.render(&mut out);
@@ -124,7 +124,7 @@ mod tests {
                     Sentence {
                         text: "Releases go through keep trials on BlackWorld, then roll out."
                             .into(),
-                        cites: vec![Cite::Line(LineId::parse("20261029-0410-a3b4").unwrap())],
+                        cites: vec![Cite::Line(LineId::parse("2026-10-29-0410-a3b4").unwrap())],
                     },
                     Sentence {
                         text: "The connector now remembers its user.".into(),
@@ -142,15 +142,17 @@ mod tests {
             m.render(),
             format!(
                 "name: candle\n\
-                 cue: \"open for the inference engine, its releases and cluster\"\n\
+                 cue: open for the inference engine, its releases and cluster\n\
                  created: 2026-10-30T09:10:02Z\n\
                  closed: 2026-10-31T01:00:00Z\n\
                  folded: true\n\
                  shared: \"@sharratt/topics/candle\"\n\
                  summary:\n  over: {}\n  built: 2026-10-30T11:02:40Z\n  lines: 12\n  children: 2\n  stale: true\n\
                  \x20 digest: \"Candle: releases go through keep.\"\n  sentences:\n\
-                 \x20   - {{text: \"Releases go through keep trials on BlackWorld, then roll out.\", cites: [\"#20261029-0410-a3b4\"]}}\n\
-                 \x20   - {{text: \"The connector now remembers its user.\", cites: [\"user-context\"]}}\n",
+                 \x20   - text: Releases go through keep trials on BlackWorld, then roll out.\n\
+                 \x20     cites: [\"#2026-10-29-0410-a3b4\"]\n\
+                 \x20   - text: The connector now remembers its user.\n\
+                 \x20     cites: [user-context]\n",
                 Fingerprint::of_bytes(b"inputs")
             )
         );
@@ -166,7 +168,7 @@ mod tests {
         );
         assert_eq!(
             m.render(),
-            "name: permits\ncue: \"open for council permits\"\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n"
+            "name: permits\ncue: open for council permits\ncreated: 2026-10-30T09:10:02Z\nfolded: false\n"
         );
         assert_eq!(Meta::read("j", &m.render()).unwrap(), m);
         let fixed = Meta::new("projects", None, at("2026-10-30T09:10:02Z"));
@@ -220,25 +222,20 @@ mod tests {
             ("over: ", "over: xyz", 8, "not a fingerprint"),
             ("lines: 12", "lines: many", 10, "not a count"),
             (
-                "[\"#20261029-0410-a3b4\"]",
+                "[\"#2026-10-29-0410-a3b4\"]",
                 "[\"#bad\"]",
                 15,
                 "not a line id",
             ),
-            (
-                "[\"user-context\"]",
-                "[\"User Context\"]",
-                16,
-                "cites neither",
-            ),
+            ("[user-context]", "[User Context]", 17, "cites neither"),
             (
                 "The connector now remembers its user.",
-                "  ",
-                16,
+                "\"  \"",
+                17,
                 "a sentence is empty",
             ),
             (
-                "cue: \"open for the inference engine, its releases and cluster\"",
+                "cue: open for the inference engine, its releases and cluster",
                 "cue: \"\"",
                 2,
                 "`cue` is empty",

@@ -43,6 +43,7 @@ mod cluster_status;
 mod gateway_command;
 pub mod group_add;
 mod group_create;
+pub mod group_describe;
 pub mod group_frame;
 mod group_remove;
 mod journal_accept;
@@ -165,6 +166,7 @@ pub fn definitions() -> Value {
         journal_share::definition(),
         journal_accept::definition(),
         group_create::definition(),
+        group_describe::definition(),
         group_add::definition(),
         group_remove::definition(),
         group_frame::definition(),
@@ -210,6 +212,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         journal_share::NAME => journal_share::call(ctx, args),
         journal_accept::NAME => journal_accept::call(ctx, args),
         group_create::NAME => group_create::call(ctx, args),
+        group_describe::NAME => group_describe::call(ctx, args),
         group_add::NAME => group_add::call(ctx, args),
         group_remove::NAME => group_remove::call(ctx, args),
         group_frame::NAME => group_frame::call(ctx, args),
@@ -321,6 +324,7 @@ mod tests {
                 "journal_share",
                 "journal_accept",
                 "group_create",
+                "group_describe",
                 "group_add",
                 "group_remove",
                 "group_frame",

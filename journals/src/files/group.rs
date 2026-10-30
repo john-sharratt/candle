@@ -8,7 +8,7 @@ use std::fmt;
 use crate::error::Problem;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::yaml::{item_line, parse_doc, quote, scalar, Fields};
+use crate::yaml::{item_line, parse_doc, scalar, text_field, Fields};
 
 /// What a group is, for whoever reads about it. Every kind has the same
 /// sections and the same rules.
@@ -110,8 +110,13 @@ pub struct GroupFile {
     pub group: Slug,
     pub name: String,
     pub kind: Kind,
+    /// What the group is for, as its README and every frame open with it.
+    pub about: Option<String>,
     pub members: Vec<Member>,
 }
+
+/// The longest a group's `about` may be, in characters.
+pub const MAX_ABOUT: usize = 400;
 
 impl GroupFile {
     /// `person`'s membership.
@@ -146,6 +151,15 @@ impl GroupFile {
         if self.name.trim().is_empty() {
             return Err("`name` is empty".into());
         }
+        if let Some(a) = &self.about {
+            let n = a.chars().count();
+            if a.trim().is_empty() {
+                return Err("`about` is empty".into());
+            }
+            if n > MAX_ABOUT {
+                return Err(format!("`about` is {n} characters, over {MAX_ABOUT}"));
+            }
+        }
         let mut seen = BTreeSet::new();
         for m in &self.members {
             if !seen.insert(&m.who) {
@@ -166,19 +180,20 @@ impl GroupFile {
     }
 
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "group: {}\nname: {}\nkind: {}\nmembers:\n",
-            scalar(self.group.as_str()),
-            quote(&self.name),
-            self.kind.name()
-        );
+        let mut out = format!("group: {}\n", scalar(self.group.as_str()));
+        out.push_str(&text_field("", "name", &self.name));
+        out.push_str(&format!("kind: {}\n", self.kind.name()));
+        if let Some(a) = &self.about {
+            out.push_str(&text_field("", "about", a));
+        }
+        out.push_str("members:\n");
         for m in &self.members {
             let who = match &m.who {
                 Who::Person(p) => format!("person: {}", scalar(p.as_str())),
                 Who::Bot(b) => format!("bot: {}", scalar(b.as_str())),
             };
             out.push_str(&format!(
-                "  - {{{who}, role: {}, joined: {}}}\n",
+                "  - {who}\n    role: {}\n    joined: {}\n",
                 m.role.name(),
                 m.joined
             ));
@@ -192,6 +207,7 @@ impl GroupFile {
         let group = f.parsed("group", Slug::parse)?;
         let name = f.str("name")?;
         let kind = f.parsed("kind", Kind::parse)?;
+        let about = f.opt_str("about")?;
         let mut members = Vec::new();
         for (i, m) in f.opt_seq("members")?.into_iter().flatten().enumerate() {
             let line = item_line(text, "members", i);
@@ -218,6 +234,7 @@ impl GroupFile {
             group,
             name,
             kind,
+            about,
             members,
         };
         out.check().map_err(|why| f.problem("members", why))?;
@@ -248,6 +265,7 @@ mod tests {
             group: slug("sharratt"),
             name: "Sharratt".into(),
             kind: Kind::Family,
+            about: None,
             members: vec![
                 person("john", Role::Owner),
                 person("yen", Role::Owner),
@@ -262,11 +280,11 @@ mod tests {
         let g = sharratt();
         assert_eq!(
             g.render(),
-            "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n\
-             \x20 - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n\
-             \x20 - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n\
-             \x20 - {person: thanhlong, role: member, joined: 2026-10-30T00:00:00Z}\n\
-             \x20 - {person: yen-nhi, role: member, joined: 2026-10-30T00:00:00Z}\n"
+            "group: sharratt\nname: Sharratt\nkind: family\nmembers:\n\
+             \x20 - person: john\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
+             \x20 - person: yen\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
+             \x20 - person: thanhlong\n    role: member\n    joined: 2026-10-30T00:00:00Z\n\
+             \x20 - person: yen-nhi\n    role: member\n    joined: 2026-10-30T00:00:00Z\n"
         );
         assert_eq!(
             GroupFile::read("groups/sharratt/group.yaml", &g.render()).unwrap(),
@@ -284,6 +302,7 @@ mod tests {
             group: slug("battle-cities"),
             name: "Battle Cities".into(),
             kind: Kind::World,
+            about: Some("The world of the Battle Cities game, its people and its bots.".into()),
             members: vec![
                 person("john", Role::Owner),
                 Member {
@@ -295,9 +314,10 @@ mod tests {
         };
         assert_eq!(
             g.render(),
-            "group: battle-cities\nname: \"Battle Cities\"\nkind: world\nmembers:\n\
-             \x20 - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n\
-             \x20 - {bot: c3f1a07e, role: reader, joined: 2026-10-30T00:00:00Z}\n"
+            "group: battle-cities\nname: Battle Cities\nkind: world\n\
+             about: The world of the Battle Cities game, its people and its bots.\nmembers:\n\
+             \x20 - person: john\n    role: owner\n    joined: 2026-10-30T00:00:00Z\n\
+             \x20 - bot: c3f1a07e\n    role: reader\n    joined: 2026-10-30T00:00:00Z\n"
         );
         assert_eq!(GroupFile::read("f", &g.render()).unwrap(), g);
         assert_eq!(g.bot(&slug("c3f1a07e")).unwrap().role, Role::Reader);
@@ -321,44 +341,44 @@ mod tests {
         let good = sharratt().render();
         for (from, to, line, says) in [
             (
-                "person: yen, role: owner",
-                "person: john, role: owner",
+                "  - person: yen\n",
+                "  - person: john\n",
                 None,
                 "john is a member twice",
             ),
             (
-                "role: member, joined: 2026-10-30T00:00:00Z}\n  - {person: yen-nhi",
-                "role: chief, joined: 2026-10-30T00:00:00Z}\n  - {person: yen-nhi",
-                Some(7),
+                "  - person: thanhlong\n    role: member",
+                "  - person: thanhlong\n    role: chief",
+                Some(11),
                 "`chief` is not a role: owner, member or reader",
             ),
             (
-                "joined: 2026-10-30T00:00:00Z}\n",
-                "joined: today}\n",
+                "    joined: 2026-10-30T00:00:00Z\n",
+                "    joined: today\n",
                 Some(5),
                 "not a time",
             ),
             (
-                "{person: john,",
-                "{who: x, person: john,",
+                "  - person: john\n",
+                "  - who: x\n    person: john\n",
                 Some(5),
                 "`who` is not a field",
             ),
             (
-                "{person: john,",
-                "{person: john, bot: b1,",
+                "  - person: john\n",
+                "  - person: john\n    bot: b1\n",
                 Some(5),
                 "a member is a `person` or a `bot`, one of the two",
             ),
             (
-                "{person: john, role: owner, joined: 2026-10-30T00:00:00Z}",
-                "{role: owner, joined: 2026-10-30T00:00:00Z}",
+                "  - person: john\n    role: owner",
+                "  - role: owner",
                 Some(5),
                 "a member is a `person` or a `bot`, one of the two",
             ),
             (
-                "{person: yen-nhi, role: member,",
-                "{bot: b1, role: member,",
+                "  - person: yen-nhi\n",
+                "  - bot: b1\n",
                 None,
                 "bot b1 is a member: a bot is only ever a reader",
             ),
@@ -368,7 +388,7 @@ mod tests {
                 None,
                 "`clan` is not a kind of group: family, team or world",
             ),
-            ("name: \"Sharratt\"", "name: \"\"", None, "`name` is empty"),
+            ("name: Sharratt", "name: \"\"", None, "`name` is empty"),
         ] {
             assert!(good.contains(from), "{from}");
             let err = GroupFile::read("group.yaml", &good.replacen(from, to, 1)).unwrap_err();

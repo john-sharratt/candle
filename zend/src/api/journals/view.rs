@@ -28,7 +28,7 @@ pub fn line(path: &JournalPath, l: &Line) -> Value {
         "kind": l.kind.name(),
         "by": l.by.name(),
         "person": l.person.as_ref().map(|p| p.as_str()),
-        "client": l.client.map(|c| c.name()),
+        "channel": l.channel.map(|c| c.name()),
         "folds": l.folds.as_ref().map(|f| match f {
             Folds::Period(p) => json!({"period": p.to_string()}),
             Folds::Journal(j) => json!({
@@ -240,7 +240,7 @@ mod tests {
                 "kind": "note",
                 "by": "grok",
                 "person": "john",
-                "client": null,
+                "channel": null,
                 "folds": null,
                 "proposed": false,
                 "text": "Flights booked.",

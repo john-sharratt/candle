@@ -261,7 +261,7 @@ mod tests {
     /// **The user's own journal is the memory's**, never a thread path.
     #[test]
     fn the_users_journal_is_no_thread_path() {
-        for memory in ["U:", "~", "~/clients/grok", "@sharratt/topics"] {
+        for memory in ["U:", "~", "~/channels/grok", "@sharratt/topics"] {
             assert!(Path::parse(memory).is_err(), "{memory}");
         }
     }

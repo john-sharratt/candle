@@ -1,9 +1,11 @@
-//! Folding a closed period of a window into its archive (§4): the lines move
-//! to `archive/<period>.yaml`, and one `fold` line, zend's account of them,
-//! takes their place where the first of them stood.
+//! Folding a closed period of a window into its archive (§4): the lines' files
+//! move to `archive/<period>/`, and one `fold` line, zend's account of them,
+//! takes their place at the period's last moment.
+
+use std::mem;
 
 use crate::error::{Error, Result};
-use crate::files::Fingerprint;
+use crate::files::{in_order, Fingerprint};
 use crate::line::{Folds, Kind, Line, LineId, Writer};
 use crate::ops::append::clean;
 use crate::ops::{mint_keeping, Applied};
@@ -14,7 +16,7 @@ use crate::tree::window::inside;
 use crate::tree::{Journal, Tree};
 
 /// What a fold of the window lines `ids` is written from — each line as the
-/// fold's question shows it: its time, kind, writer, the person and client it
+/// fold's question shows it: its time, kind, writer, the person and channel it
 /// was written for, whether it is still proposed, and its text, in time order.
 /// Ids are left out, so a replay that renames a colliding id still matches;
 /// which lines are folded is checked by id on its own. The lines are taken
@@ -39,7 +41,7 @@ fn line_bytes(l: &Line) -> Vec<u8> {
         l.kind.name(),
         l.by.name(),
         l.person.as_ref().map_or("", |p| p.as_str()),
-        l.client.map_or("", |c| c.name()),
+        l.channel.map_or("", |c| c.name()),
         if l.proposed { "proposed" } else { "" },
         l.text.as_str(),
     ] {
@@ -80,18 +82,13 @@ pub fn fold_period(
             "{path}'s lines in {period} changed while the fold was written; it is folded next pass"
         )));
     }
-    let first = j
-        .window
-        .iter()
-        .position(|l| want.binary_search(&l.id).is_ok())
-        .expect("the period holds lines of the window");
-    let (moved, kept): (Vec<Line>, Vec<Line>) = std::mem::take(&mut j.window)
+    let (moved, kept): (Vec<Line>, Vec<Line>) = mem::take(&mut j.window)
         .into_iter()
         .partition(|l| want.binary_search(&l.id).is_ok());
     let at = moved.iter().map(|l| l.at).max().expect("not empty");
     let held = j.archives.entry(period).or_default();
     held.extend(moved);
-    held.sort_by_key(|l| l.at);
+    in_order(held);
     j.window = kept;
     let fold = Line {
         id: mint_keeping(j, keep, at, Writer::Zend, &text),
@@ -99,13 +96,14 @@ pub fn fold_period(
         kind: Kind::Fold,
         by: Writer::Zend,
         person: None,
-        client: None,
+        channel: None,
         folds: Some(Folds::Period(period)),
         proposed: false,
         text,
     };
     let id = fold.id.clone();
-    j.window.insert(first.min(j.window.len()), fold);
+    j.window.push(fold);
+    in_order(&mut j.window);
     Ok(Applied {
         line: Some(id),
         ..Applied::touching(format!("Fold {period} of {path}"), vec![path.clone()])
@@ -169,7 +167,14 @@ mod tests {
         assert_eq!(j.archives[&plan.period].len(), 24);
         assert_eq!(j.window[1].text, "n24");
         let files = own_files(&path, j);
-        assert!(files.contains_key("persons/john/archive/2026-10-01.yaml"));
+        let archived = files
+            .keys()
+            .filter(|f| f.starts_with("persons/john/archive/2026-10-01/"))
+            .count();
+        assert_eq!(
+            archived, 24,
+            "a file per folded line, in its period's folder"
+        );
         // Every folded line is still found, by id, in its archive.
         assert!(plan.ids.iter().all(|id| j.has_id(id)));
     }
@@ -262,7 +267,7 @@ mod tests {
         let j = t.get(&path).unwrap().clone();
         let ids: Vec<LineId> = j.window[..2].iter().map(|l| l.id.clone()).collect();
         let mut renamed = j.clone();
-        renamed.window[0].id = LineId::parse("20261001-0000-ffff").unwrap();
+        renamed.window[0].id = LineId::parse("2026-10-01-0000-ffff").unwrap();
         let renamed_ids = vec![renamed.window[0].id.clone(), ids[1].clone()];
         assert_eq!(lines_over(&j, &ids), lines_over(&renamed, &renamed_ids));
         let mut edited = j.clone();

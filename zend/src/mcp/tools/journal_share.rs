@@ -21,7 +21,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "The user's own journal, such as `~/clients/grok/2026-10-30-2105`."},
+                "journal": {"type": "string", "description": "The user's own journal, such as `~/channels/grok/2026-10-30-2105`."},
                 "into": {"type": "string", "description": "Where it goes: `topics` by default, `projects`, `@<group>/topics`, or a journal below one."},
                 "name": {"type": "string", "description": "Its name there, when not its own."}
             },

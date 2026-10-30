@@ -69,10 +69,10 @@ fn append(
         kind,
         by,
         person: actor.person().cloned(),
-        client: match actor {
-            // The server writes for the client it serves; a client writing
+        channel: match actor {
+            // The server writes for the channel it serves; a channel writing
             // for itself is already its writer.
-            Actor::Server { client, .. } => Some(*client),
+            Actor::Server { channel, .. } => Some(*channel),
             _ => None,
         },
         folds: None,
@@ -82,9 +82,11 @@ fn append(
     line.check().map_err(Error::Invalid)?;
     let id = line.id.clone();
     // A window runs oldest to newest, so its tail is what is newest: a line
-    // recorded as made in the past takes its place in time, after any line
-    // of the same moment.
-    let at = j.window.partition_point(|l| l.at <= line.at);
+    // recorded as made in the past takes its place in time — by time, then
+    // id within a second, as a journal's files are read back.
+    let at = j
+        .window
+        .partition_point(|l| (l.at, &l.id) < (line.at, &line.id));
     j.window.insert(at, line);
     let what = match (kind, proposed) {
         (Kind::Note, true) => "Proposal on",
@@ -104,7 +106,7 @@ mod tests {
     use crate::line::Writer;
     use crate::ops::fixture::{john, now, p, sharratt, yen};
     use crate::ops::{apply, Op};
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::slug;
 
     #[test]
@@ -125,20 +127,20 @@ mod tests {
         assert_eq!(a.touched, vec![path.clone()]);
         let line = &t.get(&path).unwrap().window[0];
         assert_eq!(line.text, "The builder starts Monday.");
-        assert_eq!(line.by, Writer::Client(Client::Grok));
+        assert_eq!(line.by, Writer::Channel(Channel::Grok));
         assert_eq!(line.person, Some(slug("yen")));
-        assert_eq!(line.client, None);
+        assert_eq!(line.channel, None);
         assert_eq!(line.at, now());
         assert_eq!(Some(&line.id), a.line.as_ref());
     }
 
     #[test]
-    fn the_server_names_the_client_it_wrote_for() {
+    fn the_server_names_the_channel_it_wrote_for() {
         let mut t = sharratt();
-        let path = p("~/clients/grok");
+        let path = p("~/channels/grok");
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         apply(
             &mut t,
@@ -152,8 +154,8 @@ mod tests {
         .unwrap();
         let line = &t.get(&path).unwrap().window[0];
         assert_eq!(
-            (line.kind, line.by, line.client),
-            (Kind::Episode, Writer::Server, Some(Client::Grok))
+            (line.kind, line.by, line.channel),
+            (Kind::Episode, Writer::Server, Some(Channel::Grok))
         );
     }
 

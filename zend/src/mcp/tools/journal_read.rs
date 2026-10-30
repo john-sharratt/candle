@@ -33,7 +33,7 @@ pub fn definition() -> Value {
         "description": "Read a journal. The memory's: `~` is the user's own — who they are, and an index of \
             their conversations and the people in their life; `@<group>` one of their groups' — their \
             family's, a team's, a game world's: projects, topics, threads and bots every member shares; any \
-            journal below either by path, such as `~/clients/grok` or `@sharratt/topics/house-build`. Each opens with its summary, its sub-journals \
+            journal below either by path, such as `~/channels/grok` or `@sharratt/topics/house-build`. Each opens with its summary, its sub-journals \
             and its newest lines; `<path>#<line id>` reads one line. Read the memory when the user asks what \
             you remember. Zen's: `\"self\"` or `T:<thread>` for a thread (every task started on it, how each \
             ended, and the notes on it); `T:<thread>/<name>` for a worker (the entries it wrote about its \

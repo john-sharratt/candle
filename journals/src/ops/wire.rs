@@ -16,7 +16,7 @@ use crate::line::LineId;
 use crate::ops::{OnTaken, Op, Which};
 use crate::path::{Address, JournalPath, Owner};
 use crate::period::Period;
-use crate::scope::Client;
+use crate::scope::Channel;
 use crate::slug::Slug;
 
 pub fn path_to_wire(p: &JournalPath) -> String {
@@ -42,13 +42,13 @@ pub fn actor_to_wire(a: &Actor) -> Value {
     match a {
         Actor::Person {
             person,
-            client,
+            channel,
             admin,
         } => {
-            json!({"kind": "person", "person": person.as_str(), "client": client.name(), "admin": admin})
+            json!({"kind": "person", "person": person.as_str(), "channel": channel.name(), "admin": admin})
         }
-        Actor::Server { person, client } => {
-            json!({"kind": "server", "person": person.as_str(), "client": client.name()})
+        Actor::Server { person, channel } => {
+            json!({"kind": "server", "person": person.as_str(), "channel": channel.name()})
         }
         Actor::Zend => json!({"kind": "zend"}),
         Actor::Worker { person } => json!({"kind": "worker", "person": person.as_str()}),
@@ -114,9 +114,9 @@ impl<'a> Obj<'a> {
         LineId::parse(self.str(k)?).map_err(Error::Invalid)
     }
 
-    fn client(&self) -> Result<Client> {
-        let c = self.str("client")?;
-        Client::parse(c).ok_or_else(|| Error::invalid(format!("`{c}` is not a client")))
+    fn channel(&self) -> Result<Channel> {
+        let c = self.str("channel")?;
+        Channel::parse(c).ok_or_else(|| Error::invalid(format!("`{c}` is not a channel")))
     }
 }
 
@@ -125,12 +125,12 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
     Ok(match o.str("kind")? {
         "person" => Actor::Person {
             person: o.slug("person")?,
-            client: o.client()?,
+            channel: o.channel()?,
             admin: o.bool("admin")?,
         },
         "server" => Actor::Server {
             person: o.slug("person")?,
-            client: o.client()?,
+            channel: o.channel()?,
         },
         "zend" => Actor::Zend,
         "worker" => Actor::Worker {
@@ -210,6 +210,9 @@ pub fn op_to_wire(op: &Op) -> Value {
         }
         Op::CreateGroup { group, name, kind } => {
             json!({"op": "create_group", "group": group.as_str(), "name": name, "kind": kind.name()})
+        }
+        Op::DescribeGroup { group, about } => {
+            json!({"op": "describe_group", "group": group.as_str(), "about": about})
         }
         Op::AddMember {
             group,
@@ -352,6 +355,10 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             name: o.str("name")?.into(),
             kind: Kind::parse(o.str("kind")?).map_err(Error::Invalid)?,
         },
+        "describe_group" => Op::DescribeGroup {
+            group: o.slug("group")?,
+            about: o.str("about")?.into(),
+        },
         "add_member" => Op::AddMember {
             group: o.slug("group")?,
             person: o.slug("person")?,
@@ -407,14 +414,14 @@ mod tests {
 
     #[test]
     fn every_operation_round_trips() {
-        let id = LineId::parse("20261030-0912-7e3a").unwrap();
+        let id = LineId::parse("2026-10-30-0912-7e3a").unwrap();
         let ops = vec![
             Op::Note {
                 path: p("~"),
                 text: "a \"quoted\"\nline".into(),
             },
             Op::Episode {
-                path: p("~/clients/grok"),
+                path: p("~/channels/grok"),
                 text: "x".into(),
             },
             Op::Edit {
@@ -445,7 +452,7 @@ mod tests {
                 on_taken: OnTaken::Refuse,
             },
             Op::Create {
-                under: p("~/clients/grok"),
+                under: p("~/channels/grok"),
                 name: slug("c.2"),
                 cue: "c".into(),
                 on_taken: OnTaken::Number,
@@ -468,7 +475,7 @@ mod tests {
                 over: Fingerprint::of_bytes(b"x"),
                 sentences: vec![Sentence {
                     text: "S.".into(),
-                    cites: vec![Cite::Line(id.clone()), Cite::Child(slug("clients"))],
+                    cites: vec![Cite::Line(id.clone()), Cite::Child(slug("channels"))],
                 }],
                 digest: Some("d".into()),
                 cue: None,
@@ -495,6 +502,10 @@ mod tests {
                 group: slug("battle-cities"),
                 name: "Battle Cities".into(),
                 kind: Kind::World,
+            },
+            Op::DescribeGroup {
+                group: slug("battle-cities"),
+                about: "The game's world.".into(),
             },
             Op::AddMember {
                 group: slug("sharratt"),
@@ -543,17 +554,17 @@ mod tests {
         for a in [
             Actor::Person {
                 person: slug("yen"),
-                client: Client::Grok,
+                channel: Channel::Grok,
                 admin: false,
             },
             Actor::Person {
                 person: slug("john"),
-                client: Client::ClaudeCode,
+                channel: Channel::ClaudeCode,
                 admin: true,
             },
             Actor::Server {
                 person: slug("john"),
-                client: Client::ClaudeCode,
+                channel: Channel::ClaudeCode,
             },
             Actor::Zend,
             Actor::Worker {
@@ -588,11 +599,11 @@ mod tests {
             assert!(op_from_wire(&bad).is_err(), "{bad}");
         }
         assert!(actor_from_wire(
-            &json!({"kind": "person", "person": "john", "client": "tesla", "admin": false})
+            &json!({"kind": "person", "person": "john", "channel": "tesla", "admin": false})
         )
         .is_err());
         assert_eq!(
-            actor_from_wire(&json!({"kind": "person", "person": "john", "client": "grok"}))
+            actor_from_wire(&json!({"kind": "person", "person": "john", "channel": "grok"}))
                 .unwrap_err()
                 .to_string(),
             "`admin` is missing or not true or false"

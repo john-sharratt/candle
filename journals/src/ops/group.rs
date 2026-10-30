@@ -75,7 +75,8 @@ fn join(file: &mut PersonFile, group: &Slug) -> Result<()> {
     Ok(())
 }
 
-/// A new group, `creator` its first owner.
+/// A new group, `creator` its first owner. What it is for is said after,
+/// [`describe_group`].
 pub fn create_group(
     tree: &mut Tree,
     creator: &Slug,
@@ -94,6 +95,7 @@ pub fn create_group(
         group: group.clone(),
         name: name.to_string(),
         kind,
+        about: None,
         members: vec![Member {
             who: Who::Person(creator.clone()),
             role: Role::Owner,
@@ -242,6 +244,27 @@ pub fn add_member(
     Ok(Applied {
         subject,
         owners: vec![Owner::Group(group.clone()), Owner::Person(person.clone())],
+        ..Applied::default()
+    })
+}
+
+/// `group`'s `about`: what it is for, as its README and its frames say.
+pub fn describe_group(tree: &mut Tree, group: &Slug, about: &str) -> Result<Applied> {
+    let g = group_file(tree, group)?;
+    let about = about.trim();
+    if about.is_empty() {
+        return Err(Error::invalid(
+            "say what the group is for: `about` is empty",
+        ));
+    }
+    if g.about.as_deref() == Some(about) {
+        return Err(Error::refused(format!("@{group} says so already")));
+    }
+    g.about = Some(about.to_string());
+    g.check().map_err(Error::Invalid)?;
+    Ok(Applied {
+        subject: format!("Describe @{group}"),
+        owners: vec![Owner::Group(group.clone())],
         ..Applied::default()
     })
 }

@@ -124,7 +124,7 @@ mod tests {
     fn no_such_line_and_folds_are_refused() {
         let mut t = sharratt();
         let path = p("~");
-        let id = LineId::parse("20261030-0912-7e3a").unwrap();
+        let id = LineId::parse("2026-10-30-0912-7e3a").unwrap();
         assert!(matches!(
             apply(
                 &mut t,

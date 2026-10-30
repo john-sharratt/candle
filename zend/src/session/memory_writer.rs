@@ -338,11 +338,11 @@ impl Writer {
             Job::Close {
                 path,
                 person,
-                client,
+                channel,
             } if tree.get(path).is_some_and(|j| gone_quiet(j, Stamp::now())) => Outcome::Write(
                 Actor::Server {
                     person: person.clone(),
-                    client: *client,
+                    channel: *channel,
                 },
                 Op::Close { path: path.clone() },
             ),
@@ -518,7 +518,7 @@ mod tests {
     use journals::error::{Error, Problem};
     use journals::ops::apply;
     use journals::path::{JournalPath, Owner};
-    use journals::scope::Client;
+    use journals::scope::Channel;
     use journals::slug::Slug;
     use journals::store::StoreError;
     use journals::tree::load::load;
@@ -540,7 +540,7 @@ mod tests {
             &mut tree,
             &Actor::Person {
                 person: john,
-                client: Client::Grok,
+                channel: Channel::Grok,
                 admin: false,
             },
             &Op::Note {

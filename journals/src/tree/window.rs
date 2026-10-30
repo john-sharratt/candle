@@ -3,7 +3,7 @@
 //! A window over [`WINDOW`] lines folds its oldest lines by period. For the
 //! oldest line, the lowest level above its own whose period has closed and
 //! holds at least two of the window's lines below that level is the period
-//! to fold: those lines move to `archive/<period>.yaml` and one `fold` line
+//! to fold: those lines' files move to `archive/<period>/` and one `fold` line
 //! takes their place. A day of one lone note does not fold on its own; it
 //! waits for its week, so every fold shortens the window. If the oldest line
 //! has nothing to fold with, the next oldest is tried.

@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::error::Problem;
 use crate::slug::Slug;
-use crate::yaml::{item_line, parse_doc, quote, scalar, scalar_list, Fields};
+use crate::yaml::{item_line, parse_doc, scalar, scalar_list, text_field, Fields};
 
 /// The most groups a person may belong to, as many as a journal has live
 /// children, so `~`'s index of them stays whole (§3.5).
@@ -186,23 +186,16 @@ impl PersonFile {
     }
 
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "person: {}\nname: {}\n",
-            scalar(self.person.as_str()),
-            quote(&self.name)
-        );
+        let mut out = format!("person: {}\n", scalar(self.person.as_str()));
+        out.push_str(&text_field("", "name", &self.name));
         if self.accounts.is_empty() {
             out.push_str("accounts: []\n");
         } else {
             out.push_str("accounts:\n");
             for a in &self.accounts {
-                match &a.key {
-                    Some(k) => out.push_str(&format!(
-                        "  - {{email: {}, key: {}}}\n",
-                        quote(a.email.as_str()),
-                        scalar(k.as_str())
-                    )),
-                    None => out.push_str(&format!("  - {{email: {}}}\n", quote(a.email.as_str()))),
+                out.push_str(&format!("  - email: {}\n", scalar(a.email.as_str())));
+                if let Some(k) = &a.key {
+                    out.push_str(&format!("    key: {}\n", scalar(k.as_str())));
                 }
             }
         }
@@ -286,9 +279,10 @@ mod tests {
         let p = yen();
         assert_eq!(
             p.render(),
-            "person: yen\nname: \"Yen\"\naccounts:\n\
-             \x20 - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n\
-             \x20 - {email: \"yen.other@example.net\"}\n\
+            "person: yen\nname: Yen\naccounts:\n\
+             \x20 - email: yen@example.com\n\
+             \x20   key: 3b1f09c2d47e8a60\n\
+             \x20 - email: yen.other@example.net\n\
              groups: [sharratt]\ndefault_group: sharratt\n"
         );
         assert_eq!(
@@ -306,9 +300,10 @@ mod tests {
         p.framed = vec![slug("work")];
         assert_eq!(
             p.render(),
-            "person: yen\nname: \"Yen\"\naccounts:\n\
-             \x20 - {email: \"yen@example.com\", key: 3b1f09c2d47e8a60}\n\
-             \x20 - {email: \"yen.other@example.net\"}\n\
+            "person: yen\nname: Yen\naccounts:\n\
+             \x20 - email: yen@example.com\n\
+             \x20   key: 3b1f09c2d47e8a60\n\
+             \x20 - email: yen.other@example.net\n\
              groups: [sharratt, battle-cities, work]\ndefault_group: sharratt\nframed: [work]\n"
         );
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
@@ -327,7 +322,7 @@ mod tests {
         };
         assert_eq!(
             p.render(),
-            "person: solo\nname: \"Solo\"\naccounts: []\ngroups: []\n"
+            "person: solo\nname: Solo\naccounts: []\ngroups: []\n"
         );
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
         assert!(p.framed_groups().is_empty());
@@ -423,11 +418,11 @@ mod tests {
                 "groups: [sharratt, a, b, c]\ndefault_group: sharratt\nframed: [a, b, c]\n",
                 "4 groups framed with the default: at most 3 open every conversation",
             ),
-            ("name: \"Yen\"", "name: \"  \"", "`name` is empty"),
+            ("name: Yen", "name: \"  \"", "`name` is empty"),
             ("person: yen", "person: Yen", "not a name"),
             (
-                "{email: \"yen.other@example.net\"}",
-                "{email: \"yen.other@example.net\", phone: 1}",
+                "  - email: yen.other@example.net\n",
+                "  - email: yen.other@example.net\n    phone: 1\n",
                 "`phone` is not a field",
             ),
             ("groups:", "colour: red\ngroups:", "`colour` is not a field"),

@@ -114,26 +114,22 @@ mod tests {
         assert_eq!(lines[1], "~. 4 lines, 2 sub-journals; no summary yet");
         assert_eq!(lines[2], "No summary yet.");
         assert_eq!(lines[3], "Sub-journals:");
-        assert!(
-            lines[4].starts_with("  - ~/clients — open for each client"),
-            "{}",
-            lines[4]
-        );
-        assert!(lines[5].starts_with("  - ~/people — "));
-        assert_eq!(lines[6], "Groups:");
+        // Nothing is written under either section yet: named, not listed.
+        assert_eq!(lines[4], "  - channels, people: nothing written yet");
+        assert_eq!(lines[5], "Groups:");
         assert_eq!(
-            lines[7],
+            lines[6],
             "  - @sharratt — Sharratt, a family; their default, in every conversation"
         );
-        assert_eq!(lines[8], "Lines (the newest 2 of 3):");
+        assert_eq!(lines[7], "Lines (the newest 2 of 3):");
         assert!(
-            lines[9].ends_with("note, john via claude-code: Note 1."),
+            lines[8].ends_with("note, john via claude-code: Note 1."),
             "{}",
-            lines[9]
+            lines[8]
         );
-        assert!(lines[10].ends_with("Note 2."));
-        assert_eq!(lines[11], "1 older line folded into 2026-09-01 — grep finds them, and each fold line above says what they held.");
-        assert_eq!(lines.len(), 12);
+        assert!(lines[9].ends_with("Note 2."));
+        assert_eq!(lines[10], "1 older line folded into 2026-09-01 — grep finds them, and each fold line above says what they held.");
+        assert_eq!(lines.len(), 11);
     }
 
     /// **Every group is listed under `~`**, those that open no conversation

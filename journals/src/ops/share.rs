@@ -89,7 +89,7 @@ mod tests {
     use crate::actor::Actor;
     use crate::ops::fixture::{john, now, p, sharratt};
     use crate::ops::{apply, Op};
-    use crate::scope::Client;
+    use crate::scope::Channel;
     use crate::testing::slug;
     use crate::tree::load::load;
     use crate::tree::render::render_all;
@@ -99,13 +99,13 @@ mod tests {
         let mut t = sharratt();
         let server = Actor::Server {
             person: slug("john"),
-            client: Client::Grok,
+            channel: Channel::Grok,
         };
         let conv = apply(
             &mut t,
             &server,
             &Op::Create {
-                under: p("~/clients/grok"),
+                under: p("~/channels/grok"),
                 name: slug("2026-10-30-2105"),
                 cue: "a drive to the coast".into(),
                 on_taken: OnTaken::Number,
@@ -140,7 +140,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             a.subject,
-            "Share ~/clients/grok/2026-10-30-2105 as @sharratt/topics/trip-plans"
+            "Share ~/channels/grok/2026-10-30-2105 as @sharratt/topics/trip-plans"
         );
         let shared = t.get(&p("topics/trip-plans")).unwrap();
         assert_eq!(shared.window[0].id, id, "lines keep their ids");

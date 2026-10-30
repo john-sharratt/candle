@@ -128,11 +128,12 @@ impl Stamp {
         .ok_or_else(bad)
     }
 
-    /// `yyyymmdd-hhmm`: the minute, as a line's id starts.
-    pub fn compact_minute(self) -> String {
+    /// `yyyy-mm-dd-hhmm`: the minute, as a line's id and a dated journal's
+    /// name start — so either sorts by name in the order it was made.
+    pub fn dated_minute(self) -> String {
         let c = self.civil();
         format!(
-            "{:04}{:02}{:02}-{:02}{:02}",
+            "{:04}-{:02}-{:02}-{:02}{:02}",
             c.year, c.month, c.day, c.hour, c.minute
         )
     }
@@ -174,7 +175,7 @@ mod tests {
         let s = Stamp::parse("2026-10-30T09:10:02Z").unwrap();
         assert_eq!(s.secs(), 1_793_351_402);
         assert_eq!(s.to_string(), "2026-10-30T09:10:02Z");
-        assert_eq!(s.compact_minute(), "20261030-0910");
+        assert_eq!(s.dated_minute(), "2026-10-30-0910");
         assert_eq!(Stamp::from_secs(0).to_string(), "1970-01-01T00:00:00Z");
         assert_eq!(Stamp::from_ms(1_999), Stamp::from_secs(1));
     }

@@ -121,6 +121,11 @@ pub enum Op {
         name: String,
         kind: Kind,
     },
+    /// What a group is for: its `about`, an owner's to write.
+    DescribeGroup {
+        group: Slug,
+        about: String,
+    },
     AddMember {
         group: Slug,
         person: Slug,
@@ -268,6 +273,7 @@ fn run(
                 .ok_or_else(|| Error::forbidden("only a person makes a group"))?;
             group::create_group(tree, creator, group, name, *kind, now)
         }
+        Op::DescribeGroup { group, about } => group::describe_group(tree, group, about),
         Op::AddMember {
             group,
             person,
