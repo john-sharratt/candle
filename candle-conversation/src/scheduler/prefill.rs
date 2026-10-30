@@ -562,11 +562,14 @@ impl Scheduler {
         // relief next runs: a gallery nothing scans holds its ground until one
         // of those comes, and on WhiteWorld (9940d0ffc, 2026-10-19) 4 GB of it
         // stood minutes past its keep time while heavy-decode's opening prompts
-        // were refused at the floor. Once a second: the pass walks every
-        // resident turn under the residency lock scans take.
+        // were refused at the floor. Every five seconds: the pass walks every
+        // resident turn under the residency lock scans take — ~109k of them on
+        // a member after its preload, where once a second put the walk among
+        // the wave thread's larger costs (WhiteWorld, 2026-10-30) — and a turn
+        // past a keep time of minutes loses nothing by going seconds later.
         if self
             .gallery_evicted_at
-            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(5))
         {
             self.gallery_evicted_at = Some(now);
             arena.evict_past_keep();

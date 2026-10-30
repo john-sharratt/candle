@@ -21,7 +21,15 @@ use crate::provenance::gallery_arena::{Holder, ResidentRun};
 /// due: a burst of freed slots (a code_read scope's forks churn by the dozen)
 /// is one walk of the residency map, not one per slot, and a wave that changes
 /// nothing costs one clock read.
-pub const SWEEP_EVERY: Duration = Duration::from_secs(2);
+///
+/// **Ten seconds, because the walk is the whole residency map on the wave
+/// thread.** A slot is freed nearly every few seconds on a member serving
+/// characters and conversations, so the sweep is owed almost always and runs at
+/// this cadence; at two seconds, over the ~109k turns a member holds after its
+/// preload, the gallery's share of the wave thread was ~4.9 s a minute on
+/// WhiteWorld (2026-10-30) with the device waiting. A dead turn's ground waits
+/// at most this long to go, against keep times of minutes.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(10);
 
 /// Why a resident turn goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
