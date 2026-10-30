@@ -18,26 +18,26 @@ and write, so that a conversation begun anywhere already knows the person, what
 they and their family are working on, what was done for them and what is still
 open.
 
-It is a **tree of journals**, kept as **YAML files in git repositories**: a
+It is a **tree of journals**, kept as **YAML files in one git repository**: a
 folder per journal, a commit per change. Most of it is **shared within a
 family** — projects, topics, Zen threads, bots — and a small fixed part is
 **personal**: the person's own profile, their conversations, and their notes
-about other people. Each person has a personal repository and each family a
-shared one; a person's tree is their personal root with each of their families
-mounted under it.
+about other people. Each person has a folder and each family a folder; a
+person's tree is their personal root with each of their families mounted under
+it.
 
 The top levels are fixed in code; below them the tree grows by name, at most
 ten live sub-journals to a journal. Every journal has a capped summary, rebuilt
 in the background when it is dirty, and a window of recent lines over
 everything older, folded. Any AI reads from where it stands up to the root,
 opens any journal's children from it, and greps any subtree it may read. It is
-served by the build agents that hold the repositories, through the gateway and
+served by the build agents that hold the repository, through the gateway and
 the connector.
 
 ## 2. The hierarchy
 
 ```
-~                                    the person (personal repository)       fixed
+~                                    the person (persons/<person>/)         fixed
 ├── clients                          personal section                       fixed
 │   ├── grok                         one per Client                         fixed (mcp_server::Client)
 │   │   ├── 2026-10-30-2105          conversations                          named, windowed to 10
@@ -46,7 +46,7 @@ the connector.
 │   └── other
 ├── people                           personal section
 │   └── builder
-└── @sharratt                        a family (family repository)           mounted
+└── @sharratt                        a family (families/<family>/)          mounted
     ├── projects                     shared section                         fixed
     │   └── candle                   named, ≤ 10 children each
     │       ├── scheduler
@@ -70,9 +70,9 @@ the connector.
 /// Where a section's journals live, and so who reads them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Scope {
-    /// The person's own repository: read by their AIs alone.
+    /// The person's own folder: read by their AIs alone.
     Personal,
-    /// A family's repository: read by every member's AIs.
+    /// A family's folder: read by every member's AIs.
     Family,
 }
 
@@ -152,41 +152,44 @@ writing fill a shared journal sooner; the rules are the same.
 
 ## 3. Files
 
-### 3.1 The repositories
+### 3.1 The repository
 
-Two kinds of private GitHub repository, one per person and one per family:
+One private GitHub repository, `john-sharratt/journals`, holds every person and
+every family, each in its own folder:
 
 ```
-journal-person-<person>/                 a person's own (§3.4)
-  .gitattributes                         lines.yaml and archive/*.yaml: merge=union
-  person.yaml                            who they are: accounts, families
-  journal.yaml  lines.yaml               ~ : metadata, summary; its window
-  archive/2026-10.yaml                   its folded periods (§4)
-  clients/
-    journal.yaml  lines.yaml
-    grok/
+journals/
+  .gitattributes                         `lines.yaml` and `**/archive/*.yaml`: merge=union
+  persons/<person>/                      a person's own (§3.4)
+    person.yaml                          who they are: accounts, families
+    journal.yaml  lines.yaml             ~ : metadata, summary; its window
+    archive/2026-10.yaml                 its folded periods (§4)
+    clients/
       journal.yaml  lines.yaml
-      2026-10-30-2105/journal.yaml  lines.yaml
-  people/builder/…
-
-journal-family-<family>/                 a family's (§3.5)
-  .gitattributes
-  family.yaml                            its members and their roles
-  journal.yaml  lines.yaml               the family root
-  projects/candle/…
-  threads/user-context/implement-memory/…
-  topics/house-build/permits/…
-  bots/c3f1a07e/…
+      grok/
+        journal.yaml  lines.yaml
+        2026-10-30-2105/journal.yaml  lines.yaml
+    people/builder/…
+  families/<family>/                     a family's (§3.5)
+    family.yaml                          its members and their roles
+    journal.yaml  lines.yaml             the family root
+    projects/candle/…
+    threads/user-context/implement-memory/…
+    topics/house-build/permits/…
+    bots/c3f1a07e/…
 ```
 
 A journal is its folder; its children are its subfolders. Moving or renaming a
-journal within a repository is `git mv`.
+journal is `git mv`. Anything at the top of the repository but
+`.gitattributes`, `README.md`, `persons/` and `families/`, or a folder
+under `persons/` without a `person.yaml` (or under `families/` without a
+`family.yaml`), is an error (§3.3).
 
-**The repository is the privacy boundary.** With history kept forever (§8), a
-line once in a repository stays in it; access to a git repository is all of it
-or none. So personal and shared journals never share a repository: an agent
-holding a family's repository holds nothing personal, and a line shared by
-mistake was copied, never moved out of a history the family can read.
+**The service is the privacy boundary.** Every agent holding the repository
+holds everyone's folders (the operator's decision, 2026-10-30: one repository,
+separated by folder). Who reads what is the journal service's rule (§7.2): a
+caller's AIs read their own person's folder and their families' folders, and
+nothing else is ever put in front of them.
 
 ### 3.2 `journal.yaml` and `lines.yaml`
 
@@ -195,22 +198,32 @@ A journal is two files, because they merge differently:
 ```yaml
 # journal.yaml — metadata and summary: ordinary merge
 name: candle
-cue: open for the inference engine, its releases and cluster
+cue: "open for the inference engine, its releases and cluster"
 created: 2026-10-30T09:10:02Z
 folded: false
 summary:
-  built_from: 3f9c2a1                    # the commit it was built from (§5.3)
+  over: 5d41402abc4b2a76                 # the fingerprint of what it was built over (§5.3)
   built: 2026-10-30T11:02:40Z
+  lines: 12                              # window lines and live children it read
+  children: 2
   sentences:
-    - {text: "Releases go through keep trials on BlackWorld, then roll out.", cites: ["#20261029-0410-a3"]}
-    - {text: "The connector now remembers its user.", cites: ["threads/user-context"]}
+    - {text: "Releases go through keep trials on BlackWorld, then roll out.", cites: ["#20261029-0410-a3b4"]}
+    - {text: "The connector now remembers its user.", cites: ["cluster"]}
 ```
 
 ```yaml
 # lines.yaml — the window: union merge
-- {id: 20261030-0910-4b, at: 2026-10-30T09:10:02Z, kind: episode, by: server, person: john, client: claude-code, text: "repo_task_start — implement-user-context"}
-- {id: 20261030-0912-7e, at: 2026-10-30T09:12:40Z, kind: note, by: claude-code, person: john, text: "Workers push branches; merging is the user's decision."}
+- {id: 20261030-0910-4b1c, at: 2026-10-30T09:10:02Z, kind: episode, by: server, person: john, client: claude-code, text: "repo_task_start — implement-user-context"}
+- {id: 20261030-0912-7e3a, at: 2026-10-30T09:12:40Z, kind: note, by: claude-code, person: john, text: "Workers push branches; merging is the user's decision."}
 ```
+
+A cite is `#<line id>` — a line of the journal's window or archives — or a
+live child's name. Free text is always double-quoted. Names, times, ids, keys
+and fingerprints are plain — unless YAML would read the plain form as
+something else (`true`, `null`, `1e3`, `0x1f`), when they are quoted too; a
+number where text belongs is an error, never read as digits. A fold line
+carries `period: "2026-10-29"` or `journal: <child>`, and a worker's
+unaccepted note `proposed: true`.
 
 - **`journal.yaml` merges as git always does**: two agents rebuilding one
   summary at once conflict, and the push of the second is refused (§5.3).
@@ -218,12 +231,17 @@ summary:
 - **`lines.yaml` is one line per entry**, each a flow-style mapping on one text
   line, with `merge=union`: two writers appending to one journal at once merge
   without conflict, git keeping both added lines. This is why entries are never
-  multi-line YAML. Two writers editing the *same* line at once is the one case
-  union cannot resolve: both versions are kept, the duplicate `id` is an error
-  (§3.3), and the next edit settles it.
-- **`id`** is `<yyyymmdd-hhmm>-<hash>`, the hash of the line's time, writer and
-  text: stable, unique, and the address a line is cited and grepped by
-  (`@sharratt/projects/candle#20261030-0912-7e`). Positions are never addresses.
+  multi-line YAML. Two branches editing the *same* line is the one case union
+  cannot resolve: both versions are kept, and the duplicate `id` is an error
+  (§3.3) naming the line — the journal reads as unreadable until a commit
+  keeps one. The service never meets it: its own concurrent writes are
+  replayed as operations, not merged (§6.3), so it comes only from branches
+  merged by hand.
+- **`id`** is `<yyyymmdd-hhmm>-<4 hex>`, the hash of the line's time, writer,
+  text and a salt raised until it is free in its journal: stable, unique, and
+  the address a line is cited and grepped by
+  (`@sharratt/projects/candle#20261030-0912-7e3a`). Positions are never
+  addresses.
 - **`kind`** is one of three, set by who writes:
   - `note` — a model was told or chose to keep it (today's `Noted:`);
   - `episode` — the server recorded something that happened (today's `Done:`);
@@ -236,10 +254,12 @@ summary:
 
 ### 3.3 Errors
 
-A file that does not parse, a field that is wrong, a twelfth sub-journal, a
+A file that does not parse, a field that is wrong, an eleventh live
+sub-journal, a
 summary over its cap, a folder at the fixed levels that is not a section or
-client, a shared section in a personal repository or the reverse, an account
-listed by two people, a member no `person.yaml` names: each is **an error,
+client, a shared section in a person's folder or the reverse, an account
+listed by two people, a member no `person.yaml` names, a family a person lists
+that does not list them: each is **an error,
 answered as one**. `journal_open` on that journal answers the error, naming the
 file, the line and what is wrong; the frame shows the journal as unreadable;
 nothing is guessed, repaired or skipped silently. The service's own writes are
@@ -249,17 +269,16 @@ edit, a worker's commit or a bad merge, and is fixed by another commit.
 ### 3.4 The person
 
 A person is named by a slug chosen when they are added — `john`, `yen` — which
-names their repository, `journal-person-<person>`, so GitHub's own refusal of a
-second repository by that name keeps it unique. `person.yaml` lists the
-accounts that are them and the families they belong to:
+names their folder, `persons/<person>/`, and so is unique. `person.yaml` lists
+the accounts that are them and the families they belong to:
 
 ```yaml
-# person.yaml
+# persons/yen/person.yaml
 person: yen
-name: Yen
+name: "Yen"
 accounts:
-  - {email: yen@example.com,       key: 3b1f09c2d47e8a60}
-  - {email: yen.other@example.net, key: null}         # bound at its first sign-in
+  - {email: "yen@example.com", key: 3b1f09c2d47e8a60}
+  - {email: "yen.other@example.net"}                 # bound at its first sign-in
 families: [sharratt]
 default_family: sharratt
 ```
@@ -284,25 +303,26 @@ family — is a later design; this needs only the accounts each person has.
 `family.yaml` lists who is in a family, and as what:
 
 ```yaml
-# family.yaml
+# families/sharratt/family.yaml
 family: sharratt
+name: "Sharratt"
 members:
-  - {person: john,      role: owner, joined: 2026-10-30}
-  - {person: yen,       role: owner, joined: 2026-10-30}
-  - {person: thanhlong, role: member, joined: 2026-10-30}
-  - {person: yen-nhi,   role: member, joined: 2026-10-30}
+  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}
+  - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}
+  - {person: thanhlong, role: member, joined: 2026-10-30T00:00:00Z}
+  - {person: yen-nhi, role: member, joined: 2026-10-30T00:00:00Z}
 ```
 
 - **Two roles.** An owner adds and removes members, and edits or forgets any
   line in the family's journals. A member reads and writes the family's
   journals and edits or forgets their own lines (§7.2).
 - **Adding a person** is one tool call by an owner, `family_add {person, name,
-  emails, role}`: it creates `journal-person-<person>` with its `person.yaml`
-  if the person is new, and adds them to `family.yaml` — commits in both.
-  `family_remove` takes them out of `family.yaml`; their personal repository is
-  untouched, their lines in the family's journals stay, attributed to them, and
-  they read the family no longer. What they read while a member stays in the
-  history they once held.
+  emails, role}`: it creates `persons/<person>/person.yaml` if the person is
+  new, adds the family to it and them to `family.yaml` — one commit.
+  `family_remove` takes them out of both; their own folder is untouched, their
+  lines in the family's journals stay, attributed to them, and they read the
+  family no longer.
+- **At least one owner** stays: removing or demoting the last is refused.
 - **A person may belong to at most three families** — a household, a work
   team — because each one adds its summary to every conversation's first
   context (§6.4). New shared journals go to `default_family` unless the call
@@ -311,11 +331,13 @@ members:
 ### 3.6 Sharing
 
 `journal_share {path, into?}` copies a personal journal — a conversation, a
-note about a person — into a shared section of a family (`topics` by default),
-as a new journal with its lines, in one commit to the family's repository; the
-personal journal is then marked `shared: @<family>/<path>` and folded. Nothing
-moves the other way: a shared journal cannot be unshared, only forgotten from
-the family's current tree (§8), and the tool's answer says so.
+note about a person — into the family's `topics` (by default) or `projects`,
+or a journal inside either: a new journal with its lines, its archives and
+everything below it, and marks the personal one `shared: "@<family>/<path>"`
+and folds it — one commit. A journal below it shared before is copied without
+its own mark, which only a personal journal carries. Nothing moves the other
+way: a shared journal cannot be unshared, only forgotten from the family's
+current tree (§8), and the tool's answer says so.
 
 ## 4. Windowing
 
@@ -358,17 +380,19 @@ sections and then each family root.
 
 ### 5.3 Dirty flags and the background thread
 
-- **Dirty.** A journal is dirty when it has lines newer than its summary's
-  `built_from` commit, or a child's summary was rebuilt after it. The journal
-  service (§6) keeps the flags in memory, set as it applies its own writes and
-  each fetched commit, and rebuilt at start by comparing each summary's
-  `built_from` with the folder's last commit. They cost no writes.
+- **Dirty.** A summary records the **fingerprint** of what it was built over —
+  a hash of the journal's window and of each live child's name, cue and
+  summary. A journal is dirty exactly when that fingerprint, recomputed, no
+  longer matches: a line added, edited or forgotten, a child created, folded or
+  merged, or a child's summary rebuilt. The service computes it from the tree
+  in memory as it loads and after every write or fetch; flags cost no writes
+  and need no history.
 - **The thread** runs in zend, which has the model; the journal service holds
   none. zend reads the dirty set from the service, rebuilds bottom-up — a child
   before its parent, so a parent reads current children — and writes each
-  summary back through the service like any other writer. A personal journal's
-  rebuild reads only that person's repository; a family journal's reads only
-  the family's.
+  summary back through the service like any other writer, naming the
+  fingerprint it was built over. A personal journal's rebuild reads only that
+  person's folder; a family journal's reads only the family's.
 - **When.** A dirty journal is rebuilt once it has been quiet for 30 seconds or
   has 20 lines since its last build, whichever is first; at once when a
   conversation or task closes. The same thread runs the window folds (§4) and
@@ -381,61 +405,65 @@ sections and then each family root.
   `journal-core`'s `verify` makes), it is within its cap, and it did not shrink
   by more than half without folds or edits to explain it. A refused rebuild
   leaves the old summary, marked stale.
-- **One writer, without a lease.** A summary is committed to `journal.yaml`,
-  which merges as git always does: if two agents rebuilt the same journal, the
-  second's rebase conflicts, its push is refused, and it drops its rebuild —
-  after the fetch the journal is no longer dirty. `git push` is the
-  compare-and-swap the substrate lacks.
+- **One writer, without a lease.** A rebuild is applied only if the journal's
+  fingerprint is still the one it was built over; otherwise it is refused as a
+  conflict and the journal stays dirty for the next pass. Across agents, every
+  push names the commit origin must hold; a refused push fetches, replays its
+  writes on what origin holds — where a rebuild built over what is no longer
+  there is dropped — and pushes again. `git push` is the compare-and-swap the
+  substrate lacks.
 
 ## 6. The journal service
 
 ### 6.1 On the agents
 
-A build agent serves the journals when its file names repositories as journals:
+A build agent serves the journals when its file names the repository as the
+journal:
 
 ```yaml
 checkouts:
   - name: candle
     dir: D:/agent/candle
     push: true
-  - name: journal-family-sharratt
-    dir: D:/agent/journals/family-sharratt
+  - name: journals
+    dir: D:/agent/journals
     push: true
-    journal: true          # serve this checkout as memory
-  - name: journal-person-john
-    dir: D:/agent/journals/person-john
-    push: true
-    journal: true
+    journal: true          # serve this checkout as the memory
 ```
 
-`journal: true` requires `push: true`; the checkout's own `person.yaml` or
-`family.yaml` says which kind it is, so the flag carries no kind. Each agent
-holds exactly the memory its file lists: a family member's own machine may hold
-the family and themselves and no one else.
+`journal: true` requires `push: true`, and one checkout per agent may carry
+it. The checkout stays an ordinary one besides: every agent that holds it
+takes code jobs on it, so journals can be edited or refactored by a branch and
+a merge to `main` like any code, outside the tools. The service never touches
+the working tree, so a job running there and the service do not meet; what a
+job merges reaches the service at its next fetch, checked as it loads (§3.3).
 
-An agent with journal checkouts joins the gateway as the app `journal` beside
-`agent` (`docs/replicated_substrate.md` §5), advertising the people and families
-it holds, and serves the journal tools at `/v1/journal/mcp` and the memory
-route `POST /v1/journal/append` (§6.5). The gateway deals a person's call to an
-agent holding that person's repository and every family's they belong to; when
-none does, the call is answered as an error naming what is missing.
+An agent with it joins the gateway as the app `journal` beside `agent`
+(`docs/replicated_substrate.md` §5), and serves the journal tools at
+`/v1/journal/mcp` and the memory route `POST /v1/journal/append` (§6.5). Any
+machine running such an agent serves the memory; the gateway deals calls among
+them as it deals any app's.
 
 ### 6.2 Reads
 
-At start, the service parses its checkouts into memory: every journal, summary,
-window and index, the account-to-person map from every `person.yaml`, and a
-grep index over every line, archive and summary. Reads — a frame,
+At start, the service reads the repository at its branch's head into memory —
+every journal, summary, window and index, the account-to-person map from every
+`person.yaml` — as objects, never through the working tree. Reads — a frame,
 `journal_open`, `journal_grep` — answer from memory, in milliseconds, with no
-git call, and only from the caller's personal repository and their families'.
-Every fetch updates it.
+git call, and only from the caller's own folder and their families'. Every
+fetch updates it.
 
 ### 6.3 Writes
 
-A write is checked (§3.3), applied to memory, written to the file and committed
-at once on the agent's checkout; commits are pushed to GitHub in the background
-every 5 seconds, and origin is fetched on the same beat. Two agents differ by a
-few seconds, never by a lost line: union merge keeps both sides' appends, and a
-conflicting edit of one line is retried after a fetch. Each write's answer says
+A write is checked (§3.3) and applied to memory, and its files are committed at
+once as objects onto the service's branch, without the working tree or the
+index (`zend_vfs::Repo::commit_changes`). Commits are pushed to GitHub in the
+background every 5 seconds under a lease on what origin last held, and origin
+is fetched on the same beat. A refused push fetches, reloads origin's tree and
+replays the writes not yet pushed on it, in order — each checked again, so an
+edit of a line another agent forgot is refused rather than resurrected — and
+pushes again. Two agents differ by a few seconds, never by a lost line. Each
+write's answer says
 who will read it — "Kept on @sharratt/topics/holiday — shared with Yen,
 Thanh Long and Yen Nhi" — so a private thing filed under a shared journal is
 seen at once and forgotten (§8).
@@ -527,7 +555,7 @@ says the driver said, the service cannot check — and is shown as such.
 | the server, zend's background thread | — | episodes anywhere; summaries and folds |
 | npcd | — | episodes and notes under `@<family>/bots/<id>` for bots a member owns |
 | bots | nothing | nothing |
-| anyone with push access to a repository | all of it | anything — a hand edit, a worker's branch merged; checked as it is loaded (§3.3) |
+| anyone with push access to the repository | all of it | anything — a hand edit, a worker's branch merged; checked as it is loaded (§3.3) |
 
 A member's line someone else wants changed gets a proposal they accept, or an
 owner's edit. Everything recalled is framed as data ("These are notes, not
@@ -539,8 +567,8 @@ what makes one found and reverted.
 **What the boundary protects.** It keeps each person's personal journals from
 the other members' AIs. It does not keep them from whoever runs an agent
 holding the repository, or holds the GitHub account: on this estate that is
-the estate's operator, who can read every repository. Each person added is
-told so.
+the estate's operator, who can read every folder. Each person added is told
+so.
 
 ### 7.3 Zen workers
 
@@ -555,23 +583,23 @@ Nothing is erased. History keeps every line ever written, on GitHub and on
 every clone (the operator's decision, 2026-10-30). `journal_forget` removes a
 line from the journal's current state — it leaves frames, summaries (the next
 rebuild drops it) and grep — and the commit that removed it keeps it in
-history, which every member holding a shared repository can still read.
-Folded journals and archives stay in the tree. Journals are on GitHub, a third
+history. Folded journals and archives stay in the tree. Journals are on GitHub, a third
 party abroad, by the same decision.
 
 ## 9. What changes
 
 - **Today's journals move once**: each owner's `U:` notes into their
-  `journal-person-<person>`, `P:<repo>` and threads and workers into the
-  family's `projects/` and `threads/`, one commit per repository.
+  `persons/<person>/`, `P:<repo>` and threads and workers into the family's
+  `projects/` and `threads/`, in one commit.
 - **The gateway** passes the provider's verified email beside the owner key, so
   an account can be bound (§3.4).
 - **zend** stops serving the journal tools and keeps the background thread
   (§5.3) and the workers' export (§7.3); `get_user_context` and lineage read
   the tree through the journal service.
 - **The agent** gains `journal: true` (`agent/src/config.rs`), the journal app,
-  its MCP server and route, the in-memory trees and grep index, and advertises
-  the people and families it holds.
+  its MCP server and route, and the in-memory tree. The model, its files and
+  every operation are the `journals` crate; its git store is built on
+  `zend-vfs`.
 - **The aggregator** gains the `journal` backend.
 - **npcd** writes bot episodes to `POST /v1/journal/append` as the owner.
 - **The substrate** changes not at all: no prefix index, no lease, no new
@@ -581,7 +609,7 @@ party abroad, by the same decision.
 
 Windows of 50 lines, 10 live children a journal and folded archives keep each
 journal's file small (under ~20 KB), whatever the history. The service holds
-the trees it serves in memory; each repository grows forever, by design, at
+the whole tree in memory; the repository grows forever, by design, at
 the pace people talk — megabytes a year a person.
 
 ## 11. Evaluation
@@ -590,7 +618,7 @@ Unit rules in `cargo test` against temporary repositories (exact YAML in, exact
 YAML and commits out): parsing and every error of §3.3, union merges of
 concurrent appends, the eleventh-child rules, windowing and period folds,
 summary caps and citation checks, frames and grep across archives and across a
-person's repository and their families', reads refused outside them, account
+person's folder and their families', reads refused outside them, account
 binding by verified email, sharing, and a push refused and retried. Live,
 through the connector: said in the car, recalled in Claude Code; a topic noted
 by one member, recalled by another; a personal note never reaching another
@@ -623,13 +651,13 @@ error; rebuild latency after a write.
 
 ## 14. Build order
 
-1. The two repository kinds, `.gitattributes`, `person.yaml`, `family.yaml`,
+1. The repository's layout, `.gitattributes`, `person.yaml`, `family.yaml`,
    and the file format with its parser and errors (§3) — tested against exact
    YAML.
-2. The agent's `journal: true`, the journal app, the in-memory trees, writes,
+2. The agent's `journal: true`, the journal app, the in-memory tree, writes,
    commits, background push and fetch (§6.1–§6.3).
 3. Accounts and families: binding by verified email, the gateway's email,
-   routing by person, `family_add` / `family_remove` (§3.4, §3.5).
+   `family_add` / `family_remove` (§3.4, §3.5).
 4. The journal MCP server and route; the aggregator's `journal` backend; the
    one-time move of today's journals (§9).
 5. Frames and traversal across a person and their families; `get_user_context`
@@ -642,15 +670,16 @@ error; rebuild latency after a write.
 
 ## 15. Decisions
 
-- **The journals are git repositories on GitHub**, one per person and one per
-  family: a folder per journal, `journal.yaml` holding its metadata and summary
-  and `lines.yaml` its window, a commit per change, history forever.
+- **The journals are one git repository on GitHub**, `persons/<person>/` and
+  `families/<family>/` within it: a folder per journal, `journal.yaml` holding
+  its metadata and summary and `lines.yaml` its window, a commit per change,
+  history forever.
 - **Everything is shared within a family but the personal sections** —
   `clients`, `people` and `~` — fixed by each section's type.
-- **The repository is the privacy boundary**; sharing copies, never moves.
+- **The service is the privacy boundary**; sharing copies, never moves.
 - **A person is several accounts**, bound by verified email; a family has
   owners and members; a person belongs to at most three families.
-- **Served by the agents that hold the repositories**, flagged `journal: true`,
+- **Served by the agents that hold the repository**, flagged `journal: true`,
   through the gateway and the connector; reads from memory, writes committed at
   once and pushed in the background.
 - **Fixed at the top, named below**; at most 10 live sub-journals a journal.

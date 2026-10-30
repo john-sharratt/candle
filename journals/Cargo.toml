@@ -1,0 +1,20 @@
+[package]
+name = "journals"
+version = "0.1.0"
+edition = "2021"
+description = "The memory backbone: journal trees for people and their families, kept as YAML in one git repository (docs/memory_backbone.md)"
+
+# The model — files, paths, lines, periods, summaries, the tree and every
+# operation on it — is plain code over bytes and builds and tests in seconds.
+# Only `store` touches git, through zend-vfs.
+[dependencies]
+journal-core = { path = "../journal-core" }
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
+sha2         = "0.10"
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+zend-vfs     = { path = "../zend-vfs" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
