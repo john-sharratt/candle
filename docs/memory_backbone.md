@@ -666,6 +666,15 @@ caller's to change or an account in no group, 404 no such journal or line, 409
 a conflict or a broken file, 422 the rules refuse it (an eleventh sub-journal, a
 cap), 503 the memory not served on that member yet.
 
+The same bodies can be applied without a member, straight onto a checkout:
+`zend-journals-import <checkout> <person> <file>...` (`zend/src/api/journals/
+import.rs`) brings the checkout level with origin, applies each file as the
+route would, and pushes it, stopping at the first file refused or the first
+write a push had to drop. Whoever runs it holds push access and may write
+anything already (§7.2), so it acts with an estate admin's standing, and its
+commits record the person and client it is given, not a verified call's. It is
+how the first journals were filled.
+
 ## 7. Writers
 
 ### 7.1 Who wrote it

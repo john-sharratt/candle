@@ -11,6 +11,7 @@
 //! | [`write`] | `POST /v1/journals`: a batch of operations, checked whole, then committed one by one |
 //! | [`ops`] | the operations a batch holds, read into the journals crate's |
 //! | [`view`] | journals, lines and hits as JSON |
+//! | [`import`] | the same batches applied by hand onto a checkout, by whoever holds push access |
 //!
 //! Every refusal is `{error, message}` under the status that says what to do
 //! about it: 400 malformed, 401 signed out, 403 not the caller's to change or
@@ -18,6 +19,7 @@
 //! broken file, 422 the rules refuse it, 503 the memory not served here yet —
 //! asked again, it may be answered by another member.
 
+pub mod import;
 pub mod ops;
 pub mod read;
 pub mod view;

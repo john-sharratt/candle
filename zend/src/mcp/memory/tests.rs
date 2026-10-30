@@ -123,7 +123,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A bare origin seeded with one group and its owner, and a clone of it.
-fn repo() -> (TempDir, PathBuf) {
+pub(crate) fn repo() -> (TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let origin = root.path().join("origin.git");
     std::fs::create_dir(&origin).unwrap();

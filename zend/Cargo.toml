@@ -8,6 +8,10 @@ description = "Zen Code daemon — persistent AI coding assistant"
 name = "zend"
 path = "src/main.rs"
 
+[[bin]]
+name = "zend-journals-import"
+path = "src/bin/journals_import.rs"
+
 [lib]
 name = "zend"
 path = "src/lib.rs"

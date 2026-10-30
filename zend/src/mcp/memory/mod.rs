@@ -275,4 +275,4 @@ pub fn is_memory_path(text: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
