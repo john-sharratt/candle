@@ -24,6 +24,9 @@
 //!   tree                  per-timeline summary forest from TreeMetadata records
 //!   liveness              maintenance's live/dead count against what it carries,
 //!                         by record type and segment (directory target)
+//!   completeness --kv-layers N
+//!                         turns holding every record they declare, by writer
+//!                         (directory target)
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -40,6 +43,8 @@
     clippy::unnecessary_map_or
 )]
 
+#[path = "substrate_inspect/completeness.rs"]
+mod completeness;
 #[path = "substrate_inspect/liveness.rs"]
 mod liveness;
 
@@ -657,6 +662,15 @@ enum Cmd {
     /// churn; "counted, not carried" is lost when its segment is dropped.
     /// Directory target only.
     Liveness,
+    /// Which turns hold every record they declare — tokens and every chunk on
+    /// every K/V layer — grouped by the member that wrote them. A writer's own
+    /// turns short of chunks were never written to its log, and are a gap no
+    /// other member can fetch. Directory target only.
+    Completeness {
+        /// K/V layer count of the model the store was written by.
+        #[arg(long)]
+        kv_layers: usize,
+    },
     /// Export a conversation's projection points + candidate/target galleries
     /// as an offline selection-replay fixture
     /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
@@ -1198,6 +1212,9 @@ fn main() -> Result<()> {
         if matches!(cli.cmd, Cmd::Liveness) {
             return liveness::liveness(&target);
         }
+        if let Cmd::Completeness { kv_layers } = &cli.cmd {
+            return completeness::completeness(&target, *kv_layers);
+        }
         if let Cmd::Conversations { filter, limit } = &cli.cmd {
             return segment_conversations(&segs, filter, *limit);
         }
@@ -1274,6 +1291,9 @@ fn main() -> Result<()> {
         }
         Cmd::Liveness => {
             anyhow::bail!("liveness requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::Completeness { .. } => {
+            anyhow::bail!("completeness requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
             anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
