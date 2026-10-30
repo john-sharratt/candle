@@ -199,12 +199,10 @@ pub async fn post_generate(
         );
     };
 
-    // The description and the existing portrait's origin, read under a *read*
-    // lock and released before the drain. Holding the cast's write lock across
-    // a stop-the-world image generation would block every character's tick, the
-    // console's listing and every other write in the daemon for the duration.
+    // The description and the existing portrait's origin, from a view of the
+    // cast taken before the drain.
     let (description, name, personality_id, existing_origin) = {
-        let npcs = s.npcs.read().await;
+        let npcs = s.npcs.view();
         let Ok(record) = npcs.get(npc_id, &owner) else {
             return refused(
                 StatusCode::NOT_FOUND,
@@ -330,8 +328,10 @@ pub async fn post_generate(
     // A portrait can be edited too: placed among its holders like any picture.
     s.hand_over_image(&image_id);
 
-    let mut npcs = s.npcs.write().await;
-    match npcs.set_portrait(npc_id, &owner, image_id, "generated", crate::api::now_ms()) {
+    match s
+        .npcs
+        .set_portrait(npc_id, &owner, image_id, "generated", crate::api::now_ms())
+    {
         Ok(mut record) => {
             crate::api::name_personality(&mut record, &*s.personalities.read().await);
             // The seed rides along so an operator who liked a draw can ask for

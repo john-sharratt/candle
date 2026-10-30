@@ -101,7 +101,7 @@ async fn scope_of(s: &Arc<Authored>, id: &Identity, owner: &str, all: bool) -> S
             showing_all: true,
         };
     }
-    let ids = s.npcs.read().await.owned_by(owner);
+    let ids = s.npcs.view().owned_by(owner);
     Scope {
         ids: Some(ids),
         may_see_all,
@@ -193,7 +193,7 @@ async fn name_map(
     ids: impl Iterator<Item = u64>,
 ) -> serde_json::Map<String, Value> {
     let wanted: HashSet<u64> = ids.collect();
-    let cast = s.npcs.read().await;
+    let cast = s.npcs.view();
     wanted
         .into_iter()
         .filter_map(|id| {
@@ -478,7 +478,7 @@ async fn owned_or_admin(
         ))
     };
     let npc_id = npcs::npc_id_of_wire(nid).ok_or_else(not_found)?;
-    if !s.npcs.read().await.is_living(npc_id) {
+    if !s.npcs.view().is_living(npc_id) {
         return Err(not_found());
     }
     Ok(npc_id)

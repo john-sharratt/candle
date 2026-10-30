@@ -86,17 +86,17 @@ pub struct Authored {
     pub worlds: RwLock<Registry>,
     pub personalities: RwLock<Registry>,
     pub accounts: RwLock<Accounts>,
-    /// The cast, in memory, backed by the substrate — see [`crate::npcs`].
-    /// A write lock only for a create/edit/delete; listing takes the read lock.
+    /// The cast, in memory, backed by the substrate — see [`crate::npcs`]. No
+    /// lock: a read loads the published cast ([`Npcs::view`]) and a write runs
+    /// on the persistence owner's thread (`docs/npcd_cast_lock_free.md`).
     ///
     /// Held behind an `Arc` so the one cast — and with it the process's one
     /// writable substrate handle ([`crate::npcs::Npcs::substrate`]) — can be
     /// shared with the engine: [`crate::engine::runtime::Runtime::set_npcs`]
     /// adopts this same handle, so the effector device reads a character's own
     /// projected state and writes its agency plane through the identical `Npcs`
-    /// there is no second of. Every call site still reaches the lock through the
-    /// `Arc`'s `Deref` (`self.npcs.read().await`); only construction is wrapped.
-    pub npcs: Arc<RwLock<Npcs>>,
+    /// there is no second of.
+    pub npcs: Arc<Npcs>,
     /// Who is an admin, from the config. Not behind a lock: it is decided at
     /// startup and there is deliberately no way to change it while running —
     /// see [`web::auth::role`].
@@ -190,7 +190,7 @@ impl Authored {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
-            npcs: Arc::new(RwLock::new(npcs)),
+            npcs: Arc::new(npcs),
             roles,
             libraries: SyncRwLock::new(Arc::new(libraries)),
             images,
@@ -300,7 +300,7 @@ impl Authored {
     /// Every image a portrait names — a character's or a personality's: what
     /// no retirement of a kept picture may take.
     pub async fn portrait_image_ids(&self) -> HashSet<String> {
-        let mut named = self.npcs.read().await.portrait_ids();
+        let mut named = self.npcs.view().portrait_ids();
         named.extend(
             self.personality_portraits
                 .read()
@@ -320,7 +320,7 @@ impl Authored {
     /// locks for it.
     pub async fn world_ms(&self, npc_id: u64) -> u64 {
         crate::clock::world_ms_for(
-            &*self.npcs.read().await,
+            &self.npcs.view(),
             &*self.worlds.read().await,
             npc_id,
             now_ms() as i64,
@@ -927,7 +927,7 @@ pub(crate) fn npc_err(e: NpcError) -> Response {
 /// brings the cast back with its ids intact. Admin-only and owner-blind: this
 /// is an operator backup of the entire deployment, not a per-account listing.
 async fn export_npcs(State(s): State<Arc<Authored>>) -> Response {
-    let npcs = s.npcs.read().await.export_all();
+    let npcs = s.npcs.view().export_all();
     Json(json!({ "count": npcs.len(), "npcs": npcs })).into_response()
 }
 
@@ -945,7 +945,7 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
                 return (StatusCode::BAD_REQUEST, format!("bad npcs payload: {e}")).into_response()
             }
         };
-    match s.npcs.write().await.import(payloads) {
+    match s.npcs.import(payloads) {
         Ok(n) => Json(json!({ "imported": n })).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "npc import failed");
@@ -961,7 +961,7 @@ async fn get_owners(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respo
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let npcs = s.npcs.read().await.owners();
+    let npcs = s.npcs.view().owners();
     let accounts = s.accounts.read().await.known();
     Json(json!({ "me": me, "accounts": accounts, "npcs": npcs })).into_response()
 }
@@ -1003,7 +1003,7 @@ async fn put_owner(
             "no account has that id — an owner is somebody who has signed in",
         );
     }
-    match s.npcs.write().await.reassign(npc_id, to, now_ms()) {
+    match s.npcs.reassign(npc_id, to, now_ms()) {
         Ok(mut v) => {
             tracing::info!(npc = %nid, owner = to, "character reassigned");
             name_personality(&mut v, &*s.personalities.read().await);
@@ -1034,7 +1034,7 @@ pub(crate) async fn list_npcs(
         // listing somebody screen-shares should not contain them.
         include_hidden: matches!(q.get("hidden").map(String::as_str), Some("1" | "true")),
     };
-    let mut items = s.npcs.read().await.list(&owner, &filter);
+    let mut items = s.npcs.view().list(&owner, &filter);
     let reg = s.personalities.read().await;
     for it in &mut items {
         name_personality(it, &reg);
@@ -1079,7 +1079,7 @@ async fn get_npc(
         // An unparseable id is simply not a character anybody has.
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.read().await.get(npc_id, &owner) {
+    match s.npcs.view().get(npc_id, &owner) {
         Ok(mut v) => {
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
@@ -1121,7 +1121,7 @@ async fn post_reflect(
     // Ownership before anything expensive: a reflection costs several decodes
     // and stops the cast, and neither should be spendable on somebody else's
     // character.
-    if let Err(e) = s.npcs.read().await.get(npc_id, &owner) {
+    if let Err(e) = s.npcs.view().get(npc_id, &owner) {
         return npc_err(e);
     }
 
@@ -1234,7 +1234,7 @@ async fn post_dream(
     // should be able to poke any character in it, the same way the pulse already
     // lets them read one.
     if !s.roles.of(Some(&id)).at_least(Role::Admin) {
-        if let Err(e) = s.npcs.read().await.get(npc_id, &owner) {
+        if let Err(e) = s.npcs.view().get(npc_id, &owner) {
             return npc_err(e);
         }
     }
@@ -1304,17 +1304,7 @@ async fn create_npc(
     if let Some(r) = missing_ref(&s, &body).await {
         return r;
     }
-    // **Bound to a local so the write guard drops before the arm runs.** As a match scrutinee
-    // the guard is a temporary that lives to the end of the whole `match`, and the `Ok` arm
-    // calls `world_ms`, which takes `npcs.read()`. `tokio::sync::RwLock` is not reentrant, so
-    // that read never resolves: the request hangs *holding the write lock*, every later reader
-    // and writer queues behind it, and the tick thread — which reaches the same lock through
-    // the clock and persona closures — stops with it. The daemon wedges on the first character
-    // created while it is running.
-    //
-    // Invisible to the suite because `Authored::new` leaves `runtime: None`, so the block that
-    // calls `world_ms` only ever executes in production.
-    let created = s.npcs.write().await.create(&id, &owner, &body, now_ms());
+    let created = s.npcs.create(&id, &owner, &body, now_ms());
     match created {
         Ok(mut v) => {
             // Put the new character into the loop straight away.
@@ -1488,7 +1478,7 @@ async fn patch_npc(
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.write().await.patch(npc_id, &owner, &body, now_ms()) {
+    match s.npcs.patch(npc_id, &owner, &body, now_ms()) {
         Ok(mut v) => {
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
@@ -1542,7 +1532,7 @@ async fn patch_one(s: Arc<Authored>, headers: HeaderMap, nid: String, patch: Val
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.write().await.patch(npc_id, &owner, &patch, now_ms()) {
+    match s.npcs.patch(npc_id, &owner, &patch, now_ms()) {
         Ok(mut v) => {
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
@@ -1600,12 +1590,7 @@ async fn delete_belief(
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s
-        .npcs
-        .write()
-        .await
-        .delete_belief(npc_id, &owner, &bid, now_ms())
-    {
+    match s.npcs.delete_belief(npc_id, &owner, &bid, now_ms()) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => err(StatusCode::NOT_FOUND, "belief_not_found", &bid),
         Err(e) => npc_err(e),
@@ -1686,7 +1671,7 @@ async fn read_npc(
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.read().await.visible_to(npc_id, &owner) {
+    match s.npcs.view().visible_to(npc_id, &owner) {
         Some(n) => Json(view(n)).into_response(),
         None => err(StatusCode::NOT_FOUND, "npc_not_found", "no such character"),
     }
@@ -1694,11 +1679,11 @@ async fn read_npc(
 
 /// One authoring write, whichever it is.
 ///
-/// The write itself is a closure over `Npcs` so the lock is taken once, here,
-/// and every one of these routes supersedes the record the same way.
+/// The write itself is a closure over `Npcs` so every one of these routes
+/// resolves its caller and supersedes the record the same way.
 async fn write_npc<F>(s: Arc<Authored>, headers: HeaderMap, nid: String, write: F) -> Response
 where
-    F: FnOnce(&mut Npcs, u64, &str, u64) -> Result<Value, NpcError>,
+    F: FnOnce(&Npcs, u64, &str, u64) -> Result<Value, NpcError>,
 {
     let (_, owner) = match owner_of(&s, &headers).await {
         Ok(v) => v,
@@ -1707,8 +1692,7 @@ where
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    let mut npcs = s.npcs.write().await;
-    match write(&mut npcs, npc_id, &owner, now_ms()) {
+    match write(&s.npcs, npc_id, &owner, now_ms()) {
         Ok(mut v) => {
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
@@ -1981,7 +1965,7 @@ async fn delete_npc(
     let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.write().await.delete(npc_id, &owner, now_ms()) {
+    match s.npcs.delete(npc_id, &owner, now_ms()) {
         Ok(()) => {
             // Take the character out of the engine too. Without this its loop
             // keeps ticking against an authored record that no longer resolves —
@@ -2712,7 +2696,7 @@ async fn list_worlds(
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
     let reveal = revealing(&s, &headers, &q);
-    let npcs = s.npcs.read().await;
+    let npcs = s.npcs.view();
     let counts = npcs.counts_by(|n| n.world_id.as_str());
     let worlds: Vec<Value> = seen_all(&s, &headers, &s.worlds, WORLDS)
         .await
@@ -2762,7 +2746,7 @@ async fn get_world(
     Path(wid): Path<String>,
 ) -> Response {
     let record = seen(&s, &headers, &s.worlds, WORLDS, &wid).await;
-    let npcs = s.npcs.read().await;
+    let npcs = s.npcs.view();
     let counts = npcs.counts_by(|n| n.world_id.as_str());
     match record {
         Some(r) => {
@@ -2928,7 +2912,7 @@ async fn list_personalities(
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
     let reveal = revealing(&s, &headers, &q);
-    let npcs = s.npcs.read().await;
+    let npcs = s.npcs.view();
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
     let personalities: Vec<Value> = seen_all(&s, &headers, &s.personalities, PERSONALITIES)
         .await
@@ -2951,7 +2935,7 @@ async fn get_personality(
     Path(aid): Path<String>,
 ) -> Response {
     let record = seen(&s, &headers, &s.personalities, PERSONALITIES, &aid).await;
-    let npcs = s.npcs.read().await;
+    let npcs = s.npcs.view();
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
     match record {
         Some(r) => Json(with_portrait_image(

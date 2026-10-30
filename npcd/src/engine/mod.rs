@@ -653,7 +653,7 @@ pub(crate) async fn owned_by(
     let Some(npc_id) = npcs::npc_id_of_wire(nid) else {
         return Err(not_found());
     };
-    if s.npcs.read().await.visible_to(npc_id, &owner).is_none() {
+    if s.npcs.view().visible_to(npc_id, &owner).is_none() {
         return Err(not_found());
     }
     Ok((id, owner, npc_id))

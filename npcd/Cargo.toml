@@ -142,6 +142,11 @@ candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 # stand up an engine that runs at a rate nobody would call inference, and would
 # do it silently.
 candle = { workspace = true, features = ["cuda"] }
+# The cast is published as one immutable value that every read loads and every
+# write replaces (`docs/npcd_cast_lock_free.md`): the swap, and a persistent map
+# a write copies in O(1) instead of cloning the whole cast.
+arc-swap   = { workspace = true }
+imbl       = { workspace = true }
 
 [build-dependencies]
 embed-watch = { path = "../embed-watch" }

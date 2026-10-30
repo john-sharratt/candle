@@ -59,9 +59,10 @@ impl Runtime {
         let Some(npcs) = self.npcs() else {
             return;
         };
-        let changed = npcs.write().await.refresh();
+        let changed = npcs.refresh();
+        let cast = npcs.view();
         for npc in changed {
-            let living = npcs.read().await.is_living(npc);
+            let living = cast.is_living(npc);
             if !living {
                 if self.bodies.bound(npc).is_some() {
                     self.forget_character(npc);
@@ -184,7 +185,7 @@ impl Runtime {
         };
         let rt = Arc::clone(self);
         handle.spawn(async move {
-            let mood = npcs.read().await.mood_of(npc).map(String::from);
+            let mood = npcs.view().mood_of(npc).map(String::from);
             if let Some(mood) = mood {
                 rt.scheduler.deliver(
                     npc,

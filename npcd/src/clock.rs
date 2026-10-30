@@ -47,6 +47,9 @@
 use journal_core::period::{civil_from_days, days_from_civil};
 use serde_json::{json, Map, Value};
 
+use crate::npcs::Cast;
+use crate::registry::Registry;
+
 /// World-clock milliseconds in one narrative day.
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -279,9 +282,10 @@ pub fn with_clock(body: &Value, clock: Clock) -> Map<String, Value> {
     map
 }
 
-/// What time it is for one character, given already-taken guards.
+/// What time it is for one character, given a view of the cast and an
+/// already-taken guard on the worlds.
 ///
-/// **Guards in, not locks.** The two callers reach the same registries by
+/// **A guard in, not a lock.** The two callers reach the worlds registry by
 /// incompatible routes — the tick driver is a plain OS thread and takes
 /// `blocking_read`, an axum handler is inside the runtime and must `.await` —
 /// and `blocking_read` from a runtime thread does not contend, it *panics*.
@@ -293,12 +297,7 @@ pub fn with_clock(body: &Value, clock: Clock) -> Map<String, Value> {
 /// character with no world, or a world with no clock — a character whose world
 /// cannot be read has no time of its own, and inventing one would put it in a
 /// day the world has never been in.
-pub fn world_ms_for(
-    npcs: &crate::npcs::Npcs,
-    worlds: &crate::registry::Registry,
-    npc_id: u64,
-    now_ms: i64,
-) -> u64 {
+pub fn world_ms_for(npcs: &Cast, worlds: &Registry, npc_id: u64, now_ms: i64) -> u64 {
     let Some(world_id) = npcs.world_of(npc_id) else {
         return 0;
     };
@@ -310,12 +309,7 @@ pub fn world_ms_for(
 
 /// The calendar for one character's world, by the same route as
 /// [`world_ms_for`].
-pub fn world_time_for(
-    npcs: &crate::npcs::Npcs,
-    worlds: &crate::registry::Registry,
-    npc_id: u64,
-    now_ms: i64,
-) -> WorldTime {
+pub fn world_time_for(npcs: &Cast, worlds: &Registry, npc_id: u64, now_ms: i64) -> WorldTime {
     WorldTime::of(world_ms_for(npcs, worlds, npc_id, now_ms))
 }
 

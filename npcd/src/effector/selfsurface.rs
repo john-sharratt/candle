@@ -13,10 +13,10 @@
 //! The one handle these routes touch is the runtime's shared
 //! [`Npcs`](crate::npcs::Npcs) — the same cast the console API and the load walk
 //! use ([`crate::engine::runtime::Runtime::npcs`]). The character's own record is
-//! resolved by the caller's npc id ([`crate::npcs::Npcs::payload`], owner-blind:
-//! the effector is the character's own body), the projection is rendered while
-//! the cast's read lock is held, and the lock is released before the response is
-//! built. The world lock is never taken, so a `/self` read can never contend with
+//! resolved by the caller's npc id ([`crate::npcs::Cast::payload`], owner-blind:
+//! the effector is the character's own body) in a view of the cast, which takes
+//! no lock and never waits on a write. The world lock is never taken, so a
+//! `/self` read can never contend with
 //! a tick.
 //!
 //! # Degrades, never panics
@@ -126,9 +126,7 @@ async fn memory(
 
 /// Render the caller's own record through `view`, or answer `empty`.
 ///
-/// The cast's read lock is the only lock taken, and it is released the moment the
-/// projection is built (the view owns its output). No world lock, no `.await`
-/// while a lock is held past this point.
+/// Reads a view of the cast, which takes no lock; no world lock either.
 async fn read_self(
     local: &Local,
     caller: &DeviceCaller,
@@ -141,10 +139,7 @@ async fn read_self(
     let Some(npcs) = runtime.npcs() else {
         return Json(empty).into_response();
     };
-    let rendered = {
-        let cast = npcs.read().await;
-        cast.payload(caller.npc_id).map(view)
-    };
+    let rendered = npcs.view().payload(caller.npc_id).map(view);
     Json(rendered.unwrap_or(empty)).into_response()
 }
 
@@ -160,7 +155,6 @@ mod tests {
     use candle_conversation::persistence::record::{
         AuthoredBelief, AuthoredStrategy, Modulation, NpcPayload,
     };
-    use tokio::sync::RwLock as AsyncRwLock;
     use tower::ServiceExt;
 
     use crate::effector::router::{router, Local};
@@ -242,9 +236,9 @@ mod tests {
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));
         rt.set_tokens(tokens.clone());
         if let Some(payloads) = seed {
-            let mut npcs = Npcs::load(&tmp()).expect("a fresh cast");
+            let npcs = Npcs::load(&tmp()).expect("a fresh cast");
             npcs.import(payloads).expect("seeded");
-            rt.set_npcs(Arc::new(AsyncRwLock::new(npcs)));
+            rt.set_npcs(Arc::new(npcs));
         }
         (rt, tokens)
     }

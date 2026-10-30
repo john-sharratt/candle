@@ -410,7 +410,7 @@ pub struct Runtime {
     /// runtime to answer its routes. See [`crate::npcs::Npcs::substrate`] for
     /// what the second handle cost.
     substrate: RwLock<Option<SharedSubstrate>>,
-    /// The shared cast — the very same `Arc<RwLock<Npcs>>` [`crate::api::Authored`]
+    /// The shared cast — the very same `Arc<Npcs>` [`crate::api::Authored`]
     /// holds, adopted rather than reconstructed.
     ///
     /// Installed after construction for the same reason the substrate is: the
@@ -427,7 +427,7 @@ pub struct Runtime {
     /// one-writable-substrate-handle invariant ([`crate::npcs::Npcs::substrate`],
     /// `npcs.rs` §"One handle to the substrate"): the effector writes through the
     /// identical `Npcs`/`SharedSubstrate` the console API and the load walk use.
-    npcs: RwLock<Option<Arc<tokio::sync::RwLock<Npcs>>>>,
+    npcs: OnceLock<Arc<Npcs>>,
     /// Every character's live conversation. `None` until the model is loaded —
     /// there is nothing to hold a conversation on before then.
     pub minds: RwLock<Option<Arc<Minds>>>,
@@ -925,7 +925,7 @@ impl Runtime {
             clock: RwLock::new(None),
             guardian_log: RwLock::new(None),
             substrate: RwLock::new(None),
-            npcs: RwLock::new(None),
+            npcs: OnceLock::new(),
             minds: RwLock::new(None),
             persona: RwLock::new(None),
             mood_sink: RwLock::new(None),
@@ -3203,15 +3203,21 @@ impl Runtime {
     /// device's `/self` reads and its agency writes go through the one cast and
     /// the one writable substrate handle behind it (effector design §9.2,
     /// Appendix E "The bridge").
-    pub fn set_npcs(&self, npcs: Arc<tokio::sync::RwLock<Npcs>>) {
-        *self.npcs.write().unwrap() = Some(npcs);
+    ///
+    /// Once: a second cast would be the second writable handle this exists to
+    /// rule out, so installing one over another panics.
+    pub fn set_npcs(&self, npcs: Arc<Npcs>) {
+        assert!(
+            self.npcs.set(npcs).is_ok(),
+            "the cast is installed once, at startup"
+        );
     }
 
     /// The shared cast, for the effector bridge. `None` on a test path that
     /// stood the runtime up without one — a caller degrades to an empty result
     /// rather than failing the read.
-    pub fn npcs(&self) -> Option<Arc<tokio::sync::RwLock<Npcs>>> {
-        self.npcs.read().unwrap().clone()
+    pub fn npcs(&self) -> Option<Arc<Npcs>> {
+        self.npcs.get().cloned()
     }
 
     /// Stop one character, ask it two things, and throw the conversation away.

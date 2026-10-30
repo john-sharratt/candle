@@ -30,10 +30,21 @@
 //! character sets `state: "tombstoned"`, which is still just another
 //! superseding record: the id stays taken, because the acts it already
 //! committed still name it.
+//!
+//! # No lock
+//!
+//! A read takes the published [`Cast`] ([`Npcs::view`]) and never waits. A
+//! write runs on the persistence owner's thread: it builds its records from the
+//! current cast, appends and fsyncs them, and only then publishes the cast with
+//! them in (`docs/npcd_cast_lock_free.md`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+mod cast;
+
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use candle_conversation::models::identity::LegacySpec;
 use candle_conversation::persistence::identity::RecordIdentity;
 use candle_conversation::persistence::record::{
@@ -45,11 +56,12 @@ use candle_conversation::persistence::{
 use candle_conversation::substrate::Substrate;
 use host::MODEL;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use web::auth::session::Identity;
 
 use crate::registry::id;
+
+pub use cast::Cast;
 
 /// States a character may be in, mirroring §10 of the design doc. A state off
 /// this list is a typo or a version skew, and either way not something to write
@@ -175,18 +187,42 @@ pub enum NpcError {
     Persist(String),
 }
 
-/// The whole cast, including tombstoned characters.
-///
-/// Tombstoned ones are kept because their ids must stay taken; every read path
-/// filters them out.
+/// Which strategy an agency write lands on.
+#[derive(Clone, Copy, Debug)]
+pub enum StrategyTarget<'a> {
+    /// The strategy with this id — created, or replaced.
+    Id(&'a str),
+    /// A new child of this strategy, its id minted from the record the write
+    /// supersedes (`docs/npcd_cast_lock_free.md` §2.1).
+    ChildOf(&'a str),
+}
+
+/// The cast, and the one handle to the substrate it is written through.
 pub struct Npcs {
-    by_id: BTreeMap<u64, NpcPayload>,
+    /// The published cast. Replaced only on the persistence owner's thread,
+    /// after the records that make it different are durable.
+    current: ArcSwap<Cast>,
     /// **The daemon's only handle to the substrate**, shared with the engine
     /// rather than opened twice. See [`Npcs::substrate`].
     shared: SharedSubstrate,
-    /// The record each character was last read from, so [`Self::refresh`]
-    /// reads only what changed since.
-    read_as: HashMap<u64, RecordIdentity>,
+}
+
+/// A record the log would not take, as the error every write returns.
+fn persist(e: impl std::fmt::Display) -> NpcError {
+    NpcError::Persist(e.to_string())
+}
+
+/// One superseding record and what the caller is shown of it.
+fn one(npc: NpcPayload, viewer: &str) -> (Vec<NpcPayload>, Value) {
+    let view = wire(&npc, viewer);
+    (vec![npc], view)
+}
+
+/// `npc` with its revision moved on — every authored edit's record.
+fn bumped(mut npc: NpcPayload, now_ms: u64) -> NpcPayload {
+    npc.revision += 1;
+    npc.updated_ms = now_ms;
+    npc
 }
 
 impl Npcs {
@@ -249,10 +285,56 @@ impl Npcs {
             .keys()
             .filter_map(|id| Some((*id, persistence.npc_locs().identity(id)?)))
             .collect();
-        Ok(Self {
-            by_id,
-            shared: SharedSubstrate::new(substrate, persistence),
+        let cast = Cast {
+            by_id: by_id.into_iter().collect(),
             read_as,
+        };
+        Ok(Self {
+            current: ArcSwap::from_pointee(cast),
+            shared: SharedSubstrate::new(substrate, persistence),
+        })
+    }
+
+    /// The cast as last published. Never waits; the snapshot stays whole for as
+    /// long as it is held, whatever is written after.
+    pub fn view(&self) -> Arc<Cast> {
+        self.current.load_full()
+    }
+
+    /// Build records from the current cast with `edit`, append and fsync them,
+    /// then publish the cast with them in — one step on the persistence owner's
+    /// thread, so every write is ordered after the one before it and computed
+    /// from what that one published (`docs/npcd_cast_lock_free.md` §2).
+    ///
+    /// Nothing is published unless the records are durable: a refused edit or a
+    /// failed append leaves the cast exactly as it was. An edit that returns no
+    /// records writes nothing. `edit` runs on the owner's thread, so it must be
+    /// pure over the cast it is handed (§2.3).
+    fn write<R: Send>(
+        &self,
+        edit: impl FnOnce(&Cast) -> Result<(Vec<NpcPayload>, R), NpcError> + Send,
+    ) -> Result<R, NpcError> {
+        let current = &self.current;
+        self.shared.persistence.call(|p| {
+            let cast = current.load_full();
+            let (records, out) = edit(&cast)?;
+            if records.is_empty() {
+                return Ok(out);
+            }
+            for npc in &records {
+                p.write_npc(npc).map_err(persist)?;
+            }
+            // Flush and fsync before publishing. `write_npc` only *stages* the
+            // record, and a staged record is lost on a crash — which for a
+            // character somebody just created means the API said "created"
+            // about something that never existed.
+            p.commit().map_err(persist)?;
+            let mut next = Cast::clone(&cast);
+            for npc in records {
+                next.by_id.insert(npc.npc_id, npc);
+            }
+            current.store(Arc::new(next));
+            Ok(out)
         })
     }
 
@@ -261,46 +343,42 @@ impl Npcs {
     /// (`docs/replicated_substrate.md` §9.3). Each character whose current
     /// record is not the one it was read from is read again. Returns the ids
     /// whose record changed.
-    pub fn refresh(&mut self) -> Vec<u64> {
-        let read_as = &self.read_as;
-        let fresh = self.shared.persistence.call(|p| {
-            let current: Vec<(u64, RecordIdentity)> = p
+    ///
+    /// The identities are read, the moved records read again, and the cast
+    /// published in one step on the owner's thread, so no write lands between
+    /// what was compared and what is published (`docs/npcd_cast_lock_free.md`
+    /// §2.2).
+    pub fn refresh(&self) -> Vec<u64> {
+        let current = &self.current;
+        self.shared.persistence.call(|p| {
+            let cast = current.load_full();
+            let moved: Vec<(u64, RecordIdentity)> = p
                 .npc_locs()
                 .iter()
                 .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
+                .filter(|(id, identity)| cast.read_as.get(id) != Some(identity))
                 .collect();
-            current
-                .into_iter()
-                .filter(|(id, identity)| read_as.get(id) != Some(identity))
-                .map(|(id, identity)| (id, identity, p.read_npc(id)))
-                .collect::<Vec<_>>()
-        });
-        let mut changed = Vec::new();
-        for (id, identity, read) in fresh {
-            match read {
-                Ok(Some(npc)) => {
-                    if self.by_id.get(&id) != Some(&npc) {
-                        self.by_id.insert(id, npc);
-                        changed.push(id);
-                    }
-                    self.read_as.insert(id, identity);
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("character {id}'s record would not read: {e}"),
+            if moved.is_empty() {
+                return Vec::new();
             }
-        }
-        changed
-    }
-
-    /// The register a character last said it was in.
-    ///
-    /// What the persona reads back to it on the next turn, so a mood survives a
-    /// restart.
-    pub fn mood_of(&self, npc_id: u64) -> Option<&str> {
-        self.by_id
-            .get(&npc_id)
-            .filter(|n| !n.is_tombstoned())
-            .and_then(|n| n.mood.as_deref())
+            let mut next = Cast::clone(&cast);
+            let mut changed = Vec::new();
+            for (id, identity) in moved {
+                match p.read_npc(id) {
+                    Ok(Some(npc)) => {
+                        if next.by_id.get(&id) != Some(&npc) {
+                            next.by_id.insert(id, npc);
+                            changed.push(id);
+                        }
+                        next.read_as.insert(id, identity);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("character {id}'s record would not read: {e}"),
+                }
+            }
+            current.store(Arc::new(next));
+            changed
+        })
     }
 
     /// Record the register a character has named for itself.
@@ -315,29 +393,29 @@ impl Npcs {
     /// shows as the last time this character was worked on — and a roster
     /// sorted by "recently edited" would otherwise report whoever happened to
     /// be feeling something.
-    pub fn remember_mood(&mut self, npc_id: u64, mood: &str) -> bool {
-        let Some(npc) = self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned()) else {
-            return false;
-        };
-        if npc.mood.as_deref() == Some(mood) {
-            return false;
+    pub fn remember_mood(&self, npc_id: u64, mood: &str) -> bool {
+        let write = self.write(|cast| {
+            let Some(npc) = cast.payload(npc_id) else {
+                return Ok((Vec::new(), false));
+            };
+            if npc.mood.as_deref() == Some(mood) {
+                return Ok((Vec::new(), false));
+            }
+            let mut npc = npc.clone();
+            npc.mood = Some(mood.to_string());
+            Ok((vec![npc], true))
+        });
+        match write {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                // Not fatal and not propagated, for the reason a place
+                // checkpoint is not: soft state on a driver thread with nobody
+                // to report to. The character goes on feeling it; the next
+                // time it says so, this tries again.
+                tracing::warn!("could not record how {npc_id} feels: {e:?}");
+                false
+            }
         }
-        let mut npc = npc.clone();
-        npc.mood = Some(mood.to_string());
-        let write = self
-            .shared
-            .persistence
-            .call(|p| p.write_npc(&npc).and_then(|_| p.commit()));
-        if let Err(e) = write {
-            // Not fatal and not propagated, for the reason a place checkpoint
-            // is not: soft state on a driver thread with nobody to report to.
-            // The character goes on feeling it; the next time it says so, this
-            // tries again.
-            tracing::warn!("could not record how {npc_id} feels: {e}");
-            return false;
-        }
-        self.by_id.insert(npc_id, npc);
-        true
     }
 
     /// The substrate handle, for the engine to adopt.
@@ -360,139 +438,9 @@ impl Npcs {
         self.shared.clone()
     }
 
-    /// Every character this caller may see, newest first.
-    ///
-    /// Ownership is the filter (§8.2). Hidden characters are excluded unless
-    /// asked for, and no total is ever produced — a count of everything you own
-    /// is the one figure that gives a hidden character away (§8.3).
-    pub fn list(&self, owner: &str, f: &Filter<'_>) -> Vec<Value> {
-        let mut rows: Vec<&NpcPayload> = self
-            .by_id
-            .values()
-            .filter(|n| n.owner_id == owner && !n.is_tombstoned())
-            .filter(|n| f.include_hidden || !n.hidden)
-            .filter(|n| f.matches(n))
-            .collect();
-        rows.sort_unstable_by(|a, b| {
-            b.updated_ms
-                .cmp(&a.updated_ms)
-                .then(a.npc_id.cmp(&b.npc_id))
-        });
-        rows.into_iter().map(|n| wire(n, owner)).collect()
-    }
-
-    /// How many living characters each authored document has, keyed by slug.
-    ///
-    /// `pick` selects which reference to count by, so one walk serves both
-    /// registries. Every owner's cast is included, because the figure this
-    /// answers is a global one: publishing doctrine reaches every character of
-    /// that personality, not only the publisher's.
-    ///
-    /// Hidden characters **are** counted, which is the opposite of what it
-    /// first looks like it should be.
-    ///
-    /// §8.3 says a hidden character must not be deducible. *Excluding* them is
-    /// what breaches it: the figure would drop the moment one was hidden, so
-    /// anybody polling learns that a character was just hidden and under which
-    /// personality — a sharper signal than the roster gives, because the
-    /// denominator is smaller. Including them makes hiding invisible here,
-    /// which is the whole point of hiding.
-    ///
-    /// What remains is a global aggregate over every owner. It answers "how
-    /// many of these exist" and never "how many do *you* have" — the per-owner
-    /// total is the one §8.3 forbids, and [`Npcs::list`] still refuses to
-    /// produce it.
-    pub fn counts_by<'a>(
-        &'a self,
-        pick: fn(&'a NpcPayload) -> &'a str,
-    ) -> BTreeMap<&'a str, usize> {
-        let mut out = BTreeMap::new();
-        for n in self.by_id.values() {
-            if n.is_tombstoned() {
-                continue;
-            }
-            *out.entry(pick(n)).or_insert(0) += 1;
-        }
-        out
-    }
-
-    /// One character, if this caller may see it.
-    ///
-    /// A character owned by somebody else reads as absent rather than
-    /// forbidden. A 403 would confirm the id exists, which is enough to
-    /// enumerate a stranger's cast one guess at a time.
-    pub fn visible_to(&self, npc_id: u64, owner: &str) -> Option<&NpcPayload> {
-        self.by_id
-            .get(&npc_id)
-            .filter(|n| n.owner_id == owner && !n.is_tombstoned())
-    }
-
-    /// Whether this id is a living character, whoever owns it.
-    pub fn is_living(&self, npc_id: u64) -> bool {
-        self.by_id.get(&npc_id).is_some_and(|n| !n.is_tombstoned())
-    }
-
-    pub fn get(&self, npc_id: u64, owner: &str) -> Result<Value, NpcError> {
-        self.visible_to(npc_id, owner)
-            .map(|n| wire(n, owner))
-            .ok_or(NpcError::NotFound)
-    }
-
-    /// Every living character, with the world it belongs to.
-    ///
-    /// **Deliberately not filtered by owner.** The tick scheduler runs the whole
-    /// cast — the quartermaster counts sacks whether or not the person who
-    /// authored him is signed in — so this is the one read that crosses
-    /// ownership. Every route that reaches a character on a user's behalf still
-    /// goes through [`Self::visible_to`]; this is for the engine, which serves
-    /// the world rather than a caller.
-    pub fn cast(&self) -> Vec<Casting> {
-        self.by_id
-            .values()
-            .filter(|n| !n.is_tombstoned())
-            .map(|n| Casting {
-                npc_id: n.npc_id,
-                world_id: n.world_id.clone(),
-                at: n.at.clone(),
-                mood: n.mood.clone(),
-            })
-            .collect()
-    }
-
-    /// The world a character belongs to, whoever owns it. Used by the tick
-    /// driver to resolve which clock a character lives on.
-    pub fn world_of(&self, npc_id: u64) -> Option<&str> {
-        self.by_id
-            .get(&npc_id)
-            .filter(|n| !n.is_tombstoned())
-            .map(|n| n.world_id.as_str())
-    }
-
-    /// The ids of every living character this account owns.
-    ///
-    /// A set, because the caller is testing membership per tick record and a
-    /// linear scan over a large cast per row is the kind of cost that only shows
-    /// up once somebody has two hundred characters.
-    pub fn owned_by(&self, owner: &str) -> std::collections::HashSet<u64> {
-        self.by_id
-            .values()
-            .filter(|n| !n.is_tombstoned() && n.owner_id == owner)
-            .map(|n| n.npc_id)
-            .collect()
-    }
-
-    /// A living character's record, whoever owns it.
-    ///
-    /// Ownership-blind for the same reason [`Self::cast`] is: the engine serves
-    /// the world rather than a caller. Every route that reaches a character on a
-    /// user's behalf still goes through [`Self::visible_to`].
-    pub fn payload(&self, npc_id: u64) -> Option<&NpcPayload> {
-        self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned())
-    }
-
     /// Create a character owned by the caller.
     pub fn create(
-        &mut self,
+        &self,
         id: &Identity,
         owner: &str,
         body: &Value,
@@ -502,10 +450,9 @@ impl Npcs {
         let world_id = ref_id(body.get("world_id")).ok_or(NpcError::Invalid("world_id"))?;
         let personality_id =
             ref_id(body.get("personality_id")).ok_or(NpcError::Invalid("personality_id"))?;
-
-        let npc_id = self.mint_id(id, &name, now_ms);
-        let npc = NpcPayload {
-            npc_id,
+        let mut npc = NpcPayload {
+            // Minted against the cast the write lands on, below.
+            npc_id: 0,
             owner_id: owner.to_string(),
             revision: 1,
             created_ms: now_ms,
@@ -538,24 +485,33 @@ impl Npcs {
             agency: Vec::new(),
             modulation: Modulation::default(),
         };
-        self.commit(npc, owner)
+        self.write(|cast| {
+            npc.npc_id = cast.mint_id(id, &npc.name, now_ms);
+            Ok(one(npc, owner))
+        })
     }
 
     /// Apply a partial edit. Absent fields are left alone; a field present and
     /// invalid is an error rather than a silent default, because a durable
     /// record written from a typo is worse than a refused write.
     pub fn patch(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         body: &Value,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self
-            .visible_to(npc_id, owner)
-            .ok_or(NpcError::NotFound)?
-            .clone();
+        self.write(|cast| {
+            let npc = cast
+                .visible_to(npc_id, owner)
+                .ok_or(NpcError::NotFound)?
+                .clone();
+            Ok(one(bumped(Self::patched(npc, body)?, now_ms), owner))
+        })
+    }
 
+    /// `npc` with a partial edit's fields applied.
+    fn patched(mut npc: NpcPayload, body: &Value) -> Result<NpcPayload, NpcError> {
         if let Some(v) = body.get("name") {
             npc.name = clean_name(Some(v))?;
         }
@@ -593,10 +549,7 @@ impl Npcs {
             }
             npc.salience_gate = g as f32;
         }
-
-        npc.revision += 1;
-        npc.updated_ms = now_ms;
-        self.commit(npc, owner)
+        Ok(npc)
     }
 
     /* ── the authoring plane (§16) ──────────────────────────────────────────
@@ -612,118 +565,134 @@ impl Npcs {
 
     /// State an operator's belief. Replaces the one with that id, or adds it.
     pub fn put_belief(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         belief_id: &str,
         body: &Value,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        let existing = npc.beliefs.iter().position(|b| b.belief_id == belief_id);
-        let mut belief = existing
-            .map(|i| npc.beliefs[i].clone())
-            .unwrap_or(AuthoredBelief {
-                belief_id: belief_id.to_string(),
-                statement: String::new(),
-                confidence: 0.5,
-                threshold: 0.5,
-            });
-        if let Some(v) = body.get("statement") {
-            belief.statement = clean_line(v, "statement")?;
-        }
-        belief.confidence = unit(body, "confidence", belief.confidence)?;
-        belief.threshold = unit(body, "threshold", belief.threshold)?;
-        // A belief with nothing said in it is not a belief.
-        if belief.statement.trim().is_empty() {
-            return Err(NpcError::Invalid("statement"));
-        }
-        match existing {
-            Some(i) => npc.beliefs[i] = belief,
-            None => {
-                if npc.beliefs.len() >= MAX_BELIEFS {
-                    return Err(NpcError::Invalid("beliefs"));
-                }
-                npc.beliefs.push(belief);
+        self.write(|cast| {
+            let mut npc = cast.owned(npc_id, owner)?;
+            let existing = npc.beliefs.iter().position(|b| b.belief_id == belief_id);
+            let mut belief = existing
+                .map(|i| npc.beliefs[i].clone())
+                .unwrap_or(AuthoredBelief {
+                    belief_id: belief_id.to_string(),
+                    statement: String::new(),
+                    confidence: 0.5,
+                    threshold: 0.5,
+                });
+            if let Some(v) = body.get("statement") {
+                belief.statement = clean_line(v, "statement")?;
             }
-        }
-        self.bump(npc, owner, now_ms)
+            belief.confidence = unit(body, "confidence", belief.confidence)?;
+            belief.threshold = unit(body, "threshold", belief.threshold)?;
+            // A belief with nothing said in it is not a belief.
+            if belief.statement.trim().is_empty() {
+                return Err(NpcError::Invalid("statement"));
+            }
+            match existing {
+                Some(i) => npc.beliefs[i] = belief,
+                None => {
+                    if npc.beliefs.len() >= MAX_BELIEFS {
+                        return Err(NpcError::Invalid("beliefs"));
+                    }
+                    npc.beliefs.push(belief);
+                }
+            }
+            Ok(one(bumped(npc, now_ms), owner))
+        })
     }
 
     pub fn delete_belief(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         belief_id: &str,
         now_ms: u64,
     ) -> Result<bool, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        let before = npc.beliefs.len();
-        npc.beliefs.retain(|b| b.belief_id != belief_id);
-        if npc.beliefs.len() == before {
-            return Ok(false);
-        }
-        self.bump(npc, owner, now_ms)?;
-        Ok(true)
+        self.write(|cast| {
+            let mut npc = cast.owned(npc_id, owner)?;
+            let before = npc.beliefs.len();
+            npc.beliefs.retain(|b| b.belief_id != belief_id);
+            if npc.beliefs.len() == before {
+                return Ok((Vec::new(), false));
+            }
+            Ok((vec![bumped(npc, now_ms)], true))
+        })
     }
 
     /// Set how this character holds somebody.
     pub fn put_relationship(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         entity_id: &str,
         body: &Value,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        let existing = npc
-            .relationships
-            .iter()
-            .position(|r| r.entity_id == entity_id);
-        let mut rel =
-            existing
-                .map(|i| npc.relationships[i].clone())
-                .unwrap_or(AuthoredRelationship {
-                    entity_id: entity_id.to_string(),
-                    display: entity_id.to_string(),
-                    trust: 0.0,
-                    affect: 0.0,
-                    familiarity: 0.0,
-                    notes: String::new(),
-                });
-        if let Some(v) = body.get("display") {
-            rel.display = clean_line(v, "display")?;
-        }
-        if let Some(v) = body.get("notes") {
-            rel.notes = clean_line(v, "notes")?;
-        }
-        // Trust and affect run −1..1; familiarity only accumulates.
-        rel.trust = signed(body, "trust", rel.trust)?;
-        rel.affect = signed(body, "affect", rel.affect)?;
-        rel.familiarity = unit(body, "familiarity", rel.familiarity)?;
-        match existing {
-            Some(i) => npc.relationships[i] = rel,
-            None => {
-                if npc.relationships.len() >= MAX_RELATIONSHIPS {
-                    return Err(NpcError::Invalid("relationships"));
-                }
-                npc.relationships.push(rel);
+        self.write(|cast| {
+            let mut npc = cast.owned(npc_id, owner)?;
+            let existing = npc
+                .relationships
+                .iter()
+                .position(|r| r.entity_id == entity_id);
+            let mut rel =
+                existing
+                    .map(|i| npc.relationships[i].clone())
+                    .unwrap_or(AuthoredRelationship {
+                        entity_id: entity_id.to_string(),
+                        display: entity_id.to_string(),
+                        trust: 0.0,
+                        affect: 0.0,
+                        familiarity: 0.0,
+                        notes: String::new(),
+                    });
+            if let Some(v) = body.get("display") {
+                rel.display = clean_line(v, "display")?;
             }
-        }
-        self.bump(npc, owner, now_ms)
+            if let Some(v) = body.get("notes") {
+                rel.notes = clean_line(v, "notes")?;
+            }
+            // Trust and affect run −1..1; familiarity only accumulates.
+            rel.trust = signed(body, "trust", rel.trust)?;
+            rel.affect = signed(body, "affect", rel.affect)?;
+            rel.familiarity = unit(body, "familiarity", rel.familiarity)?;
+            match existing {
+                Some(i) => npc.relationships[i] = rel,
+                None => {
+                    if npc.relationships.len() >= MAX_RELATIONSHIPS {
+                        return Err(NpcError::Invalid("relationships"));
+                    }
+                    npc.relationships.push(rel);
+                }
+            }
+            Ok(one(bumped(npc, now_ms), owner))
+        })
     }
 
     /// State a strategy, optionally under another.
     pub fn put_strategy(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         strategy_id: &str,
         body: &Value,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
+        self.write(|cast| {
+            let npc = Self::strategized(cast.owned(npc_id, owner)?, strategy_id, body)?;
+            Ok(one(bumped(npc, now_ms), owner))
+        })
+    }
+
+    /// `npc` with the strategy `strategy_id` created or replaced from `body`.
+    fn strategized(
+        mut npc: NpcPayload,
+        strategy_id: &str,
+        body: &Value,
+    ) -> Result<NpcPayload, NpcError> {
         let existing = npc.agency.iter().position(|a| a.strategy_id == strategy_id);
         let mut st = existing
             .map(|i| npc.agency[i].clone())
@@ -770,15 +739,18 @@ impl Npcs {
                 npc.agency.push(st);
             }
         }
-        self.bump(npc, owner, now_ms)
+        Ok(npc)
     }
 
-    /// State a strategy on a character's **own** agency, owner-blind.
+    /// State a strategy on a character's **own** agency, owner-blind, and say
+    /// which strategy id it landed on.
     ///
     /// The effector device acts as the character's own body and carries no
     /// operator owner to authorise the write, so this resolves the owner from
-    /// the record itself ([`Self::payload`]) and then performs the ordinary
-    /// [`Self::put_strategy`]. That is the whole of the effector's *projected
+    /// the record itself ([`Cast::payload`]) and then performs the ordinary
+    /// [`Self::put_strategy`] write. A [`StrategyTarget::ChildOf`] mints the
+    /// child's id from the record this write supersedes, in the same step that
+    /// writes it. That is the whole of the effector's *projected
     /// store* (effector design §9.2): a `plan_*`/`orders_*` call the character
     /// makes lands in the same `agency` layer the operator API writes, supersedes
     /// the record, and projects into the next turn's prompt through the `agency`
@@ -788,21 +760,25 @@ impl Npcs {
     /// invariant is untouched — a belief is never a tool's silent edit (§9.2),
     /// and there is deliberately no `put_belief_self`.
     pub fn put_strategy_self(
-        &mut self,
+        &self,
         npc_id: u64,
-        strategy_id: &str,
+        target: StrategyTarget<'_>,
         body: &Value,
         now_ms: u64,
-    ) -> Result<Value, NpcError> {
-        // Resolved and owned before the mutable write borrows `self`. A
-        // tombstoned or unknown character reads as absent, the same as every
-        // other read path.
-        let owner = self
-            .payload(npc_id)
-            .ok_or(NpcError::NotFound)?
-            .owner_id
-            .clone();
-        self.put_strategy(npc_id, &owner, strategy_id, body, now_ms)
+    ) -> Result<(Value, String), NpcError> {
+        self.write(|cast| {
+            // A tombstoned or unknown character reads as absent, the same as
+            // every other read path.
+            let npc = cast.payload(npc_id).ok_or(NpcError::NotFound)?.clone();
+            let strategy_id = match target {
+                StrategyTarget::Id(id) => id.to_string(),
+                StrategyTarget::ChildOf(parent) => cast::child_id(&npc, parent),
+            };
+            let owner = npc.owner_id.clone();
+            let npc = bumped(Self::strategized(npc, &strategy_id, body)?, now_ms);
+            let (records, view) = one(npc, &owner);
+            Ok((records, (view, strategy_id)))
+        })
     }
 
     /// Attach an uploaded portrait.
@@ -814,139 +790,94 @@ impl Npcs {
     /// they did not upload — every id in the store is a valid one, so there
     /// would be nothing to reject.
     pub fn set_portrait(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         image_id: String,
         origin: &str,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        npc.portrait_image_id = Some(image_id);
-        npc.portrait_origin = Some(origin.to_string());
-        self.bump(npc, owner, now_ms)
-    }
-
-    /// The image every character's portrait names — what a drawn picture's
-    /// retirement leaves alone.
-    pub fn portrait_ids(&self) -> HashSet<String> {
-        self.by_id
-            .values()
-            .filter_map(|n| n.portrait_image_id.clone())
-            .collect()
+        self.write(|cast| {
+            let mut npc = cast.owned(npc_id, owner)?;
+            npc.portrait_image_id = Some(image_id);
+            npc.portrait_origin = Some(origin.to_string());
+            Ok(one(bumped(npc, now_ms), owner))
+        })
     }
 
     /// Every character whose portrait names an image `renames` has a new name
-    /// for, written again naming it. Returns how many were.
+    /// for, written again naming it. Returns how many were. One fsync covers
+    /// them all.
     pub fn repoint_portraits(
-        &mut self,
+        &self,
         renames: &HashMap<String, String>,
         now_ms: u64,
     ) -> Result<usize, NpcError> {
-        let moved: Vec<NpcPayload> = self
-            .by_id
-            .values()
-            .filter(|n| {
-                n.portrait_image_id
-                    .as_ref()
-                    .is_some_and(|id| renames.contains_key(id))
-            })
-            .cloned()
-            .collect();
-        for mut npc in moved.clone() {
-            let id = npc.portrait_image_id.take().unwrap_or_default();
-            npc.portrait_image_id = renames.get(&id).cloned();
-            let owner = npc.owner_id.clone();
-            self.bump(npc, &owner, now_ms)?;
-        }
-        Ok(moved.len())
+        self.write(|cast| {
+            let moved: Vec<NpcPayload> = cast
+                .by_id
+                .values()
+                .filter(|n| {
+                    n.portrait_image_id
+                        .as_ref()
+                        .is_some_and(|id| renames.contains_key(id))
+                })
+                .cloned()
+                .map(|mut npc| {
+                    let id = npc.portrait_image_id.take().unwrap_or_default();
+                    npc.portrait_image_id = renames.get(&id).cloned();
+                    bumped(npc, now_ms)
+                })
+                .collect();
+            let n = moved.len();
+            Ok((moved, n))
+        })
     }
 
     /// Set the affect dials.
     pub fn put_modulation(
-        &mut self,
+        &self,
         npc_id: u64,
         owner: &str,
         body: &Value,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
-        let mut npc = self.owned(npc_id, owner)?;
-        npc.modulation.affect = signed(body, "affect", npc.modulation.affect)?;
-        npc.modulation.threat = unit(body, "threat", npc.modulation.threat)?;
-        npc.modulation.curiosity = unit(body, "curiosity", npc.modulation.curiosity)?;
-        self.bump(npc, owner, now_ms)
-    }
-
-    /// The character, if the caller owns it. Every authoring write starts here:
-    /// ownership is authorization (§8.2), and a role cannot express "yours".
-    fn owned(&self, npc_id: u64, owner: &str) -> Result<NpcPayload, NpcError> {
-        let npc = self.visible_to(npc_id, owner).ok_or(NpcError::NotFound)?;
-        if npc.owner_id != owner {
-            return Err(NpcError::NotFound);
-        }
-        Ok(npc.clone())
-    }
-
-    /// One superseding record, with the revision moved on.
-    fn bump(&mut self, mut npc: NpcPayload, owner: &str, now_ms: u64) -> Result<Value, NpcError> {
-        npc.revision += 1;
-        npc.updated_ms = now_ms;
-        self.commit(npc, owner)
+        self.write(|cast| {
+            let mut npc = cast.owned(npc_id, owner)?;
+            npc.modulation.affect = signed(body, "affect", npc.modulation.affect)?;
+            npc.modulation.threat = unit(body, "threat", npc.modulation.threat)?;
+            npc.modulation.curiosity = unit(body, "curiosity", npc.modulation.curiosity)?;
+            Ok(one(bumped(npc, now_ms), owner))
+        })
     }
 
     /// Delete a character: one superseding record with `state: "tombstoned"`.
     /// The record stays, so the id stays taken.
-    pub fn delete(&mut self, npc_id: u64, owner: &str, now_ms: u64) -> Result<(), NpcError> {
-        let mut npc = self
-            .visible_to(npc_id, owner)
-            .ok_or(NpcError::NotFound)?
-            .clone();
-        npc.state = "tombstoned".to_string();
-        npc.revision += 1;
-        npc.updated_ms = now_ms;
-        self.commit(npc, owner)?;
-        Ok(())
-    }
-
-    /// Every character record, live and tombstoned, for a backup.
-    ///
-    /// Tombstoned ones travel too, so a restore keeps the whole id-space taken —
-    /// an id that was retired must not be minted again for a different character
-    /// after a wipe-and-restore.
-    pub fn export_all(&self) -> Vec<NpcPayload> {
-        self.by_id.values().cloned().collect()
-    }
-
-    /// Every living character and the account it belongs to, by name — what an
-    /// admin reassigning characters chooses from.
-    pub fn owners(&self) -> Vec<Value> {
-        let mut rows: Vec<&NpcPayload> =
-            self.by_id.values().filter(|n| !n.is_tombstoned()).collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.npc_id.cmp(&b.npc_id)));
-        rows.into_iter()
-            .map(|n| {
-                json!({
-                    "npc_id": npc_id_wire(n.npc_id),
-                    "name": n.name,
-                    "world_id": n.world_id,
-                    "owner_id": n.owner_id,
-                })
-            })
-            .collect()
+    pub fn delete(&self, npc_id: u64, owner: &str, now_ms: u64) -> Result<(), NpcError> {
+        self.write(|cast| {
+            let mut npc = cast
+                .visible_to(npc_id, owner)
+                .ok_or(NpcError::NotFound)?
+                .clone();
+            npc.state = "tombstoned".to_string();
+            Ok((vec![bumped(npc, now_ms)], ()))
+        })
     }
 
     /// Hand character `npc_id` to the account `to` (its public id) — an admin's
     /// act, and the one write that crosses ownership: every other write starts
-    /// from [`Self::owned`]. Ownership is what every read and write of the
+    /// from [`Cast::visible_to`]. Ownership is what every read and write of the
     /// character is checked against, so this is how a character made under one
     /// account comes to be another's to watch and author.
-    pub fn reassign(&mut self, npc_id: u64, to: &str, now_ms: u64) -> Result<Value, NpcError> {
-        let mut npc = self.payload(npc_id).ok_or(NpcError::NotFound)?.clone();
-        if npc.owner_id == to {
-            return Ok(wire(&npc, to));
-        }
-        npc.owner_id = to.to_string();
-        self.bump(npc, to, now_ms)
+    pub fn reassign(&self, npc_id: u64, to: &str, now_ms: u64) -> Result<Value, NpcError> {
+        self.write(|cast| {
+            let mut npc = cast.payload(npc_id).ok_or(NpcError::NotFound)?.clone();
+            if npc.owner_id == to {
+                return Ok((Vec::new(), wire(&npc, to)));
+            }
+            npc.owner_id = to.to_string();
+            Ok(one(bumped(npc, now_ms), to))
+        })
     }
 
     /// Restore backed-up character records into a fresh substrate.
@@ -955,72 +886,9 @@ impl Npcs {
     /// are preserved — so a restored cast is the same characters, only with the
     /// conversation/belief/dream history the wipe cleared. One fsync covers the
     /// batch. Returns how many were written.
-    pub fn import(&mut self, payloads: Vec<NpcPayload>) -> Result<usize, NpcError> {
-        self.shared.persistence.call(|p| {
-            for npc in &payloads {
-                p.write_npc(npc)
-                    .map_err(|e| NpcError::Persist(e.to_string()))?;
-            }
-            p.commit().map_err(|e| NpcError::Persist(e.to_string()))
-        })?;
+    pub fn import(&self, payloads: Vec<NpcPayload>) -> Result<usize, NpcError> {
         let n = payloads.len();
-        for npc in payloads {
-            self.by_id.insert(npc.npc_id, npc);
-        }
-        Ok(n)
-    }
-
-    /// Write the record, then update memory — in that order.
-    ///
-    /// If the append fails the map is untouched, so the daemon's view still
-    /// matches the log. The other order would leave a character that exists in
-    /// memory, vanishes on restart, and is never written again because nothing
-    /// knows it is missing.
-    fn commit(&mut self, npc: NpcPayload, owner: &str) -> Result<Value, NpcError> {
-        // The engine appends through this same owner, which is the point: one
-        // cursor, one `npc_locs`, so a compaction on the engine's side sees
-        // this character. One call, so nothing interleaves between the append
-        // and its fsync.
-        self.shared.persistence.call(|p| {
-            p.write_npc(&npc)
-                .map_err(|e| NpcError::Persist(e.to_string()))?;
-            // Flush and fsync before returning. `write_npc` only *stages* the
-            // record, and a staged record is lost on a crash — which for a
-            // character somebody just created means the API said "created"
-            // about something that never existed.
-            //
-            // Group-committing instead would be the right call for a hot write
-            // path; this one is a person pressing save, so the fsync is both
-            // affordable and what they are entitled to assume happened.
-            p.commit().map_err(|e| NpcError::Persist(e.to_string()))
-        })?;
-        let view = wire(&npc, owner);
-        self.by_id.insert(npc.npc_id, npc);
-        Ok(view)
-    }
-
-    /// A fresh id, unique across the whole cast including tombstoned ones.
-    ///
-    /// Derived rather than sequential: a sequential id leaks how many
-    /// characters exist and in what order they were made, which is the §8.3
-    /// enumeration problem by another route. The hash is not a secret — the
-    /// subject and name are known to their owner — it is only a spread.
-    fn mint_id(&self, id: &Identity, name: &str, now_ms: u64) -> u64 {
-        for salt in 0u32.. {
-            let mut h = Sha256::new();
-            h.update(id.sub.as_bytes());
-            h.update(name.as_bytes());
-            h.update(now_ms.to_le_bytes());
-            h.update(salt.to_le_bytes());
-            let d = h.finalize();
-            let v = u64::from_le_bytes(d[..8].try_into().expect("32-byte digest"));
-            // Never zero: zero is the header's "no stream" value, and an id that
-            // collides with an absence is a debugging session nobody needs.
-            if v != 0 && !self.by_id.contains_key(&v) {
-                return v;
-            }
-        }
-        unreachable!("u32 salts exhausted against a u64 keyspace")
+        self.write(|_| Ok((payloads, n)))
     }
 }
 
@@ -1370,13 +1238,13 @@ mod tests {
     fn a_character_survives_a_restart() {
         let dir = tmp();
         let created = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap()
         };
         let npc_id: u64 = nid(&created);
 
         // A second registry over the same log — a restart, in effect.
-        let reopened = Npcs::load(&dir).unwrap();
+        let reopened = Npcs::load(&dir).unwrap().view();
         let back = reopened.get(npc_id, ME).unwrap();
         assert_eq!(back["name"], "Varek");
         assert_eq!(back["owner_id"], ME);
@@ -1391,14 +1259,14 @@ mod tests {
     fn a_reassigned_character_belongs_to_its_new_owner() {
         let dir = tmp();
         let npc_id = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             let npc_id = nid(&n.create(&ident("u1"), OTHER, &body("Ilsa"), 1_000).unwrap());
             let handed = n.reassign(npc_id, ME, 2_000).unwrap();
             assert_eq!(handed["owner_id"], ME);
             assert_eq!(handed["access"], "owner");
             assert_eq!(handed["revision"], 2);
-            assert_eq!(n.owners()[0]["owner_id"], ME);
-            assert_eq!(n.owners()[0]["name"], "Ilsa");
+            assert_eq!(n.view().owners()[0]["owner_id"], ME);
+            assert_eq!(n.view().owners()[0]["name"], "Ilsa");
             assert_eq!(
                 n.reassign(npc_id, ME, 3_000).unwrap()["revision"],
                 2,
@@ -1410,7 +1278,7 @@ mod tests {
             ));
             npc_id
         };
-        let reopened = Npcs::load(&dir).unwrap();
+        let reopened = Npcs::load(&dir).unwrap().view();
         assert_eq!(reopened.get(npc_id, ME).unwrap()["name"], "Ilsa");
         assert!(reopened.get(npc_id, OTHER).is_err());
         assert_eq!(reopened.list(OTHER, &Filter::default()).len(), 0);
@@ -1433,7 +1301,7 @@ mod tests {
     fn a_character_created_at_runtime_survives_an_engine_compaction() {
         let dir = tmp();
         let npc_id: u64 = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             // Whatever the engine does to this log, it does through this handle
             // — the one the registry is writing through.
             let engine = n.substrate();
@@ -1450,7 +1318,7 @@ mod tests {
         };
 
         // A restart.
-        let reopened = Npcs::load(&dir).unwrap();
+        let reopened = Npcs::load(&dir).unwrap().view();
         assert_eq!(
             reopened.get(npc_id, ME).unwrap()["name"],
             "Wyneth",
@@ -1472,7 +1340,7 @@ mod tests {
     #[test]
     fn an_authoring_layer_stops_growing_but_stays_editable() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
 
         for i in 0..MAX_BELIEFS {
@@ -1491,7 +1359,8 @@ mod tests {
         // At the cap, an existing belief still revises...
         n.put_belief(id, ME, "b0", &json!({ "statement": "revised" }), 4_000)
             .expect("an existing entry must stay editable at the cap");
-        let held = n.payload(id).expect("still there");
+        let view = n.view();
+        let held = view.payload(id).expect("still there");
         assert_eq!(
             held.beliefs.len(),
             MAX_BELIEFS,
@@ -1519,19 +1388,22 @@ mod tests {
     #[test]
     fn put_strategy_self_resolves_the_owner_and_writes_the_agency() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
 
         // No owner passed — the caller does not have one.
-        n.put_strategy_self(
-            id,
-            "hold-the-gate",
-            &json!({ "statement": "Hold the toll gate.", "state": "active" }),
-            2_000,
-        )
-        .expect("the owner-blind write lands");
+        let (_, landed) = n
+            .put_strategy_self(
+                id,
+                StrategyTarget::Id("hold-the-gate"),
+                &json!({ "statement": "Hold the toll gate.", "state": "active" }),
+                2_000,
+            )
+            .expect("the owner-blind write lands");
+        assert_eq!(landed, "hold-the-gate");
 
-        let held = n.payload(id).expect("still there");
+        let view = n.view();
+        let held = view.payload(id).expect("still there");
         let strat = held
             .agency
             .iter()
@@ -1543,7 +1415,12 @@ mod tests {
         // A character nobody has is absent, the same as every other read path —
         // never a panic, never a write under a mislaid owner.
         assert!(matches!(
-            n.put_strategy_self(id + 1, "x", &json!({ "statement": "no" }), 3_000),
+            n.put_strategy_self(
+                id + 1,
+                StrategyTarget::Id("x"),
+                &json!({ "statement": "no" }),
+                3_000
+            ),
             Err(NpcError::NotFound)
         ));
     }
@@ -1559,14 +1436,14 @@ mod tests {
     fn how_a_character_feels_survives_a_restart() {
         let dir = tmp();
         let id: u64 = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
             // Absent, not calm. Nobody has asked it yet, and those are
             // different facts about a character.
-            assert_eq!(n.mood_of(id), None);
+            assert_eq!(n.view().mood_of(id), None);
 
             assert!(n.remember_mood(id, "wary"));
-            assert_eq!(n.mood_of(id), Some("wary"));
+            assert_eq!(n.view().mood_of(id), Some("wary"));
             // Feeling the same thing again costs nothing, however often it is
             // said — which is the whole of the write gate, because a register
             // is named at most once a pause and is usually last time's word.
@@ -1575,7 +1452,7 @@ mod tests {
             id
         };
 
-        let back = Npcs::load(&dir).unwrap();
+        let back = Npcs::load(&dir).unwrap().view();
         assert_eq!(
             back.mood_of(id),
             Some("cornered"),
@@ -1593,13 +1470,14 @@ mod tests {
     #[test]
     fn feeling_something_is_not_an_edit() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
         let id: u64 = nid(&made);
-        let before = n.payload(id).unwrap().clone();
+        let before = n.view().payload(id).unwrap().clone();
 
         assert!(n.remember_mood(id, "bitter"));
-        let after = n.payload(id).unwrap();
+        let view = n.view();
+        let after = view.payload(id).unwrap();
         assert_eq!(
             after.revision, before.revision,
             "a mood bumped the revision"
@@ -1616,7 +1494,7 @@ mod tests {
     fn an_edit_supersedes_the_previous_record() {
         let dir = tmp();
         let npc_id: u64 = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
             let id: u64 = nid(&c);
             n.patch(id, ME, &json!({ "name": "Varek the Elder" }), 2_000)
@@ -1626,7 +1504,7 @@ mod tests {
             id
         };
 
-        let reopened = Npcs::load(&dir).unwrap();
+        let reopened = Npcs::load(&dir).unwrap().view();
         let list = reopened.list(ME, &Filter::default());
         assert_eq!(list.len(), 1, "three records, one character");
         assert_eq!(list[0]["name"], "Varek the Elder");
@@ -1641,16 +1519,16 @@ mod tests {
     fn deleting_hides_the_character_but_keeps_its_id() {
         let dir = tmp();
         let npc_id: u64 = {
-            let mut n = Npcs::load(&dir).unwrap();
+            let n = Npcs::load(&dir).unwrap();
             let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
             let id: u64 = nid(&c);
             n.delete(id, ME, 2_000).unwrap();
-            assert!(n.list(ME, &Filter::default()).is_empty());
-            assert!(matches!(n.get(id, ME), Err(NpcError::NotFound)));
+            assert!(n.view().list(ME, &Filter::default()).is_empty());
+            assert!(matches!(n.view().get(id, ME), Err(NpcError::NotFound)));
             id
         };
 
-        let reopened = Npcs::load(&dir).unwrap();
+        let reopened = Npcs::load(&dir).unwrap().view();
         assert!(reopened.list(ME, &Filter::default()).is_empty());
         assert!(
             reopened.by_id.contains_key(&npc_id),
@@ -1663,12 +1541,12 @@ mod tests {
     #[test]
     fn another_accounts_character_is_invisible_not_forbidden() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let c = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
         let id: u64 = nid(&c);
 
-        assert!(matches!(n.get(id, OTHER), Err(NpcError::NotFound)));
-        assert!(n.list(OTHER, &Filter::default()).is_empty());
+        assert!(matches!(n.view().get(id, OTHER), Err(NpcError::NotFound)));
+        assert!(n.view().list(OTHER, &Filter::default()).is_empty());
         assert!(matches!(
             n.patch(id, OTHER, &json!({ "name": "Stolen" }), 2_000),
             Err(NpcError::NotFound)
@@ -1678,19 +1556,20 @@ mod tests {
             Err(NpcError::NotFound)
         ));
         // And the original is untouched by the attempts.
-        assert_eq!(n.get(id, ME).unwrap()["name"], "Varek");
+        assert_eq!(n.view().get(id, ME).unwrap()["name"], "Varek");
     }
 
     /// Hidden characters stay out of the default listing (§8.3).
     #[test]
     fn hidden_characters_are_opt_in() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         n.create(&ident("u1"), ME, &body("Seen"), 1_000).unwrap();
         let mut hidden_body = body("Unseen");
         hidden_body["hidden"] = json!(true);
         n.create(&ident("u1"), ME, &hidden_body, 1_001).unwrap();
 
+        let n = n.view();
         assert_eq!(n.list(ME, &Filter::default()).len(), 1);
         let all = n.list(
             ME,
@@ -1705,13 +1584,14 @@ mod tests {
     #[test]
     fn filters_narrow_and_do_not_silently_pass_everything() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let mut a = body("Varek");
         a["tags"] = json!(["north", "campaign-2"]);
         n.create(&ident("u1"), ME, &a, 1_000).unwrap();
         let mut b = json!({ "name": "Ilse", "world_id": "earth", "personality_id": "commander" });
         b["tags"] = json!(["market"]);
         n.create(&ident("u1"), ME, &b, 1_001).unwrap();
+        let n = n.view();
 
         let by_tag = |t| {
             n.list(
@@ -1760,7 +1640,7 @@ mod tests {
     #[test]
     fn minted_ids_are_unique_and_not_sequential() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let mut ids = Vec::new();
         for i in 0..24 {
             let c = n
@@ -1785,7 +1665,7 @@ mod tests {
     #[test]
     fn invalid_fields_are_refused_rather_than_defaulted() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         assert!(matches!(
             n.create(
                 &ident("u1"),
@@ -1829,7 +1709,7 @@ mod tests {
             );
         }
         // And none of the refusals bumped the revision.
-        assert_eq!(n.get(id, ME).unwrap()["revision"], 1);
+        assert_eq!(n.view().get(id, ME).unwrap()["revision"], 1);
     }
 
     /// A reference is a file name. Anything that could not become one is
@@ -1839,7 +1719,7 @@ mod tests {
     #[test]
     fn a_reference_that_could_not_be_a_file_name_is_refused() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         for bad in [
             "../etc/passwd",
             "Battle-Cities", // uppercase: the registry is lowercase-only
@@ -1873,7 +1753,7 @@ mod tests {
     #[test]
     fn hiding_a_character_does_not_move_a_count() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
         let mut b = json!({ "name": "Ilse", "world_id": "earth", "personality_id": "drifter" });
         b["hidden"] = json!(true);
@@ -1885,23 +1765,25 @@ mod tests {
         c["tags"] = json!([]);
         n.create(&ident("u2"), "u_other", &c, 1_002).unwrap();
 
-        let worlds = n.counts_by(|x| x.world_id.as_str());
+        let view = n.view();
+        let worlds = view.counts_by(|x| x.world_id.as_str());
         assert_eq!(worlds.get("battle-cities"), Some(&1));
         assert_eq!(worlds.get("earth"), Some(&2), "the hidden one still counts");
 
-        let people = n.counts_by(|x| x.personality_id.as_str());
+        let people = view.counts_by(|x| x.personality_id.as_str());
         assert_eq!(people.get("commander"), Some(&2), "across owners");
         assert_eq!(people.get("drifter"), Some(&1), "hidden, and still counted");
 
         // The property that matters: hiding a character moves nothing. An
         // observer polling this cannot tell that anything happened.
-        // Owned, so the map does not keep borrowing `n` across the edit.
-        let before: BTreeMap<String, usize> = n
-            .counts_by(|x| x.personality_id.as_str())
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
-        let ilse: u64 = n
+        let owned = |view: &Cast| -> BTreeMap<String, usize> {
+            view.counts_by(|x| x.personality_id.as_str())
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect()
+        };
+        let before = owned(&view);
+        let ilse: u64 = view
             .list(
                 ME,
                 &Filter {
@@ -1915,18 +1797,15 @@ mod tests {
             .unwrap();
         n.patch(ilse, ME, &json!({ "hidden": false }), 1_500)
             .unwrap();
-        let after: BTreeMap<String, usize> = n
-            .counts_by(|x| x.personality_id.as_str())
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
         assert_eq!(
-            after, before,
+            owned(&n.view()),
+            before,
             "un-hiding moved the count, so hiding would too"
         );
 
         // A deleted character stops counting.
         let id: u64 = n
+            .view()
             .list(ME, &Filter::default())
             .iter()
             .find(|v| v["name"] == "Varek")
@@ -1934,7 +1813,9 @@ mod tests {
             .unwrap();
         n.delete(id, ME, 2_000).unwrap();
         assert_eq!(
-            n.counts_by(|x| x.world_id.as_str()).get("battle-cities"),
+            n.view()
+                .counts_by(|x| x.world_id.as_str())
+                .get("battle-cities"),
             None
         );
     }
@@ -1945,7 +1826,7 @@ mod tests {
     #[test]
     fn the_wire_shape_reports_engine_values_as_absent() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let v = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
 
         assert_eq!(v["monitor"], Value::Null);
@@ -1964,15 +1845,95 @@ mod tests {
     #[test]
     fn the_roster_reads_as_the_mcp_tools_npc_list() {
         let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
+        let n = Npcs::load(&dir).unwrap();
         let v = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
         let listed: NpcList =
-            serde_json::from_value(json!({ "items": n.list(ME, &Filter::default()) })).unwrap();
+            serde_json::from_value(json!({ "items": n.view().list(ME, &Filter::default()) }))
+                .unwrap();
         assert_eq!(listed.items.len(), 1);
         let npc = &listed.items[0];
         assert_eq!(npc.npc_id, v["npc_id"].as_str().unwrap());
         assert_eq!(npc.name, "Varek");
         assert_eq!(npc.state, v["state"].as_str().unwrap());
         assert_eq!(npc.mood, None, "never asked is absent");
+    }
+
+    /// **A refused write publishes nothing and appends nothing**
+    /// (`docs/npcd_cast_lock_free.md` §2): the cast a reader loads afterwards is
+    /// the very one it loaded before, and a restart reads the same.
+    #[test]
+    fn a_refused_write_publishes_nothing() {
+        let dir = tmp();
+        let n = Npcs::load(&dir).unwrap();
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
+        let before = n.view();
+
+        assert!(matches!(
+            n.put_belief(id, ME, "b", &json!({ "statement": "  " }), 2_000),
+            Err(NpcError::Invalid("statement"))
+        ));
+        assert!(
+            Arc::ptr_eq(&before, &n.view()),
+            "a refused write published a cast"
+        );
+
+        // The one writer lets go before the restart opens the log again.
+        drop(n);
+        let reopened = Npcs::load(&dir).unwrap().view();
+        assert_eq!(reopened.get(id, ME).unwrap()["revision"], 1);
+    }
+
+    /// **A snapshot a reader holds is not moved by a later write**: it answers
+    /// as the cast was when it was taken, while a fresh view sees the write.
+    #[test]
+    fn a_snapshot_is_not_moved_by_a_write() {
+        let dir = tmp();
+        let n = Npcs::load(&dir).unwrap();
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
+        let held = n.view();
+
+        n.patch(id, ME, &json!({ "name": "Varek the Elder" }), 2_000)
+            .unwrap();
+
+        assert_eq!(held.get(id, ME).unwrap()["name"], "Varek");
+        assert_eq!(held.get(id, ME).unwrap()["revision"], 1);
+        assert_eq!(n.view().get(id, ME).unwrap()["name"], "Varek the Elder");
+        assert_eq!(n.view().get(id, ME).unwrap()["revision"], 2);
+    }
+
+    /// **Concurrent writes to one character lose nothing**: each is computed
+    /// from what the one before it published, so eight threads each adding
+    /// their own belief leave all eight, at revision 1 + 8 — in memory and
+    /// after a restart.
+    #[test]
+    fn concurrent_writes_to_one_character_all_land() {
+        let dir = tmp();
+        let n = Arc::new(Npcs::load(&dir).unwrap());
+        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let n = Arc::clone(&n);
+                std::thread::spawn(move || {
+                    let b = json!({ "statement": format!("belief {i}") });
+                    n.put_belief(id, ME, &format!("b{i}"), &b, 2_000 + i)
+                        .unwrap_or_else(|e| panic!("belief {i} refused: {e:?}"));
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let check = |cast: &Cast| {
+            let held = cast.payload(id).expect("still there");
+            let mut ids: Vec<&str> = held.beliefs.iter().map(|b| b.belief_id.as_str()).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]);
+            assert_eq!(held.revision, 9);
+        };
+        check(&n.view());
+        drop(n);
+        check(&Npcs::load(&dir).unwrap().view());
     }
 }

@@ -32,7 +32,6 @@ use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock;
 use tokio::task::{block_in_place, spawn_blocking, JoinHandle};
 use tokio::time::interval;
 use web::auth::Roles;
@@ -367,7 +366,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     let starting = Arc::clone(&ctx.starting);
     starting.set_step("opening", "Opening the substrate");
     let stage_shown: Cell<Option<OpenStage>> = Cell::new(None);
-    let mut npcs = Npcs::load_reporting(&data, &|stage, done, total| {
+    let npcs = Npcs::load_reporting(&data, &|stage, done, total| {
         if stage_shown.get() != Some(stage) {
             stage_shown.set(Some(stage));
             starting.set_detail(stage.label());
@@ -515,7 +514,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
 
     // The engine adopts the substrate the cast was just loaded from: one
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
-    runtime.set_substrate(authored.npcs.read().await.substrate());
+    runtime.set_substrate(authored.npcs.substrate());
     runtime.set_npcs(authored.npcs.clone());
     let authored = authored.with_runtime(runtime.clone());
 
@@ -556,7 +555,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // The loader runs on its own OS thread and returns immediately, so the
     // server binds while the model is still being fetched — the loading screen
     // has to be reachable during the load it is describing.
-    let cast: Vec<Casting> = authored.npcs.read().await.cast();
+    let cast: Vec<Casting> = authored.npcs.view().cast();
     tracing::info!("engine: loading, {} character(s) to wake", cast.len());
     let characters = authored
         .personalities
@@ -598,11 +597,10 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     };
 
     let stopping = runtime.clone();
-    let npcs = authored.npcs.clone();
     Ok(Running {
         routes,
         reports: Arc::new(NpcdReports::new(authored, data)),
-        stop: Box::new(move || Box::pin(stop(stopping, npcs, guardian))),
+        stop: Box::new(move || Box::pin(stop(stopping, guardian))),
     })
 }
 
@@ -663,11 +661,8 @@ fn read_again_on_arrival(
                 if let Some(rt) = &state.runtime {
                     host_worlds(rt, &state, &authored_dir).await;
                 }
-                let cast = {
-                    let mut npcs = state.npcs.write().await;
-                    npcs.refresh();
-                    npcs.cast()
-                };
+                state.npcs.refresh();
+                let cast = state.npcs.view().cast();
                 let characters: Vec<String> = state
                     .personalities
                     .read()
@@ -731,18 +726,17 @@ fn read_libraries(schema: &projection::Source) -> (Libraries, Vec<String>) {
 ///    turns to the substrate, and a cast killed mid-tick leaves the redo log
 ///    with a turn whose sealing never happened. Every dropped turn future has
 ///    released its scheduler slot when this returns.
-/// 2. The character store's lock is taken once, so a place or mood write a
-///    character left in flight lands before the substrate is closed.
-/// 3. The engine shuts down: its persistence drains, its writer flushes, the
+/// 2. The engine shuts down: its persistence drains — every call already
+///    queued on the owner is served first, so a cast write a character left in
+///    flight lands before the substrate is closed — its writer flushes, the
 ///    substrate detaches — stopping the scheduler when npcd is the engine's
 ///    last attachment — and the writer lock is released.
-async fn stop(runtime: Arc<Runtime>, npcs: Arc<RwLock<Npcs>>, guardian: Option<JoinHandle<()>>) {
+async fn stop(runtime: Arc<Runtime>, guardian: Option<JoinHandle<()>>) {
     runtime.stop();
     if let Some(g) = guardian {
         g.abort();
     }
     runtime.stop_characters().await;
-    drop(npcs.write().await);
     let shut = spawn_blocking(move || runtime.shutdown_engine()).await;
     match shut {
         Ok(Ok(())) => {}
@@ -896,7 +890,7 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
     runtime.set_clock(Arc::new(move |npc_id: u64| {
         let read = || {
             clock::world_ms_for(
-                &clock_state.npcs.blocking_read(),
+                &clock_state.npcs.view(),
                 &clock_state.worlds.blocking_read(),
                 npc_id,
                 now_ms_i64(),
@@ -914,7 +908,7 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
     // the authoring API has to reach the next tick.
     let persona_state = authored.clone();
     runtime.set_persona_source(Arc::new(move |npc_id: u64| {
-        let npcs = persona_state.npcs.blocking_read();
+        let npcs = persona_state.npcs.view();
         let payload = npcs.payload(npc_id)?;
         // The world's own `setting`, for the prompt's setting section.
         let world = persona_state
@@ -948,7 +942,7 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
         let state = mood_state.clone();
         let mood = mood.to_string();
         run_sink(move || {
-            state.npcs.blocking_write().remember_mood(npc_id, &mood);
+            state.npcs.remember_mood(npc_id, &mood);
         });
     }));
 }
@@ -979,7 +973,7 @@ async fn host_worlds(runtime: &Arc<Runtime>, authored: &Arc<Authored>, authored_
 /// identity collections — read here, where the registries live.
 async fn identities(authored: &Arc<Authored>) -> Identities {
     let (npcs, personalities, worlds) = (
-        authored.npcs.read().await,
+        authored.npcs.view(),
         authored.personalities.read().await,
         authored.worlds.read().await,
     );

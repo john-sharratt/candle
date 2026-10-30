@@ -194,12 +194,7 @@ async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
 /// A map in the mind's folder `folder`, kept as the write of character `npc`'s
 /// owner: their draft over a mind under git.
 async fn keep_in_mind(rt: &Runtime, folder: String, npc: u64) -> Option<Keep> {
-    let owner = rt
-        .npcs()?
-        .read()
-        .await
-        .payload(npc)
-        .map(|p| p.owner_id.clone())?;
+    let owner = rt.npcs()?.view().payload(npc).map(|p| p.owner_id.clone())?;
     let author = Author::open(&rt.mind_handle, &rt.data, Some(&rt.ops), &owner);
     Some(Keep {
         drafts: author.keeps_drafts(),
