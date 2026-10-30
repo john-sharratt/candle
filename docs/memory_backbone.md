@@ -528,16 +528,24 @@ opens every conversation:
   question ever reads another, and no person's journal reaches another's
   summary. Its KV and frame never go to disk; its sealed turn's tokens do, as
   every turn's do, until compaction drops the tombstoned timeline. It is shown the journal's window and each
-  live child's summary and cue — never its own previous summary, except as a
-  guide to structure — and answers a grammar,
+  live child's summary and cue — never its own previous summary's text, whose
+  shape a model shown it copies (a one-subject summary came back one subject
+  however many the journal held), only the length the shrink rule below holds
+  it to — and answers a grammar,
   `journal_summary {sentences: [{text, cite, also_cite?}], digest, cue?}` —
   `digest` asked of a root, which alone has one, and `cue` of a named journal,
   whose cue may drift — whose `cite` and `also_cite` are each one of its inputs
   (a window line's `#id`, or a live child whose summary says something). Each field is bounded,
-  so a call always closes. The rebuild is kept only if it is built over the
-  journal as it stands, every sentence is one line citing one of its inputs, it
+  so a call always closes; `sentences` holds at least one for every two
+  inputs, up to three, since a sentence carries only two cites and a list
+  decoded greedily closes after its first subject — except under `channels`,
+  where a conversation is one exchange and may say it in one. The question
+  states that floor, and the length the shrink rule holds a rebuild to. The rebuild is kept only if it is built over the
+  journal as it stands, every sentence is one line citing one of its inputs,
+  there are as many sentences as that floor asks for, it
   and its digest are within their caps, and it did not shrink by more than half
-  without lines or children gone to explain it. A journal left with nothing to
+  without lines or children gone to explain it — fewer of either, or an input
+  the old summary cited no longer there. A journal left with nothing to
   cite has its summary emptied without the model. A refused rebuild leaves the
   old summary, marked stale, and any refused job — a summary, a fold — is not
   asked again until its journal's fingerprint moves: at temperature 0 the same

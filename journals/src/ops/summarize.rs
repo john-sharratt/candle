@@ -1,6 +1,9 @@
 //! A rebuilt summary (§5), kept only if it was built over the journal as it
-//! stands, cites only what it was built from, fits its cap, and did not lose
-//! half of itself with nothing gone to explain it.
+//! stands, cites only what it was built from, says as many sentences as its
+//! inputs ask for, fits its cap, and did not lose half of itself with nothing
+//! gone to explain it.
+
+use journal_core::tools::half_floor;
 
 use crate::error::{Error, Result};
 use crate::files::summary::{Cite, Fingerprint, Sentence, Summary};
@@ -8,6 +11,7 @@ use crate::files::Meta;
 use crate::ops::create::clean_cue;
 use crate::ops::Applied;
 use crate::path::{JournalPath, Place};
+use crate::scope::Section;
 use crate::time::Stamp;
 use crate::tree::check::{digest_cap, summary_cap};
 use crate::tree::fingerprint::{fingerprint, has_inputs, speaks};
@@ -21,6 +25,63 @@ fn fixed_name(path: &JournalPath, j: &Journal) -> String {
         Place::Channel(c) => c.name().into(),
         Place::Named { .. } => path.last().map(|s| s.to_string()).unwrap_or_default(),
     }
+}
+
+/// The most sentences a summary's floor asks for, however many its inputs.
+pub const SENTENCE_FLOOR_MAX: usize = 3;
+
+/// `j`'s live children with something to say.
+fn speaking(j: &Journal) -> usize {
+    j.live().filter(|(_, c)| speaks(c)).count()
+}
+
+/// Whether `c` names one of `j`'s inputs: a window line, or a live child
+/// with something to say.
+fn is_input(j: &Journal, c: &Cite) -> bool {
+    match c {
+        Cite::Line(id) => j.has_id(id),
+        Cite::Child(name) => j.live().any(|(n, c)| n == name && speaks(c)),
+    }
+}
+
+/// The fewest sentences a summary of `j` holds; none when it has no inputs.
+/// A conversation is one exchange and says it in one. Any other journal
+/// holds one for every two inputs — window lines and children with
+/// something to say — since a sentence cites at most two, up to
+/// [`SENTENCE_FLOOR_MAX`]: a rebuild asked for fewer closes its list after
+/// one subject.
+pub fn sentence_floor(j: &Journal) -> usize {
+    let inputs = j.window.len() + speaking(j);
+    let conversation = matches!(
+        j.place,
+        Place::Channel(_)
+            | Place::Named {
+                section: Section::Channels,
+                ..
+            }
+    );
+    match inputs {
+        0 => 0,
+        _ if conversation => 1,
+        n => half_floor(n, SENTENCE_FLOOR_MAX),
+    }
+}
+
+/// How long `j`'s summary is and the fewest characters a rebuild may come
+/// to — half of it — while nothing it was built over has gone: no fewer
+/// lines or children, and every input it cites still there. `None` when a
+/// rebuild may be any length.
+pub fn shortest(j: &Journal) -> Option<(usize, usize)> {
+    let old = j.summary()?;
+    let nothing_gone = j.window.len() >= old.lines
+        && speaking(j) >= old.children
+        && old
+            .sentences
+            .iter()
+            .flat_map(|s| &s.cites)
+            .all(|c| is_input(j, c));
+    let len = old.len();
+    (nothing_gone && len > 0).then(|| (len, len.div_ceil(2)))
 }
 
 fn check_sentences(
@@ -44,11 +105,7 @@ fn check_sentences(
             )));
         }
         for c in &s.cites {
-            let ok = match c {
-                Cite::Line(id) => j.has_id(id),
-                Cite::Child(name) => j.live().any(|(n, c)| n == name && speaks(c)),
-            };
-            if !ok {
+            if !is_input(j, c) {
                 return Err(Error::invalid(format!(
                     "sentence {} cites {c}, which is not one of {path}'s inputs",
                     i + 1
@@ -63,6 +120,13 @@ fn check_sentences(
     if has_inputs(j) && out.is_empty() {
         return Err(Error::invalid(format!(
             "{path} has lines or children: its summary says something"
+        )));
+    }
+    let floor = sentence_floor(j);
+    if out.len() < floor {
+        return Err(Error::invalid(format!(
+            "{path}'s inputs ask for at least {floor} sentences in its summary, not {}",
+            out.len()
         )));
     }
     Ok(out)
@@ -99,7 +163,7 @@ pub fn summarize(
         over: current,
         built: now,
         lines: j.window.len(),
-        children: j.live().filter(|(_, c)| speaks(c)).count(),
+        children: speaking(j),
         stale: false,
         digest: match (digest.map(str::trim), digest_cap(j.place, scope)) {
             (None, _) => None,
@@ -126,12 +190,10 @@ pub fn summarize(
             summary.len()
         )));
     }
-    if let Some(old) = j.summary() {
-        let nothing_gone = summary.lines >= old.lines && summary.children >= old.children;
-        if nothing_gone && summary.len() * 2 < old.len() {
+    if let Some((was, least)) = shortest(j) {
+        if summary.len() < least {
             return Err(Error::refused(format!(
-                "the summary shrinks from {} to {} characters with nothing gone from {path}",
-                old.len(),
+                "the summary shrinks from {was} to {} characters with nothing gone from {path}",
                 summary.len()
             )));
         }
@@ -369,6 +431,65 @@ mod tests {
                 .to_string();
             assert!(err.contains(says), "{err}");
         }
+    }
+
+    /// **A summary says as many sentences as its inputs ask for**, whoever
+    /// writes it: one for every two inputs, up to three.
+    #[test]
+    fn a_summary_below_its_sentence_floor_is_refused() {
+        let mut t = sharratt();
+        let (path, a) = noted(&mut t, "topics", "a");
+        let (_, b) = noted(&mut t, "topics", "b");
+        let (_, c) = noted(&mut t, "topics", "c");
+        assert_eq!(sentence_floor(t.get(&path).unwrap()), 2);
+        let err = summarise(&mut t, &path, vec![s("A.", vec![a.clone(), b])], None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::invalid(
+                "@sharratt/topics's inputs ask for at least 2 sentences in its summary, not 1"
+            )
+            .to_string()
+        );
+        summarise(
+            &mut t,
+            &path,
+            vec![s("A.", vec![a]), s("C.", vec![c])],
+            None,
+        )
+        .unwrap();
+        assert_eq!(sentence_floor(t.get(&p("projects")).unwrap()), 0);
+        let (grok, _) = noted(&mut t, "~/channels/grok", "a");
+        noted(&mut t, "~/channels/grok", "b");
+        noted(&mut t, "~/channels/grok", "c");
+        assert_eq!(
+            sentence_floor(t.get(&grok).unwrap()),
+            1,
+            "a channel says its exchange in one"
+        );
+    }
+
+    /// **A line its summary cited, forgotten, is something gone** however
+    /// many lines replaced it: the rebuild may shrink.
+    #[test]
+    fn a_cited_line_forgotten_lets_the_summary_shrink() {
+        let mut t = sharratt();
+        let (path, a) = noted(&mut t, "topics", "a");
+        summarise(&mut t, &path, vec![s(&"long ".repeat(40), vec![a])], None).unwrap();
+        assert_eq!(shortest(t.get(&path).unwrap()), Some((199, 100)));
+        let first = t.get(&path).unwrap().window[0].id.clone();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Forget {
+                path: path.clone(),
+                which: Which::Id(first),
+            },
+            now(),
+        )
+        .unwrap();
+        let (_, b) = noted(&mut t, "topics", "b");
+        assert_eq!(shortest(t.get(&path).unwrap()), None);
+        summarise(&mut t, &path, vec![s("short", vec![b])], None).unwrap();
     }
 
     #[test]

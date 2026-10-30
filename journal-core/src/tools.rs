@@ -71,7 +71,14 @@ pub enum Answer {
 /// citable turns is what a stretch of steps establishes at the least, since
 /// each step is a call and its result.
 pub fn claim_floor(citable: usize) -> usize {
-    citable.div_ceil(2).clamp(1, CLAIM_FLOOR_MAX)
+    half_floor(citable, CLAIM_FLOOR_MAX)
+}
+
+/// The fewest items a list over `citable` inputs is held to when an item
+/// cites at most two of them: one for every two, at least one and at most
+/// `most`.
+pub fn half_floor(citable: usize, most: usize) -> usize {
+    citable.div_ceil(2).clamp(1, most)
 }
 
 /// The most claims the grammar insists on, however long the stretch.

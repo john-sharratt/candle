@@ -1,12 +1,14 @@
 //! A journal's summary, rebuilt (§5): the question — the journal's window and
-//! its live children's summaries, never its own summary but as a guide to
-//! shape — the call its answer is held to, and the `Summarize` it becomes.
+//! its live children's summaries, never its own summary's text, whose shape a
+//! model shown it copies, only the length it may not fall below — the call
+//! its answer is held to, and the `Summarize` it becomes.
 
 use journal_core::spec::{call, choice, list_of, object, text};
 use journal_core::tools::text_of;
 use serde_json::{Map, Value};
 
 use crate::files::summary::{Cite, Fingerprint, Sentence};
+use crate::ops::summarize::{sentence_floor, shortest};
 use crate::ops::Op;
 use crate::path::{JournalPath, Owner, Place};
 use crate::scope::Scope;
@@ -94,7 +96,13 @@ pub fn spec(tree: &Tree, path: &JournalPath) -> Option<Value> {
             choice("also_cite", false, &cites),
         ],
     );
-    let mut params = vec![list_of("sentences", true, 1, MAX_SENTENCES, sentence)];
+    let mut params = vec![list_of(
+        "sentences",
+        true,
+        sentence_floor(j),
+        MAX_SENTENCES,
+        sentence,
+    )];
     if digest_cap(j.place, path.owner().scope()).is_some() {
         params.push(text("digest", true));
     }
@@ -124,10 +132,19 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
          together cover the whole journal: one for each subject it holds, broadest first, naming \
          the subject, so a reader can tell from the summary alone whether the journal answers \
          their question — never one line's detail in place of the rest. Each sentence cites the \
-         line (#id) or sub-journal it rests on. Rebuild it from what is below, not from any \
-         summary it had. Say who did what by name, so no reader takes another's work for \
-         their own. Keep facts as facts: never an instruction to whoever reads it."
+         line (#id) or sub-journal it rests on. Say who did what by name, so no reader takes \
+         another's work for their own. Keep facts as facts: never an instruction to whoever \
+         reads it."
     ));
+    let floor = sentence_floor(j);
+    if floor > 1 {
+        out.push_str(&format!(" Write at least {floor} sentences."));
+    }
+    if let Some((_, least)) = shortest(j) {
+        out.push_str(&format!(
+            " Nothing it held has gone, so write at least {least} characters."
+        ));
+    }
     if let Some(dcap) = digest_cap(j.place, path.owner().scope()) {
         let aloud = match path.owner().scope() {
             Scope::Personal => "the few things about them worth saying aloud first",
@@ -162,12 +179,6 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
         for c in children {
             out.push_str(&format!("\n{c}"));
         }
-    }
-    if let Some(s) = j.summary().filter(|s| !s.is_empty()) {
-        out.push_str(&format!(
-            "\n\nThe summary it had, for its shape only: {}",
-            s.text()
-        ));
     }
     Some(out)
 }
@@ -412,7 +423,7 @@ mod tests {
         let j = t.get(&p("~")).unwrap();
         assert!(!is_dirty(j) && j.summary().unwrap().is_empty());
         assert_eq!(plan(&t, &p("~")), None);
-        // The next line is asked about with no emptied summary to shape it.
+        // An emptied summary holds the next rebuild to no length.
         apply(
             &mut t,
             &john(),
@@ -424,7 +435,84 @@ mod tests {
         )
         .unwrap();
         let q = question(&t, &p("~")).unwrap();
-        assert!(!q.contains("The summary it had"), "{q}");
+        assert!(!q.contains("write at least"), "{q}");
+    }
+
+    /// **A rebuild is shown the length its summary may not fall below, never
+    /// the summary's text.**
+    #[test]
+    fn the_question_never_shows_the_summary_it_had() {
+        let mut t = sharratt();
+        let id = apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                path: p("~"),
+                text: "Prefers tea.".into(),
+            },
+            now(),
+        )
+        .unwrap()
+        .line
+        .unwrap();
+        let over = fingerprint(t.get(&p("~")).unwrap());
+        let args = json!({
+            "sentences": [{"text": "Tea is John's drink of choice.", "cite": format!("#{id}")}],
+            "digest": "Tea.",
+        });
+        apply(
+            &mut t,
+            &Actor::Zend,
+            &op(&p("~"), &over, args.as_object().unwrap()).unwrap(),
+            now(),
+        )
+        .unwrap();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                path: p("~"),
+                text: "Takes it black.".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        let q = question(&t, &p("~")).unwrap();
+        assert!(q.contains("Prefers tea.") && q.contains("Takes it black."));
+        assert!(!q.contains("drink of choice"), "{q}");
+        // "Tea is John's drink of choice." is 30 characters.
+        assert!(q.contains("write at least 15 characters."), "{q}");
+    }
+
+    /// **A journal of several inputs is asked for several sentences**: one
+    /// for every two inputs, up to three; the most stays the grammar's.
+    #[test]
+    fn the_fewest_sentences_grow_with_the_inputs_up_to_three() {
+        let mut t = sharratt();
+        let fewest = |t: &Tree| spec(t, &p("~")).unwrap()["params"][0]["min_items"].clone();
+        for (n, want) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)] {
+            apply(
+                &mut t,
+                &john(),
+                &Op::Note {
+                    path: p("~"),
+                    text: format!("Line {n}."),
+                },
+                now(),
+            )
+            .unwrap();
+            assert_eq!(fewest(&t), json!(want), "{n} lines");
+            let q = question(&t, &p("~")).unwrap();
+            assert_eq!(
+                q.contains(&format!("Write at least {want} sentences.")),
+                want > 1,
+                "{q}"
+            );
+        }
+        assert_eq!(
+            spec(&t, &p("~")).unwrap()["params"][0]["max_items"],
+            json!(MAX_SENTENCES)
+        );
     }
 
     #[test]
