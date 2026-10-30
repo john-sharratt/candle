@@ -38,11 +38,13 @@ pub struct Hit {
 }
 
 /// The most of a line's text a hit shows. Nearly every line is shorter and
-/// is shown whole, so a hit answers without a second read; a longer one is
-/// cut around the match, and its address opens the rest.
-const EXCERPT: usize = 600;
+/// is shown whole, so a hit answers without a second read — a dense line of
+/// definitions, or a rule with its reason, runs to 900 characters, and the
+/// clause a search is after is often its last; a longer one is cut around
+/// the match, and its address opens the rest.
+const EXCERPT: usize = 1_000;
 /// How much of an excerpt comes before the match.
-const LEAD: usize = 160;
+const LEAD: usize = 250;
 
 /// A named journal whose own name or written cue holds `want`, a folded
 /// phrase. Only its last segment counts, and never a fixed journal's cue,
@@ -305,17 +307,17 @@ mod tests {
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
         assert!(cut.starts_with('…') && cut.ends_with('…'));
         assert!(cut.contains("the PERMIT was granted"), "{cut}");
-        let head = format!("permit {}", "x".repeat(800));
+        let head = format!("permit {}", "x".repeat(1_200));
         let cut = excerpt(&head, "permit");
         assert!(cut.starts_with("permit ") && cut.ends_with('…'));
         // Text whose lowercase is longer than itself is still cut at the
         // match, and so is a phrase that is.
-        let odd = format!("{} PERMİT granted {}", "İ".repeat(800), "x".repeat(800));
+        let odd = format!("{} PERMİT granted {}", "İ".repeat(1_200), "x".repeat(1_200));
         let cut = excerpt(&odd, "permİt");
         assert!(cut.contains("PERMİT granted"), "{cut}");
         assert_eq!(cut.chars().count(), EXCERPT + 2);
         // A match near the end keeps a full excerpt, cut at its start only.
-        let tail = format!("{} the end PERMIT", "y".repeat(800));
+        let tail = format!("{} the end PERMIT", "y".repeat(1_200));
         let cut = excerpt(&tail, "permit");
         assert!(
             cut.starts_with('…') && cut.ends_with("the end PERMIT"),

@@ -11,11 +11,8 @@ use crate::tree::{Journal, Tree};
 use crate::view::who::ago;
 
 /// `j`'s live children with something written in or below them, by name.
-fn written(j: &Journal) -> Vec<(&str, &Journal)> {
-    j.live()
-        .filter(|(_, c)| !c.is_blank())
-        .map(|(n, c)| (n.as_str(), c))
-        .collect()
+pub(crate) fn written(j: &Journal) -> Vec<(&Slug, &Journal)> {
+    j.live().filter(|(_, c)| !c.is_blank()).collect()
 }
 
 /// `path`'s line in its parent's index.
@@ -35,7 +32,10 @@ pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
     // a guess or a grep; at most ten a level, so the line stays bounded.
     let below: Vec<(&str, Vec<&str>)> = written(j)
         .into_iter()
-        .map(|(n, c)| (n, written(c).into_iter().map(|(m, _)| m).collect()))
+        .map(|(n, c)| {
+            let under = written(c).into_iter().map(|(m, _)| m.as_str()).collect();
+            (n.as_str(), under)
+        })
         .collect();
     let mut facts = vec![format!("{lines} line{}", if lines == 1 { "" } else { "s" })];
     if !below.is_empty() {

@@ -3,12 +3,15 @@
 //! each group they frame — nearest first, within its channel's budget. A
 //! bot's frame is the groups that list it, and nothing of anyone's own.
 
+use std::iter::once;
+
 use crate::actor::{framed_groups, groups_of_bot};
-use crate::path::{JournalPath, Owner};
+use crate::path::{JournalPath, Owner, Place};
+use crate::scope::Section;
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
-use crate::view::index::{group_lines, index};
+use crate::view::index::{group_lines, index, written};
 use crate::view::who::render_line;
 use crate::view::NOT_INSTRUCTIONS;
 
@@ -74,6 +77,33 @@ impl Filler {
             self.out.push('…');
         }
         self.left = 0;
+    }
+
+    /// `header`, then as many of `lines` as fit whole, in order; nothing
+    /// when not even the first fits. A line is never cut, so a path it names
+    /// is whole, and what does not fit leaves the rest of the budget to what
+    /// comes after.
+    fn push_lines(&mut self, header: &str, lines: &[String]) {
+        let Some(first) = lines.first() else { return };
+        let sep = usize::from(!self.out.is_empty());
+        let head = header.chars().count() + sep;
+        if self.full || head + 1 + first.chars().count() > self.left {
+            return;
+        }
+        if sep == 1 {
+            self.out.push('\n');
+        }
+        self.out.push_str(header);
+        self.left -= head;
+        for l in lines {
+            let n = l.chars().count() + 1;
+            if n > self.left {
+                break;
+            }
+            self.out.push('\n');
+            self.out.push_str(l);
+            self.left -= n;
+        }
     }
 }
 
@@ -167,10 +197,13 @@ pub fn frame(
         );
         f.push(&block.join("\n"));
     }
-    for group in framed_groups(tree, person) {
-        let path = JournalPath::root(Owner::Group(group.clone()));
-        if let Some(root) = tree.get(&path) {
-            root_block(&mut f, &path, root, &group_label(tree, &group), now);
+    let groups: Vec<JournalPath> = framed_groups(tree, person)
+        .into_iter()
+        .map(|g| JournalPath::root(Owner::Group(g)))
+        .collect();
+    for path in &groups {
+        if let (Some(root), Owner::Group(group)) = (tree.get(path), path.owner()) {
+            root_block(&mut f, path, root, &group_label(tree, group), now);
         }
     }
     for p in also {
@@ -179,7 +212,48 @@ pub fn frame(
             f.push(&format!("{p}: {s}"));
         }
     }
+    // Last, in what is left: the cues of the journals the indexes name only
+    // by name, so a reader picks one from the frame. The groups first, the
+    // default leading, since their journals are the deeper trees.
+    for root in groups.iter().chain(once(&me)) {
+        if let Some(j) = tree.get(root) {
+            f.push_lines(&format!("Below {root}, by cue:"), &deeper(root, j));
+        }
+    }
     f.out
+}
+
+/// Each named journal directly under `root`'s projects, topics and people
+/// with its cue, and under it each of its own, one line each — the journals
+/// an index line names without their cues. Channels, threads and bots are
+/// not walked: a conversation is found by its channel and date, and threads
+/// and bots are zend's own. A closed or unreadable journal is left out.
+fn deeper(root: &JournalPath, j: &Journal) -> Vec<String> {
+    let open = |c: &Journal| !c.is_closed() && c.problems.is_empty();
+    let said = |name: &str, c: &Journal| match c.cue() {
+        Some(cue) => format!("{name} — {cue}"),
+        None => name.to_string(),
+    };
+    let mut lines = Vec::new();
+    for (s, section) in j.live() {
+        if !matches!(
+            section.place,
+            Place::Section(Section::Projects | Section::Topics | Section::People)
+        ) {
+            continue;
+        }
+        for (n, named) in written(section).into_iter().filter(|(_, c)| open(c)) {
+            let path = root
+                .child(s.clone())
+                .and_then(|p| p.child(n.clone()))
+                .expect("a named journal is at a place");
+            lines.push(format!("  - {}", said(&path.show(), named)));
+            for (m, below) in written(named).into_iter().filter(|(_, c)| open(c)) {
+                lines.push(format!("    - {}", said(m.as_str(), below)));
+            }
+        }
+    }
+    lines
 }
 
 /// The frame for `bot`: each group that lists it, its summary and index.
@@ -246,6 +320,7 @@ fn voice(tree: &Tree, f: &mut Filler, person: &Slug, me: &JournalPath, at: Optio
 mod tests {
     use super::*;
     use crate::actor::Actor;
+    use crate::error::Problem;
     use crate::files::summary::{Cite, Sentence};
     use crate::files::Kind;
     use crate::ops::fixture::{john, now, p, sharratt};
@@ -515,6 +590,88 @@ mod tests {
             bot_frame(&t, &slug("b9"), Budget::Chat, now()),
             NOT_INSTRUCTIONS
         );
+    }
+
+    /// **A frame ends on the cues one level below its indexes**: a group's
+    /// project's sub-journals by cue, and nothing under `channels`, where a
+    /// conversation is found by its date.
+    #[test]
+    fn a_chat_frame_ends_on_the_cues_below_its_indexes() {
+        let (mut t, here) = drive();
+        for (under, name, cue) in [
+            ("@sharratt/projects", "house", "open for the extension"),
+            (
+                "@sharratt/projects/house",
+                "permits",
+                "open for council permits",
+            ),
+            (
+                "@sharratt/projects/house",
+                "budget",
+                "open for what it costs",
+            ),
+        ] {
+            let made = apply(
+                &mut t,
+                &john(),
+                &Op::Create {
+                    under: p(under),
+                    name: slug(name),
+                    cue: cue.into(),
+                    on_taken: OnTaken::Refuse,
+                },
+                now(),
+            )
+            .unwrap()
+            .created
+            .unwrap();
+            apply(
+                &mut t,
+                &john(),
+                &Op::Note {
+                    path: made,
+                    text: "Lodged.".into(),
+                },
+                now(),
+            )
+            .unwrap();
+        }
+        let f = frame(&t, &slug("john"), Some(&here), &[], Budget::Chat, now());
+        assert!(
+            f.ends_with(
+                "Below @sharratt, by cue:\n  - @sharratt/projects/house — open for the extension\n    \
+                 - budget — open for what it costs\n    - permits — open for council permits"
+            ),
+            "{f}"
+        );
+        assert!(!f.contains("Below ~"), "{f}");
+        // An unreadable journal is no place to go.
+        t.get_mut(&p("@sharratt/projects/house/budget"))
+            .unwrap()
+            .problems
+            .push(Problem::new("journal.yaml", Some(1), "`cue` is missing"));
+        let f = frame(&t, &slug("john"), Some(&here), &[], Budget::Chat, now());
+        assert!(!f.contains("- budget"), "{f}");
+    }
+
+    /// **Lines are added whole or not at all**, and what does not fit leaves
+    /// the budget to what comes after.
+    #[test]
+    fn lines_fill_whole_and_leave_the_rest() {
+        let mut fl = Filler::new(30);
+        fl.push("0123456789");
+        fl.push_lines("head:", &["  - a".into(), "  - far too long a line".into()]);
+        assert_eq!(fl.out, "0123456789\nhead:\n  - a");
+        fl.push_lines("next:", &["  - b".into()]);
+        assert_eq!(
+            fl.out, "0123456789\nhead:\n  - a",
+            "no room for a header and a line"
+        );
+        fl.push("z");
+        assert_eq!(fl.out, "0123456789\nhead:\n  - a\nz");
+        let mut empty = Filler::new(30);
+        empty.push_lines("head:", &[]);
+        assert_eq!(empty.out, "");
     }
 
     #[test]

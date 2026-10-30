@@ -644,6 +644,13 @@ A group's block opens with what `group.yaml` says it is for (`about`, written
 by its owner with `group_describe`): "Your team @tokera — John's company: the
 candle engine, Zen Code and their papers."
 
+Last, in whatever budget is left, the frame lists the cue of each named
+journal one level below what the indexes name only by name — the journals
+under a section's named journal, `@tokera/projects/candle/provenance — open
+for …` — for `~` and each framed group, so a reader picks a journal three
+levels down without opening the one above it. `channels` is not walked: a
+conversation is found by its channel and date.
+
 A Zen worker's frame is its lineage extended to the root: the worker and those
 above it, the thread, `@<group>/threads`, the group root, `~`, and
 `@<group>/projects/<repo>` for each workspace repository.
@@ -657,7 +664,7 @@ is the caller's default group's.
 | `get_user_context` | the frame for this conversation |
 | `journal_open {path}` | a journal: its summary (and staleness), its index, its window, how much is folded |
 | `journal_read {address}` | one line; for a worker, the turns behind one of its entries |
-| `journal_grep {pattern, under?}` | case-insensitive substring, a hyphen and a space matching each other, over every named journal's own name and written cue (parents, owners and fixed journals' shared cues are not matched) and every line, archive and summary of a subtree — everything the caller may read by default. Journals the phrase names come first, then lines newest first; a line of up to 600 characters is shown whole, a longer one cut around the match |
+| `journal_grep {pattern, under?}` | case-insensitive substring, a hyphen and a space matching each other, over every named journal's own name and written cue (parents, owners and fixed journals' shared cues are not matched) and every line, archive and summary of a subtree — everything the caller may read by default. Journals the phrase names come first, then lines newest first; a line of up to 1,000 characters is shown whole, a longer one cut around the match |
 | `journal_note {path, text}` | a `note` line |
 | `journal_edit {address, text}` | edits a line: a commit |
 | `journal_create {under, name, cue}` | a named sub-journal, where the section allows (§2.3) |
