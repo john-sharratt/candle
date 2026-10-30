@@ -285,6 +285,23 @@ pub(super) fn locate_rows(
     Ok((block, positions))
 }
 
+/// A wave's scored rows in the order the head wrote them, which is the order
+/// [`locate_rows`] reads one block in.
+///
+/// **Caller order is not that order.** The head scores a one-token prefill
+/// member among the decode rows (`wave_driver::caller_order_rows`), so a
+/// decode step's `[decode | verify | stencil]` rows hand a one-token static run
+/// back after the verify blocks it was written before. Read in caller order,
+/// the rows are not one range and the step copies them all to join them; in
+/// head order they are the head's own block, and a row's place is its offset.
+/// Rows of separate tensors — a sliced wave's — keep no such order, and
+/// `locate_rows` joins those as it would anyway.
+pub(super) fn in_head_order(rows: &[Tensor]) -> Vec<Tensor> {
+    let mut ordered = rows.to_vec();
+    ordered.sort_by_key(|t| t.layout().start_offset());
+    ordered
+}
+
 #[cfg(test)]
 mod tests {
     use candle::Device;
@@ -392,6 +409,40 @@ mod tests {
 
         let stranger = block(1);
         assert!(locate_rows(&wave, &[vec![stranger]]).is_err());
+        Ok(())
+    }
+
+    /// **A one-token static run scored among the decode rows does not cost a
+    /// copy.** The head wrote `[decode, run, verify, verify]`; the step hands
+    /// them back `[decode, verify, verify, run]`. In that order they are not
+    /// one range, so `locate_rows` would join copies; in head order they are
+    /// the head's block, read where it wrote them.
+    #[test]
+    fn rows_handed_back_out_of_head_order_are_read_in_place() -> Result<()> {
+        let head = block(4);
+        let rows: Vec<Tensor> = (0..4)
+            .map(|i| head.narrow(0, i, 1))
+            .collect::<Result<_>>()?;
+        let caller = vec![
+            rows[0].clone(),
+            rows[2].clone(),
+            rows[3].clone(),
+            rows[1].clone(),
+        ];
+        let per_seq = vec![
+            vec![caller[0].clone()],
+            vec![caller[1].clone(), caller[2].clone()],
+        ];
+
+        let (copied, _) = locate_rows(&caller, &per_seq)?;
+        assert!(
+            !copied.same_storage(&head),
+            "caller order is joined by a copy"
+        );
+
+        let (located, positions) = locate_rows(&in_head_order(&caller), &per_seq)?;
+        assert!(located.same_storage(&head), "a view, not a copy");
+        assert_eq!(positions, vec![vec![0], vec![2, 3]]);
         Ok(())
     }
 }

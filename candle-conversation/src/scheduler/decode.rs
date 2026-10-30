@@ -2,7 +2,7 @@ use super::band::rank;
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
-use super::spec_chooser::{locate_rows, SpecChooser};
+use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
 use super::stencil_wave::{tail_start, StencilRow, StencilWave};
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
@@ -1168,7 +1168,7 @@ impl Scheduler {
         );
         let scored = {
             let _g = profile::span("decode:score");
-            locate_rows(scored, &rows_of)
+            locate_rows(&in_head_order(&held.rows), &rows_of)
                 .and_then(|(block, positions)| chooser.score(block, &positions, &blocks))
         };
         if let Err(e) = scored {
