@@ -3,6 +3,7 @@ use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
+use super::stencil_wave::{tail_start, StencilRow, StencilWave};
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
@@ -105,36 +106,36 @@ impl Scheduler {
             .join(" ")
     }
 
-    // ── Stencil static-run prefill (Layer 3) ───────────────────────────
+    // ── Stencil static runs (Layer 3) ──────────────────────────────────
 
-    /// Inject any pending `Static` runs for active stencil sequences via the
-    /// prefill path, then record the next decode action in `pending_mask`.  Runs
-    /// once before `batch_decode_step` each decode iteration.
+    /// Play any pending `Static` runs for active stencil sequences, then record
+    /// the next decode action in `pending_mask`.  Runs once before
+    /// `batch_decode_step` each decode iteration.
     ///
     /// A static run `R` following the sequence's pending token `Y` (the last
-    /// generated, not-yet-forwarded token) is injected as `[Y] ++ R` in one
-    /// prefill forward, and the token after it is sampled from that forward's
-    /// last row under the stencil's next action ([`Self::commit_after_injection`]).
-    /// So an N-token run costs **one** forward: not N decode steps, and not a
-    /// prefill plus a decode step that re-forwards `R.last()` to read the same
-    /// row. A run that ends the turn (its last token is EOS) leaves the EOS
-    /// unforwarded, exactly as a sampled EOS is.
-    pub(super) fn inject_stencil_prefills(&mut self) {
-        self.stencil_sampled.clear();
+    /// generated, not-yet-forwarded token) becomes the row `[Y] ++ R`, which the
+    /// decode step's own wave writes (`stencil_wave`); the token after it is
+    /// sampled from that row under the stencil's next action
+    /// ([`Self::commit_after_injection`]). So an N-token run costs no forward of
+    /// its own: not N decode steps, not a prefill of its own, and not a decode
+    /// step that re-forwards `R.last()` to read the same row. A run that ends the
+    /// turn (its last token is EOS) leaves the EOS unforwarded, exactly as a
+    /// sampled EOS is.
+    pub(super) fn play_stencil_runs(&mut self) {
         let ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| !s.finished && s.stencil.is_some() && s.pending_mask.is_none())
             .map(|(&id, _)| id)
+            .filter(|&id| !self.holds_stencil_row(id))
             .collect();
         let max_recent = self.sampler.max_recent_len();
-        // Each sequence's prefill input — its runs this iteration, in the order
-        // they were played — forwarded together once every sequence has been
-        // stepped. One entry per sequence, so its last row is its last run's.
+        // Each sequence's row — its runs this iteration, in the order they were
+        // played. One entry per sequence, so its last row is its last run's.
         let mut deferred: Vec<(SequenceId, Vec<u32>)> = Vec::new();
-        // The sequences whose runs leave a token to sample: the turn goes on
-        // after them, so the row after the last run is the next token's.
-        let mut continues: HashSet<SequenceId> = HashSet::new();
+        // The sequences whose run closed the turn: they finish once the row is
+        // written.
+        let mut ends: HashSet<SequenceId> = HashSet::new();
 
         for id in ids {
             let mut guard = 0usize;
@@ -164,12 +165,9 @@ impl Scheduler {
                 let StepMask::Prefill(run) = action else {
                     // Branch / Free / Done — the action for the next token. When
                     // runs were played above, that token is sampled from their
-                    // prefill's last row; otherwise the decode step samples it.
+                    // row; otherwise the decode step samples it.
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         s.pending_mask = Some(action);
-                    }
-                    if deferred.iter().any(|(s, _)| *s == id) {
-                        continues.insert(id);
                     }
                     break;
                 };
@@ -252,13 +250,14 @@ impl Scheduler {
                 input.extend_from_slice(&run[..forwarded]);
 
                 // Empty only when nothing is pending and the run is a lone EOS.
-                // Forwarded below, in one batched pass with every other
-                // sequence's runs — not here, one sequence at a time. Each was a
-                // whole-model forward of its own on the decode loop: with eight
-                // templated ingest turns that was up to eight serial forwards
-                // between decode steps, ~29 ms a step of the 8-session decode.
-                // The bookkeeping below does not depend on the forward having
-                // run, so the run is recorded now and the forward follows.
+                // Written by the decode step's wave, with every other
+                // sequence's runs and the decode rows — not here, one sequence
+                // at a time. Each was a whole-model forward of its own on the
+                // decode loop: with eight templated ingest turns that was up to
+                // eight serial forwards between decode steps, ~29 ms a step of
+                // the 8-session decode. The bookkeeping below does not depend on
+                // the forward having run, so the run is recorded now and the
+                // wave writes it.
                 if !input.is_empty() {
                     // One input per sequence: a second run this iteration extends
                     // the first, so the forward's last row follows the last run.
@@ -266,7 +265,7 @@ impl Scheduler {
                         Some((_, existing)) => existing.extend_from_slice(&input),
                         None => deferred.push((id, input)),
                     }
-                    // Everything pending goes out with that pass.
+                    // Everything pending goes out with that row.
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         s.mark_forwarded();
                     }
@@ -330,52 +329,86 @@ impl Scheduler {
 
                 if ends_turn {
                     // The stencil emitted the tool call's closing EOS — the
-                    // assistant turn is complete.  Mark it finished and stop
-                    // steering; `cleanup_finished` finalizes and seals exactly as
-                    // for a model-sampled EOS.
+                    // assistant turn is complete.  Stop steering; once the row
+                    // is written the turn finishes and `cleanup_finished`
+                    // finalizes and seals exactly as for a model-sampled EOS.
+                    let written = deferred.iter().any(|(s, _)| *s == id);
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         if let Some(d) = &s.stencil {
                             Self::log_stencil_finish(id.0, d, "completed");
                         }
                         s.stencil = None;
-                        s.wrote_tool_call = true;
-                        s.finished = true;
+                        // A lone EOS with nothing pending has nothing to write.
+                        if !written {
+                            s.wrote_tool_call = true;
+                            s.finished = true;
+                        }
                     }
+                    ends.insert(id);
                     break;
                 }
                 // Loop: the next action is the node after this static run.
             }
         }
-
-        // One batched pass for every sequence's runs: a wave per split round,
-        // each sequence's spans in the order it played them.
         if deferred.is_empty() {
             return;
         }
-        let spans: Vec<(SequenceId, &[u32])> = deferred
+
+        // What of each row a wave cannot carry is forwarded now: the pieces up
+        // to its last page break, each break closing its page, and anything
+        // past one forward's budget (`stencil_wave::tail_start`).
+        let pass = self.prefill_pass_budget();
+        let cuts: Vec<usize> = deferred
             .iter()
-            .map(|(id, input)| (*id, input.as_slice()))
+            .map(|(_, input)| tail_start(input, self.prefill_breaks(), pass))
             .collect();
-        let (failed, rows) = self.run_prefill_batch_keeping(&spans, &continues);
+        let leads: Vec<(SequenceId, &[u32])> = deferred
+            .iter()
+            .zip(&cuts)
+            .filter(|(_, &cut)| cut > 0)
+            .map(|((id, input), &cut)| (*id, &input[..cut]))
+            .collect();
+        let failed = if leads.is_empty() {
+            Vec::new()
+        } else {
+            self.run_prefill_batch(&leads)
+        };
         // A failed forward leaves runs recorded whose K/V was never written —
         // the turn would seal tokens with nothing behind them — so it fails,
         // rather than dropping its stencil and decoding on over the gap.
-        for (id, e) in failed {
-            if let Some(s) = self.active_decodes.get_mut(&id) {
-                if let Some(d) = &s.stencil {
-                    Self::log_stencil_finish(id.0, d, "prefill failed");
+        let failed: Vec<SequenceId> = failed
+            .into_iter()
+            .map(|(id, e)| {
+                if let Some(s) = self.active_decodes.get_mut(&id) {
+                    if let Some(d) = &s.stencil {
+                        Self::log_stencil_finish(id.0, d, "prefill failed");
+                    }
+                    s.stencil = None;
                 }
-                s.stencil = None;
+                self.fail_all_decodes(&[id], &format!("stencil prefill forward failed: {e}"));
+                id
+            })
+            .collect();
+        for ((id, input), cut) in deferred.into_iter().zip(cuts) {
+            if failed.contains(&id) {
+                continue;
             }
-            self.fail_all_decodes(&[id], &format!("stencil prefill forward failed: {e}"));
+            // The lead ended on a break, and the page it closes ends there.
+            if cut > 0 && self.prefill_breaks().contains(&input[cut - 1]) {
+                self.close_page_at_break(id, &input[..cut]);
+            }
+            self.stencil_rows.push(StencilRow {
+                seq: id,
+                tokens: input[cut..].to_vec(),
+                ends_turn: ends.contains(&id),
+            });
         }
-        self.commit_after_injection(rows);
     }
 
     /// Each listed sequence's sampling config for this token, with its stencil's
     /// pending action folded in.
     ///
-    /// The action was set by `inject_stencil_prefills`, which already played any
+    /// The action was set by `play_stencil_runs`, which already played any
     /// static runs before it: a branch is its frontier (a tiny gather + sample),
     /// a free-text span clears the stencil (free decode through the kernel), and
     /// `Done` ends the walk (free decode + drop). The sampler resolves these per
@@ -428,7 +461,7 @@ impl Scheduler {
                         state.stencil = None;
                         configs[i].stencil.clear();
                     }
-                    // A `Prefill` is consumed by `inject_stencil_prefills`; `None`
+                    // A `Prefill` is consumed by `play_stencil_runs`; `None`
                     // means the driver wasn't advanced — free-decode this step.
                     Some(StepMask::Prefill(_)) | None => configs[i].stencil.clear(),
                 }
@@ -468,19 +501,18 @@ impl Scheduler {
             .collect()
     }
 
-    /// Sample and commit the token after each sequence's injected static run,
-    /// from the row its run's own prefill left.
+    /// Sample and commit the token after each sequence's static run, from the
+    /// row the wave that wrote the run left.
     ///
-    /// **This is what makes a static run one forward.** The prefill already
+    /// **This is what keeps a static run inside one forward.** The wave already
     /// computed the row after the run's last token; forwarding that token again
     /// as the next decode step's row, only to read the same distribution, was a
-    /// second pass — a whole forward when the stencil's sequence was decoding
-    /// alone. The token goes through [`Self::commit_decoded_tokens`], the path
-    /// every decoded token takes, against the row that produced it, and the
-    /// sequence then sits out this iteration's decode step (`stencil_sampled`):
-    /// its stencil has advanced, and the constraint for the token after this one
-    /// is the next injection's to set.
-    fn commit_after_injection(&mut self, mut rows: HashMap<SequenceId, Tensor>) {
+    /// second pass. The token goes through [`Self::commit_decoded_tokens`], the
+    /// path every decoded token takes, against the row that produced it. The
+    /// sequence rode this step as its run rather than as a decode row: its
+    /// stencil has advanced, and the constraint for the token after this one is
+    /// the next play's to set.
+    pub(super) fn commit_after_injection(&mut self, mut rows: HashMap<SequenceId, Tensor>) {
         let mut ids: Vec<SequenceId> = rows
             .keys()
             .copied()
@@ -557,16 +589,27 @@ impl Scheduler {
                 super::flush_page_cut(self.model.as_ref(), id, state);
             }
         }
-        self.stencil_sampled.extend(ids);
     }
 
     // ── Decode ─────────────────────────────────────────────────────────
 
     /// Run one decode step for all active (non-finished) sequences.
     ///
-    /// Each sequence contributes exactly 1 token (its last generated token).
-    /// One batched `forward_batched` call processes all sequences in parallel.
+    /// Each decoding sequence contributes its last generated token (and its
+    /// drafts); a sequence holding a played static run contributes that run
+    /// instead (`stencil_wave`). One wave carries them all.
     pub(super) fn batch_decode_step(&mut self) {
+        let mut stencil = StencilWave::default();
+        self.decode_rows_step(&mut stencil);
+        // After the step, so the wave's span is released before a heal can run
+        // the next forward.
+        self.settle_stencil_wave(stencil);
+    }
+
+    /// [`Self::batch_decode_step`]'s wave and the decode rows' commit. The
+    /// static runs it takes go in `stencil`, and are marked written once the
+    /// wave has written them.
+    fn decode_rows_step(&mut self, stencil: &mut StencilWave) {
         let t_select = std::time::Instant::now();
         // A slot with a pending deferred glue fire reprojects THIS wave (the
         // co-batched glue member rewrites its `[sealed | glue]` prefix), so its
@@ -582,17 +625,18 @@ impl Scheduler {
             .iter()
             .map(|p| p.parent_id.0)
             .collect();
-        // A sequence whose next token the stencil injection just sampled has
-        // nothing for this step to produce: that token is the one it would
-        // forward, and the constraint for the one after is the next injection's.
+        // A sequence holding a played static run rides this step as that run,
+        // not as a decode row: its next token is sampled from the run's row,
+        // and the constraint for the one after is the next play's.
         let mut seq_ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
             .map(|(&id, _)| id)
             .filter(|id| !glue_pending.contains(&id.0))
-            .filter(|id| !self.stencil_sampled.contains(id))
+            .filter(|&id| !self.holds_stencil_row(id))
             .collect();
+        stencil.rows = self.take_stencil_rows(&glue_pending);
 
         // **Why this wave is as wide as it is, in the one place that decides.** A decode
         // forward's width is the whole of decode throughput, and it is not a cap — it is
@@ -637,32 +681,71 @@ impl Scheduler {
         //
         // `BatchedInferenceSession::wave_adapter` refuses a mixed wave outright,
         // so without this filter an adapted conversation would fail the forward
-        // rather than merely share it.
-        if seq_ids.len() > 1 {
-            let wanted = self.session.sequence_adapter(seq_ids[0].0);
-            seq_ids.retain(|id| self.session.sequence_adapter(id.0) == wanted);
+        // rather than merely share it. A static run is a decode's row by
+        // another name and leads by the same rank; one of another adapter
+        // waits for a wave of its own.
+        let lead = seq_ids
+            .first()
+            .copied()
+            .into_iter()
+            .chain(stencil.rows.iter().map(|r| r.seq))
+            .min_by_key(|&id| std::cmp::Reverse(rank(self.decode_priority_or_high(id))));
+        if let Some(lead) = lead {
+            let wanted = self.session.sequence_adapter(lead.0).map(str::to_owned);
+            seq_ids.retain(|id| self.session.sequence_adapter(id.0) == wanted.as_deref());
+            let (carried, waiting): (Vec<StencilRow>, Vec<StencilRow>) =
+                std::mem::take(&mut stencil.rows)
+                    .into_iter()
+                    .partition(|r| self.session.sequence_adapter(r.seq.0) == wanted.as_deref());
+            stencil.rows = carried;
+            self.stencil_rows.extend(waiting);
         }
 
         if seq_ids.is_empty() {
             // Every active decode is excluded this wave — deferred-glue-pending,
-            // or its next token already sampled by a stencil injection, or held
-            // back by the adapter rule — so there is no decode row to run. But
-            // the work those rows would have carried must still move:
-            // `run_prefill_until_budget` is gated behind `decode_width() == 0`,
-            // which these excluded-but-live slots hold `> 0`, so the prefill
-            // cohort, section chunks and deferred glue ride ONLY the decode
-            // sweep. Without this, neither path advances them: a hard deadlock —
-            // 0 forwards, the queue standing still, a dialogue's next-round
-            // prefill (1,856 tokens) never advancing. Drive a decode-less wave,
-            // exactly as `run_prefill_until_budget` would, whenever any of the
-            // three has work.
+            // riding as a static run, or held back by the adapter rule — so
+            // there is no decode row to run. But the work those rows would have
+            // carried must still move: `run_prefill_until_budget` is gated
+            // behind `decode_width() == 0`, which these excluded-but-live slots
+            // hold `> 0`, so the prefill cohort, section chunks, deferred glue
+            // and the static runs ride ONLY the decode sweep. Without this,
+            // neither path advances them: a hard deadlock — 0 forwards, the
+            // queue standing still, a dialogue's next-round prefill (1,856
+            // tokens) never advancing. Drive a decode-less wave, exactly as
+            // `run_prefill_until_budget` would, whenever any of the four has
+            // work.
             if !self.deferred_glue_fires.is_empty()
                 || self.prefill_width() > 0
                 || self.section_ingest_width() > 0
+                || !stencil.rows.is_empty()
             {
                 let _g = profile::span("decode:step:rowless_wave");
-                if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
-                    tracing::error!("decode: decode-less wave for excluded rows failed: {e}");
+                let seqs = stencil.seqs();
+                let ran = stencil.inputs().and_then(|inputs| {
+                    self.decode_forward_cobatched(&[], &[], &[], &[], &seqs, &inputs)
+                });
+                match ran {
+                    // `[stencil]`: nothing decodes and nothing verifies.
+                    Ok(held) if !stencil.rows.is_empty() => {
+                        if let Some(failures) = self.decode_retry.succeeded() {
+                            tracing::info!(failures, "static run wave ran after failing to run");
+                        }
+                        self.stencil_rows_written(stencil, &held.rows);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("decode: decode-less wave for excluded rows failed: {e}");
+                        if !stencil.rows.is_empty() {
+                            if is_step_refusal(&e) {
+                                self.retry_step(&stencil.ids(), "static run wave", &e);
+                            } else {
+                                self.fail_all_decodes(
+                                    &stencil.ids(),
+                                    &format!("static run wave failed: {e}"),
+                                );
+                            }
+                        }
+                    }
                 }
             } else {
                 // A step with nothing to run at all — every decode excluded and
@@ -796,12 +879,7 @@ impl Scheduler {
             budget,
         ) {
             Ok(d) => d,
-            Err(e)
-                if is_tier_refusal(&e)
-                    || is_span_full(&e)
-                    || is_expert_stall(&e)
-                    || is_arena_exhausted(&e) =>
-            {
+            Err(e) if is_step_refusal(&e) => {
                 if !is_expert_stall(&e) {
                     self.note_refused_depth(budget, &e);
                 }
@@ -890,12 +968,17 @@ impl Scheduler {
         // The accept walk stacks each block position's rows beside the head's
         // logits on the forward's span, so the wave prices those stacks.
         self.session.set_accept_in_place(true);
-        let forwarded = self.decode_forward_cobatched(
-            &plan.decode_seqs,
-            &plan.decode_inputs,
-            &plan.verify_seqs,
-            &plan.verify_inputs,
-        );
+        let stencil_seqs = stencil.seqs();
+        let forwarded = stencil.inputs().and_then(|stencil_inputs| {
+            self.decode_forward_cobatched(
+                &plan.decode_seqs,
+                &plan.decode_inputs,
+                &plan.verify_seqs,
+                &plan.verify_inputs,
+                &stencil_seqs,
+                &stencil_inputs,
+            )
+        });
         self.session.set_accept_in_place(false);
         // Held until the rollback: the rows below, the walk's stacks and the
         // rows the commit checks are all views on the forward's span.
@@ -903,22 +986,29 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
-                if is_tier_refusal(&e)
-                    || is_span_full(&e)
-                    || is_expert_stall(&e)
-                    || is_arena_exhausted(&e)
-                {
+                // The static runs rode this forward, so its fate is theirs: a
+                // refusal holds their rows for the retry, a fault fails them.
+                let rode: Vec<SequenceId> = seq_ids.iter().copied().chain(stencil.ids()).collect();
+                if is_step_refusal(&e) {
                     if !is_expert_stall(&e) {
                         self.note_refused_depth(budget, &e);
                     }
-                    self.retry_step(&seq_ids, "decode forward", &e);
+                    self.retry_step(&rode, "decode forward", &e);
                 } else {
-                    self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
+                    self.fail_all_decodes(&rode, &format!("decode forward failed: {e}"));
                 }
                 return;
             }
         };
         forward_span.end();
+        // The static runs' rows follow the plan's `[decode | verify]` prefix.
+        // Taken now, while the span holds them; the walk reads only the prefix.
+        if !stencil.rows.is_empty() {
+            let at = wave_rows.min(held.rows.len());
+            let own = &held.rows[at..(at + stencil.rows.len()).min(held.rows.len())];
+            self.stencil_rows_written(stencil, own);
+        }
+        let scored = &held.rows[..wave_rows.min(held.rows.len())];
         if let Some(failures) = self.decode_retry.succeeded() {
             tracing::info!(failures, "decode step ran after failing to run");
         }
@@ -1001,7 +1091,7 @@ impl Scheduler {
                 &plain,
                 &spec_seqs,
                 &spec_blocks,
-                held.rows.clone(),
+                scored.to_vec(),
             )
         };
         let (plain_rows, spec_rows) = match verified {
@@ -1078,7 +1168,7 @@ impl Scheduler {
         );
         let scored = {
             let _g = profile::span("decode:score");
-            locate_rows(&held.rows, &rows_of)
+            locate_rows(scored, &rows_of)
                 .and_then(|(block, positions)| chooser.score(block, &positions, &blocks))
         };
         if let Err(e) = scored {
@@ -1495,7 +1585,7 @@ impl Scheduler {
         // Rows whose suppressed `</think>` close was dropped (a deep/exhaustive
         // think-steer retry): the sampled close is not committed, so it never
         // lands in the output and `inside_think_block` stays set;
-        // `inject_stencil_prefills` drains the continuation static before the next
+        // `play_stencil_runs` plays the continuation static before the next
         // wave (the session already advanced to it on `accept`).
         let mut dropped = vec![false; seq_ids.len()];
         for (i, &seq_id) in seq_ids.iter().enumerate() {
@@ -1555,7 +1645,7 @@ impl Scheduler {
                             Self::log_stencil_finish(seq_id.0, driver, "completed");
                             state.stencil = None;
                         }
-                        // Clear the pending mask so `inject_stencil_prefills` re-drives
+                        // Clear the pending mask so `play_stencil_runs` re-drives
                         // the driver into the continuation static this drop advanced to.
                         if dropped[i] {
                             state.pending_mask = None;
@@ -1605,7 +1695,7 @@ impl Scheduler {
         // dropped that close and kept the block open, so the flag is stale.  Re-arm
         // it so the EOT boost/force ramp and the in-thinking temperature/DRY gates
         // stay live across the steered spans.  (The injected `</think>` clears it
-        // for real in `inject_stencil_prefills`.)
+        // for real in `play_stencil_runs`.)
         //
         // The structural think-close ban (`think_close_ban_active`) leans on this
         // restore too: it arms whenever `in_segment` is false, so without the
@@ -2418,6 +2508,13 @@ impl Scheduler {
             }
         }
     }
+}
+
+/// Whether a step's forward did not run for want of something that comes back —
+/// a refused tier, a full span, an exhausted arena, an expert still on its way —
+/// so the step runs again with the same rows rather than failing them.
+fn is_step_refusal(e: &candle::Error) -> bool {
+    is_tier_refusal(e) || is_span_full(e) || is_expert_stall(e) || is_arena_exhausted(e)
 }
 
 /// Whether `e` is the device having no room for the work right now — a refused

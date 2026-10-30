@@ -1170,7 +1170,7 @@ impl Scheduler {
 
     /// The prefill scratch the running decodes' static runs may claim: a
     /// decode with a stencil plays its tool-call boilerplate as one prefill
-    /// span (`inject_stencil_prefills`), and a span past the timeline claims
+    /// span (`play_stencil_runs`), and a span past the timeline claims
     /// its sequence's scratch at that step (`ensure_scratch`) — one slot per
     /// recurrent layer, at its share of the region. Each decode with a stencil
     /// that does not hold its scratch yet may take one, at any step, with no

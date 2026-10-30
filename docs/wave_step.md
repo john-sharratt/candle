@@ -27,12 +27,15 @@ process with no creep in flight, hold nothing for either.
 A co-batched step with a creep in flight is up to three segment forwards:
 
 ```
-seg1  [0, cursor)        full-sweep rows (decode | verify | glue)
+seg1  [0, cursor)        full-sweep rows (decode | verify | stencil | glue)
 seg2  [cursor, win_end)  full-sweep rows + the creep
 seg3  [win_end, N)       full-sweep rows
 ```
 
-The full-sweep rows' residual passes seg1 → seg2 → seg3. It is a step-lifetime
+The stencil rows are decodes' static tool-call runs (`scheduler/stencil_wave.rs`):
+multi-token members of the prefill slot behind the verify blocks, full-sweep
+because the step samples the token after each from its last row, which is the
+only row the head scores for them. The full-sweep rows' residual passes seg1 → seg2 → seg3. It is a step-lifetime
 buffer, so it lives on the transient tier, in a forward span that is opened
 **once for the step** instead of once per segment.
 

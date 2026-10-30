@@ -208,8 +208,17 @@ Entering: in the `Free` state, `observe` checks the decoded token against the
 **trigger registry** (§9). A hit begins a session at the tree root; the trigger
 token has already been emitted, so walking starts after it.
 
-`Prefill` is a single forward pass over the node's whole buffer (the existing
-`run_prefill`), not a decode per token — this is the §1 speedup.
+`Prefill` writes the node's whole buffer in one forward, not a decode per token —
+this is the §1 speedup. That forward is the decode step's own wave
+(`scheduler/stencil_wave.rs`): the buffer, behind the sequence's pending token,
+rides the wave's prefill slot as a full-sweep member beside the decode rows and
+verify blocks, scored at its last row, and the token after it is sampled from
+that row. A run costs no forward of its own, which on a card that streams its
+experts is a second round of expert loads saved per stenciled step. The part of
+a buffer one wave cannot carry — pieces before its last page break, or more than
+one forward's budget — is forwarded ahead of the wave. A wave refused for ground
+keeps the run for the next step; the run's tokens are already recorded, so it is
+written by the retry rather than failing the turn.
 
 ---
 

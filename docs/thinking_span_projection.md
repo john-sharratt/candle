@@ -649,7 +649,7 @@ which is what decides whether a cut is possible (§8.2b):
 |---|---|---|
 | the sampler's own commit | `decode.rs`, `commit_decoded_tokens` | `commit_generated` |
 | the turn's first token | the three `DecodeState` constructions | `commit_generated` |
-| a stencil's static run | `decode.rs`, the stencil prefill | `push_forwarded` |
+| a stencil's static run | `decode.rs`, `play_stencil_runs` | `push_forwarded` |
 | an assistant prefill prefix | `decode.rs`, the heal path | `push_forwarded` |
 
 The second row is the one that would have been missed. A think-steer tree

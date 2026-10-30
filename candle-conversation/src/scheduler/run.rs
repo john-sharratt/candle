@@ -203,14 +203,15 @@ impl Scheduler {
     /// `DraftDepth::budget` under the model's width ceiling). A decode's
     /// selection carve follows its depth and its live index, and a verifying
     /// one's head scores every row of its block, so the count alone under-prices
-    /// a step beside deep or drafting conversations.
+    /// a step beside deep or drafting conversations. A decode holding a played
+    /// static run writes that run instead (`stencil_wave`).
     pub(super) fn decode_stage(&self) -> Vec<(usize, usize, usize)> {
         let ceiling = self.model.draft_budget(self.decode_width());
         let token_cost = self.model.draft_token_cost();
         self.active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
-            .map(|(id, s)| {
+            .map(|(&id, s)| {
                 let depth = if s.drafts() {
                     s.draft_depth.budget(ceiling, token_cost)
                 } else {
@@ -219,7 +220,7 @@ impl Scheduler {
                 (
                     id.0,
                     self.session.sequence_offset(id.0).unwrap_or(0),
-                    1 + depth,
+                    self.stencil_row_len(id).unwrap_or(1 + depth),
                 )
             })
             .collect()
@@ -321,13 +322,14 @@ impl Scheduler {
                 Self::withdraw_abandoned_prefills,
             );
             self.timed_rates_and_gallery();
-            // Inject any pending tool-call static runs (Layer 3) before the
-            // decode forward, so a `Static` run costs one prefill rather than N
-            // decode steps.  No-op when no sequence has an active stencil.
+            // Play any pending tool-call static runs (Layer 3) before the
+            // decode forward, which writes them beside the decode rows, so a
+            // `Static` run costs neither N decode steps nor a forward of its
+            // own.  No-op when no sequence has an active stencil.
             {
                 let _g = profile::span("loop:decode:stencil");
                 let t = Instant::now();
-                self.inject_stencil_prefills();
+                self.play_stencil_runs();
                 self.step_census
                     .spend(super::step_census::Activity::Stencil, t.elapsed());
             }
@@ -616,7 +618,7 @@ impl Scheduler {
         self.wave_step_creep_layers = 0;
         self.wave_step_creep_layer_pairs = 0.0;
         let t_step = Instant::now();
-        let out = self.decode_forward_cobatched(&[], &[], &[], &[]);
+        let out = self.decode_forward_cobatched(&[], &[], &[], &[], &[], &[]);
         self.step_census.record(
             match &out {
                 Err(e) if is_tier_refusal(e) || is_span_full(e) => {

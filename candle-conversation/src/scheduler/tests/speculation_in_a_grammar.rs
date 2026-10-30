@@ -13,10 +13,17 @@ use crate::stencil::{
     compile, compile_think_tree, TestVocab, ThinkMode, ThinkSteerEnvelope, Vocab,
 };
 use candle::{Device, Result};
-use candle_nn::kv_cache::ModelGeometry;
+use candle_nn::kv_cache::{ModelGeometry, TIER_REFUSED_MARKER};
 use candle_transformers::models::batched_inference::WaveStep;
 use candle_transformers::models::verify_wave::VerifyPlan;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+thread_local! {
+    /// Waves the stub refuses for ground before it runs one, on this test's
+    /// thread.
+    static REFUSALS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The blocks a [`ChainDrafter`] was asked to verify, in order.
 type Verified = Arc<Mutex<Vec<Vec<u32>>>>;
@@ -102,6 +109,9 @@ impl ManagedBatchedModel for ChainDrafter {
         _layer_end: usize,
         _residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
+        if REFUSALS.with(|r| r.replace(r.get().saturating_sub(1))) > 0 {
+            candle::bail!("{TIER_REFUSED_MARKER}: the stub has no ground for this wave");
+        }
         self.forwards.fetch_add(1, Ordering::Relaxed);
         let mut rows = Vec::new();
         for t in decode_inputs {
@@ -255,7 +265,7 @@ struct Slot {
 
 /// A scheduler over [`ChainDrafter`] with one decoding slot whose last
 /// committed token is `last`. With `in_think_span`, the slot is inside a think
-/// block's free span, exactly as `inject_stencil_prefills` leaves a sequence
+/// block's free span, exactly as `play_stencil_runs` leaves a sequence
 /// there before a decode step.
 fn decoding_slot(last: u32, in_think_span: bool) -> Slot {
     let verified = Arc::new(Mutex::new(Vec::new()));
@@ -284,6 +294,24 @@ fn decoding_slot(last: u32, in_think_span: bool) -> Slot {
         projection_assembler::BoundaryMarkers::default(),
         Arc::new(Guests::new()),
     );
+    let (id, events) = add_slot(&mut scheduler, last, in_think_span);
+    Slot {
+        scheduler,
+        id,
+        verified,
+        forwards,
+        _events: events,
+    }
+}
+
+/// Add a decoding slot to `scheduler` whose last committed token is `last`,
+/// inside a think block's free span when `in_think_span`. Returns its id and
+/// its event stream, which the caller holds for as long as the slot decodes.
+fn add_slot(
+    scheduler: &mut Scheduler,
+    last: u32,
+    in_think_span: bool,
+) -> (SequenceId, Receiver<TurnEvent>) {
     let id = SequenceId(scheduler.session.create_sequence().unwrap());
     let (mut state, events) = boundary_state();
     state.sampling_config = SamplingConfig::argmax();
@@ -304,13 +332,7 @@ fn decoding_slot(last: u32, in_think_span: bool) -> Slot {
     scheduler
         .sampling_states
         .insert(id, SequenceSamplingState::new(VOCAB, 8));
-    Slot {
-        scheduler,
-        id,
-        verified,
-        forwards,
-        _events: events,
-    }
+    (id, events)
 }
 
 /// **The speedup is real inside a think block**: the sequence drafts, the
@@ -399,16 +421,30 @@ fn a_think_span_block_ends_at_the_close_it_drops() {
     assert!(state.pending_mask.is_none());
     assert!(!state.stencil.as_ref().unwrap().mid_free_span());
 
-    // **The tree's closing tag is a static run, and it costs one forward.** It
-    // is prefilled — nothing already written goes with it — and the token after
-    // it is sampled from that forward's own last row, rather than the tag riding
-    // a second, decode, forward that reads the same distribution.
+    // **The tree's closing tag is a static run, and it costs no forward of its
+    // own.** Playing it records the row — nothing already written goes with it
+    // — and forwards nothing.
     let before = forwards.load(Ordering::Relaxed);
-    scheduler.inject_stencil_prefills();
+    scheduler.play_stencil_runs();
+    assert_eq!(
+        forwards.load(Ordering::Relaxed) - before,
+        0,
+        "playing a run forwards nothing"
+    );
+    assert_eq!(
+        &scheduler.active_decodes[&slot].generated_tokens[..],
+        &[100u32, 101, THINK_CLOSE][..]
+    );
+    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(2));
+
+    // The decode step's wave writes it, and the token after it is sampled from
+    // that wave's row for it, rather than the tag riding a second forward that
+    // reads the same distribution.
+    scheduler.batch_decode_step();
     assert_eq!(
         forwards.load(Ordering::Relaxed) - before,
         1,
-        "the static run and the token after it share one forward"
+        "the static run and the token after it share the step's one forward"
     );
     let after_close = successor(THINK_CLOSE);
     let state = &scheduler.active_decodes[&slot];
@@ -427,17 +463,82 @@ fn a_think_span_block_ends_at_the_close_it_drops() {
         &[after_close][..],
         "only the sampled token waits to be forwarded"
     );
+    assert!(!scheduler.holds_stencil_row(slot));
+}
 
-    // Its next step is the next iteration's: this one has nothing left to do.
+/// **A static run rides the wave a decode row is in.** One sequence's closing
+/// tag and another's drafted block go out in one forward: the run is scored at
+/// its last row, the block at every row, and each sequence commits from its own.
+#[test]
+fn a_static_run_shares_the_wave_of_another_sequences_decode() {
+    let Slot {
+        mut scheduler,
+        id: closing,
+        forwards,
+        _events,
+        ..
+    } = decoding_slot(100, true);
+    // To the close the span drops, which leaves the tag to play.
+    scheduler.batch_decode_step();
+    let (decoding, _decoding_events) = add_slot(&mut scheduler, 200, false);
+
+    scheduler.play_stencil_runs();
     let before = forwards.load(Ordering::Relaxed);
     scheduler.batch_decode_step();
     assert_eq!(
         forwards.load(Ordering::Relaxed) - before,
-        0,
-        "the decode step does not re-forward the run to read the same row"
+        1,
+        "the run and the other sequence's block share one forward"
     );
     assert_eq!(
-        &scheduler.active_decodes[&slot].generated_tokens[..],
-        &[100u32, 101, THINK_CLOSE, after_close][..]
+        &scheduler.active_decodes[&closing].generated_tokens[..],
+        &[100u32, 101, THINK_CLOSE, successor(THINK_CLOSE)][..]
     );
+    assert_eq!(scheduler.session.sequence_offset(closing.0), Some(3));
+    assert_eq!(
+        &scheduler.active_decodes[&decoding].generated_tokens[..],
+        &[200u32, 201, 202, 203][..],
+        "the block's rows are its own, not shifted by the run's"
+    );
+    assert_eq!(scheduler.session.sequence_offset(decoding.0), Some(3));
+}
+
+/// **A wave refused for ground keeps the run for the next.** The run's tokens
+/// are already recorded, so failing the turn would throw a reply away over
+/// ground the next step finds, and dropping the row would seal tokens with no
+/// K/V behind them. The retry writes it exactly once.
+#[test]
+fn a_refused_wave_keeps_the_static_run_for_the_next_step() {
+    let Slot {
+        mut scheduler,
+        id: slot,
+        forwards,
+        _events,
+        ..
+    } = decoding_slot(100, true);
+    scheduler.batch_decode_step();
+    scheduler.play_stencil_runs();
+
+    REFUSALS.with(|r| r.set(1));
+    scheduler.batch_decode_step();
+    let state = &scheduler.active_decodes[&slot];
+    assert!(!state.finished, "a refusal is not the turn's failure");
+    assert!(
+        scheduler.holds_stencil_row(slot),
+        "the row waits for the retry"
+    );
+    assert_eq!(&state.generated_tokens[..], &[100u32, 101, THINK_CLOSE][..]);
+    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(2));
+
+    let before = forwards.load(Ordering::Relaxed);
+    scheduler.play_stencil_runs();
+    scheduler.batch_decode_step();
+    assert_eq!(forwards.load(Ordering::Relaxed) - before, 1);
+    assert!(!scheduler.holds_stencil_row(slot));
+    assert_eq!(
+        &scheduler.active_decodes[&slot].generated_tokens[..],
+        &[100u32, 101, THINK_CLOSE, successor(THINK_CLOSE)][..],
+        "the run is written once and the token after it sampled once"
+    );
+    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(3));
 }

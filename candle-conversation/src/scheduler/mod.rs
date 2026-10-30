@@ -77,6 +77,7 @@ mod segment_rearm;
 mod settle;
 mod spec_chooser;
 pub mod state_census;
+mod stencil_wave;
 mod step_census;
 mod submit_admit;
 mod sweep_forecast;
@@ -1540,7 +1541,7 @@ struct DecodeState {
     /// committed-but-not-yet-forwarded. A suppressed `</think>` breaks it: the
     /// token is sampled and *dropped* rather than committed, so `last()` still
     /// names the token this step already forwarded — and
-    /// `inject_stencil_prefills`, re-driven by the same drop, forwards it a
+    /// `play_stencil_runs`, re-driven by the same drop, forwards it a
     /// second time.
     ///
     /// The K/V absorbs that silently, because it is position-addressed: the
@@ -1722,7 +1723,7 @@ struct DecodeState {
     /// present/absent, not a feature flag.
     stencil: Option<StencilDriver>,
     /// The decode action (`Branch`/`Free`/`Done`) the stencil yielded for the
-    /// upcoming decode step.  Set by `inject_stencil_prefills` once any preceding
+    /// upcoming decode step.  Set by `play_stencil_runs` once any preceding
     /// static runs are injected; consumed by `batch_decode_step` (apply the mask,
     /// then `accept` the sampled token and clear).  `None` ⇒ the driver needs
     /// advancing again.
@@ -3823,12 +3824,10 @@ pub(crate) struct Scheduler {
     high_drain: high_drain::HighDrain,
     /// `TURN_CONTENT_TOKENS` as `publish_learned_rates` last read it.
     turn_content_seen: u64,
-    /// Sequences whose next token `inject_stencil_prefills` sampled this
-    /// iteration from its static run's own prefill. They sit out the decode
-    /// step that follows: the token it would carry is the one just sampled, and
-    /// the stencil's constraint for the token after it is set by the next
-    /// injection, not by a step that has not seen the driver advance.
-    stencil_sampled: HashSet<SequenceId>,
+    /// Static runs the stencil has played and no wave has written yet
+    /// (`stencil_wave`). A sequence holding one rides the next decode step as
+    /// that run instead of as a decode row, and keeps it until a wave writes it.
+    stencil_rows: Vec<stencil_wave::StencilRow>,
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
@@ -4259,7 +4258,7 @@ impl Scheduler {
             idle_since: HashMap::new(),
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,
-            stencil_sampled: HashSet::new(),
+            stencil_rows: Vec::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),
             parked_at: HashMap::new(),
@@ -14514,7 +14513,9 @@ mod tests {
             complete: true,
         });
 
-        assert!(sched.decode_forward_cobatched(&[], &[], &[], &[]).is_err());
+        assert!(sched
+            .decode_forward_cobatched(&[], &[], &[], &[], &[], &[])
+            .is_err());
         assert!(
             sched.deferred_glue_fires.is_empty(),
             "the wave took the glue"

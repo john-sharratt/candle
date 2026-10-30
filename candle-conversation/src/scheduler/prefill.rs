@@ -27,10 +27,9 @@ use candle_nn::kv_cache::{
 };
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::expert_lre::is_expert_stall;
-use candle_transformers::models::held_tensor::hold_row;
 use candle_transformers::models::residual_rows::{compact_creeps, CreepResidual};
 use candle_transformers::models::wave_driver::{StepCreep, StepRows, StepSpec};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Free KV regions kept in hand before [`Scheduler::vram_under_pressure_for`]
 /// calls it pressure, as a divisor of the reservation's KV side plus an absolute
@@ -4739,12 +4738,19 @@ impl Scheduler {
     /// Called per decode step; the cohort/section/glue fold in on the first step
     /// (`wave_cohort_advanced` / `wave_section_advanced` guards, `take_wave_glue`
     /// drains once), the rest are plain decode.
+    ///
+    /// `stencil_seqs`/`stencil_inputs` are the decodes' static runs
+    /// (`stencil_wave`): full-sweep members of the prefill slot behind the verify
+    /// blocks, each scored at its last row, so the logits come back
+    /// `[decode | verify | stencil]`.
     pub(super) fn decode_forward_cobatched(
         &mut self,
         decode_seqs: &[usize],
         decode_inputs: &[Tensor],
         verify_seqs: &[usize],
         verify_inputs: &[Tensor],
+        stencil_seqs: &[usize],
+        stencil_inputs: &[Tensor],
     ) -> candle::Result<WaveLogits> {
         // Fold this wave's deferred glue in as a full-sweep member co-batched with
         // decode (see `take_wave_glue`). A slot that decodes this wave is never
@@ -4757,7 +4763,15 @@ impl Scheduler {
             .as_ref()
             .map(|(ids, _, _)| ids.clone())
             .unwrap_or_default();
-        let out = self.wave_step(decode_seqs, decode_inputs, verify_seqs, verify_inputs, glue);
+        let out = self.wave_step(
+            decode_seqs,
+            decode_inputs,
+            verify_seqs,
+            verify_inputs,
+            stencil_seqs,
+            stencil_inputs,
+            glue,
+        );
         // **A segmented step stands or falls whole for its full-sweep members.**
         // A refused later segment rolled back only its own layers; the ones
         // before it committed, and the retry would run their tokens in again —
@@ -4816,12 +4830,15 @@ impl Scheduler {
 
     /// One wave step of [`Self::decode_forward_cobatched`], with the wave's
     /// deferred glue already taken.
+    #[allow(clippy::too_many_arguments)]
     fn wave_step(
         &mut self,
         decode_seqs: &[usize],
         decode_inputs: &[Tensor],
         verify_seqs: &[usize],
         verify_inputs: &[Tensor],
+        stencil_seqs: &[usize],
+        stencil_inputs: &[Tensor],
         glue: Option<(Vec<usize>, Vec<Tensor>, Vec<PendingGlue>)>,
     ) -> candle::Result<WaveLogits> {
         let n = self.model.num_layers().max(1);
@@ -4841,8 +4858,21 @@ impl Scheduler {
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
         // Rows ahead of the creep in caller order, and the logits prefix the
-        // caller gets back: `[decode | verify]`.
-        let head_rows = n_dec + verify_tok;
+        // caller gets back: `[decode | verify | stencil]`.
+        let head_rows = n_dec + verify_tok + stencil_seqs.len();
+        // The static runs follow the verify blocks as full-sweep members of the
+        // same slot for the same reason — the step samples the token after each
+        // from its run's row — but a run is not a verify block: nothing armed it,
+        // so the head scores its last row only. From here on the slot's
+        // full-sweep members are both.
+        let full_seqs: Vec<usize> = verify_seqs.iter().chain(stencil_seqs).copied().collect();
+        let full_inputs: Vec<Tensor> = verify_inputs
+            .iter()
+            .chain(stencil_inputs)
+            .cloned()
+            .collect();
+        let verify_seqs = full_seqs.as_slice();
+        let verify_inputs = full_inputs.as_slice();
         // Wave-step wall-clock, shared across the co-batched classes so the prefill
         // and section throughput panels reflect the CONCURRENT rate (they ride
         // decode's sweep in one forward) rather than reading zero.
@@ -6320,19 +6350,6 @@ impl Scheduler {
         }
     }
 
-    /// [`Self::run_prefill`], keeping the row after the span's last token — an
-    /// owned copy, for a caller that samples it once the forward is done.
-    pub(super) fn run_prefill_keeping_row(
-        &mut self,
-        sequence_id: SequenceId,
-        tokens: &[u32],
-    ) -> Result<Tensor, ConversationError> {
-        match self.run_prefill_pieces(sequence_id, tokens, Continuation::KeepRow)? {
-            Some(Continued::Row(r)) => Ok(r),
-            _ => Err(ConversationError::Channel("prefill kept no row".into())),
-        }
-    }
-
     fn run_prefill_pieces(
         &mut self,
         sequence_id: SequenceId,
@@ -6389,23 +6406,6 @@ impl Scheduler {
         &mut self,
         spans: &[(SequenceId, &[u32])],
     ) -> Vec<(SequenceId, ConversationError)> {
-        self.run_prefill_batch_keeping(spans, &HashSet::new()).0
-    }
-
-    /// [`Self::run_prefill_batch`], also returning the row after the last token
-    /// of every sequence in `keep` — owned copies, for a caller that samples the
-    /// continuation once the batch is done. A sequence named more than once
-    /// returns its last span's row: the repeats forward after the batch, so the
-    /// later write is the later span.
-    pub(super) fn run_prefill_batch_keeping(
-        &mut self,
-        spans: &[(SequenceId, &[u32])],
-        keep: &HashSet<SequenceId>,
-    ) -> (
-        Vec<(SequenceId, ConversationError)>,
-        HashMap<SequenceId, Tensor>,
-    ) {
-        let mut last_rows: HashMap<SequenceId, Tensor> = HashMap::new();
         let pass = self.prefill_pass_budget();
         let mut failed: Vec<(SequenceId, ConversationError)> = Vec::new();
         let mut groups: Vec<(Option<String>, Vec<(SequenceId, Vec<&[u32]>)>)> = Vec::new();
@@ -6429,7 +6429,7 @@ impl Scheduler {
             }
         }
         for (_, members) in groups {
-            self.run_prefill_rounds(&members, pass, &mut failed, keep, &mut last_rows);
+            self.run_prefill_rounds(&members, pass, &mut failed);
         }
         for (sequence_id, tokens) in alone {
             // A turn whose earlier span failed does not forward the next one
@@ -6437,23 +6437,11 @@ impl Scheduler {
             if failed.iter().any(|(s, _)| *s == sequence_id) {
                 continue;
             }
-            let done = if keep.contains(&sequence_id) {
-                self.run_prefill_keeping_row(sequence_id, tokens)
-                    .map(|row| {
-                        last_rows.insert(sequence_id, row);
-                    })
-            } else {
-                self.run_prefill(sequence_id, tokens)
-            };
-            if let Err(e) = done {
+            if let Err(e) = self.run_prefill(sequence_id, tokens) {
                 failed.push((sequence_id, e));
             }
         }
-        // A failed turn's row describes K/V that may not all be written.
-        for (sequence_id, _) in &failed {
-            last_rows.remove(sequence_id);
-        }
-        (failed, last_rows)
+        failed
     }
 
     /// One adapter group of [`Self::run_prefill_batch`]: a wave per split round
@@ -6464,8 +6452,6 @@ impl Scheduler {
         members: &[(SequenceId, Vec<&[u32]>)],
         pass: usize,
         failed: &mut Vec<(SequenceId, ConversationError)>,
-        keep: &HashSet<SequenceId>,
-        last_rows: &mut HashMap<SequenceId, Tensor>,
     ) {
         let rounds = members.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
         let nl = self.model.num_layers().max(1);
@@ -6488,7 +6474,7 @@ impl Scheduler {
                 let take = super::admission::admit_within(lens[start..].iter().copied(), pass);
                 let group = &live[start..start + take];
                 start += take;
-                if let Err(e) = self.forward_tail_wave(group, nl, keep, last_rows) {
+                if let Err(e) = self.forward_tail_wave(group, nl) {
                     let reason = e.to_string();
                     for &(sequence_id, _, _) in group {
                         dead.push(sequence_id);
@@ -6510,8 +6496,6 @@ impl Scheduler {
         &mut self,
         group: &[(SequenceId, &[u32], bool)],
         nl: usize,
-        keep: &HashSet<SequenceId>,
-        last_rows: &mut HashMap<SequenceId, Tensor>,
     ) -> Result<(), ConversationError> {
         let seqs: Vec<usize> = group.iter().map(|(s, _, _)| s.0).collect();
         let inputs = group
@@ -6534,33 +6518,6 @@ impl Scheduler {
                 None,
             )
             .map_err(ConversationError::Model)?;
-        // **The row after a span's last token, for the members that asked.** A
-        // piece that `closes` has more of its span after it, so only a member's
-        // final piece carries the continuation. Copied off the span — one
-        // `[1, vocab]` row per member — because the next round's wave cannot open
-        // while this one's span is held, and the caller samples after the batch.
-        if group
-            .iter()
-            .any(|(s, _, closes)| !closes && keep.contains(s))
-        {
-            let rows = step.logits_on_span();
-            for (k, &(sequence_id, _, closes)) in group.iter().enumerate() {
-                if closes || !keep.contains(&sequence_id) {
-                    continue;
-                }
-                let row = rows.get(k).ok_or_else(|| {
-                    ConversationError::Channel(format!(
-                        "the tail wave returned {} rows for {} members",
-                        rows.len(),
-                        group.len()
-                    ))
-                })?;
-                last_rows.insert(
-                    sequence_id,
-                    hold_row(row).map_err(ConversationError::Model)?,
-                );
-            }
-        }
         drop(step);
         for &(sequence_id, piece, closes) in group {
             self.session
@@ -6585,7 +6542,7 @@ impl Scheduler {
     /// which keeps none: every finished turn's `<|im_end|>\n` tail took two forwards,
     /// ~20 ms each, on the loop thread between the decode steps of the turns still
     /// running.
-    fn prefill_breaks(&self) -> &[u32] {
+    pub(super) fn prefill_breaks(&self) -> &[u32] {
         if self.model.carries_positional_state() {
             &self.page_break_tokens
         } else {
@@ -6595,7 +6552,7 @@ impl Scheduler {
 
     /// Close `sequence_id`'s index page after `head`, a piece that ended on a
     /// break token — so the region it bounds occupies whole pages.
-    fn close_page_at_break(&mut self, sequence_id: SequenceId, head: &[u32]) {
+    pub(super) fn close_page_at_break(&mut self, sequence_id: SequenceId, head: &[u32]) {
         match self.model.close_positional_page(sequence_id.0) {
             // The head's own token ids when it is short. A surplus page is
             // identified by what is IN it, and the pages that do not belong
@@ -6671,12 +6628,6 @@ impl Scheduler {
                         continued =
                             Some(Continued::Token(self.sample_single(&row, config, state)?));
                     }
-                    Continuation::KeepRow => {
-                        let row = first_row()?;
-                        continued = Some(Continued::Row(
-                            hold_row(&row).map_err(ConversationError::Model)?,
-                        ));
-                    }
                 }
             }
             drop(step);
@@ -6702,14 +6653,11 @@ enum Continuation<'a> {
     Ignore,
     /// The continuation's first token, sampled in place.
     Sample(&'a SamplingConfig, &'a mut SequenceSamplingState),
-    /// The row itself, copied off the span.
-    KeepRow,
 }
 
 /// What [`Continuation`] produced.
 enum Continued {
     Token(u32),
-    Row(Tensor),
 }
 
 /// A turn whose prefill finished cleanly, its first token already drawn.
