@@ -422,8 +422,7 @@ impl OwnerLoop {
             self.serve_calls();
             match self.serve_writes() {
                 Served::Stop(ack) => {
-                    self.commit();
-                    let _ = ack.send(());
+                    self.stop(ack);
                     return;
                 }
                 Served::Wrote => continue,
@@ -519,8 +518,7 @@ impl OwnerLoop {
                 }
                 Ok(Write::Call(call)) => self.run_call(call),
                 Ok(Write::Shutdown(ack)) => {
-                    self.commit();
-                    let _ = ack.send(());
+                    self.stop(ack);
                     return false;
                 }
                 Err(_) => return false,
@@ -540,8 +538,7 @@ impl OwnerLoop {
     fn commit_after_burst(&mut self) -> bool {
         match self.serve_writes() {
             Served::Stop(ack) => {
-                self.commit();
-                let _ = ack.send(());
+                self.stop(ack);
                 false
             }
             Served::Wrote => true,
@@ -550,6 +547,15 @@ impl OwnerLoop {
                 true
             }
         }
+    }
+
+    /// Stop: serve every call already queued — each is a caller blocked on its
+    /// answer, and a queue that picked the shutdown first would otherwise drop
+    /// it unanswered — then commit the tail and acknowledge the shutdown.
+    fn stop(&mut self, ack: Sender<()>) {
+        self.serve_calls();
+        self.commit();
+        let _ = ack.send(());
     }
 }
 
@@ -708,5 +714,46 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the owner stopped");
         assert_eq!(owner.flow.written.load(Ordering::Acquire), 64);
+    }
+
+    /// **A call queued when the shutdown is taken is still answered.** With a
+    /// call and a shutdown both waiting, the owner's wait picks either; when it
+    /// picks the shutdown, the call is served before the owner stops rather
+    /// than dropped unanswered — which panicked its caller. Repeated, so both
+    /// orders are taken.
+    #[test]
+    fn a_call_queued_beside_a_shutdown_is_answered() {
+        for _ in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut substrate = Substrate::new();
+            let persistence =
+                SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+            let (call_tx, calls) = channel::unbounded::<Call>();
+            let (write_tx, writes) = channel::unbounded::<Write>();
+            let (_background_tx, background) = channel::unbounded::<Call>();
+            let (done, answered) = channel::bounded(1);
+            call_tx
+                .send(Call {
+                    run: Box::new(|_| {}),
+                    done,
+                })
+                .unwrap();
+            let (ack, _acked) = channel::bounded(1);
+            write_tx.send(Write::Shutdown(ack)).unwrap();
+            let mut owner = OwnerLoop {
+                persistence,
+                substrate: Arc::new(SubstrateLock::new(substrate)),
+                calls,
+                writes,
+                background,
+                flow: Arc::new(Flow::default()),
+                snapshots: Arc::new(WrittenSnapshots::default()),
+            };
+            owner.wait_for_work();
+            assert!(
+                matches!(answered.try_recv(), Ok(Ok(()))),
+                "the queued call went unanswered"
+            );
+        }
     }
 }

@@ -76,7 +76,7 @@ impl Rig {
     async fn new(awake: bool) -> Self {
         let base = tmp("rig");
         let owner_identity = identity("google-owner");
-        let mut npcs = Npcs::load(&base).unwrap();
+        let npcs = Npcs::load(&base).unwrap();
         let mut accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
         let owner = accounts.upsert(&owner_identity, 0).unwrap()["user_id"]
             .as_str()

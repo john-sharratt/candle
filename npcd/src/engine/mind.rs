@@ -31,14 +31,21 @@
 //!
 //! # Locking
 //!
-//! The map of live conversations and a live conversation are two locks, taken in
-//! that order and never together for long. The map is a `std` mutex, locked for
-//! a lookup and released — it is what [`Minds::resident`] and every Pulse header
-//! read, and nothing awaits under it. Each conversation is a `tokio` mutex whose
-//! guard is *built* to live across an await: a decode is seconds, and the
-//! character's own task holds its conversation for exactly that span while every
-//! other character's decode proceeds beside it. One turn at a time per character
-//! is the guard's job; one character at a time was the old driver's, and is gone.
+//! One lock, per character: its conversation. Everything around it takes none.
+//!
+//! The live conversations are a lock-free map from character to its
+//! [`Resident`] — the conversation and the handle it is asked through, one entry
+//! so a reader never sees one replaced without the other. A lookup clones the
+//! entry's `Arc` out and holds nothing; it is what [`Minds::resident`] and every
+//! Pulse header read. Only a character's own task opens or replaces its entry,
+//! and a delete only removes it, so no two writers ever race for one key. The
+//! system prompts and the grammar cache are lock-free maps the same way, and the
+//! schema and the bearings, installed once at load, are atomic slots.
+//!
+//! Each conversation is a `tokio` mutex whose guard is *built* to live across an
+//! await: a decode is seconds, and the character's own task holds its
+//! conversation for exactly that span while every other character's decode
+//! proceeds beside it. One turn at a time per character is the guard's job.
 //!
 //! # Why the sequence is windowed as well
 //!
@@ -48,10 +55,12 @@
 //! decides what is relevant, and only a bounded tail is carried verbatim. Both
 //! bounds are deliberate and neither is the other's fallback.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
+use papaya::HashMap as LockFreeMap;
 use tokio::sync::Mutex as ConversationLock;
 
 use candle_conversation::projection::{
@@ -233,7 +242,7 @@ pub struct Minds {
     /// A cast is small and rooms are stable, so this hits almost always; the
     /// miss costs one compile of a nine-act catalog, against a decode measured
     /// in seconds.
-    acts: Mutex<HashMap<(identity::Deliberation, tools::Within), Arc<StencilTree>>>,
+    acts: LockFreeMap<(identity::Deliberation, tools::Within), Arc<StencilTree>>,
     /// Whether the catalog compiled at boot. `false` means this checkpoint
     /// cannot be held to a shape at all, and every turn free-decodes — asked
     /// once here rather than inferred from an empty cache, which would also be
@@ -247,23 +256,26 @@ pub struct Minds {
     /// answers its routes. `None` for a daemon with no mind: its characters
     /// think under the rendered prompt.
     ///
-    /// Behind an `Arc` so a reader clones the handle out and lets the lock go
-    /// before any await — a `RwLock` guard held across a decode would pin the
-    /// whole cast's schema reads behind one turn.
-    projection: RwLock<Option<Arc<Projected>>>,
+    /// An atomic slot: a reader loads the `Arc` and holds it across any await
+    /// without holding anything else.
+    projection: ArcSwapOption<Projected>,
     /// What each bench draws on of the shared layers — `None` until the mind
     /// declares bearings, and then every shared layer is drawn on everywhere.
-    scopes: RwLock<Option<Arc<Scopes>>>,
-    /// Each conversation behind its own async lock, so a decode holds only the
-    /// character that is thinking — see the module's *Locking* note.
-    live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
-    /// A handle to each live conversation that can put it a question without its
-    /// lock, so asking never waits for the character's turn — see [`Minds::ask_under`].
-    askers: Mutex<HashMap<u64, UnsealedAsker>>,
+    scopes: ArcSwapOption<Scopes>,
+    /// Each character's conversation, behind its own async lock so a decode
+    /// holds only the character that is thinking — see the module's *Locking*
+    /// note.
+    ///
+    /// Each value is a slot, emptied the moment its entry is removed or
+    /// replaced: the map frees what it retires only in batches, and a retired
+    /// entry still holding its `Resident` would keep the conversation — its
+    /// scheduler slot and its resident KV — alive long after the character let
+    /// it go.
+    live: LockFreeMap<u64, ArcSwapOption<Resident>>,
     /// The system prompt each character's latest turn was made under, laid out
-    /// from that turn's projection. Held apart from `live` so reading it never
-    /// waits on a decode.
-    system_prompts: Mutex<HashMap<u64, rendered::Rendered>>,
+    /// from that turn's projection. Held apart from the conversation so reading
+    /// it never waits on a decode.
+    system_prompts: LockFreeMap<u64, rendered::Rendered>,
     /// How many turns stay verbatim in the redo log, or `None` to keep them all.
     ///
     /// **Off unless the projection asks for it**, because most conversations are
@@ -279,6 +291,14 @@ pub struct Minds {
     /// second copy of a prompt is a copy that diverges from the one being edited.
     /// See [`crate::engine::schema::ReflectionTurns`].
     reflection: Option<ReflectionTurns>,
+}
+
+/// A character's live conversation, and the handle that can put it a question
+/// without its lock, so asking never waits for the character's turn — see
+/// [`Minds::ask_under`]. One entry, so the two are replaced together.
+struct Resident {
+    conversation: ConversationLock<Live>,
+    asker: UnsealedAsker,
 }
 
 /// The schema a character's conversation opens against, with its acts and
@@ -526,14 +546,12 @@ impl Minds {
         // tokenizer lacks the markers yields nothing and turns free-decode
         // exactly as before — loud, but never fatal: a daemon that refuses to
         // boot over it helps nobody.
-        let acts = Mutex::new(HashMap::new());
+        let acts = LockFreeMap::new();
         let mut ok = true;
         for level in LEVELS {
             match compile_act_loop(&engine, &base_config, level, &tools::Within::nowhere()) {
                 Ok(tree) => {
-                    acts.lock()
-                        .unwrap()
-                        .insert((level, tools::Within::nowhere()), tree);
+                    acts.pin().insert((level, tools::Within::nowhere()), tree);
                 }
                 Err(e) => {
                     ok = false;
@@ -589,11 +607,10 @@ impl Minds {
             base_config,
             acts,
             grammar_ok: ok,
-            projection: RwLock::new(None),
-            scopes: RwLock::new(None),
-            live: Mutex::new(HashMap::new()),
-            askers: Mutex::new(HashMap::new()),
-            system_prompts: Mutex::new(HashMap::new()),
+            projection: ArcSwapOption::empty(),
+            scopes: ArcSwapOption::empty(),
+            live: LockFreeMap::new(),
+            system_prompts: LockFreeMap::new(),
             keep_turns: None,
             reflection: None,
         }
@@ -645,7 +662,7 @@ impl Minds {
     /// Draw on the shared layers by bearing from here on — see
     /// [`crate::engine::bearings`].
     pub fn set_scopes(&self, scopes: Scopes) {
-        *self.scopes.write().unwrap() = Some(Arc::new(scopes));
+        self.scopes.store(Some(Arc::new(scopes)));
     }
 
     pub fn set_projection(&self, projected: Projected) {
@@ -655,19 +672,30 @@ impl Minds {
             projected.prompt.len()
         );
         self.warm_dreams(&projected);
-        *self.projection.write().unwrap() = Some(Arc::new(projected));
+        self.projection.store(Some(Arc::new(projected)));
     }
 
-    /// The installed schema, cloned out so no lock outlives this call — the
-    /// shape every await-crossing reader of the projection uses.
+    /// The installed schema, as an `Arc` a caller may hold across an await.
     fn projected(&self) -> Option<Arc<Projected>> {
-        self.projection.read().unwrap().as_ref().map(Arc::clone)
+        self.projection.load_full()
     }
 
     /// The system prompt this character's latest turn was made under, or `None`
     /// before it has had one.
     pub fn system_prompt(&self, npc_id: u64) -> Option<rendered::Rendered> {
-        self.system_prompts.lock().unwrap().get(&npc_id).cloned()
+        self.system_prompts.pin().get(&npc_id).cloned()
+    }
+
+    /// This character's live conversation, if it has one — cloned out of the
+    /// map, so holding it holds nothing else.
+    fn resident_of(&self, npc_id: u64) -> Option<Arc<Resident>> {
+        self.live.pin().get(&npc_id)?.load_full()
+    }
+
+    /// Take this character's conversation out of the map, emptying the entry's
+    /// slot so the map's retired copy holds nothing — see [`Self::live`].
+    fn release(&self, npc_id: u64) -> Option<Arc<Resident>> {
+        self.live.pin().remove(&npc_id)?.swap(None)
     }
 
     /// The tokens this character would be given if it decoded this instant —
@@ -675,8 +703,8 @@ impl Minds {
     /// Waits for a decode in progress. `None` for a character with no live
     /// conversation.
     pub async fn prompt_dump(&self, npc_id: u64) -> Option<PromptDump> {
-        let live = self.live.lock().unwrap().get(&npc_id).map(Arc::clone)?;
-        let held = live.lock().await;
+        let resident = self.resident_of(npc_id)?;
+        let held = resident.conversation.lock().await;
         held.sequence.prompt_dump()
     }
 
@@ -699,10 +727,8 @@ impl Minds {
     /// they are written to — so what the console reads of a layer is what the
     /// character's own projection could gather from it.
     ///
-    /// The projection lock is let go before anything takes the engine's.
     fn as_character(&self, npc_id: u64) -> Option<(Builder, GroupId)> {
-        let projection = self.projection.read().unwrap();
-        let p = projection.as_ref()?;
+        let p = self.projected()?;
         Some((self.scoped_for(&p.builder, npc_id), p.group))
     }
 
@@ -943,7 +969,7 @@ impl Minds {
             return Ok(None);
         };
         // A character the daemon no longer holds narrates nothing.
-        if self.live.lock().unwrap().get(&npc_id).is_none() {
+        if !self.live.pin().contains_key(&npc_id) {
             return Ok(None);
         }
         // Whoever the act is aimed at, so the narration has them present.
@@ -1003,11 +1029,11 @@ impl Minds {
             return None;
         }
         let key = (thinking, within.clone());
-        if let Some(tree) = self.acts.lock().unwrap().get(&key) {
+        if let Some(tree) = self.acts.pin().get(&key) {
             return Some(Arc::clone(tree));
         }
-        // Compiled outside the cache lock: a compile takes a while, and a
-        // second character arriving mid-compile must not wait behind it.
+        // A compile takes a while, and a second character arriving mid-compile
+        // does not wait behind it: it compiles too.
         let built = match compile_act_loop(&self.engine, &self.base_config, thinking, within) {
             Ok(tree) => tree,
             Err(e) => {
@@ -1020,7 +1046,7 @@ impl Minds {
         };
         // Last writer wins: two characters in one room race to build the same
         // tree and either is correct, since the key determines the contents.
-        self.acts.lock().unwrap().insert(key, Arc::clone(&built));
+        self.acts.pin().insert(key, Arc::clone(&built));
         Some(built)
     }
 
@@ -1082,7 +1108,7 @@ impl Minds {
     /// this trails it. The gap is exactly "how many have thought at least once",
     /// which is what the Pulse header reports.
     pub fn resident(&self) -> usize {
-        self.live.lock().unwrap().len()
+        self.live.len()
     }
 
     /// Stop a character and run one reflection — see [`crate::engine::reflect`].
@@ -1242,16 +1268,10 @@ impl Minds {
             .into_iter()
             .chain(gone.iter().map(String::as_str))
             .collect();
-        let conversation = self
-            .live
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                anyhow::anyhow!("npc {npc_id} has no live conversation to journal in")
-            })?;
-        let mut live = conversation.lock().await;
+        let resident = self.resident_of(npc_id).ok_or_else(|| {
+            anyhow::anyhow!("npc {npc_id} has no live conversation to journal in")
+        })?;
+        let mut live = resident.conversation.lock().await;
         let Live {
             sequence, journal, ..
         } = &mut *live;
@@ -1351,7 +1371,7 @@ impl Minds {
     /// Whether this daemon can reflect at all: a mind that authors the
     /// questions, and a schema to ask them under.
     pub fn can_reflect(&self) -> bool {
-        self.reflection.is_some() && self.projection.read().unwrap().is_some()
+        self.reflection.is_some() && self.projection.load().is_some()
     }
 
     /// Rejoin this character's conversation, or open it a new one.
@@ -1425,7 +1445,7 @@ impl Minds {
         // Falling back to the rendered copy when there is no mind is not a dual
         // path kept alive for safety — a daemon with no `projection.yaml` has no
         // schema to open against, and the copy is the only prompt there is.
-        let under = self.projection.read().unwrap();
+        let under = self.projected();
         let (system, projected) = match under.as_ref() {
             Some(p) => (p.prompt.clone(), Some(p)),
             // The same envelope `compile_act_loop` compiles, so what the prompt
@@ -1605,13 +1625,12 @@ impl Minds {
     ) -> anyhow::Result<Thought> {
         let mut thought = Thought::default();
 
-        // Find or open this character's conversation. The map is a `std` lock
-        // held only for a lookup; the open — scheduler round trips — happens
-        // between locks. That gap admits no race: only this character's own
-        // task ever opens or replaces its conversation, so the entry cannot
-        // change hands while the map is unlocked.
-        let existing = self.live.lock().unwrap().get(&npc_id).map(Arc::clone);
-        let conversation = match existing {
+        // Find or open this character's conversation. The lookup holds nothing,
+        // and the open — scheduler round trips — runs after it. That gap admits
+        // no race: only this character's own task ever opens or replaces its
+        // conversation, so the entry cannot change hands in between.
+        let existing = self.resident_of(npc_id);
+        let resident = match existing {
             Some(current) => {
                 // The day boundary. Checked here rather than on a timer because
                 // a timer fires on host-elapsed time and would be wrong the
@@ -1624,7 +1643,7 @@ impl Minds {
                 // — Makers once spent hours telling each other there was nothing
                 // left to do — ends with the work it went badly on.
                 let (from, from_chapter) = {
-                    let l = current.lock().await;
+                    let l = current.conversation.lock().await;
                     (l.day, l.chapter)
                 };
                 if from == day && from_chapter == chapter {
@@ -1640,10 +1659,9 @@ impl Minds {
                     }
                     // Tombstone, not delete. The turns stay in the redo log;
                     // what changes is that they stop being selected by default.
-                    let gone = self.live.lock().unwrap().remove(&npc_id);
-                    self.askers.lock().unwrap().remove(&npc_id);
+                    let gone = self.release(npc_id);
                     if let Some(l) = gone {
-                        retire(&self.engine, &*l.lock().await);
+                        retire(&self.engine, &*l.conversation.lock().await);
                     }
                     if from != day {
                         thought.rolled_over = Some((from, day));
@@ -1713,7 +1731,7 @@ impl Minds {
             // The async guard is DESIGNED to live across this await (module
             // *Locking* note): it is what makes one turn at a time per
             // character true while the rest of the cast decodes concurrently.
-            let mut live = conversation.lock().await;
+            let mut live = resident.conversation.lock().await;
             options.selection = self.prepare(&mut live, npc_id, persona, within).await;
             // The answers to last turn's acts, taken here so they die with the
             // conversation on a roll-over rather than being delivered into one
@@ -1743,7 +1761,7 @@ impl Minds {
             // **What this turn may reach for, from where it stands** — set
             // before the send, so the prefill's projection and every one the
             // decode makes after it read the same shelves.
-            let scopes = self.scopes.read().unwrap().as_ref().map(Arc::clone);
+            let scopes = self.scopes.load_full();
             let bearing = scopes.as_ref().map(|s| {
                 s.apply(
                     &self.engine,
@@ -1761,7 +1779,7 @@ impl Minds {
             // comes back by winning the gather rather than by being pasted in —
             // so the only way to see it is to ask the projection what it held.
             if let Some(ev) = live.sequence.projection_event(&response.stats) {
-                self.system_prompts.lock().unwrap().insert(
+                self.system_prompts.pin().insert(
                     npc_id,
                     rendered::render(&ev, &live.sequence.section_contents()),
                 );
@@ -1859,7 +1877,7 @@ impl Minds {
                 ))
             };
             if let Some((through, retired)) = settled {
-                conversation.lock().await.retired_through = through;
+                resident.conversation.lock().await.retired_through = through;
                 thought.retired = retired;
             }
         }
@@ -1947,8 +1965,7 @@ impl Minds {
     ) -> SelectionState {
         let mut selection = self
             .projection
-            .read()
-            .unwrap()
+            .load()
             .as_ref()
             .map(|p| {
                 p.identities.selection_for(
@@ -1985,11 +2002,8 @@ impl Minds {
         if outcomes.is_empty() {
             return;
         }
-        // Cloned out of the map before locking the conversation, so a character
-        // mid-decode is awaited without the map held behind it.
-        let live = self.live.lock().unwrap().get(&npc_id).map(Arc::clone);
-        if let Some(l) = live {
-            l.lock().await.pending.extend(outcomes);
+        if let Some(l) = self.resident_of(npc_id) {
+            l.conversation.lock().await.pending.extend(outcomes);
         }
     }
 
@@ -2002,25 +2016,24 @@ impl Minds {
     /// lookup it runs on excludes tombstoned timelines by design.
     pub async fn retire_npc(&self, npc_id: u64) {
         // Taken out of the map first, then locked: a character mid-decode is
-        // awaited rather than tombstoned underneath, and the map is free for
-        // everyone else while we wait.
-        let gone = self.live.lock().unwrap().remove(&npc_id);
-        self.askers.lock().unwrap().remove(&npc_id);
+        // awaited rather than tombstoned underneath.
+        let gone = self.release(npc_id);
         if let Some(l) = gone {
-            retire(&self.engine, &*l.lock().await);
+            retire(&self.engine, &*l.conversation.lock().await);
         }
     }
 
-    /// Make `live` the character's conversation, and the handle it is asked
-    /// through.
-    fn adopt(&self, npc_id: u64, live: Live) -> Arc<ConversationLock<Live>> {
-        let asker = live.sequence.unsealed_asker();
-        let opened = Arc::new(ConversationLock::new(live));
-        self.askers.lock().unwrap().insert(npc_id, asker);
-        self.live
-            .lock()
-            .unwrap()
-            .insert(npc_id, Arc::clone(&opened));
+    /// Make `live` the character's conversation, with the handle it is asked
+    /// through, in one entry.
+    fn adopt(&self, npc_id: u64, live: Live) -> Arc<Resident> {
+        let opened = Arc::new(Resident {
+            asker: live.sequence.unsealed_asker(),
+            conversation: ConversationLock::new(live),
+        });
+        let slot = ArcSwapOption::from(Some(Arc::clone(&opened)));
+        if let Some(replaced) = self.live.pin().insert(npc_id, slot) {
+            replaced.store(None);
+        }
         opened
     }
 }

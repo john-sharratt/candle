@@ -817,7 +817,8 @@ the dynamic system prompt exactly as it does today. Appendix A must route these 
 the projected store, not the world store — flagged there.
 
 *As-built correction (Appendix E "The bridge"): this is now **met**. The bridge is
-built — the cast is shared as `Arc<tokio::sync::RwLock<Npcs>>` and installed on
+built — the cast is shared as `Arc<Npcs>`, which takes no lock
+(`docs/npcd_cast_lock_free.md`), and installed on
 `Runtime` (`runtime.rs::set_npcs`/`npcs`), reusing the one `Npcs`/substrate handle,
 never a second. `plan_*`/`orders_*` route through `effector/plan.rs` (mounted at
 `/plan` and `/orders`, and excluded from the generic station nest so they never reach
@@ -2285,11 +2286,12 @@ build follows Part F's order; this is the decision record it is built against.*
   `&Hosted`-only `work::perform`; `npc_id` parses from `body` (`"npc-{id}"`, `runtime.rs:763`); a
   new **owner-blind self-write** method resolves `owner` from `Npcs::payload(npc_id).owner`.
 
-  *As-built: **built.** `Authored.npcs` is `Arc<tokio::sync::RwLock<Npcs>>` (only its
-  construction changed; every call site reaches it through the `Arc`'s `Deref`), installed on
-  `Runtime` via `set_npcs`/`npcs` beside `set_substrate`. The self-write is
-  `Npcs::put_strategy_self(npc_id, strategy_id, body, now_ms)` — it resolves `owner` from
-  `payload(npc_id).owner_id` and calls the existing `put_strategy`. The projected verbs live in
+  *As-built: **built.** `Authored.npcs` is `Arc<Npcs>` — no lock: a read loads the published
+  `Cast`, a write runs on the persistence owner's thread (`docs/npcd_cast_lock_free.md`) —
+  installed on `Runtime` via `set_npcs`/`npcs` beside `set_substrate`. The self-write is
+  `Npcs::put_strategy_self(npc_id, target, body, now_ms)` — it resolves `owner` from the
+  record, and a `StrategyTarget::ChildOf` (`break_down`) mints the child's id inside the same
+  write. The projected verbs live in
   `effector/plan.rs`, an async router mounted at `/plan` and `/orders` (not the sync
   `body::perform`); the caller's `npc_id` comes straight from the device token's `DeviceCaller`,
   so no `body`-string parse is needed on this path. `/self` reads are `effector/selfsurface.rs`.

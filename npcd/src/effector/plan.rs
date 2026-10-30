@@ -62,7 +62,7 @@ use serde_json::{json, Map, Value};
 use crate::api::{err, now_ms};
 use crate::effector::auth::DeviceCaller;
 use crate::effector::router::Local;
-use crate::npcs::{self, NpcError};
+use crate::npcs::{self, NpcError, StrategyTarget};
 
 /// The sub-router for a projected-agency namespace: read the layer, or write it.
 ///
@@ -87,10 +87,7 @@ async fn read(State(local): State<Local>, Extension(caller): Extension<DeviceCal
     let Some(cast) = runtime.npcs() else {
         return Json(json!({ "agency": [] })).into_response();
     };
-    let rendered = {
-        let cast = cast.read().await;
-        cast.payload(caller.npc_id).map(npcs::agency_wire)
-    };
+    let rendered = cast.view().payload(caller.npc_id).map(npcs::agency_wire);
     Json(rendered.unwrap_or_else(|| json!({ "agency": [] }))).into_response()
 }
 
@@ -120,101 +117,86 @@ async fn write(
         _ => Map::new(),
     };
 
-    // The write acts as the character's own body, so it takes the cast's write
-    // lock — never the world lock — and holds it across the read-then-write so a
-    // `break_down`'s child id is computed against the same layer it is appended
-    // to. No `.await` under this guard reaches the world.
-    let mut cast = cast.write().await;
-    let now = now_ms();
+    // The write acts as the character's own body: it supersedes the record
+    // through the cast — never the world — and a `break_down`'s child id is
+    // minted inside that same write, against the layer it is appended to
+    // (`docs/npcd_cast_lock_free.md` §2.1).
+    //
+    // Each verb names the strategy it lands on and the write's body; the ack
+    // fits the verb (setting a goal down reads differently from finishing one
+    // or handing it back) and is built from the id the write landed on, which
+    // for a `break_down` is the child it just minted.
+    let (target, write, ack): (StrategyTarget<'_>, Value, fn(&str, &str) -> String) =
+        match verb.as_str() {
+            // Create or replace the named strategy, active.
+            "scope" => (
+                StrategyTarget::Id(&id),
+                active(with_notes(
+                    text(&body, "what"),
+                    &[("in", &body), ("out", &body)],
+                )),
+                set_down,
+            ),
+            "set" => (
+                StrategyTarget::Id(&id),
+                active(with_notes(text(&body, "what"), &[("for", &body)])),
+                set_down,
+            ),
+            "take" => (
+                StrategyTarget::Id(&id),
+                active(text(&body, "what")),
+                set_down,
+            ),
+            "hand_to" => {
+                let what = text(&body, "what");
+                let to = text(&body, "to");
+                let statement = match (what.is_empty(), to.is_empty()) {
+                    (false, false) => format!("{what} — for {to}"),
+                    (false, true) => what,
+                    (true, false) => to,
+                    (true, true) => what,
+                };
+                (StrategyTarget::Id(&id), active(statement), set_down)
+            }
+            "order" | "reorder" => (StrategyTarget::Id(&id), active(pieces(&body)), set_down),
+            // A child of `:id`: a sub-goal in the plan tree, keyed under a fresh id.
+            "break_down" => (
+                StrategyTarget::ChildOf(&id),
+                json!({ "statement": text(&body, "what"), "parent_id": id }),
+                |parent, child| format!("You break `{parent}` down into `{child}`."),
+            ),
+            // Move the strategy's state on; its statement carries forward.
+            "report_done" => (StrategyTarget::Id(&id), state("finished"), |id, _| {
+                format!("You mark `{id}` done.")
+            }),
+            "give_back" => (StrategyTarget::Id(&id), state("abandoned"), |id, _| {
+                format!("You hand `{id}` back.")
+            }),
+            other => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    "unknown_verb",
+                    &format!("`{other}` is not something you can do to a plan or an order"),
+                );
+            }
+        };
 
-    // Each verb hands back the write's result *and* the one-line ack the
-    // character reads this turn — the ack fits the verb it names (setting a goal
-    // down reads differently from finishing one or handing it back), and a
-    // `break_down` can only name the child it just minted from inside its arm.
-    let (outcome, ack) = match verb.as_str() {
-        // Create or replace the named strategy, active.
-        "scope" => {
-            let statement = with_notes(text(&body, "what"), &[("in", &body), ("out", &body)]);
-            (
-                cast.put_strategy_self(caller.npc_id, &id, &active(statement), now),
-                format!("You set down `{id}`."),
-            )
-        }
-        "set" => {
-            let statement = with_notes(text(&body, "what"), &[("for", &body)]);
-            (
-                cast.put_strategy_self(caller.npc_id, &id, &active(statement), now),
-                format!("You set down `{id}`."),
-            )
-        }
-        "take" => {
-            let statement = text(&body, "what");
-            (
-                cast.put_strategy_self(caller.npc_id, &id, &active(statement), now),
-                format!("You set down `{id}`."),
-            )
-        }
-        "hand_to" => {
-            let what = text(&body, "what");
-            let to = text(&body, "to");
-            let statement = match (what.is_empty(), to.is_empty()) {
-                (false, false) => format!("{what} — for {to}"),
-                (false, true) => what,
-                (true, false) => to,
-                (true, true) => what,
-            };
-            (
-                cast.put_strategy_self(caller.npc_id, &id, &active(statement), now),
-                format!("You set down `{id}`."),
-            )
-        }
-        "order" | "reorder" => {
-            let statement = pieces(&body);
-            (
-                cast.put_strategy_self(caller.npc_id, &id, &active(statement), now),
-                format!("You set down `{id}`."),
-            )
-        }
-        // A child of `:id`: a sub-goal in the plan tree, keyed under a fresh id.
-        "break_down" => {
-            let child = child_id(&cast, caller.npc_id, &id);
-            let statement = text(&body, "what");
-            (
-                cast.put_strategy_self(
-                    caller.npc_id,
-                    &child,
-                    &json!({ "statement": statement, "parent_id": id }),
-                    now,
-                ),
-                format!("You break `{id}` down into `{child}`."),
-            )
-        }
-        // Move the strategy's state on; its statement carries forward.
-        "report_done" => (
-            cast.put_strategy_self(caller.npc_id, &id, &state("finished"), now),
-            format!("You mark `{id}` done."),
-        ),
-        "give_back" => (
-            cast.put_strategy_self(caller.npc_id, &id, &state("abandoned"), now),
-            format!("You hand `{id}` back."),
-        ),
-        other => {
-            return err(
-                StatusCode::NOT_FOUND,
-                "unknown_verb",
-                &format!("`{other}` is not something you can do to a plan or an order"),
-            );
-        }
-    };
-    drop(cast);
-
-    match outcome {
+    match cast.put_strategy_self(caller.npc_id, target, &write, now_ms()) {
         // The line the character reads back this turn — the world took the write,
         // and the effect is that the plan now projects. Mirrors the `enact_route`
         // `Did` shape so the in-fiction `invoke` reads `ok` the same way.
-        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true, "detail": ack }))).into_response(),
+        Ok((_, landed)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "detail": ack(&id, &landed) })),
+        )
+            .into_response(),
         Err(e) => write_err(e),
     }
+}
+
+/// The ack for a verb that sets a strategy down under its own id.
+fn set_down(id: &str, _: &str) -> String {
+    format!("You set down `{id}`.")
 }
 
 /// A put-strategy body that creates or replaces an **active** strategy with this
@@ -272,36 +254,6 @@ fn pieces(body: &Map<String, Value>) -> String {
         .unwrap_or_default()
 }
 
-/// A fresh child id for a `break_down`, `<parent>-<n>` where `n` starts at how
-/// many children the parent already has and advances past any id that is
-/// already taken by a *different* strategy — a directly-authored `widget-0`
-/// with no parent, say. Without that check the guessed `<parent>-<n>` could
-/// name an unrelated existing strategy, and `put_strategy_self`'s
-/// create-or-replace would silently overwrite and reparent it. Computed under
-/// the write lock, so two break-downs in a row do not collide with each other
-/// either.
-fn child_id(cast: &npcs::Npcs, npc_id: u64, parent: &str) -> String {
-    let Some(payload) = cast.payload(npc_id) else {
-        return format!("{parent}-0");
-    };
-    let taken: std::collections::HashSet<&str> = payload
-        .agency
-        .iter()
-        .map(|s| s.strategy_id.as_str())
-        .collect();
-    let mut n = payload
-        .agency
-        .iter()
-        .filter(|s| s.parent_id.as_deref() == Some(parent))
-        .count();
-    let mut candidate = format!("{parent}-{n}");
-    while taken.contains(candidate.as_str()) {
-        n += 1;
-        candidate = format!("{parent}-{n}");
-    }
-    candidate
-}
-
 /// Map a cast write error to the route's response, in the estate error shape.
 ///
 /// `NotFound` is the character reading as absent (a `404`); `Invalid` is a
@@ -334,7 +286,6 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use candle_conversation::persistence::record::{Modulation, NpcPayload};
     use serde_json::{json, Value};
-    use tokio::sync::RwLock as AsyncRwLock;
     use tower::ServiceExt;
 
     use crate::effector::router::{router, Local};
@@ -388,13 +339,13 @@ mod tests {
 
     /// A runtime with a token store and a seeded, cast-installed character — the
     /// cast Arc is handed back so a test can read the record after a write.
-    fn daemon(npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>, Arc<AsyncRwLock<Npcs>>) {
+    fn daemon(npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>, Arc<Npcs>) {
         let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));
         rt.set_tokens(tokens.clone());
-        let mut npcs = Npcs::load(&tmp()).expect("a fresh cast");
+        let npcs = Npcs::load(&tmp()).expect("a fresh cast");
         npcs.import(vec![payload(npc_id)]).expect("seeded");
-        let cast = Arc::new(AsyncRwLock::new(npcs));
+        let cast = Arc::new(npcs);
         rt.set_npcs(cast.clone());
         (rt, tokens, cast)
     }
@@ -407,6 +358,18 @@ mod tests {
         body: Value,
     ) -> (StatusCode, Value) {
         let token = tokens.mint(npc_id, Scope::AsNpc).expect("minted");
+        post_with(rt, tokens, &token, path, body).await
+    }
+
+    /// [`post`] under a token already minted — for requests sent at once, which
+    /// would each revoke the token the one before minted.
+    async fn post_with(
+        rt: &Arc<Runtime>,
+        tokens: &Arc<Tokens>,
+        token: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let app = router(Local::new(tokens.clone(), rt));
         let req = Request::builder()
             .method("POST")
@@ -448,7 +411,7 @@ mod tests {
         assert_eq!(ack["ok"], json!(true), "{ack}");
 
         // It is in the agency layer, active — a durable superseding record.
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         let strat = held
             .agency
@@ -499,7 +462,7 @@ mod tests {
             "{ack}"
         );
 
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         let strat = held
             .agency
@@ -542,7 +505,7 @@ mod tests {
             "{ack}"
         );
 
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         let strat = held
             .agency
@@ -583,7 +546,7 @@ mod tests {
             "{ack}"
         );
 
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         let child = held
             .agency
@@ -637,7 +600,7 @@ mod tests {
             "{ack}"
         );
 
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         // The unrelated goal is untouched — still its own statement, still no
         // parent.
@@ -656,6 +619,70 @@ mod tests {
             .expect("the child landed on the free id");
         assert_eq!(child.parent_id.as_deref(), Some("widget"));
         assert_eq!(child.statement, "Get parts.");
+    }
+
+    /// **`break_down`s in a row each mint their own child**, sent at once: each
+    /// child id is minted inside its own write, against the children the writes
+    /// before it published (`docs/npcd_cast_lock_free.md` §2.1), so no two land
+    /// on one id and none is lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn break_downs_in_a_row_each_mint_their_own_child() {
+        let npc = 14;
+        let (rt, tokens, cast) = daemon(npc);
+        post(
+            &rt,
+            &tokens,
+            npc,
+            "/plan/march/scope",
+            json!({ "what": "March on the city." }),
+        )
+        .await;
+
+        let token = tokens.mint(npc, Scope::AsNpc).expect("minted");
+        let sends: Vec<_> = (0..6)
+            .map(|i| {
+                let (rt, tokens, token) = (rt.clone(), tokens.clone(), token.clone());
+                tokio::spawn(async move {
+                    post_with(
+                        &rt,
+                        &tokens,
+                        &token,
+                        "/plan/march/break_down",
+                        json!({ "what": format!("step {i}") }),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for send in sends {
+            let (status, ack) = send.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{ack}");
+        }
+
+        let guard = cast.view();
+        let held = guard.payload(npc).expect("still there");
+        let mut children: Vec<&str> = held
+            .agency
+            .iter()
+            .filter(|s| s.parent_id.as_deref() == Some("march"))
+            .map(|s| s.strategy_id.as_str())
+            .collect();
+        children.sort_unstable();
+        assert_eq!(
+            children,
+            ["march-0", "march-1", "march-2", "march-3", "march-4", "march-5"]
+        );
+        let mut steps: Vec<&str> = held
+            .agency
+            .iter()
+            .filter(|s| s.parent_id.as_deref() == Some("march"))
+            .map(|s| s.statement.as_str())
+            .collect();
+        steps.sort_unstable();
+        assert_eq!(
+            steps,
+            ["step 0", "step 1", "step 2", "step 3", "step 4", "step 5"]
+        );
     }
 
     /// **`hand_to` keeps the recipient even when `what` is not repeated.** A
@@ -684,7 +711,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{ack}");
 
-        let guard = cast.read().await;
+        let guard = cast.view();
         let held = guard.payload(npc).expect("still there");
         let strat = held
             .agency

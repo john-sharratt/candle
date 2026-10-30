@@ -27,19 +27,30 @@
 //! a removed entry has no request holding it. The entry stays in the map until
 //! the count decides, so no second fork can start under the key while a
 //! request still holds the first.
+//!
+//! # Letting go of what is released
+//!
+//! The map frees an entry it has removed only in batches, once enough have
+//! been retired — so a removed entry still holding its value would keep the
+//! conversation, its scheduler slot and its resident KV with it, alive long
+//! after it was released. Each entry's value is therefore a slot, emptied as
+//! the entry leaves the map: the released value goes when its last holder
+//! lets it go, and the map's retired copy holds nothing.
 
 use std::future::Future;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use tokio::sync::OnceCell;
 
 use crate::conv_sweep::{self, Sweep};
 
 /// One key's cell: the value once forked, and when it was last used.
 struct Entry<T> {
-    value: OnceCell<Arc<T>>,
+    /// The fork, once made: a slot that holds it until the entry is released.
+    value: OnceCell<ArcSwapOption<T>>,
     /// Nanoseconds after the map's `base` at which a request last used it.
     used: AtomicU64,
     /// Requests inside `get_or_try_init` for this entry now.
@@ -59,9 +70,21 @@ impl<T> Entry<T> {
         }
     }
 
-    /// Nothing beyond the map holds it and no request is acquiring it.
+    /// The value, while the entry holds one.
+    fn loaded(&self) -> Option<Arc<T>> {
+        self.value.get()?.load_full()
+    }
+
+    /// Nothing beyond the map holds it and no request is acquiring it, judged
+    /// through `value`, a handle loaded from the entry's slot: the slot's own
+    /// and that one are the only two.
     fn unheld(&self, value: &Arc<T>) -> bool {
-        self.acquiring.load(Ordering::SeqCst) == 0 && Arc::strong_count(value) == 1
+        self.acquiring.load(Ordering::SeqCst) == 0 && Arc::strong_count(value) == 2
+    }
+
+    /// Empty the slot as the entry leaves the map, returning what it held.
+    fn release(&self) -> Option<Arc<T>> {
+        self.value.get()?.swap(None)
     }
 }
 
@@ -123,7 +146,7 @@ impl<T> Resident<T> {
     pub fn get(&self, key: &str) -> Option<Arc<T>> {
         loop {
             let entry = Arc::clone(self.entries.pin().get(key)?);
-            let value = Arc::clone(entry.value.get()?);
+            let value = entry.loaded()?;
             if self.confirm(key, &entry) {
                 return Some(value);
             }
@@ -160,32 +183,40 @@ impl<T> Resident<T> {
             let acquiring = Acquiring::start(&entry.acquiring);
             entry.used.fetch_max(stamp, Ordering::Relaxed);
             let mut minted = false;
-            let value = Arc::clone(
-                entry
-                    .value
-                    .get_or_try_init(|| async {
-                        minted = true;
-                        init().await
-                    })
-                    .await?,
-            );
+            let slot = entry
+                .value
+                .get_or_try_init(|| async {
+                    minted = true;
+                    init().await.map(|v| ArcSwapOption::from(Some(v)))
+                })
+                .await?;
+            // Empty: released by a `remove` since it was forked. The key forks
+            // again under a fresh entry.
+            let Some(value) = slot.load_full() else {
+                drop(acquiring);
+                tokio::task::yield_now().await;
+                continue;
+            };
             if self.confirm(key, &entry) {
                 return Ok((value, minted));
             }
             // While this call was acquiring, no sweep could retire the entry
             // for it, so a value it forked left the map by a `remove`, or as
             // an unforked entry the sweep took just as this fork began. It
-            // goes back under the key unless another entry has taken it, which
-            // then wins and this fork is dropped.
-            if minted
-                && !entry.retiring.load(Ordering::SeqCst)
-                && self
+            // goes back under the key — its slot holding it again — unless
+            // another entry has taken the key, which then wins and this fork
+            // is dropped.
+            if minted && !entry.retiring.load(Ordering::SeqCst) {
+                slot.store(Some(Arc::clone(&value)));
+                if self
                     .entries
                     .pin()
                     .try_insert(key.to_string(), Arc::clone(&entry))
                     .is_ok()
-            {
-                return Ok((value, minted));
+                {
+                    return Ok((value, minted));
+                }
+                slot.store(None);
             }
             drop(acquiring);
             drop(value);
@@ -204,7 +235,7 @@ impl<T> Resident<T> {
     /// own handle; the next request forks the key again.
     pub fn remove(&self, key: &str) -> Option<Arc<T>> {
         let entry = Arc::clone(self.entries.pin().remove(key)?);
-        entry.value.get().cloned()
+        entry.release()
     }
 
     /// Release every value nothing has used for `ttl` and nothing holds,
@@ -222,7 +253,7 @@ impl<T> Resident<T> {
                 continue;
             }
             let last = self.instant(entry.used.load(Ordering::Relaxed));
-            let Some(value) = entry.value.get() else {
+            let Some(slot) = entry.value.get() else {
                 // A fork that failed and was never tried again.
                 if conv_sweep::sweep(last, now, ttl, false) == Sweep::Release {
                     let _ = self.entries.pin().remove_if(&key, |_, e| {
@@ -233,7 +264,11 @@ impl<T> Resident<T> {
                 }
                 continue;
             };
-            match conv_sweep::sweep(last, now, ttl, !entry.unheld(value)) {
+            let Some(value) = slot.load_full() else {
+                // Released by a `remove` while this sweep was collecting.
+                continue;
+            };
+            match conv_sweep::sweep(last, now, ttl, !entry.unheld(&value)) {
                 Sweep::Keep => {}
                 Sweep::Touch => {
                     entry.used.fetch_max(self.stamp(now), Ordering::Relaxed);
@@ -247,7 +282,7 @@ impl<T> Resident<T> {
                         continue;
                     }
                     fence(Ordering::SeqCst);
-                    if !entry.unheld(value) {
+                    if !entry.unheld(&value) {
                         // A request took it after the first count: it is in
                         // use, so it stays resident.
                         entry.used.fetch_max(self.stamp(now), Ordering::Relaxed);
@@ -260,7 +295,8 @@ impl<T> Resident<T> {
                         .remove_if(&key, |_, e| Arc::ptr_eq(e, &entry))
                         .is_ok_and(|r| r.is_some());
                     if removed {
-                        released.push((key, Arc::clone(value)));
+                        entry.release();
+                        released.push((key, value));
                     }
                 }
             }
@@ -500,6 +536,55 @@ mod tests {
         assert!(second.try_lock().is_err(), "the fork's lock is still held");
         drop(guard);
         assert_eq!(*second.try_lock().unwrap(), 1);
+    }
+
+    /// A value that counts its own drops.
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// **A released value goes when its last holder lets it go**, not when the
+    /// map gets round to freeing the entry it retired: by `remove` and by the
+    /// sweep alike, the drop is counted the moment the returned handle drops.
+    #[test]
+    fn a_released_value_is_dropped_with_its_last_handle() {
+        let rt = runtime();
+        let map = Resident::<Counted>::default();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let fork = |dropped: &Arc<AtomicUsize>| {
+            let dropped = Arc::clone(dropped);
+            move || {
+                let dropped = Arc::clone(&dropped);
+                async move { Ok::<_, ()>(Arc::new(Counted(dropped))) }
+            }
+        };
+
+        let (held, _) = rt
+            .block_on(map.get_or_try_init("removed", now, fork(&dropped)))
+            .unwrap();
+        drop(held);
+        let removed = map.remove("removed").expect("it was resident");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(removed);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "remove kept the value");
+
+        rt.block_on(map.get_or_try_init("swept", now, fork(&dropped)))
+            .unwrap();
+        let ttl = Duration::from_secs(60);
+        let released = map.sweep(now + ttl, ttl);
+        assert_eq!(released.len(), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(released);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            2,
+            "the sweep kept the value"
+        );
     }
 
     /// `remove` releases a key whatever holds it; the holder keeps its handle.

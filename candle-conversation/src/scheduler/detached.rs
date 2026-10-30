@@ -13,12 +13,34 @@
 //! handle frees it — no new sequence takes the id — and every request naming a
 //! reserved slot or a detached substrate is dropped unanswered: the caller sees
 //! its reply channel close, exactly as it would on a stopped scheduler.
+//!
+//! A detached substrate is still a holder of KV for as long as it lives: its
+//! residences keep their resident copies until its last handle goes. So the
+//! compaction sweep visits every detached substrate still alive
+//! ([`Detached::rewrite_for_compaction`]) — out of the attached set, it is named
+//! by nothing else the sweep reaches.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use candle_nn::kv_cache::Sweep;
 
 use super::SchedulerRequest;
 use crate::projection::{Conversation, SubstrateRef};
 use crate::sequence_handle::SequenceId;
+use crate::substrate::SubstrateLock;
+
+/// A detached substrate held alive for one compaction pass — see
+/// [`Detached::alive`].
+pub(super) struct Swept(Arc<SubstrateLock>);
+
+impl Swept {
+    /// Rewrite its residences through the pass's sweep, returning how many
+    /// were rewritten.
+    pub(super) fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
+        self.0.read().rewrite_for_compaction(sweep)
+    }
+}
 
 /// The slots and substrates detached from this scheduler.
 #[derive(Default)]
@@ -40,6 +62,23 @@ impl Detached {
         self.substrates.retain(|s| !s.is_gone());
         self.substrates.push(conversation.substrate_ref());
         self.slots.extend(slots);
+    }
+
+    /// Every detached substrate still alive, held for a compaction pass — a
+    /// detached tenant's residences hold resident KV until its last handle
+    /// goes, and nothing else the sweep visits names them.
+    ///
+    /// Held for the whole pass and let go after it, never upgraded inside it:
+    /// a tenant dropping its last handle mid-pass would otherwise leave the
+    /// pass's own upgrade as the last, and the substrate would free its chunks
+    /// into the pool the pass is relocating, on the thread that is relocating
+    /// them.
+    pub(super) fn alive(&self) -> Vec<Swept> {
+        self.substrates
+            .iter()
+            .filter_map(SubstrateRef::upgrade)
+            .map(Swept)
+            .collect()
     }
 
     /// `conversation`'s substrate attached again: its requests are live.
@@ -157,7 +196,111 @@ impl SchedulerRequest {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use candle_nn::kv_cache::{
+        ArenaLocation, ChunkGid, CompactionMap, HeadGids, SealedChunk, SealedSequence, GID_STRIDE,
+    };
     use flume::bounded;
+
+    use crate::projection::{GroupId, LayerId, TimelineId};
+    use crate::substrate::residence::own_device_frees;
+    use crate::substrate::{ResidenceIndex, TurnPartWrite};
+
+    /// A one-layer sequence of one chunk at raw gid `raw`.
+    fn seq_at(raw: i64) -> SealedSequence {
+        SealedSequence {
+            chunks: vec![SealedChunk {
+                gids: HeadGids::uniform(ChunkGid::detached(raw), 1),
+                offset: 0,
+                token_count: 32,
+                k_pal: Arc::new(Vec::new()),
+                v_pal: Arc::new(Vec::new()),
+                k_scale: Arc::new(Vec::new()),
+                v_scale: Arc::new(Vec::new()),
+                k_fmt: Arc::new(Vec::new()),
+                v_fmt: Arc::new(Vec::new()),
+                byte_size: 0,
+                meta: None,
+            }],
+            token_count: 32,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// A substrate holding one turn whose hot copy is one chunk at `raw`.
+    fn hot_at(raw: i64) -> (Conversation, ResidenceIndex) {
+        let conversation = Conversation::new();
+        let timeline = TimelineId::for_test(1);
+        conversation.register_timeline(timeline, LayerId::for_test(1), GroupId::for_test(1));
+        let residence = conversation.update(|s| {
+            let write = TurnPartWrite {
+                sealed_gpu: Some(Arc::new(vec![seq_at(raw)])),
+                token_count: 32,
+                ..Default::default()
+            };
+            let idx = s
+                .append_complete(timeline, write, |seqs| Ok(seqs.to_vec()))
+                .unwrap();
+            s.turn_residence(timeline, idx).unwrap()
+        });
+        (conversation, residence)
+    }
+
+    /// The raw gid of `residence`'s hot copy's one chunk.
+    fn hot_raw(conversation: &Conversation, residence: ResidenceIndex) -> i64 {
+        let slab = conversation.residences();
+        let hot = slab.get(residence).hot().expect("still hot");
+        hot[0].chunks[0].gids.as_slice()[0].raw()
+    }
+
+    /// **A detached substrate still alive is a holder the sweep reaches**: its
+    /// resident copy that moved comes back naming the destination, and one whose
+    /// every handle has gone is skipped, holding nothing.
+    #[test]
+    fn a_detached_substrate_is_swept_while_it_lives() {
+        // The payloads dropped here are this thread's to free, not the shared
+        // reclaim queue's.
+        own_device_frees();
+        let src = (5 * GID_STRIDE + 2) as i64;
+        let dst = (GID_STRIDE + 1) as i64;
+        let (alive, residence) = hot_at(src);
+        let mut detached = Detached::default();
+        detached.record(&alive, []);
+        let gone = Conversation::new();
+        detached.record(&gone, []);
+        drop(gone);
+
+        let mut map = CompactionMap::new();
+        map.insert(src, ChunkGid::detached(dst), 0x4000);
+        let mut sweep = Sweep::new(&map);
+
+        let held = detached.alive();
+        assert_eq!(held.len(), 1, "the gone one is not held");
+        let rewritten: usize = held
+            .iter()
+            .map(|s| s.rewrite_for_compaction(&mut sweep).unwrap())
+            .sum();
+        assert_eq!(rewritten, 1);
+        assert_eq!(hot_raw(&alive, residence), dst);
+        assert_eq!(sweep.allocations_rewritten(), 1);
+    }
+
+    /// **A detached substrate held for a pass outlives its last handle until
+    /// the pass lets it go**, so it is never freed inside the pass.
+    #[test]
+    fn a_held_substrate_outlives_its_last_handle_until_released() {
+        own_device_frees();
+        let (substrate, _) = hot_at((3 * GID_STRIDE + 1) as i64);
+        let mut detached = Detached::default();
+        detached.record(&substrate, []);
+        let held = detached.alive();
+        drop(substrate);
+        assert_eq!(detached.alive().len(), 1, "the pass's hold keeps it alive");
+        drop(held);
+        assert!(detached.alive().is_empty(), "let go once the pass is over");
+    }
 
     fn free(slot: usize) -> SchedulerRequest {
         SchedulerRequest::FreeSequence {
