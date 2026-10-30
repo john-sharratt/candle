@@ -1,6 +1,7 @@
-//! The tree the operation tests start from: the Sharratt family — John and
-//! Yen its owners, Thanh Long a member, the bot c3f1a07e a reader — and
-//! Stranger, in no group. John is the estate's admin.
+//! The tree the operation tests start from: the group Zen — John and Yen its
+//! owners, Thanh Long and Zen itself members, the bot c3f1a07e a reader of
+//! `topics/game` — `@guest`, which John owns, and Stranger, in no group. John
+//! is the estate's admin.
 
 use std::collections::BTreeMap;
 
@@ -12,34 +13,40 @@ use crate::time::Stamp;
 use crate::tree::load::load;
 use crate::tree::Tree;
 
-pub(crate) fn sharratt() -> Tree {
-    let person = |p: &str, in_group: bool| {
-        let groups = if in_group {
-            "groups: [sharratt]\ndefault_group: sharratt\n"
+pub(crate) fn zen() -> Tree {
+    let person = |p: &str, accounts: bool, groups: &str| {
+        let accounts = if accounts {
+            format!("accounts:\n  - {{email: \"{p}@example.com\"}}\n")
         } else {
-            "groups: []\n"
+            "accounts: []\n".into()
         };
         (
             format!("persons/{p}/person.yaml"),
-            format!(
-                "person: {p}\nname: \"{p}\"\naccounts:\n  - {{email: \"{p}@example.com\"}}\n{groups}"
-            )
-            .into_bytes(),
+            format!("person: {p}\nname: \"{p}\"\n{accounts}{groups}").into_bytes(),
         )
     };
+    let in_zen = "groups: [zen]\ndefault_group: zen\n";
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::from([
-        person("john", true),
-        person("yen", true),
-        person("thanhlong", true),
-        person("stranger", false),
+        person("john", true, "groups: [zen, guest]\ndefault_group: zen\n"),
+        person("yen", true, in_zen),
+        person("thanhlong", true, in_zen),
+        person("zen", false, in_zen),
+        person("stranger", true, "groups: []\n"),
     ]);
     files.insert(
-        "groups/sharratt/group.yaml".into(),
-        "group: sharratt\nname: \"Sharratt\"\nkind: family\nmembers:\n\
+        "groups/zen/group.yaml".into(),
+        "group: zen\nname: \"Zen\"\nmembers:\n\
          \x20 - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n\
          \x20 - {person: yen, role: owner, joined: 2026-10-30T00:00:00Z}\n\
          \x20 - {person: thanhlong, role: member, joined: 2026-10-30T00:00:00Z}\n\
-         \x20 - {bot: c3f1a07e, role: reader, joined: 2026-10-30T00:00:00Z}\n"
+         \x20 - {person: zen, role: member, joined: 2026-10-31T00:00:00Z}\n\
+         \x20 - {bot: c3f1a07e, role: reader, joined: 2026-10-30T00:00:00Z, reads: [topics/game]}\n"
+            .into(),
+    );
+    files.insert(
+        "groups/guest/group.yaml".into(),
+        "group: guest\nname: \"Guest\"\nmembers:\n\
+         \x20 - {person: john, role: owner, joined: 2026-10-31T00:00:00Z}\n"
             .into(),
     );
     let tree = load(&files);
@@ -56,7 +63,7 @@ pub(crate) fn john() -> Actor {
     }
 }
 
-/// Yen, an owner of @sharratt and no admin.
+/// Yen, an owner of @zen and no admin.
 pub(crate) fn yen() -> Actor {
     Actor::Person {
         person: slug("yen"),
@@ -81,41 +88,42 @@ pub(crate) fn stranger() -> Actor {
     }
 }
 
-/// The fixture's bot, a reader of @sharratt.
+/// An account no person lists.
+pub(crate) fn guest() -> Actor {
+    Actor::Guest {
+        channel: Channel::Other,
+    }
+}
+
+/// The fixture's bot, a reader of @zen's `topics/game`.
 pub(crate) fn bot() -> Actor {
     Actor::Bot {
         bot: slug("c3f1a07e"),
     }
 }
 
-/// A path as John writes it.
+/// A path as written in @zen.
 pub(crate) fn p(s: &str) -> JournalPath {
-    p_as("john", s)
-}
-
-/// A path as `person` writes it, in the fixture's groups.
-pub(crate) fn p_as(person: &str, s: &str) -> JournalPath {
     Viewer {
-        person: slug(person),
-        default_group: (person != "stranger").then(|| slug("sharratt")),
+        group: Some(slug("zen")),
+        here: None,
     }
     .parse(s)
     .unwrap()
 }
 
-/// The fixture's groups are what the tree's files say they are.
+/// The fixture's people write their paths from @zen.
 #[test]
 fn the_fixture_viewers_match_the_tree() {
-    let t = sharratt();
-    for person in ["john", "yen", "thanhlong", "stranger"] {
+    let t = zen();
+    for person in ["john", "yen", "thanhlong", "zen"] {
         assert_eq!(
-            viewer(&t, &slug(person)),
-            Viewer {
-                person: slug(person),
-                default_group: (person != "stranger").then(|| slug("sharratt")),
-            }
+            viewer(&t, &slug(person), None).group,
+            Some(slug("zen")),
+            "{person}"
         );
     }
+    assert_eq!(viewer(&t, &slug("stranger"), None).group, None);
 }
 
 pub(crate) fn now() -> Stamp {

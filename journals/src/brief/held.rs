@@ -93,7 +93,7 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::path::Address;
     use crate::testing::at;
@@ -111,6 +111,7 @@ mod tests {
             &Op::Note {
                 path: p(path),
                 text: text.into(),
+                speaker: None,
             },
             at,
         )
@@ -121,10 +122,10 @@ mod tests {
     /// it run meanwhile.
     #[test]
     fn a_refused_job_is_held_until_its_journal_changes() {
-        let mut t = sharratt();
-        note(&mut t, "~", "Prefers tea.");
+        let mut t = zen();
+        note(&mut t, "people", "Prefers tea.");
         note(&mut t, "topics", "Builder starts Monday.");
-        let mine = Job::Summary { path: p("~") };
+        let mine = Job::Summary { path: p("people") };
         let theirs = Job::Summary { path: p("topics") };
         let due = vec![mine.clone(), theirs.clone()];
         let mut h = Held::default();
@@ -137,7 +138,7 @@ mod tests {
             vec![theirs.clone()],
             "held while nothing changes"
         );
-        note(&mut t, "~", "And green tea most of all.");
+        note(&mut t, "people", "And green tea most of all.");
         assert_eq!(
             h.sift(&t, due.clone(), now()),
             due,
@@ -150,27 +151,27 @@ mod tests {
     /// does not change what the fold's question shows, so the fold stays held.
     #[test]
     fn a_refused_fold_is_held_until_its_periods_lines_change() {
-        let mut t = sharratt();
+        let mut t = zen();
         let t0 = at("2026-10-01T00:00:00Z");
         for i in 0..=WINDOW {
-            note_at(&mut t, "~", &format!("n{i}"), t0.plus(3600 * i as i64));
+            note_at(&mut t, "people", &format!("n{i}"), t0.plus(3600 * i as i64));
         }
         let now = at("2026-10-03T12:00:00Z");
-        let plan = next_fold(t.get(&p("~")).unwrap(), now).unwrap();
+        let plan = next_fold(t.get(&p("people")).unwrap(), now).unwrap();
         let fold = Job::Fold {
-            path: p("~"),
+            path: p("people"),
             plan: plan.clone(),
         };
         let mut h = Held::default();
         h.refused(&t, &fold);
-        note_at(&mut t, "~", "a later line", now);
+        note_at(&mut t, "people", "a later line", now);
         assert_eq!(h.sift(&t, vec![fold.clone()], now), vec![], "still held");
         apply(
             &mut t,
             &john(),
             &Op::Edit {
                 address: Address {
-                    path: p("~"),
+                    path: p("people"),
                     id: plan.ids[0].clone(),
                 },
                 text: "n0, corrected".into(),
@@ -184,9 +185,9 @@ mod tests {
     /// **A job that could not be asked waits a while**, then is asked again.
     #[test]
     fn a_deferred_job_is_asked_again_once_its_time_comes() {
-        let mut t = sharratt();
-        note(&mut t, "~", "Prefers tea.");
-        let job = Job::Summary { path: p("~") };
+        let mut t = zen();
+        note(&mut t, "people", "Prefers tea.");
+        let job = Job::Summary { path: p("people") };
         let mut h = Held::default();
         h.deferred(&job, now());
         assert_eq!(
@@ -205,9 +206,9 @@ mod tests {
 
     #[test]
     fn a_hold_no_longer_due_is_forgotten() {
-        let mut t = sharratt();
-        note(&mut t, "~", "Prefers tea.");
-        let job = Job::Summary { path: p("~") };
+        let mut t = zen();
+        note(&mut t, "people", "Prefers tea.");
+        let job = Job::Summary { path: p("people") };
         let mut h = Held::default();
         h.refused(&t, &job);
         assert_eq!(h.sift(&t, Vec::new(), now()), vec![]);
@@ -217,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_job_for_a_journal_that_is_gone_records_nothing() {
-        let t = sharratt();
+        let t = zen();
         let mut h = Held::default();
         h.refused(
             &t,

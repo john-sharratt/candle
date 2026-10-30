@@ -1,15 +1,14 @@
 //! Grep (§6.5 `journal_grep`): a case-insensitive phrase over every named
-//! journal's own name and written cue, and every line, archive and summary a
-//! person may read —
-//! their own folder and their groups' — or one subtree of it. Folded journals
-//! are searched too: folding changes what is shown by default, never what is
-//! found.
+//! journal's own name and written cue, and every line, archive and summary
+//! the caller may read — their groups, a bot's grants, `@guest` — or one
+//! subtree of it. Folded journals are searched too: folding changes what is
+//! shown by default, never what is found. References are not followed, so
+//! each line is found once, at its real path.
 
-use crate::actor::may_read;
+use crate::actor::{need_read, Actor};
 use crate::line::{Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
-use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
@@ -115,12 +114,12 @@ fn excerpt(text: &str, phrase: &str) -> String {
     out
 }
 
-/// Every hit for `phrase` that `person` may read, under `under` when given —
+/// Every hit for `phrase` that `actor` may read, under `under` when given —
 /// the journals it names first, then lines and summaries newest first — and
 /// the count before `limit` cut it.
 pub fn grep(
     tree: &Tree,
-    person: &Slug,
+    actor: &Actor,
     phrase: &str,
     under: Option<&JournalPath>,
     limit: usize,
@@ -131,7 +130,7 @@ pub fn grep(
     }
     let mut hits = Vec::new();
     for (path, j) in tree.journals() {
-        if !may_read(tree, person, path.owner()) || under.is_some_and(|u| !u.holds(&path)) {
+        if need_read(tree, actor, &path).is_err() || under.is_some_and(|u| !u.holds(&path)) {
             continue;
         }
         if !j.problems.is_empty() {
@@ -228,44 +227,45 @@ pub fn render(hits: &[Hit], total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::fixture::{john, now, p, p_as, sharratt, yen};
+    use crate::ops::fixture::{bot, guest, john, now, p, stranger, yen, zen};
+    use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Section;
     use crate::testing::{note, slug};
 
-    fn seeded() -> Tree {
-        let mut t = sharratt();
+    fn noted(t: &mut Tree, actor: &Actor, path: &str, text: &str, at: Stamp) {
         apply(
+            t,
+            actor,
+            &Op::Note {
+                path: p(path),
+                text: text.into(),
+                speaker: None,
+            },
+            at,
+        )
+        .unwrap();
+    }
+
+    fn seeded() -> Tree {
+        let mut t = zen();
+        noted(&mut t, &john(), "people", "John's permit worry.", now());
+        noted(&mut t, &yen(), "@zen", "Yen's permit note.", now());
+        noted(
+            &mut t,
+            &yen(),
+            "topics",
+            "Permit lodged with council.",
+            now().plus(60),
+        );
+        noted(
             &mut t,
             &john(),
-            &Op::Note {
-                path: p("~"),
-                text: "John's permit worry.".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        apply(
-            &mut t,
-            &yen(),
-            &Op::Note {
-                path: p_as("yen", "~"),
-                text: "Yen's private permit note.".into(),
-            },
-            now(),
-        )
-        .unwrap();
-        apply(
-            &mut t,
-            &yen(),
-            &Op::Note {
-                path: p("topics"),
-                text: "Permit lodged with council.".into(),
-            },
-            now().plus(60),
-        )
-        .unwrap();
-        let trip = apply(
+            "@guest",
+            "A public permit page.",
+            now().plus(30),
+        );
+        let old = apply(
             &mut t,
             &john(),
             &Op::Create {
@@ -279,12 +279,13 @@ mod tests {
         .unwrap()
         .created
         .unwrap();
-        let j = t.get_mut(&trip).unwrap();
+        let j = t.get_mut(&old).unwrap();
         j.archives.insert(
             Period::parse("2026-09-01").unwrap(),
             vec![note("2026-09-01T10:00:00Z", "An old PERMIT.")],
         );
-        apply(&mut t, &john(), &Op::Fold { path: trip }, now()).unwrap();
+        let topics = p("topics");
+        fold_child(t.get_mut(&topics).unwrap(), &topics, &slug("old"), now()).unwrap();
         t
     }
 
@@ -330,23 +331,14 @@ mod tests {
     /// that opens the whole line.
     #[test]
     fn a_long_lines_hit_is_shown_as_its_excerpt() {
-        let mut t = sharratt();
+        let mut t = zen();
         let long = format!(
             "{} the builder starts Monday {}",
             "a".repeat(800),
             "b".repeat(800)
         );
-        apply(
-            &mut t,
-            &john(),
-            &Op::Note {
-                path: p("topics"),
-                text: long.clone(),
-            },
-            now(),
-        )
-        .unwrap();
-        let (hits, _) = grep(&t, &slug("john"), "builder", None, 10);
+        noted(&mut t, &john(), "topics", &long, now());
+        let (hits, _) = grep(&t, &john(), "builder", None, 10);
         assert_eq!(hits.len(), 1);
         let cut = excerpt(&long, "builder");
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
@@ -371,68 +363,95 @@ mod tests {
             now(),
         )
         .unwrap();
-        apply(
+        noted(
             &mut t,
             &john(),
-            &Op::Note {
-                path: p("topics"),
-                text: "The cpu experts pool is on by default.".into(),
-            },
+            "topics",
+            "The cpu experts pool is on by default.",
             now().plus(120),
-        )
-        .unwrap();
-        let (hits, total) = grep(&t, &slug("john"), "CPU experts", None, 10);
+        );
+        let (hits, total) = grep(&t, &john(), "CPU experts", None, 10);
         assert_eq!(total, 2);
         assert_eq!(
             render(&hits, total),
-            "@sharratt/topics/cpu-experts (journal) experts computed by the host pool\n\
-             @sharratt/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via claude-code: \
+            "@zen/topics/cpu-experts (journal) experts computed by the host pool\n\
+             @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via Claude Code: \
              The cpu experts pool is on by default."
         );
-        let (by_cue, _) = grep(&t, &slug("john"), "host pool", None, 10);
+        let (by_cue, _) = grep(&t, &john(), "host pool", None, 10);
         assert_eq!(by_cue[0].found, Found::Journal);
-        // A word naming its owner, its section or a fixed journal's cue
+        // A word naming its group, its section or a fixed journal's cue
         // finds no journal: only a named journal's own name and cue count.
         let journals = |phrase| {
-            grep(&t, &slug("john"), phrase, None, 50)
+            grep(&t, &john(), phrase, None, 50)
                 .0
                 .into_iter()
                 .filter(|h| h.found == Found::Journal)
                 .count()
         };
-        assert_eq!(journals("sharratt"), 0);
+        assert_eq!(journals("zen"), 0);
         assert_eq!(journals("topics"), 0);
         assert_eq!(journals(Section::Topics.cue()), 0);
-        assert_eq!(journals("~"), 0);
+    }
+
+    /// **A reference is not walked**: the journal it leads to is found once,
+    /// at its real path.
+    #[test]
+    fn a_reference_is_not_walked() {
+        let mut t = zen();
+        for name in ["candle", "wasmer"] {
+            apply(
+                &mut t,
+                &john(),
+                &Op::Create {
+                    under: p("topics"),
+                    name: slug(name),
+                    cue: format!("open for {name}"),
+                    on_taken: OnTaken::Refuse,
+                },
+                now(),
+            )
+            .unwrap();
+        }
+        apply(
+            &mut t,
+            &john(),
+            &Op::Link {
+                under: p("topics/candle"),
+                name: slug("wasmer"),
+                to: p("topics/wasmer"),
+                cue: "open for the work it grew from".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        noted(&mut t, &john(), "topics/wasmer", "WASIX came first.", now());
+        let (hits, total) = grep(&t, &john(), "wasix", None, 10);
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].path, p("topics/wasmer"));
     }
 
     /// **A hyphen and a space match each other**, either way round.
     #[test]
     fn a_hyphen_matches_a_space() {
-        let mut t = sharratt();
-        apply(
+        let mut t = zen();
+        noted(
             &mut t,
             &john(),
-            &Op::Note {
-                path: p("topics"),
-                text: "No environment-variable feature flags.".into(),
-            },
+            "topics",
+            "No environment-variable feature flags.",
             now(),
-        )
-        .unwrap();
+        );
         for phrase in [
             "environment variable",
             "ENVIRONMENT-VARIABLE",
             "feature-flags",
         ] {
-            assert_eq!(grep(&t, &slug("john"), phrase, None, 10).1, 1, "{phrase}");
+            assert_eq!(grep(&t, &john(), phrase, None, 10).1, 1, "{phrase}");
         }
-        assert_eq!(
-            grep(&t, &slug("john"), "environmentvariable", None, 10).1,
-            0
-        );
+        assert_eq!(grep(&t, &john(), "environmentvariable", None, 10).1, 0);
         for empty in ["-", " - ", "--"] {
-            assert_eq!(grep(&t, &slug("john"), empty, None, 10).1, 0, "{empty:?}");
+            assert_eq!(grep(&t, &john(), empty, None, 10).1, 0, "{empty:?}");
         }
         assert_eq!(
             excerpt(
@@ -447,36 +466,42 @@ mod tests {
         );
     }
 
+    /// **Grep finds what the caller reads and nothing else**: a member all
+    /// of their groups, a guest `@guest`, a bot its grants, a stranger
+    /// nothing.
     #[test]
-    fn grep_finds_what_a_person_reads_and_nothing_else() {
+    fn grep_finds_what_the_caller_reads_and_nothing_else() {
         let t = seeded();
-        let (hits, total) = grep(&t, &slug("john"), "permit", None, 50);
-        let shown: Vec<String> = hits
-            .iter()
-            .map(|h| format!("{} {:?}", h.path, h.found))
-            .collect();
-        assert_eq!(total, 3);
+        let shown = |actor: &Actor| -> Vec<String> {
+            grep(&t, actor, "permit", None, 50)
+                .0
+                .iter()
+                .map(|h| format!("{} {:?}", h.path, h.found))
+                .collect()
+        };
         assert_eq!(
-            shown,
+            shown(&yen()),
             [
-                "@sharratt/topics Window",
-                "~ Window",
-                "@sharratt/topics/old Archive(Day { year: 2026, month: 9, day: 1 })",
-            ]
+                "@zen/topics Window",
+                "@zen Window",
+                "@zen/people Window",
+                "@zen/topics/old Archive(Day { year: 2026, month: 9, day: 1 })"
+            ],
+            "Yen reads John's lines too: every member reads the group"
         );
-        let (yens, _) = grep(&t, &slug("yen"), "private", None, 50);
-        assert_eq!(yens.len(), 1);
-        let (johns, _) = grep(&t, &slug("john"), "private", None, 50);
+        assert_eq!(shown(&john()).len(), 5, "and @guest, which John owns");
+        assert_eq!(shown(&guest()), ["@guest Window"]);
         assert!(
-            johns.is_empty(),
-            "Yen's own folder is never John's to search"
+            shown(&bot()).is_empty(),
+            "its grant, topics/game, holds no permit"
         );
+        assert!(shown(&stranger()).is_empty());
     }
 
     #[test]
     fn grep_narrows_to_a_subtree_and_cuts_at_its_limit() {
         let t = seeded();
-        let (hits, total) = grep(&t, &slug("john"), "permit", Some(&p("topics")), 1);
+        let (hits, total) = grep(&t, &john(), "permit", Some(&p("topics")), 1);
         assert_eq!((hits.len(), total), (1, 2));
         let text = render(&hits, total);
         assert!(
@@ -484,6 +509,6 @@ mod tests {
             "{text}"
         );
         assert_eq!(render(&[], 0), "Nothing found.");
-        assert_eq!(grep(&t, &slug("john"), "  ", None, 5).1, 0);
+        assert_eq!(grep(&t, &john(), "  ", None, 5).1, 0);
     }
 }

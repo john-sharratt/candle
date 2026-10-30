@@ -1,6 +1,6 @@
-//! `persons/<person>/person.yaml` (§3.4): the accounts that are one person,
-//! the groups they belong to, and which of those every conversation of
-//! theirs begins with.
+//! `persons/<person>/person.yaml` (§3.4): identity alone — the accounts that
+//! are one person, the groups they belong to, and the one their
+//! conversations open in. A person's journals are their groups'.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -9,13 +9,8 @@ use crate::error::Problem;
 use crate::slug::Slug;
 use crate::yaml::{item_line, parse_doc, scalar, scalar_list, text_field, Fields};
 
-/// The most groups a person may belong to, as many as a journal has live
-/// children, so `~`'s index of them stays whole (§3.5).
+/// The most groups a person may belong to (§3.5).
 pub const MAX_GROUPS: usize = 10;
-
-/// The most groups whose summaries open every conversation of a person's,
-/// their default group among them (§6.4).
-pub const MAX_FRAMED: usize = 3;
 
 /// One sign-in at the gateway: zend's owner key, `sha256(provider \0 sub)` as
 /// 16 lowercase hex digits.
@@ -108,18 +103,8 @@ pub struct PersonFile {
     pub name: String,
     pub accounts: Vec<Account>,
     pub groups: Vec<Slug>,
-    /// Where a bare shared section and a new shared journal go; always framed.
+    /// The group their conversations open in (§3.4).
     pub default_group: Option<Slug>,
-    /// The other groups whose summaries open every conversation of theirs.
-    pub framed: Vec<Slug>,
-}
-
-impl PersonFile {
-    /// The groups whose summaries open every conversation of theirs: the
-    /// default first, then the others framed, in the file's order.
-    pub fn framed_groups(&self) -> Vec<&Slug> {
-        self.default_group.iter().chain(&self.framed).collect()
-    }
 }
 
 impl PersonFile {
@@ -160,28 +145,6 @@ impl PersonFile {
                 ));
             }
         }
-        let mut framed = BTreeSet::new();
-        for g in &self.framed {
-            if !self.groups.contains(g) {
-                return Err(format!(
-                    "`framed` names {g}, which is not one of their groups"
-                ));
-            }
-            if Some(g) == self.default_group.as_ref() {
-                return Err(format!(
-                    "`framed` names {g}, their default group, which is always framed"
-                ));
-            }
-            if !framed.insert(g) {
-                return Err(format!("`framed` names {g} twice"));
-            }
-        }
-        if self.framed_groups().len() > MAX_FRAMED {
-            return Err(format!(
-                "{} groups framed with the default: at most {MAX_FRAMED} open every conversation",
-                self.framed_groups().len()
-            ));
-        }
         Ok(())
     }
 
@@ -203,10 +166,6 @@ impl PersonFile {
         out.push_str(&format!("groups: {}\n", scalar_list(&groups)));
         if let Some(d) = &self.default_group {
             out.push_str(&format!("default_group: {}\n", scalar(d.as_str())));
-        }
-        if !self.framed.is_empty() {
-            let framed: Vec<&str> = self.framed.iter().map(Slug::as_str).collect();
-            out.push_str(&format!("framed: {}\n", scalar_list(&framed)));
         }
         out
     }
@@ -233,7 +192,6 @@ impl PersonFile {
                 .map_err(|why| f.problem(key, format!("`{key}`: {why}")))
         };
         let groups = slugs("groups")?;
-        let framed = slugs("framed")?;
         let default_group = f.opt_parsed("default_group", Slug::parse)?;
         let out = PersonFile {
             person,
@@ -241,7 +199,6 @@ impl PersonFile {
             accounts,
             groups,
             default_group,
-            framed,
         };
         out.check().map_err(|why| f.problem("person", why))?;
         f.done()?;
@@ -268,9 +225,8 @@ mod tests {
                     key: None,
                 },
             ],
-            groups: vec![slug("sharratt")],
-            default_group: Some(slug("sharratt")),
-            framed: vec![],
+            groups: vec![slug("zen")],
+            default_group: Some(slug("zen")),
         }
     }
 
@@ -283,7 +239,7 @@ mod tests {
              \x20 - email: yen@example.com\n\
              \x20   key: 3b1f09c2d47e8a60\n\
              \x20 - email: yen.other@example.net\n\
-             groups: [sharratt]\ndefault_group: sharratt\n"
+             groups: [zen]\ndefault_group: zen\n"
         );
         assert_eq!(
             PersonFile::read("persons/yen/person.yaml", &p.render()).unwrap(),
@@ -291,41 +247,21 @@ mod tests {
         );
     }
 
-    /// **The default group is always framed**; `framed` names the others
-    /// that open every conversation too.
+    /// **Zen is a person with no accounts**: nobody signs in as it.
     #[test]
-    fn framed_groups_are_the_default_then_the_ones_named() {
-        let mut p = yen();
-        p.groups = vec![slug("sharratt"), slug("battle-cities"), slug("work")];
-        p.framed = vec![slug("work")];
-        assert_eq!(
-            p.render(),
-            "person: yen\nname: Yen\naccounts:\n\
-             \x20 - email: yen@example.com\n\
-             \x20   key: 3b1f09c2d47e8a60\n\
-             \x20 - email: yen.other@example.net\n\
-             groups: [sharratt, battle-cities, work]\ndefault_group: sharratt\nframed: [work]\n"
-        );
-        assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
-        assert_eq!(p.framed_groups(), [&slug("sharratt"), &slug("work")]);
-    }
-
-    #[test]
-    fn a_person_in_no_group_with_no_accounts_round_trips() {
+    fn a_person_with_no_accounts_round_trips() {
         let p = PersonFile {
-            person: slug("solo"),
-            name: "Solo".into(),
+            person: slug("zen"),
+            name: "Zen".into(),
             accounts: vec![],
-            groups: vec![],
-            default_group: None,
-            framed: vec![],
+            groups: vec![slug("zen")],
+            default_group: Some(slug("zen")),
         };
         assert_eq!(
             p.render(),
-            "person: solo\nname: Solo\naccounts: []\ngroups: []\n"
+            "person: zen\nname: Zen\naccounts: []\ngroups: [zen]\ndefault_group: zen\n"
         );
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
-        assert!(p.framed_groups().is_empty());
     }
 
     /// **Groups without a default are theirs to choose from**: an owner
@@ -337,7 +273,6 @@ mod tests {
         p.default_group = None;
         assert!(p.render().ends_with("groups: [work]\n"), "{}", p.render());
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
-        assert!(p.framed_groups().is_empty());
     }
 
     #[test]
@@ -346,7 +281,6 @@ mod tests {
         p.person = slug("0123");
         p.groups = vec![slug("true"), slug("null")];
         p.default_group = Some(slug("null"));
-        p.framed = vec![slug("true")];
         p.accounts[0].key = Some(AccountKey::parse("1234567890123e45").unwrap());
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
     }
@@ -384,39 +318,24 @@ mod tests {
             ("3b1f09c2d47e8a60", "3B1F", "not an account key"),
             ("yen.other@example.net", "yen@example.com", "listed twice"),
             (
-                "groups: [sharratt]",
-                "groups: [sharratt, sharratt]",
+                "groups: [zen]",
+                "groups: [zen, zen]",
                 "a group is listed twice",
             ),
             (
-                "groups: [sharratt]",
-                "groups: [sharratt, a, b, c, d, e, f, g, h, i, j]",
+                "groups: [zen]",
+                "groups: [zen, a, b, c, d, e, f, g, h, i, j]",
                 "11 groups: a person belongs to at most 10",
             ),
             (
-                "default_group: sharratt",
+                "default_group: zen",
                 "default_group: other",
                 "`default_group` is other, which is not one of their groups",
             ),
             (
-                "default_group: sharratt\n",
-                "default_group: sharratt\nframed: [work]\n",
-                "`framed` names work, which is not one of their groups",
-            ),
-            (
-                "default_group: sharratt\n",
-                "default_group: sharratt\nframed: [sharratt]\n",
-                "`framed` names sharratt, their default group, which is always framed",
-            ),
-            (
-                "groups: [sharratt]\ndefault_group: sharratt\n",
-                "groups: [sharratt, a]\ndefault_group: sharratt\nframed: [a, a]\n",
-                "`framed` names a twice",
-            ),
-            (
-                "groups: [sharratt]\ndefault_group: sharratt\n",
-                "groups: [sharratt, a, b, c]\ndefault_group: sharratt\nframed: [a, b, c]\n",
-                "4 groups framed with the default: at most 3 open every conversation",
+                "default_group: zen\n",
+                "default_group: zen\nframed: [work]\n",
+                "`framed` is not a field",
             ),
             ("name: Yen", "name: \"  \"", "`name` is empty"),
             ("person: yen", "person: Yen", "not a name"),
@@ -427,8 +346,8 @@ mod tests {
             ),
             ("groups:", "colour: red\ngroups:", "`colour` is not a field"),
             (
-                "groups: [sharratt]\ndefault_group: sharratt\n",
-                "families: [sharratt]\ndefault_family: sharratt\n",
+                "groups: [zen]\ndefault_group: zen\n",
+                "families: [zen]\ndefault_family: zen\n",
                 "`families` is not a field",
             ),
         ] {

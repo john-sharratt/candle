@@ -10,12 +10,14 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use journals::actor::home_group;
 use journals::slug::Slug;
 use journals::store::Store;
 use journals::time::Stamp;
 use serde_json::Value;
 
 use super::write::{batch, request};
+use crate::mcp::memory::who::Who;
 use crate::mcp::memory::WriteError;
 use crate::mcp::tools::mem::Mem;
 
@@ -27,14 +29,17 @@ pub fn apply(store: &mut Store, person: &Slug, body: &Value, now: Stamp) -> Resu
     // The caller as the route sees them, on `store`'s tree. No memory is
     // served here — every write goes to `store` through the closure — so
     // the memory is one that serves none, and refuses any write made to it.
+    let tree = store.shared();
     let m = Mem {
         memory: Arc::default(),
-        tree: store.shared(),
-        person: person.clone(),
+        group: home_group(&tree, person),
+        tree,
+        who: Who::Person(person.clone()),
         channel: req.channel,
         admin: true,
+        here: None,
     };
-    let (status, answer) = batch(&m, &req.ops, now, |actor, op, at| {
+    let (status, answer) = batch(&m, &req.ops, now, req.speaker.as_ref(), |actor, op, at| {
         store.write(actor, op, at).map_err(WriteError::Store)
     });
     if status == StatusCode::OK {
@@ -46,7 +51,7 @@ pub fn apply(store: &mut Store, person: &Slug, body: &Value, now: Stamp) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use journals::path::{JournalPath, Owner};
+    use journals::path::JournalPath;
     use serde_json::json;
 
     use super::*;
@@ -56,9 +61,9 @@ mod tests {
         Stamp::parse("2026-10-30T12:00:00Z").unwrap()
     }
 
-    /// **A file is applied as the route applies it, and pushed**: a group
-    /// made, a journal in it and a backdated note on it reach origin, read
-    /// back through a fresh store.
+    /// **A file is applied as the route applies it, and pushed**: a topic, a
+    /// reference to it and a backdated note on it from its speaker reach
+    /// origin, read back through a fresh store.
     #[test]
     fn a_file_is_applied_as_its_person_and_reaches_origin() {
         let (_root, dir) = repo();
@@ -67,10 +72,10 @@ mod tests {
         let answer = apply(
             &mut store,
             &john,
-            &json!({"channel": "claude-code", "ops": [
-                {"op": "create_group", "group": "tokera", "name": "Tokera", "kind": "team"},
-                {"op": "create", "under": "@tokera/projects", "name": "candle", "cue": "open for candle", "at": "2026-05-13T12:41:14Z"},
-                {"op": "note", "journal": "@tokera/projects/candle", "text": "The candle fork serves Zen Code.", "at": "2026-05-13T12:41:14Z"},
+            &json!({"channel": "claude-code", "speaker": "john", "ops": [
+                {"op": "create", "under": "topics", "name": "candle", "cue": "open for candle", "at": "2026-05-13T12:41:14Z"},
+                {"op": "link", "under": "people/john", "name": "engine", "to": "topics/candle", "cue": "open for what John builds"},
+                {"op": "note", "journal": "people/john/engine", "text": "The candle fork serves Zen Code.", "at": "2026-05-13T12:41:14Z"},
             ]}),
             now(),
         )
@@ -78,13 +83,18 @@ mod tests {
         assert_eq!(answer["applied"].as_array().unwrap().len(), 3);
         assert_eq!(store.sync().unwrap().pushed, 3);
         let tree = Store::open(&dir).unwrap().shared();
-        let candle = JournalPath::root(Owner::Group(Slug::parse("tokera").unwrap()))
-            .child(Slug::parse("projects").unwrap())
-            .and_then(|p| p.child(Slug::parse("candle").unwrap()))
-            .unwrap();
+        let candle = JournalPath::new(
+            Slug::parse("zen").unwrap(),
+            vec![
+                Slug::parse("topics").unwrap(),
+                Slug::parse("candle").unwrap(),
+            ],
+        )
+        .unwrap();
         let line = &tree.get(&candle).unwrap().window[0];
         assert_eq!(line.text, "The candle fork serves Zen Code.");
         assert_eq!(line.at, Stamp::parse("2026-05-13T12:41:14Z").unwrap());
+        assert_eq!(line.speaker, Some(john));
     }
 
     /// **A refusal anywhere keeps nothing**, and says which operation.
@@ -96,7 +106,7 @@ mod tests {
             &mut store,
             &Slug::parse("john").unwrap(),
             &json!({"ops": [
-                {"op": "note", "journal": "~", "text": "kept only with the rest"},
+                {"op": "note", "journal": "people/john", "text": "kept only with the rest"},
                 {"op": "note", "journal": "@nowhere/topics", "text": "x"},
             ]}),
             now(),

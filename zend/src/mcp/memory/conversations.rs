@@ -1,21 +1,22 @@
-//! Each conversation's own journal (§2): opened under its channel's at the
-//! conversation's first episode, named for the minute it began, and the one
-//! its episodes go on.
+//! Each conversation's own journal (§2.4, §6.6): opened under its group's
+//! `conversations` at the conversation's first call, named for the minute it
+//! began and the channel it began on. It holds the conversation's focus, its
+//! running tasks and the episodes of what it did.
 //!
 //! A conversation is a session's run of calls with no gap of [`GAP_SECS`] —
 //! the aggregator's own boundary (`docs/mcp_user_context.md` §2.5). Every
-//! memory call of a session moves its clock on ([`touch`]), not only an
-//! episode. A session this process has not seen — a new conversation, or one
-//! carried here by a restart or from another member — opens a journal of its
-//! own: two conversations are never written onto one.
+//! memory call of a session moves its clock on. A session this process has
+//! not seen — a new conversation, or one carried here by a restart or from
+//! another member — opens a journal of its own: two conversations are never
+//! written onto one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use journals::actor::Actor;
 use journals::ops::{OnTaken, Op};
-use journals::path::{JournalPath, Owner};
-use journals::scope::Channel;
+use journals::path::JournalPath;
+use journals::scope::{conversation_name, Channel, Section};
 use journals::slug::Slug;
 use journals::time::Stamp;
 
@@ -53,14 +54,6 @@ impl Sessions {
         }
         self.0.insert(session.to_string(), (path, at));
     }
-
-    fn touch(&mut self, session: &str, now: Stamp) {
-        if let Some((_, last)) = self.0.get_mut(session) {
-            if now.secs() - last.secs() < GAP_SECS {
-                *last = now;
-            }
-        }
-    }
 }
 
 /// The conversations this process has seen.
@@ -73,57 +66,49 @@ pub struct Conversations {
     opening: Mutex<()>,
 }
 
-/// The channel's journal a person's conversations go under.
-pub fn channel_journal(person: &Slug, channel: Channel) -> JournalPath {
-    let names = ["channels", channel.name()]
-        .iter()
-        .map(|n| Slug::parse(n).expect("a section's and a channel's names are names"))
-        .collect();
-    JournalPath::new(Owner::Person(person.clone()), names).expect("channels/<channel> is a place")
+/// `group`'s `conversations` section.
+pub fn section(group: &Slug) -> JournalPath {
+    JournalPath::of_section(group, Section::Conversations)
 }
 
-/// The name a conversation begun at `at` takes: `2026-10-30-2105`.
-pub fn name_at(at: Stamp) -> Slug {
-    Slug::parse(&at.dated_minute()).expect("a minute is a name")
+/// The name a conversation begun at `at` on `channel` takes:
+/// `2026-10-31-0712-grok`.
+pub fn name_at(at: Stamp, channel: Channel) -> Slug {
+    Slug::parse(&conversation_name(&at.dated_minute(), channel)).expect("a dated name is a name")
 }
 
-/// A memory call of `session` now: its conversation goes on.
-pub fn touch(memory: &Memory, session: &str) {
-    held(&memory.conversations.sessions).touch(session, Stamp::now());
-}
-
-/// The journal of the conversation `session` is in, when it has one yet.
-pub fn existing(memory: &Memory, session: &str) -> Option<JournalPath> {
-    let tree = memory.tree().ok()?;
-    let known = held(&memory.conversations.sessions)
-        .get(session, Stamp::now())
-        .cloned();
-    known.filter(|p| tree.get(p).is_some())
-}
-
-/// The journal of the conversation `session` is in, opened now when this is
-/// its first episode.
+/// The journal of the conversation `session` is in, in `group`, opened now
+/// when this is its first call: the session's clock moved on either way.
 pub fn of(
     memory: &Memory,
     person: &Slug,
+    group: &Slug,
     channel: Channel,
     session: &str,
 ) -> Result<JournalPath, String> {
     let _opening = held(&memory.conversations.opening);
-    if let Some(p) = existing(memory, session) {
-        held(&memory.conversations.sessions).keep(session, p.clone(), Stamp::now());
+    let now = Stamp::now();
+    let tree = memory.tree()?;
+    let known = held(&memory.conversations.sessions)
+        .get(session, now)
+        .filter(|p| p.group() == group && tree.get(p).is_some())
+        .cloned();
+    if let Some(p) = known {
+        held(&memory.conversations.sessions).keep(session, p.clone(), now);
         return Ok(p);
     }
-    let now = Stamp::now();
     let server = Actor::Server {
         person: person.clone(),
         channel,
     };
     let began = now.to_string()[..16].replace('T', " ");
     let op = Op::Create {
-        under: channel_journal(person, channel),
-        name: name_at(now),
-        cue: format!("open for the conversation through {channel} begun {began}"),
+        under: section(group),
+        name: name_at(now, channel),
+        cue: format!(
+            "open for the conversation through {} begun {began}",
+            channel.spoken()
+        ),
         on_taken: OnTaken::Number,
     };
     let path = memory
@@ -138,24 +123,25 @@ pub fn of(
 mod tests {
     use super::*;
 
-    fn john() -> Slug {
-        Slug::parse("john").unwrap()
+    fn zen() -> Slug {
+        Slug::parse("zen").unwrap()
     }
 
     #[test]
-    fn a_conversation_is_named_for_its_minute_under_its_channel() {
-        let at = Stamp::parse("2026-10-30T21:05:42Z").unwrap();
-        assert_eq!(name_at(at).as_str(), "2026-10-30-2105");
+    fn a_conversation_is_named_for_its_minute_and_channel_under_its_group() {
+        let at = Stamp::parse("2026-10-31T07:12:42Z").unwrap();
+        assert_eq!(name_at(at, Channel::Grok).as_str(), "2026-10-31-0712-grok");
         assert_eq!(
-            channel_journal(&john(), Channel::Grok).folder(),
-            "persons/john/channels/grok"
+            name_at(at, Channel::ClaudeCode).as_str(),
+            "2026-10-31-0712-claude-code"
         );
+        assert_eq!(section(&zen()).folder(), "groups/zen/conversations");
     }
 
     #[test]
     fn a_session_silent_past_the_gap_is_a_new_conversation() {
         let mut s = Sessions::default();
-        let p = channel_journal(&john(), Channel::Grok);
+        let p = section(&zen());
         let t = Stamp::parse("2026-10-30T12:00:00Z").unwrap();
         s.keep("s", p.clone(), t);
         assert_eq!(s.get("s", t.plus(GAP_SECS - 1)), Some(&p));
@@ -163,26 +149,10 @@ mod tests {
         assert_eq!(s.get("other", t), None);
     }
 
-    /// **Any memory call keeps a conversation going**, not only an episode;
-    /// a session already past its gap is not brought back by one.
-    #[test]
-    fn a_call_moves_the_clock_on_within_the_gap() {
-        let mut s = Sessions::default();
-        let p = channel_journal(&john(), Channel::Grok);
-        let t = Stamp::parse("2026-10-30T12:00:00Z").unwrap();
-        s.keep("s", p.clone(), t);
-        s.touch("s", t.plus(GAP_SECS - 60));
-        assert_eq!(s.get("s", t.plus(GAP_SECS + 60)), Some(&p));
-        s.touch("s", t.plus(3 * GAP_SECS));
-        assert_eq!(s.get("s", t.plus(3 * GAP_SECS)), None);
-        s.touch("unseen", t);
-        assert_eq!(s.get("unseen", t), None);
-    }
-
     #[test]
     fn the_idlest_sessions_are_let_go_past_the_cap() {
         let mut s = Sessions::default();
-        let p = channel_journal(&john(), Channel::Grok);
+        let p = section(&zen());
         for i in 0..KEPT + 3 {
             s.keep(&format!("s{i}"), p.clone(), Stamp::from_secs(i as i64));
         }

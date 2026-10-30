@@ -14,8 +14,8 @@ pub fn definition() -> Value {
         "name": NAME,
         "description": "Change what one line of a memory journal says, when it has become wrong or a detail \
             changed — `journal` is the line's address, `<path>#<line id>`, as journal_read and journal_grep \
-            print it. The line keeps its place and time; history keeps what it said. In a group's \
-            journals a member edits their own lines and an owner any.",
+            print it. The line keeps its place and time; history keeps what it said. A member edits the \
+            lines written on their own account, and an owner any.",
         "inputSchema": {
             "type": "object",
             "properties": {

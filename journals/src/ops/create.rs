@@ -1,11 +1,13 @@
 //! A new named journal, and what an eleventh live child does (§2.3).
 
+use std::collections::BTreeSet;
+
 use crate::error::{Error, Result};
 use crate::files::Meta;
 use crate::ops::fold::fold_child;
 use crate::ops::{Applied, OnTaken};
 use crate::path::{JournalPath, Place};
-use crate::scope::{is_dated, Eleventh, Naming};
+use crate::scope::{conversation_channel, Eleventh, Naming};
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree, MAX_CHILDREN};
@@ -34,7 +36,6 @@ pub(crate) fn clean_cue(cue: &str) -> Result<String> {
 fn to_fold(parent: &Journal, under: &JournalPath, rule: Eleventh) -> Result<Slug> {
     let live = || parent.live().map(|(n, j)| (n.clone(), j));
     let pick = match rule {
-        Eleventh::Fixed => None,
         Eleventh::FoldOldest => live()
             .min_by_key(|(n, j)| (j.meta.as_ref().map(|m| m.created), n.clone()))
             .map(|(n, _)| n),
@@ -49,10 +50,13 @@ fn to_fold(parent: &Journal, under: &JournalPath, rule: Eleventh) -> Result<Slug
     };
     pick.ok_or_else(|| {
         Error::refused(match rule {
-            Eleventh::FoldIdlestClosed => format!(
-                "{under} has {MAX_CHILDREN} sub-journals, all still open; close or fold one first"
+            Eleventh::FoldIdlestClosed => {
+                format!("{under} has {MAX_CHILDREN} sub-journals, all still open; close one first")
+            }
+            _ => format!(
+                "{under} has {MAX_CHILDREN} sub-journals; restructuring it is a coding task on \
+                 the journals repository"
             ),
-            _ => format!("{under} has {MAX_CHILDREN} sub-journals; fold or merge one first"),
         })
     })
 }
@@ -73,23 +77,41 @@ pub fn create(
     }
     let rule = under
         .section()
-        .expect("below a root is a section")
+        .expect("below a master is a section")
         .eleventh(under.names().len() - 1);
-    if rule == Eleventh::Fixed {
-        return Err(Error::refused(format!(
-            "{under}'s journals are fixed: one per channel"
-        )));
-    }
     let parent = tree.need_mut(under)?;
     parent.writable(&under.show())?;
-    let taken = parent.children.keys().cloned().collect();
+    // A reference's name is taken too: a path through it must stay one
+    // journal's (§2.5).
+    let referenced = |n: &Slug| {
+        parent
+            .meta
+            .iter()
+            .flat_map(|m| &m.refs)
+            .find(|r| &r.name == n)
+            .map(|r| r.to.clone())
+    };
+    let mut taken: BTreeSet<Slug> = parent.children.keys().cloned().collect();
+    taken.extend(
+        parent
+            .meta
+            .iter()
+            .flat_map(|m| &m.refs)
+            .map(|r| r.name.clone()),
+    );
     let name = match on_taken {
         OnTaken::Number => name.numbered(&taken),
+        OnTaken::Refuse if !parent.children.contains_key(name) && taken.contains(name) => {
+            let to = referenced(name).expect("a taken name that is no child is a reference's");
+            return Err(Error::refused(format!(
+                "{under}/{name} is a reference already, to {to}: name the journal otherwise"
+            )));
+        }
         OnTaken::Refuse if taken.contains(name) => {
             return Err(Error::refused(format!(
                 "{under}/{name} exists already{}",
                 if parent.children[name].is_folded() {
-                    " (folded: unfold it)"
+                    " (folded: unfolding it is a restructuring, a coding task)"
                 } else {
                     ""
                 }
@@ -99,12 +121,11 @@ pub fn create(
     };
     let path = under.child(name.clone())?;
     if let Place::Named { section, depth } = path.place()? {
-        if section.naming(depth) == Naming::Dated && !is_dated(name.as_str()) {
+        if section.naming(depth) == Naming::Dated && conversation_channel(name.as_str()).is_none() {
+            let minute = now.dated_minute();
             return Err(Error::invalid(format!(
-                "{under} holds conversations, each named for when it began: \
-                 `{}`, or `{}-<what it was about>`",
-                now.dated_minute(),
-                now.dated_minute()
+                "{under} holds conversations, each named for the minute it began and its channel: \
+                 `{minute}-<channel>`, or `{minute}-<channel>-<what it was about>`"
             )));
         }
     }
@@ -132,7 +153,7 @@ pub fn create(
 mod tests {
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::scope::Channel;
     use crate::testing::slug;
@@ -146,39 +167,46 @@ mod tests {
         }
     }
 
+    fn server() -> Actor {
+        Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        }
+    }
+
     #[test]
     fn a_journal_is_created_with_its_cue() {
-        let mut t = sharratt();
+        let mut t = zen();
         let a = apply(
             &mut t,
             &john(),
-            &create_op("topics", "house-build", OnTaken::Refuse),
+            &create_op("topics", "house-extension", OnTaken::Refuse),
             now(),
         )
         .unwrap();
         let path = a.created.unwrap();
-        assert_eq!(path.show(), "@sharratt/topics/house-build");
-        assert_eq!(a.subject, "Create @sharratt/topics/house-build");
+        assert_eq!(path.show(), "@zen/topics/house-extension");
+        assert_eq!(a.subject, "Create @zen/topics/house-extension");
         assert_eq!(a.touched, vec![path.clone()]);
         let j = t.get(&path).unwrap();
-        assert_eq!(j.cue().as_deref(), Some("open for house-build"));
+        assert_eq!(j.cue().as_deref(), Some("open for house-extension"));
         assert_eq!(j.meta.as_ref().unwrap().created, now());
         let nested = apply(
             &mut t,
             &john(),
-            &create_op("topics/house-build", "permits", OnTaken::Refuse),
+            &create_op("topics/house-extension", "permits", OnTaken::Refuse),
             now(),
         )
         .unwrap();
         assert_eq!(
             nested.created.unwrap().show(),
-            "@sharratt/topics/house-build/permits"
+            "@zen/topics/house-extension/permits"
         );
     }
 
     #[test]
     fn a_name_taken_is_refused_or_numbered() {
-        let mut t = sharratt();
+        let mut t = zen();
         apply(
             &mut t,
             &john(),
@@ -195,78 +223,102 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("exists already"));
-        let server = Actor::Server {
-            person: slug("john"),
-            channel: Channel::Grok,
-        };
-        let drive = "2026-10-30-1200-drive";
+        let drive = "2026-10-30-1200-grok-drive";
         let first = apply(
             &mut t,
-            &server,
-            &create_op("~/channels/grok", drive, OnTaken::Number),
+            &server(),
+            &create_op("conversations", drive, OnTaken::Number),
             now(),
         )
         .unwrap();
         let second = apply(
             &mut t,
-            &server,
-            &create_op("~/channels/grok", drive, OnTaken::Number),
+            &server(),
+            &create_op("conversations", drive, OnTaken::Number),
             now(),
         )
         .unwrap();
         assert_eq!(
             first.created.unwrap().show(),
-            format!("~/channels/grok/{drive}")
+            format!("@zen/conversations/{drive}")
         );
         assert_eq!(
             second.created.unwrap().show(),
-            format!("~/channels/grok/{drive}.2")
+            format!("@zen/conversations/{drive}.2")
         );
-        // A conversation is named for when it began.
+        // A conversation is named for when it began and its channel.
+        for bad in ["drive", "2026-10-30-1200"] {
+            assert_eq!(
+                apply(
+                    &mut t,
+                    &server(),
+                    &create_op("conversations", bad, OnTaken::Number),
+                    now()
+                )
+                .unwrap_err()
+                .to_string(),
+                "@zen/conversations holds conversations, each named for the minute it began and \
+                 its channel: `2026-10-30-1200-<channel>`, or \
+                 `2026-10-30-1200-<channel>-<what it was about>`",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **A reference's name is taken**: a sub-journal never shadows it, so
+    /// the tree still loads.
+    #[test]
+    fn a_references_name_is_never_a_new_journals() {
+        let mut t = zen();
+        for name in ["candle", "wasmer"] {
+            apply(
+                &mut t,
+                &john(),
+                &create_op("topics", name, OnTaken::Refuse),
+                now(),
+            )
+            .unwrap();
+        }
+        apply(
+            &mut t,
+            &john(),
+            &Op::Link {
+                under: p("topics/candle"),
+                name: slug("wasmer"),
+                to: p("topics/wasmer"),
+                cue: "open for the WebAssembly work".into(),
+            },
+            now(),
+        )
+        .unwrap();
         assert_eq!(
             apply(
                 &mut t,
-                &server,
-                &create_op("~/channels/grok", "drive", OnTaken::Number),
+                &john(),
+                &create_op("topics/candle", "wasmer", OnTaken::Refuse),
                 now()
             )
             .unwrap_err()
             .to_string(),
-            "~/channels/grok holds conversations, each named for when it began: \
-             `2026-10-30-1200`, or `2026-10-30-1200-<what it was about>`"
+            "@zen/topics/candle/wasmer is a reference already, to topics/wasmer: name the \
+             journal otherwise"
         );
     }
 
     #[test]
-    fn roots_and_the_channels_section_are_fixed() {
-        let mut t = sharratt();
-        assert!(create(
-            &mut t,
-            &p("@sharratt"),
-            &slug("x"),
-            "x",
-            OnTaken::Refuse,
-            now()
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("sections are fixed"));
-        assert!(create(
-            &mut t,
-            &p("~/channels"),
-            &slug("tesla"),
-            "x",
-            OnTaken::Refuse,
-            now()
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("one per channel"));
+    fn a_master_is_fixed() {
+        let mut t = zen();
+        assert!(
+            create(&mut t, &p("@zen"), &slug("x"), "x", OnTaken::Refuse, now())
+                .unwrap_err()
+                .to_string()
+                .contains("sections are fixed")
+        );
     }
 
     #[test]
     fn cues_are_one_short_line() {
-        let mut t = sharratt();
+        let mut t = zen();
         for (cue, says) in [
             ("", "needs a cue"),
             ("a\nb", "one line"),
@@ -288,9 +340,11 @@ mod tests {
         }
     }
 
+    /// **An eleventh topic is a restructuring**: the tool refuses and names
+    /// the coding task.
     #[test]
-    fn an_eleventh_topic_is_refused() {
-        let mut t = sharratt();
+    fn an_eleventh_topic_is_refused_and_names_the_coding_task() {
+        let mut t = zen();
         for i in 0..10 {
             apply(
                 &mut t,
@@ -301,32 +355,23 @@ mod tests {
             .unwrap();
         }
         assert_eq!(
-            apply(
-                &mut t,
-                &john(),
-                &create_op("topics", "t10", OnTaken::Refuse),
-                now()
-            )
-            .unwrap_err()
-            .to_string(),
-            "@sharratt/topics has 10 sub-journals; fold or merge one first"
+            apply(&mut t, &john(), &create_op("topics", "t10", OnTaken::Refuse), now())
+                .unwrap_err()
+                .to_string(),
+            "@zen/topics has 10 sub-journals; restructuring it is a coding task on the journals repository"
         );
     }
 
     #[test]
     fn an_eleventh_conversation_folds_the_oldest() {
-        let mut t = sharratt();
-        let server = Actor::Server {
-            person: slug("john"),
-            channel: Channel::Grok,
-        };
+        let mut t = zen();
         for i in 0..10 {
             apply(
                 &mut t,
-                &server,
+                &server(),
                 &create_op(
-                    "~/channels/grok",
-                    &format!("2026-10-30-12{i:02}"),
+                    "conversations",
+                    &format!("2026-10-30-12{i:02}-grok"),
                     OnTaken::Number,
                 ),
                 now().plus(i),
@@ -335,24 +380,24 @@ mod tests {
         }
         let a = apply(
             &mut t,
-            &server,
-            &create_op("~/channels/grok", "2026-10-30-1210", OnTaken::Number),
+            &server(),
+            &create_op("conversations", "2026-10-30-1210-grok", OnTaken::Number),
             now().plus(100),
         )
         .unwrap();
         assert_eq!(
             a.folded.iter().map(|p| p.show()).collect::<Vec<_>>(),
-            ["~/channels/grok/2026-10-30-1200"]
+            ["@zen/conversations/2026-10-30-1200-grok"]
         );
-        let grok = t.get(&p("~/channels/grok")).unwrap();
-        assert_eq!(grok.live_count(), 10);
-        assert!(grok.children[&slug("2026-10-30-1200")].is_folded());
-        assert_eq!(grok.window.len(), 1, "the fold line");
+        let conversations = t.get(&p("conversations")).unwrap();
+        assert_eq!(conversations.live_count(), 10);
+        assert!(conversations.children[&slug("2026-10-30-1200-grok")].is_folded());
+        assert_eq!(conversations.window.len(), 1, "the fold line");
     }
 
     #[test]
     fn an_eleventh_thread_folds_the_idlest_closed_one_and_never_an_open_one() {
-        let mut t = sharratt();
+        let mut t = zen();
         let mk = |t: &mut Tree, name: &str, at: Stamp| {
             apply(
                 t,
@@ -365,70 +410,50 @@ mod tests {
                 },
                 at,
             )
-            .unwrap()
         };
         for i in 0..10 {
-            mk(&mut t, &format!("th{i}"), now().plus(i));
+            mk(&mut t, &format!("th{i}"), now().plus(i)).unwrap();
         }
-        assert!(mk_err(&mut t).contains("all still open"));
+        assert!(mk(&mut t, "over", now())
+            .unwrap_err()
+            .to_string()
+            .contains("all still open"));
         // Close two: the one closed earlier is the idler.
-        apply(
-            &mut t,
-            &Actor::Zend,
-            &Op::Close {
-                path: p("threads/th7"),
-            },
-            now().plus(500),
-        )
-        .unwrap();
-        apply(
-            &mut t,
-            &Actor::Zend,
-            &Op::Close {
-                path: p("threads/th3"),
-            },
-            now().plus(400),
-        )
-        .unwrap();
-        let a = mk(&mut t, "th10", now().plus(1000));
-        assert_eq!(a.folded[0].show(), "@sharratt/threads/th3");
-    }
-
-    fn mk_err(t: &mut Tree) -> String {
-        apply(
-            t,
-            &Actor::Zend,
-            &Op::Create {
-                under: p("threads"),
-                name: slug("over"),
-                cue: "x".into(),
-                on_taken: OnTaken::Number,
-            },
-            now(),
-        )
-        .unwrap_err()
-        .to_string()
+        for (th, at) in [("threads/th7", 500), ("threads/th3", 400)] {
+            apply(
+                &mut t,
+                &Actor::Zend,
+                &Op::Close { path: p(th) },
+                now().plus(at),
+            )
+            .unwrap();
+        }
+        let a = mk(&mut t, "th10", now().plus(1000)).unwrap();
+        assert_eq!(a.folded[0].show(), "@zen/threads/th3");
     }
 
     #[test]
     fn an_eleventh_bot_folds_the_idlest() {
-        let mut t = sharratt();
+        let mut t = zen();
         let npcd = Actor::Npcd {
             person: slug("john"),
         };
-        for i in 0..10 {
+        let mk = |t: &mut Tree, name: &str, at: Stamp| {
             apply(
-                &mut t,
+                t,
                 &npcd,
                 &Op::Create {
                     under: p("bots"),
-                    name: slug(&format!("b{i}")),
+                    name: slug(name),
                     cue: "x".into(),
                     on_taken: OnTaken::Number,
                 },
-                now().plus(i),
+                at,
             )
-            .unwrap();
+            .unwrap()
+        };
+        for i in 0..10 {
+            mk(&mut t, &format!("b{i}"), now().plus(i));
         }
         // b0 has news; b1 is now the idlest.
         apply(
@@ -437,28 +462,18 @@ mod tests {
             &Op::Episode {
                 path: p("bots/b0"),
                 text: "went to market".into(),
+                speaker: None,
             },
             now().plus(50),
         )
         .unwrap();
-        let a = apply(
-            &mut t,
-            &npcd,
-            &Op::Create {
-                under: p("bots"),
-                name: slug("b10"),
-                cue: "x".into(),
-                on_taken: OnTaken::Number,
-            },
-            now().plus(60),
-        )
-        .unwrap();
-        assert_eq!(a.folded[0].show(), "@sharratt/bots/b1");
+        let a = mk(&mut t, "b10", now().plus(60));
+        assert_eq!(a.folded[0].show(), "@zen/bots/b1");
     }
 
     #[test]
     fn archive_is_no_name_for_a_journal() {
-        let mut t = sharratt();
+        let mut t = zen();
         assert!(apply(
             &mut t,
             &john(),

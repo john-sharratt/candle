@@ -29,14 +29,14 @@ pub fn close(tree: &mut Tree, path: &JournalPath, now: Stamp) -> Result<Applied>
 mod tests {
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{now, p, sharratt};
+    use crate::ops::fixture::{now, p, zen};
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Channel;
     use crate::testing::slug;
 
     #[test]
     fn a_conversation_closes_once() {
-        let mut t = sharratt();
+        let mut t = zen();
         let server = Actor::Server {
             person: slug("john"),
             channel: Channel::Grok,
@@ -45,8 +45,8 @@ mod tests {
             &mut t,
             &server,
             &Op::Create {
-                under: p("~/channels/grok"),
-                name: slug("2026-10-30-2105"),
+                under: p("conversations"),
+                name: slug("2026-10-30-2105-grok"),
                 cue: "a drive".into(),
                 on_taken: OnTaken::Number,
             },
@@ -57,7 +57,7 @@ mod tests {
         .unwrap();
         apply(
             &mut t,
-            &server,
+            &Actor::Zend,
             &Op::Close {
                 path: created.clone(),
             },
@@ -68,11 +68,13 @@ mod tests {
             t.get(&created).unwrap().meta.as_ref().unwrap().closed,
             Some(now().plus(600))
         );
-        assert!(apply(&mut t, &server, &Op::Close { path: created }, now())
-            .unwrap_err()
-            .to_string()
-            .contains("closed at"));
-        assert!(close(&mut t, &p("~/channels/grok"), now())
+        assert!(
+            apply(&mut t, &Actor::Zend, &Op::Close { path: created }, now())
+                .unwrap_err()
+                .to_string()
+                .contains("closed at")
+        );
+        assert!(close(&mut t, &p("conversations"), now())
             .unwrap_err()
             .to_string()
             .contains("is fixed"));

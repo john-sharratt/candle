@@ -1,13 +1,12 @@
 //! A journal's index (§5.2): its live children, one line each — at most ten,
-//! so a parent's index is always small enough to read whole; and for a
-//! person's root, the groups they belong to.
+//! so a parent's index is always small enough to read whole — and its
+//! references, each a way to another journal (§2.5).
 
-use crate::actor::{framed_groups, role_in, viewer};
 use crate::path::JournalPath;
 use crate::slug::Slug;
 use crate::time::Stamp;
 use crate::tree::fingerprint::is_dirty;
-use crate::tree::{Journal, Tree};
+use crate::tree::Journal;
 use crate::view::who::ago;
 
 /// `j`'s live children with something written in or below them, by name.
@@ -81,31 +80,12 @@ pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
     out
 }
 
-/// Every group `person` belongs to, one line each, as `~`'s index lists them
-/// after its sections: so a group that does not open their conversations is
-/// still one they know to open.
-pub fn group_lines(tree: &Tree, person: &Slug) -> Vec<String> {
-    let Some(file) = tree.person_file(person) else {
-        return Vec::new();
-    };
-    let framed = framed_groups(tree, person);
-    let default = viewer(tree, person).default_group;
-    file.groups
+/// `j`'s references, one line each: `→ wasmer (topics/wasmer) — open for …`.
+pub fn refs_lines(j: &Journal) -> Vec<String> {
+    j.meta
         .iter()
-        .filter(|g| role_in(tree, person, g).is_some())
-        .map(|g| {
-            let (name, kind) = tree.group_file(g).map_or((g.to_string(), "group"), |f| {
-                (f.name.clone(), f.kind.name())
-            });
-            let opens = if default.as_ref() == Some(g) {
-                "their default, in every conversation"
-            } else if framed.contains(g) {
-                "in every conversation"
-            } else {
-                "opened when needed"
-            };
-            format!("@{g} — {name}, a {kind}; {opens}")
-        })
+        .flat_map(|m| &m.refs)
+        .map(|r| format!("→ {} ({}) — {}", r.name, r.to, r.cue))
         .collect()
 }
 
@@ -143,7 +123,8 @@ mod tests {
     use crate::actor::Actor;
     use crate::error::Problem;
     use crate::files::summary::{Cite, Sentence};
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
+    use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
@@ -152,7 +133,7 @@ mod tests {
     /// the next level by name.
     #[test]
     fn an_index_line_names_its_sub_journals() {
-        let mut t = sharratt();
+        let mut t = zen();
         for name in ["trip", "budget"] {
             apply(
                 &mut t,
@@ -167,13 +148,13 @@ mod tests {
             )
             .unwrap();
         }
-        let root = p("@sharratt");
+        let root = p("@zen");
         assert_eq!(
             index(&root, t.get(&root).unwrap(), now()),
             [
-                "@sharratt/topics — open for themes that span conversations. 0 lines, 2 \
+                "@zen/topics — open for everything durable the group talks about. 0 lines, 2 \
                  sub-journals (budget, trip); no summary yet",
-                "bots, projects, threads: nothing written yet",
+                "bots, conversations, people, threads: nothing written yet",
             ]
         );
         // A level further down is named under its parent.
@@ -193,14 +174,14 @@ mod tests {
         }
         assert_eq!(
             index(&root, t.get(&root).unwrap(), now())[0],
-            "@sharratt/topics — open for themes that span conversations. 0 lines, 2 \
+            "@zen/topics — open for everything durable the group talks about. 0 lines, 2 \
              sub-journals (budget; trip: flights, hotels); no summary yet"
         );
     }
 
     #[test]
     fn index_lines_say_what_is_there_and_how_fresh() {
-        let mut t = sharratt();
+        let mut t = zen();
         let topics = p("topics");
         let trip = apply(
             &mut t,
@@ -218,7 +199,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index(&topics, t.get(&topics).unwrap(), now()),
-            ["@sharratt/topics/trip — open for the Da Nang trip. 0 lines; empty"]
+            ["@zen/topics/trip — open for the Da Nang trip. 0 lines; empty"]
         );
         let id = apply(
             &mut t,
@@ -226,6 +207,7 @@ mod tests {
             &Op::Note {
                 path: trip.clone(),
                 text: "Flights booked.".into(),
+                speaker: None,
             },
             now(),
         )
@@ -260,6 +242,7 @@ mod tests {
             &Op::Note {
                 path: trip.clone(),
                 text: "Hotel too.".into(),
+                speaker: None,
             },
             now().plus(7_200),
         )
@@ -268,7 +251,8 @@ mod tests {
             index(&topics, t.get(&topics).unwrap(), now().plus(7_300))[0]
                 .ends_with("2 lines; summary 2 h ago (+1)")
         );
-        apply(&mut t, &john(), &Op::Fold { path: trip }, now()).unwrap();
+        let parent = t.get_mut(&topics).unwrap();
+        fold_child(parent, &topics, trip.last().unwrap(), now()).unwrap();
         assert_eq!(
             index(&topics, t.get(&topics).unwrap(), now()),
             ["… and 1 folded"]
@@ -277,16 +261,16 @@ mod tests {
 
     #[test]
     fn a_broken_journal_reads_as_unreadable() {
-        let mut t = sharratt();
-        let path = p("~/channels/grok");
+        let mut t = zen();
+        let path = p("conversations");
         t.get_mut(&path).unwrap().problems.push(Problem::new(
-            "persons/john/channels/grok/lines.yaml",
+            "groups/zen/conversations/lines.yaml",
             Some(3),
             "`text` is missing",
         ));
         assert_eq!(
             index_line(&path, t.get(&path).unwrap(), now()),
-            "~/channels/grok — open for their conversations with Grok, in its apps and the car. Unreadable: persons/john/channels/grok/lines.yaml:3: `text` is missing"
+            "@zen/conversations — open for each conversation, from any client. Unreadable: groups/zen/conversations/lines.yaml:3: `text` is missing"
         );
     }
 }

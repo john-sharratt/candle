@@ -5,30 +5,34 @@
 //!
 //! An operation is checked against who asks ([`permit`]) and then applied; a
 //! refused one changes nothing.
+//!
+//! **The operations only add to the tree's structure** (§2.6): a line, a
+//! sub-journal, a reference, a focus. Renaming, moving, merging and unfolding
+//! journals is a restructuring — a coding change to the journals repository —
+//! and the service folds only what its upkeep folds (§2.3, §4).
 
 pub mod accept;
 pub mod append;
 pub mod close;
 pub mod create;
 pub mod edit;
+pub mod focus;
 pub mod fold;
 pub mod forget;
 pub mod group;
 pub mod guard;
-pub mod merge;
+pub mod link;
 pub mod period_fold;
 pub mod permit;
-pub mod place;
 pub mod remap;
-pub mod share;
 pub mod summarize;
 pub mod wire;
 
 use crate::actor::Actor;
 use crate::error::{Error, Result};
-use crate::files::{AccountKey, Email, Fingerprint, Kind, Role, Sentence, Who};
+use crate::files::{AccountKey, Email, Fingerprint, Role, Sentence, Who};
 use crate::line::{LineId, Writer};
-use crate::path::{Address, JournalPath, Owner};
+use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::slug::Slug;
 use crate::time::Stamp;
@@ -53,13 +57,16 @@ pub enum OnTaken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// `speaker` is who the conversation's focus says is talking (§2.4).
     Note {
         path: JournalPath,
         text: String,
+        speaker: Option<Slug>,
     },
     Episode {
         path: JournalPath,
         text: String,
+        speaker: Option<Slug>,
     },
     Edit {
         address: Address,
@@ -78,18 +85,23 @@ pub enum Op {
         cue: String,
         on_taken: OnTaken,
     },
+    /// A reference from `under` to the journal at `to`, in the same group
+    /// (§2.5).
+    Link {
+        under: JournalPath,
+        name: Slug,
+        to: JournalPath,
+        cue: String,
+    },
+    /// A conversation's focus: who is speaking, what it is about. A part
+    /// left `None` keeps what the focus has.
+    Focus {
+        path: JournalPath,
+        speaker: Option<Slug>,
+        about: Option<Vec<JournalPath>>,
+    },
     Close {
         path: JournalPath,
-    },
-    Fold {
-        path: JournalPath,
-    },
-    Unfold {
-        path: JournalPath,
-    },
-    Merge {
-        from: JournalPath,
-        into: JournalPath,
     },
     Summarize {
         path: JournalPath,
@@ -98,8 +110,11 @@ pub enum Op {
         digest: Option<String>,
         cue: Option<String>,
     },
+    /// `why` is the refusal that left the summary standing, which its commit
+    /// keeps, so a stale summary's history says what to mend.
     MarkStale {
         path: JournalPath,
+        why: String,
     },
     /// `over` is [`period_fold::lines_over`] of the lines the fold was
     /// written from: one edited meanwhile makes it a conflict.
@@ -110,16 +125,11 @@ pub enum Op {
         over: Fingerprint,
         text: String,
     },
-    Share {
-        from: JournalPath,
-        into: JournalPath,
-        name: Option<Slug>,
-    },
     /// A new group, its creator its first owner.
     CreateGroup {
         group: Slug,
         name: String,
-        kind: Kind,
+        about: Option<String>,
     },
     /// What a group is for: its `about`, an owner's to write.
     DescribeGroup {
@@ -133,17 +143,16 @@ pub enum Op {
         emails: Vec<Email>,
         role: Role,
     },
-    /// The actor's person's own choice: which group is their default, and
-    /// which others open every conversation of theirs. `default` absent keeps
-    /// the one they have.
-    ChooseGroups {
-        default: Option<Slug>,
-        framed: Vec<Slug>,
+    /// The actor's person's own choice: the group their conversations open
+    /// in.
+    ChooseDefault {
+        group: Slug,
     },
-    /// A bot, as a reader of the group's journals.
+    /// A bot, as a reader of the subtrees `reads` grants it.
     AddBot {
         group: Slug,
         bot: Slug,
+        reads: Vec<Below>,
     },
     RemoveMember {
         group: Slug,
@@ -156,6 +165,13 @@ pub enum Op {
     },
 }
 
+/// An owner file an operation changed: a `person.yaml` or a `group.yaml`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OwnerFile {
+    Person(Slug),
+    Group(Slug),
+}
+
 /// What an operation changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Applied {
@@ -163,10 +179,8 @@ pub struct Applied {
     pub subject: String,
     /// Journals whose own files changed.
     pub touched: Vec<JournalPath>,
-    /// Journals removed, with everything below them.
-    pub removed: Vec<JournalPath>,
-    /// Owners whose `person.yaml` or `group.yaml` changed.
-    pub owners: Vec<Owner>,
+    /// Owner files that changed.
+    pub owners: Vec<OwnerFile>,
     /// The line written, edited or forgotten.
     pub line: Option<LineId>,
     /// The journal created.
@@ -228,8 +242,16 @@ fn run(
     keep: Option<&LineId>,
 ) -> Result<Applied> {
     match op {
-        Op::Note { path, text } => append::note(tree, actor, path, text, now, keep),
-        Op::Episode { path, text } => append::episode(tree, actor, path, text, now, keep),
+        Op::Note {
+            path,
+            text,
+            speaker,
+        } => append::note(tree, actor, path, speaker.as_ref(), text, now, keep),
+        Op::Episode {
+            path,
+            text,
+            speaker,
+        } => append::episode(tree, actor, path, speaker.as_ref(), text, now, keep),
         Op::Edit { address, text } => edit::edit(tree, address, text),
         Op::Forget { path, which } => forget::forget(tree, path, which),
         Op::Accept { address } => accept::accept(tree, address),
@@ -239,10 +261,18 @@ fn run(
             cue,
             on_taken,
         } => create::create(tree, under, name, cue, *on_taken, now),
+        Op::Link {
+            under,
+            name,
+            to,
+            cue,
+        } => link::link(tree, under, name, to, cue, now),
+        Op::Focus {
+            path,
+            speaker,
+            about,
+        } => focus::focus(tree, path, speaker.as_ref(), about.as_deref()),
         Op::Close { path } => close::close(tree, path, now),
-        Op::Fold { path } => fold::fold(tree, path, now),
-        Op::Unfold { path } => fold::unfold(tree, path),
-        Op::Merge { from, into } => merge::merge(tree, from, into),
         Op::Summarize {
             path,
             over,
@@ -258,7 +288,7 @@ fn run(
             cue.as_deref(),
             now,
         ),
-        Op::MarkStale { path } => summarize::mark_stale(tree, path),
+        Op::MarkStale { path, why } => summarize::mark_stale(tree, path, why),
         Op::FoldPeriod {
             path,
             period,
@@ -266,12 +296,11 @@ fn run(
             over,
             text,
         } => period_fold::fold_period(tree, path, *period, ids, over, text, now, keep),
-        Op::Share { from, into, name } => share::share(tree, from, into, name.as_ref(), now),
-        Op::CreateGroup { group, name, kind } => {
+        Op::CreateGroup { group, name, about } => {
             let creator = actor
                 .person()
                 .ok_or_else(|| Error::forbidden("only a person makes a group"))?;
-            group::create_group(tree, creator, group, name, *kind, now)
+            group::create_group(tree, creator, group, name, about.as_deref(), now)
         }
         Op::DescribeGroup { group, about } => group::describe_group(tree, group, about),
         Op::AddMember {
@@ -281,13 +310,13 @@ fn run(
             emails,
             role,
         } => group::add_member(tree, group, person, name.as_deref(), emails, *role, now),
-        Op::ChooseGroups { default, framed } => {
+        Op::ChooseDefault { group } => {
             let person = actor
                 .person()
-                .ok_or_else(|| Error::forbidden("only a person chooses their groups"))?;
-            group::choose_groups(tree, person, default.as_ref(), framed)
+                .ok_or_else(|| Error::forbidden("only a person chooses their default group"))?;
+            group::choose_default(tree, person, group)
         }
-        Op::AddBot { group, bot } => group::add_bot(tree, group, bot, now),
+        Op::AddBot { group, bot, reads } => group::add_bot(tree, group, bot, reads, now),
         Op::RemoveMember { group, who } => group::remove_member(tree, group, who),
         Op::Bind { person, email, key } => group::bind(tree, person, email, key),
     }

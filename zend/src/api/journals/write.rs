@@ -1,6 +1,6 @@
-//! `POST /v1/journals` (`docs/memory_backbone.md` §6.7): `{channel?, ops:
-//! [...]}`, at most [`MAX_OPS`] operations of [`super::ops`], applied in
-//! order as the caller, each its own commit.
+//! `POST /v1/journals` (`docs/memory_backbone.md` §6.7): `{channel?,
+//! speaker?, ops: [...]}`, at most [`MAX_OPS`] operations of [`super::ops`],
+//! applied in order as the caller, each its own commit.
 //!
 //! The whole batch is read and applied, in order, to a copy of the tree before
 //! anything is committed — each operation read as the ones before it leave
@@ -12,7 +12,8 @@
 //!
 //! `channel` names who the person speaks through, as an MCP session's channel
 //! names itself: stated by the caller, not checked; `other` when absent. The
-//! person is the gateway's.
+//! account is the gateway's. `speaker` is who the batch's notes are from,
+//! where a note names no speaker of its own.
 
 use std::sync::Arc;
 
@@ -25,13 +26,14 @@ use journals::actor::Actor;
 use journals::ops::{applied_to, Applied, Op};
 use journals::path::JournalPath;
 use journals::scope::Channel;
+use journals::slug::Slug;
 use journals::time::Stamp;
 use serde_json::{json, Value};
 
 use super::ops::{plan, Planned};
-use super::{blocking, malformed, person, status_of, status_of_journal, Answer};
+use super::{blocking, caller, malformed, status_of, status_of_journal, Answer};
 use crate::mcp::memory::WriteError;
-use crate::mcp::tools::mem::Mem;
+use crate::mcp::tools::mem::{Mem, Miss};
 use crate::session::ZendSession;
 
 /// The most operations one request applies.
@@ -41,10 +43,12 @@ pub const MAX_OPS: usize = 500;
 /// with room for their JSON.
 pub const BODY_LIMIT: usize = 8 << 20;
 
-/// A write request: who it speaks through, and its operations.
+/// A write request: who it speaks through, who its notes are from, and its
+/// operations.
 #[derive(Debug)]
 pub struct Request {
     pub channel: Channel,
+    pub speaker: Option<Slug>,
     pub ops: Vec<Value>,
 }
 
@@ -52,12 +56,20 @@ pub fn request(body: &Value) -> Result<Request, String> {
     let obj = body.as_object().ok_or("the body is a JSON object")?;
     if let Some(k) = obj
         .keys()
-        .find(|k| !matches!(k.as_str(), "channel" | "ops"))
+        .find(|k| !matches!(k.as_str(), "channel" | "speaker" | "ops"))
     {
         return Err(format!(
-            "`{k}` is not a field of a request: send `channel` and `ops`"
+            "`{k}` is not a field of a request: send `channel`, `speaker` and `ops`"
         ));
     }
+    let speaker = obj
+        .get("speaker")
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| "`speaker` is a person's slug".to_string())
+                .and_then(|s| Slug::parse(s.trim().trim_start_matches('@')))
+        })
+        .transpose()?;
     let channel = match obj.get("channel") {
         None => Channel::Other,
         Some(v) => {
@@ -77,6 +89,7 @@ pub fn request(body: &Value) -> Result<Request, String> {
     }
     Ok(Request {
         channel,
+        speaker,
         ops: ops.clone(),
     })
 }
@@ -87,10 +100,9 @@ fn journal_of<'a>(op: &'a Op, applied: &'a Applied) -> Option<&'a JournalPath> {
         Op::Note { path, .. }
         | Op::Episode { path, .. }
         | Op::Forget { path, .. }
-        | Op::Fold { path }
-        | Op::Unfold { path } => Some(path),
+        | Op::Focus { path, .. } => Some(path),
         Op::Edit { address, .. } | Op::Accept { address } => Some(&address.path),
-        Op::Merge { into, .. } => Some(into),
+        Op::Link { under, .. } => Some(under),
         _ => applied.touched.first(),
     })
 }
@@ -124,12 +136,14 @@ fn stopped(
     )
 }
 
-/// `ops` for `m`'s caller at `now`: read, checked whole against the tree,
-/// then each handed to `commit`.
+/// `ops` for `m`'s caller at `now`, their notes from `speaker` where they
+/// name none: read, checked whole against the tree, then each handed to
+/// `commit`.
 pub fn batch(
     m: &Mem,
     ops: &[Value],
     now: Stamp,
+    speaker: Option<&Slug>,
     mut commit: impl FnMut(&Actor, &Op, Stamp) -> Result<Applied, WriteError>,
 ) -> Answer {
     let actor = m.actor();
@@ -138,9 +152,14 @@ pub fn batch(
     for (i, v) in ops.iter().enumerate() {
         // Read against the tree as the operations before it leave it: a
         // group an earlier one made the default is where a bare path goes.
-        let p = match plan(&m.seeing(Arc::clone(&tree)), v, now) {
+        let p = match plan(&m.seeing(Arc::clone(&tree)), v, now, speaker) {
             Ok(p) => p,
-            Err(e) => return stopped(StatusCode::BAD_REQUEST, "invalid", i, e, Vec::new()),
+            Err(Miss::Malformed(e)) => {
+                return stopped(StatusCode::BAD_REQUEST, "invalid", i, e, Vec::new())
+            }
+            Err(Miss::Absent(e)) => {
+                return stopped(StatusCode::NOT_FOUND, "not_found", i, e, Vec::new())
+            }
         };
         match applied_to(&tree, &actor, &p.op, p.at, None) {
             Ok((next, _)) => tree = Arc::new(next),
@@ -179,12 +198,16 @@ pub async fn write(
         Ok(r) => r,
         Err(e) => return malformed(e),
     };
-    blocking(move || match person(&session, &headers, req.channel) {
+    blocking(move || match caller(&session, &headers, req.channel) {
         Ok(m) => {
             let memory = Arc::clone(&m.memory);
-            batch(&m, &req.ops, Stamp::now(), |actor, op, at| {
-                memory.write_at(actor, op, at)
-            })
+            batch(
+                &m,
+                &req.ops,
+                Stamp::now(),
+                req.speaker.as_ref(),
+                |actor, op, at| memory.write_at(actor, op, at),
+            )
         }
         Err(a) => a,
     })
@@ -196,7 +219,6 @@ mod tests {
     use journals::error::Error;
     use journals::line::{LineId, MAX_TEXT};
     use journals::ops::{apply, OnTaken, Which};
-    use journals::slug::Slug;
     use journals::store::StoreError;
     use journals::tree::Tree;
 
@@ -216,21 +238,22 @@ mod tests {
     fn run_as(person: &str, ops: Value) -> (Answer, Tree) {
         let m = mem(person);
         let mut tree = (*m.tree).clone();
-        let answer = batch(&m, ops.as_array().unwrap(), now(), |actor, op, at| {
+        let answer = batch(&m, ops.as_array().unwrap(), now(), None, |actor, op, at| {
             apply(&mut tree, actor, op, at).map_err(|e| WriteError::Store(StoreError::Journal(e)))
         });
         (answer, tree)
     }
 
     #[test]
-    fn a_request_names_its_channel_and_holds_its_operations() {
-        let r = request(&json!({"channel": "claude-code", "ops": [{"op": "note"}]})).unwrap();
+    fn a_request_names_its_channel_and_speaker_and_holds_its_operations() {
+        let r =
+            request(&json!({"channel": "claude-code", "speaker": "@yen", "ops": [{"op": "note"}]}))
+                .unwrap();
         assert_eq!(r.channel, Channel::ClaudeCode);
+        assert_eq!(r.speaker, Some(Slug::parse("yen").unwrap()));
         assert_eq!(r.ops.len(), 1);
-        assert_eq!(
-            request(&json!({"ops": [{}]})).unwrap().channel,
-            Channel::Other
-        );
+        let bare = request(&json!({"ops": [{}]})).unwrap();
+        assert_eq!((bare.channel, bare.speaker), (Channel::Other, None));
         let err = |v: Value| request(&v).unwrap_err();
         assert_eq!(err(json!([])), "the body is a JSON object");
         assert_eq!(
@@ -253,7 +276,11 @@ mod tests {
         );
         assert_eq!(
             err(json!({"op": "note", "ops": [{}]})),
-            "`op` is not a field of a request: send `channel` and `ops`"
+            "`op` is not a field of a request: send `channel`, `speaker` and `ops`"
+        );
+        assert_eq!(
+            err(json!({"speaker": 1, "ops": [{}]})),
+            "`speaker` is a person's slug"
         );
     }
 
@@ -262,31 +289,61 @@ mod tests {
         let (answer, tree) = run(json!([
             {"op": "create", "under": "topics", "name": "trip", "cue": "open for the trip"},
             {"op": "note", "journal": "topics/trip", "text": "Flights booked.", "at": "2026-10-01T09:00:00Z"},
-            {"op": "note", "journal": "~", "text": "Prefers tea."},
+            {"op": "note", "journal": "@zen", "text": "Everyone drinks tea."},
         ]));
         assert_eq!(answer.0, StatusCode::OK);
         let applied = answer.1["applied"].as_array().unwrap();
         assert_eq!(applied.len(), 3);
-        let trip = mem("john").path("topics/trip").unwrap();
+        let trip = mem("john")
+            .path("topics")
+            .and_then(|t| {
+                t.child(Slug::parse("trip").unwrap())
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
         let line = &tree.get(&trip).unwrap().window[0];
         assert_eq!(line.at, Stamp::parse("2026-10-01T09:00:00Z").unwrap());
         assert_eq!(
             applied[0],
             json!({
                 "index": 0,
-                "subject": "Create @sharratt/topics/trip",
-                "journal": "@sharratt/topics/trip",
+                "subject": "Create @zen/topics/trip",
+                "journal": "@zen/topics/trip",
                 "line": null,
-                "readers": "shared with Yen and Thanh Long",
+                "readers": "read by everyone in @zen: Yen and Thanh Long",
                 "folded": [],
             })
         );
         assert_eq!(
             applied[1]["line"],
-            format!("@sharratt/topics/trip#{}", line.id.as_str())
+            format!("@zen/topics/trip#{}", line.id.as_str())
         );
-        assert_eq!(applied[2]["journal"], "~");
-        assert_eq!(applied[2]["readers"], "only you read it");
+        assert_eq!(applied[2]["journal"], "@zen");
+    }
+
+    /// **A batch's notes are from its speaker** where they name none, and a
+    /// speaker is someone the group has a journal for.
+    #[test]
+    fn a_batch_speaker_stamps_its_notes() {
+        let m = mem("john");
+        let mut tree = (*m.tree).clone();
+        let yen = Slug::parse("yen").unwrap();
+        let ops = [
+            json!({"op": "create", "under": "people", "name": "yen", "cue": "open for Yen"}),
+            json!({"op": "note", "journal": "@zen", "text": "Back Friday."}),
+        ];
+        let answer = batch(&m, &ops, now(), Some(&yen), |actor, op, at| {
+            apply(&mut tree, actor, op, at).map_err(|e| WriteError::Store(StoreError::Journal(e)))
+        });
+        assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
+        let master = m.path("@zen").unwrap();
+        let line = &tree.get(&master).unwrap().window[0];
+        assert_eq!(line.speaker, Some(yen));
+        assert_eq!(line.account, Some(Slug::parse("john").unwrap()));
+        let (answer, _) = run(json!([
+            {"op": "note", "journal": "@zen", "text": "x", "speaker": "nobody"},
+        ]));
+        assert_eq!(answer.0, StatusCode::NOT_FOUND, "{}", answer.1);
     }
 
     /// **A batch the rules refuse anywhere keeps nothing**: the seventh of
@@ -294,16 +351,16 @@ mod tests {
     #[test]
     fn a_refused_operation_anywhere_keeps_nothing() {
         let mut ops: Vec<Value> = (0..10)
-            .map(|i| json!({"op": "note", "journal": "~", "text": format!("n{i}")}))
+            .map(|i| json!({"op": "note", "journal": "@zen", "text": format!("n{i}")}))
             .collect();
-        ops[6] = json!({"op": "note", "journal": "~", "text": "x".repeat(MAX_TEXT + 1)});
+        ops[6] = json!({"op": "note", "journal": "@zen", "text": "x".repeat(MAX_TEXT + 1)});
         let (answer, tree) = run(Value::Array(ops));
         assert_eq!(answer.0, StatusCode::BAD_REQUEST);
         assert_eq!(answer.1["error"], "invalid");
         assert_eq!(answer.1["index"], 6);
         assert_eq!(answer.1["applied"], json!([]));
         assert!(tree
-            .get(&mem("john").path("~").unwrap())
+            .get(&mem("john").path("@zen").unwrap())
             .unwrap()
             .window
             .is_empty());
@@ -320,20 +377,32 @@ mod tests {
                 json!({
                     "error": "not_found",
                     "index": 0,
-                    "message": "there is no journal @sharratt/topics/trip",
+                    "message": mem("john").path("topics/trip").unwrap_err(),
                     "applied": [],
                 })
             )
         );
     }
 
+    /// **A guest's batch keeps nothing**: it reads `@guest`, and writes
+    /// nowhere (§3.6).
+    #[test]
+    fn a_guests_batch_keeps_nothing() {
+        let (answer, _) = run_as(
+            "guest",
+            json!([{"op": "create_group", "group": "mine", "name": "Mine"}]),
+        );
+        assert_eq!(answer.0, StatusCode::FORBIDDEN, "{}", answer.1);
+        assert_eq!(answer.1["applied"], json!([]));
+    }
+
     /// **Only an estate admin lists an email, over HTTP too**: Yen owns
-    /// @sharratt, and her batch that gives a newcomer an account keeps none
-    /// of its operations; John's, the same batch, keeps them all.
+    /// @zen, and her batch that gives a newcomer an account keeps none of
+    /// its operations; John's, the same batch, keeps them all.
     #[test]
     fn a_non_admin_owner_lists_no_email_in_a_batch() {
         let ops = json!([
-            {"op": "note", "journal": "~", "text": "Adding Yen Nhi."},
+            {"op": "note", "journal": "@zen", "text": "Adding Yen Nhi."},
             {"op": "add_member", "person": "yen-nhi", "name": "Yen Nhi", "emails": ["yen.nhi@example.com"]},
         ]);
         let (answer, tree) = run_as("yen", ops.clone());
@@ -344,7 +413,7 @@ mod tests {
                 json!({
                     "error": "forbidden",
                     "index": 1,
-                    "message": "a person's AI may not list yen-nhi's accounts or rename them: only an estate admin does",
+                    "message": "a member's AI may not list yen-nhi's accounts or rename them: only an estate admin does",
                     "applied": [],
                 })
             )
@@ -355,30 +424,31 @@ mod tests {
         assert!(tree.persons.contains_key(&Slug::parse("yen-nhi").unwrap()));
     }
 
-    /// **A group named the default earlier in a batch is where its later
-    /// bare paths go.**
+    /// **A group made in a batch is written to by name for the rest of it**,
+    /// and who reads it is told as the batch leaves it.
     #[test]
-    fn a_default_chosen_in_a_batch_holds_for_the_rest_of_it() {
+    fn a_group_made_in_a_batch_holds_for_the_rest_of_it() {
         let (answer, tree) = run(json!([
-            {"op": "create_group", "group": "tokera", "name": "Tokera", "kind": "team"},
-            {"op": "choose_groups", "default": "tokera", "framed": []},
-            {"op": "create", "under": "projects", "name": "candle", "cue": "open for candle"},
-            {"op": "add_bot", "bot": "b1"},
+            {"op": "create_group", "group": "battle-cities", "name": "Battle Cities", "about": "The game."},
+            {"op": "create", "under": "@battle-cities/topics", "name": "game", "cue": "open for the game"},
+            {"op": "add_bot", "bot": "b1", "reads": ["topics/game"], "group": "battle-cities"},
         ]));
         assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
         let applied = answer.1["applied"].as_array().unwrap();
-        assert_eq!(applied[2]["journal"], "@tokera/projects/candle");
+        assert_eq!(applied[1]["journal"], "@battle-cities/topics/game");
         // Told as the batch leaves the group: its bot, added after.
-        assert_eq!(applied[2]["readers"], "read by its bot only");
-        let tokera = tree.group_file(&Slug::parse("tokera").unwrap()).unwrap();
-        assert!(tokera.bot(&Slug::parse("b1").unwrap()).is_some());
+        assert_eq!(applied[1]["readers"], "read by a bot granted it only");
+        let g = tree
+            .group_file(&Slug::parse("battle-cities").unwrap())
+            .unwrap();
+        assert!(g.bot(&Slug::parse("b1").unwrap()).is_some());
     }
 
     #[test]
     fn a_malformed_operation_is_named_and_nothing_kept() {
         let (answer, _) = run(json!([
-            {"op": "note", "journal": "~", "text": "fine"},
-            {"op": "note", "journal": "~"},
+            {"op": "note", "journal": "@zen", "text": "fine"},
+            {"op": "note", "journal": "@zen"},
         ]));
         assert_eq!(
             answer,
@@ -400,16 +470,16 @@ mod tests {
     fn a_commit_refused_after_the_check_names_what_was_kept() {
         let m = mem("john");
         let ops = [
-            json!({"op": "note", "journal": "~", "text": "a"}),
-            json!({"op": "note", "journal": "~", "text": "b"}),
+            json!({"op": "note", "journal": "@zen", "text": "a"}),
+            json!({"op": "note", "journal": "@zen", "text": "b"}),
         ];
         let mut n = 0;
-        let answer = batch(&m, &ops, now(), |_, _, _| {
+        let answer = batch(&m, &ops, now(), None, |_, _, _| {
             n += 1;
             if n == 1 {
                 Ok(Applied {
-                    subject: "Note on ~".into(),
-                    touched: vec![m.path("~").unwrap()],
+                    subject: "Note on @zen".into(),
+                    touched: vec![m.path("@zen").unwrap()],
                     line: Some(LineId::parse("2026-10-30-1200-0001").unwrap()),
                     ..Applied::default()
                 })
@@ -422,7 +492,7 @@ mod tests {
         assert_eq!(answer.0, StatusCode::CONFLICT);
         assert_eq!(answer.1["index"], 1);
         assert_eq!(answer.1["message"], "moved");
-        assert_eq!(answer.1["applied"][0]["line"], "~#2026-10-30-1200-0001");
+        assert_eq!(answer.1["applied"][0]["line"], "@zen#2026-10-30-1200-0001");
     }
 
     #[test]
@@ -441,17 +511,14 @@ mod tests {
             ..Applied::default()
         };
         assert_eq!(journal_of(&create, &made), Some(&trip));
-        let merge = Op::Merge {
-            from: trip.clone(),
-            into: topics.clone(),
+        let people = m.path("people").unwrap();
+        let link = Op::Link {
+            under: people.clone(),
+            name: Slug::parse("trip").unwrap(),
+            to: trip.clone(),
+            cue: "c".into(),
         };
-        assert_eq!(journal_of(&merge, &Applied::default()), Some(&topics));
-        let share = Op::Share {
-            from: m.path("~/people").unwrap(),
-            into: topics.clone(),
-            name: None,
-        };
-        assert_eq!(journal_of(&share, &made), Some(&trip));
+        assert_eq!(journal_of(&link, &Applied::default()), Some(&people));
         let forget = Op::Forget {
             path: topics.clone(),
             which: Which::Says("x".into()),

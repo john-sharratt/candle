@@ -1,13 +1,15 @@
 //! The memory's journals as JSON, for the routes of [`super`]: a journal
 //! opened, one line, the shape of a subtree, a search's hits. Every path is
-//! written as its reader writes it (`~/…`, `@group/…`), every line by its
-//! address, so whatever one answer names another request can take. Every
+//! written whole, `@group/…`, every line by its address, so whatever one
+//! answer names another request can take. Every
 //! answer that carries what was written carries `framing` too: notes, not
 //! instructions (§7.2).
 
+use journals::actor::{groups_of, GUEST};
 use journals::files::Summary;
 use journals::line::{Folds, Line};
 use journals::path::JournalPath;
+use journals::slug::Slug;
 use journals::time::Stamp;
 use journals::tree::fingerprint::is_dirty;
 use journals::tree::Journal;
@@ -27,7 +29,8 @@ pub fn line(path: &JournalPath, l: &Line) -> Value {
         "at": l.at.to_string(),
         "kind": l.kind.name(),
         "by": l.by.name(),
-        "person": l.person.as_ref().map(|p| p.as_str()),
+        "account": l.account.as_ref().map(|p| p.as_str()),
+        "speaker": l.speaker.as_ref().map(|p| p.as_str()),
         "channel": l.channel.map(|c| c.name()),
         "folds": l.folds.as_ref().map(|f| match f {
             Folds::Period(p) => json!({"period": p.to_string()}),
@@ -68,10 +71,33 @@ fn summary_state(j: &Journal) -> &'static str {
     }
 }
 
-/// `j` at `path`, opened for `m`'s caller: its summary, its sub-journals, the
-/// newest `lines` of its window, what is archived, and the text a reader is
-/// shown.
+/// `j` at `path`, opened for `m`'s caller: its summary, its focus, its
+/// references and sub-journals, the newest `lines` of its window, what is
+/// archived, and the text a reader is shown.
 pub fn journal(m: &Mem, path: &JournalPath, j: &Journal, lines: usize, now: Stamp) -> Value {
+    let meta = j.meta.as_ref();
+    let references: Vec<Value> = meta
+        .into_iter()
+        .flat_map(|m| &m.refs)
+        .map(|r| {
+            json!({
+                "name": r.name.as_str(),
+                "journal": r.to.at(path.group()).map(|p| p.show()).ok(),
+                "cue": r.cue,
+            })
+        })
+        .collect();
+    let focus = meta.and_then(|m| m.focus.as_ref()).map(|f| {
+        json!({
+            "speaker": f.speaker.as_ref().map(|s| s.as_str()),
+            "about": f
+                .about
+                .iter()
+                .filter_map(|b| b.at(path.group()).ok())
+                .map(|p| p.show())
+                .collect::<Vec<_>>(),
+        })
+    });
     let live: Vec<Value> = j
         .live()
         .map(|(name, child)| {
@@ -107,6 +133,8 @@ pub fn journal(m: &Mem, path: &JournalPath, j: &Journal, lines: usize, now: Stam
         "cue": j.cue(),
         "readers": m.readers(path),
         "summary": j.summary().map(|s| summary(s, !is_dirty(j))),
+        "focus": focus,
+        "references": references,
         "sub_journals": live,
         "folded": folded,
         "window": j.window.len(),
@@ -163,15 +191,18 @@ pub fn hits(hits: &[Hit], total: usize) -> Value {
     })
 }
 
-/// The roots `m`'s caller reads: `~`, then each of their groups.
+/// The masters `m`'s caller reads: each of their groups', or a guest's
+/// `@guest`.
 pub fn roots(m: &Mem) -> Vec<JournalPath> {
-    let mut out = vec![m.path("~").expect("`~` is a path")];
-    out.extend(
-        m.groups()
-            .into_iter()
-            .filter_map(|f| m.path(&format!("@{f}")).ok()),
-    );
-    out
+    let groups = match m.person() {
+        Some(p) => groups_of(&m.tree, p),
+        None => vec![Slug::parse(GUEST).expect("a name")],
+    };
+    groups
+        .into_iter()
+        .filter(|g| m.tree.root(g).is_some())
+        .map(JournalPath::root)
+        .collect()
 }
 
 /// The journal at `path`, if `m`'s caller may read it.
@@ -192,7 +223,8 @@ mod tests {
         Stamp::parse(s).unwrap()
     }
 
-    /// A tree with one topic and two notes on it, written by John via Grok.
+    /// A tree with one topic and two notes on it, written by John via Grok
+    /// as Yen spoke.
     fn written() -> (Mem, JournalPath) {
         let mut m = mem("john");
         let mut tree = (*m.tree).clone();
@@ -202,7 +234,19 @@ mod tests {
             &mut tree,
             &actor,
             &Op::Create {
-                under: topics,
+                under: m.path("people").unwrap(),
+                name: Slug::parse("yen").unwrap(),
+                cue: "open for Yen".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            at("2026-10-29T09:00:00Z"),
+        )
+        .unwrap();
+        apply(
+            &mut tree,
+            &actor,
+            &Op::Create {
+                under: topics.clone(),
                 name: Slug::parse("trip").unwrap(),
                 cue: "open for the trip".into(),
                 on_taken: OnTaken::Refuse,
@@ -210,7 +254,7 @@ mod tests {
             at("2026-10-29T10:00:00Z"),
         )
         .unwrap();
-        let trip = m.path("topics/trip").unwrap();
+        let trip = topics.child(Slug::parse("trip").unwrap()).unwrap();
         for (t, text) in [
             ("2026-10-29T10:01:00Z", "Flights booked."),
             ("2026-10-29T10:02:00Z", "Hotel too."),
@@ -221,6 +265,7 @@ mod tests {
                 &Op::Note {
                     path: trip.clone(),
                     text: text.into(),
+                    speaker: Some(Slug::parse("yen").unwrap()),
                 },
                 at(t),
             )
@@ -238,11 +283,12 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "line": format!("@sharratt/topics/trip#{}", j.window[0].id.as_str()),
+                "line": format!("@zen/topics/trip#{}", j.window[0].id.as_str()),
                 "at": "2026-10-29T10:01:00Z",
                 "kind": "note",
                 "by": "grok",
-                "person": "john",
+                "account": "john",
+                "speaker": "yen",
                 "channel": null,
                 "folds": null,
                 "proposed": false,
@@ -263,9 +309,9 @@ mod tests {
         l.folds = Some(Folds::Journal(Slug::parse("trip").unwrap()));
         assert_eq!(
             line(&topics, &l)["folds"],
-            json!({"journal": "@sharratt/topics/trip"})
+            json!({"journal": "@zen/topics/trip"})
         );
-        assert_eq!(m.path("@sharratt/topics/trip").unwrap(), trip);
+        assert_eq!(m.path("@zen/topics/trip").unwrap(), trip);
         l.folds = Some(Folds::Period(Period::parse("2026-10-29").unwrap()));
         assert_eq!(line(&topics, &l)["folds"], json!({"period": "2026-10-29"}));
     }
@@ -275,10 +321,12 @@ mod tests {
         let (m, trip) = written();
         let j = m.tree.get(&trip).unwrap();
         let v = journal(&m, &trip, j, 1, at("2026-10-30T00:00:00Z"));
-        assert_eq!(v["journal"], "@sharratt/topics/trip");
+        assert_eq!(v["journal"], "@zen/topics/trip");
         assert_eq!(v["cue"], "open for the trip");
-        assert_eq!(v["readers"], "shared with Yen and Thanh Long");
+        assert_eq!(v["readers"], "read by everyone in @zen: Yen and Thanh Long");
         assert_eq!(v["summary"], Value::Null);
+        assert_eq!(v["focus"], Value::Null);
+        assert_eq!(v["references"], json!([]));
         assert_eq!(v["window"], 2);
         assert_eq!(v["lines"].as_array().unwrap().len(), 1);
         assert_eq!(v["lines"][0]["text"], "Hotel too.");
@@ -302,7 +350,7 @@ mod tests {
         assert_eq!(
             t["sub_journals"],
             json!([{
-                "journal": "@sharratt/topics/trip",
+                "journal": "@zen/topics/trip",
                 "cue": "open for the trip",
                 "lines": 2,
                 "sub_journals": 0,
@@ -311,11 +359,49 @@ mod tests {
         );
     }
 
+    /// **An opened journal names its references and its focus** as paths a
+    /// request takes back.
+    #[test]
+    fn an_opened_journal_names_its_references_and_focus() {
+        let (mut m, trip) = written();
+        let mut tree = (*m.tree).clone();
+        let actor = m.actor();
+        apply(
+            &mut tree,
+            &actor,
+            &Op::Link {
+                under: m.path("people").unwrap(),
+                name: Slug::parse("trip").unwrap(),
+                to: trip.clone(),
+                cue: "open for where Yen is going".into(),
+            },
+            at("2026-10-29T10:03:00Z"),
+        )
+        .unwrap();
+        m.tree = tree.into();
+        let people = m.path("people").unwrap();
+        let v = journal(
+            &m,
+            &people,
+            m.tree.get(&people).unwrap(),
+            50,
+            at("2026-10-30T00:00:00Z"),
+        );
+        assert_eq!(
+            v["references"],
+            json!([{
+                "name": "trip",
+                "journal": "@zen/topics/trip",
+                "cue": "open for where Yen is going",
+            }])
+        );
+    }
+
     #[test]
     fn a_subtree_lists_every_journal_below_its_root() {
         let (m, _) = written();
-        let fam = m.path("@sharratt").unwrap();
-        let rows = subtree(&fam, m.tree.get(&fam).unwrap());
+        let zen = m.path("@zen").unwrap();
+        let rows = subtree(&zen, m.tree.get(&zen).unwrap());
         let names: Vec<&str> = rows
             .iter()
             .map(|r| r["journal"].as_str().unwrap())
@@ -323,20 +409,23 @@ mod tests {
         assert_eq!(
             names,
             [
-                "@sharratt",
-                "@sharratt/bots",
-                "@sharratt/projects",
-                "@sharratt/threads",
-                "@sharratt/topics",
-                "@sharratt/topics/trip",
+                "@zen",
+                "@zen/bots",
+                "@zen/conversations",
+                "@zen/people",
+                "@zen/people/yen",
+                "@zen/threads",
+                "@zen/topics",
+                "@zen/topics/trip",
             ]
         );
-        assert_eq!(rows[5]["lines"], 2);
-        assert_eq!(rows[5]["folded"], false);
+        assert_eq!(rows[7]["lines"], 2);
+        assert_eq!(rows[7]["folded"], false);
         assert_eq!(
             roots(&m).iter().map(JournalPath::show).collect::<Vec<_>>(),
-            ["~", "@sharratt"]
+            ["@zen"]
         );
+        assert!(roots(&mem("guest")).is_empty(), "no @guest in this tree");
     }
 
     #[test]
@@ -356,8 +445,8 @@ mod tests {
         assert_eq!(
             v["hits"][0],
             json!({
-                "journal": "@sharratt/topics/trip",
-                "line": format!("@sharratt/topics/trip#{}", id.as_str()),
+                "journal": "@zen/topics/trip",
+                "line": format!("@zen/topics/trip#{}", id.as_str()),
                 "found": "window",
                 "at": "2026-10-29T10:02:00Z",
                 "shown": "shown",
@@ -378,7 +467,7 @@ mod tests {
         assert_eq!(
             hits(&[h], 1)["hits"][0],
             json!({
-                "journal": "@sharratt/topics/trip",
+                "journal": "@zen/topics/trip",
                 "line": null,
                 "found": "journal",
                 "at": null,

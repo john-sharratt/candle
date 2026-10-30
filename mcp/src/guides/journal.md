@@ -11,6 +11,9 @@ tools: [journal_note, journal_read, journal_grep]
 | `T:<thread>/<name>` | what the worker found, each entry citing the turns behind it | the worker |
 | `P:<repository>` | standing rules every task in every thread starts with | you |
 
+The memory's journals — `@<group>`, `people/…`, `topics/…`, `here` — are the
+`memory` guide's.
+
 ## Note
 
 - On the thread: a decision and why; what the user said or asked for; a

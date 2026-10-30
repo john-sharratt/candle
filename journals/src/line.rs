@@ -159,8 +159,11 @@ pub struct Line {
     pub at: Stamp,
     pub kind: Kind,
     pub by: Writer,
-    /// The person it was written for, when one is.
-    pub person: Option<Slug>,
+    /// The person whose sign-in made the call, as the gateway verified it.
+    pub account: Option<Slug>,
+    /// Who the conversation's focus said was talking when it was written:
+    /// the model's judgement, absent until it has one (§2.4).
+    pub speaker: Option<Slug>,
     /// The channel they spoke through, when it is not the writer itself.
     pub channel: Option<Channel>,
     /// For a fold: what it folds.
@@ -218,8 +221,11 @@ impl Line {
             self.kind.name(),
             self.by.name()
         );
-        if let Some(p) = &self.person {
-            out.push_str(&format!("person: {}\n", scalar(p.as_str())));
+        if let Some(a) = &self.account {
+            out.push_str(&format!("account: {}\n", scalar(a.as_str())));
+        }
+        if let Some(s) = &self.speaker {
+            out.push_str(&format!("speaker: {}\n", scalar(s.as_str())));
         }
         if let Some(c) = self.channel {
             out.push_str(&format!("channel: {c}\n"));
@@ -243,7 +249,8 @@ impl Line {
         let at = f.parsed("at", Stamp::parse)?;
         let kind = f.parsed("kind", Kind::parse)?;
         let by = f.parsed("by", Writer::parse)?;
-        let person = f.opt_parsed("person", Slug::parse)?;
+        let account = f.opt_parsed("account", Slug::parse)?;
+        let speaker = f.opt_parsed("speaker", Slug::parse)?;
         let channel = f.opt_parsed("channel", |s| {
             Channel::parse(s).ok_or_else(|| format!("`{s}` is not a channel"))
         })?;
@@ -272,7 +279,8 @@ impl Line {
             at,
             kind,
             by,
-            person,
+            account,
+            speaker,
             channel,
             folds,
             proposed,
@@ -316,7 +324,7 @@ mod tests {
         let text = line.render();
         assert_eq!(
             text,
-            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\nperson: john\n\
+            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\n\
              text: Workers push branches; merging is the user's decision.\n"
         );
         assert_eq!(read_as(&line.id, &text).unwrap(), line);
@@ -334,7 +342,7 @@ mod tests {
         );
         assert_eq!(
             line.render(),
-            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\nperson: john\ntext: >-\n\
+            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\ntext: >-\n\
              \x20 The candle fork powers two products: Zen Code, a persistent AI coding\n\
              \x20 assistant with institutional memory across sessions, and Battle Cities, an NPC\n\
              \x20 narrative game whose agents have unbounded memory.\n"
@@ -361,7 +369,8 @@ mod tests {
                 at,
                 kind,
                 by: Writer::Zend,
-                person: None,
+                account: Some(slug("john")),
+                speaker: Some(slug("yen")),
                 channel: Some(Channel::Grok),
                 folds,
                 proposed: kind == Kind::Note,
@@ -374,7 +383,8 @@ mod tests {
     #[test]
     fn names_yaml_would_misread_round_trip() {
         let mut line = note("2026-10-30T09:12:40Z", "x");
-        line.person = Some(slug("null"));
+        line.account = Some(slug("null"));
+        line.speaker = Some(slug("true"));
         line.kind = Kind::Fold;
         line.folds = Some(Folds::Journal(slug("true")));
         assert_eq!(read_as(&line.id, &line.render()).unwrap(), line);
@@ -448,9 +458,19 @@ mod tests {
                 "not a channel",
             ),
             (
-                "kind: note\nby: grok\nperson: Yen\ntext: x\n",
+                "kind: note\nby: grok\naccount: Yen\ntext: x\n",
                 Some(4),
                 "not a name",
+            ),
+            (
+                "kind: note\nby: grok\nspeaker: Yen\ntext: x\n",
+                Some(4),
+                "not a name",
+            ),
+            (
+                "kind: note\nby: grok\nperson: yen\ntext: x\n",
+                Some(4),
+                "`person` is not a field here",
             ),
             ("kind: note\nby: grok\n", None, "`text` is missing"),
             (
@@ -478,7 +498,8 @@ mod tests {
             at,
             kind: Kind::Fold,
             by: Writer::Zend,
-            person: None,
+            account: None,
+            speaker: None,
             channel: None,
             folds: Some(Folds::Period(Period::parse("2026").unwrap())),
             proposed: false,

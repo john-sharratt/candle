@@ -25,14 +25,14 @@ pub fn accept(tree: &mut Tree, address: &Address) -> Result<Applied> {
 mod tests {
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{john, now, p, sharratt, thanhlong};
+    use crate::ops::fixture::{john, now, p, thanhlong, zen};
     use crate::ops::{apply, Op};
     use crate::testing::slug;
 
     #[test]
     fn the_person_a_proposal_was_made_for_accepts_it_once() {
-        let mut t = sharratt();
-        let path = p("projects");
+        let mut t = zen();
+        let path = p("topics");
         let w = Actor::Worker {
             person: slug("john"),
         };
@@ -42,6 +42,7 @@ mod tests {
             &Op::Note {
                 path: path.clone(),
                 text: "Trials run on BlackWorld.".into(),
+                speaker: None,
             },
             now(),
         )
@@ -70,7 +71,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert!(a.subject.starts_with("Accept @sharratt/projects#"));
+        assert!(a.subject.starts_with("Accept @zen/topics#"));
         assert!(!t.get(&path).unwrap().window[0].proposed);
         assert!(apply(&mut t, &john(), &Op::Accept { address }, now())
             .unwrap_err()

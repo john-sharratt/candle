@@ -1,17 +1,19 @@
-//! Folding a journal out of its parent's live index, and back (§2.3).
+//! Folding a journal out of its parent's live index (§2.3): the service's
+//! upkeep when a conversation, thread or bot is the eleventh. No tool folds
+//! or unfolds a journal; a restructuring does (§2.6).
 //!
-//! A folded journal keeps everything: its folder stays, it is read by path,
-//! grepped, and unfolded. Folding writes its summary — or its cue, when it
-//! has none yet — into its parent as a `fold` line that names it.
+//! A folded journal keeps everything: its folder stays, and it is read by
+//! path and grepped. Folding writes its summary — or its cue, when it has
+//! none yet — into its parent as a `fold` line that names it.
 
 use crate::error::{Error, Result};
 use crate::files::in_order;
 use crate::line::{Folds, Kind, Line, Writer, MAX_TEXT};
-use crate::ops::{mint, Applied};
+use crate::ops::mint;
 use crate::path::JournalPath;
 use crate::slug::Slug;
 use crate::time::Stamp;
-use crate::tree::{Journal, Tree, MAX_CHILDREN};
+use crate::tree::Journal;
 
 /// Fold `parent`'s child `name`: its fold line into the parent, and the
 /// child marked folded. Both must be writable.
@@ -48,7 +50,8 @@ pub(crate) fn fold_child(
         at: now,
         kind: Kind::Fold,
         by: Writer::Zend,
-        person: None,
+        account: None,
+        speaker: None,
         channel: None,
         folds: Some(Folds::Journal(name.clone())),
         proposed: false,
@@ -65,151 +68,46 @@ pub(crate) fn fold_child(
     Ok(child_path)
 }
 
-pub fn fold(tree: &mut Tree, path: &JournalPath, now: Stamp) -> Result<Applied> {
-    let (parent_path, name) = split(path)?;
-    let parent = tree.need_mut(&parent_path)?;
-    let folded = fold_child(parent, &parent_path, &name, now)?;
-    Ok(Applied {
-        folded: vec![folded],
-        ..Applied::touching(format!("Fold {path}"), vec![parent_path, path.clone()])
-    })
-}
-
-pub fn unfold(tree: &mut Tree, path: &JournalPath) -> Result<Applied> {
-    let (parent_path, name) = split(path)?;
-    let parent = tree.need_mut(&parent_path)?;
-    parent.writable(&parent_path.show())?;
-    let child = parent
-        .children
-        .get(&name)
-        .ok_or_else(|| Error::not_found(format!("there is no journal {path}")))?;
-    child.writable(&path.show())?;
-    if !child.is_folded() {
-        return Err(Error::refused(format!("{path} is not folded")));
-    }
-    if parent.live_count() >= MAX_CHILDREN {
-        return Err(Error::refused(format!(
-            "{parent_path} has {MAX_CHILDREN} live sub-journals; fold or merge one first"
-        )));
-    }
-    parent
-        .window
-        .retain(|l| l.folds.as_ref() != Some(&Folds::Journal(name.clone())));
-    parent
-        .children
-        .get_mut(&name)
-        .and_then(|c| c.meta.as_mut())
-        .expect("a folded child has metadata")
-        .folded = false;
-    Ok(Applied::touching(
-        format!("Unfold {path}"),
-        vec![parent_path, path.clone()],
-    ))
-}
-
-fn split(path: &JournalPath) -> Result<(JournalPath, Slug)> {
-    match (path.parent(), path.last()) {
-        (Some(parent), Some(name)) => Ok((parent, name.clone())),
-        _ => Err(Error::refused(format!("{path} is a root: it never folds"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op};
     use crate::testing::slug;
 
-    fn with_topic(name: &str) -> (Tree, JournalPath) {
-        let mut t = sharratt();
-        let a = apply(
+    #[test]
+    fn folding_writes_a_fold_line_naming_the_child() {
+        let mut t = zen();
+        apply(
             &mut t,
             &john(),
             &Op::Create {
                 under: p("topics"),
-                name: slug(name),
-                cue: format!("open for the {name}"),
+                name: slug("permits"),
+                cue: "open for the permits".into(),
                 on_taken: OnTaken::Refuse,
             },
             now(),
         )
         .unwrap();
-        (t, a.created.unwrap())
-    }
-
-    #[test]
-    fn folding_writes_a_fold_line_and_unfolding_takes_it_back() {
-        let (mut t, path) = with_topic("permits");
-        let topics = path.parent().unwrap();
-        let a = apply(&mut t, &john(), &Op::Fold { path: path.clone() }, now()).unwrap();
-        assert_eq!(a.touched, vec![topics.clone(), path.clone()]);
-        let parent = t.get(&topics).unwrap();
+        let topics = p("topics");
+        let parent = t.get_mut(&topics).unwrap();
+        let folded = fold_child(parent, &topics, &slug("permits"), now()).unwrap();
+        assert_eq!(folded.show(), "@zen/topics/permits");
         assert_eq!(parent.live_count(), 0);
         let line = &parent.window[0];
         assert_eq!(line.kind, Kind::Fold);
         assert_eq!(line.folds, Some(Folds::Journal(slug("permits"))));
         assert_eq!(line.text, "permits: open for the permits");
-        assert!(
-            apply(&mut t, &john(), &Op::Fold { path: path.clone() }, now())
-                .unwrap_err()
-                .to_string()
-                .contains("folded already")
-        );
-        apply(&mut t, &john(), &Op::Unfold { path: path.clone() }, now()).unwrap();
-        let parent = t.get(&topics).unwrap();
-        assert!(parent.window.is_empty());
-        assert_eq!(parent.live_count(), 1);
-        assert!(apply(&mut t, &john(), &Op::Unfold { path }, now())
+        assert!(fold_child(parent, &topics, &slug("permits"), now())
             .unwrap_err()
             .to_string()
-            .contains("is not folded"));
-    }
-
-    #[test]
-    fn fixed_journals_and_roots_never_fold() {
-        let mut t = sharratt();
-        assert!(
-            apply(&mut t, &john(), &Op::Fold { path: p("topics") }, now())
-                .unwrap_err()
-                .to_string()
-                .contains("is fixed")
-        );
-        assert!(fold(&mut t, &p("@sharratt"), now())
+            .contains("folded already"));
+        let root = p("@zen");
+        let master = t.get_mut(&root).unwrap();
+        assert!(fold_child(master, &root, &slug("topics"), now())
             .unwrap_err()
             .to_string()
-            .contains("is a root"));
-    }
-
-    #[test]
-    fn unfolding_into_a_full_parent_is_refused() {
-        let (mut t, first) = with_topic("t0");
-        apply(
-            &mut t,
-            &john(),
-            &Op::Fold {
-                path: first.clone(),
-            },
-            now(),
-        )
-        .unwrap();
-        for i in 1..=10 {
-            apply(
-                &mut t,
-                &john(),
-                &Op::Create {
-                    under: p("topics"),
-                    name: slug(&format!("t{i}")),
-                    cue: "x".into(),
-                    on_taken: OnTaken::Refuse,
-                },
-                now(),
-            )
-            .unwrap();
-        }
-        assert!(apply(&mut t, &john(), &Op::Unfold { path: first }, now())
-            .unwrap_err()
-            .to_string()
-            .contains("10 live sub-journals"));
+            .contains("is fixed"));
     }
 }

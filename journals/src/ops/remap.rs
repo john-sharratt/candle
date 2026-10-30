@@ -41,15 +41,13 @@ pub fn remap(op: &mut Op, renamed: &BTreeMap<LineId, LineId>) {
             ..
         }
         | Op::Create { .. }
+        | Op::Link { .. }
+        | Op::Focus { .. }
         | Op::Close { .. }
-        | Op::Fold { .. }
-        | Op::Unfold { .. }
-        | Op::Merge { .. }
         | Op::MarkStale { .. }
-        | Op::Share { .. }
         | Op::CreateGroup { .. }
         | Op::DescribeGroup { .. }
-        | Op::ChooseGroups { .. }
+        | Op::ChooseDefault { .. }
         | Op::AddMember { .. }
         | Op::AddBot { .. }
         | Op::RemoveMember { .. }
@@ -111,14 +109,14 @@ mod tests {
             ),
             (
                 Op::FoldPeriod {
-                    path: p("~"),
+                    path: p("@zen"),
                     period: Period::parse("2026-10-30").unwrap(),
                     ids: vec![old.clone(), other.clone()],
                     over: Fingerprint::of_bytes(b"x"),
                     text: "x".into(),
                 },
                 Op::FoldPeriod {
-                    path: p("~"),
+                    path: p("@zen"),
                     period: Period::parse("2026-10-30").unwrap(),
                     ids: vec![new.clone(), other.clone()],
                     over: Fingerprint::of_bytes(b"x"),
@@ -127,21 +125,21 @@ mod tests {
             ),
             (
                 Op::Summarize {
-                    path: p("~"),
+                    path: p("@zen"),
                     over: Fingerprint::of_bytes(b""),
                     sentences: vec![Sentence {
                         text: "s".into(),
-                        cites: vec![Cite::Line(old.clone()), Cite::Child(slug("channels"))],
+                        cites: vec![Cite::Line(old.clone()), Cite::Child(slug("topics"))],
                     }],
                     digest: None,
                     cue: None,
                 },
                 Op::Summarize {
-                    path: p("~"),
+                    path: p("@zen"),
                     over: Fingerprint::of_bytes(b""),
                     sentences: vec![Sentence {
                         text: "s".into(),
-                        cites: vec![Cite::Line(new.clone()), Cite::Child(slug("channels"))],
+                        cites: vec![Cite::Line(new.clone()), Cite::Child(slug("topics"))],
                     }],
                     digest: None,
                     cue: None,

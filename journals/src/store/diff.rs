@@ -1,13 +1,13 @@
 //! The files an applied operation changes: for each journal it touched, its
-//! own files as they now render against what its folder held; for each it
-//! removed, everything under its folder; for each owner, its owner file.
+//! own files as they now render against what its folder held; for each
+//! owner file it changed, that file.
 
 use std::collections::BTreeMap;
 
 use crate::files::entry_id;
-use crate::ops::Applied;
+use crate::ops::{Applied, OwnerFile};
 use crate::tree::load::{ARCHIVE_DIR, JOURNAL_FILE};
-use crate::tree::render::{own_files, owner_files};
+use crate::tree::render::{group_files, own_files, person_files};
 use crate::tree::Tree;
 
 /// `path → Some(bytes)` to write, `path → None` to delete. Files that would
@@ -29,12 +29,6 @@ fn is_own(folder: &str, path: &str) -> bool {
 
 pub fn changes(before: &BTreeMap<String, Vec<u8>>, after: &Tree, applied: &Applied) -> Changes {
     let mut out = Changes::new();
-    for path in &applied.removed {
-        let prefix = format!("{}/", path.folder());
-        for file in before.keys().filter(|f| f.starts_with(&prefix)) {
-            out.insert(file.clone(), None);
-        }
-    }
     for path in &applied.touched {
         let folder = path.folder();
         for file in before.keys().filter(|f| is_own(&folder, f)) {
@@ -47,7 +41,11 @@ pub fn changes(before: &BTreeMap<String, Vec<u8>>, after: &Tree, applied: &Appli
         }
     }
     for owner in &applied.owners {
-        for (file, bytes) in owner_files(after, owner) {
+        let files = match owner {
+            OwnerFile::Person(p) => person_files(after, p),
+            OwnerFile::Group(g) => group_files(after, g),
+        };
+        for (file, bytes) in files {
             out.insert(file, Some(bytes));
         }
     }
@@ -78,7 +76,7 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::files::Role;
-    use crate::ops::fixture::{john, now, p, sharratt};
+    use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op, Which};
     use crate::path::Address;
     use crate::period::Period;
@@ -101,63 +99,51 @@ mod tests {
         ch
     }
 
+    fn note_op(path: &str, text: &str) -> Op {
+        Op::Note {
+            path: p(path),
+            text: text.into(),
+            speaker: None,
+        }
+    }
+
     #[test]
     fn own_files_are_the_journals_not_its_childrens() {
         let e = "2026-10-30-0910-4b1c.yaml";
-        assert!(is_own("persons/john", "persons/john/journal.yaml"));
-        assert!(is_own("persons/john", &format!("persons/john/{e}")));
+        let topics = "groups/zen/topics";
+        assert!(is_own(topics, "groups/zen/topics/journal.yaml"));
+        assert!(is_own(topics, &format!("groups/zen/topics/{e}")));
         assert!(is_own(
-            "persons/john",
-            &format!("persons/john/archive/2026-10/{e}")
+            topics,
+            &format!("groups/zen/topics/archive/2026-10/{e}")
         ));
-        assert!(!is_own(
-            "persons/john",
-            "persons/john/channels/journal.yaml"
-        ));
-        assert!(!is_own(
-            "persons/john",
-            &format!("persons/john/channels/{e}")
-        ));
-        assert!(!is_own("persons/john", "persons/johnny/journal.yaml"));
-        assert!(!is_own("persons/john", "persons/john/person.yaml"));
-        assert!(!is_own("persons/john", "persons/john/README.md"));
-        assert!(!is_own("persons/john", "persons/john/archive/x/y.yaml"));
+        assert!(!is_own(topics, "groups/zen/topics/candle/journal.yaml"));
+        assert!(!is_own(topics, &format!("groups/zen/topics/candle/{e}")));
+        assert!(!is_own(topics, "groups/zen/topicsx/journal.yaml"));
+        assert!(!is_own("groups/zen", "groups/zen/group.yaml"));
+        assert!(!is_own("groups/zen", "groups/zen/README.md"));
+        assert!(!is_own(topics, "groups/zen/topics/archive/x/y.yaml"));
     }
 
     #[test]
     fn a_note_writes_one_file() {
-        let t = sharratt();
-        let ch = holds(
-            &t,
-            &Op::Note {
-                path: p("topics"),
-                text: "x".into(),
-            },
-        );
+        let ch = holds(&zen(), &note_op("topics", "x"));
         let files: Vec<&String> = ch.keys().collect();
         assert_eq!(files.len(), 1);
         assert!(
-            files[0].starts_with("groups/sharratt/topics/2026-10-30-1200-"),
+            files[0].starts_with("groups/zen/topics/2026-10-30-1200-"),
             "{files:?}"
         );
     }
 
     #[test]
     fn forgetting_the_last_line_deletes_its_file() {
-        let mut t = sharratt();
-        let id = apply(
-            &mut t,
-            &john(),
-            &Op::Note {
-                path: p("topics"),
-                text: "x".into(),
-            },
-            now(),
-        )
-        .unwrap()
-        .line
-        .unwrap();
-        let file = format!("groups/sharratt/topics/{id}.yaml");
+        let mut t = zen();
+        let id = apply(&mut t, &john(), &note_op("topics", "x"), now())
+            .unwrap()
+            .line
+            .unwrap();
+        let file = format!("groups/zen/topics/{id}.yaml");
         let ch = holds(
             &t,
             &Op::Forget {
@@ -168,109 +154,84 @@ mod tests {
         assert_eq!(ch, Changes::from([(file, None)]));
     }
 
+    /// **A reference and a focus are written into their journal's
+    /// `journal.yaml`**, and nothing else.
     #[test]
-    fn a_merge_deletes_the_old_folder_and_writes_the_moved_one() {
-        let mut t = sharratt();
-        for (under, name) in [("topics", "a"), ("topics", "b"), ("topics/b", "c")] {
-            apply(
-                &mut t,
-                &john(),
-                &Op::Create {
-                    under: p(under),
-                    name: slug(name),
-                    cue: "x".into(),
-                    on_taken: OnTaken::Refuse,
-                },
-                now(),
-            )
-            .unwrap();
-        }
-        let id = apply(
+    fn a_link_and_a_focus_write_one_journal_yaml() {
+        let mut t = zen();
+        apply(
             &mut t,
             &john(),
-            &Op::Note {
-                path: p("topics/b/c"),
-                text: "deep".into(),
+            &Op::Create {
+                under: p("topics"),
+                name: slug("candle"),
+                cue: "open for the engine".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            now(),
+        )
+        .unwrap();
+        let ch = holds(
+            &t,
+            &Op::Link {
+                under: p("topics/candle"),
+                name: slug("people"),
+                to: p("people"),
+                cue: "open for who works on it".into(),
+            },
+        );
+        assert_eq!(
+            ch.keys().collect::<Vec<_>>(),
+            ["groups/zen/topics/candle/journal.yaml"]
+        );
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        let conv = apply(
+            &mut t,
+            &server,
+            &Op::Create {
+                under: p("conversations"),
+                name: slug("2026-10-30-1200-grok"),
+                cue: "open for a drive".into(),
+                on_taken: OnTaken::Number,
             },
             now(),
         )
         .unwrap()
-        .line
+        .created
         .unwrap();
         let ch = holds(
             &t,
-            &Op::Merge {
-                from: p("topics/b"),
-                into: p("topics/a"),
+            &Op::Focus {
+                path: conv,
+                speaker: None,
+                about: Some(vec![p("topics/candle")]),
             },
         );
-        assert_eq!(ch.get("groups/sharratt/topics/b/journal.yaml"), Some(&None));
         assert_eq!(
-            ch.get(&format!("groups/sharratt/topics/b/c/{id}.yaml")),
-            Some(&None)
+            ch.keys().collect::<Vec<_>>(),
+            ["groups/zen/conversations/2026-10-30-1200-grok/journal.yaml"]
         );
-        assert!(matches!(
-            ch.get(&format!("groups/sharratt/topics/a/c/{id}.yaml")),
-            Some(Some(_))
-        ));
     }
 
     /// **Lines of one second hold one order** in memory and read back from
     /// their files, so a summary over them is never stale for reading them.
     #[test]
     fn lines_of_one_second_read_back_in_the_order_they_are_held() {
-        let mut t = sharratt();
+        let mut t = zen();
         for text in ["zebra", "apple", "mango"] {
-            holds(
-                &t,
-                &Op::Note {
-                    path: p("topics"),
-                    text: text.into(),
-                },
-            );
-            apply(
-                &mut t,
-                &john(),
-                &Op::Note {
-                    path: p("topics"),
-                    text: text.into(),
-                },
-                now(),
-            )
-            .unwrap();
+            holds(&t, &note_op("topics", text));
+            apply(&mut t, &john(), &note_op("topics", text), now()).unwrap();
         }
         assert_eq!(load(&render_all(&t)), t);
     }
 
-    /// **Folding, unfolding, and editing an archived line** each write
-    /// exactly the files the new tree is.
+    /// **Editing an archived line** writes exactly its own file.
     #[test]
-    fn folds_and_archived_edits_write_their_files() {
-        let mut t = sharratt();
-        apply(
-            &mut t,
-            &john(),
-            &Op::Create {
-                under: p("topics"),
-                name: slug("permits"),
-                cue: "open for permits".into(),
-                on_taken: OnTaken::Refuse,
-            },
-            now(),
-        )
-        .unwrap();
-        let permits = p("topics/permits");
-        holds(
-            &t,
-            &Op::Fold {
-                path: permits.clone(),
-            },
-        );
-        let fold = Op::Fold {
-            path: permits.clone(),
-        };
-        apply(&mut t, &john(), &fold, now()).unwrap();
-        holds(&t, &Op::Unfold { path: permits });
+    fn an_archived_edit_writes_its_file() {
+        let mut t = zen();
         let line = note("2026-09-01T10:00:00Z", "an old one");
         t.get_mut(&p("topics"))
             .unwrap()
@@ -289,73 +250,29 @@ mod tests {
         assert_eq!(
             ch.keys().collect::<Vec<_>>(),
             [&format!(
-                "groups/sharratt/topics/archive/2026-09-01/{}.yaml",
+                "groups/zen/topics/archive/2026-09-01/{}.yaml",
                 line.id
             )]
         );
     }
 
-    /// **Sharing a journal writes its copy's entry files** under the group.
     #[test]
-    fn a_share_writes_the_copy() {
-        let mut t = sharratt();
-        apply(
-            &mut t,
-            &john(),
-            &Op::Create {
-                under: p("~/people"),
-                name: slug("builder"),
-                cue: "open for the builder".into(),
-                on_taken: OnTaken::Refuse,
-            },
-            now(),
-        )
-        .unwrap();
-        let id = apply(
-            &mut t,
-            &john(),
-            &Op::Note {
-                path: p("~/people/builder"),
-                text: "Starts Monday.".into(),
-            },
-            now(),
-        )
-        .unwrap()
-        .line
-        .unwrap();
-        let ch = holds(
-            &t,
-            &Op::Share {
-                from: p("~/people/builder"),
-                into: p("topics"),
-                name: None,
-            },
-        );
-        assert!(
-            ch.contains_key(&format!("groups/sharratt/topics/builder/{id}.yaml")),
-            "{:?}",
-            ch.keys().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn adding_a_member_writes_both_owner_files() {
-        let t = sharratt();
+    fn adding_a_member_writes_both_owner_files_and_their_journal() {
+        let t = zen();
         let op = Op::AddMember {
-            group: slug("sharratt"),
+            group: slug("zen"),
             person: slug("yen-nhi"),
             name: Some("Yen Nhi".into()),
             emails: vec![],
             role: Role::Member,
         };
         let ch = holds(&t, &op);
-        // The group's README says nothing of who is in it, so is unchanged;
-        // the new person's is new.
+        // The group's README says nothing of who is in it, so is unchanged.
         assert_eq!(
             ch.keys().collect::<Vec<_>>(),
             [
-                "groups/sharratt/group.yaml",
-                "persons/yen-nhi/README.md",
+                "groups/zen/group.yaml",
+                "groups/zen/people/yen-nhi/journal.yaml",
                 "persons/yen-nhi/person.yaml"
             ]
         );
@@ -363,21 +280,22 @@ mod tests {
 
     #[test]
     fn creating_a_conversation_past_ten_folds_and_writes_three_journals() {
-        let mut t = sharratt();
+        let mut t = zen();
         let server = Actor::Server {
             person: slug("john"),
             channel: Channel::Grok,
+        };
+        let create = |name: String| Op::Create {
+            under: p("conversations"),
+            name: slug(&name),
+            cue: "x".into(),
+            on_taken: OnTaken::Number,
         };
         for i in 0..10 {
             apply(
                 &mut t,
                 &server,
-                &Op::Create {
-                    under: p("~/channels/grok"),
-                    name: slug(&format!("2026-10-30-12{i:02}")),
-                    cue: "x".into(),
-                    on_taken: OnTaken::Number,
-                },
+                &create(format!("2026-10-30-12{i:02}-grok")),
                 now().plus(i),
             )
             .unwrap();
@@ -387,30 +305,25 @@ mod tests {
         let applied = apply(
             &mut after,
             &server,
-            &Op::Create {
-                under: p("~/channels/grok"),
-                name: slug("2026-10-30-1210"),
-                cue: "x".into(),
-                on_taken: OnTaken::Number,
-            },
+            &create("2026-10-30-1210-grok".into()),
             now().plus(100),
         )
         .unwrap();
         let ch = changes(&before, &after, &applied);
         let files: Vec<&str> = ch.keys().map(String::as_str).collect();
         assert_eq!(files.len(), 3, "{files:?}");
-        // The oldest folds, the newest is made, and the fold is an entry.
+        // The oldest folds, the fold is an entry, and the newest is made.
         assert_eq!(
             files[0],
-            "persons/john/channels/grok/2026-10-30-1200/journal.yaml"
+            "groups/zen/conversations/2026-10-30-1200-grok/journal.yaml"
         );
         assert!(
-            files[1].starts_with("persons/john/channels/grok/2026-10-30-1201-"),
+            files[1].starts_with("groups/zen/conversations/2026-10-30-1201-"),
             "{files:?}"
         );
         assert_eq!(
             files[2],
-            "persons/john/channels/grok/2026-10-30-1210/journal.yaml"
+            "groups/zen/conversations/2026-10-30-1210-grok/journal.yaml"
         );
     }
 }

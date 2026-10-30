@@ -16,8 +16,8 @@ use crate::tree::window::inside;
 use crate::tree::{Journal, Tree};
 
 /// What a fold of the window lines `ids` is written from — each line as the
-/// fold's question shows it: its time, kind, writer, the person and channel it
-/// was written for, whether it is still proposed, and its text, in time order.
+/// fold's question shows it: its time, kind, writer, the account, speaker and
+/// channel it was written for, whether it is still proposed, and its text.
 /// Ids are left out, so a replay that renames a colliding id still matches;
 /// which lines are folded is checked by id on its own. The lines are taken
 /// as a set — each one's fields, the set sorted — so neither the window's
@@ -40,7 +40,8 @@ fn line_bytes(l: &Line) -> Vec<u8> {
         l.at.to_string().as_str(),
         l.kind.name(),
         l.by.name(),
-        l.person.as_ref().map_or("", |p| p.as_str()),
+        l.account.as_ref().map_or("", |p| p.as_str()),
+        l.speaker.as_ref().map_or("", |p| p.as_str()),
         l.channel.map_or("", |c| c.name()),
         if l.proposed { "proposed" } else { "" },
         l.text.as_str(),
@@ -95,7 +96,8 @@ pub fn fold_period(
         at,
         kind: Kind::Fold,
         by: Writer::Zend,
-        person: None,
+        account: None,
+        speaker: None,
         channel: None,
         folds: Some(Folds::Period(period)),
         proposed: false,
@@ -114,7 +116,7 @@ pub fn fold_period(
 mod tests {
     use super::*;
     use crate::actor::Actor;
-    use crate::ops::fixture::{john, p, sharratt};
+    use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, Op};
     use crate::path::Address;
     use crate::testing::{at, slug};
@@ -123,7 +125,7 @@ mod tests {
     use crate::tree::WINDOW;
 
     fn filled(t: &mut Tree) -> JournalPath {
-        let path = p("~");
+        let path = p("people");
         let t0 = at("2026-10-01T00:00:00Z");
         for i in 0..=WINDOW {
             apply(
@@ -132,6 +134,7 @@ mod tests {
                 &Op::Note {
                     path: path.clone(),
                     text: format!("n{i}"),
+                    speaker: None,
                 },
                 t0.plus(3600 * i as i64),
             )
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn a_closed_day_moves_to_its_archive_behind_one_fold_line() {
-        let mut t = sharratt();
+        let mut t = zen();
         let path = filled(&mut t);
         let now = at("2026-10-03T12:00:00Z");
         let plan = next_fold(t.get(&path).unwrap(), now).unwrap();
@@ -155,7 +158,7 @@ mod tests {
             text: "Settled in on the 1st.".into(),
         };
         let a = apply(&mut t, &Actor::Zend, &op, now).unwrap();
-        assert_eq!(a.subject, "Fold 2026-10-01 of ~");
+        assert_eq!(a.subject, "Fold 2026-10-01 of @zen/people");
         let j = t.get(&path).unwrap();
         assert_eq!(j.window.len(), WINDOW + 1 - 24 + 1);
         let fold = &j.window[0];
@@ -169,7 +172,7 @@ mod tests {
         let files = own_files(&path, j);
         let archived = files
             .keys()
-            .filter(|f| f.starts_with("persons/john/archive/2026-10-01/"))
+            .filter(|f| f.starts_with("groups/zen/people/archive/2026-10-01/"))
             .count();
         assert_eq!(
             archived, 24,
@@ -181,7 +184,7 @@ mod tests {
 
     #[test]
     fn an_open_period_or_a_changed_set_is_refused() {
-        let mut t = sharratt();
+        let mut t = zen();
         let path = filled(&mut t);
         let plan = next_fold(t.get(&path).unwrap(), at("2026-10-03T12:00:00Z")).unwrap();
         let over = lines_over(t.get(&path).unwrap(), &plan.ids);
@@ -229,7 +232,7 @@ mod tests {
     /// the same lines are there by id.
     #[test]
     fn a_line_edited_while_the_fold_was_written_is_a_conflict() {
-        let mut t = sharratt();
+        let mut t = zen();
         let path = filled(&mut t);
         let now = at("2026-10-03T12:00:00Z");
         let plan = next_fold(t.get(&path).unwrap(), now).unwrap();
@@ -262,7 +265,7 @@ mod tests {
     /// The fingerprint reads what the lines say, not what they are called.
     #[test]
     fn what_a_fold_is_written_from_leaves_ids_out() {
-        let mut t = sharratt();
+        let mut t = zen();
         let path = filled(&mut t);
         let j = t.get(&path).unwrap().clone();
         let ids: Vec<LineId> = j.window[..2].iter().map(|l| l.id.clone()).collect();
@@ -277,11 +280,14 @@ mod tests {
         accepted.window[1].proposed = !accepted.window[1].proposed;
         assert_ne!(lines_over(&j, &ids), lines_over(&accepted, &ids));
         let mut reattributed = j.clone();
-        reattributed.window[1].person = match &j.window[1].person {
+        reattributed.window[1].account = match &j.window[1].account {
             Some(_) => None,
             None => Some(slug("yen")),
         };
         assert_ne!(lines_over(&j, &ids), lines_over(&reattributed, &ids));
+        let mut respoken = j.clone();
+        respoken.window[1].speaker = Some(slug("yen"));
+        assert_ne!(lines_over(&j, &ids), lines_over(&respoken, &ids));
         assert_ne!(lines_over(&j, &ids), lines_over(&j, &ids[..1]));
         let mut reordered = j.clone();
         reordered.window.swap(0, 1);

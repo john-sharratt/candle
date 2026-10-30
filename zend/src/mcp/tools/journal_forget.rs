@@ -18,16 +18,16 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Forget one line of a memory journal — when the user asks you to forget something, or \
-            a kept fact has stopped being true. `journal` is the journal, `~` or another; name the line by a \
-            few words it says (`says: \"Miso\"`), as the user would: the one line that holds them, ignoring \
-            case, is forgotten; when none does, or several do, nothing is forgotten and the answer names \
-            them. Or give `journal` as a line's address, `<path>#<line id>`, and no `says`. In a group's \
-            journals, a member forgets their own lines and an owner any. A thread's and a project's \
+            a kept fact has stopped being true. `journal` is the journal, such as `people/yen`; name the line \
+            by a few words it says (`says: \"Miso\"`), as the user would: the one line that holds them, \
+            ignoring case, is forgotten; when none does, or several do, nothing is forgotten and the answer \
+            names them. Or give `journal` as a line's address, `<path>#<line id>`, and no `says`. A member \
+            forgets the lines written on their own account, and an owner any. A thread's and a project's \
             journals are the record of their work and are not forgotten.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "A memory journal (`~`, `@<group>/…`), or a line's address `<path>#<line id>`."},
+                "journal": {"type": "string", "description": "A memory journal (`people/yen`, `@<group>/…`), or a line's address `<path>#<line id>`."},
                 "says": {"type": "string", "description": "A few words of the line to forget."}
             },
             "required": ["journal"],

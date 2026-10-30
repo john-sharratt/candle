@@ -1,7 +1,6 @@
 //! `group_remove {person | bot, group?}`: an owner takes a person or a bot
 //! out of a group, or a person leaves one (`docs/memory_backbone.md` §3.5).
-//! A person's own journals stay theirs; their lines in the group's stay,
-//! attributed to them.
+//! What they wrote stays, attributed to them.
 
 use journals::ops::Op;
 use serde_json::{json, Value};
@@ -15,15 +14,15 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Take a person or a bot out of one of the user's groups — an owner's to do — or, naming \
-            the user themselves, leave it. From then on they no longer read the group's journals; a person's \
-            own journals stay theirs, and what they wrote in the group's stays, attributed to them. The \
-            group's last owner stays. `group` is the user's default when absent.",
+            the user themselves, leave it. From then on they no longer read the group's journals; what they \
+            wrote stays, attributed to them, and so does their journal under `people`. The group's last \
+            owner stays. `group` is the conversation's when absent.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "person": {"type": "string", "description": "Their slug, as group_add named them."},
                 "bot": {"type": "string", "description": "A bot's id, to remove it instead of a person."},
-                "group": {"type": "string", "description": "The group, such as `@battle-cities`; the user's default when absent."}
+                "group": {"type": "string", "description": "The group, such as `@battle-cities`; the conversation's when absent."}
             },
             "additionalProperties": false
         }
