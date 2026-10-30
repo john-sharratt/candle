@@ -147,6 +147,10 @@ candle = { workspace = true, features = ["cuda"] }
 # a write copies in O(1) instead of cloning the whole cast.
 arc-swap   = { workspace = true }
 imbl       = { workspace = true }
+# The characters' live conversations, their system prompts and the grammar
+# cache: lock-free maps, so a lookup never waits on another character
+# (`engine/mind.rs`, *Locking*).
+papaya     = { workspace = true }
 
 [build-dependencies]
 embed-watch = { path = "../embed-watch" }

@@ -154,21 +154,10 @@ impl Minds {
             tree,
             max_tokens,
         } = put;
-        let conversation = self
-            .live
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .map(Arc::clone)
+        let resident = self
+            .resident_of(npc_id)
             .ok_or_else(|| anyhow::anyhow!("npc {npc_id} has no live conversation yet"))?;
-
-        let asker = self
-            .askers
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("npc {npc_id} has no live conversation yet"))?;
+        let (conversation, asker) = (&resident.conversation, &resident.asker);
 
         let prepared = Instant::now();
         // An idle character has its mission and journal brought current first. A
