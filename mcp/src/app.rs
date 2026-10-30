@@ -178,6 +178,26 @@ impl App {
         }
     }
 
+    /// `name` called on `backend` for `caller`, asked again — up to
+    /// [`context::MEMORY_TRIES`] calls in all — while the member it reached
+    /// answers that it does not serve the memory: the backend's members are
+    /// dealt calls one by one, so the next try is likely one that does.
+    async fn call_served(
+        &self,
+        backend: usize,
+        caller: &Caller,
+        on: &OnBehalf<'_>,
+        name: &str,
+        args: &Value,
+        step: &(dyn Fn(String) + Sync),
+    ) -> Value {
+        context::until_served(name, || {
+            self.link
+                .call(&self.backends[backend], caller, on, name, args, step)
+        })
+        .await
+    }
+
     fn route(&self, name: &str) -> Option<usize> {
         self.routes
             .read()
@@ -222,14 +242,7 @@ impl App {
         // A client gone drops the backend's call with it, so the backend does
         // not take an answer nobody read as delivered.
         let answer = tokio::select! {
-            answer = self.link.call(
-                &self.backends[backend],
-                &call.caller,
-                &on,
-                name,
-                args,
-                &step,
-            ) => answer,
+            answer = self.call_served(backend, &call.caller, &on, name, args, &step) => answer,
             _ = call.abandoned() => {
                 tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
                 return Ran::Left;
@@ -285,9 +298,8 @@ impl App {
             session: &call.session,
         };
         let answer = self
-            .link
-            .call(
-                &self.backends[backend],
+            .call_served(
+                backend,
                 &call.caller,
                 &on,
                 context::GET,
@@ -330,15 +342,7 @@ fn record_episode(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
         let tool = episode["tool"].as_str().unwrap_or("");
         for attempt in 1..=context::EPISODE_TRIES {
             let answer = this
-                .link
-                .call(
-                    &this.backends[backend],
-                    &caller,
-                    &on,
-                    context::EPISODE,
-                    &episode,
-                    &|_| {},
-                )
+                .call_served(backend, &caller, &on, context::EPISODE, &episode, &|_| {})
                 .await;
             if !context::is_error(&answer) {
                 return;

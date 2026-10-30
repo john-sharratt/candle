@@ -4,7 +4,7 @@
 //! folding changes what is shown by default, never what is found.
 
 use crate::actor::may_read;
-use crate::line::LineId;
+use crate::line::{Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
 use crate::slug::Slug;
@@ -30,6 +30,48 @@ pub struct Hit {
     pub shown: String,
 }
 
+/// The most of a line's text a hit shows: around the match, so a reader
+/// scans many hits and opens the one they want by its address.
+const EXCERPT: usize = 260;
+/// How much of an excerpt comes before the match.
+const LEAD: usize = 80;
+
+/// Each char lowercased to one char, so a place in the lowercase is the
+/// same place in the text.
+fn fold(s: &str) -> Vec<char> {
+    s.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// `text` cut to about [`EXCERPT`] characters around the first place
+/// `phrase` is found, ignoring case, `…` marking what is cut.
+fn excerpt(text: &str, phrase: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= EXCERPT {
+        return text.to_string();
+    }
+    // Text and phrase folded alike, char by char: the match is found where
+    // it is, else the excerpt starts at the text's start.
+    let lower = fold(text);
+    let want = fold(phrase.trim());
+    let at = (0..=lower.len().saturating_sub(want.len()))
+        .find(|&i| lower[i..].starts_with(&want))
+        .unwrap_or(0);
+    let start = at.saturating_sub(LEAD);
+    let end = (start + EXCERPT).min(chars.len());
+    let start = end.saturating_sub(EXCERPT).min(start);
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
 /// Every hit for `phrase` that `person` may read, under `under` when given,
 /// newest first, and the count before `limit` cut it.
 pub fn grep(
@@ -51,6 +93,11 @@ pub fn grep(
         if !j.problems.is_empty() {
             continue;
         }
+        let shown = |l: &Line| {
+            let mut cut = l.clone();
+            cut.text = excerpt(&l.text, phrase);
+            render_line(tree, &cut)
+        };
         for l in &j.window {
             if l.text.to_lowercase().contains(&want) {
                 hits.push(Hit {
@@ -58,7 +105,7 @@ pub fn grep(
                     found: Found::Window,
                     id: Some(l.id.clone()),
                     at: l.at,
-                    shown: render_line(tree, l),
+                    shown: shown(l),
                 });
             }
         }
@@ -70,7 +117,7 @@ pub fn grep(
                         found: Found::Archive(*period),
                         id: Some(l.id.clone()),
                         at: l.at,
-                        shown: render_line(tree, l),
+                        shown: shown(l),
                     });
                 }
             }
@@ -87,7 +134,7 @@ pub fn grep(
                     found: Found::Summary,
                     id: None,
                     at: s.built,
-                    shown: text,
+                    shown: excerpt(&text, phrase),
                 });
             }
         }
@@ -180,6 +227,64 @@ mod tests {
         );
         apply(&mut t, &john(), &Op::Fold { path: trip }, now()).unwrap();
         t
+    }
+
+    /// **A hit shows its text around the match**, cut where it is long.
+    #[test]
+    fn a_long_hit_is_an_excerpt_around_its_match() {
+        assert_eq!(excerpt("short line", "line"), "short line");
+        let long = format!(
+            "{} the PERMIT was granted {}",
+            "a".repeat(300),
+            "b".repeat(300)
+        );
+        let cut = excerpt(&long, "permit");
+        assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
+        assert!(cut.starts_with('…') && cut.ends_with('…'));
+        assert!(cut.contains("the PERMIT was granted"), "{cut}");
+        let head = format!("permit {}", "x".repeat(400));
+        let cut = excerpt(&head, "permit");
+        assert!(cut.starts_with("permit ") && cut.ends_with('…'));
+        // Text whose lowercase is longer than itself is still cut at the
+        // match, and so is a phrase that is.
+        let odd = format!("{} PERMİT granted {}", "İ".repeat(300), "x".repeat(300));
+        let cut = excerpt(&odd, "permİt");
+        assert!(cut.contains("PERMİT granted"), "{cut}");
+        assert_eq!(cut.chars().count(), EXCERPT + 2);
+        // A match near the end keeps a full excerpt, cut at its start only.
+        let tail = format!("{} the end PERMIT", "y".repeat(400));
+        let cut = excerpt(&tail, "permit");
+        assert!(
+            cut.starts_with('…') && cut.ends_with("the end PERMIT"),
+            "{cut}"
+        );
+        assert_eq!(cut.chars().count(), EXCERPT + 1);
+    }
+
+    /// **A grep hit on a long line shows its excerpt**, with the address
+    /// that opens the whole line.
+    #[test]
+    fn a_long_lines_hit_is_shown_as_its_excerpt() {
+        let mut t = sharratt();
+        let long = format!(
+            "{} the builder starts Monday {}",
+            "a".repeat(300),
+            "b".repeat(300)
+        );
+        apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                path: p("topics"),
+                text: long,
+            },
+            now(),
+        )
+        .unwrap();
+        let (hits, _) = grep(&t, &slug("john"), "builder", None, 10);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].shown.contains("…") && hits[0].shown.contains("the builder starts Monday"));
+        assert!(hits[0].shown.chars().count() < 400, "{}", hits[0].shown);
     }
 
     #[test]

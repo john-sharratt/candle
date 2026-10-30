@@ -111,7 +111,7 @@ mod tests {
         let text = open(&t, &path, t.get(&path).unwrap(), 2, now().plus(600));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], NOT_INSTRUCTIONS);
-        assert_eq!(lines[1], "~. 4 lines, 2 sub-journals; no summary yet");
+        assert_eq!(lines[1], "~. 4 lines; no summary yet");
         assert_eq!(lines[2], "No summary yet.");
         assert_eq!(lines[3], "Sub-journals:");
         // Nothing is written under either section yet: named, not listed.

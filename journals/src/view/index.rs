@@ -23,14 +23,23 @@ pub fn index_line(path: &JournalPath, j: &Journal, now: Stamp) -> String {
         return out;
     }
     let lines = j.all_lines().count();
-    let live = j.live_count();
+    // Named, so a reader goes a level deeper by name rather than by a guess
+    // or a grep; at most ten, so the line stays short.
+    let names: Vec<&str> = j
+        .live()
+        .filter(|(_, c)| !c.is_blank())
+        .map(|(n, _)| n.as_str())
+        .collect();
     let mut facts = vec![format!("{lines} line{}", if lines == 1 { "" } else { "s" })];
-    if live > 0 {
+    if !names.is_empty() {
         facts.push(format!(
-            "{live} sub-journal{}",
-            if live == 1 { "" } else { "s" }
+            "{} sub-journal{} ({})",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            names.join(", ")
         ));
     }
+    let live = names.len();
     let state = match j.summary() {
         None if lines == 0 && live == 0 => "empty".to_string(),
         None => "no summary yet".to_string(),
@@ -123,6 +132,36 @@ mod tests {
     use crate::ops::{apply, OnTaken, Op};
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
+
+    /// **An index line names a journal's sub-journals**, so a reader opens
+    /// the next level by name.
+    #[test]
+    fn an_index_line_names_its_sub_journals() {
+        let mut t = sharratt();
+        for name in ["trip", "budget"] {
+            apply(
+                &mut t,
+                &john(),
+                &Op::Create {
+                    under: p("topics"),
+                    name: slug(name),
+                    cue: format!("open for the {name}"),
+                    on_taken: OnTaken::Refuse,
+                },
+                now(),
+            )
+            .unwrap();
+        }
+        let root = p("@sharratt");
+        assert_eq!(
+            index(&root, t.get(&root).unwrap(), now()),
+            [
+                "@sharratt/topics — open for themes that span conversations. 0 lines, 2 \
+                 sub-journals (budget, trip); no summary yet",
+                "bots, projects, threads: nothing written yet",
+            ]
+        );
+    }
 
     #[test]
     fn index_lines_say_what_is_there_and_how_fresh() {
