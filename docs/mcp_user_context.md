@@ -145,7 +145,11 @@ forgets the clocks, so the next call after one carries the block again.
 ### 2.6 The client
 
 `mcp_server::Client` gains `Grok`: a `clientInfo.name` holding `grok` or
-`xai`. Its calls wait as `Other`'s do. The aggregator passes it on to the
+`xai` — or, when the name says nothing this knows, a `User-Agent` that does.
+Grok's handshake names itself `connectors-manager`, agent
+`grok-connectors-manager/0.1.0` (seen 2026-10-30), and opens a new session for
+each conversation, so every Grok conversation's first call carries its
+context. Its calls wait as `Other`'s do. The aggregator passes it on to the
 backends as it already passes on the client (`backend::Link::request`), so
 zend reads the same client the aggregator does. `initialize` is logged with
 the client's name and its `User-Agent`, so a client that is not recognised is

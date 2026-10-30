@@ -19,6 +19,17 @@ pub enum Client {
 }
 
 impl Client {
+    /// The client an `initialize` names: by its `clientInfo.name`, or, when
+    /// that names no client this knows, by its `User-Agent` — Grok calls
+    /// itself `connectors-manager` and says it is Grok only in its agent,
+    /// `grok-connectors-manager/0.1.0`.
+    pub fn of_hello(name: &str, agent: &str) -> Self {
+        match Self::of(name) {
+            Self::Other => Self::of(agent),
+            known => known,
+        }
+    }
+
     pub fn of(name: &str) -> Self {
         let name = name.to_ascii_lowercase();
         if name.contains("claude-code") || name.contains("claude code") {
@@ -78,6 +89,26 @@ mod tests {
         assert_eq!(Client::of("xai-mcp-client"), Client::Grok);
         assert_eq!(Client::of("claude-ai"), Client::Other);
         assert_eq!(Client::of(""), Client::Other);
+    }
+
+    /// **Grok's own handshake is known by its agent**: it names itself
+    /// `connectors-manager`, which says nothing, and Grok in its
+    /// `User-Agent`. A name that does say is believed over the agent.
+    #[test]
+    fn a_handshake_is_known_by_its_name_or_else_its_agent() {
+        assert_eq!(
+            Client::of_hello("connectors-manager", "grok-connectors-manager/0.1.0"),
+            Client::Grok
+        );
+        assert_eq!(
+            Client::of_hello("claude-code", "grok-connectors-manager/0.1.0"),
+            Client::ClaudeCode
+        );
+        assert_eq!(
+            Client::of_hello("claude-ai", "python-httpx/0.27"),
+            Client::Other
+        );
+        assert_eq!(Client::of_hello("connectors-manager", ""), Client::Other);
     }
 
     #[test]
