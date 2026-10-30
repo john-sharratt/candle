@@ -2656,6 +2656,15 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      `since[origin]` (or from 1, for an origin `since` does not name) that are
      *complete* in its own applied set, every `oseq` in them held or known gone. A gap in
      its own set ends a range. The answerer never claims a record it has not seen.
+   - **And only for what the requester lacks.** `since` is the requester's whole
+     applied set, gaps and all, so a range it already covers above its first gap is
+     not listed again (`replicate/answer.rs`). With the answer bounded (below), a
+     listing from `since`'s contiguous prefix alone re-sent the same first range
+     every time: on 2026-10-30 WhiteWorld's prefix for BlackWorld sat at a hole in
+     BlackWorld's own set (13,240,132), every answer re-listed the 131,072 `oseq`s of
+     records above it WhiteWorld already held, and the 45 million `oseq`s it lacked
+     further up — half the substrate, the dialogue and readings among them — were
+     never listed, so never fetched.
    - Each range lists every record it holds, as
      `(oseq, type, stream_id, chunk_index, len, digest)`, about 40 bytes packed, never
      the payload. It also lists the `oseq`s in the range it knows are gone.
