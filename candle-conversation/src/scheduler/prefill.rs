@@ -188,46 +188,24 @@ const RELIEF_OVERSHOOT_REGIONS: usize = 8;
 /// its own site instantly.
 const PROMOTE_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
-fn env_pct(var: &str, default: usize, max: usize) -> usize {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&p| p >= 1 && p <= max)
-        .unwrap_or(default)
-}
 /// Capacity fraction (%) at which cold **ingest** KV starts demoting to the warm
 /// (RAM) tier — gentle and early, well before the free-region setpoint is
 /// approached at all. Ingest KV is zero-reload-cost (never
 /// re-attended until query time; it re-elevates warm→hot on demand), so it is the
-/// cheapest relief and sheds first. Env `CANDLE_INGEST_DEMOTE_PCT`, default 50.
-fn ingest_demote_pct() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_pct("CANDLE_INGEST_DEMOTE_PCT", 50, 95))
-}
+/// cheapest relief and sheds first.
+const INGEST_DEMOTE_PCT: usize = 50;
 /// Slack the warm PIPELINE may hold above the standing budget: hot→warm output
 /// that exists only while the drain moves it to cold. On a zero-budget machine
 /// this is the only warm residency there ever is, and cutting admission for it
 /// would recreate the ratchet-to-the-floor failure — the drain clears it in a
 /// pass. The throttle fires only when `resident + pending` exceeds
-/// `budget + slack`, i.e. when the drain is genuinely not keeping up. Default
-/// 1 GiB; override with `CANDLE_WARM_PIPELINE_SLACK_MB`.
-pub(super) fn warm_pipeline_slack_bytes() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let mb = std::env::var("CANDLE_WARM_PIPELINE_SLACK_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(1024);
-        mb * 1024 * 1024
-    })
-}
+/// `budget + slack`, i.e. when the drain is genuinely not keeping up. 1 GiB.
+pub(super) const WARM_PIPELINE_SLACK_BYTES: u64 = 1024 * 1024 * 1024;
 /// Minimum spacing between OS memory probes for host-RAM backpressure —
 /// `sysinfo` is a syscall, so the scheduler caches the reading between waves.
 const HOST_RAM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 /// Sealed ingest turns kept hot per timeline (the rolling window) before the
-/// gentle-early demote sheds the rest to RAM. Env `CANDLE_INGEST_HOT_WINDOW`,
-/// default 8.
+/// gentle-early demote sheds the rest to RAM.
 ///
 /// **Must cover the ingest projection's gather width.** With the tool-round-trip
 /// ingest, each scope's summary decode projects the `scopes` group (`top_k` turns)
@@ -237,15 +215,7 @@ const HOST_RAM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// The scopes group is `top_k: 4`, so a scope's projected working set is ~4 turns
 /// (2 coupled turns × ~2 scopes); 8 keeps a couple of scopes of margin resident so
 /// the active working set never leaves hot.
-fn ingest_hot_window() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_INGEST_HOT_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-    })
-}
+const INGEST_HOT_WINDOW: usize = 8;
 
 /// Safety cap on the synchronous substrate-offload flush under pressure. The
 /// pass migrates hot→warm *before* its cold-disk writes, so the warm copies
@@ -3018,13 +2988,13 @@ impl Scheduler {
         // the `live <= watermark` early-return below can never satisfy. That
         // turns the gentle-early rung into an unconditional full demote of the
         // ingest tail on every wave.
-        let watermark = stats.total * ingest_demote_pct() / 100;
+        let watermark = stats.total * INGEST_DEMOTE_PCT / 100;
         if stats.live <= watermark {
             return;
         }
         let used = stats.live.saturating_mul(region_bytes() as usize);
         let watermark = watermark.saturating_mul(region_bytes() as usize);
-        let window = ingest_hot_window();
+        let window = INGEST_HOT_WINDOW;
         // Relieve back to the watermark, no further: `target` bounds the LRU walk
         // so the demote sheds the least-recently-active ingest tail just enough to
         // clear the pressure, never the whole hot working set.
@@ -3141,7 +3111,7 @@ impl Scheduler {
         usage
             > budget
                 .kv_warm_budget_bytes
-                .saturating_add(warm_pipeline_slack_bytes())
+                .saturating_add(WARM_PIPELINE_SLACK_BYTES)
     }
 
     /// **Ingest is not paced. The engine's own admission governs it.**
@@ -7009,14 +6979,13 @@ mod settle_passes_tests {
 
 #[cfg(test)]
 mod warm_budget_tests {
-    use super::warm_pipeline_slack_bytes;
+    use super::WARM_PIPELINE_SLACK_BYTES;
 
     /// The slack exists so a zero-budget machine's transient drain traffic never
-    /// reads as over-budget — tonight's healthy pipeline peaked ~0.7 GiB.
+    /// reads as over-budget — a healthy pipeline peaked ~0.7 GiB.
     #[test]
-    fn default_slack_clears_a_healthy_drain_pipeline() {
-        let slack = warm_pipeline_slack_bytes();
-        assert!(slack >= 768 * 1024 * 1024, "slack {slack} too small");
+    fn the_slack_clears_a_healthy_drain_pipeline() {
+        assert_eq!(WARM_PIPELINE_SLACK_BYTES, 1 << 30);
     }
 }
 

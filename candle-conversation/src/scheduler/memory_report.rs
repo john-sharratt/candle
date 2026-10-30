@@ -685,7 +685,7 @@ impl Scheduler {
             weights_reserved_bytes: budget.weights_reserved_bytes,
             weights_capped: budget.weights_capped,
             kv_warm_budget_bytes: budget.kv_warm_budget_bytes,
-            pipeline_slack_bytes: super::prefill::warm_pipeline_slack_bytes(),
+            pipeline_slack_bytes: super::prefill::WARM_PIPELINE_SLACK_BYTES,
             warm_usage_bytes: warm_usage,
             over_budget,
             pages_in_per_sec: candle::vram::pages_in_per_sec(),
