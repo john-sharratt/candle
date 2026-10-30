@@ -416,6 +416,7 @@ pub fn agent(ws: &Path) -> Arc<Jobs> {
             name: PROJECT_REPO.into(),
             dir: checkout,
             push: false,
+            journal: false,
         }],
     };
     let checkouts = Checkouts::open(&cfg, &policy()).expect("open the agent's checkout");

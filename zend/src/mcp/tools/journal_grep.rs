@@ -1,12 +1,17 @@
 //! `journal_grep {journal, pattern, entry?, max_results?}`: the lines of a
 //! journal's turns that hold `pattern` — one worker's, or a whole thread's
 //! when Claude does not yet know which worker learned something
-//! (`docs/claude_zend_gateway.md` §5, §5.3).
+//! (`docs/claude_zend_gateway.md` §5, §5.3) — or across the memory: every
+//! line, archive and summary the user reads, or one subtree of them
+//! (`docs/memory_backbone.md` §6.5).
 
+use journals::view::grep::{grep, render};
+use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 
-use super::{string, Answer, Ctx, LOADING};
-use crate::mcp::names::{Path, USER};
+use super::{mem, string, Answer, Ctx, LOADING};
+use crate::mcp::memory::is_memory_path;
+use crate::mcp::names::Path;
 use crate::mcp::threads::{self, project_journal, Worker};
 
 pub const NAME: &str = "journal_grep";
@@ -19,17 +24,19 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Search journals for a word or phrase (case-insensitive substring), to find the \
-            evidence behind a claim without paging through it. `journal` names where to search: a worker \
-            (`T:<thread>/<name>`), through the turns behind its entries, or behind one `entry`; every worker \
-            on a thread (`T:<thread>/*`), when you do not know which one learned it; a thread's own journal \
-            (`\"self\"` or `T:<thread>`); a project's standing rules (`P:<repository>`); or the user's own \
-            journal (`U:`), for what was kept or done for them in any earlier conversation. Each hit names its \
-            journal, entry, turn and line; read around one with `journal_read` and the entry.",
+        "description": "Search journals for a word or phrase (case-insensitive substring), to find something \
+            without paging through it. In the memory: `*` searches everything the user reads — their own \
+            journals and their family's, windows, archives and summaries, folded journals too; a path such as \
+            `~` or `@family/topics` searches below it. Each hit names its journal and line; read it with \
+            `journal_read`. In Zen's work: a worker (`T:<thread>/<name>`), through the turns behind its \
+            entries, or behind one `entry`; every worker on a thread (`T:<thread>/*`), when you do not know \
+            which one learned it; a thread's own journal (`\"self\"` or `T:<thread>`); a project's standing \
+            rules (`P:<repository>`). Each hit names its journal, entry, turn and line; read around one with \
+            `journal_read` and the entry.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>`, `U:` or `\"self\"`."},
+                "journal": {"type": "string", "description": "`*`, `~`, `@family` or a memory path; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}
@@ -66,7 +73,6 @@ fn scope(ctx: &Ctx, journal: &str) -> Result<Scope, String> {
         };
     }
     Ok(match Path::parse(journal)? {
-        Path::User => Scope::Notes(USER.into(), USER.into()),
         Path::Project(repo) => Scope::Notes(project_journal(&repo), project_journal(&repo)),
         Path::Thread(t) => thread(t),
         Path::Worker { thread, worker } => Scope::Worker(thread, worker),
@@ -123,15 +129,18 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         (Ok(j), Ok(p)) => (j, p),
         (Err(e), _) | (_, Err(e)) => return Answer::error(e),
     };
-    let scope = match scope(ctx, journal) {
-        Ok(s) => s,
-        Err(e) => return Answer::error(e),
-    };
     let max = args
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_HITS)
         .clamp(1, MAX_HITS) as usize;
+    if journal == "*" || is_memory_path(journal) {
+        return grep_memory(ctx, journal, pattern, max);
+    }
+    let scope = match scope(ctx, journal) {
+        Ok(s) => s,
+        Err(e) => return Answer::error(e),
+    };
     let entry = args.get("entry").and_then(Value::as_u64);
     let Some(records) = ctx.session.shared_substrate() else {
         return Answer::error("the model is still loading; try again shortly");
@@ -187,6 +196,27 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             answer(lines, total, pattern)
         }
     }
+}
+
+/// The memory's lines, archives and summaries that hold `pattern`: under
+/// `journal`, or everything the caller reads for `*`.
+fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
+    let m = match mem::open(ctx) {
+        Ok(m) => m,
+        Err(e) => return Answer::error(e),
+    };
+    let under = match journal {
+        "*" => None,
+        j => match m.path(j) {
+            Ok(p) => Some(p),
+            Err(e) => return Answer::error(e),
+        },
+    };
+    let (hits, total) = grep(&m.tree, &m.person, pattern, under.as_ref(), max);
+    if hits.is_empty() {
+        return Answer::ok(render(&hits, total));
+    }
+    Answer::ok(format!("{NOT_INSTRUCTIONS}\n{}", render(&hits, total)))
 }
 
 #[cfg(test)]

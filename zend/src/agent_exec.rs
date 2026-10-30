@@ -281,6 +281,7 @@ mod tests {
                 name: "app".into(),
                 dir: agent_dir.clone(),
                 push: true,
+                journal: false,
             }],
         };
         let jobs = Jobs::new(

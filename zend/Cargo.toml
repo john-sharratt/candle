@@ -63,6 +63,7 @@ doc-units           = { path = "../doc-units" }
 # A dialogue's working journal — entries, their check, the write grammar, the
 # draft — shared with npcd (`docs/zend_journal.md`).
 journal-core        = { path = "../journal-core" }
+journals            = { path = "../journals" }
 regex               = "1"
 tokenizers          = { workspace = true }
 # The resident conversations, keyed without a lock (`resident`).

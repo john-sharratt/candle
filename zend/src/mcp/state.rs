@@ -22,6 +22,7 @@ use mcp_server::{Client, Session, Store};
 use tokio::sync::watch;
 use web::auth::oidc::random_token;
 
+use super::memory::Memory;
 use super::parts::Parts;
 use super::records::Records;
 
@@ -124,11 +125,12 @@ impl<R: Records> Store for RecordStore<R> {
     }
 }
 
-/// What `/v1/mcp` holds in memory: the change signal, and the runner that
-/// starts workers' parts.
+/// What `/v1/mcp` holds in memory: the change signal, the runner that
+/// starts workers' parts, and the memory backbone.
 pub struct McpState {
     changed: watch::Sender<u64>,
     parts: Arc<Parts>,
+    memory: Arc<Memory>,
 }
 
 impl Default for McpState {
@@ -136,11 +138,17 @@ impl Default for McpState {
         Self {
             changed: watch::channel(0).0,
             parts: Arc::default(),
+            memory: Arc::default(),
         }
     }
 }
 
 impl McpState {
+    /// The memory backbone the `journal_*` tools read and write.
+    pub fn memory(&self) -> &Arc<Memory> {
+        &self.memory
+    }
+
     /// The `sub_run` runner every tool context carries.
     pub fn parts(&self) -> &Arc<Parts> {
         &self.parts

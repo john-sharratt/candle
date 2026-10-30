@@ -6549,6 +6549,15 @@ impl ZendSession {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let mcp = Arc::new(McpState::default());
+        // The memory backbone, when the agent holds the journal repository.
+        if let Some(journal) = config
+            .agent
+            .as_ref()
+            .and_then(|jobs| jobs.checkouts().journal())
+        {
+            mcp.memory().start(journal.dir.clone());
+        }
         Self {
             inference: Arc::new(ArcSwapOption::empty()),
             loading_substrate: Arc::new(OnceLock::new()),
@@ -6562,7 +6571,7 @@ impl ZendSession {
             started_at_ms,
             load_thread: Mutex::new(None),
             ingest_worker: Mutex::new(None),
-            mcp: Arc::new(McpState::default()),
+            mcp,
         }
     }
 

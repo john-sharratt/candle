@@ -174,11 +174,24 @@ pub fn apply_keeping(
     now: Stamp,
     keep: Option<&LineId>,
 ) -> Result<Applied> {
-    permit::check(tree, actor, op)?;
-    let mut scratch = tree.clone();
-    let applied = run(&mut scratch, actor, op, now, keep)?;
-    *tree = scratch;
+    let (next, applied) = applied_to(tree, actor, op, now, keep)?;
+    *tree = next;
     Ok(applied)
+}
+
+/// The tree `op` makes of `tree`, and what it changed, leaving `tree` as it
+/// was: one copy of the tree, which is the one returned.
+pub fn applied_to(
+    tree: &Tree,
+    actor: &Actor,
+    op: &Op,
+    now: Stamp,
+    keep: Option<&LineId>,
+) -> Result<(Tree, Applied)> {
+    permit::check(tree, actor, op)?;
+    let mut next = tree.clone();
+    let applied = run(&mut next, actor, op, now, keep)?;
+    Ok((next, applied))
 }
 
 fn run(

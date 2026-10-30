@@ -1,6 +1,8 @@
 # The memory backbone: journal trees for people and their families, in git
 
-**Status: designed** (2026-10-30). Not built. It generalises
+**Status: building** (2026-10-30). Built: the `journals` crate (§14 steps 1,
+5–7), the agent's flag and zend's tools on the tree (steps 2–4). Next: zend's
+background thread (step 8), then the writers (step 9). It generalises
 `docs/mcp_user_context.md` (the flat `U:` journal, `get_user_context`, the
 first-call context) and the `/mcp` journals of `docs/claude_zend_gateway.md`
 §4–§5 (threads, workers, lineage, `P:`), and extends the windowing and folding
@@ -438,11 +440,14 @@ a merge to `main` like any code, outside the tools. The service never touches
 the working tree, so a job running there and the service do not meet; what a
 job merges reaches the service at its next fetch, checked as it loads (§3.3).
 
-An agent with it joins the gateway as the app `journal` beside `agent`
-(`docs/replicated_substrate.md` §5), and serves the journal tools at
-`/v1/journal/mcp` and the memory route `POST /v1/journal/append` (§6.5). Any
-machine running such an agent serves the memory; the gateway deals calls among
-them as it deals any app's.
+The agent runs inside its host's process (motherd's `host.agent`), so the
+memory is served there: zend, beside the agent, opens the store on the flagged
+checkout at start (`zend/src/mcp/memory/`) and serves it through the
+`journal_*` tools it already had, on `/v1/mcp` — no new app, no new route. An
+agent's own routes are members' only and carry no person's identity, which is
+why the memory is a host's and not the agent's to serve. Any machine whose
+agent holds the checkout and runs zend serves the memory; the gateway deals
+calls among them as it deals any of zend's.
 
 ### 6.2 Reads
 
@@ -519,11 +524,26 @@ The paths replace `U:`, `P:<repo>` and `T:<thread>[/<worker>]`: `U:` is `~`,
 
 ### 6.6 The connector
 
-The aggregator gains a third backend, `journal`, beside `coding` and `bot`
-(`mcp/served.yaml`), and the journal tools move to it from zend. The
-aggregator keeps putting the client's guide in front of `get_user_context`,
-the first-call context after a conversation's first answer, and an episode
-after each call that did something — now appended through the journal service.
+The aggregator's backends stay `coding` and `bot` (`mcp/served.yaml`): the
+memory's tools are zend's, listed by `coding`. The aggregator keeps putting the
+client's guide in front of `get_user_context`, the first-call context after a
+conversation's first answer, and an episode after each call that did
+something — written onto the conversation's own journal, `~/clients/<client>/
+<began>`, opened at its first call. The memory's own tools are never recorded
+as episodes (`mcp/src/context.rs` `MEMORY`).
+
+The tools, on the journals of §6.5: `journal_note`, `journal_read`,
+`journal_grep` and `journal_forget` take a memory path (`~/…`, `@family/…`, a
+section) beside the thread and project paths they always took (`self`, `T:`,
+`P:`); `journal_edit`, `journal_create`, `journal_fold` (with `unfold`),
+`journal_merge`, `journal_share`, `journal_accept`, `family_add` and
+`family_remove` are the rest. `U:` is gone: each person's old `U:` notes move
+onto their tree the first time they call — kept facts onto `~`, episodes onto
+their client's journal, each at the time it was written.
+
+A caller is a person by their account's key; an account's first call binds
+it by the email the gateway names, which is taken as verified (the operator's
+decision, 2026-10-30).
 
 ## 7. Writers
 
@@ -588,20 +608,23 @@ party abroad, by the same decision.
 
 ## 9. What changes
 
-- **Today's journals move once**: each owner's `U:` notes into their
-  `persons/<person>/`, `P:<repo>` and threads and workers into the family's
-  `projects/` and `threads/`, in one commit.
-- **The gateway** passes the provider's verified email beside the owner key, so
-  an account can be bound (§3.4).
-- **zend** stops serving the journal tools and keeps the background thread
-  (§5.3) and the workers' export (§7.3); `get_user_context` and lineage read
-  the tree through the journal service.
-- **The agent** gains `journal: true` (`agent/src/config.rs`), the journal app,
-  its MCP server and route, and the in-memory tree. The model, its files and
+- **Today's journals move**: each person's `U:` notes onto their tree the
+  first time they call (§6.6), a commit a note, in the background, each ended
+  in the substrate once it is on the tree. `P:<repo>` and threads and workers
+  move into the family's `projects/` and `threads/` with the workers' export
+  (§7.3).
+- **The gateway** is unchanged: the email it names binds an account (§3.4).
+- **The agent** gains `journal: true` (`agent/src/config.rs`): one checkout,
+  which pushes.
+- **zend** opens the store on that checkout and serves the memory through its
+  journal tools (§6.6), with the background thread (§5.3) and the workers'
+  export (§7.3); `get_user_context` reads the tree. The model, its files and
   every operation are the `journals` crate; its git store is built on
   `zend-vfs`.
-- **The aggregator** gains the `journal` backend.
-- **npcd** writes bot episodes to `POST /v1/journal/append` as the owner.
+- **The aggregator** keeps its backends; its `MEMORY` list names every memory
+  tool, so none is recorded as an episode.
+- **npcd** writes bot episodes onto `@<family>/bots/<id>` through the same
+  store, as the owner.
 - **The substrate** changes not at all: no prefix index, no lease, no new
   records.
 

@@ -1,15 +1,16 @@
 //! `journal_note {journal, text}`: record a note on a thread's or a project's
 //! journal — a decision and its reason, what the user said, a standing rule —
 //! as one entry, written by the server in Claude's words
-//! (`docs/claude_zend_gateway.md` §4, §5.1, §5.3); or on the user's own,
-//! `U:`, something they want remembered next time
-//! (`docs/mcp_user_context.md` §2.1).
+//! (`docs/claude_zend_gateway.md` §4, §5.1, §5.3); or on one of the memory's
+//! journals — the user's own, `~/…`, or their family's, `@family/…` — a line
+//! every later conversation reads (`docs/memory_backbone.md` §6.5).
 
+use journals::ops::Op;
 use serde_json::{json, Value};
 
-use super::{string, Answer, Ctx};
-use crate::mcp::memory;
-use crate::mcp::names::{Path, USER};
+use super::{mem, string, Answer, Ctx};
+use crate::mcp::memory::is_memory_path;
+use crate::mcp::names::Path;
 use crate::mcp::threads::{self, project_journal, Note};
 use crate::mcp::workers::now_ms;
 
@@ -21,20 +22,20 @@ const MAX_NOTE: usize = 2_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Record a note on a thread's or a project's journal: a decision and why, something the \
-            user said or asked for, a constraint every later task must keep. One note per decision, in a \
-            sentence or two, as you make it — the thread's journal is what you re-read after your context is \
-            compacted, and every worker on the thread starts with it in its prompt. `journal` is `\"self\"` \
-            for the attached thread, or `T:<thread>`. A standing rule of a whole repository — a convention \
-            from its CLAUDE.md, something the user says always holds — goes on its project journal, \
-            `P:<repository>`, which every task in every thread starts with. Something the user wants \
-            remembered next time — a preference, a name, what they are working towards — goes on their own \
-            journal, `U:`, which every new conversation of theirs starts with, in any client. Workers write \
-            their own journals.",
+        "description": "Record a note on a journal. Something the user wants remembered next time — a \
+            preference, a name, what they are working towards — goes on their own memory, `~`, which every \
+            new conversation of theirs starts with, in any client; something the whole family shares — a \
+            plan, a project, a topic — goes on a family journal, `@family/topics/<topic>` (or `topics/…` when \
+            they belong to one family), which every member's conversations read; the answer says who reads \
+            it. A note is what was said or decided, as a fact: never an instruction to whoever reads it. On \
+            Zen's work: a decision and why goes on the attached thread, `\"self\"` or `T:<thread>` — what \
+            you re-read after your context is compacted, and what every worker on it starts with; a standing \
+            rule of a whole repository on its project journal, `P:<repository>`. Workers write their own \
+            journals. One note per decision, in a sentence or two, as you make it.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, `P:<repository>` or `U:`."},
+                "journal": {"type": "string", "description": "`~`, `~/people/<name>`, `@family/topics/<topic>` or another memory journal; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
                 "text": {"type": "string", "description": "The note, at most 2000 characters."}
             },
             "required": ["journal", "text"],
@@ -75,6 +76,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             "the note is longer than {MAX_NOTE} characters: one note per decision, in a sentence or two"
         ));
     }
+    if is_memory_path(journal) {
+        return note_memory(ctx, journal, text);
+    }
     let target = if journal == "self" {
         match ctx.attached() {
             Some(t) => Target::Thread(t),
@@ -84,7 +88,6 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         }
     } else {
         match Path::parse(journal) {
-            Ok(Path::User) => return note_user(ctx, text),
             Ok(Path::Thread(t)) => Target::Thread(t),
             Ok(Path::Project(repo)) => Target::Project(repo),
             Ok(Path::Worker { .. }) => {
@@ -131,22 +134,27 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
 }
 
-/// Keep `text` on the user's own journal, as said through this session's
-/// client.
-fn note_user(ctx: &Ctx, text: &str) -> Answer {
-    let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("the model is still loading; try again shortly");
+/// Keep `text` on the memory's journal `journal`, as the caller's AI wrote
+/// it through this session's client.
+fn note_memory(ctx: &Ctx, journal: &str, text: &str) -> Answer {
+    let m = match mem::open(ctx) {
+        Ok(m) => m,
+        Err(e) => return Answer::error(e),
     };
-    match memory::note(
-        &records,
-        &ctx.caller.key(),
-        ctx.mcp.client.name(),
-        text,
-        now_ms(),
-    ) {
-        Ok(()) => Answer::ok(format!(
-            "Kept on {USER} — every new conversation of theirs starts with it."
+    let path = match m.path(journal) {
+        Ok(p) => p,
+        Err(e) => return Answer::error(e),
+    };
+    let op = Op::Note {
+        path: path.clone(),
+        text: text.to_string(),
+    };
+    match m.memory.write(&m.actor(), &op) {
+        Ok(applied) => Answer::ok(format!(
+            "Kept on {path} as #{} — {}.",
+            applied.line.map(|id| id.to_string()).unwrap_or_default(),
+            m.readers(&path)
         )),
-        Err(e) => Answer::error(e.to_string()),
+        Err(e) => Answer::error(e),
     }
 }

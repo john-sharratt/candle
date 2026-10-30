@@ -32,6 +32,11 @@ pub struct CheckoutConfig {
     /// The agent holds the credentials to push to its origin.
     #[serde(default)]
     pub push: bool,
+    /// This checkout is the memory backbone's journal repository
+    /// (`docs/memory_backbone.md` §6.1): the host serves the journals from
+    /// it, beside the jobs it takes like any other checkout.
+    #[serde(default)]
+    pub journal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -55,6 +60,23 @@ impl AgentConfig {
         names.sort_unstable();
         if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
             anyhow::bail!("the checkout `{}` is named twice", w[0]);
+        }
+        let journals: Vec<&CheckoutConfig> = cfg.checkouts.iter().filter(|c| c.journal).collect();
+        if journals.len() > 1 {
+            anyhow::bail!(
+                "`journal: true` is on {}: one checkout is the journal repository",
+                journals
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            );
+        }
+        if let Some(j) = journals.iter().find(|c| !c.push) {
+            anyhow::bail!(
+                "the checkout `{}` is the journal repository and needs `push: true`: every write is pushed",
+                j.name
+            );
         }
         Ok(cfg)
     }
@@ -92,11 +114,13 @@ mod tests {
                         name: "candle".into(),
                         dir: "/a/candle".into(),
                         push: true,
+                        journal: false,
                     },
                     CheckoutConfig {
                         name: "site".into(),
                         dir: "/a/site".into(),
                         push: false,
+                        journal: false,
                     },
                 ],
             }
@@ -113,5 +137,31 @@ mod tests {
         )
         .is_err());
         assert!(AgentConfig::parse("jobs_dir: j\ncheckouts: []\nshell: bash\n").is_err());
+    }
+
+    /// **One checkout is the journal repository**, and it pushes.
+    #[test]
+    fn the_journal_checkout_is_one_and_pushes() {
+        let cfg = AgentConfig::parse(
+            "jobs_dir: j\ncheckouts:\n  - {name: journals, dir: x, push: true, journal: true}\n  - {name: candle, dir: y, push: true}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.checkouts.iter().map(|c| c.journal).collect::<Vec<_>>(),
+            [true, false]
+        );
+        let two = AgentConfig::parse(
+            "jobs_dir: j\ncheckouts:\n  - {name: a, dir: x, push: true, journal: true}\n  - {name: b, dir: y, push: true, journal: true}\n",
+        )
+        .unwrap_err();
+        assert!(two.to_string().contains("on a and b"), "{two}");
+        let unpushed = AgentConfig::parse(
+            "jobs_dir: j\ncheckouts:\n  - {name: journals, dir: x, journal: true}\n",
+        )
+        .unwrap_err();
+        assert!(
+            unpushed.to_string().contains("needs `push: true`"),
+            "{unpushed}"
+        );
     }
 }

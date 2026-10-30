@@ -24,7 +24,7 @@
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
 //! | [`stops`] | Claude stopping a running worker, at its next tool round |
 //! | [`threads`] | Threads, workers and the thread's journal, as records |
-//! | [`memory`] | The user's own journal, `U:`, and the context made of it |
+//! | [`memory`] | The memory backbone: the user's and their family's journals, and the context made of them |
 //! | [`names`] | Names and paths |
 //! | [`caller`] | Who is calling, and the key their records are kept under |
 //! | [`ownership`] | Who may open a worker's conversation on zend's other routes |

@@ -139,6 +139,7 @@ fn jobs_over(r: &Repos, push: bool) -> Arc<Jobs> {
             name: "r".into(),
             dir: r.agent.clone(),
             push,
+            journal: false,
         }],
     };
     let shell = copy("a", "b").0;

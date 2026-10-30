@@ -3,16 +3,22 @@
 //!
 //! `journal` is `"self"` — the attached thread — or a path: a thread's journal
 //! is the entries the server wrote as Claude delegated (§4); a worker's is the
-//! journal its own conversation kept.
+//! journal its own conversation kept. A memory path — `~/…`, `@family/…` —
+//! opens one of the memory's journals (`docs/memory_backbone.md` §6.5), or
+//! with `#<line id>` reads one line of it.
 
+use journals::time::Stamp;
+use journals::tree::WINDOW;
+use journals::view::open::open;
+use journals::view::who::render_line;
+use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 use zend_tools::tools::journal::address;
 
-use super::{string, Answer, Ctx, LOADING};
-use crate::mcp::memory;
-use crate::mcp::names::{Path, USER};
+use super::{mem, string, Answer, Ctx, LOADING};
+use crate::mcp::memory::{is_memory_path, Memory};
+use crate::mcp::names::Path;
 use crate::mcp::threads::{self, project_journal, Note};
-use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "journal_read";
 
@@ -24,19 +30,22 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Read a journal: a thread's, a worker's or a project's. `journal` names it — \
-            `\"self\"` or `T:<thread>` for a thread (every task started on it, how each ended, and the notes on \
-            it); `T:<thread>/<name>` for a worker (the entries it wrote about its work); `P:<repository>` for a \
-            project (its standing rules). With `entry`, or an address such as `T:<thread>/<name>#12`, it reads \
-            one entry instead: a thread's or project's note, or — for a worker — the turns behind that entry, \
-            `limit` lines from `offset`, which are the evidence for what it claims. Read the entry first and its \
-            turns only where a claim needs checking. Re-read the thread's journal after your context is \
-            compacted. `U:` is the user's own journal: everything kept for them and done for them, from \
-            every client — what to read when they ask what you remember.",
+        "description": "Read a journal. The memory's: `~` is the user's own — who they are, and an index of \
+            their conversations and the people in their life; `@family` their family's — projects, topics, \
+            threads and bots every member shares; any journal below either by path, such as \
+            `~/clients/grok` or `@family/topics/house-build`. Each opens with its summary, its sub-journals \
+            and its newest lines; `<path>#<line id>` reads one line. Read the memory when the user asks what \
+            you remember. Zen's: `\"self\"` or `T:<thread>` for a thread (every task started on it, how each \
+            ended, and the notes on it); `T:<thread>/<name>` for a worker (the entries it wrote about its \
+            work); `P:<repository>` for a project (its standing rules). With `entry`, or an address such as \
+            `T:<thread>/<name>#12`, it reads one entry instead: a thread's or project's note, or — for a \
+            worker — the turns behind that entry, `limit` lines from `offset`, which are the evidence for \
+            what it claims. Read the entry first and its turns only where a claim needs checking. Re-read the \
+            thread's journal after your context is compacted.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>` or `U:` — or an entry's address, `T:<thread>/<name>#12`."},
+                "journal": {"type": "string", "description": "`~`, `@family`, a memory path or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
                 "offset": {"type": "integer", "minimum": 1, "description": "The first line of a worker entry's page (1 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."}
@@ -63,6 +72,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(j) => j,
         Err(e) => return Answer::error(e),
     };
+    if is_memory_path(journal) {
+        return read_memory(ctx, journal);
+    }
     // An address names its entry: `T:<thread>/<name>#12`, or `#12.3` for one
     // of its claims.
     let (journal, addressed) = address(journal);
@@ -87,13 +99,6 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let owner = ctx.caller.key();
     match path {
-        Path::User => {
-            let notes = memory::entries(&records, &owner);
-            match args.get("entry").and_then(Value::as_u64) {
-                None => Answer::ok(memory::render(&notes, now_ms())),
-                Some(n) => notes_answer(USER, &notes, Some(n)),
-            }
-        }
         Path::Project(repo) => {
             let journal = project_journal(&repo);
             let notes = threads::notes(&records, &owner, &journal);
@@ -149,6 +154,41 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                 }
             }
         }
+    }
+}
+
+/// One of the memory's journals, opened; or one line of it, by its address.
+fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
+    let m = match mem::open(ctx) {
+        Ok(m) => m,
+        Err(e) => return Answer::error(e),
+    };
+    let actor = m.actor();
+    if journal.contains('#') {
+        let address = match m.address(journal) {
+            Ok(a) => a,
+            Err(e) => return Answer::error(e),
+        };
+        let j = match Memory::readable(&m.tree, &actor, &address.path) {
+            Ok(j) => j,
+            Err(e) => return Answer::error(e),
+        };
+        return match j.line(&address.id) {
+            Some(line) => Answer::ok(format!(
+                "{NOT_INSTRUCTIONS}\n{} {}",
+                address.path,
+                render_line(&m.tree, line)
+            )),
+            None => Answer::error(format!("{address} is no line")),
+        };
+    }
+    let path = match m.path(journal) {
+        Ok(p) => p,
+        Err(e) => return Answer::error(e),
+    };
+    match Memory::readable(&m.tree, &actor, &path) {
+        Ok(j) => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
+        Err(e) => Answer::error(e),
     }
 }
 

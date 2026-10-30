@@ -1,53 +1,89 @@
-//! `journal_forget {journal: "U:", says}`: end the entry of the user's own
-//! journal that says `says`, when they ask for something to be forgotten
-//! (`docs/mcp_user_context.md` §2.1, §4). A thread's and a project's journals
-//! are their work's record, and stay as written.
+//! `journal_forget {journal, says}`: forget one line of a memory journal —
+//! when the user asks for something to be forgotten, or a kept fact has
+//! stopped being true (`docs/memory_backbone.md` §8). The line leaves the
+//! journal's current state; the commit that removed it keeps it in history. A
+//! thread's and a project's journals are their work's record, and stay as
+//! written.
 
+use journals::ops::forget::find_line;
+use journals::ops::{Op, Which};
 use serde_json::{json, Value};
 
-use super::{string, Answer, Ctx};
-use crate::mcp::memory;
-use crate::mcp::names::{Path, USER};
+use super::{mem, string, Answer, Ctx};
+use crate::mcp::memory::is_memory_path;
 
 pub const NAME: &str = "journal_forget";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Forget one entry of the user's own journal, `U:` — when they ask you to forget \
-            something, or a kept fact has stopped being true. Name the entry by a few words it says \
-            (`says: \"Miso\"`), as the user would: the one entry that holds them, ignoring case, is \
-            forgotten; when none does, or several do, nothing is forgotten and the answer says which. Only \
-            `U:` forgets: a thread's and a project's journals are the record of their work.",
+        "description": "Forget one line of a memory journal — when the user asks you to forget something, or \
+            a kept fact has stopped being true. `journal` is the journal, `~` or another; name the line by a \
+            few words it says (`says: \"Miso\"`), as the user would: the one line that holds them, ignoring \
+            case, is forgotten; when none does, or several do, nothing is forgotten and the answer names \
+            them. Or give `journal` as a line's address, `<path>#<line id>`, and no `says`. In a family's \
+            journals, a member forgets their own lines and an owner any. A thread's and a project's \
+            journals are the record of their work and are not forgotten.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "enum": [USER], "description": "`U:`, the user's own journal."},
-                "says": {"type": "string", "description": "A few words of the entry to forget."}
+                "journal": {"type": "string", "description": "A memory journal (`~`, `@family/…`), or a line's address `<path>#<line id>`."},
+                "says": {"type": "string", "description": "A few words of the line to forget."}
             },
-            "required": ["journal", "says"],
+            "required": ["journal"],
             "additionalProperties": false
         }
     })
 }
 
 pub fn call(ctx: &Ctx, args: &Value) -> Answer {
-    let (journal, says) = match (string(args, "journal"), string(args, "says")) {
-        (Ok(j), Ok(s)) => (j, s),
-        (Err(e), _) | (_, Err(e)) => return Answer::error(e),
+    let journal = match string(args, "journal") {
+        Ok(j) => j,
+        Err(e) => return Answer::error(e),
     };
-    // The journal as an entry's address names it too: `U:#3` is on `U:`.
-    let journal = journal.split_once('#').map_or(journal, |(j, _)| j);
-    if Path::parse(journal) != Ok(Path::User) {
+    if !is_memory_path(journal) {
         return Answer::error(format!(
-            "only the user's own journal, `{USER}`, forgets: `{journal}` is the record of its work"
+            "only the memory's journals forget: `{journal}` is the record of its work"
         ));
     }
-    let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("the model is still loading; try again shortly");
+    let m = match mem::open(ctx) {
+        Ok(m) => m,
+        Err(e) => return Answer::error(e),
     };
-    match memory::forget(&records, &ctx.caller.key(), says) {
-        Ok(note) => Answer::ok(format!("Forgot: {} {}", note.label, note.text)),
+    let says = args.get("says").and_then(Value::as_str);
+    let (path, which) = match (journal.contains('#'), says) {
+        (true, None) => match m.address(journal) {
+            Ok(a) => (a.path, Which::Id(a.id)),
+            Err(e) => return Answer::error(e),
+        },
+        (true, Some(_)) => return Answer::error("give a line's address or `says`, not both"),
+        (false, Some(s)) => match m.path(journal) {
+            Ok(p) => (p, Which::Says(s.to_string())),
+            Err(e) => return Answer::error(e),
+        },
+        (false, None) => {
+            return Answer::error("say which line: `says` with a few of its words, or its address")
+        }
+    };
+    // What the line said, as this call's tree has it: told back only when the
+    // store forgot that same line, since the tree may have moved on.
+    let seen = m
+        .tree
+        .get(&path)
+        .and_then(|j| find_line(j, &which, &path).ok())
+        .map(|l| (l.id.clone(), l.text.clone()));
+    match m.memory.write(
+        &m.actor(),
+        &Op::Forget {
+            path: path.clone(),
+            which,
+        },
+    ) {
+        Ok(applied) => Answer::ok(match (applied.line, seen) {
+            (Some(id), Some((was, text))) if id == was => format!("Forgot {path}#{id}: {text}"),
+            (Some(id), _) => format!("Forgot {path}#{id}."),
+            (None, _) => format!("Forgot a line of {path}."),
+        }),
         Err(e) => Answer::error(e),
     }
 }

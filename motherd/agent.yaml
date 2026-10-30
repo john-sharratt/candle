@@ -21,6 +21,9 @@ checkouts:
   - name: battle-mind
     dir: D:/agent/battle-mind
     push: true
+  # The memory backbone (docs/memory_backbone.md §6.1): zend serves the
+  # journals from this checkout, which takes jobs like any other.
   - name: journals
     dir: D:/agent/journals
     push: true
+    journal: true

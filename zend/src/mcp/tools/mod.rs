@@ -40,13 +40,22 @@ mod cluster_command;
 mod cluster_job_status;
 mod cluster_logs;
 mod cluster_status;
+mod family_add;
+mod family_remove;
 mod gateway_command;
+mod journal_accept;
+mod journal_create;
+mod journal_edit;
+mod journal_fold;
 mod journal_forget;
 mod journal_grep;
+mod journal_merge;
 mod journal_note;
 mod journal_read;
+mod journal_share;
 mod layer_read;
 mod layer_toggle;
+mod mem;
 mod nudge;
 mod reply;
 mod repo_job;
@@ -146,7 +155,15 @@ pub fn definitions() -> Value {
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
+        journal_edit::definition(),
         journal_forget::definition(),
+        journal_create::definition(),
+        journal_fold::definition(),
+        journal_merge::definition(),
+        journal_share::definition(),
+        journal_accept::definition(),
+        family_add::definition(),
+        family_remove::definition(),
         threads::definition(),
         archive::definition(),
         cluster_status::definition(),
@@ -182,6 +199,14 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         journal_read::NAME => journal_read::call(ctx, args),
         journal_note::NAME => journal_note::call(ctx, args),
         journal_grep::NAME => journal_grep::call(ctx, args),
+        journal_edit::NAME => journal_edit::call(ctx, args),
+        journal_create::NAME => journal_create::call(ctx, args),
+        journal_fold::NAME => journal_fold::call(ctx, args),
+        journal_merge::NAME => journal_merge::call(ctx, args),
+        journal_share::NAME => journal_share::call(ctx, args),
+        journal_accept::NAME => journal_accept::call(ctx, args),
+        family_add::NAME => family_add::call(ctx, args),
+        family_remove::NAME => family_remove::call(ctx, args),
         threads::NAME => threads::call(ctx, args),
         archive::NAME => archive::call(ctx, args),
         cluster_status::NAME => cluster_status::call(ctx, args).await,
@@ -282,7 +307,15 @@ mod tests {
                 "journal_read",
                 "journal_grep",
                 "journal_note",
+                "journal_edit",
                 "journal_forget",
+                "journal_create",
+                "journal_fold",
+                "journal_merge",
+                "journal_share",
+                "journal_accept",
+                "family_add",
+                "family_remove",
                 "thread_list",
                 "thread_archive",
                 "cluster_status",

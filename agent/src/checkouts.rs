@@ -19,6 +19,8 @@ pub struct Checkout {
     pub dir: PathBuf,
     /// The agent holds the credentials to push to its origin.
     pub push: bool,
+    /// It is the journal repository the host serves the journals from.
+    pub journal: bool,
     /// Origin's fetch URL; empty when the checkout has no origin.
     pub origin: String,
     pub source: Arc<GitSource>,
@@ -74,6 +76,7 @@ impl Checkouts {
                     name: c.name.clone(),
                     dir: c.dir.clone(),
                     push: c.push,
+                    journal: c.journal,
                     origin,
                     source,
                     server,
@@ -109,6 +112,11 @@ impl Checkouts {
 
     pub fn all(&self) -> impl Iterator<Item = &Checkout> {
         self.by_name.values()
+    }
+
+    /// The journal repository, when one checkout is it.
+    pub fn journal(&self) -> Option<&Checkout> {
+        self.all().find(|c| c.journal)
     }
 
     /// The repositories `HELLO` advertises (§11.2).

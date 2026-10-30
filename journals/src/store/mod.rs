@@ -20,6 +20,7 @@ pub mod read;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 use zend_vfs::{
@@ -32,7 +33,7 @@ use crate::actor::Actor;
 use crate::error::Error;
 use crate::line::LineId;
 use crate::ops::remap::remap;
-use crate::ops::{apply, apply_keeping, Applied, Op};
+use crate::ops::{applied_to, Applied, Op};
 use crate::store::diff::{apply_changes, changes};
 use crate::store::message::{message, read};
 use crate::store::read::files_at;
@@ -91,7 +92,9 @@ pub struct Store {
     /// What origin's branch held when last fetched or pushed.
     origin_at: Oid,
     files: BTreeMap<String, Vec<u8>>,
-    tree: Tree,
+    /// Shared with whoever reads it: a write makes a new tree, never changes
+    /// the one handed out.
+    tree: Arc<Tree>,
 }
 
 fn git_time(at: Stamp) -> GitTime {
@@ -124,7 +127,7 @@ impl Store {
         })?;
         let mut store = Store {
             files: files_at(&repo, &origin_at)?,
-            tree: Tree::default(),
+            tree: Arc::default(),
             head: origin_at.clone(),
             origin_at,
             repo,
@@ -138,7 +141,7 @@ impl Store {
                     new: store.origin_at.clone(),
                 });
                 store.repo.update_refs(&txn)?;
-                store.tree = load(&store.files);
+                store.tree = Arc::new(load(&store.files));
             }
             Some(head) => {
                 let origin = Rev::Oid(store.origin_at.clone());
@@ -147,7 +150,7 @@ impl Store {
                     // Unpushed commits on top of origin: the next sync pushes them.
                     store.head = head;
                     store.files = files_at(&store.repo, &store.head)?;
-                    store.tree = load(&store.files);
+                    store.tree = Arc::new(load(&store.files));
                 } else {
                     // Origin moved past what this checkout last pushed:
                     // whatever of its own it still holds goes on top.
@@ -171,6 +174,11 @@ impl Store {
         &self.tree
     }
 
+    /// The tree, to hold beyond this borrow: no copy is made.
+    pub fn shared(&self) -> Arc<Tree> {
+        Arc::clone(&self.tree)
+    }
+
     pub fn head(&self) -> &Oid {
         &self.head
     }
@@ -183,8 +191,7 @@ impl Store {
     /// Apply `op` for `actor` at `now` and commit it onto the service's head.
     /// Nothing held here changes unless the commit and the ref move both do.
     pub fn write(&mut self, actor: &Actor, op: &Op, now: Stamp) -> Result<Applied, StoreError> {
-        let mut next = self.tree.clone();
-        let applied = apply(&mut next, actor, op, now)?;
+        let (next, applied) = applied_to(&self.tree, actor, op, now, None)?;
         let (new, files) = self.commit(&self.head, &self.files, &next, &applied, actor, op, now)?;
         let txn = RefTransaction::new().push(RefOp::Update {
             name: journal_ref(),
@@ -194,7 +201,7 @@ impl Store {
         self.repo.update_refs(&txn)?;
         self.head = new;
         self.files = files;
-        self.tree = next;
+        self.tree = Arc::new(next);
         Ok(applied)
     }
 
@@ -288,7 +295,7 @@ impl Store {
                     old: self.head.clone(),
                 });
                 self.repo.update_refs(&txn)?;
-                self.tree = load(&files);
+                self.tree = Arc::new(load(&files));
                 self.files = files;
                 self.head = theirs.clone();
                 self.origin_at = theirs;
@@ -344,9 +351,8 @@ impl Store {
                 }
             };
             remap(&mut rec.op, &renamed);
-            let mut next = tree.clone();
-            match apply_keeping(&mut next, &rec.actor, &rec.op, rec.at, rec.line.as_ref()) {
-                Ok(applied) => match self
+            match applied_to(&tree, &rec.actor, &rec.op, rec.at, rec.line.as_ref()) {
+                Ok((next, applied)) => match self
                     .commit(&base, &files, &next, &applied, &rec.actor, &rec.op, rec.at)
                 {
                     Ok((new, new_files)) => {
@@ -382,7 +388,7 @@ impl Store {
         self.head = base;
         self.origin_at = onto;
         self.files = files;
-        self.tree = tree;
+        self.tree = Arc::new(tree);
         Ok(done)
     }
 }
