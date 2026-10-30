@@ -82,7 +82,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::{TurnLayout, TurnSegment};
 use crate::working_set::marks::is_dialogue;
-use candle_nn::kv_cache::SealedSequence;
+use candle_nn::kv_cache::{SealedSequence, Sweep};
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
 /// replays on load (`take_warm_replay`). The asymmetric-EWMA hit levels
@@ -337,6 +337,21 @@ impl SubstrateRef {
     /// again.
     pub(crate) fn is_gone(&self) -> bool {
         self.0.strong_count() == 0
+    }
+
+    /// Rewrite the substrate's residences through a compaction's sweep while
+    /// any handle keeps it alive — see [`Conversation::rewrite_for_compaction`].
+    ///
+    /// A detached tenant's substrate is out of the scheduler's attached set
+    /// but goes on holding its resident KV until its last handle goes, so it
+    /// is a holder the sweep must reach. Once gone it holds nothing: the copies
+    /// its residences dropped wait on the reclaim queue, which the sweep visits
+    /// on its own.
+    pub(crate) fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
+        match self.0.upgrade() {
+            Some(substrate) => substrate.read().rewrite_for_compaction(sweep),
+            None => Ok(0),
+        }
     }
 }
 
@@ -4292,10 +4307,7 @@ impl Conversation {
     /// (`candle_nn::kv_cache::try_hold_chunk_locations`), so it sees every old
     /// gid or every new one, never a mixture — a mixture is one turn's KV read
     /// through another turn's addresses.
-    pub fn rewrite_for_compaction(
-        &self,
-        sweep: &mut candle_nn::kv_cache::Sweep<'_>,
-    ) -> candle::Result<usize> {
+    pub fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
         self.read().rewrite_for_compaction(sweep)
     }
 

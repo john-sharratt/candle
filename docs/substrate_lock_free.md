@@ -246,6 +246,17 @@ rewritten copy. Without it, the pass's copies of those slots are named by no
 holder it reached: measured as 160 of 57,985 relocated slots in one pass on the
 local zend run, reported by the pass's `unwitnessed` count.
 
+A detached tenant's substrate is a holder in the same way. A detach takes it out
+of the scheduler's attached set, but its residences keep their resident copies
+until its last handle goes — a tenant's shutdown drops those handles after the
+detach, not at it. So the sweep visits every detached substrate still alive
+(`Detached::rewrite_for_compaction`, through the weak reference the scheduler
+already keeps of each) before the reclaim queue; one that has gone holds
+nothing, its dropped copies being in the queue. Without it, a pass that ran in
+that window found most of the arena unnamed: measured on WhiteWorld at a member
+shutdown, 39,321 of 94,936 and then 55,981 of 137,287 relocated slots, in the
+two passes that ran between npcd's detach and the engine's shutdown.
+
 ### 5.5 Recency without lists
 
 `hot_lru` and `warm_lru` are gone. Each install and each use stamps the
@@ -463,6 +474,7 @@ no reader sees half a batch and nothing waits on the batch.
 | every permutation of a record set yields the same substrate | `substrate::order_independence_tests` |
 | one fork per key; a failed fork is retried; the sweep releases only what nothing holds; no request keeps a released value; a lock taken in the fork is held before anyone sees the value | `zend/src/resident.rs` |
 | chunk locations: migrates compose, a compaction excludes them, a refused pass is waited for | `migrate_flight.rs` |
+| a queued reclaim payload and a detached substrate still alive are holders the sweep rewrites | `substrate/residence.rs`, `scheduler/detached.rs` |
 
 ## 12. What remains a lock, and why
 

@@ -1577,6 +1577,9 @@ impl Scheduler {
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
                 }
+                // A detached tenant's substrate, out of the attached set but
+                // still holding its resident KV until its last handle goes.
+                swept += self.detached.rewrite_for_compaction(sweep)?;
                 // Last, so a hot copy any thread let go of while the residences
                 // were walked is still named by the sweep.
                 swept += rewrite_reclaimed(sweep)?;
