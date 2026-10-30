@@ -2233,10 +2233,8 @@ impl Scheduler {
         // never been offered and would otherwise wait for a completion that is
         // never coming, and a relief pass that actually shed.
         if !self.settled_since_admit {
-            // Skipping the pass must not skip the deadlock-freedom rule — which
-            // a decode phase holding the head does not break: its decodes step,
-            // and it ends on the head's age (`grouping::MAX_WAIT`).
-            if in_flight == 0 && !self.grouping_holds_head() {
+            // Skipping the pass must not skip the deadlock-freedom rule.
+            if in_flight == 0 {
                 self.force_queue_head("admission is closed until something settles");
             }
             return;
@@ -2273,9 +2271,7 @@ impl Scheduler {
             // 518 — and the only way to find it was to notice that the pass which should
             // have logged never did. A path that quietly costs an order of magnitude is
             // the one path that must not be quiet.
-            // A decode phase holds the head here as it does in the fill.
-            let held = self.grouping_holds_head();
-            if let Some(work) = (!held).then(|| self.pop_highest_band_head()).flatten() {
+            if let Some(work) = self.pop_highest_band_head() {
                 tracing::debug!(
                     target: "candle_conversation::scheduler::throttle",
                     queued = self.prefill_queue.len(),
@@ -2289,13 +2285,6 @@ impl Scheduler {
             // Sections have no rate question either, and nothing to wait on: the
             // width backstop is their only bound here, as it is a prefill's.
             while self.running_members() < Self::MAX_PREFILL_WIDTH {
-                if self
-                    .section_queue
-                    .front()
-                    .is_some_and(|s| self.grouping_holds(s.band))
-                {
-                    break;
-                }
                 let Some(s) = self.section_queue.pop_front() else {
                     break;
                 };
@@ -2333,11 +2322,7 @@ impl Scheduler {
         // FIFO, not the cheapest that fits: under a budget stuck at its floor,
         // cheapest-first starves the expensive work permanently, and the
         // expensive work is never the cheapest.
-        if filled.prefills == 0
-            && filled.sections == 0
-            && self.running_members() == 0
-            && !self.grouping_holds_head()
-        {
+        if filled.prefills == 0 && filled.sections == 0 && self.running_members() == 0 {
             self.force_queue_head("admission refused every offer");
         }
         // **A pass held on the floor over holes is held on ground that exists.**
@@ -2395,8 +2380,6 @@ impl Scheduler {
                 // without these a full forward read as admission refusing.
                 stopped_on_rows = unoffered.rows,
                 stopped_on_width = unoffered.width,
-                // And held for their group by a decode phase (`grouping`).
-                held_for_group = unoffered.grouped,
                 "admission pass"
             );
         }
@@ -3294,17 +3277,11 @@ impl Scheduler {
     ///
     /// Each decode counts at its target layer's `decode_priority`, `High`
     /// where that does not resolve.
-    ///
-    /// In a grouping engine's prefill phase the creep does not yield to its
-    /// own band's decodes: the group it carries is that phase's work
-    /// (`Scheduler::grouping_widens_creep`).
     pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
-        let own_band_yields = !self.grouping_widens_creep(work);
         throttle_ratio(
             work,
             self.foreground_decodes()
-                .map(|sid| self.decode_priority_or_high(sid))
-                .filter(|&d| own_band_yields || d != work),
+                .map(|sid| self.decode_priority_or_high(sid)),
         )
     }
 

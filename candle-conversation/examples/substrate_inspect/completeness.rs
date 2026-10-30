@@ -62,11 +62,7 @@ pub fn completeness(substrate_dir: &Path, kv_layers: usize) -> Result<()> {
             if id.is_none() {
                 continue;
             }
-            if persistence
-                .list(id.origin, id.oseq, id.oseq)
-                .records
-                .is_empty()
-            {
+            if persistence.list(id.origin, id.oseq, id.oseq).records.is_empty() {
                 *listed_gone.entry(id.origin).or_default() += 1;
                 if gone_samples.len() < 8 {
                     gone_samples.push((key.stream_id.0, idx, id.oseq));

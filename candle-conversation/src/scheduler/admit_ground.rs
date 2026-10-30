@@ -232,8 +232,6 @@ pub(super) struct Unoffered {
     pub rows: bool,
     /// The [`Scheduler::MAX_PREFILL_WIDTH`] backstop was reached.
     pub width: bool,
-    /// A decode phase held a band's prompts for their group (`grouping`).
-    pub grouped: bool,
 }
 
 impl<'a> AdmitPass<'a> {
@@ -590,22 +588,6 @@ impl Ground for AdmitPass<'_> {
             self.unoffered.width |= !self.sched.prefill_queue.is_empty()
                 || !self.sched.pending_submits.is_empty()
                 || !self.sched.section_queue.is_empty();
-            return None;
-        }
-        // **A decode phase holds the band's prompts** (`grouping`): they wait
-        // for the group they will sweep with, and the decodes step without
-        // them. A section is held at its own band.
-        let held = match kind {
-            Kind::Prefill => self.sched.grouping_holds(prio),
-            Kind::Section => self
-                .sched
-                .section_queue
-                .front()
-                .is_some_and(|s| self.sched.grouping_holds(s.band)),
-            Kind::Decode => false,
-        };
-        if held {
-            self.unoffered.grouped = true;
             return None;
         }
         match kind {
