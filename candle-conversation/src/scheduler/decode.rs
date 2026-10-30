@@ -4,6 +4,7 @@ use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
 use super::stencil_wave::{tail_start, StencilRow, StencilWave};
+use super::urgent_hold::UrgentHold;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
@@ -611,6 +612,7 @@ impl Scheduler {
     /// wave has written them.
     fn decode_rows_step(&mut self, stencil: &mut StencilWave) {
         let t_select = std::time::Instant::now();
+        self.step_rows = 0;
         // A slot with a pending deferred glue fire reprojects THIS wave (the
         // co-batched glue member rewrites its `[sealed | glue]` prefix), so its
         // logical offset and block table are mid-rewrite. It must not also run
@@ -659,10 +661,11 @@ impl Scheduler {
         // ── Every band's decode rides the step ──────────────────────────────
         // Decode is width-bound — the step's expert loads amortize across its
         // rows — so an ingest row beside a dialogue's costs the dialogue little
-        // and is the ingest's whole progress. Bands share the step; none sits
-        // out (`band`). The highest band leads, so the adapter rule below keeps
-        // the dialogue's. `decode_priority_or_high` treats an unresolvable slot
-        // as `High`. Tenants are equal: the band alone ranks.
+        // and is the ingest's whole progress. Bands share the step; only `Low`
+        // beside an `Urgent` decode sits out, three steps in four (below,
+        // `urgent_hold`). The highest band leads, so the adapter rule below
+        // keeps the dialogue's. `decode_priority_or_high` treats an
+        // unresolvable slot as `High`. Tenants are equal: the band alone ranks.
         seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.decode_priority_or_high(id))));
 
         // ── One adapter per wave ─────────────────────────────────────────────
@@ -700,6 +703,28 @@ impl Scheduler {
             stencil.rows = carried;
             self.stencil_rows.extend(waiting);
         }
+
+        // ── A person waiting holds the background back ───────────────────────
+        // Beside an `Urgent` decode, `Low` rows ride one step in
+        // `LOW_RIDES_EVERY` (`urgent_hold`): a step bound by its rows' contexts
+        // is the dialogue's latency, row for row. A held row is not dropped —
+        // it waits, as an adapter's does, and its static run stays pending.
+        let urgent = seq_ids
+            .iter()
+            .copied()
+            .chain(stencil.rows.iter().map(|r| r.seq))
+            .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent);
+        let low_rides = self.urgent_hold.low_rides(urgent);
+        if !low_rides {
+            seq_ids.retain(|&id| UrgentHold::rides(self.decode_priority_or_high(id), false));
+            let (carried, held): (Vec<StencilRow>, Vec<StencilRow>) =
+                std::mem::take(&mut stencil.rows)
+                    .into_iter()
+                    .partition(|r| UrgentHold::rides(self.decode_priority_or_high(r.seq), false));
+            stencil.rows = carried;
+            self.stencil_rows.extend(held);
+        }
+        self.step_rows = seq_ids.len() + stencil.rows.len();
 
         if seq_ids.is_empty() {
             // Every active decode is excluded this wave — deferred-glue-pending,

@@ -167,13 +167,25 @@ its band, ratio, budget and rows at debug on
 
 ### 3.1 Bands share; nothing is paused
 
-The throttle is the whole of priority. No band is held out of a forward for
-another's sake: every band's decode rows ride every decode step — decode is
-width-bound, so a row beside the dialogue's costs it little and is the other
-row's whole progress — and each band's prefill creeps at the ratio of the
-decodes that outrank it, a `High` one beside a `High` decode paced in tokens. Priority orders the rows (the highest band leads, so
+The throttle is nearly the whole of priority. Every band's decode rows ride
+every decode step — decode is width-bound, so a row beside the dialogue's costs
+it little and is the other row's whole progress — and each band's prefill
+creeps at the ratio of the decodes that outrank it, a `High` one beside a `High`
+decode paced in tokens. Priority orders the rows (the highest band leads, so
 the one-adapter rule keeps the dialogue's), admission's per-band offer, and the
 keep-one-alive head (the highest band's first queued turn).
+
+**The one exception: `Low` beside an `Urgent` decode** (`scheduler/urgent_hold.rs`).
+While a row a person is waiting on right now decodes, `Low` rows ride one decode
+step in `LOW_RIDES_EVERY` (4). Width-bound is not always true: rows that bring
+long contexts make the step bound by attention instead, and then every row is
+the dialogue's latency. Measured on `.5`, 2026-10-30: a zend dialogue decoding
+beside 12–13 ingest turns of ~75k positions each — ~1M positions a step, 165–250
+ms a step against 80–110 ms at three or four rows — decoded at 15–20 tokens a
+second. The hold is not the pause below: it keys on `Urgent` alone, which the
+cast never is; it holds `Low` alone; it lasts only while the `Urgent` row
+decodes, with no tail; and a held row still rides one step in four, so the
+background never stops.
 
 **Why there is no pause.** One was built: while any higher band had work, and
 for 15 s after, every lower band was held out of every forward. It was meant to

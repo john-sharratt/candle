@@ -86,6 +86,7 @@ mod test_substrate;
 mod turn_airtime;
 mod turn_group;
 pub mod turn_status;
+mod urgent_hold;
 mod wave_logits;
 mod wave_retry;
 mod wave_timing;
@@ -3828,6 +3829,12 @@ pub(crate) struct Scheduler {
     /// (`stencil_wave`). A sequence holding one rides the next decode step as
     /// that run instead of as a decode row, and keeps it until a wave writes it.
     stencil_rows: Vec<stencil_wave::StencilRow>,
+    /// Whether this decode step's `Low` rows ride beside an `Urgent` decode
+    /// (`urgent_hold`).
+    urgent_hold: urgent_hold::UrgentHold,
+    /// Rows the last decode step carried — decode rows and static runs — the
+    /// denominator of the tokens each row commits a step.
+    step_rows: usize,
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
@@ -4259,6 +4266,8 @@ impl Scheduler {
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,
             stencil_rows: Vec::new(),
+            urgent_hold: urgent_hold::UrgentHold::default(),
+            step_rows: 0,
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),
             parked_at: HashMap::new(),
@@ -16795,6 +16804,7 @@ mod tests {
     mod speculation_exits;
     mod speculation_in_a_grammar;
     mod splice_rebuild;
+    mod urgent_hold_steps;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
 

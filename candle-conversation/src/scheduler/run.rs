@@ -382,9 +382,12 @@ impl Scheduler {
                             .map_or(0, |s| s.generated_tokens.len().saturating_sub(before))
                     })
                     .sum();
-                if !decoding_before.is_empty() {
+                // Per row the step carried: a row held out of it — behind an
+                // `Urgent` decode, an adapter, a glue fire — committed nothing
+                // because it did not ride, not because a step yields less.
+                if self.step_rows > 0 {
                     self.tokens_per_step
-                        .add_value(committed as f64 / decoding_before.len() as f64);
+                        .add_value(committed as f64 / self.step_rows as f64);
                 }
                 let step = t_step.elapsed();
                 // The phase timeline's decode: the tokens the step committed, and

@@ -5,7 +5,8 @@
 //! turns with it (`docs/continuous_fair_waves.md` §3): every band's decode rows
 //! ride every forward, and a band's prefill creeps at the airtime ratio of the
 //! decodes that outrank it — and a `High` prefill, beside a `High` decode, is
-//! paced in tokens. Nothing is held out of a forward for its band.
+//! paced in tokens. The one row held out of a forward for its band is `Low`
+//! beside an `Urgent` decode, and only three steps in four (`urgent_hold`).
 //!
 //! Tenants are equal: the band alone ranks, whichever tenant the work belongs
 //! to (`docs/shared_model_host.md` §3.6).
