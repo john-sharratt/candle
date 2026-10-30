@@ -1219,13 +1219,19 @@ Journals are on GitHub, a third party abroad, by the same decision.
   - `@sharratt/topics/<x>` and `@tokera/projects/<x>` → `@zen/topics/<x>`,
     with `repo:` set where a project named a repository:
     `@tokera/projects/candle` becomes `@zen/topics/candle`;
-  - `@battle-cities` stays its own group, its sections and bots as they are;
-  - `threads` → `@zen/threads`.
+  - `@battle-cities` stays its own group, its `projects/<x>` among its
+    `topics` (`topics/mind` naming the repository `battle-mind`), and each
+    of its bots granted the world: `topics/canon`, `cast`, `campaign`,
+    `economy` and `bots`, not the code;
+  - `threads` → `@zen/threads`;
+  - Zen joins `@zen` as a member with no accounts, `people/zen` its
+    journal; `@guest` is a new group John owns.
 
   Every moved line keeps its id, its time and who wrote it. `person` becomes
   `account`, and `speaker` is left empty: who was talking was never
   recorded. Where a journal was split from what it used to sit with, a
-  reference ties the two (§2.5).
+  reference ties the two (§2.5): each moved conversation refers to
+  `people/<p>`, the person whose account it was held on.
 
   `@guest` is filled from what tokera.com already publishes, the paper and
   the blog, with no new writing (the user's decision, 2026-10-31).
