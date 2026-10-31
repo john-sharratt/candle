@@ -199,18 +199,17 @@ mod tests {
         assert!(c.npcd.data.is_some());
     }
 
-    /// The laptop's file is blackworld's with its own address and agent: the
-    /// same cluster and tenants, so a member started there joins the same way.
+    /// The laptop's file is blackworld's with its own address and no agent —
+    /// the laptop's agent is the standalone one keep runs, on the checkouts
+    /// `agent.laptop.yaml` names: the same cluster and tenants, so a member
+    /// started there joins the same way.
     #[test]
     fn the_laptop_configuration_parses() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let laptop = Config::load(&dir.join("motherd.laptop.yaml")).unwrap();
         let shipped = Config::load(&dir.join("motherd.yaml")).unwrap();
         assert_eq!(laptop.host.host, "192.168.0.237");
-        assert_eq!(
-            laptop.host.agent.as_deref(),
-            Some(Path::new("motherd/agent.laptop.yaml"))
-        );
+        assert_eq!(laptop.host.agent, None);
         assert_eq!(laptop.host.clusters, shipped.host.clusters);
         assert_eq!(laptop.host.cluster_name, shipped.host.cluster_name);
         assert_eq!(laptop.zend, shipped.zend);

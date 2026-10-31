@@ -1,18 +1,27 @@
-# The in-process agent on the laptop: agent.yaml's jobs and checkouts, on the
-# repositories already checked out beside this one under C:/Users/johna/prog
-# (this machine has no D:). The mind is named `mind`, as this machine's
-# workspace.yaml names it, not `battle-mind` as npcd's `mind_repo:` does — one
-# folder cannot be two checkouts, each would lock it alone. See agent.yaml for
-# what each setting means.
-jobs_dir: C:/Users/johna/prog/jobs
-slots: 4
+# The agent on the laptop, alienworld: `tokera-agent` run by keep
+# (`keep-local.yaml`), a standby member of the cluster's agent group. The
+# gateway gives it a job only when no other agent can run one, or when the job
+# names it (`docs/replicated_substrate.md` §11.3; `standby_agents` in
+# web/web.yaml). Its checkouts are its own, cloned over SSH under
+# C:/Users/johna/prog/agent, apart from the working trees under
+# C:/Users/johna/prog that are worked in by hand: a job fetches and resets its
+# checkout. They are named as blackworld's agent names them, so a job asking
+# for `battle-mind` or `journals` finds the same repository here. See
+# agent.yaml for what each setting means.
+jobs_dir: C:/Users/johna/prog/agent/jobs
+slots: 2
+# Where a run stages the file it built, for this machine's keep.
+stage_dir: C:/Users/johna/prog/candle/keep/stage
 checkouts:
   - name: candle
-    dir: C:/Users/johna/prog/candle
+    dir: C:/Users/johna/prog/agent/candle
     push: true
   - name: battle-cities
-    dir: C:/Users/johna/prog/battle-cities
+    dir: C:/Users/johna/prog/agent/battle-cities
     push: true
-  - name: mind
-    dir: C:/Users/johna/prog/mind
+  - name: battle-mind
+    dir: C:/Users/johna/prog/agent/battle-mind
+    push: true
+  - name: journals
+    dir: C:/Users/johna/prog/agent/journals
     push: true

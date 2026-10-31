@@ -104,6 +104,29 @@ pub fn serve(router: Router, conn: VirtualConn) {
     });
 }
 
+/// How often [`announce_when_admitted`] looks.
+const PROOF_LOOK: Duration = Duration::from_millis(500);
+
+/// Print `proof` once `admitted` holds: an agent has shown its build works
+/// once a gateway has admitted it, which is what a supervisor (`keep`) waits
+/// on before keeping the build. An agent opens no substrate and loads no
+/// model, so there is nothing after admission to wait for.
+pub fn announce_when_admitted(
+    admitted: impl Fn() -> bool + Send + 'static,
+    proof: impl FnOnce() + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let mut look = interval(PROOF_LOOK);
+        loop {
+            look.tick().await;
+            if admitted() {
+                proof();
+                return;
+            }
+        }
+    });
+}
+
 /// How an agent joins.
 pub struct Joining {
     pub targets: Vec<Target>,
@@ -265,6 +288,26 @@ mod tests {
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Disabled);
         jobs.set_enabled(true).unwrap();
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Ready);
+    }
+
+    /// **The proof is printed once, and only once admitted.**
+    #[tokio::test(start_paused = true)]
+    async fn the_proof_waits_for_admission_and_is_printed_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let admitted = Arc::new(AtomicBool::new(false));
+        let printed = Arc::new(AtomicUsize::new(0));
+        let (a, p) = (Arc::clone(&admitted), Arc::clone(&printed));
+        announce_when_admitted(
+            move || a.load(Ordering::SeqCst),
+            move || {
+                p.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(printed.load(Ordering::SeqCst), 0);
+        admitted.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(printed.load(Ordering::SeqCst), 1);
     }
 
     /// A node is drawn once and read back the same after.

@@ -1,7 +1,10 @@
 # motherd on the 16 GB laptop (RTX 4090 Laptop, 192.168.0.237): the same
 # process as motherd.yaml, which is blackworld's (.5), with this machine's
-# address and agent checkouts. Everything else, the gateway and the cluster it
-# joins included, is the same; see motherd.yaml for what each setting means.
+# address. Everything else, the gateway and the cluster it joins included, is
+# the same; see motherd.yaml for what each setting means. It runs no agent of
+# its own: this machine's agent is the standalone `tokera-agent` keep runs
+# (agent.laptop.yaml), a standby that holds the checkouts an in-process one
+# would. Its jobs go through the gateway like every member's.
 #
 # Run from the repository root:
 #
@@ -17,7 +20,6 @@ host:
   clusters: ["https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"]
   cluster_name: tokera.com
   group_key: web/secrets/group.key
-  agent: motherd/agent.laptop.yaml
 
 zend:
   working_dir: ..

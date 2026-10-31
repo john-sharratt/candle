@@ -10,7 +10,7 @@ use agent::checkouts::Checkouts;
 use agent::config::AgentConfig;
 use agent::install::{jobs_ended, AgentInstaller};
 use agent::jobs::Jobs;
-use agent::member::{join, node_in, Joining};
+use agent::member::{announce_when_admitted, join, node_in, Joining};
 use clap::Parser;
 use cluster::handshake::GroupKey;
 use cluster::launch::LaunchSpec;
@@ -20,6 +20,7 @@ use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::kept::KEEP_DEFAULT;
 use cluster::upgrade::os::wait_until_gone;
 use cluster::upgrade::runtime::{Setup, Upgrader};
+use cluster::upgrade::switch::PROOF;
 use cluster::version::info::{answer_if_asked, BuildInfo, Opens, AGENT};
 use cluster_dial::Target;
 use tracing_subscriber::EnvFilter;
@@ -112,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&jobs),
         &upgrader,
     )?;
+    let joined = Arc::clone(&member);
+    announce_when_admitted(move || joined.admitted(), || eprintln!("{PROOF}"));
     tokio::select! {
         stopped = tokio::signal::ctrl_c() => {
             stopped?;

@@ -164,4 +164,28 @@ mod tests {
             "{unpushed}"
         );
     }
+
+    /// **The machines' agent files parse**: blackworld's in-process agent,
+    /// which serves the journals, and the laptop's standalone standby, which
+    /// holds the same repositories under the same names on checkouts of its
+    /// own.
+    #[test]
+    fn the_shipped_agent_files_parse() {
+        let motherd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../motherd");
+        let names = |cfg: &AgentConfig| {
+            cfg.checkouts
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let blackworld = AgentConfig::load(&motherd.join("agent.yaml")).unwrap();
+        let laptop = AgentConfig::load(&motherd.join("agent.laptop.yaml")).unwrap();
+        assert_eq!(names(&laptop), names(&blackworld));
+        assert!(laptop.checkouts.iter().all(|c| c.push && !c.journal));
+        assert!(laptop
+            .checkouts
+            .iter()
+            .all(|c| c.dir.starts_with("C:/Users/johna/prog/agent")));
+        assert_eq!(laptop.slots(22), 2);
+    }
 }
