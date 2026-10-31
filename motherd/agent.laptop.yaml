@@ -1,4 +1,4 @@
-# The agent on the laptop, alienworld: `tokera-agent` run by keep
+# The agent on the laptop, AlienWorld: `tokera-agent` run by keep
 # (`keep-local.yaml`), a standby member of the cluster's agent group. The
 # gateway gives it a job only when no other agent can run one, or when the job
 # names it (`docs/replicated_substrate.md` §11.3; `standby_agents` in

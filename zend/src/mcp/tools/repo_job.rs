@@ -34,12 +34,12 @@ pub fn definition() -> Value {
             repository … with <program>\". Answers the job id and the agent it runs on; follow it with `repo_job_log`. A \
             job lives in its agent's process: one lost to a restart is reported lost, and is run again. Name \
             `node` to pin an agent; otherwise the gateway picks one. With `stage`, the file the job builds is \
-            staged for `service_trial` once the job succeeds. A standby agent (alienworld) is given a job \
+            staged for `service_trial` once the job succeeds. A standby agent (AlienWorld) is given a job \
             only when no other agent can run it, or when `node` names it. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "node": {"type": "string", "description": "The agent to run on, to pin one: its 16-hex-digit node id, or its machine's name (`blackworld`, `alienworld`)."},
+                "node": {"type": "string", "description": "The agent to run on, to pin one: its 16-hex-digit node id, or its machine's name in any case (`BlackWorld`, `AlienWorld`)."},
                 "repo": {"type": "string", "description": "The repository's name — `candle`, `battle-cities` — as the repo_map layer lists it."},
                 "branch": {"type": "string", "description": "The branch to run on."},
                 "program": {"type": "string", "description": "The program, e.g. `cargo`."},

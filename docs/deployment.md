@@ -79,9 +79,10 @@ on `motherd/agent.laptop.yaml`. That config names 2 slots and the agent's own ch
 `candle`, `battle-cities`, `battle-mind` and `journals`, cloned under
 `C:\Users\johna\prog\agent`, named as blackworld's agent names them. A job fetches and
 resets its checkout, so they are never the working trees under `C:\Users\johna\prog`.
-The gateway's `standby_agents: ["alienworld"]` (`web/web.yaml`) makes it a spare: it is
-given a job only when no other agent can run it, or when the job names it
-(`repo_job_start {node: "alienworld"}`; `docs/replicated_substrate.md` §11.3). keep
+It joins as `AlienWorld` (`--host`), written as the other machines are. The gateway's
+`standby_agents: ["AlienWorld"]` (`web/web.yaml`, matched in any case) makes it a spare:
+it is given a job only when no other agent can run it, or when the job names it
+(`repo_job_start {node: "AlienWorld"}`; `docs/replicated_substrate.md` §11.3). keep
 runs from the scheduled task `\keep`, as on blackworld, with its supervisor at
 `C:\Users\johna\AppData\Local\keep\supervise.ps1`. `register-task.ps1` beside it
 registers the task, and is run once from an elevated session. motherd is not in

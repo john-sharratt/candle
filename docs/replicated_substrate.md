@@ -3727,7 +3727,8 @@ other's. `/v1/agents` lists it `standby: true`.
 
 **A job may name its agent** with `x-tokera-node`: it runs there, standby or not, which
 is how a thread does something on one particular machine. `repo_job_start` takes the
-agent's node id or its machine's name as `node` (`alienworld`).
+agent's node id or its machine's name, in any case, as `node` (`AlienWorld`). The
+gateway matches `standby_agents` against an agent's host in any case too.
 
 A fork's lineage header is its parent's.
 

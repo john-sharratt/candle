@@ -136,6 +136,12 @@ pub fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: b
     best(&mut fit.iter()).map_or(Choice::NoAgent, Choice::Run)
 }
 
+/// Whether `host` is one `standby` names, in any case: `AlienWorld` and
+/// `alienworld` are one machine.
+pub fn named_standby(standby: &BTreeSet<String>, host: &str) -> bool {
+    standby.iter().any(|s| s.eq_ignore_ascii_case(host))
+}
+
 /// [`choose`] among the `ready` agents whose host `standby` does not name,
 /// and among the standby ones only when none of the others can run the job.
 pub fn choose_with_standby(
@@ -148,7 +154,7 @@ pub fn choose_with_standby(
     let (spares, regular): (Vec<&MemberView>, Vec<&MemberView>) = ready
         .iter()
         .copied()
-        .partition(|a| standby.contains(&a.host));
+        .partition(|a| named_standby(standby, &a.host));
     match choose(&regular, holder, need, waited) {
         Choice::NoAgent => choose(&spares, holder, need, waited),
         chosen => chosen,
@@ -373,7 +379,9 @@ mod tests {
     #[test]
     fn a_standby_agent_runs_only_what_no_other_agent_can() {
         let standby: BTreeSet<String> = ["alienworld".to_string()].into();
-        let spare = on("alienworld", 9, 4);
+        let spare = on("AlienWorld", 9, 4);
+        assert!(named_standby(&standby, "ALIENWORLD"));
+        assert!(!named_standby(&standby, "BlackWorld"));
         let free = on("blackworld", 1, 2);
         let busy = on("blackworld", 1, 0);
         let pick = |ready: &[&MemberView], holder, need: &Need, waited| {

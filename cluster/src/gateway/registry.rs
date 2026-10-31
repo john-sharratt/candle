@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use applied_set::AppliedSet;
 
+use super::agents::named_standby;
 use super::claims::Claims;
 use crate::dispatch::RouteTable;
 use crate::frame::{Capacity, ClaimInfo, MemberInfo};
@@ -86,7 +87,7 @@ impl Registry {
 
     /// Whether the agents on `host` stand by.
     pub fn stands_by(&self, host: &str) -> bool {
-        self.standby.contains(host)
+        named_standby(&self.standby, host)
     }
 
     fn app(&mut self, app: &str) -> &mut AppMembers {

@@ -217,7 +217,7 @@ cluster:
   # The machines whose agents are spares (§11.3): given a job only when no
   # other agent can run it, or when the job names them. AlienWorld is the
   # laptop, which runs an agent and no model member.
-  standby_agents: ["alienworld"]
+  standby_agents: ["AlienWorld"]
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
