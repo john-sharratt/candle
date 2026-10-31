@@ -737,8 +737,8 @@ thread's record for every later task. A worker may ask again; it settles after
 every turn.
 
 **Stuck turns ask the same way.** The repeat guard closes a loop after two
-rounds of a repeated call, and the round cap at `MAX_TOOL_ROUNDS = 32`
-(`zend/src/repeat_guard.rs:62-65`, `zend/src/session.rs:356-368`); both end in
+rounds of a repeated call, and the round cap at `MAX_TOOL_ROUNDS = 128`
+(`zend/src/repeat_guard.rs`, `zend/src/session.rs`); both end in
 a closing turn that may not call tools. The loop sends `StreamItem::Closing`
 when it closes (`CLOSED_BY_REPEATS`, `CLOSED_BY_CAP`), which the chat stream
 shows nothing for and the worker reads as **stuck**: it settles `stuck` with

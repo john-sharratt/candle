@@ -393,7 +393,13 @@ const DIAL_TOOLS_KEY: &str = "dial_tools";
 /// call's results with nothing said to the user. The round before the cap is
 /// answered by a closing turn ([`closes_at_cap`]), as the repeat guard's is:
 /// no tool call, a bounded answer saying what was done and what remains.
-const MAX_TOOL_ROUNDS: usize = 32;
+///
+/// **128, not 32.** A worker's restructure of the journals — dozens of reads,
+/// edits and deletes, a preview, a push — met the cap of 32 at its thirtieth
+/// round on 2026-10-31 and sat stuck waiting to be told to go on. The bound is
+/// a guard against a turn that never ends, not a budget for one that is
+/// working; the repeat guard still closes a loop that only repeats itself.
+const MAX_TOOL_ROUNDS: usize = 128;
 
 /// Whether the results of round `iteration` are the last a turn may answer
 /// under [`MAX_TOOL_ROUNDS`] — so the turn answering them must close the loop.
