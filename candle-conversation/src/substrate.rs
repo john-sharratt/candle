@@ -40,6 +40,7 @@
 //! return a plain `f32`). Scores default to zero until the reprojection's belief
 //! scan populates them.
 
+pub mod calibration_record;
 mod compacted;
 mod deleted_set;
 mod dominance;
@@ -103,6 +104,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
+use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
 use deleted_set::DeletedSet;
 use ended_sections::EndedSections;
 use label_records::label_records;
@@ -238,6 +240,13 @@ pub struct Substrate {
     /// so a scan reads a unit's calibrations without walking every timeline.
     /// Tombstoned calibrations stay listed and are filtered at the read.
     calibrations_of: PMap<TimelineId, PVec<TimelineId>>,
+    /// Each calibrated conversation's calibration signatures as one unit, shared
+    /// by every version ([`calibration_record`]).
+    calibration_records: Arc<CalRecords>,
+    /// Bumped whenever a stored signature is replaced or the streams cleared —
+    /// the one change to a calibration turn its conversation's length does not
+    /// show.
+    sig_rewrites: u64,
 
     /// Groups whose conversations are offered to a projection only as its
     /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
@@ -4693,7 +4702,8 @@ impl Substrate {
         if !take(&mut entry.ids.wide_q_sigs, id) {
             return;
         }
-        entry.wide_q_sigs = Some(payload.into());
+        let replaced = entry.wide_q_sigs.replace(payload.into()).is_some();
+        self.sig_rewrites += u64::from(replaced);
         self.gallery_epoch += 1;
     }
 
@@ -6917,6 +6927,53 @@ impl Substrate {
             .filter(|tl| !self.tombstoned_timelines.contains(tl))
     }
 
+    /// The calibration records as they stand, for one scan to read without a
+    /// lock ([`calibration_record`]).
+    pub fn calibration_snapshot(&self) -> CalSnapshot {
+        self.calibration_records.snapshot()
+    }
+
+    /// Keep the records a scan built, in one swap.
+    pub fn publish_calibration_records(&self, fresh: Vec<(TimelineId, Arc<CalRecord>)>) {
+        self.calibration_records.publish(fresh);
+    }
+
+    /// `unit`'s calibration signatures as one unit, or `None` for a conversation
+    /// with no live calibration: `snapshot`'s record while it stands, otherwise
+    /// one built now and added to `fresh` for the caller to publish
+    /// ([`calibration_record`]).
+    pub fn calibration_record(
+        &self,
+        unit: TimelineId,
+        snapshot: &CalSnapshot,
+        fresh: &mut Vec<(TimelineId, Arc<CalRecord>)>,
+    ) -> Option<Arc<CalRecord>> {
+        let live = || self.calibrations_of(unit).map(|c| (c, self.turn_count(c)));
+        live().next()?;
+        let generation = (self.sig_rewrites, self.tombstone_epoch);
+        if let Some(record) = standing(snapshot, unit, live(), generation) {
+            return Some(record);
+        }
+        let stamp: Vec<(TimelineId, u32)> = live().collect();
+        let (mut sids, mut sigs) = (Vec::new(), Vec::new());
+        let mut complete = true;
+        for &(cal, turns) in &stamp {
+            for i in 0..turns {
+                let sid = turn_stream_id(cal.raw(), i);
+                match self.wide_sig_window(sid) {
+                    Some(window) => {
+                        sids.push(sid);
+                        sigs.push(window);
+                    }
+                    None => complete = false,
+                }
+            }
+        }
+        let record = Arc::new(CalRecord::new(stamp, generation, complete, sids, sigs));
+        fresh.push((unit, record.clone()));
+        Some(record)
+    }
+
     /// Every live calibration, keyed by the conversation it calibrates —
     /// [`Self::calibrations_of`] for every unit that has one.
     pub fn calibrations(&self) -> HashMap<TimelineId, Vec<TimelineId>> {
@@ -7234,6 +7291,7 @@ impl Substrate {
         self.calibrations_of.clear();
         self.section_token_total = 0;
         self.gallery_epoch += 1;
+        self.sig_rewrites += 1;
     }
 
     /// The stored projection-event record payload for a turn, if any.

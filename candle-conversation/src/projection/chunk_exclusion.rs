@@ -343,14 +343,14 @@ fn file_mass(
     windows: &[(usize, usize, usize)],
     casts: &[Cast],
 ) -> (Vec<(StreamId, usize, usize)>, Vec<f32>) {
-    let decoded: Vec<Vec<WideQSig>> = f.arcs_kept.iter().map(|a| a.decode()).collect();
+    let decoded: Vec<Vec<WideQSig>> = (0..f.n_arcs()).map(|k| f.arc(k).decode()).collect();
     let mut index: BTreeMap<(StreamId, usize), usize> = BTreeMap::new();
     let mut chunks = Vec::new();
     for &(k, s, e) in windows {
         let len = decoded[k].len();
         for c in s / CHUNK..e.div_ceil(CHUNK) {
-            index.entry((f.arc_sids[k], c)).or_insert_with(|| {
-                chunks.push((f.arc_sids[k], c, len));
+            index.entry((f.sid(k), c)).or_insert_with(|| {
+                chunks.push((f.sid(k), c, len));
                 chunks.len() - 1
             });
         }
@@ -358,7 +358,7 @@ fn file_mass(
     let mut mass = vec![0f32; chunks.len()];
     for cast in casts {
         if let Some((k, pos)) = best_token(windows, &decoded, cast) {
-            if let Some(&c) = index.get(&(f.arc_sids[k], pos / CHUNK)) {
+            if let Some(&c) = index.get(&(f.sid(k), pos / CHUNK)) {
                 mass[c] += cast.weight;
             }
         }
@@ -422,6 +422,7 @@ mod tests {
             arc_sids: vec![turn_stream_id(raw, 0)],
             windows: vec![(0, 0, tokens.len(), 0)],
             cal_windows: Vec::new(),
+            cal: None,
             ex_tokens: vec![tokens.len()],
         }
     }

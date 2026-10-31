@@ -43,7 +43,7 @@ fn group_segment<'a>(
         let own = f.windows.iter().map(|&(k, s, e, _)| (k, s, e));
         let cal = f.cal_windows.iter().copied().filter(|_| calibrations);
         for (k, start, end) in own.chain(cal) {
-            let sid = f.arc_sids[k];
+            let sid = f.sid(k);
             if masked.contains(&sid) {
                 continue;
             }
@@ -51,8 +51,8 @@ fn group_segment<'a>(
             for (s, e) in uncut(start, end, cut) {
                 windows.push(PagedWindow {
                     sid,
-                    fingerprint: f.arcs_kept[k].fingerprint(),
-                    turn: (&f.arcs_kept[k]).into(),
+                    fingerprint: f.arc(k).fingerprint(),
+                    turn: f.arc(k).into(),
                     start: s,
                     end: e,
                     case,
@@ -147,6 +147,7 @@ mod tests {
             windows: vec![(0, 0, 1, 0)],
             cal_windows,
             ex_tokens: vec![1],
+            cal: None,
         }
     }
 

@@ -13,6 +13,7 @@
 use std::cell::OnceCell;
 use std::mem::take;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::adaptive::ScanCases;
@@ -28,6 +29,7 @@ use crate::provenance::heads_per_group;
 use crate::provenance::{
     score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, SigWindow, WideQSig,
 };
+use crate::substrate::calibration_record::CalRecord;
 use crate::substrate::Substrate;
 use crate::summary_tree::exchange::{exchanges, over_normals};
 
@@ -54,6 +56,44 @@ pub(crate) struct FileScan {
     pub cal_windows: Vec<(usize, usize, usize)>,
     /// Real signature tokens per exchange slot — the Concept A.4 size input.
     pub ex_tokens: Vec<usize>,
+    /// The file's calibration signatures, shared rather than copied: the arcs
+    /// past [`Self::arcs_kept`], so [`Self::cal_windows`] indexes one arc list
+    /// with [`Self::windows`] ([`Self::arc`], [`Self::sid`]).
+    pub cal: Option<Arc<CalRecord>>,
+}
+
+impl FileScan {
+    /// Arcs the file's windows can name: its own, then its calibrations'.
+    pub fn n_arcs(&self) -> usize {
+        self.arcs_kept.len() + self.cal.as_ref().map_or(0, |c| c.sigs.len())
+    }
+
+    /// Arc `k`'s stored signature window.
+    pub fn arc(&self, k: usize) -> &SigWindow {
+        match k.checked_sub(self.arcs_kept.len()) {
+            None => &self.arcs_kept[k],
+            Some(c) => {
+                &self
+                    .cal
+                    .as_ref()
+                    .expect("a calibration arc has a record")
+                    .sigs[c]
+            }
+        }
+    }
+
+    /// Arc `k`'s turn stream.
+    pub fn sid(&self, k: usize) -> StreamId {
+        match k.checked_sub(self.arc_sids.len()) {
+            None => self.arc_sids[k],
+            Some(c) => {
+                self.cal
+                    .as_ref()
+                    .expect("a calibration arc has a record")
+                    .sids[c]
+            }
+        }
+    }
 }
 
 /// Assemble every file in `timelines` from `sub`. Returns the files that hold
@@ -66,8 +106,12 @@ pub(crate) fn assemble_file_scans(
     let mut files: Vec<FileScan> = Vec::new();
     // Where the assembly's time goes, summed over its files into the scan's
     // split: a scan that grew is named by the phase that grew.
-    let (mut walk, mut exchange, mut cal) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-    let (mut cal_turns, mut cal_kept) = (0u64, 0u64);
+    let (mut walk, mut exchange, mut cal_time) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut cal_kept = 0u64;
+    // One moment of the calibration records, read without a lock; what this
+    // pass had to build goes back in one swap.
+    let records = sub.calibration_snapshot();
+    let mut fresh = Vec::new();
     for timeline in timelines {
         let t_walk = Instant::now();
         // Enumerate the group's turns exactly as selection does — the whole
@@ -188,25 +232,17 @@ pub(crate) fn assemble_file_scans(
         let t_cal = Instant::now();
         // Each calibration's questions, a window apiece, for the calibration
         // competition. Counted in no exchange's size: they are not its content.
-        let mut cal_windows: Vec<(usize, usize, usize)> = Vec::new();
-        for c in sub.calibrations_of(timeline) {
-            for i in 0..sub.turn_count(c) {
-                cal_turns += 1;
-                let sid = turn_stream_id(c.raw(), i);
-                let Some(window) = sub.wide_sig_window(sid) else {
-                    continue;
-                };
-                let len = window.len();
-                if len == 0 {
-                    continue;
-                }
-                arcs_kept.push(window);
-                arc_sids.push(sid);
-                cal_windows.push((arcs_kept.len() - 1, 0, len));
-            }
-        }
+        let cal = sub.calibration_record(timeline, &records, &mut fresh);
+        let own = arcs_kept.len();
+        let cal_windows: Vec<(usize, usize, usize)> = cal.as_ref().map_or(Vec::new(), |r| {
+            r.sigs
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (own + i, 0, w.len()))
+                .collect()
+        });
         cal_kept += cal_windows.len() as u64;
-        cal += t_cal.elapsed();
+        cal_time += t_cal.elapsed();
         files.push(FileScan {
             timeline,
             arc_turn,
@@ -217,16 +253,19 @@ pub(crate) fn assemble_file_scans(
             windows,
             cal_windows,
             ex_tokens,
+            cal,
         });
     }
     let kept = files.len() as u64;
+    let built = fresh.len() as u64;
+    sub.publish_calibration_records(fresh);
     add_to_split(|s| {
         s.files += kept;
         s.walk_us += walk.as_micros() as u64;
         s.exchange_us += exchange.as_micros() as u64;
-        s.cal_turns += cal_turns;
+        s.cal_built += built;
         s.cal_windows += cal_kept;
-        s.cal_us += cal.as_micros() as u64;
+        s.cal_us += cal_time.as_micros() as u64;
     });
     (files, turns_walked)
 }
@@ -242,13 +281,13 @@ pub(crate) fn cut_excluded(files: &mut [FileScan], exclusion: &ChunkExclusion) {
     for f in files {
         let windows = take(&mut f.windows);
         for (k, s, e, slot) in windows {
-            for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
+            for (a, b) in uncut(s, e, exclusion.of(f.sid(k))) {
                 f.windows.push((k, a, b, slot));
             }
         }
         let cal_windows = take(&mut f.cal_windows);
         for (k, s, e) in cal_windows {
-            for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
+            for (a, b) in uncut(s, e, exclusion.of(f.sid(k))) {
                 f.cal_windows.push((k, a, b));
             }
         }
@@ -314,7 +353,7 @@ fn case_of(slot: usize, cases: ScanCases) -> usize {
 fn decode_files(files: &[FileScan]) -> Vec<Vec<Vec<WideQSig>>> {
     files
         .iter()
-        .map(|f| f.arcs_kept.iter().map(SigWindow::decode).collect())
+        .map(|f| (0..f.n_arcs()).map(|k| f.arc(k).decode()).collect())
         .collect()
 }
 
@@ -554,9 +593,9 @@ pub(crate) fn scan_file_scans(
             for (case, &fi) in cal.iter().enumerate() {
                 let f = &files[fi];
                 windows.extend(f.cal_windows.iter().map(|&(k, s, e)| PagedWindow {
-                    sid: f.arc_sids[k],
-                    fingerprint: f.arcs_kept[k].fingerprint(),
-                    turn: (&f.arcs_kept[k]).into(),
+                    sid: f.sid(k),
+                    fingerprint: f.arc(k).fingerprint(),
+                    turn: f.arc(k).into(),
                     start: s,
                     end: e,
                     case,
@@ -712,6 +751,7 @@ mod tests {
             cal_windows: Vec::new(),
             ex_tokens: vec![tokens; exchanges],
             arcs_kept: arcs,
+            cal: None,
         }
     }
 
