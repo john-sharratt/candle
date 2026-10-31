@@ -350,14 +350,16 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   leave a chunk of the pass budget (`Scheduler::section_runs_ahead`): a turn
   is blocked on its seal. It rides behind the prompts in a group, in rows the
   group holds back for it (`gang::prompt_budget`). Below the live bands a
-  section keeps the full forward's rule. Offered at `Low` with no way to join,
+  short section still joins (a frame with a turn behind it,
+  `joins_a_full_forward`), a `Normal` prompt joins as a live one does, and bulk
+  ingest keeps the full forward's rule. Offered at `Low` with no way to join,
   a 149-token `High` section waited 40 minutes on WhiteWorld (2026-10-31) with
   ten more behind it, and nothing sealed for 47. Turned
   away with the rest, a live prompt waited for rows only it could have taken: on WhiteWorld (2026-10-27 22:46–22:48) one `High` member 158k
   tokens long held all 3,072 rows of every forward, four `Urgent` content
   checks were never offered for ninety seconds, and an 87-token `High` turn
-  waited six minutes. Below the live bands throughput leads, and a full
-  forward takes no more turns.
+  waited six minutes. At `Low` throughput leads, and a full forward takes no
+  more turns.
 - **A sweep is never restarted.** Its finished layers have taken its rows into
   their carried state — the QSA index, the DeltaNet state, the PLE history — and
   nothing rolls that back; only the K/V is position-addressed, so only the K/V

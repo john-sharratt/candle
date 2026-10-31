@@ -35,6 +35,8 @@ pub struct Unit {
     pub key: String,
     pub marker: String,
     pub ready: bool,
+    /// What its calibration's failures have recorded, if any.
+    pub prior_failures: Option<String>,
 }
 
 /// A calibration found carrying one of the layer's markers.
@@ -125,6 +127,7 @@ mod tests {
             key: marker[..1].into(),
             marker: marker.into(),
             ready: true,
+            prior_failures: None,
         }
     }
 

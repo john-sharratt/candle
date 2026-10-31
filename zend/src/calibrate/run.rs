@@ -70,6 +70,23 @@ pub const TAG: &str = "calibration";
 /// asked for without reasoning.
 const DRAFT_MAX_TOKENS: usize = 2048;
 
+/// On a unit, the marker its calibration last failed under and how many times.
+const FAILED_KEY: &str = "calibration_failed";
+
+/// Passes that may fail a unit before it is left uncalibrated. Four units
+/// answered every draft the same way and were asked again every pass on both
+/// members (2026-10-31). A new reading is a new marker, and is tried afresh.
+const MAX_FAILURES: u32 = 3;
+
+/// How many times `marker` has failed, as [`FAILED_KEY`] holds it in `recorded`.
+fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
+    recorded
+        .and_then(|r| r.rsplit_once(' '))
+        .filter(|(m, _)| *m == marker)
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Units calibrated at once. A unit's draft forks from its whole reading, so
 /// drafts are held to the width the layer reads at (`LAYER_PARALLELISM`); its
 /// thinking and prefill carry only the system prompt — shared — and a
@@ -206,11 +223,21 @@ pub fn calibrate_layer(
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         if !crate::ingest_cancel::cancelled() {
+                            let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
+                                .saturating_add(1);
+                            let recorded = engine.set_conversation_metadata(
+                                unit.timeline,
+                                FAILED_KEY,
+                                &format!("{} {tries}", unit.marker),
+                            );
                             tracing::warn!(
                                 target: "zend::calibrate",
                                 layer = %spec.layer,
                                 subject = %unit.subject,
-                                "calibration failed (calibrated again next pass): {e:#}",
+                                tries,
+                                gives_up_at = MAX_FAILURES,
+                                recorded = recorded.is_ok(),
+                                "calibration failed: {e:#}",
                             );
                         }
                     }
@@ -273,14 +300,18 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
             // A file's reading is keyed by its own content key; a unit built
             // on one records the reading's under `FILE_KEY`.
             let reading = meta.get(FILE_KEY).unwrap_or(key);
+            let marker = spec.marker(key);
+            let prior_failures = meta.get(FAILED_KEY).cloned();
             Some(Unit {
                 timeline: tl,
                 subject: subject.clone(),
                 key: key.clone(),
-                marker: spec.marker(key),
                 ready: key_version(reading) == KEY_VERSION
                     && chain_break(substrate, tl).is_none()
-                    && substrate.holds_whole(tl),
+                    && substrate.holds_whole(tl)
+                    && failures_of(prior_failures.as_deref(), &marker) < MAX_FAILURES,
+                marker,
+                prior_failures,
             })
         })
         .collect();
@@ -332,6 +363,7 @@ pub fn calibrate_committed(
         key: key.to_string(),
         marker: spec.marker(key),
         ready: true,
+        prior_failures: None,
     };
     calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
 }
@@ -563,8 +595,18 @@ fn draft(
                 "seeding the draft's recurrent memory from its unit failed: {err:#}",
             );
         }
+        // A draft has no tools, and one that opens a call anyway writes no
+        // question: a file too long for its projection was asked for again
+        // with `file_read`, every pass.
+        let mut sampling = conv.default_sampling();
+        if sampling.tool_call_open_token_id >= 0 {
+            sampling
+                .banned_tokens
+                .push(sampling.tool_call_open_token_id);
+        }
         let options = TurnOptions {
             max_tokens: Some(DRAFT_MAX_TOKENS),
+            sampling: Some(sampling),
             selection: draft_selection(),
             tags: vec![TAG.to_string()],
             ..Default::default()
@@ -591,6 +633,16 @@ mod tests {
     use candle_conversation::substrate::TurnPartWrite;
     use candle_conversation::turn_layout::{KvSpan, TurnLayout, TurnSegment};
     use candle_conversation::Role;
+
+    /// Failures count against the marker they happened under: a new reading
+    /// starts again.
+    #[test]
+    fn a_failure_counts_only_against_its_own_marker() {
+        assert_eq!(failures_of(None, "m:1"), 0);
+        assert_eq!(failures_of(Some("m:1 2"), "m:1"), 2);
+        assert_eq!(failures_of(Some("m:1 2"), "m:2"), 0);
+        assert_eq!(failures_of(Some("garbled"), "m:1"), 0);
+    }
 
     /// **Every keyed unit is found; only a whole, finished one is ready.** A
     /// unit with a turn still to arrive, and one cut off mid-thought, are
@@ -666,6 +718,7 @@ mod tests {
             marker: spec.marker(&key),
             key,
             ready,
+            prior_failures: None,
         };
         assert_eq!(
             units,

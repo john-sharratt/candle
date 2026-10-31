@@ -3,7 +3,7 @@ use super::admission::{
     ThrottleReason,
 };
 use super::admit;
-use super::admit_ground::AdmitPass;
+use super::admit_ground::{joins_a_full_forward, AdmitPass};
 use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::creep_slice::{slice_target, time_bounded_layers};
@@ -123,6 +123,10 @@ fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = Decode
 fn owes_decode(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> bool {
     decodes.into_iter().any(|d| rank(d) >= rank(work))
 }
+
+/// How long a `Normal` prompt waits for admission before the gateway is told
+/// it stands in a placed turn's way (`LearnedRates::high_backlog_tokens`).
+const STALLED_PROMPT: Duration = Duration::from_secs(30);
 
 /// `R` for a `High` creep beside a `High` decode — see [`throttle_ratio`].
 const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
@@ -590,6 +594,31 @@ impl Scheduler {
                     .map(|p| p.work.tokens.len()),
             )
             .sum::<usize>() as u64;
+        // A prompt above `Low` that admission has held this long is what a placed
+        // turn would stand behind too, whatever its band: 220 `Normal` turns
+        // waiting 86 minutes read as no backlog at all, and the gateway went on
+        // placing a person's requests on the card that held them (WhiteWorld,
+        // 2026-10-31).
+        let stalled = |band: DecodePriority, at: Instant| {
+            band == DecodePriority::Normal && at.elapsed() >= STALLED_PROMPT
+        };
+        let stalled_backlog = self
+            .prefill_queue
+            .iter()
+            .filter(|w| stalled(self.decode_priority_or_high(w.sequence_id), w.submitted_at))
+            .map(|w| w.tokens.len())
+            .chain(
+                self.pending_submits
+                    .iter()
+                    .filter(|p| {
+                        stalled(
+                            self.decode_priority_or_high(p.parent()),
+                            p.work.submitted_at,
+                        )
+                    })
+                    .map(|p| p.work.tokens.len()),
+            )
+            .sum::<usize>() as u64;
         // **The rate a placed turn's prompt drains at, measured while a `High`
         // backlog stands** — the backlog it joins and the decodes beside it
         // included, which the model's forward throughput is not (`high_drain`).
@@ -811,7 +840,7 @@ impl Scheduler {
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
             prefill_tok_s_plus_wide: prefill_wide.unwrap_or(r.prefill_tok_s_plus_wide),
-            high_backlog_tokens: high_backlog,
+            high_backlog_tokens: high_backlog + stalled_backlog,
             prompt_tokens: self.prompt_mean.tokens().unwrap_or(0.0),
             reply_tokens: self.segment_mean.tokens().unwrap_or(0.0),
             tokens_per_step: self.tokens_per_step.tokens().unwrap_or(0.0),
@@ -3300,6 +3329,16 @@ impl Scheduler {
     }
 
     /// Whether a queued prompt — carved or still a submission — belongs to a
+    /// band above `band`.
+    pub(super) fn a_queued_prompt_outranks(&self, band: DecodePriority) -> bool {
+        self.prefill_queue
+            .iter()
+            .map(|w| w.sequence_id)
+            .chain(self.pending_submits.iter().map(|p| p.parent()))
+            .any(|id| rank(self.decode_priority_or_high(id)) > rank(band))
+    }
+
+    /// Whether a queued prompt — carved or still a submission — belongs to a
     /// band above every prefill and section in flight: one the work running
     /// would be set aside for once it is admitted.
     pub(super) fn a_queued_prompt_outranks_the_work_in_flight(&self) -> bool {
@@ -3985,7 +4024,7 @@ impl Scheduler {
             .iter()
             .filter(|s| {
                 include_sections
-                    && s.band.is_live()
+                    && joins_a_full_forward(s.band, s.tokens.len())
                     && s.error.is_none()
                     && !paused.contains(&s.sequence_id.0)
                     && !below_floor(s.band)
@@ -4043,7 +4082,7 @@ impl Scheduler {
                 // standalone section pass. A live one takes what fits and rides
                 // the rest in the next.
                 let wanted = (s.tokens.len() - s.offset).min(budget);
-                let advance = if s.band.is_live() {
+                let advance = if joins_a_full_forward(s.band, s.tokens.len()) {
                     wanted.min(budget.saturating_sub(used))
                 } else {
                     wanted

@@ -682,7 +682,9 @@ impl AdmitPass<'_> {
         if let Some(room) = self.rows_left() {
             return Some((room, false));
         }
-        if prio.is_live() && self.sched.runs_ahead(prio, turn, seq) {
+        // `Normal` joins too: a full forward of `Low` ingest held a console's
+        // description for minutes it could have shared. Only `Low` waits for rows.
+        if prio != DecodePriority::Low && self.sched.runs_ahead(prio, turn, seq) {
             return Some((0, true));
         }
         self.unoffered.rows = true;
@@ -690,15 +692,14 @@ impl AdmitPass<'_> {
     }
 
     /// [`Self::rows_left`] for a section of `turn` tokens at `prio`, and whether it
-    /// joins a full forward (`Cost::ahead`). A section of a live band has a
-    /// turn blocked on its seal, so it joins as a prompt does
-    /// ([`Scheduler::section_runs_ahead`]); below the live bands a full forward
-    /// takes no more.
+    /// joins a full forward (`Cost::ahead`). A section with a turn blocked on
+    /// its seal joins as a prompt does ([`Scheduler::section_runs_ahead`],
+    /// [`joins_a_full_forward`]); bulk ingest takes no more.
     fn section_room(&mut self, prio: DecodePriority, turn: usize) -> Option<(usize, bool)> {
         if let Some(room) = self.rows_left() {
             return Some((room, false));
         }
-        if prio.is_live() && self.sched.section_runs_ahead(prio, turn) {
+        if joins_a_full_forward(prio, turn) && self.sched.section_runs_ahead(prio, turn) {
             return Some((0, true));
         }
         self.unoffered.rows = true;
@@ -1594,11 +1595,23 @@ impl Scheduler {
         let rows_ahead: usize = self
             .active_section_ingests
             .iter()
-            .filter(|s| s.error.is_none() && s.band.is_live())
+            .filter(|s| s.error.is_none() && joins_a_full_forward(s.band, s.tokens.len()))
             .map(|s| s.tokens.len().saturating_sub(s.offset))
             .sum();
         rows_ahead + turn.min(CHUNK_SIZE) <= self.prefill_pass_budget()
     }
+}
+
+/// The most tokens a section below the live bands may hold and still join a
+/// full forward: a conversation's frame, not a file. A 60-token `Low` frame
+/// waited 201 s for rows on BlackWorld (2026-10-31) with a turn behind it.
+const SHORT_SECTION_TOKENS: usize = 256;
+
+/// Whether a section of `tokens` at `prio` may join a forward whose rows are
+/// spent: every live band's, and a short one's whatever its band. A file's
+/// section below them waits for rows, as bulk ingest does.
+pub(super) fn joins_a_full_forward(prio: DecodePriority, tokens: usize) -> bool {
+    prio.is_live() || tokens <= SHORT_SECTION_TOKENS
 }
 
 /// Rows a forward `chunk_rows` wide still has for an offer once `taken` are
@@ -1635,7 +1648,19 @@ fn room_left(chunk_rows: usize, taken: usize, closed: bool, members: usize) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::{deepest_chunk_offset, room_left, CHUNK_SIZE};
+    use super::{deepest_chunk_offset, joins_a_full_forward, room_left, CHUNK_SIZE};
+    use crate::projection::DecodePriority::{High, Low, Normal, Urgent};
+
+    /// A blocked turn's section joins whatever its band; a file's does not.
+    #[test]
+    fn a_short_or_live_section_joins_a_full_forward_and_bulk_does_not() {
+        assert!(joins_a_full_forward(Urgent, 100_000));
+        assert!(joins_a_full_forward(High, 100_000));
+        assert!(joins_a_full_forward(Low, 60));
+        assert!(joins_a_full_forward(Normal, 256));
+        assert!(!joins_a_full_forward(Normal, 257));
+        assert!(!joins_a_full_forward(Low, 6_968));
+    }
 
     #[test]
     fn a_closed_forward_offers_only_joins_even_below_a_chunk() {

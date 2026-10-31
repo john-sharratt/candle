@@ -345,7 +345,14 @@ impl Scheduler {
                 // `Low` ingest chunk at 64, one debt held four Makers' `High`
                 // prompts at a fixed backlog for most of a minute (WhiteWorld,
                 // 2026-10-26).
-                if !self.creep_owed.is_zero() && self.waiting_above(self.creep_owed_band, |_| false)
+                // Queued or still a submission counts: admission offers a prompt
+                // whatever the debt, but rows closed behind the debtor's own
+                // members leave it unstarted, and read only among the running
+                // the debt stood over it, with a `High` backlog fixed for
+                // minutes (WhiteWorld, 2026-10-31).
+                if !self.creep_owed.is_zero()
+                    && (self.waiting_above(self.creep_owed_band, |_| false)
+                        || self.a_queued_prompt_outranks(self.creep_owed_band))
                 {
                     self.creep_owed = Duration::ZERO;
                 }
