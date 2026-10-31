@@ -134,6 +134,8 @@ mod tests {
 
     fn handing(signed_ms: u64) -> Handing {
         Handing {
+            from: 0xa,
+            to: 0xb,
             owner: "o1".into(),
             thread: "car-notes".into(),
             name: "clean".into(),
@@ -169,7 +171,7 @@ mod tests {
                 .1,
             "stale"
         );
-        let more = br#"{"owner":"o","thread":"t","name":"n","call_turn":7,"iteration":1,"through":4,"signed_ms":1,"extra":1}"#;
+        let more = br#"{"from":1,"to":2,"owner":"o","thread":"t","name":"n","call_turn":7,"iteration":1,"through":4,"signed_ms":1,"extra":1}"#;
         assert_eq!(
             read_signed(more, &sign_with(&KEY, more), verified, 1)
                 .unwrap_err()

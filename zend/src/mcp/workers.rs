@@ -574,14 +574,14 @@ enum First {
 
 /// How long a handed turn's commit may take to land before the member keeps
 /// the round itself.
-const HAND_COMMIT_WAIT: Duration = Duration::from_secs(30);
+const HAND_COMMIT_WAIT: Duration = Duration::from_secs(20);
 /// How long the member a turn is handed to may take to answer — it waits to
 /// hold the turn's records first ([`CONTINUE_HOLD_WAIT`]). With the commit's
-/// wait, under the beat's own limit (`threads::BEAT_LOST_MS`): the beat is
-/// stopped while the handing runs.
-const HAND_ANSWER_WAIT: Duration = Duration::from_secs(45);
+/// wait, [`TAKEN_WAIT`] and a beat's interval, under the beat's own limit
+/// (`threads::BEAT_LOST_MS`): the beat is stopped while the handing runs.
+const HAND_ANSWER_WAIT: Duration = Duration::from_secs(30);
 /// How long the member taking a handed worker waits to hold its records.
-pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(30);
+pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(20);
 /// The route a worker is handed on (`crate::api::worker_continue`).
 pub const CONTINUE_PATH: &str = "/v1/mcp/worker/continue";
 
@@ -589,6 +589,10 @@ pub const CONTINUE_PATH: &str = "/v1/mcp/worker/continue";
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Handing {
+    /// The member handing it on, and the member it is handed to: signed, so
+    /// the proof names both and stands alone.
+    pub from: u64,
+    pub to: u64,
     pub owner: String,
     pub thread: String,
     pub name: String,
@@ -619,7 +623,10 @@ async fn hand_on(
         .committed_through(&worker.conv_id, HAND_COMMIT_WAIT)
         .await
         .ok_or("its turn's commit did not land in time")?;
+    let from = worker_hop::own_node().ok_or("this member is in no cluster")?;
     let body = serde_json::to_vec(&Handing {
+        from,
+        to,
         owner: owner.to_string(),
         thread: worker.thread.clone(),
         name: worker.name.clone(),
@@ -668,6 +675,34 @@ fn taken_by(records: &dyn Records, owner: &str, worker: &Worker, to: u64) -> boo
         .is_some_and(|w| w.state == State::Running && w.runner == Some(to))
 }
 
+/// How long a member whose handing failed waits for the record to say the
+/// peer took it after all — its write may still be on its way here.
+const TAKEN_WAIT: Duration = Duration::from_secs(10);
+
+/// [`taken_by`], looked at until it holds or [`TAKEN_WAIT`] passes.
+async fn taken_within(records: &dyn Records, owner: &str, worker: &Worker, to: u64) -> bool {
+    let until = Instant::now() + TAKEN_WAIT;
+    loop {
+        if taken_by(records, owner, worker, to) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Say on `worker`'s record that it still runs, now.
+fn beat_now(records: &dyn Records, owner: &str, worker: &Worker) {
+    if let Some(mut w) = threads::worker(records, owner, &worker.thread, &worker.name) {
+        w.beat_ms = now_ms();
+        if let Err(e) = threads::put_worker(records, owner, &w) {
+            tracing::warn!(conv_id = %w.conv_id, "mcp: the task's beat could not be kept: {e}");
+        }
+    }
+}
+
 /// Take `handing`'s worker, which member `by` handed here at a round
 /// boundary: run its round's tools and carry the worker on — its record, its
 /// beat, its settling — as if it had started here. Taken only while it runs on
@@ -678,6 +713,12 @@ pub fn continue_handed(
     handing: &Handing,
     by: u64,
 ) -> Result<Worker, String> {
+    if handing.from != by || Some(handing.to) != worker_hop::own_node() {
+        return Err(format!(
+            "the handing is from {:016x} to {:016x}, not from {by:016x} to this member",
+            handing.from, handing.to
+        ));
+    }
     let records = session.shared_substrate().ok_or_else(loading)?;
     let _held = holding();
     let Some(mut worker) =
@@ -787,7 +828,10 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
     let (label, outcome) = loop {
         // A check round does not move: the answer it falls back on is kept
         // here, in `first`.
-        let movable = may_hand && first.is_none();
+        let movable = may_hand
+            && first.is_none()
+            && worker.runner.is_some()
+            && worker.runner == worker_hop::own_node();
         let ended = match turn(&session, &worker, next, movable, &live).await {
             Turned::Ended(ended) => ended,
             Turned::Handed {
@@ -802,7 +846,7 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
                 let handed = hand_on(&session, &owner, &worker, to, call_turn, iteration).await;
                 let moved = match handed {
                     Ok(()) => true,
-                    Err(why) if taken_by(&records, &owner, &worker, to) => {
+                    Err(why) if taken_within(&records, &owner, &worker, to).await => {
                         tracing::warn!(
                             conv_id = %worker.conv_id,
                             to = %format!("{to:016x}"),
@@ -832,6 +876,8 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
                     return;
                 }
                 may_hand = false;
+                // Said at once, so the stretch without a beat stays short.
+                beat_now(&records, &owner, &worker);
                 beating = start_beat();
                 next = First::Round {
                     call_turn,
@@ -933,6 +979,17 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
     // The beat stops, and is done writing, before the settled record is.
     beating.abort();
     let _ = beating.await;
+    // Another member took the worker while this one finished a round it
+    // thought its own: the record and the settling are that member's.
+    let runner_now =
+        threads::worker(&records, &owner, &worker.thread, &worker.name).and_then(|w| w.runner);
+    if worker_hop::runs_elsewhere(true, runner_now, worker_hop::own_node()) {
+        tracing::warn!(
+            conv_id = %worker.conv_id,
+            "mcp: another member runs this worker now, so its outcome here is not kept"
+        );
+        return;
+    }
     worker.activity = Some(live.snapshot());
     if !worker.state.live() {
         worker.ended_ms = Some(now_ms());

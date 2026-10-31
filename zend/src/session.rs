@@ -5003,7 +5003,9 @@ fn run_inference_stream(
             // the draft below, so the member it moves to drafts this stretch
             // and nothing here runs on after the move. A turn the guard or the
             // cap is closing answers here instead.
-            if start.may_hand && !closing && !is_final {
+            // Nor a round the cap is about to close: the member it moves to
+            // finishes it without the cap's checks.
+            if start.may_hand && !closing && !is_final && !closes_at_cap(iteration) {
                 let call_idx = resp.seal.as_ref().and_then(|s| s.turn_index);
                 if let (Some(to), Some(call_turn)) = (worker_hop::target(), call_idx) {
                     tracing::info!(

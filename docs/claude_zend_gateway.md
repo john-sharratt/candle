@@ -813,6 +813,8 @@ its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
    clients sent the member's port. So the body is signed under a key every
    member derives from the group key (`worker_hop::PURPOSE`), in
    `x-zend-handoff-proof`, and is believed only within `FRESH_MS` of signing.
+   The body names the member handing it on and the member it is for, so the
+   proof stands alone. A round the cap is about to close is not handed on.
 4. The member taking it checks, from the replicated record, that the worker
    runs on the member handing it (`Worker::runner`) and that the round at
    `call_turn` is still to run. It waits until it holds the conversation
@@ -824,8 +826,9 @@ its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
    nudge or a stop is read there, at the next boundary.
 
 **The record says who runs a worker.** Only its runner beats it: a beat that
-finds another member named stops. A handing whose answer was lost took effect
-if the record names the peer, so the handing member never runs the round too.
+finds another member named stops, and so does a settling. A handing whose
+answer was lost took effect if the record names the peer within
+`TAKEN_WAIT`, so the handing member does not run the round too.
 A worker continued on a member other than its last runner is built afresh from
 the substrate, since its cached state predates the other member's turns.
 
