@@ -13,7 +13,7 @@ use super::decisions::build_name;
 use super::kept::builds_dir;
 use super::runtime::{InstallJob, Setup};
 use super::swap::{Source, Swapped};
-use super::switch::{copy_to_stage, SWITCH_ADDR};
+use super::switch::{copy_to_stage, FORCE_HEADER, SWITCH_ADDR};
 use super::watchdog::{write_plan, WatchPlan, PLAN, READY_WITHIN};
 use crate::launch::LaunchSpec;
 
@@ -67,7 +67,7 @@ fn ask_keep(path: &Path) -> io::Result<()> {
     .map_err(|e| io::Error::new(e.kind(), format!("keep at {SWITCH_ADDR}: {e}")))?;
     stream.set_read_timeout(Some(Duration::from_secs(11 * 60)))?;
     let req = format!(
-        "POST / HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.0\r\nHost: 127.0.0.1\r\n{FORCE_HEADER}: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes())?;

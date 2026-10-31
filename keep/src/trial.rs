@@ -51,8 +51,10 @@ pub enum Verdict {
     /// The limit passed with no proof line, counted from the start or from
     /// the newest syncing line.
     TimedOut,
-    /// The process exited without the proof line.
-    Died,
+    /// The process exited without the proof line: its exit code, when it had
+    /// one, and how long it ran. A trial that writes nothing leaves these as
+    /// the only word on why (WhiteWorld, 2026-10-31).
+    Died { code: Option<i32>, ran: Duration },
 }
 
 /// How a switch ended, and the child left running.
@@ -104,13 +106,14 @@ fn launch(exe: &Path, args: &[OsString], cwd: &Path, stderr: Stdio) -> io::Resul
 /// process exiting. Lines read before that are logged. The limit restarts at
 /// every syncing line ([`is_syncing`]).
 pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
-    let mut deadline = Instant::now() + limit;
+    let started = Instant::now();
+    let mut deadline = started + limit;
     let mut at = 0u64;
     let mut partial = String::new();
     loop {
         // Read what is there before asking whether the process has exited, so
         // a line written just before the exit is still seen.
-        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        let exited = child.try_wait().ok().flatten();
         if let Some(seen) = read_new_lines(log, &mut at, &mut partial) {
             if seen.proven {
                 return Verdict::Proven;
@@ -119,8 +122,11 @@ pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
                 deadline = Instant::now() + limit;
             }
         }
-        if exited {
-            return Verdict::Died;
+        if let Some(status) = exited {
+            return Verdict::Died {
+                code: status.code(),
+                ran: started.elapsed(),
+            };
         }
         if Instant::now() >= deadline {
             return Verdict::TimedOut;
@@ -227,12 +233,21 @@ pub fn switch_to(
                 child,
             });
         }
-        Verdict::TimedOut => "no proof line within the limit",
-        Verdict::Died => "the trial exited without the proof line",
+        Verdict::TimedOut => "no proof line within the limit".to_string(),
+        Verdict::Died { code, ran } => died(code, ran),
     };
     reap(&mut child);
     restore(stable)?;
-    rolled_back(stable, args, cwd, why.to_string())
+    rolled_back(stable, args, cwd, why)
+}
+
+/// What a trial's death says.
+fn died(code: Option<i32>, ran: Duration) -> String {
+    let code = code.map_or_else(|| "no exit code".to_string(), |c| format!("exit code {c}"));
+    format!(
+        "the trial exited without the proof line ({code}, after {:.1} s)",
+        ran.as_secs_f64()
+    )
 }
 
 /// `stable` started again, the switch ended for `why`.

@@ -20,6 +20,10 @@
 //! build that cannot prove itself inside the trial's ten minutes, such as a
 //! first start on a fresh substrate.
 //!
+//! A switch, an accept, a restart or a stop by hand is refused while it would
+//! take down the only member serving an app (`guard`), for a service whose
+//! config names its `status` address.
+//!
 //! `POST /restart/<service>` stops that service and starts its stable file
 //! again — no trial, since the binary is the one already kept. `POST
 //! /stop/<service>` stops it and holds it down until `POST /start/<service>`
@@ -53,6 +57,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
 
 mod board;
+mod guard;
 #[cfg(windows)]
 mod owner_access;
 mod place;
@@ -71,6 +76,10 @@ struct ServiceCfg {
     #[serde(default)]
     args: Vec<String>,
     cwd: PathBuf,
+    /// The `host:port` its `/v1/status` answers on, which arms the last-member
+    /// guard (`guard`). Absent for a service with no quorum.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +106,8 @@ struct Slot {
     file: String,
     stable: PathBuf,
     tx: Sender<Req>,
+    /// See [`ServiceCfg::status`].
+    status: Option<String>,
 }
 
 /// What a service's supervisor is asked to do.
@@ -148,6 +159,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("granting the owner its children: {e}"))?;
     let mut slots = Vec::new();
     for svc in cfg.services {
+        let status = svc.status.clone();
         let svc = prepare(&cfg.state, svc)?;
         let (tx, rx) = mpsc::channel();
         slots.push(Slot {
@@ -155,6 +167,7 @@ fn main() -> anyhow::Result<()> {
             file: svc.file.clone(),
             stable: svc.stable.clone(),
             tx,
+            status,
         });
         let name = svc.name.clone();
         thread::Builder::new()
@@ -183,6 +196,7 @@ impl Clone for Slot {
             file: self.file.clone(),
             stable: self.stable.clone(),
             tx: self.tx.clone(),
+            status: self.status.clone(),
         }
     }
 }
@@ -548,10 +562,14 @@ fn kill_pid(pid: u32) {
 
 fn handle(mut stream: TcpStream, slots: &[Slot]) {
     let answer = match read_request(&mut stream) {
-        Ok((target, body)) => match route(&target) {
-            Route::Switch => dispatch(body.trim(), slots, Hand::Trial),
-            Route::Accept => dispatch(body.trim(), slots, Hand::Accept),
-            Route::Service(action, name) => service_request(action, name, slots),
+        Ok(Request {
+            target,
+            body,
+            forced,
+        }) => match route(&target) {
+            Route::Switch => dispatch(body.trim(), slots, Hand::Trial, forced),
+            Route::Accept => dispatch(body.trim(), slots, Hand::Accept, forced),
+            Route::Service(action, name) => service_request(action, name, slots, forced),
             Route::Exit => {
                 let _ = write_answer(
                     &mut stream,
@@ -629,7 +647,20 @@ fn route(target: &str) -> Route<'_> {
     Route::Unknown
 }
 
-fn service_request(action: Action, name: &str, slots: &[Slot]) -> Answer {
+/// Why a request by hand that would stop `slot` is refused, if it is.
+fn guarded(slot: &Slot, forced: bool) -> Option<Answer> {
+    if forced {
+        return None;
+    }
+    let why = guard::refusal(slot.status.as_deref()?)?;
+    Some(Answer {
+        status: 409,
+        reason: "Conflict",
+        body: why,
+    })
+}
+
+fn service_request(action: Action, name: &str, slots: &[Slot], forced: bool) -> Answer {
     let Some(slot) = slots.iter().find(|s| s.name.eq_ignore_ascii_case(name)) else {
         return Answer {
             status: 404,
@@ -637,6 +668,11 @@ fn service_request(action: Action, name: &str, slots: &[Slot]) -> Answer {
             body: "no such service\n".into(),
         };
     };
+    if action != Action::Start {
+        if let Some(refused) = guarded(slot, forced) {
+            return refused;
+        }
+    }
     let (tx, rx) = mpsc::channel();
     let req = match action {
         Action::Restart => Req::Restart { reply: tx },
@@ -664,11 +700,14 @@ enum Hand {
     Accept,
 }
 
-fn dispatch(body: &str, slots: &[Slot], hand: Hand) -> Answer {
+fn dispatch(body: &str, slots: &[Slot], hand: Hand, forced: bool) -> Answer {
     let (path, slot) = match target(body, slots) {
         Ok(t) => t,
         Err(refused) => return refused,
     };
+    if let Some(refused) = guarded(slot, forced) {
+        return refused;
+    }
     if hand == Hand::Trial {
         if let Err(refused) = begin(slot, body) {
             return refused;
@@ -756,9 +795,16 @@ fn switch(path: PathBuf, slot: &Slot, hand: Hand) -> Answer {
     answer
 }
 
-/// A request's target and body. A POST with no `Content-Length` has an empty
+/// A request's target and body, and whether it carries [`guard::FORCE_HEADER`].
+struct Request {
+    target: String,
+    body: String,
+    forced: bool,
+}
+
+/// The [`Request`] on `stream`. A POST with no `Content-Length` has an empty
 /// body — a restart carries none.
-fn read_request(stream: &mut TcpStream) -> io::Result<(String, String)> {
+fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -794,13 +840,16 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(String, String)> {
         ));
     };
     let target = target.to_string();
-    let len = request
-        .find_map(|line| {
+    let named = |wanted: &str| {
+        header.lines().skip(1).find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+            name.eq_ignore_ascii_case(wanted)
+                .then(|| value.trim().to_string())
         })
+    };
+    let forced = named(guard::FORCE_HEADER).is_some();
+    let len = named("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     if len > 4096 {
         return Err(io::Error::new(
@@ -819,7 +868,11 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(String, String)> {
     body.truncate(len);
     let body = String::from_utf8(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the path is not utf-8"))?;
-    Ok((target, body))
+    Ok(Request {
+        target,
+        body,
+        forced,
+    })
 }
 
 fn write_answer(stream: &mut TcpStream, answer: &Answer) -> io::Result<()> {

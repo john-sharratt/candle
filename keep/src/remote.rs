@@ -129,7 +129,7 @@ fn route(method: &Method, path: &str, body: &[u8], slots: &[Slot]) -> Response<F
                     )
                 }
             };
-            let done = service_request(action, name, slots);
+            let done = service_request(action, name, slots, false);
             reply(
                 status_of(&done),
                 json!({"service": name, "answer": done.body.trim()}),

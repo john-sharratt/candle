@@ -214,6 +214,15 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 
 ### keep
 
+**Restarting `web` drops everything in flight through the gateway**, every member's
+sockets included: a person's stream ends, and members take up to a minute to rejoin.
+Say so before releasing it. **A switch, accept, restart or stop by hand is refused
+(409) while it would take down the only member serving an app**, when the service's
+entry in `keep.yaml` names its `status: host:port`: wait for the other member to be
+ready, or send `X-Keep-Force: 1`. A rollout's own install sends that header, so roll
+`motherd` before `keep`, or an older `motherd`'s install can be refused. A trial that
+dies says its exit code and how long it ran.
+
 `keep` is a separate process and a failsafe only. The last known-good `web` and
 `motherd` are the files `keep/stable/web.exe` and `keep/stable/motherd.exe`. On startup
 `keep` runs those files with the arguments in `keep/keep.yaml`. A switch is one POST to

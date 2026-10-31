@@ -34,6 +34,10 @@ pub const SWITCH_PORT: u16 = 8092;
 /// [`SWITCH_PORT`] on loopback.
 pub const SWITCH_ADDR: &str = "127.0.0.1:8092";
 
+/// Sent with a request `keep` must carry out even if this is the only member
+/// serving an app: a rollout's install, or a person who means it.
+pub const FORCE_HEADER: &str = "X-Keep-Force";
+
 /// Where a member leaves the executable it is asking `keep` to try, under the
 /// process's working directory. Not the stable file.
 pub const STAGE_DIR: &str = "keep/stage";

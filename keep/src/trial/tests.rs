@@ -110,8 +110,17 @@ fn a_process_that_exits_without_the_line_is_not_waited_out() {
     let elapsed = started.elapsed();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
-    assert_eq!(verdict, Verdict::Died);
+    let Verdict::Died { code, ran } = verdict else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(code, Some(1));
+    assert!(ran < Duration::from_secs(5));
     assert!(elapsed < Duration::from_secs(5));
+    assert_eq!(
+        died(Some(1), Duration::from_millis(2_500)),
+        "the trial exited without the proof line (exit code 1, after 2.5 s)"
+    );
+    assert!(died(None, Duration::ZERO).contains("no exit code"));
 }
 
 #[cfg(windows)]

@@ -38,7 +38,7 @@ thread's journal, not this conversation, so state in full:
 
 1. **What moves where, and why.** Name the lines by id and the journals by
    path.
-2. **Keep every line's file and id.** Move a file with `git mv`. Never
+2. **Keep every line's file and id.** Move a line with `journal_move`. Never
    rewrite one into a new file. To merge two duplicate lines, keep the most
    complete one, edit its text if it needs words from the other, and delete
    the other.
@@ -48,14 +48,17 @@ thread's journal, not this conversation, so state in full:
    lands at the new one.
 4. **Never touch a summary.** A summary rebuilds by itself once its lines
    change.
-5. **Check before committing.** Run the journals CLI from the `candle`
-   checkout over the journals checkout:
-   `cargo run --release -p journals --bin journals -- check <journals dir>`.
-   Fix every problem it lists. A file that does not parse is refused by the
-   service until it is fixed.
+5. **Check before committing.** Run `journal_check`, which reads this
+   session's copy, changes included, as the service would. Fix every problem
+   it lists. A file that does not parse is refused by the service until it is
+   fixed.
 6. **Preview first.** Before pushing, end the turn with a `QUESTION:` block
    holding the `git diff --stat` and a table of what moved, merged and
-   changed. Push only after the reply says yes.
+   changed. Show every changed line's text before and after, in full. Under
+   a heading `Meaning changed`, list each edit that does more than tidy
+   words: who said it (from "colleagues describe him" to "he describes
+   himself"), a claim made stronger or weaker ("contributed" to "wrote"), or a
+   fact dropped. Push only after the reply says yes.
 7. **Push to main.** Never branch the journals repository: a branch there is
    never merged, and the service reads `main` alone. The live service commits
    to `main` all the time, so pull with rebase first. If the push is refused,
