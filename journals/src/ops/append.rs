@@ -38,6 +38,15 @@ pub fn note(
     append(tree, actor, path, said, text, now, keep)
 }
 
+/// `text` as two notes are compared: its words, in lower case, one space
+/// between each.
+fn same_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `text` as a line's text: trimmed, not empty, within the cap.
 pub(crate) fn clean(text: &str) -> Result<String> {
     let t = text.trim();
@@ -74,6 +83,24 @@ fn append(
     }
     let j = tree.need_mut(path)?;
     j.writable(&path.show())?;
+    // One note per fact: a model writing again what the journal's window
+    // already says — Grok did, every time a fact was refined aloud — is told to
+    // edit that line instead. A replay keeps its id and is never refused, and
+    // an episode may well happen twice.
+    if said.kind == Kind::Note && keep.is_none() {
+        let wanted = same_text(&text);
+        if let Some(said_already) = j
+            .window
+            .iter()
+            .find(|l| l.kind == Kind::Note && same_text(&l.text) == wanted)
+        {
+            return Err(Error::conflict(format!(
+                "{path} already says this as #{}: edit that line with journal_edit to change \
+                 it, rather than noting it again",
+                said_already.id
+            )));
+        }
+    }
     let by = actor.writer();
     let line = Line {
         id: mint_keeping(j, keep, now, by, &text),
@@ -237,13 +264,65 @@ mod tests {
         );
     }
 
+    /// **An episode that happens twice in a minute is two lines**, with two
+    /// ids.
     #[test]
-    fn the_same_line_twice_in_a_minute_gets_two_ids() {
+    fn the_same_episode_twice_in_a_minute_gets_two_ids() {
         let mut t = zen();
-        let op = note_op("people", "same");
-        let a = apply(&mut t, &john(), &op, now()).unwrap().line.unwrap();
-        let b = apply(&mut t, &john(), &op, now()).unwrap().line.unwrap();
+        let op = Op::Episode {
+            path: p("people"),
+            text: "repo_task_start — car-notes-cleanup".into(),
+            speaker: None,
+        };
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        let a = apply(&mut t, &server, &op, now()).unwrap().line.unwrap();
+        let b = apply(&mut t, &server, &op, now()).unwrap().line.unwrap();
         assert_ne!(a, b);
+        assert_eq!(t.get(&p("people")).unwrap().window.len(), 2);
+    }
+
+    /// **A note the window already holds is refused, naming the line to
+    /// edit**, however its spacing or case differs; a different fact, or the
+    /// same words as an episode, is kept.
+    #[test]
+    fn a_note_already_in_the_window_is_refused_naming_its_line() {
+        let mut t = zen();
+        let first = apply(
+            &mut t,
+            &john(),
+            &note_op("people", "John and Yen met in Australia."),
+            now(),
+        )
+        .unwrap()
+        .line
+        .unwrap();
+        let again = apply(
+            &mut t,
+            &john(),
+            &note_op("people", "  john and yen   met in Australia. "),
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            again.to_string(),
+            format!(
+                "@zen/people already says this as #{first}: edit that line with journal_edit to \
+                 change it, rather than noting it again"
+            )
+        );
+        apply(
+            &mut t,
+            &john(),
+            &note_op(
+                "people",
+                "John and Yen met in Australia about 18 years ago.",
+            ),
+            now(),
+        )
+        .unwrap();
         assert_eq!(t.get(&p("people")).unwrap().window.len(), 2);
     }
 

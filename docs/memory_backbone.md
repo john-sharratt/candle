@@ -899,7 +899,7 @@ own journal. A path may pass through references (§2.5).
 | `journal_focus {speaker?, about?}` | sets who is speaking and what the conversation is about (§2.4) |
 | `journal_read {journal}` | a journal: its summary (and staleness), its references, its index, its window, how much is folded; with `<path>#<line id>`, one line. The same tool reads Zen's thread and worker journals, and for a worker the turns behind one of its entries |
 | `journal_grep {journal, pattern}` | case-insensitive substring search, with a hyphen and a space matching each other, under `journal` (`*` for everything the caller reads). It searches every named journal's own name and written cue (parents, owners and fixed journals' shared cues are not matched), and every line, archive and summary of the subtree. Journals the phrase names come first, then lines, newest first. A line of up to 1,000 characters is shown whole; a longer one is cut around the match |
-| `journal_note {journal, text}` | a `note` line, stamped with the focus's speaker |
+| `journal_note {journal, text}` | a `note` line, stamped with the focus's speaker; refused, naming the line, when the window already holds a note of the same words (spacing and case aside), so a refined fact is edited rather than noted again |
 | `journal_edit {journal, text}` | corrects what a line says, `journal` its address: a commit |
 | `journal_forget {journal, says?}` | removes a line from the journal, named by its address or by `says` (§8) |
 | `journal_create {under, name, cue}` | a named sub-journal, where the section allows (§2.3) |
