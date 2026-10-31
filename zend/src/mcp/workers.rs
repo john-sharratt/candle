@@ -447,7 +447,13 @@ pub fn resume(
         return Ok(false);
     };
     let mut worker = found.observed(now);
-    if !resuming::due(&worker, now) || archiving::being_archived(&worker.conv_id) {
+    // A round its restart left unfinished is finished at boot, with no word on
+    // the worker's record (`resume_unfinished_turns`): a turn on top of that one
+    // would write the same conversation twice.
+    if !resuming::due(&worker, now)
+        || archiving::being_archived(&worker.conv_id)
+        || session.live_turn(&worker.conv_id).is_some()
+    {
         return Ok(false);
     }
     worker.state = State::Running;
