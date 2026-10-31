@@ -187,6 +187,13 @@ cast never is; it holds `Low` alone; it lasts only while the `Urgent` turn is in
 flight, with no tail; and a held row still rides one step in four, so the
 background never stops.
 
+**Work owes no airtime to decodes it outranks.** The debt a co-batched step runs
+up is decode's protection from that work, so a step whose band is above every
+decode beside it owes none, and those rows rode the step regardless. Owed anyway,
+a dialogue's tool results repaid background decodes step for step: on `.5`,
+2026-10-31, `owed` steps took 34 s of a minute and a 2,328-token `Urgent` prompt
+took 7.8 s.
+
 **Why there is no pause.** One was built: while any higher band had work, and
 for 15 s after, every lower band was held out of every forward. It was meant to
 keep one person's dialogue the device through its tool rounds. Beside npcd's

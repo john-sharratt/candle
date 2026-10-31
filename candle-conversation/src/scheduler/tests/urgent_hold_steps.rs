@@ -171,6 +171,48 @@ fn low_rows_ride_one_step_in_four_beside_an_urgent_decode() {
     assert_eq!(scheduler.active_decodes[&urgent].generated_tokens.len(), 9);
 }
 
+/// **A prompt a person waits on holds the background too**, its rows left
+/// out of a step the creep can use.
+#[test]
+fn an_urgent_prompt_holds_low_rows_like_an_urgent_decode() {
+    let (mut scheduler, carried) = recording_scheduler();
+    let (low, _l) = decoding(&mut scheduler, DecodePriority::Low, 200);
+    let prompt = SequenceId(scheduler.session.create_sequence().unwrap());
+    scheduler.slot_bands.insert(prompt, DecodePriority::Urgent);
+    scheduler.prefill_queue.push_back(test_prefill_work(prompt));
+
+    scheduler.batch_decode_step();
+    assert!(
+        carried
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|rows| !rows.contains(&low.0)),
+        "the Low row sat this step out"
+    );
+    assert_eq!(scheduler.active_decodes[&low].generated_tokens.len(), 1);
+}
+
+/// **A hold never empties a step that nothing else can use.** While the creep
+/// is held back, holding the only rows would finish a step with nothing in it
+/// and spend the hold's count on it.
+#[test]
+fn a_step_the_creep_cannot_ride_keeps_its_low_rows() {
+    let (mut scheduler, carried) = recording_scheduler();
+    let (low, _l) = decoding(&mut scheduler, DecodePriority::Low, 200);
+    let prompt = SequenceId(scheduler.session.create_sequence().unwrap());
+    scheduler.slot_bands.insert(prompt, DecodePriority::Urgent);
+    scheduler.prefill_queue.push_back(test_prefill_work(prompt));
+    scheduler.wave_cohort_advanced = true;
+
+    scheduler.batch_decode_step();
+    assert_eq!(
+        carried.lock().unwrap().as_slice(),
+        &[vec![low.0]],
+        "the step ran what it could"
+    );
+}
+
 /// **With nobody waiting, nothing is held.** `High` beside `Low` is the
 /// cast beside ingest — the pairing the removed pause never let go of.
 #[test]

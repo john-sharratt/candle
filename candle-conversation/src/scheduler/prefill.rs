@@ -111,6 +111,19 @@ fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = Decode
         .max(1)
 }
 
+/// Whether a step carrying `work` owes the decodes beside it airtime: not when
+/// it outranks every one of them.
+///
+/// The debt is decode's protection from the work that ran it up, and a decode
+/// that band outranks is not protected from it. Those rows rode the step anyway.
+/// Owed regardless, a dialogue's own tool results repaid background decodes step
+/// for step: on BlackWorld (2026-10-31) `owed` steps took 34 s of a minute beside
+/// `Low` decodes, and a 2,328-token `Urgent` prompt took 7.8 s, ~300 tokens a
+/// second on a card that publishes 1,500–1,800.
+fn owes_decode(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> bool {
+    decodes.into_iter().any(|d| rank(d) >= rank(work))
+}
+
 /// `R` for a `High` creep beside a `High` decode — see [`throttle_ratio`].
 const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 
@@ -5050,9 +5063,15 @@ impl Scheduler {
             self.high_airtime = derived;
         }
         let ratio = derived.unwrap_or(band.max(1) as f64);
+        let owes = owes_decode(
+            work,
+            self.foreground_decodes()
+                .map(|sid| self.decode_priority_or_high(sid)),
+        );
         self.wave_step_ratio = match derived {
             Some(r) => super::turn_airtime::debt_ratio(r),
-            None => ratio,
+            None if owes => ratio,
+            None => 0.0,
         };
         self.wave_step_slice = super::turn_airtime::slice_steps(
             ratio,
@@ -7221,6 +7240,21 @@ mod wave_chunk_tests {
     /// Whether `seq`'s turn is in flight.
     fn admitted(s: &Scheduler, seq: SequenceId) -> bool {
         s.active_prefills.iter().any(|p| p.work.sequence_id == seq)
+    }
+
+    /// **Work owes the decodes it outranks nothing.** A person's prompt beside
+    /// background decodes repays none of them; beside a decode of its own band
+    /// or above it does, and work of equal band still shares.
+    #[test]
+    fn work_owes_only_the_decodes_it_does_not_outrank() {
+        use super::owes_decode;
+        use DecodePriority::{High, Low, Normal, Urgent};
+        assert!(!owes_decode(Urgent, [Low, Low, Normal, High]));
+        assert!(!owes_decode(High, [Low, Normal]));
+        assert!(owes_decode(Urgent, [Low, Urgent]));
+        assert!(owes_decode(Low, [Low]));
+        assert!(owes_decode(Normal, [Low, High]));
+        assert!(!owes_decode(Low, []), "nothing decodes, nothing is owed");
     }
 
     /// **A person's prompt holds the background from the queue on.** Tool

@@ -716,12 +716,21 @@ impl Scheduler {
             .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent)
             || self.an_urgent_prompt_prefills();
         let low_rides = self.urgent_hold.low_rides(urgent);
-        if !low_rides {
-            seq_ids.retain(|&id| UrgentHold::rides(self.decode_priority_or_high(id), false));
+        // **A hold needs something to give the step to.** With the creep held
+        // back by a debt and every row `Low`, holding them would leave a step
+        // with nothing in it: done at once, its count spent, and the debt no
+        // smaller.
+        let rides =
+            |s: &Self, id: SequenceId| UrgentHold::rides(s.decode_priority_or_high(id), low_rides);
+        let something_else_runs = !self.wave_cohort_advanced
+            || seq_ids.iter().any(|&id| rides(self, id))
+            || stencil.rows.iter().any(|r| rides(self, r.seq));
+        if !low_rides && something_else_runs {
+            seq_ids.retain(|&id| rides(self, id));
             let (carried, held): (Vec<StencilRow>, Vec<StencilRow>) =
                 std::mem::take(&mut stencil.rows)
                     .into_iter()
-                    .partition(|r| UrgentHold::rides(self.decode_priority_or_high(r.seq), false));
+                    .partition(|r| rides(self, r.seq));
             stencil.rows = carried;
             self.stencil_rows.extend(held);
         }
@@ -747,9 +756,11 @@ impl Scheduler {
             {
                 let _g = profile::span("decode:step:rowless_wave");
                 let seqs = stencil.seqs();
+                let t_wave = std::time::Instant::now();
                 let ran = stencil.inputs().and_then(|inputs| {
                     self.decode_forward_cobatched(&[], &[], &[], &[], &seqs, &inputs)
                 });
+                self.step_census.forward(t_wave.elapsed());
                 match ran {
                     // `[stencil]`: nothing decodes and nothing verifies.
                     Ok(held) if !stencil.rows.is_empty() => {
@@ -995,6 +1006,7 @@ impl Scheduler {
         // logits on the forward's span, so the wave prices those stacks.
         self.session.set_accept_in_place(true);
         let stencil_seqs = stencil.seqs();
+        let t_wave = std::time::Instant::now();
         let forwarded = stencil.inputs().and_then(|stencil_inputs| {
             self.decode_forward_cobatched(
                 &plan.decode_seqs,
@@ -1006,6 +1018,7 @@ impl Scheduler {
             )
         });
         self.session.set_accept_in_place(false);
+        self.step_census.forward(t_wave.elapsed());
         // Held until the rollback: the rows below, the walk's stacks and the
         // rows the commit checks are all views on the forward's span.
         let held = match forwarded {

@@ -186,6 +186,9 @@ pub(super) struct StepCensus {
     steps: [u64; SHAPES.len()],
     wall: [Duration; SHAPES.len()],
     spent: [Duration; ACTIVITIES.len()],
+    /// Of the steps' wall, the time in their forwards. The rest is the host's
+    /// inside a step: drafting, sampling, the accept walk, the commit.
+    forwards: Duration,
 }
 
 impl Default for StepCensus {
@@ -201,7 +204,13 @@ impl StepCensus {
             steps: [0; SHAPES.len()],
             wall: [Duration::ZERO; SHAPES.len()],
             spent: [Duration::ZERO; ACTIVITIES.len()],
+            forwards: Duration::ZERO,
         }
+    }
+
+    /// File `took` of a step's wall as its forward.
+    pub(super) fn forward(&mut self, took: Duration) {
+        self.forwards += took;
     }
 
     pub(super) fn record(&mut self, shape: StepShape, took: Duration) {
@@ -234,6 +243,13 @@ impl StepCensus {
                 )
             })
             .collect();
+        if !self.forwards.is_zero() {
+            parts.push(format!(
+                "inside[forward={}ms host={}ms]",
+                self.forwards.as_millis(),
+                stepped.saturating_sub(self.forwards).as_millis()
+            ));
+        }
         let outside = elapsed.saturating_sub(stepped);
         parts.push(format!(
             "outside={}ms of {}ms",
@@ -357,5 +373,20 @@ mod tests {
         // And it starts again from the report.
         let line = c.take(t0 + Duration::from_secs(2));
         assert_eq!(line, "outside=1000ms of 1000ms around[other=1000ms]");
+    }
+
+    /// A step's wall splits into its forward and the host's work around it.
+    #[test]
+    fn the_census_splits_a_steps_wall_between_forward_and_host() {
+        let t0 = Instant::now();
+        let mut c = StepCensus::starting(t0);
+        c.record(StepShape::Cobatched, Duration::from_millis(300));
+        c.forward(Duration::from_millis(220));
+        let line = c.take(t0 + Duration::from_secs(1));
+        assert_eq!(
+            line,
+            "cob=1/300ms inside[forward=220ms host=80ms] outside=700ms of 1000ms \
+             around[other=700ms]"
+        );
     }
 }
