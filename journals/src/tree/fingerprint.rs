@@ -65,9 +65,12 @@ pub struct Dirty {
     pub path: JournalPath,
     /// Window lines newer than its summary — all of them when it has none.
     pub new_lines: usize,
-    /// When anything last changed in its window: the rebuild waits for it
-    /// to be quiet.
-    pub last_line: Option<Stamp>,
+    /// When anything its summary reads last changed: a window line, or a
+    /// live child's summary rebuilt. The rebuild waits for it to be quiet.
+    pub last_change: Option<Stamp>,
+    /// It has live children, whose summaries it reads: a parent settles for
+    /// longer than a journal of lines alone (`crate::brief::PARENT_QUIET_SECS`).
+    pub reads_children: bool,
 }
 
 /// Every dirty, writable journal, deepest first — so a child is rebuilt
@@ -85,7 +88,13 @@ pub fn dirty(tree: &Tree) -> Vec<Dirty> {
                     .iter()
                     .filter(|l| built.is_none_or(|b| l.at > b))
                     .count(),
-                last_line: j.window.iter().map(|l| l.at).max(),
+                last_change: j
+                    .window
+                    .iter()
+                    .map(|l| l.at)
+                    .chain(j.live().filter_map(|(_, c)| c.summary().map(|s| s.built)))
+                    .max(),
+                reads_children: j.live().next().is_some(),
                 path,
             }
         })

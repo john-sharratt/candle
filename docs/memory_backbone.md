@@ -731,10 +731,16 @@ a conversation working out its speaker sees who it could be:
   It writes each summary back through the service like any other writer,
   naming the fingerprint it was built over. A rebuild reads only its own
   group.
-- **When.** A dirty journal is rebuilt once it has been quiet for 30 seconds
-  or has 20 lines since its last build, whichever is first. A conversation
-  or task that closes is rebuilt at once. The same thread runs the window
-  folds (§4) and the eleventh-child folds (§2.3).
+- **When.** A dirty journal is rebuilt once what its summary reads has been
+  quiet — no new window line, and no live child's summary rebuilt — for 30
+  seconds, or for 10 minutes when it has live children; or once it has 20
+  lines since its last build, whichever is first. A parent waits for its
+  children to settle because every child's rebuild dirties it: timed by its
+  own window alone, a master with almost no lines was rebuilt the moment any
+  child was — `@zen` nine times in eighty minutes on 2026-10-31, each a new
+  `journal.yaml` for zend's code reading to read and calibrate. A
+  conversation or task that closes is rebuilt at once. The same thread runs
+  the window folds (§4) and the eleventh-child folds (§2.3).
 - **How.** Each rebuild is one turn in zend's `Low` band, in a conversation
   opened for that question alone. It runs under the reserved `Prose` layer,
   with its group closed to every other turn, and its timeline is tombstoned
