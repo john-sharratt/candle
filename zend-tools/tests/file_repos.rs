@@ -9,7 +9,8 @@ mod harness;
 
 use serde_json::json;
 use tempfile::TempDir;
-use zend_tools::ToolContext;
+use zend_tools::tools::file::image::{FileImage, ImageRequest};
+use zend_tools::{Tool, ToolContext};
 use zend_vfs::{RepoSpec, Workspace};
 
 /// A workspace with two repositories, `a` and `b`, each holding a file at the
@@ -38,6 +39,34 @@ fn two_repo_workspace() -> TempDir {
 fn ctx(dir: &TempDir) -> ToolContext {
     let ws = Workspace::new(dir.path(), vec![RepoSpec::named("a"), RepoSpec::named("b")]).unwrap();
     ToolContext::with_workspace(ws).unwrap()
+}
+
+/// **A picture in one repository makes copies in another**, and the source's
+/// repository is left as it was. A repository that does not exist is refused.
+#[test]
+fn file_image_carries_a_picture_between_repositories() {
+    let dir = two_repo_workspace();
+    image::RgbaImage::new(64, 64)
+        .save(dir.path().join("a").join("source.png"))
+        .unwrap();
+    let ctx = ctx(&dir);
+    let request = |source_repo: &str| {
+        serde_json::from_value::<ImageRequest>(json!({
+            "repo": "b",
+            "source_repo": source_repo,
+            "path": "source.png",
+            "outputs": [{"path": "icon.png", "width": 32, "height": 32}],
+        }))
+        .unwrap()
+    };
+    let made = FileImage::run(&ctx, request("a")).unwrap();
+    assert_eq!((made.width, made.height), (64, 64));
+    let bytes = ctx.files.repo("b").unwrap().read_bytes("icon.png");
+    let copy = image::load_from_memory(&bytes.unwrap().unwrap()).unwrap();
+    assert_eq!((copy.width(), copy.height()), (32, 32));
+    let source_repo = ctx.files.repo("a").unwrap();
+    assert!(source_repo.read_bytes("icon.png").unwrap().is_none());
+    assert!(FileImage::run(&ctx, request("nowhere")).is_err());
 }
 
 /// A grouped search result — `{"repos": [{"repo", <items>: [...]}]}` — as its

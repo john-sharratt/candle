@@ -78,7 +78,9 @@ impl Tool for RunCommand {
          and a script in the repository runs through its interpreter (`node` with \
          `[\"scripts/report.js\"]`). There is no shell, so no `&&`, pipes or redirects. \
          Files the program changes come back into your uncommitted changes. git cannot be run \
-         here; use the git tools. Use for: running the tests after an edit, \
+         here; use the git tools. Do not script a picture here: file_image resizes, converts \
+         and carries pictures between repositories, and a run cannot reach outside its own \
+         repository. Use for: running the tests after an edit, \
          building, formatting, running a script. Triggered by \"run the tests\", \"does it \
          build\", \"npm test\", \"cargo check\". Returns the exit code, the files it changed, \
          and the first page of its output; read further pages with run_output.";

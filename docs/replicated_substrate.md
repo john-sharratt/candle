@@ -985,6 +985,10 @@ value, and it reads that decision and proposes again at `n + 1`. Once it is deci
 - **A second rollout decided while one runs supersedes it.** The member installing now
   finishes, because a swap is never interrupted. The next member gets the newer
   decision's build.
+- **A rollout ends for a member past it, unless that build was rejected.** A rollout stays
+  the app's latest until another replaces it, so a later build would otherwise be
+  installed and then rolled back. A rollback still applies: it rejects what it rolls back
+  from.
 
 **What it overrides:**
 
