@@ -26,14 +26,22 @@ const EVERY: Duration = Duration::from_secs(60);
 /// restart is ending it, and it stays lost for a person to read.
 pub const MAX_RESUMES: u32 = 3;
 
+/// How long a lost task's beat has been silent before it is started again.
+/// "Lost" is read off a record that replicates, so a member whose copy lags, or
+/// whose runtime stalls, sees a live task's beat stop for a while; started again
+/// then, the task would run twice, each copy writing its own turns. Well past
+/// [`super::threads::BEAT_LOST_MS`], and a restart's load is within it.
+pub const RESUME_AFTER_MS: u64 = 10 * 60 * 1000;
+
 /// Whether `w`, as observed at `now`, should be started again. A part is not:
 /// the worker that started it is, and starts what it still needs. One silent
 /// for as long as the archive sweep waits has been given up on.
 pub fn due(w: &Worker, now: u64) -> bool {
+    let silent = now.saturating_sub(w.beat_ms);
     lost(w)
         && !w.is_part()
         && w.resumes < MAX_RESUMES
-        && now.saturating_sub(w.beat_ms) < LOST_ARCHIVE_MS
+        && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
 }
 
 /// Start again, on one member, every lost task. How many this one took.
@@ -112,11 +120,17 @@ mod tests {
 
     #[test]
     fn only_a_task_lost_lately_and_not_too_often_is_resumed() {
-        let after = 1_001 + BEAT_LOST_MS;
+        let after = 1_000 + RESUME_AFTER_MS;
         assert!(due(&worker("a", 0).observed(after), after));
         assert!(
             !due(&worker("a", 0).observed(1_000), 1_000),
             "its beat is fresh"
+        );
+        let lagging = 1_001 + BEAT_LOST_MS;
+        assert!(lost(&worker("a", 0).observed(lagging)), "it reads as lost");
+        assert!(
+            !due(&worker("a", 0).observed(lagging), lagging),
+            "but a member's copy may only be behind"
         );
         assert!(
             !due(&worker("a", MAX_RESUMES).observed(after), after),
@@ -126,7 +140,7 @@ mod tests {
             !due(&worker("a/part", 0).observed(after), after),
             "its worker starts its parts"
         );
-        let late = 1_001 + LOST_ARCHIVE_MS;
+        let late = 1_000 + LOST_ARCHIVE_MS;
         assert!(!due(&worker("a", 0).observed(late), late), "given up on");
         assert_eq!(worker("a", 0).observed(1_000).state, State::Running);
     }

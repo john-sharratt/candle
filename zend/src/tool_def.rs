@@ -1065,6 +1065,22 @@ mod tests {
         }
     }
 
+    /// **The grammar is built from these definitions, in their order**, not
+    /// from the executor's request type: `text` declared before `old` left a
+    /// call that wrote `old` no way to say what replaces it.
+    #[test]
+    fn file_edit_offers_old_before_text() {
+        let defs = load_bundled();
+        let edit = defs.iter().find(|d| d.name == "file_edit").unwrap();
+        let names: Vec<&String> = edit.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        let at = |n: &str| names.iter().position(|k| *k == n).unwrap();
+        assert!(at("old") < at("text"), "{names:?}");
+    }
+
     /// Two tools sharing a description and example must not collide.
     #[test]
     fn calibration_markers_are_per_tool() {

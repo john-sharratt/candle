@@ -73,10 +73,14 @@ const DRAFT_MAX_TOKENS: usize = 2048;
 /// On a unit, the marker its calibration last failed under and how many times.
 const FAILED_KEY: &str = "calibration_failed";
 
-/// Passes that may fail a unit before it is left uncalibrated. Four units
-/// answered every draft the same way and were asked again every pass on both
-/// members (2026-10-31). A new reading is a new marker, and is tried afresh.
+/// Passes whose draft may write no question before the unit is left
+/// uncalibrated. Four units answered every draft the same way and were asked
+/// again every pass on both members (2026-10-31). A new reading is a new
+/// marker, and is tried afresh.
 const MAX_FAILURES: u32 = 3;
+
+/// How a calibration that failed for want of a question says so.
+const NO_QUESTION: &str = "the draft wrote no question";
 
 /// How many times `marker` has failed, as [`FAILED_KEY`] holds it in `recorded`.
 fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
@@ -223,20 +227,29 @@ pub fn calibrate_layer(
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         if !crate::ingest_cancel::cancelled() {
-                            let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
-                                .saturating_add(1);
-                            let recorded = engine.set_conversation_metadata(
-                                unit.timeline,
-                                FAILED_KEY,
-                                &format!("{} {tries}", unit.marker),
-                            );
+                            // Only the unit's own failure counts against it: a
+                            // decode lost to a restart or a full card says
+                            // nothing about the unit, and is simply tried again.
+                            if format!("{e:#}").starts_with(NO_QUESTION) {
+                                let tries =
+                                    failures_of(unit.prior_failures.as_deref(), &unit.marker)
+                                        .saturating_add(1);
+                                if let Err(err) = engine.set_conversation_metadata(
+                                    unit.timeline,
+                                    FAILED_KEY,
+                                    &format!("{} {tries}", unit.marker),
+                                ) {
+                                    tracing::warn!(
+                                        target: "zend::calibrate",
+                                        subject = %unit.subject,
+                                        "a failed calibration could not be counted: {err}",
+                                    );
+                                }
+                            }
                             tracing::warn!(
                                 target: "zend::calibrate",
                                 layer = %spec.layer,
                                 subject = %unit.subject,
-                                tries,
-                                gives_up_at = MAX_FAILURES,
-                                recorded = recorded.is_ok(),
                                 "calibration failed: {e:#}",
                             );
                         }
@@ -393,10 +406,7 @@ fn calibrate_one(
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
         let opening: String = asked.chars().take(160).collect();
-        anyhow::bail!(
-            "the draft wrote no question ({} chars: {opening:?})",
-            asked.len()
-        );
+        anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", asked.len());
     }
     let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
