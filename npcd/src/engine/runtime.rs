@@ -1823,28 +1823,41 @@ impl Runtime {
     /// state is its authority's to mark; the idle thought is every member's.
     pub async fn mark_orders(&self) {
         for world in self.hosted.ids() {
-            let Some(hosted) = self.hosted.get(&world) else {
+            self.mark_orders_in(&world).await;
+        }
+    }
+
+    /// [`Self::mark_orders`], for the characters of world `world` alone.
+    ///
+    /// **Also run when this member takes the world's authority.** A character
+    /// is marked as it is embodied only by the world's authority, and a member
+    /// starts as a replica: the cast it embodies at startup goes unmarked there,
+    /// and the lease it takes a moment later is what makes it the authority.
+    /// Without this a character whose personality takes no orders kept the
+    /// mission it carried — Zen worked a Drone's routine for hours after
+    /// `takes_orders: false` was written.
+    pub async fn mark_orders_in(&self, world: &str) {
+        let Some(hosted) = self.hosted.get(world) else {
+            return;
+        };
+        let writes = self.standing.writes(world);
+        for (npc_id, body) in self.bodies.in_world(world) {
+            // A character whose persona cannot be read now keeps its marks.
+            let Some(p) = self.persona_of_async(npc_id).await else {
                 continue;
             };
-            let writes = self.standing.writes(&world);
-            for (npc_id, body) in self.bodies.in_world(&world) {
-                // A character whose persona cannot be read now keeps its marks.
-                let Some(p) = self.persona_of_async(npc_id).await else {
-                    continue;
-                };
-                self.set_idle(npc_id, p.idle.as_deref());
-                if !writes {
-                    continue;
-                }
-                let stands = hosted.sim(|s| (s.missions.is_unordered(&body), s.attends(&body)));
-                if stands != (p.unordered, p.attends) {
-                    hosted.with_sim(|s| {
-                        if s.missions.is_unordered(&body) != p.unordered {
-                            s.missions.set_unordered(&body, p.unordered);
-                        }
-                        s.set_attends(&body, p.attends);
-                    });
-                }
+            self.set_idle(npc_id, p.idle.as_deref());
+            if !writes {
+                continue;
+            }
+            let stands = hosted.sim(|s| (s.missions.is_unordered(&body), s.attends(&body)));
+            if stands != (p.unordered, p.attends) {
+                hosted.with_sim(|s| {
+                    if s.missions.is_unordered(&body) != p.unordered {
+                        s.missions.set_unordered(&body, p.unordered);
+                    }
+                    s.set_attends(&body, p.attends);
+                });
             }
         }
     }
@@ -8676,6 +8689,50 @@ mod tests {
         says.store(2, Ordering::SeqCst);
         rt.mark_orders().await;
         assert!(rt.takes_orders(1), "and unmarked");
+    }
+
+    /// **A cast embodied while this member followed its world is marked once the
+    /// member becomes the world's authority**: a character whose personality
+    /// takes no orders is stood down from the mission it carried, rather than
+    /// working it on until the personalities are next read.
+    #[tokio::test]
+    async fn taking_a_world_marks_the_cast_embodied_as_its_replica() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+
+        let rt = vaulted();
+        rt.standing.set_role(WORLD, Role::Replica, 0);
+        rt.embody_in_world(1, WORLD, Kind::default(), "Zen", None, 0)
+            .unwrap();
+        let (hosted, body) = rt.body_of(1).unwrap();
+        hosted.with_sim(|s| {
+            s.missions.assign(
+                &body,
+                Mission::new(
+                    "Visit the hatchery.",
+                    vec![Todo::new("go to the hatchery")],
+                    Origin::Random {
+                        routine: "visit-the-hatchery".into(),
+                    },
+                ),
+            )
+        });
+        rt.set_persona_source(Arc::new(|_| {
+            Some(OwnedPersona {
+                unordered: true,
+                ..OwnedPersona::default()
+            })
+        }));
+        rt.mark_orders_in(WORLD).await;
+        assert!(rt.takes_orders(1), "a replica marks nothing");
+        assert!(hosted.sim(|s| s.missions.active(&body).is_some()));
+
+        rt.standing.set_role(WORLD, Role::Authority { epoch: 1 }, 0);
+        rt.mark_orders_in(WORLD).await;
+        assert!(!rt.takes_orders(1), "the authority marks it");
+        assert!(
+            hosted.sim(|s| s.missions.active(&body).is_none()),
+            "and stands it down from what it carried"
+        );
     }
 
     /// **A Maker free at the open table is handed the operation waiting there**
