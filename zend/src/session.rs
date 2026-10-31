@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -35,9 +34,8 @@ use candle_conversation::persistence::{
     content_hash, OpenProgressHook, OpenStage, SharedSubstrate, SUBSTRATE_DIR,
 };
 use candle_conversation::projection::{
-    self, Builder, Conversation, DecodePriority, GroupId, GroupSchema, LayerId, Reserved,
-    SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema,
-    TimelineId, TurnIndex, WorkingSetShare,
+    self, Builder, Conversation, DecodePriority, GroupId, LayerId, Reserved, SectionId,
+    SectionLoads, SelectionRule, SystemItem, SystemPromptItem, TimelineId, TurnIndex,
 };
 use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::FOLD_GROUPS;
@@ -63,6 +61,10 @@ use candle_conversation::{
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
+use host::substrate_views::{
+    layer_conversations, overview, system_prompt, timeline, title, LayerConversations,
+    SubstrateOverview, SystemPromptView, TimelineDetail, Unit,
+};
 use journal_core::entry::Entry;
 use journal_core::fold;
 use journal_core::folding::{self, Folded};
@@ -83,9 +85,8 @@ use crate::api::chat::{
     RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
 };
 use crate::api::substrate::{
-    ConvView, Counts, GroupView, LayerConversations, LayerView, ProjectTile, ProjectView,
-    SectionView, SegmentView, SelectedNodeView, SelectionView, Storage, SubstrateOverview,
-    SystemPromptRetired, SystemPromptView, TimelineDetail, ToolView, ToolsView, TurnView,
+    ProjectTile, ProjectView, SelectedNodeView, SelectionView, SystemPromptRetired, ToolView,
+    ToolsView,
 };
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
@@ -6866,71 +6867,15 @@ impl ZendSession {
     /// Answers while zend is still loading, once its substrate has replayed.
     pub fn substrate_overview(&self) -> Option<SubstrateOverview> {
         let (conv, titler, target_layer) = self.substrate_for_views()?;
-
-        // Projection schema — the builder parsed once at session construction, no
-        // lock held (and no per-request re-parse).
-        let schema = self.projection_builder.schema();
-
-        // On-disk footprint (fs stat, no lock).
-        let (segments, total_bytes) = self.substrate_segment_files();
-
-        let dead_ratio = conv.dead_ratio();
-        let read = conv.read();
-        let s = &*read;
-
-        let counts = Counts {
-            timeline_count: s.timeline_count(),
-            conversation_count: s.conversation_count(),
-            section_count: s.section_count(),
-            token_count: s.corpus_token_total(),
-        };
-
-        // Layer metadata only — each layer carries a conversation COUNT, never
-        // the list. The list, the framing sections, and the tool catalog are
-        // fetched per-expansion (substrate_layer / substrate_system_prompt /
-        // substrate_tools) so init and the periodic refresh stay cheap no matter
-        // how large the corpus grows.
-        let layers: Vec<LayerView> = schema
-            .layers
-            .iter()
-            .map(|l| {
-                let (conversation_count, tokens) = layer_totals(s, &l.groups, titler);
-                LayerView {
-                    name: l.name.clone(),
-                    description: l.description.trim().to_string(),
-                    window: l.window,
-                    priority: l.budget.priority,
-                    groups: l
-                        .groups
-                        .iter()
-                        .map(|g| GroupView {
-                            name: g.name.clone(),
-                            selection: fmt_selection(&g.selection),
-                        })
-                        .collect(),
-                    dials: l
-                        .dials
-                        .iter()
-                        .map(|(sel, opt)| format!("{sel} = {opt}"))
-                        .collect(),
-                    conversation_count,
-                    tokens,
-                    disabled: s.is_layer_disabled(&l.name),
-                }
-            })
-            .collect();
-
-        Some(SubstrateOverview {
-            storage: Storage {
-                segments,
-                total_bytes,
-                live_chunks: s.live_chunk_count(),
-                dead_ratio,
-            },
-            counts,
+        // The builder parsed once at session construction: no lock held, and no
+        // per-request re-parse.
+        Some(overview(
+            &conv,
+            self.projection_builder.schema(),
+            titler,
             target_layer,
-            layers,
-        })
+            &self.config.workspace.root().join(SUBSTRATE_DIR),
+        ))
     }
 
     /// Flip a projection layer's runtime kill switch (in-memory, non-persistent).
@@ -6966,9 +6911,7 @@ impl ZendSession {
             .map(|l| l.groups.clone())?;
         let (conv, titler, _) = self.substrate_for_views()?;
         let read = conv.read();
-        Some(LayerConversations {
-            conversations: layer_conv_views(&read, &groups, titler),
-        })
+        Some(layer_conversations(&read, &groups, titler, unit_of))
     }
 
     /// `GET /v1/substrate/zend/system-prompt` — the target (dialogue) layer's framing:
@@ -6977,34 +6920,14 @@ impl ZendSession {
     /// itself loads from `substrate_tools`). Fetched when the system-prompt card
     /// expands.
     pub fn substrate_system_prompt(&self) -> Option<SystemPromptView> {
-        let schema = self.projection_builder.schema();
         let (conv, _, target_layer) = self.substrate_for_views()?;
         let read = conv.read();
-        let s = &*read;
-
-        // Always-emit framing sections of the single shared prompt (skips the
-        // tools collection and the section tree, which appear as labels in `items`).
-        let sections: Vec<SectionView> = schema
-            .system_prompt
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                SystemPromptItem::Section(sec) => Some(SectionView {
-                    name: sec.name.clone(),
-                    tokens: s.section_tokens_of(sec.id).len(),
-                    blocks: s.section_block_count(sec.id).unwrap_or(0),
-                    content: sec.content.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
-
-        Some(SystemPromptView {
+        Some(system_prompt(
+            &read,
+            self.projection_builder.schema(),
             target_layer,
-            items: system_prompt_labels(&schema.system_prompt),
-            sections,
-            tool_count: crate::tool_def::all().len(),
-        })
+            crate::tool_def::all().len(),
+        ))
     }
 
     /// zend's entries in `GET /v1/tools` — the live tool catalog projected into the
@@ -7038,96 +6961,9 @@ impl ZendSession {
     /// every turn decoded. `tl` is the raw timeline id. `None` before the
     /// substrate has replayed or when no such timeline exists.
     pub fn substrate_timeline(&self, tl_raw: u64) -> Option<TimelineDetail> {
-        let tl = projection::TimelineId::from_raw(tl_raw)?;
-
-        let schema = self.projection_builder.schema();
-
         let (conv, _, _) = self.substrate_for_views()?;
         let read = conv.read();
-        let s = &*read;
-
-        // Reject an unknown timeline (nothing sealed and no registration).
-        if s.turn_count(tl) == 0 && s.timeline_target(tl).is_none() {
-            return None;
-        }
-
-        let (layer, group) = match s.timeline_target(tl) {
-            Some((lid, gid)) => {
-                let l = schema.layers.iter().find(|l| l.id == lid);
-                (
-                    l.map(|l| l.name.clone()).unwrap_or_default(),
-                    l.and_then(|l| l.groups.iter().find(|g| g.id == gid))
-                        .map(|g| g.name.clone())
-                        .unwrap_or_default(),
-                )
-            }
-            None => (String::new(), String::new()),
-        };
-
-        let peak_set: HashSet<u32> = s.peaks_of(tl).into_iter().map(|(idx, _)| idx.0).collect();
-        let couplings = s.couplings_of(tl);
-        let mut coupling_list: Vec<u32> = couplings.iter().copied().collect();
-        coupling_list.sort_unstable();
-
-        let mut indices: Vec<_> = s.turn_indices(tl).collect();
-        indices.sort_by_key(|i| i.0);
-        let turns: Vec<TurnView> = indices
-            .into_iter()
-            .map(|idx| {
-                let (kind, height, children) = match s.tree_meta_of(tl, idx) {
-                    Some(m) => (
-                        match m.kind {
-                            TurnKind::Normal => "normal",
-                            TurnKind::SummaryOfTurns => "sot",
-                            TurnKind::SummaryOfSummaries => "sos",
-                        },
-                        m.tree_height,
-                        m.children.iter().map(|c| c.0).collect::<Vec<u32>>(),
-                    ),
-                    None => ("normal", 0, Vec::new()),
-                };
-                TurnView {
-                    index: idx.0,
-                    kind,
-                    height,
-                    tokens: s.turn_token_count_of(tl, idx),
-                    no_think: s.turn_no_think(tl, idx),
-                    children,
-                    coupled: couplings.contains(&idx.0),
-                    peak: peak_set.contains(&idx.0),
-                    user: s.user_text_of(tl, idx),
-                    assistant: s.assistant_text_of(tl, idx),
-                    layout: s.turn_layout(tl, idx),
-                }
-            })
-            .collect();
-
-        Some(TimelineDetail {
-            timeline: tl_raw.to_string(),
-            conv_id: s.conv_id_of(tl).unwrap_or_default().to_string(),
-            label: s.label_of(tl).unwrap_or_default().to_string(),
-            archived: s.is_archived(tl),
-            layer,
-            group,
-            total_tokens: s.timeline_token_total(tl),
-            custom: s
-                .custom_of(tl)
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default(),
-            inherited_chain: s
-                .inherited_chain(tl)
-                .into_iter()
-                .map(|t| t.raw().to_string())
-                .collect(),
-            peaks: {
-                let mut p: Vec<u32> = peak_set.into_iter().collect();
-                p.sort_unstable();
-                p
-            },
-            couplings: coupling_list,
-            turn_count: turns.len(),
-            turns,
-        })
+        timeline(&read, self.projection_builder.schema(), tl_raw)
     }
 
     /// `GET /v1/substrate/zend/timeline/{tl}/selection` — the most recent
@@ -7308,45 +7144,6 @@ impl ZendSession {
             query_tokens,
             tiles,
         })
-    }
-
-    /// The segmented redo log's on-disk segment files, ascending by id (the last
-    /// is the active one), plus their total byte size. Pure `fs` stat — no lock,
-    /// available whether or not the model has finished loading.
-    fn substrate_segment_files(&self) -> (Vec<SegmentView>, u64) {
-        let dir = self.config.workspace.root().join(SUBSTRATE_DIR);
-        let mut segs: Vec<(u64, u64)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let name = e.file_name();
-                let Some(name) = name.to_str() else { continue };
-                let Some(rest) = name.strip_prefix("seg-") else {
-                    continue;
-                };
-                let Some((num, ext)) = rest.rsplit_once('.') else {
-                    continue;
-                };
-                if ext != "log" && ext != "active" {
-                    continue;
-                }
-                let Ok(id) = num.parse::<u64>() else { continue };
-                let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
-                segs.push((id, bytes));
-            }
-        }
-        segs.sort_by_key(|(id, _)| *id);
-        let total: u64 = segs.iter().map(|(_, b)| *b).sum();
-        let last = segs.len().saturating_sub(1);
-        let views = segs
-            .iter()
-            .enumerate()
-            .map(|(i, (id, bytes))| SegmentView {
-                id: *id,
-                active: i == last,
-                bytes: *bytes,
-            })
-            .collect();
-        (views, total)
     }
 
     pub fn list_conversations(&self, include_archived: bool) -> Vec<ConvEntry> {
@@ -8830,23 +8627,6 @@ fn clean_title(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// `(conversation count, total tokens)` across the non-empty, non-tombstoned,
-/// non-titler timelines targeting a layer's groups — the cheap headline numbers
-/// the overview shows without materializing the conversation list.
-fn layer_totals(
-    s: &Substrate,
-    groups: &[GroupSchema],
-    titler: Option<TimelineId>,
-) -> (usize, usize) {
-    groups
-        .iter()
-        .flat_map(|g| s.timelines_for_group(g.id))
-        .filter(|tl| Some(*tl) != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
-        .fold((0, 0), |(n, tok), tl| {
-            (n + 1, tok + s.timeline_token_total(tl))
-        })
-}
-
 /// What a committed ingested unit is keyed by, workspace-relative: a file's
 /// reading by its path, a folder's by its folder, a layer's unit by its
 /// subject — the file or folder it analyses. `None` for a conversation that is
@@ -8858,90 +8638,54 @@ fn committed_unit_key(meta: &POrdMap<String, String>) -> Option<&String> {
         .filter(|_| meta.contains_key(CONTENT_KEY))
 }
 
-/// The conversations targeting a layer's groups, largest first. Enumerates
-/// EVERY registered timeline — not just user conversations — so internal
-/// content layers (repo_map, code_reading, the analysis layers) surface their
-/// timelines too; `known_conversations()` would return only the conv_id-bearing
-/// dialogue conversations and leave a populated layer reading empty.
-fn layer_conv_views(
-    s: &Substrate,
-    groups: &[GroupSchema],
-    titler: Option<TimelineId>,
-) -> Vec<ConvView> {
-    let mut conversations: Vec<ConvView> = Vec::new();
-    for g in groups {
-        for tl in s.timelines_for_group(g.id) {
-            if Some(tl) == titler || s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
-                continue;
-            }
-            // Title precedence: the sidebar label, then the conv_id, then the
-            // conversation's `path` metadata — code_reading (and any file-scoped
-            // ingest) records the file path there at creation, so those otherwise
-            // conv_id-less timelines read as the file they cover instead of
-            // "(untitled)".
-            let label = s
-                .label_of(tl)
-                .filter(|l| !l.is_empty())
-                .or_else(|| s.conv_id_of(tl).filter(|c| !c.is_empty()))
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    s.custom_of(tl)
-                        .and_then(|m| m.get(PATH_KEY).or_else(|| m.get(SUBJECT_KEY)))
-                        .filter(|p| !p.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_default();
-            let summary_nodes = s
-                .turn_indices(tl)
-                .filter(|idx| {
-                    s.tree_meta_of(tl, *idx)
-                        .is_some_and(|m| m.kind.is_summary())
-                })
-                .count();
-            let branches = s
-                .custom_of(tl)
-                .and_then(|m| m.get(BRANCHES_KEY))
-                .map(|v| {
-                    v.split(',')
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let commit = s
-                .custom_of(tl)
-                .and_then(|m| m.get(COMMIT_KEY))
+/// How zend names one of its conversations in a layer's list. An ingested unit
+/// — the internal content layers (repo_map, code_reading, the analysis layers)
+/// — the way the tools address it: its repository, the path inside it, and the
+/// branches or commit that tell one version from another.
+fn unit_of(s: &Substrate, tl: TimelineId) -> Unit {
+    // Title precedence: the sidebar label, then the conv_id, then the
+    // conversation's `path` metadata — code_reading (and any file-scoped
+    // ingest) records the file path there at creation, so those otherwise
+    // conv_id-less timelines read as the file they cover instead of
+    // "(untitled)".
+    let custom = s.custom_of(tl);
+    let label = title(s, tl)
+        .or_else(|| {
+            custom
+                .and_then(|m| m.get(PATH_KEY).or_else(|| m.get(SUBJECT_KEY)))
+                .filter(|p| !p.is_empty())
                 .cloned()
-                .unwrap_or_default();
-            // An ingested unit is keyed workspace-relative (`candle/CLAUDE.md`);
-            // the view shows it the way the tools address it — its repository,
-            // and the path inside it.
-            let unit_key = s.custom_of(tl).and_then(committed_unit_key).cloned();
-            let (repo, label) = match &unit_key {
-                Some(key) => {
-                    let (repo, inner) = shown_unit(key);
-                    (repo.to_string(), inner)
-                }
-                None => (String::new(), label),
-            };
-            conversations.push(ConvView {
-                timeline: tl.raw().to_string(),
-                conv_id: s.conv_id_of(tl).unwrap_or_default().to_string(),
-                label,
-                repo,
-                archived: s.is_archived(tl),
-                group: g.name.clone(),
-                turn_count: s.turn_count(tl),
-                tokens: s.timeline_token_total(tl),
-                summary_nodes,
-                branches,
-                commit,
-            });
+        })
+        .unwrap_or_default();
+    let branches = custom
+        .and_then(|m| m.get(BRANCHES_KEY))
+        .map(|v| {
+            v.split(',')
+                .filter(|b| !b.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let commit = custom
+        .and_then(|m| m.get(COMMIT_KEY))
+        .cloned()
+        .unwrap_or_default();
+    // An ingested unit is keyed workspace-relative (`candle/CLAUDE.md`); the
+    // view shows it the way the tools address it — its repository, and the
+    // path inside it.
+    let (repo, label) = match custom.and_then(committed_unit_key) {
+        Some(key) => {
+            let (repo, inner) = shown_unit(key);
+            (repo.to_string(), inner)
         }
+        None => (String::new(), label),
+    };
+    Unit {
+        label,
+        repo,
+        branches,
+        commit,
     }
-    // Largest first — the most substantial timelines lead each layer.
-    conversations.sort_by_key(|c| Reverse(c.turn_count));
-    conversations
 }
 
 /// The status a waiting prefill shows (`TurnEvent::PrefillQueued`): what it
@@ -8959,41 +8703,6 @@ fn queued_status(ahead_tokens: usize, ahead_turns: usize, waiting_ms: u64) -> St
     };
     let turns = if ahead_turns == 1 { "turn" } else { "turns" };
     format!("Waiting for the GPU — {ahead_turns} {turns} ({tokens} tokens) ahead, {secs} s")
-}
-
-/// One-line description of a group's selection rule, for the substrate viewer.
-fn fmt_selection(rule: &SelectionRule) -> String {
-    match rule {
-        SelectionRule::AlwaysVisible => "all".to_string(),
-        SelectionRule::TopK { k } => format!("top {k}"),
-        SelectionRule::Single => "single".to_string(),
-        SelectionRule::Named { selector } => format!("named({selector})"),
-        SelectionRule::Offered { selector, k } => format!("offered({selector}, k={k})"),
-        SelectionRule::Sequence {
-            recent,
-            historical_top_k,
-        } => format!("recent {recent} + top {historical_top_k}"),
-        SelectionRule::WorkingSet { share } => match share {
-            WorkingSetShare::Folders => "working set (folders)".to_string(),
-            WorkingSetShare::Remainder => "working set (files)".to_string(),
-        },
-    }
-}
-
-/// Declaration-order labels for a layer's system-prompt items — a bare section
-/// by name, a collection by name + member count, a section tree by node count.
-fn system_prompt_labels(sp: &SystemPromptSchema) -> Vec<String> {
-    sp.items
-        .iter()
-        .map(|it| match it {
-            SystemPromptItem::Section(s) => s.name.clone(),
-            // Member count is NOT taken from `c.sections` — for the `tools`
-            // collection those are installed at runtime and absent from a fresh
-            // schema parse. The viewer lists the live members separately.
-            SystemPromptItem::Collection(c) => format!("{} · collection", c.name),
-            SystemPromptItem::SectionTree(t) => format!("section tree ({} nodes)", t.nodes.len()),
-        })
-        .collect()
 }
 
 /// The workspace's projection schema — its `projection.yaml` or the embedded
@@ -9089,43 +8798,11 @@ mod queued_status_tests {
 
 #[cfg(test)]
 mod projection_schema_tests {
-    use super::{build_projection_builder, fmt_selection, system_prompt_labels};
+    use super::build_projection_builder;
     use candle_conversation::projection::{SelectionRule, WorkingSetShare};
+    use host::substrate_views::system_prompt_labels;
     use std::collections::HashMap;
     use std::path::Path;
-
-    /// `fmt_selection` renders every selection rule as the viewer's one-liner.
-    #[test]
-    fn selection_rules_render_for_the_viewer() {
-        assert_eq!(fmt_selection(&SelectionRule::AlwaysVisible), "all");
-        assert_eq!(fmt_selection(&SelectionRule::TopK { k: 3 }), "top 3");
-        assert_eq!(fmt_selection(&SelectionRule::Single), "single");
-        assert_eq!(
-            fmt_selection(&SelectionRule::Named {
-                selector: "effort".into()
-            }),
-            "named(effort)"
-        );
-        assert_eq!(
-            fmt_selection(&SelectionRule::Sequence {
-                recent: 16,
-                historical_top_k: 8,
-            }),
-            "recent 16 + top 8"
-        );
-        assert_eq!(
-            fmt_selection(&SelectionRule::WorkingSet {
-                share: WorkingSetShare::Folders
-            }),
-            "working set (folders)"
-        );
-        assert_eq!(
-            fmt_selection(&SelectionRule::WorkingSet {
-                share: WorkingSetShare::Remainder
-            }),
-            "working set (files)"
-        );
-    }
 
     /// The dialogue layer's system-prompt labels name its framing sections, its
     /// tools collection (with a member count), and its section tree — the

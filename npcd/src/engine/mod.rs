@@ -26,6 +26,7 @@
 //! | [`watcher`] | the mind directory, reloaded without a restart |
 //! | [`slash`] | `/` commands — an operator speaking to the loop |
 //! | [`pulse`] | the routes the Pulse view reads |
+//! | [`substrate_views`] | the substrate inspector's routes, over npcd's substrate |
 //!
 //! # What is still absent, and says so
 //!
@@ -105,6 +106,7 @@ pub mod slash;
 pub mod sleep;
 pub mod station;
 pub mod stir;
+pub mod substrate_views;
 pub mod survey;
 pub mod tick;
 pub mod tools;
@@ -196,6 +198,36 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             get(turn),
         )
         .route("/v1/npc/:nid/memory", Role::User, character(), get(memory))
+        // ── the substrate inspector ─────────────────────────────────────────
+        //
+        // Admin, like the host's `/v1/substrate` they hang under: they read
+        // every character's conversations, whoever owns them. Any member
+        // answers a read — the substrate is replicated — and every member
+        // flips a toggle, which is in-memory and its own.
+        .route(
+            "/v1/substrate/npcd/system-prompt",
+            Role::Admin,
+            Dispatch::Any,
+            get(substrate_views::system_prompt),
+        )
+        .route(
+            "/v1/substrate/npcd/layer/:name",
+            Role::Admin,
+            Dispatch::Any,
+            get(substrate_views::layer),
+        )
+        .route(
+            "/v1/substrate/npcd/layer/:name/toggle",
+            Role::Admin,
+            each(),
+            post(substrate_views::toggle_layer),
+        )
+        .route(
+            "/v1/substrate/npcd/timeline/:tl",
+            Role::Admin,
+            Dispatch::Any,
+            get(substrate_views::timeline),
+        )
         // ── the scenario harness ────────────────────────────────────────────
         //
         // Put a situation to a character that does not exist and report
@@ -748,7 +780,7 @@ async fn layer(
 
 /// The live minds, when the engine is up — how a route reads what a
 /// character's conversations actually hold rather than what the mind declares.
-fn minds_of(s: &Authored) -> Option<Arc<Minds>> {
+pub(crate) fn minds_of(s: &Authored) -> Option<Arc<Minds>> {
     s.runtime.as_ref()?.minds.read().unwrap().clone()
 }
 

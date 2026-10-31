@@ -18,6 +18,7 @@
 //! | [`guard`] | routes that cannot forget their role, and the path-overlap refusal |
 //! | [`access`] | the estate's role table and `--local-signin` |
 //! | [`ui`] | UIs from disk, `/common/`, the on-disk build id |
+//! | [`substrate_views`] | the substrate inspector's views, served by each tenant over its own substrate |
 //! | [`model`] | the one model every tenant runs |
 //! | [`expert_split`] | the CPU expert split's settings, applied before the engine loads |
 //! | [`build_info`] | `--build-info`, and what every binary does first |
@@ -44,6 +45,7 @@ pub mod self_heal;
 pub mod server;
 pub mod starting;
 pub mod stopping;
+pub mod substrate_views;
 pub mod syncing;
 pub mod telemetry;
 pub mod tenant;

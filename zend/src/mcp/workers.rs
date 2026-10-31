@@ -35,6 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::persistence::SharedSubstrate;
 use futures::StreamExt;
+use host::substrate_views::TimelineDetail;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
@@ -51,7 +52,6 @@ use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
-use crate::api::substrate::TimelineDetail;
 use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::types::{ChatMessage, Role};
 

@@ -1,0 +1,844 @@
+/* The engine's wave and pressure telemetry — the performance page every
+ * tenant's console mounts, because there is one engine under all of them.
+ *
+ * Five endpoints, polled together every four seconds:
+ *   /v1/telemetry    waves, the resident KV by format, migrations, host RAM
+ *   /v1/phases       the scheduler's phases, slot by slot
+ *
+ * Both are answered on one wall-clock grid of 5-second slots, and through a
+ * clustered gateway the envelope carries the cluster's rows already added up
+ * (`cluster`, `docs/performance_series.md`) — the page draws, never fuses.
+ *   /v1/projections  what projection had to lift back into VRAM, by name
+ *   /v1/memory       the allocator's own view
+ *   /v1/layers       the newest decode and prefill forward, layer by layer
+ *
+ * The four after the first are `.catch(() => null)`: a daemon that has not
+ * instrumented one of them should grey a panel, never blank the page.
+ *
+ * It draws with `common/base.css`'s vocabulary and its own `perf.css`, scoped
+ * under `.perf-page`, so each console's theme is the page's theme.
+ */
+import { h, mount, fmtNum } from './dom.js';
+import { makeChart, makeStackChart } from './chart.js';
+import { pick } from './aggregate.js';
+
+const POLL_MS = 4000;
+const MiB = 1024;
+const gib = (mib) => (mib || 0) / MiB;
+const last = (a) => a[a.length - 1] || {};
+/* Wave throughput. `ws` is the wave's wall-clock in ms (as is every duration
+ * the telemetry endpoint sends), so the /1000 is what makes this per-second.
+ * Shared by the chart and the KPI card so the headline can't disagree with
+ * the line above it. */
+const tokPerSec = (w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0);
+
+/* One hue per scheduler phase, so the flip between small-batch decode and
+ * large-batch prefill reads at a glance rather than by hunting a legend. */
+const PHASES = ['decode', 'prefill', 'projection', 'sealing', 'eviction', 'allocation',
+  'requests', 'housekeeping', 'blocked', 'sync', 'idle'];
+const PH = {
+  decode: 'var(--ok)', prefill: 'var(--info)',
+  projection: '#c084fc', sealing: 'var(--warn)', eviction: 'var(--crit)',
+  allocation: '#94a3b8', requests: '#2dd4bf', housekeeping: '#a3e635',
+  blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
+};
+
+/* The card's bands, bottom of the stack first: what was there before us, the
+ * weights, what the conversations hold, the forward's own ground, the fixed
+ * blocks, the pool outside the span, then the headroom — KV regions nobody
+ * holds and the driver's free — and last whatever no band names. Each is a
+ * field of the wave's `vram` (MiB). */
+const BANDS = [
+  ['context', 'context', '#64748b'],
+  ['dense', 'dense weights', '#6366f1'],
+  ['experts', 'experts', '#8b5cf6'],
+  ['expert_free', 'expert zone, empty', '#c4b5fd'],
+  ['kv', 'KV', 'var(--ok)'],
+  ['state', 'state', '#2dd4bf'],
+  ['transient', 'transient', 'var(--warn)'],
+  ['reserved', 'pre-allocated', '#94a3b8'],
+  ['pool', 'CUDA pool', '#f472b6'],
+  ['kv_free', 'KV, free', '#86efac'],
+  ['free', 'free', 'var(--line-2)'],
+  ['unaccounted', 'unaccounted', 'var(--crit)'],
+];
+
+/* The arena panel's bands, in the order the server ranks the formats; `other`
+ * always takes the last, neutral colour. Filled in as the formats arrive. */
+const MIX_COLORS = ['#6366f1', 'var(--ok)', 'var(--info)', 'var(--warn)', '#c084fc', '#2dd4bf'];
+const mixColor = (name, i) => (name === 'other' ? 'var(--ink-faint)' : MIX_COLORS[i % MIX_COLORS.length]);
+
+/* ── time ───────────────────────────────────────────────────────────────────
+ * Every row is one finished slot of the server's wall-clock grid, stamped `at`
+ * with the slot's start in unix milliseconds (`docs/performance_series.md`), so
+ * a row lands where it ran however many polls follow, and every axis runs to
+ * now. The engine writes no rows while nothing runs, so a chart that ends at
+ * its last row reads as frozen in time; ending at now, with the stretch since
+ * drawn as idle, it reads as idle. */
+const SLOT_MS = 5000;
+/* Idle once three slots pass with no row: the newest finished slot started up
+ * to two slots ago, and a poll lands up to one more late. */
+const IDLE_MS = 3 * SLOT_MS;
+const minsAgo = (at) => (at - Date.now()) / 60000;
+const xAgo = (v) => (v > -0.05 ? 'now' : v > -1 ? `${Math.round(v * 60)}s` : `${Math.round(v)}m`);
+const clock = (at) => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+/* `rows` with each idle stretch made explicit: a row marked `idle` just after
+ * the last row of a run and just before the next, and one at now, each
+ * carrying the row before it — so a state (KV held, backlog) holds flat, and
+ * a rate, read through `ran`, falls to zero. */
+function timeline(rows) {
+  const out = [];
+  rows.forEach((r, i) => {
+    const prev = rows[i - 1];
+    if (prev && r.at - prev.at > IDLE_MS) {
+      out.push({ ...prev, at: prev.at + 1000, idle: true }, { ...prev, at: r.at - 1000, idle: true });
+    }
+    out.push(r);
+  });
+  const end = rows[rows.length - 1];
+  if (end && Date.now() - end.at > IDLE_MS) {
+    out.push({ ...end, at: end.at + 1000, idle: true }, { ...end, at: Date.now(), idle: true });
+  }
+  return out;
+}
+const ran = (r, v) => (r.idle ? 0 : v);
+/* The x axis of a chart over `rows`: minutes before now, running to now. */
+const axis = (rows) => ({ xs: rows.map((r) => minsAgo(r.at)), xnow: 0, xFmt: xAgo });
+const series = (data, color, label, extra) => ({ data, color, label, ...(extra || {}) });
+
+/* Thresholds are the one thing on this page that cannot be derived from the
+ * data — they encode what "bad" means on this deployment. Wrong here and the
+ * page either cries wolf or stays green through a real problem, so they are
+ * named rather than buried in the expressions that use them. */
+const LIMITS = {
+  vramWarn: 0.80, vramCrit: 0.92,     // fraction of the KV ground held
+  backlogWarn: 8000, backlogCrit: 16000, // tokens waiting to migrate
+  migWarnS: 5, migCritS: 20,          // seconds per drain pass
+};
+const stateBy = (v, warn, crit) => (v >= crit ? 'crit' : v >= warn ? 'warn' : 'ok');
+
+const ago = (s) => (s < 2 ? 'just now' : s < 90 ? `${Math.round(s)}s ago`
+  : s < 5400 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`);
+
+/* The page's stylesheet, linked once whichever console mounts it first. */
+function ensureStyles() {
+  if (document.querySelector('link[href$="common/lib/perf.css"]')) return;
+  document.head.appendChild(h('link', { rel: 'stylesheet', href: '/common/lib/perf.css' }));
+}
+
+/* A chart that could not draw, written across its canvas so it reads as broken
+ * rather than as a panel with no data. */
+function drawFailure(cv, err) {
+  if (!cv) return;
+  const g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = getComputedStyle(document.body).getPropertyValue('--crit') || '#e11d48';
+  g.font = '12px ui-monospace, monospace';
+  g.fillText('this chart failed to draw: ' + (err && err.message ? err.message : err), 12, 24);
+}
+
+/* The layer flow draws single forwards, which do not add up across cards: the
+ * busiest member's — the one whose newest wave moved the most tokens. */
+function busiest(passes, tels) {
+  let best = 0, most = -1;
+  tels.forEach((b, i) => {
+    const w = (b.waves || [])[(b.waves || []).length - 1] || {};
+    if ((w.tok || 0) > most) { most = w.tok || 0; best = i; }
+  });
+  return passes[best] || [];
+}
+
+/* Mount the page into `page`, headed `title`. Returns `{ stop }`, which ends
+ * its polls and its resize listener. */
+export function mountPerf(page, { title }) {
+  ensureStyles();
+  page.classList.add('perf-page');
+
+  /* ── state ────────────────────────────────────────────────────────────── */
+
+  let W = [], MIX = { formats: [], rows: [] }, MG = [], PTS = [], PROM = [], LAYERS = [], HOST = {};
+  let lastAt = 0;          // when the newest sample landed, for the age readout
+  let paused = false;
+  let failures = 0;
+  /* Through a clustered gateway every endpoint answers for each member
+   * (`common/lib/aggregate.js`). The page shows the cluster as a whole — `''`,
+   * the default with more than one member — or one member, picked here. */
+  let member = '';
+  /* The cluster view's members: each one's latest wave and host, for the
+   * totals and the nodes panel. Empty while one member is shown. */
+  let NODES = [];
+
+  /* When the engine last ran anything, or 0 before it ever has. */
+  const lastRun = () => Math.max(0, last(W).at || 0, ...PTS.map((p) => p.at));
+  const idleFor = () => (lastRun() ? Date.now() - lastRun() : 0);
+
+  /* ── page ─────────────────────────────────────────────────────────────── */
+
+  const kpis = h('div', { class: 'kpis' });
+  const verdict = h('div', { class: 'panel verdict' }, 'waiting for the first sample…');
+  const age = h('span', { class: 'tiny dim' });
+  const live = h('span', { class: 'chip' }, 'connecting…');
+  const pauseBtn = h('button', { class: 'btn sm' }, '⏸ pause');
+  const memberPick = h('select', { class: 'btn sm', 'aria-label': 'Member', hidden: true });
+
+  memberPick.addEventListener('change', () => { member = memberPick.value; refresh(); });
+
+  /* The cluster as a whole, then one option per member that answered — shown
+   * only when there is a choice. */
+  function paintMembers(members) {
+    memberPick.hidden = members.length < 2;
+    const want = members.map((m) => m.node).join(',');
+    if (memberPick.dataset.nodes !== want) {
+      memberPick.dataset.nodes = want;
+      mount(memberPick,
+        h('option', { value: '' }, '[Cluster]'),
+        ...members.map((m) => h('option', { value: m.node }, `${m.host || m.node.slice(0, 8)}`)));
+    }
+    memberPick.value = member;
+  }
+
+  /* Whether the page shows the cluster as a whole: more than one member, and
+   * none picked. */
+  const clusterView = () => !member && NODES.length > 1;
+
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? '▶ resume' : '⏸ pause';
+    pauseBtn.classList.toggle('primary', paused);
+    page.classList.toggle('stale', paused);
+    if (!paused) refresh();
+  });
+
+  const cv = (id, hgt) => h('canvas', { id, height: hgt || 190 });
+  const cPhase = cv('c_phase', 230), cPhRate = cv('c_phrate', 200);
+  const cBacklog = cv('c_backlog'), cWave = cv('c_wave'), cArena = cv('c_arena');
+  const cVram = cv('c_vram', 200), cMig = cv('c_mig', 200), cProj = cv('c_proj'), cSlots = cv('c_slots');
+  const cFlow = h('canvas', { id: 'c_flow', height: 170 });
+  const flowReadout = h('div', { class: 'readout' }, 'hover a layer for its numbers');
+  const projList = h('div', { class: 'proj-grid' });
+
+  const card = (heading, cap, ...body) => h('div', { class: 'panel' },
+    h('h3', { style: 'margin-top:0' }, heading),
+    h('div', { class: 'tiny dim', style: 'margin-bottom:10px', html: cap }),
+    ...body);
+
+  const phLegend = h('div', { class: 'legend' }, ...PHASES.map((k) =>
+    h('span', {}, h('i', { style: `background:${PH[k]}` }), k)));
+
+  const vramLegend = h('div', { class: 'legend' }, ...BANDS.map(([, label, c]) =>
+    h('span', {}, h('i', { style: `background:${c}` }), label)));
+
+  const mixLegend = h('div', { class: 'legend' });
+  function paintMixLegend() {
+    const want = MIX.formats.join(',');
+    if (mixLegend.dataset.formats === want) return;
+    mixLegend.dataset.formats = want;
+    mount(mixLegend, ...MIX.formats.map((f, i) =>
+      h('span', {}, h('i', { style: `background:${mixColor(f, i)}` }), f)));
+  }
+
+  mount(page,
+    h('div', { class: 'hd' },
+      h('div', {}, h('h1', {}, title),
+        h('div', { class: 'sub' }, 'Where the scheduler’s wall-clock goes, and how close the card is to its wall.')),
+      h('div', { class: 'row' }, memberPick, live, age, pauseBtn)),
+    kpis,
+    verdict,
+    h('div', { class: 'panel' },
+      h('h3', { style: 'margin-top:0' }, 'Phase timeline — last 2 minutes'),
+      h('div', { class: 'tiny dim', style: 'margin-bottom:10px', html:
+        'One bar per 5-second slot, newest on the <b>right</b>. Height is time spent in each phase, stacked — so a tall '
+        + '<b>projection</b>, <b>sync</b> or <b>idle</b> segment is time <i>not</i> spent generating. Watch the flip '
+        + 'between small-batch decode and large-batch prefill.' }),
+      phLegend, cPhase),
+    h('div', { class: 'grid g2' },
+      card('Layer flow',
+        'The newest decode and prefill forward, left to right through the routed layers — a forward that carries '
+        + 'a prompt counts as prefill. <b>Height</b> is the experts the layer needed, on each strip’s own scale, by '
+        + 'where each stood: <b>hot</b> in VRAM, <b>warm</b> in pinned host memory, <b>cold</b> read from the '
+        + 'pack. <b>Width</b> is the device’s time to reach the layer from the one before.',
+        h('div', { class: 'legend' },
+          h('span', {}, h('i', { style: 'background:var(--ok)' }), 'hot'),
+          h('span', {}, h('i', { style: 'background:var(--warn)' }), 'warm'),
+          h('span', {}, h('i', { style: 'background:var(--crit)' }), 'cold'),
+          h('span', { title: 'timed by the pipeline thread, which read the layer late' },
+            h('i', { style: 'background:var(--ink-faint);opacity:.45' }), 'faded')),
+        h('div', { class: 'flow' }, cFlow, flowReadout)),
+      card('Phase throughput',
+        'Peak tokens per second <b>per phase</b>, as delivered — in each 5-second slot, the best wave’s tokens '
+        + 'for that phase over the wave’s wall-clock, the last 20 minutes; for the cluster, the members’ peaks '
+        + 'added. Two scales: <b>left</b> is large-batch prefill, <b>right</b> is decode.',
+        h('div', { class: 'legend' },
+          h('span', {}, h('i', { style: `background:${PH.prefill}` }), 'prefill — left'),
+          h('span', {}, h('i', { style: `background:${PH.decode}` }), 'decode — right')),
+        cPhRate)),
+    h('div', { class: 'grid g2' },
+      card('Drain backlog',
+        'Un-migrated hot KV waiting on the persist thread. Spikes are normal; a sustained climb is not.', cBacklog),
+      card('Wave timing',
+        'Per wave — a pass of the scheduler loop that ran a forward — its mean wall-clock against the time inside '
+        + 'the quanta, where the forwards run. The gap is the loop’s own overhead: the submission drain and the '
+        + 'housekeeping between waves.', cWave)),
+    card('VRAM, wave by wave',
+      'The whole card, cut by what holds each byte, stacked — every band is measured, and together they are the '
+      + 'driver’s total (dashed). <b>transient</b> is the widest forward’s activations since the wave before; '
+      + '<b>unaccounted</b> is what the card holds that no band names, and should sit near zero.',
+      vramLegend, cVram),
+    h('div', { class: 'grid g2' },
+      card('Arena mix',
+        'The KV resident in VRAM by the format it is stored in, in tokens, stacked. The six formats that held the '
+        + 'most keep their own band; the rest are <b>other</b>.', mixLegend, cArena),
+      card('Migration passes',
+        'Hot→warm passes per 5-second slot: how long they took, and how much of that was compress-to-warm '
+        + 'rather than the copy. Passes with nothing to move are drawn at zero, so a quiet drain reads as quiet '
+        + 'rather than stopped.', cMig)),
+    h('div', { class: 'grid g2' },
+      card('Projection cost', 'Where projection time goes: drain, re-projection, scan, layout.', cProj),
+      card('Active work', 'Resident conversations, and the decode / prefill widths sharing them.', cSlots)),
+    card('Projections',
+      'What projection had to lift back into VRAM for a working set, by name — sections by their name, '
+      + 'conversations by their title or the file they read. Something lifted on every turn is churn; an empty '
+      + 'board is the healthy state.', projList));
+
+  /* ── charts ───────────────────────────────────────────────────────────── */
+
+  const charts = [];
+  const add = (c) => { if (c) charts.push(c); return c; };
+
+  /* Phase bars: one stacked column per slot over the last two minutes,
+   * labelled by how long ago the slot ended. */
+  const BAR_SPAN_MS = 2 * 60000;
+  add(makeStackChart(cPhase, () => {
+    const now = Date.now();
+    const slots = new Map();
+    for (const p of PTS) {
+      const end = p.at + SLOT_MS;
+      if (now - end > BAR_SPAN_MS) continue;
+      // Tokens are carried alongside the duration, not dropped: the bar's
+      // HEIGHT is time, but the question asked of a bar is almost always "was
+      // that time productive", and that needs both. Every phase of a slot
+      // carries the slot's window.
+      if (!slots.has(p.at)) slots.set(p.at, { at: p.at, age: Math.max(0, (now - end) / 1000), ph: {}, tk: {}, wall: p.win });
+      const s = slots.get(p.at);
+      s.ph[p.kind] = p.dur;
+      s.tk[p.kind] = p.tok || 0;
+    }
+    const bars = [...slots.values()].sort((a, b) => a.at - b.at)
+      .map((s) => ({ age: s.age, parts: s.ph, toks: s.tk, wall: s.wall }));
+    return {
+      bars, keys: PHASES,
+      color: (k) => PH[k],
+      yFmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 's' : v.toFixed(0) + 'ms'),
+      xLabel: (b) => (b.age < 1 ? 'now' : '-' + b.age.toFixed(0) + 's'),
+      // Time and tokens together, and the rate as delivered: the phase's
+      // tokens over the slot's waves' wall-clock. A phase's own time is the
+      // scheduler thread's, which for a prefill that reads nothing back is the
+      // time to queue it, not to run it — the GPU finishes it under whatever
+      // waits next — so tokens over phase time read tens of thousands per
+      // second for work the card did at a thousand. A phase that moved no
+      // tokens — idle, sync, blocked — has no rate to quote and says so by
+      // omission.
+      tip: (b) => PHASES.filter((k) => b.parts[k]).map((k) => {
+        const ms = b.parts[k], tk = (b.toks && b.toks[k]) || 0;
+        const rate = b.wall > 0 ? tk / (b.wall / 1000) : 0;
+        return {
+          t: tk > 0 ? `${k} ${ms.toFixed(0)}ms · ${fmtNum(tk)} tok · ${fmtNum(Math.round(rate))} tok/s delivered`
+                    : `${k} ${ms.toFixed(0)}ms`,
+          c: PH[k],
+        };
+      }),
+      emptyText: lastRun()
+        ? `idle since ${clock(lastRun())} — nothing has run in the last two minutes`
+        : 'no phase samples yet',
+    };
+  }));
+
+  /* Dual axis on purpose: prefill runs orders of magnitude above decode, and
+   * one scale would draw decode as a flat line along the floor.
+   *
+   * Peak delivered rates: each slot's `peak`, the best of its waves' rates —
+   * each wave's phase tokens over that wave's own wall-clock, the rate the
+   * phase-timing tooltip quotes — and for the cluster the members' peaks
+   * added, what the cards delivered side by side. Not over the phase's own
+   * time, which is the scheduler thread's time to issue the work rather than
+   * the card's to run it (see the tooltip above); and not averaged over the
+   * slot, which smoothed a two-second decode burst into the quieter waves
+   * beside it. A slot no wave ran in draws as zero. */
+  const RATE_SPAN_MS = 20 * 60000;
+  add(makeChart(cPhRate, () => {
+    const now = Date.now();
+    const current = Math.floor(now / SLOT_MS) * SLOT_MS;
+    const first = Math.floor((now - RATE_SPAN_MS) / SLOT_MS) * SLOT_MS;
+    const peak = new Map();
+    for (const p of PTS) {
+      if (p.at < first) continue;
+      if (!peak.has(p.at)) peak.set(p.at, {});
+      peak.get(p.at)[p.kind] = p.peak || 0;
+    }
+    const slots = [];
+    for (let at = first; at < current; at += SLOT_MS) slots.push([at, peak.get(at) || {}]);
+    const rate = (e, k) => e[k] || 0;
+    return {
+      // Each slot is drawn at its end.
+      xs: slots.map(([at]) => (at + SLOT_MS - now) / 60000),
+      xnow: 0,
+      xFmt: xAgo,
+      series: [
+        series(slots.map(([, e]) => rate(e, 'prefill')), PH.prefill, 'prefill'),
+        series(slots.map(([, e]) => rate(e, 'decode')), PH.decode, 'decode', { axis: 'r' }),
+      ],
+      y2: true, fmt: fmtNum, y2Fmt: fmtNum, y2Color: PH.decode,
+    };
+  }));
+
+  add(makeChart(cBacklog, () => {
+    const R = timeline(W);
+    return { ...axis(R), series: [series(R.map((r) => r.backlog), 'var(--info)', 'backlog (tok)')], yFmt: fmtNum };
+  }));
+
+  /* Per wave, from the window's own wave count — not the 2 s window against a
+   * forward mean, which is what this chart drew before and why its gap meant
+   * nothing. A window with no wave, idle or not, draws as zero. */
+  add(makeChart(cWave, () => {
+    const R = timeline(W);
+    return {
+      ...axis(R),
+      series: [
+        series(R.map((r) => ran(r, r.wave_ms || 0)), 'var(--accent)', 'wave (ms)'),
+        series(R.map((r) => ran(r, r.quanta_ms || 0)), 'var(--ink-faint)', 'in the quanta (ms)'),
+      ],
+      yFmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + 's' : v.toFixed(0) + 'ms'),
+      tip: (i) => {
+        const r = R[i] || {};
+        if (r.idle || !r.waves) return [{ t: 'no wave' }];
+        return [
+          { t: `${r.waves} waves in ${(r.ws / 1000).toFixed(1)} s` },
+          { t: `wave ${r.wave_ms.toFixed(1)} ms`, c: 'var(--accent)' },
+          { t: `in the quanta ${r.quanta_ms.toFixed(1)} ms`, c: 'var(--ink-faint)' },
+          { t: `overhead ${(r.wave_ms - r.quanta_ms).toFixed(1)} ms` },
+        ];
+      },
+    };
+  }));
+
+  /* Stacked areas: each band drawn from the running sum below it to the sum
+   * including it. A negative `unaccounted` (the bands over-counting the card)
+   * cannot stack, so it stacks as zero and the readout says what it was. */
+  add(makeChart(cVram, () => {
+    // The card's state holds while nothing runs, so it is carried flat to now.
+    const R = timeline(W);
+    const V = R.map((w) => w.vram || {});
+    let base = V.map(() => 0);
+    const layers = BANDS.map(([key, label, color]) => {
+      const top = V.map((v, i) => base[i] + gib(Math.max(0, v[key] || 0)));
+      const layer = series(top, color, label, { type: 'area', baseData: base, lw: 1 });
+      base = top;
+      return layer;
+    });
+    const total = series(V.map((v) => gib(v.total)), 'var(--ink-faint)', 'card total', { dash: true, lw: 1.2 });
+    return {
+      ...axis(R),
+      series: [...layers, total],
+      yFmt: (v) => v.toFixed(0) + ' GiB',
+      emptyText: 'no waves yet',
+      tip: (i) => {
+        const v = V[i] || {};
+        return [
+          { t: `card ${gib(v.total).toFixed(1)} GiB` },
+          ...BANDS.slice().reverse().map(([key, label, c]) =>
+            ({ t: `${label} ${gib(v[key]).toFixed(2)} GiB`, c })),
+        ];
+      },
+    };
+  }));
+
+  /* Stacked like the VRAM bands: each format from the sum below it. The census
+   * is a state, so it holds flat to now while nothing runs. */
+  add(makeChart(cArena, () => {
+    const R = timeline(MIX.rows);
+    let base = R.map(() => 0);
+    const layers = MIX.formats.map((f, i) => {
+      const top = R.map((r, j) => base[j] + ((r.tok && r.tok[f]) || 0));
+      const layer = series(top, mixColor(f, i), f, { type: 'area', baseData: base, lw: 1 });
+      base = top;
+      return layer;
+    });
+    return {
+      ...axis(R),
+      series: layers,
+      yFmt: fmtNum,
+      emptyText: 'no census yet',
+      tip: (i) => {
+        const r = R[i] || {};
+        const tok = r.tok || {};
+        const total = Object.values(tok).reduce((a, x) => a + x, 0);
+        return [
+          { t: `${fmtNum(Math.round(total))} tokens resident` },
+          ...MIX.formats.map((f, k) => ({
+            t: `${f} ${fmtNum(Math.round(tok[f] || 0))} (${total > 0 ? ((100 * (tok[f] || 0)) / total).toFixed(0) : 0}%)`,
+            c: mixColor(f, k),
+          })).reverse(),
+        ];
+      },
+    };
+  }));
+
+  /* Migration passes, slot by slot: what each slot's passes moved and the time
+   * they took. The axis still runs to now so a quiet drain reads as quiet. */
+  add(makeChart(cMig, () => ({
+    ...axis(MG),
+    series: [
+      // A pass that moved nothing is drawn at zero: the drain ran and was idle.
+      series(MG.map((m) => (m.res > 0 ? m.total / 1000 : 0)), 'var(--crit)', 'pass (s)'),
+      series(MG.map((m) => m.quant / 1000), 'var(--warn)', 'quantize (s)'),
+      series(MG.map((m) => m.copy / 1000), 'var(--info)', 'copy (s)'),
+    ],
+    yFmt: (v) => v.toFixed(1) + 's',
+    emptyText: 'no migration passes yet',
+    tip: (i) => {
+      const m = MG[i] || {};
+      if (!m.res) return [{ t: 'a pass with nothing to move' }];
+      return [
+        { t: `${fmtNum(m.res)} residences · ${fmtNum(Math.round(m.mib))} MiB` },
+        { t: `pass ${(m.total / 1000).toFixed(2)} s`, c: 'var(--crit)' },
+        { t: `quantize ${(m.quant / 1000).toFixed(2)} s`, c: 'var(--warn)' },
+        { t: `copy ${(m.copy / 1000).toFixed(2)} s`, c: 'var(--info)' },
+      ];
+    },
+  })));
+
+  /* ── layer flow ───────────────────────────────────────────────────────────
+   * Drawn by hand rather than through `chart.js`: its x axis is the layer
+   * walk, not time, and each layer's width is a measurement. One strip per
+   * forward kind; heights share one scale across both strips so a prefill's
+   * wider routing reads as wider. */
+  /* The whole drawing is the height of the chart this panel replaced, less the
+   * readout line under it, so the row keeps its height; the strips share it. */
+  const FLOW_H = 170, STRIP_HEAD = 16, STRIP_GAP = 10;
+  let flowHits = [];
+  const css = (name) => getComputedStyle(document.body).getPropertyValue(name).trim();
+
+  function drawFlow() {
+    const passes = LAYERS.filter((p) => p.layers && p.layers.length);
+    const dpr = window.devicePixelRatio || 1;
+    const width = cFlow.clientWidth || 600;
+    const height = FLOW_H;
+    const n = Math.max(1, passes.length);
+    const STRIP = (FLOW_H - (n - 1) * STRIP_GAP) / n - STRIP_HEAD;
+    cFlow.style.height = height + 'px';
+    cFlow.width = Math.round(width * dpr);
+    cFlow.height = Math.round(height * dpr);
+    const g = cFlow.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, width, height);
+    g.font = '11px ui-sans-serif, system-ui, sans-serif';
+    flowHits = [];
+    if (!passes.length) {
+      g.fillStyle = css('--ink-faint');
+      g.fillText('no routed-layer trace — the model has no expert cache, or nothing has run yet', 4, 40);
+      return;
+    }
+    const colors = { hot: css('--ok'), warm: css('--warn'), cold: css('--crit') };
+    passes.forEach((p, k) => {
+      // Each strip on its own scale: a prefill routes most of a layer's
+      // experts and a decode a handful, and one scale drew the decode as a
+      // line.
+      const maxRouted = Math.max(1, ...p.layers.map((l) => l.hot + l.warm + l.cold));
+      const top = k * (STRIP_HEAD + STRIP + STRIP_GAP);
+      // A layer with no measured gap — a pass's first — takes the pass's
+      // median.
+      const known = p.layers.map((l) => l.ms).filter((ms) => ms != null).sort((a, b) => a - b);
+      const median = known.length ? known[Math.floor(known.length / 2)] : 1;
+      const widthMs = p.layers.map((l) => (l.ms != null ? l.ms : median));
+      const total = widthMs.reduce((a, x) => a + x, 0) || 1;
+      const measured = p.layers.reduce((a, l) => a + (l.ms || 0), 0);
+      g.fillStyle = css('--ink-faint');
+      g.textAlign = 'left';
+      g.fillText(`${p.kind === 'prefill' ? 'Prefill' : 'Decode'} forward · ${p.layers.length} layers · `
+        + `full height ${maxRouted} experts · ${ago(p.age)}`, 0, top + 12);
+      g.textAlign = 'right';
+      g.fillText(`${measured.toFixed(1)} ms`, width, top + 12);
+      g.textAlign = 'left';
+      let x = 0;
+      p.layers.forEach((l, i) => {
+        const w = (widthMs[i] / total) * width;
+        const gap = w > 3 ? 1 : 0;
+        let y = top + STRIP_HEAD + STRIP;
+        g.globalAlpha = l.late ? 0.45 : 1;
+        for (const tier of ['hot', 'warm', 'cold']) {
+          const hgt = (l[tier] / maxRouted) * STRIP;
+          g.fillStyle = colors[tier];
+          g.fillRect(x, y - hgt, Math.max(0.5, w - gap), hgt);
+          y -= hgt;
+        }
+        g.globalAlpha = 1;
+        flowHits.push({ x0: x, x1: x + w, y0: top, y1: top + STRIP_HEAD + STRIP, kind: p.kind, l });
+        x += w;
+      });
+      g.strokeStyle = css('--line-2');
+      g.beginPath();
+      g.moveTo(0, top + STRIP_HEAD + STRIP + 0.5);
+      g.lineTo(width, top + STRIP_HEAD + STRIP + 0.5);
+      g.stroke();
+    });
+  }
+
+  cFlow.addEventListener('mousemove', (e) => {
+    const r = cFlow.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const hit = flowHits.find((b) => x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1);
+    if (!hit) return;
+    const l = hit.l;
+    const ms = l.ms == null ? 'first layer, not timed' : `${l.ms.toFixed(2)} ms${l.late ? ' (thread pace)' : ''}`;
+    flowReadout.textContent = `${hit.kind} · layer ${l.row} · ${l.hot + l.warm + l.cold} experts — `
+      + `${l.hot} hot, ${l.warm} warm, ${l.cold} cold · ${ms}`;
+  });
+  cFlow.addEventListener('mouseleave', () => { flowReadout.textContent = 'hover a layer for its numbers'; });
+  const onResize = () => { try { drawFlow(); } catch (err) { drawFailure(cFlow, err); } };
+  window.addEventListener('resize', onResize);
+
+  add(makeChart(cProj, () => {
+    const R = timeline(W);
+    return {
+      ...axis(R),
+      series: [
+        series(R.map((r) => ran(r, r.reproj)), '#c084fc', 're-project (ms)'),
+        series(R.map((r) => ran(r, r.pdrain)), 'var(--warn)', 'drain (ms)'),
+        series(R.map((r) => ran(r, r.scan)), 'var(--info)', 'scan (ms)'),
+        series(R.map((r) => ran(r, r.layout)), 'var(--ink-faint)', 'layout (ms)'),
+      ],
+      yFmt: (v) => v.toFixed(0) + 'ms',
+    };
+  }));
+
+  /* Conversations stay resident while idle; the widths working on them do not. */
+  add(makeChart(cSlots, () => {
+    const R = timeline(W);
+    return {
+      ...axis(R),
+      series: [
+        series(R.map((r) => r.slots), 'var(--accent)', 'resident'),
+        series(R.map((r) => ran(r, r.dec)), PH.decode, 'decode'),
+        series(R.map((r) => ran(r, r.pre + r.sec)), PH.prefill, 'prefill'),
+      ],
+      yFmt: (v) => v.toFixed(0),
+    };
+  }));
+
+  /* ── the interpretation ───────────────────────────────────────────────── */
+
+  const kpi = (lab, val, unit, note, state, fill) => h('div', { class: 'panel kpi' },
+    h('div', { class: 'kpi-rail bg-' + state }),
+    h('div', { class: 'lab' }, lab),
+    h('div', { class: 'val st-' + state }, val, unit ? h('small', {}, ' ' + unit) : null),
+    note ? h('div', { class: 'tiny dim' }, note) : null,
+    fill != null ? h('div', { class: 'meter' },
+      h('i', { class: 'bg-' + state, style: `width:${Math.min(100, Math.max(0, fill * 100)).toFixed(0)}%` })) : null);
+
+  /* The newest pass that moved anything — the rows between are heartbeats. */
+  const lastMoved = () => {
+    for (let i = MG.length - 1; i >= 0; i--) if (MG[i].res > 0) return MG[i];
+    return null;
+  };
+
+  /* KV against the ground it can stand on — its regions and the unheld ones —
+   * which is what fills before admission has to wait. */
+  const kvGround = (w) => {
+    const v = w.vram || {};
+    const kv = gib(v.kv), ground = kv + gib(v.kv_free);
+    return { kv, ground, frac: ground > 0 ? kv / ground : 0, headroom: gib(v.free) + gib(v.kv_free) };
+  };
+
+  function paintKPIs() {
+    const w = last(W);
+    if (!W.length) return;
+    const g = kvGround(w);
+    // The last wave's rate only while waves are still landing: idle, the
+    // engine delivers nothing, and holding the last figure reads as running.
+    const idle = idleFor() > IDLE_MS;
+    const tps = idle ? 0 : tokPerSec(w);
+    const peakTps = Math.max(1, ...W.map(tokPerSec));
+
+    const cards = [
+      kpi('KV', g.kv.toFixed(1), 'GiB', `of ${g.ground.toFixed(1)} GiB of KV ground`,
+        stateBy(g.frac, LIMITS.vramWarn, LIMITS.vramCrit), g.frac),
+      kpi('Headroom', g.headroom.toFixed(1), 'GiB', 'free on the card, and KV ground nobody holds',
+        stateBy(g.frac, LIMITS.vramWarn, LIMITS.vramCrit)),
+      kpi('Throughput', tps >= 1000 ? (tps / 1000).toFixed(1) + 'k' : tps.toFixed(0), 'tok/s',
+        idle ? `idle since ${clock(lastRun())}` : `${((100 * tps) / peakTps).toFixed(0)}% of peak`,
+        idle ? 'ok' : tps > 0 ? 'ok' : 'warn', tps / peakTps),
+      kpi('Drain backlog', w.backlog >= 1000 ? (w.backlog / 1000).toFixed(1) + 'k' : String(Math.round(w.backlog)), 'tok',
+        'waiting to migrate', stateBy(w.backlog, LIMITS.backlogWarn, LIMITS.backlogCrit)),
+    ];
+    const m = lastMoved();
+    if (m) {
+      const s = m.total / 1000;
+      cards.push(kpi('Last migration', s.toFixed(1), 's',
+        `${fmtNum(Math.round(m.mib))} MiB · ${((100 * m.quant) / Math.max(1, m.total)).toFixed(0)}% quantize`,
+        stateBy(s, LIMITS.migWarnS, LIMITS.migCritS)));
+    }
+    // The host reports memory in MiB, measured or absent (`null`).
+    if (HOST.total_mib > 0 && HOST.free_mib != null) {
+      const gb = (mib) => mib / 1024;
+      cards.push(kpi('Host RAM free', gb(HOST.free_mib).toFixed(0), 'GiB',
+        `of ${gb(HOST.total_mib).toFixed(0)}`, 'ok', 1 - HOST.free_mib / HOST.total_mib));
+    }
+    mount(kpis, ...cards);
+  }
+
+  /* A sentence, not a dashboard. Charts say what happened; this says whether
+   * it is fine — which is the question somebody opening this page actually
+   * has. */
+  function paintVerdict() {
+    if (!W.length) { mount(verdict, 'waiting for the first sample…'); return; }
+    const w = last(W), g = kvGround(w);
+    const st = stateBy(g.frac, LIMITS.vramWarn, LIMITS.vramCrit);
+    const head = st === 'crit' ? 'PRESSURE' : st === 'warn' ? 'CLIMBING' : 'HEALTHY';
+    const quiet = idleFor();
+    const bits = [
+      quiet > IDLE_MS
+        ? h('span', {}, h('b', {}, 'IDLE'),
+          ` since ${clock(lastRun())} (${Math.round(quiet / 60000)} min) — nothing is running. `)
+        : null,
+      h('b', { class: 'st-' + st }, head), ' — ',
+      'KV holds ', h('b', {}, g.kv.toFixed(1) + ' GiB'), ' of ', h('b', {}, g.ground.toFixed(1) + ' GiB'),
+      ` of KV ground, with ${g.headroom.toFixed(1)} GiB of headroom. `,
+    ];
+    const m = lastMoved();
+    if (m) {
+      const q = (100 * m.quant) / Math.max(1, m.total);
+      bits.push(`Last drain took ${(m.total / 1000).toFixed(1)}s, `, h('b', {}, q.toFixed(0) + '% of it quantizing'),
+        q > 60 ? ' — the bottleneck is compress-to-warm, not the copy. ' : '. ');
+    }
+    const back = w.backlog;
+    bits.push('Backlog ', h('b', {}, fmtNum(Math.round(back)) + ' tok'),
+      back >= LIMITS.backlogCrit ? ' — climbing faster than it drains.'
+        : back >= LIMITS.backlogWarn ? ' — draining, but behind.' : ' — keeping up.');
+    mount(verdict, ...bits);
+  }
+
+  /* The board: the most-lifted first, in columns. */
+  const PROJ_SHOWN = 30;
+  function paintProjections() {
+    if (!PROM.length) {
+      mount(projList, h('div', { class: 'tiny dim' }, 'nothing lifted back yet — every working set was already hot.'));
+      return;
+    }
+    const shown = PROM.slice(0, PROJ_SHOWN);
+    mount(projList, ...shown.map((p) => h('div', { class: 'proj' },
+      h('div', { class: 'top' },
+        h('span', { class: 'name', title: p.name }, p.name),
+        h('span', { class: 'kind' }, p.kind === 'turns' ? 'conversation' : 'section')),
+      h('div', { class: 'meta' },
+        `${fmtNum(p.lifts)} lifts`
+        + (p.kind === 'turns' ? ` · ${fmtNum(p.units)} turns` : '')
+        + ` · last ${ago(p.age)}`))),
+      PROM.length > PROJ_SHOWN
+        ? h('div', { class: 'tiny dim', style: 'grid-column:1/-1' },
+          `and ${fmtNum(PROM.length - PROJ_SHOWN)} more, lifted less often`)
+        : null);
+  }
+
+  /* ── polling ──────────────────────────────────────────────────────────── */
+
+  /* ── the cluster as a whole ────────────────────────────────────────────
+   * Every panel draws one engine's rows. For the cluster as a whole the
+   * gateway answers them already added up (`cluster` in its envelope,
+   * `cluster::dispatch::fuse`), on the same 5-second slots one member
+   * answers: sizes, counts and VRAM bands summed, a wave's own durations the
+   * longest member's, so a rate (tokens over the wave's wall-clock) reads as
+   * the cluster's. The page draws it as it draws one member. */
+  async function refresh() {
+    if (paused) return;
+    try {
+      // Only the first is required. The rest degrade to `null` so a daemon
+      // that has not instrumented one greys a panel rather than blanking the
+      // page. The engine rows and the phases are asked for over the span the
+      // page draws: the whole rings were 3.7 MB a member, every poll, for
+      // twenty minutes of charts.
+      const span = `span_s=${RATE_SPAN_MS / 1000}`;
+      const [t, p, r, , l] = await Promise.all([
+        fetch(`/v1/telemetry?${span}`, { cache: 'no-store' }).then((res) => res.json()),
+        fetch(`/v1/phases?${span}`, { cache: 'no-store' }).then((res) => res.json()).catch(() => null),
+        fetch('/v1/projections', { cache: 'no-store' }).then((res) => res.json()).catch(() => null),
+        fetch('/v1/memory', { cache: 'no-store' }).then((res) => res.json()).catch(() => null),
+        fetch('/v1/layers', { cache: 'no-store' }).then((res) => res.json()).catch(() => null),
+      ]);
+      // The telemetry answer names the members. A member picked that has left
+      // falls back to the cluster.
+      NODES = pick(t, null).members;
+      if (member && !NODES.some((n) => n.node === member)) member = '';
+      paintMembers(NODES);
+      // The telemetry and the phases are slot rows already: for the cluster
+      // as a whole, the gateway's fused answer; otherwise the one member's.
+      const take = (tel, ph) => {
+        W = tel.waves || []; MG = tel.migrate || []; HOST = tel.host || {};
+        MIX = { formats: tel.mix_formats || [], rows: tel.mix || [] };
+        PTS = (ph && ph.points) || [];
+      };
+      if (clusterView()) {
+        const each = (x) => (x === null ? [] : NODES.map((n) => pick(x, n.node).body).filter(Boolean));
+        const tels = each(t);
+        take(t.cluster || {}, p && p.cluster);
+        PROM = each(r).flatMap((b) => b.items || []);
+        LAYERS = busiest(each(l).map((b) => b.passes || []), tels);
+      } else {
+        const of = (x) => (x === null ? null : pick(x, member || null).body);
+        const pr = of(r), ly = of(l);
+        take(of(t) || {}, of(p));
+        PROM = (pr && pr.items) || [];
+        LAYERS = (ly && ly.passes) || [];
+      }
+      lastAt = Date.now();
+      failures = 0;
+      live.textContent = '● live';
+      live.className = 'chip ok';
+      paintKPIs(); paintVerdict(); paintProjections(); paintMixLegend();
+      try {
+        drawFlow();
+      } catch (err) {
+        console.error('layer flow failed to draw', err);
+        drawFailure(cFlow, err);
+      }
+      // Each chart on its own: one that throws must not leave every chart
+      // after it unpainted, which is what a single loop inside this `try` did
+      // — and then reported the throw as the daemon not answering. A chart
+      // that fails says so, on its canvas and in the console.
+      for (const c of charts) {
+        try {
+          c.refresh();
+        } catch (err) {
+          console.error('chart failed to draw', c.cv && c.cv.id, err);
+          drawFailure(c.cv, err);
+        }
+      }
+    } catch (e) {
+      failures++;
+      live.textContent = failures > 2 ? '○ not answering' : '◌ retrying…';
+      live.className = 'chip' + (failures > 2 ? ' crit' : '');
+    }
+  }
+
+  /* Age is its own timer, and the reason the page is honest: without it a
+   * stalled daemon looks identical to a healthy one, because the last good
+   * numbers stay on screen indefinitely. */
+  const ageTimer = setInterval(() => {
+    if (!lastAt) { age.textContent = ''; return; }
+    const s = Math.round((Date.now() - lastAt) / 1000);
+    age.textContent = paused ? 'paused' : s < 2 ? 'just now' : `${s}s ago`;
+    age.className = 'tiny ' + (s > 15 ? 'st-warn' : 'dim');
+  }, 1000);
+
+  refresh();
+  const pollTimer = setInterval(refresh, POLL_MS);
+
+  return {
+    stop: () => {
+      clearInterval(pollTimer);
+      clearInterval(ageTimer);
+      window.removeEventListener('resize', onResize);
+      for (const c of charts) if (c.destroy) c.destroy();
+    },
+  };
+}

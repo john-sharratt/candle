@@ -1,260 +1,47 @@
-/* Substrate inspector — a lazy tree over the whole substrate.
+/* Substrate — the inspector over npcd's substrate.
  *
- * Ported in shape from zend's substrate.html: the overview is deliberately
- * light (storage + counts + layer metadata), and everything below it loads on
- * expand and caches. A collapsed node holds no DOM, so a character with four
- * thousand memory turns costs nothing until you open it.
- *
- * The poll refreshes the cheap header in place. When the structure changes it
- * OFFERS a reload rather than performing one — rebuilding would collapse
- * whatever the operator has open and throw away its fetched sub-tree. */
+ * The shared inspector (`common/lib/substrate.js`), the one zend's console
+ * mounts over its own: npcd's line in the host's `/v1/substrate`, and its views
+ * under `/v1/substrate/npcd/`. Every class it writes is `sx-`-prefixed and
+ * styled under `.subs` in `app.css`, so this console's own `.row` and `.chip`
+ * mean what they mean everywhere else. */
 
-import { API } from '../lib/api.js';
-import { h, mount, fmtNum, fmtK } from '/common/lib/dom.js';
-import { go } from '/common/lib/router.js';
-import { layerColor, empty, toast } from '../lib/ui.js';
-import { disclosure, stillOpen, spinner, cache } from '/common/lib/lazy.js';
-import { copyText } from '/common/lib/clip.js';
+import { BACKEND } from '../lib/api.js';
+import { h } from '/common/lib/dom.js';
+import { mountSubstrate } from '/common/lib/substrate.js';
 
-export async function render(_params, q) {
+/* The inspector's three states, as this console's chips. */
+const CHIP = { live: 'chip ok', stale: 'chip warn', changed: 'chip accent' };
+
+export async function render() {
   // `subs` scopes this page's styling — see the block in `app.css`.
   const el = h('div', { class: 'page wide subs' });
-  const npcs = (await API.listNpcs({}).catch(() => ({ items: [] }))).items || [];
-  let npcId = q.npc || (npcs[0] && npcs[0].npc_id);
-
-  const layerCache = cache();
-
-  const kpiHost = h('div', { class: 'grid g4', style: 'margin-bottom:16px' });
-  const storageHost = h('div', { style: 'margin-bottom:16px' });
-  const treeHost = h('div', {});
-  const liveBtn = h('button', { class: 'chip', title: 'polling every 6s' }, '● live');
-
-  const sel = h('select', {
-    class: 'select', style: 'width:auto',
-    onChange: (e) => { npcId = e.target.value; layerCache.invalidate(); paintAll(); },
-  }, npcs.map((n) => h('option', { value: n.npc_id, selected: n.npc_id === npcId }, n.name)));
+  const liveChip = h('button', { class: 'chip', title: 'polling every 6s' }, 'connecting…');
+  const kpis = h('div', { class: 'sx-kpis' });
+  const sysprompt = h('div', {});
+  const layers = h('div', {});
 
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Substrate'),
       h('div', { class: 'sub' },
-        'The layers the mind declares, then the conversations this character can read in each, then their turns. Each level loads when you open it.')),
-    h('div', { class: 'row' }, liveBtn, h('span', { class: 'tiny dim' }, 'character'), sel)));
-  el.appendChild(kpiHost);
-  el.appendChild(storageHost);
-  el.appendChild(treeHost);
+        'The redo log every character’s memory is written into, the layers the mind declares, the conversations in each, and their turns. Each level loads when you open it.')),
+    h('div', { class: 'row' }, liveChip)));
+  el.appendChild(kpis);
+  el.appendChild(h('h2', { class: 'sx-head' }, 'System prompt'));
+  el.appendChild(sysprompt);
+  el.appendChild(h('h2', { class: 'sx-head' }, 'Layers & conversations'));
+  el.appendChild(layers);
 
-  let lastShape = null;
+  const inspector = mountSubstrate({
+    tenant: 'npcd',
+    prefix: 'sx-',
+    mock: BACKEND === 'mock',
+    hosts: { kpis, sysprompt, layers },
+    live: {
+      set: (state, text) => { liveChip.className = CHIP[state]; liveChip.textContent = text; },
+      onClick: (fn) => { liveChip.onclick = fn; },
+    },
+  });
 
-  // ── header (cheap, polled) ────────────────────────────────────────────────
-
-  function paintKpis(sub, schema) {
-    const layers = sub.layers || [];
-    const totConvs = layers.reduce((a, l) => a + (l.conversation_count || 0), 0);
-    const totTurns = layers.reduce((a, l) => a + (l.turn_count || 0), 0);
-    mount(kpiHost,
-      // `gather_scope`, the schema's own word. This read `l.masking ===
-      // 'cross-timeline'`, which was the fixture's vocabulary and matched
-      // nothing in `projection.yaml` — so the count was silently always zero
-      // once the route became real.
-      stat('layers', layers.length,
-        (schema.layers || []).filter((l) => l.gather_scope === 'shared').length + ' cross-timeline'),
-      stat('conversations', fmtNum(totConvs)),
-      stat('turns', fmtNum(totTurns)),
-      stat('engine', sub.engine_connected ? 'running' : 'not running',
-        sub.engine_connected ? null : 'counts are zero until it opens the substrate'));
-  }
-
-  function stat(lbl, val, note) {
-    return h('div', { class: 'panel stat' },
-      h('div', { class: 'lbl' }, lbl),
-      h('div', { class: 'val' }, String(val)),
-      note ? h('div', { class: 'tiny dim' }, note) : null);
-  }
-
-  // ── storage ───────────────────────────────────────────────────────────────
-
-  /* The redo log every character's memory is written into.
-   *
-   * Daemon-scoped rather than per-character, and the one part of this page that
-   * does not wait on the engine: a segmented append-only log is a directory of
-   * files, so npcd's line in the host's `/v1/substrate` reads it straight off
-   * disk, with the live-chunk count and reclaimable fraction beside it once
-   * the engine holds the substrate open. */
-  async function paintStorage() {
-    let s;
-    try {
-      s = await API.getSubstrateStorage();
-    } catch (_) {
-      // The whole page is declared `role: 'admin'` in `app.js` — it names the
-      // redo log's absolute path — so a refusal here is not a permission
-      // problem, it is the daemon being unreachable. Nothing to explain that
-      // the page's other panels will not already be showing.
-      mount(storageHost);
-      return;
-    }
-    if (!s || !s.open) {
-      mount(storageHost, h('div', { class: 'panel' },
-        h('div', { class: 'row', style: 'justify-content:space-between;align-items:baseline' },
-          h('h3', { style: 'margin:0' }, 'Storage'),
-          h('span', { class: 'chip' }, 'not opened')),
-        h('div', { class: 'tiny dim', style: 'margin-top:8px' },
-          'No substrate has been written yet — nothing has run an engine against this daemon. '
-          + 'It would live at ', h('code', { class: 'mono' }, (s && s.path) || 'substrate'), '.')));
-      return;
-    }
-
-    const segs = s.segments || [];
-    const total = s.total_bytes || 0;
-    /* Width by share of the log, so the strip reads as the file it describes:
-     * a long tail of sealed segments and one growing head. */
-    const strip = segs.map((g) => h('i', {
-      class: g.active ? 'seg active' : 'seg',
-      style: `flex:${Math.max(1, g.bytes || 1)}`,
-      title: `seg-${g.id} · ${fmtBytes(g.bytes)}${g.active ? ' · active' : ''}`,
-    }));
-
-    mount(storageHost, h('div', { class: 'panel' },
-      h('div', { class: 'row', style: 'justify-content:space-between;align-items:baseline' },
-        h('h3', { style: 'margin:0' }, 'Storage ',
-          h('span', { class: 'tiny dim' }, '· the redo log on disk')),
-        h('span', { class: 'mono tiny' }, fmtBytes(total))),
-      h('div', { class: 'segstrip', style: 'margin-top:10px' }, ...strip),
-      h('div', { class: 'row wrap', style: 'gap:6px;margin-top:10px' },
-        h('span', { class: 'chip' }, fmtNum(s.segment_count || segs.length) + ' segments'),
-        s.listed === false
-          // Say so rather than showing 512 of 900 as though it were all of them.
-          ? h('span', { class: 'chip warn' }, 'showing newest ' + segs.length) : null,
-        h('span', { class: 'chip' }, 'live chunks '
-          + (s.live_chunks == null ? '—' : fmtNum(s.live_chunks))),
-        h('span', { class: 'chip' + (s.dead_ratio > 0.5 ? ' warn' : '') }, 'dead '
-          + (s.dead_ratio == null ? '—' : Math.round(s.dead_ratio * 100) + '%')),
-        h('span', { class: 'tiny dim mono', style: 'margin-left:auto' }, s.path || '')),
-      s.live_chunks == null
-        ? h('div', { class: 'tiny st-na', style: 'margin-top:8px' },
-          'Live chunk count and reclaimable fraction live in the substrate’s in-memory '
-          + 'index, so they appear when an engine holds one open.')
-        : null));
-  }
-
-  function fmtBytes(b) {
-    if (b == null) return '—';
-    const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    let i = 0, v = b;
-    while (v >= 1024 && i < u.length - 1) { v /= 1024; i += 1; }
-    return v.toFixed(i >= 2 ? 1 : 0) + ' ' + u[i];
-  }
-
-  // ── tree ──────────────────────────────────────────────────────────────────
-
-  async function paintAll() {
-    // Storage is daemon-scoped, so it paints whether or not a character is
-    // selected — and it is the only real thing on the page today.
-    paintStorage();
-    if (!npcId) return mount(treeHost, empty('◌', 'No characters', 'Create one to see its substrate.'));
-    const [sub, schema] = await Promise.all([
-      API.getSubstrate(npcId).catch(() => ({ layers: [] })),
-      API.getLayerSchema().catch(() => ({ layers: [] })),
-    ]);
-    lastShape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turn_count]));
-    paintKpis(sub, schema);
-    // Keyed by `name` — the schema names a layer that way; the occupancy rows
-    // from the substrate call the same thing `layer`.
-    const byName = Object.fromEntries((schema.layers || []).map((l) => [l.name, l]));
-    mount(treeHost, (sub.layers || []).map((l) => layerCard(l, byName[l.layer] || {})));
-  }
-
-  function layerCard(l, s) {
-    const head = [
-      h('span', { class: 'disc-swatch', style: `background:${layerColor(l.layer)}` }),
-      h('span', { class: 'disc-title mono' }, l.layer),
-      h('div', { class: 'disc-meta' },
-        s.gather_scope === 'shared'
-          ? h('span', { class: 'chip warn' }, 'cross-timeline')
-          : h('span', { class: 'chip' }, 'self-local'),
-        h('span', { class: 'chip' }, fmtNum(l.conversation_count) + ' conversations'),
-        h('span', { class: 'chip' }, fmtNum(l.turn_count) + ' turns')),
-    ];
-    return disclosure({
-      accent: layerColor(l.layer),
-      head,
-      body: async (host) => {
-        mount(host, spinner('loading conversations…'));
-        const data = await layerCache.get(npcId + '::' + l.layer, () => API.getLayer(npcId, l.layer));
-        if (!stillOpen(host)) return;                 // collapsed while fetching
-        const convs = data.conversations || [];
-        mount(host,
-          s.description ? h('div', { class: 'disc-desc' }, s.description) : null,
-          h('div', { class: 'row wrap', style: 'gap:6px;margin:8px 0 4px' },
-            s.selection ? h('span', { class: 'chip' }, 'selection · ' + s.selection) : null,
-            s.window ? h('span', { class: 'chip' }, 'window ' + fmtK(s.window)) : null,
-            s.score_threshold != null ? h('span', { class: 'chip' }, 'threshold ' + s.score_threshold) : null,
-            s.decode_priority ? h('span', { class: 'chip accent' }, s.decode_priority + ' priority') : null),
-          convs.length
-            ? convs.map((c) => conversationCard(l.layer, c))
-            : h('div', { class: 'lazy-err' },
-              data.engine_connected === false ? 'The engine is not running.' : 'Nothing in this layer yet.'),
-          data.more ? h('div', { class: 'tiny dim' }, `Showing the newest ${convs.length}.`) : null,
-          h('div', { class: 'row', style: 'margin-top:10px' },
-            h('button', {
-              class: 'btn sm ghost',
-              onClick: () => go(`/npc/${npcId}/${l.layer}`),
-            }, 'Open as a stream →')));
-      },
-    });
-  }
-
-  /* One conversation — a day, a dream, an ingested file — with what it was
-   * written with, and its turns verbatim: both halves, in order. */
-  function conversationCard(layer, c) {
-    const turns = c.turns || [];
-    const meta = Object.entries(c.metadata || {});
-    const text = turns.map((t, i) => `#${i}\n${t.user}\n→ ${t.assistant}`).join('\n\n');
-    return disclosure({
-      dense: true,
-      accent: layerColor(layer),
-      head: [
-        h('span', { class: 'disc-title mono' }, c.name || 'conversation ' + c.timeline),
-        h('div', { class: 'disc-meta' },
-          meta.map(([k, v]) => h('span', { class: 'chip', title: k }, `${k}: ${v}`)),
-          h('span', { class: 'chip' }, fmtNum(c.turn_count) + ' turns')),
-      ],
-      body: (host) => {
-        const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
-        copyBtn.addEventListener('click', () => copyText(text, copyBtn));
-        mount(host,
-          h('div', { class: 'row', style: 'justify-content:flex-end;margin-bottom:6px' }, copyBtn),
-          h('pre', { class: 'disc-pre' }, text || '(no turns)'));
-      },
-    });
-  }
-
-  // ── poll: refresh the header, OFFER a reload on structural change ─────────
-
-  await paintAll();
-
-  const timer = setInterval(async () => {
-    if (!npcId) return;
-    try {
-      const [sub, schema] = await Promise.all([API.getSubstrate(npcId), API.getLayerSchema()]);
-      paintKpis(sub, schema);
-      const shape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turn_count]));
-      if (shape !== lastShape) {
-        // Do NOT rebuild: it would collapse everything the operator has open and
-        // discard its fetched sub-tree. Offer the reload instead.
-        liveBtn.className = 'chip accent';
-        liveBtn.textContent = '↻ new data · click to reload';
-        liveBtn.onclick = () => {
-          layerCache.invalidate();
-          liveBtn.onclick = null;
-          liveBtn.className = 'chip'; liveBtn.textContent = '● live';
-          paintAll();
-        };
-      }
-    } catch (_) {
-      liveBtn.className = 'chip warn';
-      liveBtn.textContent = '○ reconnecting…';
-    }
-  }, 6000);
-
-  return { el, teardown: () => clearInterval(timer) };
+  return { el, teardown: inspector.stop };
 }

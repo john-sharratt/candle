@@ -1,0 +1,43 @@
+/* The performance page (`perf.js`): only what `common/base.css` does not
+   already say, scoped to the page's root so a console's own `.kpi`, `.legend`
+   or `.verdict` elsewhere is left alone. */
+
+.perf-page .kpis {
+  display: grid; gap: 12px; margin-bottom: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
+}
+/* Its own grid, so it needs the same release from the flow-stacking margin
+   that `base.css` gives `.grid` — otherwise every KPI after the first sat
+   10px below its neighbours. */
+.perf-page .kpis > .panel + .panel { margin-top: 0; }
+.perf-page .kpi { position: relative; overflow: hidden; padding-left: 16px; }
+/* `kpi-rail`, not `rail`: that name is the shell's sidebar in `base.css`. */
+.perf-page .kpi .kpi-rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.perf-page .kpi .val { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; line-height: 1.2; }
+.perf-page .kpi .val small { font-size: .72rem; font-weight: 600; opacity: .7; }
+.perf-page .kpi .lab { font-size: .68rem; text-transform: uppercase; letter-spacing: .08em;
+            color: var(--ink-faint); font-weight: 700; margin-bottom: 4px; }
+.perf-page .kpi .meter { height: 3px; border-radius: 2px; background: var(--line-2); margin-top: 9px; overflow: hidden; }
+.perf-page .kpi .meter i { display: block; height: 100%; border-radius: 2px; }
+.perf-page .st-ok { color: var(--ok); } .perf-page .bg-ok { background: var(--ok); }
+.perf-page .st-warn { color: var(--warn); } .perf-page .bg-warn { background: var(--warn); }
+.perf-page .st-crit { color: var(--crit); } .perf-page .bg-crit { background: var(--crit); }
+.perf-page .verdict { border-left: 3px solid var(--accent); line-height: 1.7; }
+.perf-page .verdict b { color: var(--ink); }
+.perf-page .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; font-size: .72rem; color: var(--ink-faint); }
+.perf-page .legend i { display: inline-block; width: 11px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.perf-page.stale { opacity: .55; transition: opacity .2s; }
+/* The layer flow: a canvas per forward kind, a readout under them. */
+.perf-page .flow canvas { display: block; width: 100%; }
+.perf-page .flow .readout { font-size: .72rem; color: var(--ink-faint); min-height: 1.2em; margin-top: 6px;
+                 font-variant-numeric: tabular-nums; }
+/* Projections: three columns of units, two on a narrow page, one on a phone. */
+.perf-page .proj-grid { display: grid; gap: 8px 18px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .perf-page .proj-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .perf-page .proj-grid { grid-template-columns: minmax(0, 1fr); } }
+.perf-page .proj { display: grid; gap: 3px; padding: 7px 0; border-bottom: 1px solid var(--line-2); min-width: 0; }
+.perf-page .proj .top { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.perf-page .proj .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+              font-size: .8rem; }
+.perf-page .proj .kind { font-size: .62rem; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); }
+.perf-page .proj .meta { font-size: .7rem; color: var(--ink-faint); font-variant-numeric: tabular-nums; }

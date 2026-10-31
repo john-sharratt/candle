@@ -676,7 +676,7 @@ impl Minds {
     }
 
     /// The installed schema, as an `Arc` a caller may hold across an await.
-    fn projected(&self) -> Option<Arc<Projected>> {
+    pub(crate) fn projected(&self) -> Option<Arc<Projected>> {
         self.projection.load_full()
     }
 

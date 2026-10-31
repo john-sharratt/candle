@@ -404,79 +404,6 @@ export const MockAPI = {
       model: { name: 'Qwen3.6-35B-A3B-AntiLoop', quant: 'Q4_K_M' },
       tenants: { npcd: { state: 'ready', loading: null, maintenance: null } } };
   },
-  /* A synthetic hour, in the column shape the daemon serves. This one DOES
-   * fabricate — that is what `?mock` is for, and the header chip says "backend:
-   * mock" while it is on. It exists so the performance page can be built
-   * against a full engine without one running; the live path reports absence
-   * instead, and the two must not be confused. */
-  async getTelemetry() {
-    const n = 900, period = 2;                    // 30 minutes at the real cadence
-    const t = Array.from({ length: n }, (_, i) => i * period);
-    const wave = (i, a, b, f) => a + b * Math.sin(i / f);
-    const used = t.map((_, i) => Math.round(wave(i, 9000, 1800, 90)));
-    const weights = t.map(() => 5400);
-    const kv = t.map((_, i) => Math.round(wave(i, 2200, 900, 70)));
-    const image = t.map((_, i) => (i % 130 < 40 ? 640 : 0));
-    return {
-      gpu: { name: 'mock device', compute_cap: '8.6', pcie_gen: 3, pcie_width: 16 },
-      model: {
-        name: 'Qwen3-30B-A3B', quant: 'Q6_K', params_total: '30B', params_active: '3B',
-        repo: 'unsloth/Qwen3-30B-A3B-GGUF', filename: 'Qwen3-30B-A3B-Q6_K.gguf',
-        bytes: 25092532800,
-      },
-      host: { total_mib: 65457, free_mib: 41000, rss_mib: 820 },
-      sample_period_s: period,
-      engine_measured: true,
-      image_queue_state: 'waiting_for_vram',
-      uptime_s: 4820,
-      series: {
-        t,
-        vram_total_mib: t.map(() => 24576),
-        vram_used_mib: used,
-        vram_free_mib: used.map((u) => 24576 - u),
-        host_total_mib: t.map(() => 65457),
-        host_used_mib: t.map((_, i) => Math.round(wave(i, 24000, 2600, 140))),
-        rss_mib: t.map(() => 820),
-        weights_mib: weights,
-        kv_mib: kv,
-        image_mib: image,
-        decode_tps: t.map((_, i) => Math.round(wave(i, 430, 90, 55))),
-        prefill_tps: t.map((_, i) => Math.round(wave(i, 1100, 320, 33))),
-        mean_npcs_per_decode: t.map((_, i) => +wave(i, 3.1, 1.1, 61).toFixed(1)),
-        max_batch: t.map(() => 6),
-        npcs_active: t.map((_, i) => Math.round(wave(i, 7, 4, 77))),
-        ticks_per_sec: t.map((_, i) => +wave(i, 0.45, 0.2, 48).toFixed(2)),
-        inbox_depth_p50: t.map((_, i) => Math.round(Math.abs(wave(i, 1, 2, 40)))),
-        inbox_depth_p99: t.map((_, i) => Math.round(Math.abs(wave(i, 11, 9, 95)))),
-        image_queue_depth: image.map((v) => (v ? 2 : 0)),
-      },
-    };
-  },
-  async getSubstrateStorage() {
-    const seg = (id, bytes, active) => ({ id, bytes, active: !!active });
-    return {
-      open: true,
-      path: 'substrate',
-      listed: true,
-      segment_count: 4,
-      segments: [seg(1, 67108864), seg(2, 67108864), seg(3, 67108864), seg(4, 21402112, true)],
-      total_bytes: 222728704,
-      live_chunks: 41882,
-      dead_ratio: 0.18,
-    };
-  },
-  /* `getMemoryDump`, not `getMemory`: a character's memory layer claims that
-   * name below, and a duplicate key in an object literal silently keeps the
-   * last one. */
-  async getMemoryDump() {
-    const mib = 1024 * 1024;
-    return {
-      report: null,
-      report_age_ms: null,
-      host_now: { total_bytes: 65457 * mib, available_bytes: 41000 * mib, free_bytes: 38200 * mib },
-      process: { working_set_bytes: 820 * mib, virtual_bytes: 41000 * mib },
-    };
-  },
   async getMe() {
     if (flag('loggedout')) return { role: 'unauthenticated' };
     return { role: 'creator', user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan',
@@ -851,32 +778,6 @@ export const MockAPI = {
   async getLifeJob() { return null; },
   async cancelLife() { throw noEngine('cancel a generation'); },
 
-  async getLayerSchema() {
-    const L = (layer, window, priority, min_percent, selection, masking, score_threshold,
-      decode_priority, summarize, description) =>
-      ({ layer, window, budget: { priority, min_percent }, selection, masking,
-        score_threshold, decode_priority, summarize, description });
-    return { layers: [
-      L('perception', 16000, 100, 40, 'sequence(recent 12, top-k 8)', 'self-local', 0, 'high', false,
-        'API-fed. Maps supersede at the same zoom band; descriptions accumulate.'),
-      L('action', 16000, 95, 30, 'sequence(recent 16, top-k 6)', 'self-local', 0, 'high', true,
-        'The act stream. Ground truth — everything narrated is read from here.'),
-      L('agency', 4000, 80, 20, 'top-k 4', 'self-local', 0.35, 'normal', false,
-        'Missions, strategies and sub-goals.'),
-      L('relationships', 4000, 75, 20, 'top-k 6', 'self-local', 0.30, 'normal', false,
-        'Per-entity calibration. Writable on both planes.'),
-      L('beliefs', 4000, 90, 25, 'top-k 5', 'self-local', 0.40, 'normal', false,
-        'Write-protected against the action plane. Evidence threshold only.'),
-      L('memory', 8000, 60, 15, 'sequence(recent 4, top-k 12)', 'self-local', 0.25, 'low', true,
-        'Unbounded. The consolidation target for daydream and sleep folds.'),
-      L('interaction', 16000, 100, 50, 'sequence(recent 16, top-k 8)', 'self-local', 0, 'high', true,
-        "One timeline per interaction, forked from the NPC's sealed prefix."),
-      L('environment', 6000, 50, 10, 'sequence(recent 24)', 'self-local', 0, 'low', false,
-        'Sliding window only — continuity of the scene, not recall.'),
-      L('world', 8000, 70, 10, 'top-k 6', 'cross-timeline', 0.30, 'low', true,
-        'The only unmasked layer: shared facts are retrievable across NPCs.'),
-    ] };
-  },
   async getTurn(_id, layer, turn) {
     const US = '<|im_start|>user\n', IE = '<|im_end|>\n', AS = '<|im_start|>assistant\n';
     const bodies = {

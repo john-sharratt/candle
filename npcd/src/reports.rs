@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::Conversation;
 use futures::future::BoxFuture;
 use host::loading::{tokens_per_second, LoadingView};
@@ -17,19 +18,20 @@ use web::auth::Role;
 use crate::api::{account, schema_layers, Authored};
 use crate::engine::loading::LoadingSnapshot;
 use crate::engine::pulse::catalog;
-use crate::substrate::SubstrateDir;
+use crate::engine::substrate_views;
 
 /// npcd's state, as the host reads it.
 pub struct NpcdReports {
     authored: Arc<Authored>,
-    substrate: SubstrateDir,
+    /// The redo log's directory.
+    substrate: PathBuf,
 }
 
 impl NpcdReports {
     pub fn new(authored: Arc<Authored>, data: PathBuf) -> Self {
         Self {
             authored,
-            substrate: SubstrateDir::new(&data),
+            substrate: data.join(SUBSTRATE_DIR),
         }
     }
 }
@@ -67,22 +69,6 @@ fn status_of(authored: &Authored) -> TenantStatus {
     let minds = runtime.and_then(|rt| rt.minds.read().unwrap().clone());
     status.maintenance = minds.map(|minds| Maintenance::of(minds.substrate().maintenance_status()));
     status
-}
-
-/// The substrate's storage: its files on disk, and — once an engine holds it
-/// open — its live chunks and dead weight.
-fn storage(authored: &Authored, dir: &SubstrateDir) -> Value {
-    let mut storage = dir.read();
-    let minds = authored
-        .runtime
-        .as_ref()
-        .and_then(|rt| rt.minds.read().unwrap().clone());
-    if let Some(minds) = minds {
-        let conv = minds.substrate();
-        storage.dead_ratio = conv.dead_ratio();
-        storage.live_chunks = Some(conv.read().live_chunk_count() as u64);
-    }
-    json!(storage)
 }
 
 /// The catalog npcd's console reads, split into the tools and what is said of
@@ -137,15 +123,15 @@ impl Reports for NpcdReports {
         })
     }
 
-    /// On the blocking pool: it lists the segment files and takes the engine's
-    /// lock, neither of which may park a runtime worker.
+    /// On the blocking pool: it lists the segment files and walks the
+    /// substrate, neither of which may park a runtime worker.
     fn substrate(&self) -> BoxFuture<'_, Value> {
         let authored = Arc::clone(&self.authored);
         let dir = self.substrate.clone();
         Box::pin(async move {
-            spawn_blocking(move || storage(&authored, &dir))
+            spawn_blocking(move || substrate_views::line(&authored, &dir))
                 .await
-                .expect("the storage read panicked")
+                .expect("the substrate overview panicked")
         })
     }
 
