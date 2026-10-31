@@ -267,6 +267,19 @@ impl SubstratePersistence {
         for r in self.vfs_relocations(substrate, &segments) {
             carried.insert((r.loc.segment, r.loc.offset));
         }
+        for (_, loc) in self.blob_relocations(&segments) {
+            carried.insert((loc.segment, loc.offset));
+        }
+        for (_, loc) in self.gather_index_page_relocs(substrate, &segments) {
+            carried.insert((loc.segment, loc.offset));
+        }
+        // Each is written afresh from what it says, not found by a key: the
+        // record the log holds now is the one a rewrite replaces.
+        for (&(rt, _, _), loc) in self.metadata_locs.iter() {
+            if matches!(rt, RecordType::Replica | RecordType::Rebase) {
+                carried.insert((loc.segment, loc.offset));
+            }
+        }
         // What the resident re-emission writes, by key.
         let emitted: HashSet<ResidentKey> =
             gather_resident_set(substrate, self.marker_ids(), self.node())
@@ -496,6 +509,25 @@ mod tests {
         let audit = plan.walk().unwrap();
         assert_eq!(audit.by_type()[&RecordType::Label].records, 1);
         assert_eq!(audit.gone, []);
+    }
+
+    /// **A blob is carried, and the audit says so.** Maintenance relocates
+    /// blobs and turn index pages, and the audit's own list left them out: a
+    /// clean store reported 64 GiB counted live and never carried, which is
+    /// the words for data a drop would lose.
+    #[test]
+    fn a_blob_is_counted_and_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        sp.write_blob(b"bytes kept by their hash".to_vec()).unwrap();
+        sp.commit().unwrap();
+        let audit = sp.liveness_audit(&substrate).unwrap();
+        let blobs = audit.by_type()[&RecordType::Blob];
+        assert_eq!(blobs.records, 1);
+        assert_eq!(blobs.carried, blobs.bytes);
+        assert_eq!(blobs.counted_uncarried, 0);
     }
 
     /// **A segment unlinked under the walk is reported, not fatal.**
