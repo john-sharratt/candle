@@ -232,8 +232,9 @@ export async function render() {
  * is heard in the world as them.
  *
  * **Linked by a code sent in a DM.** The daemon cannot see who a Discord
- * account belongs to, so it hands out six digits and whoever DMs them to one
- * of the characters' bots is the person who asked. The page shows the code,
+ * account belongs to, so it hands out a code (twelve characters, shown in
+ * fours) and whoever DMs it to one of the characters' bots is the person who
+ * asked. The page shows the code,
  * how long it is good for and which bots it can go to, then polls until the
  * bot that received it has linked the account — or the code runs out.
  *
