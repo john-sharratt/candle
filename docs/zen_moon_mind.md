@@ -135,14 +135,16 @@ The order table in the watch room holds the work, and Zen uses it through its ef
 
 | Act | Who | Does |
 |---|---|---|
-| `order_post` | Zen | Puts a mission on the table: a brief and its steps, for any Drone or for one by name. |
-| `order_results` | Zen | Reads what came back: each finished mission's report, newest first, and what is still out. |
+| `order_post` | Zen | Puts a mission on the table: a brief and at least one step, or a standing job by name (`job`, its brief and steps its own), for any Drone or for one by name. |
+| `order_results` | Zen | Reads what came back since it last read: each report, newest first, what is still out, and — with the table empty — the standing jobs. Offered only while a report waits unread, so a reading is never asked for again unchanged. |
 | `collect_mission` | a Drone | Takes the next mission on the table — one set for it by name first, then the oldest open one. |
 | `report_done` / `report_stuck` | a Drone | Reports the mission at the table. |
 
 An order is a **mission**, not a line on the orders board: it has steps the engine signs off as
 they happen, a compass that tells the Drone what comes next, and a report. Its origin names its
-poster (`Origin::Ordered { by }`), so its report is the poster's to read. A mission's steps may
+poster (`Origin::Ordered { by, poster }` — its name and its body), so its report is the poster's
+to read (`sim::orders`, the newest 50 kept). Steps are given one to a line; the engine adds the
+report back to the table it was posted at. A mission's steps may
 name mirrored rooms and their terminals — "go to the Sharratt house and read the hallway camera"
 — and are signed off as any journey and reading is.
 
@@ -150,30 +152,37 @@ name mirrored rooms and their terminals — "go to the Sharratt house and read t
 
 - **When a Drone finishes** (reported done or stuck): who, which mission, the outcome, and —
   when nothing is left open on the table — that **the table is empty**, so it can set the next
-  work. The report itself is read at the table (`order_results`).
+  work. The report itself is read at the table (`order_results`). A posted mission that ends
+  unreported — called off, replaced, or set for a Drone that is gone — is filed to Zen the same
+  way, as not done and why, so nothing it posted is out for good.
 - **When a Drone messages it**, which is how a Drone asks about its mission.
 
 ### 8.3 The Drones wait for work
 
 A Drone with no mission **goes to the order table and waits there, idle** — no routines, no
 nudges, nothing drawn from a bank. **A mission posted wakes it**: every Drone waiting at the
-table is told the moment work arrives, and a mission set for one by name wakes only that one.
+table is told the moment work arrives, and the table hands it to the first of them to take a
+turn there; a mission set for one by name wakes only that one.
 
 `missions/life.yaml`'s routines stop being handed out by draw; they are Zen's **maintenance
-catalogue** — the standing jobs it may post when the table is empty, read at the table.
+catalogue** — the standing jobs it may post by name when the table is empty. A standing job a
+Drone carries is a routine still, and turns no chapter of its journal.
+
+An idle thought (`idle:`) is what a character turns to alone; with others in the room it is
+still told who is there.
 
 ## 9. What changes in the engine
 
 | Piece | Change |
 |---|---|
-| `focus` | A body act for a character whose personality says `moves: attention`: puts it in any room of its world at once; the room it leaves and the room it enters see it go and come. |
+| `focus` | A body act for a character whose personality says `moves: attention` (`Sim::attends`): puts it in any room of its world at once (`body::rooms`, a name shared by two areas named with its area); the room it leaves and the room it enters see it go and come. Such a body has no `move_to` destinations and no lift. |
 | Mirrored rooms | A node carries `place` and `group`; a part carries the `source` binding it reads. Authored in the map like any node, or added by onboarding. |
 | Onboarding | A source's discoveries become `MapEdit`s through `World::reshape` and `mapstore`, kept under the group's owner. |
 | Terminal events | A source event lands on its terminal as a room event (`EventKind::Terminal`), shown on the terminal until read; Zen is told which room is waiting. A global one is raised on the tannoy. |
 | Terminals | One part kind per row of §6, each verb a station verb served by the effector, reading through its source. |
 | `order_post`, `order_results` | Acts of the order table, offered to a character that takes no orders — in `life`, Zen. |
-| `Origin::Ordered { by }` | A mission posted by a character; its report notifies its poster. |
-| Waiting at the table | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is sent to the table and waits there idle, woken by a post. |
+| `Origin::Ordered { by, poster }` | A mission posted by a character; its report notifies its poster. |
+| Waiting at the table | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is sent to the table to wait (`TO_WAIT`) and waits there told nothing, woken by a post. |
 | Notifications | Report → the poster, with "the table is empty" when it is. Post → every Drone waiting at the table, or the one named. |
 | Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it. |
 

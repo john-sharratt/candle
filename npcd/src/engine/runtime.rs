@@ -99,6 +99,7 @@ use crate::engine::mind_record;
 use crate::engine::mission::{
     compass_line, compass_report_line, doc_compass, progress_line, publish_compass,
     refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
+    Outcome as Verdict,
 };
 use crate::engine::mission_acts;
 use crate::engine::mission_gen;
@@ -121,6 +122,7 @@ use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
 use crate::projection;
+use crate::sim::orders::Notice;
 use crate::sim::phone::Origin;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
@@ -257,6 +259,12 @@ pub struct Kind<'a> {
     /// The personality says `takes_orders: false`: the world gives it no
     /// orders — see [`crate::sim::missions::Missions::set_unordered`].
     pub unordered: bool,
+    /// The personality says `moves: attention`: it `focus`es on a room rather
+    /// than walking to it — see [`Sim::set_attends`].
+    pub attends: bool,
+    /// The personality's `idle:` — what its idle wake says (see [`Runtime`]'s
+    /// `idles`).
+    pub idle: Option<&'a str>,
 }
 
 /// Everything the prompt needs about one character, owned.
@@ -282,6 +290,12 @@ pub struct OwnedPersona {
     /// Whether the world gives a character of its personality no orders — the
     /// personality's `takes_orders: false`. Never rendered; see [`Kind`].
     pub unordered: bool,
+    /// Whether it moves by attention — the personality's `moves: attention`.
+    /// Never rendered; see [`Kind`].
+    pub attends: bool,
+    /// Its idle thought — the personality's `idle:`. Never rendered as part of
+    /// the persona; see [`Kind`].
+    pub idle: Option<String>,
     pub identity: String,
     /// The personality's anchor — the floor every character of it reads.
     ///
@@ -320,6 +334,16 @@ pub struct OwnedPersona {
 }
 
 impl OwnedPersona {
+    /// What kind of character this is, for its body — see [`Kind`].
+    pub fn kind(&self) -> Kind<'_> {
+        Kind {
+            home: self.home.as_deref(),
+            unordered: self.unordered,
+            attends: self.attends,
+            idle: self.idle.as_deref(),
+        }
+    }
+
     pub fn as_persona(&self) -> Persona<'_> {
         Persona {
             name: &self.name,
@@ -532,6 +556,11 @@ pub struct Runtime {
     /// to offer whatever it is given. Empty until then, and empty for a daemon
     /// with no mind — which drops the parameter rather than the act.
     feelings: RwLock<Vec<String>>,
+    /// Each character's own idle thought, from its personality's `idle:` —
+    /// what its idle wake says in place of [`NO_MISSION`] or [`YOUR_OWN_TIME`].
+    /// Set as the character is embodied, on every member, since the idle wake
+    /// is the running member's to deliver.
+    idles: RwLock<HashMap<u64, String>>,
     /// How soon each character may take each act again.
     ///
     /// Here rather than on a world, because the limit belongs to the person
@@ -738,6 +767,13 @@ pub const TO_THE_TABLE_ON_FOOT: &str =
      offers, then take up a mission by `invoke` on its `collect_mission`. Carry \
      it out, and when it is done come back and report it at the table the same \
      way, then take up the next.";
+
+/// The summons for a character with nothing to do in a world that hands out no
+/// routines (`draw: none`), while nothing is posted: go and **wait** at the
+/// table, where work will be posted and you will be told
+/// (`docs/zen_moon_mind.md` §8.3).
+pub const TO_WAIT: &str = "You have no work yet. Go to the order table in {room} and wait there \
+                           — {how} — and you will be told the moment work is posted.";
 
 /// The summons for a character that is **already at the table** with no mission.
 ///
@@ -965,6 +1001,7 @@ impl Runtime {
             dreaming: Mutex::new(HashSet::new()),
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
+            idles: RwLock::new(HashMap::new()),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
             loop_guards: crate::engine::loopguard::LoopGuards::new(),
             stopping: AtomicBool::new(false),
@@ -1127,7 +1164,12 @@ impl Runtime {
         let Some(hosted) = self.hosted.get(world_id) else {
             return Ok(false);
         };
-        let Kind { home, unordered } = kind;
+        let Kind {
+            home,
+            unordered,
+            attends,
+            idle,
+        } = kind;
         let body = Self::body_id(npc_id);
         let placed = hosted.with(|w| {
             if w.actor(&body).is_some() {
@@ -1171,8 +1213,12 @@ impl Runtime {
         // whose missions these are; a member following the world takes the mark
         // in with the rest of its state.
         if self.standing.writes(world_id) {
-            hosted.with_sim(|s| s.missions.set_unordered(&body, unordered));
+            hosted.with_sim(|s| {
+                s.missions.set_unordered(&body, unordered);
+                s.set_attends(&body, attends);
+            });
         }
+        self.set_idle(npc_id, idle);
         // **A handset on arrival, and a line on the roster.** Two halves of one
         // thing: carrying the phone is what makes the messaging acts reachable,
         // and being on the roster is what makes this character reachable *by*
@@ -1210,22 +1256,34 @@ impl Runtime {
         //
         // **An unordered character is given no task** — the world gives it no
         // orders — but it is still woken: with nothing else arriving, this is
-        // what rouses a character gone quiet, so it is told only that its time
-        // is its own. See [`YOUR_OWN_TIME`].
-        let (on_mission, table_open, unordered) = hosted.sim(|s| {
+        // what rouses a character gone quiet. It is told its own idle thought
+        // when its personality has one, and otherwise only that its time is its
+        // own. See [`YOUR_OWN_TIME`].
+        let (on_mission, table_open, unordered, waits) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
+                !s.missions.draws() && !s.missions.has_work_for(&body),
             )
         });
         if on_mission {
             return None;
         }
+        let idle = self.idles.read().unwrap().get(&npc_id).cloned();
         if unordered {
-            return Some(YOUR_OWN_TIME.to_string());
+            return Some(idle.unwrap_or_else(|| YOUR_OWN_TIME.to_string()));
         }
         if let Some(way) = self.command_table_way(npc_id).filter(|_| table_open) {
+            // **With nothing on the table, the work is to wait for it** in a
+            // world that hands nothing out by draw: one at the table is left
+            // quiet until a post wakes it, and one away is sent there to wait.
+            if waits {
+                return match self.at_command_table(npc_id) {
+                    true => None,
+                    false => Some(Self::to_wait_at(&way)),
+                };
+            }
             // Location-aware, the same split the active summons makes (see
             // [`Self::table_summons`] / [`Self::at_table_summons`]): a character
             // that has arrived reads [`AT_THE_TABLE`] — take one up here — and one
@@ -1254,8 +1312,10 @@ impl Runtime {
                 .map(|other| other.name.clone())
                 .collect()
         });
+        // A character's own idle thought is what it turns to alone; with
+        // company, who is here is still the most useful thing to be told.
         Some(match company.is_empty() {
-            true => NO_MISSION.to_string(),
+            true => idle.unwrap_or_else(|| NO_MISSION.to_string()),
             false => IN_COMPANY.replace(
                 "{who}",
                 &format!(
@@ -1284,18 +1344,23 @@ impl Runtime {
         // that has arrived is out of its scope.
         let (hosted, body) = self.body_of(npc_id)?;
         // Nor for an unordered character, which the table never calls.
-        let (on_mission, table_open, unordered) = hosted.sim(|s| {
+        let (on_mission, table_open, unordered, waits) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
+                !s.missions.draws() && !s.missions.has_work_for(&body),
             )
         });
         if on_mission || unordered || !table_open || self.at_command_table(npc_id) {
             return None;
         }
-        self.command_table_way(npc_id)
-            .map(|way| Self::to_the_table(&way))
+        // With nothing posted in a world that draws nothing, it is called to
+        // wait there, not to take something up.
+        self.command_table_way(npc_id).map(|way| match waits {
+            true => Self::to_wait_at(&way),
+            false => Self::to_the_table(&way),
+        })
     }
 
     /// The summons for a character **standing at the command table** with no
@@ -1330,10 +1395,11 @@ impl Runtime {
         if hosted.sim(|s| {
             s.table_open && !s.missions.is_on_mission(&body) && s.missions.has_pooled_for(&body)
         }) {
-            return Some(format!(
-                "The table hands you the next piece of work, and you take it up.\n{}",
-                work::take_up(&hosted, &body)
-            ));
+            if let Some(brief) = work::take_up(&hosted, &body) {
+                return Some(format!(
+                    "The table hands you the next piece of work, and you take it up.\n{brief}"
+                ));
+            }
         }
         // The exact address, for a mission set for this character by name: the
         // general call to take one up was read past, turn after turn, by a
@@ -1366,6 +1432,10 @@ impl Runtime {
                 ),
                 None => AT_THE_TABLE.to_string(),
             }),
+            // **Waiting for work is waiting quietly.** In a world that draws
+            // nothing, a character at the table with nothing posted is told
+            // nothing: a post wakes it (`Runtime::moment`).
+            None if !s.missions.draws() => None,
             None => s.table_open.then(|| AT_THE_TABLE.to_string()),
             // A mission carried on its ask alone has no steps to have done, so
             // it is not told they are.
@@ -1745,30 +1815,47 @@ impl Runtime {
         }
     }
 
-    /// Mark every character of the worlds this member runs as its personality
-    /// now says — `takes_orders` read afresh — after the personalities are
-    /// read again. A character is marked as it is embodied, and one already
-    /// standing in its world is not embodied again, so without this an edited
-    /// personality reached its characters only at the next restart.
+    /// Mark every character as its personality now says — `takes_orders`,
+    /// `moves` and `idle:` read afresh — after the personalities are read
+    /// again. A character is marked as it is embodied, and one already standing
+    /// in its world is not embodied again, so without this an edited
+    /// personality reached its characters only at the next restart. The world's
+    /// state is its authority's to mark; the idle thought is every member's.
     pub async fn mark_orders(&self) {
         for world in self.hosted.ids() {
             let Some(hosted) = self.hosted.get(&world) else {
                 continue;
             };
-            if !self.standing.writes(&world) {
-                continue;
-            }
+            let writes = self.standing.writes(&world);
             for (npc_id, body) in self.bodies.in_world(&world) {
-                // A character whose persona cannot be read now keeps its mark.
-                let Some(unordered) = self.persona_of_async(npc_id).await.map(|p| p.unordered)
-                else {
+                // A character whose persona cannot be read now keeps its marks.
+                let Some(p) = self.persona_of_async(npc_id).await else {
                     continue;
                 };
-                if hosted.sim(|s| s.missions.is_unordered(&body)) != unordered {
-                    hosted.with_sim(|s| s.missions.set_unordered(&body, unordered));
+                self.set_idle(npc_id, p.idle.as_deref());
+                if !writes {
+                    continue;
+                }
+                let stands = hosted.sim(|s| (s.missions.is_unordered(&body), s.attends(&body)));
+                if stands != (p.unordered, p.attends) {
+                    hosted.with_sim(|s| {
+                        if s.missions.is_unordered(&body) != p.unordered {
+                            s.missions.set_unordered(&body, p.unordered);
+                        }
+                        s.set_attends(&body, p.attends);
+                    });
                 }
             }
         }
+    }
+
+    /// Keep `npc_id`'s idle thought, or forget it.
+    fn set_idle(&self, npc_id: u64, idle: Option<&str>) {
+        let mut idles = self.idles.write().unwrap();
+        match idle.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(text) => idles.insert(npc_id, text.to_string()),
+            None => idles.remove(&npc_id),
+        };
     }
 
     /// Whether the world gives this character orders: every character but one
@@ -1834,6 +1921,19 @@ impl Runtime {
             true => TO_THE_TABLE_ON_FOOT.replace("{room}", &way.room),
             false => TO_THE_TABLE.to_string(),
         }
+    }
+
+    /// [`Self::to_the_table`] for a table with nothing on it yet, in a world
+    /// that hands nothing out by draw: go and wait there — see [`TO_WAIT`].
+    fn to_wait_at(way: &TableWay) -> String {
+        let how = match way.on_foot {
+            true => format!("`move_to` {}", way.room),
+            false => format!(
+                "ride the lift with `lift_use` to its level, then `move_to` {}",
+                way.room
+            ),
+        };
+        TO_WAIT.replace("{room}", &way.room).replace("{how}", &how)
     }
 
     /// Open or shut the command table on every world this daemon runs.
@@ -1923,7 +2023,8 @@ impl Runtime {
             if self.standing.writes(hosted.id()) {
                 hosted.with_sim(|s| {
                     s.ledger.forget_questions(&body);
-                    s.missions.set_unordered(&body, false);
+                    s.missions.forget(&body);
+                    s.set_attends(&body, false);
                 });
             }
             hosted.with(|w| {
@@ -1931,6 +2032,7 @@ impl Runtime {
             });
         }
         self.bodies.unbind(npc_id);
+        self.set_idle(npc_id, None);
     }
 
     /// Take a character's body away, and let it settle back to reacting.
@@ -1977,7 +2079,14 @@ impl Runtime {
         // `lift_call` / `lift_use` are gated on, and what the ride binds to — one
         // read, from [`World::lift_within`], so the situation and the grammar
         // cannot disagree about it.
-        let (at_lift, lift_here, floors) = hosted.read(|w| w.lift_within(&body));
+        //
+        // **A body that moves by attention neither walks nor rides**: it has the
+        // world's rooms to `focus` on instead, and no destinations, no lift.
+        let attends = hosted.sim(|s| s.attends(&body));
+        let (at_lift, lift_here, floors) = match attends {
+            true => (false, false, Vec::new()),
+            false => hosted.read(|w| w.lift_within(&body)),
+        };
         // The verb-paths reachable from here — the live enum `invoke`'s `url` is
         // bound to, so the grammar forces a real address the device serves and a
         // character can never `invoke` a hallucinated one or a bare resource
@@ -1991,7 +2100,14 @@ impl Runtime {
             invokable,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
-            places: body::reachable(&hosted, &body),
+            places: match attends {
+                true => Vec::new(),
+                false => body::reachable(&hosted, &body),
+            },
+            rooms: body::rooms(&hosted, &body)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
             parts: hosted.read(|w| {
                 let Some(node) = w.actor(&body).and_then(|a| w.node(&a.at)) else {
                     return Vec::new();
@@ -2237,9 +2353,91 @@ impl Runtime {
                 );
             }
         }
+        // What the order table owes: a post wakes whoever waits for it, a report
+        // tells its poster. The world's authority tells, once.
+        if self.standing.writes(hosted.id()) {
+            for notice in hosted.with_sim(|s| s.missions.take_notices()) {
+                self.give_notice(hosted, notice);
+            }
+        }
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
         moment
+    }
+
+    /// Deliver one of the order table's notices
+    /// (`docs/zen_moon_mind.md` §8.2–§8.3).
+    ///
+    /// - **A post** wakes the one it is for, wherever it is — or, with none
+    ///   named, everybody who takes orders waiting at a table with nothing in
+    ///   hand. It only wakes them: the table hands the work to the first of
+    ///   them to take a turn there ([`Self::at_table_summons`]), so telling them
+    ///   all to collect it was telling all but one to be refused.
+    /// - **A report** tells its poster who reported what, that the report waits
+    ///   at the table, and — with nothing left on the table — that it is empty.
+    fn give_notice(&self, hosted: &Hosted, notice: Notice) {
+        let world = hosted.id();
+        let tell = |npc_id: u64, text: String| {
+            self.tell(
+                npc_id,
+                self.world_ms(npc_id),
+                Salience::URGENT,
+                EventKind::Nudge { text },
+            )
+        };
+        match notice {
+            Notice::Posted {
+                to: Some(body),
+                brief,
+            } => {
+                if let Some(npc_id) = self.bodies.mind_of(world, &body) {
+                    tell(
+                        npc_id,
+                        format!(
+                            "Work has been posted on the order table for you by name: {brief} \
+                             Go to the table and take it up with `collect_mission`."
+                        ),
+                    );
+                }
+            }
+            Notice::Posted { to: None, brief } => {
+                for (npc_id, body) in self.bodies.in_world(world) {
+                    let free = hosted.sim(|s| {
+                        !s.missions.is_unordered(&body) && !s.missions.is_on_mission(&body)
+                    });
+                    if free && self.at_command_table(npc_id) {
+                        tell(
+                            npc_id,
+                            format!("Work has been posted on the order table: {brief}"),
+                        );
+                    }
+                }
+            }
+            Notice::Reported(filed) => {
+                let Some(npc_id) = self.bodies.mind_of(world, &filed.poster) else {
+                    return;
+                };
+                let carrier = hosted
+                    .read(|w| w.actor(&filed.carrier).map(|a| a.name.clone()))
+                    .unwrap_or_else(|| filed.carrier.clone());
+                let how = match filed.outcome {
+                    Verdict::Pass => "reported it done",
+                    Verdict::Fail => "reported that it could not finish it",
+                };
+                let empty = match hosted.sim(|s| s.missions.table_empty()) {
+                    true => " The table is empty: nothing you posted waits to be taken.",
+                    false => "",
+                };
+                tell(
+                    npc_id,
+                    format!(
+                        "{carrier} has {how}: {}. The report is at the order table — \
+                         `order_results`.{empty}",
+                        filed.brief.trim_end_matches('.')
+                    ),
+                );
+            }
+        }
     }
 
     /// Restate the standing task of every character in `hosted` that runs
@@ -4975,10 +5173,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // what every path that embodies a character reads from the persona. The
         // room it was last in is consulted first, so the home is only reached
         // for one that has none.
-        let kind = Kind {
-            home: persona.as_ref().and_then(|p| p.home.as_deref()),
-            unordered: persona.as_ref().is_some_and(|p| p.unordered),
-        };
+        let kind = persona.as_ref().map(OwnedPersona::kind).unwrap_or_default();
         match rt.embody_in_world(id, world, kind, &name, remembered.as_deref(), now) {
             Ok(true) => {
                 embodied += 1;
@@ -8073,7 +8268,7 @@ mod tests {
         let facts = Facts::default();
         let queued = revived.with_sim(|s| {
             s.missions.report("m1", Outcome::Pass, "ok", None);
-            s.missions.collect("m1", &facts).mission_text()
+            s.missions.collect("m1", &facts).unwrap().mission_text()
         });
         assert_eq!(
             queued, "Then the ledger.",
@@ -8199,8 +8394,8 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         let unordered = Kind {
-            home: None,
             unordered: true,
+            ..Kind::default()
         };
         rt.embody_in_world(1, WORLD, unordered, "Zen", None, 0)
             .unwrap();
@@ -8250,6 +8445,207 @@ mod tests {
             [body],
             "it is told its mission was withdrawn"
         );
+    }
+
+    /// **In a world that draws nothing, a character with no work waits at the
+    /// table quietly**: at the table it is told nothing, away it is sent there to
+    /// wait — not to take something up — and work posted for it calls it again.
+    #[tokio::test]
+    async fn with_nothing_posted_a_character_waits_at_the_table() {
+        use crate::engine::mission::{Mission, Origin};
+        use crate::engine::mission_gen::world::Draw;
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody_in_world(1, WORLD, Kind::default(), "Wick", None, 0)
+            .unwrap();
+        embody(&rt, 2, "m2", "green-room");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        rt.set_table_open(true);
+        assert!(rt.at_command_table(1));
+        assert_eq!(rt.at_table_summons(1), None, "waiting quietly");
+        assert_eq!(rt.nudge_for(1), None);
+        let wait = rt.table_summons(2).expect("sent to wait");
+        assert!(
+            wait.starts_with("You have no work yet. Go to the order table in the command room"),
+            "{wait}"
+        );
+        assert_eq!(rt.nudge_for(2).as_deref(), Some(wait.as_str()));
+        let (_, body) = rt.body_of(2).unwrap();
+        hosted.with_sim(|s| {
+            s.missions.post(
+                Mission::new(
+                    "Read the board.",
+                    Vec::new(),
+                    Origin::Lodged { by: "op".into() },
+                ),
+                Some(&body),
+            )
+        });
+        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+    }
+
+    /// **The table's notices reach whom they are for**: a post for whoever
+    /// comes wakes those waiting at the table and nobody away from it or on
+    /// work; one by name wakes only its own; a report tells its poster.
+    #[tokio::test]
+    async fn a_post_wakes_whoever_waits_and_a_report_tells_its_poster() {
+        use crate::engine::mission::bank::Facts;
+        use crate::engine::order_table;
+        let rt = vaulted();
+        for id in [1, 3] {
+            rt.scheduler.wake(id, 0, 0);
+        }
+        rt.embody_in_world(1, WORLD, Kind::default(), "Wick", None, 0)
+            .unwrap();
+        embody(&rt, 2, "m2", "green-room");
+        let zen = Kind {
+            unordered: true,
+            ..Kind::default()
+        };
+        rt.embody_in_world(3, WORLD, zen, "Zen", None, 0).unwrap();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let (_, wick) = rt.body_of(1).unwrap();
+        let (_, poster) = rt.body_of(3).unwrap();
+        let depth = |id| rt.scheduler.inbox_depth(id).unwrap();
+        let notify = || {
+            for n in hosted.with_sim(|s| s.missions.take_notices()) {
+                rt.give_notice(&hosted, n);
+            }
+        };
+        let before = (depth(1), depth(2), depth(3));
+        let args = |v: serde_json::Value| v.as_object().unwrap().clone();
+        assert!(order_table::post(
+            &hosted,
+            &poster,
+            &args(
+                serde_json::json!({"brief": "Read the board.", "steps": "go to the dispatch room"})
+            )
+        )
+        .happened());
+        notify();
+        assert_eq!(
+            (depth(1), depth(2), depth(3)),
+            (before.0 + 1, before.1, before.2)
+        );
+
+        assert!(order_table::post(
+            &hosted,
+            &poster,
+            &args(serde_json::json!({
+                "brief": "Watch Earth.",
+                "steps": "go to the observatory",
+                "for": "Maker-02"
+            })),
+        )
+        .happened());
+        notify();
+        assert_eq!((depth(1), depth(2)), (before.0 + 1, before.1 + 1));
+
+        hosted.with_sim(|s| {
+            s.missions.collect(&wick, &Facts::default()).unwrap();
+            s.missions.report(
+                &wick,
+                Verdict::Pass,
+                "two jobs have stalled on the board",
+                None,
+            );
+        });
+        notify();
+        assert_eq!(depth(3), before.2 + 1, "the poster is told");
+    }
+
+    /// **A body that moves by attention `focus`es on any room at once**, and
+    /// neither walks nor rides; one that walks has no rooms to focus on.
+    #[tokio::test]
+    async fn a_body_that_moves_by_attention_focuses_rather_than_walks() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let attends = Kind {
+            unordered: true,
+            attends: true,
+            ..Kind::default()
+        };
+        rt.embody_in_world(1, WORLD, attends, "Zen", None, 0)
+            .unwrap();
+        embody(&rt, 2, "m2", "green-room");
+        let within = rt.within(1);
+        assert!(within.places.is_empty(), "{:?}", within.places);
+        assert!(within.floors.is_empty() && !within.at_lift);
+        assert!(
+            within.rooms.iter().any(|r| r == "the green room"),
+            "{:?}",
+            within.rooms
+        );
+        assert!(
+            !within.rooms.iter().any(|r| r == "the command room"),
+            "not where it is"
+        );
+        assert!(rt.within(2).rooms.is_empty(), "a walker has none");
+
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let (_, body) = rt.body_of(1).unwrap();
+        let act = |tool: &'static str, v: serde_json::Value| Act {
+            tool,
+            args: v.as_object().unwrap().clone(),
+        };
+        assert_eq!(
+            body::perform(
+                &hosted,
+                &body,
+                &act("focus", serde_json::json!({"on": "the green room"}))
+            ),
+            Outcome::Did("Your attention is on the green room.".into())
+        );
+        assert_eq!(hosted.place_of(&body), "vault-casting/green-room");
+        assert!(!body::perform(
+            &hosted,
+            &body,
+            &act(
+                "move_to",
+                serde_json::json!({"destination": "the command room"})
+            )
+        )
+        .happened());
+        assert!(
+            !body::perform(&hosted, &body, &act("lift_call", serde_json::json!({}))).happened()
+        );
+        assert!(
+            !within.rooms.iter().any(|r| r.starts_with("the lift")),
+            "a landing is not a room to attend to: {:?}",
+            within.rooms
+        );
+        let (_, walker) = rt.body_of(2).unwrap();
+        assert!(!body::perform(
+            &hosted,
+            &walker,
+            &act("focus", serde_json::json!({"on": "the command room"}))
+        )
+        .happened());
+    }
+
+    /// **A personality's `idle:` is its idle wake**, for one that takes no
+    /// orders and for one with no table to be called to.
+    #[tokio::test]
+    async fn a_personality_s_idle_thought_is_its_idle_wake() {
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let zen = Kind {
+            unordered: true,
+            idle: Some("You look in on the groups, through their terminals."),
+            ..Kind::default()
+        };
+        rt.embody_in_world(1, WORLD, zen, "Zen", None, 0).unwrap();
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some("You look in on the groups, through their terminals.")
+        );
+        embody(&rt, 2, "m2", "green-room");
+        rt.set_table_open(false);
+        rt.set_idle(2, Some("You tend the hatchery."));
+        assert_eq!(rt.nudge_for(2).as_deref(), Some("You tend the hatchery."));
+        rt.set_idle(2, None);
+        assert_eq!(rt.nudge_for(2).as_deref(), Some(NO_MISSION));
     }
 
     /// **An edited personality reaches characters already standing in their

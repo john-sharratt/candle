@@ -25,7 +25,7 @@ use super::material;
 use super::reading;
 use super::step;
 use super::target::{self, Kind, Target};
-use super::world::WorldMissions;
+use super::world::{Draw, WorldMissions};
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
@@ -764,13 +764,13 @@ pub fn spawn(rt: Arc<Runtime>) {
                         }
                         hosted.with_sim(|s| {
                             s.missions.set_workflows(Vec::new());
-                            s.missions.set_routines(own.routines);
+                            s.missions.set_routines(own.routines, own.draw);
                         });
                         continue;
                     }
                     Ok(None) => {
                         told_world.remove(&id);
-                        hosted.with_sim(|s| s.missions.set_routines(Vec::new()));
+                        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
                     }
                     Err(e) => {
                         if told_world.get(&id) != Some(&e) {

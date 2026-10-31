@@ -458,10 +458,14 @@ routines:
   loaded for it. Operations opened before the file was written are called off by the world's
   authority on the next tick, so a carrier is stood down rather than left on work nobody will
   read.
+- **Or nothing by draw.** `draw: none` hands out no routine: a character with nothing set for it
+  waits at the table until work is posted there (`docs/zen_moon_mind.md` §8.3), and the routines
+  are the catalogue a poster reads at the table — the standing jobs it may set when the table is
+  empty (`order_results`). `draw: routines`, the default, is the routines drawn as above.
 - **Refused when read.** A file with no routines, a routine id that is not kebab-case or is
-  repeated, an empty brief or step, or any key but those above stops that world's table, with a
-  warning naming the file — the world neither falls back to `missions.yaml` nor hands out a
-  broken mission.
+  repeated, an empty brief or step, a `draw` that is neither, or any key but those above stops
+  that world's table, with a warning naming the file — the world neither falls back to
+  `missions.yaml` nor hands out a broken mission.
 
 The routines are the mind's, like the workflows: read afresh each tick by every member and never
 saved with the world.

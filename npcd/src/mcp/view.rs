@@ -24,6 +24,11 @@ pub fn mission(m: &MissionView) -> String {
                 .and_then(|r| r.as_str())
                 .map(|r| format!("a routine: {r}")),
             "generated" => Some("written by the command table".to_string()),
+            "ordered" => m
+                .origin
+                .get("by")
+                .and_then(|b| b.as_str())
+                .map(|b| format!("posted by {b}")),
             _ => None,
         };
         if let Some(d) = detail {
@@ -128,6 +133,9 @@ mod tests {
         });
         assert!(mission(&done)
             .ends_with("\nAnswer: It is stuck shut.\nReport: fail — the scanner was down"));
+        let mut posted = view(true);
+        posted.origin = json!({"kind": "ordered", "by": "Zen", "poster": "npc-1"});
+        assert!(mission(&posted).starts_with("Open — Check the coolant valve. (posted by Zen)"));
     }
 
     #[test]

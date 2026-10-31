@@ -7,6 +7,7 @@ use std::mem::replace;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use applied_set::AppliedSet;
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::catchup::Purpose;
@@ -114,14 +115,15 @@ impl Replicator {
             return;
         }
         let store = self.store.clone();
-        let Ok(applied) = tokio::task::spawn_blocking(move || store.applied()).await else {
+        let read = tokio::task::spawn_blocking(move || (store.applied(), store.own_through()));
+        let Ok((applied, own_through)) = read.await else {
             return;
         };
         let now = Instant::now();
         let (ack, gaps, periodic, quiet) = {
             let mut s = self.state();
             let ack = replace(&mut s.ack_dirty, false).then(|| Ack {
-                applied: applied.origins().map(|(o, a)| (o, a.through())).collect(),
+                applied: ack_lines(&applied, self.node, own_through),
             });
 
             // An origin announcing more than this member holds, for 5 s.
@@ -133,6 +135,17 @@ impl Replicator {
                 .filter(|m| m.node != self.node)
                 .map(|m| (m.node, m.high_water))
                 .collect();
+            for blind in s.gaps.blind(highs.iter().copied(), &applied, now) {
+                tracing::warn!(
+                    node = self.node,
+                    origin = format_args!("{:016x}", blind.origin),
+                    announced = blind.high,
+                    top = blind.top,
+                    missing = blind.missing,
+                    "this member holds an origin past what it announces, so no catch-up will \
+                     ask for what it lacks: the origin's position is stuck"
+                );
+            }
             let due = s.gaps.observe(highs, &applied, now);
             let gaps: Vec<(usize, u64)> = due
                 .into_iter()
@@ -278,15 +291,53 @@ impl Replicator {
     }
 }
 
+/// An `ACK`'s lines: every origin's contiguous position, and for this member's
+/// own, all it may say it wrote. That line is what peers learn its high water
+/// from, so it cannot stop at a hole: one `oseq` a purge left in BlackWorld's
+/// zend held its announcement 60 million below its top, and every peer read the
+/// origin as complete and fetched nothing it had lost (2026-10-31).
+fn ack_lines(applied: &AppliedSet, node: u64, own_through: u64) -> Vec<(u64, u64)> {
+    applied
+        .origins()
+        .map(|(origin, held)| {
+            let line = if origin == node {
+                own_through.max(held.through())
+            } else {
+                held.through()
+            };
+            (origin, line)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
+    use applied_set::AppliedSet;
+
     use super::Phase;
     use super::{
-        after_quiet_admission, is_quiet, joined_mark_due, QuietAdmission, ADMISSION_QUIET_LIMIT,
-        JOINED_MARK, QUIET,
+        ack_lines, after_quiet_admission, is_quiet, joined_mark_due, QuietAdmission,
+        ADMISSION_QUIET_LIMIT, JOINED_MARK, QUIET,
     };
+
+    /// **A member's own line passes a hole in what it holds of itself**;
+    /// another origin's stays contiguous.
+    #[test]
+    fn an_ack_says_all_this_member_wrote_past_a_hole() {
+        let mut applied = AppliedSet::default();
+        for oseq in [1, 2, 4, 5] {
+            applied.insert(7, oseq);
+            applied.insert(9, oseq);
+        }
+        assert_eq!(ack_lines(&applied, 7, 5), [(7, 5), (9, 2)]);
+        assert_eq!(
+            ack_lines(&applied, 7, 0),
+            [(7, 2), (9, 2)],
+            "never below what it holds contiguously"
+        );
+    }
 
     /// **A reply still arriving is not silence.** AlienWorld's gap catch-ups
     /// were dropped every 32 s while BlackWorld's ~3 KB/s kept arriving on the
