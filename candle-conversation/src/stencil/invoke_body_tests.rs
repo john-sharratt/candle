@@ -492,6 +492,28 @@ fn a_string_value_with_escapes_does_not_close_early() {
     assert_eq!(run.healed_bytes, 0);
 }
 
+/// **A string at its `maxLength` keeps every character.** The model writes
+/// its own opening quote as the span's first token, so a bound counted over
+/// the span closed a four-character anchor after three: `file_edit`'s `at`
+/// came out `8Qy` for `8QyN` on every try (zend, 2026-10-31,
+/// `duckero-favicon-replace/swap-favicon`), and the call was refused each
+/// time for its length.
+#[test]
+fn a_string_at_its_max_length_keeps_every_character() {
+    let v = TestVocab::new();
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "at": { "type": "string", "minLength": 4, "maxLength": 4 } },
+        "required": ["at"]
+    });
+    let tree = body_tree(&schema, &v);
+    let script: Vec<TokenId> = "\"8QyN\"".bytes().map(|b| b as TokenId).collect();
+    let run = simulate(tree, &v, Oracle::Scripted(script), 5000).unwrap();
+    let body = body_json(&run, &v);
+    assert_eq!(body["at"], serde_json::json!("8QyN"));
+    assert_eq!(run.forced_closes, 0, "the model's own close ended it");
+}
+
 #[test]
 fn a_runaway_string_value_is_force_closed_and_still_parses() {
     let v = TestVocab::new();

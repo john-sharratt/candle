@@ -185,6 +185,10 @@ impl ToolSpec {
 /// recursion has to stop somewhere rather than hang the builder.
 const MAX_REF_DEPTH: usize = 8;
 
+/// The tokens a string value's span spends on its delimiters rather than its
+/// value: the opening quote the model writes, and its own close.
+const VALUE_DELIMITER_TOKENS: u32 = 2;
+
 /// A schema with its `$ref` and single-member `allOf` indirection followed.
 ///
 /// `schemars` writes a named type as `{"$ref": "#/definitions/Name"}`, and a
@@ -583,11 +587,20 @@ impl ToolCallEnvelope {
     /// bound for every value of a call is sized for its longest: a table's
     /// one-sentence `event` went "datethe is datethe" for 1,800 tokens under a
     /// bound sized for its whole reading, and the call was refused for it.
+    ///
+    /// **A field's bound is its value's, beside its delimiters.** The span
+    /// counts every token it emits, and the model writes the value's opening
+    /// quote and its close inside it ([`Terminator::JsonStringValue`]), so a
+    /// bound of `maxLength` closed the value one character short: `file_edit`'s
+    /// four-character `at` came out `8Qy` for `8QyN` on every call and was
+    /// refused each time for its length. The field's bound is lifted by
+    /// [`VALUE_DELIMITER_TOKENS`], still never above the envelope's.
     fn string_limits(&self, p: &Param) -> FreeTextLimits {
         FreeTextLimits {
-            forced_after: p
-                .max_tokens
-                .map_or(self.max_string_tokens, |m| m.min(self.max_string_tokens)),
+            forced_after: p.max_tokens.map_or(self.max_string_tokens, |m| {
+                m.saturating_add(VALUE_DELIMITER_TOKENS)
+                    .min(self.max_string_tokens)
+            }),
             ..FreeTextLimits::json_string()
         }
     }
@@ -2131,8 +2144,8 @@ mod tests {
         }
     }
 
-    /// **A field's own bound holds beneath the envelope's**, and never lifts a
-    /// value above it.
+    /// **A field's own bound holds beneath the envelope's**, with room for the
+    /// value's two delimiters, and never lifts a value above it.
     #[test]
     fn a_field_bounds_its_own_value() {
         let tools = parse_tools(
@@ -2164,9 +2177,12 @@ mod tests {
         for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
             assert_eq!(
                 forced(&env.clone().with_max_string_tokens(900)),
-                [200, 900, 900]
+                [202, 900, 900]
             );
-            assert_eq!(forced(&env), [200, 5000, MAX_STRING_VALUE_TOKENS]);
+            let long = (5000 + VALUE_DELIMITER_TOKENS).min(MAX_STRING_VALUE_TOKENS);
+            let mut want = vec![202, long, MAX_STRING_VALUE_TOKENS];
+            want.sort();
+            assert_eq!(forced(&env), want);
         }
     }
 
