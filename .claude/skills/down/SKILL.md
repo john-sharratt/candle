@@ -12,7 +12,7 @@ disable-model-invocation: true
 `docs/deployment.md` is the description of the deployment — read it first. It names the
 machines, what each runs, the launch lines, and how to tell things are healthy. The
 repository rules in `CLAUDE.md` apply: files are read and edited with the file tools only,
-never mask an exit status, never commit without permission.
+never mask an exit status, commit only finished work.
 
 ## 1. Which machine, and what to stop
 

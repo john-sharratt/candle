@@ -12,7 +12,7 @@ re-run, until every pass is green. **A failure is fixed forward — never waved 
 
 The repository rules in `CLAUDE.md` apply: read logs with Read/Grep (never
 `cat`/`Select-String`), never mask an exit status, no env-var feature flags, no stubs, no
-`TODO`s, never commit without permission.
+`TODO`s, commit only finished work.
 
 ## 1. Stop zend and npcd — remember how they were started
 
