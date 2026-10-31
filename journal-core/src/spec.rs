@@ -9,6 +9,11 @@ pub fn text(name: &str, required: bool) -> Value {
     json!({ "name": name, "type": "string", "required": required })
 }
 
+/// A string the grammar closes once it runs to `max_tokens`.
+pub fn text_upto(name: &str, required: bool, max_tokens: u32) -> Value {
+    json!({ "name": name, "type": "string", "required": required, "max_tokens": max_tokens })
+}
+
 /// A string that is one of `values`, which the grammar offers and nothing else.
 pub fn choice(name: &str, required: bool, values: &[String]) -> Value {
     json!({ "name": name, "type": "string", "required": required, "enum": values })

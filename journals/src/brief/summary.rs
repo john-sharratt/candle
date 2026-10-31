@@ -3,7 +3,7 @@
 //! model shown it copies, only the length it may not fall below — the call
 //! its answer is held to, and the `Summarize` it becomes.
 
-use journal_core::spec::{call, choice, list_of, object, text};
+use journal_core::spec::{call, choice, list_of, object, text_upto};
 use journal_core::tools::text_of;
 use serde_json::{Map, Value};
 
@@ -21,6 +21,27 @@ pub const NAME: &str = "journal_summary";
 
 /// The most sentences one summary holds.
 pub const MAX_SENTENCES: usize = 12;
+
+/// The most characters a token of an answer is taken to run to when a cap
+/// becomes the grammar's bounds: high, so an answer within them is within
+/// its cap.
+pub const CHARS_PER_TOKEN: usize = 5;
+
+/// The length a sentence is planned at when a cap is shared out.
+pub const SENTENCE_CHARS: usize = 200;
+
+/// The longest a cue runs, in tokens: one line.
+pub const CUE_TOKENS: u32 = 40;
+
+/// How many sentences the summary of the journal at `place` may hold, given
+/// it must hold `floor`, and how many tokens each may run to: together
+/// within its cap (§5.1), so the grammar, not a refusal afterwards, keeps
+/// the answer inside it.
+pub fn budget(place: Place, floor: usize) -> (usize, u32) {
+    let cap = summary_cap(place);
+    let most = (cap / SENTENCE_CHARS).clamp(floor.max(1), MAX_SENTENCES);
+    (most, (cap / (most * CHARS_PER_TOKEN)) as u32)
+}
 
 /// What rebuilding a journal's summary takes, read from one tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -86,27 +107,23 @@ pub fn spec(tree: &Tree, path: &JournalPath) -> Option<Value> {
         return None;
     }
     let j = tree.get(path)?;
+    let floor = sentence_floor(j);
+    let (most, tokens) = budget(j.place, floor);
     let sentence = object(
         "",
         true,
         vec![
-            text("text", true),
+            text_upto("text", true, tokens),
             choice("cite", true, &cites),
             choice("also_cite", false, &cites),
         ],
     );
-    let mut params = vec![list_of(
-        "sentences",
-        true,
-        sentence_floor(j),
-        MAX_SENTENCES,
-        sentence,
-    )];
-    if digest_cap(j.place).is_some() {
-        params.push(text("digest", true));
+    let mut params = vec![list_of("sentences", true, floor, most, sentence)];
+    if let Some(dcap) = digest_cap(j.place) {
+        params.push(text_upto("digest", true, (dcap / CHARS_PER_TOKEN) as u32));
     }
     if !j.is_fixed() {
-        params.push(text("cue", false));
+        params.push(text_upto("cue", false, CUE_TOKENS));
     }
     Some(call(NAME, params))
 }
@@ -135,9 +152,14 @@ pub fn question(tree: &Tree, path: &JournalPath) -> Option<String> {
          reads it."
     ));
     let floor = sentence_floor(j);
+    let (most, _) = budget(j.place, floor);
     if floor > 1 {
         out.push_str(&format!(" Write at least {floor} sentences."));
     }
+    out.push_str(&format!(
+        " Write at most {most} sentences, each short: where there are more subjects than \
+         sentences, a sentence names several."
+    ));
     if let Some((_, least)) = shortest(j) {
         out.push_str(&format!(
             " Nothing it held has gone, so write at least {least} characters."
@@ -545,8 +567,63 @@ mod tests {
         }
         assert_eq!(
             spec(&t, &p("@zen")).unwrap()["params"][0]["max_items"],
-            json!(MAX_SENTENCES)
+            json!(7)
         );
+    }
+
+    /// **The grammar keeps an answer inside its cap**: every place's
+    /// sentences, at their most and longest, fit it, at any floor; the
+    /// digest and the cue are bounded too.
+    #[test]
+    fn a_summarys_bounds_fit_its_cap() {
+        use crate::scope::Section;
+        let places = [
+            Place::Root,
+            Place::Section(Section::Topics),
+            Place::Named {
+                section: Section::Topics,
+                depth: 2,
+            },
+            Place::Named {
+                section: Section::Conversations,
+                depth: 1,
+            },
+        ];
+        let mut seen = Vec::new();
+        for place in places {
+            for floor in 0..=3 {
+                let (most, tokens) = budget(place, floor);
+                assert!(most >= floor.max(1), "{place:?} {floor}");
+                assert!(
+                    most * tokens as usize * CHARS_PER_TOKEN <= summary_cap(place),
+                    "{place:?} {floor}"
+                );
+            }
+            seen.push(budget(place, 1));
+        }
+        assert_eq!(seen, [(7, 42), (5, 40), (6, 40), (3, 40)]);
+        let mut t = zen();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Note {
+                speaker: None,
+                path: p("@zen"),
+                text: "A line.".into(),
+            },
+            now(),
+        )
+        .unwrap();
+        let s = spec(&t, &p("@zen")).unwrap();
+        assert_eq!(
+            s["params"][0]["items"]["properties"][0]["max_tokens"],
+            json!(42)
+        );
+        assert_eq!(s["params"][1]["name"], json!("digest"));
+        assert_eq!(s["params"][1]["max_tokens"], json!(80));
+        assert!(question(&t, &p("@zen"))
+            .unwrap()
+            .contains("Write at most 7 sentences"));
     }
 
     /// **An answer's sentences lose the line-id lists their cites carry**,

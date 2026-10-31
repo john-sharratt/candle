@@ -2,7 +2,7 @@
 name: memory
 description: How to work with Zen's memory — work out who is speaking and what the conversation is about, keep what is learned on the journal it belongs to, add a topic, and ask Zen to restructure the tree.
 tools: [get_user_context, journal_focus, journal_read, journal_grep, journal_note, journal_edit, journal_forget, journal_create, journal_link, journal_accept, repo_task_start]
-clients: [claude-code, other]
+clients: [claude-code, claude-ai, other]
 ---
 # Zen's memory
 

@@ -82,7 +82,7 @@ mod tests {
         let grok = library.for_client("grok").unwrap();
         assert_eq!(grok.name, "grok");
         assert!(grok.body.len() < 2_200, "{} bytes", grok.body.len());
-        for client in ["claude-code", "other"] {
+        for client in ["claude-code", "claude-ai", "other"] {
             assert_eq!(library.for_client(client).unwrap().name, "memory");
         }
         // Both say how a topic is added and who restructures the tree.

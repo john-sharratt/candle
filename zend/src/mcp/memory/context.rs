@@ -15,7 +15,7 @@ use journals::view::frame::{frame, Budget};
 pub fn budget(channel: Channel) -> Budget {
     match channel {
         Channel::Grok => Budget::Voice,
-        Channel::ClaudeCode | Channel::Other => Budget::Chat,
+        Channel::ClaudeCode | Channel::ClaudeAi | Channel::Other => Budget::Chat,
     }
 }
 

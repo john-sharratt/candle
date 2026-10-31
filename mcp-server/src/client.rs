@@ -14,7 +14,9 @@ pub enum Client {
     /// xAI's Grok — in its apps and in the car — whose answers are spoken as
     /// often as read. Its calls wait as `Other`'s do.
     Grok,
-    /// claude.ai, Claude Desktop, or anyone else: a call is cut off at 240 s.
+    /// claude.ai, which names itself `claude-ai`: a call is cut off at 240 s.
+    ClaudeAi,
+    /// Claude Desktop, or anyone else: a call is cut off at 240 s.
     Other,
 }
 
@@ -36,6 +38,8 @@ impl Client {
             Self::ClaudeCode
         } else if name.contains("grok") || name.contains("xai") {
             Self::Grok
+        } else if name.contains("claude-ai") || name.contains("claude.ai") {
+            Self::ClaudeAi
         } else {
             Self::Other
         }
@@ -45,7 +49,7 @@ impl Client {
     pub fn wait_ceiling(self) -> u64 {
         match self {
             Self::ClaudeCode => 240,
-            Self::Grok | Self::Other => 200,
+            Self::Grok | Self::ClaudeAi | Self::Other => 200,
         }
     }
 
@@ -55,6 +59,7 @@ impl Client {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Grok => "grok",
+            Self::ClaudeAi => "claude-ai",
             Self::Other => "other",
         }
     }
@@ -63,6 +68,7 @@ impl Client {
         match self {
             Self::ClaudeCode => "claude_code",
             Self::Grok => "grok",
+            Self::ClaudeAi => "claude_ai",
             Self::Other => "other",
         }
     }
@@ -87,8 +93,17 @@ mod tests {
     fn grok_is_known_by_its_name_or_its_makers() {
         assert_eq!(Client::of("Grok"), Client::Grok);
         assert_eq!(Client::of("xai-mcp-client"), Client::Grok);
-        assert_eq!(Client::of("claude-ai"), Client::Other);
         assert_eq!(Client::of(""), Client::Other);
+    }
+
+    /// **claude.ai is known by its name**; Claude Desktop and the rest are
+    /// `Other`.
+    #[test]
+    fn claude_ai_is_its_own_client() {
+        assert_eq!(Client::of("claude-ai"), Client::ClaudeAi);
+        assert_eq!(Client::of("claude.ai"), Client::ClaudeAi);
+        assert_eq!(Client::of("claude-code"), Client::ClaudeCode);
+        assert_eq!(Client::of("Claude Desktop"), Client::Other);
     }
 
     /// **Grok's own handshake is known by its agent**: it names itself
@@ -106,14 +121,19 @@ mod tests {
         );
         assert_eq!(
             Client::of_hello("claude-ai", "python-httpx/0.27"),
-            Client::Other
+            Client::ClaudeAi
         );
         assert_eq!(Client::of_hello("connectors-manager", ""), Client::Other);
     }
 
     #[test]
     fn a_client_passed_on_by_name_is_read_back_as_itself() {
-        for c in [Client::ClaudeCode, Client::Grok, Client::Other] {
+        for c in [
+            Client::ClaudeCode,
+            Client::Grok,
+            Client::ClaudeAi,
+            Client::Other,
+        ] {
             assert_eq!(Client::of(c.name()), c);
         }
     }

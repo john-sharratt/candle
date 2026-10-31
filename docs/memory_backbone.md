@@ -118,8 +118,9 @@ renamed or removed at runtime; every tool, guide and permission names it by
 type. A folder at the fixed level that is not a section is an error (§3.3).
 
 **Channels are fixed too, but they are not journals.** A channel is the
-client app a person speaks through: `grok`, `claude-code`, and `other` for
-claude.ai and the rest, named as `mcp_server::Client::name` names the app. It is
+client app a person speaks through: `grok`, `claude-code`, `claude-ai`, and
+`other` for Claude Desktop and the rest, named as `mcp_server::Client::name`
+names the app. It is
 recorded on every line it wrote (§3.2) and in each conversation's name
 (§2.2). **Every AI tied to a group shares its one master.** In `@zen`'s
 case that means:
@@ -683,7 +684,14 @@ who is in it and the handful of things the whole of its life turns on, so
 it routes a new conversation. It never stands in for the topics.
 
 A summary over its cap is an error (§3.3), and a rebuild that would exceed
-the cap is refused.
+the cap is refused. **The writer's grammar holds the cap, so a rebuild is
+not refused for its length.** The cap is shared out as at most
+`cap / 200` sentences (never fewer than the floor, never more than 12),
+each bounded at `cap / (sentences × 5)` tokens, and a digest at
+`digest cap / 5` tokens. Five characters a token is high for English, so an
+answer the grammar lets close fits its cap. Without that bound the writer
+wrote `@battle-cities` at 3,478 characters against its 1,500, and was
+refused on every attempt.
 
 ### 5.2 The index
 

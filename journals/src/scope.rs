@@ -159,17 +159,24 @@ pub enum Eleventh {
 pub enum Channel {
     ClaudeCode,
     Grok,
-    /// claude.ai, Claude Desktop, or any other app.
+    ClaudeAi,
+    /// Claude Desktop, or any other app.
     Other,
 }
 
 impl Channel {
-    pub const ALL: [Channel; 3] = [Channel::ClaudeCode, Channel::Grok, Channel::Other];
+    pub const ALL: [Channel; 4] = [
+        Channel::ClaudeCode,
+        Channel::Grok,
+        Channel::ClaudeAi,
+        Channel::Other,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Grok => "grok",
+            Self::ClaudeAi => "claude-ai",
             Self::Other => "other",
         }
     }
@@ -183,6 +190,7 @@ impl Channel {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::Grok => "Grok",
+            Self::ClaudeAi => "claude.ai",
             Self::Other => "another app",
         }
     }
@@ -243,6 +251,7 @@ mod tests {
             ("2026-10-31-0712-grok", Channel::Grok),
             ("2026-10-31-0930-claude-code-permits", Channel::ClaudeCode),
             ("2026-10-31-0930-other.2", Channel::Other),
+            ("2026-10-31-0017-claude-ai", Channel::ClaudeAi),
         ] {
             assert_eq!(conversation_channel(name), Some(channel), "{name}");
         }
