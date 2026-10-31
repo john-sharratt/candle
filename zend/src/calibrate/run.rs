@@ -49,6 +49,7 @@ use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
+use crate::ingest_lease::{self, Share};
 use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
 use crate::refresh_ctx::RefreshContext;
@@ -85,6 +86,10 @@ pub struct Report {
     pub sealed: usize,
     /// Units that failed, calibrated again by a later pass.
     pub failed: usize,
+    /// Units another member was calibrating, or had calibrated by the time
+    /// this one held its lease ([`ingest_lease::share_calibration`]). Their
+    /// calibrations arrive with replication.
+    pub elsewhere: usize,
     /// Units neither calibrated nor ready, calibrated by a later pass once
     /// they are.
     pub waiting: usize,
@@ -165,6 +170,7 @@ pub fn calibrate_layer(
     let cursor = AtomicUsize::new(0);
     let sealed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
+    let elsewhere = AtomicUsize::new(0);
     let drafts = Permits::new(LAYER_PARALLELISM);
     std::thread::scope(|s| {
         for _ in 0..CALIBRATE_PARALLELISM.min(todo.run.len()).max(1) {
@@ -175,6 +181,23 @@ pub fn calibrate_layer(
                 }
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
                     return;
+                };
+                // **One member calibrates a unit.** Every member's pass plans
+                // the same units from the same replicated substrate; the one
+                // the vote names asks for them, and a calibration handed back
+                // is looked for again before it is asked for twice.
+                let _lease = match ingest_lease::share_calibration(&unit.marker) {
+                    Share::Theirs => {
+                        elsewhere.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Share::Mine(lease) => {
+                        if lease.recheck() && calibrated(engine, &unit.marker) {
+                            elsewhere.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        lease
+                    }
                 };
                 match calibrate_one(engine, spec, layer.base, frame, Some(&drafts), unit) {
                     Ok(()) => {
@@ -197,17 +220,28 @@ pub fn calibrate_layer(
     });
     report.sealed = sealed.into_inner();
     report.failed = failed.into_inner();
+    report.elsewhere = elsewhere.into_inner();
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,
         calibrated = report.done,
         sealed = report.sealed,
         failed = report.failed,
+        elsewhere = report.elsewhere,
         waiting = report.waiting,
         retired = report.retired,
         "the layer's calibration pass ended",
     );
     report
+}
+
+/// Whether a calibration carrying `marker` stands — one another member sealed
+/// and replication has brought here.
+fn calibrated(engine: &ConversationEngine, marker: &str) -> bool {
+    engine
+        .conversations_with_metadata_key(MARKER_KEY)
+        .into_iter()
+        .any(|(_, m)| m == marker)
 }
 
 /// Every unit of `layer`: each conversation of its group committed under a

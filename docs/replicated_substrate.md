@@ -3657,6 +3657,18 @@ that died mid-reading leaves the unit for someone else, and a holder that finish
 leaves nothing to read. A member that is not joined cannot propose, so it reads the
 unit itself.
 
+A unit's **calibration** is leased the same way, under `calibrate/<marker>`
+(`ingest_lease::share_calibration`). A calibration replicates like the reading, so a
+member's catch-up pass (`zend/src/calibrate/run.rs`) plans only the units nobody has
+calibrated — but every member plans that same set from the same substrate, and
+unleased each one calibrated all of it: on 2026-10-31 BlackWorld and WhiteWorld both
+took the same fifteen code_reading units at startup, and WhiteWorld's copy — 24
+questions a unit, each in a conversation of its own — filled its 24 GB card with
+conversations it could not admit while BlackWorld's had already sealed. The member
+the vote names calibrates the unit; another leaves it and counts it `elsewhere`; a
+calibration handed back is looked for again before it is asked for twice. A unit
+calibrated as its ingest commits it is already under that reading's `ingest/` lease.
+
 Two members can still both finish a reading: one was not joined, or both passed the
 grant. Both units' conversations arrive everywhere. **The conversation whose first
 turn has the lower version stamp (§6.2) holds the unit**, the timeline breaking a

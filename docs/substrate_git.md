@@ -70,7 +70,8 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
   arrival, never superseded and never resident (`persistence/record.rs`,
   `persistence/blob/`). It is how images replicate.
 - **Leases.** Paxos leases among an app's members, used by `ingest/<content key>` so one
-  member reads a unit (`zend/src/ingest_lease.rs`).
+  member reads a unit, and by `calibrate/<marker>` so one member calibrates it
+  (`zend/src/ingest_lease.rs`).
 - **Fetch and push behind traits.** `Fetch` and `Push` (`zend-vfs/src/remote/fetcher.rs:17`,
   `pusher.rs:16`) have local and agent implementations (`AgentFetch`, `AgentPush`).
 - **Records that wait for their parents.** A record whose parent has not arrived waits for
