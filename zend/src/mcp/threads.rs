@@ -202,6 +202,10 @@ pub struct Worker {
     /// task, so neither a later answer nor a continuation is sent back again.
     #[serde(default)]
     pub checked: bool,
+    /// How many times it was started again after a restart cut it off
+    /// (`super::resuming`).
+    #[serde(default)]
+    pub resumes: u32,
 }
 
 /// How often the member running a task says so on its record.
@@ -563,6 +567,7 @@ mod tests {
             no_entry: None,
             stopped: false,
             resumable: false,
+            resumes: 0,
             audit: None,
             checked: false,
         };

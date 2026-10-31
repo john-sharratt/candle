@@ -202,6 +202,7 @@ mod tests {
             no_entry: None,
             stopped: false,
             resumable: false,
+            resumes: 0,
             audit: None,
             checked: false,
         }

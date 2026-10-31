@@ -172,6 +172,7 @@ impl GitSource {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VfsStore;
     use super::*;
     use crate::testing::TestRepo;
     use crate::BranchName;
@@ -240,6 +241,27 @@ mod tests {
             vec![first],
             "a commit is read as itself"
         );
+    }
+
+    /// **A base git cannot read moves onto its branch**, the session's changes
+    /// kept: a commit held on another member left a conversation unable to read
+    /// the repository at all.
+    #[test]
+    fn a_store_whose_base_is_lost_moves_onto_its_branch() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"one\n");
+        let commit = t.commit_all("first");
+        let source = GitSource::open(&t.path).unwrap();
+        let store = VfsStore::on_branch(source, branch("main"));
+        store.write("mine.txt", "mine\n".into()).unwrap();
+        assert_eq!(store.read("a.txt").unwrap().as_deref(), Some("one\n"));
+
+        let nothing = Oid::parse("1111111111111111111111111111111111111111").unwrap();
+        store
+            .set_base_for_test(Base::at(commit.clone(), nothing))
+            .unwrap();
+        assert_eq!(store.read("a.txt").unwrap().as_deref(), Some("one\n"));
+        assert_eq!(store.read("mine.txt").unwrap().as_deref(), Some("mine\n"));
     }
 
     /// **The working tree is never read** — only what the branch committed.

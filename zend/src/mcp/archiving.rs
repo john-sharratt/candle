@@ -466,6 +466,7 @@ mod tests {
             no_entry: None,
             stopped: false,
             resumable: state == State::Done,
+            resumes: 0,
             audit: None,
             checked: false,
         }

@@ -48,6 +48,7 @@ use super::caller::Caller;
 use super::names;
 use super::nudges;
 use super::records::Records;
+use super::resuming;
 use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
@@ -308,6 +309,7 @@ fn fresh(
         no_entry: None,
         stopped: false,
         resumable: false,
+        resumes: 0,
         audit: None,
         checked: false,
     }
@@ -415,6 +417,55 @@ pub fn answer(
         first_line(text, PROMPT_QUOTE),
     )?;
     begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
+}
+
+/// What a task cut off by a restart is told as its next turn.
+const RESUMED: &str = "The service restarted while you were working, so your last turn was \
+    cut off. Your conversation and your journal are intact; changes you had not committed may \
+    be gone. Check where the work stands (`git_status`, reading what you wrote) before \
+    repeating anything, then finish the task you were given.";
+
+/// Start the lost task `name` of `thread` again, in its own conversation
+/// (`super::resuming`). `false` when it no longer needs it: read again under
+/// the lock a reply takes, it is running, or was answered, or archived.
+pub fn resume(
+    session: &Arc<ZendSession>,
+    owner: &str,
+    thread: &str,
+    name: &str,
+    now: u64,
+) -> Result<bool, String> {
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    let _held = holding();
+    let Some(found) = threads::worker(&records, owner, thread, name) else {
+        return Ok(false);
+    };
+    let mut worker = found.observed(now);
+    if !resuming::due(&worker, now) || archiving::being_archived(&worker.conv_id) {
+        return Ok(false);
+    }
+    worker.state = State::Running;
+    worker.error = None;
+    worker.resumes += 1;
+    worker.beat_ms = now;
+    worker.turn_ms = now;
+    worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
+    worker.entries = Vec::new();
+    note(
+        &records,
+        owner,
+        &worker,
+        "Resumed:",
+        format!("cut off by a restart, try {}", worker.resumes),
+    )?;
+    begin(
+        session,
+        &records,
+        owner,
+        worker,
+        format!("{RESUMED}{ASKING}"),
+    )?;
+    Ok(true)
 }
 
 /// Queue `text` for the running worker `name` of `thread`, taken at its next
@@ -1217,6 +1268,7 @@ mod tests {
             no_entry: None,
             stopped: false,
             resumable: false,
+            resumes: 0,
             audit: None,
             checked: false,
         }

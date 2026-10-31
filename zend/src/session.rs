@@ -120,7 +120,7 @@ use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::{archiving, lineage, names, nudges, stops, threads};
+use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, threads};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -7921,6 +7921,7 @@ impl ZendSession {
         if let Some(rt) = &rt_handle {
             self.mcp.parts().bind(Arc::downgrade(self), rt.clone());
             archiving::start_sweeping(self, rt);
+            resuming::start_resuming(self, rt);
         }
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.

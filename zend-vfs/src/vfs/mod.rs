@@ -138,7 +138,7 @@ use self::git_source::GitSource;
 pub use self::tree::Tree;
 use self::view::View;
 use super::file_delta::{self, FileDelta, FileTimes, ReplayError, TimedDelta};
-use crate::{BranchName, FileChanges, ObjectFormat, Oid, Rev};
+use crate::{BranchName, FileChanges, GitError, ObjectFormat, Oid, Rev};
 
 /// The most a store's session layer holds, every chain counted: past it a
 /// change is refused [`VfsError::Full`].
@@ -633,6 +633,47 @@ impl VfsStore {
         })
     }
 
+    /// Pin the store to `base`, whatever it names.
+    #[cfg(test)]
+    pub(crate) fn set_base_for_test(&self, base: Base) -> Result<(), VfsError> {
+        self.upper.write().unwrap().base = Some(base);
+        Ok(())
+    }
+
+    /// Move a store whose base can no longer be read onto where its branch
+    /// stands, keeping the session's changes on top, and its tree.
+    ///
+    /// A base names a commit made on one member, held there until it is packed;
+    /// a worker carried to another member, or a restart, can leave it naming
+    /// objects this database never had. Refused, every read of the repository
+    /// failed for the rest of the conversation and two workers gave up on a
+    /// job they had half written (2026-10-31). Unchanged branch, or none readable,
+    /// is the refusal it always was.
+    fn repin(
+        &self,
+        source: &GitSource,
+        rev: &RwLock<Rev>,
+        lost: &Base,
+        why: GitError,
+    ) -> Result<Arc<Tree>, VfsError> {
+        let unreadable = |e: &dyn fmt::Display| {
+            VfsError::Unreadable(format!("the base could not be read from git: {e}"))
+        };
+        let current = Self::branch_base(source, rev)?;
+        if &current == lost {
+            return Err(unreadable(&why));
+        }
+        let tree = source.tree_of(&current).map_err(|e| unreadable(&e))?;
+        tracing::warn!(
+            lost = ?lost.commit(),
+            current = ?current.commit(),
+            "a store's base could not be read from git ({why}): it moves onto its branch, \
+             its changes kept"
+        );
+        self.upper.write().unwrap().base = Some(current);
+        Ok(tree)
+    }
+
     /// The lower layer: over a branch, the tree of the store's base.
     fn view(&self) -> Result<View<'_>, VfsError> {
         match &self.lower {
@@ -640,9 +681,10 @@ impl VfsStore {
             Lower::Folder(root) => Ok(View::Folder(root)),
             Lower::Branch { source, rev } => {
                 let base = self.pinned(source, rev)?;
-                let tree = source.tree_of(&base).map_err(|e| {
-                    VfsError::Unreadable(format!("the base could not be read from git: {e}"))
-                })?;
+                let tree = match source.tree_of(&base) {
+                    Ok(tree) => tree,
+                    Err(e) => self.repin(source, rev, &base, e)?,
+                };
                 Ok(View::Branch { source, tree })
             }
         }
