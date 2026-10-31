@@ -180,7 +180,8 @@ caller's headers. It reads the handler's answer back as that route's body type
 the route's: a character the caller does not own is one npcd does not show
 them. A route's role is checked by its guard, not its handler. The one tool
 whose route asks more than `User`, `bot_channel_post`, checks the Creator role
-itself.
+itself. `bot_discord_read` and `bot_thread_read` read the bot's insides rather
+than calling a route, and check its owner or the Admin role themselves.
 
 | Tool | Route | Does |
 |---|---|---|
@@ -193,6 +194,8 @@ itself.
 | `bot_message_read {bot}` | `GET /v1/npc/:nid/message` | The caller's thread with the bot |
 | `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
 | `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
+| `bot_discord_read {bot}` | — (the report `GET /v1/npc/:nid/discord/trace` answers) | What the bot's Discord bot has done, as text: state, shard, DMs, channels, servers, last events (`docs/npcd_discord.md` §5.5). The bot's owner or an admin, checked by the tool |
+| `bot_thread_read {bot, thread?, limit?}` | — | The bot's handset threads, or one thread's last messages with seq, time, origin and whether each reached the bot's mind. The bot's owner or an admin, checked by the tool |
 | `image_generate {prompt, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The JPEG (or PNG with `format: png`) comes back as an MCP `image` content block after the text block, and the text carries a signed link to the stored file |
 | `image_edit {image, mode?, …}` | by `mode`: `prompt` — `POST /v1/image/generate` with `reference`; `remove_background` — `POST /v1/image/cutout`; `resize`, `crop`, `adjust`, `rotate` — in npcd (`npcd::image_ops`) | Change a picture; each mode takes only its own arguments, one it does not take refused naming those it does (`npcd::mcp::edit_mode`). The pixel modes are instant and never wait for room; `remove_background` answers a PNG with transparency. `prompt`: redraw a picture by a prompt, starting from it: `image` names one this server stored (a link or id from a draw, an edit or an upload), read from the image store so no picture crosses the conversation. `hold` (default 0.5, at most 0.95) is how much survives. The size defaults to the picture's shape within 1024. Answered like `image_generate`, with its own link. A picture not in the store is answered "not available — store it again" at once |
 | `image_upload {}` | — | A link signed for 10 minutes, `<origin>/v1/image/upload?exp=…&sig=…`, and the `curl` that sends a file to it from the client's sandbox. `PUT` there (open; the signature is checked before the body is read) takes any JPEG, PNG, WebP, GIF, BMP or TIFF up to 32 MB, keeps it upright, within 2048 px and as a JPEG, for an hour, and answers `{image, width, height, kept_s}` |

@@ -11,10 +11,17 @@
 //!    token Discord refused, or that the gateway will not serve, stays closed
 //!    until a new token is connected.
 //! 2. **What the shards heard is taken in.** `READY` writes the bot's state
-//!    online, with its world, and reads what its DMs missed ([`gap`]); a DM
-//!    is heard in the world ([`inbound`]); a refusal (`4004`, or a `401` on
-//!    any call) stops the shard and writes the bot's state refused.
-//! 3. **What the characters wrote is posted** to their DMs ([`outbound`]).
+//!    online, with its world, tells the character of the servers it left
+//!    while offline ([`guild`]), and reads what its DMs and channels missed
+//!    ([`gap`], [`channel gap`]); a DM is heard in the world ([`inbound`]),
+//!    and so is a server channel's message ([`channel inbound`]); a server
+//!    learned of, renamed or left, and a channel made, changed or deleted,
+//!    keep the character's channel threads as the server is ([`guild`]); a
+//!    `4014` writes the bot's state as needing its Message Content intent; a
+//!    refusal (`4004`, or a `401` on any call) stops the shard and writes the
+//!    bot's state refused.
+//! 3. **What the characters wrote is posted** to their DMs ([`outbound`])
+//!    and their channels ([`channel outbound`]).
 //!
 //! A shard never writes the world: it hands what it hears to this beat's
 //! queue, and the beat — on the authority — makes the world's writes. The
@@ -24,6 +31,10 @@
 //! [`gap`]: crate::discord::dm::gap
 //! [`inbound`]: crate::discord::dm::inbound
 //! [`outbound`]: crate::discord::dm::outbound
+//! [`guild`]: crate::discord::server::guild
+//! [`channel gap`]: crate::discord::server::gap
+//! [`channel inbound`]: crate::discord::server::inbound
+//! [`channel outbound`]: crate::discord::server::outbound
 
 #[cfg(test)]
 mod tests;
@@ -37,13 +48,17 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::api::{now_ms, Authored};
-use crate::discord::dm::online::Online;
 use crate::discord::dm::outbound::{self, Unreachable};
 use crate::discord::dm::told::Told;
-use crate::discord::dm::{gap, inbound, Rejected};
-use crate::discord::gateway::protocol::{self, DIRECT_MESSAGES};
-use crate::discord::gateway::shard::{Config, Event, Shard};
+use crate::discord::dm::{gap, inbound};
+use crate::discord::gateway::protocol::{self, INTENTS};
+use crate::discord::gateway::shard::{Config, Event, Shard, CONTENT_RETRY};
+use crate::discord::online::Online;
+use crate::discord::server::outbound as channel_outbound;
+use crate::discord::server::{gap as channel_gap, guild, inbound as channel_inbound};
 use crate::discord::state::{self, BotState, State};
+use crate::discord::trace::note::{Direction, Note};
+use crate::discord::trace::{failed, note, Trace};
 use crate::engine::driver::EVERY as BEAT;
 use crate::tenant::HOST;
 
@@ -59,8 +74,13 @@ pub struct Bots {
     /// The console's public address, which an unlinked author is sent to.
     console: String,
     retry: Duration,
+    /// How long a shard waits to ask again after a `4014`.
+    content_retry: Duration,
     events: mpsc::UnboundedSender<(u64, Event)>,
     held: Mutex<Held>,
+    /// What each bot's bridge did, and how its shard stands — apart from
+    /// `held`, so a read does not wait out a beat's posts.
+    trace: Trace,
 }
 
 /// What the beat holds between beats.
@@ -86,13 +106,15 @@ struct Running {
 
 impl Bots {
     /// Bots that connect to `gateway`, send an unlinked author to the
-    /// console at `console`, and first wait `retry` to reconnect.
-    pub fn new(gateway: &str, console: &str, retry: Duration) -> Self {
+    /// console at `console`, first wait `retry` to reconnect, and wait
+    /// `content_retry` to ask again after a `4014`.
+    pub fn new(gateway: &str, console: &str, retry: Duration, content_retry: Duration) -> Self {
         let (events, heard) = mpsc::unbounded_channel();
         Self {
             gateway: gateway.to_string(),
             console: console.trim_end_matches('/').to_string(),
             retry,
+            content_retry,
             events,
             held: Mutex::new(Held {
                 heard,
@@ -101,12 +123,23 @@ impl Bots {
                 unreachable: HashMap::new(),
                 halted: HashMap::new(),
             }),
+            trace: Trace::default(),
         }
+    }
+
+    /// What each bot's bridge did here, and how its shard stands.
+    pub fn trace(&self) -> &Trace {
+        &self.trace
     }
 
     /// Bots on Discord's own gateway, sending people to npcd's console.
     pub fn production() -> Self {
-        Self::new(protocol::PRODUCTION, &format!("https://{HOST}"), RETRY)
+        Self::new(
+            protocol::PRODUCTION,
+            &format!("https://{HOST}"),
+            RETRY,
+            CONTENT_RETRY,
+        )
     }
 
     /// The console's public address.
@@ -147,7 +180,11 @@ impl Bots {
             .collect();
         for bot in online {
             let unreachable = held.unreachable.entry(bot.npc).or_default();
-            if outbound::post(a, &bot, unreachable).await.is_err() {
+            let posted = match outbound::post(a, &bot, unreachable).await {
+                Ok(()) => channel_outbound::post(a, &bot).await,
+                Err(rejected) => Err(rejected),
+            };
+            if posted.is_err() {
                 refuse(a, &mut held, bot.npc).await;
             }
         }
@@ -160,6 +197,7 @@ impl Bots {
         let shared = a.npcs.substrate();
         for (npc, r) in held.running.drain() {
             r.shard.close().await;
+            self.trace.detach(npc);
             if let Err(e) = state::remove(&shared, npc) {
                 tracing::error!(npc, "discord: {e:#}");
             }
@@ -188,10 +226,20 @@ impl Bots {
                 continue;
             };
             r.shard.close().await;
+            self.trace.detach(npc);
             if let Err(e) = state::remove(&shared, npc) {
                 tracing::error!(npc, "discord: {e:#}");
             }
-            tracing::info!(npc, world = %r.world, "discord: the bot's shard is closed here");
+            note(
+                a,
+                npc,
+                Note::new(
+                    now_ms(),
+                    Direction::Shard,
+                    "closed",
+                    "not this member's to run",
+                ),
+            );
         }
         for (npc, w) in wanted {
             if held.running.contains_key(&npc) || held.halted.get(&npc) == Some(&w.bot.connected_ms)
@@ -220,11 +268,17 @@ impl Bots {
                 npc,
                 gateway: self.gateway.clone(),
                 token: token.clone(),
-                intents: DIRECT_MESSAGES,
+                intents: INTENTS,
                 activity: format!("in {world_name}"),
                 retry: self.retry,
+                content_retry: self.content_retry,
+                link: self.trace.attach(npc),
             };
-            tracing::info!(npc, world = %w.world, "discord: opening the bot's shard");
+            note(
+                a,
+                npc,
+                Note::new(now_ms(), Direction::Shard, "opened", "connecting"),
+            );
             held.running.insert(
                 npc,
                 Running {
@@ -246,8 +300,9 @@ impl Bots {
                 // A shard closed since: what it heard is the next holder's.
                 continue;
             };
+            let online = r.online.clone();
             let refused = match event {
-                Event::Ready { user_id } => {
+                Event::Ready { user_id, guilds } => {
                     let bot = Online {
                         npc,
                         world: r.world.clone(),
@@ -261,35 +316,101 @@ impl Bots {
                         since_ms: bot.since_ms,
                         world: bot.world.clone(),
                         connected_ms: r.connected_ms,
+                        member: member(a),
                     };
                     if let Err(e) = state::put(&shared, npc, &online) {
                         tracing::error!(npc, "discord: {e:#}");
                     }
+                    note(
+                        a,
+                        npc,
+                        Note::new(bot.since_ms, Direction::Shard, "ready", "online")
+                            .author(user_id),
+                    );
+                    guild::ready(a, &bot, &guilds).await;
                     let told = held.told.entry(npc).or_default();
                     gap::fetch(a, &bot, told).await.is_err()
+                        || channel_gap::fetch(a, &bot).await.is_err()
                 }
-                Event::Message(m) => match r.online.clone() {
+                Event::NeedsContentIntent => {
+                    r.online = None;
+                    let waiting = BotState {
+                        state: State::NeedsContentIntent,
+                        since_ms: now_ms(),
+                        world: r.world.clone(),
+                        connected_ms: r.connected_ms,
+                        member: member(a),
+                    };
+                    if let Err(e) = state::put(&shared, npc, &waiting) {
+                        tracing::error!(npc, "discord: {e:#}");
+                    }
+                    failed(
+                        a,
+                        npc,
+                        Note::new(
+                            waiting.since_ms,
+                            Direction::Shard,
+                            "closed 4014",
+                            "needs_content_intent",
+                        ),
+                    );
+                    false
+                }
+                Event::Message(m) => match online {
+                    Some(bot) if m.guild_id.is_some() => {
+                        channel_inbound::hear(a, &bot, &m).await;
+                        false
+                    }
                     Some(bot) => {
                         let told = held.told.entry(npc).or_default();
-                        match inbound::hear(a, &bot, told, &m).await {
-                            Ok(heard) => {
-                                tracing::debug!(npc, message = m.id, "discord: {heard:?}");
-                                false
-                            }
-                            Err(Rejected) => true,
-                        }
+                        inbound::hear(a, &bot, told, &m).await.is_err()
                     }
                     None => false,
                 },
+                Event::Guild(g) => {
+                    if let Some(bot) = online {
+                        guild::learned(a, &bot, &g).await;
+                    }
+                    false
+                }
+                Event::GuildRenamed { guild_id, name } => {
+                    if let Some(bot) = online {
+                        guild::renamed(a, &bot, guild_id, &name);
+                    }
+                    false
+                }
+                Event::Left { guild_id } => {
+                    if let Some(bot) = online {
+                        guild::left(a, &bot, guild_id).await;
+                    }
+                    false
+                }
+                Event::Channel(c) => {
+                    if let Some(bot) = online {
+                        guild::channel(a, &bot, &c);
+                    }
+                    false
+                }
+                Event::ChannelGone { channel_id } => {
+                    if let Some(bot) = online {
+                        guild::channel_gone(a, &bot, channel_id);
+                    }
+                    false
+                }
                 Event::Refused => true,
                 Event::Stopped(why) => {
                     let connected_ms = r.connected_ms;
                     held.running.remove(&npc);
+                    self.trace.detach(npc);
                     held.halted.insert(npc, connected_ms);
                     if let Err(e) = state::remove(&shared, npc) {
                         tracing::error!(npc, "discord: {e:#}");
                     }
-                    tracing::error!(npc, "discord: the bot is stopped: {why}");
+                    failed(
+                        a,
+                        npc,
+                        Note::new(now_ms(), Direction::Shard, "stopped", &why),
+                    );
                     false
                 }
             };
@@ -307,19 +428,33 @@ async fn refuse(a: &Authored, held: &mut Held, npc: u64) {
         return;
     };
     r.shard.close().await;
+    a.bots.trace().detach(npc);
     let refused = BotState {
         state: State::Refused,
         since_ms: now_ms(),
         world: r.world,
         connected_ms: r.connected_ms,
+        member: member(a),
     };
     if let Err(e) = state::put(&a.npcs.substrate(), npc, &refused) {
         tracing::error!(npc, "discord: {e:#}");
     }
-    tracing::warn!(
+    failed(
+        a,
         npc,
-        "discord: the bot's token was refused; connect a new one"
+        Note::new(
+            refused.since_ms,
+            Direction::Shard,
+            "refused",
+            "token refused; connect a new one",
+        ),
     );
+}
+
+/// This member, as a bot's state names who runs it: its cluster node, when
+/// it is in a cluster.
+fn member(a: &Authored) -> Option<u64> {
+    a.runtime.as_ref().and_then(|rt| rt.standing.node())
 }
 
 /// Run the bots' beat until the daemon stops, then close every shard. Holds

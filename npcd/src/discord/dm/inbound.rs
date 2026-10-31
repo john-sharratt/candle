@@ -3,9 +3,9 @@
 //!
 //! In order, a message is:
 //!
-//! 1. dropped if it was written in a server (the bots of part one hear only
-//!    their DMs), by a bot or a webhook, or by this bot itself — the echo of
-//!    its own post;
+//! 1. dropped if it was written in a server (a server's channels are heard
+//!    by [`crate::discord::server::inbound`]), by a bot or a webhook, or by
+//!    this bot itself — the echo of its own post;
 //! 2. a link, if it is exactly a live link code: the author's Discord account
 //!    is linked to the code's account, and they are told so;
 //! 3. answered once and dropped if its author is linked to no account, or to
@@ -24,22 +24,26 @@ use std::sync::Arc;
 
 use web::auth::Role;
 
-use super::online::Online;
 use super::record::Dm;
 use super::told::Told;
-use super::Rejected;
 use crate::accounts::{public_id, DiscordUser};
 use crate::api::{now_ms, Authored};
 use crate::authority::ops::WorldOp;
 use crate::discord::link::{code, index, linking};
 use crate::discord::message::DiscordMessage;
+use crate::discord::online::Online;
+use crate::discord::rejected::Rejected;
+use crate::discord::trace::note;
+use crate::discord::trace::note::{Direction, Note};
 use crate::engine::speaking_as;
 use crate::sim::phone::Origin;
 
-/// What became of a message, for the log and the tests.
+/// What became of a message, for the trace and the tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heard {
-    /// Not the bot's to hear: a server's, a bot's, its own.
+    /// The bot's own post, come back.
+    Echo,
+    /// Not the bot's to hear here: a server's, another bot's, a webhook's.
     Ignored,
     /// Its author was linked, as the account speaking by this name.
     Linked { name: String },
@@ -49,21 +53,65 @@ pub enum Heard {
     Refused { told: bool },
     /// It was in the world already.
     Again,
-    /// It is in the world now, from this name.
-    Applied { from: String },
+    /// It is in the world now, from this name, as message `seq` of thread
+    /// `thread`.
+    Applied {
+        from: String,
+        thread: String,
+        seq: u64,
+    },
     /// The world did not take it; the gap fetch will offer it again.
     Unapplied,
 }
 
-/// Hear `m`, a message on `bot`'s shard.
+impl Heard {
+    /// What became of it, as the trace says it.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Heard::Echo => "echo",
+            Heard::Ignored => "bot_or_webhook_dropped",
+            Heard::Linked { .. } => "link_code",
+            Heard::Unlinked { told: true } => "unlinked_told",
+            Heard::Unlinked { told: false } => "unlinked_dropped",
+            Heard::Refused { told: true } => "refused_visibility_told",
+            Heard::Refused { told: false } => "refused_visibility_dropped",
+            Heard::Again => "duplicate",
+            Heard::Applied { .. } => "applied",
+            Heard::Unapplied => "unapplied",
+        }
+    }
+}
+
+/// Hear `m`, a message on `bot`'s shard, and say what became of it.
 pub async fn hear(
     a: &Arc<Authored>,
     bot: &Online,
     told: &mut Told,
     m: &DiscordMessage,
 ) -> Result<Heard, Rejected> {
-    if m.guild_id.is_some() || m.webhook_id.is_some() || m.author.bot || m.author.id == bot.user_id
-    {
+    let heard = judge(a, bot, told, m).await?;
+    let mut n = Note::new(now_ms(), Direction::In, "dm", heard.outcome())
+        .message(m.id)
+        .channel(m.channel_id)
+        .author(m.author.id);
+    if let Heard::Applied { thread, seq, .. } = &heard {
+        n = n.thread(thread).seq(*seq);
+    }
+    note(a, bot.npc, n);
+    Ok(heard)
+}
+
+/// What becomes of `m`.
+async fn judge(
+    a: &Arc<Authored>,
+    bot: &Online,
+    told: &mut Told,
+    m: &DiscordMessage,
+) -> Result<Heard, Rejected> {
+    if m.author.id == bot.user_id {
+        return Ok(Heard::Echo);
+    }
+    if m.guild_id.is_some() || m.webhook_id.is_some() || m.author.bot {
         return Ok(Heard::Ignored);
     }
     let shared = a.npcs.substrate();
@@ -179,11 +227,11 @@ pub async fn hear(
     }
     // A DM newly recorded starts its mirror at the thread's end: what was
     // said in the console before is the console's.
-    let through = hosted.sim(|s| {
+    let (thread, through) = hosted.sim(|s| {
         s.threads
             .direct_between(&from, &character)
-            .and_then(|t| t.messages.last())
-            .map_or(0, |last| last.seq)
+            .map(|t| (t.id.clone(), t.messages.last().map_or(0, |last| last.seq)))
+            .unwrap_or_default()
     });
     let dm = Dm {
         channel_id: m.channel_id,
@@ -192,7 +240,11 @@ pub async fn hear(
         last_seen_discord: m.id,
     };
     hosted.with_dms(|d| d.put(bot.npc, &account, dm));
-    Ok(Heard::Applied { from })
+    Ok(Heard::Applied {
+        from,
+        thread,
+        seq: through,
+    })
 }
 
 /// Answer in `channel` as `bot`.

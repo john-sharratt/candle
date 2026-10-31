@@ -13,6 +13,7 @@ use super::forward::{act_of, call_line};
 use super::npc_lease::{hand_back, leases_of, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
+use crate::discord::server::apply::channel_message;
 use crate::engine::act::Act;
 use crate::engine::body;
 use crate::engine::event::{EventKind, Salience};
@@ -172,6 +173,26 @@ impl Runtime {
             WorldOp::Channel { from, text } => OpReply::Heard {
                 by: self.say_on_channel(world, &from, &text),
             },
+            WorldOp::ChannelMessage {
+                npc,
+                channel,
+                from,
+                text,
+                origin,
+            } => OpReply::Done {
+                ok: self.hosted.get(world).is_some_and(|hosted| {
+                    channel_message(&hosted, npc, channel, &from, &text, origin)
+                }),
+            },
+            WorldOp::Notice { npc, text } => {
+                self.tell(
+                    npc,
+                    self.world_ms(npc),
+                    Salience::URGENT,
+                    EventKind::Description { text },
+                );
+                OpReply::Done { ok: true }
+            }
             WorldOp::Posting { at, on, by, text } => OpReply::Posted {
                 lines: self.post_in_world(world, &at, &on, &by, &text),
             },

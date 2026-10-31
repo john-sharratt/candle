@@ -20,28 +20,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::time::sleep;
-
-use super::online::Online;
 use super::record::Dm;
-use super::split::{split, LIMIT};
-use super::Rejected;
 use crate::accounts::public_id;
 use crate::api::{now_ms, Authored};
-use crate::discord::error::DiscordError;
 use crate::discord::link::index;
 use crate::discord::message::snowflake_at;
+use crate::discord::online::Online;
+use crate::discord::post::split::{split, LIMIT};
+use crate::discord::post::{post as send, posted, Post, Target};
+use crate::discord::rejected::Rejected;
+use crate::discord::trace::note;
+use crate::discord::trace::note::{Direction, Note};
 use crate::engine::speaking_as;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
-
-/// How many times one post is tried against a `429` in a beat.
-const RATE_TRIES: usize = 3;
-
-/// The longest a post waits on one `429` before the next beat takes it.
-const RATE_WAIT_MAX: Duration = Duration::from_secs(30);
 
 /// For each linked person with no DM yet, the last seq of the character's
 /// thread with them that Discord would not open a DM for.
@@ -84,6 +77,7 @@ pub async fn post(
             continue;
         };
         let written: Vec<Message> = waiting(&hosted, &person, &character, 0)
+            .messages
             .into_iter()
             .filter(|m| m.from == character && m.at_ms >= bot.since_ms)
             .collect();
@@ -99,10 +93,12 @@ pub async fn post(
         let channel_id = match a.discord.open_dm(&bot.token, user_id).await {
             Ok(channel_id) => channel_id,
             Err(e) if e.no_shared_server() => {
-                tracing::info!(
-                    npc = bot.npc,
-                    user = user_id,
-                    "discord: no DM opens with a person the bot shares no server with"
+                note(
+                    a,
+                    bot.npc,
+                    Note::new(now_ms(), Direction::Out, "dm_open", "no_shared_server")
+                        .author(user_id)
+                        .seq(last.seq),
                 );
                 unreachable.insert(account, last.seq);
                 continue;
@@ -133,20 +129,31 @@ async fn speaking_name(a: &Authored, account: &str) -> Option<String> {
     Some(speaking_as(&identity, &public_id(account), &a.roles))
 }
 
+/// What is waiting on a direct thread: its id, and its messages to post.
+struct Waiting {
+    thread: String,
+    messages: Vec<Message>,
+}
+
 /// The messages of `person`'s direct thread with `character` past seq
 /// `through` that came from the world, oldest first.
-fn waiting(hosted: &Hosted, person: &str, character: &str, through: u64) -> Vec<Message> {
+fn waiting(hosted: &Hosted, person: &str, character: &str, through: u64) -> Waiting {
     hosted.sim(|s| {
         s.threads
             .direct_between(person, character)
-            .map(|t| {
-                t.messages
+            .map(|t| Waiting {
+                thread: t.id.clone(),
+                messages: t
+                    .messages
                     .iter()
                     .filter(|m| m.seq > through && m.origin.is_none())
                     .cloned()
-                    .collect()
+                    .collect(),
             })
-            .unwrap_or_default()
+            .unwrap_or(Waiting {
+                thread: String::new(),
+                messages: Vec::new(),
+            })
     })
 }
 
@@ -159,38 +166,30 @@ async fn deliver(
     account: &str,
     mut dm: Dm,
     character: &str,
-    waiting: Vec<Message>,
+    waiting: Waiting,
 ) -> Result<(), Rejected> {
-    for m in waiting {
+    for m in waiting.messages {
         let text = match m.from == character {
             true => m.intent.clone(),
             false => format!("> {} (console): {}", m.from, m.intent),
         };
-        for part in split(&text, LIMIT) {
-            if !posted(a, bot, dm.channel_id, &part).await? {
-                return Ok(());
+        let to = Target {
+            kind: "dm",
+            channel: dm.channel_id,
+            thread: &waiting.thread,
+            seq: m.seq,
+        };
+        let parts = split(&text, LIMIT);
+        let mut last = 0;
+        for part in &parts {
+            match send(a, bot, to, part).await? {
+                Post::Posted(id) => last = id,
+                Post::Forbidden | Post::Unposted => return Ok(()),
             }
         }
+        posted(a, bot, to, last, parts.len());
         dm.mirrored_through = m.seq;
         hosted.with_dms(|d| d.put(bot.npc, account, dm));
     }
     Ok(())
-}
-
-/// Post `text` to `channel` as `bot`: whether it was posted. A `429` is
-/// waited out and tried again, a few times.
-async fn posted(a: &Authored, bot: &Online, channel: u64, text: &str) -> Result<bool, Rejected> {
-    for _ in 0..RATE_TRIES {
-        match a.discord.create_message(&bot.token, channel, text).await {
-            Ok(_) => return Ok(true),
-            Err(DiscordError::RateLimited { retry_after_s }) => {
-                sleep(Duration::from_secs_f64(retry_after_s.max(0.0)).min(RATE_WAIT_MAX)).await;
-            }
-            Err(e) => {
-                Rejected::or_logged(bot.npc, "a DM post", e)?;
-                return Ok(false);
-            }
-        }
-    }
-    Ok(false)
 }

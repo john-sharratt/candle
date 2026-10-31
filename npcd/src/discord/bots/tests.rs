@@ -1,6 +1,10 @@
 //! The bots against a fake Discord: its gateway and its REST API, each on a
 //! port of the test's own, and a daemon with no engine hosting the vault, in
 //! which Zen — [`OWNER`]'s character, with a bot — has a body.
+//!
+//! The DMs are tested here; a bot in its servers' channels in [`channels`].
+
+mod channels;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -109,6 +113,7 @@ async fn daemon(scripts: Vec<Script>) -> Daemon {
         &gateway.url,
         "https://console.test/",
         Duration::from_millis(10),
+        Duration::from_millis(30),
     );
     let rt = Runtime::new(Mind::new(None), base).unwrap();
     rt.set_substrate(authored.npcs.substrate());
@@ -274,15 +279,15 @@ fn post(channel: u64, content: &str, agent: &str) -> Seen {
 // ── the shards follow the authority ──────────────────────────────────────
 
 /// **A bot comes online on its world's authority**: one `IDENTIFY` with
-/// only the DM intent, its status line naming the world, and its state
-/// written online.
+/// the servers', messages', content and DM intents, its status line naming
+/// the world, and its state written online.
 #[tokio::test]
 async fn a_bot_comes_online_on_its_worlds_authority() {
     let d = daemon(vec![Script::Serve]).await;
     d.online().await;
     assert_eq!(
         d.gateway.received(),
-        [protocol::identify(TOKEN, 4096, "in creators-vault")]
+        [protocol::identify(TOKEN, 37_377, "in creators-vault")]
     );
     let held = state::get(&d.a.npcs.substrate(), d.zen).expect("a state");
     assert_eq!(

@@ -1,9 +1,11 @@
 //! A fake of Discord's gateway, on a port of the test's own.
 //!
 //! Each connection it accepts plays the next [`Script`]: `HELLO`, then to an
-//! `IDENTIFY` either `READY` or a close, and to a `RESUME` `RESUMED`. It
-//! answers heartbeats, keeps every payload a shard sent it, and delivers
-//! what [`FakeGateway::dispatch`] is given to the connection that is open.
+//! `IDENTIFY` either `READY` — listing the servers [`FakeGateway::in_guilds`]
+//! names — or a close, and to a `RESUME` `RESUMED`. It answers heartbeats,
+//! keeps every payload a shard sent it, and delivers what
+//! [`FakeGateway::dispatch`] and [`FakeGateway::event`] are given to the
+//! connection that is open.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,9 +44,28 @@ pub struct FakeGateway {
     open: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     accepted: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
+    guilds: Arc<Mutex<Vec<u64>>>,
 }
 
 impl FakeGateway {
+    /// The servers each next `READY` says the bot is in.
+    pub fn in_guilds(&self, guilds: &[u64]) {
+        *self.guilds.lock().unwrap() = guilds.to_vec();
+    }
+
+    /// Send the dispatch `t` carrying `d` to the open connection.
+    pub fn event(&self, t: &str, d: Value) {
+        let s = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let frame = json!({ "op": 0, "t": t, "s": s, "d": d });
+        self.open
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("a connection is open")
+            .send(frame)
+            .unwrap();
+    }
+
     /// Every payload a shard sent, over every connection, in order.
     pub fn received(&self) -> Vec<Value> {
         self.received.lock().unwrap().clone()
@@ -57,15 +78,7 @@ impl FakeGateway {
 
     /// Send `message` to the open connection as a `MESSAGE_CREATE`.
     pub fn dispatch(&self, message: Value) {
-        let s = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let frame = json!({ "op": 0, "t": "MESSAGE_CREATE", "s": s, "d": message });
-        self.open
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("a connection is open")
-            .send(frame)
-            .unwrap();
+        self.event("MESSAGE_CREATE", message);
     }
 }
 
@@ -81,6 +94,7 @@ pub async fn start(scripts: Vec<Script>, heartbeat_ms: u64) -> FakeGateway {
         open: Arc::new(Mutex::new(None)),
         accepted: Arc::new(AtomicUsize::new(0)),
         seq: Arc::new(AtomicU64::new(0)),
+        guilds: Arc::new(Mutex::new(Vec::new())),
     };
     let held = Held {
         url,
@@ -88,6 +102,7 @@ pub async fn start(scripts: Vec<Script>, heartbeat_ms: u64) -> FakeGateway {
         received: Arc::clone(&fake.received),
         open: Arc::clone(&fake.open),
         seq: Arc::clone(&fake.seq),
+        guilds: Arc::clone(&fake.guilds),
     };
     let accepted = Arc::clone(&fake.accepted);
     tokio::spawn(async move {
@@ -115,6 +130,7 @@ struct Held {
     received: Arc<Mutex<Vec<Value>>>,
     open: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     seq: Arc<AtomicU64>,
+    guilds: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Held {
@@ -187,6 +203,13 @@ impl Held {
 
     fn ready(&self) -> Value {
         let s = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let guilds: Vec<Value> = self
+            .guilds
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|id| json!({ "id": id.to_string(), "unavailable": true }))
+            .collect();
         json!({
             "op": 0,
             "t": "READY",
@@ -196,7 +219,7 @@ impl Held {
                 "user": { "id": BOT_USER.to_string(), "username": "Zen", "bot": true },
                 "session_id": SESSION,
                 "resume_gateway_url": self.url,
-                "guilds": [],
+                "guilds": guilds,
             },
         })
     }

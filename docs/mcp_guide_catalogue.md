@@ -347,6 +347,13 @@ reports, world material.
 - It answers in its own time; read the thread again rather than expecting an
   immediate reply.
 
+### E5b. `bot-discord`
+**Use when:** a bot's Discord bot seems not to hear or not to answer.
+**Tools:** `bot_discord_read`, `bot_thread_read`
+- The trace says whether Discord handed the message over and what became of
+  it; the thread says whether it reached the bot's mind; `unposted` and a
+  `failed` event say why an answer did not go out.
+
 ### E6. `bot-watch`
 **Use when:** following what bots are doing over time.
 **Tools:** `bot_list`, `bot_mission_read`, `bot_channel_read`,

@@ -36,6 +36,7 @@ use npc_map::world::World;
 use npc_map::{MapEdit, MapSet};
 
 use crate::discord::dm::record::Dms;
+use crate::discord::server::record::Servers;
 use crate::engine::rooms::Rooms;
 use crate::engine::watch::Watch;
 use crate::mind::files::MindFiles;
@@ -78,6 +79,9 @@ pub struct Hosted {
     /// world's — so not under the world's lock — but written, followed and
     /// reloaded with the world's records.
     dms: Mutex<Dms>,
+    /// The servers this world's characters' Discord bots are in, and their
+    /// channels' threads (§3.4) — held as the DMs are.
+    servers: Mutex<Servers>,
 }
 
 struct State {
@@ -157,6 +161,7 @@ impl Hosted {
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
+            servers: Mutex::new(Servers::default()),
         })
     }
 
@@ -188,6 +193,7 @@ impl Hosted {
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
+            servers: Mutex::new(Servers::default()),
         })
     }
 
@@ -218,6 +224,7 @@ impl Hosted {
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
+            servers: Mutex::new(Servers::default()),
         }
     }
 
@@ -302,6 +309,16 @@ impl Hosted {
     /// Change the DMs this world's bots hold.
     pub fn with_dms<T>(&self, f: impl FnOnce(&mut Dms) -> T) -> T {
         f(&mut self.dms.lock().expect("dms lock"))
+    }
+
+    /// Read the servers this world's bots are in, and their channels.
+    pub fn servers<T>(&self, f: impl FnOnce(&Servers) -> T) -> T {
+        f(&self.servers.lock().expect("servers lock"))
+    }
+
+    /// Change the servers this world's bots are in, and their channels.
+    pub fn with_servers<T>(&self, f: impl FnOnce(&mut Servers) -> T) -> T {
+        f(&mut self.servers.lock().expect("servers lock"))
     }
 
     /// Both halves at once, under one acquisition.

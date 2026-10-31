@@ -614,7 +614,9 @@ export const MockAPI = {
 
   /* The character's own Discord bot, held per character so connecting and
    * disconnecting show on the next read. A token the mock is handed is
-   * "rejected" when it has no dots, the shape of a token pasted wrong. */
+   * "rejected" when it has no dots, the shape of a token pasted wrong, and
+   * one that starts `nocontent.` connects a bot whose Message Content
+   * intent is off, so the panel's line for that can be seen. */
   async getDiscord(id) {
     return mockBots[id] || { connected: false };
   },
@@ -625,11 +627,13 @@ export const MockAPI = {
         { error: 'discord_token_rejected', detail: 'Discord rejected the token', status: 400 });
     }
     const n = await this.getNpc(id);
+    const intentOff = String(token).startsWith('nocontent.');
     mockBots[id] = {
       connected: true, application_id: '1300000000000000001', user_id: '1300000000000000002',
       username: n.name, connected_ms: Date.now(),
       invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344134372416',
-      status: 'online', world: 'Life',
+      status: intentOff ? 'needs_content_intent' : 'online',
+      ...(intentOff ? {} : { world: 'Life' }),
     };
     return mockBots[id];
   },

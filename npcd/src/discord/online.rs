@@ -1,4 +1,5 @@
-//! A bot as its DMs need it: online, and who it is there.
+//! A bot that is online: who it is on Discord, and the world it is online
+//! for — what its DMs and its servers' channels need of it.
 
 /// A character's bot whose shard Discord has answered `READY` on.
 #[derive(Debug, Clone, PartialEq, Eq)]

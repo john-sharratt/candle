@@ -53,6 +53,7 @@ use crate::discord::client::Client as DiscordClient;
 use crate::discord::link::routes as discord_link;
 use crate::discord::routes as discord;
 use crate::discord::seal::Sealer;
+use crate::discord::trace::route as discord_trace;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
 use crate::engine::runtime::Runtime;
@@ -789,6 +790,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             get(discord::get_discord)
                 .put(discord::put_discord)
                 .delete(discord::delete_discord),
+        )
+        // What the bot has done on Discord (`docs/npcd_discord.md` §5.5): its
+        // records, its shard and its last events, for any character — so
+        // `Admin`, the bar of a read that crosses ownership.
+        .route(
+            "/v1/npc/:nid/discord/trace",
+            Role::Admin,
+            character(),
+            get(discord_trace::get_trace),
         )
         // `/v1/image/models` and `/v1/generate/description` are **not** here.
         // They already exist in `engine::routes` as the placeholders the console
@@ -4183,6 +4193,9 @@ mod tests {
                 // portrait, with the 404 of a missing character for anyone
                 // else.
                 ("/v1/npc/:nid/discord", "user"),
+                // What any character's bot has done on Discord: `admin`, a
+                // read across ownership.
+                ("/v1/npc/:nid/discord/trace", "admin"),
                 ("/v1/image/:iid", "user"),
                 // A signed link to the same bytes: open, because the signature
                 // over the id and an expiry is the permission, and the handler

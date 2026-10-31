@@ -3,12 +3,15 @@
 //!
 //! It connects, reads `HELLO`, and `IDENTIFY`s — or `RESUME`s the session it
 //! had, at the URL `READY` gave for that — then heartbeats at the interval
-//! `HELLO` asked for. `READY` and each `MESSAGE_CREATE` go out as an
-//! [`Event`]. A connection that drops, is asked to reconnect, or misses a
-//! heartbeat's acknowledgement is opened again after a wait that doubles to
-//! [`MAX_WAIT`], resuming its session; a session Discord says is gone starts
-//! afresh. A refused token (`4004`) and a request Discord will never grant
-//! (`4010`–`4014`) end the task, saying which.
+//! `HELLO` asked for. `READY`, each `MESSAGE_CREATE`, and the server and
+//! channel events (`GUILD_CREATE`, `GUILD_UPDATE`, `GUILD_DELETE`,
+//! `CHANNEL_CREATE`/`UPDATE`/`DELETE`) go out as an [`Event`]. A connection
+//! that drops, is asked to reconnect, or misses a heartbeat's acknowledgement
+//! is opened again after a wait that doubles to [`MAX_WAIT`], resuming its
+//! session; a session Discord says is gone starts afresh. A `4014` — the
+//! Message Content intent not turned on — is said, and the shard asks again
+//! after [`Config::content_retry`]. A refused token (`4004`) and a request
+//! Discord will never grant (`4010`–`4013`) end the task, saying which.
 //!
 //! The task never writes the world: it only hands on what it heard.
 
@@ -16,6 +19,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -26,11 +31,19 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+use super::guild::{Guild, GuildChannel, GuildRef};
 use super::protocol::{self, closed, op, Closed, Payload, CLOSE_TO_RESUME};
-use crate::discord::message::DiscordMessage;
+use crate::api::now_ms;
+use crate::discord::message::{snowflake, DiscordMessage};
+use crate::discord::trace::link::{update, SharedLink};
 
 /// The longest a shard waits before connecting again.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a shard Discord closed with `4014` waits before asking again in
+/// production: ten minutes, 144 `IDENTIFY`s a day, well inside the 1,000
+/// Discord allows.
+pub const CONTENT_RETRY: Duration = Duration::from_secs(600);
 
 /// What one shard connects with.
 #[derive(Clone)]
@@ -47,15 +60,35 @@ pub struct Config {
     /// How long it waits before its first reconnect; each next waits twice
     /// as long, up to [`MAX_WAIT`].
     pub retry: Duration,
+    /// How long it waits to ask again after a `4014`.
+    pub content_retry: Duration,
+    /// Where it keeps how its connection stands, for the trace.
+    pub link: SharedLink,
 }
 
 /// What a shard hears.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Discord answered `READY`: the bot, as `user_id`, is online.
-    Ready { user_id: u64 },
+    /// Discord answered `READY`: the bot, as `user_id`, is online, in the
+    /// servers `guilds` names.
+    Ready { user_id: u64, guilds: Vec<u64> },
     /// A message the bot can see.
     Message(DiscordMessage),
+    /// A server the bot is in, with its channels: one `READY` named, handed
+    /// over after it, or one the bot was just added to.
+    Guild(Guild),
+    /// A server was renamed (`GUILD_UPDATE`).
+    GuildRenamed { guild_id: u64, name: String },
+    /// The bot was removed from a server — a `GUILD_DELETE` that is not an
+    /// outage.
+    Left { guild_id: u64 },
+    /// A channel was made or changed (`CHANNEL_CREATE`, `CHANNEL_UPDATE`).
+    Channel(GuildChannel),
+    /// A channel was deleted.
+    ChannelGone { channel_id: u64 },
+    /// Discord closed the shard with `4014`: the application has not turned
+    /// on the Message Content intent. The shard asks again later.
+    NeedsContentIntent,
     /// Discord refused the token; the shard has stopped.
     Refused,
     /// The shard stopped for good, for this reason.
@@ -103,6 +136,8 @@ enum Ended {
     Stop,
     /// Discord refused the token.
     Refused,
+    /// The Message Content intent is not turned on.
+    NeedsContentIntent,
     /// Discord will never grant what the shard asks for.
     Fatal(String),
     /// The session is gone.
@@ -140,8 +175,16 @@ async fn run(
         }
         shard.reached = false;
         let npc = shard.config.npc;
-        match shard.connection(&mut stopping).await {
-            Ended::Stop => return,
+        let ended = shard.connection(&mut stopping).await;
+        update(&shard.config.link, |l| {
+            l.connected = false;
+            l.since_ms = None;
+        });
+        match ended {
+            Ended::Stop => {
+                tracing::info!(npc, "discord: the bot's connection is closed");
+                return;
+            }
             Ended::Refused => {
                 tracing::warn!(npc, "discord: the gateway refused the bot's token");
                 let _ = shard.events.send((npc, Event::Refused));
@@ -152,15 +195,38 @@ async fn run(
                 let _ = shard.events.send((npc, Event::Stopped(why)));
                 return;
             }
+            Ended::NeedsContentIntent => {
+                tracing::warn!(
+                    npc,
+                    "discord: the bot's Message Content intent is not turned on; asking again later"
+                );
+                let _ = shard.events.send((npc, Event::NeedsContentIntent));
+                shard.session = None;
+                shard.seq = None;
+                update(&shard.config.link, |l| l.session = None);
+                tokio::select! {
+                    _ = stopped(&mut stopping) => return,
+                    _ = sleep(shard.config.content_retry) => {}
+                }
+                wait = shard.config.retry;
+                continue;
+            }
             Ended::Reidentify => {
                 shard.session = None;
                 shard.seq = None;
+                update(&shard.config.link, |l| l.session = None);
             }
             Ended::Resume => {}
         }
         if shard.reached {
             wait = shard.config.retry;
         }
+        tracing::info!(
+            npc,
+            resuming = shard.session.is_some(),
+            "discord: reconnecting in {} ms",
+            wait.as_millis()
+        );
         tokio::select! {
             _ = stopped(&mut stopping) => return,
             _ = sleep(wait) => {}
@@ -222,7 +288,13 @@ impl Running {
                     }
                 }
                 frame = read(&mut ws) => match frame {
-                    Err(code) => return ended(code),
+                    Err(code) => {
+                        tracing::warn!(
+                            npc = self.config.npc,
+                            "discord: the gateway closed the connection (code {code:?})"
+                        );
+                        return ended(code);
+                    }
                     Ok(None) => {}
                     Ok(Some(p)) => match p.op {
                         op::DISPATCH => self.dispatch(p),
@@ -231,12 +303,21 @@ impl Running {
                                 return Ended::Resume;
                             }
                         }
-                        op::HEARTBEAT_ACK => acked = true,
+                        op::HEARTBEAT_ACK => {
+                            acked = true;
+                            update(&self.config.link, |l| l.last_heartbeat_ack_ms = Some(now_ms()));
+                        }
                         op::RECONNECT => {
+                            tracing::info!(npc = self.config.npc, "discord: the gateway asked for a reconnect");
                             close_to_resume(&mut ws).await;
                             return Ended::Resume;
                         }
                         op::INVALID_SESSION => {
+                            tracing::info!(
+                                npc = self.config.npc,
+                                resumable = p.d.as_bool() == Some(true),
+                                "discord: the gateway said the session is invalid"
+                            );
                             close_to_resume(&mut ws).await;
                             return match p.d.as_bool() {
                                 Some(true) => Ended::Resume,
@@ -251,38 +332,96 @@ impl Running {
     }
 
     /// A dispatch: its seq kept, `READY` taken as the session, and a message
-    /// handed on.
+    /// or a server's or channel's change handed on.
     fn dispatch(&mut self, p: Payload) {
         if let Some(s) = p.s {
             self.seq = Some(s);
         }
         let npc = self.config.npc;
-        match p.t.as_deref() {
-            Some("READY") => {
+        let Some(t) = p.t.as_deref() else {
+            return;
+        };
+        let now = now_ms();
+        update(&self.config.link, |l| l.last_event_ms = Some(now));
+        let event = match t {
+            "READY" => {
                 self.reached = true;
                 let id = p.d["session_id"].as_str().unwrap_or_default().to_string();
                 let resume_url = p.d["resume_gateway_url"]
                     .as_str()
                     .unwrap_or(&self.config.gateway)
                     .to_string();
+                update(&self.config.link, |l| {
+                    l.connected = true;
+                    l.session = Some(id.clone());
+                    l.since_ms = Some(now);
+                });
                 self.session = Some(Session { id, resume_url });
                 let user_id = p.d["user"]["id"]
                     .as_str()
                     .and_then(|id| id.parse().ok())
                     .unwrap_or(0);
+                let guilds = p.d["guilds"]
+                    .as_array()
+                    .map(|guilds| {
+                        guilds
+                            .iter()
+                            .filter_map(|g| g["id"].as_str()?.parse().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 tracing::info!(npc, "discord: the bot is online");
-                let _ = self.events.send((npc, Event::Ready { user_id }));
+                Some(Event::Ready { user_id, guilds })
             }
-            Some("RESUMED") => self.reached = true,
-            Some("MESSAGE_CREATE") => match serde_json::from_value::<DiscordMessage>(p.d) {
-                Ok(m) => {
-                    let _ = self.events.send((npc, Event::Message(m)));
-                }
-                Err(e) => tracing::warn!(npc, "discord: a message that would not read: {e}"),
-            },
-            _ => {}
+            "RESUMED" => {
+                self.reached = true;
+                update(&self.config.link, |l| {
+                    l.connected = true;
+                    l.since_ms = Some(now);
+                });
+                tracing::info!(npc, "discord: the bot's session is resumed");
+                None
+            }
+            "MESSAGE_CREATE" => data::<DiscordMessage>(npc, t, p.d).map(Event::Message),
+            "GUILD_CREATE" => data::<Guild>(npc, t, p.d)
+                .filter(|g| !g.unavailable)
+                .map(Event::Guild),
+            "GUILD_UPDATE" => data::<GuildRef>(npc, t, p.d).map(|g| Event::GuildRenamed {
+                guild_id: g.id,
+                name: g.name,
+            }),
+            // An outage is not a leave: the server comes back with a
+            // `GUILD_CREATE` once Discord can serve it.
+            "GUILD_DELETE" => data::<GuildRef>(npc, t, p.d)
+                .filter(|g| !g.unavailable)
+                .map(|g| Event::Left { guild_id: g.id }),
+            "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
+                data::<GuildChannel>(npc, t, p.d).map(Event::Channel)
+            }
+            "CHANNEL_DELETE" => {
+                data::<Gone>(npc, t, p.d).map(|g| Event::ChannelGone { channel_id: g.id })
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = self.events.send((npc, event));
         }
     }
+}
+
+/// What a `CHANNEL_DELETE` names.
+#[derive(Deserialize)]
+struct Gone {
+    #[serde(deserialize_with = "snowflake")]
+    id: u64,
+}
+
+/// A dispatch's data read as `T`; one that does not read is logged and
+/// gone past.
+fn data<T: DeserializeOwned>(npc: u64, t: &str, d: Value) -> Option<T> {
+    serde_json::from_value(d)
+        .map_err(|e| tracing::warn!(npc, "discord: a {t} that would not read: {e}"))
+        .ok()
 }
 
 /// Until the shard is told to stop — or its handle is gone, which is the
@@ -325,6 +464,7 @@ async fn open(npc: u64, url: &str) -> Result<(Socket, Duration), Ended> {
 fn ended(code: Option<u16>) -> Ended {
     match closed(code) {
         Closed::Refused => Ended::Refused,
+        Closed::NeedsContentIntent => Ended::NeedsContentIntent,
         Closed::Fatal => Ended::Fatal(format!(
             "the gateway closed the connection with {}",
             code.unwrap_or_default()
@@ -369,6 +509,7 @@ mod tests {
     use super::*;
     use crate::discord::gateway::fake::{self, Script, BOT_USER, SESSION};
     use crate::discord::message::Author;
+    use crate::discord::trace::link::read;
 
     const TOKEN: &str = "MTEx.bot.token";
     /// Long enough that no heartbeat falls inside a test that is not about
@@ -380,9 +521,18 @@ mod tests {
             npc: 42,
             gateway: gateway.to_string(),
             token: TOKEN.into(),
-            intents: protocol::DIRECT_MESSAGES,
+            intents: protocol::INTENTS,
             activity: "in Life".into(),
             retry: Duration::from_millis(10),
+            content_retry: Duration::from_millis(30),
+            link: SharedLink::default(),
+        }
+    }
+
+    fn ready() -> Event {
+        Event::Ready {
+            user_id: BOT_USER,
+            guilds: vec![],
         }
     }
 
@@ -393,23 +543,127 @@ mod tests {
             .expect("the shard is still sending")
     }
 
-    /// **`HELLO`, then `IDENTIFY` with only the DM intent, then `READY`**:
-    /// the shard says the bot is online, as the user `READY` named.
+    /// **`HELLO`, then `IDENTIFY` with the servers', messages', content and
+    /// DM intents, then `READY`**: the shard says the bot is online, as the
+    /// user `READY` named, in the servers it listed.
     #[tokio::test]
     async fn a_shard_identifies_and_comes_online() {
         let gateway = fake::start(vec![Script::Serve], QUIET).await;
+        gateway.in_guilds(&[600, 700]);
         let (tx, mut events) = mpsc::unbounded_channel();
-        let shard = Shard::spawn(config(&gateway.url), tx);
+        let config = config(&gateway.url);
+        let link = config.link.clone();
+        let shard = Shard::spawn(config, tx);
         assert_eq!(
             next(&mut events).await,
-            (42, Event::Ready { user_id: BOT_USER })
+            (
+                42,
+                Event::Ready {
+                    user_id: BOT_USER,
+                    guilds: vec![600, 700]
+                }
+            )
         );
         assert_eq!(
             gateway.received(),
-            [protocol::identify(TOKEN, 4096, "in Life")]
+            [protocol::identify(TOKEN, 37_377, "in Life")]
         );
+        // The trace's view of the connection: open, on the session READY
+        // opened, since the dispatch that said so.
+        let seen = read(&link);
+        assert!(seen.connected);
+        assert_eq!(seen.session.as_deref(), Some(SESSION));
+        assert!(seen.since_ms.is_some() && seen.since_ms == seen.last_event_ms);
         shard.close().await;
         assert_eq!(gateway.accepted(), 1);
+        assert!(
+            !read(&link).connected,
+            "a closed shard still says it is connected"
+        );
+    }
+
+    /// **A 4014 says the Message Content intent is off**, and the shard asks
+    /// again after its wait — a fresh `IDENTIFY` — and comes online once it
+    /// is on.
+    #[tokio::test]
+    async fn a_4014_close_says_so_and_asks_again_later() {
+        let gateway = fake::start(vec![Script::Close(4014), Script::Serve], QUIET).await;
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let shard = Shard::spawn(config(&gateway.url), tx);
+        assert_eq!(next(&mut events).await, (42, Event::NeedsContentIntent));
+        assert_eq!(next(&mut events).await, (42, ready()));
+        assert_eq!(gateway.accepted(), 2);
+        assert_eq!(
+            gateway.received(),
+            [
+                protocol::identify(TOKEN, 37_377, "in Life"),
+                protocol::identify(TOKEN, 37_377, "in Life"),
+            ]
+        );
+        shard.close().await;
+    }
+
+    /// **The server and channel events are handed on**; a `GUILD_DELETE`
+    /// that is an outage, and a `GUILD_CREATE` of a server unavailable, are
+    /// not a leave or a join.
+    #[tokio::test]
+    async fn server_and_channel_events_are_handed_on() {
+        let gateway = fake::start(vec![Script::Serve], QUIET).await;
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let shard = Shard::spawn(config(&gateway.url), tx);
+        next(&mut events).await;
+        gateway.event("GUILD_CREATE", json!({"id": "601", "unavailable": true}));
+        gateway.event(
+            "GUILD_CREATE",
+            json!({
+                "id": "600", "name": "zenworld",
+                "channels": [{"id": "610", "type": 0, "name": "general"}],
+            }),
+        );
+        gateway.event("GUILD_UPDATE", json!({"id": "600", "name": "zen world"}));
+        gateway.event(
+            "CHANNEL_CREATE",
+            json!({"id": "611", "type": 0, "name": "lore", "guild_id": "600"}),
+        );
+        gateway.event(
+            "CHANNEL_DELETE",
+            json!({"id": "611", "type": 0, "guild_id": "600"}),
+        );
+        gateway.event("GUILD_DELETE", json!({"id": "600", "unavailable": true}));
+        gateway.event("GUILD_DELETE", json!({"id": "600"}));
+        let mut heard = Vec::new();
+        for _ in 0..5 {
+            heard.push(next(&mut events).await.1);
+        }
+        assert_eq!(
+            heard,
+            [
+                Event::Guild(Guild {
+                    id: 600,
+                    name: "zenworld".into(),
+                    channels: vec![GuildChannel {
+                        id: 610,
+                        kind: 0,
+                        name: "general".into(),
+                        guild_id: None,
+                    }],
+                    unavailable: false,
+                }),
+                Event::GuildRenamed {
+                    guild_id: 600,
+                    name: "zen world".into()
+                },
+                Event::Channel(GuildChannel {
+                    id: 611,
+                    kind: 0,
+                    name: "lore".into(),
+                    guild_id: Some(600),
+                }),
+                Event::ChannelGone { channel_id: 611 },
+                Event::Left { guild_id: 600 },
+            ]
+        );
+        shard.close().await;
     }
 
     /// **A 4004 is a refused token**: said once, and the shard stops for good
@@ -438,10 +692,7 @@ mod tests {
         let gateway = fake::start(vec![Script::DropAfterReady, Script::Serve], QUIET).await;
         let (tx, mut events) = mpsc::unbounded_channel();
         let shard = Shard::spawn(config(&gateway.url), tx);
-        assert_eq!(
-            next(&mut events).await,
-            (42, Event::Ready { user_id: BOT_USER })
-        );
+        assert_eq!(next(&mut events).await, (42, ready()));
         timeout(Duration::from_secs(10), async {
             while gateway.received().len() < 2 {
                 sleep(Duration::from_millis(5)).await;
@@ -452,7 +703,7 @@ mod tests {
         assert_eq!(
             gateway.received(),
             [
-                protocol::identify(TOKEN, 4096, "in Life"),
+                protocol::identify(TOKEN, 37_377, "in Life"),
                 protocol::resume(TOKEN, SESSION, Some(1)),
             ]
         );
@@ -492,11 +743,14 @@ mod tests {
                     author: Author {
                         id: 77,
                         username: "wren".into(),
+                        global_name: None,
                         bot: false
                     },
                     content: "hello".into(),
                     attachments: vec![],
                     webhook_id: None,
+                    member: None,
+                    mentions: vec![],
                 })
             )
         );

@@ -485,6 +485,7 @@ mod tests {
                     since_ms: 20,
                     world: "life".into(),
                     connected_ms: 10,
+                    member: None,
                 },
             )
             .unwrap();

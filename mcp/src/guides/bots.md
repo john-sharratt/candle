@@ -55,6 +55,7 @@ Missions themselves — giving, adjusting, cancelling — are `bot-mission`'s:
 | A bot to write or edit a document | `bot-documents` |
 | Several bots working one goal | `bot-campaign` |
 | To talk to a bot | `bot-message` |
+| To see what a bot's Discord bot heard and posted | `bot-discord` |
 | To follow bots over time | `bot-watch` |
 | What came of a finished mission | `bot-debrief` |
 

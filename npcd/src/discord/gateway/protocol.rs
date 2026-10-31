@@ -1,6 +1,7 @@
-//! Discord's gateway protocol, as much of it as a bot that hears its DMs
-//! speaks (`docs.discord.com/developers/events/gateway`): the payloads it
-//! sends, the one it reads, and what a close code means for the shard.
+//! Discord's gateway protocol, as much of it as a bot that hears its DMs and
+//! its servers' channels speaks (`docs.discord.com/developers/events/gateway`):
+//! the payloads it sends, the one it reads, and what a close code means for
+//! the shard.
 
 use std::env::consts::OS;
 
@@ -13,8 +14,24 @@ pub const PRODUCTION: &str = "wss://gateway.discord.gg";
 /// What every connection asks for: version 10, JSON, uncompressed.
 pub const QUERY: &str = "/?v=10&encoding=json";
 
+/// The `GUILDS` intent: the servers a bot is in and their channels, as
+/// `GUILD_CREATE`, `GUILD_UPDATE`, `GUILD_DELETE` and the `CHANNEL_` events.
+pub const GUILDS: u64 = 1;
+
+/// The `GUILD_MESSAGES` intent: what is written in a server's channels.
+pub const GUILD_MESSAGES: u64 = 1 << 9;
+
 /// The `DIRECT_MESSAGES` intent: a bot's own DMs, their content included.
 pub const DIRECT_MESSAGES: u64 = 1 << 12;
+
+/// The privileged `MESSAGE_CONTENT` intent: the text of a server message that
+/// does not mention the bot. Turned on for the application in the Developer
+/// Portal, or Discord closes the shard with `4014`.
+pub const MESSAGE_CONTENT: u64 = 1 << 15;
+
+/// What every shard asks for (`docs/npcd_discord.md` §3.4): its servers, their
+/// messages and their content, and its DMs.
+pub const INTENTS: u64 = GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT;
 
 /// The gateway's opcodes.
 pub mod op {
@@ -94,8 +111,11 @@ pub enum Closed {
     /// `4004`: Discord does not know the token. The shard stops until a new
     /// one is connected.
     Refused,
-    /// The shard asked for something Discord will never give — an intent it
-    /// is not allowed, a version it does not speak — and stops.
+    /// `4014`: the application has not turned on the Message Content intent.
+    /// The shard waits and asks again, so turning it on is all the owner does.
+    NeedsContentIntent,
+    /// The shard asked for something Discord will never give — a shard, a
+    /// version or an intent value it does not speak — and stops.
     Fatal,
     /// The session is gone: start a new one.
     Reidentify,
@@ -107,7 +127,8 @@ pub enum Closed {
 pub fn closed(code: Option<u16>) -> Closed {
     match code {
         Some(4004) => Closed::Refused,
-        Some(4010..=4014) => Closed::Fatal,
+        Some(4014) => Closed::NeedsContentIntent,
+        Some(4010..=4013) => Closed::Fatal,
         Some(4007 | 4009) => Closed::Reidentify,
         _ => Closed::Resume,
     }
@@ -117,17 +138,19 @@ pub fn closed(code: Option<u16>) -> Closed {
 mod tests {
     use super::*;
 
-    /// **`IDENTIFY` is the payload Discord documents**, with only the DM
-    /// intent, and a status line naming the world.
+    /// **`IDENTIFY` is the payload Discord documents**, asking for the
+    /// servers, their messages and content, and the DMs — `1 + 512 + 4096 +
+    /// 32768` — and a status line naming the world.
     #[test]
-    fn identify_asks_for_dms_and_names_the_world() {
+    fn identify_asks_for_servers_dms_and_content_and_names_the_world() {
+        assert_eq!(INTENTS, 37_377);
         assert_eq!(
-            identify("tok", DIRECT_MESSAGES, "in Life"),
+            identify("tok", INTENTS, "in Life"),
             json!({
                 "op": 2,
                 "d": {
                     "token": "tok",
-                    "intents": 4096,
+                    "intents": 37_377,
                     "properties": { "os": OS, "browser": "npcd", "device": "npcd" },
                     "presence": {
                         "since": null,
@@ -154,12 +177,14 @@ mod tests {
         );
     }
 
-    /// **4004 is a refused token; the 4010s stop; 4007 and 4009 start
-    /// afresh; anything else resumes.**
+    /// **4004 is a refused token; 4014 is the Message Content intent not
+    /// turned on; 4010–4013 stop; 4007 and 4009 start afresh; anything else
+    /// resumes.**
     #[test]
     fn a_close_code_says_what_the_shard_does() {
         assert_eq!(closed(Some(4004)), Closed::Refused);
-        for code in [4010, 4011, 4012, 4013, 4014] {
+        assert_eq!(closed(Some(4014)), Closed::NeedsContentIntent);
+        for code in [4010, 4011, 4012, 4013] {
             assert_eq!(closed(Some(code)), Closed::Fatal, "{code}");
         }
         assert_eq!(closed(Some(4007)), Closed::Reidentify);
