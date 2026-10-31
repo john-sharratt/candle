@@ -416,7 +416,8 @@ as long as the disk is slow gets what only the owner can give it — a plan,
 locations, handles — and does the reading on its own thread. A liveness audit
 that walked every segment on the owner stopped BlackWorld's zend for fifteen
 minutes on 2026-10-31: `AuditPlan::walk` now runs on the caller. A call that
-holds the owner 250 ms or more is named in the log by its caller.
+holds the owner 250 ms or more, or background work 2 s or more, is named in the
+log by its caller.
 
 **A status read is not a call.** What may be stale without harm is published as
 `LogFacts`, atomics any thread reads: the record types held, the space latch,

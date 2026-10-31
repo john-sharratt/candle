@@ -79,6 +79,12 @@ const BACKOFF_MAX: Duration = Duration::from_millis(5);
 /// from outside as a member gone quiet, and takes an hour to find by inference.
 const SLOW_CALL: Duration = Duration::from_millis(250);
 
+/// [`SLOW_CALL`] for background work, which runs only while nothing waits and
+/// is sized to hold the owner longer: maintenance's liveness scan takes half a
+/// second on a large store, every sixteen, and a warning that fires all day
+/// names nothing.
+const SLOW_BACKGROUND: Duration = Duration::from_secs(2);
+
 thread_local! {
     /// Whether this thread is a persistence owner — whose calls would wait for
     /// themselves.
@@ -92,6 +98,8 @@ struct Call {
     done: Sender<thread::Result<()>>,
     /// Who asked, for [`SLOW_CALL`]'s warning.
     caller: &'static Location<'static>,
+    /// How long it may hold the owner before that warning.
+    slow: Duration,
 }
 
 /// What the write queue carries.
@@ -243,14 +251,14 @@ impl PersistenceOwner {
     /// before all background work.
     #[track_caller]
     pub fn call<R: Send>(&self, f: impl FnOnce(&mut SubstratePersistence) -> R + Send) -> R {
-        self.submit(&self.calls, f)
+        self.submit(&self.calls, SLOW_CALL, f)
     }
 
     /// [`Self::call`] as background work: served only when no call and no
     /// write is waiting — maintenance, one batch at a time.
     #[track_caller]
     pub fn call_behind<R: Send>(&self, f: impl FnOnce(&mut SubstratePersistence) -> R + Send) -> R {
-        self.submit(&self.background, f)
+        self.submit(&self.background, SLOW_BACKGROUND, f)
     }
 
     /// [`Self::call`] in the write queue's order: served after every write
@@ -261,7 +269,7 @@ impl PersistenceOwner {
         &self,
         f: impl FnOnce(&mut SubstratePersistence) -> R + Send,
     ) -> R {
-        self.submit_with(f, |call| {
+        self.submit_with(SLOW_CALL, f, |call| {
             self.writes
                 .send(Write::Call(call))
                 .map_err(|channel::SendError(w)| match w {
@@ -275,9 +283,10 @@ impl PersistenceOwner {
     fn submit<R: Send>(
         &self,
         queue: &Sender<Call>,
+        slow: Duration,
         f: impl FnOnce(&mut SubstratePersistence) -> R + Send,
     ) -> R {
-        self.submit_with(f, |call| {
+        self.submit_with(slow, f, |call| {
             queue.send(call).map_err(|channel::SendError(c)| c)
         })
     }
@@ -285,6 +294,7 @@ impl PersistenceOwner {
     #[track_caller]
     fn submit_with<R: Send>(
         &self,
+        slow: Duration,
         f: impl FnOnce(&mut SubstratePersistence) -> R + Send,
         send: impl FnOnce(Call) -> Result<(), Call>,
     ) -> R {
@@ -309,7 +319,13 @@ impl PersistenceOwner {
         let run: Box<dyn FnOnce(&mut SubstratePersistence) + Send + 'static> =
             unsafe { std::mem::transmute(run) };
         let (done, ran) = channel::bounded(1);
-        if let Err(call) = send(Call { run, done, caller }) {
+        let call = Call {
+            run,
+            done,
+            caller,
+            slow,
+        };
+        if let Err(call) = send(call) {
             drop(call);
             panic!("the persistence owner has stopped");
         }
@@ -469,13 +485,18 @@ impl OwnerLoop {
     }
 
     fn run_call(&mut self, call: Call) {
-        let Call { run, done, caller } = call;
+        let Call {
+            run,
+            done,
+            caller,
+            slow,
+        } = call;
         let p = &mut self.persistence;
         let started = Instant::now();
         let result = panic::catch_unwind(AssertUnwindSafe(move || run(p)));
         let held = started.elapsed();
         let _ = done.send(result);
-        if held >= SLOW_CALL {
+        if held >= slow {
             tracing::warn!(
                 target: "candle_conversation::persistence::owner",
                 dir = %self.persistence.dir().display(),
@@ -806,6 +827,7 @@ mod tests {
                     run: Box::new(|_| {}),
                     done,
                     caller: Location::caller(),
+                    slow: SLOW_CALL,
                 })
                 .unwrap();
             let (ack, _acked) = channel::bounded(1);
