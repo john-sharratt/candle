@@ -120,6 +120,16 @@ pub enum Origin {
     Lodged { by: String },
     /// A routine drawn from the bank when nothing was lodged (`routine` names it).
     Random { routine: String },
+    /// Posted on the order table by a character that takes no orders (`by` is
+    /// its name, `poster` its body), whose report goes back to it — see
+    /// `sim::orders` and `docs/zen_moon_mind.md` §8. `job` names the standing
+    /// job it was posted from, when it was one of the world's routines.
+    Ordered {
+        by: String,
+        poster: String,
+        #[serde(default)]
+        job: Option<String>,
+    },
     /// Written by the command table for one step of an operation's workflow
     /// (`generator` names which of the configured generators found the work,
     /// `target` the piece of the corpus it is about, `operation` the operation
@@ -2402,7 +2412,7 @@ mod tests {
                         "known routine: {routine}"
                     );
                 }
-                Origin::Lodged { .. } | Origin::Generated { .. } => {
+                Origin::Lodged { .. } | Origin::Generated { .. } | Origin::Ordered { .. } => {
                     panic!("bank produces Random origins")
                 }
             }
@@ -2441,7 +2451,7 @@ mod tests {
                     no_material.contains(&routine.as_str()),
                     "a lone character gets a routine needing no material, got {routine}"
                 ),
-                Origin::Lodged { .. } | Origin::Generated { .. } => {
+                Origin::Lodged { .. } | Origin::Generated { .. } | Origin::Ordered { .. } => {
                     panic!("bank produces Random origins")
                 }
             }

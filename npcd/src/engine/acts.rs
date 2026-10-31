@@ -670,6 +670,36 @@ pub const RECALL: Tool = Tool {
     }],
 };
 
+/// Turn your attention to a room: how a body that is the building moves through
+/// it (`docs/zen_moon_mind.md` §3.2).
+///
+/// **Offered only to a body that moves by attention**, through its one argument:
+/// `on` binds to [`Choices::Rooms`](crate::engine::tools::Choices::Rooms), which
+/// is empty for everybody who walks, so the act is absent for them by the
+/// ordinary empty-set rule rather than refused.
+pub const FOCUS: Tool = Tool {
+    name: "focus",
+    at: &[],
+    category: "Movement",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Turn your attention to another room. You are there at once — no corridor, no \
+                  lift — and what is in it, and whoever is in it, is in front of you; those you \
+                  leave see your attention go.",
+    params: &[Param {
+        name: "on",
+        ty: "string",
+        required: true,
+        description: "The room to attend to.",
+    }],
+    examples: &[Example {
+        situation: "A report says the blast door on the ward is open when it should be locked.",
+        call: r#"{"on":"the ward room"}"#,
+        because: "You do not walk your own corridors: you look where it matters, and then you can \
+                  act there.",
+    }],
+};
+
 /// Call the lift to the floor you are standing on.
 ///
 /// **The lift is a shared, slow thing, and that is the point of it.** There is
@@ -1325,6 +1355,7 @@ pub const WORLD_ACTS: &[Tool] = &[
     ENGAGE,
     OPERATE,
     RECALL,
+    FOCUS,
     LIFT_CALL,
     LIFT_USE,
     SCAN,

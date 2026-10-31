@@ -37,6 +37,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 
 use npc_map::world::{Refused, Voice, Where};
+use npc_map::NodeKind;
 
 use crate::engine::act::Act;
 use crate::engine::tools::CATALOG;
@@ -108,6 +109,8 @@ pub const ANSWERS: &[&str] = &[
     // same defect: what a board says is only ever in the outcome.
     "read",
     "scan",
+    // What came back from the work posted at the order table.
+    "order_results",
 ];
 
 /// Whether this act's product is the line it answers with.
@@ -222,6 +225,8 @@ const DESK_REPORTS: &[&str] = &[
     "report_done",
     "report_stuck",
     "report_rejected",
+    "order_post",
+    "order_results",
 ];
 
 fn dispatch(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
@@ -502,6 +507,13 @@ fn who_is_here(hosted: &Hosted, body: &str) -> String {
 }
 
 fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    // A body that moves by attention is not offered the act; this is it refused
+    // when it is asked for anyway.
+    if hosted.sim(|s| s.attends(body)) {
+        return Outcome::Refused(
+            "You do not walk your own corridors: turn your attention there with `focus`.".into(),
+        );
+    }
     let Some(want) = text(args, "destination") else {
         return Outcome::Refused("You meant to go somewhere, but not where.".into());
     };
@@ -704,6 +716,57 @@ pub fn reachable(hosted: &Hosted, body: &str) -> Vec<String> {
         .into_iter()
         .map(|(name, _)| name)
         .collect()
+}
+
+/// Every room a body that moves by attention may `focus` on, and the place each
+/// name means — empty for a body that walks (`docs/zen_moon_mind.md` §3.2).
+///
+/// **Every room of the world but the one it is in**, with no route asked: its
+/// attention goes where it will. Passages are left out, as they are from
+/// [`destinations`] — nobody attends to a corridor — and so are the lift's
+/// landings, which are only where a body that rides waits for it. **One name,
+/// one place**: a
+/// room whose name another area also uses is named with its area — "the bench,
+/// on the warren" — so the grammar's arms are a set and each resolves to one
+/// room.
+pub fn rooms(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
+    if !hosted.sim(|s| s.attends(body)) {
+        return Vec::new();
+    }
+    hosted.read(|w| {
+        let here = w.actor(body).map(|a| a.at.clone());
+        let all: Vec<(String, String, Where)> = w
+            .map()
+            .areas()
+            .flat_map(|a| {
+                a.nodes
+                    .iter()
+                    .filter(|n| !matches!(n.kind, NodeKind::Passage | NodeKind::Core))
+                    .map(move |n| {
+                        (
+                            n.name.clone(),
+                            a.name.clone(),
+                            Where::new(a.id.clone(), n.id.clone()),
+                        )
+                    })
+            })
+            .filter(|(_, _, at)| Some(at) != here.as_ref())
+            .collect();
+        let shared = |name: &str| {
+            all.iter()
+                .filter(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .count()
+                > 1
+        };
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        all.iter()
+            .map(|(name, area, at)| match shared(name) {
+                true => (format!("{name}, on {area}"), at.clone()),
+                false => (name.clone(), at.clone()),
+            })
+            .filter(|(name, _)| seen.insert(name.to_ascii_lowercase()))
+            .collect()
+    })
 }
 
 fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {

@@ -25,7 +25,7 @@ use npc_map::world::Where;
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
-use crate::engine::body::{destinations, refusal, Outcome};
+use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
 use crate::engine::tools::SELF;
 use crate::engine::whereabouts;
@@ -52,6 +52,7 @@ pub fn is_mine(tool: &str) -> bool {
             | "engage"
             | "operate"
             | "recall"
+            | "focus"
             | "lift_call"
             | "lift_use"
             | "scan"
@@ -85,6 +86,12 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "engage" => engage(hosted, body, a),
         "operate" => operate(hosted, body, a),
         "recall" => recall(hosted, body),
+        "focus" => focus(hosted, body, a),
+        // A body that moves by attention has no lift to call or ride: the act is
+        // not offered it, and refused when it is asked for anyway.
+        "lift_call" | "lift_use" if hosted.sim(|s| s.attends(body)) => Outcome::Refused(
+            "You do not ride your own lift: turn your attention there with `focus`.".into(),
+        ),
         "lift_call" => lift_call(hosted, body),
         "lift_use" => lift_use(hosted, body, a),
         "scan" => scan(hosted, body, a),
@@ -516,6 +523,33 @@ fn recall(hosted: &Hosted, body: &str) -> Outcome {
     }
     match hosted.with(|w| w.place(body, to.clone())) {
         Ok(()) => Outcome::Did("The ground goes out from under you, and you are home.".into()),
+        Err(why) => Outcome::Refused(refusal(hosted, &why)),
+    }
+}
+
+/// Turn a body that moves by attention to another room, at once — see
+/// [`crate::engine::acts::FOCUS`]. Grammar-bound to [`rooms`]; the refusals
+/// here cover the paths a grammar does not.
+fn focus(hosted: &Hosted, body: &str, a: &Map<String, Value>) -> Outcome {
+    let open = rooms(hosted, body);
+    if open.is_empty() {
+        return Outcome::Refused(
+            "You go where you walk: there is no turning your attention to another room.".into(),
+        );
+    }
+    let Some(want) = text(a, "on") else {
+        return Outcome::Refused(
+            "You meant to turn your attention somewhere, but not where.".into(),
+        );
+    };
+    let Some((name, to)) = open
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&want))
+    else {
+        return Outcome::Refused(format!("There is no room called \"{want}\" to attend to."));
+    };
+    match hosted.with(|w| w.place(body, to)) {
+        Ok(()) => Outcome::Did(format!("Your attention is on {name}.")),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }

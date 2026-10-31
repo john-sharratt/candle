@@ -39,6 +39,7 @@ use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Ou
 use crate::engine::mission_gen::config::{CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC};
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
 use crate::engine::mission_gen::{gates, leakage, rejection};
+use crate::engine::order_table;
 use crate::engine::passage;
 use crate::engine::workflow::OnFailed;
 use crate::engine::workflow::PUBLISHED;
@@ -119,6 +120,15 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
              nobody gives you orders."
                 .into(),
         ),
+        // The table's orders are given by a character that takes none; the
+        // table does not offer them to anybody else, and refuses them if asked.
+        "order_post" | "order_results" if !hosted.sim(|s| s.missions.is_unordered(body)) => {
+            Outcome::Refused(
+                "The table's orders are not yours to give: you take your work from it.".into(),
+            )
+        }
+        "order_post" => order_table::post(hosted, body, a),
+        "order_results" => order_table::results(hosted, body),
         "collect_mission" => {
             // **One mission at a time.** `collect_mission` is offered whenever a
             // body stands at the desk, including when it has come back to report
@@ -154,7 +164,10 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                      {what_now}\n{carried}"
                 ));
             }
-            Outcome::Did(format!("You take it up.\n{}", take_up(hosted, body)))
+            match take_up(hosted, body) {
+                Some(brief) => Outcome::Did(format!("You take it up.\n{brief}")),
+                None => Outcome::Refused(NOTHING_POSTED.to_string()),
+            }
         }
         "report_done" => {
             let Some(account) = text(a, "found") else {
@@ -420,8 +433,9 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
 
 /// Take up the next mission for `body` at the table — lodged for it, waiting
 /// in the pool, or a routine from the bank — and answer with its brief as the
-/// character reads it.
-pub fn take_up(hosted: &Hosted, body: &str) -> String {
+/// character reads it. `None` when there is nothing to take: a world that draws
+/// nothing, with nothing posted.
+pub fn take_up(hosted: &Hosted, body: &str) -> Option<String> {
     // The character's own name, so a routine that would send it to visit
     // "the makers here" is not built around visiting itself.
     let me = hosted
@@ -442,8 +456,8 @@ pub fn take_up(hosted: &Hosted, body: &str) -> String {
             })
             .unwrap_or_default();
         let material = s.mission_material(&me, &room_name, &reach);
-        s.missions.collect(body, &material.facts()).clone()
-    });
+        s.missions.collect(body, &material.facts()).cloned()
+    })?;
     tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
     // What an operation's document says in its store as its step is taken up
     // — what a step that must change it is held against (`changed`).
@@ -454,8 +468,12 @@ pub fn take_up(hosted: &Hosted, body: &str) -> String {
     if let Some((id, text)) = found {
         hosted.with_sim(|s| s.missions.found(id, text));
     }
-    mission.standing_text()
+    Some(mission.standing_text())
 }
+
+/// What a character collecting at a table with nothing on it is told.
+pub const NOTHING_POSTED: &str = "Nothing has been posted on the table yet. Wait here: you will \
+                                  be told the moment work arrives.";
 
 /// Whether the next step of the body's mission still to do is the writing of
 /// its own document — the step the gate puts back when the document does not
@@ -2562,7 +2580,7 @@ mod tests {
         };
         put_up();
         h.with_sim(|s| {
-            let drew = s.missions.collect("m1", &Facts::default());
+            let drew = s.missions.collect("m1", &Facts::default()).unwrap();
             assert_eq!(drew.operation(), Some((id, "write")));
             let w = drew.work.as_ref().unwrap();
             assert!(w.anew && !w.edit_optional && w.tools.is_empty());
@@ -2668,11 +2686,12 @@ mod tests {
             let writer_draws = s
                 .missions
                 .collect("m1", &Facts::default())
+                .unwrap()
                 .operation()
                 .is_some();
             assert!(!writer_draws, "not its own draft");
             s.missions.cancel("m1");
-            let reviewer = s.missions.collect("m2", &Facts::default());
+            let reviewer = s.missions.collect("m2", &Facts::default()).unwrap();
             assert_eq!(reviewer.operation(), Some((id, "review")));
             assert!(reviewer.may_reject());
             assert!(reviewer.prompt.contains("The table found nothing to mend."));

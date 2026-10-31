@@ -42,6 +42,7 @@ pub mod missing;
 pub mod missions;
 pub mod operation_names;
 pub mod operations;
+pub mod orders;
 pub mod phone;
 pub mod posting;
 pub mod reading;
@@ -51,7 +52,7 @@ pub mod shelf;
 pub mod tower;
 pub mod upkeep;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -117,9 +118,28 @@ pub struct Sim {
     part_tools: BTreeMap<String, Vec<String>>,
     /// Where a recall lands, if this world has anywhere to muster from.
     home: Option<String>,
+    /// The bodies that move by attention rather than on foot — a personality
+    /// with `moves: attention`, as Zen is the moon and changes its focus rather
+    /// than walking its corridors (`docs/zen_moon_mind.md` §3.2). Such a body
+    /// `focus`es on any room at once, and neither walks nor rides the lift.
+    #[serde(default)]
+    attending: BTreeSet<String>,
 }
 
 impl Sim {
+    /// Mark `body` as moving by attention, or not — see `attending`.
+    pub fn set_attends(&mut self, body: &str, attends: bool) {
+        match attends {
+            true => self.attending.insert(body.to_string()),
+            false => self.attending.remove(body),
+        };
+    }
+
+    /// Whether `body` moves by attention rather than on foot.
+    pub fn attends(&self, body: &str) -> bool {
+        self.attending.contains(body)
+    }
+
     pub fn new() -> Sim {
         Sim::default()
     }

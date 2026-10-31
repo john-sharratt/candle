@@ -55,7 +55,7 @@ use crate::discord::routes as discord;
 use crate::discord::seal::Sealer;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
-use crate::engine::runtime::{Kind, Runtime};
+use crate::engine::runtime::{OwnedPersona, Runtime};
 use crate::guest_routes;
 use crate::identity::require;
 use crate::image_links::{ImageLinks, Refused};
@@ -1400,10 +1400,7 @@ async fn create_npc(
                     // may order it at all. Read from its persona, as every
                     // other path that embodies a character reads them.
                     let persona = rt.persona_of_async(id).await;
-                    let kind = Kind {
-                        home: persona.as_ref().and_then(|p| p.home.as_deref()),
-                        unordered: persona.as_ref().is_some_and(|p| p.unordered),
-                    };
+                    let kind = persona.as_ref().map(OwnedPersona::kind).unwrap_or_default();
                     // No remembered room: this character has just been created
                     // and has never stood anywhere. It arrives at the door.
                     match rt.embody_in_world(id, world, kind, name, None, 0) {

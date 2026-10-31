@@ -30,9 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::operations::{Operation, Operations};
+use super::orders::{Filed, Notice, Orders};
 use crate::engine::mission::bank::{self, Duty, Facts};
 use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome};
-use crate::engine::mission_gen::world::{self, Routine};
+use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
 
 /// The outcome a Maker's `report_done` reports on a step that offers a choice.
@@ -40,6 +41,14 @@ pub const PASS: &str = "pass";
 
 /// The outcome a Maker's `report_rejected` reports.
 pub const REJECT: &str = "reject";
+
+/// What a posted mission's poster is told of one called off before it was
+/// reported.
+pub const CALLED_OFF: &str = "It was called off before it was done.";
+
+/// What a posted mission's poster is told of one whose carrier, or the one it
+/// was set for, is gone from the world.
+pub const GONE: &str = "Whoever it was for is gone, and it was never done.";
 
 /// What the world offers a routine, owned: [`Sim::mission_material`]'s answer,
 /// which a caller borrows as [`Facts`] while it draws.
@@ -167,11 +176,19 @@ pub struct Missions {
     /// false` — see [`Self::set_unordered`].
     #[serde(default)]
     unordered: BTreeSet<String>,
+    /// The missions posted on the table, from the poster's side — see
+    /// [`super::orders`].
+    #[serde(default)]
+    orders: Orders,
     /// The world's own routines, from `<mind>/missions/<world>.yaml` —
     /// drawn in place of the built-in [`bank`] when there are any. The mind's,
     /// read afresh rather than saved, like the workflows.
     #[serde(skip)]
     routines: Vec<Routine>,
+    /// Whether a character with nothing set for it draws a routine — the
+    /// mind's, with the routines.
+    #[serde(skip)]
+    draw: Draw,
 }
 
 impl Missions {
@@ -250,7 +267,12 @@ impl Missions {
     /// between a mission and the next turn would otherwise write the chapter's
     /// journal entry in the mission's place.
     fn close(&mut self, body: &str, mission: &Mission) {
-        if matches!(mission.origin, Origin::Random { .. }) {
+        // A standing job posted at the table is a routine still, whoever set
+        // it.
+        if matches!(
+            mission.origin,
+            Origin::Random { .. } | Origin::Ordered { job: Some(_), .. }
+        ) {
             return;
         }
         *self.closed.entry(body.to_string()).or_insert(0) += 1;
@@ -286,6 +308,7 @@ impl Missions {
     /// found again — left marked as carried, nothing would ever set it again.
     pub fn assign(&mut self, body: &str, mission: Mission) {
         if let Some(old) = self.active.insert(body.to_string(), mission) {
+            self.called_off(body, &old, CALLED_OFF);
             if let Some(k) = target_of(&old) {
                 if target_of(&self.active[body]) != Some(k) {
                     self.targets.remove(k);
@@ -349,15 +372,19 @@ impl Missions {
         }
     }
 
-    /// Collect a mission at the desk: the next one lodged for this body, or —
-    /// when nothing is lodged — a fresh routine: one of the world's own when it
-    /// has any ([`Self::set_routines`]), otherwise a non-destructive one drawn
-    /// from the [`bank`] against who and what is around. Either way it becomes
-    /// the body's open mission, and the collected one is returned so the desk
-    /// can hand back its brief.
-    pub fn collect(&mut self, body: &str, facts: &Facts) -> &Mission {
+    /// Collect a mission at the desk: the next one lodged for this body, then
+    /// the oldest waiting at the table, or — when neither is — a fresh routine:
+    /// one of the world's own when it has any ([`Self::set_routines`]),
+    /// otherwise a non-destructive one drawn from the [`bank`] against who and
+    /// what is around. It becomes the body's open mission, and the collected one
+    /// is returned so the desk can hand back its brief.
+    ///
+    /// `None` in a world that draws nothing ([`Draw::None`]) with nothing set
+    /// for this body: it waits at the table until work is posted.
+    pub fn collect(&mut self, body: &str, facts: &Facts) -> Option<&Mission> {
         let mission = match self.take_lodged(body).or_else(|| self.take_pooled(body)) {
             Some(mission) => mission,
+            None if self.draw == Draw::None => return None,
             None => {
                 let drawn = world::draw(&self.routines, facts.table, self.seed)
                     .unwrap_or_else(|| bank::random(facts, self.seed));
@@ -366,7 +393,88 @@ impl Missions {
             }
         };
         self.active.insert(body.to_string(), mission);
-        &self.active[body]
+        self.active.get(body)
+    }
+
+    /// Whether this world hands a character with nothing set for it a routine
+    /// — see [`Draw`].
+    pub fn draws(&self) -> bool {
+        self.draw == Draw::Routines
+    }
+
+    /// Whether anything waits at the table for `body`: lodged for it, or open
+    /// to whoever takes it.
+    pub fn has_work_for(&self, body: &str) -> bool {
+        self.has_lodged(body) || self.has_pooled_for(body)
+    }
+
+    /// Post `mission` on the table: for the body `to`, or, with none, for
+    /// whoever takes it next. Whoever it is for is told
+    /// ([`Self::take_notices`]).
+    pub fn post(&mut self, mission: Mission, to: Option<&str>) {
+        self.orders.posted(to, &mission.prompt);
+        match to {
+            Some(body) => self.lodge(body, mission),
+            None => self.pool.push(mission),
+        }
+    }
+
+    /// The notices owed since this was last asked — see [`Notice`].
+    pub fn take_notices(&mut self) -> Vec<Notice> {
+        self.orders.take_notices()
+    }
+
+    /// Whether a report on what `poster` posted waits unread.
+    pub fn unread_for(&self, poster: &str) -> bool {
+        self.orders.unread_for(poster)
+    }
+
+    /// The reports on what `poster` posted that it has not read, newest first
+    /// — read now. See [`Orders::read_by`].
+    pub fn read_by(&mut self, poster: &str) -> Vec<Filed> {
+        self.orders.read_by(poster)
+    }
+
+    /// The world's standing job named `id`, if it has one.
+    pub fn routine(&self, id: &str) -> Option<&Routine> {
+        self.routines.iter().find(|r| r.id == id)
+    }
+
+    /// What `poster` posted that is not yet reported: each brief, and the body
+    /// carrying it or that it is set for — `None` while it waits for whoever
+    /// takes it.
+    pub fn out_for(&self, poster: &str) -> Vec<(String, Option<String>)> {
+        let posted_by =
+            |m: &Mission| matches!(&m.origin, Origin::Ordered { poster: p, .. } if p == poster);
+        let carried = self
+            .active
+            .iter()
+            .filter(|(_, m)| posted_by(m))
+            .map(|(body, m)| (m.prompt.clone(), Some(body.clone())));
+        let lodged = self
+            .lodged
+            .iter()
+            .flat_map(|(body, q)| q.iter().map(move |m| (body, m)))
+            .filter(|(_, m)| posted_by(m))
+            .map(|(body, m)| (m.prompt.clone(), Some(body.clone())));
+        let waiting = self
+            .pool
+            .iter()
+            .filter(|m| posted_by(m))
+            .map(|m| (m.prompt.clone(), None));
+        waiting.chain(lodged).chain(carried).collect()
+    }
+
+    /// Whether nothing waits on the table: nothing open to take, and nothing
+    /// lodged for anybody.
+    pub fn table_empty(&self) -> bool {
+        self.pool.is_empty() && self.lodged.values().all(Vec::is_empty)
+    }
+
+    /// The world's own routines — in a world that draws nothing, the standing
+    /// jobs a poster may set when the table is empty.
+    pub fn routines(&self) -> &[Routine] {
+        &self.routines
     }
 
     /// Whether a mission waits at the table that `body` may take — see
@@ -401,10 +509,12 @@ impl Missions {
         self.operations.set_workflows(workflows);
     }
 
-    /// Set the world's own routines — empty for a world that runs on
-    /// `missions.yaml` and draws from the built-in [`bank`].
-    pub fn set_routines(&mut self, routines: Vec<Routine>) {
+    /// Set the world's own routines, and whether they are drawn — empty, and
+    /// [`Draw::Routines`], for a world that runs on `missions.yaml` and draws
+    /// from the built-in [`bank`].
+    pub fn set_routines(&mut self, routines: Vec<Routine>, draw: Draw) {
         self.routines = routines;
+        self.draw = draw;
     }
 
     /// Take `from`'s workflows and routines in place of these: they are the
@@ -413,6 +523,7 @@ impl Missions {
     pub fn adopt_workflows(&mut self, from: &mut Missions) {
         self.operations.adopt_workflows(&mut from.operations);
         self.routines = std::mem::take(&mut from.routines);
+        self.draw = from.draw;
     }
 
     /// Call off every operation not yet over, for `why` — what a world that
@@ -970,6 +1081,11 @@ impl Missions {
     /// Cancel the body's open mission without a report — it is called off, not
     /// finished, so it is not kept in `done`. Returns whether there was one.
     pub fn cancel(&mut self, body: &str) -> bool {
+        self.cancel_for(body, CALLED_OFF)
+    }
+
+    /// [`Self::cancel`], its poster told `why` when it was posted.
+    fn cancel_for(&mut self, body: &str, why: &str) -> bool {
         match self.active.remove(body) {
             Some(m) => {
                 // Called off is not settled: its target can be found again.
@@ -979,10 +1095,38 @@ impl Missions {
                 if let Some((id, _)) = m.operation() {
                     self.operations.cancel(id, "its mission was called off");
                 }
+                self.called_off(body, &m, why);
                 self.close(body, &m);
                 true
             }
             None => false,
+        }
+    }
+
+    /// A body is gone from the world: what it carried is called off, what was
+    /// lodged for it is dropped, and the poster of any of it is told — a
+    /// mission set for somebody who is no longer there is otherwise out for
+    /// good, and the table never reads empty again.
+    pub fn forget(&mut self, body: &str) {
+        self.cancel_for(body, GONE);
+        for m in self.lodged.remove(body).unwrap_or_default() {
+            self.called_off(body, &m, GONE);
+        }
+        self.unordered.remove(body);
+    }
+
+    /// File `m`, a posted mission ended other than by its carrier's report, to
+    /// its poster as not done, for `why` — so its poster is told, and it is no
+    /// longer counted as out.
+    fn called_off(&mut self, body: &str, m: &Mission, why: &str) {
+        if let Origin::Ordered { poster, .. } = &m.origin {
+            self.orders.filed(Filed {
+                poster: poster.clone(),
+                carrier: body.to_string(),
+                brief: m.prompt.clone(),
+                outcome: Outcome::Fail,
+                notes: why.to_string(),
+            });
         }
     }
 
@@ -1050,6 +1194,16 @@ impl Missions {
         match mission.operation() {
             Some((id, _)) => self.settle_if_over(id),
             None => self.settle(&mission, outcome, notes),
+        }
+        // A posted mission's report is its poster's.
+        if let Origin::Ordered { poster, .. } = &mission.origin {
+            self.orders.filed(Filed {
+                poster: poster.clone(),
+                carrier: body.to_string(),
+                brief: mission.prompt.clone(),
+                outcome,
+                notes: notes.to_string(),
+            });
         }
         self.done.insert(body.to_string(), mission.clone());
         self.close(body, &mission);
@@ -1127,7 +1281,7 @@ mod tests {
     use super::Missions;
     use crate::engine::mission::bank::Facts;
     use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
-    use crate::engine::mission_gen::world::Routine;
+    use crate::engine::mission_gen::world::{Draw, Routine};
 
     fn a_mission(prompt: &str) -> Mission {
         Mission::new(
@@ -1181,8 +1335,8 @@ mod tests {
             ..Facts::default()
         };
         let mut m = Missions::default();
-        m.set_routines(routines());
-        let got = m.collect("kettle", &facts).clone();
+        m.set_routines(routines(), Draw::Routines);
+        let got = m.collect("kettle", &facts).unwrap().clone();
         assert_eq!(got.prompt, "Take a shift on the ward.");
         assert_eq!(
             got.origin,
@@ -1201,11 +1355,11 @@ mod tests {
 
         let mut adopted = Missions::default();
         adopted.adopt_workflows(&mut m);
-        let again = adopted.collect("kettle", &facts).clone();
+        let again = adopted.collect("kettle", &facts).unwrap().clone();
         assert_eq!(again.prompt, got.prompt, "adopted with the workflows");
 
-        adopted.set_routines(Vec::new());
-        let bank = adopted.collect("biscuit", &facts).clone();
+        adopted.set_routines(Vec::new(), Draw::Routines);
+        let bank = adopted.collect("biscuit", &facts).unwrap().clone();
         assert!(
             matches!(&bank.origin, Origin::Random { routine } if routine != "ward-shift"),
             "{:?}",
@@ -1357,13 +1511,13 @@ mod tests {
 
         // A lodged mission is taken first, verbatim, and becomes active.
         m.lodge("bram", a_mission("the lodged one"));
-        assert_eq!(m.collect("bram", &facts).prompt, "the lodged one");
+        assert_eq!(m.collect("bram", &facts).unwrap().prompt, "the lodged one");
         assert!(m.is_on_mission("bram"));
         assert!(!m.has_lodged("bram"), "the lodged queue is drawn down");
 
         // With nothing lodged, a routine is drawn from the bank — a valid, open,
         // non-empty, non-destructive mission it can act on.
-        let drawn = m.collect("bram", &facts).clone();
+        let drawn = m.collect("bram", &facts).unwrap().clone();
         assert!(drawn.is_open());
         assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");
         assert!(matches!(drawn.origin, Origin::Random { .. }));

@@ -78,7 +78,7 @@ fn put_up(m: &mut Missions) {
 
 /// The step `body` collected, if it collected one of an operation's.
 fn collect_step(m: &mut Missions, body: &str) -> Option<(u64, String)> {
-    m.collect(body, &Facts::default())
+    m.collect(body, &Facts::default())?
         .operation()
         .map(|(id, step)| (id, step.to_string()))
 }
@@ -106,7 +106,10 @@ fn an_operation_moves_its_target_through_the_ledger() {
     assert!(m.blocks("life:keeper", 8), "whatever it holds");
     put_up(&mut m);
     m.lodge("bram", a_mission("lodged first"));
-    assert_eq!(m.collect("bram", &Facts::default()).prompt, "lodged first");
+    assert_eq!(
+        m.collect("bram", &Facts::default()).unwrap().prompt,
+        "lodged first"
+    );
     m.cancel("bram");
 
     assert_eq!(collect_step(&mut m, "bram"), Some((id, "write".into())));
@@ -126,7 +129,7 @@ fn an_operation_moves_its_target_through_the_ledger() {
     put_up(&mut m);
     assert!(
         matches!(
-            m.collect("bram", &Facts::default()).origin,
+            m.collect("bram", &Facts::default()).unwrap().origin,
             Origin::Random { .. }
         ),
         "the writer draws past its own review"
