@@ -9,8 +9,9 @@
 //! `docs/archived/paged_gallery_arena.md` §7–8.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,7 @@ use crate::scheduler::profile;
 
 use super::super::gpu::{needle_tally_segments, BDP_TQ};
 use super::super::WideQSig;
+use super::lease::ScanHold;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
@@ -112,11 +114,21 @@ pub(super) struct PagedIndex {
     n_cases: usize,
     n_segments: usize,
     max_seg_cases: usize,
-    /// Turns referenced by this scan; pinned for its duration then unpinned.
+    /// Turns referenced by this scan; pinned for the scan that builds the
+    /// index, leased as a set by every scan that reuses it.
     pub(super) pinned_sids: Vec<StreamId>,
+    /// `pinned_sids` as a set — what a turn's eviction asks of a leased index.
+    pub(super) members: HashSet<StreamId>,
     /// Each referenced turn's run id when its addresses were taken, parallel to
     /// `pinned_sids` — what a later reuse checks the arena against.
     pub(super) run_ids: Vec<u64>,
+    /// What scans and the arena's changes agree through (`lease`).
+    pub(super) hold: ScanHold,
+    /// When its turns' use was last recorded, milliseconds since the arena
+    /// began.
+    pub(super) touched_ms: AtomicU64,
+    /// When a scan last stored or reused it — the cache evicts the oldest first.
+    pub(super) used: AtomicU64,
     /// Every probe token's row a launch over this index has produced, so the
     /// next launch scores only the tokens no earlier one did (see
     /// [`ProbeRows`]).
@@ -154,14 +166,6 @@ impl PagedIndex {
                 + (d.seg_tok.len() + d.seg_case.len()) * 4) as u64
         })
     }
-}
-
-/// A [`PagedIndex`] cached for reuse (keyed by segment fingerprint in the arena's
-/// map), valid while every turn it references still holds the run it recorded.
-pub(super) struct CachedIndex {
-    pub(super) idx: Arc<PagedIndex>,
-    /// When a scan last stored or reused it — the cache evicts the oldest first.
-    pub(super) used: u64,
 }
 
 /// One scan backend. The auto ladder resolves per DEVICE, fastest first: b1
@@ -451,8 +455,12 @@ impl GalleryArena {
             n_cases: case_off,
             n_segments: segments.len(),
             max_seg_cases,
+            members: pinned_sids.iter().copied().collect(),
             pinned_sids,
             run_ids,
+            hold: ScanHold::default(),
+            touched_ms: AtomicU64::new(0),
+            used: AtomicU64::new(0),
             rows: Mutex::new(ProbeRows::new(launch.len() * segments.len())),
         })
     }
@@ -631,17 +639,18 @@ impl GalleryArena {
         }
         // Reuse the cached index if the same segment set is rescanned and its
         // turns still hold the runs it recorded (the common case, whatever other
-        // conversations upload meanwhile) — this pins the turns. Otherwise
-        // rebuild (which also pins) and cache it. Each turn's run id is taken
-        // with its addresses under the residency lock, so a turn moved after
-        // that point carries a new id and the next reuse rejects the entry.
+        // conversations upload meanwhile) — this leases it, which holds its
+        // turns as a set and takes no lock. Otherwise rebuild (which pins each
+        // turn) and cache it. Each turn's run id is taken with its addresses
+        // under the residency lock, so a turn moved after that point carries a
+        // new id and the next reuse rejects the entry.
         let t_index = Instant::now();
         let gen_before = self.residency_gen();
         let fp = fingerprint_segments(segments);
         let fingerprint_us = t_index.elapsed().as_micros() as u64;
         let weighed: Vec<GroupSet> = segments.iter().map(|s| s.groups).collect();
-        let (idx, reused) = match self.reuse_index(fp, &weighed) {
-            Ok(idx) => (idx, true),
+        let (idx, lease) = match self.reuse_index(fp, &weighed) {
+            Ok(lease) => (lease.index(), Some(lease)),
             Err(miss) => {
                 tracing::debug!(
                     target: "candle_conversation::provenance::gallery_arena",
@@ -663,9 +672,10 @@ impl GalleryArena {
                     t_index.elapsed(),
                 );
                 self.store_index(fp, built.clone());
-                (built, false)
+                (built, None)
             }
         };
+        let reused = lease.is_some();
         let index_us = t_index.elapsed().as_micros() as u64;
         profile::record(
             if reused {
@@ -693,11 +703,13 @@ impl GalleryArena {
         let result = launch(&idx, &weighed);
         let launch_us = t_launch.elapsed().as_micros() as u64;
         profile::record("arena:launch", t_launch.elapsed());
-        // Release the scan's pins whether or not the launch succeeded — the pages
+        // Release the scan's hold whether or not the launch succeeded — the pages
         // are no longer being read once the launch has synchronized (or failed).
-        for &sid in &idx.pinned_sids {
-            self.unpin(sid);
+        // A lease lets go as it drops; a build's pins go in one pass.
+        if !reused {
+            self.unpin_all(&idx.pinned_sids);
         }
+        drop(lease);
         // Index (reuse or rebuild, which pins pages resident) versus launch
         // (which synchronizes and tallies on the host). They have unrelated
         // costs, so a slow scan is attributed to one or the other.
@@ -1788,9 +1800,7 @@ mod tests {
         let kept = arena
             .reuse_index(fp, &all)
             .expect("an unrelated upload keeps the index");
-        for &sid in &kept.pinned_sids {
-            arena.unpin(sid);
-        }
+        drop(kept);
 
         // This index's own turn is re-sealed under a new fingerprint: its pages
         // are replaced, so the cached addresses are gone with them.

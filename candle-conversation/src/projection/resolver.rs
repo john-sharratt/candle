@@ -1048,7 +1048,7 @@ impl Conversation {
                 preload.turns += turns;
                 let scan = &group.policy.scan;
                 for f in files {
-                    let mut by_arc = vec![(GroupSet::default(), Keep::All); f.arc_sids.len()];
+                    let mut by_arc = vec![(GroupSet::default(), Keep::All); f.n_arcs()];
                     let mut read = |k: usize, groups: GroupSet, keep: Keep| {
                         let (g, kept) = by_arc[k];
                         // An arc no window reads is never preloaded; its keep
@@ -1062,10 +1062,8 @@ impl Conversation {
                     for &(k, ..) in &f.cal_windows {
                         read(k, calibration, scan.calibration_gallery_keep);
                     }
-                    for ((sid, window), (groups, keep)) in
-                        f.arc_sids.into_iter().zip(f.arcs_kept).zip(by_arc)
-                    {
-                        want(sid, window, groups, keep);
+                    for (k, (groups, keep)) in by_arc.into_iter().enumerate() {
+                        want(f.sid(k), f.arc(k).clone(), groups, keep);
                     }
                 }
             }
@@ -1594,7 +1592,7 @@ impl Conversation {
             files = groups.files,
             walk_us = groups.walk_us,
             exchange_us = groups.exchange_us,
-            cal_turns = groups.cal_turns,
+            cal_built = groups.cal_built,
             cal_windows = groups.cal_windows,
             cal_us = groups.cal_us,
             segments_us = groups.segments_us,
@@ -6653,7 +6651,7 @@ layers:
         assert_eq!(files[0].cal_windows, vec![(1, 0, 1)]);
         assert_eq!(files[1].windows, vec![(0, 0, 2, 0)]);
         assert_eq!(files[1].cal_windows, vec![(1, 0, 1)]);
-        assert_eq!(files[1].arc_sids[1], turn_stream_id(cal.raw(), 0));
+        assert_eq!(files[1].sid(1), turn_stream_id(cal.raw(), 0));
 
         let group = builder
             .schema()
@@ -6666,6 +6664,35 @@ layers:
         let scanned = scan_file_scans(&files, group, &[probe.as_slice()], None, Holder::Shared);
         let (x_score, y_score) = (scanned[0][0].0[0], scanned[0][1].0[0]);
         assert!(y_score > x_score, "x {x_score} y {y_score}");
+
+        // **A conversation's calibrations are one record, read again as long
+        // as it stands.** Nothing changed, so the second pass walks no turn.
+        let assemble = || {
+            let sub = conv.inner.read();
+            assemble_file_scans(&sub, vec![x, y]).0
+        };
+        let record = || assemble()[1].cal.clone().expect("y is calibrated");
+        let first = record();
+        let second = record();
+        assert!(Arc::ptr_eq(&first, &second), "the record stands");
+
+        // A question added shows in the calibration's length.
+        write(cal, vec![sig(!0)]);
+        let grown = assemble();
+        assert_eq!(grown[1].cal_windows, vec![(1, 0, 1), (2, 0, 1)]);
+        assert_eq!(grown[1].sid(2), turn_stream_id(cal.raw(), 1));
+
+        // A stored signature replaced shows in nothing a length can: every
+        // record goes, and the next read holds the new window.
+        let before = record();
+        conv.persist_wide_q_sigs(
+            turn_stream_id(cal.raw(), 0),
+            &encode_wide_sigs(&[sig(0x7777_7777_7777_7777)]),
+        )
+        .expect("persist sigs");
+        let after = record();
+        assert!(!Arc::ptr_eq(&before, &after), "a rewrite drops the record");
+        assert_ne!(before.sigs[0].fingerprint(), after.sigs[0].fingerprint());
     }
 
     /// **The preload takes only what every conversation reads.** A shared

@@ -176,15 +176,15 @@ the one-adapter rule keeps the dialogue's), admission's per-band offer, and the
 keep-one-alive head (the highest band's first queued turn).
 
 **The one exception: `Low` beside an `Urgent` decode** (`scheduler/urgent_hold.rs`).
-While a row a person is waiting on right now decodes, `Low` rows ride one decode
-step in `LOW_RIDES_EVERY` (4). Width-bound is not always true: rows that bring
+While a turn a person is waiting on right now decodes or prefills, `Low` rows
+ride one decode step in `LOW_RIDES_EVERY` (4). Width-bound is not always true: rows that bring
 long contexts make the step bound by attention instead, and then every row is
 the dialogue's latency. Measured on `.5`, 2026-10-30: a zend dialogue decoding
 beside 12–13 ingest turns of ~75k positions each — ~1M positions a step, 165–250
 ms a step against 80–110 ms at three or four rows — decoded at 15–20 tokens a
 second. The hold is not the pause below: it keys on `Urgent` alone, which the
-cast never is; it holds `Low` alone; it lasts only while the `Urgent` row
-decodes, with no tail; and a held row still rides one step in four, so the
+cast never is; it holds `Low` alone; it lasts only while the `Urgent` turn is in
+flight, with no tail; and a held row still rides one step in four, so the
 background never stops.
 
 **Why there is no pause.** One was built: while any higher band had work, and

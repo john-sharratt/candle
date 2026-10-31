@@ -74,8 +74,11 @@ gallery gives up every unpinned resident turn that **no scan can read**:
    Only when every substrate could be read: a substrate whose lock a writer
    holds is skipped, and its turns are not judged absent.
 
-A pinned turn (an in-flight scan reads its pages) is never dropped; the next
-sweep takes it. A dropped turn costs nothing but its next upload, so a
+A turn an in-flight scan reads is never dropped; the next sweep takes it. The
+scan that builds an index pins each turn; every scan that reuses one leases the
+index as a whole, two atomics and no lock, and anything about to evict, move or
+replace a turn counts the change first and then looks for a lease on an index
+naming it (`gallery_arena/lease.rs`). A dropped turn costs nothing but its next upload, so a
 conversation reloaded later pays one upload of its own turns on its first
 scan.
 

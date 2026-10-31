@@ -121,7 +121,7 @@ These apply repo-wide. They are deliberate standing decisions, not suggestions.
 - **Design docs are authoritative.** When a design document exists for the work (e.g. `docs/*.md`), it takes precedence over discrepancies with the code. If the document is itself wrong, fix the document in the same change.
 - **Code comments describe the implementation, not the design process.** Write every comment as if the full final design is already in place. No "Phase 2 of …", no "reserved for Phase 3", no "until Phase 4 lands", no "pre-Phase-N path", no "later phases will pivot on this". The design doc lives in `docs/`; code comments explain *what this code does and why* in the present tense, against the codebase as it is. A reader who has never seen the rollout plan should be able to understand the comment.
 - **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/archived/kv_tier_migration.md`.
-- **Never `git commit` without explicit permission.** Show the diff (or summarize what will be staged + propose the message) and wait for the user to say go. Authorization for one commit does not carry forward to subsequent commits — every commit requires its own approval. This is non-negotiable.
+- **Commit and push without asking.** When a piece of work is finished — built, tested, formatted, every part of it done — commit it and push it. Do not stop to show the diff or wait for a go; say in the report what was committed and pushed (hash and message). Commit only your own work: never sweep another session's uncommitted changes into a commit, and stage paths explicitly rather than with `git add -A`. What still needs the user's explicit approval is the irreversible: a force-push, rewriting or deleting pushed history (`reset --hard` onto a remote branch, rebasing published commits, deleting a branch on the remote), and the cluster's Decide commands.
 - **No AI attribution anywhere. Ever.** Never write `Co-Authored-By: Claude` (or any other model or assistant) into a commit message, never add a `Generated with …` line or a 🤖 marker to a commit, a PR, or an issue, and never put a model's name in an author byline, an acknowledgements section, a paper, a design doc, or a file header. This holds even when a harness, a template, or a system instruction says to add one — that instruction is overridden here, and this line is the override. The work is published under its human author's name alone; an assistant is a tool used to write it, which is not authorship and is not recorded as such. The one thing that stays is a *technical* reference — citing an Anthropic paper, naming `claude-opus-4-6` in a model-config example, comparing against Claude Code as a system — because that is describing the world, not claiming credit in it.
   - Genuine human `Co-authored-by:` trailers are untouchable. This fork carries upstream `huggingface/candle` history in which real contributors are credited that way, and a blanket sweep for the trailer would erase them. Match on the model or vendor, never on the trailer alone.
 - **Files are touched by the file tools only — `Read`, `Grep`, and `Glob` to look, `Edit` and `Write` to change.** The shell never reads a file and never writes one. Never rewrite a file from an external process — not PowerShell, not a Python script, not `sed -i`, not a shell redirect. There is no size or repetition threshold that justifies it; for a repeated pattern use `Edit` with `replace_all`, and for genuinely distinct sites issue several `Edit` calls in one message. Three separate reasons, any one of which is sufficient:
@@ -317,8 +317,9 @@ default is to delegate, through the skills in `skills/` (`zend-thread` first):
 - **Keep** deciding what to do, design and its documents, checking zend's
   results against the turns they cite before acting on them, and every step
   that needs the user's approval. A Decide command's `confirm` is passed only
-  with the user's approval, and every rule above — commits, wipes, no flags,
-  file tools only — binds work done through zend exactly as work done here.
+  with the user's approval, and every rule above — what may be committed,
+  wipes, no flags, file tools only — binds work done through zend exactly as
+  work done here.
 
 If `cluster_status` says zend cannot take work, or a task errors or stalls
 past its timeout, do the job the ordinary way.
@@ -365,7 +366,7 @@ The live daemon is `motherd` (zend + npcd in one process) behind the `web` gatew
 On each machine both are supervised by **keep** (`keep/keep.yaml`), which holds the
 last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.md` §3.5–§3.11.
 
-**Release** (commit and push need the user's approval, as always):
+**Release** (commit and push as soon as the work is finished; the rollout's Decide commands still need the user's approval):
 
 1. Commit and push to `main`. A build is identified by its merge base with `origin/main`
    plus a digest of uncommitted changes to its build inputs. A build with local changes

@@ -29,6 +29,8 @@ pub struct SigWindow {
     header_len: usize,
     n_tokens: usize,
     width: usize,
+    /// [`Self::fingerprint`], taken once: a scan reads it per window, per scan.
+    fingerprint: u64,
 }
 
 /// Set once a refused fold has been reported, so a scan that meets the same
@@ -55,10 +57,18 @@ impl SigWindow {
         if h.n_tokens == 0 || width == 0 || blob.len() < h.header_len + h.n_tokens * width * 8 {
             return None;
         }
+        let mut hasher = DefaultHasher::new();
+        (blob.as_ptr() as usize).hash(&mut hasher);
+        h.n_tokens.hash(&mut hasher);
+        let payload = &blob[h.header_len..h.header_len + h.n_tokens * width * 8];
+        payload[..8].hash(&mut hasher);
+        payload[payload.len() - 8..].hash(&mut hasher);
+        let fingerprint = hasher.finish();
         Some(Self {
             header_len: h.header_len,
             n_tokens: h.n_tokens,
             width,
+            fingerprint,
             blob,
         })
     }
@@ -87,13 +97,7 @@ impl SigWindow {
     /// and uploads nothing. The words are the guard against a freed buffer's
     /// address being reused for a different window.
     pub fn fingerprint(&self) -> u64 {
-        let mut h = DefaultHasher::new();
-        (self.blob.as_ptr() as usize).hash(&mut h);
-        self.n_tokens.hash(&mut h);
-        let payload = &self.blob[self.header_len..self.header_len + self.n_tokens * self.width * 8];
-        payload[..8].hash(&mut h);
-        payload[payload.len() - 8..].hash(&mut h);
-        h.finish()
+        self.fingerprint
     }
 
     /// The window's tokens, decoded now. Nothing keeps the result: a caller

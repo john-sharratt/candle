@@ -26,6 +26,7 @@ mod dedup;
 pub(crate) mod eviction;
 mod groups;
 mod holder;
+mod lease;
 mod page_io;
 mod pages;
 mod probe_rows;
@@ -49,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use std::result::Result as StdResult;
 
+use arc_swap::ArcSwap;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{
     arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotTenant,
@@ -59,6 +61,7 @@ use crate::persistence::streams::StreamId;
 
 use dedup::Dedup;
 use eviction::{index_cache_evictions, past_keep, Resident};
+use lease::IndexLease;
 
 /// Max distinct segment-set indices cached at once — a handful of belief groups
 /// per reprojection, so this comfortably covers a whole reproject's scans.
@@ -71,6 +74,11 @@ const INDEX_CACHE_CAP: usize = 16;
 /// accounts for. This covers a working set of a couple of conversations' large
 /// groups plus the small ones.
 const INDEX_CACHE_BYTES: u64 = 256 << 20;
+
+/// How often a reused index records its turns' use. What reads it — the keep
+/// trade's `keep_within`, hours on every card measured — does not resolve five
+/// seconds, and recording it is a walk of every turn under the residency lock.
+const TOUCH_EVERY_MS: u64 = 5_000;
 
 /// What one gallery compaction pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -236,8 +244,21 @@ pub struct GalleryArena {
     /// Validated per turn, not by a device-wide generation: with ingest sealing
     /// turns concurrently, a global generation moved on every scan, and a
     /// dialogue's 7.4M-token index was rebuilt from scratch each reprojection
-    /// (1.8–2.2 s) for uploads that touched none of its turns.
-    index_cache: Mutex<HashMap<u64, scan::CachedIndex>>,
+    /// (1.8–2.2 s) for uploads that touched none of its turns. [`Self::changes`]
+    /// only says when that check can be skipped; it never rebuilds an index.
+    ///
+    /// Written under this lock, which only a build or a stale index takes.
+    /// Scans read [`Self::indexes`].
+    index_cache: Mutex<HashMap<u64, Arc<scan::PagedIndex>>>,
+    /// [`Self::index_cache`] as scans read it, without a lock, with the indices
+    /// that left the cache while a scan might still hold them (`lease`).
+    indexes: ArcSwap<Vec<(u64, Arc<scan::PagedIndex>)>>,
+    /// Counts every change to a resident turn an index could name — evicted,
+    /// dropped, moved or re-uploaded — ahead of the change. A new upload names
+    /// no index's turn and does not count (`lease`).
+    changes: AtomicU64,
+    /// When the arena began, what [`scan::PagedIndex::touched_ms`] counts from.
+    born: Instant,
     /// One page of zeros: what a scan's index points a (page, group) at when
     /// the page does not hold that group — only ever a group the window's own
     /// segment weighs zero (`docs/gallery_residency.md` §4). Claimed on first
@@ -273,6 +294,9 @@ impl GalleryArena {
             keep_within_ns: AtomicU64::new(u64::MAX),
             upload_us_per_byte: AtomicU64::new(0),
             index_cache: Mutex::new(HashMap::new()),
+            indexes: ArcSwap::default(),
+            changes: AtomicU64::new(0),
+            born: Instant::now(),
             zero_page: Mutex::new(None),
             dedup: Dedup::new(wpt),
             tensor_caps: OnceLock::new(),
@@ -397,8 +421,12 @@ impl GalleryArena {
     pub fn drop_turns(&self, sids: &[StreamId]) -> (usize, u64) {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         let mut freed = (0usize, 0u64);
+        self.note_change();
         for sid in sids {
-            if res.get(sid).is_some_and(|rt| rt.pinned == 0) {
+            if res
+                .get(sid)
+                .is_some_and(|rt| rt.pinned == 0 && !self.leased(sid))
+            {
                 if let Some(rt) = res.remove(sid) {
                     freed.0 += 1;
                     freed.1 += self.run_bytes(&rt);
@@ -558,6 +586,9 @@ impl GalleryArena {
         let mut holder = holder;
         let mut groups = groups;
         let mut keep = keep;
+        if res.contains_key(&sid) {
+            self.note_change();
+        }
         if let Some(old) = res.remove(&sid) {
             holder = old.holder.widen(holder);
             groups = old.groups.union(groups);
@@ -569,7 +600,7 @@ impl GalleryArena {
             // scan's pages are about to be recycled — the arena would need a
             // multi-version turn to stay safe under concurrent re-seal + scan.
             debug_assert!(
-                old.pinned == 0,
+                old.pinned == 0 && !self.leased(&sid),
                 "re-seal of a turn pinned by an active scan — pages would be freed \
                  under an in-flight kernel"
             );
@@ -759,10 +790,33 @@ impl GalleryArena {
 
     /// Release one pin taken by [`scan_ensure`](Self::scan_ensure).
     pub(super) fn unpin(&self, sid: StreamId) {
+        self.unpin_all(&[sid]);
+    }
+
+    /// Release the pins [`scan_ensure`](Self::scan_ensure) took on `sids`, in
+    /// one pass under one lock.
+    pub(super) fn unpin_all(&self, sids: &[StreamId]) {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rt) = res.get_mut(&sid) {
-            rt.pinned = rt.pinned.saturating_sub(1);
+        for sid in sids {
+            if let Some(rt) = res.get_mut(sid) {
+                rt.pinned = rt.pinned.saturating_sub(1);
+            }
         }
+    }
+
+    /// A resident turn an index could name is about to change. Comes before
+    /// the change and before [`Self::leased`] (`lease`).
+    fn note_change(&self) {
+        self.changes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether a scan holds `sid` through a leased index. Asked after
+    /// [`Self::note_change`], of the turn about to go.
+    fn leased(&self, sid: &StreamId) -> bool {
+        self.indexes
+            .load()
+            .iter()
+            .any(|(_, idx)| idx.hold.leased() && idx.members.contains(sid))
     }
 
     /// The residency mutation count — churn, reported per scan (see
@@ -775,10 +829,13 @@ impl GalleryArena {
     /// Reuse the cached index if it matches `fingerprint`, scans every fold
     /// group each segment weighs (`weighed`, one set per segment), AND every
     /// turn it references is still resident on the run it was built against —
-    /// in which case this **pins** them (bumping their LRU) for the scan and
-    /// returns the shared index. Otherwise says why it missed — no index
-    /// cached, one scanning fewer groups, or a turn it holds evicted, moved or
-    /// re-uploaded — and the caller rebuilds.
+    /// in which case this **leases** it, holding its turns as one for the scan.
+    /// Otherwise says why it missed — no index cached, one scanning fewer
+    /// groups, or a turn it holds evicted, moved or re-uploaded — and the caller
+    /// rebuilds.
+    ///
+    /// Takes no lock unless a resident turn changed since the index was last
+    /// checked (`lease`).
     ///
     /// An index scanning more groups than a segment weighs serves it exactly:
     /// groups are scanned independently, and the rows of the groups it does
@@ -794,49 +851,99 @@ impl GalleryArena {
         &self,
         fingerprint: u64,
         weighed: &[GroupSet],
-    ) -> StdResult<Arc<scan::PagedIndex>, IndexMiss> {
-        let idx = {
-            let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = cache.get_mut(&fingerprint).ok_or(IndexMiss::Absent)?;
-            entry.used = self.lru_clock.fetch_add(1, Ordering::Relaxed);
-            entry.idx.clone()
-        };
+    ) -> StdResult<IndexLease, IndexMiss> {
+        let idx = self
+            .indexes
+            .load()
+            .iter()
+            .find(|(fp, idx)| *fp == fingerprint && !idx.hold.retire_seen())
+            .map(|(_, idx)| idx.clone())
+            .ok_or(IndexMiss::Absent)?;
+        idx.used.store(
+            self.lru_clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if !idx.serves(weighed) {
             return Err(IndexMiss::Narrower {
                 covering: idx.covering(weighed),
             });
         }
-        // Check + pin, all under the residency lock so a concurrent eviction can
-        // neither slip in nor free a page the launch will read. Verified BEFORE
-        // pinning any, so a stale index degrades to a rebuild rather than a
-        // partial pin.
-        let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        let lease = IndexLease::take(idx.clone()).ok_or(IndexMiss::Absent)?;
+        if !idx.hold.current(&self.changes) {
+            self.check_index(fingerprint, &idx)?;
+        }
+        self.touch_index(&idx);
+        Ok(lease)
+    }
+
+    /// Check that every turn `idx` references is still resident on the run it
+    /// was built against, under the residency lock, leased so that nothing
+    /// changes behind the check. A stale index leaves the cache: it can never
+    /// be valid again — a moved turn keeps its new run id — so its device
+    /// arrays go back rather than wait for something to overwrite the key.
+    fn check_index(
+        &self,
+        fingerprint: u64,
+        idx: &Arc<scan::PagedIndex>,
+    ) -> StdResult<(), IndexMiss> {
+        let res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        let changes = self.changes.load(Ordering::SeqCst);
         let current = idx
             .pinned_sids
             .iter()
             .zip(&idx.run_ids)
             .all(|(sid, run)| res.get(sid).is_some_and(|rt| rt.run_id == *run));
+        drop(res);
         if !current {
-            // It can never be valid again — a moved turn keeps its new run id —
-            // so drop it now and hand its device arrays back, rather than
-            // holding them until something overwrites the key.
-            drop(res);
-            self.index_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&fingerprint);
+            let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.get(&fingerprint).is_some_and(|c| Arc::ptr_eq(c, idx)) {
+                cache.remove(&fingerprint);
+            }
+            self.publish_indexes(&cache);
             return Err(IndexMiss::Stale);
         }
+        idx.hold.checked(changes);
+        Ok(())
+    }
+
+    /// Record that a scan used `idx`'s turns, at most every
+    /// [`TOUCH_EVERY_MS`], and never waiting for the residency lock: a busy
+    /// lock leaves it to the next scan.
+    fn touch_index(&self, idx: &scan::PagedIndex) {
+        let now_ms = self.born.elapsed().as_millis() as u64;
+        let was = idx.touched_ms.load(Ordering::Relaxed);
+        if was != 0 && now_ms.saturating_sub(was) < TOUCH_EVERY_MS {
+            return;
+        }
+        let Ok(mut res) = self.residency.try_lock() else {
+            return;
+        };
         let lru = self.lru_clock.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
-        for &sid in &idx.pinned_sids {
-            if let Some(rt) = res.get_mut(&sid) {
-                rt.pinned += 1;
+        for sid in &idx.pinned_sids {
+            if let Some(rt) = res.get_mut(sid) {
                 rt.lru = lru;
                 rt.touch(now);
             }
         }
-        Ok(idx)
+        idx.touched_ms.store(now_ms.max(1), Ordering::Relaxed);
+    }
+
+    /// Publish `cache` for scans to read, keeping an index that left it until
+    /// a later publish finds it marked and unleased (`lease`).
+    fn publish_indexes(&self, cache: &HashMap<u64, Arc<scan::PagedIndex>>) {
+        let mut next: Vec<(u64, Arc<scan::PagedIndex>)> =
+            cache.iter().map(|(fp, idx)| (*fp, idx.clone())).collect();
+        for (fp, idx) in self.indexes.load().iter() {
+            if cache.values().any(|c| Arc::ptr_eq(c, idx)) {
+                continue;
+            }
+            let marked = idx.hold.retire();
+            if !marked || idx.hold.leased() {
+                next.push((*fp, idx.clone()));
+            }
+        }
+        self.indexes.store(Arc::new(next));
     }
 
     /// Cache `idx` under `fingerprint` for reuse, evicting the least recently
@@ -849,17 +956,22 @@ impl GalleryArena {
         let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&fingerprint);
         if bytes > INDEX_CACHE_BYTES {
+            self.publish_indexes(&cache);
             return;
         }
         let entries: Vec<(u64, u64, u64)> = cache
             .iter()
-            .map(|(&fp, e)| (fp, e.used, e.idx.device_bytes()))
+            .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed), e.device_bytes()))
             .collect();
         for fp in index_cache_evictions(&entries, bytes, INDEX_CACHE_CAP, INDEX_CACHE_BYTES) {
             cache.remove(&fp);
         }
-        let used = self.lru_clock.fetch_add(1, Ordering::Relaxed);
-        cache.insert(fingerprint, scan::CachedIndex { idx, used });
+        idx.used.store(
+            self.lru_clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        cache.insert(fingerprint, idx);
+        self.publish_indexes(&cache);
     }
 
     /// Pack the gallery's pages toward the low end of the span — the two-cursor
@@ -932,8 +1044,9 @@ impl GalleryArena {
             // surfaces as quietly wrong retrieval rather than as a fault. The
             // result is carried past the renewal instead of propagated through it.
             let mut outcome = Ok(());
-            for rt in res.values_mut() {
-                if rt.pinned != 0 {
+            self.note_change();
+            for (sid, rt) in res.iter_mut() {
+                if rt.pinned != 0 || self.leased(sid) {
                     continue;
                 }
                 let mut moved_here = 0usize;
@@ -983,9 +1096,10 @@ impl GalleryArena {
     pub fn evict_all_for_guest(&self) -> u64 {
         let before = self.resident_bytes();
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        self.note_change();
         let gone: Vec<StreamId> = res
             .iter()
-            .filter(|(_, rt)| rt.pinned == 0)
+            .filter(|(sid, rt)| rt.pinned == 0 && !self.leased(sid))
             .map(|(sid, _)| *sid)
             .collect();
         for sid in &gone {
@@ -1019,9 +1133,10 @@ impl GalleryArena {
     #[cfg(test)]
     fn evict_lru_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>, want: u64) -> u64 {
         // Order candidates by LRU ascending (oldest first), skipping pins.
+        self.note_change();
         let mut cands: Vec<(u64, StreamId, u64)> = res
             .iter()
-            .filter(|(_, rt)| rt.pinned == 0)
+            .filter(|(sid, rt)| rt.pinned == 0 && !self.leased(sid))
             .map(|(sid, rt)| (rt.lru, *sid, self.run_bytes(rt)))
             .collect();
         cands.sort_by_key(|(lru, _, _)| *lru);
@@ -1117,6 +1232,13 @@ impl GalleryArena {
             .unzip();
         let mut freed = 0u64;
         let gone = past_keep(&turns, keep);
+        if !gone.is_empty() {
+            self.note_change();
+        }
+        let gone: Vec<usize> = gone
+            .into_iter()
+            .filter(|&i| !self.leased(&sids[i]))
+            .collect();
         for &i in &gone {
             res.remove(&sids[i]); // drops the run → frees pages
             self.residency_gen.fetch_add(1, Ordering::Relaxed);

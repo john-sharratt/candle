@@ -8,9 +8,13 @@
 //! of ~75k positions each: ~1M positions a step, 165–250 ms a step against
 //! 80–110 ms at three or four rows, and the dialogue at 15–20 tokens a second.
 //!
-//! So while an `Urgent` row decodes — a person waiting on that turn right now —
-//! `Low` rows ride only one step in [`LOW_RIDES_EVERY`]. The others carry the
-//! dialogue and the bands between. The hold is narrower than the pause
+//! So while an `Urgent` turn — a person waiting on it right now — decodes or
+//! prefills, `Low` rows ride only one step in [`LOW_RIDES_EVERY`]. The others
+//! carry the dialogue and the bands between. The prefill counts because a
+//! dialogue's tool results are its next wait: on BlackWorld (2026-10-30) each
+//! tool round spent ~9 s prefilling beside 8–9 rows, with steps of 143–191 ms,
+//! because the hold had ended with the decode. The hold is narrower than the
+//! pause
 //! `docs/continuous_fair_waves.md` §3.1 records removing, in every respect that
 //! failure turned on:
 //!
@@ -18,8 +22,8 @@
 //!   seconds, so a hold keyed on `High` would never release; a person's turn
 //!   ends.
 //! - **`Low` only.** The bands between still ride every step.
-//! - **Decode steps only, and only while the `Urgent` row decodes.** Prefill
-//!   is the throttle's, and there is no tail after the turn.
+//! - **Decode rows only, and only while the `Urgent` turn is in flight.** A
+//!   `Low` prefill stays the throttle's, and there is no tail after the turn.
 //! - **Bounded.** A held row still rides one step in [`LOW_RIDES_EVERY`], so
 //!   the background never stops.
 

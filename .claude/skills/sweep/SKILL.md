@@ -12,7 +12,7 @@ passes.** Anything that fails is fixed forward (step 9) — it does not matter w
 session introduced the bug or it was already there.
 
 The repository rules in `CLAUDE.md` apply throughout: read logs with Read/Grep (never
-`cat`/`Select-String`), never mask an exit status, never commit without permission.
+`cat`/`Select-String`), never mask an exit status, commit only finished work.
 
 ## 1. Size the sweep from VRAM
 
