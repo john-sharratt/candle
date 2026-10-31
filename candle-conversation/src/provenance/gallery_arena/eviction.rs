@@ -81,10 +81,15 @@ pub fn past_keep(turns: &[Resident], keep_within: Option<Duration>) -> Vec<usize
 /// `T*`: how often a turn must be scanned to earn its ground — the upload cost
 /// per byte over the weight side's marginal value per byte per second, both in
 /// microseconds. `None` when the weights lose nothing to the ground (no miss
-/// measured), and the gallery keeps what it holds.
+/// measured), and the gallery keeps what it holds. So too when they lose so
+/// little that `T*` is past what a `Duration` holds: a vanishing marginal value
+/// divided up to overflow, and panicked the scheduler thread with it
+/// (BlackWorld, 2026-10-31).
 pub fn keep_within(upload_us_per_byte: f64, weight_us_per_byte_sec: f64) -> Option<Duration> {
-    (weight_us_per_byte_sec > 0.0 && upload_us_per_byte > 0.0)
-        .then(|| Duration::from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec))
+    if !(weight_us_per_byte_sec > 0.0 && upload_us_per_byte > 0.0) {
+        return None;
+    }
+    Duration::try_from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec).ok()
 }
 
 /// Which cached scan indices to drop, oldest first, so that one more of
@@ -195,5 +200,14 @@ mod tests {
     fn the_threshold_is_the_upload_over_the_weights_value() {
         assert_eq!(keep_within(1e-4, 0.0), None, "no weight pressure, no limit");
         assert_eq!(keep_within(1e-4, 1e-5), Some(Duration::from_secs(10)));
+    }
+
+    /// A marginal value too small to divide by is no limit, not a panic.
+    #[test]
+    fn a_vanishing_weight_pressure_keeps_everything() {
+        assert_eq!(keep_within(1e-4, f64::MIN_POSITIVE), None);
+        assert_eq!(keep_within(f64::MAX, 1e-300), None, "infinity");
+        assert_eq!(keep_within(1e-4, f64::NAN), None);
+        assert_eq!(keep_within(f64::NAN, 1e-5), None);
     }
 }
