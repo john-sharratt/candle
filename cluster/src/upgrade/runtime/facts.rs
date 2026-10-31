@@ -5,11 +5,20 @@
 //! what a member does about a verdict on its own build: rejected, it stops
 //! taking work — a candidate in fault mode, any other drained — and accepted
 //! after all, it takes work again. A rejected build's downloads are removed.
+//!
+//! **The store is asked with a bound.** Each app's reads run as one task
+//! ([`FactsRead`]); a read started this tick is waited for up to the tick's
+//! store wait, and one still running from an earlier tick is looked at without
+//! waiting. While any app's store has not answered, the facts stay as last
+//! read, the step names the store and the call it is blocked on, and the tick
+//! acts on nothing the facts decide.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::decide::{target, Lease, Target};
+use super::facts_read::{verdicts_prefix, AppFacts, FactsRead};
 use super::served::HeldAs;
 use super::Upgrader;
 use crate::coord::VerdictLine;
@@ -19,7 +28,68 @@ use crate::upgrade::decisions::{
 };
 
 impl Upgrader {
-    pub(super) async fn refresh_facts(&self) {
+    /// Every app's store's answers, or the step to show while one has not
+    /// answered: a read started now is waited for up to `wait`, one still in
+    /// flight from an earlier tick not at all.
+    async fn read_facts(&self, wait: Duration) -> Result<BTreeMap<String, AppFacts>, String> {
+        let mut held = std::mem::take(&mut self.state().reads);
+        let mut reads = Vec::new();
+        for m in self.apps() {
+            let Some(r) = m.replicator().cloned() else {
+                continue;
+            };
+            match held.remove(m.app()) {
+                Some(read) => reads.push((read, false)),
+                None => reads.push((FactsRead::start(m.app(), r), true)),
+            }
+        }
+        let deadline = Instant::now() + wait;
+        let mut answered = BTreeMap::new();
+        let mut waiting = BTreeMap::new();
+        let mut blocked = None;
+        for (read, fresh) in reads {
+            let budget = if fresh {
+                deadline.saturating_duration_since(Instant::now())
+            } else {
+                Duration::ZERO
+            };
+            let app = read.app().to_string();
+            match read.wait(budget).await {
+                Ok(facts) => {
+                    answered.insert(app, facts);
+                }
+                Err(read) => {
+                    blocked.get_or_insert_with(|| read.blocked_step(wait));
+                    waiting.insert(app, read);
+                }
+            }
+        }
+        self.state().reads = waiting;
+        match blocked {
+            Some(step) => Err(step),
+            None => Ok(answered),
+        }
+    }
+
+    /// Read the group's decisions and the census, waiting up to `wait` for
+    /// each app's store. `false` when a store has not answered: the facts are
+    /// kept as last read and the step says what it is blocked on.
+    pub(super) async fn refresh_facts(&self, wait: Duration) -> bool {
+        let mut answered = match self.read_facts(wait).await {
+            Ok(answered) => answered,
+            Err(step) => {
+                let mut s = self.state();
+                if s.blocked.is_none() {
+                    tracing::warn!("{step}: the upgrades act on nothing until it answers");
+                }
+                s.blocked = Some(step.clone());
+                s.step = step;
+                return false;
+            }
+        };
+        if let Some(was) = self.state().blocked.take() {
+            tracing::warn!("the upgrades' store reads answer again, after: {was}");
+        }
         let mut verdicts = BTreeMap::new();
         let mut lines: BTreeMap<String, Vec<VerdictLine>> = BTreeMap::new();
         let mut rollouts = BTreeMap::new();
@@ -27,14 +97,14 @@ impl Upgrader {
         let mut census: Vec<u8> = Vec::new();
         let own = build_name(&self.setup.info.build());
         for m in self.apps() {
-            let Some(r) = m.replicator().cloned() else {
+            let app = m.app().to_string();
+            let Some(facts) = answered.remove(&app) else {
                 continue;
             };
-            census.extend(r.census().await);
-            let app = m.app().to_string();
-            let prefix = format!("certify/{app}/");
+            census.extend(facts.census);
+            let prefix = verdicts_prefix(&app);
             let mut by_build: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
-            for (k, v) in r.decisions(&prefix).await {
+            for (k, v) in facts.certify {
                 let Some((build, _)) = k
                     .strip_prefix(&prefix)
                     .and_then(|rest| rest.rsplit_once('/'))
@@ -56,11 +126,11 @@ impl Upgrader {
             }
             m.set_rejected(verdicts.get(&(app.clone(), own.clone())) == Some(&Settled::Fail));
             let rp = rollout_prefix(&app);
-            if let Some(rollout) = latest::<Rollout>(&r.decisions(&rp).await, &rp) {
+            if let Some(rollout) = latest::<Rollout>(&facts.rollouts, &rp) {
                 rollouts.insert(app.clone(), rollout);
             }
             let pp = pause_prefix(&app);
-            if let Some((_, p)) = latest::<Pause>(&r.decisions(&pp).await, &pp) {
+            if let Some((_, p)) = latest::<Pause>(&facts.pauses, &pp) {
                 if p.paused {
                     paused.insert(app.clone());
                 }
@@ -103,6 +173,7 @@ impl Upgrader {
             let parts = self.parts.clone();
             let _ = tokio::task::spawn_blocking(move || parts.remove(&b)).await;
         }
+        true
     }
 
     /// Act on the verdicts on its own build. A member a forced rollout names
