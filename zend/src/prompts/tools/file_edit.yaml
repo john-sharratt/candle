@@ -57,13 +57,13 @@ parameters:
       - delete
       - move
       type: string
-    text:
-      description: For replace, insert_before and insert_after — the new text, the whole part as it is to stand, its indentation included. Not given for delete or move.
+    old:
+      description: For replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
       type:
       - string
       - 'null'
-    old:
-      description: For replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
+    text:
+      description: For replace, insert_before and insert_after — the new text, the words replacing `old` or the whole part as it is to stand, its indentation included. Not given for delete or move.
       type:
       - string
       - 'null'

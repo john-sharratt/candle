@@ -659,8 +659,13 @@ impl VfsStore {
         let unreadable = |e: &dyn fmt::Display| {
             VfsError::Unreadable(format!("the base could not be read from git: {e}"))
         };
+        // Only an object git does not hold. Any other failure — a timeout, a
+        // process that would not start — says nothing about the base, and
+        // moving off it would drop the conversation's own unpushed commit.
+        let missing = matches!(why, GitError::UnknownRevision { .. })
+            || why.to_string().contains("not found");
         let current = Self::branch_base(source, rev)?;
-        if &current == lost {
+        if !missing || &current == lost {
             return Err(unreadable(&why));
         }
         let tree = source.tree_of(&current).map_err(|e| unreadable(&e))?;
