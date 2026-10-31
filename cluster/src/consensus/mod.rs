@@ -13,17 +13,22 @@
 //! quorum when one member is down, and it counts in no larger group.
 
 mod acceptor;
+mod armed;
 mod clock;
 mod dedup;
 mod maps;
 mod paxos;
 mod quorum;
+mod rearm;
 pub mod rendezvous;
 mod value;
 pub mod votes;
+mod wall;
 
 pub use acceptor::DECIDED;
+pub use armed::{remaining_s, ArmedLease, LeaseRow};
 pub use clock::Millis;
 pub use paxos::{seats, Config, KeyStatus, Out, Paxos, HOLDER_MARGIN};
 pub use quorum::{Change, MaxMembers};
 pub use value::{Value, MAX_DECISION};
+pub use wall::WallMillis;

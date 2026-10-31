@@ -12,6 +12,7 @@ use super::traffic::TrafficView;
 use super::upgrades::held::HeldBuild;
 use super::upgrades::UpgradesView;
 use super::worlds_view::{DisconnectedRow, WorldView};
+use crate::consensus::{remaining_s, ArmedLease};
 use crate::coord::{CoordState, FaultView};
 use crate::frame::{BuildId, MemberState};
 
@@ -40,7 +41,32 @@ pub struct HubStatus {
     pub upgrades: Vec<UpgradesView>,
     /// Every build any member holds, newest first.
     pub builds: Vec<HeldBuild>,
+    /// Every lease this gateway's tie-break acceptor counts as armed (§5.9);
+    /// empty when it is not an acceptor.
+    pub tiebreak_leases: Vec<TiebreakLease>,
     pub log: Vec<Entry>,
+}
+
+/// A lease the tie-break acceptor counts as armed: the app and the member's
+/// key it is held under, its holder as a 16-hex node, and the whole seconds
+/// its term has left, rounded up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TiebreakLease {
+    pub app: String,
+    pub key: String,
+    pub holder: String,
+    pub remaining_s: u64,
+}
+
+impl TiebreakLease {
+    pub fn of(app: String, key: String, lease: &ArmedLease) -> TiebreakLease {
+        TiebreakLease {
+            app,
+            key,
+            holder: format!("{:016x}", lease.holder),
+            remaining_s: remaining_s(lease.left),
+        }
+    }
 }
 
 /// A member in fault mode, or within twice the floor of it (§7.7).

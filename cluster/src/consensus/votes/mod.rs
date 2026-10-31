@@ -18,6 +18,7 @@ pub use memory::MemoryVotes;
 
 use std::io;
 
+use super::wall::WallMillis;
 use crate::frame::{AcceptedValue, Ballot};
 
 /// One key's vote.
@@ -25,6 +26,11 @@ use crate::frame::{AcceptedValue, Ballot};
 pub struct Vote {
     pub promised: Ballot,
     pub accepted: Option<AcceptedValue>,
+    /// When the accepted lease ends as this acceptor counts it, by the wall
+    /// clock: its acceptance plus its `ttl`. A restart re-arms the lease for
+    /// what is left of it (`super::rearm`). Zero when what is accepted is not
+    /// a lease.
+    pub lease_ends: WallMillis,
 }
 
 pub trait VoteStore: Send {

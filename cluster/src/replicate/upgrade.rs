@@ -23,14 +23,14 @@ impl Replicator {
         if self.faulted() {
             return false;
         }
-        let now = self.now();
+        let (now, wall) = (self.now(), self.wall());
         let quorum = self.quorum();
         let tiebreak = self.tiebreak_allowed();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
             p.allow_tiebreak(tiebreak);
-            p.decide(key, value, now)
+            p.decide(key, value, now, wall)
         };
         match outs {
             Ok(outs) => {

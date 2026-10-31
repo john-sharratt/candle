@@ -16,15 +16,23 @@
 //!  159  u64 accepted.round · u64 accepted.node
 //!  175  u16 value_len
 //!  177  [800] value
-//!  977  zero padding
+//!  977  u64 lease_ends           Unix ms; 0 unless a lease is accepted
+//!  985  zero padding
 //! 1020  u32 CRC-32 of bytes 0..1020
 //! ```
+//!
+//! `lease_ends` sits where the padding began, so every field before it keeps
+//! its offset: a journal written before it existed still opens with every
+//! promise and acceptance it holds — an acceptor that forgot a promise would
+//! break Paxos — and its accepted leases read as having no recorded end, which
+//! the acceptor re-arms for their full term (`consensus/rearm.rs`).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use super::super::wall::WallMillis;
 use super::{Vote, VoteStore};
 use crate::frame::{AcceptedValue, Ballot};
 
@@ -67,6 +75,7 @@ fn encode(seq: u64, key: &[u8], vote: &Vote) -> [u8; HALF] {
         h[175..177].copy_from_slice(&(a.value.len() as u16).to_le_bytes());
         h[177..177 + a.value.len()].copy_from_slice(&a.value);
     }
+    h[977..985].copy_from_slice(&vote.lease_ends.0.to_le_bytes());
     let crc = crc32fast::hash(&h[..CRC_AT]);
     h[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
     h
@@ -111,6 +120,7 @@ fn decode(h: &[u8]) -> Option<(u64, Vec<u8>, Vote)> {
                 node: u64_at(h, 150),
             },
             accepted,
+            lease_ends: WallMillis(u64_at(h, 977)),
         },
     ))
 }
@@ -278,7 +288,57 @@ mod tests {
                 ballot: Ballot { round, node: 7 },
                 value: v.to_vec(),
             }),
+            lease_ends: WallMillis(0),
         }
+    }
+
+    /// An accepted lease encodes with its wall-clock end, byte for byte, and
+    /// reads back the same.
+    #[test]
+    fn a_lease_vote_encodes_its_wall_end_to_exact_bytes() {
+        // `upgrade/zend` held by node 4 for 20 minutes, ending at
+        // 0x01a1_b2c3_d4e5 ms (2026-11-06).
+        let lease: [u8; 17] = [
+            1, // tag: lease
+            4, 0, 0, 0, 0, 0, 0, 0, // holder
+            0x80, 0x4f, 0x12, 0, 0, 0, 0, 0, // ttl_ms 1,200,000
+        ];
+        let v = Vote {
+            promised: Ballot { round: 3, node: 7 },
+            accepted: Some(AcceptedValue {
+                ballot: Ballot { round: 3, node: 7 },
+                value: lease.to_vec(),
+            }),
+            lease_ends: WallMillis(0x01a1_b2c3_d4e5),
+        };
+        let mut want = [0u8; HALF];
+        let mut put = |at: usize, bytes: &[u8]| want[at..at + bytes.len()].copy_from_slice(bytes);
+        put(0, b"VOTE");
+        put(4, &[5, 0, 0, 0, 0, 0, 0, 0]);
+        put(12, &[12, 0]);
+        put(14, b"upgrade/zend");
+        put(142, &[3, 0, 0, 0, 0, 0, 0, 0]);
+        put(150, &[7, 0, 0, 0, 0, 0, 0, 0]);
+        put(158, &[1]);
+        put(159, &[3, 0, 0, 0, 0, 0, 0, 0]);
+        put(167, &[7, 0, 0, 0, 0, 0, 0, 0]);
+        put(175, &[17, 0]);
+        put(177, &lease);
+        put(977, &[0xe5, 0xd4, 0xc3, 0xb2, 0xa1, 0x01, 0, 0]);
+        let crc = crc32fast::hash(&want[..1020]).to_le_bytes();
+        want[1020..].copy_from_slice(&crc);
+        let h = encode(5, b"upgrade/zend", &v);
+        assert_eq!(h, want);
+        assert_eq!(decode(&h).unwrap(), (5, b"upgrade/zend".to_vec(), v));
+    }
+
+    /// A half written before `lease_ends` existed — zeros where it sits —
+    /// still opens, its lease reading as having no recorded end.
+    #[test]
+    fn a_half_without_a_wall_end_reads_as_no_recorded_end() {
+        let h = encode(1, b"world/w", &vote(2, Some(b"\x01lease")));
+        assert!(h[977..1020].iter().all(|b| *b == 0));
+        assert_eq!(decode(&h).unwrap().2.lease_ends, WallMillis(0));
     }
 
     /// A half encodes to exact bytes at its documented offsets.

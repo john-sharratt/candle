@@ -1,8 +1,10 @@
 //! Time as consensus counts it: milliseconds on a process's own monotonic
 //! clock. Lease terms are counted on it (§5.9), never on the wall clock, which
-//! another machine may disagree with and an operator may move. The engine is
-//! driven with a reading of it, so a simulation can run thousands of rounds in
-//! virtual time.
+//! another machine may disagree with and an operator may move. The wall clock
+//! ([`super::wall`]) is read only to record when an accepted lease ends, so a
+//! restart — where this clock begins again — knows how much of it is left. The
+//! engine is driven with a reading of it, so a simulation can run thousands of
+//! rounds in virtual time.
 
 use std::ops::{Add, Sub};
 use std::time::Duration;

@@ -8,6 +8,7 @@
 
 mod answer;
 mod answering;
+mod busy_warnings;
 mod catchup;
 mod consensus;
 mod coord;
@@ -24,6 +25,8 @@ mod serve;
 mod store;
 mod tick;
 mod upgrade;
+#[cfg(test)]
+mod view_tests;
 mod watch;
 
 pub use answer::{answer_ranges, complete_ranges, HEADERS_PER_FRAME};

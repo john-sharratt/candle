@@ -1,7 +1,9 @@
 //! A member's Paxos engine (§5.9): its acceptor, its proposals, and the leases
 //! it holds, driven by the frames it receives and readings of its monotonic
-//! clock. It does no I/O but its vote store's: what it sends comes back as
-//! [`Out`], for the owner to put on its sockets.
+//! clock and of the wall clock — the wall clock only to record, in a vote,
+//! when an accepted lease ends, for a restart to count from. It does no I/O
+//! but its vote store's: what it sends comes back as [`Out`], for the owner to
+//! put on its sockets.
 //!
 //! **One round**, for one key: `PREPARE` to every member; with promises from a
 //! quorum of distinct acceptors, `PROPOSE` the highest-ballot accepted value
@@ -35,11 +37,13 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use super::acceptor::{Acceptor, PrepareReply, ProposeReply};
+use super::armed::ArmedLease;
 use super::clock::Millis;
 use super::dedup::Dedup;
 use super::maps::{Map, Set};
 use super::value::Value;
 use super::votes::VoteStore;
+use super::wall::WallMillis;
 use crate::frame::{
     Accepted, AcceptedValue, Ballot, Frame, Kind, Nack, Prepare, Promise, Propose, Release,
 };
@@ -170,10 +174,17 @@ pub struct Paxos<S: VoteStore> {
 }
 
 impl<S: VoteStore> Paxos<S> {
-    /// Resume from `store` at `now`; `seed` drives the backoff draws.
-    pub fn open(cfg: Config, store: S, now: Millis, seed: u64) -> io::Result<Self> {
+    /// Resume from `store` at `now`, the wall clock reading `wall`; `seed`
+    /// drives the backoff draws.
+    pub fn open(
+        cfg: Config,
+        store: S,
+        now: Millis,
+        wall: WallMillis,
+        seed: u64,
+    ) -> io::Result<Self> {
         Ok(Self {
-            acceptor: Acceptor::open(store, now)?,
+            acceptor: Acceptor::open(store, now, wall)?,
             cfg,
             quorum: 1,
             tiebreak: false,
@@ -204,17 +215,29 @@ impl<S: VoteStore> Paxos<S> {
     }
 
     /// Decide one value for `key`: `value` if no other was accepted first.
-    pub fn decide(&mut self, key: &[u8], value: Vec<u8>, now: Millis) -> io::Result<Vec<Out>> {
-        self.start(key, Goal::Decide(value), now)
+    pub fn decide(
+        &mut self,
+        key: &[u8],
+        value: Vec<u8>,
+        now: Millis,
+        wall: WallMillis,
+    ) -> io::Result<Vec<Out>> {
+        self.start(key, Goal::Decide(value), now, wall)
     }
 
     /// Take `key`'s lease for `ttl`, or renew it. Nothing new while a round
     /// for `key` is in progress: that round retries itself until it resolves.
-    pub fn acquire(&mut self, key: &[u8], ttl: Duration, now: Millis) -> io::Result<Vec<Out>> {
+    pub fn acquire(
+        &mut self,
+        key: &[u8],
+        ttl: Duration,
+        now: Millis,
+        wall: WallMillis,
+    ) -> io::Result<Vec<Out>> {
         if self.proposing(key) {
             return Ok(Vec::new());
         }
-        self.start(key, Goal::Lease(ttl), now)
+        self.start(key, Goal::Lease(ttl), now, wall)
     }
 
     /// Hand `key`'s lease back; `through` is this member's own `oseq`.
@@ -261,9 +284,15 @@ impl<S: VoteStore> Paxos<S> {
         }
     }
 
-    fn start(&mut self, key: &[u8], goal: Goal, now: Millis) -> io::Result<Vec<Out>> {
+    fn start(
+        &mut self,
+        key: &[u8],
+        goal: Goal,
+        now: Millis,
+        wall: WallMillis,
+    ) -> io::Result<Vec<Out>> {
         let mut out = Vec::new();
-        self.prepare(key, goal, now, &mut out)?;
+        self.prepare(key, goal, now, wall, &mut out)?;
         Ok(out)
     }
 
@@ -272,6 +301,7 @@ impl<S: VoteStore> Paxos<S> {
         key: &[u8],
         goal: Goal,
         now: Millis,
+        wall: WallMillis,
         out: &mut Vec<Out>,
     ) -> io::Result<()> {
         let round = self.highest.get(key).copied().unwrap_or(0) + 1;
@@ -300,7 +330,7 @@ impl<S: VoteStore> Paxos<S> {
         })));
         match self.acceptor.prepare(key, ballot, now)? {
             PrepareReply::Promise(accepted) => {
-                self.on_promise(key, self.cfg.node, ballot, accepted, false, now, out)?
+                self.on_promise(key, self.cfg.node, ballot, accepted, false, now, wall, out)?
             }
             PrepareReply::Nack(promised) => self.on_nack(key, promised, now),
         }
@@ -358,6 +388,7 @@ impl<S: VoteStore> Paxos<S> {
         accepted: Option<AcceptedValue>,
         tiebreak: bool,
         now: Millis,
+        wall: WallMillis,
         out: &mut Vec<Out>,
     ) -> io::Result<()> {
         let quorum = self.quorum;
@@ -438,7 +469,7 @@ impl<S: VoteStore> Paxos<S> {
             ballot,
             value: value.clone(),
         })));
-        match self.acceptor.propose(key, ballot, &value, now)? {
+        match self.acceptor.propose(key, ballot, &value, now, wall)? {
             ProposeReply::Accepted => self.on_accepted(key, node, ballot, false, out),
             ProposeReply::Nack(promised) => self.on_nack(key, promised, now),
         }
@@ -506,7 +537,7 @@ impl<S: VoteStore> Paxos<S> {
     }
 
     /// A frame from another member.
-    pub fn handle(&mut self, frame: &Frame, now: Millis) -> io::Result<Vec<Out>> {
+    pub fn handle(&mut self, frame: &Frame, now: Millis, wall: WallMillis) -> io::Result<Vec<Out>> {
         let node = self.cfg.node;
         let mut out = Vec::new();
         match frame {
@@ -550,7 +581,10 @@ impl<S: VoteStore> Paxos<S> {
                     return Ok(out);
                 }
                 self.saw(&p.key, p.ballot.round);
-                let reply = match self.acceptor.propose(&p.key, p.ballot, &p.value, now)? {
+                let reply = match self
+                    .acceptor
+                    .propose(&p.key, p.ballot, &p.value, now, wall)?
+                {
                     ProposeReply::Accepted => Frame::Accepted(Accepted {
                         key: p.key.clone(),
                         ballot: p.ballot,
@@ -585,7 +619,7 @@ impl<S: VoteStore> Paxos<S> {
             {
                 let accepted = p.accepted.clone();
                 self.on_promise(
-                    &p.key, p.from, p.ballot, accepted, p.tiebreak, now, &mut out,
+                    &p.key, p.from, p.ballot, accepted, p.tiebreak, now, wall, &mut out,
                 )?;
             }
             Frame::Nack(n)
@@ -609,7 +643,7 @@ impl<S: VoteStore> Paxos<S> {
 
     /// The clock moved: retry rounds whose backoff ended, back off from rounds
     /// that timed out, and let lapsed leases go.
-    pub fn tick(&mut self, now: Millis) -> io::Result<Vec<Out>> {
+    pub fn tick(&mut self, now: Millis, wall: WallMillis) -> io::Result<Vec<Out>> {
         let mut out = Vec::new();
         let mut restart = Vec::new();
         let mut timed_out = Vec::new();
@@ -628,7 +662,7 @@ impl<S: VoteStore> Paxos<S> {
             self.backoff(&key, now);
         }
         for (key, goal) in restart {
-            self.prepare(&key, goal, now, &mut out)?;
+            self.prepare(&key, goal, now, wall, &mut out)?;
         }
         if self.next_lapse.is_some_and(|n| now >= n) {
             let lapsed: Vec<Vec<u8>> = self
@@ -713,10 +747,10 @@ impl<S: VoteStore> Paxos<S> {
         keys
     }
 
-    /// Every lease this member's acceptor still counts at `now`, by holder,
-    /// with the term it has left.
-    pub fn running_leases(&self, now: Millis) -> Vec<(u64, Duration)> {
-        self.acceptor.running_leases(now)
+    /// Every lease this member's acceptor still counts at `now`: key, holder
+    /// and the term it has left, in key order.
+    pub fn armed_leases(&self, now: Millis) -> Vec<ArmedLease> {
+        self.acceptor.armed_leases(now)
     }
 
     /// The leases this member holds at `now`.

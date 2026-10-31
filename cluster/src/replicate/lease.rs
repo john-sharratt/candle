@@ -82,7 +82,7 @@ impl Replicator {
         if !self.may_hold() {
             return false;
         }
-        let now = self.now();
+        let (now, wall) = (self.now(), self.wall());
         let quorum = self.quorum();
         let tiebreak = self.tiebreak_allowed();
         self.terms
@@ -93,7 +93,7 @@ impl Replicator {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
             p.allow_tiebreak(tiebreak);
-            p.acquire(key, ttl, now)
+            p.acquire(key, ttl, now, wall)
         };
         match outs {
             Ok(outs) => {

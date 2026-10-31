@@ -72,6 +72,7 @@ use super::upgrades::{Action, Below, UpgradeConfig, Upgrades};
 use super::worlds_view::{disconnected, worlds};
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
+use crate::consensus::WallMillis;
 use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
@@ -269,7 +270,7 @@ impl Hub {
         peers: usize,
         store: Box<dyn crate::consensus::votes::VoteStore>,
     ) -> std::io::Result<()> {
-        let opened = TieBreak::open(node, peers, store)?;
+        let opened = TieBreak::open(node, peers, store, WallMillis::now())?;
         *self.tiebreak.lock().unwrap_or_else(|e| e.into_inner()) = Some(opened);
         Ok(())
     }
@@ -788,7 +789,8 @@ impl Hub {
             let Some(tb) = guard.as_mut() else {
                 return;
             };
-            match tb.consider(app, frame) {
+            let (now, wall) = (tb.now(), WallMillis::now());
+            match tb.consider(app, frame, now, wall) {
                 Ok(reply) => reply,
                 Err(e) => {
                     tracing::error!(app, "tie-break vote failed: {e}");
@@ -1528,6 +1530,14 @@ impl Hub {
     /// Everything the status page shows (§12.2).
     pub fn status(&self, log_limit: usize) -> HubStatus {
         let now = now_ms();
+        // The tie-break's lock is never taken under the state's.
+        let tiebreak_leases = self
+            .tiebreak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|tb| tb.armed_leases(tb.now()))
+            .unwrap_or_default();
         let s = self.state();
         let mut members = Vec::new();
         for app in APPS {
@@ -1582,6 +1592,7 @@ impl Hub {
             traffic: self.traffic.view(now),
             upgrades: APPS.iter().map(|a| s.upgrades.view(a)).collect(),
             builds: s.held.view(),
+            tiebreak_leases,
             log: self.log.read(None, None, log_limit),
         }
     }

@@ -6,7 +6,11 @@ use std::time::Duration;
 use super::*;
 use crate::consensus::votes::MemoryVotes;
 
-/// Members, the frames in flight, and virtual time.
+/// The wall clock when the network's virtual time starts: 2026-10-26.
+const T0: u64 = 1_793_000_000_000;
+
+/// Members, the frames in flight, and virtual time — on every member's
+/// monotonic clock, and `T0` later on the wall clock.
 struct Net {
     members: Vec<Paxos<MemoryVotes>>,
     stores: Vec<MemoryVotes>,
@@ -29,6 +33,7 @@ impl Net {
                     Config::new(i as u64 + 1),
                     stores[i].clone(),
                     Millis(0),
+                    WallMillis(T0),
                     i as u64,
                 )
                 .unwrap();
@@ -49,6 +54,25 @@ impl Net {
 
     fn index(&self, node: u64) -> usize {
         node as usize - 1
+    }
+
+    /// The wall clock now.
+    fn wall(&self) -> WallMillis {
+        WallMillis(T0 + self.now.0)
+    }
+
+    /// Member `i` restarts now: a new engine on its vote store.
+    fn restart(&mut self, i: usize) {
+        let mut p = Paxos::open(
+            Config::new(i as u64 + 1),
+            self.stores[i].clone(),
+            self.now,
+            self.wall(),
+            99,
+        )
+        .unwrap();
+        p.set_quorum(self.members[i].quorum);
+        self.members[i] = p;
     }
 
     fn route(&mut self, from: usize, outs: Vec<Out>) {
@@ -83,7 +107,8 @@ impl Net {
     /// Deliver until nothing is in flight.
     fn settle(&mut self) {
         while let Some((to, frame)) = self.queue.pop_front() {
-            let outs = self.members[to].handle(&frame, self.now).unwrap();
+            let (now, wall) = (self.now, self.wall());
+            let outs = self.members[to].handle(&frame, now, wall).unwrap();
             self.route(to, outs);
         }
     }
@@ -94,7 +119,8 @@ impl Net {
         while self.now < end {
             self.now = self.now + Duration::from_millis(100);
             for i in 0..self.members.len() {
-                let outs = self.members[i].tick(self.now).unwrap();
+                let (now, wall) = (self.now, self.wall());
+                let outs = self.members[i].tick(now, wall).unwrap();
                 self.route(i, outs);
             }
             self.settle();
@@ -104,10 +130,10 @@ impl Net {
     fn act(
         &mut self,
         i: usize,
-        f: impl FnOnce(&mut Paxos<MemoryVotes>, Millis) -> io::Result<Vec<Out>>,
+        f: impl FnOnce(&mut Paxos<MemoryVotes>, Millis, WallMillis) -> io::Result<Vec<Out>>,
     ) {
-        let now = self.now;
-        let outs = f(&mut self.members[i], now).unwrap();
+        let (now, wall) = (self.now, self.wall());
+        let outs = f(&mut self.members[i], now, wall).unwrap();
         self.route(i, outs);
     }
 
@@ -129,7 +155,9 @@ impl Net {
 #[test]
 fn a_lone_proposer_decides_its_value() {
     let mut net = Net::new(3, 2);
-    net.act(0, |p, now| p.decide(b"gen/1", b"v1".to_vec(), now));
+    net.act(0, |p, now, wall| {
+        p.decide(b"gen/1", b"v1".to_vec(), now, wall)
+    });
     net.settle();
     assert_eq!(net.decided(b"gen/1"), vec![(0, b"v1".to_vec())]);
 }
@@ -142,8 +170,8 @@ fn duelling_proposers_end_with_one_decision() {
         for (i, m) in net.members.iter_mut().enumerate() {
             m.rng = StdRng::seed_from_u64(seed * 7 + i as u64);
         }
-        net.act(0, |p, now| p.decide(b"k", b"a".to_vec(), now));
-        net.act(1, |p, now| p.decide(b"k", b"b".to_vec(), now));
+        net.act(0, |p, now, wall| p.decide(b"k", b"a".to_vec(), now, wall));
+        net.act(1, |p, now, wall| p.decide(b"k", b"b".to_vec(), now, wall));
         net.settle();
         net.run_for(Duration::from_secs(20));
         let decided = net.decided(b"k");
@@ -168,8 +196,12 @@ fn a_duel_over_a_long_lease_settles_within_seconds() {
         for (i, m) in net.members.iter_mut().enumerate() {
             m.rng = StdRng::seed_from_u64(seed * 7 + i as u64);
         }
-        net.act(0, |p, now| p.acquire(b"upgrade/zend", term, now));
-        net.act(1, |p, now| p.acquire(b"upgrade/zend", term, now));
+        net.act(0, |p, now, wall| {
+            p.acquire(b"upgrade/zend", term, now, wall)
+        });
+        net.act(1, |p, now, wall| {
+            p.acquire(b"upgrade/zend", term, now, wall)
+        });
         net.settle();
         net.run_for(Duration::from_secs(10));
         let held: Vec<usize> = net
@@ -190,7 +222,9 @@ fn a_duel_over_a_long_lease_settles_within_seconds() {
 fn a_proposer_adopts_the_highest_accepted_value() {
     let mut net = Net::new(3, 2);
     // Member 1's proposal reaches only member 2 before member 1 is cut off.
-    net.act(0, |p, now| p.decide(b"k", b"first".to_vec(), now));
+    net.act(0, |p, now, wall| {
+        p.decide(b"k", b"first".to_vec(), now, wall)
+    });
     // Deliver the PREPAREs and their replies, then only the PROPOSE to member 2.
     let mut held = VecDeque::new();
     while let Some((to, frame)) = net.queue.pop_front() {
@@ -198,7 +232,8 @@ fn a_proposer_adopts_the_highest_accepted_value() {
             held.push_back((to, frame));
             continue;
         }
-        let outs = net.members[to].handle(&frame, net.now).unwrap();
+        let wall = net.wall();
+        let outs = net.members[to].handle(&frame, net.now, wall).unwrap();
         net.route(to, outs);
     }
     net.cut[0] = true;
@@ -211,7 +246,9 @@ fn a_proposer_adopts_the_highest_accepted_value() {
         .accepted
         .is_some());
     net.take_events();
-    net.act(2, |p, now| p.decide(b"k", b"second".to_vec(), now));
+    net.act(2, |p, now, wall| {
+        p.decide(b"k", b"second".to_vec(), now, wall)
+    });
     net.settle();
     assert_eq!(net.decided(b"k"), vec![(2, b"first".to_vec())]);
     drop(held);
@@ -224,7 +261,7 @@ fn a_doubled_reply_counts_once() {
     net.doubled = true;
     net.cut[3] = true;
     net.cut[4] = true;
-    net.act(0, |p, now| p.decide(b"k", b"v".to_vec(), now));
+    net.act(0, |p, now, wall| p.decide(b"k", b"v".to_vec(), now, wall));
     net.settle();
     // Members 1 and 2 answer, twice each: with member 1 itself that is three
     // distinct acceptors, a quorum.
@@ -235,7 +272,7 @@ fn a_doubled_reply_counts_once() {
     net.cut[2] = true;
     net.cut[3] = true;
     net.cut[4] = true;
-    net.act(0, |p, now| p.decide(b"k", b"v".to_vec(), now));
+    net.act(0, |p, now, wall| p.decide(b"k", b"v".to_vec(), now, wall));
     net.settle();
     assert!(
         net.decided(b"k").is_empty(),
@@ -250,7 +287,7 @@ fn a_rounds_voters_and_the_ballot_that_beat_it_are_reported() {
     let mut net = Net::new(3, 3);
     net.cut[1] = true;
     net.cut[2] = true;
-    net.act(0, |p, now| p.decide(b"k", b"v".to_vec(), now));
+    net.act(0, |p, now, wall| p.decide(b"k", b"v".to_vec(), now, wall));
     net.settle();
     let s = net.members[0].status(b"k", net.now);
     assert_eq!(s.round.map(|(_, phase)| phase), Some("preparing"));
@@ -266,7 +303,8 @@ fn a_rounds_voters_and_the_ballot_that_beat_it_are_reported() {
         tiebreak: false,
     });
     let now = net.now;
-    net.members[0].handle(&nack, now).unwrap();
+    let wall = net.wall();
+    net.members[0].handle(&nack, now, wall).unwrap();
     let s = net.members[0].status(b"k", net.now);
     assert_eq!(s.round.map(|(_, phase)| phase), Some("waiting"));
     assert_eq!(s.beaten_by, Some(higher));
@@ -282,7 +320,9 @@ fn one_member_of_two_decides_with_the_gateway_tiebreak() {
         member.allow_tiebreak(true);
     }
     net.cut[1] = true;
-    net.act(0, |p, now| p.decide(b"gen/1", b"v".to_vec(), now));
+    net.act(0, |p, now, wall| {
+        p.decide(b"gen/1", b"v".to_vec(), now, wall)
+    });
     net.settle();
     assert!(
         net.decided(b"gen/1").is_empty(),
@@ -299,7 +339,8 @@ fn one_member_of_two_decides_with_the_gateway_tiebreak() {
         reply_to: 1,
         tiebreak: true,
     });
-    let outs = net.members[0].handle(&promise, now).unwrap();
+    let wall = net.wall();
+    let outs = net.members[0].handle(&promise, now, wall).unwrap();
     assert!(
         outs.iter()
             .any(|o| matches!(o, Out::Broadcast(Frame::Propose(_)))),
@@ -312,7 +353,7 @@ fn one_member_of_two_decides_with_the_gateway_tiebreak() {
         reply_to: 1,
         tiebreak: true,
     });
-    let outs = net.members[0].handle(&accepted, now).unwrap();
+    let outs = net.members[0].handle(&accepted, now, wall).unwrap();
     assert!(
         outs.iter().any(|o| matches!(
             o,
@@ -324,10 +365,12 @@ fn one_member_of_two_decides_with_the_gateway_tiebreak() {
     // A group of three ignores the same vote: quorum two there is two members.
     let mut net = Net::new(1, 3);
     net.members[0].allow_tiebreak(true);
-    net.act(0, |p, now| p.decide(b"gen/1", b"v".to_vec(), now));
+    net.act(0, |p, now, wall| {
+        p.decide(b"gen/1", b"v".to_vec(), now, wall)
+    });
     net.settle();
     let ballot = net.members[0].status(b"gen/1", net.now).round.unwrap().0;
-    let now = net.now;
+    let (now, wall) = (net.now, net.wall());
     let outs = net.members[0]
         .handle(
             &Frame::Promise(Promise {
@@ -339,6 +382,7 @@ fn one_member_of_two_decides_with_the_gateway_tiebreak() {
                 tiebreak: true,
             }),
             now,
+            wall,
         )
         .unwrap();
     assert!(
@@ -352,8 +396,8 @@ fn a_member_alone_in_a_group_of_three_never_holds_a_lease() {
     let mut net = Net::new(3, 2);
     net.cut[1] = true;
     net.cut[2] = true;
-    net.act(0, |p, now| {
-        p.acquire(b"world/w", Duration::from_secs(10), now)
+    net.act(0, |p, now, wall| {
+        p.acquire(b"world/w", Duration::from_secs(10), now, wall)
     });
     net.run_for(Duration::from_secs(60));
     assert!(!net
@@ -373,11 +417,11 @@ fn asking_again_while_a_round_runs_starts_no_new_round() {
     net.cut[2] = true;
     let key = b"git/candle";
     let ttl = Duration::from_secs(120);
-    net.act(0, |p, now| p.acquire(key, ttl, now));
+    net.act(0, |p, now, wall| p.acquire(key, ttl, now, wall));
     let ballot = net.members[0].status(key, net.now).round.unwrap().0;
     for _ in 0..5 {
-        let now = net.now;
-        let outs = net.members[0].acquire(key, ttl, now).unwrap();
+        let (now, wall) = (net.now, net.wall());
+        let outs = net.members[0].acquire(key, ttl, now, wall).unwrap();
         assert!(outs.is_empty(), "a round is already running: {outs:?}");
     }
     assert_eq!(net.members[0].status(key, net.now).round.unwrap().0, ballot);
@@ -390,12 +434,12 @@ fn a_held_lease_asked_for_again_is_renewed() {
     let mut net = Net::new(1, 1);
     let key = b"git/candle";
     let ttl = Duration::from_secs(120);
-    net.act(0, |p, now| p.acquire(key, ttl, now));
+    net.act(0, |p, now, wall| p.acquire(key, ttl, now, wall));
     net.settle();
     assert!(net.members[0].holds(key, net.now));
     assert!(!net.members[0].proposing(key));
-    let now = net.now;
-    let outs = net.members[0].acquire(key, ttl, now).unwrap();
+    let (now, wall) = (net.now, net.wall());
+    let outs = net.members[0].acquire(key, ttl, now, wall).unwrap();
     assert!(
         outs.iter()
             .any(|o| matches!(o, Out::Broadcast(Frame::Prepare(_)))),
@@ -420,17 +464,17 @@ fn busy(m: usize, holder: u64) -> (usize, Out) {
 fn leases_are_held_renewed_refused_and_taken_over() {
     let ttl = Duration::from_secs(10);
     let mut net = Net::new(3, 2);
-    net.act(0, |p, now| p.acquire(b"w", ttl, now));
+    net.act(0, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert_eq!(net.take_events(), vec![held(0, 8_000)]);
 
-    net.act(1, |p, now| p.acquire(b"w", ttl, now));
+    net.act(1, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert_eq!(net.take_events(), vec![busy(1, 1)]);
 
     // Renewal at 5 s: the holder's own lease does not stop it.
     net.run_for(Duration::from_secs(5));
-    net.act(0, |p, now| p.acquire(b"w", ttl, now));
+    net.act(0, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert_eq!(net.take_events(), vec![held(0, 13_000)]);
 
@@ -440,13 +484,13 @@ fn leases_are_held_renewed_refused_and_taken_over() {
     assert!(!net.members[0].holds(b"w", net.now));
     let lost = (0, Out::LeaseLost { key: b"w".to_vec() });
     assert!(net.take_events().contains(&lost));
-    net.act(1, |p, now| p.acquire(b"w", ttl, now));
+    net.act(1, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert_eq!(net.take_events(), vec![busy(1, 1)]);
 
     // At 15 s every acceptor's term has run out.
     net.run_for(Duration::from_secs(1));
-    net.act(1, |p, now| p.acquire(b"w", ttl, now));
+    net.act(1, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert!(net.members[1].holds(b"w", net.now));
 }
@@ -455,45 +499,57 @@ fn leases_are_held_renewed_refused_and_taken_over() {
 fn a_released_lease_is_free_at_once() {
     let ttl = Duration::from_secs(30);
     let mut net = Net::new(3, 2);
-    net.act(0, |p, now| p.acquire(b"w", ttl, now));
+    net.act(0, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
-    net.act(0, |p, now| p.release(b"w", 42, now));
+    net.act(0, |p, now, _| p.release(b"w", 42, now));
     net.settle();
     assert!(!net.members[0].holds(b"w", net.now));
     net.take_events();
-    net.act(1, |p, now| p.acquire(b"w", ttl, now));
+    net.act(1, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
     assert!(net.members[1].holds(b"w", net.now));
 }
 
-/// A restarted acceptor keeps its votes, and counts an accepted lease for a
-/// full term from the restart.
+/// A restarted acceptor keeps its votes, and counts an accepted lease for
+/// what is left of it by the wall clock: restarts neither drop it nor extend
+/// it past the end recorded at acceptance.
 #[test]
-fn a_restarted_member_keeps_its_votes() {
+fn a_restarted_member_counts_what_is_left_of_a_lease() {
     let ttl = Duration::from_secs(10);
     let mut net = Net::new(3, 2);
-    net.act(0, |p, now| p.acquire(b"w", ttl, now));
-    net.settle();
-    // Member 2 restarts 9 s later on a fresh clock reading.
-    net.run_for(Duration::from_secs(9));
-    let mut restarted = Paxos::open(Config::new(2), net.stores[1].clone(), net.now, 99).unwrap();
-    restarted.set_quorum(2);
-    net.members[1] = restarted;
-    // Member 3 is cut off, so a quorum needs member 2, which still counts
-    // member 1's lease for 10 s from its restart.
+    // Member 3 is cut off: only members 1 and 2 accept member 1's lease.
     net.cut[2] = true;
-    net.run_for(Duration::from_secs(3));
-    net.take_events();
-    net.act(1, |p, now| p.acquire(b"w", ttl, now));
+    net.act(0, |p, now, wall| p.acquire(b"w", ttl, now, wall));
     net.settle();
-    assert_eq!(net.take_events(), vec![busy(1, 1)]);
+    assert_eq!(net.take_events(), vec![held(0, 8_000)]);
+    // Member 2 restarts at 5 s and again at 9 s.
+    net.run_for(Duration::from_secs(5));
+    net.restart(1);
+    net.run_for(Duration::from_secs(4));
+    net.restart(1);
+    // The holder is cut off now, so a quorum for member 3 needs member 2,
+    // which still counts the lease to 10 s.
+    net.cut[0] = true;
+    net.cut[2] = false;
+    net.take_events();
+    net.act(2, |p, now, wall| p.acquire(b"w", ttl, now, wall));
+    net.settle();
+    assert_eq!(net.take_events(), vec![busy(2, 1)]);
+    // At 10 s the term has run out on member 2, two restarts or not: a full
+    // term from the last restart would have kept it busy to 19 s.
+    net.run_for(Duration::from_secs(1));
+    net.act(2, |p, now, wall| p.acquire(b"w", ttl, now, wall));
+    net.settle();
+    assert!(net.members[2].holds(b"w", net.now));
 }
 
 /// A learned decision answers every later round with the same value.
 #[test]
 fn a_learned_decision_is_what_every_later_round_decides() {
     let mut net = Net::new(3, 2);
-    net.act(0, |p, now| p.decide(b"gen/7", b"x".to_vec(), now));
+    net.act(0, |p, now, wall| {
+        p.decide(b"gen/7", b"x".to_vec(), now, wall)
+    });
     net.settle();
     for m in &mut net.members {
         m.learn(b"gen/7", b"x").unwrap();
@@ -505,7 +561,9 @@ fn a_learned_decision_is_what_every_later_round_decides() {
         "slots freed"
     );
     net.take_events();
-    net.act(2, |p, now| p.decide(b"gen/7", b"y".to_vec(), now));
+    net.act(2, |p, now, wall| {
+        p.decide(b"gen/7", b"y".to_vec(), now, wall)
+    });
     net.settle();
     assert_eq!(net.decided(b"gen/7"), vec![(2, b"x".to_vec())]);
 }
