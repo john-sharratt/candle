@@ -31,8 +31,20 @@ use crate::tree::{Journal, Tree};
 /// boundary (`docs/mcp_user_context.md` §2.5).
 pub const CONVERSATION_GAP_SECS: i64 = 30 * 60;
 
-/// A dirty journal is rebuilt once its window has been quiet this long…
+/// A dirty journal is rebuilt once what its summary reads has been quiet this
+/// long…
 pub const QUIET_SECS: i64 = 30;
+
+/// …or this long, for a journal whose summary reads its children's.
+///
+/// **A parent waits for its children to settle.** Every child's rebuilt
+/// summary dirties its parent, and a master has almost no lines of its own, so
+/// timed by its window alone it was rebuilt the moment any child was: on
+/// 2026-10-31 `@zen` was rewritten nine times in eighty minutes, three of them
+/// within five, each a new `journal.yaml` that zend's code reading read and
+/// calibrated again. Timed from its newest child's rebuild, a parent is
+/// rebuilt once per lull, after the children it reads have finished.
+pub const PARENT_QUIET_SECS: i64 = 10 * 60;
 
 /// …or once this many lines are newer than its summary, whichever is first.
 pub const NEW_LINES: usize = 20;
@@ -98,9 +110,14 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
         }
     }
     let summaries = dirty(tree).into_iter().filter_map(|d| {
+        let settle = if d.reads_children {
+            PARENT_QUIET_SECS
+        } else {
+            QUIET_SECS
+        };
         let quiet = d
-            .last_line
-            .is_none_or(|t| now.secs() - t.secs() >= QUIET_SECS);
+            .last_change
+            .is_none_or(|t| now.secs() - t.secs() >= settle);
         (quiet || d.new_lines >= NEW_LINES).then_some(Job::Summary { path: d.path })
     });
     closes.into_iter().chain(folds).chain(summaries).collect()
@@ -141,6 +158,51 @@ mod tests {
             matches!(&jobs[..], [Job::Summary { path, .. }] if path.show() == "@zen/topics"),
             "{jobs:?}"
         );
+    }
+
+    /// **A master waits for its children to settle**: a child's rebuilt
+    /// summary dirties it at once, and it is rebuilt only once the newest child
+    /// rebuild is [`PARENT_QUIET_SECS`] old — not [`QUIET_SECS`] after it, which
+    /// rewrote `@zen` once per child.
+    #[test]
+    fn a_master_is_rebuilt_once_its_children_have_settled() {
+        use crate::files::{Meta, Sentence, Summary};
+        use crate::tree::fingerprint::fingerprint;
+
+        let mut t = zen();
+        let t0 = at("2026-10-30T12:00:00Z");
+        noted(&mut t, "topics", "Builder starts Monday.", t0);
+        let built = t0.plus(QUIET_SECS);
+        let topics = t.get_mut(&p("topics")).unwrap();
+        let over = fingerprint(topics);
+        topics
+            .meta
+            .get_or_insert_with(|| Meta::new("topics", None, t0))
+            .summary = Some(Summary {
+            over,
+            built,
+            lines: 1,
+            children: 0,
+            stale: false,
+            digest: None,
+            sentences: vec![Sentence {
+                text: "The builder starts on Monday.".into(),
+                cites: vec![],
+            }],
+        });
+        let masters = |now: Stamp| -> Vec<String> {
+            due(&t, now)
+                .iter()
+                .filter(|j| matches!(j, Job::Summary { .. }))
+                .map(|j| j.path().show())
+                .collect()
+        };
+        assert_eq!(masters(built.plus(QUIET_SECS)), Vec::<String>::new());
+        assert_eq!(
+            masters(built.plus(PARENT_QUIET_SECS - 1)),
+            Vec::<String>::new()
+        );
+        assert_eq!(masters(built.plus(PARENT_QUIET_SECS)), ["@zen"]);
     }
 
     #[test]

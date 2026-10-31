@@ -12,6 +12,14 @@
 //! A member that cannot propose — it is not joined — reads the unit itself.
 //! Two such members can still both read it, and the lower version stamp
 //! keeps the unit, as it does for any pair of readings that both finish.
+//!
+//! **A unit's calibration is leased the same way**, under `calibrate/<marker>`
+//! ([`share_calibration`]). Every member's calibration pass plans the same
+//! uncalibrated units from the same replicated substrate, and before this each
+//! calibrated all of them: on 2026-10-31 BlackWorld and WhiteWorld both took
+//! the same fifteen code_reading units, and WhiteWorld's copy — 24 questions a
+//! unit, each in its own conversation — filled its card while BlackWorld's had
+//! already sealed. The calibration arrives with replication like the reading.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,16 +47,28 @@ const APPLY_WAIT: Duration = Duration::from_secs(5);
 
 const PREFIX: &[u8] = b"ingest/";
 
+const CALIBRATE_PREFIX: &[u8] = b"calibrate/";
+
 /// The lease key for a content key.
 pub fn lease_key(content_key: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(PREFIX.len() + content_key.len());
-    key.extend_from_slice(PREFIX);
-    key.extend_from_slice(content_key.as_bytes());
+    prefixed(PREFIX, content_key)
+}
+
+/// The lease key for a unit's calibration, by its calibration marker.
+pub fn calibration_key(marker: &str) -> Vec<u8> {
+    prefixed(CALIBRATE_PREFIX, marker)
+}
+
+fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + name.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(name.as_bytes());
     key
 }
 
-fn is_ingest(key: &[u8]) -> bool {
-    key.starts_with(PREFIX)
+/// Whether `key` is one of this module's: a reading's or a calibration's.
+fn is_unit_lease(key: &[u8]) -> bool {
+    key.starts_with(PREFIX) || key.starts_with(CALIBRATE_PREFIX)
 }
 
 /// What this member should do with a unit it found unread.
@@ -132,15 +152,25 @@ pub fn install(replicator: Arc<Replicator>) {
 
 /// Lease `content_key`. [`Share::Mine`] when this member should read the unit.
 pub fn share(content_key: &str) -> Share {
+    share_key(lease_key(content_key))
+}
+
+/// Lease the calibration `marker` names. [`Share::Mine`] when this member
+/// should calibrate the unit; on a [`Guard::recheck`] the caller looks again
+/// for a calibration carrying the marker before it asks for one.
+pub fn share_calibration(marker: &str) -> Share {
+    share_key(calibration_key(marker))
+}
+
+fn share_key(key: Vec<u8>) -> Share {
     let seat = SEAT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match seat {
-        Some(seat) => claim(seat, content_key),
+        Some(seat) => claim(seat, key),
         None => Share::Mine(Guard::local()),
     }
 }
 
-fn claim(seat: Arc<dyn LeaseSeat>, content_key: &str) -> Share {
-    let key = lease_key(content_key);
+fn claim(seat: Arc<dyn LeaseSeat>, key: Vec<u8>) -> Share {
     let mut events = seat.subscribe();
     if !seat.try_acquire(&key) {
         return Share::Mine(Guard::local());
@@ -236,7 +266,7 @@ fn take_release(key: &[u8]) -> Option<Handback> {
 }
 
 fn note_release(key: Vec<u8>, by: u64, through: u64) {
-    if !is_ingest(&key) {
+    if !is_unit_lease(&key) {
         return;
     }
     handbacks()
@@ -370,12 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn calibration_key_names_the_marker_apart_from_the_reading() {
+        assert_eq!(
+            calibration_key("code_reading:candle/zend/src/lib.rs@abc"),
+            b"calibrate/code_reading:candle/zend/src/lib.rs@abc".to_vec()
+        );
+        assert_ne!(calibration_key("x@1"), lease_key("x@1"));
+        assert!(is_unit_lease(&calibration_key("x@1")));
+        assert!(is_unit_lease(&lease_key("x@1")));
+        assert!(!is_unit_lease(b"upgrade/zend"));
+    }
+
+    #[test]
     fn one_member_reads_a_unit_both_found() {
         let held = Arc::new(Mutex::new(HashMap::new()));
         let a = Fake::pair(1, Arc::clone(&held));
         let b = Fake::pair(2, Arc::clone(&held));
-        let key = "candle/src/main.rs@111";
-        let mine = claim(a, key);
+        let key = lease_key("candle/src/main.rs@111");
+        let mine = claim(a, key.clone());
         let Share::Mine(guard) = mine else {
             panic!("the first member should read the unit");
         };
@@ -385,13 +427,50 @@ mod tests {
         assert!(held.lock().unwrap().is_empty());
     }
 
+    /// **One member calibrates a unit every member's pass found**, and the
+    /// unit's reading lease is a different lease: calibrating it does not keep
+    /// another member from reading a new version of the file.
+    #[test]
+    fn one_member_calibrates_a_unit_both_passes_found() {
+        let held = Arc::new(Mutex::new(HashMap::new()));
+        let a = Fake::pair(1, Arc::clone(&held));
+        let b = Fake::pair(2, Arc::clone(&held));
+        let marker = "code_reading:candle/candle-conversation/src/substrate.rs@333";
+        let Share::Mine(calibrating) = claim(
+            Arc::clone(&a) as Arc<dyn LeaseSeat>,
+            calibration_key(marker),
+        ) else {
+            panic!("the first pass calibrates the unit");
+        };
+        assert!(matches!(
+            claim(
+                Arc::clone(&b) as Arc<dyn LeaseSeat>,
+                calibration_key(marker)
+            ),
+            Share::Theirs
+        ));
+        assert!(matches!(
+            claim(Arc::clone(&b) as Arc<dyn LeaseSeat>, lease_key(marker)),
+            Share::Mine(_)
+        ));
+        drop(calibrating);
+        *b.applied.lock().unwrap() = 7;
+        let Share::Mine(next) = claim(b, calibration_key(marker)) else {
+            panic!("a calibration handed back is free");
+        };
+        assert!(
+            next.recheck(),
+            "the next holder looks for the calibration first"
+        );
+    }
+
     #[test]
     fn a_handed_back_unit_is_taken_after_its_writes_apply() {
         let held = Arc::new(Mutex::new(HashMap::new()));
         let a = Fake::pair(1, Arc::clone(&held));
         let b = Fake::pair(2, held);
-        let key = "repo/dir@222";
-        let Share::Mine(guard) = claim(Arc::clone(&a) as Arc<dyn LeaseSeat>, key) else {
+        let key = lease_key("repo/dir@222");
+        let Share::Mine(guard) = claim(Arc::clone(&a) as Arc<dyn LeaseSeat>, key.clone()) else {
             panic!("first holder");
         };
         drop(guard);
@@ -413,7 +492,7 @@ mod tests {
             applied: Mutex::new(0),
             tx: a.tx.clone(),
         });
-        let Share::Mine(guard) = claim(quiet, "local-only") else {
+        let Share::Mine(guard) = claim(quiet, lease_key("local-only")) else {
             panic!("a cut-off member still reads");
         };
         assert!(!guard.recheck());
