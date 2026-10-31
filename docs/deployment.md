@@ -70,6 +70,23 @@ not identities.
 |---|---|---|---|
 | `192.168.0.5` | BlackWorld | web, motherd, keep, cf-ddns | `D:\prog\candle` |
 | `192.168.0.6` | — | nothing — its standalone npcd was stopped on 2026-10-12, to be rebuilt as a member | the checkout `/up` is run from; its mind is `D:\prog\mind` |
+| `192.168.0.237` | AlienWorld (the laptop) | keep, and under it `tokera-agent`: the cluster's standby agent. No motherd since 2026-10-25 | `C:\Users\johna\prog\candle`; the agent's own checkouts under `C:\Users\johna\prog\agent` |
+
+### AlienWorld's standby agent
+
+The laptop runs `tokera-agent` alone, under keep (`C:\Users\johna\prog\keep-local.yaml`),
+on `motherd/agent.laptop.yaml`. That config names 2 slots and the agent's own checkouts,
+`candle`, `battle-cities`, `battle-mind` and `journals`, cloned under
+`C:\Users\johna\prog\agent`, named as blackworld's agent names them. A job fetches and
+resets its checkout, so they are never the working trees under `C:\Users\johna\prog`.
+The gateway's `standby_agents: ["alienworld"]` (`web/web.yaml`) makes it a spare: it is
+given a job only when no other agent can run it, or when the job names it
+(`repo_job_start {node: "alienworld"}`; `docs/replicated_substrate.md` §11.3). keep
+runs from the scheduled task `\keep`, as on blackworld, with its supervisor at
+`C:\Users\johna\AppData\Local\keep\supervise.ps1`. `register-task.ps1` beside it
+registers the task, and is run once from an elevated session. motherd is not in
+keep's config here, because a keep restart starts every listed service and a hold does
+not survive one.
 
 ## Services
 
