@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use super::inbound::{hear, Heard};
-use super::online::Online;
 use super::told::Told;
-use super::Rejected;
 use crate::api::Authored;
+use crate::discord::online::Online;
+use crate::discord::rejected::Rejected;
 
 /// Hear what `bot`'s DMs missed; what became of each message heard.
 pub async fn fetch(

@@ -75,6 +75,21 @@ pub enum WorldOp {
     Cancel { npc: u64 },
     /// A person speaks on the world's open channel.
     Channel { from: String, text: String },
+    /// Somebody wrote in Discord channel `channel` of a server character
+    /// `npc`'s bot is in: said on the thread that mirrors it, its author
+    /// brought onto the thread on their first message
+    /// (`docs/npcd_discord.md` §3.4).
+    ChannelMessage {
+        npc: u64,
+        channel: u64,
+        from: String,
+        text: String,
+        origin: Option<Origin>,
+    },
+    /// Something the character is told happened to it — its bot added to a
+    /// Discord server, or removed from one — delivered as a description that
+    /// wakes it.
+    Notice { npc: u64, text: String },
     /// A person leaves words on something in the world.
     Posting {
         at: String,
@@ -210,5 +225,47 @@ mod tests {
             .unwrap(),
             json!({"op": "hand_back", "npc": 3, "through": 40})
         );
+    }
+
+    /// **A server channel's message and a notice travel as these**, exactly.
+    #[test]
+    fn a_channel_message_and_a_notice_travel_as_tagged_json() {
+        let said = WorldOp::ChannelMessage {
+            npc: 9,
+            channel: 610,
+            from: "Wren (@wren)".into(),
+            text: "hi all".into(),
+            origin: Some(Origin::Discord {
+                message: 901,
+                channel: 610,
+            }),
+        };
+        let wire = serde_json::to_value(&said).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "op": "channel_message",
+                "npc": 9,
+                "channel": 610,
+                "from": "Wren (@wren)",
+                "text": "hi all",
+                "origin": {"kind": "discord", "message": 901, "channel": 610},
+            })
+        );
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), said);
+        let told = WorldOp::Notice {
+            npc: 9,
+            text: "You were removed from the Discord server zenworld.".into(),
+        };
+        let wire = serde_json::to_value(&told).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "op": "notice",
+                "npc": 9,
+                "text": "You were removed from the Discord server zenworld.",
+            })
+        );
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), told);
     }
 }

@@ -26,6 +26,14 @@ pub struct DiscordMessage {
     /// The webhook that posted it, for a webhook's message.
     #[serde(default, deserialize_with = "maybe_snowflake")]
     pub webhook_id: Option<u64>,
+    /// The author as a member of the server, for a server's message: what
+    /// the server calls them.
+    #[serde(default)]
+    pub member: Option<Member>,
+    /// Everybody the message mentions, so a `<@id>` in it can be written out
+    /// by name.
+    #[serde(default)]
+    pub mentions: Vec<Mentioned>,
 }
 
 /// Who wrote a message.
@@ -34,9 +42,45 @@ pub struct Author {
     #[serde(deserialize_with = "snowflake")]
     pub id: u64,
     pub username: String,
+    /// The name they chose to be shown by, across Discord.
+    #[serde(default)]
+    pub global_name: Option<String>,
     /// Absent on a person's account, which is the same as `false`.
     #[serde(default)]
     pub bot: bool,
+}
+
+/// Somebody as a member of one server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Member {
+    /// Their nickname in the server, when they have one.
+    #[serde(default)]
+    pub nick: Option<String>,
+}
+
+/// A user a message mentions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Mentioned {
+    #[serde(deserialize_with = "snowflake")]
+    pub id: u64,
+    pub username: String,
+    #[serde(default)]
+    pub global_name: Option<String>,
+    /// Them as a member of the server the message was written in.
+    #[serde(default)]
+    pub member: Option<Member>,
+}
+
+/// What a server shows somebody as: their nickname there, else the name
+/// they chose across Discord, else their username.
+pub fn display_name(member: Option<&Member>, global_name: Option<&str>, username: &str) -> String {
+    member
+        .and_then(|m| m.nick.as_deref())
+        .or(global_name)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(username)
+        .to_string()
 }
 
 /// A file attached to a message.
@@ -81,7 +125,7 @@ pub fn snowflake<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
 }
 
 /// A snowflake that may be absent or `null`.
-fn maybe_snowflake<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+pub fn maybe_snowflake<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     match Option::<String>::deserialize(d)? {
         None => Ok(None),
         Some(s) => s
@@ -120,6 +164,7 @@ mod tests {
                 author: Author {
                     id: 1_300_000_000_000_000_013,
                     username: "wren".into(),
+                    global_name: Some("Wren".into()),
                     bot: false,
                 },
                 content: " hello there ".into(),
@@ -127,6 +172,8 @@ mod tests {
                     url: "https://cdn.discordapp.com/a/b.png".into()
                 }],
                 webhook_id: None,
+                member: None,
+                mentions: vec![],
             }
         );
         assert_eq!(
@@ -161,5 +208,61 @@ mod tests {
             "id": "x1", "channel_id": "2", "author": {"id": "5", "username": "a"},
         }))
         .is_err());
+    }
+
+    /// **A server message carries its author as a member and who it
+    /// mentions**, as Discord sends them.
+    #[test]
+    fn a_server_message_reads_its_member_and_mentions() {
+        let m: DiscordMessage = serde_json::from_value(json!({
+            "id": "1", "channel_id": "2", "guild_id": "3",
+            "author": {"id": "5", "username": "wren", "global_name": null},
+            "member": {"nick": "Wrennie", "roles": []},
+            "content": "<@222> hi <@!6>",
+            "mentions": [
+                {"id": "222", "username": "Zen", "bot": true},
+                {"id": "6", "username": "kit", "global_name": "Kit", "member": {"nick": null}},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            m.member,
+            Some(Member {
+                nick: Some("Wrennie".into())
+            })
+        );
+        assert_eq!(
+            m.mentions,
+            [
+                Mentioned {
+                    id: 222,
+                    username: "Zen".into(),
+                    global_name: None,
+                    member: None,
+                },
+                Mentioned {
+                    id: 6,
+                    username: "kit".into(),
+                    global_name: Some("Kit".into()),
+                    member: Some(Member { nick: None }),
+                },
+            ]
+        );
+    }
+
+    /// **A server shows its nickname first, then the global name, then the
+    /// username**; a blank one is no name.
+    #[test]
+    fn a_display_name_is_the_nick_then_the_global_name_then_the_username() {
+        let nick = Member {
+            nick: Some("Wrennie".into()),
+        };
+        assert_eq!(display_name(Some(&nick), Some("Wren"), "wren"), "Wrennie");
+        assert_eq!(display_name(None, Some("Wren"), "wren"), "Wren");
+        assert_eq!(
+            display_name(Some(&Member { nick: None }), None, "wren"),
+            "wren"
+        );
+        assert_eq!(display_name(None, Some("  "), "wren"), "wren");
     }
 }

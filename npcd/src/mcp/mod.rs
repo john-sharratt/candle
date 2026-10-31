@@ -27,12 +27,17 @@
 //! | [`message_read`] | `bot_message_read` — the caller's thread with it |
 //! | [`channel_read`] | `bot_channel_read` — a world's channel |
 //! | [`channel_post`] | `bot_channel_post` — speak on a world's channel |
+//! | [`discord_read`] | `bot_discord_read` — what a bot's Discord bridge has done |
+//! | [`thread_read`] | `bot_thread_read` — a bot's handset threads, and one's messages |
 //! | [`image`] | `image_generate` — draw a picture, answered as an image and a link to the file |
 //! | [`image_edit`] | `image_edit` — change a picture by a prompt, answered the same way |
 //! | [`image_upload`] | `image_upload` — a link the user's own picture is sent to, for `image_edit` |
 //!
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer,
 //! [`view`] words a mission, and [`edit_mode`] is `image_edit`'s modes.
+//! `bot_discord_read` and `bot_thread_read` read a bot's insides rather than
+//! calling a route, so they make their bar themselves: the bot's owner, or an
+//! admin ([`owned`]).
 //!
 //! `image_generate` and `image_upload` act on nothing stored, so like
 //! `bot_list` they name no subject and go to the best member. `image_edit`
@@ -62,6 +67,7 @@ pub mod args;
 pub mod cancel;
 pub mod channel_post;
 pub mod channel_read;
+pub mod discord_read;
 pub mod edit_mode;
 pub mod give;
 pub mod image;
@@ -71,8 +77,10 @@ pub mod list;
 pub mod message_read;
 pub mod message_send;
 pub mod mission_read;
+pub mod owned;
 pub mod route;
 pub mod step;
+pub mod thread_read;
 pub mod view;
 
 /// What the server is, plainly: it manages bots.
@@ -174,6 +182,8 @@ pub fn definitions() -> Value {
         message_read::Thread::definition(),
         channel_read::Read::definition(),
         channel_post::Post::definition(),
+        discord_read::DiscordRead::definition(),
+        thread_read::ThreadRead::definition(),
         image::Generate::definition(),
         image_edit::Edit::definition(),
         image_upload::Upload::definition(),
@@ -192,6 +202,8 @@ pub async fn call(s: &Arc<Authored>, headers: &HeaderMap, name: &str, args: &Val
         message_read::Thread::NAME => message_read::Thread::call(s, headers, args).await,
         channel_read::Read::NAME => channel_read::Read::call(s, headers, args).await,
         channel_post::Post::NAME => channel_post::Post::call(s, headers, args).await,
+        discord_read::DiscordRead::NAME => discord_read::DiscordRead::call(s, headers, args).await,
+        thread_read::ThreadRead::NAME => thread_read::ThreadRead::call(s, headers, args).await,
         image::Generate::NAME => image::Generate::call(s, headers, args).await,
         image_edit::Edit::NAME => image_edit::Edit::call(s, headers, args).await,
         image_upload::Upload::NAME => image_upload::Upload::call(s, headers, args).await,
@@ -297,6 +309,8 @@ mod tests {
                 "bot_message_read",
                 "bot_channel_read",
                 "bot_channel_post",
+                "bot_discord_read",
+                "bot_thread_read",
                 "image_generate",
                 "image_edit",
                 "image_upload"

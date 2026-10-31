@@ -52,7 +52,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 
 use candle::cuda_backend::kernels::simple::rows_scatter::{
-    run_rows_scatter, ROWS_SCATTER_INLINE_MAX, ROWS_SCATTER_WORDS,
+    run_rows_scatter, status_error, ROWS_SCATTER_INLINE_MAX, ROWS_SCATTER_WORDS,
 };
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{CudaDevice, Result};
@@ -255,8 +255,8 @@ fn flush_pending(generation: &Generation) -> Result<()> {
             stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
-    if status != 0 {
-        candle::bail!("slot upload batch: the scatter launch failed with CUDA error {status}");
+    if let Some(why) = status_error(status, runs.len(), max_words as i32, 1) {
+        candle::bail!("slot upload batch: {why}");
     }
     Ok(())
 }

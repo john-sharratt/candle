@@ -923,9 +923,16 @@ impl Scheduler {
                 self.retry_step(&seq_ids, "decode draft", &e);
                 return;
             }
+            // A draft is a proposal: the walk rolled back what it wrote, and
+            // the step needs none of it. Every turn in the wave rides as a
+            // plain row; a fault that is not the draft's fails the forward,
+            // which is where a turn's own bytes are at stake.
             Err(e) => {
-                self.fail_all_decodes(&seq_ids, &format!("decode draft failed: {e}"));
-                return;
+                tracing::error!(
+                    sequences = seq_ids.len(),
+                    "decode draft failed, so the step runs without one: {e}"
+                );
+                vec![Vec::new(); seq_ids.len()]
             }
         };
         if drafts.len() != seq_ids.len() {

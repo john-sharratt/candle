@@ -1624,6 +1624,8 @@ fn a_commands_flags_are_written_in_their_natural_tokens() {
         r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "agent", "--lib", "--", "--nocapture"]}}"#,
         r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "node", "args": ["./scripts/report.js", "-v"]}}"#,
         r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": []}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "node", "args": ["-e", "console.log(1)"]}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "node", "args": ["-e", "const fs = require('fs'); console.log(fs.readdirSync('.').join(\" \"));"]}}"#,
     ] {
         let target = format!("{MARKER}\n{call}\n</tool_call>{TURN_CLOSE}");
         if let Err(e) = drive_natural_strict(Arc::clone(&tree), &tok, &target) {

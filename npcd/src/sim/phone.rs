@@ -331,6 +331,12 @@ impl Thread {
         self.messages.get(from..).unwrap_or_default()
     }
 
+    /// Whether the message at `index` of [`Thread::messages`] has been handed
+    /// to `who`'s mind.
+    pub fn delivered_to(&self, who: &str, index: usize) -> bool {
+        index < self.delivered.get(who).copied().unwrap_or(0)
+    }
+
     /// Mark everything said so far as handed to this member's mind.
     pub fn mark_delivered(&mut self, who: &str) {
         self.delivered.insert(who.to_string(), self.messages.len());
@@ -590,6 +596,88 @@ impl Threads {
         id
     }
 
+    /// Open a named group that stands as part of the world for as long as
+    /// what it mirrors does — a Discord channel a character's bot is in
+    /// (`docs/npcd_discord.md` §3.4) — with `members` on it.
+    ///
+    /// **Permanent, so it is not evicted** under [`KEEP_THREADS`]: a server
+    /// of forty quiet channels would otherwise collect the character's own
+    /// conversations out from under it, or be collected itself while the
+    /// channel still stands. What bounds these is what they mirror, not the
+    /// world's count; [`Threads::close`] makes one ordinary again.
+    pub fn open_standing(&mut self, name: &str, members: &[String]) -> String {
+        self.next += 1;
+        let touched = self.now();
+        let id = format!("th{}", self.next);
+        self.threads.insert(
+            id.clone(),
+            Thread {
+                id: id.clone(),
+                name: name.to_string(),
+                members: members.to_vec(),
+                messages: Vec::new(),
+                open: true,
+                named: true,
+                permanent: true,
+                joined_at: BTreeMap::new(),
+                next_seq: FIRST_SEQ,
+                delivered: BTreeMap::new(),
+                touched,
+            },
+        );
+        // No `forget_quiet_threads`, as for the channel: a permanent thread
+        // never needs room.
+        id
+    }
+
+    /// Call thread `id` `name` from now on. `false` with no such thread.
+    pub fn rename(&mut self, id: &str, name: &str) -> bool {
+        let Some(t) = self.threads.get_mut(id) else {
+            return false;
+        };
+        t.name = name.to_string();
+        true
+    }
+
+    /// Close thread `id`: nobody is offered it, and what was said on it is
+    /// kept. **It stops being permanent**, so a thread whose channel is gone
+    /// is kept as any thread is, and goes when it is the quietest. `false`
+    /// with no such thread.
+    pub fn close(&mut self, id: &str) -> bool {
+        let Some(t) = self.threads.get_mut(id) else {
+            return false;
+        };
+        t.open = false;
+        t.permanent = false;
+        true
+    }
+
+    /// Open thread `id` again, standing as [`Threads::open_standing`] opens
+    /// one. `false` with no such thread.
+    pub fn reopen(&mut self, id: &str) -> bool {
+        let Some(t) = self.threads.get_mut(id) else {
+            return false;
+        };
+        t.open = true;
+        t.permanent = true;
+        true
+    }
+
+    /// Bring `who` onto thread `id` at the end of what has been said, as
+    /// [`Threads::invite`] does. `false` when they are on it already, or
+    /// there is no such thread.
+    pub fn join(&mut self, id: &str, who: &str) -> bool {
+        let Some(t) = self.threads.get_mut(id) else {
+            return false;
+        };
+        if t.has(who) {
+            return false;
+        }
+        t.joined_at.insert(who.to_string(), t.messages.len());
+        t.members.push(who.to_string());
+        true
+    }
+
     /// Say something on one of `from`'s threads, named the way `from` names it,
     /// from inside the world.
     pub fn send(&mut self, from: &str, named: &str, intent: &str) -> Result<Vec<String>, String> {
@@ -598,10 +686,6 @@ impl Threads {
 
     /// [`Threads::send`], for a message that came from `origin` outside the
     /// world — or from inside it, with `None`.
-    ///
-    /// **Every message is said here**, so this is where one is named and
-    /// timed: its seq from the thread ([`Thread::say`]), its time from the
-    /// clock.
     pub fn send_from(
         &mut self,
         from: &str,
@@ -612,10 +696,30 @@ impl Threads {
         let Some(id) = self.id_by_name_for(from, named) else {
             return Err(format!("You have no conversation with {named}."));
         };
+        self.send_on(&id, from, intent, origin)
+    }
+
+    /// Say something on thread `id`, which `from` is on and which is open:
+    /// what a mirror writes into the very thread it mirrors, whatever its
+    /// members call it.
+    ///
+    /// **Every message is said here**, so this is where one is named and
+    /// timed: its seq from the thread ([`Thread::say`]), its time from the
+    /// clock.
+    pub fn send_on(
+        &mut self,
+        id: &str,
+        from: &str,
+        intent: &str,
+        origin: Option<Origin>,
+    ) -> Result<Vec<String>, String> {
+        if !self.threads.get(id).is_some_and(|t| t.open && t.has(from)) {
+            return Err(format!("{from} is on no open conversation {id}."));
+        }
         // Stamped before the borrow, so a live conversation is the last thing
         // `forget_quiet_threads` would take and a silent one the first.
         let touched = self.now();
-        let t = self.threads.get_mut(&id).expect("just found");
+        let t = self.threads.get_mut(id).expect("just found");
         t.touched = touched;
         t.say(Message {
             from: from.to_string(),
@@ -1208,6 +1312,75 @@ mod tests {
         for who in ["Maker-02", "Maker-03"] {
             assert_eq!(p.waiting_for(who), 1, "{who} was not told");
         }
+    }
+
+    // ── a standing group: a Discord channel ─────────────────────────────────
+
+    /// **A standing group is not evicted** however many conversations the
+    /// world opens around it, and the bound still holds over the rest — a
+    /// server of quiet channels neither crowds out the character's own
+    /// conversations nor is collected while its channel stands.
+    #[test]
+    fn a_standing_group_survives_a_world_that_fills_up_with_conversations() {
+        let mut p = Threads::new();
+        let general = p.open_standing("zenworld #general", &names(&["Zen"]));
+        for i in 0..(KEEP_THREADS * 3) {
+            p.open_group(&format!("crew {i}"), &names(&["Wren", "Soren", "Orion"]));
+        }
+        let t = p.get(&general).expect("the channel's thread was evicted");
+        assert!(t.open && t.permanent && t.named);
+        assert_eq!(t.kind(), Kind::Group);
+        assert_eq!(p.names_for("Zen"), ["zenworld #general"]);
+        assert_eq!(p.iter().filter(|t| !t.permanent).count(), KEEP_THREADS);
+    }
+
+    /// **Somebody who writes on it joins at its end**, as an invitation
+    /// does: they hear what is said from then on, and the character hears
+    /// them.
+    #[test]
+    fn joining_a_standing_group_by_id_comes_in_at_its_end() {
+        let mut p = Threads::new();
+        let id = p.open_standing("zenworld #general", &names(&["Zen"]));
+        p.send_on(&id, "Zen", "before anybody", None).unwrap();
+        assert!(p.join(&id, "Wren (@wren)"));
+        assert!(!p.join(&id, "Wren (@wren)"), "joined twice");
+        assert_eq!(p.waiting_for("Wren (@wren)"), 0);
+        let origin = Origin::Discord {
+            message: 901,
+            channel: 610,
+        };
+        let reached = p
+            .send_on(&id, "Wren (@wren)", "hi all", Some(origin))
+            .unwrap();
+        assert_eq!(reached, ["Zen"]);
+        let waiting = p.undelivered_for("Zen");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].0, "zenworld #general");
+        assert_eq!(waiting[0].2[0].origin, Some(origin));
+        assert!(p
+            .send_on(&id, "Stranger", "not a member", None)
+            .unwrap_err()
+            .contains("no open conversation"));
+    }
+
+    /// **Renamed, it is offered under its new name; closed, not at all** —
+    /// and it is kept, no longer standing, so it can go when it is the
+    /// quietest; reopened, it stands again.
+    #[test]
+    fn a_standing_group_is_renamed_closed_and_reopened() {
+        let mut p = Threads::new();
+        let id = p.open_standing("zenworld #general", &names(&["Zen"]));
+        assert!(p.rename(&id, "zenworld #lobby"));
+        assert_eq!(p.names_for("Zen"), ["zenworld #lobby"]);
+        assert!(p.close(&id));
+        assert!(p.names_for("Zen").is_empty());
+        assert!(!p.get(&id).unwrap().permanent);
+        assert!(p.send_on(&id, "Zen", "anyone?", None).is_err());
+        assert!(p.reopen(&id));
+        let t = p.get(&id).unwrap();
+        assert!(t.open && t.permanent);
+        assert!(!p.rename("th404", "x") && !p.close("th404") && !p.reopen("th404"));
+        assert!(!p.join("th404", "Zen"));
     }
 
     /// A thread is handed back by id, so evicting the one just opened would

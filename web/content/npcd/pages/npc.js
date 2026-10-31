@@ -1004,15 +1004,20 @@ export async function render(params) {
       });
       /* Where the bot is now: online while the member running the
        * character's world holds its shard open, offline with no world
-       * running it, refused once Discord turned its token down. */
+       * running it, waiting while Discord closes it for want of the
+       * Message Content intent (it asks again every ten minutes), refused
+       * once Discord turned its token down. */
       const status = d.status === 'online' ? `online in ${d.world}`
         : d.status === 'refused' ? 'Discord refused the token — connect a new one'
-          : 'offline';
+          : d.status === 'needs_content_intent'
+            ? 'Turn on Message Content Intent under Bot in the Developer Portal'
+            : 'offline';
+      const wrong = d.status === 'refused' || d.status === 'needs_content_intent';
       return h('div', { class: 'row wrap' },
         h('span', { style: 'flex:1' }, h('b', {}, d.username), ` is ${npc.name} on Discord · `,
           h('span', {
-            class: d.status === 'refused' ? 'tiny' : 'tiny dim',
-            style: d.status === 'refused' ? 'color:var(--crit)' : '',
+            class: wrong ? 'tiny' : 'tiny dim',
+            style: wrong ? 'color:var(--crit)' : '',
           }, status)),
         h('a', { class: 'btn sm', href: d.invite_url, target: '_blank', rel: 'noopener' }, 'Invite to a server'),
         h('button', { class: 'btn sm ghost', onClick: disconnect }, 'Disconnect'));

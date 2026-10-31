@@ -48,6 +48,8 @@ native-tls = "0.2"
 dns-lookup = "2"
 hex = "0.4"
 base64 = { workspace = true }
+# `file_image`: the workspace's formats, and the multi-size `.ico` a favicon is.
+image = { workspace = true, features = ["ico"] }
 scraper = "0.21"
 byteorder = { workspace = true }
 boa_engine = "0.21.1"

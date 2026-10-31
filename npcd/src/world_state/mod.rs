@@ -32,15 +32,17 @@ pub use diff::{diff, Changes};
 pub use snapshot::{sim_records, world_records, Records};
 
 use crate::discord::dm::record::Dms;
+use crate::discord::server::record::Servers;
 use crate::world::Hosted;
 
 /// A hosted world's records as they stand now: its map's, its [`Sim`]'s, and
-/// its bots' DMs (`docs/npcd_discord.md` §4.2).
+/// its bots' DMs, servers and channels (`docs/npcd_discord.md` §4.2).
 ///
 /// [`Sim`]: crate::sim::Sim
 pub fn records_of(hosted: &Hosted) -> Records {
     let mut records = hosted.read(world_records);
     records.extend(hosted.sim(sim_records));
     records.extend(hosted.dms(Dms::records));
+    records.extend(hosted.servers(Servers::records));
     records
 }

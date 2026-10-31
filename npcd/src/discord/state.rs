@@ -2,7 +2,8 @@
 //!
 //! The custom object `discord/state/<npc_id>`, written by the member running
 //! the bot's shard when the bot's state changes — online once Discord answers
-//! `READY`, refused when Discord refuses its token — and tombstoned by that
+//! `READY`, needing its Message Content intent while Discord closes it with
+//! `4014`, refused when Discord refuses its token — and tombstoned by that
 //! member when it stops the shard for any other reason. A refusal stays, so
 //! the console can say so, until a new token is connected.
 //!
@@ -31,6 +32,9 @@ pub fn key(npc_id: u64) -> String {
 pub enum State {
     /// The shard is open and Discord answered `READY`.
     Online,
+    /// Discord closed the shard with `4014`: the application has not turned
+    /// on the Message Content intent. The shard asks again every ten minutes.
+    NeedsContentIntent,
     /// Discord refused the token (close code 4004, or a 401), and the shard
     /// was stopped.
     Refused,
@@ -48,6 +52,9 @@ pub struct BotState {
     /// The `connected_ms` of the bot record whose token it ran: a refusal is
     /// of that token, and a newer one is not refused.
     pub connected_ms: u64,
+    /// The cluster member that wrote it — the one running the shard — when
+    /// this daemon is in a cluster.
+    pub member: Option<u64>,
 }
 
 /// What the console says of a bot.
@@ -55,15 +62,18 @@ pub struct BotState {
 pub enum Status {
     Online { world: String },
     Offline,
+    NeedsContentIntent,
     Refused,
 }
 
 impl Status {
-    /// Its name on the wire: `online`, `offline` or `refused`.
+    /// Its name on the wire: `online`, `offline`, `needs_content_intent` or
+    /// `refused`.
     pub fn name(&self) -> &'static str {
         match self {
             Status::Online { .. } => "online",
             Status::Offline => "offline",
+            Status::NeedsContentIntent => "needs_content_intent",
             Status::Refused => "refused",
         }
     }
@@ -105,15 +115,16 @@ pub fn status(shared: &SharedSubstrate, npc_id: u64, bot: &Bot) -> Status {
     let Some(s) = get(shared, npc_id) else {
         return Status::Offline;
     };
+    if s.connected_ms != bot.connected_ms {
+        return Status::Offline;
+    }
+    // A running shard's state is in force while its world's authority is the
+    // one that wrote it; a refusal stays until another token is connected.
     match s.state {
-        State::Refused if s.connected_ms == bot.connected_ms => Status::Refused,
-        State::Online
-            if s.connected_ms == bot.connected_ms
-                && s.since_ms >= world_store::highest_epoch(shared, &s.world) =>
-        {
-            Status::Online { world: s.world }
-        }
-        _ => Status::Offline,
+        State::Refused => Status::Refused,
+        _ if s.since_ms < world_store::highest_epoch(shared, &s.world) => Status::Offline,
+        State::Online => Status::Online { world: s.world },
+        State::NeedsContentIntent => Status::NeedsContentIntent,
     }
 }
 
@@ -142,6 +153,7 @@ mod tests {
             since_ms,
             world: "life".into(),
             connected_ms,
+            member: Some(3),
         }
     }
 
@@ -159,6 +171,7 @@ mod tests {
                 "since_ms": 1_800_000_000_500u64,
                 "world": "life",
                 "connected_ms": 1_800_000_000_000u64,
+                "member": 3,
             })
         );
         remove(&shared, 42).unwrap();
@@ -204,6 +217,7 @@ mod tests {
                 since_ms: 2_500,
                 world: "life".into(),
                 connected_ms: 10,
+                member: None,
             },
         )
         .unwrap();
@@ -214,6 +228,45 @@ mod tests {
         assert_eq!(
             [Status::Refused.name(), Status::Offline.name()],
             ["refused", "offline"]
+        );
+    }
+
+    /// **A bot waiting on its Message Content intent says so** while its
+    /// world's authority is the one running it — as `needs_content_intent`,
+    /// in exactly this record — and is not refused, so a member keeps asking.
+    #[test]
+    fn a_bot_needing_its_content_intent_says_so_while_in_force() {
+        let dir = TempDir::new().unwrap();
+        let shared = Npcs::load(dir.path()).unwrap().substrate();
+        let waiting = BotState {
+            state: State::NeedsContentIntent,
+            since_ms: 1_500,
+            world: "life".into(),
+            connected_ms: 10,
+            member: None,
+        };
+        put(&shared, 42, &waiting).unwrap();
+        assert_eq!(
+            shared.custom_object("discord/state/42").unwrap().blob,
+            json!({
+                "state": "needs_content_intent",
+                "since_ms": 1_500,
+                "world": "life",
+                "connected_ms": 10,
+                "member": null,
+            })
+        );
+        assert_eq!(status(&shared, 42, &bot(10)), Status::NeedsContentIntent);
+        assert_eq!(Status::NeedsContentIntent.name(), "needs_content_intent");
+        assert!(!refused(&shared, 42, &bot(10)));
+        assert_eq!(status(&shared, 42, &bot(11)), Status::Offline);
+
+        let records: Records = [("sim/meta".to_string(), json!({}))].into_iter().collect();
+        world_store::write(&shared, "life", &diff(&Records::new(), &records), 2_000).unwrap();
+        assert_eq!(
+            status(&shared, 42, &bot(10)),
+            Status::Offline,
+            "a member that took the world since has not run the bot"
         );
     }
 }

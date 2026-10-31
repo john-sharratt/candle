@@ -57,7 +57,9 @@ use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
-use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
+use crate::ingest_lease::{self, Guard, Share};
+use crate::session::{NoDraft, Resume, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
+use crate::tools::Dispatch;
 use crate::worker_hop;
 
 /// How long a task's draft may take before its earlier entries are taken.
@@ -425,21 +427,79 @@ pub fn answer(
     begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
 }
 
-/// What a task cut off by a restart is told as its next turn.
-const RESUMED: &str = "The service restarted while you were working, so your last turn was \
-    cut off. Your conversation and your journal are intact; changes you had not committed may \
-    be gone. Check where the work stands (`git_status`, reading what you wrote) before \
-    repeating anything, then finish the task you were given.";
+/// What a task cut off by a restart is told first.
+const RESUMED: &str = "Your work was cut off, so your last turn may not have finished. Your \
+    conversation and your journal are intact; changes you had not committed may be gone. Check \
+    where the work stands (`git_status`, reading what you wrote) before repeating anything, then \
+    finish the task below. It is your task, whatever else you remember.";
+
+/// How many of a cut-off task's journal entries it is reminded of.
+const RESUMED_ENTRIES: usize = 8;
+/// How much of each it is reminded of.
+const RESUMED_ENTRY_QUOTE: usize = 300;
+
+/// What `worker`, cut off, is told: [`RESUMED`], its task in full, and what its
+/// journal says it did. A turn's context is selected by relevance, so nothing
+/// else keeps the task in front of it: told only to finish "the task you were
+/// given", a worker 88 turns in took up something else it could see, reported
+/// that done, and the task it had was never finished (2026-10-31).
+fn resumed_message(worker: &Worker) -> String {
+    let mut message = format!("{RESUMED}\n\nYour task:\n{}", worker.prompt);
+    let skipped = worker.entries.len().saturating_sub(RESUMED_ENTRIES);
+    let kept = &worker.entries[skipped..];
+    if !kept.is_empty() {
+        message.push_str("\n\nWhat your journal says you did so far:");
+        for entry in kept {
+            message.push_str("\n- ");
+            message.push_str(&first_line(&entry.text, RESUMED_ENTRY_QUOTE));
+        }
+    }
+    message
+}
+
+/// Make `worker`, cut off, run again from `now`, the try entered on its thread.
+/// What it should be told is read first, off the entries this clears.
+fn revive(
+    session: &ZendSession,
+    records: &dyn Records,
+    owner: &str,
+    worker: &mut Worker,
+    now: u64,
+) -> Result<String, String> {
+    let told = resumed_message(worker);
+    worker.state = State::Running;
+    worker.error = None;
+    worker.ended_ms = None;
+    worker.resumes += 1;
+    worker.beat_ms = now;
+    worker.turn_ms = now;
+    worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
+    worker.entries = Vec::new();
+    note(
+        records,
+        owner,
+        worker,
+        "Resumed:",
+        format!("cut off, try {}", worker.resumes),
+    )?;
+    Ok(told)
+}
 
 /// Start the lost task `name` of `thread` again, in its own conversation
-/// (`super::resuming`). `false` when it no longer needs it: read again under
-/// the lock a reply takes, it is running, or was answered, or archived.
+/// (`super::resuming`), under `lease`. `false` when it no longer needs it: read
+/// again under the lock a reply takes, it is running, or was answered, or
+/// archived.
+///
+/// A round it stopped in the middle of is finished first, with what it is told
+/// following that round's results: a new message would leave those calls
+/// unanswered in the conversation.
 pub fn resume(
     session: &Arc<ZendSession>,
     owner: &str,
     thread: &str,
     name: &str,
     now: u64,
+    lease: Guard,
 ) -> Result<bool, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let _held = holding();
@@ -447,35 +507,68 @@ pub fn resume(
         return Ok(false);
     };
     let mut worker = found.observed(now);
-    // A round its restart left unfinished is finished at boot, with no word on
-    // the worker's record (`resume_unfinished_turns`): a turn on top of that one
-    // would write the same conversation twice.
     if !resuming::due(&worker, now)
         || archiving::being_archived(&worker.conv_id)
         || session.live_turn(&worker.conv_id).is_some()
     {
         return Ok(false);
     }
-    worker.state = State::Running;
-    worker.error = None;
-    worker.resumes += 1;
-    worker.beat_ms = now;
-    worker.turn_ms = now;
-    worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
-    worker.entries = Vec::new();
-    note(
-        &records,
-        owner,
-        &worker,
-        "Resumed:",
-        format!("cut off by a restart, try {}", worker.resumes),
-    )?;
-    begin(
+    let told = revive(session, &records, owner, &mut worker, now)?;
+    let first = match session.pending_round(&worker.conv_id) {
+        Some(call_turn) => {
+            nudges::queue(&records, &worker.conv_id, &told, now).map_err(|e| e.to_string())?;
+            First::Interrupted { call_turn }
+        }
+        None => First::Message(format!("{told}{ASKING}")),
+    };
+    begin_held(session, &records, owner, worker, first, Some(lease))?;
+    Ok(true)
+}
+
+/// Finish, as `name` of `thread`'s own, the round at `call_turn` this member's
+/// last run stopped in the middle of: the worker is carried on from there, with
+/// its beat, its settling and its lease, so no other member takes it for lost
+/// and starts it over the same round. `false` when the worker is not one to
+/// carry on — it ended, it is a part, or it was cut off too often — and the
+/// round is simply finished. `true` too when another member holds its turns.
+pub async fn carry_on(
+    session: &Arc<ZendSession>,
+    owner: &str,
+    thread: &str,
+    name: &str,
+    call_turn: u32,
+) -> Result<bool, String> {
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    let cut_off = |w: &Worker| {
+        let seen = w.clone().observed(now_ms());
+        !seen.is_part()
+            && seen.resumes < resuming::MAX_RESUMES
+            && (seen.state == State::Running || archiving::lost(&seen))
+    };
+    let Some(found) = threads::worker(&records, owner, thread, name).filter(cut_off) else {
+        return Ok(false);
+    };
+    let conv_id = found.conv_id;
+    let share = tokio::task::spawn_blocking(move || ingest_lease::share_worker(&conv_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Share::Mine(lease) = share else {
+        return Ok(true);
+    };
+    let _held = holding();
+    let Some(mut worker) = threads::worker(&records, owner, thread, name).filter(cut_off) else {
+        return Ok(false);
+    };
+    let now = now_ms();
+    let told = revive(session, &records, owner, &mut worker, now)?;
+    nudges::queue(&records, &worker.conv_id, &told, now).map_err(|e| e.to_string())?;
+    begin_held(
         session,
         &records,
         owner,
         worker,
-        format!("{RESUMED}{ASKING}"),
+        First::Interrupted { call_turn },
+        Some(lease),
     )?;
     Ok(true)
 }
@@ -593,6 +686,26 @@ fn begin(
     worker: Worker,
     message: String,
 ) -> Result<Worker, String> {
+    begin_held(
+        session,
+        records,
+        owner,
+        worker,
+        First::Message(message),
+        None,
+    )
+}
+
+/// Keep `worker` as running and start its turn from `first`, under `lease` when
+/// the caller already took it.
+fn begin_held(
+    session: &Arc<ZendSession>,
+    records: &dyn Records,
+    owner: &str,
+    worker: Worker,
+    first: First,
+    lease: Option<Guard>,
+) -> Result<Worker, String> {
     // A stop sent as the last turn ended — after its settling looked — is
     // not this turn's.
     stops::take(records, &worker.conv_id);
@@ -614,7 +727,8 @@ fn begin(
         Arc::clone(session),
         owner.to_string(),
         worker.clone(),
-        First::Message(message),
+        first,
+        lease,
     ));
     Ok(worker)
 }
@@ -627,6 +741,83 @@ enum First {
     /// sealed and whose tools have not run — handed here by a slower member,
     /// or kept when a handing failed.
     Round { call_turn: u32, iteration: usize },
+    /// A round whose call turn `call_turn` is sealed and which a restart cut
+    /// off: some of its tools may have run.
+    Interrupted { call_turn: u32 },
+}
+
+impl First {
+    /// What the turn is sent, and the round it finishes.
+    fn into_start(self) -> (String, Option<Resume>) {
+        match self {
+            First::Message(message) => (message, None),
+            First::Round {
+                call_turn,
+                iteration,
+            } => (
+                String::new(),
+                Some(Resume {
+                    call_turn,
+                    dispatch: Dispatch::Live,
+                    iteration,
+                }),
+            ),
+            First::Interrupted { call_turn } => (
+                String::new(),
+                Some(Resume {
+                    call_turn,
+                    dispatch: Dispatch::Resumed,
+                    iteration: 0,
+                }),
+            ),
+        }
+    }
+}
+
+/// How long a member starting a worker's turns waits for their lease: long
+/// enough for one a restart left behind to run out ([`ingest_lease`]'s
+/// `INGEST_TTL`).
+const LEASE_WAIT: Duration = Duration::from_secs(150);
+/// How often it asks again.
+const LEASE_LOOK: Duration = Duration::from_secs(2);
+
+/// Take the lease on `conv_id`'s turns, waiting up to [`LEASE_WAIT`] for
+/// whoever holds it.
+async fn hold_turns(conv_id: &str) -> Option<Guard> {
+    let until = Instant::now() + LEASE_WAIT;
+    loop {
+        let conv_id = conv_id.to_string();
+        let share = tokio::task::spawn_blocking(move || ingest_lease::share_worker(&conv_id))
+            .await
+            .ok()?;
+        if let Share::Mine(lease) = share {
+            return Some(lease);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(LEASE_LOOK).await;
+    }
+}
+
+/// End `worker`, whose turns this member could not get the lease on.
+fn give_up(records: &dyn Records, owner: &str, worker: &mut Worker) {
+    let why = "another member holds this task's turns, so it was not started here";
+    worker.state = State::Error;
+    worker.error = Some(why.into());
+    worker.ended_ms = Some(now_ms());
+    if let Err(e) = threads::put_worker(records, owner, worker) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
+    }
+    if let Err(e) = note(
+        records,
+        owner,
+        worker,
+        "Task ended:",
+        format!("error: {why}"),
+    ) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
+    }
 }
 
 /// How long a handed turn's commit may take to land before the member keeps
@@ -817,6 +1008,7 @@ pub fn continue_handed(
             call_turn: handing.call_turn,
             iteration: handing.iteration,
         },
+        None,
     ));
     Ok(worker)
 }
@@ -853,8 +1045,15 @@ impl Ended {
     }
 }
 
-/// The turn's life after [`begin`], and the worker's settling.
-async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first: First) {
+/// The turn's life after [`begin`], and the worker's settling, under the lease
+/// on its turns from start to end: `lease`, or one taken here.
+async fn run(
+    session: Arc<ZendSession>,
+    owner: String,
+    mut worker: Worker,
+    first: First,
+    lease: Option<Guard>,
+) {
     let Some(records) = session.shared_substrate() else {
         return;
     };
@@ -874,6 +1073,17 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
         ))
     };
     let mut beating = start_beat();
+    let mut lease = match lease {
+        Some(lease) => Some(lease),
+        None => hold_turns(&worker.conv_id).await,
+    };
+    if lease.is_none() {
+        beating.abort();
+        let _ = beating.await;
+        give_up(&records, &owner, &mut worker);
+        session.mcp().bump();
+        return;
+    }
     let mut next = first;
     // Whether a turn here may move to a markedly faster member: not again,
     // once a handing failed, so a peer that cannot take it is not asked at
@@ -900,6 +1110,8 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
                 // the last word on who runs it.
                 beating.abort();
                 let _ = beating.await;
+                // Handed back with the turn's writes, for the member taking it.
+                drop(lease.take());
                 let handed = hand_on(&session, &owner, &worker, to, call_turn, iteration).await;
                 let moved = match handed {
                     Ok(()) => true,
@@ -936,6 +1148,14 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first
                 // Said at once, so the stretch without a beat stays short.
                 beat_now(&records, &owner, &worker);
                 beating = start_beat();
+                lease = hold_turns(&worker.conv_id).await;
+                if lease.is_none() {
+                    beating.abort();
+                    let _ = beating.await;
+                    give_up(&records, &owner, &mut worker);
+                    session.mcp().bump();
+                    return;
+                }
                 next = First::Round {
                     call_turn,
                     iteration,
@@ -1329,13 +1549,7 @@ async fn turn(
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
     apply_tools_dial(&mut selection, mode);
-    let (message, round) = match first {
-        First::Message(m) => (m, None),
-        First::Round {
-            call_turn,
-            iteration,
-        } => (String::new(), Some((call_turn, iteration))),
-    };
+    let (message, round) = first.into_start();
     let mut stream = session
         .submit_worker(
             message,
@@ -1622,6 +1836,66 @@ mod tests {
             checked: false,
             runner: None,
         }
+    }
+
+    /// **A cut-off worker is told its task whole**, and what its journal says
+    /// it did, the newest entries when there are many.
+    #[test]
+    fn a_resumed_worker_is_told_its_task_and_its_progress() {
+        let mut w = worker();
+        w.prompt = "Replace the Battle Cities icon.\nRegenerate all six sizes.".into();
+        w.entries = (1..=10)
+            .map(|id| Entry {
+                id,
+                text: format!("Entry {id} — step {id}\n- detail"),
+            })
+            .collect();
+        let told = resumed_message(&w);
+        assert!(told.starts_with(RESUMED));
+        assert!(
+            told.contains("Your task:\nReplace the Battle Cities icon.\nRegenerate all six sizes."),
+            "{told}"
+        );
+        assert!(!told.contains("Entry 2 —"), "{told}");
+        assert!(told.ends_with("\n- Entry 10 — step 10"), "{told}");
+        w.entries.clear();
+        assert!(!resumed_message(&w).contains("journal says"));
+    }
+
+    /// **A round cut off is run as resumed, one handed on as live**: only the
+    /// first may have run some of its calls.
+    #[test]
+    fn a_turn_starts_as_what_it_finishes() {
+        assert_eq!(
+            First::Message("m".into()).into_start(),
+            ("m".to_string(), None)
+        );
+        assert_eq!(
+            First::Interrupted { call_turn: 7 }.into_start(),
+            (
+                String::new(),
+                Some(Resume {
+                    call_turn: 7,
+                    dispatch: Dispatch::Resumed,
+                    iteration: 0
+                })
+            )
+        );
+        assert_eq!(
+            First::Round {
+                call_turn: 7,
+                iteration: 3
+            }
+            .into_start(),
+            (
+                String::new(),
+                Some(Resume {
+                    call_turn: 7,
+                    dispatch: Dispatch::Live,
+                    iteration: 3
+                })
+            )
+        );
     }
 
     /// **A check round that does not finish leaves the task done** with the

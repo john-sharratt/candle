@@ -102,7 +102,8 @@ fn apply_world(w: &mut World, records: &Records) {
 }
 
 /// Put `records` into `hosted`, under one hold of its lock — and its bots'
-/// DMs (`docs/npcd_discord.md` §4.2), which are not under it.
+/// DMs, servers and channels (`docs/npcd_discord.md` §4.2), which are not
+/// under it.
 pub fn apply(hosted: &Hosted, records: &Records) {
     let sim = sim_of(records);
     hosted.with_both(|w, s| {
@@ -112,6 +113,7 @@ pub fn apply(hosted: &Hosted, records: &Records) {
         }
     });
     hosted.with_dms(|dms| dms.take_in(records));
+    hosted.with_servers(|servers| servers.take_in(records));
 }
 
 #[cfg(test)]
@@ -122,6 +124,7 @@ mod tests {
     use super::super::snapshot::{sim_records, world_records};
     use super::*;
     use crate::discord::dm::record::Dm;
+    use crate::discord::server::record::{Channel, Server};
     use crate::sim::seed;
     use crate::world_state::records_of;
 
@@ -184,6 +187,54 @@ mod tests {
         apply(&replica, &records);
         assert_eq!(replica.dms(|d| d.of(42)), [("0a1b".to_string(), dm)]);
         assert_eq!(replica.dms(|d| d.of(9)), []);
+    }
+
+    /// **A bot's servers and channels are world records** too, taken in by
+    /// a world hosted from them in place of what it held.
+    #[test]
+    fn a_bots_servers_and_channels_travel_with_the_worlds_records() {
+        let channel = Channel {
+            guild_id: 600,
+            thread: "th7".into(),
+            mirrored_through: 2,
+            last_seen_discord: 901,
+        };
+        let source = vault();
+        source.with_servers(|s| {
+            s.put_channel(42, 610, channel.clone());
+            s.put_server(
+                42,
+                600,
+                Server {
+                    name: "zenworld".into(),
+                },
+            );
+        });
+        let records = records_of(&source);
+        assert_eq!(
+            records.get("discord/channel/42/610"),
+            Some(&json!({
+                "guild_id": 600,
+                "thread": "th7",
+                "mirrored_through": 2,
+                "last_seen_discord": 901,
+            }))
+        );
+        assert_eq!(
+            records.get("discord/server/42/600"),
+            Some(&json!({ "name": "zenworld" }))
+        );
+        let replica = vault();
+        replica.with_servers(|s| s.put_channel(9, 1, channel.clone()));
+        apply(&replica, &records);
+        assert_eq!(replica.servers(|s| s.channels_of(42)), [(610, channel)]);
+        assert_eq!(replica.servers(|s| s.channels_of(9)), []);
+        assert_eq!(
+            replica.servers(|s| s.server(42, 600)),
+            Some(Server {
+                name: "zenworld".into()
+            })
+        );
     }
 
     /// A body not in the world yet keeps its place for when it is embodied;

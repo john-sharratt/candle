@@ -20,6 +20,14 @@
 //! the same fifteen code_reading units, and WhiteWorld's copy — 24 questions a
 //! unit, each in its own conversation — filled its card while BlackWorld's had
 //! already sealed. The calibration arrives with replication like the reading.
+//!
+//! **A worker's turns are leased the same way**, under `worker/<conversation>`
+//! ([`share_worker`]), for as long as a member runs them: every way of starting
+//! one — a task, an answer, a handing, a boot scan finishing a round, the sweep
+//! starting a lost task — takes it first. The worker's record replicates, so
+//! it cannot decide this: on 2026-10-31 WhiteWorld's boot scan took a worker
+//! back four seconds before BlackWorld's sweep did, each on a copy of the record
+//! saying nobody ran it, and both wrote the conversation.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +57,8 @@ const PREFIX: &[u8] = b"ingest/";
 
 const CALIBRATE_PREFIX: &[u8] = b"calibrate/";
 
+const WORKER_PREFIX: &[u8] = b"worker/";
+
 /// The lease key for a content key.
 pub fn lease_key(content_key: &str) -> Vec<u8> {
     prefixed(PREFIX, content_key)
@@ -59,6 +69,11 @@ pub fn calibration_key(marker: &str) -> Vec<u8> {
     prefixed(CALIBRATE_PREFIX, marker)
 }
 
+/// The lease key for the turns of the worker conversation `conv_id`.
+pub fn worker_key(conv_id: &str) -> Vec<u8> {
+    prefixed(WORKER_PREFIX, conv_id)
+}
+
 fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + name.len());
     key.extend_from_slice(prefix);
@@ -66,9 +81,12 @@ fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     key
 }
 
-/// Whether `key` is one of this module's: a reading's or a calibration's.
+/// Whether `key` is one of this module's: a reading's, a calibration's or a
+/// worker's.
 fn is_unit_lease(key: &[u8]) -> bool {
-    key.starts_with(PREFIX) || key.starts_with(CALIBRATE_PREFIX)
+    [PREFIX, CALIBRATE_PREFIX, WORKER_PREFIX]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 /// What this member should do with a unit it found unread.
@@ -160,6 +178,13 @@ pub fn share(content_key: &str) -> Share {
 /// for a calibration carrying the marker before it asks for one.
 pub fn share_calibration(marker: &str) -> Share {
     share_key(calibration_key(marker))
+}
+
+/// Lease the turns of the worker conversation `conv_id`. [`Share::Mine`] when
+/// this member should run them, having waited for the turns the last holder
+/// wrote. Blocks for the vote, so it is not called on the runtime.
+pub fn share_worker(conv_id: &str) -> Share {
+    share_key(worker_key(conv_id))
 }
 
 fn share_key(key: Vec<u8>) -> Share {
@@ -462,6 +487,33 @@ mod tests {
             next.recheck(),
             "the next holder looks for the calibration first"
         );
+    }
+
+    /// **One member runs a worker's turns**: the member that reaches the lease
+    /// second leaves them, whichever way it came, and the next holder waits for
+    /// the turns the last one wrote.
+    #[test]
+    fn one_member_runs_a_worker_two_found_cut_off() {
+        let held = Arc::new(Mutex::new(HashMap::new()));
+        let boot = Fake::pair(1, Arc::clone(&held));
+        let sweep = Fake::pair(2, Arc::clone(&held));
+        let key = worker_key("mcp:owner:thread/task");
+        assert_eq!(key, b"worker/mcp:owner:thread/task".to_vec());
+        assert!(is_unit_lease(&key));
+        let Share::Mine(running) = claim(Arc::clone(&boot) as Arc<dyn LeaseSeat>, key.clone())
+        else {
+            panic!("the boot scan reached it first");
+        };
+        assert!(matches!(
+            claim(Arc::clone(&sweep) as Arc<dyn LeaseSeat>, key.clone()),
+            Share::Theirs
+        ));
+        drop(running);
+        *sweep.applied.lock().unwrap() = 7;
+        let Share::Mine(next) = claim(sweep, key) else {
+            panic!("its turns are free once the holder is done");
+        };
+        assert!(next.recheck(), "and the holder's writes were waited on");
     }
 
     #[test]

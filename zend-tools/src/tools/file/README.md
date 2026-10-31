@@ -18,6 +18,7 @@ which is what most unit tests use.
 | File | Tool | Description |
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
+| `image.rs` | `file_image` | Resized copies of a picture: PNG, JPEG, WebP, multi-size ICO |
 | `read.rs` | `file_read` | Return a page of a file — its parts under their anchors — in a fenced block; `repo`, `path` and `page` are required, `line` optional |
 | `edit.rs` | `file_edit` | One anchored edit — replace, insert, delete, move — by the anchors `file_read` shows; the engine is `doc-units` |
 | `grep.rs` | `file_grep` | Regex over file contents; each hit names its part's anchor and the page holding it |
