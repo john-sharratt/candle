@@ -67,6 +67,12 @@ pub async fn lodge(
             "that character has no body in a world to carry a mission",
         );
     };
+    // **An unordered character takes no missions**, from the table or from
+    // anybody: its world gives it no orders (`Missions::set_unordered`). Talk
+    // to it instead.
+    if hosted.sim(|s| s.missions.is_unordered(&character)) {
+        return takes_no_orders();
+    }
 
     let mut todo: Vec<Todo> = body
         .todo
@@ -132,8 +138,12 @@ pub async fn lodge(
         mission: Box::new(mission),
         start,
     };
-    if let Err(e) = rt.world_write(hosted.id(), op).await {
-        return world_unreached(&e);
+    match rt.world_write(hosted.id(), op).await {
+        Err(e) => return world_unreached(&e),
+        // The world's own word, which this member's copy may not have caught
+        // up with.
+        Ok(OpReply::Lodged { refused: true, .. }) => return takes_no_orders(),
+        Ok(_) => {}
     }
 
     Json(LodgeReply {
@@ -143,6 +153,16 @@ pub async fn lodge(
         steps,
     })
     .into_response()
+}
+
+/// The refusal of a mission for a character that takes no orders.
+fn takes_no_orders() -> Response {
+    err(
+        StatusCode::CONFLICT,
+        "takes_no_orders",
+        "that character takes no orders: nothing in its world sets it work, so it takes no \
+         missions — talk to it instead",
+    )
 }
 
 /// `GET /v1/npc/:nid/mission` — read a character's current or last mission.
@@ -272,17 +292,32 @@ pub async fn command_table(
     };
     // The chat channel — a line on every world's standing channel.
     rt.say_to_all_channels("Command", &line);
-    // The tannoy — one announcement to the whole cast, loud enough on opening to
-    // break a character off what it is doing. Each reads it on its own clock.
+    // The tannoy — one announcement to everybody the table gives work to, loud
+    // enough on opening to break a character off what it is doing. Each reads
+    // it on its own clock. A character that takes no orders is not called
+    // (`Missions::set_unordered`).
+    let called: Vec<u64> = rt
+        .scheduler
+        .census()
+        .into_iter()
+        .map(|c| c.npc_id)
+        .filter(|id| rt.takes_orders(*id))
+        .collect();
     let mut when: HashMap<u64, u64> = HashMap::new();
-    for c in rt.scheduler.census() {
-        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+    for id in &called {
+        when.insert(*id, s.world_ms(*id).await);
     }
-    let reached = rt.scheduler.broadcast(
-        |id| when.get(&id).copied().unwrap_or(0),
-        salience,
-        EventKind::Announcement { text: line },
-    );
+    let reached = called
+        .iter()
+        .filter(|id| {
+            rt.scheduler.deliver(
+                **id,
+                when.get(id).copied().unwrap_or(0),
+                salience,
+                EventKind::Announcement { text: line.clone() },
+            )
+        })
+        .count();
 
     Json(json!({ "open": body.open, "called": reached })).into_response()
 }

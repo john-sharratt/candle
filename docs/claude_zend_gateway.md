@@ -845,8 +845,20 @@ workers it ran (`BEAT_LOST_MS`), and the next call lands on another.
 **A round handed on is not run again at boot.** Its resume entry stays until
 the member finishing it clears it. A member that restarts skips any worker
 whose record still beats with another member named its runner
-(`worker_runs_elsewhere`), rather than run the round's tools a second time. It
-still finishes the rounds of workers it ran itself.
+(`worker_runs_elsewhere`), rather than run the round's tools a second time. A
+worker it ran itself is carried on from that round as a worker
+(`workers::carry_on`), with its beat and its settling.
+
+**One member runs a worker's turns.** Its record replicates, so it cannot decide
+this. Every way of starting a worker takes the lease `worker/<conversation>`
+first and holds it to the end of the run (`ingest_lease::share_worker`): a member
+reaching it second leaves the worker alone, and the next holder waits for the
+turns the last one wrote. A handing gives it up before it asks the peer.
+
+**A cut-off worker is told its task again.** A turn's context is selected by
+relevance, so the message that resumes it carries the task in full and what its
+journal says it did (`workers::resumed_message`). When a round is unfinished the
+same words follow that round's results, as a nudge does.
 
 ## 7. Work skills
 
@@ -1420,7 +1432,7 @@ and reached the way a real client reaches it:
 | A command's member is busy | `cluster_command` answers busy (409); the skill waits for the running job and retries |
 | A command's or an agent job fails | `cluster_job_status` / `repo_job_log` answer its errors; the skill reports them and stops |
 | A trial fails | keep restores the previous binary; `service_status` reports the rollback |
-| The motherd running a worker restarts mid-task | The round it was in is finished by that member's boot scan (`resume_unfinished_turns`), with nothing listening; the worker itself reads as lost once its beat stops (`BEAT_LOST_MS`), and Claude runs the task again. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
+| The motherd running a worker restarts mid-task | That member's boot scan carries the worker on from the round it was in (`workers::carry_on`). A member that does not come back loses it: it reads as lost once its beat stops (`BEAT_LOST_MS`), and after `RESUME_AFTER_MS` another member starts it again (`super::resuming`), told its task in full. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
 | An OAuth token expires | The client refreshes it; a refused refresh signs the user in again |
 
 ## 16. Changes to other documents

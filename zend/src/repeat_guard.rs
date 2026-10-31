@@ -67,11 +67,12 @@ pub const STOP_AFTER: usize = 2;
 /// The file tools that change the session's files. They write the session
 /// overlay rather than the disk, so they declare no capability, and nothing
 /// else about them says they change anything.
-const OVERLAY_WRITERS: [&str; 5] = [
+const OVERLAY_WRITERS: [&str; 6] = [
     "write",
     "file_edit",
     "file_delete",
     "file_move",
+    "file_image",
     "journal_move",
 ];
 
@@ -170,7 +171,7 @@ impl RepeatGuard {
     pub fn screen(&mut self, results: &mut [ToolResult]) -> Verdict {
         let mutating: Vec<bool> = results
             .iter()
-            .map(|r| mutates(&r.call) && r.response.get("error").is_none())
+            .map(|r| mutates(&r.call) && r.response.get("error").is_none() && !changed_nothing(r))
             .collect();
         let repeated: Vec<bool> = results
             .iter()
@@ -186,15 +187,16 @@ impl RepeatGuard {
             self.seen.clear();
         } else {
             for result in results.iter() {
+                let answer = answer_of(result);
                 match self
                     .seen
                     .iter_mut()
-                    .find(|s| s.call == result.call && s.response == result.response)
+                    .find(|s| s.call == result.call && s.response == answer)
                 {
                     Some(seen) => seen.count += 1,
                     None => self.seen.push(Seen {
                         call: result.call.clone(),
-                        response: result.response.clone(),
+                        response: answer,
                         count: 1,
                     }),
                 }
@@ -219,10 +221,37 @@ impl RepeatGuard {
 
     /// The earlier occurrences of `result`'s call with `result`'s response.
     fn find(&self, result: &ToolResult) -> Option<&Seen> {
+        let answer = answer_of(result);
         self.seen
             .iter()
-            .find(|s| s.call == result.call && s.response == result.response)
+            .find(|s| s.call == result.call && s.response == answer)
     }
+}
+
+/// Whether `result` is a program that failed and left no file changed: it
+/// mutated nothing, so it is screened like a read. Counted as a mutation for
+/// starting a program, the same `node -e` failed sixteen times in one turn
+/// with the guard clearing its counts each time.
+fn changed_nothing(result: &ToolResult) -> bool {
+    let response = &result.response;
+    result.call.name == "run_command"
+        && response.get("exit_code").and_then(Value::as_i64) != Some(0)
+        && response
+            .get("changed")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
+/// `result`'s response as repeats are compared: a run's job id is new every
+/// time, and says nothing about what the run came to.
+fn answer_of(result: &ToolResult) -> Value {
+    let mut answer = result.response.clone();
+    if result.call.name == "run_command" {
+        if let Some(fields) = answer.as_object_mut() {
+            fields.remove("job");
+        }
+    }
+    answer
 }
 
 /// The page a paged result names as the next one, if more remain.
@@ -456,6 +485,39 @@ mod tests {
         assert_eq!(fourth[0].response["error"], "repeated_call");
         let mut fifth = ambiguous();
         assert_eq!(guard.screen(&mut fifth), Verdict::Close);
+    }
+
+    /// **A program failing the same way is a repeat**, whatever job id each
+    /// run was given; one that changed a file or succeeded is not.
+    #[test]
+    fn a_program_failing_the_same_way_is_a_repeat() {
+        let run = |job: u32, exit: i32, changed: Value| {
+            result(
+                "run_command",
+                json!({"repo": "r", "program": "node", "args": ["-e"]}),
+                json!({"job": format!("j{job}"), "exit_code": exit, "changed": changed}),
+            )
+        };
+        let mut guard = RepeatGuard::new();
+        for job in 0..NOTICE_FROM as u32 - 1 {
+            let mut round = [run(job, 9, json!([]))];
+            assert_eq!(guard.screen(&mut round), Verdict::Continue);
+            assert!(round[0].response.get("job").is_some(), "not yet a repeat");
+        }
+        let mut round = [run(90, 9, json!([]))];
+        assert_eq!(guard.screen(&mut round), Verdict::Continue);
+        assert!(round[0].response.get("job").is_none(), "{:?}", round[0]);
+
+        let mut succeeded = RepeatGuard::new();
+        let mut wrote = RepeatGuard::new();
+        for job in 0..2 * NOTICE_FROM as u32 {
+            let mut ok = [run(job, 0, json!([]))];
+            assert_eq!(succeeded.screen(&mut ok), Verdict::Continue);
+            assert!(ok[0].response.get("job").is_some());
+            let mut made = [run(job, 1, json!([{"path": "a", "change": "written"}]))];
+            assert_eq!(wrote.screen(&mut made), Verdict::Continue);
+            assert!(made[0].response.get("job").is_some());
+        }
     }
 
     /// **A repeat of a paged call names the next page** — the step a model

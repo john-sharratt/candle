@@ -22,7 +22,7 @@ use candle::quantized::pinned_staging::Generation;
 use candle::Tensor;
 use candle::{DType, Device, LiveTensor, Result, Storage};
 use candle_kernels::simple::rows_scatter::{
-    run_rows_scatter, ROWS_SCATTER_INLINE_MAX, ROWS_SCATTER_WORDS,
+    run_rows_scatter, status_error, ROWS_SCATTER_INLINE_MAX, ROWS_SCATTER_WORDS,
 };
 
 use super::desc;
@@ -235,8 +235,8 @@ fn scatter_impl(runs: &[RowRun<'_>], generation: Option<&Generation>) -> Result<
             stream.cu_stream() as *mut core::ffi::c_void,
         )
     };
-    if status != 0 {
-        candle::bail!("rows_scatter: launch failed with CUDA error {status}");
+    if let Some(why) = status_error(status, live.len(), max_elems as i32, max_rows as i32) {
+        candle::bail!("{why}");
     }
     Ok(())
 }

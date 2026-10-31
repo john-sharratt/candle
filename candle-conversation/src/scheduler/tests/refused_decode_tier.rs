@@ -24,6 +24,8 @@ const VOCAB: usize = 512;
 struct RefusingDrafter {
     inner: DummyModel,
     refusals: Arc<AtomicUsize>,
+    /// Every draft fails with a fault, not a refusal, counted in `refusals`.
+    faults: bool,
 }
 
 impl ManagedBatchedModel for RefusingDrafter {
@@ -98,6 +100,10 @@ impl ManagedBatchedModel for RefusingDrafter {
         _max_len: usize,
     ) -> Result<Vec<Vec<u32>>> {
         let left = self.refusals.load(Ordering::Relaxed);
+        if self.faults {
+            self.refusals.store(left + 1, Ordering::Relaxed);
+            candle::bail!("rows_scatter: launch failed with CUDA error 9");
+        }
         if left > 0 {
             self.refusals.store(left - 1, Ordering::Relaxed);
             candle::bail!(
@@ -112,10 +118,15 @@ impl ManagedBatchedModel for RefusingDrafter {
 /// One decoding slot whose last committed token is 110, over a drafter that
 /// refuses its tier `refusals` times.
 fn refused_slot(refusals: usize) -> (Scheduler, SequenceId, Receiver<TurnEvent>) {
-    let model = RefusingDrafter {
+    drafting_slot(RefusingDrafter {
         inner: DummyModel::new(),
         refusals: Arc::new(AtomicUsize::new(refusals)),
-    };
+        faults: false,
+    })
+}
+
+/// One decoding slot whose last committed token is 110, over `model`.
+fn drafting_slot(model: RefusingDrafter) -> (Scheduler, SequenceId, Receiver<TurnEvent>) {
     let (_tx, rx) = flume::bounded(16);
     let mut scheduler = Scheduler::new(
         rx,
@@ -181,6 +192,37 @@ fn a_refused_decode_step_keeps_the_turn_and_runs_again() {
         "the step after the refusals commits as if none had happened"
     );
     assert_eq!(scheduler.session.sequence_offset(slot.0), Some(1));
+    assert!(errors(&events).is_empty(), "the turn heard no error");
+    assert_eq!(
+        scheduler.decode_retry.take_wait(),
+        None,
+        "a step that ran owes no wait"
+    );
+}
+
+/// **A faulted draft costs the step its proposals, not the turn.** A draft is
+/// only a proposal, so the step runs as a plain row and commits its token: on
+/// the live daemon one failed launch in the draft ended a worker's turn 88
+/// turns into its task.
+#[test]
+fn a_faulted_draft_runs_the_step_without_one() {
+    let drafts = Arc::new(AtomicUsize::new(0));
+    let (mut scheduler, slot, events) = drafting_slot(RefusingDrafter {
+        inner: DummyModel::new(),
+        refusals: Arc::clone(&drafts),
+        faults: true,
+    });
+    for expected in [&[110u32, 111][..], &[110u32, 111, 112][..]] {
+        scheduler.batch_decode_step();
+        let state = &scheduler.active_decodes[&slot];
+        assert!(!state.finished, "the fault does not end the turn");
+        assert_eq!(&state.generated_tokens[..], expected);
+    }
+    assert_eq!(
+        drafts.load(Ordering::Relaxed),
+        2,
+        "each step tried to draft"
+    );
     assert!(errors(&events).is_empty(), "the turn heard no error");
     assert_eq!(
         scheduler.decode_retry.take_wait(),

@@ -203,9 +203,11 @@ arriving message finds its account without a scan.
 **Linking**, on the person's **Profile** page (`web/content/npcd/pages/profile.js`), in a
 Discord section:
 
-1. "Link Discord" asks `POST /v1/me/discord/link`, which answers a **code**: six
-   digits, valid for **ten minutes**, used **once**, one standing code per account (asking
-   again replaces it). Codes are the custom object `discord/link/<code>` →
+1. "Link Discord" asks `POST /v1/me/discord/link`, which answers a **code**: twelve
+   characters of Crockford's base32 (no I, L, O or U), shown as `ABCD-EFGH-JKMN` and taken
+   back with or without the dashes, in either case — 2^60 codes, so a stranger DMing guesses
+   at a bot finds none — valid for **ten minutes**, used **once**, one standing code per
+   account (asking again replaces it). Codes are the custom object `discord/link/<code>` →
    `{ account, expires_ms }`, so any member's bot can redeem one. The page shows the
    code and the names of the bots it can be sent to — every connected bot of a character
    the person may message.
@@ -218,8 +220,8 @@ Discord section:
 A Discord account links to one tokera account; linking it again moves it, and the
 previous account's field is cleared; an account that links a second Discord account
 lets go of the first. A code is not a secret worth more than its ten minutes: it names
-no account and grants only that link. Six digits that are not a live code are an
-ordinary message. The three routes are the caller's own, like the rest of `/v1/me`
+no account and grants only that link. A code-shaped message that is not a live code is
+an ordinary message. The three routes are the caller's own, like the rest of `/v1/me`
 (`Guest`, the bar of an account route).
 
 **An unlinked author** is not heard in the world. Their first message to a bot is

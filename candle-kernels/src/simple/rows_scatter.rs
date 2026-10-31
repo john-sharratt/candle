@@ -50,7 +50,8 @@ extern "C" {
     ///   max_rows:  the longest run's `rows`, for the row axis
     ///
     /// Returns the launch's `cudaGetLastError` code: 0 on success (and for an
-    /// empty set, which launches nothing).
+    /// empty set, which launches nothing), or negative when it launched and an
+    /// earlier launch on this thread had failed unread ([`status_error`]).
     pub fn run_rows_scatter(
         desc: *const i64,
         host_desc: *const i64,
@@ -59,4 +60,42 @@ extern "C" {
         max_rows: i32,
         stream: *mut c_void,
     ) -> i32;
+}
+
+/// What a [`run_rows_scatter`] `status` of a launch of `n_runs` over
+/// `max_elems` × `max_rows` says went wrong; `None` when nothing did.
+pub fn status_error(status: i32, n_runs: usize, max_elems: i32, max_rows: i32) -> Option<String> {
+    match status {
+        0 => None,
+        s if s < 0 => Some(format!(
+            "rows_scatter: an earlier launch on this thread failed with CUDA error {}, and \
+             nothing read it; the {n_runs}-run scatter itself ran",
+            -s
+        )),
+        s => Some(format!(
+            "rows_scatter: launch failed with CUDA error {s} ({n_runs} runs, {max_elems} words \
+             wide, {max_rows} rows)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_error;
+
+    /// **Another launch's failure is not reported as this one's**, and this
+    /// one's says the grid it asked for.
+    #[test]
+    fn a_status_names_whose_failure_it_is() {
+        assert_eq!(status_error(0, 4, 32, 1), None);
+        assert_eq!(
+            status_error(9, 4, 32, 1).unwrap(),
+            "rows_scatter: launch failed with CUDA error 9 (4 runs, 32 words wide, 1 rows)"
+        );
+        assert_eq!(
+            status_error(-9, 4, 32, 1).unwrap(),
+            "rows_scatter: an earlier launch on this thread failed with CUDA error 9, and \
+             nothing read it; the 4-run scatter itself ran"
+        );
+    }
 }

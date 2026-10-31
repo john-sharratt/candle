@@ -150,7 +150,11 @@ extern "C" __global__ void rows_scatter_inline_kernel(
     rows_scatter_run(&table.w[e * ROWS_SCATTER_WORDS]);
 }
 
-// Returns the launch's `cudaGetLastError` (0 on success, and for an empty set).
+// Returns this launch's `cudaGetLastError` (0 on success, and for an empty set),
+// or, when it launched and an earlier one on this thread had failed unread, that
+// launch's error negated: `cudaGetLastError` is one sticky word per thread and
+// most kernels here never read it, so without taking it first this launch would
+// report another's failure as its own.
 extern "C" int run_rows_scatter(
     const long long* desc,
     const long long* host_desc,
@@ -160,6 +164,7 @@ extern "C" int run_rows_scatter(
     void* stream)
 {
     if (n_runs <= 0 || max_elems <= 0 || max_rows <= 0) return 0;
+    const int earlier = (int)cudaGetLastError();
     const int threads = 256;
     // Column tiles cover the widest run's *vector* width — sizing on the scalar
     // width would launch four times the blocks the vector path needs and leave
@@ -184,8 +189,9 @@ extern "C" int run_rows_scatter(
         }
         rows_scatter_inline_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(
             desc, n_runs, table);
-        return (int)cudaGetLastError();
+    } else {
+        rows_scatter_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(desc, n_runs);
     }
-    rows_scatter_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(desc, n_runs);
-    return (int)cudaGetLastError();
+    const int own = (int)cudaGetLastError();
+    return own != 0 ? own : -earlier;
 }

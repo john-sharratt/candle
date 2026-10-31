@@ -6054,6 +6054,20 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 );
                 continue;
             }
+            // A worker this member ran is carried on as itself, with its beat
+            // and its settling, not finished with nothing listening: that left
+            // its record saying nobody ran it, and another member's sweep
+            // started it again over the same round.
+            if let Some((owner, thread, name)) = conv_names(&conv_id) {
+                match workers::carry_on(&session, owner, thread, name, call_turn).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        conv_id = %conv_id,
+                        "resume: the worker could not be carried on: {e}"
+                    ),
+                }
+            }
 
             let (selection, tools_mode) = resume_dials(session.conversation_dials(&conv_id));
             // The turn carries no question of its own: its message is the tool
@@ -8632,18 +8646,18 @@ impl ZendSession {
         .await
     }
 
-    /// A worker's turn (`crate::mcp::workers`): from `message`, or — `round`
-    /// naming a call turn and the round it was, sealed before its tools ran,
-    /// here or on the member that handed it here — by running that round's
-    /// tools. With `may_hand` it moves to a markedly faster member at a round
-    /// boundary ([`StreamItem::Handed`]).
+    /// A worker's turn (`crate::mcp::workers`): from `message`, or — `resume`
+    /// naming a sealed call turn, its tools not run or cut off part way, here
+    /// or on the member that handed it here — by running that round's tools.
+    /// With `may_hand` it moves to a markedly faster member at a round boundary
+    /// ([`StreamItem::Handed`]).
     pub async fn submit_worker(
         &self,
         message: String,
         conv_id: String,
         tools_mode: ToolMode,
         selection: candle_conversation::SelectionState,
-        round: Option<(u32, usize)>,
+        resume: Option<Resume>,
         may_hand: bool,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         self.submit_turn(
@@ -8657,14 +8671,7 @@ impl ZendSession {
             tools_mode,
             None,
             selection,
-            TurnStart {
-                resume: round.map(|(call_turn, iteration)| Resume {
-                    call_turn,
-                    dispatch: Dispatch::Live,
-                    iteration,
-                }),
-                may_hand,
-            },
+            TurnStart { resume, may_hand },
         )
         .await
     }
@@ -8688,6 +8695,14 @@ impl ZendSession {
         let timeline = timeline_for(conv_id);
         resume::marked_call_turn(&state.engine, timeline) == Some(call_turn)
             && !resume::round_answered(&state.engine, timeline, call_turn)
+    }
+
+    /// The call turn of `conv_id`'s round still to run, when one is.
+    pub fn pending_round(&self, conv_id: &str) -> Option<u32> {
+        let state = self.inference.load_full()?;
+        let timeline = timeline_for(conv_id);
+        resume::marked_call_turn(&state.engine, timeline)
+            .filter(|&call_turn| !resume::round_answered(&state.engine, timeline, call_turn))
     }
 
     /// The `oseq` of this member's newest commit of `conv_id`, once every turn

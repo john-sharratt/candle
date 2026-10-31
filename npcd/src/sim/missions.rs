@@ -25,7 +25,7 @@
 //! A target is settled when its operation is, not when one of its steps is
 //! reported.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +163,10 @@ pub struct Missions {
     /// was called off, not yet told — see [`Self::take_stood_down`].
     #[serde(default)]
     stood_down: Vec<String>,
+    /// Bodies the world gives no orders — a personality with `takes_orders:
+    /// false` — see [`Self::set_unordered`].
+    #[serde(default)]
+    unordered: BTreeSet<String>,
     /// The world's own routines, from `<mind>/missions/<world>.yaml` —
     /// drawn in place of the built-in [`bank`] when there are any. The mind's,
     /// read afresh rather than saved, like the workflows.
@@ -182,6 +186,32 @@ impl Missions {
     pub fn take_stood_down(&mut self) -> Vec<String> {
         std::mem::take(&mut self.stood_down)
     }
+
+    /// Mark the body unordered, or not: **the world gives an unordered
+    /// character no orders.** The table never calls it, never hands it work and
+    /// never offers it `collect_mission`, nothing is lodged for it, and its
+    /// idle wake sets it nothing — what it does with its time is its own. Made
+    /// unordered, it is stood down from whatever it carries, and told so, and
+    /// what was lodged for it is dropped. `docs/mission_generator.md`, "A
+    /// character that takes no orders".
+    pub fn set_unordered(&mut self, body: &str, unordered: bool) {
+        if !unordered {
+            self.unordered.remove(body);
+            return;
+        }
+        if self.cancel(body) {
+            self.stood_down.push(body.to_string());
+        }
+        self.lodged.remove(body);
+        self.unordered.insert(body.to_string());
+    }
+
+    /// Whether the world gives this body no orders — see
+    /// [`Self::set_unordered`].
+    pub fn is_unordered(&self, body: &str) -> bool {
+        self.unordered.contains(body)
+    }
+
     /// The body's open mission, if it is on one.
     pub fn active(&self, body: &str) -> Option<&Mission> {
         self.active.get(body)
@@ -342,10 +372,11 @@ impl Missions {
     /// Whether a mission waits at the table that `body` may take — see
     /// [`Self::take_pooled`].
     pub fn has_pooled_for(&self, body: &str) -> bool {
-        self.pool.iter().any(|m| match m.operation() {
-            Some((id, _)) => self.operations.may_take(id, body),
-            None => true,
-        })
+        !self.is_unordered(body)
+            && self.pool.iter().any(|m| match m.operation() {
+                Some((id, _)) => self.operations.may_take(id, body),
+                None => true,
+            })
     }
 
     /// The oldest generated mission waiting at the table that `body` may take,
@@ -1210,6 +1241,29 @@ mod tests {
             m.last_closed("bram").map(|x| x.prompt.as_str()),
             Some("the work")
         );
+    }
+
+    /// **A character made unordered is stood down from what it carries, and
+    /// told**; what was lodged for it goes, and marking it again changes
+    /// nothing.
+    #[test]
+    fn an_unordered_character_carries_nothing_and_is_told_so() {
+        let mut m = Missions::default();
+        m.assign("zen", a_mission("visit the hatchery"));
+        m.lodge("zen", a_mission("then the ward"));
+        m.assign("wick", a_mission("read a cradle"));
+        m.set_unordered("zen", true);
+        assert!(m.is_unordered("zen"));
+        assert!(!m.is_on_mission("zen"));
+        assert!(!m.has_lodged("zen"));
+        assert_eq!(m.take_stood_down(), ["zen"]);
+        assert!(!m.is_unordered("wick"));
+        assert!(m.is_on_mission("wick"), "nobody else is touched");
+
+        m.set_unordered("zen", true);
+        assert!(m.take_stood_down().is_empty(), "nothing left to stand down");
+        m.set_unordered("zen", false);
+        assert!(!m.is_unordered("zen"));
     }
 
     #[test]

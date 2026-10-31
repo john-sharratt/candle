@@ -129,8 +129,13 @@ pub enum OpReply {
     /// Where a person now stands; `None` when there was nowhere.
     Placed { at: Option<String> },
     /// A mission lodged: the standing task to rouse the character with, when
-    /// it was carried at once.
-    Lodged { now_text: Option<String> },
+    /// it was carried at once — or `refused`, for a character that takes no
+    /// orders, with nothing lodged. Absent, `refused` is a lodge taken.
+    Lodged {
+        now_text: Option<String>,
+        #[serde(default)]
+        refused: bool,
+    },
     /// A step ticked off and one added, as asked.
     Stepped {
         ticked: Option<bool>,

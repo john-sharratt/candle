@@ -167,6 +167,7 @@ impl Paging {
 pub mod delete;
 pub mod edit;
 pub mod grep;
+pub mod image;
 pub mod list;
 pub mod mv;
 pub mod present;
@@ -178,6 +179,7 @@ pub mod write;
 pub use delete::FILE_DELETE;
 pub use edit::FILE_EDIT;
 pub use grep::FILE_GREP;
+pub use image::FILE_IMAGE;
 pub use list::FILE_LIST;
 pub use mv::FILE_MOVE;
 pub use present::FILE_PRESENT;

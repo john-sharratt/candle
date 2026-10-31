@@ -391,7 +391,10 @@ async fn a_link_code_links_its_sender() {
             "Linked — you are Wren S here.".to_string()
         )]
     );
-    assert_eq!(shared.custom_object(&code::key(&minted)), None);
+    assert_eq!(
+        shared.custom_object(&code::key(&code::normal(&minted).unwrap())),
+        None
+    );
     assert_eq!(d.thread(), [], "a code is not a message to the character");
 }
 

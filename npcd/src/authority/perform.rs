@@ -154,9 +154,7 @@ impl Runtime {
                 npc,
                 mission,
                 start,
-            } => OpReply::Lodged {
-                now_text: self.lodge_mission(npc, *mission, start),
-            },
+            } => self.lodge_mission(npc, *mission, start),
             WorldOp::Step {
                 npc,
                 done,
@@ -346,18 +344,41 @@ impl Runtime {
     }
 
     /// Lodge a mission for a character, or put it in its hands at once when
-    /// `start`; the standing task to rouse it with, when carried at once.
-    pub(crate) fn lodge_mission(&self, npc: u64, mission: Mission, start: bool) -> Option<String> {
-        let (hosted, character) = self.body_of(npc)?;
-        let now_text = hosted.with_sim(|sim| {
-            if start {
+    /// `start`, with the standing task to rouse it with when carried at once.
+    ///
+    /// **Refused for a character that takes no orders**
+    /// ([`crate::sim::missions::Missions::set_unordered`]) — read under the same
+    /// hold of the world that would lodge it, so a mark landing between the two
+    /// cannot let one through.
+    pub(crate) fn lodge_mission(&self, npc: u64, mission: Mission, start: bool) -> OpReply {
+        let Some((hosted, character)) = self.body_of(npc) else {
+            return OpReply::Lodged {
+                now_text: None,
+                refused: false,
+            };
+        };
+        let lodged = hosted.with_sim(|sim| {
+            if sim.missions.is_unordered(&character) {
+                return None;
+            }
+            Some(if start {
                 sim.missions.assign(&character, mission);
                 sim.missions.active(&character).map(|m| m.standing_text())
             } else {
                 sim.missions.lodge(&character, mission);
                 None
-            }
+            })
         });
+        let Some(now_text) = lodged else {
+            tracing::warn!(
+                npc,
+                "a mission for a character that takes no orders was refused"
+            );
+            return OpReply::Lodged {
+                now_text: None,
+                refused: true,
+            };
+        };
         if let Some(text) = &now_text {
             self.tell(
                 npc,
@@ -366,7 +387,10 @@ impl Runtime {
                 EventKind::Nudge { text: text.clone() },
             );
         }
-        now_text
+        OpReply::Lodged {
+            now_text,
+            refused: false,
+        }
     }
 
     /// Tick off `done` on a character's open mission, and add `add`.

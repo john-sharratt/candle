@@ -402,6 +402,10 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         &["move_file", "rename_file", "mv", "fs_move", "fs_rename"],
     ),
     (
+        "file_image",
+        &["resize_image", "image_resize", "convert_image", "make_icon"],
+    ),
+    (
         "file_present",
         &["show_file", "present_file", "display_file"],
     ),
@@ -1008,8 +1012,8 @@ use crate::tools::{
     },
     datetime::REGISTRATION as DATETIME,
     file::{
-        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_MOVE, FILE_PRESENT, FILE_READ,
-        FILE_SEARCH, FILE_WRITE,
+        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_IMAGE, FILE_LIST, FILE_MOVE, FILE_PRESENT,
+        FILE_READ, FILE_SEARCH, FILE_WRITE,
     },
     git::{
         GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
@@ -1089,7 +1093,7 @@ fn register_all() -> &'static [RegisteredTool] {
         WEB_SEARCH.requires(NET),
         WEB_FETCH.requires(NET),
         WEATHER.requires(NET),
-        // File tools (9) — all safe: every change is held in the overlay
+        // File tools (10) — all safe: every change is held in the overlay
         FILE_WRITE,
         FILE_READ,
         FILE_EDIT,
@@ -1098,6 +1102,7 @@ fn register_all() -> &'static [RegisteredTool] {
         FILE_GREP,
         FILE_DELETE,
         FILE_MOVE,
+        FILE_IMAGE,
         FILE_PRESENT,
         // Git tools (9) — the split that decides the whole family.
         //
