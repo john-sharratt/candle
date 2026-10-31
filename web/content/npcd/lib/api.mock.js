@@ -11,6 +11,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /// Threads the mock is holding, by character. See `getMessages`: a conversation
 /// has to accumulate across calls or the tab looks right and shows nothing.
 const mockThreads = {};
+
+/// Characters' Discord bots, by character. See `getDiscord`.
+const mockBots = {};
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
 const EMPTY = flag('empty');
 
@@ -604,6 +607,31 @@ export const MockAPI = {
     mockThreads[id] = mockThreads[id] || [];
     mockThreads[id].push({ from: 'Wren', text });
     return { sent: text, from: 'Wren', to: 'Maker-01', waiting_for_them: 1, can_reply: true };
+  },
+
+  /* The character's own Discord bot, held per character so connecting and
+   * disconnecting show on the next read. A token the mock is handed is
+   * "rejected" when it has no dots, the shape of a token pasted wrong. */
+  async getDiscord(id) {
+    return mockBots[id] || { connected: false };
+  },
+  async connectDiscord(id, token) {
+    await sleep(300);
+    if (!String(token || '').includes('.')) {
+      throw Object.assign(new Error('Discord rejected the token'),
+        { error: 'discord_token_rejected', detail: 'Discord rejected the token', status: 400 });
+    }
+    const n = await this.getNpc(id);
+    mockBots[id] = {
+      connected: true, application_id: '1300000000000000001', user_id: '1300000000000000002',
+      username: n.name, connected_ms: Date.now(),
+      invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344134372416',
+    };
+    return mockBots[id];
+  },
+  async disconnectDiscord(id) {
+    delete mockBots[id];
+    return { connected: false };
   },
 
   async listInteractions(id) {

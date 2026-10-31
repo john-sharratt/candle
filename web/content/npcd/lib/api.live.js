@@ -171,6 +171,15 @@ export const LiveAPI = {
   getMessages:  (id) => j(`/v1/npc/${id}/message`),
   sendMessage:  (id, text) => j(`/v1/npc/${id}/message`, { method: 'POST', body: { text } }),
 
+  // The character's own Discord bot. Its owner makes the bot in the Developer
+  // Portal and hands the token over once; the daemon checks it, names and
+  // pictures the bot as the character, and keeps it sealed. The token never
+  // comes back — the read is `{connected}` and, when connected, which bot it is
+  // and the link that invites it to a server.
+  getDiscord:        (id) => j(`/v1/npc/${id}/discord`),
+  connectDiscord:    (id, token) => j(`/v1/npc/${id}/discord`, { method: 'PUT', body: { token } }),
+  disconnectDiscord: (id) => j(`/v1/npc/${id}/discord`, { method: 'DELETE' }),
+
   listInteractions: (id) => j(`/v1/npc/${id}/interaction`),
   openInteraction:  (id, spec) => j(`/v1/npc/${id}/interaction`, { method: 'POST', body: spec }),
   getInteraction:   (ix) => j(`/v1/interaction/${ix}`),

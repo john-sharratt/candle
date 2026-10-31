@@ -656,6 +656,22 @@ failure on another is a failure.
    (`upgrade/runtime/facts.rs`): the candidate enters fault mode on a failure, a member
    on a rejected build drains itself, and an accepted one takes work again.
 
+   **A store that does not answer holds the upgrades for 10 s, and no longer.** The
+   decisions and the census (§3.9) are blocking calls into the store, and a store's own
+   thread can be busy for minutes — on zend every census waits for the persistence
+   thread. Each app's reads therefore run as one task (`upgrade/runtime/facts_read.rs`),
+   and a tick waits for a read it started for at most `STORE_WAIT`, 10 s. One that has
+   not answered by then is kept. The next tick looks at it again without waiting, and
+   asks that store nothing new, so a held store never collects more than one waiting
+   call. While any app's read is out, the facts stay as last read and the tick acts on
+   nothing decided from them: no verdict acted on, no certification proposed, no
+   install. What an install left is still finished, and holdings are still announced and
+   fetched. The member's upgrade `step` says what the tick is blocked on, for example
+   `blocked: zend's store did not answer census in 10s`. A warning is logged when the
+   tick becomes blocked, not on every tick, and another when the store answers again.
+   A candidate's read of its next verdict index is bounded the same way: a store that
+   does not answer defers the proposal to its 5 s retry.
+
 A candidate that stops before proposing leaves its build uncertified, and the next
 candidate at that build starts again.
 
@@ -760,6 +776,11 @@ build is certified (§3.8):
      stable file `keep` started again, acquires each lease for 5 s as the same node,
      which for Paxos is a renewal, and releases it for the next member. The leases
      it held are in `<data>/upgrade/watch.json`.
+   - **A member waiting for a lease names it.** Its upgrade `step` lists the leases it
+     asked for and does not hold yet, for example `waiting: upgrade/zend not held`, so
+     a downloaded build left uninstalled says what it waits for. The step does not name
+     who holds a lease: a refused proposer learns the holder only as a `LeaseEvent::Busy`,
+     and the replicator keeps none.
 3. **Each member that holds the lease and a verified artifact:**
    - **drains** (§12.4): hands back claims, worlds and characters, and waits for its
      outbox;

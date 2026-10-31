@@ -75,12 +75,21 @@ fn ask_keep(path: &Path) -> io::Result<()> {
     stream.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
     let status = text.lines().next().unwrap_or("");
-    if status.contains(" 200 ") || status.contains(" 409 ") {
+    if keep_ran_it(status) {
         return Ok(());
     }
     Err(io::Error::other(format!(
         "keep refused the trial: {status}"
     )))
+}
+
+/// Whether `status`, keep's answer's first line, says the trial ran: 200 proven,
+/// 409 rolled back. Anything else started nothing. Read as run, a 423 for a
+/// trial already under way kept the plan naming a build keep never started, and
+/// the process restored afterwards recorded that build as failed: on WhiteWorld
+/// (2026-10-31) a healthy 4107 was refused for good.
+fn keep_ran_it(status: &str) -> bool {
+    status.contains(" 200 ") || status.contains(" 409 ")
 }
 
 /// Stage `job`, write the plan the next process reads for its leases, and ask
@@ -126,6 +135,15 @@ mod tests {
     use super::*;
 
     use crate::upgrade::watchdog::read_plan;
+
+    #[test]
+    fn only_a_proven_or_rolled_back_trial_counts_as_run() {
+        assert!(keep_ran_it("HTTP/1.0 200 OK"));
+        assert!(keep_ran_it("HTTP/1.0 409 Conflict"));
+        assert!(!keep_ran_it("HTTP/1.0 423 Locked"));
+        assert!(!keep_ran_it("HTTP/1.0 400 Bad Request"));
+        assert!(!keep_ran_it(""));
+    }
 
     fn launch(dir: &Path, exe: PathBuf) -> LaunchSpec {
         LaunchSpec {

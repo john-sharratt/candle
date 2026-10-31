@@ -7,6 +7,7 @@
 //! |---|---|
 //! | what to install, under which lease, and what to fetch ahead | [`decide`] |
 //! | the group's verdicts, rollouts and pauses, read from the substrate | [`facts`] |
+//! | one app's store reads for them, in flight across ticks | [`facts_read`] |
 //! | announcing what it holds, and a candidate's offer | [`announce`] |
 //! | fetching an artifact, and serving one | [`fetch`] |
 //! | a candidate's verdicts and its `certify` proposal | [`candidate`] |
@@ -21,6 +22,7 @@ mod candidate;
 pub mod commands;
 pub mod decide;
 mod facts;
+mod facts_read;
 mod failed_install;
 mod fetch;
 mod install;
@@ -37,11 +39,13 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::artifacts::Probe;
+use super::decisions::build_name;
 use super::parts::Parts;
 use super::watchdog::{Failure, FAILED};
 use crate::coord::{KeptLine, VerdictLine};
 use crate::frame::{BuildArtifacts, Frame};
 use crate::member::AppMember;
+use facts_read::FactsRead;
 use failed_install::failed_install;
 
 pub use decide::{prefetch, target, Facts, Lease, Target};
@@ -54,6 +58,16 @@ pub const TICK: Duration = Duration::from_secs(1);
 
 /// How often a member announces what it holds, when nothing prompts it.
 pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
+
+/// The longest a tick waits for a store to answer what the upgrades ask it —
+/// the census and the decisions. Each is an in-RAM read that answers in
+/// milliseconds while the store's own thread is free, so a store that takes
+/// this long is held by other work (on zend, anything holding the persistence
+/// thread). It is the same 10 s after which replication reports records ahead
+/// of a request not applied, so a store held this long says so in both places
+/// at once; and it is well inside a `COORD` report's period, so the step that
+/// names the stall is reported while the stall lasts.
+pub const STORE_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 struct State {
@@ -87,6 +101,10 @@ struct State {
     kept: Vec<KeptLine>,
     /// A build an admin's `rollback` or `upgrade-now` named for this member.
     forced: Option<Target>,
+    /// Per app: a facts read that has not answered yet.
+    reads: BTreeMap<String, FactsRead>,
+    /// The step while a store has not answered: what it is blocked on.
+    blocked: Option<String>,
 }
 
 /// See the module documentation.
@@ -122,6 +140,13 @@ impl Upgrader {
                 build,
                 "restored after a failed install: it is not tried again"
             );
+        }
+        let own = build_name(&setup.info.build());
+        if refused.contains(&own) {
+            match refused::forgive(&dir, &own) {
+                Ok(r) => refused = r,
+                Err(e) => tracing::error!("the running build {own} was not forgiven: {e}"),
+            }
         }
         let failure = fs::read(dir.join(FAILED))
             .ok()
@@ -229,18 +254,35 @@ impl Upgrader {
     /// verdicts, finish what an install left, certify, announce, fetch, and
     /// install.
     async fn tick(self: &Arc<Self>) {
+        self.tick_within(STORE_WAIT).await;
+    }
+
+    /// [`Self::tick`], waiting up to `store_wait` for each store call. While a
+    /// store has not answered, the facts are stale, so nothing decided from
+    /// them runs — no certification proposal, no install; what an install
+    /// left is still finished, and holdings still announced and fetched.
+    async fn tick_within(self: &Arc<Self>, store_wait: Duration) {
         if self.state().installing {
             return;
         }
         if !self.state().scanned {
             self.scan().await;
         }
-        self.refresh_facts().await;
-        self.own_verdicts().await;
+        let fresh = self.refresh_facts(store_wait).await;
+        if fresh {
+            self.own_verdicts().await;
+        }
         self.finish_install().await;
-        self.candidate_tick().await;
+        if fresh {
+            self.candidate_tick(store_wait).await;
+        }
         self.announce_tick().await;
         self.fetch_tick().await;
-        self.install_tick().await;
+        if fresh {
+            self.install_tick().await;
+        }
     }
 }
+
+#[cfg(test)]
+mod tick_tests;

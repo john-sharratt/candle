@@ -33,6 +33,7 @@ pub mod collections;
 pub mod compliance;
 pub mod console;
 pub mod describe;
+pub mod discord;
 pub mod drafts;
 pub mod effector;
 pub mod engine;

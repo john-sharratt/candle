@@ -761,11 +761,18 @@ fn target<'a>(body: &str, slots: &'a [Slot]) -> Result<(PathBuf, &'a Slot), Answ
 /// Put a trial of `artifact` on `slot`'s board: on it while it runs, however
 /// it was asked for, so the cluster reads it and a second one is refused.
 fn begin(slot: &Slot, artifact: &str) -> Result<(), Answer> {
-    BOARD.begin(&slot.name, artifact).map_err(|why| Answer {
-        status: 409,
-        reason: "Conflict",
+    BOARD.begin(&slot.name, artifact).map_err(trial_running)
+}
+
+/// The answer to a trial asked for while one runs: 423, which is not the 409 of
+/// a trial rolled back. Nothing was started, and a member handing off must not
+/// read this as an install that ran (`cluster::upgrade::handoff`).
+fn trial_running(why: String) -> Answer {
+    Answer {
+        status: 423,
+        reason: "Locked",
         body: format!("{why}\n"),
-    })
+    }
 }
 
 /// Hand `path` to `slot`'s supervisor and wait for its answer; a trial's end
@@ -922,6 +929,14 @@ mod tests {
         assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
         assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);
         assert_eq!(cfg.services[2].args, ["--config", "mcp/mcp.yaml"]);
+    }
+
+    /// A trial asked for during another is 423, never the 409 of a rollback:
+    /// `cluster::upgrade::handoff` reads a 409 as a trial that ran.
+    #[test]
+    fn a_trial_during_a_trial_is_not_a_rollback() {
+        let answer = trial_running("a trial of x is already running".to_string());
+        assert_eq!(answer.status, 423);
     }
 
     /// `/` is a switch, `/<action>/<name>` that action on that service,

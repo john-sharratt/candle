@@ -971,6 +971,101 @@ export async function render(params) {
         'characterful near-edge deliberately, and to see when it is about to tip past character into incoherence.'));
   }
 
+  /* The character's own Discord account, above its conversation.
+   *
+   * **A bot is made by hand.** Discord has no API that creates one, so the
+   * panel walks the owner through the two things only they can do in the
+   * Developer Portal — make the application, copy its bot's token — and takes
+   * the token at the end. Everything after the paste is the daemon's: it checks
+   * the token, names and pictures the bot as this character, and keeps the
+   * token sealed. The token is never shown again; the read says only which bot
+   * is connected and how to invite it to a server.
+   *
+   * Painted from its own read, so a slow or failing Discord answer never holds
+   * up the thread below it. */
+  function discordPanel() {
+    const host = h('div', { class: 'panel discord-panel' });
+    const paint = (d) => mount(host, d.connected ? connected(d) : unconnected());
+
+    function connected(d) {
+      const disconnect = () => confirmDialog({
+        title: 'Disconnect ' + d.username,
+        confirmText: 'Disconnect',
+        message: `${npc.name} stops being ${d.username} here. The bot stays yours in the Developer `
+          + 'Portal, and connecting it again takes a fresh token.',
+        onConfirm: async () => {
+          try {
+            paint(await API.disconnectDiscord(id));
+            toast('Discord disconnected', 'ok');
+          } catch (err) {
+            toast(err.detail || err.message || 'could not disconnect', 'err');
+          }
+        },
+      });
+      return h('div', { class: 'row wrap' },
+        h('span', { style: 'flex:1' }, h('b', {}, d.username), ` is ${npc.name} on Discord`),
+        h('a', { class: 'btn sm', href: d.invite_url, target: '_blank', rel: 'noopener' }, 'Invite to a server'),
+        h('button', { class: 'btn sm ghost', onClick: disconnect }, 'Disconnect'));
+    }
+
+    function unconnected() {
+      const token = h('input', {
+        class: 'input', type: 'password', style: 'flex:1', autocomplete: 'off',
+        placeholder: 'Bot token',
+      });
+      const note = h('div', { class: 'tiny discord-err' });
+      const send = h('button', { class: 'btn primary', type: 'submit' }, 'Connect');
+      async function connect(e) {
+        e.preventDefault();
+        const t = (token.value || '').trim();
+        if (!t) return;
+        send.disabled = true;
+        note.textContent = '';
+        try {
+          paint(await API.connectDiscord(id, t));
+          toast(`${npc.name} is on Discord`, 'ok');
+        } catch (err) {
+          // Under the field rather than only in a toast: a rejected token is
+          // fixed here, by pasting again, and the reason should stay in view.
+          note.textContent = err.error === 'discord_rate_limited' && err.retry_after != null
+            ? `Discord is busy — try again in ${Math.ceil(err.retry_after)} s.`
+            : (err.detail || err.message || 'Discord refused the token');
+          send.disabled = false;
+        }
+      }
+      const steps = h('ol', { class: 'discord-steps', hidden: true },
+        h('li', {}, 'Open ',
+          h('a', { href: 'https://discord.com/developers/applications', target: '_blank', rel: 'noopener' },
+            'the Developer Portal'),
+          ` and click New Application. Name it ${npc.name}.`),
+        h('li', {}, 'Open Bot, click Reset Token, and copy it.'),
+        h('li', {}, 'Paste it here.',
+          h('form', { class: 'row', style: 'margin-top:6px', onSubmit: connect }, token, send),
+          note));
+      const setUp = h('button', {
+        class: 'btn sm',
+        onClick: () => {
+          steps.hidden = false;
+          setUp.hidden = true;
+          token.focus();
+        },
+      }, 'Set up Discord');
+      return h('div', {},
+        h('div', { class: 'row wrap' },
+          h('span', { class: 'tiny dim', style: 'flex:1' },
+            `Give ${npc.name} its own Discord account, so people can DM it on Discord.`),
+          setUp),
+        steps);
+    }
+
+    // Hidden until the read answers, so a click on Set up is never undone by
+    // the first paint landing after it. A daemon that cannot answer leaves it
+    // hidden rather than offering a setup it cannot finish.
+    host.hidden = true;
+    API.getDiscord(id).then((d) => { paint(d); host.hidden = false; }).catch(() => {});
+    return host;
+  }
+
   /* Messaging the character on its handset.
    *
    * **The same threads the characters use between themselves.** What is sent
@@ -1101,6 +1196,7 @@ export async function render(params) {
     }
 
     mount(bodyHost,
+      discordPanel(),
       h('div', { class: 'tiny dim', style: 'margin-bottom:11px' },
         first.in_a_world
           ? `On ${first.with}’s handset, as ${first.as}. It answers on its own schedule — when its next turn comes round.`
