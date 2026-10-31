@@ -1422,6 +1422,15 @@ pub enum Choices {
     /// from the branch it is not a mistake available to it — the same move that
     /// killed invented tool names and invented addressees.
     Reachable,
+    /// A room of the world this body can turn its attention to — every room
+    /// but the one it is in. Empty for a body that walks, which takes `focus`
+    /// out of the grammar: only a body that moves by attention has one
+    /// (`docs/zen_moon_mind.md` §3.2).
+    Rooms,
+    /// One of the world's standing jobs, by its name — what `order_post` may
+    /// post whole (`docs/zen_moon_mind.md` §8.3). Empty in a world with none,
+    /// which takes the argument out and leaves the post to say its own steps.
+    Jobs,
     /// A floor the lift can carry this body to, by the level's name — never the
     /// one it is standing on. Bound to `lift_use`, and offered only while the
     /// body is on a landing (see [`Availability::AtLanding`]).
@@ -1735,6 +1744,8 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("reach_out", "to", Choices::Contacts),
     ("reflect", "feeling", Choices::Feelings),
     ("move_to", "destination", Choices::Reachable),
+    ("focus", "on", Choices::Rooms),
+    ("order_post", "job", Choices::Jobs),
     ("lift_use", "floor", Choices::Floors),
     ("time_travel", "year", Choices::Years),
     // ---- contact and obligation ----
@@ -1788,6 +1799,11 @@ pub struct Within {
     /// Empty for a character with nowhere to go, which takes `move_to` out of
     /// the grammar entirely.
     pub places: Vec<String>,
+    /// Every room this body may turn its attention to — [`Choices::Rooms`].
+    /// Empty for a body that walks, which takes `focus` out of the grammar.
+    pub rooms: Vec<String>,
+    /// The world's standing jobs, by name — [`Choices::Jobs`].
+    pub jobs: Vec<String>,
     /// Acts this body has taken too recently to take again — see
     /// [`crate::engine::cooldown`].
     ///
@@ -1984,6 +2000,12 @@ impl Within {
         // carrying an operation was still handed the bench's working-set verbs
         // as acts of their own, and stashed and logged round and round.
         self.year = sim.missions.year_of(body);
+        self.jobs = sim
+            .missions
+            .routines()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
         self.years = sim
             .missions
             .active(body)
@@ -2288,6 +2310,8 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Reachable => within.places.clone(),
         Choices::Floors => within.floors.clone(),
         Choices::Years => within.years.clone(),
+        Choices::Rooms => within.rooms.clone(),
+        Choices::Jobs => within.jobs.clone(),
         Choices::Feelings => within.feelings.clone(),
         Choices::Carried => within.carried.clone(),
         Choices::Equippable => within.equippable.clone(),
@@ -3437,6 +3461,7 @@ mod tests {
             Choices::Company,
             Choices::CompanyOrSelf,
             Choices::Reachable,
+            Choices::Rooms,
             Choices::Carried,
             Choices::Operable,
             Choices::Threads,

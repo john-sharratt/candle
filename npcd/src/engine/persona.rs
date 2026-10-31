@@ -128,6 +128,8 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         // The personality's, which the caller supplies when it has it.
         home: None,
         unordered: false,
+        attends: false,
+        idle: None,
         manner: String::new(),
         beliefs: n.beliefs.iter().map(believe).collect(),
         relationships: n.relationships.iter().map(know).collect(),

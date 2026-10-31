@@ -948,6 +948,8 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
             .and_then(|r| r.body.get("takes_orders"))
             .and_then(Value::as_bool)
             == Some(false);
+        persona.attends = field("moves").as_deref() == Some("attention");
+        persona.idle = field("idle");
         Some(persona)
     }));
 

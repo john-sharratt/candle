@@ -127,9 +127,80 @@ pub const REPORT_REJECTED: Tool = desk_on!(
      cannot stand is the review doing its job."
 );
 
+/// Post a mission on the table, as a character that takes no orders gives them
+/// (`docs/zen_moon_mind.md` §8).
+pub const ORDER_POST: Tool = Tool {
+    name: "order_post",
+    at: COMMAND_DESK,
+    category: "Command",
+    plane: Plane::World,
+    availability: Availability::AtPart,
+    description: "Put a mission on the table for one of those who take your orders to carry \
+                  out: what is to be done and the steps to it — or one of the standing jobs, \
+                  whole — and, if it is for one in particular, who. Whoever waits at the table \
+                  is told at once; you are told when it is reported, and read the report here.",
+    params: &[
+        Param {
+            name: "job",
+            ty: "string",
+            required: false,
+            description: "One of the standing jobs, by its name: posted with its own brief and \
+                          steps, so you need give neither.",
+        },
+        Param {
+            name: "brief",
+            ty: "string",
+            required: false,
+            description: "What is to be done and why, as the one who carries it will read it. \
+                          Needed unless you post a standing job.",
+        },
+        Param {
+            name: "steps",
+            ty: "string",
+            required: false,
+            description: "The steps, one to a line, each something they can be seen to do: \
+                          \"go to the ward room\", \"scan the sensor panel and read what state \
+                          it is in\". Needed unless you post a standing job.",
+        },
+        Param {
+            name: "for",
+            ty: "string",
+            required: false,
+            description: "Who is to carry it, by name. Left out, the first to come for work \
+                          takes it.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The sensor panel showed a fault on the Sharratts' level, and nobody has \
+                    looked at it.",
+        call: r#"{"brief":"Find out what the fault on the groups level is and whether the Sharratts are affected.","steps":"go to the ward room\nscan the sensor panel and read what state it is in\nscan the status board and read what state it is in"}"#,
+        because: "Something seen and set as work is something that gets done; something seen and \
+                  only thought about is not.",
+    }],
+};
+
+/// Read what has come back from the missions posted on the table.
+pub const ORDER_RESULTS: Tool = desk!(
+    "order_results",
+    "Read the reports on the missions you posted, newest first, and what is still out — who \
+     carries it, or that it waits to be taken. When nothing is left on the table, it lists the \
+     standing jobs you may post.",
+    "You were told a mission you posted has been reported, or you want to know how the work you \
+     set is going.",
+    "A report nobody reads is work done for nothing; reading it is how what was found becomes \
+     what you do next."
+);
+
 /// Every mission act, for the catalog. All at the command table: a mission is
 /// taken up and answered for there, and carried out in the world between.
-pub const MISSION_ACTS: &[Tool] = &[COLLECT_MISSION, REPORT_DONE, REPORT_STUCK, REPORT_REJECTED];
+pub const MISSION_ACTS: &[Tool] = &[
+    COLLECT_MISSION,
+    REPORT_DONE,
+    REPORT_STUCK,
+    REPORT_REJECTED,
+    ORDER_POST,
+    ORDER_RESULTS,
+];
 
 /// What a body at the table is carrying, as far as the table's acts care.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +220,8 @@ pub struct Carrying {
     /// The world gives this body no orders — see
     /// [`crate::sim::missions::Missions::set_unordered`].
     pub unordered: bool,
+    /// A report on what it posted waits that it has not read.
+    pub unread: bool,
 }
 
 /// What `body` is carrying in `s`.
@@ -163,6 +236,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
             .and_then(|m| m.work.as_ref())
             .is_some_and(|w| !w.edit_optional),
         unordered: s.missions.is_unordered(body),
+        unread: s.missions.unread_for(body),
     }
 }
 
@@ -201,6 +275,11 @@ const NOT_FOR_OPERATIONS: [&str; 9] = [
 pub fn offered(tool: &str, c: Carrying) -> bool {
     match tool {
         t if t == COLLECT_MISSION.name => !c.mission && !c.unordered,
+        // The table is the poster's to give work from and read back at, and only
+        // a character that takes no orders gives them. What came back is read
+        // once: the reading is offered only while something new waits in it.
+        t if t == ORDER_POST.name => c.unordered,
+        t if t == ORDER_RESULTS.name => c.unordered && c.unread,
         t if t == REPORT_DONE.name || t == REPORT_STUCK.name => c.mission,
         t if t == REPORT_REJECTED.name => c.mission && c.review,
         "orders_report_done" => c.order,
@@ -234,6 +313,7 @@ mod tests {
             order,
             drafts: false,
             unordered: false,
+            unread: false,
         }
     }
 
@@ -286,5 +366,18 @@ mod tests {
         };
         assert!(!offered("collect_mission", unordered));
         assert!(offered("present", unordered));
+        // And it is the one the table's orders are for; nobody else posts. What
+        // came back is offered only while something new waits in it.
+        assert!(offered("order_post", unordered));
+        assert!(!offered("order_results", unordered), "nothing new to read");
+        assert!(offered(
+            "order_results",
+            Carrying {
+                unread: true,
+                ..unordered
+            }
+        ));
+        assert!(!offered("order_post", idle));
+        assert!(!offered("order_results", busy));
     }
 }
