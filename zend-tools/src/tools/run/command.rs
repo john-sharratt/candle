@@ -171,6 +171,7 @@ fn take_apart(program: String, args: Vec<String>) -> Result<(String, Vec<String>
         .chain(args.iter().cloned())
         .collect();
     refuse_shell_syntax(&rest)?;
+    refuse_code_flag_alone(&first, &rest)?;
     if rest.len() == args.len() {
         return Ok((program, args));
     }
@@ -231,6 +232,31 @@ fn refuse_shell_syntax(args: &[String]) -> Result<(), RunError> {
         )));
     }
     Ok(())
+}
+
+/// An interpreter's code flag as the last argument, with no code after it, is
+/// refused with what to do instead. Measured live, `node` with `["-e"]`: sixteen
+/// calls in one turn, each answered only `-e requires an argument`, and the
+/// worker never found out its code had not gone.
+fn refuse_code_flag_alone(program: &str, args: &[String]) -> Result<(), RunError> {
+    let flags: &[&str] = match Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("node") => &["-e", "--eval", "-p", "--print"],
+        Some("python" | "python3" | "py") => &["-c"],
+        _ => &[],
+    };
+    match args.last() {
+        Some(flag) if flags.contains(&flag.as_str()) => Err(RunError::Shell(format!(
+            "`{flag}` is the last of your args, so the code it runs is missing: the code must be \
+             the next entry of `args`, whole, as one string. If it will not go there, `write` it \
+             to a file in the repository and run that file"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Whether `program` names git, by name or by path, with or without `.exe`.
@@ -337,6 +363,22 @@ mod tests {
         );
         assert!(refuse_shell_syntax(&strings(&["\\\"x\\\""])).is_err());
         assert!(refuse_shell_syntax(&strings(&["-e", "console.log(\"a \\\"b\\\"\")"])).is_ok());
+    }
+
+    /// **A code flag with no code is refused**, by whichever spelling of the
+    /// interpreter; with its code after it, or as another program's flag, it
+    /// runs.
+    #[test]
+    fn a_code_flag_with_no_code_is_refused() {
+        for (program, flag) in [("node", "-e"), ("NODE.EXE", "--eval"), ("python", "-c")] {
+            let refused = take_apart(program.into(), strings(&[flag]));
+            assert!(
+                matches!(&refused, Err(RunError::Shell(why)) if why.contains("the code it runs is missing")),
+                "{refused:?}"
+            );
+        }
+        assert!(take_apart("node".into(), strings(&["-e", "console.log(1)"])).is_ok());
+        assert!(take_apart("cargo".into(), strings(&["-p"])).is_ok());
     }
 
     #[test]
