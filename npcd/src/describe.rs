@@ -392,7 +392,7 @@ pub async fn post_describe(
         choices: None,
     };
 
-    match prose::run(&s, request).await {
+    match prose::run(&s, request, prose::ASKED).await {
         Ok(prose::Answer { text, tokens, seed }) => {
             let description = text.trim();
             if description.is_empty() {
@@ -499,7 +499,7 @@ pub async fn post_describe_stream(
     let world_id = body.world_id.clone();
     let personality_id = body.personality_id.clone();
     tokio::spawn(async move {
-        let line = match prose::run_streamed(&s, request, on_fragment).await {
+        let line = match prose::run_streamed(&s, request, prose::ASKED, on_fragment).await {
             Ok(prose::Answer { text, tokens, seed }) => {
                 let description = text.trim();
                 if description.is_empty() {

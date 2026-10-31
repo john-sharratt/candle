@@ -243,7 +243,7 @@ pub async fn post_name(State(s): State<Arc<Authored>>, Json(body): Json<NameBody
         choices: None,
     };
 
-    match prose::run(&s, request).await {
+    match prose::run(&s, request, prose::ASKED).await {
         Ok(prose::Answer { text, seed, .. }) => {
             let name = clean_name(&text);
             if name.is_empty() {

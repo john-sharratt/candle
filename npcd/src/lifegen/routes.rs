@@ -599,7 +599,7 @@ pub async fn post_generate(
                 // Prose, not a decision — nothing to constrain it to.
                 choices: None,
             };
-            prose::run(&state, request)
+            prose::run(&state, request, prose::BACKGROUND)
                 .await
                 .map(|a| a.text)
                 .map_err(|e| e.to_string())

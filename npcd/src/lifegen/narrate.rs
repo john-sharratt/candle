@@ -316,7 +316,7 @@ pub async fn post_narrate(
         choices: None,
     };
 
-    let (text, tokens, seed) = match prose::run(&s, request).await {
+    let (text, tokens, seed) = match prose::run(&s, request, prose::ASKED).await {
         Ok(a) => (a.text, a.tokens, a.seed),
         Err(e) => return prose::refusal(&e),
     };

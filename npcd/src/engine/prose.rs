@@ -72,9 +72,10 @@ pub enum Frame {
 /// Decode `request` with `seed` on `band`, its system prompt held as `frame`,
 /// handing each new fragment of text to `on_fragment` as it lands.
 ///
-/// Awaits the decode; the routes in [`crate::prose`] call it directly, on the
-/// characters' [`DecodePriority::Normal`]; a judgement an operation waits on
-/// takes [`WORK_BAND`].
+/// Awaits the decode; the routes in [`crate::prose`] call it directly, at
+/// [`crate::prose::ASKED`] for a person waiting at the console or
+/// [`crate::prose::BACKGROUND`] for a job nobody watches; a judgement an
+/// operation waits on takes [`WORK_BAND`].
 pub async fn decode(
     engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
@@ -154,8 +155,9 @@ pub struct CallAsk<'a> {
 /// four Makers' turns, dreams and journals — its prefill throttled under their
 /// decodes — and then decoded in under a minute. While it waited every Maker
 /// drew routines, because the work the call would have handed them did not
-/// exist yet. The engine's other prose — a description, a name, a life — stays
-/// at the characters' band.
+/// exist yet. The console's prose — a name, a description, a narrated node — is
+/// [`crate::prose::ASKED`], above this, because a person is waiting on it; a
+/// whole life's ladder is [`crate::prose::BACKGROUND`], below the cast.
 pub const WORK_BAND: DecodePriority = DecodePriority::High;
 
 /// Decode an answer held to one of `ask.calls`, and return the call as written.
@@ -476,8 +478,9 @@ async fn run_turn(
 /// Tagged with something no turn carries, it admits none of them, and a job
 /// reads its own system prompt and question and nothing else.
 ///
-/// `band` is the job's: the characters' own, [`DecodePriority::Normal`] —
-/// below zend's dialogue — or [`WORK_BAND`] for the work an operation waits on.
+/// `band` is the job's: [`crate::prose::ASKED`] for a person waiting at the
+/// console, [`crate::prose::BACKGROUND`] for a job nobody watches, or
+/// [`WORK_BAND`] for the work an operation waits on.
 fn prose_projection(
     system: &str,
     frame: SectionId,

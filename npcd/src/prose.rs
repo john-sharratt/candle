@@ -42,6 +42,24 @@ use crate::engine::prose::Frame;
 /// bounds how long one ask can hold a slot in them.
 pub const MAX_TOKENS: u32 = 4096;
 
+/// The band of a job a person is waiting on at the console: a name, a
+/// description, one node of a life narrated on demand, free prose.
+///
+/// **Above the characters, whose own turns decode at `high`** (the interaction,
+/// perception and action layers of the mind's `projection.yaml`). These jobs
+/// rode `Normal`, below every one of them: on BW (2026-10-31, the cast decoding,
+/// fifteen turns pending) a description waited 178 to 252 s for its first token
+/// and then wrote itself in five, and the create page gave up first. `Urgent` is
+/// the band the scheduler keeps for exactly this — a person waiting on the turn
+/// right now — and the one the image route's content check already rides
+/// ([`crate::compliance`]).
+pub const ASKED: DecodePriority = DecodePriority::Urgent;
+
+/// The band of a job nobody is waiting on as it decodes: a whole life's ladder,
+/// hundreds of nodes fanned out as a background job the console polls. Below the
+/// cast, so writing a history never slows the characters living in it.
+pub const BACKGROUND: DecodePriority = DecodePriority::Normal;
+
 /// The voice a job gets when the caller names none.
 pub const DEFAULT_SYSTEM: &str =
     "You are a careful writer. Answer exactly what is asked, in plain prose, and nothing else.";
@@ -174,14 +192,18 @@ pub fn refusal(e: &ProseError) -> Response {
         .into_response()
 }
 
-/// Decode `request` on the resident model and wait for the answer, on the
-/// characters' band.
-pub async fn run(s: &Arc<Authored>, request: Request) -> Result<Answer, ProseError> {
-    run_streamed(s, request, |_: &str| {}).await
+/// Decode `request` on the resident model at `band` — [`ASKED`] or
+/// [`BACKGROUND`] — and wait for the answer.
+pub async fn run(
+    s: &Arc<Authored>,
+    request: Request,
+    band: DecodePriority,
+) -> Result<Answer, ProseError> {
+    run_streamed(s, request, band, |_: &str| {}).await
 }
 
-/// The same on `band` — for a job something else is held up on until it
-/// answers.
+/// The same with its system prompt kept sealed — for a gate something else is
+/// held up on until it answers.
 ///
 /// **A gate in front of another job decodes above the characters.** The image
 /// route's content check is four one-token answers, and the draw is not queued
@@ -211,18 +233,10 @@ pub async fn run_at(
 pub async fn run_streamed(
     s: &Arc<Authored>,
     request: Request,
+    band: DecodePriority,
     mut on_fragment: impl FnMut(&str) + Send + 'static,
 ) -> Result<Answer, ProseError> {
-    // On the characters' band: a job asked for here is nothing an operation
-    // waits on.
-    decode_on(
-        s,
-        request,
-        DecodePriority::Normal,
-        Frame::Transient,
-        &mut on_fragment,
-    )
-    .await
+    decode_on(s, request, band, Frame::Transient, &mut on_fragment).await
 }
 
 /// Decode `request` on `band`, its system prompt held as `frame`, handing each
@@ -292,7 +306,7 @@ impl ProseBody {
 
 /// `POST /v1/generate/prose` — free prose from the resident model.
 pub async fn post_prose(State(s): State<Arc<Authored>>, Json(body): Json<ProseBody>) -> Response {
-    match run(&s, body.into_request()).await {
+    match run(&s, body.into_request(), ASKED).await {
         // The seed rides back with the text because a draft an author liked is a
         // one-off unless the draw can be repeated.
         Ok(a) => {
@@ -315,6 +329,16 @@ mod tests {
             seed: None,
             choices: None,
         }
+    }
+
+    /// **A person waiting at the console outranks the cast**, whose own turns
+    /// decode at `high`; a ladder nobody watches stays below them.
+    #[test]
+    fn the_console_asks_above_the_characters_and_a_ladder_below_them() {
+        assert_eq!(ASKED, DecodePriority::Urgent);
+        assert!(ASKED.is_live());
+        assert_eq!(BACKGROUND, DecodePriority::Normal);
+        assert!(!BACKGROUND.is_live());
     }
 
     #[test]
