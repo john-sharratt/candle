@@ -97,7 +97,8 @@ pub fn open(ctx: &Ctx) -> Result<Mem, String> {
     let mut m = Mem::of(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
     if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
         if writes_in(&m.tree, person, group) {
-            match conversations::of(&m.memory, person, group, m.channel, &ctx.mcp_id) {
+            let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
+            match conversations::of(&m.memory, person, group, m.channel, &followed) {
                 Ok(here) => {
                     m.tree = m.memory.tree()?;
                     m.here = Some(here);

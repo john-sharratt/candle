@@ -926,8 +926,13 @@ The aggregator's backends stay `coding` and `bot` (`mcp/served.yaml`). The
 memory's tools are zend's, listed by `coding`.
 
 At a conversation's first call, the server opens its journal,
-`conversations/<began>-<channel>`, in the account's group (§3.4). The
-aggregator then does three things:
+`conversations/<began>-<channel>`, in the account's group (§3.4). A
+conversation is an MCP session's run of calls with no 30-minute gap. Grok is
+the exception: it opens a session for every call it makes, sixteen
+conversations in six minutes on 2026-10-31. So a Grok conversation is
+followed by the person and the group, not the session. Two people driving
+on one account at once share a conversation, and the focus tells their lines
+apart. The aggregator then does three things:
 - it puts the client's guide in front of `get_user_context`;
 - it adds the first-call context after the conversation's first answer;
 - after each call that did something, it writes an episode onto the

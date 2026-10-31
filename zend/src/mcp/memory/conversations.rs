@@ -9,6 +9,10 @@
 //! not seen — a new conversation, or one carried here by a restart or from
 //! another member — opens a journal of its own: two conversations are never
 //! written onto one.
+//!
+//! Grok opens a session for every call it makes, so its calls are followed
+//! by the person and group instead ([`followed_by`]): a drive is one
+//! conversation until it goes quiet.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -77,6 +81,17 @@ pub fn name_at(at: Stamp, channel: Channel) -> Slug {
     Slug::parse(&conversation_name(&at.dated_minute(), channel)).expect("a dated name is a name")
 }
 
+/// What a conversation of `person`'s in `group` through `channel` is
+/// followed by: its MCP `session` — or, for Grok, which opens a session for
+/// every call (sixteen conversations in six minutes, 2026-10-31), the person
+/// and group, so its calls run on as one conversation.
+pub fn followed_by(channel: Channel, person: &Slug, group: &Slug, session: &str) -> String {
+    match channel {
+        Channel::Grok => format!("{person}@{group}:{}", channel.name()),
+        Channel::ClaudeCode | Channel::ClaudeAi | Channel::Other => session.to_string(),
+    }
+}
+
 /// The journal of the conversation `session` is in, in `group`, opened now
 /// when this is its first call: the session's clock moved on either way.
 pub fn of(
@@ -136,6 +151,25 @@ mod tests {
             "2026-10-31-0712-claude-code"
         );
         assert_eq!(section(&zen()).folder(), "groups/zen/conversations");
+    }
+
+    /// **Grok's calls are one conversation whatever their sessions**; every
+    /// other channel's conversation is its session.
+    #[test]
+    fn a_grok_conversation_is_followed_by_its_person_not_its_session() {
+        let john = Slug::parse("john").unwrap();
+        let grok = |s| followed_by(Channel::Grok, &john, &zen(), s);
+        assert_eq!(grok("s1"), "john@zen:grok");
+        assert_eq!(grok("s1"), grok("s2"));
+        let other = Slug::parse("battle-cities").unwrap();
+        assert_ne!(followed_by(Channel::Grok, &john, &other, "s1"), grok("s1"));
+        for c in [Channel::ClaudeCode, Channel::ClaudeAi, Channel::Other] {
+            assert_eq!(followed_by(c, &john, &zen(), "s1"), "s1");
+            assert_ne!(
+                followed_by(c, &john, &zen(), "s1"),
+                followed_by(c, &john, &zen(), "s2")
+            );
+        }
     }
 
     #[test]
