@@ -78,13 +78,16 @@ pub enum WorldOp {
     /// Somebody wrote in Discord channel `channel` of a server character
     /// `npc`'s bot is in: said on the thread that mirrors it, its author
     /// brought onto the thread on their first message
-    /// (`docs/npcd_discord.md` §3.4).
+    /// (`docs/npcd_discord.md` §3.4). `to` is the character, when the
+    /// message was said to it — it mentions or answers the bot, or names it.
     ChannelMessage {
         npc: u64,
         channel: u64,
         from: String,
         text: String,
         origin: Option<Origin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
     },
     /// Something the character is told happened to it — its bot added to a
     /// Discord server, or removed from one — delivered as a description that
@@ -239,6 +242,7 @@ mod tests {
                 message: 901,
                 channel: 610,
             }),
+            to: None,
         };
         let wire = serde_json::to_value(&said).unwrap();
         assert_eq!(
@@ -253,6 +257,28 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), said);
+        let said_to = WorldOp::ChannelMessage {
+            npc: 9,
+            channel: 610,
+            from: "Wren (@wren)".into(),
+            text: "Zen, you there?".into(),
+            origin: None,
+            to: Some("Zen".into()),
+        };
+        let wire = serde_json::to_value(&said_to).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "op": "channel_message",
+                "npc": 9,
+                "channel": 610,
+                "from": "Wren (@wren)",
+                "text": "Zen, you there?",
+                "origin": null,
+                "to": "Zen",
+            })
+        );
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), said_to);
         let told = WorldOp::Notice {
             npc: 9,
             text: "You were removed from the Discord server zenworld.".into(),

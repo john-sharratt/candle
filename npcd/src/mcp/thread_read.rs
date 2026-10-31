@@ -191,8 +191,11 @@ pub fn show(character: &str, t: &Thread, mapped: Option<&str>, limit: usize) -> 
                 (false, true) => "delivered",
                 (false, false) => "undelivered",
             };
+            let to =
+                m.to.as_deref()
+                    .map_or_else(String::new, |to| format!(", to {to}"));
             format!(
-                "  #{} {} {} [{origin}, {reached}]: {}",
+                "  #{} {} {} [{origin}, {reached}{to}]: {}",
                 m.seq,
                 utc(m.at_ms),
                 m.from,
@@ -240,7 +243,8 @@ mod tests {
         p.reach("Wren S", "Zen");
         p.send("Wren S", "Zen", "are you there?").unwrap();
         p.mark_delivered_for("Zen");
-        p.send_on(&general, "Kit (@kit)", "good", None).unwrap();
+        p.send_to(&general, "Kit (@kit)", "good", None, Some("Zen"))
+            .unwrap();
         let mut out: Vec<Thread> = p.iter().cloned().collect();
         for t in &mut out {
             for (i, m) in t.messages.iter_mut().enumerate() {
@@ -287,12 +291,12 @@ mod tests {
             "Thread th1 \"zenworld #general\" (group, open; Discord channel 610), last 3 of 3:\n\
              \x20 #1 2026-11-01 12:00:00 UTC Kit (@kit) [discord 901 in 610, delivered]: anyone?\n\
              \x20 #2 2026-11-01 12:00:01 UTC Zen [world, own]: I'm here.\n\
-             \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered]: good"
+             \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered, to Zen]: good"
         );
         assert_eq!(
             show("Zen", general, None, 1),
             "Thread th1 \"zenworld #general\" (group, open), last 1 of 3:\n\
-             \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered]: good"
+             \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered, to Zen]: good"
         );
         assert_eq!(
             find(&threads, "Zen", "th2").map(|t| t.id.as_str()),
