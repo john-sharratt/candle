@@ -16,12 +16,21 @@
 //! This walks every record of every segment, reading payloads only for the
 //! resident types keyed by their payload, and reports both disagreements by
 //! segment and record type. It reads; it writes nothing.
+//!
+//! **Two halves, because the walk is as long as the disk is slow.** What the
+//! count and the carry say comes from the log's indexes, so
+//! [`SubstratePersistence::liveness_audit_plan`] takes it on the log's owner.
+//! [`AuditPlan::walk`] then needs only the files, and runs anywhere. A sealed
+//! segment never changes, and the active one is read to the commit the plan saw,
+//! so the walk meets the log as the plan left it; a segment maintenance unlinks
+//! before the walk reaches it is reported in [`LivenessAudit::gone`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use super::identity::RecordIdentity;
-use super::log_file::{LogFile, SUPERBLOCK_SIZE};
+use super::log_file::{LogFile, LogSource, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{decode_conv_state_payload, decode_label_payload};
 use super::record::{
@@ -31,7 +40,7 @@ use super::record::{
 use super::segment::SegmentId;
 use super::segmented_log::segment_path;
 use super::walker::walk_filtered;
-use super::{Result, SubstratePersistence};
+use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::Substrate;
 
 /// The identity a resident record supersedes by: a record with the same key
@@ -166,6 +175,9 @@ pub struct AuditCell {
 #[derive(Debug, Default)]
 pub struct LivenessAudit {
     pub cells: BTreeMap<(SegmentId, RecordType), AuditCell>,
+    /// Segments the plan named that were unlinked before the walk reached
+    /// them: maintenance finished with them, so nothing here reads them.
+    pub gone: Vec<SegmentId>,
 }
 
 impl LivenessAudit {
@@ -199,11 +211,35 @@ fn add(into: &mut AuditCell, c: &AuditCell) {
     into.counted_uncarried_records += c.counted_uncarried_records;
 }
 
+/// What the log's indexes say of a liveness audit, ready to check against the
+/// files. See the module documentation.
+pub struct AuditPlan {
+    dir: PathBuf,
+    sealed: Vec<SegmentId>,
+    active: SegmentId,
+    /// How far the plan saw `active` durable: the walk stops there.
+    active_end: u64,
+    counted: HashSet<(SegmentId, u64)>,
+    carried: HashSet<(SegmentId, u64)>,
+    emitted: HashSet<ResidentKey>,
+}
+
 impl SubstratePersistence {
     /// Audit the liveness count against the carry over every segment. Read-only.
     pub fn liveness_audit(&self, substrate: &Substrate) -> Result<LivenessAudit> {
-        let mut segments: Vec<SegmentId> = self.segments.sealed_ids().to_vec();
-        segments.push(self.segments.active_id());
+        self.liveness_audit_plan(substrate).walk()
+    }
+
+    /// The half of an audit that reads the log's indexes.
+    pub fn liveness_audit_plan(&self, substrate: &Substrate) -> AuditPlan {
+        let sealed: Vec<SegmentId> = self.segments.sealed_ids().to_vec();
+        let active = self.segments.active_id();
+        let active_end = self
+            .sealed_reader()
+            .committed_end(active)
+            .unwrap_or(SUPERBLOCK_SIZE);
+        let mut segments = sealed.clone();
+        segments.push(active);
 
         let counted: HashSet<(SegmentId, u64)> = self
             .counted_live_records(substrate)
@@ -237,15 +273,45 @@ impl SubstratePersistence {
                 .iter()
                 .filter_map(|r| resident_key(r.rt, r.stream_id, &r.payload, &r.id))
                 .collect();
+        AuditPlan {
+            dir: self.dir().to_path_buf(),
+            sealed,
+            active,
+            active_end,
+            counted,
+            carried,
+            emitted,
+        }
+    }
+}
 
+impl AuditPlan {
+    /// The half of an audit that reads every segment. Needs nothing of the log
+    /// but its files.
+    pub fn walk(self) -> Result<LivenessAudit> {
+        let AuditPlan {
+            dir,
+            sealed,
+            active,
+            active_end,
+            counted,
+            mut carried,
+            emitted,
+        } = self;
         // One walk: tally every record, and find each resident key's current
         // copy — the greatest stamp, and of equal stamps the later copy.
         let mut seen: Vec<(SegmentId, u64, RecordType, u64)> = Vec::new();
         let mut current: HashMap<ResidentKey, (RecordIdentity, SegmentId, u64)> = HashMap::new();
-        for &seg in &segments {
-            walk_segment(
-                self.dir(),
+        let mut audit = LivenessAudit::default();
+        let ends = sealed
+            .iter()
+            .map(|&seg| (seg, u64::MAX))
+            .chain([(active, active_end)]);
+        for (seg, end) in ends {
+            let walked = walk_segment(
+                &dir,
                 seg,
+                end,
                 |rt, stream_id, offset, size, payload, id| {
                     seen.push((seg, offset, rt, size));
                     if let Some(k) = resident_key(rt, stream_id, payload, &id) {
@@ -255,7 +321,11 @@ impl SubstratePersistence {
                         }
                     }
                 },
-            )?;
+            );
+            match walked {
+                Err(e) if unlinked(&e) => audit.gone.push(seg),
+                other => other?,
+            }
         }
         for (k, (_, seg, offset)) in &current {
             if emitted.contains(k) {
@@ -263,7 +333,6 @@ impl SubstratePersistence {
             }
         }
 
-        let mut audit = LivenessAudit::default();
         for (seg, offset, rt, size) in seen {
             let cell = audit.cells.entry((seg, rt)).or_default();
             let is_counted = counted.contains(&(seg, offset));
@@ -289,16 +358,49 @@ impl SubstratePersistence {
     }
 }
 
-/// Visit every record of one segment: its type, header stream id, offset,
-/// padded size, — for a payload-keyed resident type only — its payload, and
-/// its identity.
+/// Whether opening a segment failed because maintenance unlinked it: `NotFound`,
+/// or `PermissionDenied` while a Windows volume has the name pending deletion.
+fn unlinked(e: &PersistenceError) -> bool {
+    matches!(
+        e,
+        PersistenceError::Io(e)
+            if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied)
+    )
+}
+
+/// A log read no further than `end`: the walker frames records up to its
+/// source's size, and what lies past a commit may still be arriving.
+struct Upto<'a> {
+    log: &'a mut LogFile,
+    end: u64,
+}
+
+impl LogSource for Upto<'_> {
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.log.read_at(offset, len)
+    }
+
+    fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        self.log.read_into(offset, dest)
+    }
+
+    fn size(&mut self) -> Result<u64> {
+        Ok(LogSource::size(self.log)?.min(self.end))
+    }
+}
+
+/// Visit every record of one segment below `end`: its type, header stream id,
+/// offset, padded size, — for a payload-keyed resident type only — its payload,
+/// and its identity.
 fn walk_segment(
     dir: &Path,
     seg: SegmentId,
+    end: u64,
     mut visit: impl FnMut(RecordType, u64, u64, u64, &[u8], RecordIdentity),
 ) -> Result<()> {
     let mut log = LogFile::open_read_only(&segment_path(dir, seg))?;
-    walk_filtered(&mut log, seg, SUPERBLOCK_SIZE, keyed_by_payload, |e| {
+    let mut upto = Upto { log: &mut log, end };
+    walk_filtered(&mut upto, seg, SUPERBLOCK_SIZE, keyed_by_payload, |e| {
         let h = &e.record.header;
         visit(
             h.record_type,
@@ -367,6 +469,54 @@ mod tests {
             );
             assert_eq!(cell.counted_uncarried, 0, "{key:?} counted but not carried");
         }
+    }
+
+    fn label(sp: &mut SubstratePersistence, timeline: u64) {
+        let label = encode_label_payload(timeline, "conv", "title", &BTreeMap::new());
+        sp.append_record(RecordType::Label, 0, 0, 0, 0, 0, &label)
+            .unwrap();
+    }
+
+    /// **The walk stops at the commit the plan saw.** What the owner staged
+    /// and what it appends while the walk runs may be half on disk; a record
+    /// past that commit is the next audit's.
+    #[test]
+    fn the_walk_stops_at_the_commit_the_plan_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        label(&mut sp, 1);
+        sp.commit().unwrap();
+        label(&mut sp, 2);
+        let plan = sp.liveness_audit_plan(&substrate);
+        sp.commit().unwrap();
+        label(&mut sp, 3);
+        sp.commit().unwrap();
+        let audit = plan.walk().unwrap();
+        assert_eq!(audit.by_type()[&RecordType::Label].records, 1);
+        assert_eq!(audit.gone, []);
+    }
+
+    /// **A segment unlinked under the walk is reported, not fatal.**
+    /// Maintenance goes on running beside it, and the audit of the rest stands.
+    #[test]
+    fn a_segment_unlinked_after_the_plan_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        label(&mut sp, 1);
+        sp.commit().unwrap();
+        let first = sp.segments.active_id();
+        sp.seal_active().unwrap();
+        label(&mut sp, 2);
+        sp.commit().unwrap();
+        let plan = sp.liveness_audit_plan(&substrate);
+        sp.segments.drop_sealed(first).unwrap();
+        let audit = plan.walk().unwrap();
+        assert_eq!(audit.gone, [first]);
+        assert_eq!(audit.by_type()[&RecordType::Label].records, 1);
     }
 
     #[test]

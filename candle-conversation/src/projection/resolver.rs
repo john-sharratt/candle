@@ -5307,7 +5307,7 @@ impl Conversation {
     /// walks the whole substrate, up to 0.86 s on BlackWorld. `None` before the
     /// first scan.
     pub fn dead_ratio(&self) -> Option<f32> {
-        self.persistence.call(|p| p.scanned_dead_ratio())
+        self.persistence.facts().dead_ratio()
     }
 
     /// Run `f` against the persistence layer's current manifest snapshot, on

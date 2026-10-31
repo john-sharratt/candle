@@ -53,7 +53,7 @@ use std::sync::Arc;
 
 use super::manifest::RecordLoc;
 use super::record::{
-    decode_header, decode_record, padded_record_len, verify_record_crc, HEADER_PROBE_SIZE,
+    decode_header, decode_record, padded_record_len, verify_record_crc, Record, HEADER_PROBE_SIZE,
 };
 use super::segment::SegmentId;
 use super::segmented_log::segment_path;
@@ -113,6 +113,14 @@ impl ActiveSegment {
         self.0.committed_segment.store(id.raw(), Ordering::Release);
     }
 
+    /// How far `segment` is durable, while it is the active one.
+    pub fn committed_end(&self, segment: SegmentId) -> Option<u64> {
+        let before = self.0.committed_segment.load(Ordering::Acquire);
+        let end = self.0.committed_end.load(Ordering::Acquire);
+        let after = self.0.committed_segment.load(Ordering::Acquire);
+        (before == after && before == segment.raw()).then_some(end)
+    }
+
     /// Whether `segment` is sealed as of the latest publish.
     pub fn is_sealed(&self, segment: SegmentId) -> bool {
         segment.raw() < self.0.active.load(Ordering::Acquire)
@@ -146,6 +154,11 @@ impl SealedReader {
         SealedReader { dir, active }
     }
 
+    /// How far the active `segment` is durable as of the latest publish.
+    pub fn committed_end(&self, segment: SegmentId) -> Option<u64> {
+        self.active.committed_end(segment)
+    }
+
     /// Whether the record at `loc` is durable — readable here, and never to
     /// change — as of the latest publish ([`ActiveSegment::is_durable`]).
     pub fn is_durable(&self, loc: &RecordLoc) -> bool {
@@ -167,25 +180,39 @@ impl SealedReader {
         if !self.active.is_durable(loc) {
             return None;
         }
-        Some(self.read_sealed(loc))
+        let file = UnbufferedFile::open(&segment_path(&self.dir, loc.segment), Access::ReadOnly);
+        Some(
+            file.map_err(PersistenceError::from)
+                .and_then(|f| read_sealed(&f, loc, &mut AlignedScratch::new()))
+                .map(|r| r.payload),
+        )
     }
 
-    fn read_sealed(&self, loc: &RecordLoc) -> Result<Vec<u8>> {
-        let file = UnbufferedFile::open(&segment_path(&self.dir, loc.segment), Access::ReadOnly)?;
-        let len = loc.record_size as usize;
-        let mut bytes = vec![0u8; len];
+    /// The records at `locs`, in `(segment, offset)` order, or `None` when any
+    /// is not yet durable. Each segment is opened once, so a timeline's
+    /// thousands of small records are not thousands of opens.
+    pub fn read_records(&self, locs: &[RecordLoc]) -> Option<Result<Vec<Record>>> {
+        if !locs.iter().all(|l| self.active.is_durable(l)) {
+            return None;
+        }
+        Some(self.read_durable(locs))
+    }
+
+    fn read_durable(&self, locs: &[RecordLoc]) -> Result<Vec<Record>> {
+        let mut sorted = locs.to_vec();
+        sorted.sort_by_key(|l| (l.segment, l.offset));
+        let mut out = Vec::with_capacity(sorted.len());
         let mut scratch = AlignedScratch::new();
-        file.read_span(loc.offset, &mut bytes, &mut scratch)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    PersistenceError::Truncated { need: len, have: 0 }
-                } else {
-                    PersistenceError::Io(e)
-                }
-            })?;
-        let (header, payload, _) = decode_record(&bytes)?;
-        verify_record_crc(&header, payload)?;
-        Ok(payload.to_vec())
+        let mut open: Option<(SegmentId, UnbufferedFile)> = None;
+        for loc in &sorted {
+            let file = match open.take() {
+                Some((segment, file)) if segment == loc.segment => file,
+                _ => UnbufferedFile::open(&segment_path(&self.dir, loc.segment), Access::ReadOnly)?,
+            };
+            out.push(read_sealed(&file, loc, &mut scratch)?);
+            open = Some((loc.segment, file));
+        }
+        Ok(out)
     }
 
     /// The whole record at `offset` of `segment` — header line, payload and
@@ -219,6 +246,30 @@ impl SealedReader {
         })?;
         Ok(bytes)
     }
+}
+
+/// The record at `loc` of `file`, decoded and checked by its CRC.
+fn read_sealed(
+    file: &UnbufferedFile,
+    loc: &RecordLoc,
+    scratch: &mut AlignedScratch,
+) -> Result<Record> {
+    let len = loc.record_size as usize;
+    let mut bytes = vec![0u8; len];
+    file.read_span(loc.offset, &mut bytes, scratch)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                PersistenceError::Truncated { need: len, have: 0 }
+            } else {
+                PersistenceError::Io(e)
+            }
+        })?;
+    let (header, payload, _) = decode_record(&bytes)?;
+    verify_record_crc(&header, payload)?;
+    Ok(Record {
+        header,
+        payload: payload.to_vec(),
+    })
 }
 
 /// Reads of one record, each after re-reading its location, before a caller
@@ -496,6 +547,34 @@ mod tests {
             .expect("the read finished while the log was held");
         worker.join().expect("worker");
         assert_eq!(got, Some(Some(b"read under a held lock".to_vec())));
+    }
+
+    /// **A batch comes back in log order, and all of it or none.** Records
+    /// across two segments read through one open each, and a batch naming one
+    /// record past the last commit is declined whole, so a caller never gets
+    /// part of a timeline.
+    #[test]
+    fn a_batch_reads_in_log_order_and_declines_what_is_not_durable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = open(dir.path());
+        let first = write(&mut log, 1, b"first");
+        log.seal_and_rotate().expect("seal");
+        let second = write(&mut log, 2, b"second");
+        let reader = log.sealed_reader();
+        let records = reader
+            .read_records(&[second, first])
+            .expect("durable")
+            .expect("read");
+        let payloads: Vec<&[u8]> = records.iter().map(|r| r.payload.as_slice()).collect();
+        assert_eq!(payloads, [b"first".as_slice(), b"second".as_slice()]);
+
+        let staged = stage(&mut log, 3, b"staged");
+        assert!(reader.read_records(&[first, staged]).is_none());
+        assert!(reader
+            .read_records(&[])
+            .expect("nothing")
+            .expect("to read")
+            .is_empty());
     }
 
     /// **A whole record reads back as the log wrote it**, header and padding

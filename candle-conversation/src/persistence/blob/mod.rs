@@ -19,6 +19,8 @@ pub mod index;
 pub mod payload;
 mod writes;
 
+pub(super) use writes::blob_bytes;
+
 #[cfg(test)]
 mod tests;
 

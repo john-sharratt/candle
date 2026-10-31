@@ -24,7 +24,7 @@ impl Conversation {
     /// Whether a write has failed for lack of space since the last
     /// [`Self::test_write`] succeeded.
     pub fn out_of_space(&self) -> bool {
-        self.persistence.call(|p| p.out_of_space())
+        self.persistence.facts().out_of_space()
     }
 
     /// A test append and commit, as leaving fault mode needs (§7.7).
@@ -43,7 +43,7 @@ impl Conversation {
     /// Every record type the substrate holds, by tag: what a build replacing
     /// this one must decode (§3.9).
     pub fn held_record_tags(&self) -> Vec<u8> {
-        self.persistence.call(|p| p.held_record_tags())
+        self.persistence.facts().held_record_tags()
     }
 
     /// Records held back because this build does not decode their type, by
@@ -71,8 +71,15 @@ impl Conversation {
 
     /// The read-only liveness audit: what maintenance counts as live against
     /// what it carries. Changes nothing.
+    ///
+    /// Only the plan runs on the log's owner, behind everything else it has to
+    /// do. The walk reads every segment and takes as long as the disk does
+    /// (fifteen minutes over BlackWorld's 346 GiB), so it runs here: on the
+    /// owner it stopped every write, read and replicated record for as long.
     pub fn liveness_audit(&self) -> PersistenceResult<LivenessAudit> {
         let view = self.read();
-        self.persistence.call(|p| p.liveness_audit(&view))
+        self.persistence
+            .call_behind(|p| p.liveness_audit_plan(&view))
+            .walk()
     }
 }

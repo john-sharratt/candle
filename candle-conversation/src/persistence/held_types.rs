@@ -8,9 +8,7 @@ impl SubstratePersistence {
     /// Every record type the substrate has held since it opened — the open
     /// walk's, and each appended since — by tag, ascending.
     pub fn held_record_tags(&self) -> Vec<u8> {
-        (0..32u8)
-            .filter(|t| self.held_types & (1 << t) != 0)
-            .collect()
+        self.facts.held_record_tags()
     }
 }
 
