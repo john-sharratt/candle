@@ -156,6 +156,42 @@ pub fn target(f: &Facts) -> Option<Target> {
         })
 }
 
+/// Why a member [`target`] gave nothing to is not installing the newest build
+/// it has heard of above its own; `None` when it knows of none. A blank step
+/// reads as idle: on WhiteWorld (2026-10-31) a member held 4123, downloaded and
+/// verified, for ten minutes with nothing to say why.
+pub fn holding_back(f: &Facts) -> Option<String> {
+    let own = f.own.as_ref()?.build();
+    let newest = f
+        .known
+        .iter()
+        .filter(|b| !b.is_local() && b.count > own.count)
+        .max_by_key(|b| b.count)?;
+    let name = build_name(newest);
+    if own.is_local() {
+        return Some(format!("holding: {name} offered, this build is local"));
+    }
+    if let Some(app) = f.apps.iter().find(|a| f.paused.contains(*a)) {
+        return Some(format!("holding: {name} offered, {app} is paused"));
+    }
+    if f.refused.contains(&name) {
+        return Some(format!("holding: {name} refused here"));
+    }
+    if f.rejected(newest) {
+        return Some(format!("holding: {name} rejected"));
+    }
+    let unsettled: Vec<&str> = f
+        .apps
+        .iter()
+        .filter(|a| f.verdicts.get(&((*a).clone(), name.clone())) != Some(&Settled::Pass))
+        .map(String::as_str)
+        .collect();
+    Some(format!(
+        "holding: {name} not certified by {}",
+        unsettled.join(", ")
+    ))
+}
+
 /// The build this member fetches now, if any: the one it would install, or
 /// the newest offered above its own.
 pub fn prefetch(f: &Facts) -> Option<BuildId> {
@@ -309,6 +345,34 @@ mod tests {
         f.verdicts
             .insert(("npcd".into(), "12-h12".into()), Settled::Pass);
         assert_eq!(target(&f).map(|t| t.build), Some(b(12)));
+    }
+
+    /// A member says why it is not taking the newest build it knows of.
+    #[test]
+    fn a_member_holding_a_build_back_says_why() {
+        let mut f = facts(10, "");
+        assert_eq!(holding_back(&f), None, "nothing known");
+        f.known = vec![b(12)];
+        assert_eq!(
+            holding_back(&f).as_deref(),
+            Some("holding: 12-h12 not certified by zend")
+        );
+        f.refused.insert("12-h12".into());
+        assert_eq!(
+            holding_back(&f).as_deref(),
+            Some("holding: 12-h12 refused here")
+        );
+        f.paused.insert("zend".into());
+        assert_eq!(
+            holding_back(&f).as_deref(),
+            Some("holding: 12-h12 offered, zend is paused")
+        );
+        let mut local = facts(10, "abcd");
+        local.known = vec![b(12)];
+        assert_eq!(
+            holding_back(&local).as_deref(),
+            Some("holding: 12-h12 offered, this build is local")
+        );
     }
 
     /// A local build is never upgraded automatically, nor fetches.

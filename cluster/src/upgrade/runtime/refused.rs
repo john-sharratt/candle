@@ -22,14 +22,29 @@ pub fn read(upgrade_dir: &Path) -> BTreeSet<String> {
 pub fn refuse(upgrade_dir: &Path, build: &str) -> io::Result<BTreeSet<String>> {
     let mut refused = read(upgrade_dir);
     refused.insert(build.to_string());
+    write(upgrade_dir, &refused)?;
+    Ok(refused)
+}
+
+/// Take `build` off the refused builds: it is running here, so it runs. One
+/// refused and then started by hand stayed refused, and a rollout of it would
+/// have passed it over.
+pub fn forgive(upgrade_dir: &Path, build: &str) -> io::Result<BTreeSet<String>> {
+    let mut refused = read(upgrade_dir);
+    if refused.remove(build) {
+        write(upgrade_dir, &refused)?;
+    }
+    Ok(refused)
+}
+
+fn write(upgrade_dir: &Path, refused: &BTreeSet<String>) -> io::Result<()> {
     fs::create_dir_all(upgrade_dir)?;
     let tmp = upgrade_dir.join(format!("{REFUSED}.tmp"));
     fs::write(
         &tmp,
-        serde_json::to_vec(&refused).expect("a set of names serializes"),
+        serde_json::to_vec(refused).expect("a set of names serializes"),
     )?;
-    fs::rename(tmp, upgrade_dir.join(REFUSED))?;
-    Ok(refused)
+    fs::rename(tmp, upgrade_dir.join(REFUSED))
 }
 
 #[cfg(test)]
@@ -47,5 +62,11 @@ mod tests {
             fs::read_to_string(t.path().join(REFUSED)).unwrap(),
             r#"["12-h12","13-h13"]"#
         );
+        let left = forgive(t.path(), "12-h12").unwrap();
+        assert_eq!(
+            fs::read_to_string(t.path().join(REFUSED)).unwrap(),
+            r#"["13-h13"]"#
+        );
+        assert_eq!(left, read(t.path()));
     }
 }

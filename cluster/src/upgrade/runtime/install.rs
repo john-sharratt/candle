@@ -24,7 +24,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::decide::{target, Lease};
+use super::decide::{holding_back, target, Lease};
 use super::served::HeldAs;
 use super::Upgrader;
 use crate::frame::BuildId;
@@ -230,7 +230,13 @@ impl Upgrader {
         let Some(t) = chosen else {
             let mut s = self.state();
             if s.stranded.is_none() {
-                s.step.clear();
+                let step = holding_back(&s.facts).unwrap_or_default();
+                if step != s.step {
+                    if !step.is_empty() {
+                        tracing::warn!("{step}");
+                    }
+                    s.step = step;
+                }
             }
             return;
         };

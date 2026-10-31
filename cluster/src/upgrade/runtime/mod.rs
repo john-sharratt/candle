@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::artifacts::Probe;
+use super::decisions::build_name;
 use super::parts::Parts;
 use super::watchdog::{Failure, FAILED};
 use crate::coord::{KeptLine, VerdictLine};
@@ -122,6 +123,13 @@ impl Upgrader {
                 build,
                 "restored after a failed install: it is not tried again"
             );
+        }
+        let own = build_name(&setup.info.build());
+        if refused.contains(&own) {
+            match refused::forgive(&dir, &own) {
+                Ok(r) => refused = r,
+                Err(e) => tracing::error!("the running build {own} was not forgiven: {e}"),
+            }
         }
         let failure = fs::read(dir.join(FAILED))
             .ok()
