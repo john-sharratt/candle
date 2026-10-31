@@ -48,6 +48,9 @@ use crate::authorize;
 use crate::authorize::{Cache as AuthorizationCache, Signer};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
+use crate::discord::client::Client as DiscordClient;
+use crate::discord::routes as discord;
+use crate::discord::seal::Sealer;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
 use crate::engine::runtime::Runtime;
@@ -117,6 +120,13 @@ pub struct Authored {
     /// process's own key until the tenant, joining a cluster, sets the one
     /// every member derives.
     pub authorizations: Signer,
+    /// Seals and opens the characters' Discord bot tokens
+    /// ([`crate::discord::seal`]). This process's own key until the tenant,
+    /// joining a cluster, sets the one every member derives.
+    pub discord_tokens: Sealer,
+    /// Discord's REST API, which a bot's connect checks its token with
+    /// ([`crate::discord::client`]).
+    pub discord: DiscordClient,
     /// The authorizations this member has, for their lifetime.
     pub authorized: AuthorizationCache,
     /// `personality_id -> image_id` for the portraits personalities were
@@ -196,6 +206,8 @@ impl Authored {
             images,
             image_links: ImageLinks::minted(),
             authorizations: Signer::minted(),
+            discord_tokens: Sealer::minted(),
+            discord: DiscordClient::production(),
             authorized: AuthorizationCache::default(),
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
@@ -760,6 +772,17 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::User,
             character(),
             post(portrait::post_generate),
+        )
+        // The character's own Discord bot (`docs/npcd_discord.md` §4.3): its
+        // owner pastes the token, and it is checked, named, sealed and kept.
+        // `User` and the ownership check inside, like the portrait.
+        .route(
+            "/v1/npc/:nid/discord",
+            Role::User,
+            character(),
+            get(discord::get_discord)
+                .put(discord::put_discord)
+                .delete(discord::delete_discord),
         )
         // `/v1/image/models` and `/v1/generate/description` are **not** here.
         // They already exist in `engine::routes` as the placeholders the console
@@ -4126,6 +4149,10 @@ mod tests {
                 // admin-only would mean nobody could use the button on the
                 // character they just made.
                 ("/v1/npc/:nid/portrait/generate", "user"),
+                // The character's own Discord bot: the owner's, like the
+                // portrait, with the 404 of a missing character for anyone
+                // else.
+                ("/v1/npc/:nid/discord", "user"),
                 ("/v1/image/:iid", "user"),
                 // A signed link to the same bytes: open, because the signature
                 // over the id and an expiry is the permission, and the handler

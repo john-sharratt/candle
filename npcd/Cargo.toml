@@ -81,6 +81,13 @@ hmac       = "0.12"
 # with, so there is one answer in the workspace to "where does a secret come
 # from".
 rand       = { workspace = true }
+# Sealing a character's Discord bot token (`discord::seal`) under a key derived
+# from the group key. The version `zend-tools` already builds its AEADs with.
+chacha20poly1305 = "0.10"
+# Discord's REST API (`discord::client`): a bot's own user and application,
+# and its name and avatar. Declared as `web` declares it, so the two unify on
+# one TLS stack.
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Driving the `local` effector router in-process: the fast path builds an
 # `http::Request` and invokes the router through `ServiceExt::oneshot`, the same
 # service the external mount answers on, minus the socket (effector design §8.1).

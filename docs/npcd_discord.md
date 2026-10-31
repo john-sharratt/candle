@@ -1,19 +1,22 @@
 # npcd on Discord
 
-**Discord is where people talk to the characters.** Every character a world runs gets
-a Discord account of its own; a person DMs a character's bot as they would a friend,
-and talks with the cast in the world's server. The console and an assistant's
-`bot_message_send` remain ways in, but the secondary ones.
+**Discord is where people talk to the characters.** A person talks with the cast in the
+world's server, and DMs a character there as they would a friend: a character its owner
+has given a Discord bot of its own is DMed as that bot, and every other character is
+"DMed" in a private thread in the world's server, where it speaks through the persona
+webhook (§3.1). The console and an assistant's `bot_message_send` remain ways in, but
+the secondary ones.
 
 **The substrate stays the record.** What is said is kept in the world, where the
 characters hear it, answer it and remember it, and Discord mirrors it in both
 directions: each group a character is in is a Discord channel, each direct message
-between a person and a character is a Discord DM with that character's bot, and a
-person who writes on Discord is heard in the world exactly as one who writes in the
-console. Background jobs keep the two in step through restarts, gaps and authority
+between a person and a character is a Discord DM with that character's bot or, for a
+character without one, a private thread, and a person who writes on Discord is heard in
+the world exactly as one who writes in the console. Background jobs keep the two in step through restarts, gaps and authority
 moves. §1.1 says why Discord is not the record.
 
-This document is the design. Code: `npcd/src/discord/` (new). It sits on npcd's
+This document is the design. Code: `npcd/src/discord/` — so far the bot provisioning
+of §4.3 (`seal`, `store`, `client`, `profile`, `invite`, `routes`). It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
@@ -114,9 +117,9 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
   │  #the-channel   ◄──────────────── │◄── post ───│  outbound: per-thread cursor, beat    │
   │  #<group>  (one per named group)  │            │  inbound:  gateway events → WorldOp   │
   │  DM: person ↔ Zen's bot           │──events───►│  reconcile: channels, members, gaps   │
-  │  DM: person ↔ Drone-Kettle's bot  │            │                                        │
-  └──────────────────────────────────┘            │  one gateway shard per character bot  │
-                                                   └──────────────────────────────────────┘
+  │  #dms ▸ private thread: person ↔  │            │                                        │
+  │         Drone-Kettle (webhook)    │            │  one gateway shard per provisioned bot │
+  └──────────────────────────────────┘             └──────────────────────────────────────┘
 ```
 
 - **A world is a Discord server (guild).** The world document names it
@@ -126,7 +129,9 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
   permission overwrites admit exactly the thread's members: each member character's bot
   and each member person's Discord account.
 - **A person ↔ character DM** is a Discord DM between that person and that character's
-  bot.
+  bot, when its owner has given it one; otherwise a private thread in the world's
+  server, holding the person and the world's bots, in which the character speaks through
+  the persona webhook (§3.1).
 - **A character ↔ character DM** is private to the two characters in the world, and is
   mirrored only for the characters' **owners**: a private thread under `#backstage`,
   read-only, visible to the owners of both characters. A world can leave it out
@@ -134,23 +139,32 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
 
 ### 3.1 Who speaks on Discord
 
+A real bot is **opt-in, per character**. Discord makes a bot only by hand (§2), so a
+character has one when its owner made one in the Developer Portal and connected it in
+the console (§4.3); nothing assumes that every character has one, and most need not.
+
 - **A character with its own bot** posts everything — channel, groups, DMs — as that bot,
-  under its own name and portrait. This is the whole point: the character is a member
-  of the server, appears in the member list, and is DMed like a person.
-- **A character without a bot** (past the team's 75, or not yet provisioned) speaks in
-  channels and groups through the guild's **persona webhook**, one per channel, with
-  its name and portrait per message. It has no DMs on Discord; its DMs stay in the
-  console.
+  under its own name and portrait. The character is a member of the server, appears in
+  the member list, and is DMed like a person.
+- **A character without a bot** — not provisioned, or past the team's 75 — speaks in
+  channels, groups and its "DMs" through the guild's **persona webhook**, one per
+  channel, with its name and portrait per message. Its DMs are **private threads** in
+  the world's server: a person who wants to talk to it alone is added to a private
+  thread under a `#dms` channel, which the bridge opens (with Create Private Threads)
+  and in which the character's lines are webhook posts and the person's are their own.
+  A webhook cannot DM (§2); a private thread is the nearest thing a server has.
 - **A person writing on Discord** — the usual case — is already there; the bridge only
   carries the message into the world (§5.2).
 - **A person writing through a secondary way in** — the console, or an assistant's
   `bot_message_send` — is mirrored into a group by the persona webhook under the
-  person's own name, and into a DM by the character's bot as a quoted line
-  (`> John (console): …`): a bot cannot post as a person, and a webhook cannot DM.
+  person's own name, into a bot's DM by the character's bot as a quoted line
+  (`> John (console): …`) — a bot cannot post as a person, and a webhook cannot DM — and
+  into a private thread by the webhook under the person's name, as in a group.
 - **Reading** a guild's channels is done by **one bot per world** — the world's
   *listener*, the character the world names (`discord: { listener: zen-moon }`), with
   `MESSAGE_CONTENT` on — so a message is received once, not once per bot in the channel.
-  Every other bot connects with `DIRECT_MESSAGES` only, and hears its own DMs.
+  The listener hears the private threads too, so a world needs one provisioned bot at
+  least. Every other bot connects with `DIRECT_MESSAGES` only, and hears its own DMs.
 
 ### 3.2 People
 
@@ -207,17 +221,54 @@ record):
 |---|---|
 | `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` |
 | `discord/dm/<npc_id>/<person>` | `{ channel_id, mirrored_through, last_seen_discord }` |
-| `discord/bot/<npc_id>` | `{ application_id, user_id, token: <sealed> }` |
+
+A character's bot is not a world record: it belongs to the character, whichever world
+it is in, and is kept beside it (§4.3).
 
 ### 4.3 Bot tokens
 
-A character's token is sealed with a key the cluster derives (`join.derive_key("npcd
-discord tokens")`, the pattern of `image_links.rs`) and stored in `discord/bot/<npc_id>`,
-so every member can take over a world and its bots; it is never in the character
-record (which `/v1/npcs/export` hands out whole), never in git, and never logged. The
-console's character page takes a token once (`PUT /v1/npc/:nid/discord`, owner only),
-checks it (`GET /users/@me`), sets the bot's name and avatar from the character
-(`PATCH /users/@me`), and seals it.
+A character's bot is the replicated custom object **`discord/bot/<npc_id>`**
+(`npcd/src/discord/store.rs`, the pattern of `accounts.rs`), not a world record:
+
+```json
+{ "application_id": "<id>", "user_id": "<id>", "username": "<name>",
+  "token": "<sealed>", "connected_ms": 1793000000000 }
+```
+
+The token is sealed with **ChaCha20-Poly1305** under a key the cluster derives
+(`join.derive_key("npcd discord tokens")`, the pattern of `image_links.rs`; a daemon
+with no cluster mints its own at start, so a token it sealed must be connected again
+after a restart). A sealed token is `base64(nonce(12) ‖ ciphertext ‖ tag(16))`, a fresh
+nonce per seal, with the record's key as associated data, so a sealed token copied onto
+another character's record does not open (`npcd/src/discord/seal.rs`). Every member can
+therefore take over a world and its bots. The token is never in the character record
+(which `/v1/npcs/export` hands out whole), never in git, never logged, and never in any
+route's answer, sealed or not.
+
+Three routes, the owner's like every route on a character (`User`, then ownership; a
+character that is somebody else's is the same 404 as one that does not exist):
+
+| Route | Does |
+|---|---|
+| `GET /v1/npc/:nid/discord` | `{"connected": false}`, or `{"connected": true, application_id, user_id, username, connected_ms, invite_url}` |
+| `PUT /v1/npc/:nid/discord` `{"token"}` | checks the token (`GET /users/@me`, refusing a user's token; `GET /applications/@me`), names the bot as the character (2–32 characters, cut to fit) and pictures it with the portrait if there is one (`PATCH /users/@me`, sending only what differs — Discord allows few renames an hour), seals the token, writes the record, and answers as `GET` |
+| `DELETE /v1/npc/:nid/discord` | writes the record's tombstone; `{"connected": false}`. The bot stays the owner's in the portal |
+
+A token Discord refuses is `400 {"error": "discord_token_rejected"}` (a user's token,
+`discord_not_a_bot`); a rate limit is `429 discord_rate_limited` with `retry_after` and a
+`Retry-After` header; any other failure is `502`. None is retried, for the per-IP limit
+(§2), and nothing is written unless every call succeeded. `invite_url` is
+`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344134372416`:
+View Channels, Send Messages, Read Message History, Embed Links, Attach Files, Add
+Reactions, Send Messages in Threads, Create Private Threads and Manage Webhooks
+(`npcd/src/discord/invite.rs`).
+
+In the console it is the **Discord** panel at the top of the character's Messages tab.
+Unconnected, it offers "Set up Discord", which opens the steps: open the Developer
+Portal and make a New Application named as the character; open Bot, Reset Token and
+copy it; paste it into the panel and Connect. A refusal is shown under the field.
+Connected, it says which bot is the character, links the invite, and has a Disconnect
+that asks first.
 
 ---
 
@@ -307,10 +358,13 @@ that bot `revoked` on the console and stops its shard rather than retrying.
 For each world:
 
 1. Create a Discord server for it, and a Discord **team** that will own the bots.
-2. For each character that should have its own account: create an application in the
-   team, add a bot, enable `MESSAGE_CONTENT` (listener) or leave it off (others), copy
-   the token into the character's page in the console. npcd names it, pictures it and
-   invites it (the bot's invite URL is shown with the token).
+2. For each character that should have its own account — at least the listener —
+   its owner follows the console's **Set up Discord** flow on the character's Messages
+   tab (§4.3): a New Application named as the character (in the team), Bot → Reset
+   Token, the token pasted in and connected. For the listener, also turn
+   `MESSAGE_CONTENT` on under Bot; leave it off for the others. npcd names the bot,
+   pictures it, and shows its "Invite to a server" link, which adds it to the world's
+   server. Every other character needs nothing: it speaks through the persona webhook.
 3. Put the guild id in the world document.
 
 Linking people is theirs: a code from the console, sent to a bot.
