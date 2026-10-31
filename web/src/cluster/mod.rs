@@ -158,6 +158,7 @@ impl Gateway {
             grace: Duration::from_secs(cluster.floor_grace_minutes * 60),
             canary_pct: cluster.canary_share.min(100),
         });
+        hub.set_standby_agents(cluster.standby_agents.iter().cloned().collect());
         let peering = peers::peering(cfg, &key, &hub)?;
         let (voter, peer_n) = match &peering {
             Some(p) => (p.node(), cluster.peers.len()),

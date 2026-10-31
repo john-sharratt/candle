@@ -3716,6 +3716,19 @@ free slot (`cluster/src/gateway/agents.rs`). It is never the best idle agent bes
 dedicated one, a lineage it holds moves to a free dedicated agent, and a job that must
 queue queues on a dedicated agent.
 
+**A standby agent** is a spare. It runs on a machine the gateway's `cluster.standby_agents`
+names (`web/web.yaml`), the laptop AlienWorld among them. It is given a job only when no
+other ready agent can run it at all: when the others are down, switched off, or hold
+neither the job's repository nor its toolchain (`choose_with_standby`). An agent that is
+merely busy is waited for and queued on, never spilled past onto the spare, and a lineage
+the spare held goes back to a regular agent as soon as one fits. The standing-by is the
+gateway's to know, from the agent's host, so the agent's `CAPACITY` is the same as any
+other's. `/v1/agents` lists it `standby: true`.
+
+**A job may name its agent** with `x-tokera-node`: it runs there, standby or not, which
+is how a thread does something on one particular machine. `repo_job_start` takes the
+agent's node id or its machine's name as `node` (`alienworld`).
+
 A fork's lineage header is its parent's.
 
 ### 11.4 Jobs

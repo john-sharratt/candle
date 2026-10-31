@@ -41,7 +41,7 @@
 //! the requester fetches again. A record larger than the cap counts as the
 //! cap: it crosses an empty lane.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -1008,6 +1008,11 @@ impl Hub {
         self.state().upgrades = Upgrades::new(cfg);
     }
 
+    /// Name the hosts whose agents stand by (§11.3).
+    pub fn set_standby_agents(&self, hosts: BTreeSet<String>) {
+        self.state().registry.set_standby(hosts);
+    }
+
     /// `raise-floor` (§12.4): end `app`'s grace period now.
     pub fn raise_floor(&self, app: &str) -> Result<(), String> {
         if !rolls_out(app) {
@@ -1472,7 +1477,7 @@ impl Hub {
                     .sockets
                     .get(&(app.to_string(), m.node))
                     .map_or(0, |x| x.connected_ms);
-                AgentRow::of(m, connected)
+                AgentRow::of(m, connected, s.registry.stands_by(&m.host))
             })
             .collect();
         rows.sort_by(|a, b| (&a.host, &a.node).cmp(&(&b.host, &b.node)));

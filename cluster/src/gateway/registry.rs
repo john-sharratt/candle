@@ -69,11 +69,24 @@ pub struct Registry {
     apps: HashMap<String, AppMembers>,
     /// The plan's fences (`docs/cooperative_admission.md` §4.4).
     fences: Fences,
+    /// The hosts whose agents stand by (§11.3): given a job only when no
+    /// other agent can run it.
+    standby: BTreeSet<String>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Name the hosts whose agents stand by.
+    pub fn set_standby(&mut self, hosts: BTreeSet<String>) {
+        self.standby = hosts;
+    }
+
+    /// Whether the agents on `host` stand by.
+    pub fn stands_by(&self, host: &str) -> bool {
+        self.standby.contains(host)
     }
 
     fn app(&mut self, app: &str) -> &mut AppMembers {

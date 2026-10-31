@@ -120,6 +120,10 @@ pub struct Cluster {
     /// kept linked (§13.4).
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// The machines whose agents stand by (§11.3): given a job only when no
+    /// other agent can run it, or when the job names them.
+    #[serde(default)]
+    pub standby_agents: Vec<String>,
 }
 
 /// One peer gateway in `cluster.peers`.

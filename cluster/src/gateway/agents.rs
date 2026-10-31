@@ -13,8 +13,16 @@
 //! (§11.5) — is chosen only when no dedicated agent fit for the job has a
 //! free slot: it is never the best idle agent beside one, and a lineage it
 //! holds moves to a free dedicated agent rather than staying on it.
+//!
+//! **A standby agent** — one on a host the gateway's `standby_agents` names —
+//! is a spare: a job goes to it only when no other ready agent can run the
+//! job at all, because they are down, switched off, or hold neither its
+//! repository nor its toolchain ([`choose_with_standby`]). An agent that is
+//! merely busy is waited for, never spilled past onto a standby one. A job
+//! that names its agent (`x-tokera-node`) runs there, standby or not.
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::registry::MemberView;
@@ -126,6 +134,25 @@ pub fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: b
     // Every agent is still busy: it queues on the one with the most idle
     // cores.
     best(&mut fit.iter()).map_or(Choice::NoAgent, Choice::Run)
+}
+
+/// [`choose`] among the `ready` agents whose host `standby` does not name,
+/// and among the standby ones only when none of the others can run the job.
+pub fn choose_with_standby(
+    ready: &[&MemberView],
+    standby: &BTreeSet<String>,
+    holder: Option<u64>,
+    need: &Need,
+    waited: bool,
+) -> Choice {
+    let (spares, regular): (Vec<&MemberView>, Vec<&MemberView>) = ready
+        .iter()
+        .copied()
+        .partition(|a| standby.contains(&a.host));
+    match choose(&regular, holder, need, waited) {
+        Choice::NoAgent => choose(&spares, holder, need, waited),
+        chosen => chosen,
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +356,59 @@ mod tests {
         assert_eq!(
             choose(&[&gpu_full, &full], None, &cargo(), true),
             Choice::Run(2)
+        );
+    }
+
+    /// An agent on `host`.
+    fn on(host: &str, node: u64, slots_free: u32) -> MemberView {
+        let mut a = agent(node, 16, 0, slots_free);
+        a.host = host.into();
+        a
+    }
+
+    /// **A standby agent runs a job only when no other agent can**: never
+    /// beside a free or merely busy regular agent, at once when the regular
+    /// ones are gone or hold neither repository nor toolchain, and a lineage
+    /// it held goes back to a regular agent as soon as one fits.
+    #[test]
+    fn a_standby_agent_runs_only_what_no_other_agent_can() {
+        let standby: BTreeSet<String> = ["alienworld".to_string()].into();
+        let spare = on("alienworld", 9, 4);
+        let free = on("blackworld", 1, 2);
+        let busy = on("blackworld", 1, 0);
+        let pick = |ready: &[&MemberView], holder, need: &Need, waited| {
+            choose_with_standby(ready, &standby, holder, need, waited)
+        };
+        assert_eq!(
+            pick(&[&spare, &free], None, &cargo(), false),
+            Choice::Run(1)
+        );
+        assert_eq!(pick(&[&spare, &busy], None, &cargo(), false), Choice::Wait);
+        assert_eq!(
+            pick(&[&spare, &busy], None, &cargo(), true),
+            Choice::Run(1),
+            "a busy regular agent is queued on, never spilled past"
+        );
+        assert_eq!(pick(&[&spare], None, &cargo(), false), Choice::Run(9));
+        assert_eq!(
+            pick(&[&spare, &free], Some(9), &cargo(), false),
+            Choice::Run(1),
+            "a lineage the spare held goes back to a regular agent"
+        );
+        let mut elsewhere = on("blackworld", 1, 2);
+        elsewhere.repos.retain(|r| r.name == "site");
+        assert_eq!(
+            pick(&[&spare, &elsewhere], None, &cargo(), false),
+            Choice::Run(9),
+            "no regular agent holds the repository"
+        );
+        let mut gone = spare.clone();
+        gone.repos.clear();
+        assert_eq!(pick(&[&gone], None, &cargo(), false), Choice::NoAgent);
+        // With no standby hosts named, every agent is a regular one.
+        assert_eq!(
+            choose_with_standby(&[&spare, &busy], &BTreeSet::new(), None, &cargo(), false),
+            Choice::Run(9)
         );
     }
 

@@ -6,7 +6,7 @@
 
 use super::{MemberView, PeerAsk, Pick, Registry};
 use crate::dispatch::{reaches, Dispatch};
-use crate::gateway::agents::{choose, Choice, Need};
+use crate::gateway::agents::{choose_with_standby, Choice, Need};
 use crate::gateway::placement::{guest_reach, has_room, place, within_reach, Placed, Weigh};
 
 impl Registry {
@@ -167,8 +167,8 @@ impl Registry {
 
     /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
     /// lineage's holder while it has a free slot, and after `waited` the best
-    /// idle agent. The agent chosen is counted as handed the job until its
-    /// next `CAPACITY`.
+    /// idle agent; a standby agent only when no other can run it. The agent
+    /// chosen is counted as handed the job until its next `CAPACITY`.
     pub fn pick_agent(
         &mut self,
         app: &str,
@@ -181,7 +181,7 @@ impl Registry {
                 .get(app)
                 .and_then(|a| a.claims.holder(k.as_bytes()))
         });
-        let choice = choose(&self.ready(app), holder, need, waited);
+        let choice = choose_with_standby(&self.ready(app), &self.standby, holder, need, waited);
         if let Choice::Run(node) = choice {
             if let Some(m) = self.app(app).members.get_mut(&node) {
                 m.handed += 1;

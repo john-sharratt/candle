@@ -5,10 +5,13 @@
 //!
 //! The job goes over this member's own agent stream, placed as the gateway
 //! places any job — sticky on the caller, spilling to an idle agent, low
-//! priority last — or on the agent `node` names. The program is checked against
-//! the agent's sandbox allow-list there, not here.
+//! priority last, a standby agent only when no other can — or on the agent
+//! `node` names, by its node id or by its machine's name. The program is
+//! checked against the agent's sandbox allow-list there, not here.
 
+use agent::client::Agents;
 use agent::wire::RunJob;
+use cluster::gateway::AgentRow;
 use serde_json::{json, Value};
 use zend_vfs::Snapshot;
 
@@ -31,11 +34,12 @@ pub fn definition() -> Value {
             repository … with <program>\". Answers the job id and the agent it runs on; follow it with `repo_job_log`. A \
             job lives in its agent's process: one lost to a restart is reported lost, and is run again. Name \
             `node` to pin an agent; otherwise the gateway picks one. With `stage`, the file the job builds is \
-            staged for `service_trial` once the job succeeds. Admins only.",
+            staged for `service_trial` once the job succeeds. A standby agent (alienworld) is given a job \
+            only when no other agent can run it, or when `node` names it. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "node": {"type": "string", "description": "The agent's node id, to pin one."},
+                "node": {"type": "string", "description": "The agent to run on, to pin one: its 16-hex-digit node id, or its machine's name (`blackworld`, `alienworld`)."},
                 "repo": {"type": "string", "description": "The repository's name — `candle`, `battle-cities` — as the repo_map layer lists it."},
                 "branch": {"type": "string", "description": "The branch to run on."},
                 "program": {"type": "string", "description": "The program, e.g. `cargo`."},
@@ -82,6 +86,38 @@ pub fn place(node: u64) -> String {
     format!("{node:016x}")
 }
 
+/// The node of the agent on machine `host` among `agents`: a ready one first.
+pub fn on_host(agents: &[AgentRow], host: &str) -> Result<u64, String> {
+    let on: Vec<&AgentRow> = agents
+        .iter()
+        .filter(|a| a.host.eq_ignore_ascii_case(host.trim()))
+        .collect();
+    let Some(agent) = on.iter().find(|a| a.state == "ready").or(on.first()) else {
+        let known: Vec<&str> = agents.iter().map(|a| a.host.as_str()).collect();
+        return Err(format!(
+            "no agent on {host} has a socket on the gateway; agents are on: {}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    };
+    u64::from_str_radix(&agent.node, 16).map_err(|_| format!("{:?} is not a node", agent.node))
+}
+
+/// The agent `pin` names: a node id, or the machine it runs on.
+async fn pinned(agents: &Agents, pin: &str) -> Result<u64, String> {
+    if let Ok(n) = ops::node(pin) {
+        return Ok(u64::from_str_radix(&n, 16).expect("sixteen hex digits"));
+    }
+    let listed = agents
+        .listing()
+        .await
+        .map_err(|e| format!("the agents could not be listed: {e}"))?;
+    on_host(&listed, pin)
+}
+
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
@@ -90,17 +126,17 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(j) => j,
         Err(e) => return Answer::error(e),
     };
-    let to = match args.get("node").and_then(Value::as_str) {
-        Some(n) => match ops::node(n) {
-            Ok(n) => Some(u64::from_str_radix(&n, 16).expect("sixteen hex digits")),
-            Err(e) => return Answer::error(e),
-        },
-        None => None,
-    };
     let Some(agents) = ctx.session.agents() else {
         return Answer::error(
             "this member reaches no agent: it has no cluster and no agent of its own",
         );
+    };
+    let to = match args.get("node").and_then(Value::as_str) {
+        Some(pin) => match pinned(&agents, pin).await {
+            Ok(node) => Some(node),
+            Err(e) => return Answer::error(e),
+        },
+        None => None,
     };
     let command = format!("{} {}", job.program, job.args.join(" "));
     let (at, view) = match agents.submit(&ctx.caller.key(), job, to).await {
@@ -150,5 +186,36 @@ mod tests {
     #[test]
     fn an_agent_is_named_by_its_node() {
         assert_eq!(place(0xab), "00000000000000ab");
+    }
+
+    fn row(host: &str, node: u64, state: &str) -> AgentRow {
+        serde_json::from_value(json!({
+            "node": place(node), "host": host,
+            "build": {"count": 1, "hash": "h", "local": ""},
+            "state": state, "os": "windows", "cores": 8, "load_milli": 0,
+            "mem_free_mib": 0, "slots_free": 1, "jobs": 0, "toolchains": ["cargo"],
+            "low_priority": false, "standby": host == "alienworld", "repos": [],
+            "connected_ms": 0
+        }))
+        .unwrap()
+    }
+
+    /// **An agent is pinned by its machine's name**, in any case, a ready one
+    /// first; a machine with no agent is refused, naming those there are.
+    #[test]
+    fn an_agent_is_pinned_by_its_machine() {
+        let agents = [
+            row("BlackWorld", 0x1, "ready"),
+            row("alienworld", 0x2, "disabled"),
+            row("alienworld", 0x3, "ready"),
+        ];
+        assert_eq!(on_host(&agents, "blackworld"), Ok(0x1));
+        assert_eq!(on_host(&agents, " AlienWorld "), Ok(0x3));
+        assert_eq!(on_host(&agents[..2], "alienworld"), Ok(0x2));
+        assert_eq!(
+            on_host(&agents, "whiteworld").unwrap_err(),
+            "no agent on whiteworld has a socket on the gateway; agents are on: BlackWorld, \
+             alienworld, alienworld"
+        );
     }
 }

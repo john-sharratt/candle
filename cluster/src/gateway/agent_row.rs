@@ -45,14 +45,18 @@ pub struct AgentRow {
     /// It shares its host with a model member, and runs its jobs below
     /// normal priority (§11.5).
     pub low_priority: bool,
+    /// It stands by: the gateway gives it a job only when no other agent can
+    /// run it (§11.3). A job that names it runs there.
+    pub standby: bool,
     pub repos: Vec<AgentRepo>,
     /// When its socket to this gateway connected, in Unix milliseconds.
     pub connected_ms: u64,
 }
 
 impl AgentRow {
-    /// `agent` as listed, its socket connected at `connected_ms`.
-    pub fn of(agent: &MemberView, connected_ms: u64) -> AgentRow {
+    /// `agent` as listed, its socket connected at `connected_ms`, standing by
+    /// when `standby`.
+    pub fn of(agent: &MemberView, connected_ms: u64, standby: bool) -> AgentRow {
         let cap = agent.capacity.clone().unwrap_or_default();
         AgentRow {
             node: format!("{:016x}", agent.node),
@@ -67,6 +71,7 @@ impl AgentRow {
             jobs: cap.jobs,
             toolchains: cap.toolchains,
             low_priority: cap.low_priority,
+            standby,
             repos: agent
                 .repos
                 .iter()
@@ -133,19 +138,19 @@ mod tests {
             closing: false,
         };
         assert_eq!(
-            serde_json::to_value(AgentRow::of(&agent, 1_700_000_000_000)).unwrap(),
+            serde_json::to_value(AgentRow::of(&agent, 1_700_000_000_000, true)).unwrap(),
             json!({
                 "node": "00000000000000a1", "host": "build-1",
                 "build": { "count": 7, "hash": "abc", "local": "" },
                 "state": "disabled", "os": "linux", "cores": 16, "load_milli": 2500,
                 "mem_free_mib": 9000, "slots_free": 3, "jobs": 1, "toolchains": ["cargo"],
-                "low_priority": false,
+                "low_priority": false, "standby": true,
                 "repos": [{ "name": "candle", "origin": "git@h:candle.git", "push": true }],
                 "connected_ms": 1_700_000_000_000u64
             })
         );
         agent.capacity = None;
-        let row = AgentRow::of(&agent, 0);
+        let row = AgentRow::of(&agent, 0, false);
         assert_eq!(
             (row.state.as_str(), row.cores, row.os.as_str()),
             ("loading", 0, "")

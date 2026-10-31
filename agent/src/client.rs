@@ -420,6 +420,7 @@ impl Agents {
             jobs: cap.jobs,
             toolchains: cap.toolchains,
             low_priority: cap.low_priority,
+            standby: false,
             repos: jobs
                 .checkouts()
                 .ads()

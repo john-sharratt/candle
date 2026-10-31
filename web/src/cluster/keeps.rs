@@ -121,6 +121,7 @@ mod tests {
             jobs: 0,
             toolchains: Vec::new(),
             low_priority: false,
+            standby: false,
             repos: Vec::new(),
             connected_ms: 0,
         }

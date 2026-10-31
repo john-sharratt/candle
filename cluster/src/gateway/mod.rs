@@ -31,8 +31,8 @@ mod worlds_view;
 pub use admission::{Admission, Admitted, MAX_SKEW_MS};
 pub use agent_row::{AgentRepo, AgentRow, AGENTS_PATH};
 pub use agents::{
-    choose, Choice, Need, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, SPILL_AFTER,
-    TOOLCHAIN_HEADER,
+    choose, choose_with_standby, Choice, Need, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER,
+    REPO_HEADER, SPILL_AFTER, TOOLCHAIN_HEADER,
 };
 pub use claims::Claims;
 pub use coord_log::changes;
