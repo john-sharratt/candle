@@ -466,6 +466,32 @@ routines:
 The routines are the mind's, like the workflows: read afresh each tick by every member and never
 saved with the world.
 
+## A character that takes no orders
+
+Every world's table opens as the world is hosted, and everybody with no mission is called to it
+and handed one. For the Makers that is right. In `life` it was wrong: Zen is the moon, the
+Drones are its children and the routines are theirs, and Zen, called like everybody else, was
+sent down to the hatchery to read a cradle and report back to a table.
+
+A personality says so with `takes_orders: false`. **The world gives a character of it no
+orders** (`sim::missions::Missions::set_unordered`):
+
+- **No summons, no standing task.** The table never calls it, on its way or standing at the
+  table, and it is given no idle nudge either — what it does with its time is its own
+  (`Runtime::table_summons`, `at_table_summons`, `nudge_for`).
+- **No work at the table.** `collect_mission` is not offered to it, and refused if asked for;
+  the table hands it nothing from the pool.
+- **Nothing lodged.** `POST /v1/npc/:nid/mission` (and the MCP `bot_mission_give` behind it)
+  answers `409 takes_no_orders`; talk to it instead. The world's authority refuses a lodge for it
+  too.
+- **Stood down on arrival.** It is marked each time it is embodied, from its personality, so the
+  personality's word is the one that stands. Marked while it carries a mission, it is stood down
+  from it and told the mission was withdrawn, and what was lodged for it is dropped.
+
+The guardian's loop-breaker still reaches it — "you keep covering the same ground" is the
+character's own thought, not work set for it — and so does an operator's broadcast or
+announcement, which is a person speaking, not the world ordering.
+
 ## Measured
 
 Live runs of 2026-10-09 on the RTX 3090, Qwen3-30B-A3B serving both the generator and the

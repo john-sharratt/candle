@@ -18,7 +18,7 @@ use super::npc_lease::{by_plan, hex, leases_of};
 use super::ops::{OpReply, WorldOp};
 use crate::engine::environment;
 use crate::engine::event::{EventKind, Salience};
-use crate::engine::runtime::Runtime;
+use crate::engine::runtime::{Kind, Runtime};
 use crate::engine::tick::Pace;
 use crate::world_state::place_of;
 
@@ -76,14 +76,11 @@ impl Runtime {
                 continue;
             };
             let remembered = place_of(&self.standing.written(&p.world_id), &Runtime::body_id(npc));
-            match self.embody_in_world(
-                npc,
-                &p.world_id,
-                p.home.as_deref(),
-                &p.name,
-                remembered.as_deref(),
-                0,
-            ) {
+            let kind = Kind {
+                home: p.home.as_deref(),
+                unordered: p.unordered,
+            };
+            match self.embody_in_world(npc, &p.world_id, kind, &p.name, remembered.as_deref(), 0) {
                 Ok(true) => {
                     tracing::info!(npc, world = %p.world_id, "a character made elsewhere is embodied here")
                 }

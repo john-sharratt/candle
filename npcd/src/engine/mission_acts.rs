@@ -146,6 +146,9 @@ pub struct Carrying {
     /// That mission writes a document — a draft, or a review that must mend
     /// one — which is what `compose` is for.
     pub drafts: bool,
+    /// The world gives this body no orders — see
+    /// [`crate::sim::missions::Missions::set_unordered`].
+    pub unordered: bool,
 }
 
 /// What `body` is carrying in `s`.
@@ -159,6 +162,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
         drafts: mission
             .and_then(|m| m.work.as_ref())
             .is_some_and(|w| !w.edit_optional),
+        unordered: s.missions.is_unordered(body),
     }
 }
 
@@ -192,10 +196,11 @@ const NOT_FOR_OPERATIONS: [&str; 9] = [
 /// `orders_report_done` is for a body holding an order — a character with a
 /// mission and no order filed its mission against an order it never held. A
 /// Maker on an operation is not offered the bench's working-set verbs (see
-/// [`NOT_FOR_OPERATIONS`]).
+/// [`NOT_FOR_OPERATIONS`]), and an unordered character is offered no work at
+/// all.
 pub fn offered(tool: &str, c: Carrying) -> bool {
     match tool {
-        t if t == COLLECT_MISSION.name => !c.mission,
+        t if t == COLLECT_MISSION.name => !c.mission && !c.unordered,
         t if t == REPORT_DONE.name || t == REPORT_STUCK.name => c.mission,
         t if t == REPORT_REJECTED.name => c.mission && c.review,
         "orders_report_done" => c.order,
@@ -228,6 +233,7 @@ mod tests {
             operation: review,
             order,
             drafts: false,
+            unordered: false,
         }
     }
 
@@ -272,5 +278,13 @@ mod tests {
         assert!(offered("compose", writing));
         assert!(!offered("file_write", writing), "written sitting down");
         assert!(offered("file_edit", writing), "a passage is still mended");
+        // An unordered character is handed nothing at the table, and the table
+        // is otherwise the same to it.
+        let unordered = Carrying {
+            unordered: true,
+            ..idle
+        };
+        assert!(!offered("collect_mission", unordered));
+        assert!(offered("present", unordered));
     }
 }

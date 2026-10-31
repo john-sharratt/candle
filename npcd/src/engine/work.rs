@@ -111,6 +111,14 @@ fn subject(args: &Map<String, Value>) -> Option<String> {
 fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
+        // **The world gives an unordered character no orders** — see
+        // [`crate::sim::missions::Missions::set_unordered`]. The table does not
+        // offer it the act; this is the act refused if it is asked for anyway.
+        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => Outcome::Refused(
+            "Nothing at this table is yours to take up: the work here is for others, and \
+             nobody gives you orders."
+                .into(),
+        ),
         "collect_mission" => {
             // **One mission at a time.** `collect_mission` is offered whenever a
             // body stands at the desk, including when it has come back to report
