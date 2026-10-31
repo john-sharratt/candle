@@ -121,6 +121,7 @@ use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
 use crate::projection;
+use crate::sim::phone::Origin;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
@@ -2282,12 +2283,22 @@ impl Runtime {
     ///
     /// Returns what the character is called and whether it can answer. `None`
     /// when it has no body, because there is then nothing to reach it on.
-    pub fn message_npc(&self, npc_id: u64, from: &str, text: &str) -> Option<MessageSent> {
+    ///
+    /// `origin` is where the message was written when not in the console —
+    /// a Discord DM — and goes onto the thread with it, so the mirror knows
+    /// it for one it must not post back.
+    pub fn message_npc(
+        &self,
+        npc_id: u64,
+        from: &str,
+        text: &str,
+        origin: Option<Origin>,
+    ) -> Option<MessageSent> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
         let sent = hosted.with_sim(|sim| {
             sim.threads.reach(from, &them);
-            let _ = sim.threads.send(from, &them, text);
+            let _ = sim.threads.send_from(from, &them, text, origin);
             // Everybody a handset can reach comes from the cast rather than the
             // room, so a person messaging in from outside has to be made known
             // to the world's phones or the character is offered nobody to
@@ -6710,7 +6721,7 @@ mod tests {
         let hosted = rt.hosted.get(WORLD).expect("hosted");
 
         let sent = rt
-            .message_npc(1, "Johnathan Sharratt", "are you there")
+            .message_npc(1, "Johnathan Sharratt", "are you there", None)
             .expect("the character could be messaged");
         assert_eq!(sent.with, "Maker-01");
         assert_eq!(sent.waiting_for_them, 1, "it was not written to the thread");
@@ -6738,7 +6749,7 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
-        rt.message_npc(1, "Johnathan Sharratt", "are you there");
+        rt.message_npc(1, "Johnathan Sharratt", "are you there", None);
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
 
         assert_eq!(

@@ -1217,6 +1217,7 @@ pub(crate) async fn post_message(
         npc: npc_id,
         from: me.clone(),
         text: text.to_string(),
+        origin: None,
     };
     let sent = match rt.world_write(hosted.id(), op).await {
         Ok(OpReply::Sent { sent: Some(sent) }) => sent,

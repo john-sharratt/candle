@@ -37,6 +37,7 @@
 //! nobody is reading.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +158,15 @@ pub struct Thread {
     /// them, because that would be a record claiming somebody read something
     /// they never got.
     joined_at: BTreeMap<String, usize>,
+    /// The [`Message::seq`] the next message said on this thread takes.
+    ///
+    /// Counted on the thread rather than read off its messages, because the
+    /// messages are trimmed ([`Thread::say`]) and a count derived from what is
+    /// left would hand a new message the name of one already dropped. A thread
+    /// saved before messages had names loads at [`FIRST_SEQ`], and its older
+    /// messages at `0`, which names no message.
+    #[serde(default = "first_seq")]
+    pub next_seq: u64,
     /// How much of the thread each member's *mind* has already been handed.
     ///
     /// **Separate from `seen_by`, which is a different question.** `seen_by`
@@ -189,6 +199,14 @@ pub const KEEP_DIRECT: usize = 64;
 /// a group's history is worth more.
 pub const KEEP_GROUP: usize = 128;
 
+/// The [`Message::seq`] a thread's first message takes. `0` is the seq of a
+/// message saved before messages had one, and names no message.
+pub const FIRST_SEQ: u64 = 1;
+
+fn first_seq() -> u64 {
+    FIRST_SEQ
+}
+
 /// One thing said on a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -200,6 +218,32 @@ pub struct Message {
     /// fact about each reader rather than about the message: a group of four
     /// has four answers to it.
     pub seen_by: Vec<String>,
+    /// Its name on the thread: strictly increasing, never reused, and kept
+    /// through trimming — what a mirror says it has posted up to.
+    #[serde(default)]
+    pub seq: u64,
+    /// When it was said, in real milliseconds.
+    #[serde(default)]
+    pub at_ms: u64,
+    /// Where it came from, when not from the world: the Discord message it
+    /// mirrors, so the mirror never posts it back.
+    #[serde(default)]
+    pub origin: Option<Origin>,
+}
+
+/// Where a message said on a thread came from, outside the world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Origin {
+    /// A Discord message: its id, and the channel it was written in.
+    Discord { message: u64, channel: u64 },
+}
+
+/// Now, in real milliseconds: when a message is said.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 impl Thread {
@@ -248,7 +292,13 @@ impl Thread {
     /// the argument it joined after: the indices stay valid numbers and start
     /// pointing at the wrong messages, which is the kind of wrong nothing
     /// reports.
-    pub fn say(&mut self, message: Message) {
+    ///
+    /// **The message is named here, not by its sender**: it takes the
+    /// thread's [`Thread::next_seq`], so no two messages on a thread share a
+    /// seq and trimming renames none of them.
+    pub fn say(&mut self, mut message: Message) {
+        message.seq = self.next_seq;
+        self.next_seq += 1;
         self.messages.push(message);
         let keep = match self.kind() {
             Kind::Direct => KEEP_DIRECT,
@@ -448,6 +498,7 @@ impl Threads {
                 named: false,
                 permanent: false,
                 joined_at: BTreeMap::new(),
+                next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
                 touched,
             },
@@ -499,6 +550,7 @@ impl Threads {
                 named: true,
                 permanent: true,
                 joined_at: BTreeMap::new(),
+                next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
                 touched,
             },
@@ -526,6 +578,7 @@ impl Threads {
                 named: true,
                 permanent: false,
                 joined_at: BTreeMap::new(),
+                next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
                 touched,
             },
@@ -537,8 +590,25 @@ impl Threads {
         id
     }
 
-    /// Say something on one of `from`'s threads, named the way `from` names it.
+    /// Say something on one of `from`'s threads, named the way `from` names it,
+    /// from inside the world.
     pub fn send(&mut self, from: &str, named: &str, intent: &str) -> Result<Vec<String>, String> {
+        self.send_from(from, named, intent, None)
+    }
+
+    /// [`Threads::send`], for a message that came from `origin` outside the
+    /// world — or from inside it, with `None`.
+    ///
+    /// **Every message is said here**, so this is where one is named and
+    /// timed: its seq from the thread ([`Thread::say`]), its time from the
+    /// clock.
+    pub fn send_from(
+        &mut self,
+        from: &str,
+        named: &str,
+        intent: &str,
+        origin: Option<Origin>,
+    ) -> Result<Vec<String>, String> {
         let Some(id) = self.id_by_name_for(from, named) else {
             return Err(format!("You have no conversation with {named}."));
         };
@@ -552,6 +622,9 @@ impl Threads {
             intent: intent.to_string(),
             // The sender has seen what they sent.
             seen_by: vec![from.to_string()],
+            seq: 0,
+            at_ms: now_ms(),
+            origin,
         });
         Ok(t.others(from))
     }
@@ -763,6 +836,143 @@ mod tests {
         for t in p.iter() {
             assert!(t.messages.len() <= KEEP_GROUP.max(KEEP_DIRECT));
         }
+    }
+
+    // ── what a message is called ────────────────────────────────────────────
+
+    /// **Trimming renames nothing.** Every message that survives a trim keeps
+    /// the seq it was said with, so a mirror that posted through seq 70 still
+    /// means the same seventy messages after the front is dropped.
+    #[test]
+    fn a_trimmed_thread_keeps_every_surviving_message_s_seq() {
+        let mut p = Threads::new();
+        p.reach("Wren", "Soren");
+        let said = KEEP_DIRECT as u64 + 40;
+        for i in 0..said {
+            p.send("Soren", "Wren", &format!("line {i}")).unwrap();
+        }
+        let t = p.direct_between("Wren", "Soren").unwrap();
+        let seqs: Vec<u64> = t.messages.iter().map(|m| m.seq).collect();
+        let want: Vec<u64> = (said - KEEP_DIRECT as u64 + 1..=said).collect();
+        assert_eq!(seqs, want);
+        // And the seq still names what was said with it.
+        assert_eq!(
+            t.messages[0].intent,
+            format!("line {}", said - KEEP_DIRECT as u64)
+        );
+        assert_eq!(t.next_seq, said + 1);
+    }
+
+    /// Strictly increasing on each thread, from [`FIRST_SEQ`], each thread
+    /// counting its own.
+    #[test]
+    fn seq_is_strictly_increasing_per_thread() {
+        let mut p = Threads::new();
+        p.reach("Wren", "Soren");
+        p.open_group(
+            "the sweep",
+            &["Wren".into(), "Orion".into(), "Perrin".into()],
+        );
+        p.send("Wren", "Soren", "a").unwrap();
+        p.send("Wren", "the sweep", "b").unwrap();
+        p.send("Soren", "Wren", "c").unwrap();
+        p.send("Orion", "the sweep", "d").unwrap();
+        p.send("Wren", "Soren", "e").unwrap();
+        let pair: Vec<(u64, &str)> = p
+            .direct_between("Wren", "Soren")
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| (m.seq, m.intent.as_str()))
+            .collect();
+        assert_eq!(pair, [(1, "a"), (2, "c"), (3, "e")]);
+        let group: Vec<(u64, &str)> = p
+            .by_name_for("Wren", "the sweep")
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| (m.seq, m.intent.as_str()))
+            .collect();
+        assert_eq!(group, [(1, "b"), (2, "d")]);
+    }
+
+    /// A message carries when it was said and where it came from; one said
+    /// in the world comes from nowhere outside it.
+    #[test]
+    fn a_message_carries_its_time_and_origin() {
+        let mut p = Threads::new();
+        p.reach("Wren", "Soren");
+        let before = now_ms();
+        p.send("Soren", "Wren", "from the world").unwrap();
+        let origin = Origin::Discord {
+            message: 1_300_000_000_000_000_011,
+            channel: 1_300_000_000_000_000_012,
+        };
+        p.send_from("Wren", "Soren", "from Discord", Some(origin))
+            .unwrap();
+        let after = now_ms();
+        let t = p.direct_between("Wren", "Soren").unwrap();
+        assert_eq!(t.messages[0].origin, None);
+        assert_eq!(t.messages[1].origin, Some(origin));
+        for m in &t.messages {
+            assert!(before <= m.at_ms && m.at_ms <= after, "{}", m.at_ms);
+        }
+    }
+
+    /// **The origin round-trips** as the record holds it, exactly.
+    #[test]
+    fn an_origin_round_trips_through_its_record() {
+        let m = Message {
+            from: "Wren".into(),
+            intent: "hello".into(),
+            seen_by: vec!["Wren".into()],
+            seq: 7,
+            at_ms: 1_800_000_000_000,
+            origin: Some(Origin::Discord {
+                message: 1_300_000_000_000_000_011,
+                channel: 1_300_000_000_000_000_012,
+            }),
+        };
+        let wire = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            wire,
+            "{\"from\":\"Wren\",\"intent\":\"hello\",\"seen_by\":[\"Wren\"],\"seq\":7,\
+             \"at_ms\":1800000000000,\"origin\":{\"kind\":\"discord\",\
+             \"message\":1300000000000000011,\"channel\":1300000000000000012}}"
+        );
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), m);
+    }
+
+    /// **A world saved before messages had names still opens**: its messages
+    /// load at seq `0`, which names none, and its thread names the next one
+    /// [`FIRST_SEQ`].
+    #[test]
+    fn a_thread_saved_before_seq_loads_and_names_its_next_message() {
+        let saved = serde_json::json!({
+            "id": "th1",
+            "name": "Soren",
+            "members": ["Wren", "Soren"],
+            "messages": [{"from": "Wren", "intent": "old", "seen_by": ["Wren"]}],
+            "open": true,
+            "named": false,
+            "joined_at": {},
+            "delivered": {},
+        });
+        let mut t: Thread = serde_json::from_value(saved).unwrap();
+        assert_eq!(
+            (t.messages[0].seq, t.messages[0].at_ms, t.messages[0].origin),
+            (0, 0, None)
+        );
+        assert_eq!(t.next_seq, FIRST_SEQ);
+        t.say(Message {
+            from: "Soren".into(),
+            intent: "new".into(),
+            seen_by: vec![],
+            seq: 0,
+            at_ms: 5,
+            origin: None,
+        });
+        assert_eq!(t.messages[1].seq, FIRST_SEQ);
     }
 
     // ── delivery ────────────────────────────────────────────────────────────

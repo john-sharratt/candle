@@ -24,6 +24,7 @@ use std::path::Path;
 
 use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity;
@@ -69,13 +70,32 @@ fn file_id(provider: &str, sub: &str) -> String {
 
 /// The public id of an account filed under `key`: what its characters are
 /// owned by, and its author's store over the mind (§10.3).
-fn public_id(key: &str) -> String {
+pub fn public_id(key: &str) -> String {
     format!("u_{}", &key[..8])
 }
 
 /// The public id of `id`'s account.
 pub fn user_id_of(id: &Identity) -> String {
-    public_id(&file_id(&id.provider, &id.sub))
+    public_id(&key_of(id))
+}
+
+/// The key `id`'s account is filed under: what names the account to the
+/// records that point at it — a Discord link, a bot's DM with the person.
+pub fn key_of(id: &Identity) -> String {
+    file_id(&id.provider, &id.sub)
+}
+
+/// A person's Discord account, linked to their account here
+/// (`docs/npcd_discord.md` §3.2): the account's `discord` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordUser {
+    /// Their Discord user id, as Discord writes it.
+    pub id: String,
+    /// Their Discord username, as of the link.
+    pub username: String,
+    /// When they linked it, in real milliseconds.
+    pub linked_ms: u64,
 }
 
 /// The account store: the substrate's `account/` records.
@@ -451,6 +471,56 @@ impl Accounts {
     pub fn get(&self, id: &Identity) -> Option<Value> {
         let key = file_id(&id.provider, &id.sub);
         self.body(&key).map(|body| with_public_id(&key, &body))
+    }
+
+    /// The identity account `key` was made for, as its record keeps it: who
+    /// the person is when they arrive by another way than signing in — a
+    /// Discord DM. `None` with no such account.
+    pub fn identity(&self, key: &str) -> Option<Identity> {
+        let body = self.body(key)?;
+        let field = |f: &str| body[f].as_str().unwrap_or_default().to_string();
+        Some(Identity {
+            provider: field("provider"),
+            sub: field("sub"),
+            email: field("email"),
+            name: field("display"),
+            picture: field("avatar_url"),
+            exp: 0,
+        })
+    }
+
+    /// The Discord account linked to account `key`, if any.
+    pub fn discord(&self, key: &str) -> Option<DiscordUser> {
+        let body = self.body(key)?;
+        serde_json::from_value(body.get("discord")?.clone()).ok()
+    }
+
+    /// Link `user` to account `key`, or unlink whatever is linked with
+    /// `None`. `false` with no such account. Writes nothing when nothing
+    /// changes.
+    pub fn set_discord(&self, key: &str, user: Option<&DiscordUser>) -> anyhow::Result<bool> {
+        let Some(mut body) = self.body(key) else {
+            return Ok(false);
+        };
+        let Some(map) = body.as_object_mut() else {
+            anyhow::bail!("account {key} is not an object");
+        };
+        let was = map.get("discord").cloned();
+        match user {
+            Some(user) => {
+                map.insert(
+                    "discord".into(),
+                    serde_json::to_value(user).expect("a Discord user serialises"),
+                );
+            }
+            None => {
+                map.remove("discord");
+            }
+        }
+        if map.get("discord").cloned() != was {
+            self.put(key, body)?;
+        }
+        Ok(true)
     }
 }
 
@@ -1243,6 +1313,72 @@ mod tests {
             again.get(&who("g1")).unwrap()["unique_name"],
             "ridge-walker"
         );
+    }
+
+    /// **A linked Discord account is the account's `discord` field**, in
+    /// exactly this shape; a sign-in does not unlink it, and unlinking
+    /// removes the field.
+    #[test]
+    fn a_linked_discord_account_is_a_field_a_sign_in_keeps() {
+        let dir = tmp();
+        let mut a = open(&dir);
+        let id = ident("g1", "wren@example.com", "Wren S");
+        a.upsert(&id, 1).unwrap();
+        let key = key_of(&id);
+        let user = DiscordUser {
+            id: "1300000000000000013".into(),
+            username: "wren".into(),
+            linked_ms: 1_800_000_000_000,
+        };
+        assert!(a.set_discord(&key, Some(&user)).unwrap());
+        assert_eq!(
+            a.shared
+                .custom_object(&format!("account/{key}"))
+                .unwrap()
+                .blob["discord"],
+            json!({
+                "id": "1300000000000000013",
+                "username": "wren",
+                "linked_ms": 1_800_000_000_000u64,
+            })
+        );
+        a.upsert(&id, 2).unwrap();
+        assert_eq!(a.discord(&key), Some(user.clone()));
+
+        let version = a.shared.custom_objects_version();
+        assert!(a.set_discord(&key, Some(&user)).unwrap());
+        assert_eq!(
+            a.shared.custom_objects_version(),
+            version,
+            "an unchanged link wrote"
+        );
+
+        assert!(a.set_discord(&key, None).unwrap());
+        assert_eq!(a.discord(&key), None);
+        assert!(a.get(&id).unwrap().get("discord").is_none());
+        assert!(!a
+            .set_discord("0123456789abcdef0123456789abcdef", None)
+            .unwrap());
+    }
+
+    /// **The identity an account was made for comes back from its record**,
+    /// so the same person arriving another way is the same person.
+    #[test]
+    fn an_account_gives_back_the_identity_it_was_made_for() {
+        let dir = tmp();
+        let mut a = open(&dir);
+        let mut id = ident("g1", "wren@example.com", "Wren S");
+        id.picture = "https://example.com/w.png".into();
+        a.upsert(&id, 1).unwrap();
+        assert_eq!(
+            a.identity(&key_of(&id)),
+            Some(Identity {
+                exp: 0,
+                ..id.clone()
+            })
+        );
+        assert_eq!(user_id_of(&id), public_id(&key_of(&id)));
+        assert_eq!(a.identity("0123456789abcdef0123456789abcdef"), None);
     }
 
     #[test]

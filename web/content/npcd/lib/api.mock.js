@@ -14,6 +14,9 @@ const mockThreads = {};
 
 /// Characters' Discord bots, by character. See `getDiscord`.
 const mockBots = {};
+
+/// The caller's Discord link. See `linkDiscord`.
+const mockLink = { linked: null, pending: null };
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
 const EMPTY = flag('empty');
 
@@ -626,12 +629,33 @@ export const MockAPI = {
       connected: true, application_id: '1300000000000000001', user_id: '1300000000000000002',
       username: n.name, connected_ms: Date.now(),
       invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344134372416',
+      status: 'online', world: 'Life',
     };
     return mockBots[id];
   },
   async disconnectDiscord(id) {
     delete mockBots[id];
     return { connected: false };
+  },
+
+  /* The caller's own Discord link. A code the mock hands out links itself a
+   * few seconds later, as if it had been sent to the bot, so the Profile
+   * page's polling has something to find. */
+  async linkDiscord() {
+    await sleep(200);
+    const code = String(Math.floor(Math.random() * 1e6)).padStart(6, '0');
+    mockLink.pending = setTimeout(() => {
+      mockLink.linked = { linked: true, username: 'wren', linked_ms: Date.now() };
+    }, 4000);
+    return { code, expires_ms: Date.now() + 10 * 60 * 1000, bots: ['Zen'] };
+  },
+  async getDiscordLink() {
+    return mockLink.linked || { linked: false };
+  },
+  async unlinkDiscord() {
+    clearTimeout(mockLink.pending);
+    mockLink.linked = null;
+    return { linked: false };
   },
 
   async listInteractions(id) {

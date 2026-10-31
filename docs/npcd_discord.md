@@ -15,9 +15,10 @@ character without one, a private thread, and a person who writes on Discord is h
 the world exactly as one who writes in the console. Background jobs keep the two in step through restarts, gaps and authority
 moves. §1.1 says why Discord is not the record.
 
-This document is the design. Code: `npcd/src/discord/` — so far the bot provisioning
-of §4.3 (`seal`, `store`, `client`, `profile`, `invite`, `routes`); §8 says what comes
-next, in the order it is built. It sits on npcd's
+This document is the design. Code: `npcd/src/discord/` — part one of §8: the bot
+provisioning of §4.3 (`seal`, `store`, `client`, `profile`, `invite`, `routes`), the bot
+runtime of §3.3 and §6 (`gateway/`, `state`, `bots/`), linking (§3.2, `link/`) and DMs
+both ways (§5, `dm/`); §8 says what comes next, in the order it is built. It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
@@ -211,23 +212,30 @@ Discord section:
    an Unlink (`DELETE /v1/me/discord`, clearing the field and the index).
 
 A Discord account links to one tokera account; linking it again moves it, and the
-previous account's field is cleared. A code is not a secret worth more than its ten
-minutes: it names no account and grants only that link.
+previous account's field is cleared; an account that links a second Discord account
+lets go of the first. A code is not a secret worth more than its ten minutes: it names
+no account and grants only that link. Six digits that are not a live code are an
+ordinary message. The three routes are the caller's own, like the rest of `/v1/me`
+(`Guest`, the bar of an account route).
 
 **An unlinked author** is not heard in the world. Their first message to a bot is
 answered once — "I don't know you yet. Open <console>/#/profile, choose Link Discord,
-and send me the code." — and later ones are dropped without an answer, so a stranger
-cannot make a bot talk on a loop. The bot keeps the set of authors it has told in
-memory; a restart tells them once more.
+and send me the code.", `<console>` the console's public host (`npcd::tenant::HOST`,
+`https://bot.tokera.com`) — and later ones are dropped without an answer, so a
+stranger cannot make a bot talk on a loop. The bot keeps the set of authors it has told
+in memory; a restart tells them once more.
 
 A linked person is then the same author in both places: their Discord messages arrive
 as `WorldOp::Message { from: <their speaking name> }`, the name `speaking_as`
 (`engine/mod.rs:1153-1166`) gives their account, exactly as `post_message`
 (`engine/mod.rs:1179-1234`) builds it — so a conversation started in the console goes
-on in Discord, one thread. **Who may DM a character** is who may see it: the
-`visible_to` check `owned_by` makes (`engine/mod.rs:672-692`). A linked person DMing a
-character they may not see is answered once, "I can't talk with you", and nothing
-enters the world. A channel post from Discord still needs the Creator role.
+on in Discord, one thread. The person's identity is the one their account was made
+for, read back from the account record (`Accounts::identity`), so the name and the
+role are what their own requests would get. **Who may DM a character** is who may see
+it: the `visible_to` check `owned_by` makes (`engine/mod.rs:672-692`), at the `User`
+bar `post_message` is registered at. A linked person DMing a character they may not
+see is answered once, "I can't talk with you", and nothing enters the world. A channel
+post from Discord still needs the Creator role.
 
 ### 3.3 Where a bot runs, and how it shows
 
@@ -249,18 +257,23 @@ is what keeps it at one: two members never hold one world.
 
 **The bot's state** is the replicated custom object `discord/state/<npc_id>`, written by
 the member running the shard when it changes (not on every beat):
-`{ state, since_ms, world }`, where `state` is
+`{ state, since_ms, world, connected_ms }`, where `connected_ms` is the bot record's
+(§4.3) — which token the state is of — and `state` is
 
 - `online` — a shard is open and Discord answered `READY`;
 - `refused` — Discord refused the token (close code 4004, or 401), so the shard was
-  stopped (§6) and the owner must connect a fresh token.
+  stopped (§6) and the owner must connect a fresh token. No member opens a shard for a
+  token its state says was refused, whichever member takes the world next; a token
+  connected since (a newer `connected_ms`) is not refused.
 
-No record, or one older than its world's authority, is **offline**: no member runs the
-bot, because its character is in no running world or the world is moving. The member
-that stops a shard tombstones the record. `GET /v1/npc/:nid/discord` (§4.3) answers it
-as `status` (`online`, `offline` or `refused`), and the Messages-tab panel shows it
-beside the bot's name: "online in Life", "offline", "Discord refused the token — connect
-a new one".
+No record, an `online` one older than its world's authority (its `since_ms` below the
+highest epoch the world's records carry), or one of a token since replaced, is
+**offline**: no member runs the bot, because its character is in no running world or
+the world is moving. The member that stops a shard for any other reason than a refusal
+tombstones the record. `GET /v1/npc/:nid/discord` (§4.3) answers it as `status`
+(`online`, `offline` or `refused`), with the world's name as `world` when online, and
+the Messages-tab panel shows it beside the bot's name: "online in Life", "offline",
+"Discord refused the token — connect a new one".
 
 ---
 
@@ -285,9 +298,14 @@ pub struct Message {
 }
 ```
 
-`Thread` gains `next_seq: u64`. `Threads::send` assigns `seq` and `at_ms`; the trimming
-in `phone.rs:251-268` no longer changes what a message is called. `Origin` is
-`Discord { message: u64, channel: u64 }`.
+`Thread` gains `next_seq: u64`, the seq its next message takes, from 1. Every message
+is said through `Threads::send_from` (`Threads::send` is it with no origin), which
+stamps `at_ms`, and `Thread::say` gives it the thread's `seq`; the trimming in
+`Thread::say` no longer changes what a message is called. `Origin` is
+`Discord { message: u64, channel: u64 }`. A world saved before these fields loads its
+messages at seq 0, which names no message, and its threads at `next_seq` 1. A person's
+message reaches the thread as `WorldOp::Message { npc, from, text, origin }` →
+`Runtime::message_npc` → `Threads::send_from`; the console's carries no origin.
 
 ### 4.2 The bridge's own store
 
@@ -300,6 +318,11 @@ record):
 | `discord/guild` | `{ guild_id, listener: <npc_id>, backstage: bool }` — the world's server (§4.4) |
 | `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
+
+The hosted world holds the bridge's records beside its sim, under their own lock
+(`Hosted::dms`), and they go out and come in with the world's other records:
+`records_of` writes them each beat, `apply` takes them in on a replica, a reload and a
+takeover (`npcd/src/discord/dm/record.rs`).
 
 A character's bot is not a world record: it belongs to the character, whichever world
 it is in, and is kept beside it (§4.3). Nor are a person's link (§3.2) and a bot's
@@ -331,7 +354,7 @@ character that is somebody else's is the same 404 as one that does not exist):
 
 | Route | Does |
 |---|---|
-| `GET /v1/npc/:nid/discord` | `{"connected": false}`, or `{"connected": true, application_id, user_id, username, connected_ms, invite_url, status}` — `status` the bot's state (§3.3) |
+| `GET /v1/npc/:nid/discord` | `{"connected": false}`, or `{"connected": true, application_id, user_id, username, connected_ms, invite_url, status}` — `status` the bot's state (§3.3), and `world`, the world's name, when it is `online` |
 | `PUT /v1/npc/:nid/discord` `{"token"}` | checks the token (`GET /users/@me`, refusing a user's token; `GET /applications/@me`), names the bot as the character (2–32 characters, cut to fit) and pictures it with the portrait if there is one (`PATCH /users/@me`, sending only what differs — Discord allows few renames an hour), seals the token, writes the record, and answers as `GET` |
 | `DELETE /v1/npc/:nid/discord` | writes the record's tombstone; `{"connected": false}`. The bot stays the owner's in the portal |
 
@@ -384,9 +407,14 @@ follow it.
 
 ### 5.1 Outbound — npcd to Discord
 
-Each world beat (`authority/beat.rs:69-83`, after `write_world`), the world's bots and
-bridge walk the threads and, for each mapped thread or DM, post every message with
-`seq > mirrored_through` and no `origin`:
+Each beat of the bots — their own, at the world beat's 500 ms (`engine::driver::EVERY`),
+on the member that is the world's authority (`npcd/src/discord/bots/`) — the world's
+bots and bridge walk the threads and, for each mapped thread or DM, post every message
+with `seq > mirrored_through` and no `origin`. The beat is the bots' own rather than a
+step of the world's beat (`authority/beat.rs`) because a post waits on Discord and a
+world's beat waits on nothing; what the world's beat writes is what the bots' next beat
+reads, and the cursors the bots move are written with the world's records on its next
+beat (§4.2).
 
 1. **The text is the message's own.** A message holds what was said, `intent`
    (`phone.rs:193-203`), and the console shows exactly that: `get_messages` reads it
@@ -396,14 +424,21 @@ bridge walk the threads and, for each mapped thread or DM, post every message wi
 3. `mirrored_through` advances only on Discord's `200` with the message id it returned.
 
 **A DM is posted to the person's DM channel with the bot.** Its channel id is the
-`discord/dm` record's; a person who has linked but never DMed this bot gets one opened
-(`POST /users/@me/channels {recipient_id}`) the first time the character writes to
-them, which Discord allows only if they share a server (50278: the message stays
-unposted, and the panel's status says "can't reach <person> — no shared server").
+`discord/dm` record's. What the person wrote in the console is posted as a quoted line,
+`> Wren S (console): …`, since a bot cannot post as a person (§3.1). A DM first recorded
+from the person's own message starts its cursor at the thread's end: what was said in
+the console before is not posted. A person who has linked but never DMed this bot gets
+one opened (`POST /users/@me/channels {recipient_id}`) the first time the character
+writes to them, and what the character wrote to them since the bot came online is
+posted there. Discord allows that only if they share a server (50278: the message
+stays unposted, and Discord is not asked again until the character writes again). The
+record is then written with `last_seen_discord` the lowest snowflake of that moment, so
+the gap fetch reads only what the person writes from then on.
 
-A post that fails with 429 waits `retry_after`; one that fails otherwise leaves the
-cursor where it was, and the next beat tries again — so a gap is retried, never
-skipped. Posting is per channel and in order.
+A post that fails with 429 waits `retry_after` (at most 30 s, three tries a beat); one
+that fails otherwise leaves the cursor where it was, and the next beat tries again — so
+a gap is retried, never skipped. Posting is per channel and in order. Every post sends
+`allowed_mentions: {parse: []}`: what a character says pings nobody.
 
 ### 5.2 Inbound — Discord to npcd
 
@@ -411,9 +446,12 @@ The listener (for channels) and each character's bot (for its DMs) receive
 `MESSAGE_CREATE`. The bridge drops:
 
 - a message any of the world's own bots or webhooks wrote (by author id and
-  `webhook_id`) — the echo of an outbound post;
+  `webhook_id`) — the echo of an outbound post — and, on a bot's shard, any bot's;
 - one from an unlinked person (§3.2), after answering them once;
-- one already applied (its id is a recorded `origin` in the thread).
+- one already applied (its id at or below the record's `last_seen_discord`, or a
+  recorded `origin` in the thread).
+
+In part one a bot hears only its DMs: a message with a `guild_id` is dropped.
 
 **A DM** arrives on one bot's shard, so it names its character: the bot's
 `discord/bot/<npc_id>` record. Its author's `discord/user/<id>` index names their
@@ -467,22 +505,32 @@ drops it.
 
 ## 6. Running many bots
 
-One process holds every bot's gateway connection: **twilight** (`twilight-gateway`,
-`twilight-http` 0.17), one `Shard` per token in one tokio runtime, one HTTP client per
-token for its own buckets, and a shared identify queue. `serenity` builds a whole
-client per token and is the heavier fit.
+One process holds every bot's gateway connection: a small gateway client of npcd's
+own on **`tokio-tungstenite`** 0.24 (rustls, webpki roots — the version `host` and
+`web` build with), one shard task per token in one tokio runtime, and the REST calls
+on the `reqwest` client npcd already carries (`npcd/src/discord/client.rs`).
+`twilight-gateway` was the first choice; a bot that hears only its DMs needs only
+`HELLO`, `IDENTIFY`, heartbeats, `READY`, `MESSAGE_CREATE`, `RESUME` and the close
+codes, and a client of its own points at a fake gateway in a test with nothing in the
+way (`npcd/src/discord/gateway/fake.rs`). `serenity` builds a whole client per token
+and is the heavier fit.
 
 The **per-IP invalid-request limit is shared by every token**, so the bridge keeps one
 counter for the host: past 5,000 401/403/429 responses in ten minutes it stops sending
-for the rest of the window and says so. A 401 (a token revoked in the portal) marks
-that bot `refused` (§3.3) and stops its shard rather than retrying; a new token
-connected in the panel reopens it.
+for the rest of the window and says so (`npcd/src/discord/limit.rs`). A 401 (a token
+revoked in the portal) marks that bot `refused` (§3.3) and stops its shard rather than
+retrying; a new token connected in the panel reopens it.
 
 **A shard is a task of the authority**, one per bot, in `npcd/src/discord/gateway/`:
 it IDENTIFYs with `DIRECT_MESSAGES` (and, for the listener, `GUILDS`,
-`GUILD_MESSAGES`, `MESSAGE_CONTENT`), resumes on a dropped connection, and hands each
-`MESSAGE_CREATE` to the world's inbound queue (§5.2), which the beat drains. It never
-writes the world itself.
+`GUILD_MESSAGES`, `MESSAGE_CONTENT`), heartbeats at the interval `HELLO` asks for,
+resumes its session at `READY`'s `resume_gateway_url` on a dropped connection, a
+`RECONNECT`, a resumable `INVALID_SESSION` or an unanswered heartbeat — waiting 1 s,
+doubling to 60 s, between tries — and starts afresh on `4007`/`4009` or a session
+Discord says is gone. `4004` ends it as refused; `4010`–`4014` (an intent not allowed,
+a version not spoken) end it for good, until another token is connected. It hands each
+`MESSAGE_CREATE` to the bots' inbound queue (§5.2), which their beat drains on the
+authority (`npcd/src/discord/bots/`). It never writes the world itself.
 
 ---
 
@@ -519,20 +567,20 @@ channel, group and webhook halves of §5, and it is built first and alone.
 
 1. **Built:** sealed bot tokens and `GET`/`PUT`/`DELETE /v1/npc/:nid/discord`, with the
    Messages-tab panel (§4.3).
-2. `Message.seq` / `at_ms` / `origin` and `Thread.next_seq` (§4.1), with tests that a
-   trimmed thread keeps every surviving message's `seq`.
-3. The bot runtime (§3.3, §6): a shard per bot with `DIRECT_MESSAGES` on the authority of
-   its character's world, opened and closed as the authority and the
+2. **Built:** `Message.seq` / `at_ms` / `origin` and `Thread.next_seq` (§4.1), with tests
+   that a trimmed thread keeps every surviving message's `seq`.
+3. **Built:** the bot runtime (§3.3, §6): a shard per bot with `DIRECT_MESSAGES` on the
+   authority of its character's world, opened and closed as the authority and the
    `discord/bot` record change; presence; the `discord/state` record and the panel's
    status. A fake Discord gateway in tests drives `HELLO`/`READY`, a 4004 close
    (refused), and a lost authority closing the shard.
-4. Account linking (§3.2): the Profile section, the code routes, redeeming a code over a
-   DM, and the unlinked author's one answer.
-5. DMs both ways (§5.1–5.2, the DM halves): a linked person DMs a character's bot, the
-   message enters the world as `post_message` writes it, and the character's answer is
-   posted back; the visibility refusal; the DM gap fetch when a world starts (§5.3,
-   DMs). A fake Discord HTTP server in tests asserts the exact requests, echo
-   suppression, `origin`, and that a 429 and a 500 are retried in order.
+4. **Built:** account linking (§3.2): the Profile section, the code routes, redeeming a
+   code over a DM, and the unlinked author's one answer.
+5. **Built:** DMs both ways (§5.1–5.2, the DM halves): a linked person DMs a character's
+   bot, the message enters the world as `post_message` writes it, and the character's
+   answer is posted back; the visibility refusal; the DM gap fetch when a bot comes
+   online (§5.3, DMs). A fake Discord HTTP server in tests asserts the exact requests,
+   echo suppression, `origin`, and that a 429 and a 500 are retried in order.
 
 **Part two — mirroring a world into its server**
 

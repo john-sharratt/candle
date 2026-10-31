@@ -101,7 +101,8 @@ fn apply_world(w: &mut World, records: &Records) {
     }
 }
 
-/// Put `records` into `hosted`, under one hold of its lock.
+/// Put `records` into `hosted`, under one hold of its lock — and its bots'
+/// DMs (`docs/npcd_discord.md` §4.2), which are not under it.
 pub fn apply(hosted: &Hosted, records: &Records) {
     let sim = sim_of(records);
     hosted.with_both(|w, s| {
@@ -110,6 +111,7 @@ pub fn apply(hosted: &Hosted, records: &Records) {
             s.take_in(sim);
         }
     });
+    hosted.with_dms(|dms| dms.take_in(records));
 }
 
 #[cfg(test)]
@@ -119,7 +121,9 @@ mod tests {
     use super::super::snapshot::tests::{at, vault};
     use super::super::snapshot::{sim_records, world_records};
     use super::*;
+    use crate::discord::dm::record::Dm;
     use crate::sim::seed;
+    use crate::world_state::records_of;
 
     /// What one world's snapshot says, another world built from the same map
     /// takes in: the bodies where they stood, the table, the handsets — and it
@@ -151,6 +155,35 @@ mod tests {
             source.sim(sim_records),
             "the same state"
         );
+    }
+
+    /// **A bot's DM is one of the world's records**: written with them,
+    /// and taken in by a world hosted from them — replacing what it held.
+    #[test]
+    fn a_bots_dm_travels_with_the_worlds_records() {
+        let dm = Dm {
+            channel_id: 31,
+            user_id: 77,
+            mirrored_through: 4,
+            last_seen_discord: 900,
+        };
+        let source = vault();
+        source.with_dms(|d| d.put(42, "0a1b", dm));
+        let records = records_of(&source);
+        assert_eq!(
+            records.get("discord/dm/42/0a1b"),
+            Some(&json!({
+                "channel_id": 31,
+                "user_id": 77,
+                "mirrored_through": 4,
+                "last_seen_discord": 900,
+            }))
+        );
+        let replica = vault();
+        replica.with_dms(|d| d.put(9, "gone", dm));
+        apply(&replica, &records);
+        assert_eq!(replica.dms(|d| d.of(42)), [("0a1b".to_string(), dm)]);
+        assert_eq!(replica.dms(|d| d.of(9)), []);
     }
 
     /// A body not in the world yet keeps its place for when it is embodied;

@@ -48,7 +48,9 @@ use crate::authorize;
 use crate::authorize::{Cache as AuthorizationCache, Signer};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
+use crate::discord::bots::Bots;
 use crate::discord::client::Client as DiscordClient;
+use crate::discord::link::routes as discord_link;
 use crate::discord::routes as discord;
 use crate::discord::seal::Sealer;
 use crate::drafts::routes as drafts;
@@ -127,6 +129,9 @@ pub struct Authored {
     /// Discord's REST API, which a bot's connect checks its token with
     /// ([`crate::discord::client`]).
     pub discord: DiscordClient,
+    /// The characters' bots this member runs, on the authority of each
+    /// one's world ([`crate::discord::bots`]).
+    pub bots: Bots,
     /// The authorizations this member has, for their lifetime.
     pub authorized: AuthorizationCache,
     /// `personality_id -> image_id` for the portraits personalities were
@@ -208,6 +213,7 @@ impl Authored {
             authorizations: Signer::minted(),
             discord_tokens: Sealer::minted(),
             discord: DiscordClient::production(),
+            bots: Bots::production(),
             authorized: AuthorizationCache::default(),
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
@@ -849,6 +855,27 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Best,
             put(put_unique_name),
         )
+        // The caller's own Discord account, linked by a code sent to a
+        // character's bot (`docs/npcd_discord.md` §3.2). The caller's own
+        // like the profile; the read anywhere, the writes on the best member.
+        .route(
+            "/v1/me/discord",
+            Role::Guest,
+            Dispatch::Any,
+            get(discord_link::get_link),
+        )
+        .route(
+            "/v1/me/discord",
+            Role::Guest,
+            Dispatch::Best,
+            delete(discord_link::delete_link),
+        )
+        .route(
+            "/v1/me/discord/link",
+            Role::Guest,
+            Dispatch::Best,
+            post(discord_link::post_link),
+        )
 }
 
 /// The finished router, for tests. The tenant builds it from [`api`] so the
@@ -875,7 +902,10 @@ fn caller(s: &Arc<Authored>, headers: &HeaderMap) -> Result<Identity, Box<Respon
 /// The caller's identity on an account route, which a guest — signed in, not
 /// on the role table — reaches too: their own account is the one thing a
 /// guest owns (`docs/guest_access.md` §3).
-fn account_holder(s: &Arc<Authored>, headers: &HeaderMap) -> Result<Identity, Box<Response>> {
+pub(crate) fn account_holder(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+) -> Result<Identity, Box<Response>> {
     Ok(require(headers, &s.roles, Role::Guest)?
         .into_identity()
         .expect("`Role::Guest` is only reachable with an identity"))
@@ -4169,6 +4199,11 @@ mod tests {
                 ("/v1/me/profile/history/:rev", "guest"),
                 ("/v1/me/profile/restore/:rev", "guest"),
                 ("/v1/me/unique-name", "guest"),
+                // The caller's own Discord link: the read, the unlink, and a
+                // code to link with.
+                ("/v1/me/discord", "guest"),
+                ("/v1/me/discord", "guest"),
+                ("/v1/me/discord/link", "guest"),
             ]
         );
     }

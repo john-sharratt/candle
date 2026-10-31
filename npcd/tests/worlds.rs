@@ -511,6 +511,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
                 npc: speaker,
                 from: "An Operator".into(),
                 text: "come up".into(),
+                origin: None,
             },
             Some(auth.node()),
         )

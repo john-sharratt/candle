@@ -130,6 +130,11 @@ export const LiveAPI = {
   getProfileRevision: (n) => j(`/v1/me/profile/history/${n}`),
   restoreProfile: (n) => j(`/v1/me/profile/restore/${n}`, { method: 'POST' }),
   putUniqueName:  (n) => j('/v1/me/unique-name', { method: 'PUT', body: { unique_name: n } }),
+  /* The caller's own Discord account. A code is sent to a character's bot in
+   * a DM, which links whoever sent it; the read says whether that happened. */
+  linkDiscord:    () => j('/v1/me/discord/link', { method: 'POST' }),
+  getDiscordLink: () => j('/v1/me/discord'),
+  unlinkDiscord:  () => j('/v1/me/discord', { method: 'DELETE' }),
 
   listNpcs:  (f) => j('/v1/npc' + qs(f)),
   getNpc:    (id) => j(`/v1/npc/${id}`),

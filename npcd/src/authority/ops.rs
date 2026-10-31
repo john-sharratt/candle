@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::MessageSent;
+use crate::sim::phone::Origin;
 
 /// The decision a character's act was made in: where it stood and who was with
 /// it when its turn began, so the authority answers the act from the company
@@ -38,11 +39,14 @@ pub enum WorldOp {
         /// Where its body stood when the turn's grammar was built, `area/node`.
         pinned_at: Option<String>,
     },
-    /// A person's message to a character, on its handset.
+    /// A person's message to a character, on its handset — from the console,
+    /// with no `origin`, or from where `origin` says.
     Message {
         npc: u64,
         from: String,
         text: String,
+        #[serde(default)]
+        origin: Option<Origin>,
     },
     /// A person comes to stand beside a character.
     EnterBeside {
@@ -158,6 +162,40 @@ mod tests {
         assert_eq!(
             serde_json::to_value(OpReply::Done { ok: true }).unwrap(),
             json!({"reply": "done", "ok": true})
+        );
+        let message = WorldOp::Message {
+            npc: 9,
+            from: "Wren S".into(),
+            text: "hello".into(),
+            origin: Some(Origin::Discord {
+                message: 31,
+                channel: 32,
+            }),
+        };
+        let wire = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "op": "message",
+                "npc": 9,
+                "from": "Wren S",
+                "text": "hello",
+                "origin": {"kind": "discord", "message": 31, "channel": 32},
+            })
+        );
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), message);
+        assert_eq!(
+            serde_json::from_value::<WorldOp>(
+                json!({"op": "message", "npc": 9, "from": "Wren S", "text": "hello"})
+            )
+            .unwrap(),
+            WorldOp::Message {
+                npc: 9,
+                from: "Wren S".into(),
+                text: "hello".into(),
+                origin: None,
+            },
+            "a member that sends no origin sends one from the console"
         );
         assert_eq!(
             serde_json::to_value(WorldOp::HandBack {

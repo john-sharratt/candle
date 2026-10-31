@@ -35,6 +35,7 @@ use npc_map::delta::{Attention, Delta};
 use npc_map::world::World;
 use npc_map::{MapEdit, MapSet};
 
+use crate::discord::dm::record::Dms;
 use crate::engine::rooms::Rooms;
 use crate::engine::watch::Watch;
 use crate::mind::files::MindFiles;
@@ -72,6 +73,11 @@ pub struct Hosted {
     /// (`docs/replicated_substrate.md` §10.3); unset for a world that holds no
     /// documents.
     ops: OnceLock<Arc<MindStores>>,
+    /// The DMs this world's characters' Discord bots hold with people
+    /// (`docs/npcd_discord.md` §4.2): the Discord bridge's, not the
+    /// world's — so not under the world's lock — but written, followed and
+    /// reloaded with the world's records.
+    dms: Mutex<Dms>,
 }
 
 struct State {
@@ -150,6 +156,7 @@ impl Hosted {
             map_in_mind: None,
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
+            dms: Mutex::new(Dms::default()),
         })
     }
 
@@ -180,6 +187,7 @@ impl Hosted {
             map_in_mind: Some(rel.to_string()),
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
+            dms: Mutex::new(Dms::default()),
         })
     }
 
@@ -209,6 +217,7 @@ impl Hosted {
             map_in_mind: None,
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
+            dms: Mutex::new(Dms::default()),
         }
     }
 
@@ -283,6 +292,16 @@ impl Hosted {
     pub fn sim<T>(&self, f: impl FnOnce(&Sim) -> T) -> T {
         let state = self.state.lock().expect("world lock");
         f(&state.sim)
+    }
+
+    /// Read the DMs this world's bots hold.
+    pub fn dms<T>(&self, f: impl FnOnce(&Dms) -> T) -> T {
+        f(&self.dms.lock().expect("dms lock"))
+    }
+
+    /// Change the DMs this world's bots hold.
+    pub fn with_dms<T>(&self, f: impl FnOnce(&mut Dms) -> T) -> T {
+        f(&mut self.dms.lock().expect("dms lock"))
     }
 
     /// Both halves at once, under one acquisition.

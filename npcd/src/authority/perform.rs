@@ -126,8 +126,13 @@ impl Runtime {
                     moved: done.moved,
                 }
             }
-            WorldOp::Message { npc, from, text } => OpReply::Sent {
-                sent: self.message_npc(npc, &from, &text),
+            WorldOp::Message {
+                npc,
+                from,
+                text,
+                origin,
+            } => OpReply::Sent {
+                sent: self.message_npc(npc, &from, &text, origin),
             },
             WorldOp::EnterBeside { npc, visitor, name } => OpReply::Placed {
                 at: self

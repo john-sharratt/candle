@@ -5,7 +5,7 @@
 
 import { API } from '../lib/api.js';
 import { h, mount, ago } from '/common/lib/dom.js';
-import { toast, empty } from '../lib/ui.js';
+import { toast, empty, confirmDialog } from '../lib/ui.js';
 import { go } from '/common/lib/router.js';
 import { AUTH_UNAVAILABLE, faceOf } from '../app.js';
 
@@ -115,6 +115,9 @@ export async function render() {
         },
       }, 'Save'))));
 
+  el.appendChild(h('h2', {}, 'Discord'));
+  el.appendChild(discordSection());
+
   /* Earlier wording, and a way to bring it back.
    *
    * A chooser, not a list. Every save appends a revision, so an author who
@@ -223,4 +226,109 @@ export async function render() {
       h('button', { class: 'btn', onClick: () => go('/') }, 'View roster'))));
 
   return { el };
+}
+
+/* The caller's Discord account, linked so a DM they send a character's bot
+ * is heard in the world as them.
+ *
+ * **Linked by a code sent in a DM.** The daemon cannot see who a Discord
+ * account belongs to, so it hands out six digits and whoever DMs them to one
+ * of the characters' bots is the person who asked. The page shows the code,
+ * how long it is good for and which bots it can go to, then polls until the
+ * bot that received it has linked the account — or the code runs out.
+ *
+ * Painted from its own read, like the Messages tab's Discord panel, so a
+ * slow answer never holds up the profile above it. */
+function discordSection() {
+  const host = h('div', { class: 'panel discord-panel' });
+  let poll = null;
+  const stop = () => {
+    if (poll) clearInterval(poll);
+    poll = null;
+  };
+  const paint = (d) => {
+    stop();
+    mount(host, d.linked ? linked(d) : unlinked());
+  };
+
+  function linked(d) {
+    const unlink = () => confirmDialog({
+      title: 'Unlink Discord',
+      confirmText: 'Unlink',
+      message: `Characters stop hearing @${d.username} as you: what you send their bots on Discord `
+        + 'goes unheard until you link again.',
+      onConfirm: async () => {
+        try {
+          paint(await API.unlinkDiscord());
+          toast('Discord unlinked', 'ok');
+        } catch (err) {
+          toast(err.detail || err.message || 'could not unlink', 'err');
+        }
+      },
+    });
+    return h('div', { class: 'row wrap' },
+      h('span', { style: 'flex:1' }, 'Linked as ', h('b', {}, '@' + d.username),
+        h('span', { class: 'tiny dim' }, ' · ' + ago(d.linked_ms))),
+      h('button', { class: 'btn sm ghost', onClick: unlink }, 'Unlink'));
+  }
+
+  function unlinked() {
+    const shown = h('div', {});
+    const ask = h('button', { class: 'btn sm' }, 'Link Discord');
+    ask.addEventListener('click', async () => {
+      ask.disabled = true;
+      try {
+        const c = await API.linkDiscord();
+        mount(shown, code(c));
+        ask.textContent = 'New code';
+        watch(c.expires_ms);
+      } catch (err) {
+        toast(err.detail || err.message || 'could not make a code', 'err');
+      }
+      ask.disabled = false;
+    });
+    return h('div', {},
+      h('div', { class: 'row wrap' },
+        h('span', { class: 'tiny dim', style: 'flex:1' },
+          'Link your Discord account to DM the characters there as yourself.'),
+        ask),
+      shown);
+  }
+
+  function code(c) {
+    const to = (c.bots || []).join(', ');
+    return h('div', { style: 'margin-top:10px' },
+      h('div', { class: 'row', style: 'gap:12px;align-items:baseline' },
+        h('b', { style: 'font-size:1.6em;letter-spacing:0.15em;font-family:monospace' }, c.code),
+        h('span', { class: 'tiny dim' }, 'good until ' + new Date(c.expires_ms).toLocaleTimeString())),
+      h('div', { class: 'tiny', style: 'margin-top:6px' }, to
+        ? `Send it to ${to} in a DM on Discord. It works once, for ten minutes.`
+        : 'Send it in a DM to a character’s bot on Discord. None of your characters has one '
+          + 'yet — set one up on a character’s Messages tab.'));
+  }
+
+  /* While a code stands, ask every few seconds whether it was used. Stops
+   * when it was, when it runs out, and when the page is left. */
+  function watch(until) {
+    stop();
+    poll = setInterval(async () => {
+      if (!host.isConnected || Date.now() > until) {
+        stop();
+        return;
+      }
+      try {
+        const d = await API.getDiscordLink();
+        if (d.linked) {
+          paint(d);
+          toast('Discord linked', 'ok');
+        }
+      } catch (_) {
+        // A missed poll is tried again on the next tick.
+      }
+    }, 3000);
+  }
+
+  host.hidden = true;
+  API.getDiscordLink().then((d) => { paint(d); host.hidden = false; }).catch(() => {});
+  return host;
 }
