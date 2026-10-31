@@ -65,6 +65,10 @@ pub struct ImageRequest {
     /// Path of the picture to copy from, relative to the repository: PNG, JPEG, WebP, GIF, BMP or TIFF. Required.
     #[validate(length(min = 1))]
     pub path: String,
+    /// The repository `path` is in, when it is not `repo`: how a picture gets from one repository into another. The copies always go in `repo`. Optional.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub source_repo: Option<String>,
     /// The part of the picture to use; all of it when left out. Use it when a copy's shape differs from the picture's. Optional.
     #[serde(default)]
     pub crop: Option<Crop>,
@@ -97,8 +101,9 @@ impl Tool for FileImage {
     const DESCRIPTION: &'static str =
         "Make resized copies of a picture in the repository, keeping its transparency: PNG, \
          JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your \
-         uncommitted changes. Use for: an icon set, a favicon, thumbnails, converting a picture \
-         to another format. Triggered by \"resize the image\", \"make a favicon\", \"generate \
+         uncommitted changes. The picture may be in another repository (`source_repo`), which \
+         is how a picture gets from one repository into another. Use for: an icon set, a \
+         favicon, thumbnails, converting a picture to another format. Triggered by \"resize the image\", \"make a favicon\", \"generate \
          the icon sizes\", \"convert to webp\". Returns the picture's size and each copy's path, \
          bytes and size. A copy whose shape differs from the picture's is refused: crop first.";
 
@@ -113,7 +118,9 @@ impl Tool for FileImage {
 
     fn run(ctx: &ToolContext, req: ImageRequest) -> Result<ImageResponse, FileError> {
         let files = ctx.files.repo(&req.repo)?;
-        let source = files
+        let source = ctx
+            .files
+            .repo(req.source_repo.as_deref().unwrap_or(&req.repo))?
             .read_bytes(&req.path)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
         let picture = decode(&source, &req.path)?;

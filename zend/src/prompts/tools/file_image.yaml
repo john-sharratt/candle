@@ -25,7 +25,7 @@ questions:
 - build the whole icon set from this one picture
 - I want the transparent background kept when you resize it
 category: Files
-description: 'Make resized copies of a picture in the repository, keeping its transparency: PNG, JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your uncommitted changes. Use for: an icon set, a favicon, thumbnails, converting a picture to another format. Triggered by "resize the image", "make a favicon", "generate the icon sizes", "convert to webp". Returns the picture''s size and each copy''s path, bytes and size. A copy whose shape differs from the picture''s is refused: crop first.'
+description: 'Make resized copies of a picture in the repository, keeping its transparency: PNG, JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your uncommitted changes. The picture may be in another repository (`source_repo`), which is how a picture gets from one repository into another. Use for: an icon set, a favicon, thumbnails, converting a picture to another format. Triggered by "resize the image", "make a favicon", "generate the icon sizes", "convert to webp". Returns the picture''s size and each copy''s path, bytes and size. A copy whose shape differs from the picture''s is refused: crop first.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -36,6 +36,10 @@ parameters:
       type: string
     path:
       description: 'Path of the picture to copy from, relative to the repository: PNG, JPEG, WebP, GIF, BMP or TIFF. Required.'
+      minLength: 1
+      type: string
+    source_repo:
+      description: The repository `path` is in, when it is not `repo`, which is how a picture gets from one repository into another. The copies always go in `repo`. Optional.
       minLength: 1
       type: string
     crop:
@@ -109,6 +113,16 @@ parameters:
   title: ImageRequest
   type: object
 examples:
+- |-
+  make the game repo's favicon from the art in the candle repo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The picture is in candle and the copy belongs in the game's own repository, battle-cities. file_image reads from source_repo and writes into repo, so nothing has to be copied by hand.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_image", "arguments": {"repo": "battle-cities", "source_repo": "candle", "path": "art/source.png", "outputs": [{"path": "favicon-32x32.png", "width": 32, "height": 32}]}}
+  </tool_call><|projection|>
 - |-
   resize logo.png to 64 by 64<|im_end|>
   <|im_start|>assistant
