@@ -176,8 +176,9 @@ the one-adapter rule keeps the dialogue's), admission's per-band offer, and the
 keep-one-alive head (the highest band's first queued turn).
 
 **The one exception: `Low` beside an `Urgent` decode** (`scheduler/urgent_hold.rs`).
-While a turn a person is waiting on right now decodes or prefills, `Low` rows
-ride one decode step in `LOW_RIDES_EVERY` (4). Width-bound is not always true: rows that bring
+While a turn a person is waiting on right now decodes or prefills, each `Low` row
+rides one decode step in `LOW_RIDES_EVERY` (4), on a step its id picks, so the
+rows spread across the four rather than stalling every stream on one wide step. Width-bound is not always true: rows that bring
 long contexts make the step bound by attention instead, and then every row is
 the dialogue's latency. Measured on `.5`, 2026-10-30: a zend dialogue decoding
 beside 12–13 ingest turns of ~75k positions each — ~1M positions a step, 165–250

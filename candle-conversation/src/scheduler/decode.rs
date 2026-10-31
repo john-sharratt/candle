@@ -4,7 +4,7 @@ use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
 use super::stencil_wave::{tail_start, StencilRow, StencilWave};
-use super::urgent_hold::UrgentHold;
+use super::step_census::HostPart;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
@@ -715,17 +715,17 @@ impl Scheduler {
             .chain(stencil.rows.iter().map(|r| r.seq))
             .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent)
             || self.an_urgent_prompt_prefills();
-        let low_rides = self.urgent_hold.low_rides(urgent);
+        self.urgent_hold.advance(urgent);
         // **A hold needs something to give the step to.** With the creep held
-        // back by a debt and every row `Low`, holding them would leave a step
+        // back by a debt and no row riding, holding them would leave a step
         // with nothing in it: done at once, its count spent, and the debt no
         // smaller.
         let rides =
-            |s: &Self, id: SequenceId| UrgentHold::rides(s.decode_priority_or_high(id), low_rides);
+            |s: &Self, id: SequenceId| s.urgent_hold.rides(id.0, s.decode_priority_or_high(id));
         let something_else_runs = !self.wave_cohort_advanced
             || seq_ids.iter().any(|&id| rides(self, id))
             || stencil.rows.iter().any(|r| rides(self, r.seq));
-        if !low_rides && something_else_runs {
+        if something_else_runs {
             seq_ids.retain(|&id| rides(self, id));
             let (carried, held): (Vec<StencilRow>, Vec<StencilRow>) =
                 std::mem::take(&mut stencil.rows)
@@ -967,6 +967,7 @@ impl Scheduler {
         let spec_blocks: Vec<Vec<u32>> = spec_idx.iter().map(|&i| blocks[i].clone()).collect();
         draft_span.end();
         let draft_elapsed = t_fwd.elapsed();
+        self.step_census.host(HostPart::Draft, draft_elapsed);
 
         // ── The wave ─────────────────────────────────────────────────────────
         //
@@ -974,6 +975,7 @@ impl Scheduler {
         // ride the SAME continuous-fair wave as the creep group and the glue and
         // speculation costs no prefill throughput.
         let begin_span = profile::span("decode:begin_verify");
+        let t_plan = std::time::Instant::now();
         let plan = match self.model.begin_verify(
             &mut self.session,
             &plain,
@@ -1000,6 +1002,7 @@ impl Scheduler {
             }
         };
         begin_span.end();
+        self.step_census.host(HostPart::Plan, t_plan.elapsed());
         let wave_rows = plan.rows;
         let forward_span = profile::span("decode:forward_cobatched");
         // The accept walk stacks each block position's rows beside the head's
@@ -1123,6 +1126,7 @@ impl Scheduler {
         // Reads the scored rows back and advances each sequence by what the wave
         // actually wrote — the walk below rolls the rejected tail off again.
         let _accept_span = profile::span("decode:end_verify_and_sample");
+        let t_read = std::time::Instant::now();
         let verified = {
             let _g = profile::span("decode:end_verify");
             self.model.end_verify(
@@ -1133,6 +1137,7 @@ impl Scheduler {
                 scored.to_vec(),
             )
         };
+        self.step_census.host(HostPart::Read, t_read.elapsed());
         let (plain_rows, spec_rows) = match verified {
             Ok(r) => r,
             Err(e) => {
@@ -1210,6 +1215,7 @@ impl Scheduler {
             locate_rows(&in_head_order(&held.rows), &rows_of)
                 .and_then(|(block, positions)| chooser.score(block, &positions, &blocks))
         };
+        self.step_census.host(HostPart::Score, t_sample.elapsed());
         if let Err(e) = scored {
             for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
                 self.sampling_states.insert(id, state);
@@ -1231,6 +1237,7 @@ impl Scheduler {
                     .map_or(0, |s| s.max_tokens.saturating_sub(s.generated_tokens.len()))
             })
             .collect();
+        let t_walk = std::time::Instant::now();
         let walked = {
             let _g = profile::span("decode:accept_walk");
             let eos = &self.eos_tokens;
@@ -1279,6 +1286,7 @@ impl Scheduler {
                 None => Ok((walk.finish(), ruled)),
             }
         };
+        self.step_census.host(HostPart::Walk, t_walk.elapsed());
         let kept = match walked {
             // The walk's next-seed is not read here: the scheduler takes each
             // step's input from `generated_tokens.last()`, which the commit
@@ -1402,6 +1410,7 @@ impl Scheduler {
         // `HealPrefill`.
         let mut heal_prefills: Vec<HealPrefill> = Vec::new();
         let commit_span = profile::span("decode:commit");
+        let t_commit = std::time::Instant::now();
         for p in 0..deepest {
             let at: Vec<usize> = (0..blocks.len())
                 .filter(|&i| emitted[i].len() > p)
@@ -1476,6 +1485,7 @@ impl Scheduler {
             }
         }
         commit_span.end();
+        self.step_census.host(HostPart::Commit, t_commit.elapsed());
 
         // ── Roll each sequence back to what actually reached the turn ────────
         //
@@ -1516,6 +1526,7 @@ impl Scheduler {
         drop(rows_of);
         drop(held);
         let rollback_span = profile::span("decode:rollback");
+        let t_rollback = std::time::Instant::now();
         if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
             // Every verifying sequence's recurrent rows go with the step: none of
             // them is kept, so none may stay pending into the next one.
@@ -1531,6 +1542,9 @@ impl Scheduler {
             self.model.abort_verify(&stopped_seqs);
         }
         rollback_span.end();
+        self.step_census
+            .host(HostPart::Rollback, t_rollback.elapsed());
+        let t_settle = std::time::Instant::now();
         for id in degenerate {
             describe_recurrent_state(self.model.as_ref(), id);
         }
@@ -1563,6 +1577,7 @@ impl Scheduler {
             let n = committed[i].min(blocks[i].len());
             super::Scheduler::record_slot_tokens(&mut self.slot_tokens, id, &blocks[i][..n]);
         }
+        self.step_census.host(HostPart::Settle, t_settle.elapsed());
     }
 
     /// Commit one decoded token per sequence: everything that happens to a token

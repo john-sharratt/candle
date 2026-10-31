@@ -160,9 +160,9 @@ fn low_rows_ride_one_step_in_four_beside_an_urgent_decode() {
     for (step, rows) in carried.iter().enumerate() {
         assert!(rows.contains(&urgent.0), "step {step}: the dialogue rides");
         assert!(rows.contains(&high.0), "step {step}: High is not held");
-        let low_rides = (step + 1) % LOW_RIDES_EVERY as usize == 0;
-        assert_eq!(rows.contains(&low.0), low_rides, "step {step}: {rows:?}");
     }
+    let rode = carried.iter().filter(|r| r.contains(&low.0)).count();
+    assert_eq!(rode, 2, "one step in four: {carried:?}");
     assert_eq!(
         &scheduler.active_decodes[&low].generated_tokens[..],
         &[200u32, 201, 202][..],

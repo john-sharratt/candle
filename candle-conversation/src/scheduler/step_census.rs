@@ -83,6 +83,56 @@ impl StepShape {
     }
 }
 
+/// What the scheduler thread does inside a decode step, around its forward.
+///
+/// 8 of a minute's 60 s on BlackWorld (2026-10-31), in steps nothing split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostPart {
+    /// The drafter's proposals, on the sequences that draft.
+    Draft,
+    /// Planning the wave's rows and arming what it captures.
+    Plan,
+    /// Reading the scored rows back.
+    Read,
+    /// Scoring every block position in one sampler dispatch.
+    Score,
+    /// The accept walk.
+    Walk,
+    /// Committing each accepted token.
+    Commit,
+    /// Taking the rejected tail back off.
+    Rollback,
+    /// Healed prefixes and page cuts, after the rollback.
+    Settle,
+}
+
+/// Every [`HostPart`], in the order a step runs them.
+const HOST_PARTS: [HostPart; 8] = [
+    HostPart::Draft,
+    HostPart::Plan,
+    HostPart::Read,
+    HostPart::Score,
+    HostPart::Walk,
+    HostPart::Commit,
+    HostPart::Rollback,
+    HostPart::Settle,
+];
+
+impl HostPart {
+    fn label(self) -> &'static str {
+        match self {
+            HostPart::Draft => "draft",
+            HostPart::Plan => "plan",
+            HostPart::Read => "read",
+            HostPart::Score => "score",
+            HostPart::Walk => "walk",
+            HostPart::Commit => "commit",
+            HostPart::Rollback => "rollback",
+            HostPart::Settle => "settle",
+        }
+    }
+}
+
 /// What the scheduler thread was doing between steps.
 ///
 /// **The wall no step covers, by what covered it.** On BlackWorld (41bd79ae3,
@@ -189,6 +239,8 @@ pub(super) struct StepCensus {
     /// Of the steps' wall, the time in their forwards. The rest is the host's
     /// inside a step: drafting, sampling, the accept walk, the commit.
     forwards: Duration,
+    /// Of that rest, what each part took.
+    host: [Duration; HOST_PARTS.len()],
 }
 
 impl Default for StepCensus {
@@ -205,12 +257,22 @@ impl StepCensus {
             wall: [Duration::ZERO; SHAPES.len()],
             spent: [Duration::ZERO; ACTIVITIES.len()],
             forwards: Duration::ZERO,
+            host: [Duration::ZERO; HOST_PARTS.len()],
         }
     }
 
     /// File `took` of a step's wall as its forward.
     pub(super) fn forward(&mut self, took: Duration) {
         self.forwards += took;
+    }
+
+    /// File `took` of a step's wall as `part` of the host's work in it.
+    pub(super) fn host(&mut self, part: HostPart, took: Duration) {
+        let i = HOST_PARTS
+            .iter()
+            .position(|&p| p == part)
+            .expect("every part is listed");
+        self.host[i] += took;
     }
 
     pub(super) fn record(&mut self, shape: StepShape, took: Duration) {
@@ -244,11 +306,23 @@ impl StepCensus {
             })
             .collect();
         if !self.forwards.is_zero() {
-            parts.push(format!(
-                "inside[forward={}ms host={}ms]",
-                self.forwards.as_millis(),
-                stepped.saturating_sub(self.forwards).as_millis()
+            let named: Duration = self.host.iter().sum();
+            let mut inside = vec![format!("forward={}ms", self.forwards.as_millis())];
+            inside.extend(
+                HOST_PARTS
+                    .iter()
+                    .zip(&self.host)
+                    .filter(|(_, took)| !took.is_zero())
+                    .map(|(p, took)| format!("{}={}ms", p.label(), took.as_millis())),
+            );
+            inside.push(format!(
+                "host={}ms",
+                stepped
+                    .saturating_sub(self.forwards)
+                    .saturating_sub(named)
+                    .as_millis()
             ));
+            parts.push(format!("inside[{}]", inside.join(" ")));
         }
         let outside = elapsed.saturating_sub(stepped);
         parts.push(format!(
@@ -373,6 +447,23 @@ mod tests {
         // And it starts again from the report.
         let line = c.take(t0 + Duration::from_secs(2));
         assert_eq!(line, "outside=1000ms of 1000ms around[other=1000ms]");
+    }
+
+    /// The host's work is named by part, and `host` is what no part covered.
+    #[test]
+    fn the_census_names_the_hosts_parts_of_a_step() {
+        let t0 = Instant::now();
+        let mut c = StepCensus::starting(t0);
+        c.record(StepShape::Cobatched, Duration::from_millis(300));
+        c.forward(Duration::from_millis(200));
+        c.host(HostPart::Draft, Duration::from_millis(30));
+        c.host(HostPart::Commit, Duration::from_millis(50));
+        let line = c.take(t0 + Duration::from_secs(1));
+        assert_eq!(
+            line,
+            "cob=1/300ms inside[forward=200ms draft=30ms commit=50ms host=20ms] \
+             outside=700ms of 1000ms around[other=700ms]"
+        );
     }
 
     /// A step's wall splits into its forward and the host's work around it.

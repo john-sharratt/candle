@@ -4106,9 +4106,12 @@ fn run_inference_stream(
             if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
                 if let Err(e) = tokio::task::spawn_blocking(move || {
+                    let t_open = Instant::now();
                     open_state
                         .engine
                         .working_set_clear(timeline);
+                    let clear_ms = t_open.elapsed().as_millis() as u64;
+                    let t_scope = Instant::now();
                     // Scope it first. A seed or a restored lock is admitted only
                     // as the conversation's scope offers it, and the scope is
                     // otherwise first set right before its first submit — after
@@ -4118,13 +4121,22 @@ fn run_inference_stream(
                     open_state
                         .retrieval_scope
                         .apply(&open_state.engine, timeline, &files);
+                    let scope_ms = t_scope.elapsed().as_millis() as u64;
+                    let t_seed = Instant::now();
                     let seeded = seed_working_set(&open_state, timeline, &files, &config);
+                    let seed_ms = t_seed.elapsed().as_millis() as u64;
+                    let t_restore = Instant::now();
                     let restored = restore_locks(&open_state.engine, timeline);
+                    let restore_ms = t_restore.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
                         timeline = timeline.raw(),
                         seeded,
                         restored,
+                        clear_ms,
+                        scope_ms,
+                        seed_ms,
+                        restore_ms,
                         "working set opened: seeds in provenance, locks restored from the turn marks",
                     );
                 })

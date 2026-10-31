@@ -29,8 +29,8 @@
 
 use crate::projection::DecodePriority;
 
-/// While an `Urgent` row decodes, `Low` rows ride one decode step in this
-/// many.
+/// While an `Urgent` turn is in flight, a `Low` row rides one decode step in
+/// this many.
 ///
 /// Four keeps three steps in four at the dialogue's own width — on the
 /// BlackWorld figures above, ~90 ms against ~220 ms — so the dialogue's
@@ -38,35 +38,33 @@ use crate::projection::DecodePriority;
 /// four rather than stopping.
 pub const LOW_RIDES_EVERY: u32 = 4;
 
-/// Whether this step's `Low` rows ride, counted over the run of steps an
-/// `Urgent` row has been decoding in.
+/// Which `Low` rows ride this step, counted over the steps an `Urgent` turn has
+/// been in flight.
+///
+/// **Each row on a step of its own.** All of them riding one step in four made
+/// that step the whole cost: 250–420 ms beside 8–10 rows against ~60 ms for the
+/// three around it, a stall in every stream beside it. A row's own id picks its
+/// step, so the rows spread across the four and each still rides exactly one.
 #[derive(Debug, Default)]
 pub(super) struct UrgentHold {
-    /// Steps since `Low` rows last rode, while an `Urgent` row decodes.
-    held: u32,
+    /// Steps of the current run; `None` while no `Urgent` turn is in flight.
+    step: Option<u64>,
 }
 
 impl UrgentHold {
-    /// Whether this step carries `Low` rows, given whether an `Urgent` row
-    /// decodes in it. Every step does when none does; beside one, every
-    /// [`LOW_RIDES_EVERY`]th.
-    pub fn low_rides(&mut self, urgent: bool) -> bool {
-        if !urgent {
-            self.held = 0;
-            return true;
-        }
-        self.held += 1;
-        if self.held >= LOW_RIDES_EVERY {
-            self.held = 0;
-            true
-        } else {
-            false
-        }
+    /// Start a step, given whether an `Urgent` turn is in flight in it.
+    pub fn advance(&mut self, urgent: bool) {
+        self.step = urgent.then(|| self.step.map_or(1, |s| s + 1));
     }
 
-    /// Whether a row of `band` rides a step whose `Low` rows ride or not.
-    pub fn rides(band: DecodePriority, low_rides: bool) -> bool {
-        low_rides || band != DecodePriority::Low
+    /// Whether this step carries sequence `seq` of `band`.
+    pub fn rides(&self, seq: usize, band: DecodePriority) -> bool {
+        match self.step {
+            Some(step) if band == DecodePriority::Low => {
+                (seq as u64 + step).is_multiple_of(u64::from(LOW_RIDES_EVERY))
+            }
+            _ => true,
+        }
     }
 }
 
@@ -74,42 +72,69 @@ impl UrgentHold {
 mod tests {
     use super::*;
 
-    #[test]
-    fn without_an_urgent_row_low_rides_every_step() {
+    use DecodePriority::Low;
+
+    /// The steps of `n` on which each of `seqs` rode.
+    fn rode(seqs: &[usize], n: usize) -> Vec<Vec<bool>> {
         let mut h = UrgentHold::default();
-        assert!((0..10).all(|_| h.low_rides(false)));
+        let mut out = vec![Vec::new(); seqs.len()];
+        for _ in 0..n {
+            h.advance(true);
+            for (i, &s) in seqs.iter().enumerate() {
+                out[i].push(h.rides(s, Low));
+            }
+        }
+        out
     }
 
     #[test]
-    fn beside_an_urgent_row_low_rides_one_step_in_four() {
+    fn without_an_urgent_turn_low_rides_every_step() {
         let mut h = UrgentHold::default();
-        let rode: Vec<bool> = (0..8).map(|_| h.low_rides(true)).collect();
+        for s in 0..10 {
+            h.advance(false);
+            assert!(h.rides(s, Low));
+        }
+    }
+
+    #[test]
+    fn beside_an_urgent_turn_a_low_row_rides_one_step_in_four() {
         assert_eq!(
-            rode,
-            vec![false, false, false, true, false, false, false, true]
+            rode(&[3], 8),
+            vec![vec![true, false, false, false, true, false, false, false]]
         );
     }
 
+    /// **Rows spread across the steps.** Four rows of different residues never
+    /// share one, so no step carries them all.
     #[test]
-    fn the_count_starts_over_once_no_urgent_row_decodes() {
+    fn low_rows_ride_on_steps_of_their_own() {
+        let rode = rode(&[0, 1, 2, 3], 8);
+        for step in 0..8 {
+            assert_eq!(rode.iter().filter(|r| r[step]).count(), 1, "step {step}");
+        }
+    }
+
+    #[test]
+    fn the_count_starts_over_once_no_urgent_turn_is_in_flight() {
         let mut h = UrgentHold::default();
-        assert!(!h.low_rides(true));
-        assert!(!h.low_rides(true));
-        assert!(h.low_rides(false));
-        let rode: Vec<bool> = (0..4).map(|_| h.low_rides(true)).collect();
-        assert_eq!(rode, vec![false, false, false, true]);
+        h.advance(true);
+        h.advance(true);
+        h.advance(false);
+        h.advance(true);
+        assert!(h.rides(3, Low), "the first step of a new run");
     }
 
     #[test]
     fn only_low_is_held() {
+        let mut h = UrgentHold::default();
+        h.advance(true);
         for band in [
             DecodePriority::Normal,
             DecodePriority::High,
             DecodePriority::Urgent,
         ] {
-            assert!(UrgentHold::rides(band, false), "{band:?}");
+            assert!(h.rides(0, band), "{band:?}");
         }
-        assert!(!UrgentHold::rides(DecodePriority::Low, false));
-        assert!(UrgentHold::rides(DecodePriority::Low, true));
+        assert!(!h.rides(0, Low));
     }
 }
