@@ -797,32 +797,53 @@ its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
 (2×) this one's weight, the peak decode rate each member is admitted at
 (`MEMBERS`). If one is:
 
-1. The turn stops there, sending `StreamItem::Handed { to, call_turn }`, and
-   leaves its resume entry in place.
-2. The worker loop waits for the turn's commit to land
-   (`ZendSession::committed_through`), stops beating, and asks member `to` to
-   take it: `POST /v1/mcp/worker/continue {owner, thread, name, call_turn,
-   through}`, addressed by `x-tokera-node`. The gateway lets a member address a
-   peer this way, as it lets an admin.
-3. The member taking it believes only a member's stamp (`from_member`). It
-   waits until it holds the conversation through that commit
-   (`holds_complete_through`, as a handover does), runs the round's tools
-   itself (`Dispatch::Live`: they never ran), and carries the worker on. From
-   then on it owns the worker's beat, its settling and its answers. A nudge or
-   a stop is read there, at the next boundary.
+1. The turn stops there, before it starts the stretch's journal draft, so
+   nothing it began runs on after the move. It sends
+   `StreamItem::Handed { to, call_turn, iteration }` and leaves its resume
+   entry in place.
+2. The worker loop stops beating, waits for the turn's commit to land
+   (`ZendSession::committed_through`), and asks member `to` to take it:
+   `POST /v1/mcp/worker/continue` with a `Handing {owner, thread, name,
+   call_turn, iteration, through, signed_ms}`, addressed by `x-tokera-node`.
+   The gateway lets a member address a peer this way, as it lets an admin.
+   A client reaching a member's own port may not: the member's listener
+   strips the header, as it strips a client's identity.
+3. **The handing is signed.** The gateway's stamp (`from_member`) names the
+   member whose stream carried a request, but that stream also carries what
+   clients sent the member's port. So the body is signed under a key every
+   member derives from the group key (`worker_hop::PURPOSE`), in
+   `x-zend-handoff-proof`, and is believed only within `FRESH_MS` of signing.
+4. The member taking it checks, from the replicated record, that the worker
+   runs on the member handing it (`Worker::runner`) and that the round at
+   `call_turn` is still to run. It waits until it holds the conversation
+   through that commit (`holds_complete_through`, as a handover does), and
+   names itself the runner. It drops what it kept of the conversation in
+   memory, runs the round's tools itself (`Dispatch::Live`: they never ran),
+   and carries the worker on from `iteration`, so the round cap counts on.
+   From then on it owns the worker's beat, its settling and its answers. A
+   nudge or a stop is read there, at the next boundary.
+
+**The record says who runs a worker.** Only its runner beats it: a beat that
+finds another member named stops. A handing whose answer was lost took effect
+if the record names the peer, so the handing member never runs the round too.
+A worker continued on a member other than its last runner is built afresh from
+the substrate, since its cached state predates the other member's turns.
 
 **A move that fails keeps the worker where it is**: the member that sealed the
-round runs its tools after all, and does not try again in that run of the
-worker. The ratio keeps two cards of one class from trading a worker back and
-forth, and a member never hands a worker to a slower one.
+round runs its tools after all, beats again, and does not try again in that run
+of the worker. A citation check round does not move, since the answer it falls
+back on is kept in the running member's memory. The ratio keeps two cards of
+one class from trading a worker back and forth, and a member never hands a
+worker to a slower one.
 
 **Moving off a card needs nothing new.** A member that goes away loses the
 workers it ran (`BEAT_LOST_MS`), and the next call lands on another.
 
 **A round handed on is not run again at boot.** Its resume entry stays until
-the member finishing it clears it. A member that restarts in that window skips
-any worker still beating elsewhere (`worker_runs_elsewhere`), rather than run
-the round's tools a second time.
+the member finishing it clears it. A member that restarts skips any worker
+whose record still beats with another member named its runner
+(`worker_runs_elsewhere`), rather than run the round's tools a second time. It
+still finishes the rounds of workers it ran itself.
 
 ## 7. Work skills
 

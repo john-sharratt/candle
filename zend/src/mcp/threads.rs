@@ -202,6 +202,12 @@ pub struct Worker {
     /// task, so neither a later answer nor a continuation is sent back again.
     #[serde(default)]
     pub checked: bool,
+    /// The member whose process runs its turns, by node: the one that began
+    /// them, or the one a turn was handed to (`crate::worker_hop`). `None`
+    /// where no cluster is joined. Only this member beats the record, or hands
+    /// the worker on.
+    #[serde(default)]
+    pub runner: Option<u64>,
 }
 
 /// How often the member running a task says so on its record.
@@ -565,6 +571,7 @@ mod tests {
             resumable: false,
             audit: None,
             checked: false,
+            runner: None,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,

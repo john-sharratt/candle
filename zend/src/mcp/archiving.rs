@@ -468,6 +468,7 @@ mod tests {
             resumable: state == State::Done,
             audit: None,
             checked: false,
+            runner: None,
         }
     }
 

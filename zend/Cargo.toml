@@ -79,6 +79,9 @@ arc-swap            = { workspace = true }
 # per-language syntax trees code is carved by live in `doc-units`.
 ignore                  = "0.4"
 sha2                    = "0.10"
+# A worker handed to another member is signed under a key the members derive
+# from the group key (`worker_hop`).
+hmac                    = "0.12"
 thiserror               = { workspace = true }
 
 [build-dependencies]

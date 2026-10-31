@@ -252,6 +252,7 @@ mod tests {
             resumable: false,
             audit: None,
             checked: false,
+            runner: None,
         }
     }
 
