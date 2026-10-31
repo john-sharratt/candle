@@ -120,7 +120,7 @@ use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::{archiving, lineage, names, nudges, stops, threads};
+use crate::mcp::{archiving, lineage, names, nudges, stops, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -142,6 +142,7 @@ use crate::tools::{
 };
 use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
+use crate::worker_hop;
 use crate::working_set::promises::{self, Release};
 use crate::working_set::restore::restore_locks;
 use crate::working_set::seeds::Seeding;
@@ -264,6 +265,29 @@ pub enum StreamItem {
     /// reads it as stuck (`crate::mcp::workers`); the chat stream shows nothing
     /// for it.
     Closing(&'static str),
+    /// A worker's turn stopped at a round boundary to move to a markedly
+    /// faster member (`crate::worker_hop`): its call turn `call_turn` is
+    /// sealed, its tools not run, and the member `to` is to run them once it
+    /// holds the turn's commit (`ZendSession::committed_through`). Sent once,
+    /// last; only a worker's turn sends it.
+    Handed {
+        to: u64,
+        call_turn: u32,
+    },
+}
+
+/// How a turn begins (`run_inference_stream`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnStart {
+    /// A sealed call turn whose round this turn finishes, its calls run as
+    /// `Dispatch` says: `Resumed` after a restart, which may have run some of
+    /// them; `Live` for a round another member handed here before running
+    /// any. `None` for a turn that begins from its message.
+    pub resume: Option<(u32, Dispatch)>,
+    /// A worker's turn, which moves to a markedly faster member at a round
+    /// boundary (`crate::worker_hop`). Nothing else may: a chat client reads
+    /// its own turn, and a turn the boot scan finishes has nobody to hand to.
+    pub may_hand: bool,
 }
 
 /// [`StreamItem::Closing`]'s reason when the repeat guard closed the loop.
@@ -3028,6 +3052,9 @@ impl InferenceState {
                     state.forget_conversation(key);
                 }
             });
+            // A worker's turn moves to a markedly faster member at a round
+            // boundary (`worker_hop`).
+            worker_hop::install(Arc::clone(member));
         }
         // The priming chain, read before `ready` and before the ingest worker's
         // first pass: the first question asked must already have it, and the
@@ -3898,10 +3925,10 @@ fn run_inference_stream(
     tools_mode: ToolMode,
     identity: Option<String>,
     selection: candle_conversation::SelectionState,
-    // Not from the HTTP handler: set only by the boot scan, naming a sealed
-    // call turn whose tools never delivered. `user_message` is then unused —
-    // the turn's message is the tool output, produced below.
-    resume_call_turn: Option<u32>,
+    // Not from the HTTP handler: how the turn begins. When it resumes a sealed
+    // call turn — the boot scan's, or a worker's handed here — `user_message`
+    // is unused: the turn's message is the tool output, produced below.
+    start: TurnStart,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -4287,7 +4314,7 @@ fn run_inference_stream(
         // round it answers did to the working set, in the order it happened
         // (`docs/zend_working_set.md` §4.8).
         let mut marks: Vec<String> = Vec::new();
-        if let Some(call_turn) = resume_call_turn {
+        if let Some((call_turn, dispatch)) = start.resume {
             let calls = resumed_calls(&cs.conv, &conv_id, timeline, call_turn);
             let n_calls = calls.len();
             if calls.is_empty() {
@@ -4303,8 +4330,7 @@ fn run_inference_stream(
                 journal_shelf(&state, &conv_id, timeline),
             );
             let dispatched =
-                tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
-                    .await;
+                tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, dispatch)).await;
             conv_overlay::save(&state.engine, timeline, &cs.files, &cs.mirror);
             let results = match dispatched {
                 Ok(results) => results,
@@ -4343,11 +4369,15 @@ fn run_inference_stream(
                 conv_id = %conv_id,
                 call_turn,
                 n_calls,
-                "resume: finishing a tool round the daemon stopped in the middle of",
+                handed = dispatch == Dispatch::Live,
+                "resume: finishing a tool round begun on another run or member",
             );
             current_message = text;
             start_iteration = 1;
         }
+        // Set when the turn stops at a round boundary to move to a faster
+        // member: that member finishes the round, so its entry stays.
+        let mut handed = false;
 
         // The reflection-marker suppression ceiling is per-dial: derive the think
         // mode once, materialise the turn's sampling config (the conversation
@@ -4977,6 +5007,26 @@ fn run_inference_stream(
                 break;
             }
 
+            // A worker's turn moves to a markedly faster member here: its call
+            // turn is sealed and its commit queued above, and its tools have not
+            // run, so the member it moves to runs them (`worker_hop`). A turn
+            // the guard or the cap is closing answers here instead.
+            if start.may_hand && !closing {
+                let call_idx = resp.seal.as_ref().and_then(|s| s.turn_index);
+                if let (Some(to), Some(call_turn)) = (worker_hop::target(), call_idx) {
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        iteration,
+                        call_turn,
+                        to = %format!("{to:016x}"),
+                        "a worker's turn moves to a markedly faster member",
+                    );
+                    handed = true;
+                    let _ = tx.send(Ok(StreamItem::Handed { to, call_turn })).await;
+                    break;
+                }
+            }
+
             // Answer what the corpus has already ingested before dispatching the
             // rest. A `file_read` of a file an existing `code_reading`
             // conversation read whole is served by locking that conversation
@@ -5189,10 +5239,13 @@ fn run_inference_stream(
 
         // The round is over, however it ended — a final answer, a tool round
         // that yielded nothing, a dispatch that panicked. The entry only ever
-        // means "tools are in flight", so it goes now. A crash before this
+        // means "tools are in flight", so it goes now — unless the turn moved,
+        // when the member finishing the round clears it. A crash before this
         // reaches disk is covered by the scan's own check: an entry whose turn
         // arrived is tombstoned rather than acted on.
-        resume::clear_call_turn(&state.engine, timeline);
+        if !handed {
+            resume::clear_call_turn(&state.engine, timeline);
+        }
 
         // Title generation has already been fired in parallel from
         // `submit_with_sampling` — it doesn't depend on the main
@@ -5888,6 +5941,19 @@ fn resume_dials(dials: Option<ConversationDials>) -> (SelectionState, ToolMode) 
 /// Resumed one at a time, deliberately: each is a full decode, and starting
 /// every one of them at once would hand the scheduler a boot-time burst that
 /// competes with the first real request.
+/// Whether `conv_id` is a worker's whose record still beats: a member is
+/// running it, and none is running here at boot.
+fn worker_runs_elsewhere(session: &ZendSession, conv_id: &str) -> bool {
+    let Some((owner, thread, name)) = conv_names(conv_id) else {
+        return false;
+    };
+    let Some(records) = session.shared_substrate() else {
+        return false;
+    };
+    threads::worker(&records, owner, thread, name)
+        .is_some_and(|w| w.observed(workers::now_ms()).state == threads::State::Running)
+}
+
 fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
     tokio::spawn(async move {
         // Passthrough conversations are the client's own turns and are not
@@ -5938,12 +6004,29 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
             let Some(call_turn) = unfinished else {
                 continue;
             };
+            // A worker still beating is run by a live member, which finishes
+            // the round itself: a round handed on keeps its entry until the
+            // member it moved to clears it (`worker_hop`), and running it here
+            // too would run its tools twice.
+            if worker_runs_elsewhere(&session, &conv_id) {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    call_turn,
+                    "resume: its worker runs on another member, which finishes the round",
+                );
+                continue;
+            }
 
             let (selection, tools_mode) = resume_dials(session.conversation_dials(&conv_id));
             // The turn carries no question of its own: its message is the tool
             // output, built inside the loop from the call turn's own request.
             let user_message = String::new();
-            let resume_call_turn = Some(call_turn);
+            // Its calls may have run before the restart: a call that cannot
+            // run twice is answered instead of run again.
+            let start = TurnStart {
+                resume: Some((call_turn, Dispatch::Resumed)),
+                may_hand: false,
+            };
 
             // Drained to completion with nothing listening: the turn's worth is
             // the seal it writes, and the next client to open the conversation
@@ -5960,7 +6043,7 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 tools_mode,
                 None,
                 selection,
-                resume_call_turn,
+                start,
             );
             while turn.next().await.is_some() {}
             resumed += 1;
@@ -8480,6 +8563,117 @@ impl ZendSession {
         identity: Option<String>,
         selection: candle_conversation::SelectionState,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
+        self.submit_turn(
+            messages,
+            max_tokens,
+            conv_id,
+            sampling,
+            force_hires,
+            assistant_prefill,
+            lossless_kv,
+            tools_mode,
+            identity,
+            selection,
+            TurnStart::default(),
+        )
+        .await
+    }
+
+    /// A worker's turn (`crate::mcp::workers`): from `message`, or — `resume`
+    /// naming a call turn sealed before its tools ran, here or on the member
+    /// that handed it here — by running that round's tools. With `may_hand`
+    /// it moves to a markedly faster member at a round boundary
+    /// ([`StreamItem::Handed`]).
+    pub async fn submit_worker(
+        &self,
+        message: String,
+        conv_id: String,
+        tools_mode: ToolMode,
+        selection: candle_conversation::SelectionState,
+        resume: Option<u32>,
+        may_hand: bool,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
+        self.submit_turn(
+            vec![ChatMessage::new(Role::User, message)],
+            None,
+            conv_id,
+            None,
+            None,
+            None,
+            false,
+            tools_mode,
+            None,
+            selection,
+            TurnStart {
+                resume: resume.map(|call_turn| (call_turn, Dispatch::Live)),
+                may_hand,
+            },
+        )
+        .await
+    }
+
+    /// The `oseq` of this member's newest commit of `conv_id`, once every turn
+    /// it wrote of it is committed — what a member taking the conversation
+    /// must hold it through (`crate::handover`); waited for as
+    /// [`turn_claims::release`] waits, up to `within`. `None` when it is not
+    /// committed by then, or this member wrote none of it.
+    pub async fn committed_through(&self, conv_id: &str, within: Duration) -> Option<u64> {
+        let state = self.inference.load_full()?;
+        let conversation = state.engine.conversation();
+        let timeline = timeline_for(conv_id);
+        let node = conversation.node();
+        let until = tokio::time::Instant::now() + within;
+        while !conversation.own_turns_committed(timeline, node) {
+            if tokio::time::Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        conversation.last_commit_oseq(timeline, node)
+    }
+
+    /// Whether this member holds `conv_id` complete through `origin`'s commit
+    /// `through`, waiting up to `within` for it to arrive.
+    pub async fn holds_through(
+        &self,
+        conv_id: &str,
+        origin: u64,
+        through: u64,
+        within: Duration,
+    ) -> bool {
+        let Some(state) = self.inference.load_full() else {
+            return false;
+        };
+        let conversation = state.engine.conversation();
+        let timeline = timeline_for(conv_id);
+        let until = tokio::time::Instant::now() + within;
+        loop {
+            if conversation.holds_complete_through(timeline, origin, through) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // See the note on `run_inference_stream`.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_turn(
+        &self,
+        messages: Vec<ChatMessage>,
+        max_tokens: Option<usize>,
+        conv_id: String,
+        sampling: Option<candle_conversation::SamplingConfig>,
+        force_hires: Option<String>,
+        assistant_prefill: Option<String>,
+        lossless_kv: bool,
+        tools_mode: ToolMode,
+        identity: Option<String>,
+        selection: candle_conversation::SelectionState,
+        start: TurnStart,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         let last_user = messages
             .iter()
             .rev()
@@ -8553,7 +8747,7 @@ impl ZendSession {
                     tools_mode,
                     identity,
                     selection,
-                    None,
+                    start,
                 );
                 relay_live(&mut ts, &tx, &live, &conv_id).await;
                 live_turns.end(&conv_id, &live);

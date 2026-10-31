@@ -408,6 +408,9 @@ fn stream_sse(
 
             // The closing turn's own text says what it could not do.
             Ok(StreamItem::Closing(_)) => Vec::new(),
+            // Only a worker's turn hands itself on, and a worker reads its
+            // turn in process.
+            Ok(StreamItem::Handed { .. }) => Vec::new(),
         })
         .flat_map(futures::stream::iter);
 
@@ -465,6 +468,7 @@ async fn collect_completion(
             Ok(StreamItem::Prefill { .. }) => {} // prefill progress; display-only
             Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
             Ok(StreamItem::Closing(_)) => {} // the closing turn's text says it
+            Ok(StreamItem::Handed { .. }) => {} // only a worker's turn, read in process
             Ok(StreamItem::Error(message)) => {
                 failed.get_or_insert(message);
             }

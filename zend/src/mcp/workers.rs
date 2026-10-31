@@ -33,8 +33,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::http::{HeaderName, HeaderValue, Method};
 use candle_conversation::persistence::SharedSubstrate;
 use futures::StreamExt;
+use host::cluster::up::send_up;
 use host::substrate_views::TimelineDetail;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -47,13 +49,14 @@ use super::audit::{Audit, Turn};
 use super::caller::Caller;
 use super::names;
 use super::nudges;
+use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
-use crate::types::{ChatMessage, Role};
+use crate::worker_hop;
 
 /// How long a task's draft may take before its earlier entries are taken.
 const DRAFT_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -543,7 +546,110 @@ fn begin(
         Arc::clone(session),
         owner.to_string(),
         worker.clone(),
-        message,
+        First::Message(message),
+    ));
+    Ok(worker)
+}
+
+/// What a worker's next turn starts from.
+enum First {
+    /// A message: the task, an answer, a correction.
+    Message(String),
+    /// A round whose call turn is sealed and whose tools have not run — handed
+    /// here by a slower member, or kept when a handing failed.
+    Round(u32),
+}
+
+/// How long a handed turn's commit may take to land before the member keeps
+/// the round itself.
+const HAND_COMMIT_WAIT: Duration = Duration::from_secs(60);
+/// How long the member a turn is handed to may take to answer — it waits to
+/// hold the turn's records first ([`CONTINUE_HOLD_WAIT`]).
+const HAND_ANSWER_WAIT: Duration = Duration::from_secs(90);
+/// How long the member taking a handed worker waits to hold its records.
+pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(60);
+/// The route a worker is handed on (`crate::api::worker_continue`).
+pub const CONTINUE_PATH: &str = "/v1/mcp/worker/continue";
+
+/// Hand `worker`, whose turn stopped before running call turn `call_turn`'s
+/// tools, to member `to` (`crate::worker_hop`): once this member's commit of
+/// it has landed, `to` is asked to take it, and answers once it holds the
+/// commit and runs the worker. `Err` keeps the worker here.
+async fn hand_on(
+    session: &ZendSession,
+    owner: &str,
+    worker: &Worker,
+    to: u64,
+    call_turn: u32,
+) -> Result<(), String> {
+    let member = worker_hop::member().ok_or("this member is in no cluster")?;
+    let through = session
+        .committed_through(&worker.conv_id, HAND_COMMIT_WAIT)
+        .await
+        .ok_or("its turn's commit did not land in time")?;
+    let body = serde_json::json!({
+        "owner": owner,
+        "thread": worker.thread,
+        "name": worker.name,
+        "call_turn": call_turn,
+        "through": through,
+    });
+    let headers = [(
+        HeaderName::from_static(NODE_HEADER),
+        HeaderValue::from_str(&format!("{to:016x}")).map_err(|e| e.to_string())?,
+    )];
+    let reply = send_up(
+        &member,
+        Method::POST,
+        CONTINUE_PATH,
+        &headers,
+        body.to_string().into_bytes(),
+        Some(HAND_ANSWER_WAIT),
+    )
+    .await
+    .map_err(|e| format!("the gateway could not be reached: {e:#}"))?;
+    if reply.status == 202 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{to:016x} answered {}: {}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        ))
+    }
+}
+
+/// Take the worker `name` of `thread`, `owner`'s, which a slower member handed
+/// here at a round boundary: run call turn `call_turn`'s tools and carry the
+/// worker on — its record, its beat, its settling — as if it had started
+/// here. Only a worker still running may be taken.
+pub fn continue_handed(
+    session: &Arc<ZendSession>,
+    owner: &str,
+    thread: &str,
+    name: &str,
+    call_turn: u32,
+) -> Result<Worker, String> {
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    let _held = holding();
+    let Some(worker) = threads::worker(&records, owner, thread, name) else {
+        return Err(format!("there is no worker `T:{thread}/{name}`"));
+    };
+    if worker.state != State::Running {
+        return Err(format!(
+            "`{}` is not running, so there is no round to take",
+            worker.path()
+        ));
+    }
+    if let Some(Err(e)) = session.set_decode_band(&worker.conv_id, worker.priority.band()) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the task's priority could not be kept: {e}");
+    }
+    session.mcp().bump();
+    tokio::spawn(run(
+        Arc::clone(session),
+        owner.to_string(),
+        worker.clone(),
+        First::Round(call_turn),
     ));
     Ok(worker)
 }
@@ -561,6 +667,17 @@ enum Ended {
     Failed(String),
 }
 
+/// What a turn came to: an ending the worker settles on, or a move.
+enum Turned {
+    Ended(Ended),
+    /// It stopped at a round boundary to move to member `to`, its call turn
+    /// `call_turn` sealed and its tools not run ([`StreamItem::Handed`]).
+    Handed {
+        to: u64,
+        call_turn: u32,
+    },
+}
+
 impl Ended {
     /// Whether Claude stopped the turn (`repo_task_stop`).
     fn stopped(&self) -> bool {
@@ -569,7 +686,7 @@ impl Ended {
 }
 
 /// The turn's life after [`begin`], and the worker's settling.
-async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, message: String) {
+async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first: First) {
     let Some(records) = session.shared_substrate() else {
         return;
     };
@@ -585,12 +702,45 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         worker.name.clone(),
         live.clone(),
     ));
-    let mut message = message;
+    let mut next = first;
+    // Whether a turn here may move to a markedly faster member: not again,
+    // once a handing failed, so a peer that cannot take it is not asked at
+    // every round.
+    let mut may_hand = true;
     // The answer, audit and settling of a task sent back to open what it
     // cited: what it ends with when the check round does not finish.
     let mut first: Option<(String, Audit, (&'static str, String))> = None;
     let (label, outcome) = loop {
-        let ended = turn(&session, &worker, message, &live).await;
+        let ended = match turn(&session, &worker, next, may_hand, &live).await {
+            Turned::Ended(ended) => ended,
+            Turned::Handed { to, call_turn } => {
+                match hand_on(&session, &owner, &worker, to, call_turn).await {
+                    // The member it moved to beats, settles and answers for it now;
+                    // what Claude sent it, a nudge or a stop, is read there.
+                    Ok(()) => {
+                        beating.abort();
+                        let _ = beating.await;
+                        tracing::info!(
+                            conv_id = %worker.conv_id,
+                            to = %format!("{to:016x}"),
+                            call_turn,
+                            "mcp: the worker moved to a faster member"
+                        );
+                        return;
+                    }
+                    Err(why) => {
+                        tracing::warn!(
+                            conv_id = %worker.conv_id,
+                            to = %format!("{to:016x}"),
+                            "mcp: the worker could not move, so it goes on here: {why}"
+                        );
+                        may_hand = false;
+                        next = First::Round(call_turn);
+                        continue;
+                    }
+                }
+            }
+        };
         live.set_doing(Doing::Journaling);
         // A nudge that came after the turn's last tool round was never read.
         for undelivered in nudges::take(&records, &worker.conv_id) {
@@ -658,7 +808,7 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            message = format!("{}{ASKING}", audit.correction());
+            next = First::Message(format!("{}{ASKING}", audit.correction()));
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
             worker.checked = true;
@@ -952,26 +1102,34 @@ fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
 
 /// Run one turn of the worker on `message` to its end, as its role, counting
 /// what it does into `live`.
-async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live: &Live) -> Ended {
+async fn turn(
+    session: &Arc<ZendSession>,
+    worker: &Worker,
+    first: First,
+    may_hand: bool,
+    live: &Live,
+) -> Turned {
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
     apply_tools_dial(&mut selection, mode);
+    let (message, round) = match first {
+        First::Message(m) => (m, None),
+        First::Round(call_turn) => (String::new(), Some(call_turn)),
+    };
     let mut stream = session
-        .submit(
-            vec![ChatMessage::new(Role::User, message)],
-            None,
+        .submit_worker(
+            message,
             worker.conv_id.clone(),
-            None,
-            None,
-            false,
             mode,
-            None,
             selection,
+            round,
+            may_hand,
         )
         .await;
     let mut text = String::new();
     let mut failed: Option<String> = None;
     let mut closed: Option<&'static str> = None;
+    let mut handed: Option<(u64, u32)> = None;
     while let Some(item) = stream.next().await {
         if let Ok(item) = &item {
             live.observe(item);
@@ -982,16 +1140,18 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live
                 failed.get_or_insert(e);
             }
             Ok(StreamItem::Closing(by)) => closed = Some(by),
+            Ok(StreamItem::Handed { to, call_turn }) => handed = Some((to, call_turn)),
             Ok(_) => {}
             Err(e) => {
                 failed.get_or_insert(format!("{e:#}"));
             }
         }
     }
-    match (failed, closed) {
-        (Some(e), _) => Ended::Failed(e),
-        (None, Some(by)) => Ended::Closed { text, by },
-        (None, None) => Ended::Replied(text),
+    match (failed, closed, handed) {
+        (Some(e), _, _) => Turned::Ended(Ended::Failed(e)),
+        (None, _, Some((to, call_turn))) => Turned::Handed { to, call_turn },
+        (None, Some(by), None) => Turned::Ended(Ended::Closed { text, by }),
+        (None, None, None) => Turned::Ended(Ended::Replied(text)),
     }
 }
 
