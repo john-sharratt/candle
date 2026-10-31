@@ -56,13 +56,13 @@ fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
             if !due(&w, now) {
                 continue;
             }
-            // Held across the resume: a member that loses this finds the task
-            // running on the next pass, or takes it if this one failed.
-            let lease = format!("resume/{}/{}", w.conv_id, w.resumes);
-            let Share::Mine(_guard) = ingest_lease::share(&lease) else {
+            // The lease the worker's turns run under, handed to them: a member
+            // that loses it finds the task running on the next pass, or takes
+            // it if this one failed.
+            let Share::Mine(lease) = ingest_lease::share_worker(&w.conv_id) else {
                 continue;
             };
-            match workers::resume(session, &owner, &t.name, &w.name, now) {
+            match workers::resume(session, &owner, &t.name, &w.name, now, lease) {
                 Ok(true) => resumed += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(
