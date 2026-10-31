@@ -1009,6 +1009,7 @@ mod tests {
             "file_edit",
             "file_delete",
             "file_move",
+            "file_image",
             "journal_move",
             "journal_check",
             "file_present",
