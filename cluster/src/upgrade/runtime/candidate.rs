@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tokio::time::timeout;
 
+use super::facts_read::blocked_step;
 use super::served::{offered, HeldAs};
 use super::Upgrader;
 use crate::clock::now_ms;
@@ -175,7 +177,12 @@ impl Upgrader {
             .insert(c, v);
     }
 
-    pub(super) async fn candidate_tick(self: &Arc<Self>) {
+    /// Certify its own build where it is a candidate: propose the verdict
+    /// once the gateways' verdicts settle it. The next free decision index is
+    /// read from the store, waiting up to `store_wait`; a store that does not
+    /// answer by then defers the proposal to its next retry rather than
+    /// holding the tick.
+    pub(super) async fn candidate_tick(self: &Arc<Self>, store_wait: Duration) {
         let own = self.setup.info.build();
         if own.is_local() {
             return;
@@ -236,7 +243,12 @@ impl Upgrader {
                 continue;
             };
             let prefix = certify_prefix(&app, &own);
-            let i = next(&r.decisions(&prefix).await, &prefix);
+            let Ok(held) = timeout(store_wait, r.decisions(&prefix)).await else {
+                let step = blocked_step(&app, &format!("decisions under {prefix}"), store_wait);
+                tracing::warn!("{step}: the certification's verdict is proposed on a retry");
+                continue;
+            };
+            let i = next(&held, &prefix);
             tracing::warn!(
                 app,
                 build = own_name,

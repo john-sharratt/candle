@@ -81,6 +81,13 @@ fn app_of(key: &str) -> Option<&str> {
     key.strip_prefix("upgrade/")?.split('/').next()
 }
 
+/// The step while an install waits for leases: `waiting: <keys> not held`.
+/// Who holds one is not named — the replicator learns a lease's holder only as
+/// a `LeaseEvent::Busy` on its event stream, and keeps none.
+fn lease_wait_step(missing: &[&str]) -> String {
+    format!("waiting: {} not held", missing.join(", "))
+}
+
 impl Upgrader {
     /// Whether every app it serves is joined and ready.
     fn ready(&self) -> bool {
@@ -281,7 +288,7 @@ impl Upgrader {
                 keys
             }
         };
-        let mut all_held = true;
+        let mut missing: Vec<&str> = Vec::new();
         for key in &leases {
             let Some(r) = app_of(key)
                 .and_then(|a| self.member(a))
@@ -292,7 +299,7 @@ impl Upgrader {
             if r.holds(key.as_bytes()) {
                 continue;
             }
-            all_held = false;
+            missing.push(key);
             let due = self
                 .state()
                 .lease_try
@@ -301,9 +308,9 @@ impl Upgrader {
                 r.acquire(key.as_bytes(), LEASE_TTL);
             }
         }
-        if !all_held {
+        if !missing.is_empty() {
             let mut s = self.state();
-            s.step = "waiting".into();
+            s.step = lease_wait_step(&missing);
             if s.lease_try.is_none_or(|at| at.elapsed() >= LEASE_RETRY) {
                 s.lease_try = Some(Instant::now());
             }
@@ -347,5 +354,19 @@ mod tests {
         assert_eq!(app_of("upgrade/zend"), Some("zend"));
         assert_eq!(app_of("upgrade/npcd/1"), Some("npcd"));
         assert_eq!(app_of("world/w1"), None);
+    }
+
+    /// **A lease wait names the leases it waits for.** It said only
+    /// `waiting`, the same word as a build not yet downloaded.
+    #[test]
+    fn a_lease_wait_names_the_leases_not_held() {
+        assert_eq!(
+            lease_wait_step(&["upgrade/zend"]),
+            "waiting: upgrade/zend not held"
+        );
+        assert_eq!(
+            lease_wait_step(&["upgrade/zend/1", "upgrade/npcd"]),
+            "waiting: upgrade/zend/1, upgrade/npcd not held"
+        );
     }
 }
