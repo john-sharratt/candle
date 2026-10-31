@@ -42,6 +42,7 @@ use crate::authority;
 use crate::authorize::{self, Signer};
 use crate::clock;
 use crate::collections::Libraries;
+use crate::discord::bots;
 use crate::discord::seal::{self, Sealer};
 use crate::effector::router::{router as effector_router, Local};
 use crate::effector::token::Tokens;
@@ -77,6 +78,11 @@ pub fn requires() -> Capabilities {
 
 /// npcd's console, `web/content/npcd`, compiled in.
 pub static CONSOLE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/npcd");
+
+/// The public host the console is served on: the first of the hosts the
+/// gateway routes to npcd (the tenant's `ui`), and where a person a
+/// character's bot does not know yet is sent to link their Discord account.
+pub const HOST: &str = "bot.tokera.com";
 
 /// npcd's flags.
 #[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -298,7 +304,7 @@ impl Tenant for NpcdTenant {
 
     fn ui(&self) -> TenantUi {
         TenantUi {
-            hosts: vec!["bot.tokera.com".into(), "npcd.localhost".into()],
+            hosts: vec![HOST.into(), "npcd.localhost".into()],
             content: &CONSOLE,
             default: false,
         }
@@ -531,6 +537,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     install_sinks(&runtime, &authored, feelings);
     reload_on_move(&runtime, &authored);
     retire_kept_pictures(&authored);
+    // The characters' Discord bots, on the authority of each one's world
+    // (`docs/npcd_discord.md` §3.3).
+    bots::start(&authored);
     // Only for a mind still pending: the hook holds the authored state, which
     // holds the runtime, and the load takes it back out once it has run.
     if let Some(source) = repo.as_ref().filter(|_| mind_pending) {

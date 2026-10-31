@@ -48,6 +48,7 @@ pub use queue::{Placing, RouteAt, Urgency, HOLD};
 pub use registry::{MemberView, Pick, Registry};
 pub use status::{
     state_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
+    TiebreakLease,
 };
 pub use traffic::{Class, Failure, OpenStream, Traffic, TrafficView};
 pub use worlds_view::{disconnected, proposer_key, worlds, DisconnectedRow, WorldView};

@@ -1794,7 +1794,8 @@ among the members of the app.
   lowest node id is also an acceptor: a `PREPARE` or `PROPOSE` that arrives on a
   member's socket is answered on that socket, with the tie-break flag. Its journal is
   `gateway-votes` beside the group key, the same layout as a member's `substrate/VOTES`,
-  and a restart resumes it. A promise so flagged counts as one vote, and only when the
+  and a restart resumes it, a lease it accepted counting for what is left of its
+  recorded end and never a fresh term (see *Leases add a term*). A promise so flagged counts as one vote, and only when the
   group size is two — one member plus the gateway is a quorum of two, so zend and npcd
   keep deciding with one of two members down. It does not count in a larger group: a
   quorum of two is also three members' majority, and one member plus a gateway must not
@@ -1901,8 +1902,14 @@ round.
      - The layout (`cluster/src/consensus/votes/file.rs`): a slot is two 1 KiB halves,
        so 64 MiB holds 32,768 keys at once. A half is `magic "VOTE" · u64 seq · u16
        key_len · [128] key · promised ballot · u8 accepted · accepted ballot · u16
-       value_len · [800] value`, zero-padded, ending in a CRC-32 of the rest. A key is
-       at most 128 bytes and a value at most 800.
+       value_len · [800] value · u64 lease_ends`, zero-padded, ending in a CRC-32 of
+       the rest. A key is at most 128 bytes and a value at most 800. `lease_ends`, at
+       byte 977, is the wall-clock time in Unix milliseconds at which this acceptor
+       counts the accepted lease to end — zero when what is accepted is not a lease.
+       It sits where the padding began, so every earlier field keeps its offset: a
+       journal written before it existed opens with every promise and acceptance it
+       holds, and its accepted leases read as having no recorded end, which re-arms
+       them for their full term (below).
      - A value is `u8` tag then, for a decision, its bytes, or for a lease `u64
        holder · u64 ttl_ms`.
 2. **Propose.** With promises from a quorum, it proposes the value of the highest-ballot
@@ -1919,7 +1926,9 @@ round.
 **Leases add a term.** A lease value is `(holder, ttl)`.
 
 - An acceptor treats an accepted lease as present only while its `ttl` runs, counted on
-  its own monotonic clock from when it accepted.
+  its own monotonic clock from when it accepted. Its vote also records when that term
+  ends by the wall clock, `lease_ends`: the wall clock at the acceptance plus `ttl`,
+  rewritten by every acceptance, renewals included, and kept by every promise.
 - The holder counts from when it sent `PREPARE`, and stops 2 s before the end, so it
   always stops before any acceptor would let another proposer in.
 - A `PROMISE` carrying another member's unexpired lease stops a proposer, which routes
@@ -1935,9 +1944,47 @@ round.
   granted under renews that lease at once, and a majority of the group as it stands
   knows it (`replicate/lease.rs`, `reaffirm_leases`).
 - Because the acceptors are durable, a restarting member resumes its promises from its
-  substrate, and needs no sit-out period for decisions. A lease it had accepted before
-  the restart counts as present for one full `ttl` from the restart. Its monotonic clock
-  began again, and that errs on the side of the old holder.
+  substrate, and needs no sit-out period for decisions. **A lease it had accepted before
+  the restart counts for what is left of it by the wall clock**
+  (`cluster/src/consensus/rearm.rs`). Its monotonic clock began again and cannot say how
+  much of the term had run, so the acceptor reads the wall clock at the restart and
+  arms the lease for `lease_ends − now`, clamped to `[0, ttl]`:
+  - **some left**: armed for exactly that. Every restart counts against the same
+    recorded end, so restarts never extend a lease;
+  - **none left**: not armed, so the key is free at once, and its slot is freed one
+    `ttl` after the recorded end, as it would have been without the restart;
+  - **the wall clock reads earlier than the acceptance** (`lease_ends − ttl`): it went
+    back, the record says nothing of how long the lease has run, and the lease is armed
+    for its full `ttl` from the restart, erring on the side of the holder;
+  - **no end recorded** (`lease_ends = 0`, a vote written before votes carried one): the
+    same full `ttl`. Dropping it would free, at this acceptor, a lease its holder may
+    still count, and a restarted member and a restarted gateway are together a quorum
+    of a group of two.
+
+  A full `ttl` from every restart was the rule before, and it kept a dead lease alive:
+  the gateway's tie-break acceptor restarts on every web deploy, each deploy re-armed
+  `upgrade/zend` for its 20-minute term, and on 2026-10-31 a member asking for it was
+  refused by the gateway's promise from 09:52 to ~10:02 after web restarted at
+  09:42:09Z.
+
+  **What this assumes.** Across a restart the wall clock moves forward by no more than
+  the time that really passed, give or take the 2 s a holder stops before its
+  acceptors (`HOLDER_MARGIN`). A forward step larger than that while an acceptor is
+  down ends the lease early at that one acceptor; with a quorum of acceptors so
+  stepped, another proposer could take a lease its holder still counts. A backward
+  step is safe — it re-arms for at least what was left. Members and gateways keep NTP
+  time, and the gateway measures each member's clock offset at admission (§3.4). While
+  an acceptor runs, terms are counted on its monotonic clock alone; the wall clock is
+  read only to record an end and to re-arm at a restart.
+- **Every armed lease is on a status page.** A member's `/v1/status` lists the leases
+  its acceptor counts in `cluster.apps.<app>.replication.leases`, and the gateway's
+  `/gateway/status.json` those of its tie-break acceptor in `tiebreak_leases`: each as
+  `{key, holder, remaining_s}` — the gateway's with its `app` beside the member's key —
+  the key shown as UTF-8, the holder as its 16-hex node, the seconds left rounded up. A
+  member whose round for an `upgrade/` lease comes back `LeaseBusy` logs one warning
+  naming the key and the holder, once per change of holder, not on every retry
+  (`replicate/busy_warnings.rs`); world leases are refused as a matter of course and
+  stay quiet.
 
 **Routing the frames.** Paxos frames are sent to every member of the app on every
 cluster the proposer has joined. Replies carry `reply_to`, and the gateway delivers them
@@ -3993,7 +4040,7 @@ stylesheets.
 | **Members** | For each one: node, host, build (`count`, `hash`, and for a local build its `local` digest, flagged *local*), power and weight, idle, free slots, state (loading — connecting or catching up — / ready / upgrading / draining / **fault**, and *lagging* beside it), its `mode` and `gen`, free disk on its substrate's volume, session, time connected, clock offset, the last close; and its `clusters` column, the socket state to every gateway it was given, which is what explains a member this gateway sees and another does not |
 | **Generations** (§6.7) | Per member: its mode, the generation it writes under, the one its last rejoin took, the greatest decided, whether it holds writes from while cut off, and the records it defers for a type its build does not decode (§6.5). Each rejoin, the generation it took, and each reload are in the log |
 | **Claims** (§5.4) | Live claims, with key, holder and epoch, as this gateway has been told them. Each claim taken and released is in the log; `409`-then-`503` answers are counted under Traffic |
-| **Consensus** (§5.9) | Every Paxos key each member knows — leases and decisions alike: the round it has in progress, its ballot and phase, the members that promised or accepted it, the ballot a `NACK` beat it with, a lease's time left, and **its acceptor's promised and accepted ballots**, as reported in `COORD`, so a split vote shows member by member |
+| **Consensus** (§5.9) | Every Paxos key each member knows — leases and decisions alike: the round it has in progress, its ballot and phase, the members that promised or accepted it, the ballot a `NACK` beat it with, a lease's time left, and **its acceptor's promised and accepted ballots**, as reported in `COORD`, so a split vote shows member by member. Beside them, the leases this gateway's tie-break acceptor counts as armed (`tiebreak_leases`: app, key, holder, seconds left), so a member refused by the gateway's promise shows whose lease refused it (§5.9) |
 | **World leases** (§9.2; chunk 7) | For each npcd world: its authority and term left; the member rendezvous names as proposer, flagged where it is not the authority; worlds with no holder, and why (no quorum reachable, a term still running out); handovers in progress, with the `through` the new proposer is waiting on |
 | **NPC leases** (§9.3; chunk 7) | Per world: characters by holder and expiry; characters held by members now away, which are not lent again until those members return; forced admin releases |
 | **Disconnected worlds** (§9.4; chunk 7) | Members running worlds in disconnected mode: which worlds, which characters, since when |
@@ -4420,7 +4467,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | turn order | two writers' turn *N* never overwrite each other in the `(stream_id, origin)` index; a timeline's turns are its committed decls in stamp order, in any arrival order; `turn_stream_id(timeline, N)` resolves to the *N*-th of them; a single writer's turns keep the order it wrote them in; a partitioned former holder's turns sort before its successor's |
 | generations | a cut-off member's events carry ⊤ and sort after everything it holds; on rejoin it catches up before sending anything detached; it takes `gen/<k>` by Paxos for *k* one above the greatest decided it knows, and moves to *k + 1* when *k* is already decided; decided generations have no gaps; a joined member's event written before the decision, including one the rejoining member never caught up on, sorts before its detached events on every member; the generation is persisted as a local `Rebase` that is never replicated, and applied on reading its own records back; without a quorum the member stays cut off, serving locally and sending nothing detached, and takes its generation once a quorum is reachable; two members cut off together sort in the order their generations were decided; offline keyed writes win over the group's from the same period; a tombstone still kills offline writes to its timeline; a turn arriving ranked below one held makes the member drain, reload and come back |
 | consensus (`cluster` crate, Paxos among members) | a proposer `NACK`ed waits a random time within the key's `ttl` before trying a higher ballot, and two duelling proposers end with one decision; an acceptor promises only above its highest promised ballot and `NACK`s the rest with that ballot; a promise and an acceptance are durable in the substrate before they are sent, and survive a restart; a proposer proposes the highest-ballot accepted value it was shown; under every interleaving of two and three proposers against three and five member-acceptors, with dropped and duplicated frames and frames arriving through two clusters, a decision never changes and two lease holders never overlap; a decided value is written as a replicated record |
-| leases | `PROMISE` carries an accepted lease only while its `ttl` runs; another member's unexpired lease stops a proposer, its own does not (renewal); under `start_paused`, the holder's term, counted from `PREPARE`, ends before every acceptor's; a lease accepted before an acceptor restarts counts for a full `ttl` after; `RELEASE` drops it and the next proposer waits for `through`; a partitioned authority stops persisting before its lease runs out; a member alone in a group of three can never hold one |
+| leases | `PROMISE` carries an accepted lease only while its `ttl` runs; another member's unexpired lease stops a proposer, its own does not (renewal); under `start_paused`, the holder's term, counted from `PREPARE`, ends before every acceptor's; a lease accepted before an acceptor restarts counts for what is left of the wall-clock end its vote recorded — the rest of its term after a restart inside it, nothing after a restart past it, a full `ttl` when the wall clock went back — and repeated restarts never extend it; `RELEASE` drops it and the next proposer waits for `through`; a partitioned authority stops persisting before its lease runs out; a member alone in a group of three can never hold one |
 | gateway peering (`cluster/src/peer/`, `cluster/src/frame/tests.rs`, `web/src/acme/{ledger,certs}.rs`, `web/src/acme/peers/inventory.rs`, `web/src/cluster/peers.rs`, `web/src/config.rs`, `web/tests/peering.rs`) | every peer frame encodes to exact bytes; two gateways link and carry frames; three in a mesh name the same orderer for every site, and a gateway alone orders everything; crossed dials keep the lower node's link on both ends, and it stays; a differing session key or OAuth client refuses the peering on both ends, each recording why, and a node other than the handshake's or the gateway's own is refused; a closed link is redialled; ledgers merge to the union in either order, and a save keeps what a peer merged meanwhile; a peer is sent the certificates it lacks or holds older, and the later `not_after` wins; the node id is minted once and kept; peers need the TLS entrance. Against a local stand-in for the CA, at the `Ca` trait — it publishes through the gateways' own path and asks every gateway it could reach for each answer: three linked gateways name one orderer and only it may order, its challenges are answered on all three before the CA validates, and its certificate is installed on all three with every challenge withdrawn; a peer's `ACME_ORDERING` holds the site until `ACME_DONE`; two gateways partitioned each order, and once linked both serve the later certificate; over a link that is not verified TLS the challenges cross but no certificate key and no account do; the account is given to a peer that has none, and the ledgers merge on connect and on change |
 | commands | each command of §12.4 runs on an in-process member and its effect is asserted; `drain` hands back every claim and lease and the gateway routes nothing new; `restart` waits for in-flight work and the outbox, then builds a relaunch with the original arguments, one-shot flags dropped (the process spawn is asserted on, not run); `compact` is refused in fault mode and when free space is below the live size; a destructive command without the matching `confirm` is refused; a second command while one runs is refused; every command lands in the coordination log; `drain-gateway` closes members with `1001` and they carry on through their other cluster; a delivered Ctrl-C on a joined member drains, waits for the outbox, flushes, closes `1001` and then runs the tenant shutdown, with another member taking its world at once rather than after a term; a second Ctrl-C mid-drain exits at once; without `--cluster`, Ctrl-C is unchanged |
 | fault mode | a simulated `ENOSPC` on append, and free space under the floor, each enter fault mode; the member stays connected and keeps sending `COORD`; it releases every claim and world lease, stops its characters, and proposes nothing; **with the volume completely full it still promises and accepts, durably, through the vote journal, and counts toward the quorum**; it keeps sending its unsent events and answering `FETCH`es; the gateway routes no request to it and relays no live events to it, but relays Paxos frames to it; only `Drop` maintenance runs; leaving needs twice the floor and a test append, then catches up before taking work; free space hovering at the floor does not flap the mode; the status page and the log show both transitions |
@@ -4570,7 +4617,8 @@ it changes how *every* log is replayed, today's single-machine ones included.
 
 - Leases and one-time decisions, with durable acceptors in the preallocated vote journal
   (`VOTES`, written in place to alternating halves).
-- Lease terms counted on the monotonic clock, and the restart rule.
+- Lease terms counted on the monotonic clock, and the restart rule: what is left of the
+  wall-clock end the vote recorded, at most one `ttl`.
 - `max_members` with automatic raises and stamped sets, and the quorum.
 - The randomised backoff after a `NACK`.
 - Rendezvous (§9.5).

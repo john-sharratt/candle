@@ -1,22 +1,29 @@
-//! The Discord REST calls a bot's connect makes.
+//! The Discord REST calls a bot makes.
 //!
-//! Three, each authorised as the bot (`Authorization: Bot <token>`): who the
-//! bot is (`GET /users/@me`), which application it belongs to
-//! (`GET /applications/@me`), and its name and avatar (`PATCH /users/@me`).
+//! Each is authorised as the bot (`Authorization: Bot <token>`). A connect
+//! asks who the bot is (`GET /users/@me`), which application it belongs to
+//! (`GET /applications/@me`), and sets its name and avatar
+//! (`PATCH /users/@me`). A DM posts a message (`POST /channels/{id}/messages`),
+//! opens a DM channel with a person (`POST /users/@me/channels`), and reads
+//! what was written in one since a message (`GET /channels/{id}/messages`).
 //! The API's base is a field, Discord's own in production ([`PRODUCTION`]),
 //! so a test points it at a fake server and asserts the exact requests.
 //!
 //! A refusal is answered once, as a [`DiscordError`]; nothing here retries.
 
 use std::fmt::{self, Debug, Formatter};
+use std::sync::Arc;
+use std::time::Instant;
 
 use reqwest::header::{HeaderMap, AUTHORIZATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client as Http, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::discord::error::DiscordError;
+use crate::discord::limit::InvalidRequests;
+use crate::discord::message::{snowflake, DiscordMessage};
 
 /// Discord's API, at the version this client speaks.
 pub const PRODUCTION: &str = "https://discord.com/api/v10";
@@ -48,11 +55,25 @@ pub struct Application {
     pub name: String,
 }
 
-/// Discord's REST API, from one base.
+/// Anything Discord answers with only its id read: a posted message, an
+/// opened channel.
+#[derive(Deserialize)]
+struct Made {
+    #[serde(deserialize_with = "snowflake")]
+    id: u64,
+}
+
+/// The most messages one read of a channel's history answers, as Discord
+/// caps it.
+pub const HISTORY_PAGE: u32 = 100;
+
+/// Discord's REST API, from one base. Its clones share one count of the
+/// host's invalid requests ([`InvalidRequests`]).
 #[derive(Clone)]
 pub struct Client {
     http: Http,
     base: String,
+    invalid: Arc<InvalidRequests>,
 }
 
 impl Debug for Client {
@@ -69,9 +90,15 @@ impl Client {
 
     /// The API at `base` — Discord's, or a test's fake of it.
     pub fn at(base: &str) -> Self {
+        Self::limited(base, InvalidRequests::default())
+    }
+
+    /// The API at `base`, sending nothing past `invalid`'s ceiling.
+    pub fn limited(base: &str, invalid: InvalidRequests) -> Self {
         Self {
             http: Http::new(),
             base: base.trim_end_matches('/').to_string(),
+            invalid: Arc::new(invalid),
         }
     }
 
@@ -115,6 +142,61 @@ impl Client {
         .await
     }
 
+    /// Post `content` to channel `channel_id` as the bot; the message's id.
+    ///
+    /// Mentions in it ping nobody: what a character says is never an
+    /// `@everyone`.
+    pub async fn create_message(
+        &self,
+        token: &str,
+        channel_id: u64,
+        content: &str,
+    ) -> Result<u64, DiscordError> {
+        let made: Made = self
+            .call(
+                Method::POST,
+                &format!("/channels/{channel_id}/messages"),
+                token,
+                Some(json!({ "content": content, "allowed_mentions": { "parse": [] } })),
+            )
+            .await?;
+        Ok(made.id)
+    }
+
+    /// The bot's DM channel with Discord user `user_id`, opened if it was not.
+    pub async fn open_dm(&self, token: &str, user_id: u64) -> Result<u64, DiscordError> {
+        let made: Made = self
+            .call(
+                Method::POST,
+                "/users/@me/channels",
+                token,
+                Some(json!({ "recipient_id": user_id.to_string() })),
+            )
+            .await?;
+        Ok(made.id)
+    }
+
+    /// What was written in channel `channel_id` after message `after`, up to
+    /// [`HISTORY_PAGE`] of it, oldest first.
+    pub async fn messages_after(
+        &self,
+        token: &str,
+        channel_id: u64,
+        after: u64,
+    ) -> Result<Vec<DiscordMessage>, DiscordError> {
+        let mut messages: Vec<DiscordMessage> = self
+            .call(
+                Method::GET,
+                &format!("/channels/{channel_id}/messages?after={after}&limit={HISTORY_PAGE}"),
+                token,
+                None,
+            )
+            .await?;
+        // Discord answers newest first.
+        messages.sort_by_key(|m| m.id);
+        Ok(messages)
+    }
+
     /// One request, as the bot, and its answer read as `T`.
     async fn call<T: DeserializeOwned>(
         &self,
@@ -123,6 +205,9 @@ impl Client {
         token: &str,
         body: Option<Value>,
     ) -> Result<T, DiscordError> {
+        if let Err(retry_after_s) = self.invalid.check(Instant::now()) {
+            return Err(DiscordError::Paused { retry_after_s });
+        }
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.base))
@@ -138,6 +223,7 @@ impl Client {
             .await
             .map_err(|e| DiscordError::Transport(e.without_url().to_string()))?;
         let status = response.status();
+        self.invalid.answered(status.as_u16(), Instant::now());
         let headers = response.headers().clone();
         let text = response
             .text()
@@ -170,6 +256,7 @@ fn refusal(status: StatusCode, headers: &HeaderMap, text: &str) -> DiscordError 
         },
         _ => DiscordError::Status {
             status: status.as_u16(),
+            code: body["code"].as_u64().unwrap_or(0),
             detail: body["message"]
                 .as_str()
                 .map(str::to_string)
@@ -180,6 +267,8 @@ fn refusal(status: StatusCode, headers: &HeaderMap, text: &str) -> DiscordError 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::*;
@@ -244,6 +333,56 @@ mod tests {
         );
     }
 
+    /// **A DM's calls are the requests Discord documents**: a post with the
+    /// text and no mentions, a channel opened by the recipient's id as a
+    /// string, and a history read after a message, answered oldest first.
+    #[tokio::test]
+    async fn the_dm_calls_are_the_documented_requests() {
+        let discord = fake::start(Mode::Ok).await;
+        let client = Client::at(&discord.url);
+        discord.history(
+            31,
+            vec![
+                json!({"id": "903", "channel_id": "31", "author": {"id": "7", "username": "wren"}, "content": "b"}),
+                json!({"id": "902", "channel_id": "31", "author": {"id": "7", "username": "wren"}, "content": "a"}),
+            ],
+        );
+
+        assert_eq!(
+            client.create_message(TOKEN, 31, "hello").await,
+            Ok(fake::FIRST_POSTED)
+        );
+        assert_eq!(client.open_dm(TOKEN, 77).await, Ok(fake::DM_CHANNEL));
+        let read = client.messages_after(TOKEN, 31, 901).await.unwrap();
+        assert_eq!(
+            read.iter()
+                .map(|m| (m.id, m.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(902, "a"), (903, "b")]
+        );
+
+        assert_eq!(
+            discord.seen(),
+            [
+                seen(
+                    "POST",
+                    "/channels/31/messages",
+                    json!({ "content": "hello", "allowed_mentions": { "parse": [] } })
+                ),
+                seen(
+                    "POST",
+                    "/users/@me/channels",
+                    json!({ "recipient_id": "77" })
+                ),
+                seen(
+                    "GET",
+                    "/channels/31/messages?after=901&limit=100",
+                    Value::Null
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_401_is_a_rejected_token() {
         let discord = fake::start(Mode::Unauthorized).await;
@@ -272,6 +411,27 @@ mod tests {
         assert_eq!(discord.seen().len(), 1);
     }
 
+    /// **Past the host's ceiling of invalid answers nothing more is sent**,
+    /// for any token.
+    #[tokio::test]
+    async fn past_the_hosts_ceiling_nothing_is_sent() {
+        let discord = fake::start(Mode::Unauthorized).await;
+        let client = Client::limited(
+            &discord.url,
+            InvalidRequests::new(2, Duration::from_secs(600)),
+        );
+        assert_eq!(client.me(TOKEN).await, Err(DiscordError::TokenRejected));
+        assert_eq!(
+            client.clone().me("another.token").await,
+            Err(DiscordError::TokenRejected)
+        );
+        assert!(matches!(
+            client.me(TOKEN).await,
+            Err(DiscordError::Paused { retry_after_s }) if retry_after_s > 599.0
+        ));
+        assert_eq!(discord.seen().len(), 2, "a request went past the ceiling");
+    }
+
     #[tokio::test]
     async fn a_user_token_is_not_a_bot() {
         let discord = fake::start(Mode::NotABot).await;
@@ -288,6 +448,7 @@ mod tests {
             Client::at(&discord.url).me(TOKEN).await,
             Err(DiscordError::Status {
                 status: 502,
+                code: 0,
                 detail: "upstream is down".into()
             })
         );
@@ -323,8 +484,16 @@ mod tests {
             ),
             DiscordError::Status {
                 status: 403,
+                code: 50001,
                 detail: "Missing Access".into()
             }
         );
+        let no_server = refusal(
+            StatusCode::BAD_REQUEST,
+            &HeaderMap::new(),
+            r#"{"message": "Cannot send messages to this user", "code": 50278}"#,
+        );
+        assert!(no_server.no_shared_server());
+        assert!(!DiscordError::TokenRejected.no_shared_server());
     }
 }

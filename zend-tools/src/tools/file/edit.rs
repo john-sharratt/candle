@@ -117,6 +117,12 @@ impl Tool for FileEdit {
         let done = apply(&doc, &edit)?;
         let text = done.doc.text();
         let bytes = text.len();
+        if let (None, "replace", Some(new)) = (&req.old, req.action.as_str(), &req.text) {
+            let (written, after) = (new.lines().count(), text.lines().count());
+            if let Some(why) = clobbers(content.lines().count(), after, written) {
+                return Err(FileError::InvalidArguments(why));
+            }
+        }
         // Recorded as an edit — the changed lines only, not the file they
         // landed in.
         store.edit(&req.path, text)?;
@@ -139,6 +145,25 @@ impl Tool for FileEdit {
             bytes,
         })
     }
+}
+
+/// The fewest lines a whole-part replace may cut a part down from unasked.
+const CLOBBER_LINES: usize = 8;
+
+/// Why a whole-part replace taking a file from `before` lines to `after`, with
+/// `written` lines of new text, looks like a slip, if it does: a call meant to
+/// change a few words that forgot `old` replaces the whole part with them. A
+/// worker wiped a function and a test that way (2026-10-31). What it means to
+/// shrink that far, it can say: `delete` the part and `insert` the new one.
+fn clobbers(before: usize, after: usize, written: usize) -> Option<String> {
+    let replaced = (before + written).saturating_sub(after);
+    (replaced >= CLOBBER_LINES && written * 4 <= replaced).then(|| {
+        format!(
+            "without `old` this replaces the whole {replaced}-line part with {written} line(s). \
+             To change words inside it, send them as `old`; to give the whole part up for this \
+             text, `delete` it and `insert_before` a neighbour"
+        )
+    })
 }
 
 /// The request as the edit it names, or why it names none.
@@ -219,6 +244,25 @@ pub const FILE_EDIT: RegisteredTool = RegisteredTool::new::<FileEdit>();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A few lines over a large part is refused.** The two lines that
+    /// replaced a forty-line function; a rewrite of about its size, and a short
+    /// part, are not slips.
+    #[test]
+    fn a_whole_part_cut_to_a_few_lines_is_refused() {
+        // 100 lines, a 40-line part replaced by 2: 62 left.
+        assert_eq!(
+            clobbers(100, 62, 2).as_deref(),
+            Some(
+                "without `old` this replaces the whole 40-line part with 2 line(s). To change \
+                 words inside it, send them as `old`; to give the whole part up for this text, \
+                 `delete` it and `insert_before` a neighbour"
+            )
+        );
+        assert_eq!(clobbers(100, 95, 35), None, "a rewrite of about its size");
+        assert_eq!(clobbers(100, 95, 1), None, "a six-line part");
+        assert_eq!(clobbers(100, 105, 45), None, "it grew");
+    }
 
     /// **`old` is offered before `text`.** The tool grammar emits optional
     /// arguments in declared order, so with `text` first a call that wrote

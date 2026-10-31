@@ -64,10 +64,10 @@ impl Replicator {
                 });
             }
         }
-        let now = self.now();
+        let (now, wall) = (self.now(), self.wall());
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
-            p.handle(frame, now)
+            p.handle(frame, now, wall)
         };
         match outs {
             Ok(outs) => self.dispatch(outs),
@@ -87,9 +87,27 @@ impl Replicator {
                 Out::Decided { key, value } => self.decided(key, value),
                 // Leases are the app's (§9.2): it follows them as events.
                 Out::LeaseHeld { key, .. } => {
+                    self.busy_warnings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .held(&key);
                     let _ = self.leases.send(LeaseEvent::Held { key });
                 }
                 Out::LeaseBusy { key, holder } => {
+                    let news = self
+                        .busy_warnings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .busy(&key, holder);
+                    if news {
+                        tracing::warn!(
+                            node = self.node,
+                            key = %String::from_utf8_lossy(&key),
+                            holder = format_args!("{holder:016x}"),
+                            "an upgrade lease is refused: an acceptor counts another member's \
+                             lease on it (each acceptor's armed leases are in its status)"
+                        );
+                    }
                     let _ = self.leases.send(LeaseEvent::Busy { key, holder });
                 }
                 Out::LeaseLost { key } => {
@@ -174,7 +192,7 @@ impl Replicator {
             k,
             deadline: Instant::now() + REJOIN_WAIT,
         });
-        let now = self.now();
+        let (now, wall) = (self.now(), self.wall());
         let quorum = self.quorum();
         let tiebreak = self.tiebreak_allowed();
         let outs = {
@@ -183,7 +201,12 @@ impl Replicator {
             // on a stale one.
             p.set_quorum(quorum);
             p.allow_tiebreak(tiebreak);
-            p.decide(&generation_key(k), self.node.to_le_bytes().to_vec(), now)
+            p.decide(
+                &generation_key(k),
+                self.node.to_le_bytes().to_vec(),
+                now,
+                wall,
+            )
         };
         match outs {
             Ok(outs) => self.dispatch(outs),
@@ -242,14 +265,14 @@ impl Replicator {
     /// The once-a-tick consensus work: the engine's timers, the quorum, and a
     /// rejoin that found no quorum.
     pub(super) fn consensus_tick(self: &Arc<Self>) {
-        let now = self.now();
+        let (now, wall) = (self.now(), self.wall());
         let quorum = self.quorum();
         let tiebreak = self.tiebreak_allowed();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
             p.allow_tiebreak(tiebreak);
-            p.tick(now)
+            p.tick(now, wall)
         };
         match outs {
             Ok(outs) => self.dispatch(outs),
@@ -347,10 +370,10 @@ impl Replicator {
             self.paxos
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .running_leases(now)
+                .armed_leases(now)
                 .into_iter()
-                .filter(|(holder, _)| *holder != self.node && !ready_nodes.contains(holder))
-                .map(|(_, left)| left)
+                .filter(|l| l.holder != self.node && !ready_nodes.contains(&l.holder))
+                .map(|l| l.left)
                 .max()
         };
         let step = {

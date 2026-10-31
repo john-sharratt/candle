@@ -406,21 +406,16 @@ mod tests {
         }
     }
 
-    /// The nav mark and the tab icon are one file, not two drawings.
-    ///
-    /// They used to be two — an inline SVG and a `favicon.svg` holding the same
-    /// coordinates — and this test compared the geometry because two copies of
-    /// one drawing is exactly the thing that drifts. Pointing both at the same
-    /// file removes the failure rather than detecting it, so what is left to
-    /// check is that the file is really there and that nothing still reaches
-    /// for the drawing it replaced.
+    /// The tab icon is the Zen mark; the nav mark stays Tokera's own file, and
+    /// each is really there. Nothing still reaches for the `favicon.svg`
+    /// drawing the marks replaced.
     #[tokio::test]
-    async fn the_nav_mark_and_the_favicon_are_one_file() {
+    async fn the_tab_icon_is_the_zen_mark_and_the_nav_mark_stays_tokera() {
         let (_, page) = get("/").await;
 
         assert!(
-            page.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#),
-            "the tab icon is not the brand mark"
+            page.contains(r#"<link rel="icon" type="image/png" href="/brand/zen.png">"#),
+            "the tab icon is not the Zen mark"
         );
         // The nav mark is the switcher's chip, drawn from the switcher's own
         // copy rather than from this site's favicon. They are the same drawing;
@@ -452,13 +447,18 @@ mod tests {
             );
         }
 
-        let mark = content_root().join("tokera").join("favicon.png");
-        let bytes =
-            std::fs::read(&mark).unwrap_or_else(|e| panic!("reading {}: {e}", mark.display()));
-        assert!(
-            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "the brand mark is not a PNG"
-        );
+        for mark in [
+            content_root().join("tokera").join("favicon.png"),
+            content_root().join("common").join("brand").join("zen.png"),
+        ] {
+            let bytes =
+                std::fs::read(&mark).unwrap_or_else(|e| panic!("reading {}: {e}", mark.display()));
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{} is not a PNG",
+                mark.display()
+            );
+        }
     }
 
     #[tokio::test]

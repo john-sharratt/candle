@@ -5,7 +5,8 @@
 //! is somebody else's answered exactly as one that does not exist (§8.3).
 //!
 //! - `GET` says whether the character has a bot, and if so which, with the
-//!   link that invites it to a server.
+//!   link that invites it to a server and its status (§3.3): `online` — with
+//!   the world it is online in — `offline` or `refused`.
 //! - `PUT {"token": …}` connects one: the token is checked with Discord
 //!   (`GET /users/@me`, refusing a user's token, and `GET /applications/@me`),
 //!   the bot is named as the character and pictured with its portrait if it
@@ -30,6 +31,7 @@ use crate::api::{err, now_ms, npc_err, owner_of, Authored};
 use crate::discord::error::DiscordError;
 use crate::discord::invite;
 use crate::discord::profile;
+use crate::discord::state::{self, Status};
 use crate::discord::store::{self, Bot};
 use crate::npcs;
 
@@ -50,7 +52,8 @@ pub async fn get_discord(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    Json(connection(store::get(&s.npcs.substrate(), npc_id).as_ref())).into_response()
+    let bot = store::get(&s.npcs.substrate(), npc_id);
+    Json(connection(&s, bot.as_ref().map(|bot| (npc_id, bot))).await).into_response()
 }
 
 /// `PUT /v1/npc/:nid/discord`
@@ -124,7 +127,7 @@ pub async fn put_discord(
         application = %bot.application_id,
         "discord: bot connected"
     );
-    Json(connection(Some(&bot))).into_response()
+    Json(connection(&s, Some((npc_id, &bot))).await).into_response()
 }
 
 /// `DELETE /v1/npc/:nid/discord`
@@ -149,7 +152,7 @@ pub async fn delete_discord(
         }
         tracing::info!(npc = npc_id, "discord: bot disconnected");
     }
-    Json(connection(None)).into_response()
+    Json(connection(&s, None).await).into_response()
 }
 
 /// The caller's character `nid`: its id and its record, or the 404 that
@@ -175,19 +178,34 @@ async fn owned(
     Ok((npc_id, record))
 }
 
-/// The wire shape of a character's bot, or of its having none.
-fn connection(bot: Option<&Bot>) -> Value {
-    match bot {
-        None => json!({ "connected": false }),
-        Some(bot) => json!({
-            "connected": true,
-            "application_id": bot.application_id,
-            "user_id": bot.user_id,
-            "username": bot.username,
-            "connected_ms": bot.connected_ms,
-            "invite_url": invite::url(&bot.application_id),
-        }),
+/// The wire shape of character `npc_id`'s bot, or of its having none: which
+/// bot it is, and its status — with, when it is online, the name of the
+/// world it is online in.
+async fn connection(s: &Authored, bot: Option<(u64, &Bot)>) -> Value {
+    let Some((npc_id, bot)) = bot else {
+        return json!({ "connected": false });
+    };
+    let status = state::status(&s.npcs.substrate(), npc_id, bot);
+    let mut wire = json!({
+        "connected": true,
+        "application_id": bot.application_id,
+        "user_id": bot.user_id,
+        "username": bot.username,
+        "connected_ms": bot.connected_ms,
+        "invite_url": invite::url(&bot.application_id),
+        "status": status.name(),
+    });
+    if let Status::Online { world } = status {
+        let name = s
+            .worlds
+            .read()
+            .await
+            .get(&world)
+            .and_then(|r| r.body["name"].as_str().map(str::to_string))
+            .unwrap_or(world);
+        wire["world"] = json!(name);
     }
+    wire
 }
 
 /// A Discord refusal as the console reads it.
@@ -199,7 +217,7 @@ fn refused(npc_id: u64, e: DiscordError) -> Response {
             err(StatusCode::BAD_REQUEST, "discord_token_rejected", &detail)
         }
         DiscordError::NotABot => err(StatusCode::BAD_REQUEST, "discord_not_a_bot", &detail),
-        DiscordError::RateLimited { retry_after_s } => {
+        DiscordError::RateLimited { retry_after_s } | DiscordError::Paused { retry_after_s } => {
             let mut res = (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
@@ -240,6 +258,7 @@ mod tests {
     use crate::collections::Libraries;
     use crate::discord::client::Client;
     use crate::discord::fake::{self, Mode, Seen};
+    use crate::discord::state::{BotState, State as BotStateKind};
     use crate::images::Images;
     use crate::mind::Mind;
     use crate::npcs::Npcs;
@@ -387,6 +406,7 @@ mod tests {
             "username": "Zen",
             "connected_ms": connected_ms,
             "invite_url": "https://discord.com/oauth2/authorize?client_id=111&scope=bot&permissions=344134372416",
+            "status": "offline",
         });
         assert_eq!(v, expected);
         assert!(!text.contains(TOKEN), "{text}");
@@ -434,6 +454,47 @@ mod tests {
         let (_, v, _) = call(router(st.clone()), request("GET", &path, OWNER, None)).await;
         assert_eq!(v, json!({ "connected": false }));
         assert_eq!(store::get(&st.npcs.substrate(), npc_id), None);
+    }
+
+    /// **The read says what the bot's state record says** while it is in
+    /// force: online with the world it is in, or refused.
+    #[tokio::test]
+    async fn the_read_carries_the_bots_status() {
+        let discord = fake::start(Mode::Ok).await;
+        let (st, zen) = state(&discord.url, None);
+        let npc_id = npcs::npc_id_of_wire(&zen).unwrap();
+        let path = format!("/v1/npc/{zen}/discord");
+        let bot = Bot {
+            application_id: "111".into(),
+            user_id: "222".into(),
+            username: "Zen".into(),
+            token: "c2VhbGVk".into(),
+            connected_ms: 10,
+        };
+        store::put(&st.npcs.substrate(), npc_id, &bot).unwrap();
+        let shared = st.npcs.substrate();
+        for (kind, status, world) in [
+            (BotStateKind::Online, "online", Some("life")),
+            (BotStateKind::Refused, "refused", None),
+        ] {
+            state::put(
+                &shared,
+                npc_id,
+                &BotState {
+                    state: kind,
+                    since_ms: 20,
+                    world: "life".into(),
+                    connected_ms: 10,
+                },
+            )
+            .unwrap();
+            let (_, v, _) = call(router(st.clone()), request("GET", &path, OWNER, None)).await;
+            assert_eq!(v["status"], status);
+            assert_eq!(v["world"].as_str(), world);
+        }
+        state::remove(&shared, npc_id).unwrap();
+        let (_, v, _) = call(router(st.clone()), request("GET", &path, OWNER, None)).await;
+        assert_eq!(v["status"], "offline");
     }
 
     /// **A bot already named as its character, of a character with no

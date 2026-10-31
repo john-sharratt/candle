@@ -586,7 +586,7 @@ async fn a_person_can_message_a_character_and_it_is_told() {
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
 
     let sent = rt
-        .message_npc(1, "Wren S", "that the third era will not reconcile")
+        .message_npc(1, "Wren S", "that the third era will not reconcile", None)
         .expect("the character has a body");
     assert_eq!(sent.with, "Maker-01");
     assert!(
@@ -612,7 +612,7 @@ async fn a_character_answers_a_person_on_the_same_thread() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
-    rt.message_npc(1, "Wren S", "that the third era will not reconcile");
+    rt.message_npc(1, "Wren S", "that the third era will not reconcile", None);
     moment(&rt);
 
     // The character answers with the ordinary act, naming the thread the way it
@@ -643,7 +643,7 @@ async fn messaging_a_character_puts_the_person_within_its_reach() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
-    rt.message_npc(1, "Wren S", "anything");
+    rt.message_npc(1, "Wren S", "anything", None);
 
     let within = rt.within(1);
     assert!(
@@ -659,7 +659,9 @@ async fn messaging_a_character_puts_the_person_within_its_reach() {
 async fn a_character_with_no_handset_says_it_cannot_answer() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
-    let sent = rt.message_npc(1, "Wren S", "anything").expect("has a body");
+    let sent = rt
+        .message_npc(1, "Wren S", "anything", None)
+        .expect("has a body");
     assert!(!sent.can_reply);
 }
 
@@ -667,7 +669,7 @@ async fn a_character_with_no_handset_says_it_cannot_answer() {
 #[tokio::test]
 async fn messaging_a_character_with_no_body_reaches_nothing() {
     let rt = daemon();
-    assert!(rt.message_npc(404, "Wren S", "anything").is_none());
+    assert!(rt.message_npc(404, "Wren S", "anything", None).is_none());
     assert!(rt.messages_with(404, "Wren S").is_none());
 }
 

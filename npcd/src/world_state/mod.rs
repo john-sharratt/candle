@@ -13,7 +13,7 @@
 //! |---|---|
 //! | [`keys`] | where the records live |
 //! | [`split`] | a facet taken apart into one record per entity, and back |
-//! | [`snapshot`] | a hosted world as records |
+//! | [`snapshot`] | a hosted world's map and sim as records |
 //! | [`apply`] | records put into a hosted world |
 //! | [`diff`] | what a beat changed |
 //! | [`store`] | the records in the substrate |
@@ -31,11 +31,16 @@ pub use apply::{apply, place_of, sim_of};
 pub use diff::{diff, Changes};
 pub use snapshot::{sim_records, world_records, Records};
 
+use crate::discord::dm::record::Dms;
 use crate::world::Hosted;
 
-/// A hosted world's records as they stand now.
+/// A hosted world's records as they stand now: its map's, its [`Sim`]'s, and
+/// its bots' DMs (`docs/npcd_discord.md` §4.2).
+///
+/// [`Sim`]: crate::sim::Sim
 pub fn records_of(hosted: &Hosted) -> Records {
     let mut records = hosted.read(world_records);
     records.extend(hosted.sim(sim_records));
+    records.extend(hosted.dms(Dms::records));
     records
 }

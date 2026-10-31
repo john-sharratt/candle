@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, mpsc, watch, Notify, OwnedSemaphorePermit, Semaphor
 use tokio::task::JoinHandle;
 
 use super::answering::Answering;
+use super::busy_warnings::BusyWarnings;
 use super::catchup::{Progress, Purpose, Requester, FETCH_WINDOW};
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
@@ -32,7 +33,7 @@ use super::store::Store;
 use super::tick::{ADMISSION_QUIET_LIMIT, QUIET};
 use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
-use crate::consensus::{Config, Millis, Paxos};
+use crate::consensus::{Config, LeaseRow, Millis, Paxos, WallMillis};
 use crate::coord::{AppCoord, CommandLine};
 use crate::delivery::Outbox;
 use crate::fragment::Whole;
@@ -364,6 +365,9 @@ pub struct ReplicationView {
     /// count) overwrote the `catchups` list above.
     pub stats: Stats,
     pub quorum: QuorumView,
+    /// Every lease this member's acceptor counts as armed, in key order: what
+    /// another member asking for one of these keys is refused by.
+    pub leases: Vec<LeaseRow>,
 }
 
 /// The group's size as this member counts it, and a downgrade under way
@@ -388,7 +392,7 @@ impl Replication {
     pub fn open(store: Arc<dyn Store>, votes: Box<dyn VoteStore>) -> io::Result<Replication> {
         let node = store.node();
         Ok(Replication {
-            paxos: Paxos::open(Config::new(node), votes, Millis(0), node)?,
+            paxos: Paxos::open(Config::new(node), votes, Millis(0), WallMillis::now(), node)?,
             store,
         })
     }
@@ -417,6 +421,8 @@ pub struct Replicator {
     /// The sender, receiver and ticker, ended by [`Self::shutdown`].
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(super) paxos: Mutex<Paxos<Box<dyn VoteStore>>>,
+    /// Which upgrade-lease refusals have been logged (`dispatch`).
+    pub(super) busy_warnings: Mutex<BusyWarnings>,
     epoch: Instant,
     pub(super) member: Weak<AppMember>,
     /// The maintenance commands run lately, for `COORD` (§12.4).
@@ -506,6 +512,7 @@ impl Replicator {
             applied_upto: watch::channel(0).0,
             tasks: Mutex::new(Vec::new()),
             paxos: Mutex::new(paxos),
+            busy_warnings: Mutex::new(BusyWarnings::default()),
             epoch,
             member,
             commands: Mutex::new(VecDeque::new()),
@@ -531,6 +538,11 @@ impl Replicator {
     /// The consensus clock: milliseconds since this replicator started.
     pub(super) fn now(&self) -> Millis {
         Millis(self.epoch.elapsed().as_millis() as u64)
+    }
+
+    /// The wall clock, which the acceptor records a lease's end by.
+    pub(super) fn wall(&self) -> WallMillis {
+        WallMillis::now()
     }
 
     pub fn node(&self) -> u64 {
@@ -752,6 +764,11 @@ impl Replicator {
 
     pub fn view(&self) -> ReplicationView {
         let ready = self.ready_members();
+        let leases = {
+            let now = self.now();
+            let p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
+            p.armed_leases(now).iter().map(LeaseRow::of).collect()
+        };
         let s = self.state();
         let (unsent, in_flight) = s.outbox.counts();
         ReplicationView {
@@ -768,6 +785,7 @@ impl Replicator {
                 ready,
                 downgrade: s.governor.view(Instant::now()),
             },
+            leases,
         }
     }
 

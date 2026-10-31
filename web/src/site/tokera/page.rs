@@ -245,7 +245,7 @@ fn doc_open(m: &Meta) -> String {
 <meta name="twitter:title" content="{title}">
 <meta name="twitter:description" content="{description}">
 <meta name="twitter:image" content="{image}">
-<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="icon" type="image/png" href="/brand/zen.png">
 <link rel="alternate" type="application/rss+xml" title="Tokera — the blog" href="/blog/feed.xml">
 <link rel="stylesheet" href="/base.css">
 <link rel="stylesheet" href="/lib/estate.css">

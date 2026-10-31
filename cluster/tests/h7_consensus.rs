@@ -20,8 +20,17 @@ use cpu_time::ThreadTime;
 
 use cluster::consensus::rendezvous::score;
 use cluster::consensus::votes::MemoryVotes;
-use cluster::consensus::{Config, Millis, Out, Paxos};
+use cluster::consensus::{Config, Millis, Out, Paxos, WallMillis};
 use cluster::frame::Frame;
+
+/// The wall clock when virtual time starts: 2026-10-26. Virtual time runs on
+/// both clocks alike, so a restarted member re-arms each lease it accepted for
+/// exactly what is left of it.
+const T0: u64 = 1_793_000_000_000;
+
+fn wall(at: u64) -> WallMillis {
+    WallMillis(T0 + at)
+}
 
 /// SplitMix64: the simulation draws several numbers per frame, and a
 /// generator this small is inlined and optimised with the harness, where a
@@ -130,6 +139,7 @@ impl Sim {
             Config::new(i as u64 + 1),
             store.clone(),
             Millis(now),
+            wall(now),
             1000 + i as u64 + now,
         )
         .unwrap();
@@ -260,7 +270,9 @@ impl Sim {
                 continue;
             }
             self.now = at;
-            let outs = self.members[to].handle(&frame, Millis(at)).unwrap();
+            let outs = self.members[to]
+                .handle(&frame, Millis(at), wall(at))
+                .unwrap();
             self.route(to, outs);
         }
         self.now = t;
@@ -268,7 +280,9 @@ impl Sim {
 
     fn tick(&mut self) {
         for i in 0..MEMBERS {
-            let outs = self.members[i].tick(Millis(self.now)).unwrap();
+            let outs = self.members[i]
+                .tick(Millis(self.now), wall(self.now))
+                .unwrap();
             if self.reachable(i) {
                 self.route(i, outs);
             } else {
@@ -317,7 +331,9 @@ impl Sim {
                 .iter()
                 .any(|(h, u)| *h == m && *u > self.now + RENEW_UNDER.as_millis() as u64);
             if !held_long && !self.members[m].proposing(&key) {
-                let outs = self.members[m].acquire(&key, TTL, now).unwrap();
+                let outs = self.members[m]
+                    .acquire(&key, TTL, now, wall(self.now))
+                    .unwrap();
                 self.route(m, outs);
             }
         }
@@ -434,7 +450,7 @@ fn h7_consensus() {
                 let w = sim.rng.below(0, WORLDS as u64) as usize;
                 if sim.reachable(m) && !sim.members[m].proposing(&world(w)) {
                     let outs = sim.members[m]
-                        .acquire(&world(w), TTL, Millis(sim.now))
+                        .acquire(&world(w), TTL, Millis(sim.now), wall(sim.now))
                         .unwrap();
                     sim.route(m, outs);
                 }
@@ -445,7 +461,7 @@ fn h7_consensus() {
                 if sim.reachable(m) {
                     let value = format!("from {m}").into_bytes();
                     let outs = sim.members[m]
-                        .decide(&gen_key(d), value, Millis(sim.now))
+                        .decide(&gen_key(d), value, Millis(sim.now), wall(sim.now))
                         .unwrap();
                     sim.route(m, outs);
                 }
@@ -459,7 +475,12 @@ fn h7_consensus() {
             for d in 0..DECISIONS {
                 if !sim.decided.contains_key(&gen_key(d)) {
                     let outs = sim.members[0]
-                        .decide(&gen_key(d), b"late".to_vec(), Millis(sim.now))
+                        .decide(
+                            &gen_key(d),
+                            b"late".to_vec(),
+                            Millis(sim.now),
+                            wall(sim.now),
+                        )
                         .unwrap();
                     sim.route(0, outs);
                 }
