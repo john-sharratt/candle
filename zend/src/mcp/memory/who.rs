@@ -35,6 +35,13 @@ pub fn known(tree: &Tree, key: &str, email: &str) -> Result<(Who, Option<Op>), S
     }
 }
 
+/// Who `caller` is, read from the tree alone: a new account is already its
+/// person, and its bind is left to the first call that writes (§3.1).
+pub fn read(memory: &Memory, caller: &Caller) -> Result<Who, String> {
+    let tree = memory.tree()?;
+    Ok(known(&tree, &caller.key(), &caller.person.email)?.0)
+}
+
 /// Who `caller` is, binding their account first when it is new.
 ///
 /// Two calls of a new account arrive together — the aggregator reads the

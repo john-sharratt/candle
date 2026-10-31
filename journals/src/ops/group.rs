@@ -2,6 +2,8 @@
 //! are a person (§3.4). Every person in a group has their own journal in it,
 //! `people/<person>`, opened when they join.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::files::{
     Account, AccountKey, Email, GroupFile, Member, Meta, PersonFile, Role, Who, MAX_GROUPS,
@@ -203,7 +205,7 @@ pub fn create_group(
         group.clone(),
         Group {
             file: Ok(file),
-            root: skeleton(),
+            root: Arc::new(skeleton()),
             problems: Vec::new(),
         },
     );

@@ -44,7 +44,7 @@ pub use hub::{
 pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};
 pub use paxos_log::paxos_step;
-pub use queue::{Placing, Urgency, HOLD};
+pub use queue::{Placing, RouteAt, Urgency, HOLD};
 pub use registry::{MemberView, Pick, Registry};
 pub use status::{
     state_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,

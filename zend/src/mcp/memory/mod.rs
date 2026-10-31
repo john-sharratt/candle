@@ -11,10 +11,10 @@
 //! | [`context`] | `get_user_context`: the frame, within the client's budget |
 //!
 //! Reads answer from a published snapshot of the tree and never take the
-//! store, so a voice client's read never waits behind a push. Writes take the
-//! store, commit at once, and publish the new snapshot; a write made while the
-//! sync thread is pushing waits for the push. The thread keeps the store in
-//! step with origin every [`SYNC_EVERY`].
+//! store. Writes take the store, commit at once, and publish the new
+//! snapshot. The thread keeps the store in step with origin every
+//! [`SYNC_EVERY`], holding it only between the push and fetch, never across
+//! them (`journals::store::sync`), so no write waits on the network.
 
 pub mod context;
 pub mod conversations;
@@ -26,13 +26,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use journals::actor::{need_read, Actor};
 use journals::error::Error;
 use journals::ops::{Applied, Op};
 use journals::path::{JournalPath, HERE};
 use journals::scope::Section;
+use journals::store::sync::sync;
 use journals::store::{Store, StoreError};
 use journals::time::Stamp;
 use journals::tree::{Journal, Tree};
@@ -179,9 +180,10 @@ impl Memory {
         }
         loop {
             thread::sleep(SYNC_EVERY);
-            let mut guard = held(&self.store);
-            let Some(store) = guard.as_mut() else { return };
-            match store.sync() {
+            let Some(synced) = sync(&self.store) else {
+                return;
+            };
+            match synced {
                 Ok(synced) => {
                     for (subject, why) in &synced.dropped {
                         tracing::warn!(
@@ -194,7 +196,11 @@ impl Memory {
                         );
                     }
                     if synced.fetched || synced.replayed > 0 {
-                        self.publish(store.shared());
+                        // Under the store, so a write's newer tree is never
+                        // published over.
+                        if let Some(store) = held(&self.store).as_ref() {
+                            self.publish(store.shared());
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("journals: sync: {e}"),
@@ -204,6 +210,25 @@ impl Memory {
 
     fn publish(&self, tree: Arc<Tree>) {
         *self.tree.write().unwrap_or_else(|e| e.into_inner()) = tree;
+    }
+
+    /// Whether the memory opened, waiting up to `within` while it is still
+    /// being read: what decides whether this member declares the memory's
+    /// routes, so a member whose checkout could not be read never draws a
+    /// memory call, nor one still reading it.
+    pub fn opened_within(&self, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            match &*self.status.read().unwrap_or_else(|e| e.into_inner()) {
+                Status::Open => return true,
+                Status::Absent | Status::Failed(_) => return false,
+                Status::Opening => {}
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// This zend serves the memory: its agent holds the journal checkout, and

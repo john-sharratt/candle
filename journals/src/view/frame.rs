@@ -313,6 +313,13 @@ pub fn frame(
                     up = p.parent();
                 }
             }
+        } else if tree.get(at).is_none() && at.place().is_ok_and(Place::is_conversation) {
+            // A conversation nothing has written to yet: its journal opens at
+            // its first write, and reads as an empty one until then.
+            f.push(&format!(
+                "This conversation, {at} (here):\n  Focus: who is speaking and what it is \
+                 about are not known yet."
+            ));
         }
     }
     if let Some(fo) = focus {
@@ -614,6 +621,31 @@ mod tests {
             "open for a drive",
         );
         (t, today)
+    }
+
+    /// **A conversation nothing has written to reads as a just-opened one**:
+    /// its frame is the frame its journal would give, opened and empty.
+    #[test]
+    fn a_conversation_not_yet_opened_frames_as_an_empty_one() {
+        let (t, opened) = drive();
+        let begun = p("conversations/2026-10-30-0900-grok");
+        assert!(t.get(&begun).is_none());
+        for budget in [Budget::Chat, Budget::Voice] {
+            let open = frame(&t, &slug("zen"), Some(&opened), &[], budget, now());
+            let not_yet = frame(&t, &slug("zen"), Some(&begun), &[], budget, now());
+            // The group's index lists the journals there are, the opened one
+            // among them, the same in both.
+            let expected = open
+                .replace(
+                    "This conversation, @zen/conversations/2026-10-30-0800-grok",
+                    "This conversation, @zen/conversations/2026-10-30-0900-grok",
+                )
+                .replace(
+                    "This conversation is @zen/conversations/2026-10-30-0800-grok",
+                    "This conversation is @zen/conversations/2026-10-30-0900-grok",
+                );
+            assert_eq!(not_yet, expected, "{budget:?}");
+        }
     }
 
     /// **A voice names the group the frame is for**, as its `group.yaml`

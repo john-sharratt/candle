@@ -4,6 +4,7 @@
 //! | Module | |
 //! |---|---|
 //! | [`journal`] | one journal: metadata, window, archives, children, problems |
+//! | [`children`] | a journal's sub-journals, shared with earlier versions of the tree |
 //! | [`load`] | the files into a tree, every fault kept as a problem |
 //! | [`check`] | the rules a loaded tree is held to |
 //! | [`render`] | a tree, or one journal, back into files |
@@ -13,6 +14,7 @@
 
 pub mod accounts;
 pub mod check;
+pub mod children;
 pub mod fingerprint;
 pub mod journal;
 pub mod load;
@@ -21,6 +23,7 @@ pub mod render;
 pub mod window;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::{Error, Problem, Result};
 use crate::files::{GroupFile, PersonFile};
@@ -39,11 +42,13 @@ pub struct Person {
     pub problems: Vec<Problem>,
 }
 
-/// A group: its `group.yaml` (or why it cannot be read) and its tree.
+/// A group: its `group.yaml` (or why it cannot be read) and its tree, its
+/// master shared with earlier versions of the tree as every journal below
+/// it is ([`children`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
     pub file: Result<GroupFile, Problem>,
-    pub root: Journal,
+    pub root: Arc<Journal>,
     pub problems: Vec<Problem>,
 }
 
@@ -69,11 +74,15 @@ pub fn skeleton() -> Journal {
 
 impl Tree {
     pub fn root(&self, group: &Slug) -> Option<&Journal> {
-        self.groups.get(group).map(|g| &g.root)
+        self.groups.get(group).map(|g| &*g.root)
     }
 
+    /// `group`'s master, to change: copied first when an earlier tree still
+    /// shares it.
     pub fn root_mut(&mut self, group: &Slug) -> Option<&mut Journal> {
-        self.groups.get_mut(group).map(|g| &mut g.root)
+        self.groups
+            .get_mut(group)
+            .map(|g| Arc::make_mut(&mut g.root))
     }
 
     /// The journal at exactly `path`, references not followed.
@@ -227,7 +236,7 @@ mod tests {
             slug("zen"),
             Group {
                 file: Err(Problem::new("x", None, "unread")),
-                root,
+                root: Arc::new(root),
                 problems: vec![],
             },
         );
@@ -262,10 +271,8 @@ mod tests {
         );
         assert_eq!(reached(&["people", "yen"]).as_deref(), Some("@zen/people"));
         assert_eq!(tree.reached(&JournalPath::root(slug("nobody"))), None);
-        tree.groups
-            .get_mut(&slug("zen"))
+        tree.root_mut(&slug("zen"))
             .unwrap()
-            .root
             .children
             .get_mut(&slug("topics"))
             .unwrap()

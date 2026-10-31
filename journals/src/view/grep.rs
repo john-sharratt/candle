@@ -162,7 +162,7 @@ pub fn grep(
             }
         }
         for (period, lines) in &j.archives {
-            for l in lines {
+            for l in lines.iter() {
                 if holds(&l.text, &want) {
                     hits.push(Hit {
                         path: path.clone(),
@@ -226,6 +226,8 @@ pub fn render(hits: &[Hit], total: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::ops::fixture::{bot, guest, john, now, p, stranger, yen, zen};
     use crate::ops::fold::fold_child;
@@ -282,7 +284,7 @@ mod tests {
         let j = t.get_mut(&old).unwrap();
         j.archives.insert(
             Period::parse("2026-09-01").unwrap(),
-            vec![note("2026-09-01T10:00:00Z", "An old PERMIT.")],
+            Arc::new(vec![note("2026-09-01T10:00:00Z", "An old PERMIT.")]),
         );
         let topics = p("topics");
         fold_child(t.get_mut(&topics).unwrap(), &topics, &slug("old"), now()).unwrap();

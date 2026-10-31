@@ -108,12 +108,18 @@ impl Repo {
         spec: &FetchSpec,
     ) -> Result<Vec<RefUpdate>, GitError> {
         self.require_remote(remote)?;
-        let _write = self.write_lock();
+        let _transfer = self.transfer_lock();
         let scope = spec.scope(remote);
         let before = self.snapshot(&scope)?;
-        let mut inv = self
-            .git("fetch")
-            .args(["--quiet", "--no-tags", "--no-recurse-submodules"]);
+        // No auto-maintenance: a `gc --auto` or `pack-refs` run behind a fetch
+        // locks refs a local write — which no longer waits out a transfer —
+        // may be moving at the same moment.
+        let mut inv = self.git("fetch").args([
+            "--quiet",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+        ]);
         match spec {
             FetchSpec::AllBranches => inv = inv.arg("--prune"),
             // A branch the remote does not have is an unknown revision.

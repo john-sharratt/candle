@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 
 use crate::caller::Caller;
+use crate::context;
 use crate::sse::Reader;
 
 /// How long listing a backend's tools may take.
@@ -40,6 +41,20 @@ pub struct Backend {
     pub host: String,
     /// Its MCP server's path on that site.
     pub path: String,
+    /// The path its memory's calls go to, when it serves one: declared only
+    /// by the members that hold the memory.
+    pub memory: Option<String>,
+}
+
+impl Backend {
+    /// The path a call of `tool` with `args` goes to: the memory's, for a
+    /// call that reads or writes the memory, on a backend that serves one.
+    pub fn path_for(&self, tool: &str, args: &Value) -> &str {
+        match &self.memory {
+            Some(memory) if context::needs_memory(tool, args) => memory,
+            _ => &self.path,
+        }
+    }
 }
 
 /// The session a request is made on behalf of.
@@ -115,11 +130,13 @@ impl Link {
         })
     }
 
-    /// The request carrying `method` to `backend` as `caller`, on behalf of
-    /// `on`; asking for progress when `progress`.
+    /// The request carrying `method` to `backend`'s server at `path` as
+    /// `caller`, on behalf of `on`; asking for progress when `progress`.
+    #[allow(clippy::too_many_arguments)]
     pub fn request(
         &self,
         backend: &Backend,
+        path: &str,
         caller: &Caller,
         on: &OnBehalf,
         method: &str,
@@ -137,7 +154,7 @@ impl Link {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = self
             .client
-            .post(format!("{}{}", self.base, backend.path))
+            .post(format!("{}{path}", self.base))
             .header(header::HOST, &backend.host)
             .header(VERSION_HEADER, MODERN)
             .header(header::ACCEPT, "application/json, text/event-stream")
@@ -156,7 +173,15 @@ impl Link {
         on: &OnBehalf<'_>,
     ) -> Result<Vec<Value>, String> {
         let req = self
-            .request(backend, caller, on, "tools/list", json!({}), false)
+            .request(
+                backend,
+                &backend.path,
+                caller,
+                on,
+                "tools/list",
+                json!({}),
+                false,
+            )
             .timeout(LIST_TIMEOUT);
         let result = answer(backend, req, &|_| {}).await?;
         result
@@ -178,7 +203,8 @@ impl Link {
         step: &(dyn Fn(String) + Sync),
     ) -> Value {
         let params = json!({"name": name, "arguments": args});
-        let req = self.request(backend, caller, on, "tools/call", params, true);
+        let path = backend.path_for(name, args);
+        let req = self.request(backend, path, caller, on, "tools/call", params, true);
         match answer(backend, req, step).await {
             Ok(result) => result,
             Err(why) => text_result(&why, true),
@@ -414,6 +440,7 @@ mod tests {
             name: "npcd".into(),
             host: "bot.tokera.com".into(),
             path: "/v1/npc/mcp".into(),
+            memory: None,
         };
         let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
         let on = OnBehalf {
@@ -423,6 +450,7 @@ mod tests {
         let req = link
             .request(
                 &backend,
+                &backend.path,
                 &caller(),
                 &on,
                 "tools/call",
@@ -452,5 +480,32 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// **A memory call goes to the memory's path**, which only the members
+    /// holding the memory declare; every other call, and every call to a
+    /// backend with no memory, to the server's own.
+    #[test]
+    fn a_memory_call_goes_where_the_memory_is_served() {
+        let coding = Backend {
+            name: "coding".into(),
+            host: "code.tokera.com".into(),
+            path: "/v1/mcp".into(),
+            memory: Some("/v1/mcp/memory".into()),
+        };
+        let none = json!({});
+        let memory = json!({"journal": "people/yen"});
+        let thread = json!({"journal": "T:review"});
+        assert_eq!(coding.path_for("get_user_context", &none), "/v1/mcp/memory");
+        assert_eq!(coding.path_for("journal_note", &memory), "/v1/mcp/memory");
+        assert_eq!(coding.path_for("journal_read", &thread), "/v1/mcp");
+        for other in ["thread_attach", "repo_task_start", "cluster_status"] {
+            assert_eq!(coding.path_for(other, &none), "/v1/mcp", "{other}");
+        }
+        let bot = Backend {
+            memory: None,
+            ..coding
+        };
+        assert_eq!(bot.path_for("get_user_context", &none), "/v1/mcp");
     }
 }

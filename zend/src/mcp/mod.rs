@@ -30,6 +30,7 @@
 //! | [`ownership`] | Who may open a worker's conversation on zend's other routes |
 //! | [`records`] | The small records kept in the substrate |
 //! | [`state`] | Sessions as records, the attached thread, the change signal |
+//! | [`tending`] | The sessions' noted use written in, and the stale swept, off the request path |
 
 pub mod activity;
 pub mod archiving;
@@ -48,6 +49,10 @@ pub mod resuming;
 pub mod server;
 pub mod state;
 pub mod stops;
+pub mod tending;
 pub mod threads;
+
+#[cfg(test)]
+mod latency_tests;
 pub mod tools;
 pub mod workers;

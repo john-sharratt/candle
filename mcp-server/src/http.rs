@@ -15,7 +15,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
@@ -299,7 +299,7 @@ pub async fn post<S: Server>(
                 call.progress = Some(steps_tx);
                 stream_call(server, call, name, args, id, progress, steps, modern)
             } else {
-                let answer = S::call(&server, &call, &name, &args).await;
+                let answer = timed(&server, &call, &name, &args).await;
                 let result = server.result(&answer);
                 // Answered in the response itself, which nothing here can see
                 // fail; settled behind it, so the answer does not wait on it.
@@ -325,6 +325,21 @@ pub async fn post<S: Server>(
     }
 }
 
+/// `S::call`, its time logged: what the server itself spent on the call, so
+/// a caller in front of it — which times the call with its hops — can tell
+/// the two apart.
+async fn timed<S: Server>(server: &Arc<S>, call: &Call<S>, name: &str, args: &Value) -> S::Answer {
+    let started = Instant::now();
+    let answer = S::call(server, call, name, args).await;
+    tracing::info!(
+        server = %server.identity().name,
+        tool = name,
+        us = started.elapsed().as_micros() as u64,
+        "mcp: handled"
+    );
+    answer
+}
+
 /// Run a `tools/call` on an event stream: progress while it runs, then the
 /// result, which ends the stream. Each step the tool says on `steps` is a
 /// progress notification of its own, and a quiet [`PROGRESS_EVERY`] repeats
@@ -346,7 +361,7 @@ fn stream_call<S: Server>(
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
     tokio::spawn(async move {
-        let running = S::call(&server, &call, &name, &args);
+        let running = timed(&server, &call, &name, &args);
         tokio::pin!(running);
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.tick().await;

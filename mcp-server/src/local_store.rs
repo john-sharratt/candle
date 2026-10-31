@@ -114,15 +114,21 @@ impl Store for LocalStore {
         })
     }
 
-    fn hold(&self, id: &str, key: &str, value: &str, now: u64) -> anyhow::Result<()> {
-        self.change(|held| match held.get_mut(id) {
-            Some(s) => {
-                s.held.insert(key.to_string(), value.to_string());
-                s.used_ms = now;
-                Ok(())
-            }
-            None => Err(anyhow::anyhow!("the session is gone; start again")),
-        })?
+    fn hold(
+        &self,
+        id: &str,
+        session: &Session,
+        key: &str,
+        value: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.change(|held| {
+            let s = held
+                .entry(id.to_string())
+                .or_insert_with(|| session.clone());
+            s.held.insert(key.to_string(), value.to_string());
+            s.used_ms = now;
+        })
     }
 
     fn close(&self, id: &str) -> anyhow::Result<()> {
@@ -145,13 +151,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = LocalStore::in_dir(dir.path()).unwrap();
         let id = s.open("o", Client::Other, "2025-11-25", 10).unwrap();
-        assert_eq!(s.get(&id, 11).unwrap().held("attached"), None);
-        s.hold(&id, "attached", "review", 12).unwrap();
+        let session = s.get(&id, 11).unwrap();
+        assert_eq!(session.held("attached"), None);
+        s.hold(&id, &session, "attached", "review", 12).unwrap();
         let again = LocalStore::in_dir(dir.path()).unwrap();
         assert_eq!(again.get(&id, 13).unwrap().held("attached"), Some("review"));
         again.close(&id).unwrap();
         assert!(again.get(&id, 14).is_none());
-        assert!(again.hold(&id, "attached", "x", 15).is_err());
     }
 
     #[test]
@@ -166,9 +172,10 @@ mod tests {
     fn a_stateless_clients_session_outlives_its_tokens() {
         let s = LocalStore::in_memory();
         let id = stateless_key("o", Client::ClaudeCode, None);
-        s.ensure(&id, "o", Client::ClaudeCode, "2026-07-28", 10)
+        let session = s
+            .ensure(&id, "o", Client::ClaudeCode, "2026-07-28", 10)
             .unwrap();
-        s.hold(&id, "attached", "review", 11).unwrap();
+        s.hold(&id, &session, "attached", "review", 11).unwrap();
         let again = s
             .ensure(&id, "o", Client::ClaudeCode, "2026-07-28", 12)
             .unwrap();
@@ -190,9 +197,10 @@ mod tests {
                 })
             })
             .collect();
-        s.ensure(&id, "o", Client::ClaudeCode, "2026-07-28", 10)
+        let session = s
+            .ensure(&id, "o", Client::ClaudeCode, "2026-07-28", 10)
             .unwrap();
-        s.hold(&id, "attached", "review", 11).unwrap();
+        s.hold(&id, &session, "attached", "review", 11).unwrap();
         for r in racers {
             r.join().unwrap();
         }

@@ -14,6 +14,13 @@ pub enum Change {
         content: Vec<u8>,
         mode: Option<FileMode>,
     },
+    /// The blob's contents exactly as committed: content the caller built in
+    /// its canonical form, never a file read from a working tree, so no
+    /// filter applies and it is written in process, with no `git` run.
+    Blob {
+        content: Vec<u8>,
+        mode: Option<FileMode>,
+    },
     Delete,
 }
 
@@ -54,15 +61,36 @@ impl ChangeSet {
         mode: Option<FileMode>,
     ) -> Result<(), GitError> {
         Self::check(&path)?;
-        if let Some(mode) = mode {
-            if !matches!(mode, FileMode::Regular | FileMode::Executable) {
-                return Err(GitError::invalid(format!(
+        Self::file_mode(&path, mode)?;
+        self.changes.insert(path, Change::Write { content, mode });
+        Ok(())
+    }
+
+    /// A file is written `Regular` or `Executable`, or with its base's mode.
+    fn file_mode(path: &RepoPath, mode: Option<FileMode>) -> Result<(), GitError> {
+        match mode {
+            Some(mode) if !matches!(mode, FileMode::Regular | FileMode::Executable) => {
+                Err(GitError::invalid(format!(
                     "{path}: a file cannot be written with mode {}",
                     mode.as_str()
-                )));
+                )))
             }
+            _ => Ok(()),
         }
-        self.changes.insert(path, Change::Write { content, mode });
+    }
+
+    /// Set `path`'s blob to `content` exactly ([`Change::Blob`]): for content
+    /// a program built — a record it renders itself, never a file a person
+    /// edited in a checkout — whose committed bytes are the bytes given.
+    pub fn write_blob(
+        &mut self,
+        path: RepoPath,
+        content: Vec<u8>,
+        mode: Option<FileMode>,
+    ) -> Result<(), GitError> {
+        Self::check(&path)?;
+        Self::file_mode(&path, mode)?;
+        self.changes.insert(path, Change::Blob { content, mode });
         Ok(())
     }
 

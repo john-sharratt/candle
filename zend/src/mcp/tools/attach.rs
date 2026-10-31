@@ -53,7 +53,10 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(created) => created,
         Err(e) => return Answer::error(e.to_string()),
     };
-    if let Err(e) = ctx.store.hold(&ctx.mcp_id, ATTACHED, thread, now_ms()) {
+    if let Err(e) = ctx
+        .store
+        .hold(&ctx.mcp_id, &ctx.mcp, ATTACHED, thread, now_ms())
+    {
         return Answer::error(e.to_string());
     }
     let notes = threads::notes(&records, &owner, thread);

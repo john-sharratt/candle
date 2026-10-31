@@ -2,6 +2,8 @@
 //! window or archive, and so frames, summaries at their next rebuild, and
 //! grep. The commit that removes it keeps it in history, forever.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::line::Line;
 use crate::ops::{Applied, Which};
@@ -52,7 +54,7 @@ pub fn forget(tree: &mut Tree, path: &JournalPath, which: &Which) -> Result<Appl
             j.window.remove(i);
         }
         Held::Archive(period, i) => {
-            let lines = j.archives.get_mut(&period).expect("just found");
+            let lines = Arc::make_mut(j.archives.get_mut(&period).expect("just found"));
             lines.remove(i);
             if lines.is_empty() {
                 j.archives.remove(&period);
@@ -178,7 +180,7 @@ mod tests {
         t.get_mut(&path)
             .unwrap()
             .archives
-            .insert(period, vec![old.clone()]);
+            .insert(period, Arc::new(vec![old.clone()]));
         apply(
             &mut t,
             &john(),

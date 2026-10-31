@@ -71,7 +71,14 @@ impl Store for SealedStore {
         Ok(Session::new(owner, client, protocol, now))
     }
 
-    fn hold(&self, _id: &str, key: &str, _value: &str, _now: u64) -> anyhow::Result<()> {
+    fn hold(
+        &self,
+        _id: &str,
+        _session: &Session,
+        key: &str,
+        _value: &str,
+        _now: u64,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("this server holds nothing on a session, so `{key}` cannot be kept")
     }
 
@@ -115,6 +122,7 @@ mod tests {
         assert_eq!(SealedStore.get("abc", 0), None);
         assert_eq!(SealedStore.get("abc-zz", 0), None);
         assert_eq!(SealedStore.get("abc-7b7d", 0), None);
-        assert!(SealedStore.hold("x", "attached", "t", 0).is_err());
+        let s = Session::new("o", Client::Other, "2026-07-28", 0);
+        assert!(SealedStore.hold("x", &s, "attached", "t", 0).is_err());
     }
 }

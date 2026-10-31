@@ -22,6 +22,7 @@ use handover::Handover;
 
 pub use cards::{CardKey, CardLoad, Cards, Fences, HOSTING_APP, LATENCY_APP};
 pub use member::{MemberView, PeerAsk, SYNC_SLACK};
+pub use pick::is_errand;
 
 #[cfg(test)]
 use super::agents::{Choice, Need};
@@ -345,6 +346,21 @@ impl Registry {
             .values()
             .filter(|m| m.ready())
             .find_map(|m| m.routes.as_ref())
+    }
+
+    /// The table a request for `method` on `path` is matched in: a ready
+    /// member's that declares a route answering it — tables differ while a
+    /// build that adds a route rolls out, and where a member declares a route
+    /// only while it holds what the route needs — else [`Self::table`].
+    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<&RouteTable> {
+        self.apps
+            .get(app)?
+            .members
+            .values()
+            .filter(|m| m.ready())
+            .filter_map(|m| m.routes.as_ref())
+            .find(|t| t.lookup(method, path).is_some())
+            .or_else(|| self.table(app))
     }
 }
 

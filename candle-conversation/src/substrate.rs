@@ -42,6 +42,8 @@
 
 pub mod calibration_record;
 mod compacted;
+#[cfg(test)]
+mod custom_object_tests;
 mod deleted_set;
 mod dominance;
 mod ended_sections;
@@ -438,6 +440,10 @@ pub struct Substrate {
     /// old one (last-writer-wins). Held in RAM and re-emitted on compaction, the
     /// same survival the other resident metadata gets.
     custom_objects: PMap<u64, Arc<CustomObjectPayload>>,
+    /// Every key [`Self::custom_objects`] holds, in key order, to its hash: a
+    /// prefix is read as a range of it ([`Self::custom_objects_under`]), never
+    /// by walking every object.
+    custom_object_keys: POrdMap<String, u64>,
     /// Moves whenever a custom object is taken or dropped
     /// ([`Self::custom_objects_version`]).
     custom_objects_version: u64,
@@ -4930,6 +4936,9 @@ impl Substrate {
     pub fn apply_custom_object(&mut self, obj: CustomObjectPayload, id: RecordIdentity) {
         let key = obj.stream_id();
         if take(self.custom_object_ids.entry(key).or_default(), id) {
+            if !self.custom_object_keys.contains_key(&obj.key) {
+                self.custom_object_keys.insert(obj.key.clone(), key);
+            }
             self.custom_objects.insert(key, Arc::new(obj));
             self.custom_objects_version += 1;
         }
@@ -4974,14 +4983,35 @@ impl Substrate {
     /// Every live custom object whose key starts with `prefix`, with the
     /// record behind it, in key order.
     pub fn custom_objects_under(&self, prefix: &str) -> Vec<(CustomObjectPayload, RecordIdentity)> {
-        let mut out: Vec<(CustomObjectPayload, RecordIdentity)> = self
-            .custom_objects
-            .iter()
-            .filter(|(_, obj)| !obj.ceased && obj.key.starts_with(prefix))
-            .map(|(key, obj)| ((**obj).clone(), self.custom_object_id(*key)))
-            .collect();
-        out.sort_by(|a, b| a.0.key.cmp(&b.0.key));
-        out
+        self.live_under(prefix)
+            .map(|(hash, obj)| (obj.clone(), self.custom_object_id(hash)))
+            .collect()
+    }
+
+    /// The live custom objects under `prefix`, in key order, as their key
+    /// hash and the object, without copying any: a range of the key index.
+    fn live_under<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = (u64, &'a CustomObjectPayload)> + 'a {
+        self.custom_object_keys
+            .range(prefix.to_string()..)
+            .take_while(move |(k, _)| k.starts_with(prefix))
+            .filter_map(|(_, hash)| {
+                let obj = self.custom_objects.get(hash)?;
+                (!obj.ceased).then_some((*hash, &**obj))
+            })
+    }
+
+    /// How many live custom objects' keys start with `prefix`.
+    pub fn custom_objects_count_under(&self, prefix: &str) -> usize {
+        self.live_under(prefix).count()
+    }
+
+    /// The live custom object under `prefix` whose key sorts last: only it is
+    /// copied.
+    pub fn custom_object_last_under(&self, prefix: &str) -> Option<CustomObjectPayload> {
+        self.live_under(prefix).last().map(|(_, obj)| obj.clone())
     }
 
     /// A count that moves whenever a custom object is taken: what a reader of
@@ -5076,7 +5106,13 @@ impl Substrate {
             self.transient_timelines.remove(tl);
         }
         for key in &expired.keys {
-            if self.custom_objects.get(key).is_some_and(|obj| obj.ceased) {
+            let ceased = self
+                .custom_objects
+                .get(key)
+                .filter(|obj| obj.ceased)
+                .map(|obj| obj.key.clone());
+            if let Some(name) = ceased {
+                self.custom_object_keys.remove(&name);
                 self.custom_objects.remove(key);
                 self.custom_object_ids.remove(key);
                 self.custom_objects_version += 1;

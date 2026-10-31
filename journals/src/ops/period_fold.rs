@@ -3,6 +3,7 @@
 //! takes their place at the period's last moment.
 
 use std::mem;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::files::{in_order, Fingerprint};
@@ -87,7 +88,7 @@ pub fn fold_period(
         .into_iter()
         .partition(|l| want.binary_search(&l.id).is_ok());
     let at = moved.iter().map(|l| l.at).max().expect("not empty");
-    let held = j.archives.entry(period).or_default();
+    let held = Arc::make_mut(j.archives.entry(period).or_default());
     held.extend(moved);
     in_order(held);
     j.window = kept;

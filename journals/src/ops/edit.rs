@@ -32,6 +32,8 @@ pub fn edit(tree: &mut Tree, address: &Address, text: &str) -> Result<Applied> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::line::{Folds, LineId};
     use crate::ops::fixture::{john, now, p, zen};
@@ -101,7 +103,7 @@ mod tests {
         t.get_mut(&path)
             .unwrap()
             .archives
-            .insert(period, vec![line.clone()]);
+            .insert(period, Arc::new(vec![line.clone()]));
         apply(
             &mut t,
             &john(),

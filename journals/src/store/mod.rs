@@ -13,10 +13,12 @@
 //! | [`read`] | a commit's files, as objects |
 //! | [`diff`] | the files an operation changes |
 //! | [`message`] | a commit's subject, trailers, and the operation it carries |
+//! | [`sync`] | the push and fetch, run with the store free for writes |
 
 pub mod diff;
 pub mod message;
 pub mod read;
+pub mod sync;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,9 +26,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use zend_vfs::{
-    BranchName, ChangeSet, FetchSpec, GitError, GitTime, Lease, LogRange, Oid, PushOutcome,
-    PushSpec, RefName, RefOp, RefTransaction, Rejection, RemoteName, Repo, RepoPath, Rev,
-    Signature, ORIGIN,
+    BranchName, ChangeSet, FetchSpec, GitError, GitTime, LogRange, Oid, RefName, RefOp,
+    RefTransaction, RemoteName, Repo, RepoPath, Rev, Signature, ORIGIN,
 };
 
 use crate::actor::Actor;
@@ -34,7 +35,7 @@ use crate::error::Error;
 use crate::line::LineId;
 use crate::ops::remap::remap;
 use crate::ops::{applied_to, Applied, Op};
-use crate::store::diff::{apply_changes, changes};
+use crate::store::diff::{apply_changes, changes, Changes};
 use crate::store::message::{message, read};
 use crate::store::read::files_at;
 use crate::time::Stamp;
@@ -84,7 +85,8 @@ pub struct Synced {
 }
 
 pub struct Store {
-    repo: Repo,
+    /// Shared with a sync's push and fetch, which run without the store.
+    repo: Arc<Repo>,
     branch: BranchName,
     remote: RemoteName,
     /// The service's head: what [`JOURNAL_REF`] holds.
@@ -130,7 +132,7 @@ impl Store {
             tree: Arc::default(),
             head: origin_at.clone(),
             origin_at,
-            repo,
+            repo: Arc::new(repo),
             branch,
             remote,
         };
@@ -192,7 +194,7 @@ impl Store {
     /// Nothing held here changes unless the commit and the ref move both do.
     pub fn write(&mut self, actor: &Actor, op: &Op, now: Stamp) -> Result<Applied, StoreError> {
         let (next, applied) = applied_to(&self.tree, actor, op, now, None)?;
-        let (new, files) = self.commit(&self.head, &self.files, &next, &applied, actor, op, now)?;
+        let (new, ch) = self.commit(&self.head, &self.files, &next, &applied, actor, op, now)?;
         let txn = RefTransaction::new().push(RefOp::Update {
             name: journal_ref(),
             new: new.clone(),
@@ -200,13 +202,14 @@ impl Store {
         });
         self.repo.update_refs(&txn)?;
         self.head = new;
-        self.files = files;
+        apply_changes(&mut self.files, &ch);
         self.tree = Arc::new(next);
         Ok(applied)
     }
 
     /// The commit of `applied` onto `base`, whose files are `before`; and
-    /// the new commit's files.
+    /// the changes it made to them, for the caller to take in once the
+    /// commit stands — the files are never copied whole.
     #[allow(clippy::too_many_arguments)]
     fn commit(
         &self,
@@ -217,16 +220,18 @@ impl Store {
         actor: &Actor,
         op: &Op,
         now: Stamp,
-    ) -> Result<(Oid, BTreeMap<String, Vec<u8>>), StoreError> {
+    ) -> Result<(Oid, Changes), StoreError> {
         let ch = changes(before, after, applied);
         if ch.is_empty() {
             return Err(Error::refused("that changes nothing").into());
         }
+        // The files are rendered here in their committed form, so each is
+        // stored as given: no filter, and no `git` run per file.
         let mut set = ChangeSet::new();
         for (path, change) in &ch {
             let path = RepoPath::parse(path)?;
             match change {
-                Some(bytes) => set.write(path, bytes.clone(), None)?,
+                Some(bytes) => set.write_blob(path, bytes.clone(), None)?,
                 None => set.delete(path)?,
             }
         }
@@ -242,83 +247,14 @@ impl Store {
         let new = self
             .repo
             .commit_changes(base, &set, &msg, &author, &committer)?;
-        let mut files = before.clone();
-        apply_changes(&mut files, &ch);
-        Ok((new, files))
+        Ok((new, ch))
     }
 
     /// Push what origin lacks, fetch what it has, and replay the service's
-    /// commits onto it when it moved first.
+    /// commits onto it when it moved first: [`sync::sync`] on a store held
+    /// by its caller alone.
     pub fn sync(&mut self) -> Result<Synced, StoreError> {
-        let mut done = Synced::default();
-        for _ in 0..PUSH_TRIES {
-            if self.unpushed() {
-                let spec = PushSpec::branch(
-                    self.head.clone(),
-                    self.branch.clone(),
-                    Lease::Expect(self.origin_at.clone()),
-                );
-                let results = self.repo.push(&self.remote, &[spec])?;
-                let outcome = results.first().map(|r| r.outcome.clone());
-                match outcome {
-                    Some(PushOutcome::Rejected(Rejection::Stale))
-                    | Some(PushOutcome::Rejected(Rejection::AtomicAborted)) => {}
-                    Some(PushOutcome::Rejected(other)) => {
-                        return Err(StoreError::Repository(format!(
-                            "origin refused the push: {other:?}"
-                        )))
-                    }
-                    Some(_) => {
-                        done.pushed += self.count_between(&self.origin_at, &self.head)?;
-                        self.origin_at = self.head.clone();
-                    }
-                    None => return Err(StoreError::Repository("the push reported nothing".into())),
-                }
-            }
-            self.repo
-                .fetch(&self.remote, &FetchSpec::Branch(self.branch.clone()))?;
-            let theirs = self
-                .repo
-                .ref_target(&self.remote.tracking(&self.branch))?
-                .ok_or_else(|| {
-                    StoreError::Repository(format!("{}/{} is gone", self.remote, self.branch))
-                })?;
-            if theirs == self.origin_at {
-                done.settled = !self.unpushed();
-                if done.settled {
-                    return Ok(done);
-                }
-                continue;
-            }
-            done.fetched = true;
-            if !self.unpushed() {
-                // Nothing of ours is waiting: take origin as it is.
-                let files = files_at(&self.repo, &theirs)?;
-                let txn = RefTransaction::new().push(RefOp::Update {
-                    name: journal_ref(),
-                    new: theirs.clone(),
-                    old: self.head.clone(),
-                });
-                self.repo.update_refs(&txn)?;
-                self.tree = Arc::new(load(&files));
-                self.files = files;
-                self.head = theirs.clone();
-                self.origin_at = theirs;
-                done.settled = true;
-                return Ok(done);
-            }
-            let r = self.replay_onto(theirs)?;
-            done.replayed += r.replayed;
-            done.dropped.extend(r.dropped);
-            done.renamed.extend(r.renamed);
-        }
-        // What was replayed and dropped on the way is reported all the same:
-        // the head no longer holds the dropped writes, and nothing later will
-        // say so again.
-        tracing::warn!(
-            "journals: origin kept moving through {PUSH_TRIES} pushes; the next sync goes on"
-        );
-        Ok(done)
+        sync::sync(self).expect("a store held by its caller is always lent")
     }
 
     fn count_between(&self, from: &Oid, to: &Oid) -> Result<usize, StoreError> {
@@ -360,7 +296,7 @@ impl Store {
                 Ok((next, applied)) => match self
                     .commit(&base, &files, &next, &applied, &rec.actor, &rec.op, rec.at)
                 {
-                    Ok((new, new_files)) => {
+                    Ok((new, ch)) => {
                         // Only a write of a new line mints an id; an edit or a
                         // forget names one that is already there.
                         let mints = matches!(
@@ -374,7 +310,7 @@ impl Store {
                             }
                         }
                         base = new;
-                        files = new_files;
+                        apply_changes(&mut files, &ch);
                         tree = next;
                         done.replayed += 1;
                     }

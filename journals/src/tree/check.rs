@@ -314,7 +314,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
     let places = iter::once((String::new(), &j.window)).chain(
         j.archives
             .iter()
-            .map(|(p, lines)| (format!("{ARCHIVE_DIR}/{p}/"), lines)),
+            .map(|(p, lines)| (format!("{ARCHIVE_DIR}/{p}/"), &**lines)),
     );
     for (dir, lines) in places {
         for line in lines {
@@ -333,7 +333,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
         }
     }
     for (period, lines) in &j.archives {
-        for line in lines {
+        for line in lines.iter() {
             if !period.holds(line.unit()) || line.level() >= period.level() {
                 found.push(Problem::new(
                     format!("{folder}/{ARCHIVE_DIR}/{period}/{}", entry_file(&line.id)),

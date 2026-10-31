@@ -84,6 +84,11 @@ pub struct BackendConfig {
     pub name: String,
     pub host: String,
     pub path: String,
+    /// The path its memory's calls go to, when it serves a memory: the same
+    /// server, declared only by the members that hold the memory, so the
+    /// gateway sends those calls only to one of them.
+    #[serde(default)]
+    pub memory: Option<String>,
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
@@ -143,12 +148,14 @@ mod tests {
                 BackendConfig {
                     name: "coding".into(),
                     host: "code.tokera.com".into(),
-                    path: "/v1/mcp".into()
+                    path: "/v1/mcp".into(),
+                    memory: Some("/v1/mcp/memory".into()),
                 },
                 BackendConfig {
                     name: "bot".into(),
                     host: "bot.tokera.com".into(),
-                    path: "/v1/npc/mcp".into()
+                    path: "/v1/npc/mcp".into(),
+                    memory: None,
                 }
             ]
         );

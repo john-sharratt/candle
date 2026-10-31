@@ -268,7 +268,7 @@ impl Repo {
             )));
         }
         self.require_remote(remote)?;
-        let _write = self.write_lock();
+        let _transfer = self.transfer_lock();
         let mut inv = self.git("push").args([
             "--porcelain",
             "--atomic",

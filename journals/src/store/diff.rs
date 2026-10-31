@@ -31,7 +31,14 @@ pub fn changes(before: &BTreeMap<String, Vec<u8>>, after: &Tree, applied: &Appli
     let mut out = Changes::new();
     for path in &applied.touched {
         let folder = path.folder();
-        for file in before.keys().filter(|f| is_own(&folder, f)) {
+        // Only the files under the journal's folder are read, never the rest.
+        let under = format!("{folder}/");
+        for file in before
+            .range(under.clone()..)
+            .map(|(f, _)| f)
+            .take_while(|f| f.starts_with(&under))
+            .filter(|f| is_own(&folder, f))
+        {
             out.insert(file.clone(), None);
         }
         if let Some(j) = after.get(path) {
@@ -73,6 +80,8 @@ pub fn apply_changes(files: &mut BTreeMap<String, Vec<u8>>, changes: &Changes) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::actor::Actor;
     use crate::files::Role;
@@ -233,10 +242,10 @@ mod tests {
     fn an_archived_edit_writes_its_file() {
         let mut t = zen();
         let line = note("2026-09-01T10:00:00Z", "an old one");
-        t.get_mut(&p("topics"))
-            .unwrap()
-            .archives
-            .insert(Period::parse("2026-09-01").unwrap(), vec![line.clone()]);
+        t.get_mut(&p("topics")).unwrap().archives.insert(
+            Period::parse("2026-09-01").unwrap(),
+            Arc::new(vec![line.clone()]),
+        );
         let ch = holds(
             &t,
             &Op::Edit {

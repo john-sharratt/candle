@@ -473,6 +473,16 @@ impl SharedSubstrate {
             .collect()
     }
 
+    /// How many live custom objects' keys start with `prefix`.
+    pub fn custom_objects_count_under(&self, prefix: &str) -> usize {
+        self.substrate.read().custom_objects_count_under(prefix)
+    }
+
+    /// The live custom object under `prefix` whose key sorts last.
+    pub fn custom_object_last_under(&self, prefix: &str) -> Option<CustomObjectPayload> {
+        self.substrate.read().custom_object_last_under(prefix)
+    }
+
     /// A count that moves whenever a custom object changes: read a prefix
     /// again only when it has.
     pub fn custom_objects_version(&self) -> u64 {

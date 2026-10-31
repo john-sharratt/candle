@@ -7,6 +7,7 @@
 //! `here` — opens one of the memory's journals (`docs/memory_backbone.md`
 //! §6.5), or with `#<line id>` reads one line of it.
 
+use journals::path::JournalPath;
 use journals::time::Stamp;
 use journals::tree::WINDOW;
 use journals::view::open::open;
@@ -160,7 +161,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 
 /// One of the memory's journals, opened; or one line of it, by its address.
 fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
-    let m = match mem::open(ctx) {
+    let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
@@ -183,6 +184,9 @@ fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
             None => Answer::error(format!("{address} is no line")),
         };
     }
+    if let Some(here) = m.here_unopened(journal) {
+        return Answer::ok(unopened(here));
+    }
     let path = match m.path(journal) {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
@@ -191,6 +195,15 @@ fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
         Ok(j) => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
         Err(e) => Answer::error(e),
     }
+}
+
+/// This conversation's journal before anything has written to it: empty,
+/// and named as its first write will open it.
+pub fn unopened(here: &JournalPath) -> String {
+    format!(
+        "{NOT_INSTRUCTIONS}\n{here} (here). Nothing is written in it yet: it opens at this \
+         conversation's first write."
+    )
 }
 
 /// The one entry a call names — by its address, by `entry`, or by both alike —

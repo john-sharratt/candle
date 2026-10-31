@@ -440,6 +440,18 @@ pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Note> {
         .collect()
 }
 
+/// How many entries the thread's journal holds, none of them read.
+pub fn note_count(records: &dyn Records, owner: &str, thread: &str) -> usize {
+    records.count_under(&note_prefix(owner, thread))
+}
+
+/// The thread's newest entry, the only one read.
+pub fn last_note(records: &dyn Records, owner: &str, thread: &str) -> Option<Note> {
+    records
+        .last_under(&note_prefix(owner, thread))
+        .and_then(|(_, v)| decode(v))
+}
+
 /// The thread's journal, oldest first, each entry with the record key it is
 /// kept under — what ending one names.
 pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Note)> {

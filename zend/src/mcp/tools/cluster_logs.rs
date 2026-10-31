@@ -31,8 +31,8 @@ pub fn definition() -> Value {
             what they say about a symptom: every member's matching lines, oldest first, each under its member, \
             each cut at 400 characters. `grep` is a regular expression found anywhere in a line; narrow with \
             `level`, `tenant` and `since` (UTC). When more lines match than `limit`, the newest are kept and \
-            the answer says how many were left out: narrow the search to see the earlier ones. Cite the lines \
-            you rely on.",
+            the answer says earlier ones were left out: narrow the search, or name `since`, to see them. Cite \
+            the lines you rely on.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -94,14 +94,30 @@ pub fn render(envelope: &Value) -> String {
             .collect();
         let matched = body.get("matched").and_then(Value::as_u64).unwrap_or(0);
         let left_out = matched.saturating_sub(lines.len() as u64);
-        out.push_str(&format!(
-            "{host} {node}: {} of {matched} matching lines",
-            lines.len()
-        ));
-        if left_out > 0 {
+        // A search that stopped at its limit read no further back: there may
+        // be earlier matches it never counted.
+        let complete = body
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !complete {
+            // How many it left out is not known: only that it stopped.
             out.push_str(&format!(
-                " — the newest; the {left_out} earlier are left out (narrow the search to see them)"
+                "{host} {node}: {} matching lines — the newest; earlier ones may be left out \
+                 (narrow the search, or name `since`, to see them)",
+                lines.len()
             ));
+        } else {
+            out.push_str(&format!(
+                "{host} {node}: {} of {matched} matching lines",
+                lines.len()
+            ));
+            if left_out > 0 {
+                out.push_str(&format!(
+                    " — the newest; the {left_out} earlier are left out (narrow the search to see \
+                     them)"
+                ));
+            }
         }
         for line in lines {
             out.push('\n');
@@ -177,7 +193,9 @@ mod tests {
              "body": {"lines": ["2026 WARN x", long], "matched": 5}},
             {"host": "ww", "node": "02", "status": 504},
             {"host": "aw", "node": "03", "status": 200,
-             "body": {"lines": ["2026 ERROR y"], "matched": 1}}
+             "body": {"lines": ["2026 ERROR y"], "matched": 1, "complete": true}},
+            {"host": "lw", "node": "04", "status": 200,
+             "body": {"lines": ["2026 INFO z"], "matched": 1, "complete": false}}
         ]});
         let cut: String = long.chars().take(LINE_CHARS).collect();
         assert_eq!(
@@ -185,7 +203,9 @@ mod tests {
             format!(
                 "bw 01: 2 of 5 matching lines — the newest; the 3 earlier are left out (narrow the \
                  search to see them)\n2026 WARN x\n{cut}…\n\nww 02: no answer (504)\n\n\
-                 aw 03: 1 of 1 matching lines\n2026 ERROR y"
+                 aw 03: 1 of 1 matching lines\n2026 ERROR y\n\n\
+                 lw 04: 1 matching lines — the newest; earlier ones may be left out (narrow the \
+                 search, or name `since`, to see them)\n2026 INFO z"
             )
         );
         assert_eq!(render(&json!({"members": []})), "No member answered.");

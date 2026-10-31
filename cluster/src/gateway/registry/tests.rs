@@ -1,7 +1,7 @@
 //! Modes, dispatch, claims and UI pinning over a registry of members.
 
 use super::*;
-use crate::dispatch::{KeySource, Merge};
+use crate::dispatch::{KeySource, Merge, Route};
 use crate::frame::Epoch;
 
 fn capacity(state: MemberState, power: u32, idle: bool, slots_free: u32) -> Capacity {
@@ -74,6 +74,45 @@ fn a_closing_member_is_routed_nothing() {
         );
     }
     assert!(r.clustered("zend"));
+}
+
+/// **A route goes only to the members that declare it**: tables differ, and a
+/// request is matched in one that has its route, then dealt in turn among the
+/// members declaring it. Where every member declares it, nothing narrows.
+#[test]
+fn a_route_goes_only_to_the_members_declaring_it() {
+    let mut r = three();
+    let plain = RouteTable::new(vec![Route::new(&["POST"], "/v1/mcp", Dispatch::Any)]).unwrap();
+    let with_memory = RouteTable::new(vec![
+        Route::new(&["POST"], "/v1/mcp", Dispatch::Any),
+        Route::new(&["POST"], "/v1/mcp/memory", Dispatch::Any),
+    ])
+    .unwrap();
+    r.routes("zend", 1, plain.clone());
+    r.routes("zend", 2, with_memory.clone());
+    r.routes("zend", 3, with_memory.clone());
+    assert_eq!(r.declaring("zend", "POST", "/v1/mcp"), None, "every member");
+    let memory = r.declaring("zend", "POST", "/v1/mcp/memory").unwrap();
+    assert_eq!(memory, [2, 3]);
+    let dealt: Vec<Option<u64>> = (0..4)
+        .map(|_| r.round_robin_among("zend", &memory))
+        .collect();
+    assert!(
+        dealt.iter().all(|n| matches!(n, Some(2) | Some(3))),
+        "{dealt:?}"
+    );
+    assert!(dealt.contains(&Some(2)) && dealt.contains(&Some(3)));
+    assert!(r
+        .table_for("zend", "POST", "/v1/mcp/memory")
+        .is_some_and(|t| t.lookup("POST", "/v1/mcp/memory").is_some()));
+    r.routes("zend", 2, plain.clone());
+    r.routes("zend", 3, plain);
+    assert_eq!(
+        r.declaring("zend", "POST", "/v1/mcp/memory"),
+        Some(Vec::new()),
+        "no member declares it: nobody takes it"
+    );
+    assert_eq!(r.round_robin_among("zend", &[]), None);
 }
 
 /// A lagging member is routed nothing and never answers a catch-up, though it

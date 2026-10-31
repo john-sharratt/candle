@@ -15,6 +15,7 @@
 //! the host (`zend/web/`). Nothing here overlaps either.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::middleware;
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
@@ -45,13 +46,38 @@ pub mod worker_continue;
 /// ownership layer, which keeps a conversation MCP started to its owner
 /// ([`mcp::ownership`]).
 pub fn routes(session: Arc<ZendSession>, roles: Roles) -> Routes {
+    // Built once the memory has opened, or failed to: it opens at start, a
+    // fetch and a read long before the model is loaded.
+    let serves_memory = session.mcp().memory().opened_within(MEMORY_OPEN_WAIT);
     let mut routes = table(roles).into_routes(Arc::clone(&session));
     routes.router = routes.router.layer(middleware::from_fn_with_state(
         session,
         mcp::ownership::guard,
     ));
+    // The memory's routes are declared only by a member holding the journal
+    // repository, so the gateway sends them only to one that serves them.
+    if !serves_memory {
+        routes.declared.retain(|g| !MEMORY_ROUTES.contains(&g.path));
+    }
     routes
 }
+
+/// The longest the routes wait for the memory to open before they are
+/// declared without it.
+const MEMORY_OPEN_WAIT: Duration = Duration::from_secs(120);
+
+/// Where zend's MCP server is reached for the memory's calls: the server at
+/// `/v1/mcp`, declared only by the members that hold the journal repository.
+pub const MEMORY_MCP_PATH: &str = "/v1/mcp/memory";
+
+/// The routes only a member holding the journal repository declares: the
+/// memory's MCP calls, and the journals by hand.
+const MEMORY_ROUTES: [&str; 4] = [
+    MEMORY_MCP_PATH,
+    "/v1/journals",
+    "/v1/journals/tree",
+    "/v1/journals/grep",
+];
 
 /// Every route zend serves, and the role each needs — the table the host
 /// merges with its own and the other tenants' at start, read without a
@@ -307,6 +333,17 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
                 .get(mcp_http::get)
                 .delete(mcp_http::delete::<ZendSession>),
         )
+        // The same server, for the memory's calls: declared only where the
+        // journal repository is held ([`routes`]), so the gateway deals them
+        // only among the members that serve them.
+        .route(
+            MEMORY_MCP_PATH,
+            Role::Unauthenticated,
+            Dispatch::Any,
+            post(mcp_http::post::<ZendSession>)
+                .get(mcp_http::get)
+                .delete(mcp_http::delete::<ZendSession>),
+        )
         // A worker a slower member hands to this one at a round boundary
         // (`crate::worker_hop`). Open at the gateway, because a member asks it,
         // addressed by node; the handler believes only a member's stamp.
@@ -367,6 +404,7 @@ mod tests {
                 ("/v1/journals/tree", "user"),
                 ("/v1/journals/grep", "user"),
                 ("/v1/mcp", "unauthenticated"),
+                ("/v1/mcp/memory", "unauthenticated"),
                 // Open at the gateway; its handler believes a member's stamp
                 // alone (`worker_continue`).
                 ("/v1/mcp/worker/continue", "unauthenticated"),

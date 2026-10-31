@@ -68,6 +68,7 @@ fn chat() -> Placing {
         key: None,
         pinned: None,
         sender: None,
+        route: None,
     }
 }
 

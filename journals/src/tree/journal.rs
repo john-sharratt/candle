@@ -2,7 +2,9 @@
 //! whatever is wrong with its files.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use super::children::Children;
 use crate::error::{Error, Problem, Result};
 use crate::files::{Meta, Summary};
 use crate::line::{Line, LineId};
@@ -25,8 +27,12 @@ pub struct Journal {
     /// broken without it.
     pub meta: Option<Meta>,
     pub window: Vec<Line>,
-    pub archives: BTreeMap<Period, Vec<Line>>,
-    pub children: BTreeMap<Slug, Journal>,
+    /// Each period's lines, shared with earlier versions of the tree as its
+    /// children are: a write to the journal copies its window, never its
+    /// archives, unless it changes one.
+    pub archives: BTreeMap<Period, Arc<Vec<Line>>>,
+    /// Shared with earlier versions of the tree ([`Children`]).
+    pub children: Children,
     /// What is wrong with its own files; a journal with any is read as
     /// unreadable and refuses writes until a commit fixes them.
     pub problems: Vec<Problem>,
@@ -46,7 +52,7 @@ impl Journal {
             meta,
             window: Vec::new(),
             archives: BTreeMap::new(),
-            children: BTreeMap::new(),
+            children: Children::new(),
             problems: Vec::new(),
         }
     }
@@ -135,13 +141,15 @@ impl Journal {
     pub fn line_mut(&mut self, id: &LineId) -> Option<&mut Line> {
         match self.find(id)? {
             Held::Window(i) => self.window.get_mut(i),
-            Held::Archive(p, i) => self.archives.get_mut(&p)?.get_mut(i),
+            Held::Archive(p, i) => self.archives.get_mut(&p).map(Arc::make_mut)?.get_mut(i),
         }
     }
 
     /// Every line it holds, window first, then each archive.
     pub fn all_lines(&self) -> impl Iterator<Item = &Line> {
-        self.window.iter().chain(self.archives.values().flatten())
+        self.window
+            .iter()
+            .chain(self.archives.values().flat_map(|lines| lines.iter()))
     }
 
     pub fn has_id(&self, id: &LineId) -> bool {
@@ -198,7 +206,7 @@ mod tests {
         let a = note("2026-10-29T10:00:00Z", "archived");
         let b = note("2026-10-30T10:00:00Z", "in the window");
         let day = Period::parse("2026-10-29").unwrap();
-        j.archives.insert(day, vec![a.clone()]);
+        j.archives.insert(day, Arc::new(vec![a.clone()]));
         j.window.push(b.clone());
         assert_eq!(j.find(&b.id), Some(Held::Window(0)));
         assert_eq!(j.find(&a.id), Some(Held::Archive(day, 0)));

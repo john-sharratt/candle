@@ -52,6 +52,20 @@ impl Repo {
             .run_ok()?;
         Oid::parse(utf8("hash-object", out)?.trim_end())
     }
+
+    /// Store `content` as a blob exactly, through no filter: in process where
+    /// libgit2 holds the repository, else one unfiltered `hash-object`.
+    pub(crate) fn write_exact_locked(&self, content: &[u8]) -> Result<Oid, GitError> {
+        if let Some(lib) = self.library() {
+            return objects::hash_raw(&lib, content);
+        }
+        let out = self
+            .git("hash-object")
+            .args(["-w", "--stdin", "--no-filters"])
+            .stdin(content.to_vec())
+            .run_ok()?;
+        Oid::parse(utf8("hash-object", out)?.trim_end())
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +128,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(t.git(&["cat-file", "blob", oid.as_str()]), "a\r\nb\r\n");
+    }
+
+    /// **An exact blob is the bytes given**, whatever the checkout converts:
+    /// CRLF stays CRLF under `core.autocrlf`, and `hello\n` is the standard id.
+    #[test]
+    fn an_exact_blob_is_the_bytes_given() {
+        let t = TestRepo::init();
+        t.git(&["config", "core.autocrlf", "true"]);
+        let repo = t.repo();
+        let oid = repo.write_exact_locked(b"hello\n").unwrap();
+        assert_eq!(oid.as_str(), "ce013625030ba8dba906f756967f9e9ca394464a");
+        let crlf = repo.write_exact_locked(b"one\r\ntwo\r\n").unwrap();
+        assert_eq!(
+            t.git(&["cat-file", "blob", crlf.as_str()]),
+            "one\r\ntwo\r\n"
+        );
     }
 }

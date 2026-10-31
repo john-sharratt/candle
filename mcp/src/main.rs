@@ -14,9 +14,11 @@
 //! | [`presence`] | The cluster socket: joining as `mcp`, and serving its streams |
 //! | [`guides`] | The guide library: the methods for using the tools, served as tools |
 //! | [`context`] | The user's context: the client's guide, the first call's context, episodes |
+//! | [`routes`] | Which backend runs each tool, learned from every listing and kept across restarts |
+//! | [`reading`] | The context reads a first call answered ahead of, for the conversation's next call |
 //! | [`config`] | Each machine's file, and the `served` file they share |
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -45,6 +47,8 @@ mod context;
 mod guides;
 mod last_listed;
 mod presence;
+mod reading;
+mod routes;
 mod sse;
 
 use app::App;
@@ -52,6 +56,8 @@ use backend::{Backend, Link};
 use config::Config;
 use context::Conversations;
 use last_listed::LastListed;
+use reading::Readings;
+use routes::Routes;
 
 #[derive(Parser)]
 struct Args {
@@ -62,6 +68,8 @@ struct Args {
 
 /// The log's name in the state folder.
 const LOG_NAME: &str = "mcp.log";
+/// The tools' routes' file in the state folder.
+const ROUTES_FILE: &str = "routes.json";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -98,14 +106,19 @@ async fn main() -> anyhow::Result<()> {
                 name: b.name.clone(),
                 host: b.host.clone(),
                 path: b.path.clone(),
+                memory: b.memory.clone(),
             })
             .collect(),
         link: Link::new(&config.gateway)?,
-        routes: RwLock::new(HashMap::new()),
+        routes: Routes::kept_in(
+            &config.state.join(ROUTES_FILE),
+            config.backends.iter().map(|b| b.name.clone()).collect(),
+        ),
         last_listed: LastListed::default(),
         library: guides::embedded()?,
         read_only: RwLock::new(BTreeSet::new()),
         conversations: Conversations::default(),
+        readings: Readings::default(),
     });
     tracing::info!(guides = app.library.count(), "guides loaded");
     let gateways: Arc<[IpAddr]> = config.trusted_gateways.clone().into();

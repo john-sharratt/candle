@@ -32,6 +32,8 @@ use crate::context::{self, Conversations};
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
 use crate::last_listed::LastListed;
+use crate::reading::{Read, Readings};
+use crate::routes::Routes;
 
 /// What every request is served with.
 pub struct App {
@@ -41,8 +43,8 @@ pub struct App {
     pub store: Arc<SealedStore>,
     pub backends: Vec<Backend>,
     pub link: Link,
-    /// Which backend runs each tool, by name, as they were last listed.
-    pub routes: RwLock<HashMap<String, usize>>,
+    /// Which backend runs each tool, by name, as every listing has said.
+    pub routes: Routes,
     /// Each backend's last listing for each caller, listed in its place while
     /// it cannot be.
     pub last_listed: LastListed,
@@ -52,6 +54,9 @@ pub struct App {
     pub read_only: RwLock<BTreeSet<String>>,
     /// When each conversation last had a call.
     pub conversations: Conversations,
+    /// The context reads first calls answered ahead of, for each
+    /// conversation's next call.
+    pub readings: Readings,
 }
 
 /// Every backend's tools in backend order, and which backend runs each: a
@@ -88,23 +93,6 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
-/// The routes learned from a listing in which the backends in `failed` did
-/// not answer: theirs are kept as they were, so one backend down does not
-/// lose the way to another's tools, nor its own once it is back.
-pub fn relearn(
-    old: &HashMap<String, usize>,
-    learned: HashMap<String, usize>,
-    failed: &[usize],
-) -> HashMap<String, usize> {
-    let mut routes = learned;
-    for (name, backend) in old {
-        if failed.contains(backend) && !routes.contains_key(name) {
-            routes.insert(name.clone(), *backend);
-        }
-    }
-    routes
-}
-
 /// How a call ran: answered, or given up because its client left.
 enum Ran {
     Answered(Value),
@@ -134,7 +122,6 @@ impl App {
         .await;
         let who = call.caller.key();
         let mut lists = Vec::new();
-        let mut failed = Vec::new();
         let mut why_failed = Vec::new();
         for (i, (got, took)) in listed.into_iter().enumerate() {
             let backend = &self.backends[i].name;
@@ -157,7 +144,6 @@ impl App {
                         listed_as_last = last.as_ref().map_or(0, Vec::len),
                         "mcp: listing failed: {why}"
                     );
-                    failed.push(i);
                     why_failed.push(format!("the {backend} tools could not be listed: {why}"));
                     if let Some(tools) = last {
                         lists.push((i, tools));
@@ -170,18 +156,16 @@ impl App {
             &mut self.read_only.write().unwrap_or_else(|e| e.into_inner()),
             &tools,
         );
-        let mut routes = self.routes.write().unwrap_or_else(|e| e.into_inner());
-        *routes = relearn(&routes, learned, &failed);
+        self.routes.learn(learned);
         Listed {
             tools,
             failed: why_failed,
         }
     }
 
-    /// `name` called on `backend` for `caller`, asked again — up to
-    /// [`context::MEMORY_TRIES`] calls in all — while the member it reached
-    /// answers that it does not serve the memory: the backend's members are
-    /// dealt calls one by one, so the next try is likely one that does.
+    /// `name` called on `backend` for `caller`: a memory call at the path only
+    /// the members serving the memory declare, so the gateway sends it to one
+    /// of them ([`Backend::path_for`]).
     async fn call_served(
         &self,
         backend: usize,
@@ -191,24 +175,18 @@ impl App {
         args: &Value,
         step: &(dyn Fn(String) + Sync),
     ) -> Value {
-        context::until_served(name, || {
-            self.link
-                .call(&self.backends[backend], caller, on, name, args, step)
-        })
-        .await
+        self.link
+            .call(&self.backends[backend], caller, on, name, args, step)
+            .await
     }
 
     fn route(&self, name: &str) -> Option<usize> {
-        self.routes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .copied()
+        self.routes.get(name)
     }
 
     /// The call, run by the backend that lists `name` — the tools listed
-    /// again first when none does yet, as after a restart — or answered here
-    /// when it is a guide tool.
+    /// first when none has, as for a tool new to every listing so far — or
+    /// answered here when it is a guide tool.
     async fn run(&self, call: &Call<Self>, name: &str, args: &Value) -> Ran {
         if guide_tools::is_guide_tool(name) {
             let answer = guide_tools::call(&self.library, name, args);
@@ -284,30 +262,30 @@ impl App {
         ))
     }
 
-    /// The user's context for `call`'s client, read from the backend that
-    /// keeps the memory — `None` when it cannot be, which is logged and costs
-    /// the call nothing.
-    async fn read_context(&self, call: &Call<Self>) -> Option<String> {
+    /// Begin reading the user's context for `call`'s client from the backend
+    /// that keeps the memory, beside the call: `None` when no listing has
+    /// named that backend yet. A read that fails is `None` when it ends,
+    /// which is logged and costs the call nothing.
+    fn start_reading(this: &Arc<Self>, call: &Call<Self>) -> Option<Read> {
         let client = call.session.client.name();
-        let Some(backend) = self.route(context::GET) else {
+        let Some(backend) = this.route(context::GET) else {
             tracing::warn!(client, "mcp: no backend lists the user's context yet");
             return None;
         };
-        let on = OnBehalf {
-            id: &call.session_id,
-            session: &call.session,
-        };
-        let answer = self
-            .call_served(
-                backend,
-                &call.caller,
-                &on,
-                context::GET,
-                &json!({}),
-                &|_| {},
-            )
-            .await;
-        self.served_context(client, &answer)
+        let this = Arc::clone(this);
+        let caller = call.caller.clone();
+        let id = call.session_id.clone();
+        let session = call.session.clone();
+        Some(tokio::spawn(async move {
+            let on = OnBehalf {
+                id: &id,
+                session: &session,
+            };
+            let answer = this
+                .call_served(backend, &caller, &on, context::GET, &json!({}), &|_| {})
+                .await;
+            this.served_context(session.client.name(), &answer)
+        }))
     }
 
     /// Whether the last listing marked `name` as only reading.
@@ -430,23 +408,42 @@ impl Server for App {
         let claim = this.conversations.claim(&who, now_ms());
         let begins = claim.begins();
         let around = context::around(name, begins);
-        // The context is read beside the call: a first call costs one backend
-        // round trip, not two. Before any listing has said which backend
-        // keeps it, as after a restart, the call lists first and the context
-        // is read after it.
-        let (ran, user) = match (around.fetch_context, this.route(context::GET)) {
-            (false, _) => (this.run(call, name, args).await, None),
-            (true, Some(_)) => tokio::join!(this.run(call, name, args), this.read_context(call)),
-            (true, None) => {
-                let ran = this.run(call, name, args).await;
-                (ran, this.read_context(call).await)
+        // The context is read beside the call, and the call never waits for
+        // it: the read an earlier call left running is taken up, else one
+        // begins. Before any listing has said which backend keeps it, the
+        // call lists first, and the read begins after it.
+        let mut reading = around
+            .fetch_context
+            .then(|| {
+                this.readings
+                    .take(&who, Instant::now())
+                    .or_else(|| Self::start_reading(this, call))
+            })
+            .flatten();
+        let ran = this.run(call, name, args).await;
+        if around.fetch_context && reading.is_none() {
+            reading = Self::start_reading(this, call);
+        }
+        // The context goes with this answer when it is read by now; otherwise
+        // it is left running, and the conversation's next call — a first call
+        // still, since this one leaves it without its context — carries it.
+        let user = match reading {
+            Some(read) if read.is_finished() => read.await.ok().flatten(),
+            Some(read) => {
+                this.readings.leave(&who, read, Instant::now());
+                None
             }
+            None => None,
         };
         // A client that left neither had the context nor needs a record of
         // an answer it never read.
         let Ran::Answered(mut answer) = ran else {
             return text_result("the client stopped listening", true);
         };
+        if around.compose && !context::is_error(&answer) {
+            // The conversation has its context from this answer itself.
+            this.readings.forget(&who);
+        }
         if around.compose {
             if let Some(served) = this.served_context(client, &answer) {
                 context::replace_text(&mut answer, &served);
@@ -517,29 +514,5 @@ mod tests {
         assert_eq!(routes["shared"], 0);
         assert_eq!(routes["bot_list"], 1);
         assert_eq!(routes.len(), 3);
-    }
-
-    /// **A backend down loses neither the way to another backend's tools nor
-    /// its own**: its routes are kept from before, and the others' relearned.
-    #[test]
-    fn a_backend_that_did_not_answer_keeps_its_routes() {
-        let old = HashMap::from([
-            ("repo_task_start".to_string(), 0),
-            ("bot_list".to_string(), 1),
-            ("task_gone".to_string(), 0),
-        ]);
-        let learned = HashMap::from([
-            ("repo_task_start".to_string(), 0),
-            ("task_new".to_string(), 0),
-        ]);
-        let routes = relearn(&old, learned, &[1]);
-        assert_eq!(
-            routes,
-            HashMap::from([
-                ("repo_task_start".to_string(), 0),
-                ("task_new".to_string(), 0),
-                ("bot_list".to_string(), 1),
-            ])
-        );
     }
 }

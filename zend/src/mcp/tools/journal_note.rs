@@ -129,7 +129,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     let key = target.key();
     match threads::add_note(&records, &owner, &key, &note) {
         Ok(()) => {
-            let n = threads::notes(&records, &owner, &key).len();
+            let n = threads::note_count(&records, &owner, &key);
             Answer::ok(format!("Noted as {}#{n}.", target.path()))
         }
         Err(e) => Answer::error(e.to_string()),

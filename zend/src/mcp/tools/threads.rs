@@ -84,9 +84,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                 .filter(|w| !w.is_part())
                 .map(|w| w.observed(now))
                 .collect();
-            let notes = threads::notes(&records, &owner, &t.name);
-            let last = notes
-                .last()
+            let last = threads::last_note(&records, &owner, &t.name)
                 .map(|n| first_line(&format!("{} {}", n.label, n.text), 160));
             render_thread(&t, &workers, last.as_deref(), now)
         })

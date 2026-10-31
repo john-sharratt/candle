@@ -96,8 +96,17 @@ pub trait Store: Send + Sync {
         now: u64,
     ) -> anyhow::Result<Session>;
 
-    /// Hold `value` under `key` on the session under `id`.
-    fn hold(&self, id: &str, key: &str, value: &str, now: u64) -> anyhow::Result<()>;
+    /// Hold `value` under `key` on the session under `id` — `session`, as
+    /// this request found or opened it, when the store keeps nothing for it
+    /// yet.
+    fn hold(
+        &self,
+        id: &str,
+        session: &Session,
+        key: &str,
+        value: &str,
+        now: u64,
+    ) -> anyhow::Result<()>;
 
     /// End the session under `id`.
     fn close(&self, id: &str) -> anyhow::Result<()>;

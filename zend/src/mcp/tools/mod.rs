@@ -78,6 +78,7 @@ pub(crate) mod wait;
 pub const LOADING: &str = "the model is still loading; try again shortly";
 
 /// What a tool call runs with.
+#[derive(Clone)]
 pub struct Ctx {
     pub session: Arc<ZendSession>,
     pub caller: Caller,
@@ -188,33 +189,44 @@ pub fn definitions() -> Value {
     ])
 }
 
+/// A synchronous tool's call, run on the blocking pool: it reads the
+/// substrate and may commit a record or a journal write, which waits on the
+/// disk, and on the pool that wait holds up none of the calls the runtime is
+/// running beside it.
+async fn blocking(ctx: &Ctx, args: &Value, tool: fn(&Ctx, &Value) -> Answer) -> Answer {
+    let (ctx, args) = (ctx.clone(), args.clone());
+    tokio::task::spawn_blocking(move || tool(&ctx, &args))
+        .await
+        .unwrap_or_else(|e| Answer::error(format!("the tool failed: {e}")))
+}
+
 /// Run tool `name` with `args`.
 pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
     match name {
-        user_context::NAME => user_context::call(ctx, args),
-        user_episode::NAME => user_episode::call(ctx, args),
-        journal_forget::NAME => journal_forget::call(ctx, args),
-        attach::NAME => attach::call(ctx, args),
+        user_context::NAME => blocking(ctx, args, user_context::call).await,
+        user_episode::NAME => blocking(ctx, args, user_episode::call).await,
+        journal_forget::NAME => blocking(ctx, args, journal_forget::call).await,
+        attach::NAME => blocking(ctx, args, attach::call).await,
         task::NAME => task::call(ctx, args).await,
         wait::NAME => wait::call(ctx, args).await,
         reply::NAME => reply::call(ctx, args).await,
-        nudge::NAME => nudge::call(ctx, args),
+        nudge::NAME => blocking(ctx, args, nudge::call).await,
         stop::NAME => stop::call(ctx, args).await,
-        journal_read::NAME => journal_read::call(ctx, args),
-        journal_note::NAME => journal_note::call(ctx, args),
-        journal_grep::NAME => journal_grep::call(ctx, args),
-        journal_edit::NAME => journal_edit::call(ctx, args),
-        journal_focus::NAME => journal_focus::call(ctx, args),
-        journal_create::NAME => journal_create::call(ctx, args),
-        journal_link::NAME => journal_link::call(ctx, args),
-        journal_accept::NAME => journal_accept::call(ctx, args),
-        group_create::NAME => group_create::call(ctx, args),
-        group_describe::NAME => group_describe::call(ctx, args),
-        group_add::NAME => group_add::call(ctx, args),
-        group_remove::NAME => group_remove::call(ctx, args),
-        group_default::NAME => group_default::call(ctx, args),
-        threads::NAME => threads::call(ctx, args),
-        archive::NAME => archive::call(ctx, args),
+        journal_read::NAME => blocking(ctx, args, journal_read::call).await,
+        journal_note::NAME => blocking(ctx, args, journal_note::call).await,
+        journal_grep::NAME => blocking(ctx, args, journal_grep::call).await,
+        journal_edit::NAME => blocking(ctx, args, journal_edit::call).await,
+        journal_focus::NAME => blocking(ctx, args, journal_focus::call).await,
+        journal_create::NAME => blocking(ctx, args, journal_create::call).await,
+        journal_link::NAME => blocking(ctx, args, journal_link::call).await,
+        journal_accept::NAME => blocking(ctx, args, journal_accept::call).await,
+        group_create::NAME => blocking(ctx, args, group_create::call).await,
+        group_describe::NAME => blocking(ctx, args, group_describe::call).await,
+        group_add::NAME => blocking(ctx, args, group_add::call).await,
+        group_remove::NAME => blocking(ctx, args, group_remove::call).await,
+        group_default::NAME => blocking(ctx, args, group_default::call).await,
+        threads::NAME => blocking(ctx, args, threads::call).await,
+        archive::NAME => blocking(ctx, args, archive::call).await,
         cluster_status::NAME => cluster_status::call(ctx, args).await,
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
@@ -226,9 +238,9 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         service_status::NAME => service_status::call(ctx, args).await,
         service_trial::NAME => service_trial::call(ctx, args).await,
         service_control::NAME => service_control::call(ctx, args).await,
-        layer_read::NAME => layer_read::call(ctx, args),
+        layer_read::NAME => blocking(ctx, args, layer_read::call).await,
         layer_toggle::NAME => layer_toggle::call(ctx, args).await,
-        timeline_read::NAME => timeline_read::call(ctx, args),
+        timeline_read::NAME => blocking(ctx, args, timeline_read::call).await,
         timeline_delete::NAME => timeline_delete::call(ctx, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }

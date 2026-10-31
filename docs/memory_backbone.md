@@ -508,8 +508,9 @@ default_group: zen
 - **Binding.** An account is listed by its email before it has ever signed in.
   At its first call, the gateway's verified identity gives the key and the
   provider's *verified* email. The service finds the one `person.yaml` that
-  lists that email with no key, writes the key in (a commit), and from then
-  on knows the account by its key alone. An unverified email binds nothing.
+  lists that email with no key, and reads the account as that person. At its
+  first call that writes, it writes the key in (a commit), and from then on
+  knows the account by its key alone. An unverified email binds nothing.
 - **An account no person lists is a guest.** It reads `@guest`, and nothing
   else, until an admin lists it (§3.6).
 - **An account says which group, not who is speaking.** A conversation opens
@@ -820,12 +821,15 @@ loads (§3.3).
 The agent runs inside its host's process (motherd's `host.agent`), so the
 memory is served there. zend, beside the agent, opens the store on the
 flagged checkout at start (`zend/src/mcp/memory/`). It serves the memory
-through its `journal_*` tools on `/v1/mcp`, and through `/v1/journals` to a
-person editing by hand (§6.7); there is no new app. The agent's own routes
-are for members only and carry no person's identity, which is why the
-memory is served by a host and not by the agent. Any machine whose agent
-holds the checkout and runs zend serves the memory, and the gateway deals
-calls among them as it deals any of zend's.
+through its `journal_*` tools on `/v1/mcp/memory` — the same server as
+`/v1/mcp` — and through `/v1/journals` to a person editing by hand (§6.7);
+there is no new app. The agent's own routes are for members only and carry
+no person's identity, which is why the memory is served by a host and not by
+the agent. Any machine whose agent holds the checkout and runs zend serves the
+memory. Only those members declare the memory's routes, and the gateway sends
+a route only to the members that declare it, so a memory call always reaches
+one that serves it; the aggregator sends the memory's calls there
+(`mcp/served.yaml` `memory`).
 
 ### 6.2 Reads
 
@@ -844,7 +848,10 @@ A write is checked (§3.3) and applied to memory. Its files are committed at
 once as objects onto the service's branch, without the working tree or the
 index (`zend_vfs::Repo::commit_changes`). Commits are pushed to GitHub in
 the background every 5 seconds, under a lease on what origin last held, and
-origin is fetched on the same beat.
+origin is fetched on the same beat. The push and the fetch run with the
+store free (`journals::store::sync`): it is held only to read what to send
+and to take in what came back, so a write commits at once whatever the
+network is doing, and goes up at the next beat.
 
 A refused push fetches, reloads origin's tree and replays the writes not yet
 pushed on it, in order. Each write is checked again, so an edit of a line
@@ -931,9 +938,12 @@ The `per` citations follow the same mapping.
 The aggregator's backends stay `coding` and `bot` (`mcp/served.yaml`). The
 memory's tools are zend's, listed by `coding`.
 
-At a conversation's first call, the server opens its journal,
-`conversations/<began>-<channel>`, in the account's group (§3.4). A
-conversation is an MCP session's run of calls with no 30-minute gap. Grok is
+A conversation's journal is `conversations/<began>-<channel>`, in the
+account's group (§3.4), named for the minute of the conversation's first
+call. The server opens it at the conversation's first *write*. A
+conversation that only reads writes nothing: its frame names the journal as
+`here` all the same, and reads it as an empty one, so a read never waits on
+a commit. A conversation is an MCP session's run of calls with no 30-minute gap. Grok is
 the exception: it opens a session for every call it makes, sixteen
 conversations in six minutes on 2026-10-31. So a Grok conversation is
 followed by the person and the group, not the session. Two people driving
@@ -974,9 +984,10 @@ voice digest; once it has a topic, that topic's summary. Each block that
 does not fit is left out whole, in reverse order. The guide's spine is
 never cut.
 
-A caller is a person by their account's key. An account's first call binds
-it by the email the gateway names, which is taken as verified (the
-operator's decision, 2026-10-30). Whether the caller is an estate admin is
+A caller is a person by their account's key. An account is read as its
+person from its first call, by the email the gateway names, which is taken
+as verified (the operator's decision, 2026-10-30); its first call that
+writes binds it. Whether the caller is an estate admin is
 read from `roles.yaml` on every call. It travels with each commit's actor
 (`"admin"` in its `Journal-Op` wire form), so a replay checks the rule the
 call was checked against.
@@ -989,8 +1000,10 @@ editing by hand or a program writing many lines at once.
 Every request is the signed-in caller's, as the gateway names them. The
 caller must be listed in the estate's roles, as `/v1/mcp` requires, and
 reads and writes exactly what their AIs may (§7.2). Requests are dealt round
-robin like the tools' calls. A member that does not serve the memory answers
-503 with `Retry-After`, and the client asks again. A member reads what
+robin among the members that serve the memory, the only ones declaring these
+routes (§6.1); while none is ready, a request waits at the gateway. A member
+whose memory is still being read answers 503 with `Retry-After`, and the
+client asks again. A member reads what
 another wrote after its next fetch, within seconds.
 
 | Route | Answers |

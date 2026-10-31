@@ -268,6 +268,45 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
 
 ---
 
+## MCP Request-Path Invariants
+
+Every `/mcp` tool that runs no model answers within **30 ms at the 95th percentile**, gateway
+hops included. A typical call already does — the floor through both hops is ~15 ms — so a tool
+over budget is one *waiting* on something, never one working. Each rule below names a wait that
+was found on the path and removed; adding one back puts the tail back.
+
+1. **No network I/O under a lock a request takes.** The journal sync pushes and fetches with the
+   store free and takes it only between the steps (`journals::store::sync`); `zend_vfs::Repo`
+   runs transfers under their own lock, never the write lock a commit needs. A write waited out a
+   `git fetch` to GitHub every 5 s before this — 3–4 s at p90.
+2. **A read never writes.** No commit, no record, no session put on a call that only reads. A
+   conversation's journal opens at its first *write* (`memory::conversations::open`); an account
+   binds at its first write; a stateless MCP session is written only once it holds something,
+   and its use is noted in memory and written in by `mcp::tending`, off the request path.
+3. **No blocking on the async runtime.** A synchronous tool runs on the blocking pool
+   (`tools::blocking`); an answer's marks are written there too. A tool parked on a disk sync
+   holds up no other call.
+4. **No full scans.** A prefix of the substrate's keyed objects is a range of its key index
+   (`Substrate::custom_objects_under`); a count or a newest-of reads keys only
+   (`count_under`, `last_under`). A journal write touches the files of the journals it changed,
+   never every file of the repository.
+5. **No retries to find the right member.** A route only some members can serve is declared by
+   those members alone, and the gateway sends it only to a member declaring it
+   (`Registry::declaring`) — the memory's calls go to `/v1/mcp/memory`. A request routed by its
+   subject that names none and draws nothing is no unit of work and waits for no card
+   (`is_errand`).
+6. **Nothing waits on what it does not need.** A first call never waits for the user's
+   context (`mcp/src/reading.rs`); independent requests run together, not one after another; a
+   log search reads back only as far as its answer needs.
+
+The gate is `cargo test --release -p zend --lib latency -- --ignored --test-threads=1`
+(`zend/src/mcp/latency_tests.rs`): every tool that runs no model and needs no other member,
+against a real substrate and a real journal repository, refused over budget. It measures time,
+so run it on a quiet machine. In production, `mcp: called` (the aggregator, both hops) and
+`mcp: handled` (the backend's own time) split a slow call into hops and work.
+
+---
+
 ## The `tensor-assert` Harness
 
 Everything below is behind the **`tensor-assert`** feature and compiles to nothing without it.

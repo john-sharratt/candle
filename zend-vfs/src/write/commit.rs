@@ -56,7 +56,7 @@ impl Repo {
         let unmoded: Vec<&RepoPath> = changes
             .iter()
             .filter_map(|(path, change)| match change {
-                Change::Write { mode: None, .. } => Some(path),
+                Change::Write { mode: None, .. } | Change::Blob { mode: None, .. } => Some(path),
                 _ => None,
             })
             .collect();
@@ -65,30 +65,37 @@ impl Repo {
 
         let mut ops = Vec::with_capacity(changes.len());
         for (path, change) in changes.iter() {
-            match change {
-                Change::Write { content, mode } => {
-                    let inherited = existing
-                        .iter()
-                        .find(|e| &e.path == path && e.kind == ObjectKind::Blob)
-                        .map(|e| e.mode);
-                    // Inheriting a symlink's mode would make the written text
-                    // the link's target — a link the caller never asked for.
-                    if mode.is_none() && inherited == Some(FileMode::Symlink) {
-                        return Err(GitError::invalid(format!(
-                            "{path} is a symlink in the base; replace it with an explicit \
-                             mode or ChangeSet::symlink"
-                        )));
-                    }
-                    let mode = mode.or(inherited).unwrap_or(FileMode::Regular);
-                    let oid = self.write_blob_locked(path, content.clone(), mode)?;
-                    ops.push(FileOp::Modify {
-                        mode,
-                        oid,
-                        path: path.clone(),
-                    });
+            let (content, mode, exact) = match change {
+                Change::Write { content, mode } => (content, mode, false),
+                Change::Blob { content, mode } => (content, mode, true),
+                Change::Delete => {
+                    ops.push(FileOp::Delete { path: path.clone() });
+                    continue;
                 }
-                Change::Delete => ops.push(FileOp::Delete { path: path.clone() }),
+            };
+            let inherited = existing
+                .iter()
+                .find(|e| &e.path == path && e.kind == ObjectKind::Blob)
+                .map(|e| e.mode);
+            // Inheriting a symlink's mode would make the written text the
+            // link's target — a link the caller never asked for.
+            if mode.is_none() && inherited == Some(FileMode::Symlink) {
+                return Err(GitError::invalid(format!(
+                    "{path} is a symlink in the base; replace it with an explicit mode or \
+                     ChangeSet::symlink"
+                )));
             }
+            let mode = mode.or(inherited).unwrap_or(FileMode::Regular);
+            let oid = if exact {
+                self.write_exact_locked(content)?
+            } else {
+                self.write_blob_locked(path, content.clone(), mode)?
+            };
+            ops.push(FileOp::Modify {
+                mode,
+                oid,
+                path: path.clone(),
+            });
         }
 
         // In this process where libgit2 holds the repository: the base's tree

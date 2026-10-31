@@ -6,7 +6,6 @@
 //! knows when to ask for it and what to tell it.
 
 use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -23,45 +22,37 @@ pub const EPISODE: &str = "user_episode_note";
 /// enough together to outlast the memory's backend reloading its model.
 pub const EPISODE_RETRY: Duration = Duration::from_secs(30);
 pub const EPISODE_TRIES: u32 = 12;
-/// How many times a call is made in all while the member it reaches answers
-/// that it does not serve the memory: calls are dealt among the coding
-/// backend's members one by one, so each try is likely another member.
-pub const MEMORY_TRIES: u32 = 4;
-/// How a member answers a memory call it cannot serve now, as zend writes
-/// it (`zend/src/mcp/memory/mod.rs` `NO_MEMORY` and `Memory::unavailable`):
-/// a passing answer, which another member may not give.
-const NOT_SERVED: [&str; 2] = [
-    "this zend serves no journal repository",
-    "the journal repository is still being read",
-];
 
-/// `answer` is a member saying it does not serve the memory now — asked
-/// again, another may.
-pub fn not_served_here(answer: &Value) -> bool {
-    is_error(answer) && text_of(answer).is_some_and(|t| NOT_SERVED.iter().any(|s| t.starts_with(s)))
+/// The tools that take a thread's or a project's journal as well as one of
+/// the memory's: which it is, their `journal` says.
+const JOURNAL_TOOLS: [&str; 3] = ["journal_note", "journal_read", "journal_grep"];
+
+/// The sections of a group's memory, which a bare memory path starts with.
+const SECTIONS: [&str; 5] = ["bots", "conversations", "people", "threads", "topics"];
+
+/// `journal` names the memory, as zend reads it (`zend/src/mcp/memory/mod.rs`
+/// `is_memory_path`, and `journal_grep`'s `*`): `~`, `@group`, `here`, a path
+/// starting at a section, or everything it holds, `*`.
+fn names_memory(journal: &str) -> bool {
+    let first = journal.split(['/', '#']).next().unwrap_or_default();
+    journal == "*"
+        || journal.starts_with('~')
+        || journal.starts_with('@')
+        || first == "here"
+        || SECTIONS.contains(&first)
 }
 
-/// `call` made until a member serving the memory answers — up to
-/// [`MEMORY_TRIES`] calls in all — and its last answer. `tool` names it in
-/// the log.
-pub async fn until_served<F, Fut>(tool: &str, mut call: F) -> Value
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Value>,
-{
-    let mut answer = call().await;
-    for attempt in 2..=MEMORY_TRIES {
-        if !not_served_here(&answer) {
-            break;
-        }
-        tracing::info!(
-            tool,
-            attempt,
-            "mcp: a member that serves no memory answered; asking again"
-        );
-        answer = call().await;
+/// `tool` called with `args` reads or writes the memory: it is sent where the
+/// memory is served ([`crate::backend::Backend::path_for`]). A thread's or a
+/// project's journal is any member's to serve.
+pub fn needs_memory(tool: &str, args: &Value) -> bool {
+    if JOURNAL_TOOLS.contains(&tool) {
+        return args
+            .get("journal")
+            .and_then(Value::as_str)
+            .is_some_and(names_memory);
     }
-    answer
+    MEMORY.contains(&tool)
 }
 
 /// The silence after which a call is the first of a new conversation, for a
@@ -339,49 +330,49 @@ mod tests {
         );
     }
 
-    /// **A member that does not serve the memory is asked past**; every
-    /// other answer, an error or not, stands.
+    /// **The memory's tools need the memory, and a journal tool when its
+    /// journal is the memory's**; a thread's or a project's journal, and the
+    /// work and operations tools, do not.
     #[test]
-    fn only_a_member_without_the_memory_is_asked_past() {
-        let err = |t: &str| json!({"content": [{"type": "text", "text": t}], "isError": true});
-        assert!(not_served_here(&err(
-            "this zend serves no journal repository: its agent has no `journal: true` checkout"
-        )));
-        assert!(not_served_here(&err(
-            "the journal repository is still being read; try again shortly"
-        )));
-        assert!(!not_served_here(&err(
-            "this account is in no group yet, so nothing is remembered for it"
-        )));
-        assert!(!not_served_here(&json!({
-            "content": [{"type": "text", "text": "this zend serves no journal repository"}]
-        })));
-    }
-
-    /// **A call is asked again only while no member serves the memory**: it
-    /// stops at the first other answer, and gives up after
-    /// [`MEMORY_TRIES`], with the last answer.
-    #[tokio::test]
-    async fn a_call_is_asked_again_until_a_member_serves_it() {
-        let not = json!({"content": [{"type": "text", "text": "this zend serves no journal repository: x"}], "isError": true});
-        let ok = json!({"content": [{"type": "text", "text": "kept"}]});
-        let mut answers = vec![not.clone(), not.clone(), ok.clone()].into_iter();
-        let mut calls = 0;
-        let got = until_served("t", || {
-            calls += 1;
-            let a = answers.next().unwrap();
-            async move { a }
-        })
-        .await;
-        assert_eq!((got, calls), (ok, 3));
-        let mut calls = 0;
-        let got = until_served("t", || {
-            calls += 1;
-            let a = not.clone();
-            async move { a }
-        })
-        .await;
-        assert_eq!((got, calls), (not, MEMORY_TRIES));
+    fn a_call_needs_the_memory_when_it_touches_the_memorys_journals() {
+        let none = json!({});
+        for tool in [
+            "get_user_context",
+            "user_episode_note",
+            "journal_focus",
+            "group_add",
+        ] {
+            assert!(needs_memory(tool, &none), "{tool}");
+        }
+        for tool in JOURNAL_TOOLS {
+            for memory in [
+                "people/yen",
+                "@zen/topics",
+                "here#2026-10-30-0912-7e3a",
+                "~",
+                "*",
+            ] {
+                assert!(
+                    needs_memory(tool, &json!({"journal": memory})),
+                    "{tool} {memory}"
+                );
+            }
+            for thread in ["T:review", "P:candle", "U:", "self", ""] {
+                assert!(
+                    !needs_memory(tool, &json!({"journal": thread})),
+                    "{tool} {thread}"
+                );
+            }
+            assert!(!needs_memory(tool, &none), "{tool} with no journal");
+        }
+        for tool in [
+            "thread_attach",
+            "repo_task_start",
+            "cluster_status",
+            "bot_list",
+        ] {
+            assert!(!needs_memory(tool, &none), "{tool}");
+        }
     }
 
     #[test]

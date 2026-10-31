@@ -138,14 +138,19 @@ use runner::{utf8, Invocation};
 
 /// One repository: the top level of a git working tree.
 ///
-/// Reads run concurrently. Writes — objects, ref transactions, fetches and
-/// pushes — are serialised by one lock per `Repo`, so two writers in this
-/// process never race; correctness across processes rests on the
-/// compare-and-swap every ref update carries, not on the lock.
+/// Reads run concurrently. Local writes — objects and ref transactions — are
+/// serialised by one lock per `Repo`, so two writers in this process never
+/// race. Fetches and pushes are serialised by a lock of their own, so a local
+/// commit never waits out a network transfer: a transfer only adds objects and
+/// moves the remote's tracking refs, which no local write touches, and a
+/// fetch runs no auto-maintenance that would lock the refs a write moves.
+/// Correctness across processes rests on the compare-and-swap every ref
+/// update carries, not on either lock.
 pub struct Repo {
     place: Place,
     format: ObjectFormat,
     write: Mutex<()>,
+    transfer: Mutex<()>,
     /// The repository held in this process, which answers what its own files
     /// can without a `git` process (see [`library`]). `None` for a repository
     /// libgit2 cannot hold, whose every question goes to the `git` program.
@@ -250,6 +255,7 @@ impl Repo {
             },
             format,
             write: Mutex::new(()),
+            transfer: Mutex::new(()),
             library: None,
             pusher: here(),
             fetcher: fetch_here(),
@@ -265,6 +271,7 @@ impl Repo {
             place: Place::Substrate(db.clone()),
             format: ObjectFormat::Sha1,
             write: Mutex::new(()),
+            transfer: Mutex::new(()),
             pusher: here(),
             fetcher: fetch_here(),
         })
@@ -332,6 +339,12 @@ impl Repo {
     /// the ordering of writes.
     pub(crate) fn write_lock(&self) -> MutexGuard<'_, ()> {
         self.write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The transfer lock, held for a fetch or a push from this checkout.
+    /// Poisoning is ignored, as for [`Self::write_lock`].
+    pub(crate) fn transfer_lock(&self) -> MutexGuard<'_, ()> {
+        self.transfer.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

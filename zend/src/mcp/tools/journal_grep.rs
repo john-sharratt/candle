@@ -203,10 +203,14 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 /// The memory's lines, archives and summaries that hold `pattern`: under
 /// `journal`, or everything the caller reads for `*`.
 fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
-    let m = match mem::open(ctx) {
+    let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
+    // This conversation's journal holds nothing before its first write.
+    if m.here_unopened(journal).is_some() {
+        return Answer::ok(render(&[], 0));
+    }
     let under = match journal {
         "*" => None,
         j => match m.path(j) {

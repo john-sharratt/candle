@@ -201,13 +201,28 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
         (Who::Person(john()), None),
         "the account is bound now"
     );
-    let conv = conversations::of(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap();
+    let before = m.tree().unwrap();
+    let named = conversations::here(&m, &zen(), Channel::Grok, "session-1").unwrap();
+    assert!(
+        Arc::ptr_eq(&before, &m.tree().unwrap()) && before.get(&named).is_none(),
+        "a read names the conversation and writes nothing"
+    );
+    let conv = conversations::open(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap();
+    assert_eq!(
+        conv, named,
+        "the first write opens the journal its reads named"
+    );
     assert!(conv.show().starts_with("@zen/conversations/"), "{conv}");
     assert!(conv.show().ends_with("-grok"), "{conv}");
+    assert!(m.tree().unwrap().get(&conv).is_some());
     assert_eq!(
-        conversations::of(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap(),
+        conversations::open(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap(),
         conv,
         "one journal a session"
+    );
+    assert_eq!(
+        conversations::here(&m, &zen(), Channel::Grok, "session-1").unwrap(),
+        conv
     );
     let own = johns_journal();
     let actor = Actor::Person {

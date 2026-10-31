@@ -3,6 +3,7 @@
 //! but a draw, and the fence holds rows back from latency work.
 
 use super::*;
+use crate::dispatch::KeySource;
 use crate::frame::{BuildId, Epoch};
 
 /// A ready member of `app` on `card`, with `slots` free and the line `next_us`
@@ -113,6 +114,39 @@ fn a_drawing_card_takes_only_draws() {
         r.pick("npcd", &Dispatch::Best, Some(512 * 512), None, None),
         Pick::Member(1),
         "a draw still goes to the card that reaches it"
+    );
+}
+
+/// **An errand waits for no card**: a request routed by its subject that
+/// names none and draws nothing — a tool listing, a read of the caller's own
+/// — goes at once while a draw holds every card, and is counted as no unit
+/// of work; one that names its subject is placed as work.
+#[test]
+fn an_errand_waits_for_no_card() {
+    let mut r = Registry::new();
+    r.join(on_card("npcd", 1, 9, 40_000, 40_000));
+    r.begin("npcd", 1, true);
+    let subject = Dispatch::Owner(KeySource::Header("x-subject".into()));
+    assert_eq!(best(&mut r, "npcd"), Pick::Wait, "work waits");
+    assert_eq!(
+        r.pick("npcd", &subject, None, None, None),
+        Pick::Member(1),
+        "an errand goes at once"
+    );
+    assert!(is_errand(&subject, None, None));
+    assert!(
+        !is_errand(&subject, Some("w1"), None),
+        "it names its subject"
+    );
+    assert!(!is_errand(&subject, None, Some(512 * 512)), "it draws");
+    assert!(
+        !is_errand(&Dispatch::Best, None, None),
+        "not routed by a subject"
+    );
+    assert_eq!(
+        r.pick("npcd", &subject, None, Some("w1"), None),
+        Pick::Wait,
+        "a subject no member holds is placed as work"
     );
 }
 

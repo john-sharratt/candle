@@ -4,9 +4,11 @@
 //! the rest of the tree is read.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::Problem;
 use crate::files::{entry_id, in_order, read_entry, GroupFile, Meta, PersonFile, README};
+use crate::line::Line;
 use crate::path::JournalPath;
 use crate::period::Period;
 use crate::slug::Slug;
@@ -119,7 +121,7 @@ fn load_group(tree: &mut Tree, group: Slug, files: GroupFiles<'_>) {
         group,
         Group {
             file,
-            root,
+            root: Arc::new(root),
             problems: Vec::new(),
         },
     );
@@ -141,6 +143,7 @@ fn text<'a>(path: &str, bytes: &'a [u8]) -> Result<&'a str, Problem> {
 fn order(j: &mut Journal) {
     in_order(&mut j.window);
     for lines in j.archives.values_mut() {
+        let lines: &mut Vec<Line> = Arc::make_mut(lines);
         in_order(lines);
     }
     for child in j.children.values_mut() {
@@ -192,7 +195,9 @@ fn place_file(
             match (period, entry(name), read) {
                 (Err(p), _, _) | (_, Err(p), _) | (_, _, Err(p)) => journal.problems.push(p),
                 (Ok(period), Ok(id), Ok(t)) => match read_entry(path, id, t) {
-                    Ok(line) => journal.archives.entry(period).or_default().push(line),
+                    Ok(line) => {
+                        Arc::make_mut(journal.archives.entry(period).or_default()).push(line)
+                    }
                     Err(p) => journal.problems.push(p),
                 },
             }
@@ -223,8 +228,7 @@ fn node<'a>(root: &'a mut Journal, path: &JournalPath) -> &'a mut Journal {
             .expect("a prefix of a place is a place");
         j = j
             .children
-            .entry(name.clone())
-            .or_insert_with(|| Journal::new(place, None));
+            .get_or_insert_with(name.clone(), || Journal::new(place, None));
     }
     j
 }
@@ -294,7 +298,7 @@ mod tests {
             .unwrap();
         assert_eq!(candle.window, vec![early, late]);
         assert_eq!(
-            candle.archives[&Period::parse("2026-10-29").unwrap()],
+            *candle.archives[&Period::parse("2026-10-29").unwrap()],
             vec![old]
         );
         assert_eq!(candle.problems, vec![]);

@@ -4,9 +4,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use tempfile::TempDir;
 
+use super::sync::{sync, Lend, Round};
 use super::*;
 use crate::files::{entry_file, Email, Role};
 use crate::line::Writer;
@@ -171,6 +173,50 @@ fn a_backdated_write_keeps_its_time_as_the_author_and_is_committed_now() {
     let (author, committer) = times.split_once(' ').unwrap();
     assert_eq!(author.parse::<i64>().unwrap(), then.secs());
     assert!(committer.parse::<i64>().unwrap() >= before, "{times}");
+}
+
+/// **A write never waits out the network**: the store is lent only to read
+/// what a round sends and to take in what came back, so a write made while
+/// the push and fetch run commits at once, on top of the head being pushed,
+/// and goes up at the next sync.
+#[test]
+fn a_write_made_while_a_round_is_on_the_network_commits_and_goes_up_next() {
+    let r = Repos::new();
+    let held = Mutex::new(Some(Store::open(&r.clone("a")).unwrap()));
+    let write = |text: &str, at: Stamp| {
+        held.lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .write(&yen(), &note(text), at)
+            .unwrap();
+    };
+    write("first", now());
+    let sent = (&held).lend(|s| s.transfer()).unwrap();
+    write("second", now().plus(1));
+    let got = sent.run().unwrap();
+    let mut done = Synced::default();
+    let round = (&held)
+        .lend(|s| s.settle(&sent, got, &mut done))
+        .unwrap()
+        .unwrap();
+    assert_eq!(round, Round::Done);
+    assert_eq!((done.pushed, done.settled), (1, false));
+    assert_eq!(texts(&r.origin_tree("check1"), "topics"), ["first"]);
+    let synced = sync(&held).unwrap().unwrap();
+    assert_eq!((synced.pushed, synced.settled), (1, true));
+    assert_eq!(
+        texts(&r.origin_tree("check2"), "topics"),
+        ["first", "second"]
+    );
+}
+
+/// **There is nothing to sync without a store**: a memory whose checkout has
+/// not opened lends nothing.
+#[test]
+fn a_sync_with_no_store_does_nothing() {
+    let none: Mutex<Option<Store>> = Mutex::new(None);
+    assert!(sync(&none).is_none());
 }
 
 #[test]

@@ -120,7 +120,7 @@ use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, threads, workers};
+use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, tending, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -6752,6 +6752,13 @@ impl ZendSession {
         Some(conv.shared())
     }
 
+    /// Hold `conv` as the substrate the load would have opened: what a test
+    /// of the `/mcp` tools runs on without a model.
+    #[cfg(test)]
+    pub(crate) fn hold_substrate(&self, conv: Conversation) {
+        let _ = self.loading_substrate.set(conv);
+    }
+
     /// Whether the model and its substrate are loaded: what a conversation's
     /// files need.
     pub fn is_loaded(&self) -> bool {
@@ -8049,6 +8056,7 @@ impl ZendSession {
             self.mcp.parts().bind(Arc::downgrade(self), rt.clone());
             archiving::start_sweeping(self, rt);
             resuming::start_resuming(self, rt);
+            tending::start_tending(self, rt);
         }
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.

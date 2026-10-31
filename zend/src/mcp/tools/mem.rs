@@ -10,7 +10,7 @@ use journals::actor::{
     groups_of, guest_viewer, home_group, need_read, role_in, viewer, Actor, GUEST,
 };
 use journals::files::{Role, Who as Member};
-use journals::path::{Address, JournalPath, Viewer};
+use journals::path::{Address, JournalPath, Viewer, HERE};
 use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::time::Stamp;
@@ -87,18 +87,33 @@ pub fn channel_of(c: McpClient) -> Channel {
     Channel::parse(c.name()).unwrap_or(Channel::Other)
 }
 
-/// The caller through an MCP session: [`Mem::of`], in this session's
-/// conversation — opened at its first call (§6.6), for a person who writes
-/// in their group. A reader writes nothing there, not even a conversation
-/// of their own, and reads without one. A conversation that could not be
-/// opened leaves the call to read without it: what fails is the write that
-/// needs it, never the read.
+/// The caller through an MCP session, for a call that only reads: who they
+/// are and this session's conversation as the tree already has them. It
+/// writes nothing — no account is bound and no conversation opened — so a
+/// read never waits on a commit. `here` names the conversation's journal
+/// whether or not a write has opened it yet.
+pub fn read(ctx: &Ctx) -> Result<Mem, String> {
+    let mut m = Mem::reading(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
+    if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
+        if writes_in(&m.tree, person, group) {
+            let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
+            m.here = Some(conversations::here(&m.memory, group, m.channel, &followed)?);
+        }
+    }
+    Ok(m)
+}
+
+/// The caller through an MCP session, for a call that writes: [`Mem::of`],
+/// in this session's conversation — opened at its first write (§6.6), for a
+/// person who writes in their group. A reader writes nothing there, not even
+/// a conversation of their own. A conversation that could not be opened
+/// leaves the call without it: what fails is the write that needs it.
 pub fn open(ctx: &Ctx) -> Result<Mem, String> {
     let mut m = Mem::of(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
     if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
         if writes_in(&m.tree, person, group) {
             let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
-            match conversations::of(&m.memory, person, group, m.channel, &followed) {
+            match conversations::open(&m.memory, person, group, m.channel, &followed) {
                 Ok(here) => {
                     m.tree = m.memory.tree()?;
                     m.here = Some(here);
@@ -124,16 +139,38 @@ impl Mem {
     pub fn of(session: &ZendSession, caller: &Caller, channel: Channel) -> Result<Mem, String> {
         let memory = Arc::clone(session.mcp().memory());
         let who = who::who(&memory, caller)?;
+        let m = Self::as_who(caller, channel, memory, who)?;
+        if let (Who::Person(person), Some(group), Some(records)) =
+            (&m.who, &m.group, session.shared_substrate())
+        {
+            moved::once(&m.memory, records, &caller.key(), group, person);
+        }
+        Ok(m)
+    }
+
+    /// [`Mem::of`] for a call that only reads: a new account is read as its
+    /// person, unbound, and nothing is moved.
+    pub fn reading(
+        session: &ZendSession,
+        caller: &Caller,
+        channel: Channel,
+    ) -> Result<Mem, String> {
+        let memory = Arc::clone(session.mcp().memory());
+        let who = who::read(&memory, caller)?;
+        Self::as_who(caller, channel, memory, who)
+    }
+
+    fn as_who(
+        caller: &Caller,
+        channel: Channel,
+        memory: Arc<Memory>,
+        who: Who,
+    ) -> Result<Mem, String> {
         let tree = memory.tree()?;
         let group = match &who {
             Who::Person(p) => home_group(&tree, p),
             Who::Guest => Some(Slug::parse(GUEST).expect("a name")),
         };
-        if let (Who::Person(person), Some(group), Some(records)) =
-            (&who, &group, session.shared_substrate())
-        {
-            moved::once(&memory, records, &caller.key(), group, person);
-        }
         Ok(Mem {
             tree,
             memory,
@@ -289,6 +326,14 @@ impl Mem {
             }
             out.join("\n")
         })
+    }
+
+    /// This conversation's journal when `text` names it as `here` and nothing
+    /// has written to it yet: it is not in the tree until its first write
+    /// opens it, and reads as empty until then.
+    pub fn here_unopened(&self, text: &str) -> Option<&JournalPath> {
+        let here = self.here.as_ref()?;
+        (text.trim() == HERE && self.tree.get(here).is_none()).then_some(here)
     }
 
     /// Who the conversation's focus says is speaking, when it says.
@@ -495,6 +540,28 @@ pub(crate) mod tests {
         assert_eq!(
             reader.why_no_here(),
             "you read @zen and write nothing there, not even a conversation of your own"
+        );
+    }
+
+    /// **`here` before the conversation's first write is its journal to
+    /// come**: named, not in the tree, and only when `here` is what is asked.
+    #[test]
+    fn here_before_the_first_write_is_unopened() {
+        let mut m = mem("john");
+        let begun = m
+            .path("conversations")
+            .unwrap()
+            .child(Slug::parse("2026-10-31-0712-grok").unwrap());
+        m.here = Some(begun.unwrap());
+        assert_eq!(
+            m.here_unopened(" here ").map(|p| p.show()).as_deref(),
+            Some("@zen/conversations/2026-10-31-0712-grok")
+        );
+        assert!(m.here_unopened("topics").is_none());
+        m.here = Some(m.path("topics").unwrap());
+        assert!(
+            m.here_unopened("here").is_none(),
+            "an opened journal is read"
         );
     }
 

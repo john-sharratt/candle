@@ -63,6 +63,7 @@ pub(crate) fn open_in_process(dir: &Path) -> Option<Repo> {
         },
         format: ObjectFormat::Sha1,
         write: Mutex::new(()),
+        transfer: Mutex::new(()),
         library: Some(Mutex::new(library)),
         pusher: here(),
         fetcher: fetch_here(),

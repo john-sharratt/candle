@@ -81,7 +81,7 @@ impl Server for ZendSession {
     /// client; there are none to read until the substrate has loaded.
     fn store(&self) -> Result<Arc<dyn Store>, String> {
         self.shared_substrate()
-            .map(|s| Arc::new(RecordStore(s)) as Arc<dyn Store>)
+            .map(|s| Arc::new(RecordStore::new(s, Arc::clone(self.mcp().used()))) as Arc<dyn Store>)
             .ok_or_else(|| LOADING.to_string())
     }
 
@@ -105,7 +105,16 @@ impl Server for ZendSession {
         answer.result()
     }
 
+    /// The answer's marks are records, written on the blocking pool.
     async fn delivered(this: &Arc<Self>, call: &Call<Self>, answer: &Answer) {
-        answer.delivered(this, &call.caller.key());
+        if answer.marks.is_empty() {
+            return;
+        }
+        let (session, owner, answer) = (Arc::clone(this), call.caller.key(), answer.clone());
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || answer.delivered(&session, &owner)).await
+        {
+            tracing::warn!("mcp: an answer's marks were not kept: {e}");
+        }
     }
 }

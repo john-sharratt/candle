@@ -192,7 +192,7 @@ pub fn render_gateway(status: &Value) -> String {
 
 pub async fn call(ctx: &Ctx, _args: &Value) -> Answer {
     let within = Duration::from_secs(15);
-    let reply = match ops::up(
+    let members = ops::up(
         &ctx.session,
         &ctx.caller,
         Method::GET,
@@ -200,9 +200,28 @@ pub async fn call(ctx: &Ctx, _args: &Value) -> Answer {
         None,
         None,
         within,
-    )
-    .await
-    {
+    );
+    // The gateway's own view is asked for beside the members', not after it.
+    let gateway = async {
+        if !ctx.caller.is_admin() {
+            return None;
+        }
+        Some(
+            ops::up(
+                &ctx.session,
+                &ctx.caller,
+                Method::GET,
+                "/gateway/status.json?log=0",
+                None,
+                None,
+                within,
+            )
+            .await
+            .and_then(|r| json_of(&r)),
+        )
+    };
+    let (reply, gateway) = tokio::join!(members, gateway);
+    let reply = match reply {
         Ok(r) => r,
         Err(e) => return Answer::error(e),
     };
@@ -210,18 +229,7 @@ pub async fn call(ctx: &Ctx, _args: &Value) -> Answer {
         Ok(v) => render_members(&v, now_ms()),
         Err(e) => return Answer::error(format!("/v1/status: {e}")),
     };
-    if ctx.caller.is_admin() {
-        let gateway = ops::up(
-            &ctx.session,
-            &ctx.caller,
-            Method::GET,
-            "/gateway/status.json?log=0",
-            None,
-            None,
-            within,
-        )
-        .await
-        .and_then(|r| json_of(&r));
+    if let Some(gateway) = gateway {
         out.push_str("\n\n");
         match gateway {
             Ok(v) => out.push_str(&render_gateway(&v)),

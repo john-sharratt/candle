@@ -57,6 +57,16 @@ pub struct Placing {
     pub pinned: Option<u64>,
     /// The member that sent it up asking for a peer.
     pub sender: Option<u64>,
+    /// The route it matched, which an `Any` request goes only to a member
+    /// declaring ([`super::registry::Registry::declaring`]).
+    pub route: Option<RouteAt>,
+}
+
+/// A request's method and path, as a member's table is matched with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAt {
+    pub method: String,
+    pub path: String,
 }
 
 /// One waiting unit.
@@ -132,6 +142,7 @@ mod tests {
             key: None,
             pinned: None,
             sender,
+            route: None,
         }
     }
 

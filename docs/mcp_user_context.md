@@ -115,13 +115,17 @@ A conversation is a person's MCP session through a client: a new session is a
 new conversation, and one silent for `CONVERSATION_GAP_MS` (30 minutes) is
 one again — the only boundary a client that keeps one session, or none, can
 be given. The first call of a conversation reads the context *beside* its own
-work (one round trip, not two), and its answer gets a second text block,
-"Before you answer — …" followed by the user context (guide and memory).
-`get_user_context` itself is never given it twice.
+work, and never waits for it: when the read has finished by the time the call
+answers, its answer gets a second text block, "Before you answer — …"
+followed by the user context (guide and memory). A read the call answered
+ahead of is left running (`mcp/src/reading.rs`), and the conversation's next
+call carries it instead of reading again. `get_user_context` itself is never
+given it twice.
 
 The conversation's clock is stamped only once it has had its context. A first
-call whose context could not be read — the memory's backend restarting, or
-not listed yet — leaves it unstamped, and the next call tries again.
+call that answered ahead of its read, or whose context could not be read —
+the memory's backend restarting, or not listed yet — leaves it unstamped, and
+the next call carries it or tries again.
 
 Two aggregators serve `/mcp` in turn, so a conversation may get the block once
 from each; it is a few hundred tokens and says the same both times. A restart

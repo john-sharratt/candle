@@ -1,8 +1,9 @@
 //! `get_user_context`: the frame for this conversation — the group's master,
 //! who it could be talking to, this conversation and its focus, the journals
 //! the focus names, the last conversation on this channel and the cues below
-//! — within the client's budget (`docs/memory_backbone.md` §6.4–§6.6). Its
-//! first call opens the conversation's journal. A guest is given `@guest`'s.
+//! — within the client's budget (`docs/memory_backbone.md` §6.4–§6.6). It
+//! writes nothing: the conversation's journal is named, and opened by its
+//! first write. A guest is given `@guest`'s.
 //! The aggregator puts the client's guide in front of the answer, and gives
 //! the same answer to the first call of a conversation, whatever tool it is
 //! (`docs/mcp_user_context.md` §2.5).
@@ -41,7 +42,7 @@ pub fn nothing_kept(why: &str) -> String {
 }
 
 pub fn call(ctx: &Ctx, _args: &Value) -> Answer {
-    let m = match mem::open(ctx) {
+    let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };

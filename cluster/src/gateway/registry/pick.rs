@@ -156,6 +156,11 @@ impl Registry {
 
     fn round_robin_but(&mut self, app: &str, except: Option<u64>) -> Option<u64> {
         let nodes: Vec<u64> = self.ready_but(app, except).iter().map(|m| m.node).collect();
+        self.round_robin_among(app, &nodes)
+    }
+
+    /// The next of `nodes` in `app`'s turn; `None` when there are none.
+    pub fn round_robin_among(&mut self, app: &str, nodes: &[u64]) -> Option<u64> {
         if nodes.is_empty() {
             return None;
         }
@@ -163,6 +168,25 @@ impl Registry {
         let pick = nodes[a.rr % nodes.len()];
         a.rr = a.rr.wrapping_add(1);
         Some(pick)
+    }
+
+    /// The ready members of `app` whose own table declares a route answering
+    /// `method` on `path`, when not every ready member does: a member that
+    /// lacks a route — a build without it yet, or a member that serves it only
+    /// while it holds what the route needs — is never sent it. `None` when
+    /// every ready member declares it.
+    pub fn declaring(&self, app: &str, method: &str, path: &str) -> Option<Vec<u64>> {
+        let ready = self.ready_but(app, None);
+        let declaring: Vec<u64> = ready
+            .iter()
+            .filter(|m| {
+                m.routes
+                    .as_ref()
+                    .is_some_and(|t| t.lookup(method, path).is_some())
+            })
+            .map(|m| m.node)
+            .collect();
+        (declaring.len() < ready.len()).then_some(declaring)
     }
 
     /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
@@ -256,6 +280,12 @@ impl Registry {
             Dispatch::Best if ask == PeerAsk::default() => self.best(app, draw, &weigh),
             Dispatch::Best => self.best_for_peer(app, draw, ask, &weigh),
             Dispatch::Any => self.round_robin(app).map_or(Placed::Nobody, Placed::To),
+            // A request routed by its subject that names none and draws
+            // nothing — a listing, a read of the caller's own — is no unit of
+            // work: it goes in turn, never held back for a card's room.
+            Dispatch::Owner(_) if is_errand(dispatch, key, draw) => {
+                self.round_robin(app).map_or(Placed::Nobody, Placed::To)
+            }
             // A key held by a member here goes to it — syncing, or still
             // loading, included: the conversation is the holder's, possibly
             // with turns it wrote cut off that no other member has, and a
@@ -365,6 +395,15 @@ impl Registry {
             Placed::Nobody => Pick::Wait,
         }
     }
+}
+
+/// Whether a request placed by `dispatch` with `key` and `draw` is an errand
+/// rather than a unit of work: routed by its subject, it names none and
+/// draws nothing, so no member's card is the place for it and it waits for
+/// no room ([`Registry::pick_from`]), and it is not counted against the
+/// member that answers it.
+pub fn is_errand(dispatch: &Dispatch, key: Option<&str>, draw: Option<u64>) -> bool {
+    matches!(dispatch, Dispatch::Owner(_)) && key.is_none() && draw.is_none()
 }
 
 /// A pick made by something other than the placement policy — a key's

@@ -75,9 +75,10 @@ fn newest(records: &dyn Records, owner: &str, t: &Thread, workers: &[Worker]) ->
         0 => 0,
         at => at.saturating_add(threads::ATTACH_MARK_MS),
     };
-    threads::notes(records, owner, &t.name)
-        .iter()
+    // Notes are kept in the order they were written: the newest is the last.
+    threads::last_note(records, owner, &t.name)
         .map(|n| n.at_ms)
+        .into_iter()
         .chain(workers.iter().map(last_active))
         .fold(t.created_ms.max(attached), u64::max)
 }

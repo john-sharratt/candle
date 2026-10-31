@@ -69,7 +69,13 @@ impl Server for Stand {
                 let before = call.session.held("text").unwrap_or("nothing").to_string();
                 let text = args["text"].as_str().unwrap_or_default();
                 call.store
-                    .hold(&call.session_id, "text", text, http::now_ms())
+                    .hold(
+                        &call.session_id,
+                        &call.session,
+                        "text",
+                        text,
+                        http::now_ms(),
+                    )
                     .unwrap();
                 format!("{} held {before}", call.caller)
             }

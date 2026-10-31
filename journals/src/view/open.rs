@@ -65,7 +65,7 @@ pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Sta
         out.push("References:".into());
         out.extend(refs.into_iter().map(|l| format!("  - {l}")));
     }
-    let archived: usize = j.archives.values().map(Vec::len).sum();
+    let archived: usize = j.archives.values().map(|lines| lines.len()).sum();
     if j.window.is_empty() {
         out.push("No lines.".into());
     } else {
@@ -95,6 +95,8 @@ pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Sta
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::actor::Actor;
     use crate::error::Problem;
@@ -137,7 +139,7 @@ mod tests {
         t.get_mut(&path)
             .unwrap()
             .archives
-            .insert(Period::parse("2026-09-01").unwrap(), vec![old]);
+            .insert(Period::parse("2026-09-01").unwrap(), Arc::new(vec![old]));
         let text = open(&t, &path, t.get(&path).unwrap(), 2, now().plus(600));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], NOT_INSTRUCTIONS);

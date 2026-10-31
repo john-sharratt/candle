@@ -58,8 +58,8 @@ use super::log::{CoordLog, Entry};
 use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
 use super::planner::{Planned, Planner, NPC_FLOOR_PERCENT};
-use super::queue::{Placing, Queue, Urgency, HOLD};
-use super::registry::{MemberView, PeerAsk, Pick, Registry, HOSTING_APP};
+use super::queue::{Placing, Queue, RouteAt, Urgency, HOLD};
+use super::registry::{is_errand, MemberView, PeerAsk, Pick, Registry, HOSTING_APP};
 use super::status::{
     mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
@@ -1238,10 +1238,12 @@ impl Hub {
         sender: Option<u64>,
     ) -> Picked {
         let mut s = self.state();
-        self.pick_in(&mut s, app, dispatch, draw, key, pinned, sender)
+        self.pick_in(&mut s, app, dispatch, draw, key, pinned, sender, None)
     }
 
     /// [`Self::pick_from`] under a hold of the state the caller already has.
+    /// An `Any` request whose `route` not every ready member declares goes to
+    /// one that does, in turn, and waits while none is ready.
     #[allow(clippy::too_many_arguments)]
     fn pick_in(
         self: &Arc<Self>,
@@ -1252,6 +1254,7 @@ impl Hub {
         key: Option<&str>,
         pinned: Option<u64>,
         sender: Option<u64>,
+        route: Option<&RouteAt>,
     ) -> Picked {
         let State {
             registry,
@@ -1264,6 +1267,14 @@ impl Hub {
         for ((a, node), socket) in sockets.iter() {
             if a == app && socket.handle.is_gone() {
                 registry.closing(app, *node, socket.session);
+            }
+        }
+        if let (Dispatch::Any, Some(at)) = (dispatch, route) {
+            if let Some(nodes) = registry.declaring(app, &at.method, &at.path) {
+                let pick = registry
+                    .round_robin_among(app, &nodes)
+                    .map_or(Pick::Wait, Pick::Member);
+                return Picked { pick, load: None };
             }
         }
         let canary = upgrades.canary(app);
@@ -1286,7 +1297,7 @@ impl Hub {
         let work = matches!(
             dispatch,
             Dispatch::Best | Dispatch::Sticky(_) | Dispatch::Owner(_)
-        );
+        ) && !is_errand(dispatch, key, draw);
         let load = match pick {
             Pick::Member(node) if work => registry
                 .begin(app, node, draw.is_some())
@@ -1311,6 +1322,7 @@ impl Hub {
                 placing.key.as_deref(),
                 placing.pinned,
                 placing.sender,
+                placing.route.as_ref(),
             );
             if picked.pick != Pick::Wait {
                 return Some(picked);
@@ -1403,6 +1415,7 @@ impl Hub {
                     w.ask.key.as_deref(),
                     w.ask.pinned,
                     w.ask.sender,
+                    w.ask.route.as_ref(),
                 );
                 if picked.pick == Pick::Wait {
                     s.queue.keep(w);
@@ -1450,6 +1463,12 @@ impl Hub {
     /// The dispatch table `app`'s ready members declared.
     pub fn table(&self, app: &str) -> Option<RouteTable> {
         self.state().registry.table(app).cloned()
+    }
+
+    /// The table a request for `method` on `path` is matched in
+    /// ([`super::registry::Registry::table_for`]).
+    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<RouteTable> {
+        self.state().registry.table_for(app, method, path).cloned()
     }
 
     pub fn clustered(&self, app: &str) -> bool {

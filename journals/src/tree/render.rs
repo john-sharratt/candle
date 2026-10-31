@@ -29,7 +29,7 @@ pub fn own_files(path: &JournalPath, j: &Journal) -> BTreeMap<String, Vec<u8>> {
         );
     }
     for (period, lines) in &j.archives {
-        for line in lines {
+        for line in lines.iter() {
             out.insert(
                 format!("{folder}/{ARCHIVE_DIR}/{period}/{}", entry_file(&line.id)),
                 line.render().into_bytes(),
@@ -87,6 +87,8 @@ pub fn render_all(tree: &Tree) -> BTreeMap<String, Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::files::summary::{Cite, Fingerprint, Sentence};
     use crate::files::{Focus, Meta, Ref, Summary};
@@ -122,9 +124,10 @@ mod tests {
             cue: "open for who leads it".into(),
         });
         let old = note("2026-10-28T10:00:00Z", "archived");
-        candle
-            .archives
-            .insert(Period::parse("2026-10-28").unwrap(), vec![old.clone()]);
+        candle.archives.insert(
+            Period::parse("2026-10-28").unwrap(),
+            Arc::new(vec![old.clone()]),
+        );
         let fresh = note("2026-10-30T10:00:00Z", "fresh");
         candle.window.push(fresh.clone());
         candle.meta.as_mut().unwrap().summary = Some(Summary {

@@ -42,7 +42,7 @@ use axum::response::Response;
 use cluster::dispatch::{
     draw_area, extract, Dispatch, Extracted, KeySource, Merge, Mirror, Reach, BODY_LIMIT,
 };
-use cluster::gateway::{Class, Pick, Placing, HOLD, NODE_HEADER};
+use cluster::gateway::{Class, Pick, Placing, RouteAt, HOLD, NODE_HEADER};
 use cluster::member::PREFER_PEER;
 use serde_json::Value;
 use tracing::Instrument;
@@ -179,7 +179,7 @@ async fn none_ready(gateway: &Arc<Gateway>, app: &str, ctx: &Context<'_>, req: R
 /// Route `req` for `app`, clustered on this gateway.
 pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Request) -> Routed {
     let hub = &gateway.hub;
-    let Some(table) = hub.table(app) else {
+    let Some(table) = hub.table_for(app, req.method().as_str(), req.uri().path()) else {
         return none_ready(gateway, app, &ctx, req).await;
     };
     match addressed(&req, &ctx) {
@@ -287,6 +287,7 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
         key: key.clone(),
         pinned: pin,
         sender: peer_of,
+        route: Some(RouteAt { method, path }),
     };
     let span = tracing::info_span!("place", req = id, app, dispatch = dispatch.name());
     let Some(picked) = hub.place(placing).instrument(span).await else {
