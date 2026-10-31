@@ -126,12 +126,15 @@ pub fn target(f: &Facts) -> Option<Target> {
                 hash,
                 local: String::new(),
             };
-            // A rollout is over for a member past it on a build the group
-            // certified since. It stands as the app's latest for good, and read
-            // as "run this" it took WhiteWorld back down from 4166 to the 4164
-            // forced before it, for the certified build to bring it up again. A
-            // rollback rejects what it rolls back from, so it still applies.
-            let passed = running.count > build.count && f.certified(&running);
+            // A rollout is over for a member past it, unless that build was
+            // rejected. It stands as the app's latest for good, and read as "run
+            // this" it took WhiteWorld back down from 4166 to the 4164 forced
+            // before it, for the floor to bring it up again. Not "certified": a
+            // member that came up by the floor may not hold the verdict yet,
+            // and went down again on 4170 for that. A rollback rejects what it
+            // rolls back from, so it still applies.
+            let passed =
+                running.count > build.count && !running.is_local() && !f.rejected(&running);
             (build != running && !passed).then(|| Target {
                 build,
                 lease: Lease::Forced {
@@ -339,10 +342,11 @@ mod tests {
         assert_eq!(prefetch(&f), None, "a rejected build is not fetched");
     }
 
-    /// **A rollout does not pull a member back off a build certified since**,
-    /// and it still rolls one back off a build that was rejected.
+    /// **A rollout does not pull a member back off a later build**, even one
+    /// whose verdict it does not hold yet, and it still rolls one back off a
+    /// build that was rejected.
     #[test]
-    fn a_standing_rollout_stays_behind_a_certified_build() {
+    fn a_standing_rollout_stays_behind_a_later_build() {
         let mut f = facts(12, "");
         f.apps = vec!["zend".into()];
         f.nodes
@@ -351,14 +355,17 @@ mod tests {
             "zend".into(),
             (3, rollout("10-h10", &["0000000000000007"], 1)),
         );
+        assert_eq!(target(&f), None, "12 is past it, its verdict not held");
+        f.verdicts
+            .insert(("zend".into(), "12-h12".into()), Settled::Pass);
+        assert_eq!(target(&f), None, "12 is certified and past it");
+        f.verdicts
+            .insert(("zend".into(), "12-h12".into()), Settled::Fail);
         assert_eq!(
             target(&f).map(|t| t.build),
             Some(b(10)),
-            "12 is not certified: the rollout rolls it back"
+            "12 is rejected: the rollout rolls it back"
         );
-        f.verdicts
-            .insert(("zend".into(), "12-h12".into()), Settled::Pass);
-        assert_eq!(target(&f), None, "12 is certified and past the rollout");
     }
 
     /// A motherd installs only what both of its apps certified.
