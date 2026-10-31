@@ -731,10 +731,16 @@ a conversation working out its speaker sees who it could be:
   It writes each summary back through the service like any other writer,
   naming the fingerprint it was built over. A rebuild reads only its own
   group.
-- **When.** A dirty journal is rebuilt once it has been quiet for 30 seconds
-  or has 20 lines since its last build, whichever is first. A conversation
-  or task that closes is rebuilt at once. The same thread runs the window
-  folds (§4) and the eleventh-child folds (§2.3).
+- **When.** A dirty journal is rebuilt once what its summary reads has been
+  quiet — no new window line, and no live child's summary rebuilt — for 30
+  seconds, or for 10 minutes when it has live children; or once it has 20
+  lines since its last build, whichever is first. A parent waits for its
+  children to settle because every child's rebuild dirties it: timed by its
+  own window alone, a master with almost no lines was rebuilt the moment any
+  child was — `@zen` nine times in eighty minutes on 2026-10-31, each a new
+  `journal.yaml` for zend's code reading to read and calibrate. A
+  conversation or task that closes is rebuilt at once. The same thread runs
+  the window folds (§4) and the eleventh-child folds (§2.3).
 - **How.** Each rebuild is one turn in zend's `Low` band, in a conversation
   opened for that question alone. It runs under the reserved `Prose` layer,
   with its group closed to every other turn, and its timeline is tombstoned
@@ -899,7 +905,7 @@ own journal. A path may pass through references (§2.5).
 | `journal_focus {speaker?, about?}` | sets who is speaking and what the conversation is about (§2.4) |
 | `journal_read {journal}` | a journal: its summary (and staleness), its references, its index, its window, how much is folded; with `<path>#<line id>`, one line. The same tool reads Zen's thread and worker journals, and for a worker the turns behind one of its entries |
 | `journal_grep {journal, pattern}` | case-insensitive substring search, with a hyphen and a space matching each other, under `journal` (`*` for everything the caller reads). It searches every named journal's own name and written cue (parents, owners and fixed journals' shared cues are not matched), and every line, archive and summary of the subtree. Journals the phrase names come first, then lines, newest first. A line of up to 1,000 characters is shown whole; a longer one is cut around the match |
-| `journal_note {journal, text}` | a `note` line, stamped with the focus's speaker |
+| `journal_note {journal, text}` | a `note` line, stamped with the focus's speaker; refused, naming the line, when the window already holds a note of the same words (spacing and case aside), so a refined fact is edited rather than noted again |
 | `journal_edit {journal, text}` | corrects what a line says, `journal` its address: a commit |
 | `journal_forget {journal, says?}` | removes a line from the journal, named by its address or by `says` (§8) |
 | `journal_create {under, name, cue}` | a named sub-journal, where the section allows (§2.3) |
