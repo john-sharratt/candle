@@ -3401,6 +3401,18 @@ impl Scheduler {
             .count()
     }
 
+    /// Whether a prompt a person is waiting on is prefilling, or queued to.
+    /// A dialogue's tool results are that prompt between its decodes, so the
+    /// `Low` hold beside its decode covers them too (`urgent_hold`).
+    pub(super) fn an_urgent_prompt_prefills(&self) -> bool {
+        let urgent = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::Urgent;
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.offset < p.work.tokens.len())
+            .any(|p| urgent(p.work.sequence_id))
+            || self.prefill_queue.iter().any(|w| urgent(w.sequence_id))
+    }
+
     /// In-flight prefills that can advance: not errored. What admission's
     /// progress gates count.
     pub(super) fn running_prefills(&self) -> usize {
@@ -7209,6 +7221,32 @@ mod wave_chunk_tests {
     /// Whether `seq`'s turn is in flight.
     fn admitted(s: &Scheduler, seq: SequenceId) -> bool {
         s.active_prefills.iter().any(|p| p.work.sequence_id == seq)
+    }
+
+    /// **A person's prompt holds the background from the queue on.** Tool
+    /// results are that prompt between two decodes; a `High` one is the cast,
+    /// which the hold must never key on (`urgent_hold`).
+    #[test]
+    fn only_an_urgent_prompt_counts_as_prefilling_for_the_hold() {
+        let (mut s, _tx) = make_test_scheduler();
+        assert!(!s.an_urgent_prompt_prefills());
+        queue_turn(&mut s, DecodePriority::High, 8);
+        assert!(!s.an_urgent_prompt_prefills(), "the cast does not hold it");
+        queue_turn(&mut s, DecodePriority::Urgent, 8);
+        assert!(s.an_urgent_prompt_prefills(), "queued");
+
+        s.prefill_queue.clear();
+        assert!(!s.an_urgent_prompt_prefills());
+        let seq = SequenceId(s.session.create_sequence().expect("create"));
+        s.slot_bands.insert(seq, DecodePriority::Urgent);
+        s.active_prefills.push(dialogue_prefill(seq, vec![1; 8]));
+        assert!(s.an_urgent_prompt_prefills(), "in flight");
+
+        s.active_prefills[0].offset = 8;
+        assert!(
+            !s.an_urgent_prompt_prefills(),
+            "written: nothing to hold for"
+        );
     }
 
     /// **A live turn that runs ahead of a full creep is admitted.** On

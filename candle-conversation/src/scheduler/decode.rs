@@ -705,7 +705,7 @@ impl Scheduler {
         }
 
         // ── A person waiting holds the background back ───────────────────────
-        // Beside an `Urgent` decode, `Low` rows ride one step in
+        // Beside an `Urgent` decode or prefill, `Low` rows ride one step in
         // `LOW_RIDES_EVERY` (`urgent_hold`): a step bound by its rows' contexts
         // is the dialogue's latency, row for row. A held row is not dropped —
         // it waits, as an adapter's does, and its static run stays pending.
@@ -713,7 +713,8 @@ impl Scheduler {
             .iter()
             .copied()
             .chain(stencil.rows.iter().map(|r| r.seq))
-            .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent);
+            .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent)
+            || self.an_urgent_prompt_prefills();
         let low_rides = self.urgent_hold.low_rides(urgent);
         if !low_rides {
             seq_ids.retain(|&id| UrgentHold::rides(self.decode_priority_or_high(id), false));
