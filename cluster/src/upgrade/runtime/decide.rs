@@ -126,7 +126,13 @@ pub fn target(f: &Facts) -> Option<Target> {
                 hash,
                 local: String::new(),
             };
-            (build != running).then(|| Target {
+            // A rollout is over for a member past it on a build the group
+            // certified since. It stands as the app's latest for good, and read
+            // as "run this" it took WhiteWorld back down from 4166 to the 4164
+            // forced before it, for the certified build to bring it up again. A
+            // rollback rejects what it rolls back from, so it still applies.
+            let passed = running.count > build.count && f.certified(&running);
+            (build != running && !passed).then(|| Target {
                 build,
                 lease: Lease::Forced {
                     app: app.clone(),
@@ -331,6 +337,28 @@ mod tests {
             .insert(("zend".into(), "12-h12".into()), Settled::Fail);
         assert_eq!(target(&f), None);
         assert_eq!(prefetch(&f), None, "a rejected build is not fetched");
+    }
+
+    /// **A rollout does not pull a member back off a build certified since**,
+    /// and it still rolls one back off a build that was rejected.
+    #[test]
+    fn a_standing_rollout_stays_behind_a_certified_build() {
+        let mut f = facts(12, "");
+        f.apps = vec!["zend".into()];
+        f.nodes
+            .insert("zend".into(), "0000000000000007".to_string());
+        f.rollouts.insert(
+            "zend".into(),
+            (3, rollout("10-h10", &["0000000000000007"], 1)),
+        );
+        assert_eq!(
+            target(&f).map(|t| t.build),
+            Some(b(10)),
+            "12 is not certified: the rollout rolls it back"
+        );
+        f.verdicts
+            .insert(("zend".into(), "12-h12".into()), Settled::Pass);
+        assert_eq!(target(&f), None, "12 is certified and past the rollout");
     }
 
     /// A motherd installs only what both of its apps certified.
