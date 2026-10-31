@@ -357,7 +357,11 @@ impl Commands {
                             )
                         })
                         .collect();
-                    out.insert(t.app.into(), Value::Object(by_type));
+                    let gone: Vec<u64> = audit.gone.iter().map(|s| s.raw()).collect();
+                    out.insert(
+                        t.app.into(),
+                        json!({ "by_type": by_type, "segments_gone": gone }),
+                    );
                 }
                 Ok(Value::Object(out))
             }

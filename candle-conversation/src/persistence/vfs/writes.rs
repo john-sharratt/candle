@@ -5,8 +5,22 @@ use serde_json::Value;
 use super::index::VfsIndex;
 use super::payload::{VfsEventId, VfsEventPayload, VfsTombstonePayload};
 use crate::persistence::manifest::RecordLoc;
-use crate::persistence::record::RecordType;
+use crate::persistence::record::{Record, RecordType};
 use crate::persistence::{Result, SubstratePersistence};
+
+/// The file events `records` hold, in `(repo, key)` order and within a key in
+/// stamp order.
+pub(in crate::persistence) fn vfs_events_of(records: &[Record]) -> Result<Vec<VfsEventPayload>> {
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        let stamp = record.header.identity().stamp();
+        out.push((stamp, VfsEventPayload::decode(&record.payload)?));
+    }
+    out.sort_by(|(sa, a), (sb, b)| {
+        (&a.repo, &a.key, sa, a.id()).cmp(&(&b.repo, &b.key, sb, b.id()))
+    });
+    Ok(out.into_iter().map(|(_, event)| event).collect())
+}
 
 /// One set of a conversation's changes to its files, written together:
 /// events first, then tombstones — so a batch cut short leaves old events
@@ -134,24 +148,25 @@ impl SubstratePersistence {
     /// is committed first: a conversation built again moments after its last
     /// save reads that save too.
     pub fn vfs_events(&mut self, timeline: u64) -> Result<Vec<VfsEventPayload>> {
+        let locs = self.vfs_event_locs(timeline)?;
+        let mut records = Vec::with_capacity(locs.len());
+        for loc in locs {
+            records.push(
+                self.segments
+                    .read_record_at(loc.segment, loc.offset, loc.record_size)?,
+            );
+        }
+        vfs_events_of(&records)
+    }
+
+    /// Where every live file event of `timeline` is, made durable first.
+    pub fn vfs_event_locs(&mut self, timeline: u64) -> Result<Vec<RecordLoc>> {
         self.commit_if_pending()?;
-        let locs: Vec<RecordLoc> = self
+        Ok(self
             .vfs_index
             .timeline(timeline)
             .map(|tl| tl.events().values().copied().collect())
-            .unwrap_or_default();
-        let mut out = Vec::with_capacity(locs.len());
-        for loc in locs {
-            let record = self
-                .segments
-                .read_record_at(loc.segment, loc.offset, loc.record_size)?;
-            let stamp = record.header.identity().stamp();
-            out.push((stamp, VfsEventPayload::decode(&record.payload)?));
-        }
-        out.sort_by(|(sa, a), (sb, b)| {
-            (&a.repo, &a.key, sa, a.id()).cmp(&(&b.repo, &b.key, sb, b.id()))
-        });
-        Ok(out.into_iter().map(|(_, event)| event).collect())
+            .unwrap_or_default())
     }
 
     /// Where every live file event and tombstone is.

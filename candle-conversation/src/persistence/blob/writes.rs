@@ -3,9 +3,19 @@
 use super::index::BlobIndex;
 use super::payload::{BlobKey, BlobPayload};
 use super::{forget_if_retired, forget_retired};
+use crate::persistence::manifest::RecordLoc;
 use crate::persistence::record::{CustomObjectPayload, RecordType};
 use crate::persistence::{Result, SubstratePersistence};
 use crate::substrate::Substrate;
+
+/// The bytes of a blob record's `payload`, when it is the blob named `sha256`.
+pub(in crate::persistence) fn blob_bytes(
+    payload: &[u8],
+    sha256: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    let blob = BlobPayload::decode(payload)?;
+    Ok((&blob.sha256 == sha256).then_some(blob.bytes))
+}
 
 impl SubstratePersistence {
     /// Stage `bytes` as a blob, unless one of their hash is already held;
@@ -60,15 +70,19 @@ impl SubstratePersistence {
     /// Whatever is staged is committed first, so a blob reads back the moment
     /// after it was written.
     pub fn blob(&mut self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        self.commit_if_pending()?;
-        let Some(loc) = self.blob_index.get(BlobKey::of(sha256)) else {
+        let Some(loc) = self.blob_loc(sha256)? else {
             return Ok(None);
         };
         let record = self
             .segments
             .read_record_at(loc.segment, loc.offset, loc.record_size)?;
-        let blob = BlobPayload::decode(&record.payload)?;
-        Ok((&blob.sha256 == sha256).then_some(blob.bytes))
+        blob_bytes(&record.payload, sha256)
+    }
+
+    /// Where the blob named `sha256` is, made durable first.
+    pub fn blob_loc(&mut self, sha256: &[u8; 32]) -> Result<Option<RecordLoc>> {
+        self.commit_if_pending()?;
+        Ok(self.blob_index.get(BlobKey::of(sha256)))
     }
 
     /// Whether a blob of `sha256` is held, without reading it.

@@ -57,6 +57,7 @@ mod joined_tests;
 mod le_reader;
 pub mod listing;
 pub mod liveness_audit;
+mod log_facts;
 pub mod log_file;
 pub mod maintenance;
 pub mod manifest;
@@ -99,7 +100,6 @@ pub mod written_snapshots;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use dead_ratio::dead_ratio_of;
@@ -114,7 +114,7 @@ use crate::substrate::{file_store_key, Substrate, SubstrateLock, TurnMark};
 use accounting::RecordAccounting;
 use adoption::Adoption;
 use appended::Appended;
-use blob::{retired_blob, BlobIndex, BlobKey};
+use blob::{blob_bytes, retired_blob, BlobIndex, BlobKey};
 use chunk_plan::ChunkedReadPlan;
 use compaction::Housekeeping;
 use content_hash::snapshot_stream_id;
@@ -126,6 +126,7 @@ use identity::{
 use inherit::InheritedSubstrate;
 use joined::Purge;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
+pub use log_facts::LogFacts;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
 use open_progress::MibMeter;
@@ -150,7 +151,7 @@ use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use tombstone_expiry::{TombstoneExpiry, DEFAULT_TOMBSTONE_RETENTION};
 use vanished_segment::retry_vanished;
-use vfs::{VfsEventId, VfsEventPayload, VfsIndex, VfsWrite};
+use vfs::{vfs_events_of, VfsEventId, VfsEventPayload, VfsIndex, VfsWrite};
 use walker::WalkEntry;
 use writer_lock::WriterLock;
 
@@ -491,8 +492,16 @@ impl SharedSubstrate {
 
     /// Every live file event of `timeline`, in `(repo, key)` order and within
     /// a key in stamp order.
+    ///
+    /// The owner commits what is staged and says where the events are; they
+    /// are read off its thread. Maintenance may move one first, and then the
+    /// owner reads them all.
     pub fn vfs_events(&self, timeline: u64) -> Result<Vec<VfsEventPayload>> {
-        self.persistence.call(|p| p.vfs_events(timeline))
+        let locs = self.persistence.call(|p| p.vfs_event_locs(timeline))?;
+        match self.persistence.sealed_reader().read_records(&locs) {
+            Some(Ok(records)) => vfs_events_of(&records),
+            _ => self.persistence.call(|p| p.vfs_events(timeline)),
+        }
     }
 
     /// Every timeline holding file events or tombstones, in id order.
@@ -531,8 +540,18 @@ impl SharedSubstrate {
     }
 
     /// The bytes named `sha256`, or `None` when no blob of that hash is held.
+    ///
+    /// The owner commits what is staged and says where the blob is; the bytes,
+    /// up to a 64 MiB pack, are read off its thread. Maintenance may move the
+    /// record first, and then the owner reads it.
     pub fn blob(&self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        self.persistence.call(|p| p.blob(sha256))
+        let Some(loc) = self.persistence.call(|p| p.blob_loc(sha256))? else {
+            return Ok(None);
+        };
+        match self.persistence.sealed_reader().read_record_payload(&loc) {
+            Some(Ok(payload)) => blob_bytes(&payload, sha256),
+            _ => self.persistence.call(|p| p.blob(sha256)),
+        }
     }
 
     /// Whether a blob of `sha256` is held, without reading it: a pack of
@@ -589,9 +608,6 @@ pub struct SubstratePersistence {
     /// surfaced in the daemon status for the GUI's compaction indicator.
     /// `None` until the first op runs.
     last_maintenance: Option<(String, u64)>,
-    /// The dead ratio the last liveness scan found, as `f32` bits — NaN before
-    /// the first ([`Self::scanned_dead_ratio`]).
-    scanned_dead_ratio: AtomicU32,
     /// The writes made since the running maintenance op was planned that its
     /// relocation must step around — see [`RelocationWatch`]. `Some` from the
     /// plan until the op's sources are unlinked (or the op fails), so it also
@@ -661,11 +677,14 @@ pub struct SubstratePersistence {
     /// updated: it is a *baseline*, and re-basing it after a rewrite would erase
     /// the very comparison it exists for.
     open_census: RecordCensus,
-    /// Every record type the substrate has held since it opened, as bit `tag`:
-    /// the open walk's census, and each type appended since — written here or
-    /// applied from another member. What a build replacing this one must
-    /// decode, or it would not see them (`docs/replicated_substrate.md` §3.9).
-    held_types: u32,
+    /// Published for any thread to read without a call on the owner: every
+    /// record type the substrate has held since it opened, as bit `tag` — the
+    /// open walk's census, and each type appended since, written here or
+    /// applied from another member, which a build replacing this one must
+    /// decode or it would not see them (`docs/replicated_substrate.md` §3.9);
+    /// a write failed for lack of space (§7.7, see [`space`]); and the dead
+    /// ratio the last liveness scan found.
+    facts: LogFacts,
     /// The exclusive lock a writable handle holds on its directory
     /// ([`WriterLock`]) until it drops or [`Self::release_writer`] hands the
     /// directory on; `None` on a read-only handle.
@@ -717,8 +736,6 @@ pub struct SubstratePersistence {
     /// `oseq`s this process minted whose append failed: never coming, so no
     /// hold on [`Self::own_sendable_through`].
     own_unwritten: OriginApplied,
-    /// A write failed for lack of space (§7.7) — see [`space`].
-    out_of_space: bool,
 }
 
 /// Told the `oseq` of each record this node writes that may be sent.
@@ -1412,7 +1429,6 @@ impl SubstratePersistence {
             last_index,
             recovered_records,
             last_maintenance: None,
-            scanned_dead_ratio: AtomicU32::new(f32::NAN.to_bits()),
             relocation_watch: None,
             metadata_locs,
             resident_locs,
@@ -1420,7 +1436,7 @@ impl SubstratePersistence {
             npc_locs,
             vfs_index,
             blob_index,
-            held_types: census.held_mask(),
+            facts: LogFacts::new(census.held_mask()),
             open_census: census,
             writer_lock,
             minter: Minter::with_sections(origination, own_sections.live()),
@@ -1437,7 +1453,6 @@ impl SubstratePersistence {
             open_top: own_written.top(),
             own_unwritten: OriginApplied::default(),
             own_written,
-            out_of_space: false,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -1746,9 +1761,10 @@ impl SubstratePersistence {
         if let Some(watch) = self.relocation_watch.as_mut() {
             watch.record(&header, payload);
         }
-        self.held_types |= 1u32
-            .checked_shl(header.record_type.tag() as u32)
-            .unwrap_or(0);
+        self.facts.note_held(
+            1u32.checked_shl(header.record_type.tag() as u32)
+                .unwrap_or(0),
+        );
         self.track_identity(&header, segment, offset);
         self.accounting.record(&header, payload, size);
         self.track_metadata_loc(&header, segment, offset, size);
@@ -2199,7 +2215,7 @@ impl SubstratePersistence {
     /// record and has no gaps writes none.
     fn replica_record(&self) -> ReplicaPayload {
         let mut record = self.replica.clone();
-        let holds_one = self.held_types & (1u32 << RecordType::Replica.tag()) != 0;
+        let holds_one = self.facts.holds(1u32 << RecordType::Replica.tag());
         let needed = holds_one || !self.replica.is_empty() || !self.own_written.gaps().is_empty();
         if self.own_written.top() > 0 && needed {
             record
@@ -3299,8 +3315,7 @@ impl SubstratePersistence {
     /// liveness scan, this one's or maintenance's.
     pub(crate) fn note_dead_ratio(&self, total: u64, live: u64) -> f32 {
         let ratio = dead_ratio_of(total, live);
-        self.scanned_dead_ratio
-            .store(ratio.to_bits(), AtomicOrdering::Relaxed);
+        self.facts.set_dead_ratio(ratio);
         ratio
     }
 
@@ -3312,8 +3327,12 @@ impl SubstratePersistence {
     /// for it on every refresh — a hold every writer, the scheduler's among
     /// them, waited out. Maintenance scans every pass anyway.
     pub fn scanned_dead_ratio(&self) -> Option<f32> {
-        let ratio = f32::from_bits(self.scanned_dead_ratio.load(AtomicOrdering::Relaxed));
-        (!ratio.is_nan()).then_some(ratio)
+        self.facts.dead_ratio()
+    }
+
+    /// What this log publishes for any thread to read without the owner.
+    pub fn facts(&self) -> LogFacts {
+        self.facts.clone()
     }
 
     /// Compact the store — reclaim dead weight by rewriting only the **live**

@@ -23,7 +23,7 @@ impl SubstratePersistence {
     pub(super) fn watch_space<T>(&mut self, result: Result<T>) -> Result<T> {
         if let Err(PersistenceError::Io(e)) = &result {
             if is_out_of_space(e) {
-                self.out_of_space = true;
+                self.facts.set_out_of_space(true);
             }
         }
         result
@@ -32,7 +32,7 @@ impl SubstratePersistence {
     /// Whether a write has failed for lack of space since the last
     /// [`Self::test_write`] succeeded.
     pub fn out_of_space(&self) -> bool {
-        self.out_of_space
+        self.facts.out_of_space()
     }
 
     /// A test append and commit: the replica rewritten, made durable. Clears
@@ -40,7 +40,7 @@ impl SubstratePersistence {
     pub fn test_write(&mut self) -> Result<()> {
         self.replica_dirty = true;
         self.commit()?;
-        self.out_of_space = false;
+        self.facts.set_out_of_space(false);
         Ok(())
     }
 }

@@ -410,6 +410,21 @@ A call from the owner's own thread would wait for itself and panics. A call's
 closure borrows from its caller's frame; the caller waits for the owner to run
 and drop it before the frame returns.
 
+**A call is short.** The owner is one thread, so nothing on the substrate moves
+while a call runs: not writes, not replication, not the calls behind it. Work
+as long as the disk is slow gets what only the owner can give it — a plan,
+locations, handles — and does the reading on its own thread. A liveness audit
+that walked every segment on the owner stopped BlackWorld's zend for fifteen
+minutes on 2026-10-31: `AuditPlan::walk` now runs on the caller. A call that
+holds the owner 250 ms or more is named in the log by its caller.
+
+**A status read is not a call.** What may be stale without harm is published as
+`LogFacts`, atomics any thread reads: the record types held, the space latch,
+the last dead ratio. `own_sendable_through` stays a call, since a lease's next
+holder waits for that `oseq` and a stale, low answer would let it serve before
+it had what the last holder wrote; the applied set and the deferred records,
+which the same protocol paths read, stay with it.
+
 A shutdown serves every call already queued before it commits the tail and
 acknowledges: each is a caller blocked on its answer, and the owner's wait,
 picking among ready queues, may take the shutdown first. A call sent after the

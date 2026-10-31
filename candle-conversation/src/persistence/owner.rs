@@ -29,7 +29,7 @@
 //! drains it, holding nothing while it waits, so nothing waits behind it.
 
 use std::cell::Cell;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::{self, AssertUnwindSafe, Location};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{self, Receiver, Select, Sender};
 
 use super::identity::Minter;
+use super::log_facts::LogFacts;
 use super::sealed_reader::SealedReader;
 use super::writer::{self, WriteJob};
 use super::written_snapshots::WrittenSnapshots;
@@ -73,6 +74,11 @@ const WAIT_WRITTEN: Duration = Duration::from_secs(10);
 /// The longest a waiting producer or durability waiter sleeps between looks.
 const BACKOFF_MAX: Duration = Duration::from_millis(5);
 
+/// A call that held the owner this long is named in the log. The owner is one
+/// thread, so everything else on the substrate waited for it: a long call reads
+/// from outside as a member gone quiet, and takes an hour to find by inference.
+const SLOW_CALL: Duration = Duration::from_millis(250);
+
 thread_local! {
     /// Whether this thread is a persistence owner — whose calls would wait for
     /// themselves.
@@ -84,6 +90,8 @@ thread_local! {
 struct Call {
     run: Box<dyn FnOnce(&mut SubstratePersistence) + Send + 'static>,
     done: Sender<thread::Result<()>>,
+    /// Who asked, for [`SLOW_CALL`]'s warning.
+    caller: &'static Location<'static>,
 }
 
 /// What the write queue carries.
@@ -141,6 +149,7 @@ pub struct PersistenceOwner {
     read_only: bool,
     sealed: SealedReader,
     minter: Minter,
+    facts: LogFacts,
 }
 
 impl std::fmt::Debug for PersistenceOwner {
@@ -162,6 +171,7 @@ impl PersistenceOwner {
         let read_only = persistence.is_read_only();
         let sealed = persistence.sealed_reader();
         let minter = persistence.minter();
+        let facts = persistence.facts();
         let owner = Arc::new(Self {
             calls,
             writes,
@@ -173,6 +183,7 @@ impl PersistenceOwner {
             read_only,
             sealed,
             minter,
+            facts,
         });
         let handle = thread::Builder::new()
             .name("substrate-persistence-owner".into())
@@ -211,6 +222,11 @@ impl PersistenceOwner {
         self.sealed.clone()
     }
 
+    /// What the log publishes for reading without a call — see [`LogFacts`].
+    pub fn facts(&self) -> &LogFacts {
+        &self.facts
+    }
+
     /// The substrate's identity minter, shared with the log.
     pub fn minter(&self) -> Minter {
         self.minter.clone()
@@ -225,12 +241,14 @@ impl PersistenceOwner {
     /// Run `f` on the log and return what it returns, waiting for it alone:
     /// it is served before any queued write it was not submitted behind, and
     /// before all background work.
+    #[track_caller]
     pub fn call<R: Send>(&self, f: impl FnOnce(&mut SubstratePersistence) -> R + Send) -> R {
         self.submit(&self.calls, f)
     }
 
     /// [`Self::call`] as background work: served only when no call and no
     /// write is waiting — maintenance, one batch at a time.
+    #[track_caller]
     pub fn call_behind<R: Send>(&self, f: impl FnOnce(&mut SubstratePersistence) -> R + Send) -> R {
         self.submit(&self.background, f)
     }
@@ -238,6 +256,7 @@ impl PersistenceOwner {
     /// [`Self::call`] in the write queue's order: served after every write
     /// queued before it. For work that must see every record whose in-memory
     /// change came first — a full rewrite of the log.
+    #[track_caller]
     pub fn call_after_writes<R: Send>(
         &self,
         f: impl FnOnce(&mut SubstratePersistence) -> R + Send,
@@ -252,6 +271,7 @@ impl PersistenceOwner {
         })
     }
 
+    #[track_caller]
     fn submit<R: Send>(
         &self,
         queue: &Sender<Call>,
@@ -262,11 +282,13 @@ impl PersistenceOwner {
         })
     }
 
+    #[track_caller]
     fn submit_with<R: Send>(
         &self,
         f: impl FnOnce(&mut SubstratePersistence) -> R + Send,
         send: impl FnOnce(Call) -> Result<(), Call>,
     ) -> R {
+        let caller = Location::caller();
         assert!(
             !IS_OWNER.with(Cell::get),
             "a persistence call from the owner's own thread would wait for itself"
@@ -287,7 +309,7 @@ impl PersistenceOwner {
         let run: Box<dyn FnOnce(&mut SubstratePersistence) + Send + 'static> =
             unsafe { std::mem::transmute(run) };
         let (done, ran) = channel::bounded(1);
-        if let Err(call) = send(Call { run, done }) {
+        if let Err(call) = send(Call { run, done, caller }) {
             drop(call);
             panic!("the persistence owner has stopped");
         }
@@ -447,10 +469,21 @@ impl OwnerLoop {
     }
 
     fn run_call(&mut self, call: Call) {
-        let Call { run, done } = call;
+        let Call { run, done, caller } = call;
         let p = &mut self.persistence;
+        let started = Instant::now();
         let result = panic::catch_unwind(AssertUnwindSafe(move || run(p)));
+        let held = started.elapsed();
         let _ = done.send(result);
+        if held >= SLOW_CALL {
+            tracing::warn!(
+                target: "candle_conversation::persistence::owner",
+                dir = %self.persistence.dir().display(),
+                held_ms = held.as_millis() as u64,
+                caller = %caller,
+                "a call held the persistence owner: everything on this substrate waited for it"
+            );
+        }
     }
 
     /// Up to [`MAX_BATCH`] write jobs, a call served between any two, then one
@@ -592,6 +625,42 @@ mod tests {
         });
         assert_eq!(n, 42);
         assert_eq!(seen.len(), 1);
+    }
+
+    /// **What is published and an audit's walk need no owner.** The owner is
+    /// held for the whole test by a call that waits for them to finish: on the
+    /// queue, either would wait for the other for ever. This is what stopped a
+    /// member's upgrades and replication for the length of an audit.
+    #[test]
+    fn status_and_an_audit_walk_go_on_while_the_owner_is_held() {
+        let (_dir, owner, substrate) = owner();
+        let plan = {
+            let view = substrate.read();
+            owner.call_behind(|p| p.liveness_audit_plan(&view))
+        };
+        let (entered, held) = channel::bounded(1);
+        let (release, finish) = channel::bounded::<()>(1);
+        let holder = {
+            let owner = Arc::clone(&owner);
+            thread::spawn(move || {
+                owner.call(move |_| {
+                    entered.send(()).unwrap();
+                    finish.recv().unwrap();
+                })
+            })
+        };
+        held.recv().unwrap();
+        let facts = owner.facts().clone();
+        let worker = thread::spawn(move || {
+            assert!(!facts.out_of_space());
+            let _ = facts.held_record_tags();
+            assert_eq!(facts.dead_ratio(), None);
+            plan.walk().unwrap().gone
+        });
+        let gone = worker.join().unwrap();
+        assert!(gone.is_empty());
+        release.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     /// **A call's panic reaches its caller, and the owner keeps serving.**
@@ -736,6 +805,7 @@ mod tests {
                 .send(Call {
                     run: Box::new(|_| {}),
                     done,
+                    caller: Location::caller(),
                 })
                 .unwrap();
             let (ack, _acked) = channel::bounded(1);

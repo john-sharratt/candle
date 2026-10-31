@@ -16,6 +16,7 @@ mod tests;
 
 pub use index::{TimelineVfs, VfsIndex};
 pub use payload::{VfsEventId, VfsEventPayload, VfsTombstonePayload};
+pub(super) use writes::vfs_events_of;
 pub use writes::{VfsAppend, VfsKill, VfsWrite};
 
 use std::num::NonZeroU64;
