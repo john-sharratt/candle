@@ -12,7 +12,7 @@ use super::{process_one_dir, IngestPlan, UnitJob};
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
-use crate::refresh_ctx::RefreshContext;
+use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
 /// Ingest `job` with `parent` recorded as its parent before it is read, and
 /// return the conversation that holds it — `None` when its ingest failed (the
@@ -41,6 +41,7 @@ pub(crate) fn ingest_link(
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let link_ctx = RefreshContext {
         chain_end: parent,
+        band: Some(PRIMING_BAND),
         ..ctx.clone()
     };
     let failures = Failures::new();

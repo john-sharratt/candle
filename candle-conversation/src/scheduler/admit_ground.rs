@@ -592,7 +592,7 @@ impl Ground for AdmitPass<'_> {
         }
         match kind {
             Kind::Prefill => self.peek_prefill(prio),
-            Kind::Section => self.peek_section(),
+            Kind::Section => self.peek_section(prio),
             // See the module header: nothing queues a decode.
             Kind::Decode => None,
         }
@@ -647,7 +647,7 @@ impl Ground for AdmitPass<'_> {
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
         match kind {
             Kind::Prefill => self.admit_prefill(prio, cost),
-            Kind::Section => self.admit_section(cost),
+            Kind::Section => self.admit_section(prio, cost),
             Kind::Decode => false,
         }
     }
@@ -656,15 +656,7 @@ impl Ground for AdmitPass<'_> {
 impl AdmitPass<'_> {
     /// Rows of this wave's forward still free for an offer — see `peek_prefill`
     /// — or `None` when the forward is full and one more member could not
-    /// advance a chunk beside the rest, which the pass records
-    /// ([`Unoffered::rows`]): it is asked only with an offer waiting.
-    fn room(&mut self) -> Option<usize> {
-        let room = self.rows_left();
-        self.unoffered.rows |= room.is_none();
-        room
-    }
-
-    /// The forward's rows still free, as [`Self::room`] reads them.
+    /// advance a chunk beside the rest.
     fn rows_left(&self) -> Option<usize> {
         room_left(
             self.chunk_rows,
@@ -674,7 +666,7 @@ impl AdmitPass<'_> {
         )
     }
 
-    /// [`Self::room`] for a prompt of `turn` tokens on `seq` at `prio`, and
+    /// [`Self::rows_left`] for a prompt of `turn` tokens on `seq` at `prio`, and
     /// whether it joins a full forward because it runs ahead of the members
     /// there (`Cost::ahead`): a live prompt the formation would give rows
     /// though the forward's rows are spent ([`Scheduler::runs_ahead`],
@@ -697,13 +689,33 @@ impl AdmitPass<'_> {
         None
     }
 
-    /// The section band's next candidate: the head of the section queue,
-    /// priced as a prefill is — its whole K/V, a recurrent store on a hybrid,
-    /// and its rows in the forward's tier. It never decodes. Strictly FIFO and
-    /// never paused: admission takes every section in this band, and a
-    /// section's own band decides only how it rides the forwards once admitted.
-    fn peek_section(&mut self) -> Option<Cost> {
-        let s = self.sched.section_queue.front()?;
+    /// [`Self::rows_left`] for a section of `turn` tokens at `prio`, and whether it
+    /// joins a full forward (`Cost::ahead`). A section of a live band has a
+    /// turn blocked on its seal, so it joins as a prompt does
+    /// ([`Scheduler::section_runs_ahead`]); below the live bands a full forward
+    /// takes no more.
+    fn section_room(&mut self, prio: DecodePriority, turn: usize) -> Option<(usize, bool)> {
+        if let Some(room) = self.rows_left() {
+            return Some((room, false));
+        }
+        if prio.is_live() && self.sched.section_runs_ahead(prio, turn) {
+            return Some((0, true));
+        }
+        self.unoffered.rows = true;
+        None
+    }
+
+    /// Where the queue's oldest section of band `prio` stands.
+    fn section_at(&self, prio: DecodePriority) -> Option<usize> {
+        self.sched.section_queue.iter().position(|s| s.band == prio)
+    }
+
+    /// The band's next candidate: its oldest queued section, priced as a
+    /// prefill is — its whole K/V, a recurrent store on a hybrid, and its rows
+    /// in the forward's tier. It never decodes. Strictly FIFO within the band
+    /// and never paused.
+    fn peek_section(&mut self, prio: DecodePriority) -> Option<Cost> {
+        let s = &self.sched.section_queue[self.section_at(prio)?];
         let (turn, seq) = (s.tokens.len(), s.sequence_id);
         // A reused slot already holds a store, whose regions the residency
         // already counts: its restart zeroes that store where it stands.
@@ -712,7 +724,7 @@ impl AdmitPass<'_> {
         } else {
             self.recurrent
         };
-        let room = self.room()?;
+        let (room, ahead) = self.section_room(prio, turn)?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
@@ -727,15 +739,18 @@ impl AdmitPass<'_> {
             activations,
             rows,
             decodes_after: false,
-            ahead: false,
+            ahead,
         }))
     }
 
-    /// Admit the section queue's head, priced at `cost`, and start it — its
+    /// Admit the band's oldest section, priced at `cost`, and start it — its
     /// carried state claimed now, as a turn's is (`begin_admitted`). A claim the
-    /// allocators refuse puts it back at the head and ends the band.
-    fn admit_section(&mut self, cost: Cost) -> bool {
-        let Some(section) = self.sched.section_queue.pop_front() else {
+    /// allocators refuse puts it back where it stood and ends the band.
+    fn admit_section(&mut self, prio: DecodePriority, cost: Cost) -> bool {
+        let Some(at) = self.section_at(prio) else {
+            return false;
+        };
+        let Some(section) = self.sched.section_queue.remove(at) else {
             return false;
         };
         let before = residency_now(self.standing_tier);
@@ -746,7 +761,7 @@ impl AdmitPass<'_> {
                 target: "candle_conversation::scheduler::throttle",
                 "admitted section could not claim its state — it waits: {why}",
             );
-            self.sched.section_queue.push_front(section);
+            self.sched.section_queue.insert(at, section);
             return false;
         }
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
@@ -811,7 +826,7 @@ impl AdmitPass<'_> {
         // **A full forward takes no more turns** ([`room_left`]): its rows are
         // filled in order (`gang::gang_shares`), so a turn past them would
         // advance by nothing while holding its store. Every member in flight is
-        // counted, sections and paused prefills included. See [`Self::room`].
+        // counted, sections and paused prefills included. See [`Self::rows_left`].
         let (turn, seq) = (w.tokens.len(), w.sequence_id);
         // **A store is charged once.** A turn whose sequence already holds a
         // store has that store's regions in the residency this offer is read
@@ -1526,8 +1541,9 @@ impl Scheduler {
     /// first token, which the group re-formed nearest-first fills first, each
     /// at most a pass. It takes rows when those leave at least a chunk of the
     /// pass budget — and when none of them carries another adapter, since the
-    /// nearest sets the group's. Sections ride behind every prompt and take
-    /// nothing ahead of it.
+    /// nearest sets the group's. Sections ride behind every prompt, in rows
+    /// the group holds back for them (`gang::prompt_budget`), and take nothing
+    /// ahead of it.
     pub(super) fn runs_ahead(&self, prio: DecodePriority, turn: usize, seq: usize) -> bool {
         let paused_ahead = self
             .paused_creep
@@ -1555,6 +1571,32 @@ impl Scheduler {
             }
             rows_ahead += remaining.min(self.max_prefill_pass_tokens);
         }
+        rows_ahead + turn.min(CHUNK_SIZE) <= self.prefill_pass_budget()
+    }
+
+    /// Whether a live section of `turn` tokens at `prio` would take rows in the
+    /// next group formed though the forward's rows are spent.
+    ///
+    /// What stands ahead of it is what stands ahead of a prompt: work above its
+    /// band and a paused creep of its band or above. Of its own kind, the live
+    /// sections already in flight, whose rows the group holds back first. It
+    /// takes rows when those leave at least a chunk of the pass budget. Past
+    /// that it would claim its store and advance by nothing, as a turn joining
+    /// a full forward would ([`room_left`]).
+    pub(super) fn section_runs_ahead(&self, prio: DecodePriority, turn: usize) -> bool {
+        let paused_ahead = self
+            .paused_creep
+            .as_ref()
+            .is_some_and(|p| rank(p.band) >= rank(prio));
+        if paused_ahead || self.waiting_above(prio, |_| false) {
+            return false;
+        }
+        let rows_ahead: usize = self
+            .active_section_ingests
+            .iter()
+            .filter(|s| s.error.is_none() && s.band.is_live())
+            .map(|s| s.tokens.len().saturating_sub(s.offset))
+            .sum();
         rows_ahead + turn.min(CHUNK_SIZE) <= self.prefill_pass_budget()
     }
 }

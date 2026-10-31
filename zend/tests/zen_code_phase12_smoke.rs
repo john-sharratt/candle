@@ -285,6 +285,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         tool_ctx,
         retrieval: &retrieval,
         chain_end: None,
+        band: None,
         think_for: None,
         dialogue: None,
     };

@@ -2271,7 +2271,7 @@ impl Scheduler {
             // Sections have no rate question either, and nothing to wait on: the
             // width backstop is their only bound here, as it is a prefill's.
             while self.running_members() < Self::MAX_PREFILL_WIDTH {
-                let Some(s) = self.section_queue.pop_front() else {
+                let Some(s) = self.pop_highest_band_section() else {
                     break;
                 };
                 if !self.begin_section_forced(s) {
@@ -2403,7 +2403,7 @@ impl Scheduler {
                 "nothing in flight; forcing the queue head so the engine makes progress",
             );
             self.begin_forced(work);
-        } else if let Some(s) = self.section_queue.pop_front() {
+        } else if let Some(s) = self.pop_highest_band_section() {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
                 queued_sections = self.section_queue.len() + 1,
@@ -2412,6 +2412,16 @@ impl Scheduler {
             );
             self.begin_section_forced(s);
         }
+    }
+
+    /// Remove and return the oldest queued section of the highest band queued.
+    fn pop_highest_band_section(&mut self) -> Option<QueuedSection> {
+        let top = self.section_queue.iter().map(|s| rank(s.band)).max()?;
+        let at = self
+            .section_queue
+            .iter()
+            .position(|s| rank(s.band) == top)?;
+        self.section_queue.remove(at)
     }
 
     /// Remove and return the first queued prefill of the highest band queued,
@@ -3967,7 +3977,27 @@ impl Scheduler {
         // whole, rather than leaving a straggler group a sweep of its own.
         let budget = self.prefill_group_budget(remaining.iter().sum());
         let seqs: Vec<usize> = members.iter().map(WaveMember::seq_id).collect();
-        let shares = self.cohort_shares(&seqs, &remaining, budget);
+        // A live section has a turn blocked on its seal, and the prompts would
+        // otherwise spend the whole budget: it rode only what they left, so
+        // beside a steady queue of prompts it never rode at all.
+        let live_section_rows: usize = self
+            .active_section_ingests
+            .iter()
+            .filter(|s| {
+                include_sections
+                    && s.band.is_live()
+                    && s.error.is_none()
+                    && !paused.contains(&s.sequence_id.0)
+                    && !below_floor(s.band)
+                    && self.session.sequence_adapter(s.sequence_id.0) == group_adapter.as_deref()
+            })
+            .map(|s| s.tokens.len().saturating_sub(s.offset))
+            .sum();
+        let shares = self.cohort_shares(
+            &seqs,
+            &remaining,
+            gang::prompt_budget(budget, live_section_rows),
+        );
         let members_before = std::mem::take(&mut members);
         for (m, share) in members_before.into_iter().zip(shares) {
             if share == 0 {
@@ -4006,13 +4036,19 @@ impl Scheduler {
                 if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
                     continue;
                 }
-                let advance = (s.tokens.len() - s.offset).min(budget);
                 // Sections share the forward, so they draw on the budget the
                 // prefills above have already spent and fill only what is left.
                 // The cohort already guarantees this group makes progress, so no
                 // section is forced in past it; the rest ride a later group or the
-                // standalone section pass.
-                if used + advance > budget {
+                // standalone section pass. A live one takes what fits and rides
+                // the rest in the next.
+                let wanted = (s.tokens.len() - s.offset).min(budget);
+                let advance = if s.band.is_live() {
+                    wanted.min(budget.saturating_sub(used))
+                } else {
+                    wanted
+                };
+                if advance == 0 || used + advance > budget {
                     break;
                 }
                 members.push(WaveMember::Section {

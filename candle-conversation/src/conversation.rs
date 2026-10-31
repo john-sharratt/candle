@@ -4282,6 +4282,21 @@ impl Sequence {
         self.fork_onto(fork_timeline, true)
     }
 
+    /// [`Self::fork`], decoding at `band` in place of its layer's priority. The
+    /// band is recorded before the fork's slot is made, which is when a slot
+    /// reads it.
+    pub fn fork_at(&self, band: DecodePriority) -> crate::Result<Sequence> {
+        let fork_timeline = self
+            .substrate
+            .mint_timeline(self.target.layer, self.target.group);
+        self.substrate.set_conversation_metadata(
+            fork_timeline,
+            DecodePriority::METADATA_KEY,
+            band.name(),
+        )?;
+        self.fork_onto(fork_timeline, true)
+    }
+
     /// Fork onto a **specific** timeline rather than a freshly minted one —
     /// the daemon resume path (§16.12 of `docs/archived/kv_tier_migration.md`).
     ///

@@ -1059,8 +1059,8 @@ fn process_one_dir(
         // live dialogue turn forks from, rather than this pool's workers each
         // independently re-running the schema's "eager section ingestion"
         // under concurrent load.
-        let conv = base
-            .fork()
+        let conv = ctx
+            .fork_unit(base)
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
         // The priming chain is this conversation's parent, recorded BEFORE its
         // own listing and summary run, so its turns are projected with the

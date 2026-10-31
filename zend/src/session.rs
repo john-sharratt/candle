@@ -3098,6 +3098,7 @@ impl InferenceState {
             ),
             retrieval: &self.retrieval_scope,
             chain_end: *self.chain_end.lock().unwrap(),
+            band: None,
             think_for: Some({
                 let steering = self.think_steering.clone();
                 // A unit decodes under the grammar of the mode whose catalog

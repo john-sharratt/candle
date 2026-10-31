@@ -753,7 +753,7 @@ mod tests {
             match kind {
                 Kind::Decode => self.decode_prio,
                 Kind::Prefill => self.prefill_prio,
-                // Sections carry no priority of their own: one band, `Low`.
+                // This fake's sections are all background ones.
                 Kind::Section => DecodePriority::Low,
             }
         }

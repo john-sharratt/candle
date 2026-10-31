@@ -344,8 +344,15 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   of the pass budget, and none of them carries another adapter, it takes rows
   (`Scheduler::runs_ahead`). Such a prompt is offered as a join, sharing the
   forwards rather than widening them; refused, its band ends and nothing else
-  does (`Cost::ahead`): no rows close and no wave latches. Sections ride
-  behind every prompt in a group and keep the full forward's rule. Turned
+  does (`Cost::ahead`): no rows close and no wave latches. A section is
+  offered at its own band, ahead of that band's prompts, and one of a live
+  band joins a spent forward the same way, while the live sections in flight
+  leave a chunk of the pass budget (`Scheduler::section_runs_ahead`): a turn
+  is blocked on its seal. It rides behind the prompts in a group, in rows the
+  group holds back for it (`gang::prompt_budget`). Below the live bands a
+  section keeps the full forward's rule. Offered at `Low` with no way to join,
+  a 149-token `High` section waited 40 minutes on WhiteWorld (2026-10-31) with
+  ten more behind it, and nothing sealed for 47. Turned
   away with the rest, a live prompt waited for rows only it could have taken: on WhiteWorld (2026-10-27 22:46–22:48) one `High` member 158k
   tokens long held all 3,072 rows of every forward, four `Urgent` content
   checks were never offered for ninety seconds, and an 87-token `High` turn

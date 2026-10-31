@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use candle_conversation::projection::{Builder, GroupId, TimelineId};
+use candle_conversation::projection::{Builder, DecodePriority, GroupId, TimelineId};
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
-use candle_conversation::{ConversationEngine, SequenceConfig};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 
 use crate::retrieval_scope::RetrievalScope;
@@ -56,6 +56,10 @@ pub struct RefreshContext<'a> {
     /// unit's parent before its reading starts, so its turns are projected
     /// with the chain already in context. `None` when there is no chain.
     pub chain_end: Option<TimelineId>,
+    /// The band a unit's new conversation decodes at in place of its layer's
+    /// ([`Self::fork_unit`]). `None` for the layer's own: only a priming-chain
+    /// link names one ([`PRIMING_BAND`]).
+    pub band: Option<DecodePriority>,
     /// The steering for each thinking level and tools mode, for a unit of a
     /// layer that thinks (`crate::layers`) — the same registry a dialogue turn
     /// at that level and mode runs under, so a unit whose tools only a wider
@@ -70,7 +74,26 @@ pub struct RefreshContext<'a> {
 /// The steering for a thinking level, over a tools mode's call grammar.
 pub type ThinkFor = Arc<dyn Fn(ThinkMode, ToolMode) -> Arc<TriggerRegistry> + Send + Sync>;
 
+/// The band a priming-chain link is read at.
+///
+/// Nothing in this daemon is served until the chain is built, so it is not
+/// background work. At its layer's `Low` it yields 64:1 to any `High` decode on
+/// the device: beside npcd's constant decodes on WhiteWorld (805affbfe,
+/// 2026-10-31) one link's prompt moved only when they paused, four minutes of
+/// 73, and the load took 93 minutes against 12–14 before. `High` splits the
+/// device with them by the work each side holds. `Normal` would not: it yields
+/// 64:1 too.
+pub const PRIMING_BAND: DecodePriority = DecodePriority::High;
+
 impl RefreshContext<'_> {
+    /// `base`'s fork for a new unit, at this context's band.
+    pub fn fork_unit(&self, base: &Sequence) -> candle_conversation::Result<Sequence> {
+        match self.band {
+            Some(band) => base.fork_at(band),
+            None => base.fork(),
+        }
+    }
+
     /// The steering a turn thinking at `mode` runs under, its tool calls held
     /// to `tools`' grammar.
     pub fn triggers_for(&self, mode: ThinkMode, tools: ToolMode) -> Arc<TriggerRegistry> {

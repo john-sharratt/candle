@@ -13,7 +13,7 @@ use super::{chain_finished, finished_content_keys, process_one_file, FileJob, Jo
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
-use crate::refresh_ctx::RefreshContext;
+use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
 /// Read `file` with `parent` recorded as its parent before its reading
 /// starts, and return the conversation that holds it — `None` when it could
@@ -43,6 +43,7 @@ pub(crate) fn ingest_link(
     }
     let link_ctx = RefreshContext {
         chain_end: parent,
+        band: Some(PRIMING_BAND),
         ..ctx.clone()
     };
     let job = Job {

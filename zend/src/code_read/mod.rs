@@ -849,8 +849,8 @@ fn process_one_file(
         // conversation was measured losing track of its own turns after being
         // built this way, and stopped doing so once it forked `base_conv`
         // like every dialogue turn already did.
-        let conv = base
-            .fork()
+        let conv = ctx
+            .fork_unit(base)
             .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
         // The priming chain is this conversation's parent, recorded BEFORE its
         // own reading starts, so every turn below is projected with the chain

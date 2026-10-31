@@ -2273,7 +2273,7 @@ fn resolve_seal_range(from: usize, block_count: usize, chunk_len: usize) -> Opti
 /// **A section is a first admission exactly as a prefill is**: fresh K/V on its
 /// slot, a recurrent store on a hybrid, and rows in the wave's tier. So it waits
 /// here until an admission pass prices it and finds the wave better off
-/// carrying it (`AdmitPass`, the `Low` section band), and only then has its slot
+/// carrying it (`AdmitPass`, at its own band), and only then has its slot
 /// prepared and joins the forwards. Sections put into flight as their requests
 /// drain take a minute to push Qwen3.6's weight zone from 10,398 MiB to its
 /// hold, and on Qwen3.8-Flash-Next on a 16 GB card a calibration's sections
@@ -17039,6 +17039,18 @@ mod tests {
         SequenceId,
         flume::Receiver<Result<SealResult, ConversationError>>,
     ) {
+        ingest_section_at(sched, tokens, DecodePriority::Low)
+    }
+
+    /// [`ingest_section`] at `band`.
+    fn ingest_section_at(
+        sched: &mut Scheduler,
+        tokens: usize,
+        band: DecodePriority,
+    ) -> (
+        SequenceId,
+        flume::Receiver<Result<SealResult, ConversationError>>,
+    ) {
         let slot = SequenceId(sched.session.create_sequence().unwrap());
         let (response_tx, response_rx) = flume::bounded(1);
         assert!(sched.handle_request(SchedulerRequest::IngestSection {
@@ -17050,10 +17062,44 @@ mod tests {
             debug_name: "s".into(),
             in_collection: false,
             start: None,
-            band: DecodePriority::Low,
+            band,
             response_tx,
         }));
         (slot, response_rx)
+    }
+
+    /// **A section is offered at its own band.** Offered at `Low` whatever it
+    /// carried, a dialogue's section stood behind every background one queued
+    /// ahead of it; within a band the queue stays first come, first served.
+    #[test]
+    fn a_section_is_admitted_at_its_own_band() {
+        let mut sched = admission_scheduler();
+        ingest_section_at(&mut sched, 64, DecodePriority::Low);
+        let (first, _rx) = ingest_section_at(&mut sched, 64, DecodePriority::High);
+        let (second, _rx) = ingest_section_at(&mut sched, 64, DecodePriority::High);
+
+        sched.promote_new_prefills();
+
+        let order: Vec<SequenceId> = sched
+            .active_section_ingests
+            .iter()
+            .map(|s| s.sequence_id)
+            .collect();
+        assert_eq!(&order[..2], &[first, second]);
+    }
+
+    /// **A live section joins a spent forward only while the pass can carry
+    /// it.** Past that it would claim its store and advance by nothing.
+    #[test]
+    fn a_live_section_runs_ahead_while_the_pass_has_a_chunk_for_it() {
+        let mut sched = admission_scheduler();
+        assert!(sched.section_runs_ahead(DecodePriority::High, 149));
+
+        let budget = sched.prefill_pass_budget();
+        ingest_section_at(&mut sched, budget, DecodePriority::High);
+        sched.promote_new_prefills();
+
+        assert!(!sched.section_runs_ahead(DecodePriority::High, 149));
     }
 
     /// **A section waits for admission; it does not go straight into flight.**

@@ -8,6 +8,7 @@
 //! and shares its steps.
 
 use super::admission::fill_in_order;
+use super::CHUNK_SIZE;
 
 /// The widest gang, up to `longs` members, whose decode step `step(n)` costs no
 /// more than twice a lone decode's: each member then decodes at worst half as
@@ -44,6 +45,15 @@ pub(super) fn form_gang(longs: &[(usize, usize)], width: usize) -> Vec<usize> {
         return Vec::new();
     }
     gang
+}
+
+/// What a group of `budget` rows leaves its prompts beside `section_rows` of
+/// live sections: the rest, and never less than a chunk, so a queue of sections
+/// cannot hold a prompt out of the group that carries them.
+pub(super) fn prompt_budget(budget: usize, section_rows: usize) -> usize {
+    budget
+        .saturating_sub(section_rows)
+        .max(CHUNK_SIZE.min(budget))
 }
 
 /// The rows each of `remaining` advances in one forward of `budget` rows, the
@@ -181,6 +191,15 @@ mod tests {
     /// **Shorts ride first, from what the gang's reserve leaves**: two shorts
     /// take 500 rows whole and the gang the 524 left; a long outside the gang
     /// waits.
+    #[test]
+    fn live_sections_keep_their_rows_and_prompts_keep_a_chunk() {
+        assert_eq!(prompt_budget(3072, 0), 3072);
+        assert_eq!(prompt_budget(3072, 149), 2923);
+        assert_eq!(prompt_budget(3072, 3072), CHUNK_SIZE);
+        assert_eq!(prompt_budget(3072, 9000), CHUNK_SIZE);
+        assert_eq!(prompt_budget(16, 149), 16, "a budget under a chunk is all");
+    }
+
     #[test]
     fn shorts_ride_ahead_of_the_gang_and_the_rest_behind() {
         assert_eq!(

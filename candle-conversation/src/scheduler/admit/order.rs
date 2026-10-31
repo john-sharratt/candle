@@ -13,7 +13,7 @@ pub(crate) enum Kind {
     Prefill,
     /// A section ingest: context-independent K/V prefilled on a scratch slot
     /// and sealed into the substrate — a tool catalog, a repository summary.
-    /// No decode follows it, and it belongs to no conversation's priority.
+    /// No decode follows it.
     Section,
 }
 
@@ -29,22 +29,26 @@ pub(crate) enum Kind {
 /// is a directory that never completes. So prefill goes first for `Normal` and
 /// `Low`, and their decodes take what is left.
 ///
-/// **Sections sit ahead of background prefill.** A section is substrate work
-/// with no conversation behind it, so it carries no priority of its own; it
-/// takes the `Low` band. It goes before that band's prefills because the
-/// caller inserting it is blocked on its seal before it can submit the turn
-/// that attends over it — a section that waits behind the turns queued ahead
-/// of it is a directory whose next turn cannot be built. Nothing a person is
-/// waiting on sits behind it.
+/// **A section sits ahead of its own band's prefill.** Each section carries the
+/// band of the conversation it frames, `Low` for substrate work with none
+/// behind it. It goes before that band's prefills because the caller inserting
+/// it is blocked on its seal before it can submit the turn that attends over it
+/// — a section that waits behind the turns queued ahead of it is a turn that
+/// cannot be built. Offered at `Low` whatever it carried, a 149-token `High`
+/// section stood behind every npcd prompt for 40 minutes on WhiteWorld
+/// (2026-10-31), and eleven queued up behind it.
 ///
 /// **`Urgent` goes ahead of `High`, and is ordered the same way**: a person
 /// waiting on the turn itself — a live dialogue, the check an image draw waits
 /// on — goes before the work a person is waiting on only through it.
-pub(crate) const BANDS: [(DecodePriority, Kind); 9] = [
+pub(crate) const BANDS: [(DecodePriority, Kind); 12] = [
     (DecodePriority::Urgent, Kind::Decode),
+    (DecodePriority::Urgent, Kind::Section),
     (DecodePriority::Urgent, Kind::Prefill),
     (DecodePriority::High, Kind::Decode),
+    (DecodePriority::High, Kind::Section),
     (DecodePriority::High, Kind::Prefill),
+    (DecodePriority::Normal, Kind::Section),
     (DecodePriority::Normal, Kind::Prefill),
     (DecodePriority::Normal, Kind::Decode),
     (DecodePriority::Low, Kind::Section),
@@ -116,21 +120,19 @@ mod tests {
         assert!(pos(DecodePriority::High, Kind::Prefill) < pos(DecodePriority::Low, Kind::Prefill));
     }
 
-    /// Sections take the Low band, ahead of its prefills and behind everything
-    /// a person could be waiting on.
+    /// A section goes ahead of its own band's prefills, behind that band's
+    /// live decodes, and behind every band above it.
     #[test]
-    fn sections_precede_background_prefill_and_follow_every_interactive_band() {
+    fn a_section_precedes_its_bands_prefill_and_follows_every_band_above() {
+        use DecodePriority::{High, Low, Normal, Urgent};
         let pos = |p, k| BANDS.iter().position(|b| *b == (p, k)).unwrap();
-        let section = pos(DecodePriority::Low, Kind::Section);
-        assert!(section < pos(DecodePriority::Low, Kind::Prefill));
-        assert!(section < pos(DecodePriority::Low, Kind::Decode));
-        assert!(pos(DecodePriority::High, Kind::Decode) < section);
-        assert!(pos(DecodePriority::High, Kind::Prefill) < section);
-        assert!(pos(DecodePriority::Normal, Kind::Decode) < section);
-        assert_eq!(
-            BANDS.iter().filter(|(_, k)| *k == Kind::Section).count(),
-            1,
-            "sections have no priority of their own: one band"
-        );
+        for band in [Urgent, High, Normal, Low] {
+            assert!(pos(band, Kind::Section) < pos(band, Kind::Prefill));
+        }
+        assert!(pos(Urgent, Kind::Decode) < pos(Urgent, Kind::Section));
+        assert!(pos(High, Kind::Decode) < pos(High, Kind::Section));
+        assert!(pos(Urgent, Kind::Prefill) < pos(High, Kind::Section));
+        assert!(pos(High, Kind::Prefill) < pos(Normal, Kind::Section));
+        assert!(pos(Normal, Kind::Decode) < pos(Low, Kind::Section));
     }
 }
