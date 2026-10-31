@@ -268,6 +268,10 @@ pub struct AppliedLine {
     /// `oseq`s missing below the highest it holds.
     pub missing: u64,
     pub high_water: u64,
+    /// The highest `oseq` it holds: above `high_water`, what it holds stands
+    /// past what the origin announces, and no gap below it is ever asked for.
+    #[serde(default)]
+    pub top: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

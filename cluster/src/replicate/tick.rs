@@ -133,6 +133,17 @@ impl Replicator {
                 .filter(|m| m.node != self.node)
                 .map(|m| (m.node, m.high_water))
                 .collect();
+            for blind in s.gaps.blind(highs.iter().copied(), &applied) {
+                tracing::warn!(
+                    node = self.node,
+                    origin = format_args!("{:016x}", blind.origin),
+                    announced = blind.high,
+                    top = blind.top,
+                    missing = blind.missing,
+                    "this member holds an origin past what it announces, so no catch-up will \
+                     ask for what it lacks: the origin's position is stuck"
+                );
+            }
             let due = s.gaps.observe(highs, &applied, now);
             let gaps: Vec<(usize, u64)> = due
                 .into_iter()
