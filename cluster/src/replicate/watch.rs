@@ -25,9 +25,15 @@ pub fn periodic_due(socket_down: bool, last: Instant, now: Instant) -> bool {
 pub struct GapWatch {
     /// Each origin seen ahead, and since when.
     ahead: HashMap<u64, Instant>,
-    /// Each origin last said to be [`Self::blind`], by the top it was said at.
-    blind: HashMap<u64, u64>,
+    /// Each origin held past what it announces: the high it stands at, since
+    /// when, and whether it has been said ([`Self::blind`]).
+    blind: HashMap<u64, (u64, Instant, bool)>,
 }
+
+/// How long an origin must announce one high, held past, before it is said.
+/// Records arrive ahead of the announcement that covers them, so a live stream
+/// is held past for a moment all the time; the high moving on is what clears it.
+pub const BLIND_AFTER: Duration = Duration::from_secs(60);
 
 /// An origin this member holds gaps of that no catch-up will ever ask for: what
 /// it holds stands above what the origin announces, so the announced high reads
@@ -42,12 +48,13 @@ pub struct Blind {
 }
 
 impl GapWatch {
-    /// The origins `highs` leaves blind that were not already reported at this
-    /// top: said once per top, so a stuck origin is one line per change.
+    /// The origins `highs` has left blind for [`BLIND_AFTER`] on one announced
+    /// high: said once for that high, so a stuck origin is one line.
     pub fn blind(
         &mut self,
         highs: impl IntoIterator<Item = (u64, u64)>,
         applied: &AppliedSet,
+        now: Instant,
     ) -> Vec<Blind> {
         let mut found = Vec::new();
         let mut seen = Vec::new();
@@ -60,7 +67,12 @@ impl GapWatch {
                 continue;
             }
             seen.push(origin);
-            if self.blind.insert(origin, held.top()) != Some(held.top()) {
+            let watched = self.blind.entry(origin).or_insert((high, now, false));
+            if watched.0 != high {
+                *watched = (high, now, false);
+            }
+            if !watched.2 && now.duration_since(watched.1) >= BLIND_AFTER {
+                watched.2 = true;
                 found.push(Blind {
                     origin,
                     high,
@@ -109,17 +121,22 @@ impl GapWatch {
 mod tests {
     use super::*;
 
-    /// **An origin held past what it announces is reported once per top**,
-    /// and one with no gap, or announcing all that is held, never.
+    /// **An origin held past one announced high for a minute is said once**;
+    /// a high that moves on starts over, so a live stream is never said, and
+    /// one with no gap, or announcing all that is held, never is.
     #[test]
-    fn an_origin_held_past_its_announcement_is_reported_once_per_top() {
+    fn an_origin_stuck_past_its_announcement_is_said_once() {
         let mut applied = AppliedSet::default();
         for oseq in [1, 2, 3, 6, 7] {
             applied.insert(9, oseq);
         }
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
         let mut watch = GapWatch::default();
+        assert!(watch.blind([(9, 3)], &applied, at(0)).is_empty());
+        assert!(watch.blind([(9, 3)], &applied, at(59)).is_empty());
         assert_eq!(
-            watch.blind([(9, 3)], &applied),
+            watch.blind([(9, 3)], &applied, at(60)),
             [Blind {
                 origin: 9,
                 high: 3,
@@ -127,15 +144,28 @@ mod tests {
                 missing: 2
             }]
         );
-        assert!(watch.blind([(9, 3)], &applied).is_empty(), "said once");
-        applied.insert(9, 8);
-        assert_eq!(watch.blind([(9, 3)], &applied).len(), 1, "the top moved");
-        assert!(watch.blind([(9, 8)], &applied).is_empty(), "announced");
-        assert!(watch.blind([(9, 0)], &applied).is_empty(), "nothing said");
+        assert!(
+            watch.blind([(9, 3)], &applied, at(120)).is_empty(),
+            "said once"
+        );
+        assert!(
+            watch.blind([(9, 4)], &applied, at(130)).is_empty(),
+            "the high moved"
+        );
+        assert!(
+            watch.blind([(9, 5)], &applied, at(189)).is_empty(),
+            "a live stream"
+        );
+        assert!(watch.blind([(9, 7)], &applied, at(300)).is_empty());
+        assert!(watch.blind([(9, 0)], &applied, at(400)).is_empty());
         for oseq in [4, 5] {
             applied.insert(9, oseq);
         }
-        assert!(watch.blind([(9, 3)], &applied).is_empty(), "no gap");
+        assert!(watch.blind([(9, 3)], &applied, at(500)).is_empty());
+        assert!(
+            watch.blind([(9, 3)], &applied, at(600)).is_empty(),
+            "no gap"
+        );
     }
 
     /// Every 30 s while a socket is down, and never while every socket is up.

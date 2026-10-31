@@ -133,7 +133,7 @@ impl Replicator {
                 .filter(|m| m.node != self.node)
                 .map(|m| (m.node, m.high_water))
                 .collect();
-            for blind in s.gaps.blind(highs.iter().copied(), &applied) {
+            for blind in s.gaps.blind(highs.iter().copied(), &applied, now) {
                 tracing::warn!(
                     node = self.node,
                     origin = format_args!("{:016x}", blind.origin),
