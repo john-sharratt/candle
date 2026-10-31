@@ -47,14 +47,17 @@ journals must move, it is a restructuring.
 
 ## "Restructure", "move", "merge", "rename", "split"
 
-Start a Zen coding task with `repo_task_start` on the `journals` checkout,
-saying:
+Start a Zen coding task with `repo_task_start` on the `journals` checkout:
+the memory's own git repository, apart from `candle`. Read the
+`journal-restructure` guide for the full brief. In short:
 
 - what to move where, and why;
 - to keep every line's file and id (`git mv`);
 - to leave a reference at each old path;
 - to run `journals check`;
-- to merge to `main`.
+- to show you the diff before pushing;
+- to push to `main`, never to a branch.
 
 Tell the person it is running, and note the request on `here`. The new tree
-is served from the next fetch.
+is served from the next fetch. Correcting a single line is not a
+restructure: `journal_edit` it.
