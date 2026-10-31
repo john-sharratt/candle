@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::operations::{Operation, Operations};
 use crate::engine::mission::bank::{self, Duty, Facts};
 use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome};
+use crate::engine::mission_gen::world::{self, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
 
 /// The outcome a Maker's `report_done` reports on a step that offers a choice.
@@ -162,6 +163,11 @@ pub struct Missions {
     /// was called off, not yet told — see [`Self::take_stood_down`].
     #[serde(default)]
     stood_down: Vec<String>,
+    /// The world's own routines, from `<mind>/missions/<world>.yaml` —
+    /// drawn in place of the built-in [`bank`] when there are any. The mind's,
+    /// read afresh rather than saved, like the workflows.
+    #[serde(skip)]
+    routines: Vec<Routine>,
 }
 
 impl Missions {
@@ -314,15 +320,17 @@ impl Missions {
     }
 
     /// Collect a mission at the desk: the next one lodged for this body, or —
-    /// when nothing is lodged — a fresh non-destructive routine drawn from the
-    /// [`bank`] against who and what is around. Either way it becomes the body's
-    /// open mission, and the collected one is returned so the desk can hand back
-    /// its brief.
+    /// when nothing is lodged — a fresh routine: one of the world's own when it
+    /// has any ([`Self::set_routines`]), otherwise a non-destructive one drawn
+    /// from the [`bank`] against who and what is around. Either way it becomes
+    /// the body's open mission, and the collected one is returned so the desk
+    /// can hand back its brief.
     pub fn collect(&mut self, body: &str, facts: &Facts) -> &Mission {
         let mission = match self.take_lodged(body).or_else(|| self.take_pooled(body)) {
             Some(mission) => mission,
             None => {
-                let drawn = bank::random(facts, self.seed);
+                let drawn = world::draw(&self.routines, facts.table, self.seed)
+                    .unwrap_or_else(|| bank::random(facts, self.seed));
                 self.seed = self.seed.wrapping_add(1);
                 drawn
             }
@@ -362,11 +370,33 @@ impl Missions {
         self.operations.set_workflows(workflows);
     }
 
-    /// Take `from`'s workflows in place of these: they are the mind's, not
-    /// the world's, and a world taken in from elsewhere keeps the ones this
-    /// machine loaded.
+    /// Set the world's own routines — empty for a world that runs on
+    /// `missions.yaml` and draws from the built-in [`bank`].
+    pub fn set_routines(&mut self, routines: Vec<Routine>) {
+        self.routines = routines;
+    }
+
+    /// Take `from`'s workflows and routines in place of these: they are the
+    /// mind's, not the world's, and a world taken in from elsewhere keeps the
+    /// ones this machine loaded.
     pub fn adopt_workflows(&mut self, from: &mut Missions) {
         self.operations.adopt_workflows(&mut from.operations);
+        self.routines = std::mem::take(&mut from.routines);
+    }
+
+    /// Call off every operation not yet over, for `why` — what a world that
+    /// has come to run on its own missions does with the record's work opened
+    /// before it did. Returns the ids called off.
+    pub fn call_off_operations(&mut self, why: &str) -> Vec<u64> {
+        let open: Vec<u64> = self
+            .operations
+            .all()
+            .filter(|o| !o.settled())
+            .map(|o| o.id)
+            .collect();
+        open.into_iter()
+            .filter(|id| self.cancel_operation(*id, why))
+            .collect()
     }
 
     /// Record what operation `id`'s document said when its step was taken up.
@@ -1066,6 +1096,7 @@ mod tests {
     use super::Missions;
     use crate::engine::mission::bank::Facts;
     use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
+    use crate::engine::mission_gen::world::Routine;
 
     fn a_mission(prompt: &str) -> Mission {
         Mission::new(
@@ -1101,6 +1132,54 @@ mod tests {
         assert!(!m.cancel("bram"), "nothing open, nothing closed");
         assert_eq!(m.chapter("bram"), 2);
         assert_eq!(m.chapter("cindy"), 0);
+    }
+
+    /// **A world with routines of its own hands them out in place of the
+    /// bank's**, closed by the report at its table; with none, the bank again.
+    #[test]
+    fn a_world_s_own_routines_replace_the_bank() {
+        let routines = || {
+            vec![Routine {
+                id: "ward-shift".to_string(),
+                brief: "Take a shift on the ward.".to_string(),
+                steps: vec!["go to the ward room".to_string()],
+            }]
+        };
+        let facts = Facts {
+            table: Some("the watch room"),
+            ..Facts::default()
+        };
+        let mut m = Missions::default();
+        m.set_routines(routines());
+        let got = m.collect("kettle", &facts).clone();
+        assert_eq!(got.prompt, "Take a shift on the ward.");
+        assert_eq!(
+            got.origin,
+            Origin::Random {
+                routine: "ward-shift".to_string()
+            }
+        );
+        let steps: Vec<&str> = got.todo.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                "go to the ward room",
+                "go back to the table in the watch room and report it"
+            ]
+        );
+
+        let mut adopted = Missions::default();
+        adopted.adopt_workflows(&mut m);
+        let again = adopted.collect("kettle", &facts).clone();
+        assert_eq!(again.prompt, got.prompt, "adopted with the workflows");
+
+        adopted.set_routines(Vec::new());
+        let bank = adopted.collect("biscuit", &facts).clone();
+        assert!(
+            matches!(&bank.origin, Origin::Random { routine } if routine != "ward-shift"),
+            "{:?}",
+            bank.origin
+        );
     }
 
     /// **A routine handed in turns no chapter**, and a chapter closes with the

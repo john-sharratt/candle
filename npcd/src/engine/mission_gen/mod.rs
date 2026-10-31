@@ -16,6 +16,8 @@
 //! - [`answer`] — the `mission` / `no_mission` call, checked against the corpus
 //!   and made into a [`crate::engine::mission::Mission`].
 //! - [`run`] — one generation, and the loop that keeps the table stocked.
+//! - [`world`] — `<mind>/missions/<world>.yaml`: a world's own routines, in
+//!   place of `missions.yaml` for that world.
 //!
 //! A generated mission carries its work ([`crate::engine::mission::Work`]): the
 //! document to write and those to read. The engine signs off the reads and the
@@ -42,3 +44,4 @@ pub mod research;
 pub mod run;
 pub mod step;
 pub mod target;
+pub mod world;

@@ -431,6 +431,41 @@ path. The material comes first in what the model reads and the prompt after it, 
 thing read is what to do — instruction first, then a character's anchor in the second person,
 and the model went on in the anchor's voice.
 
+## A world's own missions
+
+`missions.yaml` is written for the Makers: its generators read the record and its workflows end
+with a document landed on it. Every world falls back to it. A world whose characters are not
+Makers — `life`, where Zen and its Drones look after families on Earth — says what its own work
+is in `<mind>/missions/<world>.yaml`, and that file **replaces** `missions.yaml` for that world
+(`engine::mission_gen::world`):
+
+```yaml
+routines:
+  - id: check-on-the-sharratts
+    brief: Look in on the Sharratt family …
+    steps:
+      - go to the Sharratt room
+      - settle how the family is today
+```
+
+- **Routines, authored whole.** Each is the brief a character is handed and the steps it works
+  through. They take the bank's place: a character collecting at the table with nothing lodged
+  draws one of the world's routines by seed, closed — like the bank's — by going back to the
+  table to report. Steps are written in the grammar the engine signs off (`go to …`, `scan … and
+  read what state it is in`, `find …`, `ask …`); a step outside it is ticked by the character's
+  report, as the bank's free-form steps are.
+- **The record's work does not run there.** No generator draws for the world and no workflow is
+  loaded for it. Operations opened before the file was written are called off by the world's
+  authority on the next tick, so a carrier is stood down rather than left on work nobody will
+  read.
+- **Refused when read.** A file with no routines, a routine id that is not kebab-case or is
+  repeated, an empty brief or step, or any key but those above stops that world's table, with a
+  warning naming the file — the world neither falls back to `missions.yaml` nor hands out a
+  broken mission.
+
+The routines are the mind's, like the workflows: read afresh each tick by every member and never
+saved with the world.
+
 ## Measured
 
 Live runs of 2026-10-09 on the RTX 3090, Qwen3-30B-A3B serving both the generator and the
