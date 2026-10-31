@@ -126,7 +126,8 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
   └──────────────────────────────────┘             └──────────────────────────────────────┘
 ```
 
-There are two parts, and the first stands without the second:
+There are two parts, and the first stands without the second and is built first
+(§8):
 
 - **Bots** (§3.3). A character with its own bot is online on Discord whenever its world
   is running, and is DMed there, in any server the person and the bot share. This needs
@@ -215,9 +216,9 @@ minutes: it names no account and grants only that link.
 
 **An unlinked author** is not heard in the world. Their first message to a bot is
 answered once — "I don't know you yet. Open <console>/#/profile, choose Link Discord,
-and send me the code." — and further messages from them are dropped silently for an
-hour, so a stranger cannot make a bot talk on a loop. The bridge keeps that
-"told" set in memory; a restart tells them once more.
+and send me the code." — and later ones are dropped without an answer, so a stranger
+cannot make a bot talk on a loop. The bot keeps the set of authors it has told in
+memory; a restart tells them once more.
 
 A linked person is then the same author in both places: their Discord messages arrive
 as `WorldOp::Message { from: <their speaking name> }`, the name `speaking_as`
@@ -247,18 +248,19 @@ is what keeps it at one: two members never hold one world.
   world ("in Life"). Discord shows it offline once the shard closes.
 
 **The bot's state** is the replicated custom object `discord/state/<npc_id>`, written by
-the member running the shard on each change (not on every beat):
+the member running the shard when it changes (not on every beat):
+`{ state, since_ms, world }`, where `state` is
 
-| `state` | Meaning |
-|---|---|
-| `online` | a shard is open and Discord answered `READY`; `member` names who runs it |
-| `connecting` | a shard is opening or resuming |
-| `revoked` | Discord answered 401 to the token, so the shard was stopped (§6); the owner must connect a fresh token |
-| `no_world` | the character has no body in a running world |
+- `online` — a shard is open and Discord answered `READY`;
+- `refused` — Discord refused the token (close code 4004, or 401), so the shard was
+  stopped (§6) and the owner must connect a fresh token.
 
-`{ state, since_ms, member, world }`. `GET /v1/npc/:nid/discord` (§4.3) answers it as
-`status`, and the Messages-tab panel shows it beside the bot's name: "online in Life",
-"offline — Zen is in no running world", "Discord refused the token — connect a new one".
+No record, or one older than its world's authority, is **offline**: no member runs the
+bot, because its character is in no running world or the world is moving. The member
+that stops a shard tombstones the record. `GET /v1/npc/:nid/discord` (§4.3) answers it
+as `status` (`online`, `offline` or `refused`), and the Messages-tab panel shows it
+beside the bot's name: "online in Life", "offline", "Discord refused the token — connect
+a new one".
 
 ---
 
@@ -399,12 +401,6 @@ bridge walk the threads and, for each mapped thread or DM, post every message wi
 them, which Discord allows only if they share a server (50278: the message stays
 unposted, and the panel's status says "can't reach <person> — no shared server").
 
-**Typing.** From when a DM from Discord is delivered to the character
-(`deliver_messages`) until the character answers on that thread or its turn ends —
-two minutes at most — its bot shows typing in that DM (`POST /channels/{id}/typing`,
-renewed every 8 s, as Discord's indicator lasts 10), so a person who wrote sees the
-character is answering.
-
 A post that fails with 429 waits `retry_after`; one that fails otherwise leaves the
 cursor where it was, and the next beat tries again — so a gap is retried, never
 skipped. Posting is per channel and in order.
@@ -459,7 +455,7 @@ Every five minutes, and once when a member takes a world:
 ### 5.4 Authority moves
 
 When the authority moves, the old holder closes its gateway connections — every bot of
-the world's cast, and the listener — and writes each bot's state `connecting`; the new
+the world's cast, and the listener — and tombstones each bot's state; the new
 holder opens them; IDENTIFY's 1,000 a day per token is far above any move rate. The
 records the old holder wrote — `mirrored_through`, `last_seen_discord` — arrive with
 replication before the new holder's first beat as its authority (§9.3), so it resumes
@@ -479,7 +475,7 @@ client per token and is the heavier fit.
 The **per-IP invalid-request limit is shared by every token**, so the bridge keeps one
 counter for the host: past 5,000 401/403/429 responses in ten minutes it stops sending
 for the rest of the window and says so. A 401 (a token revoked in the portal) marks
-that bot `revoked` (§3.3) and stops its shard rather than retrying; a new token
+that bot `refused` (§3.3) and stops its shard rather than retrying; a new token
 connected in the panel reopens it.
 
 **A shard is a task of the authority**, one per bot, in `npcd/src/discord/gateway/`:
@@ -515,28 +511,40 @@ writes the world itself.
 
 ## 8. Build order
 
-Ordered so that a person can talk to a character on Discord as early as possible,
-since that is the way in.
+In two parts. **Part one is talking to a character**: a person DMs a character's bot
+and the character answers there. It needs no world server and none of §4.4 or the
+channel, group and webhook halves of §5, and it is built first and alone.
+
+**Part one — DMs with a character's own bot**
 
 1. **Built:** sealed bot tokens and `GET`/`PUT`/`DELETE /v1/npc/:nid/discord`, with the
    Messages-tab panel (§4.3).
 2. `Message.seq` / `at_ms` / `origin` and `Thread.next_seq` (§4.1), with tests that a
    trimmed thread keeps every surviving message's `seq`.
-3. The bot runtime (§3.3, §6): a shard per bot on the authority of its character's
-   world, presence, the `discord/state` record and the panel's status. A fake Discord
-   gateway in tests drives `HELLO`/`READY`/`RESUMED`, a 4004 close (revoked), and a move
-   of authority closing one shard and opening another.
+3. The bot runtime (§3.3, §6): a shard per bot with `DIRECT_MESSAGES` on the authority of
+   its character's world, opened and closed as the authority and the
+   `discord/bot` record change; presence; the `discord/state` record and the panel's
+   status. A fake Discord gateway in tests drives `HELLO`/`READY`, a 4004 close
+   (refused), and a lost authority closing the shard.
 4. Account linking (§3.2): the Profile section, the code routes, redeeming a code over a
-   DM, the unlinked answer and its hour of silence.
-5. DMs both ways (§5.1–5.2): a linked person DMs a character's bot and the character
-   answers there — the first thing anyone uses — with typing, the visibility refusal
-   and the DM gap fetch. A fake Discord HTTP server in tests asserts the exact requests,
-   echo suppression, `origin`, and that a 429 and a 500 are retried in order.
+   DM, and the unlinked author's one answer.
+5. DMs both ways (§5.1–5.2, the DM halves): a linked person DMs a character's bot, the
+   message enters the world as `post_message` writes it, and the character's answer is
+   posted back; the visibility refusal; the DM gap fetch when a world starts (§5.3,
+   DMs). A fake Discord HTTP server in tests asserts the exact requests, echo
+   suppression, `origin`, and that a 429 and a 500 are retried in order.
+
+**Part two — mirroring a world into its server**
+
 6. The world's server (§4.4) and the channel both ways.
 7. Groups as channels, persona webhooks and private-thread "DMs", and the reconcile
    (§5.3).
-8. Authority moves (§5.4), with a two-member test that the cursor carries over.
+8. Authority moves for the listener and the channel cursors (§5.4), with a two-member
+   test that a cursor carries over.
 9. Backstage threads for character-to-character DMs.
+10. Typing: from when a DM from Discord is delivered to the character until it answers
+    or its turn ends — two minutes at most — its bot shows typing in that DM
+    (`POST /channels/{id}/typing`, renewed every 8 s).
 
 ---
 
