@@ -5,10 +5,10 @@
 //! first line; or, with `turn`, that one turn in full, a page of characters at
 //! a time. Admins only.
 
+use host::substrate_views::TimelineDetail;
 use serde_json::{json, Value};
 
 use super::{Answer, Ctx, LOADING};
-use crate::api::substrate::TimelineDetail;
 use crate::mcp::names::Path;
 use crate::mcp::ops;
 use crate::mcp::threads;
@@ -221,7 +221,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::api::substrate::TurnView;
+    use host::substrate_views::TurnView;
 
     /// **An id is a timeline's number or a worker's path**; anything else is
     /// refused saying what it may be.

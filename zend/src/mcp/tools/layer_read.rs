@@ -2,10 +2,10 @@
 //! holds (`docs/claude_zend_gateway.md` §8.5) — `GET
 //! /v1/substrate/zend/layer/:name`, read in process. Admins only.
 
+use host::substrate_views::LayerConversations;
 use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx, LOADING};
-use crate::api::substrate::LayerConversations;
 use crate::mcp::ops;
 
 pub const NAME: &str = "layer_read";
@@ -102,7 +102,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::substrate::ConvView;
+    use host::substrate_views::ConvView;
 
     fn conv(timeline: &str, repo: &str, label: &str) -> ConvView {
         ConvView {

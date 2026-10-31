@@ -2,7 +2,9 @@
 //! overview is deliberately lightweight (storage + counts + layer metadata) and
 //! is the host's (`GET /v1/substrate`, zend's line built by `crate::tenant`), as
 //! is the tool catalog (`GET /v1/tools`); each drill-down level is its own
-//! endpoint the page fetches only when the user expands that node:
+//! endpoint the page fetches only when the user expands that node. The views
+//! themselves are the host's, which every tenant serves over its own substrate
+//! (`host::substrate_views`):
 //!
 //! - `GET /v1/substrate/zend/system-prompt`       — the target layer's framing.
 //! - `GET /v1/substrate/zend/layer/{name}`        — the conversations in one layer.
@@ -18,7 +20,6 @@
 //! rebuild from the multi-GB redo log, and return `503` until the model is
 //! loaded.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use candle_conversation::summary_tree::SelectionOrigin;
-use candle_conversation::turn_layout::TurnLayout;
+use host::substrate_views::{LayerConversations, SystemPromptView, TimelineDetail};
 
 use crate::session::ZendSession;
 
@@ -199,151 +200,6 @@ pub async fn retire_system_prompt(
     }
 }
 
-/// zend's line in `GET /v1/substrate` — the lightweight top of the tree. No
-/// conversations, section text, or tool catalog: those are fetched
-/// per-expansion so init and the periodic refresh stay cheap regardless of
-/// corpus size.
-#[derive(Serialize)]
-pub struct SubstrateOverview {
-    pub storage: Storage,
-    pub counts: Counts,
-    /// The projection target layer (`dialogue`) — where the live chat lives.
-    pub target_layer: String,
-    /// Every declared projection layer, low → high, with its config and a count
-    /// of the conversations targeting it (fetched on expand).
-    pub layers: Vec<LayerView>,
-}
-
-/// On-disk footprint of the segmented redo log.
-#[derive(Serialize)]
-pub struct Storage {
-    /// One entry per `seg-*.log` file, ascending by id; the last is active.
-    pub segments: Vec<SegmentView>,
-    /// Sum of every segment file's size on disk.
-    pub total_bytes: u64,
-    /// Live KV chunk records currently indexed in RAM. A record is one 32-token
-    /// block of ONE attention layer, so this is a count of records, not of tokens.
-    pub live_chunks: usize,
-    /// Fraction of record bytes that are dead (superseded + tombstoned) and
-    /// reclaimable by compaction. `None` when the persistence lock was
-    /// momentarily held (a compaction in flight) — the viewer shows "—".
-    pub dead_ratio: Option<f32>,
-}
-
-#[derive(Serialize)]
-pub struct SegmentView {
-    pub id: u64,
-    pub active: bool,
-    pub bytes: u64,
-}
-
-/// The substrate's totals. A count is always `*_count`
-/// (`docs/shared_model_host.md` §3.5).
-#[derive(Serialize)]
-pub struct Counts {
-    pub timeline_count: usize,
-    pub conversation_count: usize,
-    pub section_count: usize,
-    /// Tokens sealed in the substrate: every live timeline's turns and the shared
-    /// sections, each counted once. The layers' `tokens` sum to this less the
-    /// sections and any timeline no layer lists.
-    pub token_count: usize,
-}
-
-/// One projection layer's schema config plus a conversation count (the list
-/// itself is fetched from `/v1/substrate/zend/layer/{name}` on expand).
-#[derive(Serialize)]
-pub struct LayerView {
-    pub name: String,
-    pub description: String,
-    /// Per-target token budget when this layer is the projection target.
-    pub window: usize,
-    /// Flex priority when another layer is the target.
-    pub priority: f32,
-    /// Declared turn groups (name + selection rule), in declaration order.
-    pub groups: Vec<GroupView>,
-    /// This layer's dial overrides for the shared system prompt, as
-    /// `"<selector> = <option>"` labels. Empty inherits the section-tree defaults.
-    pub dials: Vec<String>,
-    /// Number of conversations targeting this layer.
-    pub conversation_count: usize,
-    /// Total sealed tokens across every conversation in this layer.
-    pub tokens: usize,
-    /// Runtime projection kill switch: `true` while this layer is toggled OFF
-    /// (excluded from projection assembly). In-memory only — clears on restart.
-    pub disabled: bool,
-}
-
-#[derive(Serialize)]
-pub struct GroupView {
-    pub name: String,
-    pub selection: String,
-}
-
-/// `GET /v1/substrate/zend/layer/{name}` — the conversations in one layer.
-#[derive(Serialize)]
-pub struct LayerConversations {
-    pub conversations: Vec<ConvView>,
-}
-
-/// One conversation timeline as it sits in a layer.
-#[derive(Serialize)]
-pub struct ConvView {
-    /// Raw timeline id as a decimal string (see [`SubstrateOverview`] note).
-    pub timeline: String,
-    pub conv_id: String,
-    /// For an ingested unit, the path inside its repository (`src/lib.rs`,
-    /// `src/`, `/` for the repository's root) — the repository is
-    /// [`Self::repo`]. Otherwise the conversation's title.
-    pub label: String,
-    /// For an ingested unit, the repository it is in; empty otherwise, and
-    /// for the workspace's own unit.
-    pub repo: String,
-    pub archived: bool,
-    pub group: String,
-    /// Turn count including summary nodes.
-    pub turn_count: u32,
-    /// The timeline's own sealed turn tokens — never the shared sections, which
-    /// every conversation projects and none owns.
-    pub tokens: usize,
-    /// Summary-forest nodes (SoT + SoS) — how much has been compressed.
-    pub summary_nodes: usize,
-    /// For an ingested unit, every branch whose tip holds the version this
-    /// conversation read, default branch first — what tells one `candle/`
-    /// row from another. Empty for a dialogue, an upload, and the workspace's
-    /// own unit.
-    pub branches: Vec<String>,
-    /// For a file reading, the commit it read the file at — the version it
-    /// holds, which every branch sharing that version shares, so the view shows
-    /// this rather than [`Self::branches`]. Empty for anything else.
-    pub commit: String,
-}
-
-/// `GET /v1/substrate/zend/system-prompt` — the single shared system prompt. Fetched
-/// when the "system prompt" card expands.
-#[derive(Serialize)]
-pub struct SystemPromptView {
-    /// The layer currently targeted — whose dials pick the active section-tree
-    /// branch of this shared prompt.
-    pub target_layer: String,
-    /// Ordered system-prompt item labels (sections / collection / tree).
-    pub items: Vec<String>,
-    /// Always-emit framing sections, with authored text + token cost.
-    pub sections: Vec<SectionView>,
-    /// Live tool-catalog size (the catalog itself loads from `/tools` on expand).
-    pub tool_count: usize,
-}
-
-#[derive(Serialize)]
-pub struct SectionView {
-    pub name: String,
-    pub tokens: usize,
-    pub blocks: usize,
-    /// The section's authored text — what gets tokenized into these blocks.
-    /// Shown when the viewer expands the section.
-    pub content: String,
-}
-
 /// zend's live tool catalog, as its entries in `GET /v1/tools`.
 #[derive(Serialize)]
 pub struct ToolsView {
@@ -361,61 +217,6 @@ pub struct ToolView {
     /// tool-call card from it — the ones a call left out included, with the
     /// default they took — since a call names only what it overrides.
     pub parameters: Value,
-}
-
-/// `GET /v1/substrate/zend/timeline/{tl}` body — one conversation's forest.
-#[derive(Serialize)]
-pub struct TimelineDetail {
-    pub timeline: String,
-    pub conv_id: String,
-    pub label: String,
-    pub archived: bool,
-    pub layer: String,
-    pub group: String,
-    pub total_tokens: usize,
-    /// The conversation's persisted `custom` metadata — content hashes, source
-    /// path, and the `forked_from` lineage pointer.
-    pub custom: BTreeMap<String, String>,
-    /// The lineage this conversation actually projects with, oldest ancestor
-    /// first, ending in itself — what `Substrate::inherited_chain` resolves
-    /// `forked_from` to after dropping retired ancestors and applying the
-    /// token cap. A single entry means it inherits nothing.
-    pub inherited_chain: Vec<String>,
-    /// Forest peaks — the orphan summary nodes that are the window entry points.
-    pub peaks: Vec<u32>,
-    /// Turn indices that open a coupled exchange (a tool-call turn joined with
-    /// its response turn) — the `from` side of each `TurnCoupling`.
-    pub couplings: Vec<u32>,
-    /// How many turns `turns` holds.
-    pub turn_count: usize,
-    /// Every turn in append order.
-    pub turns: Vec<TurnView>,
-}
-
-/// One turn / summary node in the forest.
-#[derive(Serialize)]
-pub struct TurnView {
-    pub index: u32,
-    /// `"normal"` | `"sot"` (summary of turns) | `"sos"` (summary of summaries).
-    pub kind: &'static str,
-    /// Tree height (0 for a normal leaf turn).
-    pub height: u8,
-    pub tokens: usize,
-    pub no_think: bool,
-    /// Child turn indices this summary node compresses (empty for a normal turn).
-    pub children: Vec<u32>,
-    /// `true` when this turn opens a coupled exchange (its response turn follows).
-    pub coupled: bool,
-    /// `true` when this node is a forest peak (a window entry point).
-    pub peak: bool,
-    /// Decoded user half (the derived scope for a summary node).
-    pub user: String,
-    /// Decoded assistant half (the summary text for a summary node).
-    pub assistant: String,
-    /// K/V segment layout (real vs ethereal glue, user, thinking, assistant) —
-    /// present for normal turns, letting the viewer colorize the exact segments.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub layout: Option<TurnLayout>,
 }
 
 /// `GET /v1/substrate/zend/timeline/{tl}/selection` body — the most recent

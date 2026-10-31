@@ -572,13 +572,9 @@ table.t tr.click:hover td { background: var(--panel-2); }
 }
 canvas { width: 100%; display: block; }
 
-/* ── the performance page's interpreted numbers ──────────────────────────────
-   A KPI is a `.stat` that also says whether its value is fine, so it reuses
-   `.lbl` / `.val` rather than restating them. What is added is the judgement:
-   a colour rail down the edge, an optional fill, and the three states those
-   two share with the verdict line. */
-.kpi { position: relative; overflow: hidden; padding-left: 16px; }
-.kpi-rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+/* ── interpreted numbers ─────────────────────────────────────────────────────
+   A fill under a figure, and the states a figure shares with the text that
+   judges it. */
 .kpi-meter {
   height: 3px; border-radius: 2px; background: var(--line-2);
   margin-top: 9px; overflow: hidden;
@@ -589,157 +585,210 @@ canvas { width: 100%; display: block; }
 .st-warn { color: var(--warn); }  .bg-warn { background: var(--warn); }
 .st-crit { color: var(--crit); }  .bg-crit { background: var(--crit); }
 
-/* Not measured — a fourth state, and the reason the performance page can be
- * trusted. Nothing has reported this number, which is different from having
- * reported a zero. Deliberately colourless: green, amber and red are verdicts,
- * and there is no verdict to give about a number nobody has taken. */
-.st-na { color: var(--ink-faint); }  .bg-na { background: var(--line-2); }
-
-/* ── Performance page ──────────────────────────────────────────────────────
+/* ── Performance: the shared page (`common/lib/perf.js`) ────────────────────
  *
- * Everything here is scoped to `.perf`, the page's own root class. The panel
- * and KPI rules below alter hover and spacing, and a bare `.panel:hover` would
- * quietly change the roster, the substrate view and every other page that uses
- * the same component.
+ * Its layout is `common/lib/perf.css`, scoped to `.perf-page`; what follows is
+ * this console's look on it, under the same root.
  */
 
 /* A figure that changes every four seconds must not change width as it does.
  * With proportional digits a KPI twitches on each poll, which reads as
  * instability in the daemon rather than in the typeface. */
-.perf .val, .perf .mono, .perf .dev-chip b { font-variant-numeric: tabular-nums; }
+.perf-page .val, .perf-page .mono { font-variant-numeric: tabular-nums; }
 
-/* The device banner — what this page is about, stated once at the top so the
- * card's identity is not buried in a chart caption. */
-.perf .dev {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  padding: 13px 16px; margin-bottom: 14px; border-radius: var(--radius);
-  background:
-    linear-gradient(100deg, color-mix(in srgb, var(--accent) 9%, transparent), transparent 46%),
-    var(--panel);
-  border: 1px solid var(--line);
-}
-/* Card and model, side by side — the two facts every number below depends on. */
-.perf .dev-id { display: flex; align-items: center; gap: 11px; min-width: 0; }
-.perf .dev-split {
-  width: 1px; align-self: stretch; background: var(--line); flex: none; margin: 0 2px;
-}
-.perf .dev-mark {
-  width: 30px; height: 30px; flex: none; border-radius: 8px;
-  display: grid; place-items: center; font-size: 15px;
-  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
-}
-.perf .dev-name { font-weight: 650; letter-spacing: -.01em; }
-/* Brighter than `.dim`, which is `--ink-faint` and disappears against the
- * banner's gradient — this line carries the card's memory and the model's size,
- * which are the two figures somebody actually reads here. */
-.perf .dev-sub { color: var(--ink-dim); }
-.perf .dev-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-left: auto; }
-.perf .dev-chip {
-  font-family: var(--mono); font-size: 10.5px; padding: 3px 8px; border-radius: 6px;
-  background: var(--panel-2); color: var(--ink-dim); border: 1px solid var(--line);
-}
-.perf .dev-chip b { color: var(--ink); font-weight: 600; }
+/* Cards and chart panels lift on hover to say they are live things. */
+.perf-page .kpi { transition: transform .14s ease, box-shadow .14s ease; }
+.perf-page .kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgb(0 0 0 / .17); }
+.perf-page .kpi .kpi-rail { opacity: .85; }
+.perf-page .panel { transition: box-shadow .14s ease; }
+.perf-page .panel:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
+.perf-page canvas { border-radius: 6px; }
 
-/* Narrow: the blocks stack, so a full-height divider between them would be a
- * rule across the middle of the banner rather than between two columns. */
-@media (max-width: 860px) {
-  .perf .dev-split { display: none; }
-  .perf .dev-chips { margin-left: 0; }
-}
+/* The sentence that says whether the charts below are good news. */
+.perf-page .verdict { color: var(--ink-soft); margin-bottom: 16px; }
 
-/* KPI cards. The rail is a gradient rather than a flat bar so a glance down the
- * row reads as a row, and the card lifts on hover to say it is a live thing. */
-.perf .kpi { transition: transform .14s ease, box-shadow .14s ease; }
-.perf .kpi:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgb(0 0 0 / .17); }
-.perf .kpi-rail { width: 3px; opacity: .85; }
-.perf .kpi .val { font-size: 1.35rem; letter-spacing: -.02em; line-height: 1.15; }
-
-/* The sparkline under a KPI: the same metric's shape over the retained window.
- * A number says where you are; this says which way you are going, which is the
- * question a number on its own always provokes. */
-.perf .kpi-spark { margin-top: 9px; height: 26px; line-height: 0; }
-.perf .kpi-spark svg { width: 100%; height: 26px; display: block; overflow: visible; }
-
-/* Chart panels lift the same way, and their canvas gets a hairline floor so an
- * empty-looking chart still reads as a plotted area. */
-.perf .panel { transition: box-shadow .14s ease; }
-.perf .panel:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
-.perf canvas { border-radius: 6px; }
-
-/* The live chip breathes while it is live, and only while it is live — a
- * stopped animation is the first thing you notice out of the corner of an eye,
- * which is exactly the right signal for a daemon that stopped answering. */
-.perf .chip.ok .dot-live {
-  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: currentColor; margin-right: 6px; vertical-align: middle;
-  animation: perf-pulse 2.1s ease-in-out infinite;
-}
-@keyframes perf-pulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
-  50%      { opacity: .55; box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 0%, transparent); }
-}
-
-/* The verdict, led by a state pill so the answer is legible before the
- * sentence explaining it is read. */
-.perf .verdict { display: flex; gap: 12px; align-items: flex-start; }
-.perf .verdict-pill {
-  flex: none; font-family: var(--mono); font-size: 10px; font-weight: 700;
-  letter-spacing: .08em; padding: 4px 9px; border-radius: 6px; margin-top: 1px;
-}
-.perf .verdict-body { flex: 1; min-width: 0; }
-.pill-ok   { background: color-mix(in srgb, var(--ok) 15%, transparent);   color: var(--ok); }
-.pill-warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
-.pill-crit { background: color-mix(in srgb, var(--crit) 16%, transparent); color: var(--crit); }
-.pill-na   { background: var(--panel-2); color: var(--ink-faint); }
-
-/* A legend row under a chart, so the colours mean something without hovering. */
-.perf .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 9px; }
-.perf .legend span { font-size: 10.5px; color: var(--ink-dim); display: inline-flex;
-  align-items: center; gap: 5px; font-family: var(--mono); }
-.perf .legend i { width: 9px; height: 3px; border-radius: 2px; display: inline-block; }
-
-/* Before the first sample lands. A shimmer says "coming", where an empty panel
- * says "broken" and a spinner says nothing at all. */
-.perf .skel { border-radius: 8px; background: var(--panel-2); overflow: hidden; position: relative; }
-.perf .skel::after {
-  content: ""; position: absolute; inset: 0; transform: translateX(-100%);
-  background: linear-gradient(90deg, transparent,
-    color-mix(in srgb, var(--ink) 7%, transparent), transparent);
-  animation: perf-shimmer 1.5s infinite;
-}
-@keyframes perf-shimmer { 100% { transform: translateX(100%); } }
+/* A legend's swatches and names in the console's mono, like its chips. */
+.perf-page .legend span { font-family: var(--mono); color: var(--ink-dim); }
 
 /* Somebody reading rather than watching gets the motion out of the way. */
 @media (prefers-reduced-motion: reduce) {
-  .perf .chip.ok .dot-live, .perf .skel::after { animation: none; }
-  .perf .kpi, .perf .panel { transition: none; }
-  .proj .gather-bar i, .subs .seg { transition: none; }
+  .perf-page .kpi, .perf-page .panel { transition: none; }
+  .proj .gather-bar i { transition: none; }
 }
 
-/* ── Substrate: the redo log on disk ───────────────────────────────────────
+/* ── Substrate: the shared inspector (`common/lib/substrate.js`) ────────────
  *
- * One strip, segments sized by their share of the log — so it reads as the
- * thing it describes: a long tail of sealed files and one growing head.
+ * Every class it writes here is `sx-`-prefixed, so this block is the whole of
+ * its look and nothing else on the console is touched by it. The colours the
+ * inspector names inline (`--line2`, `--c-*`, `--seg-*`) are this console's
+ * tokens under the names it uses.
  */
-.subs .segstrip {
-  display: flex; gap: 2px; height: 26px; border-radius: 6px; overflow: hidden;
-  background: var(--panel-2);
+.subs {
+  --line2: var(--line-2);
+  --c-user: var(--l-perception); --c-asst: var(--l-action); --c-glue: var(--ink-ghost);
+  --c-think: var(--l-beliefs); --c-sum: var(--warn); --c-sys: var(--l-agency);
+  --seg-a: color-mix(in srgb, var(--l-perception) 45%, transparent);
+  --seg-b: color-mix(in srgb, var(--l-perception) 28%, transparent);
 }
-.subs .seg {
-  display: block; min-width: 3px; border-radius: 3px;
-  background: color-mix(in srgb, var(--l-perception) 45%, transparent);
-  transition: background .14s ease;
+.subs .sx-head {
+  font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint);
+  font-family: var(--mono); margin: 22px 0 10px; font-weight: 600;
 }
-.subs .seg:hover { background: var(--l-perception); }
-/* The one being appended to. Striped rather than merely brighter, because
- * "which file is growing" is a categorical fact, not a stronger version of the
- * others — and a colour alone would not survive a colour-blind reader. */
-.subs .seg.active {
-  background: repeating-linear-gradient(115deg,
-    var(--accent) 0 6px, color-mix(in srgb, var(--accent) 55%, transparent) 6px 12px);
+
+/* KPI tiles */
+.subs .sx-kpis {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;
+  margin-bottom: 12px;
 }
-.subs .panel { transition: box-shadow .14s ease; }
-.subs .panel:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
+.subs .sx-kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 13px 15px; transition: box-shadow .14s ease;
+}
+.subs .sx-kpi:hover { box-shadow: 0 3px 14px rgb(0 0 0 / .13); }
+.subs .sx-kpi .sx-k {
+  color: var(--ink-faint); font-family: var(--mono); font-size: .66rem; letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.subs .sx-kpi .sx-v {
+  font-size: 1.35rem; font-weight: 650; letter-spacing: -.02em; margin-top: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.subs .sx-kpi .sx-v small { font-size: .75rem; font-weight: 500; color: var(--ink-dim); margin-left: 3px; }
+.subs .sx-kpi .sx-x { color: var(--ink-faint); font-size: .7rem; margin-top: 3px; font-family: var(--mono); }
+.subs .sx-kpi .sx-v.sx-warn { color: var(--warn); }
+.subs .sx-kpi .sx-v.sx-crit { color: var(--crit); }
+.subs .sx-kpi .sx-v.sx-ok { color: var(--ok); }
+
+/* The redo log on disk: one strip, segments sized by their share of it — a long
+ * tail of sealed files and one growing head. */
+.subs .sx-segbar {
+  display: flex; gap: 2px; height: 14px; border-radius: 6px; overflow: hidden;
+  background: var(--panel-2); margin-top: 4px;
+}
+.subs .sx-segbar span { display: block; height: 100%; min-width: 3px; border-radius: 3px; }
+.subs .sx-seglegend {
+  display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; color: var(--ink-dim);
+  font-family: var(--mono); font-size: .69rem;
+}
+.subs .sx-seglegend i {
+  display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: 0;
+}
+
+/* Collapsible card */
+.subs .sx-grp {
+  background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--line-2);
+  border-radius: var(--radius); margin-bottom: 10px; overflow: hidden;
+}
+.subs .sx-grp > .sx-hdr {
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px; cursor: pointer; user-select: none;
+}
+.subs .sx-grp > .sx-hdr:hover { background: var(--panel-2); }
+.subs .sx-chev {
+  flex-shrink: 0; width: 10px; height: 10px; color: var(--ink-faint);
+  transition: transform .15s ease; transform: rotate(0deg);
+}
+.subs .sx-grp.sx-open > .sx-hdr .sx-chev,
+.subs .sx-turn.sx-open > .sx-thdr .sx-chev { transform: rotate(90deg); }
+.subs .sx-grp .sx-title { font-weight: 600; font-size: .875rem; min-width: 0; }
+.subs .sx-mono { font-family: var(--mono); font-weight: 500; }
+.subs .sx-grp .sx-meta {
+  margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--ink-dim);
+  font-family: var(--mono); font-size: .72rem; flex-wrap: wrap; justify-content: flex-end;
+}
+.subs .sx-grp > .sx-body { display: none; padding: 2px 14px 14px; border-top: 1px solid var(--line); }
+.subs .sx-grp.sx-open > .sx-body { display: block; }
+.subs .sx-desc { color: var(--ink-dim); font-size: .8rem; line-height: 1.55; margin: 11px 0 4px; max-width: 74ch; }
+
+/* Badges and chips */
+.subs .sx-badge {
+  font-family: var(--mono); font-size: .63rem; letter-spacing: .04em; text-transform: uppercase;
+  border-radius: 5px; padding: 2px 6px; border: 1px solid var(--line-2); color: var(--ink-dim);
+  white-space: nowrap;
+}
+.subs .sx-badge.sx-on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.subs .sx-badge.sx-off { color: var(--ink-faint); }
+.subs .sx-badge.sx-arch { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.subs .sx-badge.sx-sum,
+.subs .sx-badge.sx-sot,
+.subs .sx-badge.sx-sos { color: var(--c-sum); border-color: color-mix(in srgb, var(--c-sum) 40%, transparent); }
+.subs .sx-badge.sx-think { color: var(--c-think); border-color: color-mix(in srgb, var(--c-think) 40%, transparent); }
+.subs .sx-badge.sx-peak { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.subs .sx-repo {
+  font-family: var(--mono); font-size: .69rem; font-weight: 500; color: var(--accent);
+  border: 1px solid var(--line-2); border-radius: 5px; padding: 1px 6px; margin-right: 8px;
+  vertical-align: 1px;
+}
+.subs .sx-branches {
+  display: block; font-family: var(--mono); font-size: .69rem; font-weight: 400; color: var(--ink-dim);
+  margin-top: 2px; overflow-wrap: anywhere;
+}
+.subs .sx-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0; }
+.subs .sx-chip {
+  font-family: var(--mono); font-size: .69rem; color: var(--ink-dim); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px;
+}
+.subs .sx-chip b { color: var(--ink); font-weight: 600; }
+
+/* A tool in the catalog */
+.subs .sx-row {
+  display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--line);
+  border-radius: 9px; margin-top: 7px; background: var(--panel-2);
+}
+.subs .sx-row .sx-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--c-sys); }
+.subs .sx-row .sx-nm { font-family: var(--mono); font-size: .8rem; font-weight: 500; overflow-wrap: anywhere; }
+.subs .sx-row .sx-rmeta {
+  margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--ink-faint);
+  font-family: var(--mono); font-size: .69rem; flex-wrap: wrap; justify-content: flex-end;
+}
+
+/* A turn in the forest */
+.subs .sx-turn {
+  border: 1px solid var(--line); border-left: 3px solid var(--line-2); border-radius: 9px;
+  margin-top: 7px; background: var(--panel-2); overflow: hidden;
+}
+.subs .sx-turn.sx-k-sot, .subs .sx-turn.sx-k-sos { border-left-color: var(--c-sum); }
+.subs .sx-turn > .sx-thdr {
+  display: flex; align-items: center; gap: 9px; padding: 9px 11px; cursor: pointer; user-select: none;
+}
+.subs .sx-turn > .sx-thdr:hover { background: var(--panel-3); }
+.subs .sx-turn .sx-idx { font-family: var(--mono); font-size: .75rem; color: var(--ink-dim); min-width: 34px; }
+.subs .sx-turn .sx-tlabel { font-weight: 600; font-size: .8rem; }
+.subs .sx-turn .sx-tmeta {
+  margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--ink-faint);
+  font-family: var(--mono); font-size: .69rem; flex-wrap: wrap; justify-content: flex-end;
+}
+.subs .sx-turn > .sx-tbody { display: none; padding: 0 11px 11px; border-top: 1px solid var(--line); }
+.subs .sx-turn.sx-open > .sx-tbody { display: block; }
+
+.subs .sx-seg { margin-top: 9px; }
+.subs .sx-seg .sx-lbl {
+  font-family: var(--mono); font-size: .63rem; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ink-faint); margin-bottom: 3px;
+}
+.subs pre.sx-body {
+  margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: .78rem;
+  line-height: 1.55; background: var(--bg-deep); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 11px; max-height: 520px; overflow: auto;
+}
+.subs pre.sx-body.sx-user { color: var(--c-user); }
+.subs pre.sx-body.sx-asst { color: var(--c-asst); }
+.subs .sx-empty { color: var(--ink-faint); font-style: italic; font-size: .78rem; padding: 8px 2px; }
+.subs .sx-spin {
+  display: inline-block; width: 13px; height: 13px; border: 2px solid var(--line-2);
+  border-top-color: var(--accent); border-radius: 50%; animation: sx-spin .7s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes sx-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 640px) {
+  .subs .sx-kpi .sx-v { font-size: 1.15rem; }
+  .subs .sx-grp .sx-meta, .subs .sx-row .sx-rmeta, .subs .sx-turn .sx-tmeta { font-size: .66rem; gap: 6px; }
+  .subs .sx-grp .sx-title { font-size: .8rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .subs .sx-chev, .subs .sx-kpi { transition: none; }
+  .subs .sx-spin { animation: none; }
+}
 
 /* ── A page with nothing in it yet ─────────────────────────────────────────
  *
@@ -822,17 +871,6 @@ canvas { width: 100%; display: block; }
   .proj .gather-row { grid-template-columns: 92px 1fr 104px; }
   .proj .gather-bar, .proj .gather-top { display: none; }
 }
-
-/* The sentence that says whether the charts below are good news. */
-.verdict {
-  border-left: 3px solid var(--accent); line-height: 1.7;
-  color: var(--ink-soft); margin-bottom: 16px;
-}
-.verdict b { color: var(--ink); }
-
-/* Paused: dimmed so the page cannot be mistaken for live at a glance, but not
-   so far that it stops being readable — reading is the reason it is paused. */
-.page.is-paused .grid, .page.is-paused .verdict { opacity: .62; transition: opacity .15s; }
 
 /* ── the loading screen ──────────────────────────────────────────────────────
    A restart takes tens of seconds — weights onto the card, a redo log replayed,

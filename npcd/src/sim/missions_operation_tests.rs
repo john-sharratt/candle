@@ -277,6 +277,37 @@ fn a_step_no_maker_may_take_is_called_off() {
     assert!(!m.blocks("life:keeper", 1), "its target is free");
 }
 
+/// **A world that comes to run on its own missions calls off the record's
+/// work**: the operation waiting at the table leaves it, the one being carried
+/// stands its carrier down, and one already over is left as it was.
+#[test]
+fn every_open_operation_is_called_off_and_a_settled_one_is_left() {
+    let mut m = table();
+    let carried = launch(&mut m, "era:w", 1);
+    let waiting = launch(&mut m, "life:keeper", 1);
+    let over = launch(&mut m, "era:x", 1);
+    assert!(m.cancel_operation(over, "earlier"));
+    put_up(&mut m);
+    assert_eq!(
+        collect_step(&mut m, "wren").map(|(id, _)| id),
+        Some(carried)
+    );
+
+    let mut called = m.call_off_operations("this world runs on its own missions");
+    called.sort();
+    let mut open = vec![waiting, carried];
+    open.sort();
+    assert_eq!(called, open);
+    assert!(m.pooled().is_empty());
+    assert_eq!(m.take_stood_down(), vec!["wren".to_string()]);
+    assert_eq!(
+        m.operations().get(over).unwrap().why(),
+        Some("earlier"),
+        "already over: left as it was"
+    );
+    assert!(m.call_off_operations("again").is_empty());
+}
+
 /// **Stuck where the step says**: a correction stuck at its writing fails, and
 /// its target counts it; stuck twice on the same text, it is left until it
 /// changes. A review stuck goes to somebody else first.

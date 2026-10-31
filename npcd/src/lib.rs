@@ -60,7 +60,6 @@ pub mod refimage;
 pub mod registry;
 pub mod reports;
 pub mod sim;
-pub mod substrate;
 pub mod tenant;
 pub mod visibility;
 pub mod world;

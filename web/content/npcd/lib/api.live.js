@@ -2,7 +2,7 @@
  * push streams under /ws. */
 
 import { subscribe } from '/common/lib/ws.js';
-import { isEnvelope, memberStatus, memberWith, pick } from '/common/lib/aggregate.js';
+import { isEnvelope, memberStatus, pick } from '/common/lib/aggregate.js';
 
 /* Through a clustered gateway, an instrument every member answers comes back
  * as an envelope of their answers (`common/lib/aggregate.js`). npcd's group
@@ -118,20 +118,6 @@ const qs = (o) => {
 
 export const LiveAPI = {
   getStatus:    () => raw('/v1/status').then((b) => memberStatus(b, 'npcd')),
-  getTelemetry: () => j('/v1/telemetry'),
-  /* Full memory accounting. Separate from telemetry because it is a fresh OS
-   * read rather than a slice of the retained series, and the performance page
-   * wants it at a slower cadence than the charts. */
-  /* `getMemoryDump`, not `getMemory` — that name is taken further down by a
-   * character's memory layer, and an object literal silently keeps the LAST
-   * definition of a duplicated key. The daemon's memory accounting would have
-   * been shadowed by a character's memory turns, with no error anywhere. */
-  getMemoryDump: () => j('/v1/memory'),
-  /* The redo log on disk. Daemon-scoped, not per-character: it is the storage
-   * every character's memory is written into. npcd's line in the host's
-   * overview of every attached substrate. */
-  getSubstrateStorage: () => raw('/v1/substrate')
-    .then((b) => ((memberWith(b, 'npcd') || {}).tenants || {}).npcd || null),
 
   /* No sign-in or sign-out here. The gateway owns both — its `/auth/*` is
    * served ahead of site routing on every hostname, and the cookie it issues is
@@ -259,10 +245,6 @@ export const LiveAPI = {
   getLifeJob:     (w) => j(`/v1/life/${w}/job`),
   cancelLife:     (w) => j(`/v1/life/${w}/cancel`, { method: 'POST' }),
 
-  /* Every tenant's layers come back, each naming its tenant; this console's
-   * are npcd's. */
-  getLayerSchema: () => j('/v1/schema/layers')
-    .then((o) => ({ layers: ((o && o.layers) || []).filter((l) => l.tenant === 'npcd') })),
   getTurn:     (id, layer, turn) => j('/v1/npc/' + id + '/substrate/turn/' + layer + '/' + turn),
   probe:       (id, text) => j('/v1/npc/' + id + '/project', { method: 'POST', body: { text } }),
   getWorldCollections:     (w) => j('/v1/world/' + w + '/collections'),

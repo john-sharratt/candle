@@ -7,7 +7,7 @@
 //! do. The loop runs one at a time per world while the table is open and its
 //! pool is below the configured level.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use super::material;
 use super::reading;
 use super::step;
 use super::target::{self, Kind, Target};
+use super::world::WorldMissions;
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
@@ -50,6 +51,10 @@ pub(super) const READING_TOKENS: usize = 2400;
 
 /// How many times an answer is asked for before the target is given up.
 const ATTEMPTS: usize = 3;
+
+/// Why the record's work is called off in a world that runs on its own
+/// missions ([`WorldMissions`]).
+const OWN_MISSIONS: &str = "this world runs on its own missions";
 
 /// How much a mission and the table's reading are thought through before the
 /// call is written — see [`crate::engine::prose::decode_call`].
@@ -716,6 +721,7 @@ pub fn settle_failed(hosted: &Hosted) {
 pub fn spawn(rt: Arc<Runtime>) {
     tokio::spawn(async move {
         let mut told: Option<String> = None;
+        let mut told_world: BTreeMap<String, String> = BTreeMap::new();
         loop {
             tokio::time::sleep(TICK).await;
             if rt.stopping() {
@@ -725,19 +731,56 @@ pub fn spawn(rt: Arc<Runtime>) {
                 return;
             };
             let config = match Config::load(&mind) {
-                Ok(Some(c)) => c,
-                Ok(None) => continue,
+                Ok(c) => {
+                    told = None;
+                    c
+                }
                 Err(e) => {
                     if told.as_deref() != Some(e.as_str()) {
                         tracing::warn!("mission generator: {e}");
                         told = Some(e);
                     }
-                    continue;
+                    None
                 }
             };
-            told = None;
             for id in rt.hosted.ids() {
                 let Some(hosted) = rt.hosted.get(&id) else {
+                    continue;
+                };
+                // **A world with its own missions runs on them alone.** Its
+                // routines replace the bank's, and the record's generators and
+                // workflows are not this world's: work they opened before the
+                // file was written is called off, by the world's authority,
+                // whose records every follower takes the table from.
+                match WorldMissions::load(&mind, &id) {
+                    Ok(Some(own)) => {
+                        told_world.remove(&id);
+                        if rt.standing.role(&id).is_authority() {
+                            let called =
+                                hosted.with_sim(|s| s.missions.call_off_operations(OWN_MISSIONS));
+                            for op in called {
+                                tracing::info!(world = %id, operation = op, "operation: called off, {OWN_MISSIONS}");
+                            }
+                        }
+                        hosted.with_sim(|s| {
+                            s.missions.set_workflows(Vec::new());
+                            s.missions.set_routines(own.routines);
+                        });
+                        continue;
+                    }
+                    Ok(None) => {
+                        told_world.remove(&id);
+                        hosted.with_sim(|s| s.missions.set_routines(Vec::new()));
+                    }
+                    Err(e) => {
+                        if told_world.get(&id) != Some(&e) {
+                            tracing::warn!(world = %id, "a world's own missions: {e}");
+                            told_world.insert(id.clone(), e);
+                        }
+                        continue;
+                    }
+                }
+                let Some(config) = config.as_ref() else {
                     continue;
                 };
                 // The workflows as the mind's file has them now: an edit to
@@ -789,7 +832,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                             return;
                         }
                         offer_owed(&hosted, &mind);
-                        if let Err(e) = table_step(&rt, &hosted, &config, op, &call).await {
+                        if let Err(e) = table_step(&rt, &hosted, config, op, &call).await {
                             tracing::warn!("operation: the table's step: {e:#}");
                             break;
                         }
@@ -818,7 +861,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                     && !hosted.sim(|s| s.missions.stocked_for(&makers, config.keep))
                     && !rt.stopping()
                 {
-                    match generate(&rt, &hosted, &config, None).await {
+                    match generate(&rt, &hosted, config, None).await {
                         Ok(Generation::NoWork) => {}
                         // An operation just opened has its first step put on
                         // the table now rather than a tick later, while a

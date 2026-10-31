@@ -6,9 +6,9 @@
 use std::fs;
 use std::path::Path;
 
+use host::substrate_views::LayerView;
 use serde_json::{json, Map, Value};
 
-use crate::api::substrate::LayerView;
 use crate::session::PROJECTION_SCHEMA_TEMPLATE;
 
 /// The `layers:` entries of the schema zend runs for `workspace` — its

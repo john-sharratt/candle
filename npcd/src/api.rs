@@ -4175,6 +4175,12 @@ mod tests {
                 ("/v1/npc/:nid/substrate/layer/:layer", "user"),
                 ("/v1/npc/:nid/substrate/turn/:layer/:turn", "user"),
                 ("/v1/npc/:nid/memory", "user"),
+                // The substrate inspector: admin, like `/v1/substrate` — it reads
+                // every character's conversations, whoever owns them.
+                ("/v1/substrate/npcd/system-prompt", "admin"),
+                ("/v1/substrate/npcd/layer/:name", "admin"),
+                ("/v1/substrate/npcd/layer/:name/toggle", "admin"),
+                ("/v1/substrate/npcd/timeline/:tl", "admin"),
                 // The scenario harness: admin, because it spends the card's time
                 // and reports the daemon's own prompt.
                 ("/v1/simulate", "admin"),
