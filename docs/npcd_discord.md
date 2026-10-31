@@ -1,11 +1,17 @@
 # npcd on Discord
 
-Every character a world runs gets a Discord account of its own, and the world's
-messaging is mirrored with Discord in both directions: each group a character is in
-is a Discord channel, each direct message between a person and a character is a
-Discord DM with that character's bot, and a person who writes on Discord is heard in
-the world exactly as one who writes in the console. Background jobs keep the two in
-step through restarts, gaps and authority moves.
+**Discord is where people talk to the characters.** Every character a world runs gets
+a Discord account of its own; a person DMs a character's bot as they would a friend,
+and talks with the cast in the world's server. The console and an assistant's
+`bot_message_send` remain ways in, but the secondary ones.
+
+**The substrate stays the record.** What is said is kept in the world, where the
+characters hear it, answer it and remember it, and Discord mirrors it in both
+directions: each group a character is in is a Discord channel, each direct message
+between a person and a character is a Discord DM with that character's bot, and a
+person who writes on Discord is heard in the world exactly as one who writes in the
+console. Background jobs keep the two in step through restarts, gaps and authority
+moves. §1.1 says why Discord is not the record.
 
 This document is the design. Code: `npcd/src/discord/` (new). It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
@@ -45,6 +51,28 @@ What a mirror needs and the store does not have:
 - **No outbound HTTP** in npcd (`host` carries `reqwest` and `tokio-tungstenite`).
 
 §4 adds the first three; the fourth is a dependency.
+
+### 1.1 Why Discord is not the record
+
+Making Discord the store of the world's messages — reading them back from it rather
+than mirroring them — was considered and set aside:
+
+- **Characters could not message each other privately.** A Discord bot cannot open a
+  DM with another bot, so every character-to-character DM would have to become a
+  hidden channel.
+- **The world would stop with Discord.** Characters hear messages as world events each
+  500 ms beat (`deliver_messages`); an outage, a revoked token or the per-IP ban (§2)
+  would leave every character deaf and mute, where today a world runs on even cut off
+  from its cluster.
+- **Character traffic is the heavy traffic.** The cast talks among itself far more
+  than people talk to it; Discord's rate limits would throttle the world, not a mirror.
+- **Not every character has an account.** A team holds 75 applications; Battle
+  Cities' cast is larger.
+- **It is the characters' memory.** What a character said is its substrate — what
+  replication, replay and provenance over memory read. Kept on Discord it would sit
+  behind another company's API and retention, and so would the family's conversations.
+
+So people's way in is Discord, and the record is the world's.
 
 ---
 
@@ -113,8 +141,11 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
   channels and groups through the guild's **persona webhook**, one per channel, with
   its name and portrait per message. It has no DMs on Discord; its DMs stay in the
   console.
-- **A person writing in the console** is mirrored into a group by the persona webhook
-  under the person's own name, and into a DM by the character's bot as a quoted line
+- **A person writing on Discord** — the usual case — is already there; the bridge only
+  carries the message into the world (§5.2).
+- **A person writing through a secondary way in** — the console, or an assistant's
+  `bot_message_send` — is mirrored into a group by the persona webhook under the
+  person's own name, and into a DM by the character's bot as a quoted line
   (`> John (console): …`): a bot cannot post as a person, and a webhook cannot DM.
 - **Reading** a guild's channels is done by **one bot per world** — the world's
   *listener*, the character the world names (`discord: { listener: zen-moon }`), with
@@ -122,6 +153,10 @@ From Discord's documentation (October 2026; `docs.discord.com/developers`):
   Every other bot connects with `DIRECT_MESSAGES` only, and hears its own DMs.
 
 ### 3.2 People
+
+Because Discord is the way in, linking is the first thing a person does, and the
+console's own message pages show a person's threads with the character but point them
+to the character's bot to talk.
 
 A person on Discord is a person in npcd only once **linked**: the account record
 (`accounts.rs:151-200`) gains `discord: Option<DiscordUser { id, username }>`. Linking:
@@ -284,14 +319,19 @@ Linking people is theirs: a code from the console, sent to a bot.
 
 ## 8. Build order
 
+Ordered so that a person can talk to a character on Discord as early as possible,
+since that is the way in.
+
 1. `Message.seq` / `at_ms` / `origin` and `Thread.next_seq` (§4.1), with tests that a
    trimmed thread keeps every surviving message's `seq`.
 2. The bridge's records and sealed tokens (§4.2–4.3); `PUT /v1/npc/:nid/discord`.
-3. Outbound for the channel (§5.1), with a fake Discord HTTP server in tests asserting
-   the exact requests and that a 429 and a 500 are retried in order.
-4. Inbound for the channel and DMs (§5.2), echo suppression and `origin` tests.
-5. Groups as channels and the reconcile (§5.3).
-6. Account linking (§3.2).
+3. Account linking (§3.2).
+4. DMs both ways (§5.1–5.2): a linked person DMs a character's bot and the character
+   answers there — the first thing anyone uses. A fake Discord HTTP server in tests
+   asserts the exact requests, echo suppression, `origin`, and that a 429 and a 500 are
+   retried in order.
+5. The channel both ways.
+6. Groups as channels and the reconcile (§5.3).
 7. Authority moves (§5.4), with a two-member test that the cursor carries over.
 8. Backstage threads for character-to-character DMs.
 
@@ -304,6 +344,6 @@ Linking people is theirs: a code from the console, sent to a bot.
   the text with the cursor, rather than rendering on every reconcile.
 - **Which world first.** `life` (Zen and its Drones, the family) is the natural first
   guild; Battle Cities' cast is larger than one team's 75.
-- **The family's Discord accounts.** Linking assumes each person has one; a person
-  without one keeps the console.
+- **The family's Discord accounts.** Discord being the way in assumes each person has
+  one; a person without one keeps the console, which stays a working way in.
 - **Voice.** Discord voice channels are out of scope here.
