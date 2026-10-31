@@ -29,7 +29,7 @@ use npcd::engine::act::Act;
 use npcd::engine::body::Outcome;
 use npcd::engine::environment;
 use npcd::engine::mission::{Mission, Origin, Todo};
-use npcd::engine::runtime::Runtime;
+use npcd::engine::runtime::{Kind, Runtime};
 use npcd::engine::tick::Pace;
 use npcd::engine::workflow::parse_missions;
 use npcd::mind::Mind;
@@ -1224,7 +1224,7 @@ async fn a_character_created_into_a_world_starts_standing_somewhere_real() {
     let rt = daemon();
     rt.scheduler.wake(1, 0, 0);
     assert!(rt
-        .embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        .embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
         .unwrap());
 
     think(&rt, 1);
@@ -1243,7 +1243,7 @@ async fn a_character_with_nothing_asked_of_it_is_pointed_at_the_work() {
     // and arriving with nothing to say, because a room is not a subject.
     let rt = daemon();
     rt.scheduler.wake(1, 0, 0);
-    rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+    rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
         .unwrap();
     // The command table opens by default now; shut it to read the
     // no-mission-no-table standing task this test is about.
@@ -1275,7 +1275,7 @@ async fn the_standing_instruction_is_restated_and_never_accumulates() {
     // working to a task it has been taken off.
     let rt = daemon();
     rt.scheduler.wake(1, 0, 0);
-    rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+    rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
         .unwrap();
 
     for round in 0..5 {
@@ -1307,7 +1307,7 @@ async fn a_maker_told_to_explore_can_reach_everywhere_it_might_go() {
     // starts, or the instruction is one it cannot follow.
     let rt = daemon();
     rt.scheduler.wake(1, 0, 0);
-    rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+    rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
         .unwrap();
 
     let world = rt.hosted.get(WORLD).unwrap();
@@ -1353,8 +1353,15 @@ async fn two_makers_exploring_the_same_building_find_each_other() {
     let rt = daemon();
     for id in [1u64, 2] {
         rt.scheduler.wake(id, 0, 0);
-        rt.embody_in_world(id, WORLD, None, &format!("Maker-{id:02}"), None, 0)
-            .unwrap();
+        rt.embody_in_world(
+            id,
+            WORLD,
+            Kind::default(),
+            &format!("Maker-{id:02}"),
+            None,
+            0,
+        )
+        .unwrap();
     }
     moment(&rt);
     think(&rt, 1);

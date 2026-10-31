@@ -53,7 +53,7 @@ use crate::discord::routes as discord;
 use crate::discord::seal::Sealer;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
-use crate::engine::runtime::Runtime;
+use crate::engine::runtime::{Kind, Runtime};
 use crate::guest_routes;
 use crate::identity::require;
 use crate::image_links::{ImageLinks, Refused};
@@ -263,6 +263,9 @@ impl Authored {
             for wid in &gone {
                 rt.remove_world(wid);
             }
+            // A personality's `takes_orders` reaches characters already standing
+            // in their worlds.
+            rt.mark_orders().await;
         }
         let portraits = {
             let personalities = self.personalities.read().await;
@@ -1363,21 +1366,17 @@ async fn create_npc(
                         .unwrap_or_default();
                     // Where this kind of character belongs, from its
                     // personality — a Maker starts in the vault, a soldier in a
-                    // city, and they are the same world. Absent for a
-                    // personality with no particular home, which arrives at the
-                    // world's own door.
-                    let home = {
-                        let personalities = s.personalities.read().await;
-                        v.get("personality_id")
-                            .and_then(Value::as_str)
-                            .and_then(|p| personalities.get(p))
-                            .and_then(|r| r.body.get("home"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
+                    // city, and they are the same world — and whether the world
+                    // may order it at all. Read from its persona, as every
+                    // other path that embodies a character reads them.
+                    let persona = rt.persona_of_async(id).await;
+                    let kind = Kind {
+                        home: persona.as_ref().and_then(|p| p.home.as_deref()),
+                        unordered: persona.as_ref().is_some_and(|p| p.unordered),
                     };
                     // No remembered room: this character has just been created
                     // and has never stood anywhere. It arrives at the door.
-                    match rt.embody_in_world(id, world, home.as_deref(), name, None, 0) {
+                    match rt.embody_in_world(id, world, kind, name, None, 0) {
                         Ok(true) => tracing::info!("npc {id}: standing in `{world}`"),
                         Ok(false) => {}
                         // Not fatal to the create: the character exists and is

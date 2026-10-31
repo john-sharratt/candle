@@ -935,6 +935,10 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
         let anchor = field("anchor").unwrap_or_default();
         let mut persona = engine::persona::of(payload, &world, &anchor);
         persona.home = field("home");
+        persona.unordered = personality
+            .and_then(|r| r.body.get("takes_orders"))
+            .and_then(Value::as_bool)
+            == Some(false);
         Some(persona)
     }));
 

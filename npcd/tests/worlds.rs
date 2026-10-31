@@ -666,12 +666,16 @@ async fn a_cut_off_member_runs_its_world_locally_and_scraps_it_on_return() {
     let a = member(&gw, sa, world, &cast).await;
     let b = member(&gw, sb, world, &cast).await;
     let both = [&a, &b];
+    // Spread means on both members: a cast lent before the second member was
+    // ready runs wholly on the first until rendezvous moves its share, and
+    // the member cut off below must have characters of its own.
     until("one authority, the cast spread and running", WITHIN, || {
         let auth = authority_of(world, &both);
         auth.len() == 1
             && cast
                 .iter()
                 .all(|&npc| both.iter().filter(|m| m.awake(npc)).count() == 1)
+            && both.iter().all(|m| cast.iter().any(|&npc| m.awake(npc)))
     })
     .await;
     let auth = authority_of(world, &both)[0];

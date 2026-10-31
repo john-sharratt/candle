@@ -246,6 +246,18 @@ impl Drop for DreamSlot<'_> {
     }
 }
 
+/// What kind of character a body is entered for, from its personality: where in
+/// the world it belongs, and whether the world may order it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Kind<'a> {
+    /// The personality's `home` — where a character with no remembered room
+    /// arrives. `None` arrives at the world's own door.
+    pub home: Option<&'a str>,
+    /// The personality says `takes_orders: false`: the world gives it no
+    /// orders — see [`crate::sim::missions::Missions::set_unordered`].
+    pub unordered: bool,
+}
+
 /// Everything the prompt needs about one character, owned.
 ///
 /// Owned rather than borrowed because it crosses from the async world (where the
@@ -266,6 +278,9 @@ pub struct OwnedPersona {
     /// personality's `home` — and so where its body first enters. Never
     /// rendered.
     pub home: Option<String>,
+    /// Whether the world gives a character of its personality no orders — the
+    /// personality's `takes_orders: false`. Never rendered; see [`Kind`].
+    pub unordered: bool,
     pub identity: String,
     /// The personality's anchor — the floor every character of it reads.
     ///
@@ -652,6 +667,13 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
                               you can actually see or read here, and carry it far enough to have \
                               a view about it you could defend. If nothing here has anything for \
                               you, say so.";
+
+/// The idle wake for a character that takes no orders
+/// ([`crate::sim::missions::Missions::set_unordered`]): [`NO_MISSION`]'s place,
+/// with nothing set for it to do — not even "look around". It is woken all the
+/// same, because with nothing else arriving a character gone quiet stays quiet.
+pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting on you. Your \
+                                 time is your own, to spend however you choose.";
 
 /// What a character is told when its mission is called off: the errand is
 /// withdrawn, nothing of it is still owed, and what it said about it earlier is
@@ -1096,7 +1118,7 @@ impl Runtime {
         &self,
         npc_id: u64,
         world_id: &str,
-        home: Option<&str>,
+        kind: Kind<'_>,
         name: &str,
         remembered: Option<&str>,
         now_ms: u64,
@@ -1104,6 +1126,7 @@ impl Runtime {
         let Some(hosted) = self.hosted.get(world_id) else {
             return Ok(false);
         };
+        let Kind { home, unordered } = kind;
         let body = Self::body_id(npc_id);
         let placed = hosted.with(|w| {
             if w.actor(&body).is_some() {
@@ -1142,6 +1165,13 @@ impl Runtime {
             w.enter(&body, name, at).map_err(anyhow::Error::from)
         });
         placed?;
+        // Whether the world may order it, set every time it is embodied so the
+        // personality's word is the one that stands — by the world's authority,
+        // whose missions these are; a member following the world takes the mark
+        // in with the rest of its state.
+        if self.standing.writes(world_id) {
+            hosted.with_sim(|s| s.missions.set_unordered(&body, unordered));
+        }
         // **A handset on arrival, and a line on the roster.** Two halves of one
         // thing: carrying the phone is what makes the messaging acts reachable,
         // and being on the roster is what makes this character reachable *by*
@@ -1176,10 +1206,23 @@ impl Runtime {
         // With no mission but the command table open, the standing task is to go
         // and take one up — so an idle character makes its way there rather than
         // settling where it stands. See [`TO_THE_TABLE`].
-        let (on_mission, table_open) =
-            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
+        //
+        // **An unordered character is given no task** — the world gives it no
+        // orders — but it is still woken: with nothing else arriving, this is
+        // what rouses a character gone quiet, so it is told only that its time
+        // is its own. See [`YOUR_OWN_TIME`].
+        let (on_mission, table_open, unordered) = hosted.sim(|s| {
+            (
+                s.missions.is_on_mission(&body),
+                s.table_open,
+                s.missions.is_unordered(&body),
+            )
+        });
         if on_mission {
             return None;
+        }
+        if unordered {
+            return Some(YOUR_OWN_TIME.to_string());
         }
         if let Some(way) = self.command_table_way(npc_id).filter(|_| table_open) {
             // Location-aware, the same split the active summons makes (see
@@ -1239,9 +1282,15 @@ impl Runtime {
         // the slow one that must not repeat over a long journey, and a character
         // that has arrived is out of its scope.
         let (hosted, body) = self.body_of(npc_id)?;
-        let (on_mission, table_open) =
-            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
-        if on_mission || !table_open || self.at_command_table(npc_id) {
+        // Nor for an unordered character, which the table never calls.
+        let (on_mission, table_open, unordered) = hosted.sim(|s| {
+            (
+                s.missions.is_on_mission(&body),
+                s.table_open,
+                s.missions.is_unordered(&body),
+            )
+        });
+        if on_mission || unordered || !table_open || self.at_command_table(npc_id) {
             return None;
         }
         self.command_table_way(npc_id)
@@ -1267,7 +1316,8 @@ impl Runtime {
     /// Same window, same reasoning: it stops the moment the report is filed.
     pub fn at_table_summons(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
-        if !self.at_command_table(npc_id) {
+        // An unordered character standing at the table is only standing there.
+        if !self.at_command_table(npc_id) || hosted.sim(|s| s.missions.is_unordered(&body)) {
             return None;
         }
         // **The table hands its work to whoever stands at it free.** Told every
@@ -1694,6 +1744,41 @@ impl Runtime {
         }
     }
 
+    /// Mark every character of the worlds this member runs as its personality
+    /// now says — `takes_orders` read afresh — after the personalities are
+    /// read again. A character is marked as it is embodied, and one already
+    /// standing in its world is not embodied again, so without this an edited
+    /// personality reached its characters only at the next restart.
+    pub async fn mark_orders(&self) {
+        for world in self.hosted.ids() {
+            let Some(hosted) = self.hosted.get(&world) else {
+                continue;
+            };
+            if !self.standing.writes(&world) {
+                continue;
+            }
+            for (npc_id, body) in self.bodies.in_world(&world) {
+                // A character whose persona cannot be read now keeps its mark.
+                let Some(unordered) = self.persona_of_async(npc_id).await.map(|p| p.unordered)
+                else {
+                    continue;
+                };
+                if hosted.sim(|s| s.missions.is_unordered(&body)) != unordered {
+                    hosted.with_sim(|s| s.missions.set_unordered(&body, unordered));
+                }
+            }
+        }
+    }
+
+    /// Whether the world gives this character orders: every character but one
+    /// whose personality says `takes_orders: false` — see
+    /// [`crate::sim::missions::Missions::set_unordered`]. A character with no
+    /// body has no table to be called to, and is not one of those.
+    pub fn takes_orders(&self, npc_id: u64) -> bool {
+        self.body_of(npc_id)
+            .is_none_or(|(hosted, body)| !hosted.sim(|s| s.missions.is_unordered(&body)))
+    }
+
     /// Whether this character stands where a mission is taken up — i.e. the order
     /// table's `collect_mission` is among the acts the room offers it.
     fn at_command_table(&self, npc_id: u64) -> bool {
@@ -1835,7 +1920,10 @@ impl Runtime {
         self.cooldowns.forget(npc_id);
         if let Some((hosted, body)) = self.body_of(npc_id) {
             if self.standing.writes(hosted.id()) {
-                hosted.with_sim(|s| s.ledger.forget_questions(&body));
+                hosted.with_sim(|s| {
+                    s.ledger.forget_questions(&body);
+                    s.missions.set_unordered(&body, false);
+                });
             }
             hosted.with(|w| {
                 let _ = w.leave(&body);
@@ -4857,9 +4945,10 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // Back into the body it had. Entering one that is already there is not
         // an error, so this is the same call the create path makes and the two
         // do not have to agree about anything beyond the id.
-        let name = rt
-            .persona_of(id)
-            .map(|p| p.name)
+        let persona = rt.persona_of(id);
+        let name = persona
+            .as_ref()
+            .map(|p| p.name.clone())
             .unwrap_or_else(|| Runtime::body_id(id));
         // Where the world's records last saw its body standing — or, in a
         // world taken in this boot from the objects kept before world records,
@@ -4871,12 +4960,15 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     .then(|| casting.at.clone())
                     .flatten()
             });
-        // No home named here: the personality knows where its characters
-        // belong, and the persona source does not carry it. The room the
-        // character was last in is consulted first anyway, so the door is only
-        // reached for one that has none — and the create path, which does know
-        // the home, named it then.
-        match rt.embody_in_world(id, world, None, &name, remembered.as_deref(), now) {
+        // Where its personality belongs, and whether the world may order it —
+        // what every path that embodies a character reads from the persona. The
+        // room it was last in is consulted first, so the home is only reached
+        // for one that has none.
+        let kind = Kind {
+            home: persona.as_ref().and_then(|p| p.home.as_deref()),
+            unordered: persona.as_ref().is_some_and(|p| p.unordered),
+        };
+        match rt.embody_in_world(id, world, kind, &name, remembered.as_deref(), now) {
             Ok(true) => {
                 embodied += 1;
                 if remembered.is_some() {
@@ -7435,7 +7527,7 @@ mod tests {
         rt.scheduler.wake(1, 0, 0);
 
         assert!(rt
-            .embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap());
         let (world, body) = rt.body_of(1).expect("it has a body");
         assert_eq!(body, Runtime::body_id(1));
@@ -7455,7 +7547,7 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         assert!(!rt
-            .embody_in_world(1, "unmapped", None, "Maker-01", None, 0)
+            .embody_in_world(1, "unmapped", Kind::default(), "Maker-01", None, 0)
             .unwrap());
         assert!(rt.body_of(1).is_none());
     }
@@ -7467,7 +7559,7 @@ mod tests {
         // every boot after.
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
 
         // It walks off the command level's arrival room — one stop, same level.
@@ -7482,7 +7574,7 @@ mod tests {
         );
 
         assert!(rt
-            .embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap());
         assert_eq!(
             world.read(|w| w.actor(&body).unwrap().at.clone()),
@@ -7503,7 +7595,7 @@ mod tests {
         let green = "vault-casting/green-room";
 
         assert!(rt
-            .embody_in_world(1, WORLD, None, "Maker-01", Some(green), 0)
+            .embody_in_world(1, WORLD, Kind::default(), "Maker-01", Some(green), 0)
             .unwrap());
         let (world, body) = rt.body_of(1).expect("it has a body");
         assert_eq!(
@@ -7525,7 +7617,7 @@ mod tests {
             .embody_in_world(
                 1,
                 WORLD,
-                None,
+                Kind::default(),
                 "Maker-01",
                 Some("vault-casting/no-such-room"),
                 0
@@ -7561,7 +7653,7 @@ mod tests {
         // produced nothing to talk about, because a room is not a subject.
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
         // The command table opens by default now; shut it to read the
         // no-mission-no-table standing task this test is about.
@@ -7990,7 +8082,7 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         // Arrives at the command room, where the order table stands.
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
         assert!(
             rt.at_command_table(1),
@@ -8056,7 +8148,7 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         // At the command room — the table itself.
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
         rt.set_table_open(true);
         assert_eq!(
@@ -8085,6 +8177,100 @@ mod tests {
         assert_eq!(rt.table_summons(2), None, "the table closed");
     }
 
+    /// **The world gives an unordered character no orders.** At the open table
+    /// or on its way to it, it is not summoned; idle, it is woken only with
+    /// [`YOUR_OWN_TIME`]; and the table offers it no `collect_mission`, while a
+    /// character beside it is called as ever. Embodied unordered while it
+    /// carries a mission, it is stood down from it.
+    #[tokio::test]
+    async fn an_unordered_character_is_given_no_orders() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let unordered = Kind {
+            home: None,
+            unordered: true,
+        };
+        rt.embody_in_world(1, WORLD, unordered, "Zen", None, 0)
+            .unwrap();
+        rt.set_table_open(true);
+        assert!(rt.at_command_table(1), "it is standing at the table");
+        assert_eq!(rt.at_table_summons(1), None);
+        assert_eq!(rt.table_summons(1), None);
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some(YOUR_OWN_TIME),
+            "woken, and set nothing"
+        );
+        assert!(!rt.takes_orders(1));
+        let (hosted, body) = rt.body_of(1).unwrap();
+        let acts: Vec<String> = rt
+            .invokable_urls(&hosted, &body)
+            .into_iter()
+            .map(|i| i.act.to_string())
+            .collect();
+        assert!(
+            !acts.iter().any(|a| a == mission_acts::COLLECT_MISSION.name),
+            "{acts:?}"
+        );
+
+        embody(&rt, 2, "m2", "green-room");
+        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+        assert!(rt.takes_orders(2));
+
+        hosted.with_sim(|s| {
+            s.missions.set_unordered(&body, false);
+            s.missions.assign(
+                &body,
+                Mission::new(
+                    "Visit the hatchery.",
+                    vec![Todo::new("go to the hatchery")],
+                    Origin::Lodged {
+                        by: "u_op".to_string(),
+                    },
+                ),
+            );
+        });
+        rt.embody_in_world(1, WORLD, unordered, "Zen", None, 0)
+            .unwrap();
+        assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
+        assert_eq!(
+            hosted.with_sim(|s| s.missions.take_stood_down()),
+            [body],
+            "it is told its mission was withdrawn"
+        );
+    }
+
+    /// **An edited personality reaches characters already standing in their
+    /// world**: read again, `takes_orders` marks them, and unmarks them, with no
+    /// embodiment in between; one whose persona cannot be read keeps its mark.
+    #[tokio::test]
+    async fn an_edited_personality_marks_its_characters_where_they_stand() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let rt = vaulted();
+        rt.embody_in_world(1, WORLD, Kind::default(), "Zen", None, 0)
+            .unwrap();
+        assert!(rt.takes_orders(1));
+        // 0: no persona to read, 1: takes no orders, 2: takes them.
+        let says = Arc::new(AtomicU8::new(1));
+        let reads = Arc::clone(&says);
+        rt.set_persona_source(Arc::new(move |_| match reads.load(Ordering::SeqCst) {
+            0 => None,
+            n => Some(OwnedPersona {
+                unordered: n == 1,
+                ..OwnedPersona::default()
+            }),
+        }));
+        rt.mark_orders().await;
+        assert!(!rt.takes_orders(1), "marked where it stands");
+        says.store(0, Ordering::SeqCst);
+        rt.mark_orders().await;
+        assert!(!rt.takes_orders(1), "an unread persona keeps the mark");
+        says.store(2, Ordering::SeqCst);
+        rt.mark_orders().await;
+        assert!(rt.takes_orders(1), "and unmarked");
+    }
+
     /// **A Maker free at the open table is handed the operation waiting there**
     /// — and never the review of a draft it wrote; that one it is only told to
     /// take up something else for, and the table's routine stays its to choose.
@@ -8095,7 +8281,7 @@ mod tests {
         use std::collections::BTreeMap;
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
         rt.set_table_open(true);
         let hosted = rt.hosted.get(WORLD).unwrap();
@@ -8270,7 +8456,7 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         // At the command room — the table.
-        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
             .unwrap();
         rt.set_table_open(true);
         assert_eq!(
