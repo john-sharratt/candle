@@ -13,8 +13,9 @@
 //!    `last_seen_discord`, or recorded as an origin on its thread;
 //! 4. otherwise `WorldOp::ChannelMessage`, from the name its author speaks
 //!    by when linked and `<display name> (@<username>)` when not, its
-//!    mentions written out by name and its attachments as link lines — and
-//!    the channel's `last_seen_discord` advanced.
+//!    mentions written out by name and its attachments as link lines, said
+//!    to the character when it mentions or answers the bot or names the
+//!    character — and the channel's `last_seen_discord` advanced.
 //!
 //! Anyone the server lets write there is heard, linked or not: the server's
 //! members chose to invite the bot.
@@ -125,6 +126,9 @@ async fn judge(a: &Arc<Authored>, bot: &Online, m: &DiscordMessage) -> Heard {
             from: from.clone(),
             text,
             origin: Some(origin),
+            to: m
+                .addresses(bot.user_id, &character)
+                .then(|| character.clone()),
         };
         let rt = a.runtime.as_ref().expect("a body is the runtime's");
         if let Err(e) = rt.world_write(&bot.world, op).await {
