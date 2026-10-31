@@ -79,5 +79,6 @@ pub mod turn_claims;
 pub mod turn_sink;
 pub mod types;
 pub mod uploads;
+pub mod worker_hop;
 pub mod working_set;
 pub mod workspace;

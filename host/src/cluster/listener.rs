@@ -19,10 +19,11 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use cluster::gateway::NODE_HEADER;
 use cluster::member::{decide, Arrival, Serve, DUMB_HOP, DUMB_HOP_VALUE};
 use cluster::session::VirtualConn;
 use hyper::client::conn::http1;
@@ -118,16 +119,29 @@ fn unavailable(app: &str, why: &str) -> Response {
     res
 }
 
+/// What a client that reached this port directly may not say, before its
+/// request goes up as this member's: who it is — the gateway in front of a
+/// `trusted` peer has said that already — and which member it is for. The
+/// gateway stamps what this stream carries as this member's, and a member may
+/// address a peer by node; a client reaching this port is no member.
+fn scrub(headers: &mut HeaderMap, trusted: bool) {
+    if !trusted {
+        for name in IDENTITY_HEADERS {
+            headers.remove(name);
+        }
+        headers.remove(NODE_HEADER);
+    }
+}
+
 /// Forward `req` up a stream to a gateway.
 async fn up(l: &Listener, conn: VirtualConn, peer: Option<SocketAddr>, req: Request) -> Response {
     let (mut parts, body) = req.into_parts();
     let client_upgrade = parts.extensions.remove::<OnUpgrade>();
     let upgrading = parts.headers.contains_key(header::UPGRADE);
-    if !peer.is_some_and(|p| l.gateways.trusts(p.ip())) {
-        for name in IDENTITY_HEADERS {
-            parts.headers.remove(name);
-        }
-    }
+    scrub(
+        &mut parts.headers,
+        peer.is_some_and(|p| l.gateways.trusts(p.ip())),
+    );
     l.local_signin.apply(&mut parts.headers, peer);
     parts.headers.remove(DUMB_HOP);
     for h in HOP_BY_HOP {
@@ -184,4 +198,32 @@ async fn up(l: &Listener, conn: VirtualConn, peer: Option<SocketAddr>, req: Requ
 fn failed(why: &str) -> Response {
     tracing::debug!("forwarding up failed: {why}");
     unavailable("this app", "its gateway did not answer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A client reaching a member's port neither names itself nor names a
+    /// member**; one behind a trusted gateway keeps what that gateway said.
+    #[test]
+    fn a_direct_client_says_neither_who_it_is_nor_which_member() {
+        let said = || {
+            let mut h = HeaderMap::new();
+            h.insert(NODE_HEADER, HeaderValue::from_static("00000000000000ab"));
+            for name in IDENTITY_HEADERS {
+                h.insert(name, HeaderValue::from_static("x"));
+            }
+            h.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+            h
+        };
+        let mut direct = said();
+        scrub(&mut direct, false);
+        assert!(direct.get(NODE_HEADER).is_none());
+        assert!(IDENTITY_HEADERS.iter().all(|n| direct.get(*n).is_none()));
+        assert!(direct.get(header::ACCEPT).is_some());
+        let mut trusted = said();
+        scrub(&mut trusted, true);
+        assert_eq!(trusted, said());
+    }
 }

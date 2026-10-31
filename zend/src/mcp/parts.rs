@@ -205,6 +205,7 @@ mod tests {
             resumes: 0,
             audit: None,
             checked: false,
+            runner: None,
         }
     }
 

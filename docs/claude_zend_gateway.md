@@ -781,6 +781,73 @@ answered, its thread is archived, or it sits 24 hours unanswered; archiving
 archives its waiting workers, and their questions stay in their entries as open
 items.
 
+### 6.3 Where a worker runs: back to the fast card
+
+**A worker's turn runs on the member that took the call starting it.** The
+call (`repo_task_start`, `repo_task_reply`) is `/v1/mcp`, placed round robin,
+and the worker loop submits its turns in that process. A turn runs until it
+answers or meets the round cap, 128 tool rounds. So a worker started while the
+fast card was busy or down ran its whole turn on the slow one. On 2026-10-31 a
+cleanup worker ran at 7–16 tokens a second on WhiteWorld's 3090 for 23 minutes
+while BlackWorld, at 42–108, stood beside it.
+
+**At every tool-round boundary a worker's turn may move** (`zend/src/worker_hop.rs`).
+The boundary is the moment its call turn is sealed and its commit queued, before
+its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
+(2×) this one's weight, the peak decode rate each member is admitted at
+(`MEMBERS`). If one is:
+
+1. The turn stops there, before it starts the stretch's journal draft, so
+   nothing it began runs on after the move. It sends
+   `StreamItem::Handed { to, call_turn, iteration }` and leaves its resume
+   entry in place.
+2. The worker loop stops beating, waits for the turn's commit to land
+   (`ZendSession::committed_through`), and asks member `to` to take it:
+   `POST /v1/mcp/worker/continue` with a `Handing {owner, thread, name,
+   call_turn, iteration, through, signed_ms}`, addressed by `x-tokera-node`.
+   The gateway lets a member address a peer this way, as it lets an admin.
+   A client reaching a member's own port may not: the member's listener
+   strips the header, as it strips a client's identity.
+3. **The handing is signed.** The gateway's stamp (`from_member`) names the
+   member whose stream carried a request, but that stream also carries what
+   clients sent the member's port. So the body is signed under a key every
+   member derives from the group key (`worker_hop::PURPOSE`), in
+   `x-zend-handoff-proof`, and is believed only within `FRESH_MS` of signing.
+   The body names the member handing it on and the member it is for, so the
+   proof stands alone. A round the cap is about to close is not handed on.
+4. The member taking it checks, from the replicated record, that the worker
+   runs on the member handing it (`Worker::runner`) and that the round at
+   `call_turn` is still to run. It waits until it holds the conversation
+   through that commit (`holds_complete_through`, as a handover does), and
+   names itself the runner. It drops what it kept of the conversation in
+   memory, runs the round's tools itself (`Dispatch::Live`: they never ran),
+   and carries the worker on from `iteration`, so the round cap counts on.
+   From then on it owns the worker's beat, its settling and its answers. A
+   nudge or a stop is read there, at the next boundary.
+
+**The record says who runs a worker.** Only its runner beats it: a beat that
+finds another member named stops, and so does a settling. A handing whose
+answer was lost took effect if the record names the peer within
+`TAKEN_WAIT`, so the handing member does not run the round too.
+A worker continued on a member other than its last runner is built afresh from
+the substrate, since its cached state predates the other member's turns.
+
+**A move that fails keeps the worker where it is**: the member that sealed the
+round runs its tools after all, beats again, and does not try again in that run
+of the worker. A citation check round does not move, since the answer it falls
+back on is kept in the running member's memory. The ratio keeps two cards of
+one class from trading a worker back and forth, and a member never hands a
+worker to a slower one.
+
+**Moving off a card needs nothing new.** A member that goes away loses the
+workers it ran (`BEAT_LOST_MS`), and the next call lands on another.
+
+**A round handed on is not run again at boot.** Its resume entry stays until
+the member finishing it clears it. A member that restarts skips any worker
+whose record still beats with another member named its runner
+(`worker_runs_elsewhere`), rather than run the round's tools a second time. It
+still finishes the rounds of workers it ran itself.
+
 ## 7. Work skills
 
 Each skill is a folder holding a `SKILL.md`: when to use it; the thread it
@@ -1353,7 +1420,7 @@ and reached the way a real client reaches it:
 | A command's member is busy | `cluster_command` answers busy (409); the skill waits for the running job and retries |
 | A command's or an agent job fails | `cluster_job_status` / `repo_job_log` answer its errors; the skill reports them and stops |
 | A trial fails | keep restores the previous binary; `service_status` reports the rollback |
-| The motherd running a worker restarts mid-task | The worker resumes on the member that claims it (`resume_unfinished_turns`). Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
+| The motherd running a worker restarts mid-task | The round it was in is finished by that member's boot scan (`resume_unfinished_turns`), with nothing listening; the worker itself reads as lost once its beat stops (`BEAT_LOST_MS`), and Claude runs the task again. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
 | An OAuth token expires | The client refreshes it; a refused refresh signs the user in again |
 
 ## 16. Changes to other documents

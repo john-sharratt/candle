@@ -102,15 +102,17 @@ fn set_pin(res: &mut Response, app: &str, node: u64, secure: bool) {
     }
 }
 
-/// The node an admin's `x-tokera-node` names; `Err` refuses the request.
-/// Boxed because a `Problem` is large and this is the cold path.
+/// The node `x-tokera-node` names, on an admin's request or a member's — a
+/// member, proven by the group key, hands work to a peer it chose (a worker
+/// moving to a faster card); `Err` refuses the request. Boxed because a
+/// `Problem` is large and this is the cold path.
 fn addressed(req: &Request, ctx: &Context<'_>) -> Result<Option<u64>, Box<Problem>> {
     let Some(raw) = req.headers().get(NODE_HEADER) else {
         return Ok(None);
     };
-    if !ctx.roles.of(ctx.identity).at_least(Role::Admin) {
+    if ctx.from_member.is_none() && !ctx.roles.of(ctx.identity).at_least(Role::Admin) {
         return Err(Box::new(Problem::forbidden(format!(
-            "`{NODE_HEADER}` addresses one member, which is an admin's to do"
+            "`{NODE_HEADER}` addresses one member, which is an admin's or a member's to do"
         ))));
     }
     raw.to_str()
@@ -382,4 +384,44 @@ pub async fn forward(
         }
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(roles: &Roles, from_member: Option<u64>) -> Context<'_> {
+        Context {
+            want_html: false,
+            peer: None,
+            identity: None,
+            secure: false,
+            cache: Cache::default(),
+            roles,
+            from_member,
+        }
+    }
+
+    fn naming(node: &str) -> Request {
+        Request::builder()
+            .uri("/v1/mcp/worker/continue")
+            .header(NODE_HEADER, node)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// **A member addresses a peer by node, as an admin does**; anyone else
+    /// is refused, and a request that names nothing is placed as ever.
+    #[test]
+    fn a_member_or_an_admin_addresses_one_member() {
+        let roles = Roles::default();
+        assert_eq!(
+            addressed(&naming("00000000000000ab"), &ctx(&roles, Some(0xcd))).ok(),
+            Some(Some(0xab))
+        );
+        assert!(addressed(&naming("00000000000000ab"), &ctx(&roles, None)).is_err());
+        assert!(addressed(&naming("not a node"), &ctx(&roles, Some(0xcd))).is_err());
+        let plain = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(addressed(&plain, &ctx(&roles, None)).ok(), Some(None));
+    }
 }

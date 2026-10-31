@@ -33,9 +33,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::http::{HeaderName, HeaderValue, Method};
 use candle_conversation::persistence::SharedSubstrate;
 use futures::StreamExt;
+use host::cluster::up::send_up;
 use host::substrate_views::TimelineDetail;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
@@ -47,6 +50,7 @@ use super::audit::{Audit, Turn};
 use super::caller::Caller;
 use super::names;
 use super::nudges;
+use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::resuming;
 use super::stops;
@@ -54,7 +58,7 @@ use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EV
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
-use crate::types::{ChatMessage, Role};
+use crate::worker_hop;
 
 /// How long a task's draft may take before its earlier entries are taken.
 const DRAFT_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -312,6 +316,8 @@ fn fresh(
         resumes: 0,
         audit: None,
         checked: false,
+        // `begin` names the member it begins on.
+        runner: None,
     }
 }
 
@@ -584,6 +590,14 @@ fn begin(
     // A stop sent as the last turn ended — after its settling looked — is
     // not this turn's.
     stops::take(records, &worker.conv_id);
+    // Its last turns may have run on another member, after what this one
+    // keeps of the conversation in memory: the turn here is built afresh.
+    let mut worker = worker;
+    let here = worker_hop::own_node();
+    if worker.runner != here {
+        session.forget(&worker.conv_id);
+    }
+    worker.runner = here;
     threads::put_worker(records, owner, &worker).map_err(|e| e.to_string())?;
     // Recorded before the turn makes the conversation's slot, which reads it.
     if let Some(Err(e)) = session.set_decode_band(&worker.conv_id, worker.priority.band()) {
@@ -594,7 +608,209 @@ fn begin(
         Arc::clone(session),
         owner.to_string(),
         worker.clone(),
-        message,
+        First::Message(message),
+    ));
+    Ok(worker)
+}
+
+/// What a worker's next turn starts from.
+enum First {
+    /// A message: the task, an answer, a correction.
+    Message(String),
+    /// A round whose call turn `call_turn`, round `iteration` of its turn, is
+    /// sealed and whose tools have not run — handed here by a slower member,
+    /// or kept when a handing failed.
+    Round { call_turn: u32, iteration: usize },
+}
+
+/// How long a handed turn's commit may take to land before the member keeps
+/// the round itself.
+const HAND_COMMIT_WAIT: Duration = Duration::from_secs(20);
+/// How long the member a turn is handed to may take to answer — it waits to
+/// hold the turn's records first ([`CONTINUE_HOLD_WAIT`]). With the commit's
+/// wait, [`TAKEN_WAIT`] and a beat's interval, under the beat's own limit
+/// (`threads::BEAT_LOST_MS`): the beat is stopped while the handing runs.
+const HAND_ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// How long the member taking a handed worker waits to hold its records.
+pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(20);
+/// The route a worker is handed on (`crate::api::worker_continue`).
+pub const CONTINUE_PATH: &str = "/v1/mcp/worker/continue";
+
+/// What a member hands a worker on with (`crate::api::worker_continue`).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Handing {
+    /// The member handing it on, and the member it is handed to: signed, so
+    /// the proof names both and stands alone.
+    pub from: u64,
+    pub to: u64,
+    pub owner: String,
+    pub thread: String,
+    pub name: String,
+    pub call_turn: u32,
+    /// The round of its turn the call turn was.
+    pub iteration: usize,
+    /// The handing member's newest commit of the worker's conversation.
+    pub through: u64,
+    /// When it was signed, Unix ms (`worker_hop::fresh`).
+    pub signed_ms: u64,
+}
+
+/// Hand `worker`, whose turn stopped before running round `iteration`'s call
+/// turn `call_turn`, to member `to` (`crate::worker_hop`): once this member's
+/// commit of it has landed, `to` is asked to take it, signed with the members'
+/// handing key, and answers once it holds the commit and runs the worker.
+/// `Err` keeps the worker here.
+async fn hand_on(
+    session: &ZendSession,
+    owner: &str,
+    worker: &Worker,
+    to: u64,
+    call_turn: u32,
+    iteration: usize,
+) -> Result<(), String> {
+    let member = worker_hop::member().ok_or("this member is in no cluster")?;
+    let through = session
+        .committed_through(&worker.conv_id, HAND_COMMIT_WAIT)
+        .await
+        .ok_or("its turn's commit did not land in time")?;
+    let from = worker_hop::own_node().ok_or("this member is in no cluster")?;
+    let body = serde_json::to_vec(&Handing {
+        from,
+        to,
+        owner: owner.to_string(),
+        thread: worker.thread.clone(),
+        name: worker.name.clone(),
+        call_turn,
+        iteration,
+        through,
+        signed_ms: now_ms(),
+    })
+    .map_err(|e| e.to_string())?;
+    let proof = worker_hop::sign(&body).ok_or("this member holds no handing key")?;
+    let headers = [
+        (
+            HeaderName::from_static(NODE_HEADER),
+            HeaderValue::from_str(&format!("{to:016x}")).map_err(|e| e.to_string())?,
+        ),
+        (
+            HeaderName::from_static(worker_hop::PROOF_HEADER),
+            HeaderValue::from_str(&proof).map_err(|e| e.to_string())?,
+        ),
+    ];
+    let reply = send_up(
+        &member,
+        Method::POST,
+        CONTINUE_PATH,
+        &headers,
+        body,
+        Some(HAND_ANSWER_WAIT),
+    )
+    .await
+    .map_err(|e| format!("the gateway could not be reached: {e:#}"))?;
+    if reply.status == 202 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{to:016x} answered {}: {}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        ))
+    }
+}
+
+/// Whether `worker`'s record says member `to` runs it now: a handing whose
+/// answer was lost took effect all the same.
+fn taken_by(records: &dyn Records, owner: &str, worker: &Worker, to: u64) -> bool {
+    threads::worker(records, owner, &worker.thread, &worker.name)
+        .is_some_and(|w| w.state == State::Running && w.runner == Some(to))
+}
+
+/// How long a member whose handing failed waits for the record to say the
+/// peer took it after all — its write may still be on its way here.
+const TAKEN_WAIT: Duration = Duration::from_secs(10);
+
+/// [`taken_by`], looked at until it holds or [`TAKEN_WAIT`] passes.
+async fn taken_within(records: &dyn Records, owner: &str, worker: &Worker, to: u64) -> bool {
+    let until = Instant::now() + TAKEN_WAIT;
+    loop {
+        if taken_by(records, owner, worker, to) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Say on `worker`'s record that it still runs, now.
+fn beat_now(records: &dyn Records, owner: &str, worker: &Worker) {
+    if let Some(mut w) = threads::worker(records, owner, &worker.thread, &worker.name) {
+        w.beat_ms = now_ms();
+        if let Err(e) = threads::put_worker(records, owner, &w) {
+            tracing::warn!(conv_id = %w.conv_id, "mcp: the task's beat could not be kept: {e}");
+        }
+    }
+}
+
+/// Take `handing`'s worker, which member `by` handed here at a round
+/// boundary: run its round's tools and carry the worker on — its record, its
+/// beat, its settling — as if it had started here. Taken only while it runs on
+/// `by`, its round still to run, so a handing sent twice, or by anyone but its
+/// runner, runs nothing.
+pub fn continue_handed(
+    session: &Arc<ZendSession>,
+    handing: &Handing,
+    by: u64,
+) -> Result<Worker, String> {
+    if handing.from != by || Some(handing.to) != worker_hop::own_node() {
+        return Err(format!(
+            "the handing is from {:016x} to {:016x}, not from {by:016x} to this member",
+            handing.from, handing.to
+        ));
+    }
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    let _held = holding();
+    let Some(mut worker) =
+        threads::worker(&records, &handing.owner, &handing.thread, &handing.name)
+    else {
+        return Err(format!(
+            "there is no worker `T:{}/{}`",
+            handing.thread, handing.name
+        ));
+    };
+    if worker.state != State::Running || worker.runner != Some(by) {
+        return Err(format!(
+            "`{}` is not running on {by:016x}, so it is not {by:016x}'s to hand on",
+            worker.path()
+        ));
+    }
+    if !session.round_pending(&worker.conv_id, handing.call_turn) {
+        return Err(format!(
+            "`{}` has no round at call turn {} still to run",
+            worker.path(),
+            handing.call_turn
+        ));
+    }
+    // Its turns were written on `by` after anything this member keeps of the
+    // conversation in memory.
+    session.forget(&worker.conv_id);
+    worker.runner = worker_hop::own_node();
+    worker.beat_ms = now_ms();
+    threads::put_worker(&records, &handing.owner, &worker).map_err(|e| e.to_string())?;
+    if let Some(Err(e)) = session.set_decode_band(&worker.conv_id, worker.priority.band()) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the task's priority could not be kept: {e}");
+    }
+    session.mcp().bump();
+    tokio::spawn(run(
+        Arc::clone(session),
+        handing.owner.clone(),
+        worker.clone(),
+        First::Round {
+            call_turn: handing.call_turn,
+            iteration: handing.iteration,
+        },
     ));
     Ok(worker)
 }
@@ -612,6 +828,18 @@ enum Ended {
     Failed(String),
 }
 
+/// What a turn came to: an ending the worker settles on, or a move.
+enum Turned {
+    Ended(Ended),
+    /// It stopped at round `iteration` to move to member `to`, its call turn
+    /// `call_turn` sealed and its tools not run ([`StreamItem::Handed`]).
+    Handed {
+        to: u64,
+        call_turn: u32,
+        iteration: usize,
+    },
+}
+
 impl Ended {
     /// Whether Claude stopped the turn (`repo_task_stop`).
     fn stopped(&self) -> bool {
@@ -620,7 +848,7 @@ impl Ended {
 }
 
 /// The turn's life after [`begin`], and the worker's settling.
-async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, message: String) {
+async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, first: First) {
     let Some(records) = session.shared_substrate() else {
         return;
     };
@@ -628,20 +856,87 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     // the turn and the draft after it — so no reader takes it for cut off,
     // and carries what the turn has done so far.
     let live = Live::default();
-    let beating = tokio::spawn(beat(
-        Arc::clone(&session),
-        records.clone(),
-        owner.clone(),
-        worker.thread.clone(),
-        worker.name.clone(),
-        live.clone(),
-    ));
-    let mut message = message;
+    let (thread, name) = (worker.thread.clone(), worker.name.clone());
+    let start_beat = || {
+        tokio::spawn(beat(
+            Arc::clone(&session),
+            records.clone(),
+            owner.clone(),
+            thread.clone(),
+            name.clone(),
+            live.clone(),
+        ))
+    };
+    let mut beating = start_beat();
+    let mut next = first;
+    // Whether a turn here may move to a markedly faster member: not again,
+    // once a handing failed, so a peer that cannot take it is not asked at
+    // every round.
+    let mut may_hand = true;
     // The answer, audit and settling of a task sent back to open what it
     // cited: what it ends with when the check round does not finish.
     let mut first: Option<(String, Audit, (&'static str, String))> = None;
     let (label, outcome) = loop {
-        let ended = turn(&session, &worker, message, &live).await;
+        // A check round does not move: the answer it falls back on is kept
+        // here, in `first`.
+        let movable = may_hand
+            && first.is_none()
+            && worker.runner.is_some()
+            && worker.runner == worker_hop::own_node();
+        let ended = match turn(&session, &worker, next, movable, &live).await {
+            Turned::Ended(ended) => ended,
+            Turned::Handed {
+                to,
+                call_turn,
+                iteration,
+            } => {
+                // Stopped first, so the record the member taking it writes is
+                // the last word on who runs it.
+                beating.abort();
+                let _ = beating.await;
+                let handed = hand_on(&session, &owner, &worker, to, call_turn, iteration).await;
+                let moved = match handed {
+                    Ok(()) => true,
+                    Err(why) if taken_within(&records, &owner, &worker, to).await => {
+                        tracing::warn!(
+                            conv_id = %worker.conv_id,
+                            to = %format!("{to:016x}"),
+                            "mcp: the handing's answer was lost, but the worker moved: {why}"
+                        );
+                        true
+                    }
+                    Err(why) => {
+                        tracing::warn!(
+                            conv_id = %worker.conv_id,
+                            to = %format!("{to:016x}"),
+                            "mcp: the worker could not move, so it goes on here: {why}"
+                        );
+                        false
+                    }
+                };
+                // The member it moved to beats, settles and answers for it
+                // now; what Claude sent it, a nudge or a stop, is read there.
+                if moved {
+                    session.forget(&worker.conv_id);
+                    tracing::info!(
+                        conv_id = %worker.conv_id,
+                        to = %format!("{to:016x}"),
+                        call_turn,
+                        "mcp: the worker moved to a faster member"
+                    );
+                    return;
+                }
+                may_hand = false;
+                // Said at once, so the stretch without a beat stays short.
+                beat_now(&records, &owner, &worker);
+                beating = start_beat();
+                next = First::Round {
+                    call_turn,
+                    iteration,
+                };
+                continue;
+            }
+        };
         live.set_doing(Doing::Journaling);
         // A nudge that came after the turn's last tool round was never read.
         for undelivered in nudges::take(&records, &worker.conv_id) {
@@ -709,7 +1004,7 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            message = format!("{}{ASKING}", audit.correction());
+            next = First::Message(format!("{}{ASKING}", audit.correction()));
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
             worker.checked = true;
@@ -735,6 +1030,17 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     // The beat stops, and is done writing, before the settled record is.
     beating.abort();
     let _ = beating.await;
+    // Another member took the worker while this one finished a round it
+    // thought its own: the record and the settling are that member's.
+    let runner_now =
+        threads::worker(&records, &owner, &worker.thread, &worker.name).and_then(|w| w.runner);
+    if worker_hop::runs_elsewhere(true, runner_now, worker_hop::own_node()) {
+        tracing::warn!(
+            conv_id = %worker.conv_id,
+            "mcp: another member runs this worker now, so its outcome here is not kept"
+        );
+        return;
+    }
     worker.activity = Some(live.snapshot());
     if !worker.state.live() {
         worker.ended_ms = Some(now_ms());
@@ -829,6 +1135,10 @@ async fn beat(
         let Some(mut w) = threads::worker(&records, &owner, &thread, &name) else {
             return;
         };
+        // Another member took it over: the record is that member's to keep.
+        if worker_hop::runs_elsewhere(true, w.runner, worker_hop::own_node()) {
+            return;
+        }
         w.beat_ms = now_ms();
         w.activity = Some(live.snapshot());
         w.entries = entries_after(session.journal(&w.conv_id).as_ref(), w.entries_after);
@@ -1003,26 +1313,37 @@ fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
 
 /// Run one turn of the worker on `message` to its end, as its role, counting
 /// what it does into `live`.
-async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live: &Live) -> Ended {
+async fn turn(
+    session: &Arc<ZendSession>,
+    worker: &Worker,
+    first: First,
+    may_hand: bool,
+    live: &Live,
+) -> Turned {
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
     apply_tools_dial(&mut selection, mode);
+    let (message, round) = match first {
+        First::Message(m) => (m, None),
+        First::Round {
+            call_turn,
+            iteration,
+        } => (String::new(), Some((call_turn, iteration))),
+    };
     let mut stream = session
-        .submit(
-            vec![ChatMessage::new(Role::User, message)],
-            None,
+        .submit_worker(
+            message,
             worker.conv_id.clone(),
-            None,
-            None,
-            false,
             mode,
-            None,
             selection,
+            round,
+            may_hand,
         )
         .await;
     let mut text = String::new();
     let mut failed: Option<String> = None;
     let mut closed: Option<&'static str> = None;
+    let mut handed: Option<(u64, u32, usize)> = None;
     while let Some(item) = stream.next().await {
         if let Ok(item) = &item {
             live.observe(item);
@@ -1033,16 +1354,38 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live
                 failed.get_or_insert(e);
             }
             Ok(StreamItem::Closing(by)) => closed = Some(by),
+            Ok(StreamItem::Handed {
+                to,
+                call_turn,
+                iteration,
+            }) => handed = Some((to, call_turn, iteration)),
             Ok(_) => {}
             Err(e) => {
                 failed.get_or_insert(format!("{e:#}"));
             }
         }
     }
-    match (failed, closed) {
-        (Some(e), _) => Ended::Failed(e),
-        (None, Some(by)) => Ended::Closed { text, by },
-        (None, None) => Ended::Replied(text),
+    turned(text, failed, closed, handed)
+}
+
+/// What a turn that streamed `text` came to: a failure first, since nothing
+/// it said can be trusted; then a move, since its round is not over; then a
+/// close; else a reply.
+fn turned(
+    text: String,
+    failed: Option<String>,
+    closed: Option<&'static str>,
+    handed: Option<(u64, u32, usize)>,
+) -> Turned {
+    match (failed, closed, handed) {
+        (Some(e), _, _) => Turned::Ended(Ended::Failed(e)),
+        (None, _, Some((to, call_turn, iteration))) => Turned::Handed {
+            to,
+            call_turn,
+            iteration,
+        },
+        (None, Some(by), None) => Turned::Ended(Ended::Closed { text, by }),
+        (None, None, None) => Turned::Ended(Ended::Replied(text)),
     }
 }
 
@@ -1271,6 +1614,7 @@ mod tests {
             resumes: 0,
             audit: None,
             checked: false,
+            runner: None,
         }
     }
 
@@ -1494,6 +1838,36 @@ mod tests {
         let (label, line) = settle(&mut w, Ended::Failed("boom".into()));
         assert_eq!((w.state, label), (State::Error, "Task ended:"));
         assert_eq!(line, "error: boom");
+    }
+
+    /// **A turn that failed failed, a turn that moved moved, whatever else
+    /// it said**; a closed turn is its close; else its reply.
+    #[test]
+    fn a_turn_comes_to_its_failure_its_move_its_close_or_its_reply() {
+        let t = || "said".to_string();
+        assert!(matches!(
+            turned(t(), Some("boom".into()), Some("round_cap"), Some((1, 2, 3))),
+            Turned::Ended(Ended::Failed(e)) if e == "boom"
+        ));
+        assert!(matches!(
+            turned(t(), None, Some("round_cap"), Some((1, 2, 3))),
+            Turned::Handed {
+                to: 1,
+                call_turn: 2,
+                iteration: 3
+            }
+        ));
+        assert!(matches!(
+            turned(t(), None, Some("round_cap"), None),
+            Turned::Ended(Ended::Closed {
+                by: "round_cap",
+                ..
+            })
+        ));
+        assert!(matches!(
+            turned(t(), None, None, None),
+            Turned::Ended(Ended::Replied(text)) if text == "said"
+        ));
     }
 
     #[test]

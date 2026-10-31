@@ -39,6 +39,7 @@ pub mod prompt_tokens;
 mod repo_map;
 pub mod scan;
 pub mod substrate;
+pub mod worker_continue;
 
 /// zend's routes, graded by `roles`, on `session` — every one behind the
 /// ownership layer, which keeps a conversation MCP started to its owner
@@ -306,6 +307,15 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
                 .get(mcp_http::get)
                 .delete(mcp_http::delete::<ZendSession>),
         )
+        // A worker a slower member hands to this one at a round boundary
+        // (`crate::worker_hop`). Open at the gateway, because a member asks it,
+        // addressed by node; the handler believes only a member's stamp.
+        .route(
+            "/v1/mcp/worker/continue",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            post(worker_continue::post),
+        )
 }
 
 #[cfg(test)]
@@ -357,6 +367,9 @@ mod tests {
                 ("/v1/journals/tree", "user"),
                 ("/v1/journals/grep", "user"),
                 ("/v1/mcp", "unauthenticated"),
+                // Open at the gateway; its handler believes a member's stamp
+                // alone (`worker_continue`).
+                ("/v1/mcp/worker/continue", "unauthenticated"),
             ]
         );
     }
