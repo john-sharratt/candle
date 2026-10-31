@@ -1,0 +1,71 @@
+name: journal_check
+questions:
+- check the journals before I commit
+- validate the memory repository
+- is the journal tree still valid after those moves
+- did my edits break anything in the journals
+- run the journals check
+- are there any problems in the memory
+- check it
+- verify the restructure
+- is it safe to commit these journal changes
+- make sure every line still parses
+- does the tree load as the service would read it
+- how many journals and lines does it hold now
+- check the journal repo for problems
+- validate my changes to the notes
+- confirm the new topic is well formed
+- did the moved lines land properly
+- look for broken journal files
+- run journals check on the session's copy
+- anything wrong with the memory tree
+- test the journals before pushing
+- the service must read this, check it first
+- check the yaml in the journals
+- is the new journal.yaml right
+- validate before the commit
+category: Journals
+description: 'Check the memory''s journal repository as this session holds it, uncommitted changes included, reading it as the memory service would. Use before committing a change to the journals: moved lines, edited entries, a new journal. Triggered by "check the journals", "validate the memory", "is the journal tree valid". Returns how many journals and lines it holds and every problem found; none means it is safe to commit.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: The repository holding the journals. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  title: CheckRequest
+  type: object
+examples:
+- |-
+  check the journals before I commit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants the journal tree validated before committing. journal_check reads the session's copy of the journals repository as the service would,<|projection|> uncommitted changes included, and lists every problem.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_check", "arguments": {"repo": "journals"}}
+  </tool_call><|projection|>
+- |-
+  did those moves break anything in the memory<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The moves are uncommitted, and journal_check sees them. It takes the repository,<|projection|> and an empty problems list means the tree is safe to commit.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_check", "arguments": {"repo": "journals"}}
+  </tool_call><|projection|>
+- |-
+  validate the memory repository<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A check of the memory repository is journal_check over the journals repo,<|projection|> which returns the journal and line counts and any problems.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_check", "arguments": {"repo": "journals"}}
+  </tool_call><|projection|>

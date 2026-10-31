@@ -40,27 +40,6 @@ fn read_dir(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> io:
     Ok(())
 }
 
-/// Every problem the tree holds, in its files and its journals.
-fn problems(tree: &Tree) -> Vec<String> {
-    let mut out: Vec<String> = tree.problems.iter().map(ToString::to_string).collect();
-    for p in tree.persons.values() {
-        if let Err(e) = &p.file {
-            out.push(e.to_string());
-        }
-        out.extend(p.problems.iter().map(ToString::to_string));
-    }
-    for f in tree.groups.values() {
-        if let Err(e) = &f.file {
-            out.push(e.to_string());
-        }
-        out.extend(f.problems.iter().map(ToString::to_string));
-    }
-    for (_, j) in &tree.journals() {
-        out.extend(j.problems.iter().map(ToString::to_string));
-    }
-    out
-}
-
 /// `bytes` at `path`, put in place whole: written beside it, then renamed
 /// over it, so an interrupted write leaves the old file rather than half a
 /// new one.
@@ -112,7 +91,7 @@ fn main() -> ExitCode {
             .map(|(_, j)| j.all_lines().count())
             .sum::<usize>()
     );
-    let problems = problems(&tree);
+    let problems = tree.all_problems();
     if !problems.is_empty() {
         for p in &problems {
             println!("{p}");

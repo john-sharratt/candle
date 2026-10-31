@@ -16,6 +16,7 @@ pub mod check;
 pub mod fingerprint;
 pub mod journal;
 pub mod load;
+mod problems;
 pub mod render;
 pub mod window;
 

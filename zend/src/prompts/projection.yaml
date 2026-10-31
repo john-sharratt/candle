@@ -1024,7 +1024,7 @@ layers:
       # Every call that may change what a later read returns. Checked against
       # the tool registry at load; `file_write` is an alias of `write`, and
       # `code_run` / `code_session_exec` write the conversation's files too.
-      release_on: [write, file_edit, file_delete,
+      release_on: [write, file_edit, file_delete, file_move, journal_move,
                    git_commit, git_merge, git_ref, git_switch, git_reset,
                    run_command, code_run, code_session_exec]
     budget:

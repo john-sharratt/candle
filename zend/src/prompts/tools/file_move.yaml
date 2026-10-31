@@ -1,0 +1,81 @@
+name: file_move
+questions:
+- move scratch/notes.md to docs/notes.md
+- rename config.old to config.bak
+- put the helper file in the util folder
+- this file belongs under src/net, move it
+- can you rename that module without changing it
+- shift the draft into the archive folder
+- the file name is wrong, change it
+- reorganise these into a tests folder
+- mv old.txt new.txt
+- move it
+- rename it
+- would you relocate the fixture next to its test
+- I want that file in another directory
+- change the folder this file lives in
+- give the report a better file name
+- take the file out of tmp and put it in docs
+- is there a way to rename the file without rewriting it
+- the migration landed in the wrong folder, move it across
+- relocate the config to the config directory
+- file this under reports
+- keep the contents exactly, just change the path
+- put the draft where the others are
+- rename the file to match its module
+- move the script up one folder
+category: Files
+description: 'Move or rename a file inside one repository, its bytes exactly as they are, with no need to read it first. Use for: moving a file to another folder, renaming a file, reorganising a directory. Triggered by "move", "rename", "mv". Refused when something already stands at `to`. Returns the repo, both paths and the file''s size. Held in this session until committed, as `write` is. To change the file as well, edit it after moving it.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: The repository the file belongs to. Required.
+      minLength: 1
+      type: string
+    path:
+      description: Path of the file to move, relative to the repository. Required.
+      minLength: 1
+      type: string
+    to:
+      description: Where it goes, relative to the repository, its file name included. A file already there is refused. Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - path
+  - to
+  title: MoveRequest
+  type: object
+examples:
+- |-
+  move scratch/notes.md to docs/notes.md<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Okay, the user wants to move scratch/notes.md to docs/notes.md, without naming a repository — the workspace's generic app repository is where this goes. There's a file_move tool that takes repo, path and to, and moves the file byte for byte.<|projection|> Nothing needs reading first.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_move", "arguments": {"repo": "app", "path": "scratch/notes.md", "to": "docs/notes.md"}}
+  </tool_call><|projection|>
+- |-
+  rename config.old to config.bak<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A rename is a move to a new path in the same folder, without naming a repository — the workspace's generic app repository is where this goes. file_move takes repo, path and to,<|projection|> so the path is config.old and to is config.bak.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_move", "arguments": {"repo": "app", "path": "config.old", "to": "config.bak"}}
+  </tool_call><|projection|>
+- |-
+  move src/helper.rs into src/util in the candle repo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user names the candle repository and wants src/helper.rs under src/util. file_move's `to` carries the file name, so it is src/util/helper.rs.<|projection|> The bytes stay as they are, and the move is held in the session until it is committed.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_move", "arguments": {"repo": "candle", "path": "src/helper.rs", "to": "src/util/helper.rs"}}
+  </tool_call><|projection|>

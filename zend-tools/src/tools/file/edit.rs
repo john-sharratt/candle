@@ -38,16 +38,16 @@ pub struct EditRequest {
     #[validate(length(min = 1))]
     pub path: String,
     /// The anchor of the part to change: the four characters before the `|` that `file_read` shows it under (e.g. `r7Lm`). Required.
-    #[validate(length(min = 4, max = 4))]
+    #[validate(length(min = 1))]
     pub at: String,
     /// What to do there: `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
     #[serde(rename = "do")]
     #[schemars(with = "EditAction")]
     pub action: String,
-    /// For replace, insert_before and insert_after: the new text — the whole part as it is to stand, its indentation included. Not given for delete or move.
-    pub text: Option<String>,
-    /// For replace only: words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
+    /// For replace only: words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is. Comes before `text`: the grammar offers the arguments in this order, and `text` declared first left a call that wrote `old` no way to say what replaces it.
     pub old: Option<String>,
+    /// For replace, insert_before and insert_after: the new text — the words replacing `old`, or the whole part as it is to stand, its indentation included. Not given for delete or move.
+    pub text: Option<String>,
     /// For replace, delete and move: the anchor of the last part of a run of consecutive parts, so the edit covers `at` through `to`.
     pub to: Option<String>,
     /// For move: the anchor of the part to move it beside.
@@ -144,10 +144,25 @@ impl Tool for FileEdit {
 /// The request as the edit it names, or why it names none.
 fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
     let invalid = |why: &str| FileError::InvalidArguments(why.to_string());
+    if req.at.chars().count() != 4 {
+        return Err(invalid(&format!(
+            "`at` is the four characters before the `|`; {:?} is not — copy the anchor whole \
+             from `file_read`",
+            req.at
+        )));
+    }
     let text = || {
-        req.text
-            .clone()
-            .ok_or_else(|| invalid(&format!("`{}` needs `text`", req.action)))
+        req.text.clone().ok_or_else(|| {
+            invalid(&match (&req.old, req.action.as_str()) {
+                (Some(_), "replace") => {
+                    "`replace` with `old` needs `text`, the words that replace them".to_string()
+                }
+                (None, "replace") => {
+                    "`replace` needs `text`, the whole part as it is to stand".to_string()
+                }
+                (_, action) => format!("`{action}` needs `text`, the part to insert"),
+            })
+        })
     };
     let op = match req.action.as_str() {
         "replace" => Op::Replace {
@@ -200,3 +215,20 @@ impl From<EditError> for FileError {
 }
 
 pub const FILE_EDIT: RegisteredTool = RegisteredTool::new::<FileEdit>();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **`old` is offered before `text`.** The tool grammar emits optional
+    /// arguments in declared order, so with `text` first a call that wrote
+    /// `old` could not go back: every word-level replace was refused for
+    /// wanting `text`.
+    #[test]
+    fn old_is_offered_before_text() {
+        let schema = serde_json::to_string(&schemars::schema_for!(EditRequest)).unwrap();
+        let old = schema.find("\"old\"").unwrap();
+        let text = schema.find("\"text\"").unwrap();
+        assert!(old < text, "{schema}");
+    }
+}

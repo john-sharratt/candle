@@ -1,0 +1,81 @@
+name: journal_move
+questions:
+- move this note to the family story topic
+- file that line under topics/car
+- that note belongs on people/yen, move it
+- put the shared fact on the family topic
+- this line is on the wrong journal
+- move the Twilight note to its own topic
+- file it under the right person
+- shift these notes to topics/twilight
+- the note about the school should be on the car topic
+- move the line, keep its id
+- refile that note
+- this belongs in another journal
+- can you put that under john instead
+- take this off yen-nhi and put it on the family story
+- reorganise the memory, moving these lines
+- the joint fact should not be on one person's journal
+- move it to the topic
+- file this properly
+- keep the line exactly and change the journal it is on
+- put that memory where it belongs
+- re-home the note
+- this entry went to the wrong person
+- send that line to the shared journal
+- which journal should this be on, and move it there
+category: Journals
+description: 'Move a line of a journal to another journal in the memory repository, keeping its id and bytes exactly. Use for: filing a note under the right person or topic, moving shared facts onto a shared topic. Triggered by "move this note to", "file it under". The journal must already exist. Returns the line''s old and new paths. Held in this session until committed; run journal_check before committing.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: The repository holding the journals. Required.
+      minLength: 1
+      type: string
+    line:
+      description: The line's file, relative to the repository (e.g. `groups/zen/people/john/2026-10-31-0131-4159.yaml`). Required.
+      minLength: 1
+      type: string
+    journal:
+      description: The folder of the journal it goes to, relative to the repository (e.g. `groups/zen/topics/family-story`). Required.
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - line
+  - journal
+  title: MoveRequest
+  type: object
+examples:
+- |-
+  move groups/zen/people/john/2026-10-31-0131-4159.yaml to the family story topic in journals<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The user wants that line on the family story topic. journal_move takes repo, line and journal, and keeps the line's id and bytes.<|projection|> The journal's folder is groups/zen/topics/family-story.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_move", "arguments": {"repo": "journals", "line": "groups/zen/people/john/2026-10-31-0131-4159.yaml", "journal": "groups/zen/topics/family-story"}}
+  </tool_call><|projection|>
+- |-
+  file groups/zen/people/yen-nhi/2026-10-31-0125-7a52.yaml under topics/twilight<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This line belongs on the twilight topic, in the journals repository. journal_move refiles it whole,<|projection|> so nothing needs reading first, and journal_check confirms the tree before a commit.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_move", "arguments": {"repo": "journals", "line": "groups/zen/people/yen-nhi/2026-10-31-0125-7a52.yaml", "journal": "groups/zen/topics/twilight"}}
+  </tool_call><|projection|>
+- |-
+  that car note is on the wrong journal: groups/zen/people/yen/2026-10-31-0122-d791.yaml should be on topics/car<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The note should be on the car topic. journal_move takes the line's path and the journal's folder,<|projection|> keeping its file name, which is its id.
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_move", "arguments": {"repo": "journals", "line": "groups/zen/people/yen/2026-10-31-0122-d791.yaml", "journal": "groups/zen/topics/car"}}
+  </tool_call><|projection|>

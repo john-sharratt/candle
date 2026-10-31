@@ -30,10 +30,14 @@ use thiserror::Error;
 
 use crate::{ToolContext, ToolError};
 
+pub mod check;
 pub mod grep;
+pub mod mv;
 pub mod read;
 
+pub use check::JOURNAL_CHECK;
 pub use grep::JOURNAL_GREP;
+pub use mv::JOURNAL_MOVE;
 pub use read::JOURNAL_READ;
 
 /// What `journal` names the caller's own journal with.

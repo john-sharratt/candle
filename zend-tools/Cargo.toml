@@ -61,6 +61,7 @@ doc-units = { path = "../doc-units" }
 # The journal tools read and search a conversation's journal text with the
 # logic npcd's characters share.
 journal-core = { path = "../journal-core" }
+journals = { path = "../journals" }
 # A sandbox job is async; a tool call drives it on a runtime of its own.
 tokio = { version = "1", features = ["rt"] }
 

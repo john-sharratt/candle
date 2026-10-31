@@ -150,7 +150,10 @@ impl Tool for GitStatus {
                 .and_then(|b| b.upstream),
             None => None,
         };
+        // A repository read from the substrate configures no upstream, so its
+        // branch's copy on origin is the tracking ref alone.
         let no_upstream = match (&branch, &tracked, has_origin) {
+            (Some(_), None, true) if record.is_some() => None,
             (Some(_), None, true) => Some(
                 "origin has no copy of this branch yet; its first commit or git_switch \
                  publishes it there",

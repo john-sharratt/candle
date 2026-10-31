@@ -1342,14 +1342,14 @@ mod tests {
     /// for whole.
     #[test]
     fn opening_prompt_batches_within_the_per_reply_cap() {
-        let long = opening_prompt("candle/src/big.rs", 2000, 10);
+        let long = opening_prompt("candle/src/big.rs", 4000, 20);
         assert!(
             long.contains(&format!(
                 "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can hold"
             )),
             "{long:?}"
         );
-        assert!(!long.contains("issue all 10"), "{long:?}");
+        assert!(!long.contains("issue all 20"), "{long:?}");
         let short = opening_prompt("candle/src/small.rs", 300, 2);
         assert!(
             short.contains("issue all 2 in the SAME reply, one per page from page 1 to page 2"),

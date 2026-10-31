@@ -106,6 +106,11 @@ fn status_without_an_upstream_says_why() {
     let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
     let hint = out["no_upstream"].as_str().unwrap();
     assert!(hint.contains("origin has no copy"), "{hint}");
+
+    // A copy on origin is one whether or not the branch was told to track it.
+    ws.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
+    assert!(out.get("no_upstream").is_none(), "{out}");
 }
 
 /// **Counts cover every changed path, not just the page.** They exist because

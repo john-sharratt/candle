@@ -75,6 +75,52 @@ fn file_write_unicode() {
     assert_eq!(page_body(&resp), format!("{anchor}| {content}\n"));
 }
 
+/// A move keeps the bytes, leaves nothing behind, and overwrites nothing.
+#[test]
+fn file_move_keeps_the_bytes_and_refuses_an_occupied_path() {
+    let ctx = ctx();
+    write(&ctx, "a.txt", "exact  bytes\r\n");
+    write(&ctx, "b.txt", "other\n");
+    let refused = harness::invoke_with_ctx(
+        "file_move",
+        json!({"repo": REPO, "path": "a.txt", "to": "b.txt"}),
+        &ctx,
+    );
+    let detail = harness::expect_error(&refused, "invalid_arguments");
+    assert!(detail.contains("already exists"), "{detail}");
+
+    harness::expect_success(harness::invoke_with_ctx(
+        "file_move",
+        json!({"repo": REPO, "path": "a.txt", "to": "sub/c.txt"}),
+        &ctx,
+    ));
+    let store = ctx.files.repo(REPO).unwrap();
+    assert_eq!(store.read("a.txt").unwrap(), None);
+    assert_eq!(
+        store.read("sub/c.txt").unwrap().as_deref(),
+        Some("exact  bytes\r\n")
+    );
+}
+
+#[test]
+fn file_edit_refusals_say_what_to_send() {
+    let ctx = ctx();
+    write(&ctx, "e.txt", "one\n");
+    let resp = edit(
+        &ctx,
+        json!({"path": "e.txt", "at": "abc", "do": "replace", "text": "y"}),
+    );
+    let detail = harness::expect_error(&resp, "invalid_arguments");
+    assert!(detail.contains("four characters"), "{detail}");
+    assert!(detail.contains("\"abc\""), "{detail}");
+    let resp = edit(
+        &ctx,
+        json!({"path": "e.txt", "at": "abcd", "do": "replace", "old": "one"}),
+    );
+    let detail = harness::expect_error(&resp, "invalid_arguments");
+    assert!(detail.contains("the words that replace them"), "{detail}");
+}
+
 #[test]
 fn file_edit_not_found() {
     let resp = harness::invoke(

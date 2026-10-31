@@ -398,6 +398,10 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         &["delete_file", "rm", "remove_file", "fs_delete", "unlink"],
     ),
     (
+        "file_move",
+        &["move_file", "rename_file", "mv", "fs_move", "fs_rename"],
+    ),
+    (
         "file_present",
         &["show_file", "present_file", "display_file"],
     ),
@@ -1004,8 +1008,8 @@ use crate::tools::{
     },
     datetime::REGISTRATION as DATETIME,
     file::{
-        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_PRESENT, FILE_READ, FILE_SEARCH,
-        FILE_WRITE,
+        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_LIST, FILE_MOVE, FILE_PRESENT, FILE_READ,
+        FILE_SEARCH, FILE_WRITE,
     },
     git::{
         GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
@@ -1016,7 +1020,7 @@ use crate::tools::{
     http_session::{
         HTTP_SESSION_CLOSE, HTTP_SESSION_LIST, HTTP_SESSION_OPEN, HTTP_SESSION_REQUEST,
     },
-    journal::{JOURNAL_GREP, JOURNAL_READ},
+    journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
     random::REGISTRATION as RANDOM,
@@ -1085,7 +1089,7 @@ fn register_all() -> &'static [RegisteredTool] {
         WEB_SEARCH.requires(NET),
         WEB_FETCH.requires(NET),
         WEATHER.requires(NET),
-        // File tools (8) — all safe: every change is held in the overlay
+        // File tools (9) — all safe: every change is held in the overlay
         FILE_WRITE,
         FILE_READ,
         FILE_EDIT,
@@ -1093,6 +1097,7 @@ fn register_all() -> &'static [RegisteredTool] {
         FILE_SEARCH,
         FILE_GREP,
         FILE_DELETE,
+        FILE_MOVE,
         FILE_PRESENT,
         // Git tools (9) — the split that decides the whole family.
         //
@@ -1132,6 +1137,8 @@ fn register_all() -> &'static [RegisteredTool] {
         // Journal tools (2) — read the conversation's own journal text
         JOURNAL_READ,
         JOURNAL_GREP,
+        JOURNAL_CHECK,
+        JOURNAL_MOVE,
         // Credential tools (3) — all high-risk (secrets)
         CREDENTIAL_SAVE.requires(SECRETS),
         CREDENTIAL_LIST.requires(SECRETS),
