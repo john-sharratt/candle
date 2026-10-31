@@ -17,7 +17,7 @@
 
 #include "kernel_instantiate.cuh"
 #include "common.cuh"
-#include "../loader/q4_k.cuh"
+#include "../loader/q4_K.cuh"
 
 // K/128 format parameters:
 // qk = 128 elements per block

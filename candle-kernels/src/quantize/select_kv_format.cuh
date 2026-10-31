@@ -151,6 +151,7 @@
 
 #pragma once
 
+#include <cfloat>
 #include "fp8_e4m3_utils.cuh"
 #include "../arena_table.cuh"
 #include "../convert/convert_all.cuh"

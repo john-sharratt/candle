@@ -99,7 +99,12 @@ __global__ void kv_hash_kernel(
         const int slot = slot_of[b];
         // `seeds[b]` is odd by construction on the host, so the multiply is
         // invertible and cannot fold a band's contribution to zero.
-        atomicAdd(out + slot, partial[0] * seeds[b]);
+        // `out` is uint64_t*, which is `unsigned long` on LP64 Linux; atomicAdd
+        // has an overload for `unsigned long long` but none for `unsigned long`,
+        // so cast to the 64-bit type the overload names (identical bits on every
+        // target).
+        atomicAdd((unsigned long long*)(out + slot),
+                  (unsigned long long)(partial[0] * seeds[b]));
     }
 }
 
