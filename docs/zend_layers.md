@@ -1,10 +1,12 @@
 # zend's compounding layers
 
-How the layers above `code_reading` are built. zend's schema declares three,
-per file and side by side — `dependency_analysis`, `code_review` and
-`security_review`, each `after: code_reading` — so an edit to a file makes all
-three of its units stale at once and each is read again. The engine also builds
-layers per day (`unit: day`), which zend's schema declares none of. The code is
+How layers above `code_reading` are built. zend's schema declares none now:
+`dependency_analysis`, `code_review` and `security_review`, the three it
+declared per file and side by side, were removed on 2026-10-31 because they
+could not keep up with the corpus while holding the forwards live work waits
+for. Each boot retires their conversations on every member
+(`zend/src/layers/removed.rs`). They remain the examples below; the engine is
+kept, for per-file units and for layers per day (`unit: day`). The code is
 `zend/src/layers/`, the declarations are the `ingest:` blocks in
 `zend/src/prompts/projection.yaml`, and the design they come from is
 `docs/coding_assistant.md` §"Trunk Session — Phased Parallel Analysis".

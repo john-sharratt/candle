@@ -118,9 +118,8 @@ A browser `Origin` naming anywhere but this origin is `403`.
 **Every delegated turn is a native zend conversation**, so it is projected the
 way a dialogue is:
 
-- **provenance retrieval** over every layer — `repo_map`, `code_reading`,
-  `dependency_analysis`, `code_review`, `security_review` — scoped to the
-  conversation's branches (`docs/zend_layers.md`, "Tied to a branch");
+- **provenance retrieval** over every layer — `repo_map`, `code_reading` —
+  scoped to the conversation's branches (`docs/zend_layers.md`, "Tied to a branch");
 - **the working set**: seeds, the files its reads lock, momentum
   (`docs/zend_working_set.md`);
 - **its journal and its ancestors' journals** in its prompt (§5);

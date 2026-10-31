@@ -2775,6 +2775,7 @@ impl InferenceState {
                 "retired the recurrent snapshots of finished ingest conversations"
             );
         }
+        crate::layers::removed::sweep(&engine);
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
                 continue;
@@ -8866,37 +8867,16 @@ mod projection_schema_tests {
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
 
-        // Whole files and analysis units are each one case of one competition,
-        // content weighed on fold groups 1-2 and the calibration competition
-        // on the top group alone, at a quarter of the content's weight.
-        for name in [
-            "code_reading",
-            "dependency_analysis",
-            "code_review",
-            "security_review",
-        ] {
-            let g = &layer(name).groups[0];
-            assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
-            assert_eq!(g.policy.layer_weights, vec![0.0, 1.0, 1.0], "{name}");
-            assert_eq!(
-                g.policy.calibration_layer_weights,
-                vec![0.0, 0.0, 1.0],
-                "{name}"
-            );
-            assert_eq!(g.policy.scan.calibration_weight, 0.25, "{name}");
-            // The cold-scope floor is code_reading's alone.
-            let floor = if name == "code_reading" {
-                (2.0, 16.0)
-            } else {
-                (0.0, 8.0)
-            };
-            let scan = &g.policy.scan;
-            assert_eq!(
-                (scan.level_prior_base, scan.level_prior_cap),
-                floor,
-                "{name}"
-            );
-        }
+        // A whole file is one case of one competition, content weighed on fold
+        // groups 1-2 and the calibration competition on the top group alone,
+        // at a quarter of the content's weight.
+        let g = &layer("code_reading").groups[0];
+        assert_eq!(g.policy.scan.cases, ScanCases::File);
+        assert_eq!(g.policy.layer_weights, vec![0.0, 1.0, 1.0]);
+        assert_eq!(g.policy.calibration_layer_weights, vec![0.0, 0.0, 1.0]);
+        assert_eq!(g.policy.scan.calibration_weight, 0.25);
+        let scan = &g.policy.scan;
+        assert_eq!((scan.level_prior_base, scan.level_prior_cap), (2.0, 16.0));
         assert_eq!(
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
@@ -8908,14 +8888,6 @@ mod projection_schema_tests {
             .expect("code_reading declares a calibration");
         assert_eq!((calibrate.questions, calibrate.think), (24, 64));
         assert!(calibrate.prompt.contains("<<path>>"));
-        // So is every analysis of a file.
-        for name in ["dependency_analysis", "code_review", "security_review"] {
-            let spec = CalibrateSpec::of(layer(name))
-                .unwrap()
-                .unwrap_or_else(|| panic!("{name} declares a calibration"));
-            assert_eq!((spec.questions, spec.think), (24, 64), "{name}");
-            assert!(spec.prompt.contains("<<path>>"), "{name}");
-        }
 
         let ws = layer("dialogue")
             .working_set
@@ -8960,7 +8932,6 @@ mod projection_schema_tests {
     #[test]
     fn embedded_turn_sinks_are_derived_from_structure() {
         use crate::ingest::IngestMode;
-        use crate::layers::expiry::DAY_MS;
         let builder = build_projection_builder(Path::new("demo-project"));
         // "demo-project" doesn't exist on disk, so no folder-backed raw sinks
         // resolve — only the two built-in pipelines.
@@ -8978,46 +8949,8 @@ mod projection_schema_tests {
             vec![
                 ("repo_map", IngestMode::Folders, ""),
                 ("code_reading", IngestMode::Files, ""),
-                ("dependency_analysis", IngestMode::Derived, ""),
-                ("code_review", IngestMode::Derived, ""),
-                ("security_review", IngestMode::Derived, ""),
             ],
             "derived turn-sinks: {got:?}"
-        );
-        // All three analyses build on each file's reading, side by side: an
-        // edit to the file makes every one of them stale at once.
-        let after: Vec<(&str, Option<&str>)> = layers
-            .iter()
-            .filter_map(|l| Some((l.name.as_str(), l.spec.as_ref()?.after.as_deref())))
-            .collect();
-        assert_eq!(
-            after,
-            vec![
-                ("dependency_analysis", Some("code_reading")),
-                ("code_review", Some("code_reading")),
-                ("security_review", Some("code_reading")),
-            ]
-        );
-        // Only the security review researches the web, and only its units
-        // expire.
-        let research: Vec<(&str, bool, Option<u64>)> = layers
-            .iter()
-            .filter_map(|l| {
-                let s = l.spec.as_ref()?;
-                Some((
-                    l.name.as_str(),
-                    s.researches(),
-                    s.expiry.map(|e| e.period_ms() / DAY_MS),
-                ))
-            })
-            .collect();
-        assert_eq!(
-            research,
-            vec![
-                ("dependency_analysis", false, None),
-                ("code_review", false, None),
-                ("security_review", true, Some(30)),
-            ]
         );
         // Every layer keeps the id its conversations were persisted under.
         let ids: Vec<(&str, u32)> = builder
@@ -9028,14 +8961,7 @@ mod projection_schema_tests {
             .collect();
         assert_eq!(
             ids,
-            vec![
-                ("repo_map", 1),
-                ("code_reading", 2),
-                ("dependency_analysis", 4),
-                ("code_review", 11),
-                ("security_review", 12),
-                ("dialogue", 10),
-            ]
+            vec![("repo_map", 1), ("code_reading", 2), ("dialogue", 10),]
         );
         // The live dialogue layer is never a turn-sink.
         assert!(
@@ -9084,7 +9010,7 @@ mod projection_schema_tests {
     }
 
     /// A coding-agent workspace with a folder matching a declared-but-pipeline-fed
-    /// layer name (e.g. `dependency_analysis/`) must NOT be ingested as a raw sink; only a
+    /// layer name (e.g. `code_reading/`) must NOT be ingested as a raw sink; only a
     /// mind (a workspace with its own `projection.yaml`) draws raw sinks from its
     /// folders. Guards the folder-name-collision fix.
     #[test]
@@ -9093,10 +9019,10 @@ mod projection_schema_tests {
         let builder = build_projection_builder(Path::new("demo-project"));
         let ws = std::env::temp_dir().join(format!("zend_ingestws_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
-        std::fs::create_dir_all(ws.join("dependency_analysis")).unwrap();
+        std::fs::create_dir_all(ws.join("code_reading")).unwrap();
 
-        // Not a mind (no projection.yaml): the colliding `dependency_analysis/` folder
-        // is never a raw sink — the layer is built from the layers below it.
+        // Not a mind (no projection.yaml): the colliding `code_reading/` folder
+        // is never a raw sink — the layer is read by its own pipeline.
         let coding = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert!(
             !coding.iter().any(|l| l.mode == IngestMode::Raw),
@@ -9104,17 +9030,7 @@ mod projection_schema_tests {
         );
         assert!(coding
             .iter()
-            .any(|l| l.name == "dependency_analysis" && l.mode == IngestMode::Derived));
-
-        // Not in a mind either: a layer that declares how its units are read
-        // is read that way, whatever folder shares its name.
-        std::fs::write(ws.join("projection.yaml"), "layers: []").unwrap();
-        let mind = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
-        assert!(
-            mind.iter()
-                .any(|l| l.name == "dependency_analysis" && l.mode == IngestMode::Derived),
-            "a declared layer of units is never a mind's raw sink"
-        );
+            .any(|l| l.name == "code_reading" && l.mode == IngestMode::Files));
 
         let _ = std::fs::remove_dir_all(&ws);
     }

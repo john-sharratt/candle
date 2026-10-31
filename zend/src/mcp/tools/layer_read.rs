@@ -18,8 +18,8 @@ pub fn definition() -> Value {
         "name": NAME,
         "annotations": {"readOnlyHint": true},
         "description": "Read what one of the projection layers holds. A layer is one kind of analysis kept \
-            about the repositories — `repo_map`, `code_reading`, `dependency_analysis`, `code_review`, \
-            `security_review`, `dialogue` — and workers read from it; each piece of it is a stored \
+            about the repositories — `repo_map`, `code_reading`, `dialogue` — and workers read from it; \
+            each piece of it is a stored \
             conversation, a timeline. Lists the layer's timelines, each with its id, label, repository, \
             turns and tokens, a page at a time; read one with `timeline_read`. Admins only.",
         "inputSchema": {

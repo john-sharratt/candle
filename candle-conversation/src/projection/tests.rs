@@ -4160,12 +4160,7 @@ fn zend_projection_yaml_parses() {
     let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", "candle")], Some(&dlct))
         .expect("zend projection.yaml must parse");
 
-    let expected_layers = [
-        "repo_map",
-        "code_reading",
-        "dependency_analysis",
-        "dialogue",
-    ];
+    let expected_layers = ["repo_map", "code_reading", "dialogue"];
     for name in &expected_layers {
         assert!(
             b.id_for_layer(name).is_some(),
@@ -4196,12 +4191,7 @@ fn zend_projection_yaml_parses() {
             .expect("layer has a summaries level")
             .content
     };
-    for single in [
-        "repo_map",
-        "code_reading",
-        "dependency_analysis",
-        "dialogue",
-    ] {
+    for single in ["repo_map", "code_reading", "dialogue"] {
         assert_eq!(
             mode_of(single),
             Content::Decode,
