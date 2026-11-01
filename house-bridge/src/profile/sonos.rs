@@ -80,6 +80,21 @@ pub fn parse_volume(xml: &str) -> Option<u8> {
     soap::tag(xml, "CurrentVolume")?.parse().ok()
 }
 
+/// The transport URI for a source. A Sonos scheme (`x-…`) is used as given; a
+/// plain `http(s)` address is turned into a Sonos internet-radio stream, which
+/// is how a player takes a live stream rather than a fixed-length track.
+pub fn radio_uri(source: &str) -> String {
+    let s = source.trim();
+    if s.starts_with("x-") {
+        return s.to_string();
+    }
+    let bare = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    format!("x-rincon-mp3radio://{bare}")
+}
+
 /// One player, at its address.
 pub struct Player {
     address: Ipv4Addr,
@@ -139,6 +154,24 @@ impl Player {
             .map(drop)
     }
 
+    /// Point the player at `source` and start it — the one act that begins
+    /// playback from nothing queued. `SetAVTransportURI` sets what plays, then
+    /// `Play` starts it.
+    pub async fn set_source_and_play(&self, source: &str) -> Result<()> {
+        let uri = soap::escape(&radio_uri(source));
+        self.call(
+            TRANSPORT,
+            "SetAVTransportURI",
+            &[
+                ("InstanceID", "0"),
+                ("CurrentURI", &uri),
+                ("CurrentURIMetaData", ""),
+            ],
+        )
+        .await?;
+        self.play().await
+    }
+
     pub async fn set_volume(&self, volume: u8) -> Result<()> {
         let v = volume.min(100).to_string();
         self.call(
@@ -174,6 +207,16 @@ pub async fn work(
         "pause" => {
             player.pause().await?;
             format!("The {name} is paused.")
+        }
+        "source" => {
+            let source = args
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("Say what to play — a radio stream address."))?;
+            player.set_source_and_play(source).await?;
+            format!("The {name} is playing {source}.")
         }
         "volume" => {
             let v = args
@@ -215,6 +258,25 @@ mod tests {
         assert_eq!(
             s.line("Sonos speaker"),
             "The Sonos speaker is playing \"Harbour Lights\" by The Waves & Co, at volume 23 of 100."
+        );
+    }
+
+    #[test]
+    fn a_source_becomes_a_sonos_radio_uri() {
+        // A plain address becomes an internet-radio stream — the exact form
+        // that started Groove Salad on the real player.
+        assert_eq!(
+            radio_uri("http://ice1.somafm.com/groovesalad-128-mp3"),
+            "x-rincon-mp3radio://ice1.somafm.com/groovesalad-128-mp3"
+        );
+        assert_eq!(
+            radio_uri("https://ice1.somafm.com/groovesalad-128-mp3"),
+            "x-rincon-mp3radio://ice1.somafm.com/groovesalad-128-mp3"
+        );
+        // A Sonos scheme is left as the caller gave it.
+        assert_eq!(
+            radio_uri("x-sonosapi-stream:foo?sid=1"),
+            "x-sonosapi-stream:foo?sid=1"
         );
     }
 

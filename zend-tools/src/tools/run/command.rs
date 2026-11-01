@@ -315,13 +315,17 @@ fn refuse_broken_flags(program: &str, args: &[String]) -> Result<(), RunError> {
             && args[i].len() > 2
             && !args.get(i + 1).is_some_and(|next| !next.starts_with('-'))
     };
+    // A plain word counts as a bare flag does: measured live, `args` ran on as
+    // `icon_dims.py icon_dims.py ./icon_dims.py …` instead of closing.
+    let plain = |i: usize| !args[i].starts_with('-') && !args[..i].iter().any(|a| a == "--");
     let mut seen: HashMap<&str, usize> = HashMap::new();
-    for i in (0..args.len()).filter(|i| bare(*i)) {
+    for i in (0..args.len()).filter(|i| bare(*i) || plain(*i)) {
         let count = seen.entry(args[i].as_str()).or_default();
         *count += 1;
         if *count > FLAG_REPEATS {
             return Err(RunError::Shell(format!(
-                "`{}` is in your args more than {FLAG_REPEATS} times: give each flag once",
+                "`{}` is in your args more than {FLAG_REPEATS} times: give each argument once, \
+                 and close `args` when the command is complete",
                 args[i]
             )));
         }
@@ -374,8 +378,21 @@ mod tests {
         );
         assert!(
             matches!(&repeated, Err(RunError::Shell(why))
-                if why == "`--quiet` is in your args more than 2 times: give each flag once"),
+                if why.starts_with("`--quiet` is in your args more than 2 times")),
             "{repeated:?}"
+        );
+        let ran_on = take_apart(
+            "python".into(),
+            strings(&["a.py", "a.py", "a.py", "./a.py"]),
+        );
+        assert!(
+            matches!(&ran_on, Err(RunError::Shell(why))
+                if why.starts_with("`a.py` is in your args more than 2 times")),
+            "{ran_on:?}"
+        );
+        assert!(
+            take_apart("cargo".into(), strings(&["test", "--", "x", "x", "x"])).is_ok(),
+            "what follows `--` is the program's own"
         );
         for args in [
             vec!["test", "-p", "web", "--", "--skip", "slow"],

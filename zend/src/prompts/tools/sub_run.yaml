@@ -53,3 +53,13 @@ examples:
 - delegate writing the unit tests for the parser module to a subagent<|im_end|>
 - have a subagent research the top three Rust web frameworks and recommend one for a REST API<|im_end|>
 - spawn an agent to trace where this config value is read across the repo<|im_end|>
+- |-
+  trace where this value is read across the repo while you carry on<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This search would fill my context with reads I do not need to keep. A part can do it and hand back the answer alone, so I name it for what it is for and give it everything it needs in the prompt.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"name": "trace-config-value", "prompt": "Find every place the `decode_band` setting is read in the candle repository. Answer with each file and line, and what the code does with it."}}
+  </tool_call><|projection|>

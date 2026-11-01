@@ -76,6 +76,38 @@ pub const SONOS_PAUSE: Tool = sonos!(
     "Paused, it picks up where it was."
 );
 
+pub const SONOS_SOURCE: Tool = Tool {
+    name: "sonos_source",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Put something on the Sonos player here from nothing — a radio station by its stream \
+         address — and start it playing. Use this when the player is stopped with nothing queued \
+         and the room wants music; `sonos_play` only resumes what is already there.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The Sonos player here, by name.",
+        },
+        Param {
+            name: "source",
+            ty: "string",
+            required: true,
+            description: "The stream address to play, e.g. a radio station's MP3 stream URL.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The room wants music and the player is stopped with an empty queue.",
+        call: r#"{"device":"Sonos speaker","source":"http://ice1.somafm.com/groovesalad-128-mp3"}"#,
+        because: "Resuming does nothing when nothing is queued; a source is what gives the player \
+                  something to play.",
+    }],
+};
+
 pub const SONOS_VOLUME: Tool = Tool {
     name: "sonos_volume",
     at: &[],
@@ -194,6 +226,145 @@ pub const RECEIVER_VOLUME: Tool = Tool {
     }],
 };
 
+pub const RECEIVER_LOUDER: Tool = receiver!(
+    "receiver_louder",
+    "Turn the AV receiver here up a step, a little louder than it was.",
+    "The room asked for it a bit louder and does not want to name a number.",
+    "A nudge up is its own act; the receiver knows its own step."
+);
+
+pub const RECEIVER_QUIETER: Tool = receiver!(
+    "receiver_quieter",
+    "Turn the AV receiver here down a step, a little quieter than it was.",
+    "The music is a touch loud and the room wants it eased down, not set.",
+    "A nudge down is its own act; the receiver knows its own step."
+);
+
+pub const RECEIVER_PLAY: Tool = receiver!(
+    "receiver_play",
+    "Resume play on the AV receiver's current network or USB source.",
+    "The family asked for the music back on and the stereo is on a network source.",
+    "The source holds what it was on; starting it is the whole act."
+);
+
+pub const RECEIVER_PAUSE: Tool = receiver!(
+    "receiver_pause",
+    "Pause the AV receiver's current network or USB source.",
+    "Somebody is on a call and the stereo's streaming music is in the way.",
+    "Paused, the source picks up where it was."
+);
+
+pub const RECEIVER_NEXT: Tool = receiver!(
+    "receiver_next",
+    "Skip to the next track on the AV receiver's network or USB source.",
+    "The room is tired of this track and wants the next one.",
+    "Skipping is a single act the source does; nobody need reach for it."
+);
+
+pub const RECEIVER_PREVIOUS: Tool = receiver!(
+    "receiver_previous",
+    "Go back to the previous track on the AV receiver's network or USB source.",
+    "The room wants the track that just played again.",
+    "Going back is a single act the source does."
+);
+
+pub const RECEIVER_PLAYING: Tool = receiver!(
+    "receiver_playing",
+    "Read what the AV receiver's network or USB source is playing: the track, who by, and whether it is playing or paused.",
+    "You want to know what is on the stereo right now, and what.",
+    "What is playing is in the source, not in anybody's guess."
+);
+
+pub const RECEIVER_INPUT: Tool = Tool {
+    name: "receiver_input",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Switch the AV receiver here to one of its inputs — CD, BD/DVD, the tuner, the network, \
+         USB, and the like — so the room hears that source.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The AV receiver here, by name, as the room calls it.",
+        },
+        Param {
+            name: "source",
+            ty: "string",
+            required: true,
+            description: "The input to switch to, e.g. cd, bd, tuner, fm, network, usb, bluetooth.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The family want to put a CD on and the stereo is set to the TV.",
+        call: r#"{"device":"the stereo","source":"cd"}"#,
+        because: "The source is a setting the receiver holds; switch it, do not ask somebody to.",
+    }],
+};
+
+pub const RECEIVER_MODE: Tool = Tool {
+    name: "receiver_mode",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Set the AV receiver's listening mode — stereo, direct, surround, all-channel stereo, \
+         pure audio, and the like — so the room hears it the way it wants.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The AV receiver here, by name, as the room calls it.",
+        },
+        Param {
+            name: "mode",
+            ty: "string",
+            required: true,
+            description: "The listening mode, e.g. stereo, direct, surround, all-ch-stereo, pure.",
+        },
+    ],
+    examples: &[Example {
+        situation: "A film is on and the room wants surround rather than plain stereo.",
+        call: r#"{"device":"the stereo","mode":"surround"}"#,
+        because: "The listening mode is the receiver's to set; name the one the room wants.",
+    }],
+};
+
+pub const RECEIVER_DIM: Tool = Tool {
+    name: "receiver_dim",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Set how bright the AV receiver's front display is — bright, dim, dark or off — so it does \
+         not light the room when it is not wanted.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The AV receiver here, by name, as the room calls it.",
+        },
+        Param {
+            name: "level",
+            ty: "string",
+            required: true,
+            description: "How bright: bright, dim, dark or off.",
+        },
+    ],
+    examples: &[Example {
+        situation: "It is a film night and the receiver's display is lighting the wall.",
+        call: r#"{"device":"the stereo","level":"dark"}"#,
+        because: "The display's brightness is the receiver's to set; dark it rather than cover it.",
+    }],
+};
+
 pub const WAKE_DEVICE: Tool = Tool {
     name: "wake_device",
     at: &[],
@@ -220,6 +391,7 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     SONOS_STATUS,
     SONOS_PLAY,
     SONOS_PAUSE,
+    SONOS_SOURCE,
     SONOS_VOLUME,
     RECEIVER_STATUS,
     RECEIVER_ON,
@@ -227,6 +399,16 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     RECEIVER_MUTE,
     RECEIVER_UNMUTE,
     RECEIVER_VOLUME,
+    RECEIVER_LOUDER,
+    RECEIVER_QUIETER,
+    RECEIVER_INPUT,
+    RECEIVER_MODE,
+    RECEIVER_DIM,
+    RECEIVER_PLAY,
+    RECEIVER_PAUSE,
+    RECEIVER_NEXT,
+    RECEIVER_PREVIOUS,
+    RECEIVER_PLAYING,
     WAKE_DEVICE,
 ];
 
