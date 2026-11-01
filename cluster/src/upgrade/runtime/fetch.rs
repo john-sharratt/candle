@@ -64,6 +64,16 @@ pub fn needed(offer: &BuildArtifacts, kind: &str, platform: &str) -> Result<Arti
         })
 }
 
+/// The app to ask through after `current`'s chunk did not come: the next of
+/// `routes`, in turn. Chunks arrive on the catch-up lane of the socket that
+/// asked, and a socket whose lane has stopped draining held one member at
+/// 0 bytes for half an hour with its other app's socket idle beside it.
+fn next_route(routes: &[(String, u64)], current: &str) -> Option<(String, u64)> {
+    let at = routes.iter().position(|(app, _)| app == current);
+    let next = at.map_or(0, |i| i + 1) % routes.len().max(1);
+    routes.get(next).cloned()
+}
+
 /// Up to [`MAX_BUILD_CHUNK`] bytes of the file at `path` from `offset`.
 fn read_chunk(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     let mut f = File::open(path)?;
@@ -124,6 +134,16 @@ impl Upgrader {
                         f.resumes += 1;
                         f.offset = offset;
                         f.asked = Instant::now();
+                        let routes: Vec<(String, u64)> = self
+                            .apps()
+                            .into_iter()
+                            .filter(|m| !m.admitted_sockets().is_empty())
+                            .map(|m| (m.app().to_string(), m.node()))
+                            .collect();
+                        if let Some((app, node)) = next_route(&routes, &f.app) {
+                            f.app = app;
+                            f.reply_to = node;
+                        }
                         Some(f.clone())
                     }
                 }
@@ -330,6 +350,25 @@ mod tests {
             },
             artifacts,
         }
+    }
+
+    /// **A chunk that did not come is asked for on the next app's socket**, so
+    /// one stalled lane costs one wait.
+    #[test]
+    fn a_resume_moves_to_the_next_apps_socket() {
+        let routes = vec![("zend".to_string(), 1), ("npcd".to_string(), 2)];
+        assert_eq!(next_route(&routes, "zend"), Some(("npcd".to_string(), 2)));
+        assert_eq!(next_route(&routes, "npcd"), Some(("zend".to_string(), 1)));
+        assert_eq!(
+            next_route(&routes, "gone"),
+            Some(("zend".to_string(), 1)),
+            "an app that lost its socket hands over to the first that has one"
+        );
+        assert_eq!(
+            next_route(&routes[..1], "zend"),
+            Some(("zend".to_string(), 1))
+        );
+        assert_eq!(next_route(&[], "zend"), None);
     }
 
     /// A member takes its own kind and platform; with no match it is
