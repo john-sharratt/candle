@@ -25,7 +25,7 @@ questions:
 - change the name of that file on the remote filesystem
 - move a directory to a new path on the remote machine
 category: Remote filesystem
-description: Rename or move a file or directory on a remote host's filesystem over SFTP.
+description: Rename or move a file or directory on a remote host's filesystem over SFTP, in an open remote_fs_session_open session. A file in a repository moves with file_move instead.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

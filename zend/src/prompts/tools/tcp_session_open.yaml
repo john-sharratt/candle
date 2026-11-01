@@ -25,7 +25,7 @@ questions:
 - open a byte-stream socket to the server on port 6379
 - give me a raw TCP session for this non-HTTP service
 category: TCP sessions
-description: 'Open a raw TCP connection. Use for: custom protocols, debugging, non-HTTP services. Use tls_session_open for TLS. Returns session_id.'
+description: 'Open a raw TCP connection. Use for: custom protocols, debugging, non-HTTP services. Use tls_session_open for TLS. Returns session_id. Then tcp_session_send and tcp_session_recv carry the bytes, and tcp_session_close ends it. For HTTP use http_request, and for a text-terminal device telnet_session_open.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

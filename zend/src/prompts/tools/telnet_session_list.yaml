@@ -25,7 +25,7 @@ questions:
 - give me the telnet session for the router
 - list the plaintext terminal connections
 category: Telnet sessions
-description: Enumerate the Telnet terminal sessions currently open to network devices in this conversation.
+description: Enumerate the Telnet terminal sessions currently open to network devices in this conversation. Use to find a session_id you opened earlier with telnet_session_open.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

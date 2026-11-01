@@ -25,7 +25,7 @@ questions:
 - begin a SQL session on this database path
 - get me a database session for that .db file
 category: SQL sessions
-description: Open a SQL database session. SQLite is supported natively and needs no credential — pass the database path (or ':memory:' for in-memory). A credential_name is optional and only supplies a default database. Use sql_session_query to run statements. Close with sql_session_close.
+description: Open a SQL database session. SQLite is supported natively and needs no credential — pass the database path (or ':memory:' for in-memory). A credential_name is optional and only supplies a default database. Use sql_session_query to run statements. Close with sql_session_close. Use when the task is about the contents of a database. A database file is binary, so file_read cannot read it, and this is the way in.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

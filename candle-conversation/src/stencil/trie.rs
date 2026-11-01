@@ -61,6 +61,9 @@ pub struct TokenTrie {
     nodes: Vec<TrieNode>,
     root: TrieNodeId,
     spills: Vec<Spill>,
+    /// The first byte of each way out of the root, with the tokens that open
+    /// it ([`Self::with_leads`]).
+    leads: Vec<(u8, Vec<TokenId>)>,
 }
 
 /// The result of stepping a trie with a decoded token.
@@ -131,6 +134,7 @@ impl TokenTrie {
             nodes,
             root,
             spills: Vec::new(),
+            leads: Vec::new(),
         })
     }
 
@@ -172,6 +176,31 @@ impl TokenTrie {
 
     pub fn root(&self) -> TrieNodeId {
         self.root
+    }
+
+    /// Group the root's tokens by the first byte `first` gives each.
+    pub fn with_leads(mut self, first: impl Fn(TokenId) -> Option<u8>) -> Self {
+        for token in self.frontier(self.root) {
+            let Some(byte) = first(token) else {
+                continue;
+            };
+            match self.leads.iter_mut().find(|(b, _)| *b == byte) {
+                Some((_, tokens)) => tokens.push(token),
+                None => self.leads.push((byte, vec![token])),
+            }
+        }
+        self
+    }
+
+    /// The root tokens that continue what `rest` began: those of the first
+    /// byte of `rest` that opens any way out. `None` when no byte does.
+    pub fn led_by(&self, rest: &[u8]) -> Option<&[TokenId]> {
+        rest.iter().find_map(|byte| {
+            self.leads
+                .iter()
+                .find(|(b, _)| b == byte)
+                .map(|(_, tokens)| tokens.as_slice())
+        })
     }
 
     /// The allowed token set at `pos` — the sorted edge and spill tokens.

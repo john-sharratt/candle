@@ -25,7 +25,7 @@ questions:
 - delete the remote log file, not the local one
 - erase that path on the SFTP server
 category: Remote filesystem
-description: Remove a file on a remote host's filesystem over SFTP. For the local session VFS use file_delete instead.
+description: Remove a file on a remote host's filesystem over SFTP. For the local session VFS use file_delete instead. There is no undo on the remote host, so name the exact path you listed with remote_fs_session_list_dir.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

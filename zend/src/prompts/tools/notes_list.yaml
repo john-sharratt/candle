@@ -25,7 +25,7 @@ questions:
 - list note keys and their tags
 - what have I written notes about
 category: Notes
-description: Browse stored notes by key prefix or tag, returning each note's key, tags, and timestamps — metadata only, not the body text. Use to discover which notes exist before reading one.
+description: Browse stored notes by key prefix or tag, returning each note's key, tags, and timestamps — metadata only, not the body text. Use to discover which notes exist before reading one. To find a note by what it says use notes_search, and to read its body use notes_read. Files in a repository are listed by file_list, never here.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

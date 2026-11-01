@@ -25,7 +25,7 @@ questions:
 - generate a memory-hard key from this secret and salt
 - what's the argon2 hash of this password
 category: Cryptography
-description: Stretch a low-entropy password into a cryptographic key with a slow, memory-hard KDF — argon2id, pbkdf2_sha256, or scrypt. Use for password hashing and brute-force-resistant key derivation.
+description: Stretch a low-entropy password into a cryptographic key with a slow, memory-hard KDF — argon2id, pbkdf2_sha256, or scrypt. Use for password hashing and brute-force-resistant key derivation. It is deliberately slow, so it is the wrong tool for fingerprinting data, which is hash_compute, or for keys from material that is already random, which is hkdf_extract.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

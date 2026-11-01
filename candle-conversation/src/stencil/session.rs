@@ -113,6 +113,11 @@ pub struct StencilSession {
     /// Where the current span's value stands against its rule; `None` when it
     /// has none, or a token left the rule and the rest of the value is free.
     value: Option<ValueState>,
+    /// What the token that closed a span said past the close, which is not
+    /// committed but is the model's decision: `",` means another element and
+    /// `"]` the end of the array. The next branch offers only what continues
+    /// it, because a model asked again from a bare quote answers differently.
+    carried: Vec<u8>,
 }
 
 impl StencilSession {
@@ -125,6 +130,7 @@ impl StencilSession {
             pushback: None,
             rewrite: None,
             value: None,
+            carried: Vec::new(),
         }
     }
 
@@ -224,11 +230,16 @@ impl StencilSession {
                 }
                 StencilNode::Branch { trie } => {
                     let pos = trie.root();
-                    let set = AllowedSet::from_tokens(trie.frontier(pos));
+                    let set = AllowedSet::from_tokens(match trie.led_by(&self.carried) {
+                        Some(tokens) => tokens.to_vec(),
+                        None => trie.frontier(pos),
+                    });
+                    self.carried.clear();
                     self.cursor = Cursor::InBranch { node, pos };
                     StencilAction::MaskedDecode(set)
                 }
                 StencilNode::FreeText(span) => {
+                    self.carried.clear();
                     self.value = Self::value_start(span);
                     let action = Self::span_action(span, 0, self.value);
                     self.cursor = Cursor::InFreeText {
@@ -546,6 +557,7 @@ impl StencilSession {
         match term.feed(bytes) {
             Feed::Close { consumed } => {
                 self.cursor = Cursor::At(span.next);
+                self.carried = bytes[consumed..].to_vec();
                 // A lookahead terminator's delimiter belongs to the next node.
                 // When it is its own token (consumed == 0, the byte-level /
                 // clean case), push it back so the next node consumes it
@@ -556,6 +568,7 @@ impl StencilSession {
                     if !self.continues_with(span.next, token) {
                         return Observe::DelimiterDropped;
                     }
+                    self.carried.clear();
                     self.pushback = Some(token);
                 }
                 Observe::SpanClosed {

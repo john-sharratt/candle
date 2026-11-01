@@ -25,7 +25,7 @@ questions:
 - produce a sha3_256 digest of the message below
 - what does this hash to under sha256
 category: Security utilities
-description: Compute a one-shot cryptographic digest — a fixed-size fingerprint — of data, using sha256, sha512, sha1, md5, sha3_256, sha3_512, or blake3. Returns the digest as hex or base64 for content fingerprinting and integrity checks.
+description: Compute a one-shot cryptographic digest — a fixed-size fingerprint — of data, using sha256, sha512, sha1, md5, sha3_256, sha3_512, or blake3. Returns the digest as hex or base64 for content fingerprinting and integrity checks. It hashes the data you pass as text, not a file by its path. To name which algorithm produced a digest use hash_scan, and for a keyed tag use hmac_compute.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:
