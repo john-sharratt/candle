@@ -11,7 +11,7 @@ pub mod finding;
 
 use agent::client::Agents;
 use agent::wire::BridgeCall;
-use house_bridge::work::profile_act;
+use effector_bridge::work::profile_act;
 use npc_map::part::PartLink;
 use npc_map::schema::Where;
 use serde_json::{Map, Value};

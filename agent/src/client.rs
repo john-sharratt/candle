@@ -657,7 +657,7 @@ fn refused(e: JobError) -> AgentError {
 /// Run a bridge call on this process's own library — a daemon cut off from
 /// every cluster, whose house is reached through the agent in its own process.
 async fn bridge_in_process(call: &BridgeCall) -> Bridged {
-    let nets = house_bridge::nets();
+    let nets = effector_bridge::nets();
     let worked = match call {
         BridgeCall::Work {
             profile,
@@ -665,8 +665,8 @@ async fn bridge_in_process(call: &BridgeCall) -> Bridged {
             address,
             action,
             args,
-        } => house_bridge::work(profile, name, address, action, args, &nets).await,
-        BridgeCall::Wake { name, mac } => house_bridge::wake(name, mac, &nets),
+        } => effector_bridge::work(profile, name, address, action, args, &nets).await,
+        BridgeCall::Wake { name, mac } => effector_bridge::wake(name, mac, &nets),
     };
     match worked {
         Ok(line) => Bridged { ok: true, line },

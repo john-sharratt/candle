@@ -455,6 +455,19 @@ every round at no cost. The journal already works this way for its own
 conversation (`docs/zend_journal.md` §4); inheritance extends it down the
 lineage (`zend/src/mcp/lineage.rs`).
 
+**A worker carries the document of its kind.** `repo_task_start` takes a `role`
+(`coder` by default, `researcher`, `reviewer`) and a part takes its worker's.
+The kind selects an option of the `role` selector in `projection.yaml`. Every
+option is pre-sealed at startup and read back by its hash, as a tool's section
+is, so the document is in the system prompt from the worker's first round and
+no conversation prefills it. `generic`, the default, emits nothing: a
+conversation that is no worker carries the prompt it always did. The selector is
+a tree of its own, so a role adds one sealed section and multiplies no dial. An
+option stays short, at most 2,000 characters, and holds working rules only:
+turns sealed under it are borrowed into dialogues, and a worked exchange there
+would hijack them. Editing one is a commit and a zend release. The aggregator's
+guides (`docs/mcp_guides.md`) are the caller's and do not reach a worker.
+
 **A conversation carries its ancestors' journals.** The lineage runs project →
 thread → worker → part: `P:candle`, `T:review-layers`,
 `T:review-layers/verify-expiry`, `T:review-layers/verify-expiry/check-plan`.

@@ -365,6 +365,169 @@ pub const RECEIVER_DIM: Tool = Tool {
     }],
 };
 
+/// A Cast act that names only its device.
+macro_rules! cast {
+    ($name:literal, $desc:literal, $situation:literal, $because:literal) => {
+        Tool {
+            name: $name,
+            at: &[],
+            category: "House",
+            plane: Plane::World,
+            availability: Availability::Embodied,
+            description: $desc,
+            params: &[Param {
+                name: "device",
+                ty: "string",
+                required: true,
+                description: "The Cast device here — a TV or a speaker — by name.",
+            }],
+            examples: &[Example {
+                situation: $situation,
+                call: r#"{"device":"the TV"}"#,
+                because: $because,
+            }],
+        }
+    };
+}
+
+pub const CAST_STATUS: Tool = cast!(
+    "cast_status",
+    "Read what the Cast device here — a TV or speaker — is doing: what app is on, what is playing, how loud.",
+    "You want to know whether anything is on the TV, and what.",
+    "What is on the device is in the device, not in anybody's guess."
+);
+
+pub const CAST_PLAYING: Tool = cast!(
+    "cast_playing",
+    "Read what the Cast device here is playing: the title, who by, and whether it is playing or paused.",
+    "The room wants to know what is on the TV right now.",
+    "What is playing is in the device, not in anybody's guess."
+);
+
+pub const CAST_PLAY: Tool = cast!(
+    "cast_play",
+    "Resume play on the Cast device here, where it was paused.",
+    "The show was paused and the room is ready to go on.",
+    "The device holds where it was; starting it is the whole act."
+);
+
+pub const CAST_PAUSE: Tool = cast!(
+    "cast_pause",
+    "Pause whatever the Cast device here is playing.",
+    "Somebody needs the room quiet and the TV is mid-show.",
+    "Paused, it picks up where it was."
+);
+
+pub const CAST_STOP: Tool = cast!(
+    "cast_stop",
+    "Stop whatever the Cast device here is playing.",
+    "The show is over and the room wants it off.",
+    "Stopping is a single act the device does."
+);
+
+pub const CAST_MUTE: Tool = cast!(
+    "cast_mute",
+    "Mute the Cast device here, so its sound stops at once.",
+    "The phone is ringing and the TV needs to be quiet this moment.",
+    "Muting stops the sound and keeps the place, so unmuting brings it back."
+);
+
+pub const CAST_UNMUTE: Tool = cast!(
+    "cast_unmute",
+    "Unmute the Cast device here, bringing its sound back.",
+    "The call is over and the room wants the TV's sound back.",
+    "The device is muted; unmuting is the act that undoes it."
+);
+
+pub const CAST_VOLUME: Tool = Tool {
+    name: "cast_volume",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Set how loud the Cast device here plays, from 0 (silent) to 100 (as loud as it goes).",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The Cast device here — a TV or a speaker — by name.",
+        },
+        Param {
+            name: "volume",
+            ty: "integer",
+            required: true,
+            description: "How loud, from 0 to 100.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The TV is louder than the room needs.",
+        call: r#"{"device":"the TV","volume":25}"#,
+        because: "Loudness is a number the device holds; set it, do not ask somebody to.",
+    }],
+};
+
+pub const CAST_CAST: Tool = Tool {
+    name: "cast_cast",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Cast a video or audio stream to the Cast device here by its URL and start it playing — \
+         put something on from nothing.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The Cast device here — a TV or a speaker — by name.",
+        },
+        Param {
+            name: "url",
+            ty: "string",
+            required: true,
+            description: "The media URL to cast — an MP4, an MP3, an HLS (.m3u8) stream, and the like.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The room asked to put a clip on the TV and gave its address.",
+        call: r#"{"device":"the TV","url":"http://192.168.0.5/clip.mp4"}"#,
+        because: "A stopped device plays nothing until it is given something; casting the URL is what starts it.",
+    }],
+};
+
+pub const CAST_LAUNCH: Tool = Tool {
+    name: "cast_launch",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Open an app on the Cast device here — YouTube, Netflix, Spotify, and the like — so the \
+         room can use it.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The Cast device here — a TV or a speaker — by name.",
+        },
+        Param {
+            name: "app",
+            ty: "string",
+            required: true,
+            description: "The app to open, e.g. youtube, netflix, spotify.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The room wants YouTube up on the TV.",
+        call: r#"{"device":"the TV","app":"youtube"}"#,
+        because: "Opening the app is the device's to do; name the one the room wants.",
+    }],
+};
+
 pub const WAKE_DEVICE: Tool = Tool {
     name: "wake_device",
     at: &[],
@@ -409,6 +572,16 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     RECEIVER_NEXT,
     RECEIVER_PREVIOUS,
     RECEIVER_PLAYING,
+    CAST_STATUS,
+    CAST_PLAYING,
+    CAST_PLAY,
+    CAST_PAUSE,
+    CAST_STOP,
+    CAST_MUTE,
+    CAST_UNMUTE,
+    CAST_VOLUME,
+    CAST_CAST,
+    CAST_LAUNCH,
     WAKE_DEVICE,
 ];
 

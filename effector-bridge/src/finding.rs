@@ -97,7 +97,7 @@ pub fn reach(profile: &str) -> &'static str {
     match profile {
         SONOS => "the world can work it (Sonos)",
         RECEIVER => "the world can work it (an AV receiver)",
-        CAST => "the world can see it (a Cast device)",
+        CAST => "the world can work it (a Cast device)",
         RENDERER => "the world can see it (a media player)",
         GATEWAY => "the world can see it (the router)",
         AIRPLAY => "the world can see it (AirPlay)",
@@ -110,7 +110,7 @@ pub fn reach(profile: &str) -> &'static str {
 /// Whether a part linked with `profile` has acts the world can take at it —
 /// what makes it a terminal rather than a thing merely seen.
 pub fn workable(profile: &str) -> bool {
-    matches!(profile, SONOS | RECEIVER)
+    matches!(profile, SONOS | RECEIVER | CAST)
 }
 
 /// The profile that reaches a device saying what `f` says.
@@ -240,10 +240,10 @@ mod tests {
 
     #[test]
     fn only_a_workable_profile_is_a_terminal() {
-        for p in [SONOS, RECEIVER] {
+        for p in [SONOS, RECEIVER, CAST] {
             assert!(workable(p), "{p} should be workable");
         }
-        for p in [CAST, RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {
+        for p in [RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {
             assert!(!workable(p), "{p} should be see-only");
         }
     }

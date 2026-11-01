@@ -1,4 +1,4 @@
-//! `repo_task_start {thread, name, prompt, priority?, effort?, wait_s?}`: start a
+//! `repo_task_start {thread, name, prompt, role?, priority?, effort?, wait_s?}`: start a
 //! task on a new worker, and wait for it up to `wait_s`
 //! (`docs/claude_zend_gateway.md` §3.2, §3.3, §3.4).
 
@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use super::wait::answer_for;
 use super::{string, wait_secs, Answer, Ctx};
+use crate::mcp::roles::WorkerKind;
 use crate::mcp::threads::{Effort, Priority};
 use crate::mcp::workers;
 
@@ -31,6 +32,7 @@ pub fn definition() -> Value {
                 "thread": {"type": "string", "description": "The thread the task belongs to; created on first use."},
                 "name": {"type": "string", "description": "The worker's name: a kebab-case slug of at most 40 characters saying what it does."},
                 "prompt": {"type": "string", "description": "The task, stated in full."},
+                "role": {"type": "string", "enum": ["coder", "researcher", "reviewer"], "description": "The kind of work it does, which puts that kind's working rules in its system prompt: `coder` by default, for changing code; `researcher` to answer a question from evidence; `reviewer` to read a change and report what is wrong with it."},
                 "priority": {"type": "string", "enum": ["normal", "high"], "description": "How soon its turns decode — scheduling only, not how hard it thinks: today both decode at the top band beside a live dialogue, since someone is waiting on the task; `normal` is the default."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard it thinks (`deep` by default). `exhaustive` for work that must weigh many sources or results against each other — research that reconciles what it fetched, a review that cross-checks findings — where catching a contradiction takes thought; `balanced` for routine, mechanical tasks."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (45 by default)."}
@@ -58,13 +60,17 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(e) => e,
         Err(e) => return Answer::error(e),
     };
+    let kind = match WorkerKind::of(args.get("role").and_then(Value::as_str)) {
+        Ok(k) => k,
+        Err(e) => return Answer::error(e),
+    };
     let worker = match workers::start(
         &ctx.session,
         &ctx.caller,
         thread,
         name,
         prompt,
-        (priority, effort),
+        (priority, effort, kind),
     ) {
         Ok(w) => w,
         Err(e) => return Answer::error(e),

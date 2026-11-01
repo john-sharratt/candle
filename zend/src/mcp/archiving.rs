@@ -454,6 +454,7 @@ mod tests {
             role: Role::User,
             priority: Default::default(),
             effort: Default::default(),
+            kind: Default::default(),
             started_ms: at,
             turn_ms: at,
             beat_ms: at,
