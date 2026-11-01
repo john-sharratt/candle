@@ -74,7 +74,8 @@ impl Registry {
 
     /// Every card as the plan reads it (§4.4): its latency units in flight,
     /// the bulk work its members report outstanding, and its npcd members —
-    /// each eligible to host only while it may be routed to (rule 1).
+    /// each eligible to host only while it may be routed to and nothing in its
+    /// process still loads (rule 1, [`MemberView::may_host`]).
     pub fn card_views(&self) -> Vec<CardView> {
         let loads = self.cards();
         let mut views: BTreeMap<CardKey, CardView> = BTreeMap::new();
@@ -92,7 +93,7 @@ impl Registry {
                 view.hosts.push(Host {
                     node: m.node,
                     weight: m.weight,
-                    eligible: m.routable(),
+                    eligible: m.may_host(),
                 });
             }
         }

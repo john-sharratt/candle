@@ -1018,9 +1018,27 @@ impl OptionalState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionState {
     chosen: HashMap<String, Vec<String>>,
+    /// Sealed sections to project right after a catalog summary, by summary.
+    summary_notes: HashMap<SectionId, Vec<SectionId>>,
 }
 
 impl SelectionState {
+    /// Project `notes`, sealed sections, right after the catalog summary
+    /// `summary`, where a turn reads what the listing means for it now.
+    /// Replaces any earlier notes on it.
+    pub fn note_summary(&mut self, summary: SectionId, notes: Vec<SectionId>) -> &mut Self {
+        self.summary_notes.insert(summary, notes);
+        self
+    }
+
+    /// The notes to project after `summary`.
+    fn summary_notes(&self, summary: SectionId) -> &[SectionId] {
+        self.summary_notes
+            .get(&summary)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// An empty selection — every selector falls back to its authored default.
     pub fn new() -> Self {
         Self::default()
@@ -2232,6 +2250,25 @@ pub fn run_with_sink<R: ContentResolver>(
 /// A [`SectionSchema`] with `depends_on = Some(cid)` only emits if the
 /// named collection materialised ≥ 1 section in this same emission pass.
 #[allow(clippy::too_many_arguments)]
+/// A catalog summary, then the notes the turn set on it that are sealed.
+fn emit_summary<R: ContentResolver>(
+    out: &mut Vec<ProjectionSegment>,
+    summary: SectionId,
+    resolver: &R,
+    selection_state: &SelectionState,
+) {
+    let notes = selection_state
+        .summary_notes(summary)
+        .iter()
+        .copied()
+        .filter(|&id| resolver.section_token_count(id) > 0);
+    for id in std::iter::once(summary).chain(notes) {
+        out.push(ProjectionSegment::Sealed(SealedKind::Section(
+            ResolvedSection { id },
+        )));
+    }
+}
+
 fn emit_system_prompt_items<R: ContentResolver>(
     sp: &SystemPromptSchema,
     resolver: &R,
@@ -2369,9 +2406,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                     if s.is_template {
                         if let Some(cid) = s.depends_on {
                             if let Some(sum_id) = pending_summaries.remove(&cid) {
-                                out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                                    ResolvedSection { id: sum_id },
-                                )));
+                                emit_summary(&mut out, sum_id, resolver, selection_state);
                             }
                         }
                     }
@@ -2385,9 +2420,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                     // before. (When the collection IS wrapped — e.g. `<tools>` —
                     // the open template already drained and emitted it outside.)
                     if let Some(sum_id) = pending_summaries.remove(&coll.id) {
-                        out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                            ResolvedSection { id: sum_id },
-                        )));
+                        emit_summary(&mut out, sum_id, resolver, selection_state);
                     }
                     out.extend(selected);
                 }
@@ -2432,9 +2465,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                         }
                         if let Some(selected) = collection_results.remove(&tc.collection.id) {
                             if let Some(sum_id) = pending_summaries.remove(&tc.collection.id) {
-                                out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                                    ResolvedSection { id: sum_id },
-                                )));
+                                emit_summary(&mut out, sum_id, resolver, selection_state);
                             }
                             out.extend(selected);
                         }

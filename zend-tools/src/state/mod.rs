@@ -31,4 +31,4 @@ pub use credentials::CredentialStore;
 pub use hash_state::HashStateStore;
 pub use notes::NotesStore;
 pub use secrets::{Secrets, SecretsError};
-pub use sessions::SessionRegistry;
+pub use sessions::{OpenSessions, SessionRegistry};

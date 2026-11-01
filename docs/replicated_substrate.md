@@ -2850,12 +2850,10 @@ them as §6.3 says. Every route to a missing record ends at the one member certa
 hold it, its origin, for as long as that origin exists.
 
 **A member is ready** once its admission catch-up's last `FETCH` has ended in `DONE`
-with nothing missing, **and every tenant in its process has loaded** — for every one of
-its apps alike (`host::cluster::readiness`). The tenants share one engine and a tenant's
-load ends with forwards of its own (zend primes), so a member ready for npcd while zend
-still loads is lent a share of the cast whose turns starve zend's priming; not ready, it
-is lent no characters and sent no requests, and the cast runs on the members that are.
-It tells every cluster in `CAPACITY.state`. A gateway routes only
+with nothing missing. It tells every cluster in `CAPACITY.state`. A ready member with
+another tenant of its process still loading says so in `CAPACITY.process_loading`, and
+is lent no characters (`docs/cooperative_admission.md` §4.4) while it otherwise serves
+as ready. A gateway routes only
 to ready members, and the first ready member of an app is what switches that app to
 clustered mode there (§5.7). A member that is alone is ready on admission. A member in
 fault mode is not ready (§7.7), and the last one going into fault mode reverts the app to

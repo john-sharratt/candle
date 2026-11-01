@@ -91,6 +91,12 @@ pub struct Capacity {
     /// running — which the gateway's plan moves movable work off the card for
     /// (`docs/cooperative_admission.md` §4.4). Zero for every other member.
     pub bulk_backlog: u32,
+    /// A tenant in its process is still loading — zend priming, say — while
+    /// this app's own may be ready. The plan lends such a member no characters
+    /// (`docs/cooperative_admission.md` §4.4): their turns would take the
+    /// shared engine from the load. Everything else about it is as `state`
+    /// says.
+    pub process_loading: bool,
 }
 
 /// The rows beyond its decodes at which a member states its wide figures
@@ -123,7 +129,8 @@ impl Capacity {
             .u32(self.reply_tokens)
             .u32(self.tokens_per_step_milli)
             .u32(self.guest_reach)
-            .u32(self.bulk_backlog);
+            .u32(self.bulk_backlog)
+            .bool(self.process_loading);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -151,6 +158,7 @@ impl Capacity {
             tokens_per_step_milli: r.u32()?,
             guest_reach: r.u32()?,
             bulk_backlog: r.u32()?,
+            process_loading: r.bool()?,
         })
     }
 

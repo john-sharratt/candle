@@ -11,7 +11,7 @@
 //! | [`listener`] | the own listener: forward up when joined, serve when cut off (§5.8) |
 //! | [`sticky`] | claiming a sticky key before serving it (§5.4) |
 //! | [`capacity`] | what `CAPACITY` reports (§5.3) |
-//! | [`readiness`] | whether this member is ready for its apps: every tenant loaded |
+//! | [`readiness`] | each app's tenant ready, and whether any tenant in the process still loads |
 //! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
@@ -64,7 +64,7 @@ use candle_conversation::guest::reach;
 use candle_conversation::phase_ring::{latest_wave, learned_rates, rates_read_every};
 use cluster::card;
 use cluster::dispatch::RouteTable;
-use cluster::frame::{BuildId, ModelId, RepoAd};
+use cluster::frame::{BuildId, Capacity, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
 use cluster::member::{AppMember, ClusterView, Identity, Link, CAPACITY_EVERY};
@@ -190,6 +190,9 @@ pub struct AppLink {
     routes: OnceLock<RouteTable>,
     /// Whether the tenant has finished loading — `CAPACITY`'s state.
     ready: AtomicBool,
+    /// Whether any tenant in the process is still loading —
+    /// `CAPACITY.process_loading` ([`readiness`]).
+    process_loading: AtomicBool,
     member: OnceLock<Arc<AppMember>>,
     /// The `oseq` of the last record the tenant's substrate wrote, for
     /// `UNCLAIM`'s `through`.
@@ -276,6 +279,7 @@ impl Cluster {
                             app,
                             routes: OnceLock::new(),
                             ready: AtomicBool::new(false),
+                            process_loading: AtomicBool::new(true),
                             member: OnceLock::new(),
                             own_oseq: OnceLock::new(),
                             repos: OnceLock::new(),
@@ -389,15 +393,18 @@ impl Cluster {
                     tokens_per_step: r.tokens_per_step,
                     high_backlog_tokens: r.high_backlog_tokens,
                 });
-                capacity(
-                    state,
-                    telemetry.capacity(),
-                    wave,
-                    rates,
-                    measure(),
-                    reach::stated(),
-                    ready.bulk.get().map_or(0, |bulk| bulk()),
-                )
+                Capacity {
+                    process_loading: ready.process_loading.load(Ordering::Relaxed),
+                    ..capacity(
+                        state,
+                        telemetry.capacity(),
+                        wave,
+                        rates,
+                        measure(),
+                        reach::stated(),
+                        ready.bulk.get().map_or(0, |bulk| bulk()),
+                    )
+                }
             }),
             replication,
             Instant::now(),
@@ -566,6 +573,17 @@ impl AppLink {
     pub fn set_ready(&self, ready: bool) {
         let was = self.ready.swap(ready, Ordering::Relaxed);
         if was != ready {
+            if let Some(m) = self.member.get() {
+                m.capacity_changed();
+            }
+        }
+    }
+
+    /// A tenant in the process is still loading, or none is: `CAPACITY` says
+    /// so at once, and the plan lends characters by it.
+    pub fn set_process_loading(&self, loading: bool) {
+        let was = self.process_loading.swap(loading, Ordering::Relaxed);
+        if was != loading {
             if let Some(m) = self.member.get() {
                 m.capacity_changed();
             }

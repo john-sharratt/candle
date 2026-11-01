@@ -87,13 +87,20 @@ pub enum Reserved {
     /// distinct system prompt's frame sections live in a partition of their own
     /// (see [`super::Builder::for_reserved_corpus`]).
     Passthrough,
+    /// One line saying a tool cannot be used yet, by its index in the daemon's
+    /// rules. Sealed at startup beside the tool summary and projected after it
+    /// on a round where the rule holds ([`super::SelectionState::note_summary`]).
+    ToolUnavailable(u8),
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 6;
+    pub const COUNT: u32 = 6 + Self::TOOL_UNAVAILABLE_SLOTS;
+
+    /// Slots held for [`Reserved::ToolUnavailable`].
+    pub const TOOL_UNAVAILABLE_SLOTS: u32 = 32;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -105,6 +112,7 @@ impl Reserved {
             Reserved::Calibration => 3,
             Reserved::Prose => 4,
             Reserved::Passthrough => 5,
+            Reserved::ToolUnavailable(rule) => 6 + rule as u32,
         }
     }
 
