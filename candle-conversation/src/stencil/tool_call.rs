@@ -113,6 +113,7 @@ pub struct Param {
     /// `string`: the most tokens the value may run to before the grammar closes
     /// it — the schema's `maxLength`, counted in tokens. Bounds the value below
     /// the envelope's [`ToolCallEnvelope::max_string_tokens`], never above it.
+    /// `integer`: the digits of the schema's `maximum`.
     #[serde(default)]
     pub max_tokens: Option<u32>,
     /// A required enum field: the fields of the same object each value
@@ -476,11 +477,19 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         properties,
         nullable,
         minimum: schema.get("minimum").and_then(Value::as_f64),
-        // Characters bound tokens from above: no token is shorter than one.
-        max_tokens: schema
-            .get("maxLength")
-            .and_then(Value::as_u64)
-            .map(|n| n.min(u32::MAX as u64) as u32),
+        // Characters bound tokens from above: no token is shorter than one. An
+        // integer's bound is its `maximum`'s digits: each is one token.
+        max_tokens: match ty {
+            ParamType::Integer => schema
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .filter(|m| *m >= 1.0)
+                .map(|m| (m.log10().floor() as u32) + 1),
+            _ => schema
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .map(|n| n.min(u32::MAX as u64) as u32),
+        },
         requires: Vec::new(),
         shapes: Vec::new(),
         pattern,
@@ -1700,8 +1709,13 @@ impl<'a> ToolTreeBuilder<'a> {
         let finished = self.choice(ends.clone());
         // Built back to front: after the last admitted digit only the end
         // remains, and each level before it offers one more digit or the end.
+        // A schema's `maximum` bounds the digits, so a value too long for it
+        // cannot be written; one of the right length past it is the tool's.
+        let digits = p
+            .max_tokens
+            .map_or(MAX_INTEGER_DIGITS, |d| (d as usize).min(MAX_INTEGER_DIGITS));
         let mut more = finished;
-        for _ in 1..MAX_INTEGER_DIGITS {
+        for _ in 1..digits {
             let mut arms: Vec<(String, SpecId)> =
                 DIGITS.iter().map(|d| (d.to_string(), more)).collect();
             arms.extend(ends.iter().cloned());
