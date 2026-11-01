@@ -434,6 +434,16 @@ impl Sim {
         }
     }
 
+    /// `message.to` once it has said how it goes — the conversations of
+    /// `kind` this character has: the people it talks to alone, or its
+    /// channels and groups. Empty without a handset.
+    pub fn threads_of_kind_for(&self, me: &str, body: &str, kind: phone::Kind) -> Vec<String> {
+        match self.has_phone(body) {
+            true => self.threads.names_of_kind_for(me, kind),
+            false => Vec::new(),
+        }
+    }
+
     /// `reply.to` — the conversations where somebody else spoke last, waiting
     /// on this character. Empty without a handset.
     pub fn awaiting_for(&self, me: &str, body: &str) -> Vec<String> {

@@ -25,7 +25,10 @@
 //! does not — a group's channel ([`groups`]), a DM's private thread
 //! ([`dms`]) — keeps each group's members in step, archives a group nobody
 //! remains on, reads what the channels missed, and names and pictures the
-//! bots.
+//! bots. It also takes in what the server has that the world does not: each
+//! channel a person made there is a channel of the world, with the
+//! description Discord gives it ([`rooms`]) — read again on the beat after
+//! Discord says a channel was made, changed or deleted.
 //!
 //! What was written there while no member ran the listener is read when it
 //! comes online ([`gap`]). Every other bot in the world's server drops its
@@ -41,14 +44,15 @@
 //! | [`members`] | who a thread's members are on Discord, and what a channel lets them do |
 //! | [`groups`] | the named groups as channels only their members see |
 //! | [`dms`] | a person's DM with a character without a bot, as a private thread |
-//! | [`backstage`] | a DM between two characters, read-only for their owners |
+//! | [`rooms`] | the channels people made in the server, as channels of the world |
 //! | [`reconcile`] | the five-minute pass: channels, members, gaps, bots |
 //! | [`speaker`] | who posts a message, and as whom |
 //! | [`outbound`] | what is said on a mirrored thread, posted to its channel |
 //! | [`inbound`] | a mirrored channel's message, heard in the world |
+//! | [`apply`] | `WorldOp::Mirrored`, made on the world's authority |
 //! | [`gap`] | what was written while no member ran the listener |
 
-pub mod backstage;
+pub mod apply;
 pub mod channels;
 pub mod dms;
 pub mod gap;
@@ -59,6 +63,7 @@ pub mod members;
 pub mod outbound;
 pub mod reconcile;
 pub mod record;
+pub mod rooms;
 pub mod routes;
 pub mod speaker;
 
@@ -108,8 +113,11 @@ pub async fn tick(a: &Arc<Authored>, online: &[Online]) {
             held(a, bot, hosted.id(), hold::after(&e));
             continue;
         }
+        let rooms_due = a.bots.rooms_due(hosted.id());
         if a.bots.reconcile_due(hosted.id(), reconcile::EVERY) {
             reconcile::run(a, bot, &hosted, &guild, &by_npc).await;
+        } else if rooms_due {
+            rooms::reconcile(a, bot, &hosted, &guild).await;
         }
         match outbound::post(a, bot, &hosted, &guild, &by_npc).await {
             Some(wait) => held(a, bot, hosted.id(), wait),

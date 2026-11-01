@@ -1000,8 +1000,8 @@ async fn the_phone_lists_a_placed_bodys_threads() {
 
 /// **`OPTIONS /phone` lists the phone verbs and their raw body shapes.** One
 /// `POST` verb per phone act, each built from the act's own params — so it names
-/// exactly `message`/`invite`/`open_group`/`reach_out`, plus `sign_off`
-/// (addressed per-thread), and `message`'s body is the raw two-string object its
+/// exactly `message`/`reply`/`invite`/`open_group`/`reach_out`, plus `sign_off`
+/// (addressed per-thread), and `message`'s body is the raw object of strings its
 /// params declare (`acts.rs` `MESSAGE`). `send_image` is **not** advertised: it
 /// is performed above the body layer and is not routable through `body::perform`,
 /// so mounting it would be a route that only ever `500`s.
@@ -1018,20 +1018,32 @@ async fn the_phone_options_lists_its_verbs_and_their_shapes() {
     // minus `send_image`, which is deferred (performed above the body layer).
     assert_eq!(
         verbs(&body),
-        ["invite", "message", "open_group", "reach_out", "sign_off"],
+        [
+            "invite",
+            "message",
+            "open_group",
+            "reach_out",
+            "reply",
+            "sign_off"
+        ],
         "the schema is the phone acts' verbs: {body}"
     );
     assert!(
         !verbs(&body).contains(&"send_image".to_string()),
         "send_image must not be advertised — it is not routable through body::perform: {body}"
     );
-    // `message`'s body is raw, from its own params — two required strings.
+    // `message`'s body is raw, from its own params — how it goes and what are
+    // required, and to which one with it.
     assert_eq!(
         body["methods"]["POST"]["verbs"]["message"]["body"],
         json!({
             "type": "object",
-            "properties": { "to": { "type": "string" }, "intent": { "type": "string" } },
-            "required": ["to", "intent"]
+            "properties": {
+                "via": { "type": "string" },
+                "to": { "type": "string" },
+                "intent": { "type": "string" },
+            },
+            "required": ["via", "intent"]
         }),
         "{body}"
     );
@@ -1055,8 +1067,8 @@ async fn the_phone_options_lists_its_verbs_and_their_shapes() {
 
 /// **`POST /phone/message` runs the real act, and the world's own refusal comes
 /// back.** In the bare test daemon the body is on no thread, so `message`
-/// synthesised and run through the dispatch refuses — `s.threads.send` finds no
-/// conversation by that name — and that refusal is a `409` carrying the
+/// synthesised and run through the dispatch refuses — it finds no channel by
+/// that name — and that refusal is a `409` carrying the
 /// handler's own words, exactly as the act would answer reached any other way.
 #[tokio::test]
 async fn posting_a_phone_message_runs_the_real_act_and_carries_its_refusal() {
@@ -1069,7 +1081,9 @@ async fn posting_a_phone_message_runs_the_real_act_and_carries_its_refusal() {
         22,
         "POST",
         "/phone/message",
-        Some(json!({ "to": "the channel", "intent": "where each of you is working" })),
+        Some(json!({
+            "via": "channel", "to": "the channel", "intent": "where each of you is working",
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");

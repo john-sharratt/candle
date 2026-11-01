@@ -145,6 +145,7 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         building: String::new(),
         mission: None,
         journal: None,
+        channels: Vec::new(),
         mode: Mode::Physical,
     }
 }

@@ -203,14 +203,12 @@ export async function render(params, q) {
     };
     listener.onchange = fill;
     fill();
-    const backstage = h('input', { type: 'checkbox',
-      checked: guild ? guild.backstage : true, ...ro('creator', 'toggle') });
 
     const save = only('creator', () => h('button', { class: 'btn primary' }, guild ? 'Save' : 'Set the server'));
     if (save) save.onclick = async () => {
       try {
         await API.setWorldDiscord(w.world_id, {
-          guild_id: server.value.trim(), listener: listener.value, backstage: backstage.checked,
+          guild_id: server.value.trim(), listener: listener.value,
         });
         toast('the world’s server is set', 'ok');
         go('/world/' + w.world_id + '?tab=discord');
@@ -239,14 +237,13 @@ export async function render(params, q) {
         h('div', { class: 'tiny dim', style: 'max-width:88ch;margin-top:6px' },
           'With a server set, the world’s channel is #the-channel there, each group a channel only its '
           + 'members see, and a person’s DM with a character without a bot a private thread under #dms. '
-          + 'Characters with a bot speak as it; the rest speak through a webhook under their own names.'),
+          + 'A channel you make in the server is a channel of the world, the whole cast on it, and its '
+          + 'description tells the characters what it is for. Characters with a bot speak as it; the '
+          + 'rest speak through a webhook under their own names.'),
         h('div', { class: 'grid g2', style: 'margin-top:12px' },
           h('label', { class: 'field' }, h('span', {}, 'Listener — reads the server for the world'), listener),
           h('label', { class: 'field' }, h('span', {}, 'Server — one the listener’s bot is in'), server)),
         h('div', { class: 'row', style: 'margin-top:6px' }, invite),
-        h('label', { class: 'row', style: 'gap:9px;margin-top:10px;cursor:pointer' }, backstage,
-          h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Backstage'),
-            h('div', { class: 'tiny dim' }, 'mirror DMs between two characters, read-only, for their owners'))),
         h('div', { class: 'tiny dim', style: 'margin-top:10px;max-width:88ch' },
           'The listener needs Message Content Intent turned on under Bot in the Developer Portal. A bot '
           + 'added before its invite asked for Manage Channels and Manage Roles needs adding again with '

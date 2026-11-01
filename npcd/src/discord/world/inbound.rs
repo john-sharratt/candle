@@ -9,22 +9,22 @@
 //! 2. dropped if its channel mirrors no thread;
 //! 3. dropped if it is already in the world: at or below the channel's
 //!    `last_seen_discord`, or recorded as an origin on its thread;
-//! 4. dropped if it was written in a backstage thread, which its owners
-//!    read and nobody writes in;
-//! 5. dropped if its author is linked to no account; on the open channel, to
+//! 4. dropped if its author is linked to no account; on the open channel, to
 //!    one without the Creator role — the role the console's own route asks of
 //!    anyone speaking there (§3.2); on a group or a DM, to one not on it;
-//! 6. otherwise said as that person, with the Discord message as its origin:
-//!    on the open channel as the console's route says it, on a group's
-//!    thread, and in a DM as a message to its character
-//!    (`WorldOp::Message`), as a DM to a bot is.
+//! 5. otherwise said as that person, with the Discord message as its origin:
+//!    on the open channel as the console's route says it; on a group's
+//!    thread, or a channel a person made — whose author is brought onto it on
+//!    their first message — said to the character it mentions, answers or
+//!    names, so that character is told it urgently; and in a DM as a message
+//!    to its character (`WorldOp::Message`), as a DM to a bot is.
 //!
 //! The channel's `last_seen_discord` moves past every message judged past
 //! the first three steps, so the gap fetch reads none of them again.
 
 use std::sync::Arc;
 
-use super::members::character as character_of;
+use super::members::{bot_user, character as character_of};
 use super::record::Kind;
 use crate::accounts::public_id;
 use crate::api::{now_ms, Authored};
@@ -55,9 +55,6 @@ pub enum Heard {
     NotCreator,
     /// Its author is not on the group or DM it was written in.
     NotMember,
-    /// It was written in a mirror nobody on Discord writes in: a backstage
-    /// thread.
-    ReadOnly,
     /// It is in the world now, from this name, as message `seq` of thread
     /// `thread`.
     Applied {
@@ -79,7 +76,6 @@ impl Heard {
             Heard::Unlinked => "unlinked_dropped",
             Heard::NotCreator => "not_creator_dropped",
             Heard::NotMember => "not_member_dropped",
-            Heard::ReadOnly => "read_only_dropped",
             Heard::Applied { .. } => "applied",
             Heard::Unapplied => "unapplied",
         }
@@ -153,9 +149,6 @@ async fn speak(
     m: &DiscordMessage,
     origin: Origin,
 ) -> Heard {
-    if kind == Kind::Backstage {
-        return Heard::ReadOnly;
-    }
     let Some(account) = index::account_of(&a.npcs.substrate(), &m.author.id.to_string()) else {
         return Heard::Unlinked;
     };
@@ -189,9 +182,10 @@ async fn speak(
             text,
             origin: Some(origin),
         },
-        Kind::Group => WorldOp::Mirrored {
+        Kind::Group | Kind::Room => WorldOp::Mirrored {
             thread: thread.to_string(),
             from: from.clone(),
+            to: said_to(a, hosted, &members, m),
             text,
             origin,
         },
@@ -207,7 +201,6 @@ async fn speak(
                 origin: Some(origin),
             }
         }
-        Kind::Backstage => return Heard::ReadOnly,
     };
     let rt = a.runtime.as_ref().expect("a listener is the runtime's");
     if let Err(e) = rt.world_write(&bot.world, op).await {
@@ -222,4 +215,21 @@ async fn speak(
         thread: thread.to_string(),
         seq: 0,
     }
+}
+
+/// The character of `members` that `m` is said to: the first it mentions or
+/// answers by its bot, or calls by name.
+fn said_to(
+    a: &Authored,
+    hosted: &Hosted,
+    members: &[String],
+    m: &DiscordMessage,
+) -> Option<String> {
+    members
+        .iter()
+        .find(|name| {
+            character_of(a, hosted, name)
+                .is_some_and(|npc| m.addresses(bot_user(a, npc).unwrap_or_default(), name))
+        })
+        .cloned()
 }

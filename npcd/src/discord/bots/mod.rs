@@ -42,7 +42,7 @@
 mod tests;
 pub mod wanted;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,9 @@ pub struct Bots {
     /// When each world's server was last reconciled here. A world this
     /// member has just taken has none, so its first beat reconciles it.
     reconciled: StdMutex<HashMap<String, Instant>>,
+    /// The worlds whose server Discord said made, changed or deleted a
+    /// channel since the mirror last read its channels.
+    rooms_changed: StdMutex<HashSet<String>>,
     /// Each world's mirror held off after Discord refused it
     /// (`crate::discord::world::hold`): until when, and how many refusals
     /// in a row, which the next hold doubles for.
@@ -146,6 +149,7 @@ impl Bots {
             }),
             trace: Trace::default(),
             reconciled: StdMutex::new(HashMap::new()),
+            rooms_changed: StdMutex::new(HashSet::new()),
             mirror_held: StdMutex::new(HashMap::new()),
         }
     }
@@ -197,6 +201,21 @@ impl Bots {
             last.insert(world.to_string(), now);
         }
         due
+    }
+
+    /// Discord said a channel of world `world`'s server was made, changed or
+    /// deleted: its mirror reads the server's channels on its next beat.
+    pub fn rooms_changed(&self, world: &str) {
+        self.rooms_changed
+            .lock()
+            .expect("rooms lock")
+            .insert(world.to_string());
+    }
+
+    /// Whether world `world`'s server's channels are to be read again, taken
+    /// so: a reconcile reads them too.
+    pub fn rooms_due(&self, world: &str) -> bool {
+        self.rooms_changed.lock().expect("rooms lock").remove(world)
     }
 
     /// Forget when world `world` was last reconciled here: this member lost

@@ -87,13 +87,18 @@ pub enum WorldOp {
     /// The world's Discord server set, or taken away (`docs/npcd_discord.md`
     /// §4.4): its `discord/guild` record.
     Guild { guild: Option<Guild> },
-    /// A member of group thread `thread` wrote in the channel that mirrors
-    /// it in the world's server: said on the thread, from `origin`.
+    /// Somebody wrote in the channel of the world's server that mirrors
+    /// thread `thread` — a group they are on, or a channel a person made:
+    /// said on the thread, from `origin`, its author brought onto the thread
+    /// at its end on their first message there. `to` is the character it was
+    /// said to, when it mentions, answers or names one.
     Mirrored {
         thread: String,
         from: String,
         text: String,
         origin: Origin,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
     },
     /// Somebody wrote in Discord channel `channel` of a server character
     /// `npc`'s bot is in: said on the thread that mirrors it, its author

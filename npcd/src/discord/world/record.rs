@@ -4,9 +4,8 @@
 //! Records under the world, written by its authority with the world's other
 //! records each beat, and followed and reloaded with them:
 //!
-//! - `discord/guild` — the world's server, its name, the listener (the
-//!   character whose bot reads it) and whether character-to-character DMs are
-//!   mirrored under `#backstage`;
+//! - `discord/guild` — the world's server, its name and the listener (the
+//!   character whose bot reads it);
 //! - `discord/thread/<thid>` — a thread of the world mirrored into the server:
 //!   the Discord channel it is, what kind of conversation it is, how far it has
 //!   been posted there (`mirrored_through`, a
@@ -38,7 +37,7 @@ pub const THREAD_PREFIX: &str = "discord/thread/";
 pub const HOOK_PREFIX: &str = "discord/webhook/";
 
 /// Where the channels private threads are made under are among a world's
-/// records: `#dms` and `#backstage`, by name.
+/// records: `#dms`, by name.
 pub const PARENT_PREFIX: &str = "discord/parent/";
 
 /// A channel private threads are made under.
@@ -48,17 +47,15 @@ pub struct Parent {
     pub channel_id: u64,
 }
 
-/// A world's Discord server.
+/// A world's Discord server. Read past fields it does not name: the record
+/// is written whole from this on the authority's next beat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Guild {
     pub guild_id: u64,
     /// What the server is called, as Discord last said.
     pub name: String,
     /// The character whose bot reads the server's channels.
     pub listener: u64,
-    /// Whether DMs between two characters are mirrored for their owners.
-    pub backstage: bool,
 }
 
 /// What kind of conversation a mirrored thread is.
@@ -72,9 +69,9 @@ pub enum Kind {
     /// A person and a character without a bot of its own: a private thread
     /// under `#dms`.
     Dm,
-    /// Two characters: a private thread under `#backstage`, read by their
-    /// owners.
-    Backstage,
+    /// A channel a person made in the server: a channel of the world, with
+    /// the whole cast on it ([`super::rooms`]).
+    Room,
 }
 
 /// One thread of the world, mirrored into a channel of its server.
@@ -201,6 +198,25 @@ impl Mirror {
         self.parents.insert(name.to_string(), Parent { channel_id });
     }
 
+    /// Every channel private threads are made under, by name.
+    pub fn parents(&self) -> Vec<(String, u64)> {
+        self.parents
+            .iter()
+            .map(|(name, p)| (name.clone(), p.channel_id))
+            .collect()
+    }
+
+    /// Forget the channel called `name`: the server no longer has it, so the
+    /// next private thread under that name makes it again.
+    pub fn remove_parent(&mut self, name: &str) {
+        self.parents.remove(name);
+    }
+
+    /// Forget thread `thread`'s mirror: the channel it was posted in is gone.
+    pub fn remove_thread(&mut self, thread: &str) {
+        self.threads.remove(thread);
+    }
+
     /// Thread `thread`'s mirror.
     pub fn thread(&self, thread: &str) -> Option<Mirrored> {
         self.threads.get(thread).copied()
@@ -304,8 +320,46 @@ mod tests {
             guild_id,
             name: "Life".into(),
             listener: 42,
-            backstage: true,
         }
+    }
+
+    /// **A server record written with a field it no longer has still reads**
+    /// as the server, and is written back without it.
+    #[test]
+    fn a_server_record_reads_past_a_field_it_no_longer_has() {
+        let mut records = Records::new();
+        records.insert(
+            GUILD.to_string(),
+            json!({ "guild_id": 600, "name": "Life", "listener": 42, "backstage": true }),
+        );
+        let mut m = Mirror::default();
+        m.take_in(&records);
+        assert_eq!(m.guild(), Some(&guild(600)));
+        assert_eq!(
+            m.records().get(GUILD),
+            Some(&json!({ "guild_id": 600, "name": "Life", "listener": 42 }))
+        );
+    }
+
+    /// **A channel a person made is a `room`**, and a channel forgotten, or a
+    /// parent, is gone from the records.
+    #[test]
+    fn a_room_is_recorded_and_forgotten() {
+        let mut m = Mirror::default();
+        m.set_guild(Some(guild(600)));
+        m.put_thread("th9", Mirrored::new(7300, Kind::Room, 0, 5));
+        m.put_parent("dms", 7001);
+        assert_eq!(
+            m.records().get("discord/thread/th9"),
+            Some(
+                &json!({ "channel_id": 7300, "kind": "room", "mirrored_through": 0,
+                          "last_seen_discord": 5 })
+            )
+        );
+        assert_eq!(m.parents(), [("dms".to_string(), 7001)]);
+        m.remove_thread("th9");
+        m.remove_parent("dms");
+        assert_eq!(m.records().len(), 1);
     }
 
     fn mirrored(channel_id: u64) -> Mirrored {
@@ -352,7 +406,7 @@ mod tests {
             [
                 (
                     "discord/guild".to_string(),
-                    json!({ "guild_id": 600, "name": "Life", "listener": 42, "backstage": true })
+                    json!({ "guild_id": 600, "name": "Life", "listener": 42 })
                 ),
                 (
                     "discord/thread/th1".to_string(),

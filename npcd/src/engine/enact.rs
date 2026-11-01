@@ -27,11 +27,11 @@ use serde_json::{Map, Value};
 use crate::engine::act::Act;
 use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
-use crate::engine::tools::SELF;
+use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
 use crate::engine::whereabouts;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
-use crate::sim::phone::Threads;
+use crate::sim::phone::{Kind as ThreadKind, Threads};
 use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
 use crate::sim::Sim;
 use crate::world::Hosted;
@@ -103,8 +103,13 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "remind" => remind(hosted, body, a),
         "record_verdict" => record_verdict(hosted, body, a),
         // The same send on the thread named: what differs is the set the
-        // thread is named from (`tools::Choices::Awaiting`).
-        "message" | "reply" => message(hosted, body, a),
+        // thread is named from — of the kind `via` said for `message`, the
+        // ones waiting on the character for `reply` (`tools::Choices`).
+        "message" => match via(a) {
+            Ok(kind) => message(hosted, body, a, Some(kind)),
+            Err(refused) => refused,
+        },
+        "reply" => message(hosted, body, a, None),
         "invite" => invite(hosted, body, a),
         "open_group" => open_group(hosted, body, a),
         "sign_off" => sign_off(hosted, body, a),
@@ -965,14 +970,45 @@ fn record_verdict(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Out
 // character is standing, at a time that is not necessarily now. That is the
 // whole difference from `tell`, and it is why they are separate acts.
 
-fn message(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+/// The kind of conversation a `message`'s `via` names.
+fn via(args: &Map<String, Value>) -> Result<ThreadKind, Outcome> {
+    match text(args, "via").as_deref() {
+        Some(PRIVATE) => Ok(ThreadKind::Direct),
+        Some(CHANNEL_WAY) => Ok(ThreadKind::Group),
+        _ => Err(Outcome::Refused(format!(
+            "You meant to send something, but not whether `{PRIVATE}`, to one person, or on a \
+             `{CHANNEL_WAY}`."
+        ))),
+    }
+}
+
+/// Send `intent` on the conversation `to`, one of `kind` when it is said.
+fn message(
+    hosted: &Hosted,
+    body: &str,
+    args: &Map<String, Value>,
+    kind: Option<ThreadKind>,
+) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to send something, but not to which conversation, or not what.".into(),
         );
     };
     let me = my_name(hosted, body);
-    let sent = hosted.with_sim(|s| s.threads.send(&me, &to, &intent));
+    let sent = hosted.with_sim(|s| match kind {
+        None => s.threads.send(&me, &to, &intent),
+        Some(kind) => {
+            let Some(id) = s.threads.by_kind_for(&me, kind, &to).map(|t| t.id.clone()) else {
+                return Err(match kind {
+                    ThreadKind::Direct => format!("You have no conversation with {to} alone."),
+                    ThreadKind::Group => {
+                        format!("You have no conversation called {to} among your channels.")
+                    }
+                });
+            };
+            s.threads.send_on(&id, &me, &intent, None)
+        }
+    });
     match sent {
         Ok(reached) => {
             // **Answering by handset is answering.** The obligation a question

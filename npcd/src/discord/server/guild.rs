@@ -17,8 +17,13 @@
 //!   to the character, closes the server's threads, and forgets the server.
 //!   Its channels' records stay, so a bot added back takes its threads up
 //!   again.
-//! - **A rename** of a server or a channel renames the threads; a channel
+//! - **A rename** of a server or a channel renames the threads, and a
+//!   channel's description changed describes its thread again; a channel
 //!   made is stood up, and one deleted is closed and forgotten.
+//! - **In the world's server** none of this stands a thread up: its channels
+//!   are the world's ([`crate::discord::world::rooms`]), and a channel made,
+//!   changed or deleted there has the mirror read them again on its next
+//!   beat.
 
 use std::collections::HashSet;
 
@@ -30,7 +35,7 @@ use crate::discord::gateway::guild::{Guild, GuildChannel};
 use crate::discord::online::Online;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
-use crate::discord::world::is_world_server;
+use crate::discord::world::{is_world_server, listened};
 use crate::world::Hosted;
 
 /// Server `g`, as a `GUILD_CREATE` hands it to `bot`.
@@ -60,6 +65,7 @@ pub async fn learned(a: &Authored, bot: &Online, g: &Guild) {
         for (channel_id, _) in hosted.servers(|s| s.channels_in(npc, g.id)) {
             gone(&hosted, npc, channel_id);
         }
+        a.bots.rooms_changed(hosted.id());
         note(
             a,
             npc,
@@ -69,7 +75,7 @@ pub async fn learned(a: &Authored, bot: &Online, g: &Guild) {
     }
     let text: Vec<&GuildChannel> = g.text_channels().collect();
     for c in &text {
-        thread::stand(&hosted, npc, &character, g.id, &g.name, c.id, &c.name);
+        thread::stand(&hosted, npc, &character, standing(g.id, &g.name, c));
     }
     let standing: HashSet<u64> = text.iter().map(|c| c.id).collect();
     for (channel_id, _) in hosted.servers(|s| s.channels_in(npc, g.id)) {
@@ -159,6 +165,9 @@ pub fn channel(a: &Authored, bot: &Online, c: &GuildChannel) {
         return;
     };
     if is_world_server(a, bot, guild_id) {
+        if listened(a, bot).is_some() {
+            a.bots.rooms_changed(&bot.world);
+        }
         return;
     }
     let Some((hosted, character)) = embodied(a, bot) else {
@@ -171,19 +180,33 @@ pub fn channel(a: &Authored, bot: &Online, c: &GuildChannel) {
         &hosted,
         bot.npc,
         &character,
-        guild_id,
-        &server.name,
-        c.id,
-        &c.name,
+        standing(guild_id, &server.name, c),
     );
 }
 
-/// Channel `channel_id` of one of `bot`'s servers was deleted.
+/// Channel `channel_id` of one of `bot`'s servers was deleted. Discord does
+/// not say which server; for the listener of a world's server it may have
+/// been one of the world's, so the mirror reads them again.
 pub fn channel_gone(a: &Authored, bot: &Online, channel_id: u64) {
+    if listened(a, bot).is_some() {
+        a.bots.rooms_changed(&bot.world);
+    }
     let Some((hosted, _)) = embodied(a, bot) else {
         return;
     };
     gone(&hosted, bot.npc, channel_id);
+}
+
+/// Channel `c` of server `guild_id`, called `server`, as a thread stands it
+/// up.
+fn standing<'a>(guild_id: u64, server: &'a str, c: &'a GuildChannel) -> thread::Standing<'a> {
+    thread::Standing {
+        guild_id,
+        server,
+        channel_id: c.id,
+        channel: &c.name,
+        topic: c.topic.as_deref(),
+    }
 }
 
 /// A channel that no longer stands: its thread closed and its record

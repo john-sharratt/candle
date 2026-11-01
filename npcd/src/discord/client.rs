@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::discord::error::DiscordError;
+use crate::discord::gateway::guild::TEXT_TYPES;
 use crate::discord::limit::InvalidRequests;
 use crate::discord::message::{snowflake, DiscordMessage};
 
@@ -83,6 +84,18 @@ pub struct GuildChannel {
     /// Absent on a channel of a kind that has none.
     #[serde(default)]
     pub name: String,
+    /// What the channel is for, as its server describes it: `null` or absent
+    /// for one with no description.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+impl GuildChannel {
+    /// Whether it is a channel people write in: a text or an announcement
+    /// channel.
+    pub fn is_text(&self) -> bool {
+        TEXT_TYPES.contains(&self.kind)
+    }
 }
 
 /// One permission overwrite on a channel: whose it is — a role's, the
@@ -767,7 +780,8 @@ mod tests {
             Ok(vec![GuildChannel {
                 id: 610,
                 kind: 0,
-                name: "general".into()
+                name: "general".into(),
+                topic: None,
             }])
         );
         assert_eq!(

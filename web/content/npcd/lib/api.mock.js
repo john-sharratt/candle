@@ -732,8 +732,7 @@ export const MockAPI = {
       e.detail = e.message;
       throw e;
     }
-    mockWorldServers[w] = { guild_id: s.guild_id, name: 'Life', listener: s.listener,
-      backstage: s.backstage };
+    mockWorldServers[w] = { guild_id: s.guild_id, name: 'Life', listener: s.listener };
     return { guild: mockWorldServers[w] };
   },
   async clearWorldDiscord(w) { delete mockWorldServers[w]; return { guild: null }; },

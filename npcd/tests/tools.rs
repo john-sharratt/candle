@@ -27,6 +27,7 @@
 //! no clock and no randomness, so an assertion about *exactly which* names an
 //! argument admits is a real assertion rather than a hopeful one.
 
+use candle_conversation::stencil::ToolSpec;
 use npc_map::part::{Part, PartKind, Placement};
 use npc_map::witness;
 use npc_map::world::{Happening, Where, World};
@@ -174,6 +175,31 @@ fn lift_within(h: &Hosted, body: &str) -> (bool, bool, Vec<String>) {
 /// The values an argument admits, here. `None` when the act is not offered at
 /// all, `Some(vec![])` when it is offered with the argument free.
 fn admits(h: &Hosted, body: &str, tool: &str, param: &str) -> Option<Vec<String>> {
+    let t = spec_of(h, body, tool)?;
+    let p = t.params.iter().find(|p| p.name == param)?;
+    Some(p.enum_values.clone().unwrap_or_default())
+}
+
+/// Every conversation `message` can be sent to from here, whichever way it
+/// goes: each `to` its `via` brings, the people first. `None` when `message`
+/// is not offered.
+fn message_to(h: &Hosted, body: &str) -> Option<Vec<String>> {
+    let t = spec_of(h, body, "message")?;
+    let via = t.params.iter().find(|p| p.name == "via")?;
+    Some(
+        via.enum_values
+            .iter()
+            .flatten()
+            .filter_map(|way| via.shapes.iter().find(|(v, _)| v == way))
+            .flat_map(|(_, fields)| fields.iter().filter(|f| f.name == "to"))
+            .flat_map(|f| f.enum_values.clone().unwrap_or_default())
+            .collect(),
+    )
+}
+
+/// The act `tool` as the grammar offers it to `body` here, `None` when it is
+/// not offered.
+fn spec_of(h: &Hosted, body: &str, tool: &str) -> Option<ToolSpec> {
     let place = h.place_of(body);
     let company: Vec<String> = h.read(|w| {
         let me = w.actor(body).expect("a body");
@@ -194,10 +220,9 @@ fn admits(h: &Hosted, body: &str, tool: &str, param: &str) -> Option<Vec<String>
     }
     .in_the_house(h, body);
     let within = h.sim(|s| within.from_sim(s, body, &place));
-    let specs = specs_within(Mode::Physical, &within);
-    let t = specs.iter().find(|t| t.name == tool)?;
-    let p = t.params.iter().find(|p| p.name == param)?;
-    Some(p.enum_values.clone().unwrap_or_default())
+    specs_within(Mode::Physical, &within)
+        .into_iter()
+        .find(|t| t.name == tool)
 }
 
 fn did(o: &Outcome) -> &str {
@@ -1439,7 +1464,7 @@ fn a_character_with_no_handset_is_offered_no_way_to_message_anybody() {
         acts.contains(&"message".to_string()),
         "a handset was issued and there was nowhere to send: {acts:?}"
     );
-    let threads = admits(&h, "c1", "message", "to").expect("the channel is a thread");
+    let threads = message_to(&h, "c1").expect("the channel is a thread");
     assert_eq!(threads, vec![npcd::sim::phone::CHANNEL], "{threads:?}");
 }
 
@@ -1531,7 +1556,7 @@ fn a_character_holds_more_than_one_conversation_at_a_time() {
     );
 
     // Two of its own, beside the channel every handset carries.
-    let threads = admits(&h, "c1", "message", "to").expect("two conversations");
+    let threads = message_to(&h, "c1").expect("two conversations");
     assert_eq!(threads.len(), 3, "{threads:?}");
     assert!(threads.contains(&"Soren".to_string()));
     assert!(threads.contains(&"Orion Vance".to_string()));
@@ -1560,7 +1585,10 @@ fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
     perform(
         &h,
         "c1",
-        &act("message", json!({"to":"Soren","intent":"both of you"})),
+        &act(
+            "message",
+            json!({"via":"channel","to":"Soren","intent":"both of you"}),
+        ),
     );
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 2);
     assert_eq!(
@@ -1590,7 +1618,7 @@ fn a_group_can_be_opened_with_several_people_at_once() {
     assert!(out.happened(), "{out:?}");
     assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
     assert_eq!(h.sim(|s| s.messages_waiting("Orion Vance")), 1);
-    assert!(admits(&h, "c1", "message", "to")
+    assert!(message_to(&h, "c1")
         .unwrap()
         .contains(&"the boundary".to_string()));
 }
@@ -1687,7 +1715,7 @@ fn leaving_a_group_does_not_end_it_for_everybody_else() {
     // Its own conversations are gone; the standing channel is not something it
     // was able to sign off from in the first place — see `Choices::Leavable`.
     assert_eq!(
-        admits(&h, "c1", "message", "to").unwrap_or_default(),
+        message_to(&h, "c1").unwrap_or_default(),
         vec![npcd::sim::phone::CHANNEL]
     );
     assert!(

@@ -253,5 +253,6 @@ fn persona_of<'a>(s: &'a Scenario, world: &'a str, mission: &'a str) -> Persona<
         building: "",
         mission: None,
         journal: None,
+        channels: &[],
     }
 }

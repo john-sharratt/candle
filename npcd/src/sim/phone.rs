@@ -140,6 +140,12 @@ pub struct Thread {
     /// asking would be gone until the daemon restarted.
     #[serde(default)]
     pub permanent: bool,
+    /// What it is for, in its own words: the description of the Discord
+    /// channel it stands for, which its members read beside its name to
+    /// choose where to say something. Left out of the record when it has
+    /// none, which most threads do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     /// When anything was last said on it, on [`Threads`]'s own counter.
     ///
     /// Not a clock: nothing here needs to know *when*, only which of two
@@ -442,6 +448,35 @@ impl Threads {
             .collect()
     }
 
+    /// What `who` calls each of its threads of `kind`: the people it talks
+    /// to alone, or its channels and groups — what `message` offers once it
+    /// has said which.
+    pub fn names_of_kind_for(&self, who: &str, kind: Kind) -> Vec<String> {
+        self.of(who)
+            .into_iter()
+            .filter(|t| t.kind() == kind)
+            .map(|t| t.as_named_to(who))
+            .collect()
+    }
+
+    /// The channels `who` is on — the world's own, and each Discord channel
+    /// that stands as one — by name, each with what it is for.
+    pub fn channels_for(&self, who: &str) -> Vec<&Thread> {
+        self.of(who)
+            .into_iter()
+            .filter(|t| t.permanent && t.kind() == Kind::Group)
+            .collect()
+    }
+
+    /// Find one of `who`'s threads of `kind` by the name `who` calls it.
+    pub fn by_kind_for(&self, who: &str, kind: Kind, name: &str) -> Option<&Thread> {
+        let want = name.trim().to_lowercase();
+        self.of(who)
+            .into_iter()
+            .filter(|t| t.kind() == kind)
+            .find(|t| t.as_named_to(who).to_lowercase() == want || t.id == want)
+    }
+
     /// Find one of `who`'s threads by the name `who` calls it.
     pub fn by_name_for(&self, who: &str, name: &str) -> Option<&Thread> {
         let want = name.trim().to_lowercase();
@@ -517,6 +552,7 @@ impl Threads {
                 open: true,
                 named: false,
                 permanent: false,
+                topic: None,
                 joined_at: BTreeMap::new(),
                 next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
@@ -569,6 +605,7 @@ impl Threads {
                 // those two would see it under the *other* member's name.
                 named: true,
                 permanent: true,
+                topic: None,
                 joined_at: BTreeMap::new(),
                 next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
@@ -597,6 +634,7 @@ impl Threads {
                 open: true,
                 named: true,
                 permanent: false,
+                topic: None,
                 joined_at: BTreeMap::new(),
                 next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
@@ -633,6 +671,7 @@ impl Threads {
                 open: true,
                 named: true,
                 permanent: true,
+                topic: None,
                 joined_at: BTreeMap::new(),
                 next_seq: FIRST_SEQ,
                 delivered: BTreeMap::new(),
@@ -650,6 +689,19 @@ impl Threads {
             return false;
         };
         t.name = name.to_string();
+        true
+    }
+
+    /// Say what thread `id` is for, or that it says nothing — a blank topic
+    /// is none. `false` with no such thread.
+    pub fn describe(&mut self, id: &str, topic: Option<&str>) -> bool {
+        let Some(t) = self.threads.get_mut(id) else {
+            return false;
+        };
+        t.topic = topic
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         true
     }
 
@@ -883,6 +935,45 @@ impl Threads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── conversations by kind ───────────────────────────────────────────────
+
+    /// **A person and a channel of the same name are two conversations**,
+    /// found by kind: the direct thread with Wren among the people, a group
+    /// called "Wren" among the channels, each named once in its own list; the
+    /// channels are the standing ones, each with what it is for.
+    #[test]
+    fn conversations_are_found_by_kind() {
+        let mut p = Threads::new();
+        let direct = p.reach("Zen", "Wren");
+        let group = p.open_group("Wren", &["Zen".into(), "Wren".into(), "Wick".into()]);
+        let research = p.open_standing("#research", &["Zen".into()]);
+        assert!(p.describe(&research, Some("  findings  ")));
+        assert_eq!(p.names_of_kind_for("Zen", Kind::Direct), ["Wren"]);
+        let mut channels = p.names_of_kind_for("Zen", Kind::Group);
+        channels.sort();
+        assert_eq!(channels, ["#research", "Wren"]);
+        assert_eq!(
+            p.by_kind_for("Zen", Kind::Direct, "wren")
+                .map(|t| t.id.clone()),
+            Some(direct)
+        );
+        assert_eq!(
+            p.by_kind_for("Zen", Kind::Group, "Wren")
+                .map(|t| t.id.clone()),
+            Some(group)
+        );
+        assert!(p.by_kind_for("Zen", Kind::Direct, "#research").is_none());
+        let standing: Vec<(&str, Option<&str>)> = p
+            .channels_for("Zen")
+            .into_iter()
+            .map(|t| (t.name.as_str(), t.topic.as_deref()))
+            .collect();
+        assert_eq!(standing, [("#research", Some("findings"))]);
+        assert!(p.describe(&research, Some(" ")));
+        assert_eq!(p.get(&research).unwrap().topic, None);
+        assert!(!p.describe("th404", None));
+    }
 
     // ── what a thread keeps ─────────────────────────────────────────────────
 

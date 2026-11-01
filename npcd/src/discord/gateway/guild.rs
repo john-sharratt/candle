@@ -34,6 +34,10 @@ pub struct GuildChannel {
     pub kind: u8,
     #[serde(default)]
     pub name: String,
+    /// What the channel is for, as its server describes it: `null` or absent
+    /// for one with no description.
+    #[serde(default)]
+    pub topic: Option<String>,
     /// The server it is in: present on a `CHANNEL_` event, absent inside a
     /// `GUILD_CREATE`, which is the server's own.
     #[serde(default, deserialize_with = "maybe_snowflake")]
@@ -100,12 +104,13 @@ mod tests {
         );
     }
 
-    /// A `CHANNEL_CREATE` names its server; a `GUILD_DELETE` says whether it
-    /// was an outage.
+    /// A `CHANNEL_CREATE` names its server and its description, `null` read
+    /// as none; a `GUILD_DELETE` says whether it was an outage.
     #[test]
     fn a_channel_event_names_its_server_and_a_delete_its_outage() {
         let c: GuildChannel = serde_json::from_value(json!({
             "id": "605", "type": 0, "name": "lore", "guild_id": "600",
+            "topic": "The world's history, era by era",
         }))
         .unwrap();
         assert_eq!(
@@ -114,9 +119,15 @@ mod tests {
                 id: 605,
                 kind: 0,
                 name: "lore".into(),
+                topic: Some("The world's history, era by era".into()),
                 guild_id: Some(600),
             }
         );
+        let bare: GuildChannel = serde_json::from_value(json!({
+            "id": "606", "type": 0, "name": "ops", "topic": null,
+        }))
+        .unwrap();
+        assert_eq!(bare.topic, None);
         let gone: GuildRef =
             serde_json::from_value(json!({"id": "600", "unavailable": true})).unwrap();
         assert!(gone.unavailable);

@@ -102,6 +102,16 @@ impl Fake {
             .collect();
     }
 
+    /// A text channel `id` called `name` made in the server by a person, as
+    /// `GET /guilds/{id}/channels` answers it from now: described as `topic`.
+    pub fn made_by_hand(&self, id: u64, name: &str, topic: Option<&str>) {
+        self.held
+            .channels
+            .lock()
+            .unwrap()
+            .push(json!({ "id": id.to_string(), "type": 0, "name": name, "topic": topic }));
+    }
+
     /// Channel `channel`'s permission overwrites, as `(id, type, allow,
     /// deny)`, sorted by id.
     pub fn overwrites_of(&self, channel: u64) -> Vec<(u64, u8, u64, u64)> {

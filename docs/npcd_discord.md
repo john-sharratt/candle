@@ -22,9 +22,10 @@ bot runtime of §3.3 and §6 (`gateway/` — `protocol`, `guild`, `shard` — `s
 channels (§3.4, `server/`), the posting both share (`post/`), and seeing what the bridge
 did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
 and part three: the world's own server mirrored — its open channel, groups,
-private-thread DMs and backstage — with the reconcile, the carry-over of its cursors,
-and typing (§4.4, §5.3–5.4, `world/`, `dm/typing.rs`). §8 records the order it was
-built in. It sits on npcd's
+private-thread DMs and the channels its people make there — with the reconcile, the
+carry-over of its cursors, and typing (§4.4, §5.3–5.4, `world/`, `dm/typing.rs`); and
+how a character knows its channels and chooses where to speak (§3.5,
+`engine/channels.rs`). §8 records the order it was built in. It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
@@ -155,10 +156,17 @@ In a world with a server:
   bot, when its owner has given it one — with or without a world server; otherwise a
   private thread in the world's server, holding the person and the world's listener, in
   which the character speaks through the persona webhook (§3.1).
-- **A character ↔ character DM** is private to the two characters in the world, and is
-  mirrored only for the characters' **owners**: a private thread under `#backstage`,
-  read-only, visible to the owners of both characters. A world can leave it out
-  (`backstage: false` on its `discord/guild` record, §4.4).
+- **A character ↔ character DM** is private to the two characters and stays in the
+  world: nothing of it is mirrored, to their owners or anyone.
+- **A channel a person made in the server** — any text channel the bridge did not make
+  itself — is a **room**: a standing channel of the world named `#<channel>`, the whole
+  cast on it as the cast is on the world's channel, described as Discord describes the
+  channel. The server's people set up a room for each thing the world talks about, and
+  its description is what tells a character what the room is for (§3.5). A person who
+  writes there is brought onto the room on their first message; a message that
+  mentions, answers or names a character is said to it, and it is told urgently. A room
+  is renamed and described again with its channel, and closed when the channel is
+  deleted — kept, as a closed group is, and offered to nobody.
 
 ### 3.1 Who speaks on Discord
 
@@ -351,12 +359,44 @@ handset, and the character uses it as it uses any group.
   channels', so a bot added back takes its threads up again, mirroring on from their
   end.
 
+A channel's description (its Discord `topic`) is its thread's, as a room's is (§3.5):
+read from `GUILD_CREATE` and each `CHANNEL_CREATE` and `CHANNEL_UPDATE`.
+
 This needs the privileged **Message Content** intent (§2): a bot IDENTIFYs with
 `GUILDS`, `GUILD_MESSAGES`, `DIRECT_MESSAGES` and `MESSAGE_CONTENT`. Discord closes a
 shard whose application has not turned it on with `4014`; its state is then
 `needs_content_intent`, the panel says "Turn on Message Content Intent under Bot in the
 Developer Portal", and the shard tries again every ten minutes (144 IDENTIFYs a day,
 well inside 1,000), so turning it on is all the owner does.
+
+### 3.5 A character's channels, and where it speaks
+
+**A character knows its channels the way it knows its journal: in its system prompt.**
+Each channel it is on — the world's own channel, each room (§3), and each server
+channel of its bot's (§3.4) — is one section of the `channels` collection, submitted to
+its own conversation as `channels/<thread id>` and selected under `channels_intro`
+("The channels you are on, and what each is for…"); `channels_none` shows for a
+character on none. A section is one line, the channel's name as `message` takes it and
+its description: `- #research: Findings and open questions`. The sections are
+reconciled at the head of every turn (`Minds::prepare`, `engine/channels.rs`), so a
+channel made, renamed or described again reseals its own line and nothing else, and one
+the character is no longer on leaves the prompt. A character with no handset reads
+none, as it can send on none. A schema that declares no `channels` collection carries
+none.
+
+**Two acts, and the grammar keeps them apart.**
+
+- **`reply`** answers on the conversation it was asked on: its `to` offers only the
+  conversations where somebody else spoke last (`Choices::Awaiting`, §3.4). Every
+  message's line says to answer it there.
+- **`message`** says first how it goes — `via` is `private`, to one person alone, or
+  `channel`, to one of its channels or groups — and `to` is then chosen from that kind
+  alone (`Choices::Ways`, brought by its value: `Choices::Private`,
+  `Choices::Channels`). A way with nothing to send to is not offered, and a character
+  with neither has no `message`. A person on a channel with the character is on a
+  direct thread with it too, under the same name; said first, the way is the
+  character's choice and the name can only be one of that kind, so the stencil guides
+  it to a real conversation without a list in which the two collide.
 
 ---
 
@@ -398,9 +438,9 @@ record):
 
 | Record | Holds |
 |---|---|
-| `discord/guild` | `{ guild_id, name, listener: <npc_id>, backstage: bool }` — the world's server (§4.4), and its name as Discord last gave it |
-| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, parent?, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a private thread under `#dms`, or `backstage`; `parent` the channel a private thread is under, whose webhook posts into it; `archived` a group nobody remains on |
-| `discord/parent/<name>` | `{ channel_id }` — `#dms` or `#backstage`, the channel private threads are made under |
+| `discord/guild` | `{ guild_id, name, listener: <npc_id> }` — the world's server (§4.4), and its name as Discord last gave it |
+| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, parent?, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a private thread under `#dms`, or `room` for a channel a person made (§3); `parent` the channel a private thread is under, whose webhook posts into it; `archived` a group nobody remains on |
+| `discord/parent/<name>` | `{ channel_id }` — `#dms`, the channel private threads are made under; forgotten when the server no longer has it, so the next private thread makes it again |
 | `discord/webhook/<channel_id>` | `{ webhook_id, token }` — a mirrored channel's persona webhook (§3.1), its token sealed for this record as a bot token is (§4.3) |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
 | `discord/channel/<npc_id>/<channel_id>` | `{ guild_id, thread, mirrored_through, last_seen_discord }` — a server channel the bot is in, and its thread (§3.4) |
@@ -473,8 +513,8 @@ the world's page (`web/content/npcd/pages/worlds.js`), in a Discord section:
 
 | Route | Does |
 |---|---|
-| `GET /v1/world/:wid/discord` | `{"guild": null}`, or `{"guild": {guild_id, name, listener, backstage}}` |
-| `PUT /v1/world/:wid/discord` `{guild_id, listener, backstage}` | checks that `listener` is a character with a body in the world and a connected bot, then asks Discord as that bot (`GET /guilds/{guild_id}`) — the bot must already be in the server, and Discord's answer gives the server's name; writes the world's `discord/guild` record through the authority (a `WorldOp`), and answers as `GET` |
+| `GET /v1/world/:wid/discord` | `{"guild": null}`, or `{"guild": {guild_id, name, listener}}` |
+| `PUT /v1/world/:wid/discord` `{guild_id, listener}` | checks that `listener` is a character with a body in the world and a connected bot, then asks Discord as that bot (`GET /guilds/{guild_id}`) — the bot must already be in the server, and Discord's answer gives the server's name; writes the world's `discord/guild` record through the authority (a `WorldOp`), and answers as `GET` |
 | `DELETE /v1/world/:wid/discord` | tombstones the record; the mirror stops, and the bots' DMs (§3.3) go on |
 
 The section lists the world's characters that have bots, to pick the listener from,
@@ -563,10 +603,12 @@ account. Then, in order:
    `post_message` writes, with `origin`, and the `discord/dm/<npc_id>/<account>`
    record is written or advanced.
 
-**The channel and groups** arrive on the listener's shard and apply as the console's
-routes would: the channel as `WorldOp::Channel`, a group as a send into that thread,
-each carrying `origin` so it is never posted back. `last_seen_discord` advances with
-each.
+**The channel, groups and rooms** arrive on the listener's shard and apply as the
+console's routes would: the channel as `WorldOp::Channel`; a group or a room as
+`WorldOp::Mirrored { thread, from, text, origin, to }`, a send into that thread that
+brings its author on at its end on their first message (on a group, only a member is
+heard at all), `to` the character the message mentions, answers or names; each carrying
+`origin` so it is never posted back. `last_seen_discord` advances with each.
 
 Attachments become a link line (`[image: <url>]`) until npcd threads carry images.
 Edits and deletions on Discord are not replayed into the world: a world's past is not
@@ -580,6 +622,15 @@ Every five minutes, and once when a member takes a world:
   overwrites match the thread's members (a member who left is removed, a new one
   added), and a group a character signed off from that nobody remains in is archived
   (made read-only), not deleted.
+- **Rooms.** One read of the server's channels (`GET /guilds/{id}/channels`): a text
+  channel nobody recorded is opened as a room, posted from its end and read from now;
+  every mirrored thread is described as its channel now is; a room is named as its
+  channel is and has the cast on it, a character new to the world brought on at its
+  end; a room whose channel is gone is closed and forgotten; and a parent whose channel
+  is gone is forgotten. The same read runs on the first beat after the listener's shard
+  hears a channel of the server made, changed or deleted — the mirror's own beat, so a
+  channel it has just made for a group is already recorded when it is read
+  (`world/rooms.rs`).
 - **Gaps.** For each mapped channel and DM, `GET /channels/{id}/messages?after=
   <last_seen_discord>` fetches what arrived while no member held the world — a restart,
   a move — and applies it through §5.2, oldest first.
@@ -783,19 +834,22 @@ channel, group and webhook halves of §5, and it is built first and alone.
    one member's records to another and checks the next holder posts on from the cursor
    and nothing twice. A webhook whose sealed token does not open on the new holder — a
    member with no cluster key in common — is made again.
-12. **Built:** backstage threads for character-to-character DMs, in a world whose
-   `discord/guild` says `backstage`: a private thread under `#backstage` (everyone may
-   see it, nobody may write in it or its threads) named for the two characters, each
-   owner who has linked Discord added. Every line in a private thread — a DM's or a
-   backstage one — is posted through its parent's webhook, a character's with its own
-   bot too, since a bot is no member of the thread; anything written backstage is
-   dropped (`read_only_dropped`).
+12. **Built:** rooms — every channel a person made in the world's server a standing
+   channel of the world with the cast on it, described as Discord describes it, read on
+   the reconcile and on the beat after a channel event (§3, §5.3); a person's message
+   there brings them on and is said to the character it names (`WorldOp::Mirrored`'s
+   `to`). Every line in a private thread is posted through its parent's webhook, a
+   character's with its own bot too, since a bot is no member of the thread.
+   Character-to-character DMs are not mirrored (§3).
 13. **Built:** typing. While a person's DM from Discord is the last thing said to the
    character and under two minutes old, its bot shows typing in that DM
    (`POST /channels/{id}/typing`, renewed every 8 s); the character's answer, being
    the last thing said then, ends it (`npcd/src/discord/dm/typing.rs`). A turn that ends
    without an answer is not seen from the bots' beat, so the two minutes are the
    bound.
+14. **Built:** a character's channels in its system prompt, each with its description
+   (§3.5, `engine/channels.rs`, the mind's `channels` collection), and `message` split by
+   `via` into `private` and `channel`, each bringing its own `to`.
 
 ---
 

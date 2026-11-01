@@ -56,7 +56,6 @@ impl Daemon {
                 guild_id: GUILD,
                 name: "Life".into(),
                 listener: self.zen,
-                backstage: true,
             }))
         });
     }
@@ -172,6 +171,10 @@ async fn the_listener_makes_the_channel_and_its_webhook() {
         d.hosted.mirror(|m| m.hook(MADE).is_some())
     })
     .await;
+    d.until("the server's channels read", |d| {
+        d.hosted.mirror(|m| m.by_channel(GENERAL)).is_some()
+    })
+    .await;
 
     let token = |path: &str, body: Value| as_bot_of(path, body);
     let calls: Vec<Seen> = d
@@ -181,7 +184,7 @@ async fn the_listener_makes_the_channel_and_its_webhook() {
         .filter(|s| !s.path.contains("/messages"))
         .collect();
     assert_eq!(
-        calls,
+        calls[..4],
         [
             token("GET /guilds/600/channels", Value::Null),
             token(
@@ -192,6 +195,7 @@ async fn the_listener_makes_the_channel_and_its_webhook() {
                 &format!("POST /channels/{MADE}/webhooks"),
                 json!({ "name": "Life" })
             ),
+            token("GET /guilds/600/channels", Value::Null),
         ]
     );
     let thread = d.the_channel();
@@ -211,7 +215,7 @@ async fn the_listener_makes_the_channel_and_its_webhook() {
     let records = world_store::read(&d.a.npcs.substrate(), WORLD);
     assert_eq!(
         records.get("discord/guild"),
-        Some(&json!({ "guild_id": GUILD, "name": "Life", "listener": d.zen, "backstage": true }))
+        Some(&json!({ "guild_id": GUILD, "name": "Life", "listener": d.zen }))
     );
     assert_eq!(
         records.get(&format!("discord/thread/{thread}")),
@@ -399,7 +403,6 @@ async fn a_bot_that_is_not_the_listener_drops_the_worlds_server() {
             guild_id: GUILD,
             name: "Life".into(),
             listener: d.zen + 1,
-            backstage: true,
         }))
     });
     d.online().await;
@@ -635,16 +638,10 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
     );
 }
 
-/// **Two characters' DM is a backstage thread their owner reads**: under
-/// `#backstage`, which everyone may see and nobody may write in or its
-/// threads, a thread named for the two with their owner added once; each
-/// character's lines posted by the webhook — Zen's too, though it has a bot
-/// — and anything written there dropped. A world whose server does not
-/// mirror them opens none.
+/// **Two characters' DM stays in the world**: private to them, it opens
+/// nothing in the server and nothing said on it is posted there.
 #[tokio::test]
-async fn two_characters_dm_is_a_backstage_thread_their_owner_reads() {
-    use crate::discord::world::members::{HISTORY, LISTENER, SEND, SEND_IN_THREADS, VIEW};
-
+async fn two_characters_dm_stays_in_the_world() {
     let d = daemon(vec![Script::Serve]).await;
     d.link(OWNER, WREN).await;
     d.wick();
@@ -658,70 +655,111 @@ async fn two_characters_dm_is_a_backstage_thread_their_owner_reads() {
             .unwrap()
     });
     d.mirroring().await;
-    d.until("backstage opened", |d| {
-        d.hosted.mirror(|m| m.thread(&dm)).is_some()
-    })
-    .await;
-
-    let parent = d.hosted.mirror(|m| m.parent("backstage")).unwrap();
-    assert_eq!(
-        d.discord.overwrites_of(parent),
-        [
-            (BOT_USER, 1, LISTENER, 0),
-            (GUILD, 0, VIEW | HISTORY, SEND | SEND_IN_THREADS),
-        ]
-    );
-    let mirrored = d.hosted.mirror(|m| m.thread(&dm)).unwrap();
-    assert_eq!(
-        (mirrored.kind, mirrored.parent),
-        (Kind::Backstage, Some(parent))
-    );
-    let added: Vec<String> = d
-        .discord
-        .seen()
-        .into_iter()
-        .filter(|s| s.path.contains("/thread-members/"))
-        .map(|s| s.path)
-        .collect();
-    assert_eq!(
-        added,
-        [format!(
-            "/channels/{}/thread-members/{WREN}",
-            mirrored.channel_id
-        )]
-    );
-
     d.hosted
         .with_sim(|s| s.threads.send("Zen", "Wick", "report at dusk").unwrap());
-    d.until("posted backstage", |d| {
-        d.hooked()
-            .contains(&("Zen".to_string(), "report at dusk".to_string()))
+    d.reconcile_now().await;
+    d.settle().await;
+    assert!(d.hosted.mirror(|m| m.thread(&dm)).is_none());
+    assert!(
+        !d.discord.seen().iter().any(|s| s.path.contains("/threads")),
+        "a thread was opened for two characters"
+    );
+    assert_eq!(d.hooked(), [], "two characters' DM was posted");
+}
+
+/// The channels people made in the world's server: one there before the
+/// mirror, and one made while it runs.
+const RESEARCH: u64 = 7400;
+
+/// **A channel a person made is a channel of the world**: the one the server
+/// had and the one Discord says was made, each a room named for it with the
+/// cast on it and the channel's description; a character's line on it posted
+/// there, and a linked person's heard on it — brought on, and said to the
+/// character it names. A channel's description changed is its room's.
+#[tokio::test]
+async fn a_channel_a_person_made_is_a_channel_of_the_world() {
+    let d = daemon(vec![Script::Serve]).await;
+    d.link(OWNER, WREN).await;
+    d.mirroring().await;
+    d.until("#general a room", |d| {
+        d.hosted.mirror(|m| m.by_channel(GENERAL)).is_some()
     })
     .await;
+    let (general, mirrored) = d.hosted.mirror(|m| m.by_channel(GENERAL)).unwrap();
+    assert_eq!(mirrored.kind, Kind::Room);
+    assert_eq!(
+        d.hosted
+            .sim(|s| s.threads.get(&general).map(|t| t.name.clone())),
+        Some("#general".to_string())
+    );
+
+    d.discord
+        .made_by_hand(RESEARCH, "research", Some("Findings and open questions"));
+    d.gateway.event(
+        "CHANNEL_CREATE",
+        json!({ "id": RESEARCH.to_string(), "type": 0, "name": "research",
+                "topic": "Findings and open questions", "guild_id": GUILD.to_string() }),
+    );
+    d.until("#research a room", |d| {
+        d.hosted.mirror(|m| m.by_channel(RESEARCH)).is_some()
+    })
+    .await;
+    let (research, _) = d.hosted.mirror(|m| m.by_channel(RESEARCH)).unwrap();
+    let (name, topic, members) = d.hosted.sim(|s| {
+        let t = s.threads.get(&research).unwrap();
+        (t.name.clone(), t.topic.clone(), t.members.clone())
+    });
+    assert_eq!(name, "#research");
+    assert_eq!(topic.as_deref(), Some("Findings and open questions"));
+    assert_eq!(members, ["Zen", "Wick"]);
+
+    d.hosted.with_sim(|s| {
+        s.threads
+            .send_on(&research, "Wick", "the seam runs east", None)
+            .unwrap()
+    });
+    d.until("posted in #research", |d| {
+        d.discord.seen().iter().any(|s| {
+            s.path
+                .starts_with(&format!("/webhooks/{}/", RESEARCH + HOOK_OFFSET))
+        })
+    })
+    .await;
+
     d.gateway.dispatch(posted_in(
-        mirrored.channel_id,
+        RESEARCH,
         later(),
         WREN,
-        "a word from me",
+        "Zen, what did the survey find?",
     ));
-    d.settle().await;
-    assert_eq!(d.said_on(&dm).len(), 1, "a word was written backstage");
+    d.until("the person heard", |d| d.said_on(&research).len() == 2)
+        .await;
+    let (heard, on) = d.hosted.sim(|s| {
+        let t = s.threads.get(&research).unwrap();
+        let m = t.messages.last().unwrap();
+        (
+            (m.from.clone(), m.to.clone(), m.origin.is_some()),
+            t.has(WREN_S),
+        )
+    });
+    assert_eq!(heard, (WREN_S.to_string(), Some("Zen".to_string()), true));
+    assert!(on, "the person was not brought onto the room");
 
-    let quiet = daemon(vec![Script::Serve]).await;
-    quiet.link(OWNER, WREN).await;
-    quiet.wick();
-    quiet.hosted.with_sim(|s| {
-        s.threads.reach("Zen", "Wick");
-    });
-    quiet.serve_world();
-    quiet.hosted.with_mirror(|m| {
-        let mut g = m.guild().cloned().unwrap();
-        g.backstage = false;
-        m.set_guild(Some(g));
-    });
-    quiet.online().await;
-    quiet.settle().await;
-    assert!(quiet.hosted.mirror(|m| m.parent("backstage")).is_none());
+    d.discord
+        .channels(&[(GENERAL, 0, "general"), (MADE, 0, CHANNEL_NAME)]);
+    d.discord
+        .made_by_hand(RESEARCH, "research", Some("Only what is confirmed"));
+    d.gateway.event(
+        "CHANNEL_UPDATE",
+        json!({ "id": RESEARCH.to_string(), "type": 0, "name": "research",
+                "topic": "Only what is confirmed", "guild_id": GUILD.to_string() }),
+    );
+    d.until("described again", |d| {
+        d.hosted
+            .sim(|s| s.threads.get(&research).and_then(|t| t.topic.clone()))
+            == Some("Only what is confirmed".to_string())
+    })
+    .await;
 }
 
 /// **The cursors go with the world** (§5.4): the member that held it wrote
@@ -861,9 +899,8 @@ async fn world_route(d: &Daemon, method: &str, sub: &str, body: Option<Value>) -
 async fn a_creator_sets_reads_and_takes_away_the_worlds_server() {
     let d = daemon(vec![Script::Serve]).await;
     let zen = npc_id_wire(d.zen);
-    let set = |listener: &str, guild: &str| {
-        Some(json!({ "guild_id": guild, "listener": listener, "backstage": false }))
-    };
+    let set =
+        |listener: &str, guild: &str| Some(json!({ "guild_id": guild, "listener": listener }));
 
     // Zen can listen: a body here and a bot, in the servers its records hold.
     d.hosted.with_servers(|s| {
@@ -912,7 +949,7 @@ async fn a_creator_sets_reads_and_takes_away_the_worlds_server() {
 
     let guild = json!({ "guild": {
         "guild_id": "600", "name": crate::discord::fake::GUILD_NAME,
-        "listener": zen, "backstage": false,
+        "listener": zen,
     }});
     assert_eq!(
         world_route(&d, "PUT", CREATOR, set(&zen, " 600 ")).await,
@@ -927,7 +964,6 @@ async fn a_creator_sets_reads_and_takes_away_the_worlds_server() {
             guild_id: GUILD,
             name: crate::discord::fake::GUILD_NAME.into(),
             listener: d.zen,
-            backstage: false,
         })
     );
     assert_eq!(

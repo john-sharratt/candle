@@ -162,7 +162,7 @@ async fn a_message_reaches_the_other_characters_mind() {
             1,
             &act(
                 "message",
-                json!({"to": "Maker-02", "intent": "that the redoubt burned twice"}),
+                json!({"via": "private", "to": "Maker-02", "intent": "that the redoubt burned twice"}),
             ),
         )
         .feed;
@@ -238,6 +238,7 @@ async fn what_is_said_on_the_channel_reaches_every_other_mind() {
             &act(
                 "message",
                 json!({
+                    "via": "channel",
                     "to": npcd::sim::phone::CHANNEL,
                     "intent": "that I am in band one with the third era open and cannot make it reconcile",
                 }),
@@ -307,7 +308,11 @@ async fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
             1,
             &act(
                 "message",
-                json!({"to": npcd::sim::phone::CHANNEL, "intent": "that I will go up and look"}),
+                json!({
+                    "via": "channel",
+                    "to": npcd::sim::phone::CHANNEL,
+                    "intent": "that I will go up and look",
+                }),
             ),
         )
         .feed;
@@ -527,7 +532,10 @@ async fn a_message_is_delivered_once_and_not_again_every_moment() {
     );
     rt.record_act(
         1,
-        &act("message", json!({"to": "Maker-02", "intent": "once only"})),
+        &act(
+            "message",
+            json!({"via": "private", "to": "Maker-02", "intent": "once only"}),
+        ),
     );
     for _ in 0..4 {
         moment(&rt);
@@ -558,7 +566,10 @@ async fn your_own_message_does_not_come_back_to_you() {
     );
     rt.record_act(
         1,
-        &act("message", json!({"to": "Maker-02", "intent": "mine alone"})),
+        &act(
+            "message",
+            json!({"via": "private", "to": "Maker-02", "intent": "mine alone"}),
+        ),
     );
     moment(&rt);
     think(&rt, 1);
@@ -622,7 +633,11 @@ async fn a_character_answers_a_person_on_the_same_thread() {
             1,
             &act(
                 "message",
-                json!({"to": "Wren S", "intent": "that I dated it against both neighbours"}),
+                json!({
+                    "via": "private",
+                    "to": "Wren S",
+                    "intent": "that I dated it against both neighbours",
+                }),
             ),
         )
         .feed;

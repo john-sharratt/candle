@@ -1174,10 +1174,17 @@ pub const MESSAGE: Tool = Tool {
     category: "Messaging",
     plane: Plane::Speech,
     availability: Availability::Always,
-    description: "Send something on one of your conversations. It reaches everybody on that \
-                  thread and nobody else — not the room you are standing in, and not people on \
-                  your other threads. They will see it whenever they next look, which may not be \
-                  now. As with speaking, you give what you MEAN and the wording follows.\n\
+    description: "Send something on one of your conversations. Say first how it goes — \
+                  `private`, to one person alone, or `channel`, to one of your channels or \
+                  groups — and then which one. It reaches everybody on that conversation and \
+                  nobody else — not the room you are standing in, and not people on your other \
+                  threads. They will see it whenever they next look, which may not be now. As \
+                  with speaking, you give what you MEAN and the wording follows.\n\
+                  \n\
+                  **Each channel is for something**, and your channels are listed with what \
+                  each one is for: say a thing on the channel whose description fits it. To \
+                  answer something said to you, use `reply`, which goes back where it was \
+                  said.\n\
                   \n\
                   **For people who are not here.** If the person you want is standing in front of \
                   you, `tell` or `ask` — texting somebody in the same room is a worse version of \
@@ -1194,11 +1201,19 @@ pub const MESSAGE: Tool = Tool {
                   are ready and wait.",
     params: &[
         Param {
-            name: "to",
+            name: "via",
             ty: "string",
             required: true,
-            description: "Which conversation — a person's name for one of yours with them, or a \
-                          group's name.",
+            description: "How it goes: `private`, to one person alone, or `channel`, to one of \
+                          your channels or groups — your channels are listed with what each is \
+                          for.",
+        },
+        Param {
+            name: "to",
+            ty: "string",
+            required: false,
+            description: "Which one: the person's name for `private`, the channel's or the \
+                          group's for `channel`.",
         },
         Param {
             name: "intent",
@@ -1211,16 +1226,23 @@ pub const MESSAGE: Tool = Tool {
         Example {
             situation: "You are two rooms away from somebody who is waiting on a thing you have \
                         just finished.",
-            call: r#"{"to":"Soren","intent":"that it is done and I am not walking it over tonight"}"#,
+            call: r#"{"via":"private","to":"Soren","intent":"that it is done and I am not walking it over tonight"}"#,
             because: "Reaching somebody who is not here is what the handset is for. Walking over \
                       is `move_to` and costs the evening.",
         },
         Example {
             situation: "Three of you are working the same span and one of them has just found \
                         something that changes what the other two are doing.",
-            call: r#"{"to":"the eastern sweep","intent":"stop dating anything until we have settled the boundary"}"#,
+            call: r#"{"via":"channel","to":"the eastern sweep","intent":"stop dating anything until we have settled the boundary"}"#,
             because: "One send, everybody on the thread. A group is a thread with more people on \
                       it, not a different kind of act.",
+        },
+        Example {
+            situation: "You have found something the survey turned up, and among your channels \
+                        is #research, for findings and open questions.",
+            call: r##"{"via":"channel","to":"#research","intent":"that the seam under the east wing runs further than the map shows"}"##,
+            because: "A channel is for what its description says. A finding goes where findings \
+                      are kept, not to whoever you last spoke to.",
         },
         // **The case a solitary character had no answer to.** Nobody here, and
         // no way to learn that anybody exists anywhere — the percept names who
@@ -1230,7 +1252,7 @@ pub const MESSAGE: Tool = Tool {
         Example {
             situation: "You have been alone in the chronicle for an hour and you do not know \
                         where anybody else is.",
-            call: r#"{"to":"the channel","intent":"where each of you is working, because I want to bring the third era to whoever is nearest"}"#,
+            call: r#"{"via":"channel","to":"the channel","intent":"where each of you is working, because I want to bring the third era to whoever is nearest"}"#,
             because: "**Asking is what finds people.** Nothing else tells you which of seventy \
                       rooms has somebody in it, and an answer names one you can walk to. \
                       Reporting your own position instead leaves everybody informed and \
@@ -1245,7 +1267,7 @@ pub const MESSAGE: Tool = Tool {
         Example {
             situation: "Somebody has said they want to work through something with you, and you \
                         do not know which room they are in.",
-            call: r#"{"to":"the channel","intent":"which room you are in, so I can come to you rather than both of us moving"}"#,
+            call: r#"{"via":"channel","to":"the channel","intent":"which room you are in, so I can come to you rather than both of us moving"}"#,
             because: "One of you has to name a place or you will cross. \"I am ready\" from both \
                       sides is two people waiting; a question has an answer, and the answer is \
                       somewhere to walk.",

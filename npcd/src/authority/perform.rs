@@ -21,6 +21,7 @@ use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
 use crate::discord::server::apply::channel_message;
+use crate::discord::world::apply::mirrored_message;
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, StepOutcome};
@@ -183,13 +184,10 @@ impl Runtime {
                 from,
                 text,
                 origin,
+                to,
             } => OpReply::Done {
                 ok: self.hosted.get(world).is_some_and(|hosted| {
-                    hosted.with_sim(|s| {
-                        s.threads
-                            .send_on(&thread, &from, &text, Some(origin))
-                            .is_ok()
-                    })
+                    mirrored_message(&hosted, &thread, &from, &text, origin, to.as_deref())
                 }),
             },
             WorldOp::Guild { guild } => OpReply::Done {

@@ -400,8 +400,12 @@ mod tests {
             schema["methods"]["POST"]["verbs"]["message"]["body"],
             json!({
                 "type": "object",
-                "properties": { "to": { "type": "string" }, "intent": { "type": "string" } },
-                "required": ["to", "intent"]
+                "properties": {
+                    "via": { "type": "string" },
+                    "to": { "type": "string" },
+                    "intent": { "type": "string" },
+                },
+                "required": ["via", "intent"]
             }),
             "{schema}"
         );
@@ -418,7 +422,7 @@ mod tests {
         let cases = [
             (
                 "message",
-                json!({ "to": "the channel", "intent": "where are you" }),
+                json!({ "via": "channel", "to": "the channel", "intent": "where are you" }),
             ),
             ("invite", json!({ "to": "the channel", "who": "Maker-99" })),
             (

@@ -81,6 +81,7 @@ use crate::engine::act::Act;
 use crate::engine::authoring;
 use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
+use crate::engine::channels::{self, ChannelSection};
 use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment::{self, Reach};
@@ -330,6 +331,9 @@ pub struct OwnedPersona {
     /// What the character has written down — see [`Persona::journal`]. Filled in
     /// by the runtime, which owns the journals.
     pub journal: Option<JournalPrompt>,
+    /// The channels the character is on — see [`Persona::channels`]. Filled
+    /// in by the runtime from the world's threads.
+    pub channels: Vec<ChannelSection>,
     pub mode: Mode,
 }
 
@@ -361,6 +365,7 @@ impl OwnedPersona {
             building: &self.building,
             mission: self.mission.as_ref(),
             journal: self.journal.as_ref(),
+            channels: &self.channels,
         }
     }
 }
@@ -4147,6 +4152,11 @@ impl Runtime {
                 who.place = text;
             }
             who.mission = hosted.sim(|s| s.missions.active(&body).map(|m| m.prompt()));
+            let me = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()));
+            if let Some(me) = me {
+                who.channels =
+                    hosted.sim(|s| channels::sections(&s.threads, &me, s.has_phone(&body)));
+            }
         }
         who.journal = self
             .scheduler

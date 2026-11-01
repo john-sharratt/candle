@@ -4,12 +4,11 @@
 //! A Creator's, like everything else that writes into a world as a whole
 //! rather than into a character somebody owns.
 //!
-//! - `GET` answers `{"guild": null}`, or the server: its id, its name, the
-//!   listener and whether character-to-character DMs are mirrored; and
-//!   `listeners`, each character of the world with a bot of its own, with
-//!   the servers its bot is in and the link that adds it to another — what
-//!   the console picks the server and the listener from.
-//! - `PUT {guild_id, listener, backstage}` sets it, once three checks pass:
+//! - `GET` answers `{"guild": null}`, or the server: its id, its name and the
+//!   listener; and `listeners`, each character of the world with a bot of its
+//!   own, with the servers its bot is in and the link that adds it to
+//!   another — what the console picks the server and the listener from.
+//! - `PUT {guild_id, listener}` sets it, once three checks pass:
 //!   the listener is a character with a body in the world, it has a bot
 //!   connected, and that bot is in the server — Discord's answer to
 //!   `GET /guilds/{guild_id}` as the bot, which also names the server. It is
@@ -45,12 +44,6 @@ pub struct SetBody {
     guild_id: String,
     /// The listener's character id, on the wire.
     listener: String,
-    #[serde(default = "mirrored_by_default")]
-    backstage: bool,
-}
-
-fn mirrored_by_default() -> bool {
-    true
 }
 
 /// `GET /v1/world/:wid/discord`
@@ -169,7 +162,6 @@ pub async fn put_world_discord(
         guild_id,
         name: server.name,
         listener,
-        backstage: body.backstage,
     };
     let answer = write(&s, &wid, Some(guild.clone()), wire(Some(&guild))).await;
     // Setting the server is the person answering what Discord refused —
@@ -222,7 +214,6 @@ fn wire(guild: Option<&Guild>) -> Value {
                 "guild_id": g.guild_id.to_string(),
                 "name": g.name,
                 "listener": npc_id_wire(g.listener),
-                "backstage": g.backstage,
             }
         }),
     }

@@ -301,6 +301,7 @@ async fn the_characters_message_on_a_channel_is_posted() {
     d.joined().await;
     let call = json!({
         "tool": "message",
+        "via": "channel",
         "to": "zenworld #general",
         "intent": "Hello, zenworld.",
     })
@@ -471,8 +472,9 @@ async fn ready_tells_of_the_servers_left_and_joined_while_offline() {
     assert_eq!((hall.id, hall.open), (home, true));
 }
 
-/// **A renamed server or channel renames its threads**; a channel made is
-/// a thread, and one deleted is closed and forgotten.
+/// **A renamed server or channel renames its threads, and a channel
+/// described describes its thread**; a channel made is a thread, and one
+/// deleted is closed and forgotten.
 #[tokio::test]
 async fn renames_rename_the_threads_and_channels_come_and_go() {
     let d = daemon(vec![Script::Serve]).await;
@@ -486,7 +488,8 @@ async fn renames_rename_the_threads_and_channels_come_and_go() {
     );
     d.gateway.event(
         "CHANNEL_UPDATE",
-        json!({ "id": GENERAL.to_string(), "type": 0, "name": "lobby", "guild_id": GUILD.to_string() }),
+        json!({ "id": GENERAL.to_string(), "type": 0, "name": "lobby",
+                "topic": "Say hello", "guild_id": GUILD.to_string() }),
     );
     d.gateway.event(
         "CHANNEL_CREATE",
@@ -506,6 +509,11 @@ async fn renames_rename_the_threads_and_channels_come_and_go() {
     names.sort();
     assert_eq!(names, ["zen world #lobby", "zen world #news"]);
     assert_eq!(d.record(GENERAL).unwrap().thread, general, "a new thread");
+    assert_eq!(
+        d.hosted
+            .sim(|s| s.threads.get(&general).unwrap().topic.clone()),
+        Some("Say hello".to_string())
+    );
     assert!(!d.hosted.sim(|s| s.threads.get(&lore).unwrap().open));
     assert_eq!(d.hosted.servers(|s| s.channel(d.zen, 613)), None);
     assert_eq!(

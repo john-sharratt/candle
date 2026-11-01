@@ -34,6 +34,7 @@
 use candle_conversation::stencil::{CallStyle, ToolCallEnvelope};
 use journal_core::section::JournalPrompt;
 
+use crate::engine::channels::ChannelSection;
 use crate::engine::mission::MissionPrompt;
 use crate::engine::tools::{one_line, Mode, Tool};
 
@@ -104,6 +105,11 @@ pub struct Persona<'a> {
     /// turn reconciles the conversation's `journal` sections against it, which is
     /// also what hides `journal_none`. `None` is a journal with nothing in it.
     pub journal: Option<&'a JournalPrompt>,
+    /// The channels the character is on, each with what it is for, as its
+    /// system prompt carries them. A turn reconciles the conversation's
+    /// `channels` sections against it, which is also what hides
+    /// `channels_none`.
+    pub channels: &'a [ChannelSection],
 }
 
 /// Who this particular character is, as one block.
@@ -733,6 +739,7 @@ mod tests {
             building: "",
             mission: None,
             journal: None,
+            channels: &[],
         }
     }
 

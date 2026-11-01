@@ -169,6 +169,9 @@ struct Live {
     /// The journal sections this conversation holds, reconciled the same way
     /// and also whenever an entry is kept — see [`Minds::keep_journal`].
     journal: Carried,
+    /// The channel sections this conversation holds, reconciled at the head
+    /// of every turn against the channels the character is on.
+    channels: Carried,
     /// The journal record last written to this conversation's metadata, so an
     /// unchanged journal is not written again.
     journal_record: String,
@@ -1523,6 +1526,7 @@ impl Minds {
                 sequence,
                 mission: Carried::new(false),
                 journal: Carried::new(false),
+                channels: Carried::new(false),
                 journal_record: String::new(),
                 day,
                 chapter,
@@ -1593,6 +1597,7 @@ impl Minds {
             sequence,
             mission: Carried::new(true),
             journal: Carried::new(true),
+            channels: Carried::new(true),
             journal_record: String::new(),
             day,
             chapter,
@@ -1944,13 +1949,41 @@ impl Minds {
                 tracing::warn!("npc {npc_id}: {e:#}");
             }
         }
-        self.selection(
+        let declared = self
+            .projection
+            .load()
+            .as_ref()
+            .is_some_and(|p| p.identities.channels);
+        let channels: Vec<Want<'_>> = persona
+            .channels
+            .iter()
+            .filter(|_| declared)
+            .map(|c| Want {
+                name: &c.name,
+                text: &c.text,
+            })
+            .collect();
+        let channels_sealed = live
+            .channels
+            .reconcile(
+                &mut live.sequence,
+                identity::CHANNELS,
+                &channels,
+                Linking::Apart,
+                &[],
+                None,
+                tokio::time::sleep,
+            )
+            .await;
+        let mut selection = self.selection(
             npc_id,
             persona,
             within,
             !mission_sealed.is_empty(),
             &journal_sealed,
-        )
+        );
+        identity::carry_channels(&mut selection, &channels_sealed);
+        selection
     }
 
     /// The selection a turn reads, given which of the character's mission and

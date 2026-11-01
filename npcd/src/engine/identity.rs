@@ -50,6 +50,13 @@
 //! after its section seals — until then the turns it was written from are still
 //! in the window. See [`crate::engine::journal::section`].
 //!
+//! # So are the channels a character is on
+//!
+//! One section per channel, `channels/<thread id>`, each its name and what it
+//! is for, submitted to the character's own conversation and selected by
+//! [`carry_channels`] under `channels_intro`; `channels_none` shows while
+//! none has sealed. See [`crate::engine::channels`].
+//!
 //! # A dream reads a different floor
 //!
 //! A personality's anchor is the self it works as: a Keeper attends, remembers
@@ -91,6 +98,10 @@ pub const MISSION: &str = "mission";
 
 /// What a character has written down. Selected only while it holds an entry.
 pub const JOURNAL: &str = "journal";
+
+/// The channels a character is on, each with what it is for. Selected only
+/// while it is on one.
+pub const CHANNELS: &str = "channels";
 
 /// The member every collection carries for the case nothing else resolves.
 pub const GENERIC: &str = "generic";
@@ -280,6 +291,9 @@ pub struct Installed {
     pub characters: Vec<u64>,
     pub settings: Vec<String>,
     pub buildings: Vec<String>,
+    /// Whether the schema declares the [`CHANNELS`] collection: what a turn's
+    /// channel sections are submitted to.
+    pub channels: bool,
 }
 
 impl Installed {
@@ -366,6 +380,13 @@ pub fn carry_mission(selection: &mut SelectionState, sealed: bool) {
 /// emits nothing, which is what shows `journal_none`.
 pub fn carry_journal(selection: &mut SelectionState, sealed: &[String]) {
     selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
+}
+
+/// Pin the channel sections that have `sealed` for the turn to read under
+/// `channels_intro`'s heading. With none sealed the collection pins nothing
+/// and emits nothing, which is what shows `channels_none`.
+pub fn carry_channels(selection: &mut SelectionState, sealed: &[String]) {
+    selection.select_all(CHANNELS, sealed.iter().map(String::as_str));
 }
 
 /// The name one part of a world is installed and selected under.
@@ -458,7 +479,24 @@ pub fn install(
             .map_err(|e| anyhow::anyhow!("scoping `{JOURNAL}` to its members: {e}"))?;
     }
 
-    let mut out = Installed::default();
+    // As the journal: a schema with no `channels` has no `channels_none` to
+    // hide, and the collection holds nothing but the conversation's own
+    // sections.
+    if builder.id_for_system_collection(CHANNELS).is_some() {
+        builder
+            .set_collection_selection(
+                CHANNELS,
+                SelectionRule::Named {
+                    selector: CHANNELS.to_string(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("scoping `{CHANNELS}` to its members: {e}"))?;
+    }
+
+    let mut out = Installed {
+        channels: builder.id_for_system_collection(CHANNELS).is_some(),
+        ..Installed::default()
+    };
 
     add(builder, ANCHOR, GENERIC, GENERIC_ANCHOR)?;
     for (id, anchor) in &authored.anchors {
@@ -541,6 +579,7 @@ mod tests {
             characters: vec![7],
             settings: vec!["battle-cities".into()],
             buildings: vec![VAULT.into(), REDOUBT.into()],
+            channels: false,
         }
     }
 

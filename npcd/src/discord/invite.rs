@@ -7,7 +7,7 @@
 ///
 /// | Bit | Permission | For |
 /// |---|---|---|
-/// | `1 << 4` | Manage Channels | the channels a world is mirrored into: `#the-channel`, a group's, `#dms`, `#backstage` |
+/// | `1 << 4` | Manage Channels | the channels a world is mirrored into: `#the-channel`, a group's, `#dms` |
 /// | `1 << 6` | Add Reactions | answering a message without a message |
 /// | `1 << 10` | View Channels | seeing the channels it is a member of |
 /// | `1 << 11` | Send Messages | speaking in them |

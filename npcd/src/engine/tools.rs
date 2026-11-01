@@ -54,6 +54,7 @@ use crate::bridge::BRIDGE_ACTS;
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::{acts, bench, mission, mission_acts, station};
+use crate::sim::phone::Kind as ThreadKind;
 
 /// What a tool changes, which decides where it can be used and what it must be
 /// checked against.
@@ -1563,6 +1564,23 @@ pub enum Choices {
     /// something the world can *do* to somebody rather than a flag anybody has
     /// to remember to set.
     Threads,
+    /// How a `message` goes: **`private`**, to somebody it talks to alone,
+    /// or **`channel`**, to a channel or a group — each offered only while it
+    /// has one of those.
+    ///
+    /// Chosen before the conversation, and what the conversation is chosen
+    /// from: a person on a channel with this character is on a direct thread
+    /// with it too, under the same name, so a flat list of names put both in
+    /// one branch and the first name won. Said first, the choice is the
+    /// character's and the name can only be one of that kind
+    /// ([`Choices::Private`], [`Choices::Channels`]).
+    Ways,
+    /// The people this character talks to alone, by name — what a `private`
+    /// message is sent to.
+    Private,
+    /// This character's channels and groups, by name — what a `channel`
+    /// message is sent to.
+    Channels,
     /// The conversations where somebody else spoke last — each one waiting on
     /// this character — as it names them, most recently spoken first.
     ///
@@ -1777,7 +1795,9 @@ const LIVE: &[(&str, &str, Choices)] = &[
     // to be beside it and refused the one name that would have worked.
     ("send_image", "to", Choices::Threads),
     // ---- the phone ----
-    ("message", "to", Choices::Threads),
+    // How it goes, and from that, to which conversation: `to` is brought by
+    // the way chosen ([`BRINGS`], [`BROUGHT_CHOICES`]).
+    ("message", "via", Choices::Ways),
     // Not `Threads`: an answer goes on the conversation that is waiting for
     // it, never on one the asker merely shares a name with. See
     // [`Choices::Awaiting`].
@@ -1995,6 +2015,12 @@ pub struct Within {
     pub postures: Vec<String>,
     /// The conversations on this character's phone, as it names them.
     pub threads: Vec<String>,
+    /// The subset of [`Self::threads`] it has with one other person — see
+    /// [`Choices::Private`].
+    pub private: Vec<String>,
+    /// The subset of [`Self::threads`] that are channels and groups — see
+    /// [`Choices::Channels`].
+    pub channels: Vec<String>,
     /// The subset of [`Self::threads`] where somebody else spoke last — see
     /// [`Choices::Awaiting`].
     pub awaiting: Vec<String>,
@@ -2160,6 +2186,8 @@ impl Within {
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
         self.threads = sim.threads_for(&self.me, body);
+        self.private = sim.threads_of_kind_for(&self.me, body, ThreadKind::Direct);
+        self.channels = sim.threads_of_kind_for(&self.me, body, ThreadKind::Group);
         self.awaiting = sim.awaiting_for(&self.me, body);
         self.leavable = sim.leavable_for(&self.me, body);
         self.invitable = sim.invitable_for(&self.me, body);
@@ -2354,16 +2382,39 @@ fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilParam {
 ///
 /// A value with no entry takes nothing. Closed by
 /// [`tests::every_brought_field_is_a_real_optional_field`].
-const BRINGS: &[(&str, &str, &[Needs])] = &[(
-    "file_edit",
-    "do",
-    &[
-        ("replace", &["text"]),
-        ("insert_before", &["text"]),
-        ("insert_after", &["text"]),
-        ("move", &["dest", "where"]),
-    ],
-)];
+const BRINGS: &[(&str, &str, &[Needs])] = &[
+    (
+        "file_edit",
+        "do",
+        &[
+            ("replace", &["text"]),
+            ("insert_before", &["text"]),
+            ("insert_after", &["text"]),
+            ("move", &["dest", "where"]),
+        ],
+    ),
+    (
+        "message",
+        "via",
+        &[(PRIVATE, &["to"]), (CHANNEL_WAY, &["to"])],
+    ),
+];
+
+/// A `message` sent to somebody alone — the value of its `via`.
+pub const PRIVATE: &str = "private";
+
+/// A `message` sent on a channel or a group — the value of its `via`.
+pub const CHANNEL_WAY: &str = "channel";
+
+/// What a field a value brings is chosen from, when that is the world's to
+/// say and differs by the value. `(tool, value, field) → Choices`.
+///
+/// `message`'s `to` is a person for `private` and a channel for `channel`:
+/// one name offered from the set the way chose, never from both.
+const BROUGHT_CHOICES: &[(&str, &str, &str, Choices)] = &[
+    ("message", PRIVATE, "to", Choices::Private),
+    ("message", CHANNEL_WAY, "to", Choices::Channels),
+];
 
 /// Every field some value of `tool`'s choices brings. See [`BRINGS`].
 fn brought(tool: &str) -> Vec<&'static str> {
@@ -2375,6 +2426,15 @@ fn brought(tool: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// What `tool`'s `field` is chosen from once its chooser said `value`. See
+/// [`BROUGHT_CHOICES`].
+fn brought_choice(tool: &str, value: &str, field: &str) -> Option<Choices> {
+    BROUGHT_CHOICES
+        .iter()
+        .find(|(t, v, f, _)| *t == tool && *v == value && *f == field)
+        .map(|(_, _, _, c)| *c)
+}
+
 /// The fields each value of `t.param` brings, as the grammar's own. See
 /// [`BRINGS`].
 fn value_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<StencilParam>)> {
@@ -2382,18 +2442,30 @@ fn value_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<Sten
         .iter()
         .filter(|(tool, p, _)| *tool == t.name && *p == param)
         .flat_map(|(_, _, rules)| rules.iter())
-        .map(|(value, fields)| {
+        .filter_map(|(value, fields)| {
             // Required, as the stencil writes every field a value brings: after
-            // the value it is part of the call, not a choice beside it.
+            // the value it is part of the call, not a choice beside it. A
+            // field the world enumerates for this value takes that set, and a
+            // value whose set is empty brings nothing — its chooser does not
+            // offer it, and a branch with no arms would fail the grammar.
             let params = fields
                 .iter()
                 .filter_map(|f| t.params.iter().find(|p| p.name == *f))
-                .map(|p| StencilParam {
-                    required: true,
-                    ..stencil_param(t, p, within)
+                .map(|p| {
+                    let enum_values = match brought_choice(t.name, value, p.name) {
+                        Some(c) => Some(live_set(c, within)).filter(|v| !v.is_empty()),
+                        None => stencil_param(t, p, within).enum_values,
+                    };
+                    let offered =
+                        brought_choice(t.name, value, p.name).is_none() || enum_values.is_some();
+                    offered.then(|| StencilParam {
+                        required: true,
+                        enum_values,
+                        ..stencil_param(t, p, within)
+                    })
                 })
-                .collect();
-            ((*value).to_string(), params)
+                .collect::<Option<Vec<_>>>()?;
+            Some(((*value).to_string(), params))
         })
         .collect()
 }
@@ -2476,6 +2548,13 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Presentable => within.presentable.clone(),
         Choices::Postures => within.postures.clone(),
         Choices::Threads => within.threads.clone(),
+        Choices::Ways => [(PRIVATE, &within.private), (CHANNEL_WAY, &within.channels)]
+            .into_iter()
+            .filter(|(_, to)| !to.is_empty())
+            .map(|(way, _)| way.to_string())
+            .collect(),
+        Choices::Private => within.private.clone(),
+        Choices::Channels => within.channels.clone(),
         Choices::Awaiting => within.awaiting.clone(),
         Choices::Leavable => within.leavable.clone(),
         Choices::Invitable => within.invitable.clone(),
@@ -3323,6 +3402,51 @@ mod tests {
             place.enum_values.as_deref().unwrap(),
             crate::engine::bench::MOVE_PLACES
         );
+    }
+
+    /// **A message says how it goes before where**: `via` offers `private`
+    /// only while there is somebody to message alone and `channel` only while
+    /// there is a channel or group, and each brings its own `to` — the people
+    /// for one, the channels for the other — never a name of the other kind
+    /// and never as a sibling. With neither, `message` is not offered.
+    #[test]
+    fn a_message_says_how_it_goes_and_then_to_which_of_that_kind() {
+        let mut within = Within::among(&[]);
+        within.private = vec!["Soren".into()];
+        within.channels = vec!["the channel".into(), "#research".into()];
+        let params = stencil_params(by_name("message").unwrap(), &within);
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["via", "intent"]);
+        let via = &params[0];
+        assert_eq!(
+            via.enum_values.as_deref().unwrap(),
+            [PRIVATE.to_string(), CHANNEL_WAY.to_string()]
+        );
+        let to = |value: &str| -> Vec<String> {
+            let (_, fields) = via.shapes.iter().find(|(v, _)| v == value).unwrap();
+            assert_eq!(fields.len(), 1);
+            assert_eq!((fields[0].name.as_str(), fields[0].required), ("to", true));
+            fields[0].enum_values.clone().unwrap()
+        };
+        assert_eq!(to(PRIVATE), ["Soren"]);
+        assert_eq!(to(CHANNEL_WAY), ["the channel", "#research"]);
+
+        within.private.clear();
+        let params = stencil_params(by_name("message").unwrap(), &within);
+        assert_eq!(
+            params[0].enum_values.as_deref().unwrap(),
+            [CHANNEL_WAY.to_string()]
+        );
+        assert_eq!(
+            params[0].shapes.len(),
+            1,
+            "a way not offered brought a `to`"
+        );
+
+        within.channels.clear();
+        assert!(!specs_within(Mode::Physical, &within)
+            .iter()
+            .any(|s| s.name == "message"));
     }
 
     /// **A fold cannot be sent without somewhere to fold to.** The refusal
