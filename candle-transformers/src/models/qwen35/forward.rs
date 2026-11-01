@@ -1067,6 +1067,7 @@ fn sweep_layers(
     // slot header per decode sequence, so it is ~1 ms at a handful of slots and
     // ~20 ms at 128.
     let accept_in_place = session.accept_in_place();
+    let stencil_rows = session.stencil_rows();
     let g_meta = crate::models::profile::gpu_span("fwd:meta", model.device());
     // A segment being prepared runs no layer, so it builds no header — but it
     // claims the decode rows' write chunks the build would, here, before the
@@ -1165,6 +1166,7 @@ fn sweep_layers(
                 // The caller's accept walk selects on the head's span only when
                 // it reads the logits there.
                 accept_rows: if accept_in_place { scored_rows } else { 0 },
+                stencil_rows,
                 // This lineage's attention is dense: no sparse selection.
                 qsa_bytes: 0,
                 // Its MoE layers apply no look-ahead routers.

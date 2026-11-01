@@ -184,6 +184,10 @@ pub struct WaveWidth {
     /// the logits in place, zero when it owns them first (or runs no walk), so
     /// a wave reserves the walk's selections only when they will land there.
     pub accept_rows: usize,
+    /// Rows the sampler holds to a grammar's bitmap after this wave —
+    /// [`WaveBuffer::StencilBitmaps`]. The caller counts them before the forward:
+    /// a row's mask is decided by then.
+    pub stencil_rows: usize,
     /// Bytes one attention layer's **sparse selection** carves on its phase:
     /// the index keys and queries, the score buffer, the scoring products, the
     /// selection table and the per-span tables — [`WaveBuffer::QsaSelection`].
@@ -232,6 +236,7 @@ impl WaveWidth {
             scored_rows: sequences,
             prefill_spans: if sequences < pairs { sequences } else { pairs },
             accept_rows: 0,
+            stencil_rows: 0,
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
             look_ahead_hops: 0,
@@ -247,6 +252,7 @@ impl WaveWidth {
             scored_rows: sequences,
             prefill_spans: 0,
             accept_rows: 0,
+            stencil_rows: 0,
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
             look_ahead_hops: 0,
@@ -1093,6 +1099,11 @@ pub enum WaveBuffer {
     /// are at most the scored rows: this is the logits' second buffer, the same
     /// width, in either head mode.
     AcceptRows,
+    /// The sampler's grammar bitmaps, `[stencil_rows, vocab / 32]` `u32`: one bit
+    /// per token for each row held to a set too wide to name. Written from the
+    /// host beside the logits they mask and read by the sampling kernel, so a
+    /// wider forward simply has more of them and the span's reset takes them all.
+    StencilBitmaps,
     /// The wide residual, `[rows, streams · hidden]` F32 — on a multi-stream
     /// stack, for every forward.
     ///
@@ -1453,6 +1464,7 @@ impl WaveBuffer {
             | Self::HeadLogits
             | Self::HeadLogitsF32
             | Self::AcceptRows
+            | Self::StencilBitmaps
             | Self::HyperResidual
             | Self::HeadRowEmbeds
             | Self::HeadScoredResidual
@@ -1599,6 +1611,7 @@ impl WaveBuffer {
             | Self::HeadLogits
             | Self::HeadLogitsF32
             | Self::AcceptRows
+            | Self::StencilBitmaps
             | Self::HyperResidual
             | Self::HeadRowEmbeds
             | Self::HeadScoredResidual
@@ -2048,6 +2061,7 @@ impl WaveBuffer {
             }
             Self::HeadLogitsF32 => dense(0, 0, DType::F32),
             Self::AcceptRows => dense(w.accept_rows, g.vocab, g.act_dtype),
+            Self::StencilBitmaps => dense(w.stencil_rows, g.vocab.div_ceil(32), DType::U32),
             Self::HeadNormF32 => dense(0, 0, g.act_dtype),
             // Every row of the wave, fresh or resumed, whether or not the head
             // runs: a window that stops short hands its residual on from here.
@@ -3660,6 +3674,7 @@ mod tests {
                         scored_rows: rows,
                         prefill_spans: rows,
                         accept_rows: rows,
+                        stencil_rows: rows,
                         qsa_bytes: rows,
                         // A staged chunk of the line's rows, `rows` deep.
                         kv_stage: PrefillKvStageLayout::new(
@@ -4154,6 +4169,14 @@ mod tests {
             ..w4
         };
         assert_eq!(WaveBuffer::AcceptRows.bytes(&g, walked), 4 * 496_640);
+        // Each row under a grammar's bitmap holds one bit per token, rounded up
+        // to whole words: 7,760 words at 248,320 tokens.
+        let masked = WaveWidth {
+            stencil_rows: 3,
+            ..w4
+        };
+        assert_eq!(WaveBuffer::StencilBitmaps.bytes(&g, masked), 3 * 31_040);
+        assert_eq!(WaveBuffer::StencilBitmaps.bytes(&g, w4), 0);
         assert_eq!(
             plan.chain_bytes(Chain::Forward, walked),
             1_991_168 + 4 * 496_640 + 8_208,

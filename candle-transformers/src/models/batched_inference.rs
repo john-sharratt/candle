@@ -662,6 +662,9 @@ pub struct BatchedInferenceSession {
     /// first (the scheduler) never sets it, so its waves reserve nothing for a
     /// walk that does not happen on the span.
     accept_in_place: bool,
+    /// Rows of the wave being issued that the sampler holds to a grammar's
+    /// bitmap: the forward prices `WaveBuffer::StencilBitmaps` for them.
+    stencil_rows: usize,
     /// The draft walk's token buffer — see [`Self::walk_tokens`].
     walk_tokens: Option<Tensor>,
 }
@@ -744,6 +747,7 @@ impl BatchedInferenceSession {
             pending_glue: None,
             rope: RungSelect::unbounded(),
             accept_in_place: false,
+            stencil_rows: 0,
             walk_tokens: None,
         })
     }
@@ -854,6 +858,7 @@ impl BatchedInferenceSession {
             pending_glue: None,
             rope: RungSelect::unbounded(),
             accept_in_place: false,
+            stencil_rows: 0,
             walk_tokens: None,
         }
     }
@@ -880,6 +885,17 @@ impl BatchedInferenceSession {
     /// which decides whether the forward reserves the accept walk's rows.
     pub fn accept_in_place(&self) -> bool {
         self.accept_in_place
+    }
+
+    /// Say how many rows of the waves issued from here the sampler holds to a
+    /// grammar's bitmap — see the field.
+    pub fn set_stencil_rows(&mut self, rows: usize) {
+        self.stencil_rows = rows;
+    }
+
+    /// Rows of the wave being issued held to a grammar's bitmap.
+    pub fn stencil_rows(&self) -> usize {
+        self.stencil_rows
     }
 
     /// A contiguous `[rows, n]` `u32` buffer for one draft walk: its committed

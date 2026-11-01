@@ -145,6 +145,12 @@ __device__ __forceinline__ float load_as_float<__nv_fp8_e4m3>(const __nv_fp8_e4m
 // whose other rows are resolved elsewhere (a grammar allow-list) hands the
 // kernel the whole block and names each kernel row's source row here, instead
 // of gathering the kernel rows into a compacted copy first.
+//
+// `allowed_bits_lo`/`_hi` are the device address of the row's allowed-token
+// bitmap, one bit per token of the vocabulary, or zero on a row with none. The
+// bitmaps stand on the wave's span beside the logits. A grammar step that allows
+// most of the vocabulary samples here, through its row's bitmap, instead of on
+// an allow-list naming hundreds of thousands of tokens.
 struct SeqDials {
     float temperature;
     int32_t top_k;
@@ -171,6 +177,8 @@ struct SeqDials {
     float typical_eps;
     float typical_delta;
     int32_t logits_row;
+    uint32_t allowed_bits_lo;
+    uint32_t allowed_bits_hi;
 };
 
 // ============================================================================
@@ -246,7 +254,10 @@ struct PenaltyParams {
     const int32_t* banned_tokens;
     int32_t num_banned_tokens;      // Total banned tokens (if shared)
     int32_t banned_tokens_per_seq;  // Tokens per sequence (0 = shared list)
-    
+
+    // This row's allowed-token bitmap, or null: a clear bit is a -inf logit.
+    const uint32_t* allowed_bits;
+
     // Stencil (constrained vocabulary - only allowed tokens)
     // When provided, ONLY stencil tokens are considered for sampling.
     // Layout: [stencil_size] - array of allowed token IDs
@@ -867,6 +878,13 @@ __device__ __forceinline__ float apply_penalties_branchless(
     // Note: Cannot use `banned_mult * logit - (1-banned_mult) * INFINITY` because
     // when banned_mult==1.0 (no ban), 0.0f * INFINITY = NaN in IEEE 754.
     logit = (banned_mult < 1.0f) ? -INFINITY : logit;
+
+    // 5b. The row's allowed-token bitmap: one read per token, however many the
+    //     grammar forbids.
+    if (params.allowed_bits != nullptr) {
+        const uint32_t word = params.allowed_bits[token_id >> 5];
+        logit = ((word >> (token_id & 31)) & 1u) ? logit : -INFINITY;
+    }
 
     // 6. Token suppression (in-segment ceiling lever).
     // `suppress_penalty` is non-zero only while this sequence is inside a segment
@@ -2904,6 +2922,12 @@ batched_penalty_sampling_kernel(
     penalty_params_local.banned_tokens = banned_tokens;
     penalty_params_local.num_banned_tokens = num_banned_tokens;
     penalty_params_local.banned_tokens_per_seq = banned_tokens_per_seq;
+    penalty_params_local.allowed_bits = nullptr;
+    if (seq_dials != nullptr) {
+        const SeqDials& d = seq_dials[batch_idx];
+        penalty_params_local.allowed_bits = reinterpret_cast<const uint32_t*>(
+            (static_cast<uint64_t>(d.allowed_bits_hi) << 32) | d.allowed_bits_lo);
+    }
     penalty_params_local.suppress_tokens = suppress_tokens;
     penalty_params_local.suppress_count = suppress_count;
     // Per-sequence suppression strength; gated to segments just below.

@@ -18,6 +18,7 @@ members = [
     "candle-wasm-examples/*",
     "candle-wasm-tests",
     "host",
+    "house-bridge",
     "journal-core",
     "journals",
     "mcp",
