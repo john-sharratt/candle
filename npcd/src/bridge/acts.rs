@@ -249,7 +249,7 @@ pub const RECEIVER_PLAY: Tool = receiver!(
 
 pub const RECEIVER_PAUSE: Tool = receiver!(
     "receiver_pause",
-    "Pause the AV receiver's current network or USB source.",
+    "Pause the AV receiver's current network or USB source, keeping its place in what was playing.",
     "Somebody is on a call and the stereo's streaming music is in the way.",
     "Paused, the source picks up where it was."
 );
