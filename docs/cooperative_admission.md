@@ -381,7 +381,11 @@ A card is **busy** when its latency or bulk load has held (§4.5). Then:
   A busy card lends nothing — unless it is fenced, when it lends its fence share,
   or unless every card is busy, when every card lends by its whole power and
   characters run beneath the conversations everywhere. A member syncing or
-  lagging lends nothing (rule 1).
+  lagging lends nothing (rule 1), and neither does one whose `CAPACITY` says
+  `process_loading`: another tenant of its process is still loading — zend
+  priming, say — and a character's turns there would take the shared engine
+  from the load. It serves, keeps its quorum place and takes its own leases as
+  ready; the cast runs on the members that have loaded.
 
 The gateway sends the weights to every npcd member as `PLAN { epoch, weights }`
 (protocol 7) whenever they change, and to a member as it is admitted. npcd's

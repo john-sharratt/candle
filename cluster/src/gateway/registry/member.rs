@@ -99,6 +99,14 @@ impl MemberView {
         self.ready() && !self.lagging && !self.syncing && !self.closing
     }
 
+    /// Routable, and nothing else in its process still loading: it may be lent
+    /// a character (`docs/cooperative_admission.md` §4.4, rule 1). A member
+    /// whose zend still primes serves and takes its own leases as ready, but a
+    /// character's turns there would take the shared engine from the load.
+    pub fn may_host(&self) -> bool {
+        self.routable() && !self.capacity.as_ref().is_some_and(|c| c.process_loading)
+    }
+
     /// Ready and not closing: a conversation may be placed on it (§4.4).
     /// Current enough is a conversation dimension, not a member one: a new
     /// conversation has no history to be behind on, and a released one goes

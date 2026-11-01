@@ -46,6 +46,20 @@ fn member(node: u64, session: u64) -> MemberView {
     }
 }
 
+/// **A member whose process is still loading may host no character**, while
+/// it stays routable for everything else.
+#[test]
+fn a_member_still_loading_its_process_hosts_no_character() {
+    let mut m = member(1, 1);
+    m.capacity = Some(capacity(MemberState::Ready, 1, true, 1));
+    assert!(m.may_host());
+    m.capacity.as_mut().unwrap().process_loading = true;
+    assert!(m.routable(), "still served");
+    assert!(!m.may_host(), "but lent no characters");
+    m.capacity = Some(capacity(MemberState::Loading, 1, true, 1));
+    assert!(!m.may_host(), "and none before it is ready at all");
+}
+
 /// A member whose session has ended is routed nothing, even as a canary or
 /// when it would rank best — but only that session: a newer session of the
 /// same node is left alone (§5.3).

@@ -218,6 +218,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 tokens_per_step_milli: 2_650,
                 guest_reach: 2048,
                 bulk_backlog: 37,
+                process_loading: true,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -245,6 +246,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(2_650)
                 .u32(2048)
                 .u32(37)
+                .u8(1)
                 .0,
         ),
         (

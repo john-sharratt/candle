@@ -630,6 +630,22 @@ async fn handle(
                 })
         })
         .or_else(|| origin.as_ref().and_then(|_| identify(req.headers()).ok()));
+    // **The gateway's ops key** (`Gateway::key_holder`): its admin, on any
+    // route of every site this gateway serves — for a request that came from no
+    // member, which vouches for the callers it forwards by its own rules, and
+    // whose callers a key they carry lifts to nothing. Either of the gateway's
+    // keys, accepted or not, goes no further than this gateway: no member or
+    // upstream ever holds one.
+    let gateway = app.cluster.as_ref();
+    let identity = identity.or_else(|| {
+        origin
+            .is_none()
+            .then(|| gateway.and_then(|gw| gw.key_holder(req.headers())))
+            .flatten()
+    });
+    if gateway.is_some_and(|gw| gw.presents_key(req.headers())) {
+        req.headers_mut().remove(header::AUTHORIZATION);
+    }
     let assertion = app
         .auth
         .as_ref()
