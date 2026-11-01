@@ -101,6 +101,17 @@ async fn page(State(s): State<PageState>, origin: Origin, headers: HeaderMap) ->
     ([(header::CACHE_CONTROL, "no-store")], Html(PAGE.as_str())).into_response()
 }
 
+/// **A member is reached for its commands and its log search, nothing else.**
+#[cfg(test)]
+#[test]
+fn a_member_is_reached_for_its_commands_and_its_logs() {
+    assert!(reaches_member("v1/cluster/command/drain"));
+    assert!(reaches_member("v1/logs"));
+    assert!(!reaches_member("v1/logs/../substrate"));
+    assert!(!reaches_member("v1/status"));
+    assert!(!reaches_member("v1/npc/1/discord/trace"));
+}
+
 /// **The page wears tokera.com's bar and stylesheets**, so it reads as part of
 /// the site it is linked from; its template has no placeholder left over.
 #[cfg(test)]
@@ -174,13 +185,23 @@ async fn undrain(State(s): State<PageState>, origin: Origin, headers: HeaderMap)
 }
 
 /// The member routes the page reaches through this gateway: its maintenance
-/// commands and their jobs, nothing else.
+/// commands and their jobs.
 const MEMBER_ROUTES: &str = "v1/cluster/";
 
-/// A maintenance command for one member, forwarded down its socket (§12.4):
-/// `/gateway/member/<app>/<node>/v1/cluster/command/…`. The page is served on
-/// every host, so the member is named by its app here rather than by the host
-/// the request arrived on.
+/// A member's log search. A machine's log is its daemon's, not one app's, so
+/// it is read through whichever of the machine's members is joined — the
+/// npcd member while the zend one is still loading, and the other way round.
+const MEMBER_LOGS: &str = "v1/logs";
+
+/// Whether `rest` is a route [`member`] forwards.
+fn reaches_member(rest: &str) -> bool {
+    rest.starts_with(MEMBER_ROUTES) || rest == MEMBER_LOGS
+}
+
+/// A maintenance command or a log search for one member, forwarded down its
+/// socket (§12.4): `/gateway/member/<app>/<node>/v1/cluster/command/…`, or
+/// `…/v1/logs?…`. The page is served on every host, so the member is named by
+/// its app here rather than by the host the request arrived on.
 async fn member(
     State(s): State<PageState>,
     Path((app, node, rest)): Path<(String, String, String)>,
@@ -194,10 +215,10 @@ async fn member(
     let refuse = |status: StatusCode, detail: String| {
         (status, Json(json!({"error": "refused", "detail": detail}))).into_response()
     };
-    if !rest.starts_with(MEMBER_ROUTES) {
+    if !reaches_member(&rest) {
         return refuse(
             StatusCode::NOT_FOUND,
-            format!("only /{MEMBER_ROUTES}… reaches a member from this page"),
+            format!("only /{MEMBER_ROUTES}… and /{MEMBER_LOGS} reach a member from this page"),
         );
     }
     let Ok(node) = u64::from_str_radix(&node, 16) else {

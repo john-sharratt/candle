@@ -938,6 +938,16 @@ Admin-only, the read-only ones included (`host/src/commands/mod.rs`), so
 
 `cluster_logs` answers a page, never a stream; the gateway's `/ws/logs` takes
 no filters (`host/src/endpoints/logs.rs:28`) and is for the live page.
+
+**A machine's log is its daemon's, not one app's.** The gateway gathers
+`/v1/logs` from zend's members, and a machine's zend loads for ten minutes after
+every restart, answering nothing, while its npcd member is up and writing to
+the same log. So for an Admin, `cluster_logs` reads the gateway's member list
+beside the gathering, and reads each machine the gathering missed through
+another of its members, by `GET /gateway/member/<app>/<node>/v1/logs`
+(`web/src/cluster/page.rs`, which forwards that one route besides the
+maintenance commands); its lines come back under the machine, marked with the
+member that answered. A `node` may name a member of either app.
 `cluster_audit` is not the `audit` command, which walks the substrate checking
 what it holds against what maintenance counts as live
 (`host/src/commands/exec.rs:334-363`).

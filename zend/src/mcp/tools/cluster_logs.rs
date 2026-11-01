@@ -1,10 +1,20 @@
 //! `cluster_logs`: what the members' logs say (`docs/claude_zend_gateway.md`
 //! §8.1) — `GET /v1/logs`, which the gateway asks every member and gathers;
 //! with `node`, one member's, which is for Admins only.
+//!
+//! **A machine's log is its daemon's, not one app's.** The gateway gathers
+//! `/v1/logs` from zend's members, so a machine whose zend is still loading —
+//! for ten minutes after every restart — answered nothing, though its npcd
+//! member was up and writing to the same log. For an Admin, a machine the
+//! gathering missed is read through another of its members, by the gateway's
+//! member route (`/gateway/member/<app>/<node>/v1/logs`), and a `node` names a
+//! member of any app.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::http::Method;
+use futures::future::join_all;
 use serde_json::{json, Value};
 use url::form_urlencoded::Serializer;
 
@@ -12,6 +22,15 @@ use super::{Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 
 pub const NAME: &str = "cluster_logs";
+
+/// The apps whose members serve `/v1/logs`: the daemon's tenants.
+const LOGGING_APPS: [&str; 2] = ["zend", "npcd"];
+
+/// The app the gateway gathers `/v1/logs` from for this tool.
+const GATHERED_APP: &str = "zend";
+
+/// How long one member has to answer a search.
+const WITHIN: Duration = Duration::from_secs(30);
 
 /// Lines answered when the call names no `limit`, and the most, as the
 /// members' search allows. The default keeps a page inside what a client
@@ -65,6 +84,137 @@ pub fn path_of(args: &Value) -> String {
     format!("/v1/logs?{}", q.finish())
 }
 
+/// One member as the gateway's status lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub app: String,
+    pub host: String,
+    pub node: String,
+}
+
+/// The members of the logging apps in the gateway's `status`, a ready one
+/// before the others of its machine.
+pub fn listed(status: &Value) -> Vec<Listed> {
+    let mut members: Vec<(bool, Listed)> = status
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let field = |k: &str| m.get(k).and_then(Value::as_str).map(str::to_string);
+            let app = field("app")?;
+            LOGGING_APPS.contains(&app.as_str()).then_some(())?;
+            let ready = m.get("state").and_then(Value::as_str) == Some("ready");
+            Some((
+                !ready,
+                Listed {
+                    app,
+                    host: field("host")?,
+                    node: field("node")?,
+                },
+            ))
+        })
+        .collect();
+    members.sort_by_key(|(not_ready, _)| *not_ready);
+    members.into_iter().map(|(_, m)| m).collect()
+}
+
+/// For each machine `envelope` holds no answer from, one of its members in
+/// `members` to read it through.
+pub fn missed(envelope: &Value, members: &[Listed]) -> Vec<Listed> {
+    let mut answered: HashSet<String> = envelope
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("status").and_then(Value::as_u64) == Some(200))
+        .filter_map(|m| m.get("host").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    members
+        .iter()
+        .filter(|m| answered.insert(m.host.clone()))
+        .cloned()
+        .collect()
+}
+
+/// `envelope` with each machine it missed answered by `through`: a machine
+/// that came back in place of its unanswered entry, the rest after.
+pub fn with_answers(mut envelope: Value, through: Vec<Value>) -> Value {
+    let members = envelope
+        .get_mut("members")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let answered: HashSet<String> = through
+        .iter()
+        .filter_map(|m| m.get("host").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut out: Vec<Value> = members
+        .into_iter()
+        .filter(|m| {
+            m.get("host")
+                .and_then(Value::as_str)
+                .is_none_or(|h| !answered.contains(h))
+        })
+        .collect();
+    out.extend(through);
+    envelope["members"] = Value::Array(out);
+    envelope
+}
+
+/// The gateway's route to one member's search.
+fn member_path(member: &Listed, search: &str) -> String {
+    format!("/gateway/member/{}/{}{search}", member.app, member.node)
+}
+
+/// `member`'s search, as an envelope entry.
+async fn read_through(ctx: &Ctx, member: &Listed, search: &str) -> Value {
+    let reply = ops::up(
+        &ctx.session,
+        &ctx.caller,
+        Method::GET,
+        &member_path(member, search),
+        None,
+        None,
+        WITHIN,
+    )
+    .await;
+    let (status, body) = match reply {
+        Ok(r) => (
+            r.status,
+            serde_json::from_slice::<Value>(&r.body).unwrap_or(Value::Null),
+        ),
+        Err(_) => (502, Value::Null),
+    };
+    json!({
+        "host": member.host,
+        "node": member.node,
+        "through": member.app,
+        "status": status,
+        "body": body,
+    })
+}
+
+/// The gateway's status, for an Admin; `None` for anyone else or when it
+/// cannot be read.
+async fn gateway_members(ctx: &Ctx) -> Option<Vec<Listed>> {
+    if !ctx.caller.is_admin() {
+        return None;
+    }
+    let reply = ops::up(
+        &ctx.session,
+        &ctx.caller,
+        Method::GET,
+        "/gateway/status.json?log=0",
+        None,
+        None,
+        WITHIN,
+    )
+    .await
+    .ok()?;
+    json_of(&reply).ok().map(|s| listed(&s))
+}
+
 /// Every member's lines, under its member.
 pub fn render(envelope: &Value) -> String {
     let mut out = String::new();
@@ -75,7 +225,17 @@ pub fn render(envelope: &Value) -> String {
         .flatten()
     {
         let host = m.get("host").and_then(Value::as_str).unwrap_or("?");
-        let node = m.get("node").and_then(Value::as_str).unwrap_or("?");
+        let node = match m.get("through").and_then(Value::as_str) {
+            Some(app) => format!(
+                "{} (its {app} member)",
+                m.get("node").and_then(Value::as_str).unwrap_or("?")
+            ),
+            None => m
+                .get("node")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+        };
         let code = m.get("status").and_then(Value::as_u64).unwrap_or(0);
         if !out.is_empty() {
             out.push_str("\n\n");
@@ -137,37 +297,74 @@ pub fn render(envelope: &Value) -> String {
 }
 
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
-    let node = match args.get("node").and_then(Value::as_str) {
-        Some(n) => match ops::admin_only(&ctx.caller, "cluster_logs` with `node")
+    let search = path_of(args);
+    if let Some(n) = args.get("node").and_then(Value::as_str) {
+        let node = match ops::admin_only(&ctx.caller, "cluster_logs` with `node")
             .and_then(|()| ops::node(n))
         {
-            Ok(n) => Some(n),
+            Ok(n) => n,
             Err(e) => return Answer::error(e),
-        },
-        None => None,
-    };
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        &path_of(args),
-        node.as_deref(),
-        None,
-        Duration::from_secs(30),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Answer::error(e),
-    };
-    match json_of(&reply) {
-        // One member, named: its own answer, not an envelope.
-        Ok(v) if v.get("members").is_none() => Answer::ok(render(&json!({
-            "members": [{"host": "", "node": node.unwrap_or_default(), "status": 200, "body": v}]
-        }))),
-        Ok(v) => Answer::ok(render(&v)),
-        Err(e) => Answer::error(format!("/v1/logs: {e}")),
+        };
+        return one(ctx, &node, &search).await;
     }
+    let (reply, members) = tokio::join!(
+        ops::up(
+            &ctx.session,
+            &ctx.caller,
+            Method::GET,
+            &search,
+            None,
+            None,
+            WITHIN
+        ),
+        gateway_members(ctx)
+    );
+    let envelope = match reply.and_then(|r| json_of(&r)) {
+        Ok(v) => v,
+        Err(e) => return Answer::error(format!("/v1/logs: {e}")),
+    };
+    let Some(members) = members else {
+        return Answer::ok(render(&envelope));
+    };
+    let missed = missed(&envelope, &members);
+    let through = join_all(missed.iter().map(|m| read_through(ctx, m, &search))).await;
+    Answer::ok(render(&with_answers(envelope, through)))
+}
+
+/// Member `node`'s search: a zend member's as the gateway routes it, any
+/// other logging app's through the gateway's member route.
+async fn one(ctx: &Ctx, node: &str, search: &str) -> Answer {
+    let listed = gateway_members(ctx).await.unwrap_or_default();
+    let member = listed.iter().find(|m| m.node == node);
+    let entry = match member {
+        Some(m) if m.app != GATHERED_APP => read_through(ctx, m, search).await,
+        _ => {
+            let reply = match ops::up(
+                &ctx.session,
+                &ctx.caller,
+                Method::GET,
+                search,
+                Some(node),
+                None,
+                WITHIN,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => return Answer::error(e),
+            };
+            match json_of(&reply) {
+                Ok(v) => json!({
+                    "host": member.map_or("", |m| m.host.as_str()),
+                    "node": node,
+                    "status": 200,
+                    "body": v,
+                }),
+                Err(e) => return Answer::error(format!("/v1/logs: {e}")),
+            }
+        }
+    };
+    Answer::ok(render(&json!({ "members": [entry] })))
 }
 
 #[cfg(test)]
@@ -209,5 +406,72 @@ mod tests {
             )
         );
         assert_eq!(render(&json!({"members": []})), "No member answered.");
+    }
+
+    fn status() -> Value {
+        json!({"members": [
+            {"app": "zend", "host": "BlackWorld", "node": "00000000000000b1", "state": "ready"},
+            {"app": "agent", "host": "WhiteWorld", "node": "00000000000000a6", "state": "ready"},
+            {"app": "zend", "host": "WhiteWorld", "node": "00000000000000c6", "state": "loading"},
+            {"app": "npcd", "host": "WhiteWorld", "node": "00000000000000d6", "state": "ready"},
+            {"app": "keep", "host": "whiteworld", "node": "00000000000000e6", "state": "ready"}
+        ]})
+    }
+
+    /// **A machine whose zend did not answer is read through its other
+    /// member**: only the daemon's tenants are listed, a ready one first, and
+    /// a machine that answered is not asked again.
+    #[test]
+    fn a_machine_the_gathering_missed_is_read_through_another_member() {
+        let members = listed(&status());
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| (m.app.as_str(), m.node.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("zend", "00000000000000b1"),
+                ("npcd", "00000000000000d6"),
+                ("zend", "00000000000000c6"),
+            ],
+            "agents and keeps hold no daemon log; ready members first"
+        );
+        let envelope = json!({"members": [
+            {"host": "BlackWorld", "node": "00000000000000b1", "status": 200, "body": {"lines": []}},
+        ]});
+        let missed = missed(&envelope, &members);
+        assert_eq!(
+            missed,
+            [Listed {
+                app: "npcd".into(),
+                host: "WhiteWorld".into(),
+                node: "00000000000000d6".into(),
+            }],
+            "WhiteWorld, through its ready npcd member"
+        );
+        assert_eq!(
+            member_path(&missed[0], "/v1/logs?limit=5"),
+            "/gateway/member/npcd/00000000000000d6/v1/logs?limit=5"
+        );
+    }
+
+    /// **The machine read through takes the place of its unanswered entry**,
+    /// and says which member answered for it.
+    #[test]
+    fn the_machine_read_through_replaces_its_unanswered_entry() {
+        let envelope = json!({"members": [
+            {"host": "BlackWorld", "node": "01", "status": 200,
+             "body": {"lines": ["2026 INFO a"], "matched": 1}},
+            {"host": "WhiteWorld", "node": "02", "status": 504},
+        ]});
+        let through = vec![json!({
+            "host": "WhiteWorld", "node": "03", "through": "npcd", "status": 200,
+            "body": {"lines": ["2026 INFO npcd::discord: b"], "matched": 1},
+        })];
+        assert_eq!(
+            render(&with_answers(envelope, through)),
+            "BlackWorld 01: 1 of 1 matching lines\n2026 INFO a\n\n\
+             WhiteWorld 03 (its npcd member): 1 of 1 matching lines\n2026 INFO npcd::discord: b"
+        );
     }
 }
