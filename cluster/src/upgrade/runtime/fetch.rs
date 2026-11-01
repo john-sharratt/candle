@@ -144,6 +144,13 @@ impl Upgrader {
                             f.app = app;
                             f.reply_to = node;
                         }
+                        tracing::warn!(
+                            build = %build_name(&f.build),
+                            offset,
+                            resumes = f.resumes,
+                            app = %f.app,
+                            "no chunk of the build came in time: asking again"
+                        );
                         Some(f.clone())
                     }
                 }
