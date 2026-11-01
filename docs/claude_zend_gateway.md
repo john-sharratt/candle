@@ -457,14 +457,16 @@ lineage (`zend/src/mcp/lineage.rs`).
 
 **A worker carries the document of its kind.** `repo_task_start` takes a `role`
 (`coder` by default, `researcher`, `reviewer`) and a part takes its worker's.
-The kind's document, `zend/src/prompts/roles/<role>.md`, is the first section of
-the collection, under `lineage/role`: instructions on how that kind of work is
-done, where the journals below it are information to weigh. It sits outside the
-inherited budget, so a long lineage never cuts it, and it is short, at most
-4,000 characters, because every round reads it. Working rules live here rather
-than in the system prompt, which every conversation carries, chat included.
-Editing one is a commit and a zend release. The aggregator's guides
-(`docs/mcp_guides.md`) are the caller's and do not reach a worker.
+The kind selects an option of the `role` selector in `projection.yaml`. Every
+option is pre-sealed at startup and read back by its hash, as a tool's section
+is, so the document is in the system prompt from the worker's first round and
+no conversation prefills it. `generic`, the default, emits nothing: a
+conversation that is no worker carries the prompt it always did. The selector is
+a tree of its own, so a role adds one sealed section and multiplies no dial. An
+option stays short, at most 2,000 characters, and holds working rules only:
+turns sealed under it are borrowed into dialogues, and a worked exchange there
+would hijack them. Editing one is a commit and a zend release. The aggregator's
+guides (`docs/mcp_guides.md`) are the caller's and do not reach a worker.
 
 **A conversation carries its ancestors' journals.** The lineage runs project →
 thread → worker → part: `P:candle`, `T:review-layers`,
