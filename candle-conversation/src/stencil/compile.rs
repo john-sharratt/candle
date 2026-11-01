@@ -121,8 +121,6 @@ fn dfs(
 struct Arena {
     nodes: Vec<StencilNode>,
     lowered: HashMap<(SpecId, String), NodeId>,
-    /// Each pattern's rule, built once: many fields share one.
-    rules: HashMap<String, Option<Arc<ValueRule>>>,
 }
 
 impl Arena {
@@ -130,18 +128,13 @@ impl Arena {
     /// value left free is at worst refused by its tool, where a rule that
     /// cannot finish would never end the turn.
     fn rule(&mut self, pattern: &str, vocab: &dyn Vocab) -> Option<Arc<ValueRule>> {
-        if let Some(rule) = self.rules.get(pattern) {
-            return rule.clone();
-        }
-        let rule = match ValueRule::new(pattern, vocab) {
-            Ok(rule) => Some(Arc::new(rule)),
+        match ValueRule::shared(pattern, vocab) {
+            Ok(rule) => Some(rule),
             Err(e) => {
                 tracing::warn!(pattern, "a value's pattern was left unenforced: {e}");
                 None
             }
-        };
-        self.rules.insert(pattern.to_string(), rule.clone());
-        rule
+        }
     }
 }
 

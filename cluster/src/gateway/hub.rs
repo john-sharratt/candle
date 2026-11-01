@@ -77,11 +77,12 @@ use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
 use crate::frame::{
-    name, Admit, BuildFetch, BuildId, Frame, Hello, Lost, MemberState, Members, Plan as PlanFrame,
+    name, Admit, BuildFetch, BuildId, Capacity, Frame, Hello, Lost, MemberState, Members,
+    Plan as PlanFrame,
 };
-use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
+use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, PROTO};
 use crate::pipe::{Message, PipeRx, PipeTx};
-use crate::session::{start, Ended, Incoming, Role, SessionHandle, VirtualConn};
+use crate::session::{start, start_behind, Ended, Incoming, Role, SessionHandle, VirtualConn};
 
 use super::tiebreak::TieBreak;
 use crate::upgrade::decisions::build_name;
@@ -461,8 +462,18 @@ impl Hub {
         F: Fn(MemberStream) + Send + Sync,
     {
         let node = hello.node;
-        let session = start(Role::Gateway, tx, rx);
+        let session = if admitted.behind {
+            start_behind(tx, rx)
+        } else {
+            start(Role::Gateway, tx, rx)
+        };
         let handle = session.handle.clone();
+        // Its `CAPACITY` does not cross protocols: it stands as upgrading from
+        // here to the end of its session.
+        let capacity = admitted.behind.then(|| Capacity {
+            state: MemberState::Upgrading,
+            ..Capacity::default()
+        });
         {
             let mut s = self.state();
             let connected_ms = now_ms();
@@ -502,7 +513,7 @@ impl Hub {
                 weight: hello.power,
                 session: admitted.session,
                 repos: hello.repos.clone(),
-                capacity: None,
+                capacity,
                 routes: None,
                 high_water: 0,
                 applied: Vec::new(),
@@ -874,10 +885,17 @@ impl Hub {
             self.note(
                 app,
                 hex(node),
-                format!(
-                    "admitted to upgrade: build {} is below the floor {}",
-                    build.count, floor.count
-                ),
+                if admitted.behind {
+                    format!(
+                        "admitted to upgrade: protocol {} is behind {PROTO}, build {} takes {}",
+                        hello.proto, build.count, floor.count
+                    )
+                } else {
+                    format!(
+                        "admitted to upgrade: build {} is below the floor {}",
+                        build.count, floor.count
+                    )
+                },
             );
             if let Some(offer) = offer {
                 let _ = handle.control(Frame::BuildOffer(offer));

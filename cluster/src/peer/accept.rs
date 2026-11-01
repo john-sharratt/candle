@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::{link, Peering, GATEWAY_APP};
 use crate::close::{Close, CloseCode};
 use crate::frame::Admit;
-use crate::handshake::{admit, HandshakeError};
+use crate::handshake::{admit, HandshakeError, PROTO};
 use crate::pipe::{PipeRx, PipeTx};
 use crate::session::{start, Role};
 
@@ -49,6 +49,17 @@ impl Peering {
                         format!(
                             "a peer link's handshake names app `{GATEWAY_APP}`, not `{}`",
                             hello.app
+                        ),
+                    ));
+                }
+                // A link carries the whole protocol, so an older peer has no
+                // lane to be admitted to: it redials until it is replaced.
+                if hello.proto != PROTO {
+                    return Err(Close::new(
+                        CloseCode::Protocol,
+                        format!(
+                            "protocol {} is not supported; this gateway speaks {PROTO}",
+                            hello.proto
                         ),
                     ));
                 }

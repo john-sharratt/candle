@@ -20,7 +20,8 @@ pub enum CloseCode {
     Model,
     /// `HELLO.now_ms` is more than 60 s from the gateway's clock.
     Skew,
-    /// Protocol version unsupported.
+    /// Protocol version unsupported: the two ends differ and nothing yet
+    /// bridges them. It clears when either end is replaced.
     Protocol,
 }
 
@@ -58,10 +59,9 @@ impl CloseCode {
     pub fn after(self) -> AfterClose {
         match self {
             CloseCode::GoingAway | CloseCode::Malformed | CloseCode::Proof => AfterClose::Backoff,
-            CloseCode::Model | CloseCode::Skew => AfterClose::AtCap,
+            CloseCode::Model | CloseCode::Skew | CloseCode::Protocol => AfterClose::AtCap,
             CloseCode::Replaced => AfterClose::StopSocket,
             CloseCode::Superseded => AfterClose::StopApp,
-            CloseCode::Protocol => AfterClose::StopSocket,
         }
     }
 }
@@ -73,8 +73,8 @@ pub enum AfterClose {
     Backoff,
     /// Wait at the 8 s cap and dial again: the cause will not clear sooner.
     AtCap,
-    /// This socket stops dialling — it is stale (4409) or speaks a protocol the
-    /// gateway refuses (4426). The member's other sockets carry on.
+    /// This socket stops dialling: it is stale (4409). The member's other
+    /// sockets carry on.
     StopSocket,
     /// The app's sockets to every cluster stop until the binary is replaced
     /// (4410): a build any cluster has superseded serves on none.
@@ -122,7 +122,7 @@ mod tests {
             (CloseCode::Superseded, 4410, AfterClose::StopApp),
             (CloseCode::Model, 4412, AfterClose::AtCap),
             (CloseCode::Skew, 4417, AfterClose::AtCap),
-            (CloseCode::Protocol, 4426, AfterClose::StopSocket),
+            (CloseCode::Protocol, 4426, AfterClose::AtCap),
         ];
         for (code, number, after) in table {
             assert_eq!(code.code(), number);
