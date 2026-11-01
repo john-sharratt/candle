@@ -293,9 +293,10 @@ pub const READ: Tool = Tool {
     plane: Plane::Internal,
     availability: Availability::Always,
     description: "Read something the place you are standing holds — a board, a panel, a page, a \
-                  terminal's subject. What comes back is its contents, not a description of it. \
-                  You are already told what is in the room and who is in it; this is for what is \
-                  written down, which you cannot know until you read it.",
+                  terminal's subject — or a conversation on your phone, by the name you call it, \
+                  or `messages` for everything unread there. What comes back is its contents, not \
+                  a description of it. You are already told what is in the room and who is in \
+                  it; this is for what is written down, which you cannot know until you read it.",
     params: &[Param {
         name: "what",
         ty: "string",

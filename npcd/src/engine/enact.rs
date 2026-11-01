@@ -31,6 +31,7 @@ use crate::engine::tools::SELF;
 use crate::engine::whereabouts;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
+use crate::sim::phone::Threads;
 use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
 use crate::sim::Sim;
 use crate::world::Hosted;
@@ -275,6 +276,15 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                 .join("; ");
             return Outcome::Did(format!("You read {what}: {said}"));
         }
+        // **A conversation on its phone, by the name it calls it** — or all of
+        // them with something unread, asked for as its messages or phone. Read
+        // as a board is: marked read as it is handed over, which is what ends
+        // the unread reminder (`sim::unread`).
+        if s.has_phone(body) {
+            if let Some(said) = read_phone(&mut s.threads, &me, &what) {
+                return said;
+            }
+        }
         if what.contains("order") {
             // Marked as this body has now seen them, which is what stops the
             // orders becoming the next thing to be read on a loop.
@@ -290,6 +300,49 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             }
         }
         Outcome::Refused(format!("There is nothing here called {what} to read."))
+    })
+}
+
+/// `what`, read off `me`'s phone: one of its conversations by the name it
+/// calls it, or every one with something unread when `what` asks for its
+/// messages or its phone. `None` when `what` names neither, so the reading
+/// goes on to the room.
+fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
+    let want = what.trim().to_lowercase();
+    let all = matches!(
+        want.as_str(),
+        "messages" | "my messages" | "phone" | "my phone" | "handset"
+    );
+    let names: Vec<String> = match all {
+        true => threads
+            .unread_threads(me)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect(),
+        false => vec![threads.by_name_for(me, what)?.as_named_to(me)],
+    };
+    let mut said = Vec::new();
+    for name in &names {
+        let fresh = threads.read(me, name).ok()?;
+        if fresh.is_empty() {
+            continue;
+        }
+        let lines: Vec<String> = fresh
+            .iter()
+            .map(|m| format!("{}: {}", m.from, m.intent.trim()))
+            .collect();
+        said.push(format!("On {name}: {}", lines.join("; ")));
+    }
+    Some(match (said.is_empty(), all) {
+        (true, true) => Outcome::Refused("Nothing on your phone is unread.".into()),
+        (true, false) => Outcome::Refused(format!(
+            "You have read everything on {}. Nothing has been said since.",
+            names[0]
+        )),
+        (false, _) => Outcome::Did(format!(
+            "{}\nTo answer, `message` the conversation by that name.",
+            said.join("\n")
+        )),
     })
 }
 
@@ -1482,6 +1535,47 @@ mod tests {
             !line.contains("ore count"),
             "the content stays in `read`: {line}"
         );
+    }
+
+    /// **`read` reads a conversation on the phone**, by the name the character
+    /// calls it, or every one with something unread as its messages — marked
+    /// read as it is handed over, so nothing is left unread to remind it of.
+    #[test]
+    fn read_reads_a_conversation_on_the_phone() {
+        let h = waste();
+        h.with_sim(|s| {
+            crate::sim::seed::issue_handset(s, "c1", "Wren");
+            s.threads.reach("Wren", "Soren");
+            s.threads
+                .send("Soren", "Wren", "asks for the ore count")
+                .unwrap();
+            s.threads.reach("Wren", "Kit");
+            s.threads.send("Kit", "Wren", "says hello").unwrap();
+        });
+        let out = perform(&h, "c1", &act("read", json!({"what": "Soren"})));
+        assert_eq!(
+            out.line().unwrap(),
+            "On Soren: Soren: asks for the ore count\nTo answer, `message` the conversation \
+             by that name."
+        );
+        let again = perform(&h, "c1", &act("read", json!({"what": "soren"})));
+        assert!(!again.happened(), "{again:?}");
+        assert_eq!(
+            again.line().unwrap(),
+            "You have read everything on Soren. Nothing has been said since."
+        );
+
+        let all = perform(&h, "c1", &act("read", json!({"what": "messages"})));
+        assert_eq!(
+            all.line().unwrap(),
+            "On Kit: Kit: says hello\nTo answer, `message` the conversation by that name."
+        );
+        assert!(
+            h.sim(|s| s.threads.unread_threads("Wren").is_empty()),
+            "nothing left unread"
+        );
+        let none = perform(&h, "c1", &act("read", json!({"what": "messages"})));
+        assert_eq!(none.line().unwrap(), "Nothing on your phone is unread.");
     }
 
     /// **A character with no handset is not told about one.**
