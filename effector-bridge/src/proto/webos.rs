@@ -56,7 +56,12 @@ pub fn register_payload(client_key: Option<&str>) -> Value {
                 "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV", "CONTROL_POWER",
                 "READ_APP_STATUS", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST",
                 "READ_NETWORK_STATE", "READ_RUNNING_APPS", "READ_TV_CHANNEL_LIST",
-                "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO"
+                "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO",
+                "READ_SETTINGS", "CONTROL_TV_SCREEN", "CONTROL_TV_STANBY",
+                "CONTROL_FAVORITE_GROUP", "CONTROL_BLUETOOTH", "CONTROL_TIMER_INFO",
+                "READ_TV_CURRENT_TIME", "ADD_LAUNCHER_CHANNEL", "CONTROL_TV_POWER",
+                "CONTROL_WOL", "READ_INSTALLED_APPS", "CONTROL_MOUSE_AND_KEYBOARD",
+                "CONTROL_INPUT_TEXT", "READ_NOTIFICATIONS", "WRITE_SETTINGS"
             ],
             "signatures": [{
                 "signatureVersion": 1,
@@ -172,6 +177,36 @@ impl Remote {
     pub async fn tell(&mut self, uri: &str, payload: Value) -> Result<()> {
         self.request(uri, payload).await.map(drop)
     }
+
+    /// The URL of the TV's pointer-input socket — a second WebSocket that
+    /// carries remote-control button presses (`HOME`, `UP`, `ENTER`, …).
+    pub async fn pointer_socket(&mut self) -> Result<String> {
+        let p = self
+            .request(
+                "ssap://com.webos.service.networkinput/getPointerInputSocket",
+                json!({}),
+            )
+            .await?;
+        p["socketPath"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("the TV gave no pointer socket"))
+    }
+}
+
+/// Press one remote button by opening the pointer-input socket, sending it, and
+/// closing — the socket speaks a tiny line protocol, not SSAP JSON.
+pub async fn send_button(socket_path: &str, name: &str) -> Result<()> {
+    let (mut socket, _) = timeout(ANSWER, connect_async(socket_path))
+        .await
+        .map_err(|_| anyhow!("the pointer socket did not answer in time"))??;
+    socket
+        .send(Message::Text(format!("type:button\nname:{name}\n\n")))
+        .await?;
+    // Let the press reach the TV before the socket drops.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let _ = socket.close(None).await;
+    Ok(())
 }
 
 #[cfg(test)]

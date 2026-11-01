@@ -93,6 +93,95 @@ impl WebOs {
         }
         Ok(format!("{}.", parts.join(", ")))
     }
+
+    /// Press one remote button over the pointer-input socket.
+    async fn button(&self, key: Option<&str>, name: &str) -> Result<()> {
+        let mut r = self.remote(key).await?;
+        let socket = r.pointer_socket().await?;
+        crate::proto::webos::send_button(&socket, name).await
+    }
+
+    /// The installed apps, by their shown titles.
+    async fn apps(&self, name: &str, key: Option<&str>) -> Result<String> {
+        let mut r = self.remote(key).await?;
+        let p = r
+            .request(
+                "ssap://com.webos.applicationManager/listLaunchPoints",
+                json!({}),
+            )
+            .await?;
+        let titles: Vec<String> = p["launchPoints"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x["title"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if titles.is_empty() {
+            Ok(format!("The {name} listed no apps."))
+        } else {
+            Ok(format!("The {name} has: {}.", titles.join(", ")))
+        }
+    }
+
+    /// The external inputs, by their labels.
+    async fn inputs(&self, name: &str, key: Option<&str>) -> Result<String> {
+        let mut r = self.remote(key).await?;
+        let p = r
+            .request("ssap://tv/getExternalInputList", json!({}))
+            .await?;
+        let labels: Vec<String> = p["devices"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        x["label"]
+                            .as_str()
+                            .or_else(|| x["id"].as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if labels.is_empty() {
+            Ok(format!("The {name} listed no inputs."))
+        } else {
+            Ok(format!("The {name}'s inputs: {}.", labels.join(", ")))
+        }
+    }
+}
+
+/// The webOS input id for a friendly name (`hdmi2` → `HDMI_2`), else the value
+/// itself so a raw id or a device-specific label passes through.
+fn input_id(input: &str) -> String {
+    let t = input
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "");
+    match t.as_str() {
+        "hdmi" | "hdmi1" => "HDMI_1",
+        "hdmi2" => "HDMI_2",
+        "hdmi3" => "HDMI_3",
+        "hdmi4" => "HDMI_4",
+        "av" | "av1" => "AV_1",
+        "comp" | "component" | "comp1" => "COMP_1",
+        _ => return input.trim().to_string(),
+    }
+    .to_string()
+}
+
+/// The webOS sound-output id for a friendly name, else the value itself.
+fn sound_output(output: &str) -> String {
+    match output.trim().to_ascii_lowercase().as_str() {
+        "tv" | "tv speaker" | "internal" | "speaker" => "tv_speaker",
+        "arc" | "earc" | "receiver" | "hdmi" | "amp" => "external_arc",
+        "optical" => "external_optical",
+        "bluetooth" | "bt" | "soundbar" => "bt_soundbar",
+        "headphones" | "wired" | "lineout" => "tv_external_speaker",
+        other => return other.to_string(),
+    }
+    .to_string()
 }
 
 /// Read `{volume, muted}` or `{volumeStatus:{volume, muted}}`.
@@ -148,6 +237,37 @@ pub async fn work(
     if action == "status" {
         return tv.status(name, key).await;
     }
+    if action == "apps" {
+        return tv.apps(name, key).await;
+    }
+    if action == "inputs" {
+        return tv.inputs(name, key).await;
+    }
+
+    // Remote-button actions go over the pointer-input socket, not SSAP.
+    let named_button = match action {
+        "home" => Some("HOME"),
+        "back" => Some("BACK"),
+        "up" => Some("UP"),
+        "down" => Some("DOWN"),
+        "left" => Some("LEFT"),
+        "right" => Some("RIGHT"),
+        "ok" | "enter" | "select" => Some("ENTER"),
+        "exit" => Some("EXIT"),
+        "menu" => Some("MENU"),
+        "info" => Some("INFO"),
+        "guide" | "dash" => Some("DASH"),
+        _ => None,
+    };
+    if let Some(b) = named_button {
+        tv.button(key, b).await?;
+        return Ok(format!("Pressed {} on the {name}.", b.to_ascii_lowercase()));
+    }
+    if action == "button" {
+        let b = arg(args, "name").ok_or_else(|| anyhow!("Say which button."))?;
+        tv.button(key, &b.to_ascii_uppercase()).await?;
+        return Ok(format!("Pressed {} on the {name}.", b.to_ascii_lowercase()));
+    }
 
     let mut r = tv.remote(key).await?;
     let line = match action {
@@ -194,7 +314,8 @@ pub async fn work(
         }
         "input" => {
             let input = arg(args, "input").ok_or_else(|| anyhow!("Say which input."))?;
-            r.tell("ssap://tv/switchInput", json!({ "inputId": input.trim() }))
+            let id = input_id(&input);
+            r.tell("ssap://tv/switchInput", json!({ "inputId": id }))
                 .await?;
             format!("The {name} switched to {input}.")
         }
@@ -209,6 +330,61 @@ pub async fn work(
         "stop" => {
             r.tell("ssap://media.controls/stop", json!({})).await?;
             format!("The {name} is stopped.")
+        }
+        "forward" | "fast_forward" => {
+            r.tell("ssap://media.controls/fastForward", json!({}))
+                .await?;
+            format!("The {name} is fast-forwarding.")
+        }
+        "rewind" => {
+            r.tell("ssap://media.controls/rewind", json!({})).await?;
+            format!("The {name} is rewinding.")
+        }
+        "close" => {
+            let app = arg(args, "app").ok_or_else(|| anyhow!("Say which app to close."))?;
+            r.tell(
+                "ssap://system.launcher/close",
+                json!({ "id": app_id(&app) }),
+            )
+            .await?;
+            format!("The {name} closed {app}.")
+        }
+        "open" => {
+            let url = arg(args, "url").ok_or_else(|| anyhow!("Say the URL to open."))?;
+            r.tell("ssap://system.launcher/open", json!({ "target": url }))
+                .await?;
+            format!("The {name} opened {url}.")
+        }
+        "channel" => {
+            let ch = arg(args, "channel").ok_or_else(|| anyhow!("Say the channel number."))?;
+            r.tell("ssap://tv/openChannel", json!({ "channelNumber": ch }))
+                .await?;
+            format!("The {name} went to channel {ch}.")
+        }
+        "sound" => {
+            let out = arg(args, "output").ok_or_else(|| anyhow!("Say the sound output."))?;
+            r.tell(
+                "ssap://com.webos.service.apiadapter/audio/changeSoundOutput",
+                json!({ "output": sound_output(&out) }),
+            )
+            .await?;
+            format!("The {name}'s sound is on {out}.")
+        }
+        "screen_off" => {
+            r.tell(
+                "ssap://com.webos.service.tvpower/power/turnOffScreen",
+                json!({}),
+            )
+            .await?;
+            format!("The {name}'s screen is off.")
+        }
+        "screen_on" => {
+            r.tell(
+                "ssap://com.webos.service.tvpower/power/turnOnScreen",
+                json!({}),
+            )
+            .await?;
+            format!("The {name}'s screen is on.")
         }
         "channel_up" => {
             r.tell("ssap://tv/channelUp", json!({})).await?;
@@ -245,6 +421,18 @@ mod tests {
         assert_eq!(app_name("youtube.leanback.v4"), "youtube");
         assert_eq!(app_name("com.webos.app.livetv"), "livetv");
         assert_eq!(app_name("com.unknown"), "com.unknown");
+    }
+
+    #[test]
+    fn inputs_and_sound_outputs_resolve() {
+        assert_eq!(input_id("hdmi2"), "HDMI_2");
+        assert_eq!(input_id("HDMI 3"), "HDMI_3");
+        assert_eq!(input_id("HDMI_1"), "HDMI_1");
+        assert_eq!(input_id("AV"), "AV_1");
+        assert_eq!(input_id("SOME_CUSTOM"), "SOME_CUSTOM");
+        assert_eq!(sound_output("arc"), "external_arc");
+        assert_eq!(sound_output("tv"), "tv_speaker");
+        assert_eq!(sound_output("bt_soundbar"), "bt_soundbar");
     }
 
     #[test]
