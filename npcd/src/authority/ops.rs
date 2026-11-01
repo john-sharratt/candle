@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::discord::world::record::Guild;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::MessageSent;
 use crate::sim::phone::Origin;
@@ -73,8 +74,25 @@ pub enum WorldOp {
     },
     /// A character's mission called off.
     Cancel { npc: u64 },
-    /// A person speaks on the world's open channel.
-    Channel { from: String, text: String },
+    /// A person speaks on the world's open channel — from the console, with
+    /// no `origin`, or from the world's Discord server's `#the-channel`.
+    Channel {
+        from: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
+    },
+    /// The world's Discord server set, or taken away (`docs/npcd_discord.md`
+    /// §4.4): its `discord/guild` record.
+    Guild { guild: Option<Guild> },
+    /// A member of group thread `thread` wrote in the channel that mirrors
+    /// it in the world's server: said on the thread, from `origin`.
+    Mirrored {
+        thread: String,
+        from: String,
+        text: String,
+        origin: Origin,
+    },
     /// Somebody wrote in Discord channel `channel` of a server character
     /// `npc`'s bot is in: said on the thread that mirrors it, its author
     /// brought onto the thread on their first message

@@ -38,6 +38,7 @@ use npc_map::{MapEdit, MapSet};
 
 use crate::discord::dm::record::Dms;
 use crate::discord::server::record::Servers;
+use crate::discord::world::record::Mirror;
 use crate::engine::rooms::Rooms;
 use crate::engine::watch::Watch;
 use crate::mind::files::MindFiles;
@@ -83,6 +84,9 @@ pub struct Hosted {
     /// The servers this world's characters' Discord bots are in, and their
     /// channels' threads (§3.4) — held as the DMs are.
     servers: Mutex<Servers>,
+    /// The world's own Discord server and what is mirrored into it (§4.4) —
+    /// held as the DMs are.
+    mirror: Mutex<Mirror>,
 }
 
 struct State {
@@ -163,6 +167,7 @@ impl Hosted {
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
+            mirror: Mutex::new(Mirror::default()),
         })
     }
 
@@ -195,6 +200,7 @@ impl Hosted {
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
+            mirror: Mutex::new(Mirror::default()),
         })
     }
 
@@ -226,6 +232,7 @@ impl Hosted {
             ops: OnceLock::new(),
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
+            mirror: Mutex::new(Mirror::default()),
         }
     }
 
@@ -320,6 +327,16 @@ impl Hosted {
     /// Change the servers this world's bots are in, and their channels.
     pub fn with_servers<T>(&self, f: impl FnOnce(&mut Servers) -> T) -> T {
         f(&mut self.servers.lock().expect("servers lock"))
+    }
+
+    /// Read the world's Discord server and what is mirrored into it.
+    pub fn mirror<T>(&self, f: impl FnOnce(&Mirror) -> T) -> T {
+        f(&self.mirror.lock().expect("mirror lock"))
+    }
+
+    /// Change the world's Discord server and what is mirrored into it.
+    pub fn with_mirror<T>(&self, f: impl FnOnce(&mut Mirror) -> T) -> T {
+        f(&mut self.mirror.lock().expect("mirror lock"))
     }
 
     /// Both halves at once, under one acquisition.

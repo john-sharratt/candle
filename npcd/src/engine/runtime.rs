@@ -2689,6 +2689,19 @@ impl Runtime {
     /// Returns who is on the channel to hear it. `None` when the world is not
     /// hosted.
     pub fn say_on_channel(&self, world_id: &str, from: &str, text: &str) -> Option<Vec<String>> {
+        self.say_on_channel_from(world_id, from, text, None)
+    }
+
+    /// [`Self::say_on_channel`], for words that came from `origin` outside
+    /// the world — the world's Discord server's `#the-channel`, whose bridge
+    /// never posts them back — or from inside it, with `None`.
+    pub fn say_on_channel_from(
+        &self,
+        world_id: &str,
+        from: &str,
+        text: &str,
+        origin: Option<Origin>,
+    ) -> Option<Vec<String>> {
         let hosted = self.hosted.get(world_id)?;
         Some(hosted.with_sim(|sim| {
             // Enrolled first, so somebody speaking for the first time is on the
@@ -2696,7 +2709,7 @@ impl Runtime {
             // refuses, having correctly found that they are on no such thread.
             sim.enrol(from);
             sim.threads
-                .send(from, crate::sim::phone::CHANNEL, text)
+                .send_from(from, crate::sim::phone::CHANNEL, text, origin)
                 .unwrap_or_default()
         }))
     }

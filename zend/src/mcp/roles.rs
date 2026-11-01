@@ -1,22 +1,15 @@
-//! What kind of work a worker does, and the document that tells it how
-//! (`docs/claude_zend_gateway.md` §5.1).
+//! What kind of work a worker does (`docs/claude_zend_gateway.md` §5.1).
 //!
-//! A task names its kind when it starts and a part takes its worker's. The
-//! kind's document is carried as the first section of the conversation's
-//! journal collection, ahead of the inherited journals and outside their
-//! budget, so a long lineage never cuts it. The documents are compiled in from
-//! `prompts/roles/`, one file a kind, and ship with the behaviour they describe.
+//! A task names its kind when it starts and a part takes its worker's. The kind
+//! selects an option of the `role` selector in `projection.yaml`: every option
+//! is pre-sealed at startup, so a worker's first round already reads its
+//! document and nothing is prefilled for it. A conversation that is no worker
+//! takes the selector's default, `generic`, which emits nothing.
 
 use serde::{Deserialize, Serialize};
 
-use super::lineage::Inherited;
-
-/// The section name a worker's document is carried under.
-pub const SECTION: &str = "lineage/role";
-
-/// The most characters one document may run to: about 1,000 tokens. It is read
-/// every round of every worker of its kind.
-pub const MAX_DOCUMENT_CHARS: usize = 4_000;
+/// The `role` selector's id in `projection.yaml`.
+pub const ROLE_SELECTOR: &str = "role";
 
 /// The kind of work a task does: `coder` unless the call asks otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -41,25 +34,22 @@ impl WorkerKind {
         }
     }
 
-    fn document(self) -> &'static str {
+    /// Its option of the `role` selector.
+    pub fn option(self) -> &'static str {
         match self {
-            Self::Coder => include_str!("../prompts/roles/coder.md"),
-            Self::Researcher => include_str!("../prompts/roles/researcher.md"),
-            Self::Reviewer => include_str!("../prompts/roles/reviewer.md"),
-        }
-    }
-
-    /// The section that carries this kind's document.
-    pub fn section(self) -> Inherited {
-        Inherited {
-            name: SECTION.to_string(),
-            text: self.document().trim_end().to_string(),
+            Self::Coder => "coder",
+            Self::Researcher => "researcher",
+            Self::Reviewer => "reviewer",
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::models::Dialect;
+    use candle_conversation::projection::{Builder, SystemPromptItem};
+    use serde_yaml::Value;
+
     use super::*;
 
     const KINDS: [WorkerKind; 3] = [
@@ -68,8 +58,78 @@ mod tests {
         WorkerKind::Reviewer,
     ];
 
+    /// The `role` selector's options as `projection.yaml` declares them.
+    fn options() -> Vec<(String, Option<String>)> {
+        let schema: Value =
+            serde_yaml::from_str(include_str!("../prompts/projection.yaml")).unwrap();
+        let node = schema["system_prompt"]["items"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["nodes"].as_sequence())
+            .flatten()
+            .find(|node| node["id"].as_str() == Some(ROLE_SELECTOR))
+            .expect("projection.yaml declares the role selector");
+        assert_eq!(node["default"].as_str(), Some("generic"));
+        node["options"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                (
+                    o["id"].as_str().unwrap().to_string(),
+                    o["content"].as_str().map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// **Every role is one pre-sealed section**: the daemon's own parse gives
+    /// each kind's option exactly one sealed variant, `generic` none, and the
+    /// tree's default branch emits nothing, so what follows it seals unchanged.
+    #[test]
+    fn the_schema_seals_one_section_a_role_and_none_by_default() {
+        let dialect = Dialect::chat_ml();
+        let builder = Builder::from_yaml_with_vars_and_dialect(
+            include_str!("../prompts/projection.yaml"),
+            &[("workspace", "test")],
+            Some(&dialect),
+        )
+        .expect("projection.yaml must parse");
+        let tree = builder
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                SystemPromptItem::SectionTree(t)
+                    if t.nodes.iter().any(|n| n.name == ROLE_SELECTOR) =>
+                {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .expect("the role selector is a tree");
+        assert_eq!(tree.nodes.len(), 1, "a tree of its own multiplies no dial");
+        assert!(tree.default_present_ids.is_empty());
+        let variants: Vec<(&str, usize)> = tree.nodes[0]
+            .options
+            .iter()
+            .map(|o| (o.id.as_str(), o.variants.len()))
+            .collect();
+        assert_eq!(
+            variants,
+            [
+                ("generic", 0),
+                ("coder", 1),
+                ("researcher", 1),
+                ("reviewer", 1)
+            ]
+        );
+    }
+
     /// **A task codes unless asked**, and a kind nobody defined is refused
-    /// rather than leaving a worker with no document.
+    /// rather than leaving a worker on no document.
     #[test]
     fn a_call_names_a_kind_or_gets_coder() {
         assert_eq!(WorkerKind::of(None).unwrap(), WorkerKind::Coder);
@@ -83,28 +143,28 @@ mod tests {
         );
     }
 
-    /// The record holds the name the tool takes.
+    /// **`generic` is today's prompt to the byte**: it emits nothing, so a
+    /// conversation that is no worker seals no new section.
     #[test]
-    fn the_kind_is_stored_by_its_name() {
-        assert_eq!(
-            serde_json::to_string(&WorkerKind::Reviewer).unwrap(),
-            "\"reviewer\""
-        );
+    fn generic_emits_nothing() {
+        let options = options();
+        assert_eq!(options[0], ("generic".to_string(), None));
     }
 
-    /// Every document opens with its title and stays short: it is carried
-    /// every round.
+    /// Every kind names a real option, and only working rules: a worked
+    /// exchange in a role would hijack the dialogues that borrow its turns.
     #[test]
-    fn every_document_is_short_and_titled() {
+    fn every_kind_has_an_option_of_its_own() {
+        let options = options();
+        assert_eq!(options.len(), KINDS.len() + 1);
         for kind in KINDS {
-            let section = kind.section();
-            assert_eq!(section.name, "lineage/role");
-            assert!(section.text.starts_with("# How a "), "{kind:?}");
-            assert!(
-                section.text.len() <= MAX_DOCUMENT_CHARS,
-                "{kind:?} runs to {}",
-                section.text.len()
-            );
+            let (_, content) = options
+                .iter()
+                .find(|(id, _)| id == kind.option())
+                .unwrap_or_else(|| panic!("no option for {kind:?}"));
+            let content = content.as_deref().unwrap();
+            assert!(content.starts_with("You are working as a "), "{kind:?}");
+            assert!(!content.contains("<|im_start|>"), "{kind:?}");
         }
     }
 }

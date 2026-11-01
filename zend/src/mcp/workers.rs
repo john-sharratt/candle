@@ -53,7 +53,7 @@ use super::nudges;
 use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::resuming;
-use super::roles::WorkerKind;
+use super::roles::{WorkerKind, ROLE_SELECTOR};
 use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
@@ -1550,6 +1550,7 @@ async fn turn(
 ) -> Turned {
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
+    selection.select(ROLE_SELECTOR, worker.kind.option());
     apply_tools_dial(&mut selection, mode);
     let (message, round) = first.into_start();
     let mut stream = session

@@ -17,8 +17,6 @@
 //! or long-lived lineage drops its outermost journals' oldest lines from the
 //! prompt — never from the tools, which read them whole.
 
-use super::roles;
-
 /// The most inherited text a conversation carries, in characters: about 8K
 /// tokens.
 pub const MAX_CHARS: usize = 32_000;
@@ -41,7 +39,6 @@ pub fn section_name(i: usize) -> String {
 pub fn sweep_names() -> Vec<String> {
     let mut names: Vec<String> = (0..MAX_JOURNALS).map(section_name).collect();
     names.push(READER.to_string());
-    names.push(roles::SECTION.to_string());
     names
 }
 
@@ -265,9 +262,8 @@ mod tests {
     #[test]
     fn the_sweep_names_cover_every_name_a_section_can_take() {
         let names = sweep_names();
-        assert_eq!(names.len(), MAX_JOURNALS + 2);
+        assert_eq!(names.len(), MAX_JOURNALS + 1);
         assert!(names.contains(&section_name(MAX_JOURNALS - 1)));
         assert!(names.contains(&READER.to_string()));
-        assert!(names.contains(&roles::SECTION.to_string()));
     }
 }

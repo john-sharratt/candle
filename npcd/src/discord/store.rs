@@ -36,6 +36,11 @@ pub struct Bot {
     pub token: String,
     /// When the owner connected it, in real milliseconds.
     pub connected_ms: u64,
+    /// The portrait the bot was last pictured with, by image id: what the
+    /// reconcile (`docs/npcd_discord.md` §5.3) compares the character's
+    /// portrait with, so an avatar is sent only when it changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pictured: Option<String>,
 }
 
 impl Debug for Bot {
@@ -46,6 +51,7 @@ impl Debug for Bot {
             .field("username", &self.username)
             .field("token", &"…")
             .field("connected_ms", &self.connected_ms)
+            .field("pictured", &self.pictured)
             .finish()
     }
 }
@@ -105,7 +111,24 @@ mod tests {
             username: "Zen".into(),
             token: "c2VhbGVk".into(),
             connected_ms: 1_800_000_000_000,
+            pictured: None,
         }
+    }
+
+    /// **The portrait a bot was pictured with is written only when it has
+    /// one**, and read back.
+    #[test]
+    fn the_portrait_a_bot_was_pictured_with_is_kept() {
+        let dir = tmp();
+        let shared = Npcs::load(&dir).unwrap().substrate();
+        let mut pictured = bot();
+        pictured.pictured = Some("abc123".into());
+        put(&shared, 42, &pictured).unwrap();
+        assert_eq!(
+            shared.custom_object("discord/bot/42").unwrap().blob["pictured"],
+            json!("abc123")
+        );
+        assert_eq!(get(&shared, 42), Some(pictured));
     }
 
     /// **A bot is the record `discord/bot/<npc_id>`**, in exactly this shape,

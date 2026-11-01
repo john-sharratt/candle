@@ -71,7 +71,8 @@ pub async fn post(a: &Arc<Authored>, bot: &Online) -> Result<(), Rejected> {
                         thread::close(&hosted, npc, channel_id);
                         continue 'channels;
                     }
-                    Post::Unposted => continue 'channels,
+                    // A deleted channel is closed by its `CHANNEL_DELETE`.
+                    Post::Gone | Post::Unposted => continue 'channels,
                 }
             }
             posted(a, bot, to, last, parts.len());

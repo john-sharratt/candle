@@ -29,6 +29,7 @@
 //! | [`link`] | a person's Discord account, linked to their account |
 //! | [`dm`] | DMs with a character's bot, both ways |
 //! | [`server`] | a bot in its servers' channels, both ways |
+//! | [`world`] | a world's own server, and the world mirrored into it |
 //! | [`bots`] | every bot this member runs, and their beat |
 //! | [`trace`] | what the bridge did, logged, kept and answered |
 //!
@@ -55,3 +56,4 @@ pub mod server;
 pub mod state;
 pub mod store;
 pub mod trace;
+pub mod world;

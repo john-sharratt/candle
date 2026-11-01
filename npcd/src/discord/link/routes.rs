@@ -181,6 +181,7 @@ mod tests {
                         username: "Zen".into(),
                         token: "c2VhbGVk".into(),
                         connected_ms: 1,
+                        pictured: None,
                     },
                 )
                 .unwrap();

@@ -184,7 +184,7 @@ async fn deliver(
         for part in &parts {
             match send(a, bot, to, part).await? {
                 Post::Posted(id) => last = id,
-                Post::Forbidden | Post::Unposted => return Ok(()),
+                Post::Forbidden | Post::Gone | Post::Unposted => return Ok(()),
             }
         }
         posted(a, bot, to, last, parts.len());

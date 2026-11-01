@@ -1,6 +1,7 @@
 //! A bot's posts (`docs/npcd_discord.md` §5.1): what a DM or a channel is
-//! sent, cut to what Discord takes ([`split`]), and each post waited out
-//! against a `429` and tried again a few times.
+//! sent — as the bot, or through a channel's persona webhook — cut to what
+//! Discord takes ([`split`]), and each post waited out against a `429` and
+//! tried again a few times.
 //!
 //! A post Discord forbids (`403`: the bot may not write there) is said
 //! apart from any other failure, so a channel can stop being offered; any
@@ -11,11 +12,13 @@
 
 pub mod split;
 
+use std::future::Future;
 use std::time::Duration;
 
 use tokio::time::sleep;
 
 use crate::api::{now_ms, Authored};
+use crate::discord::client::Webhook;
 use crate::discord::error::DiscordError;
 use crate::discord::online::Online;
 use crate::discord::rejected::Rejected;
@@ -31,6 +34,9 @@ const RATE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// Discord's status for a request the bot is not allowed to make.
 const FORBIDDEN: u16 = 403;
 
+/// Discord's status for a channel or webhook it no longer has.
+const NOT_FOUND: u16 = 404;
+
 /// What became of one post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Post {
@@ -38,6 +44,9 @@ pub enum Post {
     Posted(u64),
     /// Discord forbade it: the bot may not write there.
     Forbidden,
+    /// Discord no longer has where it was sent: a deleted channel or
+    /// webhook.
+    Gone,
     /// It was not posted this beat.
     Unposted,
 }
@@ -70,8 +79,48 @@ pub async fn post(
     to: Target<'_>,
     text: &str,
 ) -> Result<Post, Rejected> {
+    tried(a, bot, to, || {
+        a.discord.create_message(&bot.token, to.channel, text)
+    })
+    .await
+}
+
+/// Post `text` to `to` through `hook`, under `username` and the picture at
+/// `avatar_url`, on behalf of `bot` — the listener, whose trace says it. `to`
+/// is a thread of the webhook's channel when `in_thread` says so. A `429` is
+/// waited out and tried again, as [`post`]'s is.
+pub async fn post_hook(
+    a: &Authored,
+    bot: &Online,
+    hook: &Webhook,
+    as_who: (&str, Option<&str>),
+    in_thread: bool,
+    to: Target<'_>,
+    text: &str,
+) -> Result<Post, Rejected> {
+    let (username, avatar_url) = as_who;
+    let thread = in_thread.then_some(to.channel);
+    tried(a, bot, to, || {
+        a.discord
+            .execute_webhook(hook, username, avatar_url, thread, text)
+    })
+    .await
+}
+
+/// One post made by `send`, a `429` waited out and tried again a few times,
+/// and what came of it said in `bot`'s trace.
+async fn tried<F, Fut>(
+    a: &Authored,
+    bot: &Online,
+    to: Target<'_>,
+    send: F,
+) -> Result<Post, Rejected>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<u64, DiscordError>>,
+{
     for _ in 0..RATE_TRIES {
-        match a.discord.create_message(&bot.token, to.channel, text).await {
+        match send().await {
             Ok(id) => return Ok(Post::Posted(id)),
             Err(DiscordError::RateLimited { retry_after_s }) => {
                 failed(a, bot.npc, to.note("failed 429 (waiting it out)"));
@@ -79,8 +128,14 @@ pub async fn post(
             }
             Err(e) => {
                 failed(a, bot.npc, to.note(&format!("failed {}", status_of(&e))));
-                if matches!(e, DiscordError::Status { status, .. } if status == FORBIDDEN) {
-                    return Ok(Post::Forbidden);
+                match e {
+                    DiscordError::Status { status, .. } if status == FORBIDDEN => {
+                        return Ok(Post::Forbidden)
+                    }
+                    DiscordError::Status { status, .. } if status == NOT_FOUND => {
+                        return Ok(Post::Gone)
+                    }
+                    _ => {}
                 }
                 Rejected::or_logged(bot.npc, "a post", e)?;
                 return Ok(Post::Unposted);

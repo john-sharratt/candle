@@ -21,7 +21,8 @@
 //!    refusal (`4004`, or a `401` on any call) stops the shard and writes the
 //!    bot's state refused.
 //! 3. **What the characters wrote is posted** to their DMs ([`outbound`])
-//!    and their channels ([`channel outbound`]).
+//!    and their channels ([`channel outbound`]), and every world whose
+//!    listener is online here is mirrored into its server ([`world`]).
 //!
 //! A shard never writes the world: it hands what it hears to this beat's
 //! queue, and the beat — on the authority — makes the world's writes. The
@@ -41,8 +42,8 @@ mod tests;
 pub mod wanted;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
@@ -59,6 +60,7 @@ use crate::discord::server::{gap as channel_gap, guild, inbound as channel_inbou
 use crate::discord::state::{self, BotState, State};
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::trace::{failed, note, Trace};
+use crate::discord::world;
 use crate::engine::driver::EVERY as BEAT;
 use crate::tenant::HOST;
 
@@ -81,6 +83,9 @@ pub struct Bots {
     /// What each bot's bridge did, and how its shard stands — apart from
     /// `held`, so a read does not wait out a beat's posts.
     trace: Trace,
+    /// When each world's server was last reconciled here. A world this
+    /// member has just taken has none, so its first beat reconciles it.
+    reconciled: StdMutex<HashMap<String, Instant>>,
 }
 
 /// What the beat holds between beats.
@@ -124,7 +129,31 @@ impl Bots {
                 halted: HashMap::new(),
             }),
             trace: Trace::default(),
+            reconciled: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether world `world`'s server is due its reconcile, `every` since the
+    /// last here, or never reconciled here; stamped now when it is.
+    pub fn reconcile_due(&self, world: &str, every: Duration) -> bool {
+        let mut last = self.reconciled.lock().expect("reconciled lock");
+        let now = Instant::now();
+        let due = last
+            .get(world)
+            .is_none_or(|at| now.duration_since(*at) >= every);
+        if due {
+            last.insert(world.to_string(), now);
+        }
+        due
+    }
+
+    /// Forget when world `world` was last reconciled here: this member lost
+    /// it, so the next time it takes it the reconcile runs at once.
+    pub fn forget_reconciled(&self, world: &str) {
+        self.reconciled
+            .lock()
+            .expect("reconciled lock")
+            .remove(world);
     }
 
     /// What each bot's bridge did here, and how its shard stands.
@@ -178,16 +207,17 @@ impl Bots {
             .values()
             .filter_map(|r| r.online.clone())
             .collect();
-        for bot in online {
+        for bot in &online {
             let unreachable = held.unreachable.entry(bot.npc).or_default();
-            let posted = match outbound::post(a, &bot, unreachable).await {
-                Ok(()) => channel_outbound::post(a, &bot).await,
+            let posted = match outbound::post(a, bot, unreachable).await {
+                Ok(()) => channel_outbound::post(a, bot).await,
                 Err(rejected) => Err(rejected),
             };
             if posted.is_err() {
                 refuse(a, &mut held, bot.npc).await;
             }
         }
+        world::tick(a, &online).await;
     }
 
     /// Close every shard, tombstoning each bot's state: this member is
@@ -227,6 +257,7 @@ impl Bots {
             };
             r.shard.close().await;
             self.trace.detach(npc);
+            self.forget_reconciled(&r.world);
             if let Err(e) = state::remove(&shared, npc) {
                 tracing::error!(npc, "discord: {e:#}");
             }
@@ -331,6 +362,7 @@ impl Bots {
                     let told = held.told.entry(npc).or_default();
                     gap::fetch(a, &bot, told).await.is_err()
                         || channel_gap::fetch(a, &bot).await.is_err()
+                        || world::gap::fetch(a, &bot).await.is_err()
                 }
                 Event::NeedsContentIntent => {
                     r.online = None;
@@ -357,6 +389,17 @@ impl Bots {
                     false
                 }
                 Event::Message(m) => match online {
+                    // The world's server is its listener's to hear, and no
+                    // other bot's: its channels mirror the world's threads.
+                    Some(bot)
+                        if m.guild_id
+                            .is_some_and(|g| world::is_world_server(a, &bot, g)) =>
+                    {
+                        if let Some((hosted, _)) = world::listened(a, &bot) {
+                            world::inbound::hear(a, &bot, &hosted, &m).await;
+                        }
+                        false
+                    }
                     Some(bot) if m.guild_id.is_some() => {
                         channel_inbound::hear(a, &bot, &m).await;
                         false
