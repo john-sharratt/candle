@@ -50,6 +50,7 @@ fn body_tree(schema: &Value, v: &TestVocab) -> Arc<StencilTree> {
             max_tokens: None,
             requires: Vec::new(),
             shapes: Vec::new(),
+            pattern: None,
         }],
     };
     let spec = compile_action_loop(&[tool], &ToolCallEnvelope::qwen3(), 1, "<|im_end|>", None)

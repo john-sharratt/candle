@@ -131,6 +131,10 @@ pub struct Param {
     /// number of distinct shapes and not the number of values.
     #[serde(default)]
     pub shapes: Vec<(String, Vec<Param>)>,
+    /// `string`: the schema's `pattern`, a whole-value regular expression the
+    /// value is held to token by token ([`super::value_rule::ValueRule`]).
+    #[serde(default)]
+    pub pattern: Option<String>,
 }
 
 /// One tool: a name and an ordered parameter list.
@@ -308,6 +312,7 @@ fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> 
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
+        pattern: None,
     })
 }
 
@@ -424,9 +429,18 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         })
         .filter(|v| !v.is_empty());
     let (ty, type_nullable) = parse_param_type(schema);
-    let nullable = type_nullable
-        || enum_members.is_some_and(|a| a.iter().any(Value::is_null))
-        || schema.get("nullable").and_then(Value::as_bool) == Some(true);
+    let pattern = schema
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|_| ty == ParamType::String && enum_values.is_none())
+        .map(str::to_string);
+    // A pattern takes the place of `null`: a nullable string is a free JSON
+    // value, which no rule reaches. Leaving the key out is how such a value is
+    // absent, and an `Option` field reads that the same way.
+    let nullable = pattern.is_none()
+        && (type_nullable
+            || enum_members.is_some_and(|a| a.iter().any(Value::is_null))
+            || schema.get("nullable").and_then(Value::as_bool) == Some(true));
     // A minimum past the unrolled bound has no level to require it at, and the
     // grammar would write exactly the bound — a call the schema refuses. Such
     // an array is left a free value.
@@ -469,6 +483,7 @@ fn param_of(schema: &Value, root: &Value) -> Param {
             .map(|n| n.min(u32::MAX as u64) as u32),
         requires: Vec::new(),
         shapes: Vec::new(),
+        pattern,
     }
 }
 
@@ -968,6 +983,17 @@ fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
                 limits: *limits,
                 close_token: *close_token,
                 suppress_close: *suppress_close,
+                next: remap(*next),
+            },
+            NodeSpec::Value {
+                pattern,
+                opened,
+                limits,
+                next,
+            } => NodeSpec::Value {
+                pattern: pattern.clone(),
+                opened: *opened,
+                limits: *limits,
                 next: remap(*next),
             },
         };
@@ -1525,6 +1551,15 @@ impl<'a> ToolTreeBuilder<'a> {
             if p.nullable {
                 return Ok((String::new(), self.free_value(next)));
             }
+            if let Some(pattern) = &p.pattern {
+                let span = self.spec.push(NodeSpec::Value {
+                    pattern: pattern.clone(),
+                    opened: false,
+                    limits: self.env.string_limits(p),
+                    next,
+                });
+                return Ok((String::new(), span));
+            }
             let span = self.spec.push(NodeSpec::FreeText {
                 term: Terminator::JsonStringValue,
                 eos_ends: false,
@@ -1585,13 +1620,22 @@ impl<'a> ToolTreeBuilder<'a> {
                 .collect(),
             (None, ParamType::Boolean) => vec![("true".into(), next), ("false".into(), next)],
             (None, ParamType::String) => {
-                let span = self.spec.push(NodeSpec::FreeText {
-                    term: Terminator::JsonString,
-                    eos_ends: false,
-                    limits: self.env.string_limits(p),
-                    close_token: None,
-                    suppress_close: false,
-                    next,
+                let limits = self.env.string_limits(p);
+                let span = self.spec.push(match &p.pattern {
+                    Some(pattern) => NodeSpec::Value {
+                        pattern: pattern.clone(),
+                        opened: true,
+                        limits,
+                        next,
+                    },
+                    None => NodeSpec::FreeText {
+                        term: Terminator::JsonString,
+                        eos_ends: false,
+                        limits,
+                        close_token: None,
+                        suppress_close: false,
+                        next,
+                    },
                 });
                 vec![("\"".into(), span)]
             }
@@ -1714,7 +1758,9 @@ impl<'a> ToolTreeBuilder<'a> {
         match self.spec.node(next) {
             NodeSpec::Static { text, next } => vec![(text.clone(), *next)],
             NodeSpec::Branch { arms } => arms.clone(),
-            NodeSpec::FreeText { .. } | NodeSpec::End => vec![(String::new(), next)],
+            NodeSpec::FreeText { .. } | NodeSpec::Value { .. } | NodeSpec::End => {
+                vec![(String::new(), next)]
+            }
         }
     }
 
