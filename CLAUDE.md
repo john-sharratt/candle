@@ -405,7 +405,17 @@ The live daemon is `motherd` (zend + npcd in one process) behind the `web` gatew
 On each machine both are supervised by **keep** (`keep/keep.yaml`), which holds the
 last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.md` §3.5–§3.11.
 
-**Release** (commit and push as soon as the work is finished; the rollout's Decide commands still need the user's approval):
+**Deploy through the zend MCP first.** Once the commit is on `origin/main`, follow the
+`zend-deploy` skill: build and stage on the machine's agent with `repo_job_start`, try it with
+`service_trial`, and read the outcome with `service_status`. To delegate it, a coder worker
+does all of that with `service_deploy`, from a member on another machine. A refusal from
+`service_deploy` because the machine runs the worker or holds an app's only ready member is a
+reason to ask the user, not to work around it by hand. Fall back to the manual steps below,
+through keep's HTTP API and the command line, when the connector is not attached,
+`cluster_status` says zend cannot take work, or a deploy call fails or stalls. Say in the
+report that the fallback was used and why.
+
+**Manual release** (commit and push as soon as the work is finished; the rollout's Decide commands still need the user's approval):
 
 1. Commit and push to `main`. A build is identified by its merge base with `origin/main`
    plus a digest of uncommitted changes to its build inputs. A build with local changes
