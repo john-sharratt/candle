@@ -142,7 +142,7 @@ impl NodeKind {
 /// of shape replaces every corridor name in the description. When it loops,
 /// [`crate::load`] weaves the links between consecutive passages, so the
 /// author writes the order and nothing else.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spine {
     /// What the route is called: "the ring", "the main hall".
     pub name: String,
@@ -163,7 +163,7 @@ pub struct Spine {
 /// Nothing a room contains is described in the room's own file. A terminal is
 /// defined once, and every room that has one gets the same name, the same
 /// claim and the same tools — including the ones written later.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
     pub kind: NodeKind,
@@ -318,7 +318,7 @@ impl fmt::Display for Where {
 ///
 /// Declared by whichever area contains both ends, because neither end can know
 /// about the other without the file that joins them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Portal {
     /// The two node references it joins, each `area-id/node-id`.
     pub between: [String; 2],
@@ -327,7 +327,7 @@ pub struct Portal {
 }
 
 /// One map file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Area {
     pub id: String,
     pub kind: AreaKind,
@@ -391,6 +391,12 @@ pub struct Area {
     pub teleport_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spine: Option<Spine>,
+    /// Whether this area mirrors a real place, and so may be changed by the
+    /// world's own builders — a part onboarded, a room discovered — and not
+    /// only by its authors. An area inside a mirrored building is mirrored too
+    /// ([`crate::MapSet::is_mirrored`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mirrored: bool,
     #[serde(default)]
     pub nodes: Vec<Node>,
 }

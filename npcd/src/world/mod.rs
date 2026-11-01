@@ -28,6 +28,7 @@ pub mod mapstore;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -365,33 +366,64 @@ impl Hosted {
     /// nothing changed.
     pub fn reshape(&self, edit: &MapEdit, keep: Option<Keep>) -> Result<Reshaped, String> {
         let relocated = self.with(|w| w.reshape(edit))?;
-        let kept_somewhere = self.map_dir.is_some() || self.map_in_mind.is_some();
-        let durability = match (kept_somewhere, keep) {
-            (false, _) | (_, None) => Durability::Ephemeral,
-            (true, Some(keep)) => {
-                // Held for the snapshot and the write together, so no other
-                // reshape's write-back can interleave with this one's.
-                let _writeback = self.writeback.lock().expect("writeback lock");
-                let map = self.read(|w| w.map().clone());
-                match mapstore::persist(&keep, edit, &map) {
-                    Ok(()) if keep.drafts => Durability::Drafted,
-                    Ok(()) => Durability::Written,
-                    Err(e) => {
-                        tracing::error!(
-                            world = %self.id,
-                            area = %edit.area(),
-                            error = %e,
-                            "reshape landed in memory but could not be written back"
-                        );
-                        Durability::Failed(e.to_string())
-                    }
-                }
-            }
-        };
         Ok(Reshaped {
             relocated,
-            durability,
+            durability: self.keep_all(slice::from_ref(edit), keep),
         })
+    }
+
+    /// Build this world by every one of `edits`, or by none — what one of its
+    /// builders' acts makes (`docs/zen_moon_mind.md` §14).
+    ///
+    /// **All of it or none of it, and nothing between.** The edits are tried
+    /// together on a copy of the map, then laid and recorded in what the world's
+    /// builders made ([`Sim::built`]) under one hold of the lock, so no other
+    /// act lands between two of them. Kept as [`Self::reshape`] keeps one.
+    pub fn build(&self, edits: &[MapEdit], keep: Option<Keep>) -> Result<Reshaped, String> {
+        let relocated = self.with_both(|w, s| {
+            edits
+                .iter()
+                .try_fold(w.map().clone(), |map, e| map.apply(e))
+                .map_err(|e| e.to_string())?;
+            let mut relocated = Vec::new();
+            for edit in edits {
+                relocated.extend(w.reshape(edit)?);
+                s.built.laid_now(edit.clone());
+            }
+            Ok::<_, String>(relocated)
+        })?;
+        Ok(Reshaped {
+            relocated,
+            durability: self.keep_all(edits, keep),
+        })
+    }
+
+    /// Keep `edits`, just laid, in the authored map — see [`Self::reshape`].
+    fn keep_all(&self, edits: &[MapEdit], keep: Option<Keep>) -> Durability {
+        let kept_somewhere = self.map_dir.is_some() || self.map_in_mind.is_some();
+        let keep = match (kept_somewhere, keep) {
+            (false, _) | (_, None) => return Durability::Ephemeral,
+            (true, Some(keep)) => keep,
+        };
+        // Held for the snapshot and the writes together, so no other reshape's
+        // write-back can interleave with these.
+        let _writeback = self.writeback.lock().expect("writeback lock");
+        let map = self.read(|w| w.map().clone());
+        for edit in edits {
+            if let Err(e) = mapstore::persist(&keep, edit, &map) {
+                tracing::error!(
+                    world = %self.id,
+                    area = edit.area().unwrap_or("the part catalogue"),
+                    error = %e,
+                    "reshape landed in memory but could not be written back"
+                );
+                return Durability::Failed(e.to_string());
+            }
+        }
+        match keep.drafts {
+            true => Durability::Drafted,
+            false => Durability::Written,
+        }
     }
 
     /// Point this world's benches at the documents they work on.
@@ -420,7 +452,7 @@ impl Hosted {
     /// time its call lands, and an act that looked its target up in the room it
     /// had reached would refuse a name the grammar had just offered. Acts that
     /// name something in the room read it here, so what was offered is what is
-    /// acted on.
+    /// acted on — the house's acts too (`crate::bridge`, `crate::engine::build`).
     pub fn standpoint_of(&self, body: &str) -> String {
         self.read(|w| {
             w.decided_at(body)

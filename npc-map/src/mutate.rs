@@ -39,7 +39,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::load::MapSet;
-use crate::part::Placement;
+use crate::part::{Part, PartLink, Placement};
 use crate::schema::{Area, Node, Portal, Where};
 
 /// One change to the shape of a world.
@@ -59,7 +59,7 @@ use crate::schema::{Area, Node, Portal, Where};
 /// [`Where`], a struct) tags uniformly. This is the operator/embedder surface's
 /// format, not the NPC device's; it carries whole `Area`/`Node` structures, which
 /// is the honest shape of "add this room", not a thing a character types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", content = "with", rename_all = "snake_case")]
 pub enum MapEdit {
     /// Add a whole area — a level, a region, a building.
@@ -81,6 +81,15 @@ pub enum MapEdit {
     PlacePart { at: Where, placement: Placement },
     /// Remove every placement of one part from a node.
     UnplacePart { at: Where, part: String },
+    /// Add a kind of thing to the catalogue — the one edit that changes what
+    /// exists rather than where it stands. A part found in the world and not
+    /// yet known (a device, onboarded) is defined this way, then placed.
+    DefinePart(Box<Part>),
+    /// Say that a part in the catalogue is a real thing found — the link it is
+    /// reached by.
+    LinkPart { part: String, link: PartLink },
+    /// Rewrite what a node is like — its `character`.
+    Describe { at: Where, character: String },
 }
 
 impl MapSet {
@@ -89,10 +98,27 @@ impl MapSet {
     ///
     /// The transaction described in the module docs: clone the authored data,
     /// apply the edit to it, and re-[`assemble`](MapSet::assemble). The parts
-    /// catalogue is carried through unchanged — topology mutation reshapes where
-    /// things stand, never what kinds of thing exist.
+    /// catalogue is carried through unchanged except by
+    /// [`MapEdit::DefinePart`] and [`MapEdit::LinkPart`], which change it and
+    /// touch no area.
     pub fn apply(&self, edit: &MapEdit) -> Result<MapSet> {
-        let (mut areas, parts) = self.authored();
+        let (mut areas, mut parts) = self.authored();
+        match edit {
+            MapEdit::DefinePart(part) => {
+                if parts.iter().any(|p| p.id == part.id) {
+                    bail!("a part `{}` is already in the catalogue", part.id);
+                }
+                parts.push((**part).clone());
+            }
+            MapEdit::LinkPart { part, link } => {
+                let p = parts
+                    .iter_mut()
+                    .find(|p| &p.id == part)
+                    .ok_or_else(|| anyhow::anyhow!("no part `{part}` in the catalogue"))?;
+                p.link = Some(link.clone());
+            }
+            _ => {}
+        }
         edit.apply_to(&mut areas)?;
         // Carries this set's own instance offsets forward ([`part_offsets`])
         // so the edit can only ever add new instance ids, never renumber one
@@ -173,6 +199,11 @@ impl MapEdit {
                     bail!("no `{part}` placed at `{at}` to remove");
                 }
             }
+            // The catalogue's, applied in [`MapSet::apply`]; no area changes.
+            MapEdit::DefinePart(_) | MapEdit::LinkPart { .. } => {}
+            MapEdit::Describe { at, character } => {
+                node_mut(areas, at)?.character = Some(character.clone());
+            }
         }
         Ok(())
     }
@@ -186,8 +217,11 @@ impl MapEdit {
     /// portal or placement lives in. That single id is what lets writeback touch
     /// one authored file rather than rewriting the whole map (and stripping the
     /// comments off every untouched one).
-    pub fn area(&self) -> &str {
-        match self {
+    ///
+    /// `None` for an edit to the catalogue, which changes no area: what it
+    /// writes is the part's own file ([`Self::catalogue_part`]).
+    pub fn area(&self) -> Option<&str> {
+        Some(match self {
             MapEdit::AddArea(a) => &a.id,
             MapEdit::RemoveArea(id) => id,
             MapEdit::AddNode { area, .. }
@@ -196,7 +230,19 @@ impl MapEdit {
             MapEdit::RemoveNode(at)
             | MapEdit::Retitle { at, .. }
             | MapEdit::PlacePart { at, .. }
-            | MapEdit::UnplacePart { at, .. } => &at.area,
+            | MapEdit::UnplacePart { at, .. }
+            | MapEdit::Describe { at, .. } => &at.area,
+            MapEdit::DefinePart(_) | MapEdit::LinkPart { .. } => return None,
+        })
+    }
+
+    /// The id of the catalogue part this edit changes — defined or linked —
+    /// whose own file a persistence layer rewrites.
+    pub fn catalogue_part(&self) -> Option<&str> {
+        match self {
+            MapEdit::DefinePart(part) => Some(&part.id),
+            MapEdit::LinkPart { part, .. } => Some(part),
+            _ => None,
         }
     }
 
@@ -248,6 +294,7 @@ mod tests {
             short: None,
             long: "what it is".into(),
             modes: vec![],
+            link: None,
         }
     }
 
@@ -285,6 +332,7 @@ mod tests {
             arrival: None,
             teleport_to: None,
             spine: None,
+            mirrored: false,
             nodes,
         }
     }
@@ -321,6 +369,90 @@ mod tests {
         );
         // The original set is untouched — a mutation returns a new set.
         assert!(set.get("a").unwrap().node("green").is_none());
+    }
+
+    /// **A part defined joins the catalogue and touches no area**, and can then
+    /// be placed; defined twice it is refused. A room described takes its new
+    /// character; one that is not there is refused.
+    #[test]
+    fn a_part_is_defined_then_placed_and_a_room_described() {
+        let set = base();
+        let defined = set
+            .apply(&MapEdit::DefinePart(Box::new(part("speaker"))))
+            .expect("a new part");
+        assert!(defined.part("speaker").is_some());
+        assert_eq!(MapEdit::DefinePart(Box::new(part("speaker"))).area(), None);
+        let link = PartLink {
+            profile: "sonos".into(),
+            address: "192.168.0.89".into(),
+            hardware: "f0:f6:c1:a0:79:b4".into(),
+        };
+        let linked = defined
+            .apply(&MapEdit::LinkPart {
+                part: "speaker".into(),
+                link: link.clone(),
+            })
+            .unwrap();
+        assert_eq!(linked.part("speaker").unwrap().link, Some(link.clone()));
+        assert!(defined
+            .apply(&MapEdit::LinkPart {
+                part: "nothing".into(),
+                link,
+            })
+            .is_err());
+        assert!(defined
+            .apply(&MapEdit::DefinePart(Box::new(part("speaker"))))
+            .is_err());
+        let placed = defined
+            .apply(&MapEdit::PlacePart {
+                at: Where::new("a", "hall"),
+                placement: Placement::Bare("speaker".into()),
+            })
+            .expect("placed");
+        assert_eq!(
+            placed.get("a").unwrap().node("hall").unwrap().parts.len(),
+            1
+        );
+
+        let described = placed
+            .apply(&MapEdit::Describe {
+                at: Where::new("a", "hall"),
+                character: "Lit from the water.".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            described
+                .get("a")
+                .unwrap()
+                .node("hall")
+                .unwrap()
+                .character
+                .as_deref(),
+            Some("Lit from the water.")
+        );
+        assert!(placed
+            .apply(&MapEdit::Describe {
+                at: Where::new("a", "attic"),
+                character: "x".into(),
+            })
+            .is_err());
+    }
+
+    /// **An area is mirrored when it or anything it is within is.**
+    #[test]
+    fn mirroring_reaches_down_through_what_contains_it() {
+        let mut home = area("home", vec![]);
+        home.kind = AreaKind::Building;
+        home.mirrored = true;
+        home.contains = vec!["flat".into()];
+        let mut flat = area("flat", vec![node("front", NodeKind::Social, &[])]);
+        flat.within = Some("home".into());
+        let moon = area("moon", vec![node("core", NodeKind::Core, &[])]);
+        let set = MapSet::from_areas([home, flat, moon]).unwrap();
+        assert!(set.is_mirrored("flat"));
+        assert!(set.is_mirrored("home"));
+        assert!(!set.is_mirrored("moon"));
+        assert!(!set.is_mirrored("nowhere"));
     }
 
     /// **A node that opens off nothing real is refused, and nothing changes.**
@@ -503,13 +635,13 @@ mod tests {
         let wire = serde_yaml::to_string(&edit).expect("serialises");
         assert!(wire.contains("op: add_node"), "{wire}");
         let back: MapEdit = serde_yaml::from_str(&wire).expect("parses back");
-        assert_eq!(back.area(), "vault-casting");
+        assert_eq!(back.area(), Some("vault-casting"));
         assert!(!back.removes_area());
 
         // A bare-string variant tags the same way and reports a removal.
         let drown = MapEdit::RemoveArea("vault-annex".into());
         let back: MapEdit = serde_yaml::from_str(&serde_yaml::to_string(&drown).unwrap()).unwrap();
-        assert_eq!(back.area(), "vault-annex");
+        assert_eq!(back.area(), Some("vault-annex"));
         assert!(back.removes_area());
     }
 

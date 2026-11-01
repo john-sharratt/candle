@@ -163,7 +163,7 @@ async fn reshape_world(
 /// kept: a map in the mind as a write of the character's owner — their draft
 /// over a mind under git — and a map outside it in its own folder. `None` for
 /// a world with no folder, or a map in the mind with nobody to keep it for.
-async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
+pub(crate) async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
     // A map read from the mind's files is kept in the mind, as the owner's
     // write (`docs/substrate_git.md` §8.1).
     if let Some(rel) = hosted.map_in_mind() {

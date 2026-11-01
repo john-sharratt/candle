@@ -39,7 +39,9 @@ use serde_json::{Map, Value};
 use npc_map::world::{Refused, Voice, Where};
 use npc_map::NodeKind;
 
+use crate::bridge;
 use crate::engine::act::Act;
+use crate::engine::build;
 use crate::engine::tools::CATALOG;
 use crate::world::Hosted;
 
@@ -204,6 +206,17 @@ pub fn is_of_the_body(tool: &str) -> bool {
 /// be dispatched twice.
 pub fn is_device(tool: &str) -> bool {
     tool == "invoke"
+}
+
+/// Whether this act reaches the real house — a bridge act ([`bridge`]) or one
+/// that builds the world ([`build`]).
+///
+/// It is **not** [`is_of_the_body`]: a survey waits on the house network and a
+/// build is kept through the map store, both on the async path
+/// (`Runtime::bridge_act`, `Runtime::build_act`), where [`perform`] is
+/// synchronous and has nothing to run for them.
+pub fn is_of_the_house(tool: &str) -> bool {
+    bridge::is_mine(tool) || build::is_mine(tool)
 }
 
 /// Perform one act against the world a body stands in.
@@ -699,6 +712,22 @@ pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
                     continue;
                 }
                 out.push((node.name.clone(), place));
+            }
+            // **And the rooms a door leads to from this level** — a portal out
+            // of one of its rooms into another building, as the Sharratt room
+            // on the moon opens into the family's own front room. A door is
+            // walked through like any other; the lift, which is no portal, is
+            // still ridden.
+            for node in &area.nodes {
+                let from = Where::new(here.area.clone(), node.id.clone());
+                for to in w.map().ways_from(&from) {
+                    let Some(n) = w.node(to) else { continue };
+                    if n.kind == NodeKind::Passage || n.kind == NodeKind::Core || !open.contains(to)
+                    {
+                        continue;
+                    }
+                    out.push((n.name.clone(), to.clone()));
+                }
             }
         }
 

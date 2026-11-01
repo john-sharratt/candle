@@ -190,10 +190,158 @@ still told who is there.
 
 1. **The work loop**, all in-world: `focus`; `order_post` and `order_results`;
    `Origin::Ordered` and its notifications; the Drones waiting at the table; `idle:`.
-2. **The mirror's machinery**: mirrored rooms (`place`, `group`, `source`), terminal events and
-   the tannoy raised from them, onboarding through `World::reshape`.
-3. **The web terminal**, the first source, which touches nothing private.
+2. **The world builds itself** (§12–§16): standing missions, the house link and discovery, the
+   world-building acts, the first bridge (Sonos), and the effector's reach to the internet.
+3. **Terminal events** and the tannoy raised from them.
 4. **Private sources**, one at a time, as each group connects them (§11).
+
+## 12. Standing missions
+
+**The world's own work is missions too.** A standing mission is a mission the table puts up by
+itself, on a schedule, in every room it applies to — and gives out last, when nobody has
+anything better to do. Drones waiting at the table for work (§8.3) take Zen's orders first and a
+standing mission only when nothing else waits, so their idle time becomes the world's upkeep and
+its growth. Each is a file in the mind, `missions/<world>/<id>.yaml`, so how the world grows is
+in source control:
+
+```yaml
+id: survey-devices
+brief: >-
+  Survey the room you are sent to: find every device in it on the house's network, and put
+  each in the room as what it is.
+where: linked          # every room with a house link (§13); or a list of `area/node`
+every: never           # once per room, ever; or a period: 6h, 2d
+grants: [onboard_part, link_part, onboard_thing, describe_room]
+steps:
+  - go to {room}
+  - survey the network at the house link
+  - put each device found into the room as what it is
+  - describe {room} as you now know it
+```
+
+- **Where it applies.** `where` names the rooms: `linked`, every room with a house link, or a
+  list of rooms by `area/node`. `{room}` in a step is the room it is for.
+- **When it is due.** `every: never` puts it up **once in each room, ever**: done there, it is
+  done. A period puts it up again that long after it was last done there. **There is never more
+  than one in a room at a time**: while one is up or carried there, none is put up beside it.
+  One that fails in a room is put up there again, but not before an hour has passed
+  (`standing::RETRY_MS`), so a house network that is down is not surveyed on every beat.
+- **Who takes it.** Whoever comes to the table when nothing posted waits. A standing mission
+  is the table's, not Zen's; its report is filed for every body there that gives orders all the
+  same, and each is told, so Zen knows what the world did (`Origin::Standing { id, room }`).
+- **Its grants.** The world-building acts (§14) a carrier may use while it carries it, and only
+  in its room.
+- **Steps the engine signs off.** A `go to …` step is signed off by the journey; a step that
+  begins `survey` by `survey_network` landing; a step that begins `put each device found` once
+  the room has been surveyed and no device the survey found is without a part. Any other step is
+  the carrier's to report.
+
+The routines of `missions/life.yaml` are standing missions in all but name; they become
+`missions/life/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing
+missions not yet due.
+
+## 13. The house link
+
+A mirrored building on a real network has a **house link**: a part (`house-link`) in each room
+that reaches the network that room is on. It is served by the world's bridge (§15) on the member
+that is the world's authority — the members are in the house, on its network
+(`docs/replicated_substrate.md` §9). A room's link names its network in the map
+(`link: home-lan`); the deployment names which member reaches it.
+
+**`survey_network`**, at the link, finds what is on the network, from what devices openly
+announce and no further:
+
+- the member's neighbour table, and the router's name for each address (reverse DNS);
+- SSDP: each UPnP device's own description (its friendly name, maker, model, services);
+- mDNS: what announces itself as a Cast device, a Sonos player, a Spotify Connect receiver,
+  a printer, a phone;
+- the maker, from the hardware address.
+
+It probes nothing, logs in to nothing, and reaches only the subnet the member is on. **It never
+leaves the house**: the neighbour table is the member's own, mDNS and SSDP are link-local
+multicast that no router forwards, a description is fetched only from an address on the
+member's own subnet, and it never walks an address range. A device whose address is not a
+private address on that subnet is dropped before it is a finding — so nothing on the internet
+can be found, and nothing found can be onboarded. The bridges are offered only in rooms of the
+mirror (§14), and a device is worked only at an address on the member's own subnets — a part's
+link naming any other address, private or not, is refused. Each device found is a **finding** — an id, its address, hardware address, names, maker, model, the
+services it announces, and the profile it matches (§15) — kept with the room and read back as
+the survey's answer. Findings are what the world-building acts are grounded in. A device a
+survey finds at a new address — the router gave it another — is followed there: the part
+standing for it is linked where it is now, found by its hardware address, which outlasts the
+change.
+
+## 14. The world builds itself
+
+**A Drone may change the world, but only as a mission grants it, only where it stands, and only
+in the mirror.** The moon's own levels never change; a building marked `mirrored: true` (the
+Sharratt home) does. The acts, each offered only while a mission granting it is carried and only
+in that mission's room:
+
+| Act | Does | Grounded in |
+|---|---|---|
+| `onboard_part` | Puts a device the survey found in the room, as a new part linked to it. | A finding (`from`, by its label). |
+| `link_part` | Says a part already in the room is a device the survey found — the room's Chromecast is that Cast device. Only a part placed once in the whole map: a link is the part's, so a part standing in several rooms cannot be one device. | A finding, and the part. |
+| `onboard_thing` | Puts a thing that is really there, on no network, in the room as a part. | What it knows of the room. |
+| `offboard_part` | Takes a part that stands for a device out of the room. An authored part is never taken out. | A reason: the latest survey, or what it was told. |
+| `discover_door` | Adds a room off this one, and the door to it. | What it knows of the house: a name and what the room is. |
+| `undiscover_door` | Takes away a room the builders discovered off this one, that nobody is in — never a room as it was authored, nor a passage. | A reason. |
+| `describe_room` | Rewrites what the room is like. | — |
+
+**A room is discovered only inside the building it is found from.** `discover_door` adds a room
+to the area its carrier stands in, never a new area, and never from a finding: a survey finds
+devices, not places, and the internet is reached through the effector (§16), never through the
+map.
+
+Each is one or more `MapEdit`s through `World::reshape`, **all of an act or none of it**: its
+edits are tried together on a copy of the map first, and refused whole when they would break it.
+**It is kept in the world's own state** (`Sim::built`), replicated with the rest of the world and
+laid over its authored map again whenever the world is loaded or takes in its authority's state,
+so what the Drones built stands across a restart and on every member. The list is only ever
+appended to (`sim::built::Built`) — a change and a later one undoing it are both kept — and each
+member counts how far its own copy of the world has laid it: a world loaded lays all of it, in
+order, each edit against the map as it then stands and passed over when the map already holds
+it; a member taking in its authority's state lays only what came since, undoings too. It is also
+drafted into the
+mind's map files by `world::mapstore` under the world's owner, with a new part's own file beside
+them (`MapEdit::DefinePart`), for the owner to publish as the authored map. A part onboarded from a
+finding carries its **link** — the profile and address it is reached at — which is what makes it
+a terminal: its acts are its profile's (§15). A device already standing in the world is refused,
+and so is a new part whose name the room already has; a device offboarded and found again is put
+back as the part it was, linked at the address it has now.
+
+Every change goes on the record with who made it and on which mission, and its poster is told
+(§8.2). A device's controls are its profile's; what a device asks for to be controlled — a
+pairing, an account — is given once, by its owner.
+
+## 15. Bridges
+
+**A bridge is how the world reaches a kind of real thing.** `npcd::bridge` holds one module per
+kind, each a **profile**: how a finding is recognised as one, and the acts a part linked to one
+offers, served at that part like any station act.
+
+| Profile | Recognised by | Acts |
+|---|---|---|
+| `sonos` | mDNS `_sonos._tcp`, or a UPnP description by Sonos | `sonos_status` (what is playing, volume), `sonos_play`, `sonos_pause`, `sonos_volume` — over the player's own UPnP control on port 1400 |
+| `device` | anything else found | none: present or not, its names and maker |
+
+A profile is code in candle, written against the device's own documented or openly offered
+interface. Building one for a kind of device the house has and the world cannot yet reach is
+work like any other — a profile at a time.
+
+## 16. The effector reaches the internet
+
+Every body in `life` reaches the internet through its effector, wherever it stands:
+
+- `web_search` — ranked results, through the daemon's search key;
+- `web_fetch` — a page, as text;
+- `web_request` — any method, headers and body, to any public address, answered with its status
+  and reply.
+
+**What is inside the house is reached through its terminals, never here**: `web_fetch` and
+`web_request` refuse a loopback, private or link-local address, checked after the name is
+resolved — the members' own control ports are on those addresses. Every request is recorded with
+who made it.
 
 ## 11. Decided by the deployment
 

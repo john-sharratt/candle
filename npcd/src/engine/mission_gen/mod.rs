@@ -42,6 +42,7 @@ pub mod rejection;
 mod replay;
 pub mod research;
 pub mod run;
+pub mod standing;
 pub mod step;
 pub mod target;
 pub mod world;

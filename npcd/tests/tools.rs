@@ -27,11 +27,16 @@
 //! no clock and no randomness, so an assertion about *exactly which* names an
 //! argument admits is a real assertion rather than a hopeful one.
 
+use npc_map::part::{Part, PartKind, Placement};
 use npc_map::witness;
-use npc_map::world::{Happening, Where};
+use npc_map::world::{Happening, Where, World};
+use npc_map::MapSet;
+use npcd::bridge::finding::Finding;
 use npcd::engine::act::Act;
 use npcd::engine::body::{perform, Outcome};
+use npcd::engine::build::{self, BUILD_ACTS};
 use npcd::engine::mission::{Mission, Origin, Todo, Work};
+use npcd::engine::mission_gen::standing::HOUSE_LINK;
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
 use npcd::sim::field::Resource;
@@ -80,6 +85,51 @@ fn waste() -> Hosted {
     h
 }
 
+/// The vault with its green room made the mirror of a real place, with a
+/// house link in it — where the house's acts can be offered.
+fn mirrored_vault_with_link() -> Hosted {
+    let map = MapSet::load_dir(MAPS).expect("the shipped maps must load");
+    let (mut areas, mut parts) = map.authored();
+    parts.push(Part {
+        id: HOUSE_LINK.into(),
+        kind: PartKind::Fixture,
+        name: "house link".into(),
+        plural: None,
+        binds: None,
+        short: None,
+        long: "The house link: where the house network is reached from.".into(),
+        modes: vec![],
+        link: None,
+    });
+    let casting = areas
+        .iter_mut()
+        .find(|a| a.id == "vault-casting")
+        .expect("the vault has a casting floor");
+    casting.mirrored = true;
+    casting
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "green-room")
+        .expect("the casting floor has a green room")
+        .parts
+        .push(Placement::Bare(HOUSE_LINK.into()));
+    Hosted::of(
+        "creators-vault",
+        World::new(MapSet::assemble(areas, parts).expect("the mirrored vault assembles")),
+    )
+}
+
+/// A Sonos player, as the survey of the green room finds it.
+fn sonos_found() -> Finding {
+    Finding {
+        address: "192.168.0.89".into(),
+        hardware: "f0:f6:c1:a0:79:b4".into(),
+        names: vec!["SonosZP".into()],
+        profile: "sonos".into(),
+        ..Finding::default()
+    }
+}
+
 /// Move a body, so a test can stand somewhere the act it is testing works.
 fn stand(h: &Hosted, body: &str, area: &str, node: &str) {
     h.with(|w| w.place(body, Where::new(area, node)).unwrap());
@@ -104,7 +154,8 @@ fn offered(h: &Hosted, body: &str) -> Vec<String> {
         lift_here,
         floors,
         ..Default::default()
-    };
+    }
+    .in_the_house(h, body);
     let within = h.sim(|s| within.from_sim(s, body, &place));
     specs_within(Mode::Physical, &within)
         .into_iter()
@@ -140,7 +191,8 @@ fn admits(h: &Hosted, body: &str, tool: &str, param: &str) -> Option<Vec<String>
         lift_here,
         floors,
         ..Default::default()
-    };
+    }
+    .in_the_house(h, body);
     let within = h.sim(|s| within.from_sim(s, body, &place));
     let specs = specs_within(Mode::Physical, &within);
     let t = specs.iter().find(|t| t.name == tool)?;
@@ -1847,6 +1899,73 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     // — the one just assigned.
     stand(&vault, "m1", "vault-story", "first-room");
     for name in offered(&vault, "m1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // The house's acts are offered only in the mirror of a real place: the
+    // bridges where what they work stands, the building acts to a body whose
+    // mission grants them there. Neither shipped world mirrors anywhere, so the
+    // vault's green room is made a mirror with a house link in it.
+    let house = mirrored_vault_with_link();
+    house.with(|w| {
+        w.enter("d1", "Wick", Where::new("vault-casting", "green-room"))
+            .unwrap()
+    });
+    house.with_sim(|s| {
+        s.missions.assign(
+            "d1",
+            Mission::new(
+                "map the green room",
+                vec![Todo::new("survey the network at the house link")],
+                Origin::Standing {
+                    id: "survey-devices".into(),
+                    room: "vault-casting/green-room".into(),
+                },
+            )
+            .granting(BUILD_ACTS.iter().map(|t| t.name.to_string()).collect()),
+        );
+        let cast = Finding {
+            address: "192.168.0.214".into(),
+            hardware: "14:ae:85:71:eb:44".into(),
+            names: vec!["Family Room TV".into()],
+            profile: "device".into(),
+            ..Finding::default()
+        };
+        s.findings
+            .surveyed("vault-casting/green-room", vec![sonos_found(), cast]);
+    });
+    for name in offered(&house, "d1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    // The Sonos player onboarded, through the very act's plan, is what the
+    // Sonos acts and `offboard_part` work; a thing onboarded is a part placed
+    // once, which `link_part` may link to the Cast device still open; a room
+    // discovered off this one is what `undiscover_door` takes away.
+    for (tool, args) in [
+        (
+            "onboard_thing",
+            json!({"called": "television", "description": "The television on the west wall."}),
+        ),
+        (
+            "onboard_part",
+            json!({"from": sonos_found().label(), "called": "Sonos speaker", "description": "The Sonos speaker plays for the room."}),
+        ),
+        (
+            "discover_door",
+            json!({"room": "the wings", "description": "The wings, off the green room."}),
+        ),
+    ] {
+        let (edits, _) = build::plan(&house, "d1", tool, args.as_object().unwrap())
+            .unwrap_or_else(|e| panic!("{tool} is planned: {e}"));
+        house
+            .build(&edits, None)
+            .unwrap_or_else(|e| panic!("{tool} is built: {e}"));
+    }
+    for name in offered(&house, "d1") {
         if !seen.contains(&name) {
             seen.push(name);
         }
