@@ -103,6 +103,8 @@ pub struct SessionGone;
 #[derive(Clone)]
 pub struct SessionHandle {
     role: Role,
+    /// The member at the far end speaks an older protocol ([`start_behind`]).
+    behind: bool,
     commands: UnboundedSender<Command>,
     registry: Registry,
     next_stream: Arc<AtomicU32>,
@@ -126,8 +128,18 @@ impl SessionHandle {
         self.commands.is_closed()
     }
 
+    /// Whether `frame` goes out on this session: a member on an older protocol
+    /// is sent only what crosses protocols, so nothing the hub addresses to all
+    /// its members needs to know about it.
+    fn carries(&self, frame: &Frame) -> bool {
+        !self.behind || frame.kind().crosses_protocols()
+    }
+
     /// Open a virtual connection towards `target`.
     pub fn open(&self, target: &str) -> Result<VirtualConn, SessionGone> {
+        if self.behind {
+            return Err(SessionGone);
+        }
         let id = self.next_stream.fetch_add(2, Ordering::Relaxed);
         debug_assert!(self.role.opens(id));
         let shared = Shared::new();
@@ -149,6 +161,9 @@ impl SessionHandle {
 
     /// Queue a control frame: it goes before anything else.
     pub fn control(&self, frame: Frame) -> Result<(), SessionGone> {
+        if !self.carries(&frame) {
+            return Ok(());
+        }
         self.commands
             .send(Command::Control(frame))
             .map_err(|_| SessionGone)
@@ -156,6 +171,9 @@ impl SessionHandle {
 
     /// Queue a frame on the ordered lane (`PULSE`).
     pub fn ordered(&self, frame: Frame) -> Result<(), SessionGone> {
+        if !self.carries(&frame) {
+            return Ok(());
+        }
         self.commands
             .send(Command::Ordered(frame))
             .map_err(|_| SessionGone)
@@ -163,6 +181,9 @@ impl SessionHandle {
 
     /// Queue a catch-up frame (`HEADERS`, `DONE`, `HAVE`, `BUILD_CHUNK`).
     pub fn catchup(&self, frame: Frame) -> Result<(), SessionGone> {
+        if !self.carries(&frame) {
+            return Ok(());
+        }
         // Gauged before it is queued, so the writer never takes off what was
         // not yet put on.
         let bytes = frame.encoded_len();
@@ -186,6 +207,9 @@ impl SessionHandle {
         catchup: bool,
     ) -> Result<oneshot::Receiver<u64>, SessionGone> {
         let (done, sent) = oneshot::channel();
+        if self.behind {
+            return Ok(sent);
+        }
         let pending = PendingEvent {
             fragments: split(origin, oseq, record, reply_to).into(),
             catchup,
@@ -220,6 +244,19 @@ pub struct Session {
 
 /// Run a session over an admitted socket.
 pub fn start<T: PipeTx, R: PipeRx>(role: Role, tx: T, rx: R) -> Session {
+    begin(role, false, tx, rx)
+}
+
+/// Run the gateway's end of a session with a member on an older protocol,
+/// admitted only to fetch the build that replaces it (§3.5). Only the frames
+/// that [cross protocols](crate::frame::Kind::crosses_protocols) pass, either
+/// way: what else it says may not decode here, and what else this end says may
+/// not decode there.
+pub fn start_behind<T: PipeTx, R: PipeRx>(tx: T, rx: R) -> Session {
+    begin(Role::Gateway, true, tx, rx)
+}
+
+fn begin<T: PipeTx, R: PipeRx>(role: Role, behind: bool, tx: T, rx: R) -> Session {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let (incoming_tx, incoming) = mpsc::channel(INCOMING_DEPTH);
@@ -232,13 +269,14 @@ pub fn start<T: PipeTx, R: PipeRx>(role: Role, tx: T, rx: R) -> Session {
         let registry = registry.clone();
         let hearing = hearing.clone();
         async move {
-            let how = reader::run(rx, hearing, role, commands, registry, incoming_tx).await;
+            let how = reader::run(rx, hearing, role, behind, commands, registry, incoming_tx).await;
             let _ = ended_tx.send(how);
         }
     });
     Session {
         handle: SessionHandle {
             role,
+            behind,
             commands,
             registry,
             next_stream: Arc::new(AtomicU32::new(role.first_stream())),

@@ -126,4 +126,21 @@ impl Kind {
             Kind::Hello | Kind::Challenge | Kind::Prove | Kind::Admit
         )
     }
+
+    /// Whether a session with a member on an older protocol carries it (§3.5):
+    /// what fetching the build that replaces it takes, and nothing else. These
+    /// frames, with the handshake's, are the one part of the wire two protocols
+    /// share, so a change to their layout is a new frame kind, never a new
+    /// `PROTO`.
+    pub fn crosses_protocols(self) -> bool {
+        matches!(
+            self,
+            Kind::Ping
+                | Kind::Pong
+                | Kind::BuildOffer
+                | Kind::BuildHave
+                | Kind::BuildFetch
+                | Kind::BuildChunk
+        )
+    }
 }

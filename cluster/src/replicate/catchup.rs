@@ -6,13 +6,19 @@
 //!    complete range. A listed record this member does not hold is wanted;
 //!    the `oseq`s listed as gone are handed back for the store to record.
 //! 2. **Fetch.** Once the headers end in `DONE`, the wanted records are
-//!    fetched from the member that listed them, at most [`FETCH_WINDOW`] bytes
-//!    outstanding at once, so the requester sets the pace (§7.4).
+//!    fetched from the member that listed them in [`FETCH_SEGMENT`]s, at most
+//!    [`FETCH_WINDOW`] bytes outstanding at once, so the requester sets the
+//!    pace (§7.4). **The window slides as records land**, as TCP's slides on
+//!    each acknowledgement: a record applied frees its bytes at once
+//!    ([`Requester::landed`]) and the next segment goes out, so the
+//!    answerer's reads, the wire and this member's applies overlap rather
+//!    than taking turns.
 //! 3. **Done.** A `FETCH` that ends in `DONE` short of a record asks for it
 //!    again; one its answerer cannot deliver after [`FETCH_TRIES`] fetches is
 //!    left wanted for a later catch-up rather than holding this one open.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use applied_set::AppliedSet;
 use serde::{Deserialize, Serialize};
@@ -28,6 +34,16 @@ use crate::frame::{Fetch, Headers};
 /// 40 GB backlogs each way, 2026-10-17). Half the gateway's catch-up cap, so a
 /// window in flight never fills the lane on its own.
 pub const FETCH_WINDOW: u64 = 64 << 20;
+
+/// The most bytes one `FETCH` asks for: a sixteenth of the window.
+///
+/// The whole window as one `FETCH` freed nothing until its `DONE` — after the
+/// answerer had read all of it, the gateway carried all of it and this member
+/// had applied all of it — so the three took turns, and WhiteWorld's gap fill
+/// on 2026-11-01 moved 64 MiB every ~6 s, 11 MB/s on a LAN that carries ten
+/// times that. Sixteen segments in flight keep each stage busy while the
+/// others work.
+pub const FETCH_SEGMENT: u64 = FETCH_WINDOW / 16;
 
 /// How many times one record is fetched before it is left for a later
 /// catch-up.
@@ -89,6 +105,9 @@ pub struct Requester {
     headers_done: bool,
     wanted: VecDeque<Want>,
     fetching: BTreeMap<u64, Fetching>,
+    /// The fetch each record in flight was asked for in, by `(origin, oseq)`:
+    /// what a record landing credits.
+    landing: HashMap<(u64, u64), u64>,
     outstanding: u64,
     tries: HashMap<(u64, u64), u8>,
     progress: Progress,
@@ -96,6 +115,8 @@ pub struct Requester {
     gone_learned: u64,
     /// What this member held when it asked: the request's `since`.
     since: AppliedSet,
+    /// When it was asked: what its rate is measured from.
+    started: Instant,
 }
 
 impl Requester {
@@ -116,12 +137,26 @@ impl Requester {
             headers_done: false,
             wanted: VecDeque::new(),
             fetching: BTreeMap::new(),
+            landing: HashMap::new(),
             outstanding: 0,
             tries: HashMap::new(),
             progress: Progress::default(),
             gone_learned: 0,
             since,
+            started: Instant::now(),
         }
+    }
+
+    /// How fast it fetched: the bytes landed so far over the time since it
+    /// was asked, in MB a second.
+    pub fn rate_mb_s(&self) -> f64 {
+        let secs = self.started.elapsed().as_secs_f64().max(1e-3);
+        self.progress.fetched_bytes as f64 / 1e6 / secs
+    }
+
+    /// The time since it was asked.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// One `HEADERS` of the answer: what this member lacks of it becomes
@@ -174,10 +209,38 @@ impl Requester {
         self.fetching.contains_key(&request)
     }
 
-    /// A fetched record arrived.
-    pub fn record(&mut self, len: u64) {
+    /// Whether `origin`'s `oseq` is a record this catch-up has in flight.
+    pub fn expects(&self, origin: u64, oseq: u64) -> bool {
+        self.landing.contains_key(&(origin, oseq))
+    }
+
+    /// A record this catch-up fetched landed — applied here, `len` bytes:
+    /// its bytes leave the window at once, and the fetches that fill the
+    /// room it made are returned. Nothing for a record it does not expect.
+    pub fn landed(
+        &mut self,
+        origin: u64,
+        oseq: u64,
+        len: u64,
+        next_request: impl FnMut() -> u64,
+    ) -> Vec<Fetch> {
+        let Some(request) = self.landing.remove(&(origin, oseq)) else {
+            return Vec::new();
+        };
+        if let Some(f) = self.fetching.get_mut(&request) {
+            if let Some(i) = f
+                .wants
+                .iter()
+                .position(|w| w.origin == origin && w.oseq == oseq)
+            {
+                let w = f.wants.remove(i);
+                f.bytes -= w.len;
+                self.outstanding -= w.len;
+            }
+        }
         self.progress.fetched += 1;
         self.progress.fetched_bytes += len;
+        self.fill(next_request)
     }
 
     /// Fetch `request` ended in `DONE`: a record of it this member still does
@@ -192,8 +255,11 @@ impl Requester {
     ) -> (Vec<Fetch>, Vec<(u64, u64)>) {
         let mut settled = Vec::new();
         if let Some(f) = self.fetching.remove(&request) {
+            // What is left of it never landed: its bytes leave the window, and
+            // each record is held now or wanted again.
             self.outstanding -= f.bytes;
             for w in f.wants {
+                self.landing.remove(&(w.origin, w.oseq));
                 if held(w.origin, w.oseq) {
                     settled.push((w.origin, w.oseq));
                     continue;
@@ -212,8 +278,9 @@ impl Requester {
     }
 
     /// The fetches to send now: wanted records grouped by answerer and
-    /// origin, while the window has room. A record larger than the window is
-    /// fetched alone once nothing else is outstanding.
+    /// origin, each at most a [`FETCH_SEGMENT`], while the window has room. A
+    /// record larger than a segment is fetched alone, and one larger than the
+    /// window once nothing else is outstanding.
     fn fill(&mut self, mut next_request: impl FnMut() -> u64) -> Vec<Fetch> {
         let mut out = Vec::new();
         while let Some(first) = self.wanted.front().copied() {
@@ -221,12 +288,13 @@ impl Requester {
             if first.len > room && self.outstanding > 0 {
                 break;
             }
+            let cap = room.min(FETCH_SEGMENT);
             let mut wants = vec![self.wanted.pop_front().expect("front")];
             let mut bytes = first.len;
             while let Some(next) = self.wanted.front() {
                 if next.answerer != first.answerer
                     || next.origin != first.origin
-                    || bytes + next.len > room
+                    || bytes + next.len > cap
                 {
                     break;
                 }
@@ -234,6 +302,9 @@ impl Requester {
                 wants.push(self.wanted.pop_front().expect("front"));
             }
             let request = next_request();
+            for w in &wants {
+                self.landing.insert((w.origin, w.oseq), request);
+            }
             out.push(Fetch {
                 request,
                 reply_to: self.node,
@@ -377,19 +448,63 @@ mod tests {
         assert!(r.outstanding_wants().is_empty());
     }
 
-    /// No more than `FETCH_WINDOW` is outstanding; the next fetch goes once a
-    /// `DONE` frees the window.
+    /// **The window goes out as segments**: no `FETCH` asks for more than a
+    /// segment, and no more than the window is outstanding.
     #[test]
-    fn fetches_stay_within_the_window() {
+    fn the_window_goes_out_as_segments() {
         let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
-        let eighth = (FETCH_WINDOW / 8) as u32;
-        r.headers(listing(3, 9, 1, 12, &[eighth; 12]), |_, _| false);
+        let half = (FETCH_SEGMENT / 2) as u32;
+        r.headers(listing(3, 9, 1, 40, &[half; 40]), |_, _| false);
         let first = r.headers_done(counter());
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].oseqs, (1..=8).collect::<Vec<_>>());
+        assert_eq!(first.len(), 16);
+        for (i, f) in first.iter().enumerate() {
+            let at = 1 + 2 * i as u64;
+            assert_eq!(f.oseqs, vec![at, at + 1]);
+        }
         assert_eq!(r.outstanding(), FETCH_WINDOW);
-        let (next, _) = r.fetch_done(first[0].request, |_, _| true, counter());
-        assert_eq!(next[0].oseqs, (9..=12).collect::<Vec<_>>());
+    }
+
+    /// **The window slides as records land**, not as fetches end: a landed
+    /// record's bytes are free at once and fill with the next wanted record,
+    /// and its fetch's `DONE` later settles only what never landed.
+    #[test]
+    fn the_window_slides_as_records_land() {
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
+        let half = FETCH_SEGMENT / 2;
+        r.headers(listing(3, 9, 1, 40, &[half as u32; 40]), |_, _| false);
+        // One counter, as the replicator's request ids are one sequence.
+        let mut ids = counter();
+        let first = r.headers_done(&mut ids);
+        assert!(r.expects(9, 1));
+        assert!(!r.expects(9, 33), "past the window");
+
+        let next = r.landed(9, 1, half, &mut ids);
+        assert_eq!(
+            next,
+            vec![Fetch {
+                request: 117,
+                reply_to: 7,
+                from_node: 3,
+                origin: 9,
+                oseqs: vec![33],
+            }]
+        );
+        assert_eq!(r.outstanding(), FETCH_WINDOW);
+        assert!(!r.expects(9, 1));
+        assert!(
+            r.landed(9, 1, half, &mut ids).is_empty(),
+            "a record lands once"
+        );
+        assert!(r.landed(8, 5, half, &mut ids).is_empty(), "not this one's");
+        assert_eq!(
+            (r.progress().fetched, r.progress().fetched_bytes),
+            (1, half)
+        );
+
+        // Its fetch ends: only the record that never landed is left to settle.
+        let (_, settled) = r.fetch_done(first[0].request, |_, _| true, &mut ids);
+        assert_eq!(settled, vec![(9, 2)]);
+        assert!(!r.expects(9, 2));
     }
 
     /// A record bigger than the window is fetched alone once nothing else is

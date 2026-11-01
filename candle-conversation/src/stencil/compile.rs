@@ -15,6 +15,7 @@
 //! nodes are immutable, so a node lowered once is shared by every edge to it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::encode_cache::EncodeCache;
 use super::error::BuildError;
@@ -22,6 +23,7 @@ use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::TokenTrie;
+use super::value_rule::{ValueRule, ValueState};
 use super::vocab::{TokenId, Vocab};
 
 /// Compile a string-space spec against a tokenizer.
@@ -72,7 +74,7 @@ fn validate(spec: &TreeSpec) -> Result<(), BuildError> {
 fn successors(node: &NodeSpec) -> Vec<SpecId> {
     match node {
         NodeSpec::Static { next, .. } => vec![*next],
-        NodeSpec::FreeText { next, .. } => vec![*next],
+        NodeSpec::FreeText { next, .. } | NodeSpec::Value { next, .. } => vec![*next],
         NodeSpec::Branch { arms } => arms.iter().map(|(_, s)| *s).collect(),
         NodeSpec::End => vec![],
     }
@@ -92,9 +94,9 @@ fn dfs(
     color[n.0] = 1;
     let re = match spec.node(n) {
         NodeSpec::End => true,
-        NodeSpec::Static { next, .. } | NodeSpec::FreeText { next, .. } => {
-            dfs(spec, *next, color, reaches_end)?
-        }
+        NodeSpec::Static { next, .. }
+        | NodeSpec::FreeText { next, .. }
+        | NodeSpec::Value { next, .. } => dfs(spec, *next, color, reaches_end)?,
         NodeSpec::Branch { arms } => {
             if arms.is_empty() {
                 return Err(BuildError::EmptyBranch(n.0));
@@ -119,6 +121,21 @@ fn dfs(
 struct Arena {
     nodes: Vec<StencilNode>,
     lowered: HashMap<(SpecId, String), NodeId>,
+}
+
+impl Arena {
+    /// The rule for `pattern`. `None` when it cannot be held to in `vocab`: a
+    /// value left free is at worst refused by its tool, where a rule that
+    /// cannot finish would never end the turn.
+    fn rule(&mut self, pattern: &str, vocab: &dyn Vocab) -> Option<Arc<ValueRule>> {
+        match ValueRule::shared(pattern, vocab) {
+            Ok(rule) => Some(rule),
+            Err(e) => {
+                tracing::warn!(pattern, "a value's pattern was left unenforced: {e}");
+                None
+            }
+        }
+    }
 }
 
 fn lower(
@@ -224,7 +241,9 @@ fn spills_into(
         .into_iter()
         .filter_map(|(t, bytes)| {
             let rest = bytes[head.len()..].to_vec();
-            plain_string_content(&rest).then_some((t, rest))
+            let keeps_rule = |rule: &Arc<ValueRule>| rule.admits(ValueState::Inside(0), &rest);
+            let allowed = plain_string_content(&rest) && span.rule.as_ref().is_none_or(keeps_rule);
+            allowed.then_some((t, rest))
         })
         .collect()
 }
@@ -370,6 +389,31 @@ fn lower_terminal(
                     // copy it verbatim (never tokenize it in context).
                     close_token: *close_token,
                     suppress_close: *suppress_close,
+                    rule: None,
+                    next: next_id,
+                }),
+            ))
+        }
+        NodeSpec::Value {
+            pattern,
+            opened,
+            limits,
+            next,
+        } => {
+            let next_id = lower(spec, vocab, *next, "", arena)?;
+            let rule = arena.rule(pattern, vocab);
+            Ok(push(
+                arena,
+                StencilNode::FreeText(FreeTextSpan {
+                    term: match opened {
+                        true => Terminator::JsonString,
+                        false => Terminator::JsonStringValue,
+                    },
+                    eos_ends: false,
+                    limits: *limits,
+                    close_token: None,
+                    suppress_close: false,
+                    rule,
                     next: next_id,
                 }),
             ))

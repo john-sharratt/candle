@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use candle_conversation::stencil::{
     compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HfVocab,
     NodeSpec, Observe, Param, ParamType, StencilAction, StencilNode, StencilSession, StencilTree,
-    Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, Vocab, WalkError,
+    Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, ValueRule, Vocab, WalkError,
     MAX_TOOL_CALLS_PER_TURN,
 };
 use zend_vfs::{RepoSpec, Workspace};
@@ -1308,6 +1308,43 @@ fn cached_live_tokenizer() -> Option<std::path::PathBuf> {
         .flatten()
         .map(|e| e.path().join("tokenizer.json"))
         .find(|p| p.exists())
+}
+
+/// What the constraints cost against the live vocabulary: each pattern's build
+/// time, its states, and the widest mask a step under it sends to the device.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json; prints timings"]
+fn constraint_patterns_cost_this_much_on_the_live_vocabulary() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0)
+        .with_bytes(std::sync::Arc::new(HfVocab::token_bytes_of(&tok)));
+    let mut patterns = std::collections::BTreeSet::new();
+    for spec in zend::tools::tool_catalog() {
+        fn collect(params: &[Param], out: &mut std::collections::BTreeSet<String>) {
+            for p in params {
+                out.extend(p.pattern.clone());
+                collect(p.properties.as_deref().unwrap_or(&[]), out);
+                collect(p.items.as_deref().map_or(&[], std::slice::from_ref), out);
+            }
+        }
+        collect(&spec.params, &mut patterns);
+    }
+    let start = std::time::Instant::now();
+    for pattern in &patterns {
+        let one = std::time::Instant::now();
+        match ValueRule::new(pattern, &vocab) {
+            Ok(rule) => println!(
+                "{:>7.1} ms  {:>3} states  widest {:>6}  {pattern}",
+                one.elapsed().as_secs_f64() * 1e3,
+                rule.states(),
+                rule.widest_mask(),
+            ),
+            Err(e) => panic!("{pattern}: {e}"),
+        }
+    }
+    println!("{} patterns in {:?}", patterns.len(), start.elapsed());
 }
 
 // ── The live tokenizer's own encoding of a correct call ─────────────────────

@@ -16,6 +16,7 @@
 mod choices;
 mod fuzz;
 mod intent;
+mod patterns;
 mod structure;
 mod values;
 

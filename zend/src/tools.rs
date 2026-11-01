@@ -56,6 +56,7 @@ use crate::agent_exec::AgentExecutor;
 use crate::mcp::ownership::owner_of;
 use crate::substrate_git::agents as agents_for;
 use crate::tool_availability::Facts;
+use crate::tool_constraints::grammar_schema;
 use crate::tool_guidance;
 use crate::tool_round::{self, Step};
 use crate::types::ToolMode;
@@ -501,9 +502,10 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
         crate::tool_def::all()
             .iter()
             .flat_map(|d| {
+                let schema = grammar_schema(&d.name, &d.parameters);
                 iter::once(d.name.as_str())
                     .chain(registry::aliases(&d.name).iter().copied())
-                    .map(|name| ToolSpec::from_json_schema(name, &pinned(name, &d.parameters)))
+                    .map(move |name| ToolSpec::from_json_schema(name, &pinned(name, &schema)))
             })
             .collect()
     })

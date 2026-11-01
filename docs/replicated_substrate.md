@@ -405,7 +405,7 @@ member                                               gateway
 | **4410** | **Build superseded, and no way to upgrade:** `build.count` below the app's floor, and no build at the floor fits it (no artifact for its kind and platform, or the checks of §3.9 fail); or a member left behind when a rollout ends: stranded, or its install failed (§3.5, §3.9). A member below the floor that *can* take the floor's build is admitted to upgrade instead (§3.5) | **closes that app's sockets to every cluster and stops reconnecting** until the process is replaced by a rebuilt binary — a build any cluster has superseded serves on none |
 | 4412 | Model mismatch: the app's group is locked to another model. A new model is moved to by hand, not by an upgrade (§3.6) | reconnects at the 8 s cap; admitted once the group empties and the lock clears |
 | 4417 | Clock skew: `HELLO.now_ms` is more than 60 s from the gateway's clock. A clock far ahead would drag every member's `hlc` with it (§6.2), and Paxos lease terms and tombstone ages read the clock (§5.9, §6.8) | reconnects at the 8 s cap; the loading page names the skew |
-| **4426** | **Protocol version unsupported** | **stops reconnecting** |
+| 4426 | Protocol version unsupported: a member ahead of its gateway, or behind it with no build to take (§3.5) | reconnects at the 8 s cap; admitted the moment either end moves, with no restart |
 | 1001 | Gateway shutting down | reconnects |
 
 Every close carries a reason string naming the values involved — e.g.
@@ -460,6 +460,28 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
     (`--upgrade-failed`); it installs nothing more, and the gateway closes it 4410 at
     once, with the reason.
   - A local build is never below the floor in this sense (§3.10).
+- **A protocol bump upgrades the group by itself, as a forced rollout nobody has to
+  order.** A gateway and a member on different protocols cannot exchange the group's
+  frames, so certifying against the old members and a grace period beside them mean
+  nothing: the members are already apart.
+  - A member **ahead** of its gateway is closed 4426 and redials at the cap until the
+    gateway is replaced.
+  - A member **behind** its gateway never sets the floor. While the app has no floor, or
+    none it can reach, it is closed 4426 and redials. Once the floor is above it and held,
+    it is admitted upgrading and takes the floor's build under the rules above: no
+    certification, no grace, no lease, no approval. A gateway forgets its floors on the
+    restart that gave it the new `PROTO`, so the first non-local member on that protocol
+    sets the floor, and that is the whole order to roll out.
+  - Its session carries only the frames that cross protocols
+    (`Kind::crosses_protocols`): `PING`, `PONG`, `BUILD_OFFER`, `BUILD_HAVE`, `BUILD_FETCH`,
+    `BUILD_CHUNK`. Anything else it sends is dropped by its tag, undecoded, and nothing
+    else is sent to it; the gateway holds it as `upgrading`. Those frames and the handshake's
+    are the one part of the wire two protocols share. Their layouts are pinned to raw bytes
+    (`frame/crossing_tests.rs`): a change to one is a new frame kind, never a new `PROTO`.
+  - The services (`keep`, `mcp`) and a local build have no floor to take. They redial
+    at 4426 until their machine's `keep` runs a rebuilt binary, and need no restart beyond
+    that one.
+  - A peer link carries the whole protocol, so a gateway behind its peer redials too.
 - **A newer build starts a 30-minute grace period, then the floor rises.**
   - When a member above the floor is admitted, the gateway sets the app's **pending
     floor** to its `count`. The 30-minute deadline starts only when that member is
@@ -1116,7 +1138,7 @@ misread, and on an admitted socket closes it 4400.
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
 | `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
-| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) · `u32 bulk_backlog` (protocol 7) |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) · `u32 bulk_backlog` (protocol 7) · `bool process_loading` (protocol 8; another tenant of its process still loading, `cooperative_admission.md` §4.4) |
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding: each route's methods, path, dispatch, mirror and, from protocol 6, `u8 reach`) |
 | `CLAIM` | 15 | `blob key` · `epoch` |

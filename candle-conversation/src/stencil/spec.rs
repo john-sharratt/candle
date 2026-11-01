@@ -40,6 +40,17 @@ pub enum NodeSpec {
         suppress_close: bool,
         next: SpecId,
     },
+    /// A JSON string value held to `pattern` ([`ValueRule`]), or free text when
+    /// the rule cannot be built. `opened` when the grammar has already written
+    /// the value's opening quote, as an array element's separator does.
+    ///
+    /// [`ValueRule`]: super::value_rule::ValueRule
+    Value {
+        pattern: String,
+        opened: bool,
+        limits: FreeTextLimits,
+        next: SpecId,
+    },
     /// Terminal.
     End,
 }

@@ -2263,6 +2263,7 @@ fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilParam {
             Some(Choices::InvokeUrl) => invoke_body::shapes(within),
             _ => value_shapes(t, p.name, within),
         },
+        pattern: None,
     }
 }
 

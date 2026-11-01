@@ -8,9 +8,9 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::close::{Close, CloseCode};
-use crate::frame::{BuildId, Frame, Hello, Open, Receipt};
+use crate::frame::{BuildFetch, BuildId, Frame, Hello, Kind, Open, Receipt, Routes};
 use crate::pipe::memory::{pair, End, MemoryRx, MemoryTx};
-use crate::pipe::{Heard, Message, PipeRx};
+use crate::pipe::{Heard, Message, PipeRx, PipeTx};
 
 fn sessions(cap: usize) -> (Session, Session) {
     let (g, m) = pair(cap);
@@ -24,6 +24,41 @@ fn sessions(cap: usize) -> (Session, Session) {
 fn against_raw(role: Role) -> (Session, MemoryTx, MemoryRx) {
     let (ours, End { tx, rx }) = pair(1 << 20);
     (start(role, ours.tx, ours.rx), tx, rx)
+}
+
+/// **A member behind the protocol can fetch its way out and nothing else.** A
+/// frame this end could not decode — a `CAPACITY` one byte short, what closed
+/// such a member 4400 at every report — is passed over by its tag with the
+/// session up, and a build frame after it arrives. Nothing outbound but a build
+/// frame leaves.
+#[tokio::test]
+async fn a_session_behind_the_protocol_carries_only_what_crosses() {
+    let (ours, End { mut tx, mut rx }) = pair(1 << 20);
+    let mut s = start_behind(ours.tx, ours.rx);
+
+    let short_capacity = vec![Kind::Capacity.tag(), 0, 0, 0, 0, 0, 1];
+    tx.send(Message::Frame(short_capacity)).await.unwrap();
+    let fetch = Frame::BuildFetch(BuildFetch {
+        artifact: [2; 32],
+        offset: 3,
+        from_node: 0,
+        reply_to: 5,
+    });
+    tx.send(Message::Frame(fetch.encode())).await.unwrap();
+    let Some(Incoming::Frame(got)) = s.incoming.recv().await else {
+        panic!("the fetch arrives, and the session stands");
+    };
+    assert_eq!(got, fetch);
+
+    let routes = || Frame::Routes(Routes { table: vec![] });
+    s.handle.control(routes()).unwrap();
+    s.handle.ordered(routes()).unwrap();
+    assert!(s.handle.open("").is_err());
+    s.handle.control(fetch.clone()).unwrap();
+    let Some(Message::Frame(out)) = rx.recv().await else {
+        panic!("the build frame is sent");
+    };
+    assert_eq!(Frame::decode(&out).unwrap(), fetch, "the routes never left");
 }
 
 async fn accept(s: &mut Session) -> VirtualConn {

@@ -48,6 +48,7 @@ mod tool_call;
 mod tree;
 mod trie;
 mod trigger;
+mod value_rule;
 mod vocab;
 mod yaml;
 
@@ -85,6 +86,7 @@ pub use tool_call::{
     ToolCallEnvelope, ToolSpec, INVOKE_BODY_TREE_LABEL, MAX_TOOL_CALLS_PER_TURN,
     TOOL_CALL_TREE_LABEL,
 };
+pub use value_rule::ValueRule;
 // `ToolCallEnvelope::style` is public, so a consumer has to be able to name its
 // type to match on it — and `npcd` does, to describe the call format in a
 // character's prompt. Re-exported here rather than making every such caller

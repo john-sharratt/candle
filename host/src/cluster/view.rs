@@ -248,6 +248,7 @@ mod tests {
                 left: 0,
                 answerer: Some(0xab),
             },
+            rate_kb_s: 0,
             waiting: None,
         };
         assert_eq!(
@@ -262,6 +263,7 @@ mod tests {
             cluster: 0,
             purpose,
             progress: Progress::default(),
+            rate_kb_s: 0,
             waiting: Some(waiting),
         }
     }

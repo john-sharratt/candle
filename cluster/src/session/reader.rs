@@ -3,7 +3,9 @@
 //! everything else to the session's owner. A socket with nothing from the peer
 //! for 45 s — no frame, and no bytes of one still arriving — is dead (§3.2); a
 //! frame that fails to decode, a handshake frame after admission, or a stream
-//! opened out of turn is a protocol violation, closed 4400.
+//! opened out of turn is a protocol violation, closed 4400. On a session with a
+//! member on an older protocol, only the frames that cross protocols are read
+//! at all.
 
 use std::time::Duration;
 
@@ -17,15 +19,24 @@ use super::stream::{Registry, Shared, VirtualConn};
 use super::{Ended, Incoming, Role};
 use crate::close::{Close, CloseCode};
 use crate::fragment::Reassembly;
-use crate::frame::{name, Frame};
+use crate::frame::{name, Frame, Kind};
 use crate::pipe::{Message, PipeRx};
 
 pub const DEAD_AFTER: Duration = Duration::from_secs(45);
+
+/// Whether the frame in `message` crosses protocols, by its tag.
+fn crosses(message: &[u8]) -> bool {
+    message
+        .first()
+        .and_then(|tag| Kind::from_tag(*tag).ok())
+        .is_some_and(Kind::crosses_protocols)
+}
 
 pub async fn run<R: PipeRx>(
     mut rx: R,
     hearing: Hearing,
     role: Role,
+    behind: bool,
     commands: UnboundedSender<Command>,
     registry: Registry,
     incoming: Sender<Incoming>,
@@ -60,6 +71,11 @@ pub async fn run<R: PipeRx>(
             Ok(Some(Message::Frame(bytes))) => bytes,
         };
         number += 1;
+        // Read by its tag alone: its body may be a layout this build cannot
+        // decode, which is the reason the session is on this footing.
+        if behind && !crosses(&message) {
+            continue;
+        }
         let frame = match Frame::decode(&message) {
             Ok(f) => f,
             Err(e) => break violation(e.to_string()),

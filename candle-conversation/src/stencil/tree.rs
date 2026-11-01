@@ -4,8 +4,11 @@
 //! Built once by [`compile`](super::compile::compile) and shared (`Arc`) across
 //! decode sessions.
 
+use std::sync::Arc;
+
 use super::terminator::Terminator;
 use super::trie::TokenTrie;
+use super::value_rule::ValueRule;
 use super::vocab::TokenId;
 
 /// Arena index of a tree node.
@@ -46,6 +49,8 @@ pub struct FreeTextSpan {
     /// close token is kept (committed normally).  Only meaningful with
     /// `close_token`.
     pub suppress_close: bool,
+    /// What the span's value may spell. `None` leaves it free.
+    pub rule: Option<Arc<ValueRule>>,
     pub next: NodeId,
 }
 
