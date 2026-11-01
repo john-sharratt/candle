@@ -33,6 +33,8 @@ use super::reported::{self, Mark};
 use super::state::{ATTACHED, DEFAULT_WAIT_S};
 use crate::session::ZendSession;
 
+pub use fit::fit;
+
 mod archive;
 mod attach;
 mod cluster_audit;
@@ -40,6 +42,7 @@ mod cluster_command;
 mod cluster_job_status;
 mod cluster_logs;
 mod cluster_status;
+mod fit;
 mod gateway_command;
 pub mod group_add;
 pub mod group_create;

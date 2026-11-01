@@ -98,7 +98,7 @@ impl Server for ZendSession {
             store: Arc::clone(&call.store),
             progress: call.progress.clone(),
         };
-        tools::call(&ctx, name, args).await
+        tools::fit(tools::call(&ctx, name, args).await)
     }
 
     fn result(&self, answer: &Answer) -> Value {

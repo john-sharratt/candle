@@ -9,6 +9,7 @@ use journals::view::grep::{grep, render};
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 
+use super::fit::around;
 use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::is_memory_path;
@@ -102,7 +103,7 @@ fn grep_worker(
                         h.entry,
                         h.part,
                         h.line,
-                        h.text.trim()
+                        around(h.text.trim(), pattern)
                     )
                 })
                 .collect(),
