@@ -19,7 +19,7 @@ impl Runtime {
             return refused(act, "You have no body here to do that with.");
         };
         let place = hosted.standpoint_of(&body);
-        let done = bridge::enact(&hosted, &body, act.tool, &act.args).await;
+        let done = bridge::enact(&hosted, &body, act.tool, &act.args, self.agents()).await;
         if done.landed {
             hosted.with_sim(|s| {
                 s.missions

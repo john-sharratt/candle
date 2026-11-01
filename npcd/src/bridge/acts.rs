@@ -105,6 +105,115 @@ pub const SONOS_VOLUME: Tool = Tool {
     }],
 };
 
+/// An AV-receiver act that names only the receiver it works.
+macro_rules! receiver {
+    ($name:literal, $desc:literal, $situation:literal, $because:literal) => {
+        Tool {
+            name: $name,
+            at: &[],
+            category: "House",
+            plane: Plane::World,
+            availability: Availability::Embodied,
+            description: $desc,
+            params: &[Param {
+                name: "device",
+                ty: "string",
+                required: true,
+                description: "The AV receiver here, by name, as the room calls it.",
+            }],
+            examples: &[Example {
+                situation: $situation,
+                call: r#"{"device":"the stereo"}"#,
+                because: $because,
+            }],
+        }
+    };
+}
+
+pub const RECEIVER_STATUS: Tool = receiver!(
+    "receiver_status",
+    "Read what the AV receiver here is doing: on or in standby, how loud, and whether it is muted.",
+    "You want to know whether the stereo is on in the room, and how loud.",
+    "What the receiver is doing is in the receiver, not in anybody's guess."
+);
+
+pub const RECEIVER_ON: Tool = receiver!(
+    "receiver_on",
+    "Turn the AV receiver here on, out of standby, so the room can play sound through it.",
+    "The family want to put music or a film on and the stereo is in standby.",
+    "The receiver is off; turning it on is the whole act, and nobody is there to press it."
+);
+
+pub const RECEIVER_OFF: Tool = receiver!(
+    "receiver_off",
+    "Put the AV receiver here into standby, so it draws little and the room is quiet.",
+    "The room is empty and the stereo was left on.",
+    "A receiver left on all night is a receiver nobody turned off; standby is the act."
+);
+
+pub const RECEIVER_MUTE: Tool = receiver!(
+    "receiver_mute",
+    "Mute the AV receiver here, so its sound stops at once without changing anything else.",
+    "The phone is ringing and the room needs to be quiet this moment.",
+    "Muting stops the sound and keeps the volume, so unmuting brings it back as it was."
+);
+
+pub const RECEIVER_UNMUTE: Tool = receiver!(
+    "receiver_unmute",
+    "Unmute the AV receiver here, bringing its sound back at the volume it had.",
+    "The call is over and the room wants its sound back.",
+    "The receiver is muted; unmuting is the act that undoes it."
+);
+
+pub const RECEIVER_VOLUME: Tool = Tool {
+    name: "receiver_volume",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Set how loud the AV receiver here plays, from 0 (silent) to 100 (as loud as it goes).",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The AV receiver here, by name, as the room calls it.",
+        },
+        Param {
+            name: "volume",
+            ty: "integer",
+            required: true,
+            description: "How loud, from 0 to 100; 25 is quiet, 60 fills the room.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The stereo is louder than the room needs.",
+        call: r#"{"device":"the stereo","volume":30}"#,
+        because: "Loudness is a number the receiver holds; set it, do not ask somebody to.",
+    }],
+};
+
+pub const WAKE_DEVICE: Tool = Tool {
+    name: "wake_device",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Wake a device here that is asleep — a PC or a laptop — by its hardware address, so it comes back on the network with nobody at it.",
+    params: &[Param {
+        name: "device",
+        ty: "string",
+        required: true,
+        description: "The device here to wake, by name, as the room calls it.",
+    }],
+    examples: &[Example {
+        situation: "A workstation here is asleep and something needs it awake.",
+        call: r#"{"device":"John's workstation"}"#,
+        because: "A sleeping machine wakes on a magic packet, which needs nothing switched on at it.",
+    }],
+};
+
 /// Every bridge act, for the catalog.
 pub const BRIDGE_ACTS: &[Tool] = &[
     SURVEY_NETWORK,
@@ -112,6 +221,13 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     SONOS_PLAY,
     SONOS_PAUSE,
     SONOS_VOLUME,
+    RECEIVER_STATUS,
+    RECEIVER_ON,
+    RECEIVER_OFF,
+    RECEIVER_MUTE,
+    RECEIVER_UNMUTE,
+    RECEIVER_VOLUME,
+    WAKE_DEVICE,
 ];
 
 /// Whether `tool` is a bridge act — enacted by the runtime, which awaits the
