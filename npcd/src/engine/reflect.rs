@@ -387,6 +387,7 @@ fn call_tree(
                 max_tokens: None,
                 requires: Vec::new(),
                 shapes: Vec::new(),
+                pattern: None,
             })
             .collect(),
     };
