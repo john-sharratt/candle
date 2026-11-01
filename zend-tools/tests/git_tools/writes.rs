@@ -189,6 +189,57 @@ fn committing_some_files_leaves_the_rest() {
     assert_eq!(status["changes"][0]["path"], "b.txt");
 }
 
+/// **A commit of binary files leaves `git_status` telling the truth**, through
+/// every step a file goes through: added, replaced, committed beside one left
+/// uncommitted, and deleted. Each commit holds the exact bytes and no step
+/// reads as modified or in conflict.
+#[test]
+fn binary_files_read_clean_after_each_commit() {
+    let ws = GitWorkspace::new();
+    let conv = ws.conversation();
+    let repo = conv.ctx.files.repo("app").unwrap();
+    let all = json!({"repo": "app", "from": "all_changes", "message": "pictures"});
+
+    repo.write_bytes("a.png", vec![0xff, 0x00, 0xfe]).unwrap();
+    repo.write_bytes("b.png", vec![0xff, 0x01]).unwrap();
+    conv.write("note.txt", "text beside them\n");
+    let out = conv.call("git_commit", all.clone());
+    assert_eq!(out["applied"], true, "{out}");
+    let status = conv.status();
+    assert_eq!(status["clean"], true, "{status}");
+    assert_eq!(status.get("conflicts"), None, "{status}");
+
+    repo.write_bytes("a.png", vec![0xff, 0x02]).unwrap();
+    repo.write_bytes("b.png", vec![0xff, 0x03]).unwrap();
+    let out = conv.call(
+        "git_commit",
+        json!({"repo": "app", "from": "files", "message": "one picture",
+               "changes": [{"action": "take", "path": "a.png"}]}),
+    );
+    assert_eq!(out["applied"], true, "{out}");
+    let status = conv.status();
+    assert_eq!(status["counts"]["modified"], 1, "{status}");
+    assert_eq!(status["changes"][0]["path"], "b.png", "{status}");
+    assert_eq!(status.get("conflicts"), None, "{status}");
+
+    let out = conv.call("git_commit", all.clone());
+    assert_eq!(out["applied"], true, "{out}");
+    assert_eq!(conv.status()["clean"], true);
+
+    conv.write("b.png", "text now\n");
+    conv.delete("a.png");
+    let out = conv.call("git_commit", all);
+    assert_eq!(out["applied"], true, "{out}");
+    assert_eq!(out.get("note"), None, "{out}");
+    let status = conv.status();
+    assert_eq!(status["clean"], true, "{status}");
+    assert_eq!(status["incoming"], Value::Null, "{status}");
+    assert!(!ws
+        .git(&["ls-tree", "--name-only", "-r", "main"])
+        .lines()
+        .any(|l| l == "a.png"));
+}
+
 /// **`expected_head` is optional, and both paths work.** Omitted, the tip is
 /// read here and still swapped atomically; given and stale, it is refused.
 #[test]

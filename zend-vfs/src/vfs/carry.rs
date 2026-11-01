@@ -126,6 +126,18 @@ pub(super) fn carry(
             },
         };
         let now = Side::of(new, &path)?;
+        // The new tree holding what the session holds is the change landed,
+        // whatever the old copy was: a binary one cannot be merged, and has no
+        // need to be.
+        let landed = match (&ours, &now) {
+            (None, Side::Absent) => true,
+            (Some(ours), Side::Text(now)) => ours == now,
+            _ => false,
+        };
+        if landed && chains.get(&path).is_some_and(|c| !c.conflict) {
+            settled.push((path, None));
+            continue;
+        }
         let resolved = resolve(&Carried {
             path: &path,
             ours: ours.as_deref(),
@@ -264,7 +276,7 @@ mod tests {
             })
         })
         .unwrap();
-        assert_eq!(asked, ["gone.txt", "landed.txt", "moved.txt"]);
+        assert_eq!(asked, ["moved.txt"], "the new tree holds the other two");
         let mut left: Vec<&str> = chains.keys().map(String::as_str).collect();
         left.sort_unstable();
         assert_eq!(left, ["moved.txt"], "the new copies hold the rest");
@@ -275,6 +287,35 @@ mod tests {
 
     /// **A resolver's answer is recorded against the new copy, flag and
     /// all**, and a path named besides the changed ones is reconsidered too.
+    /// **A binary file the commit deleted or replaced with text is settled
+    /// without asking the resolver**, which refuses a binary side: the first
+    /// such file used to fail the whole move and leave every change behind.
+    #[test]
+    fn a_landed_change_over_a_binary_copy_is_settled_unasked() {
+        let (old_dir, new_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(old_dir.path().join("gone.png"), [0xff, 0x00]).unwrap();
+        std::fs::write(old_dir.path().join("text.dat"), [0xff, 0x00]).unwrap();
+        put(new_dir.path(), "text.dat", "now text\n");
+        let mut chains = HashMap::from([
+            ("gone.png".to_string(), chain(vec![FileDelta::Delete])),
+            (
+                "text.dat".to_string(),
+                chain(vec![FileDelta::Replace {
+                    content: "now text\n".into(),
+                }]),
+            ),
+        ]);
+        carry(
+            &mut chains,
+            &View::Folder(old_dir.path()),
+            &View::Folder(new_dir.path()),
+            &[],
+            &mut |c: &Carried<'_>| panic!("{} needed no answer", c.path),
+        )
+        .unwrap();
+        assert!(chains.is_empty(), "the commit holds both");
+    }
+
     /// **A binary change its commit landed is gone from the store, not in
     /// conflict.** It cannot be replayed as text, and read that way every
     /// committed picture came back modified and conflicted, `clean: false`,

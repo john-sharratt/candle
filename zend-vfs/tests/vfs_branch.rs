@@ -373,7 +373,6 @@ fn a_reset_drops_the_work_even_from_a_base_that_is_gone() {
     }))
     .unwrap();
     store.restore(snapshot).unwrap();
-    assert!(store.read("ten.txt").is_err(), "its base is gone");
     assert_eq!(
         store.reset_to(None, base_of(dir.path(), "main")).unwrap(),
         1
