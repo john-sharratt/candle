@@ -77,6 +77,7 @@ pub mod remote;
 pub mod replica;
 #[cfg(test)]
 mod replica_tests;
+pub mod replication_load;
 pub mod resume;
 pub mod rewritten;
 pub mod sealed_reader;

@@ -1933,8 +1933,17 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
             profile: "device".into(),
             ..Finding::default()
         };
-        s.findings
-            .surveyed("vault-casting/green-room", vec![sonos_found(), cast]);
+        let receiver = Finding {
+            address: "192.168.0.61".into(),
+            hardware: "00:1b:21:aa:bb:cc".into(),
+            names: vec!["the stereo".into()],
+            profile: "receiver".into(),
+            ..Finding::default()
+        };
+        s.findings.surveyed(
+            "vault-casting/green-room",
+            vec![sonos_found(), cast, receiver],
+        );
     });
     for name in offered(&house, "d1") {
         if !seen.contains(&name) {
@@ -1953,6 +1962,10 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         (
             "onboard_part",
             json!({"from": sonos_found().label(), "called": "Sonos speaker", "description": "The Sonos speaker plays for the room."}),
+        ),
+        (
+            "onboard_part",
+            json!({"from": "the stereo at 192.168.0.61", "called": "the stereo", "description": "The AV receiver on the shelf."}),
         ),
         (
             "discover_door",

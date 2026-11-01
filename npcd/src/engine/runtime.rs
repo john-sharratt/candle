@@ -421,6 +421,11 @@ pub struct Runtime {
     pub mind_handle: Mind,
     /// The mind repository, loaded and followed, with `--mind-repo`.
     mind_repos: OnceLock<Repos>,
+    /// How a device-bridge job reaches an agent (`docs/zen_moon_mind.md` §15):
+    /// the same agent client the mind's git jobs go through, kept so an NPC's
+    /// effector verb and the operator route can submit a `BridgeCall`. Set once
+    /// the member's agents are known; absent on a daemon that reaches none.
+    agents: OnceLock<Agents>,
     /// Asked for a relaunch: the mind's schema moved.
     relaunch: OnceLock<Arc<Stopping>>,
     /// What reads the authored state again when a mind pending at start
@@ -975,6 +980,7 @@ impl Runtime {
 
             mind_handle,
             mind_repos: OnceLock::new(),
+            agents: OnceLock::new(),
             relaunch: OnceLock::new(),
             mind_arrived: RwLock::new(None),
             // Read from disk: a document already in the substrate must not be
@@ -1959,6 +1965,19 @@ impl Runtime {
     /// of the world's records on its next beat, so a reboot, and every member
     /// following the world, finds it as it was left. A world this daemon only
     /// follows is its authority's to open or shut.
+    /// The agent client a device-bridge job is submitted through, when this
+    /// member can reach one (`docs/zen_moon_mind.md` §15). `None` on a daemon
+    /// that reaches no agent — a bridge act is then refused, not run here.
+    pub fn agents(&self) -> Option<Agents> {
+        self.agents.get().cloned()
+    }
+
+    /// Keep the agent client, so an NPC's effector verb and the operator route
+    /// can hand a bridge job to an in-network agent.
+    pub fn set_agents(&self, agents: Agents) {
+        let _ = self.agents.set(agents);
+    }
+
     pub fn set_table_open(&self, open: bool) {
         for id in self.hosted.ids() {
             if !self.standing.writes(&id) {
@@ -4734,6 +4753,10 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                 (Agents::in_process(jobs), None)
             }
         };
+        // The same agent client the mind's git jobs go through also carries a
+        // device-bridge job to an in-network agent (`docs/zen_moon_mind.md`
+        // §15), so an NPC's effector verb and the operator route can reach it.
+        rt.set_agents(agents.clone());
         rt.ops.set_pusher(AgentPush::shared(
             agents.clone(),
             handle.clone(),

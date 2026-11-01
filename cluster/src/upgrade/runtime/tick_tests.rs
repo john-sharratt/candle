@@ -133,6 +133,10 @@ impl Store for HeldStore {
     fn mark_joined(&self) {
         self.inner.mark_joined()
     }
+
+    fn note_busy(&self, busy: bool) {
+        self.inner.note_busy(busy)
+    }
 }
 
 struct NoInstall;

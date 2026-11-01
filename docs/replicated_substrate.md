@@ -1287,7 +1287,10 @@ Each member has an outbound queue per lane.
   events throughout, placed conversations as above, routed no other request until its
   `ACK`s cover what the members serving
   have applied of every origin, within 64 records (`SYNC_SLACK`), as the gateway judges
-  from those `ACK`s. Waiting instead for its
+  from those `ACK`s — or, for an origin whose own coverage of itself has a hole, until
+  its `COORD` says it holds up to what is served and misses no more of that origin than
+  the origin does (`Registry::in_sync`): an `ACK` is gap-free, and a record nobody holds
+  pinned WhiteWorld's zend syncing for good on 2026-11-01. Waiting instead for its
   catch-up to reach every origin's `high_water` before sending it live events waits
   for ever while any origin keeps writing — the catch-up trails the writes it is not
   sent — and so it did: WhiteWorld's zend, lagging behind `.5`'s ingest, was routed
@@ -2862,6 +2865,21 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
 **Nothing is broadcast.** Headers and fetched records reach the requester only. Other
 members see no catch-up traffic, so a member's return costs the group one answerer's
 disk reads and one socket's bandwidth.
+
+**The window slides.** Wanted records are fetched in segments of at most 4 MiB, sixteen in
+flight inside the 64 MiB window, and each record applied frees its bytes from the window
+at once, so the answerer's reads, the gateway and the apply overlap (`catchup.rs`). A
+finished catch-up logs its records, bytes and MB/s.
+
+**An own gap no member holds is gone.** A gap in a member's own origin is usually a
+record a purge dropped that another member still holds, and a catch-up fills it. One no
+member holds never fills, and every member's gap-free coverage of the origin stops at it.
+Each `CATCHUP` carries its requester's applied set, so the member answering learns
+whether that requester holds each of its own gaps below what it has written; a gap every
+other member it can see has been found to lack is declared gone (`own_gaps.rs`), listed
+gone from then on, and every member's coverage moves past it. A requester found holding
+any of a gap withdraws the evidence. A member away while this is decided is not
+counted.
 
 **The answerer may itself be behind**, because round robin does not pick the
 best-informed member. Its complete ranges then stop short for some origin. The requester

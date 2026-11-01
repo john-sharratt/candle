@@ -8,16 +8,17 @@
 pub mod acts;
 pub mod discover;
 pub mod finding;
-pub mod sonos;
 
+use agent::client::Agents;
+use agent::wire::BridgeCall;
+use house_bridge::work::profile_act;
 use npc_map::part::PartLink;
 use npc_map::schema::Where;
 use serde_json::{Map, Value};
 
 use crate::engine::mission_gen::standing::HOUSE_LINK;
 use crate::world::Hosted;
-use finding::SONOS;
-use sonos::Player;
+use finding::{RECEIVER, SONOS};
 
 pub use acts::{is_mine, BRIDGE_ACTS};
 
@@ -66,13 +67,32 @@ pub fn links_of(parts: &[Here]) -> Vec<String> {
         .collect()
 }
 
-/// The names of the parts among `parts` that stand for a Sonos player.
-pub fn sonos_of(parts: &[Here]) -> Vec<String> {
+/// The names of the parts among `parts` that stand for a device of `profile`.
+pub fn on_profile(parts: &[Here], profile: &str) -> Vec<String> {
     parts
         .iter()
-        .filter(|p| p.link.as_ref().is_some_and(|l| l.profile == SONOS))
+        .filter(|p| p.link.as_ref().is_some_and(|l| l.profile == profile))
         .map(|p| p.name.clone())
         .collect()
+}
+
+/// The names of the parts among `parts` that stand for a Sonos player.
+pub fn sonos_of(parts: &[Here]) -> Vec<String> {
+    on_profile(parts, SONOS)
+}
+
+/// The names of the parts among `parts` that stand for an AV receiver.
+pub fn receiver_of(parts: &[Here]) -> Vec<String> {
+    on_profile(parts, RECEIVER)
+}
+
+/// The part here named `name` that stands for a device of `profile`, and its
+/// address.
+fn linked_here(hosted: &Hosted, body: &str, name: &str, profile: &str) -> Option<PartLink> {
+    parts_here(hosted, body).into_iter().find_map(|p| {
+        let link = p.link?;
+        (p.name.eq_ignore_ascii_case(name) && link.profile == profile).then_some(link)
+    })
 }
 
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
@@ -101,9 +121,18 @@ impl Done {
     }
 }
 
-/// Enact bridge act `tool` for `body` in `hosted`, with `args`: survey from
-/// the house link here, or work the Sonos player here.
-pub async fn enact(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, Value>) -> Done {
+/// Enact bridge act `tool` for `body`: survey the house network from the link
+/// here [done on this member], or work a device here by handing a [`BridgeCall`]
+/// to an in-network agent (`docs/zen_moon_mind.md` §15) — the device I/O runs
+/// on the agent, the way the git jobs do, not on whatever member the character
+/// happens to run on.
+pub async fn enact(
+    hosted: &Hosted,
+    body: &str,
+    tool: &str,
+    args: &Map<String, Value>,
+    agents: Option<Agents>,
+) -> Done {
     match tool {
         "survey_network" => {
             let Some(at) = text(args, "at") else {
@@ -136,48 +165,72 @@ pub async fn enact(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, V
                 Err(e) => Done::refused(format!("The survey could not be made: {e}")),
             }
         }
-        "sonos_status" | "sonos_play" | "sonos_pause" | "sonos_volume" => {
+        "wake_device" => {
             let Some(name) = text(args, "device") else {
-                return Done::refused("Say which Sonos player.");
+                return Done::refused("Say which device to wake.");
             };
-            let address = parts_here(hosted, body).into_iter().find_map(|p| {
+            let mac = parts_here(hosted, body).into_iter().find_map(|p| {
                 let link = p.link?;
-                (p.name.eq_ignore_ascii_case(&name) && link.profile == SONOS)
-                    .then_some(link.address)
+                (p.name.eq_ignore_ascii_case(&name) && !link.hardware.is_empty())
+                    .then_some(link.hardware)
             });
-            let Some(address) = address else {
-                return Done::refused(format!("There is no Sonos player called {name} here."));
+            let Some(mac) = mac else {
+                return Done::refused(format!(
+                    "There is no device called {name} here that the world knows how to wake."
+                ));
             };
-            let player = match Player::at(&address, &discover::nets()) {
-                Ok(p) => p,
-                Err(e) => return Done::refused(format!("The {name} cannot be reached: {e}")),
+            submit(
+                agents,
+                &name,
+                BridgeCall::Wake {
+                    name: name.clone(),
+                    mac,
+                },
+            )
+            .await
+        }
+        // The device profiles' acts — `sonos_play`, `receiver_volume`, … — each
+        // bound to a device standing here. The part names the device's profile
+        // and address; the act is handed to an in-network agent to carry out.
+        t if profile_act(t).is_some() => {
+            let (profile, action) = profile_act(tool).expect("just checked");
+            let Some(name) = text(args, "device") else {
+                return Done::refused("Say which device.");
             };
-            let worked = match tool {
-                "sonos_status" => player.status().await.map(|s| s.line(&name)),
-                "sonos_play" => player
-                    .play()
-                    .await
-                    .map(|()| format!("The {name} is playing.")),
-                "sonos_pause" => player
-                    .pause()
-                    .await
-                    .map(|()| format!("The {name} is paused.")),
-                _ => {
-                    let Some(v) = args.get("volume").and_then(Value::as_u64) else {
-                        return Done::refused("Say the volume, 0 to 100.");
-                    };
-                    let v = v.min(100) as u8;
-                    player
-                        .set_volume(v)
-                        .await
-                        .map(|()| format!("The {name} is at volume {v} of 100."))
-                }
+            let Some(link) = linked_here(hosted, body, &name, profile) else {
+                return Done::refused(format!("There is no {profile} called {name} here."));
             };
-            match worked {
-                Ok(line) => Done::did(line),
-                Err(e) => Done::refused(format!("The {name} did not answer: {e}")),
-            }
+            submit(
+                agents,
+                &name,
+                BridgeCall::Work {
+                    profile: profile.to_string(),
+                    name: name.clone(),
+                    address: link.address,
+                    action: action.to_string(),
+                    args: args.clone(),
+                },
+            )
+            .await
         }
         other => Done::refused(format!("`{other}` is no bridge act.")),
+    }
+}
+
+/// Hand `call` to an in-network agent and read back the device's line.
+///
+/// A device that refuses is a refusal, not a landed act; and with no agent to
+/// reach — a member off the cluster, or none in the house — the act is refused
+/// rather than silently doing nothing.
+pub async fn submit(agents: Option<Agents>, name: &str, call: BridgeCall) -> Done {
+    let Some(agents) = agents else {
+        return Done::refused(
+            "No agent in the house can work it right now. Try again in a moment.",
+        );
+    };
+    match agents.bridge(&call).await {
+        Ok(b) if b.ok => Done::did(b.line),
+        Ok(b) => Done::refused(b.line),
+        Err(e) => Done::refused(format!("The {name} could not be reached: {e}")),
     }
 }

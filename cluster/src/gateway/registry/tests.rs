@@ -60,6 +60,57 @@ fn a_member_still_loading_its_process_hosts_no_character() {
     assert!(!m.may_host(), "and none before it is ready at all");
 }
 
+/// **A hole its own origin lacks does not hold a member syncing**: one whose
+/// gap-free `ACK` stops at that hole is in sync once it holds up to what is
+/// served and misses no more of the origin than the origin does of itself —
+/// and still not while it misses more.
+#[test]
+fn a_hole_the_origin_lacks_does_not_hold_a_member_syncing() {
+    let serving: BTreeMap<u64, u64> = [(1, 74_494_768)].into_iter().collect();
+    let acks = [(1, 13_240_132)];
+    let held_with = |missing| -> BTreeMap<u64, Held> {
+        [(
+            1,
+            Held {
+                top: 74_494_768,
+                missing,
+            },
+        )]
+        .into_iter()
+        .collect()
+    };
+    let origin_lacks: BTreeMap<u64, u64> = [(1, 1)].into_iter().collect();
+    let none = BTreeMap::new();
+    assert!(
+        !Registry::in_sync(3, &acks, &serving, &held_with(1), &none),
+        "the origin is not known to lack it"
+    );
+    assert!(Registry::in_sync(
+        3,
+        &acks,
+        &serving,
+        &held_with(1),
+        &origin_lacks
+    ));
+    assert!(
+        !Registry::in_sync(3, &acks, &serving, &held_with(2), &origin_lacks),
+        "one more missing than the origin is a gap to fill"
+    );
+    let short: BTreeMap<u64, Held> = [(
+        1,
+        Held {
+            top: 70_000_000,
+            missing: 1,
+        },
+    )]
+    .into_iter()
+    .collect();
+    assert!(
+        !Registry::in_sync(3, &acks, &serving, &short, &origin_lacks),
+        "nor while it holds short of what is served"
+    );
+}
+
 /// A member whose session has ended is routed nothing, even as a canary or
 /// when it would rank best — but only that session: a newer session of the
 /// same node is left alone (§5.3).
@@ -1115,20 +1166,20 @@ fn a_syncing_member_is_routed_only_its_own() {
     );
 
     let serving: BTreeMap<u64, u64> = [(1, 500), (2, 80)].into_iter().collect();
+    let (held, origin_missing) = (BTreeMap::new(), BTreeMap::new());
+    let in_sync =
+        |acks: &[(u64, u64)]| Registry::in_sync(3, acks, &serving, &held, &origin_missing);
+    assert!(!in_sync(&[(1, 400), (2, 80)]), "100 behind node 1");
     assert!(
-        !Registry::in_sync(3, &[(1, 400), (2, 80)], &serving),
-        "100 behind node 1"
-    );
-    assert!(
-        Registry::in_sync(3, &[(1, 500 - SYNC_SLACK), (2, 80)], &serving),
+        in_sync(&[(1, 500 - SYNC_SLACK), (2, 80)]),
         "within the slack"
     );
     assert!(
-        !Registry::in_sync(3, &[(1, 500)], &serving),
+        !in_sync(&[(1, 500)]),
         "nothing applied of node 2, which the serving members hold"
     );
     assert!(
-        Registry::in_sync(3, &[(1, 500), (2, 80)], &serving),
+        in_sync(&[(1, 500), (2, 80)]),
         "a write seen of a member away that nobody serving holds is not waited on"
     );
     assert!(r.set_syncing("zend", 3, false));

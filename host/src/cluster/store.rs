@@ -119,6 +119,10 @@ impl Store for ConversationStore {
         }
     }
 
+    fn note_busy(&self, busy: bool) {
+        self.conversation.note_replication_busy(busy);
+    }
+
     fn set_tap(&self, tap: Tap) {
         self.conversation.set_replication_tap(tap);
     }

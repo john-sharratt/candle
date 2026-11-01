@@ -180,9 +180,17 @@ pub struct MemoryStore {
     local_only: Mutex<Vec<u8>>,
     /// How many times the replicator has marked it joined.
     joined_marks: AtomicU64,
+    /// What the replicator last said of its load ([`Store::note_busy`]).
+    busy: AtomicBool,
 }
 
 impl MemoryStore {
+    /// Whether the replicator last said it is busy applying here
+    /// ([`Store::note_busy`]).
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
     /// How many times the replicator has marked it joined
     /// ([`Store::mark_joined`]).
     pub fn joined_marks(&self) -> u64 {
@@ -208,6 +216,7 @@ impl MemoryStore {
             refused_origins: Mutex::new(Vec::new()),
             local_only: Mutex::new(Vec::new()),
             joined_marks: AtomicU64::new(0),
+            busy: AtomicBool::new(false),
         }
     }
 
@@ -614,6 +623,10 @@ impl Store for MemoryStore {
 
     fn mark_joined(&self) {
         self.joined_marks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Relaxed);
     }
 }
 

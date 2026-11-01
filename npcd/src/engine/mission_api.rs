@@ -19,6 +19,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use agent::wire::BridgeCall;
+
 use crate::api::{err, owner_of, Authored};
 use crate::authority::ops::{OpReply, WorldOp};
 use crate::engine::bodies::{
@@ -252,6 +254,41 @@ pub async fn step(
 pub struct TableBody {
     /// Open the command table, or shut it.
     open: bool,
+}
+
+/// `POST /v1/pulse/bridge` — an operator works a device directly through an
+/// in-network agent (`docs/zen_moon_mind.md` §15), the admin path that needs no
+/// character in the room. The body is a [`BridgeCall`] — `work` a device of a
+/// profile at an address, or `wake` one — and the answer is the device's own
+/// line. The job goes to whichever in-network agent the gateway picks, which
+/// runs the `house-bridge` library and does the real network commands locally.
+///
+/// The address is the one a survey recorded, so the agent that runs it must be
+/// on that address's network — true while every agent shares the one house LAN.
+/// A deployment whose agents span more than one subnet would need the job
+/// pinned to an agent on the device's subnet; not so here.
+pub async fn bridge(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(call): Json<BridgeCall>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("the house bridge");
+    };
+    let Some(agents) = rt.agents() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_agent",
+            "no agent in the house to run it",
+        );
+    };
+    match agents.bridge(&call).await {
+        Ok(b) => Json(json!({ "ok": b.ok, "line": b.line })).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
+    }
 }
 
 /// `POST /v1/pulse/command-table` — open or shut the command table.

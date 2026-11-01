@@ -488,6 +488,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             each(),
             post(mission_api::command_table),
         )
+        // The operator's house bridge (`docs/zen_moon_mind.md` §15): work a
+        // device directly through an in-network agent, no character needed.
+        // One member takes it and submits the job; admin, like the table.
+        .route(
+            "/v1/pulse/bridge",
+            Role::Admin,
+            Dispatch::Any,
+            post(mission_api::bridge),
+        )
         // What the guardian has found and done. Admin: it names every
         // character, including ones the caller does not own.
         .route(

@@ -4306,6 +4306,9 @@ mod tests {
                 // The command table and clearing the board — admin, they drive
                 // the whole cast.
                 ("/v1/pulse/command-table", "admin"),
+                // The operator's house bridge — work a device through an
+                // in-network agent, admin like the table.
+                ("/v1/pulse/bridge", "admin"),
                 // What the guardian has found and done — names every
                 // character, so admin.
                 ("/v1/pulse/guardian", "admin"),

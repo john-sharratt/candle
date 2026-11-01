@@ -11,7 +11,7 @@
 //! | Paxos, `max_members`, generations and the rejoin | [`super::consensus`] |
 //! | the once-a-tick work: `ACK`, gaps, periodic catch-ups, cutting off | [`super::tick`] |
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +27,7 @@ use super::busy_warnings::BusyWarnings;
 use super::catchup::{Progress, Purpose, Requester, FETCH_WINDOW};
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
+use super::own_gaps::OwnGaps;
 use super::pulse::PULSES_KEPT;
 use super::quorum_governor::{Downgrade, Governor};
 use super::store::Store;
@@ -91,6 +92,22 @@ fn waiting(available: usize) -> usize {
     ROOM_PERMITS.saturating_sub(available) * ROOM_UNIT
 }
 
+/// Whether replication is busy applying here: a catch-up is running, or a
+/// quarter or more of [`ARRIVALS_CAP`] waits to be applied. What the store's
+/// own background work defers to ([`super::store::Store::note_busy`]).
+pub(super) fn busy(catchups_running: bool, waiting_bytes: usize) -> bool {
+    catchups_running || waiting_bytes >= ARRIVALS_CAP / 4
+}
+
+impl Replicator {
+    /// Tell the store whether replication is busy applying to it now.
+    pub(super) fn note_load(&self) {
+        let running = !self.state().catchups.is_empty();
+        let waiting_bytes = waiting(self.room.available_permits());
+        self.store.note_busy(busy(running, waiting_bytes));
+    }
+}
+
 #[cfg(test)]
 mod room_tests {
     use super::*;
@@ -107,6 +124,19 @@ mod room_tests {
         assert_eq!(room_for(59 * 1024), 59);
         assert_eq!(room_for(ARRIVALS_CAP * 4), ROOM_PERMITS as u32);
         assert_eq!(ROOM_PERMITS, 131_072, "twice a 64 MiB fetch window, in KiB");
+    }
+
+    /// **Replication is busy while a catch-up runs or a quarter of the budget
+    /// waits**, and quiet otherwise.
+    #[test]
+    fn replication_is_busy_while_catching_up_or_backed_up() {
+        assert!(!busy(false, 0));
+        assert!(!busy(false, ARRIVALS_CAP / 4 - 1));
+        assert!(
+            busy(false, ARRIVALS_CAP / 4),
+            "a quarter of the budget waits"
+        );
+        assert!(busy(true, 0), "a catch-up runs");
     }
 
     /// What waits to be applied is the budget's spent share, in bytes: none
@@ -205,6 +235,9 @@ pub(super) struct State {
     /// Records some catch-up of this member wants: another lists them as
     /// held, so two catch-ups never fetch one record.
     pub claimed: HashSet<(u64, u64)>,
+    /// Who has been seen to lack each of this member's own gaps, so one no
+    /// member holds is declared gone ([`OwnGaps`]).
+    pub own_gaps: OwnGaps,
     /// The first admission since the process started has classified the
     /// own events (§7.5).
     pub restarted: bool,
@@ -272,6 +305,17 @@ impl State {
     pub fn next_request(&mut self) -> u64 {
         self.next_request += 1;
         self.next_request
+    }
+
+    /// Every other member of the app any gateway lists now.
+    pub fn other_members(&self, me: u64) -> BTreeSet<u64> {
+        self.members
+            .iter()
+            .flatten()
+            .flat_map(|m| m.members.iter())
+            .map(|m| m.node)
+            .filter(|node| *node != me)
+            .collect()
     }
 
     /// Drop catch-up `id`, letting go of every record it still wanted.
@@ -488,6 +532,7 @@ impl Replicator {
                 lost: HashSet::new(),
                 fetches: HashMap::new(),
                 claimed: HashSet::new(),
+                own_gaps: OwnGaps::default(),
                 restarted: false,
                 offered: false,
                 gaps: GapWatch::default(),

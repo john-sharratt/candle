@@ -16,6 +16,7 @@ mod drain;
 mod fault;
 mod lease;
 mod memory;
+mod own_gaps;
 mod pulse;
 mod quorum_governor;
 mod receive;
