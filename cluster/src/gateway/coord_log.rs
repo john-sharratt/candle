@@ -261,6 +261,7 @@ mod tests {
                 skipped: 3,
                 ..Progress::default()
             },
+            rate_kb_s: 0,
             waiting: None,
         };
         let mut before = joined();

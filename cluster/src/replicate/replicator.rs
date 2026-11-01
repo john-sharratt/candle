@@ -262,6 +262,7 @@ impl State {
                     cluster: r.socket,
                     purpose: r.purpose,
                     progress,
+                    rate_kb_s: (r.rate_mb_s() * 1000.0) as u64,
                     waiting,
                 }
             })
@@ -314,6 +315,9 @@ pub struct CatchupView {
     pub purpose: Purpose,
     #[serde(flatten)]
     pub progress: Progress,
+    /// How fast it has fetched since it was asked, in KB a second.
+    #[serde(default)]
+    pub rate_kb_s: u64,
     /// What it waits on while no member has answered it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<Waiting>,
