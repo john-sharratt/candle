@@ -812,7 +812,8 @@ async fn the_status_page_is_an_admins() {
 
 /// **The status key** reads the status and nothing else: presented, the data
 /// answers; the page and the commands still refuse it, and any other key is
-/// refused like no key at all.
+/// refused like no key at all. (Nor does it name anybody on a site route —
+/// [`the_ops_key_reaches_every_site_route_and_no_key_leaves_the_gateway`].)
 #[tokio::test]
 async fn the_status_key_reads_the_status_and_nothing_else() {
     let dumb = spawn(dumb_daemon()).await;
@@ -911,6 +912,62 @@ async fn the_ops_key_is_an_admin_without_a_session() {
         ask(gw, "GET", "/gateway", &with_status, "").await.status,
         401
     );
+}
+
+/// An upstream that says who the gateway named to it, and whether any
+/// `Authorization` reached it.
+fn witness_daemon() -> Router {
+    Router::new().fallback(|headers: HeaderMap| async move {
+        axum::Json(json!({
+            "email": header(&headers, "x-tokera-email"),
+            "provider": header(&headers, "x-tokera-provider"),
+            "authorization": header(&headers, "authorization"),
+        }))
+    })
+}
+
+/// **The ops key is its admin on every site route too**, so a shell watches
+/// what an admin sees — and neither key ever reaches the upstream: the ops key
+/// is taken off what it identified, the status key off what it could not, and
+/// a key nobody knows passes through untouched as the caller's own.
+#[tokio::test]
+async fn the_ops_key_reaches_every_site_route_and_no_key_leaves_the_gateway() {
+    let witness = spawn(witness_daemon()).await;
+    let ops = "6c".repeat(32);
+    let status = "5a".repeat(32);
+    let (gw, _hub) = gateway_keyed(
+        witness,
+        BearerKey::from_hex(&status),
+        BearerKey::from_hex(&ops),
+    )
+    .await;
+    for method in ["GET", "POST"] {
+        let bearer = format!("Bearer {ops}");
+        let with_ops = [("authorization", bearer.as_str())];
+        let seen = ask(gw, method, "/plain/v1/pulse", &with_ops, "").await;
+        assert_eq!(seen.status, 200, "{}", seen.body);
+        let seen = seen.json();
+        assert_eq!(seen["email"], OPS_ADMIN, "{method}: the admin is named");
+        assert_eq!(seen["provider"], "ops-key");
+        assert_eq!(
+            seen["authorization"], "",
+            "{method}: the ops key stays here"
+        );
+    }
+
+    let bearer = format!("Bearer {status}");
+    let with_status = [("authorization", bearer.as_str())];
+    let seen = ask(gw, "GET", "/plain/v1/pulse", &with_status, "").await;
+    let seen = seen.json();
+    assert_eq!(seen["email"], "", "the status key names nobody on a site");
+    assert_eq!(seen["authorization"], "", "and it stays here too");
+
+    let other = format!("Bearer {}", "6d".repeat(32));
+    let with_other = [("authorization", other.as_str())];
+    let seen = ask(gw, "GET", "/plain/v1/pulse", &with_other, "").await;
+    let seen = seen.json();
+    assert_eq!(seen["email"], "");
+    assert_eq!(seen["authorization"], other, "not the gateway's to take");
 }
 
 /// **The cluster socket** refuses an app that is none of the three, and a

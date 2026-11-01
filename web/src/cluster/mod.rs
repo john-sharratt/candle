@@ -270,6 +270,25 @@ impl Gateway {
             .or_else(|| origin.and_then(|_| identify(headers).ok()))
     }
 
+    /// Who a request to the sites this gateway serves is by its ops key
+    /// (`docs/replicated_substrate.md` §12): the key's admin, on any route of
+    /// any site, so an operator at a shell sees and does what an admin can.
+    /// The status key reads the status page and nothing else.
+    pub fn key_holder(&self, headers: &HeaderMap) -> Option<Identity> {
+        self.ops_key.as_ref().and_then(|k| k.caller(headers))
+    }
+
+    /// Whether `headers` present one of this gateway's keys, accepted or not
+    /// — a request that does is never forwarded with it, so no member or
+    /// upstream ever holds a key.
+    pub fn presents_key(&self, headers: &HeaderMap) -> bool {
+        self.ops_key.as_ref().is_some_and(|k| k.presented(headers))
+            || self
+                .status_key
+                .as_ref()
+                .is_some_and(|k| k.presented(headers))
+    }
+
     pub fn set_router(&self, router: Router) {
         // Set once, when the server's router is built.
         let _ = self.router.set(router);

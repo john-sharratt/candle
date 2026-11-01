@@ -6,11 +6,16 @@
 //!
 //! - **The status key** (`status_key_file`, `web --new-status-key <PATH>`)
 //!   reads `/gateway/status.json` and nothing else.
-//! - **The ops key** (`ops_key_file`, `web --new-ops-key <PATH>`) acts as the
-//!   admin named by `ops_as` on every route of the gateway's own: the page, its
-//!   commands, and each upgrade command — `rollout` included, so a build can be
-//!   rolled back in an emergency by whoever can read the key on the gateway's
-//!   box, without a browser or a sign-in.
+//! - **The ops key** (`ops_key`, `web --new-ops-key <PATH>`) acts as its
+//!   admin on every route of the gateway's own — the page, its commands, and
+//!   each upgrade command, `rollout` included, so a build can be rolled back in
+//!   an emergency by whoever can read the key on the gateway's box, without a
+//!   browser or a sign-in — and on every route of the sites it serves, so an
+//!   operator at a shell watches everything an admin can.
+//!
+//! Neither leaves the gateway: a request presenting either, accepted or not,
+//! is forwarded without its `Authorization` header, so no member or upstream
+//! ever holds a key.
 
 use std::fs::OpenOptions;
 use std::io::Write;

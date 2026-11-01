@@ -199,11 +199,13 @@ roles_file: "../host/roles.yaml"
 #
 #   target\release\web.exe --new-status-key web/secrets/status.key
 #
-# `ops_key` is an admin without a session, for the emergency that cannot wait
-# for a sign-in: presenting `file`'s contents as `Authorization: Bearer <key>`
-# acts as `admin` on the gateway's page and every command on it — a `rollout`
-# back to the previous build among them (§12). `admin` must be in the role
-# table. Made once with
+# `ops_key` is an admin without a session, for an operator watching from a
+# shell and the emergency that cannot wait for a sign-in: presenting `file`'s
+# contents as `Authorization: Bearer <key>` acts as `admin` on the gateway's
+# page and every command on it — a `rollout` back to the previous build among
+# them — and on every route of every site this gateway serves: Pulse, the
+# logs, each app's own routes (§12). `admin` must be in the role table. Neither
+# key is ever forwarded to a member. Made once with
 #
 #   target\release\web.exe --new-ops-key web/secrets/ops.key
 cluster:
