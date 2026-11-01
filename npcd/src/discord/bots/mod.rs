@@ -251,6 +251,11 @@ impl Bots {
     /// One beat: the shards to the authority, what they heard taken in, what
     /// the characters wrote posted.
     pub async fn tick(&self, a: &Arc<Authored>) {
+        // Every npcd member of the group may share this one's public
+        // address, so each holds an even share of its invalid-request lines.
+        if let Some(rt) = &a.runtime {
+            a.discord.share_invalid(rt.npcd_members().1.len());
+        }
         let mut held = self.held.lock().await;
         self.follow(a, &mut held).await;
         self.take_in(a, &mut held).await;

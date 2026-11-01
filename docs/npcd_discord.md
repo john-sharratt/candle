@@ -651,8 +651,12 @@ counter for the process (`npcd/src/discord/limit.rs`): a rolling window of the 4
 answers of the last ten minutes. From `--discord-invalid-throttle` (5,000) every request is
 spaced one per `600 s / (ceiling − throttle)` — 200 ms — so even a window of nothing but
 refusals cannot reach `--discord-invalid-ceiling` (8,000), at which nothing is sent until the
-oldest answer leaves the window. Each crossing is logged once. Every member behind one public
-address shares Discord's 10,000, so each is given its own part of it. And no caller asks again
+oldest answer leaves the window. Each crossing is logged once. The two lines are the
+**public address's**, not a member's: members of one group may sit behind one NAT, and
+Discord counts them all against one 10,000, so each of the group's `n` npcd members holds
+`throttle / n` and `ceiling / n` (two members: 2,500 and 4,000, 400 ms apart), re-read
+from the membership every beat. Members on separate addresses are held to less than their
+own address allows, which costs nothing until Discord is refusing. And no caller asks again
 on the next beat after a refusal: a world's mirror and a bot's DM hold off for the 429's
 `retry_after`, ten minutes after a 403 or a 401, thirty seconds otherwise, each doubled for
 every refusal in a row up to an hour (`npcd/src/discord/world/hold.rs`). A 401 (a token

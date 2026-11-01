@@ -15,12 +15,18 @@
 //!   counted answer leaves the window.
 //!
 //! A request held back is answered as `DiscordError::Paused` with how long
-//! to wait, which every caller holds off for. The lines are configurable
-//! (`--discord-invalid-throttle`, `--discord-invalid-ceiling`): every member
-//! behind one public address shares Discord's 10,000, so each takes its own
-//! part of it.
+//! to wait, which every caller holds off for.
+//!
+//! The lines are the **public address's** (`--discord-invalid-throttle`,
+//! `--discord-invalid-ceiling`), not this member's. Members of one group may
+//! sit behind one address, and Discord counts all of them against the one
+//! 10,000, so each member takes an even share of the lines: with `n` npcd
+//! members in the group, `throttle / n` and `ceiling / n` ([`Self::share`]).
+//! Members on separate addresses are held under their own address's limit
+//! by more than they need, which costs nothing until Discord is refusing.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -40,6 +46,8 @@ pub struct InvalidRequests {
     throttle: u32,
     ceiling: u32,
     window: Duration,
+    /// How many members share the address's lines; at least 1.
+    shares: AtomicU32,
     held: Mutex<Held>,
 }
 
@@ -69,22 +77,41 @@ impl Default for InvalidRequests {
 }
 
 impl InvalidRequests {
-    /// A counter that throttles from `throttle` invalid answers a `window`
-    /// and stops at `ceiling`. A ceiling at or under the throttle line stops
-    /// at the throttle line.
+    /// A counter for an address that throttles from `throttle` invalid
+    /// answers a `window` and stops at `ceiling`, held by this member alone
+    /// until [`Self::share`] says otherwise. A ceiling at or under the
+    /// throttle line stops at the throttle line.
     pub fn new(throttle: u32, ceiling: u32, window: Duration) -> Self {
         Self {
             throttle,
             ceiling: ceiling.max(throttle),
             window,
+            shares: AtomicU32::new(1),
             held: Mutex::new(Held::default()),
         }
     }
 
+    /// The address's lines are shared among `members` (none counts as one).
+    pub fn share(&self, members: usize) {
+        let members = u32::try_from(members).unwrap_or(u32::MAX).max(1);
+        self.shares.store(members, Ordering::Relaxed);
+    }
+
+    /// This member's throttle and ceiling lines: its share of the
+    /// address's, never under one request.
+    pub fn lines(&self) -> (u32, u32) {
+        let shares = self.shares.load(Ordering::Relaxed);
+        (
+            (self.throttle / shares).max(1),
+            (self.ceiling / shares).max(1),
+        )
+    }
+
     /// The spacing between requests while throttled: what keeps a window
-    /// of all-refused requests from reaching the ceiling.
+    /// of all-refused requests from reaching this member's ceiling.
     pub fn slice(&self) -> Duration {
-        match self.ceiling - self.throttle {
+        let (throttle, ceiling) = self.lines();
+        match ceiling.saturating_sub(throttle) {
             0 => self.window,
             room => self.window / room,
         }
@@ -93,16 +120,17 @@ impl InvalidRequests {
     /// Whether a request may go at `now`; if not, how many seconds until it
     /// may. A request that may go is counted as sent.
     pub fn check(&self, now: Instant) -> Result<(), f64> {
+        let (throttle, ceiling) = self.lines();
         let mut held = self.held.lock().unwrap();
         self.forget_before(&mut held, now);
         let count = held.answers.len() as u32;
-        if count >= self.ceiling {
+        if count >= ceiling {
             let oldest = *held.answers.front().expect("at the ceiling");
             let wait = (oldest + self.window).saturating_duration_since(now);
             self.say(&mut held, Line::Stopped, count);
             return Err(wait.as_secs_f64().max(0.001));
         }
-        if count >= self.throttle {
+        if count >= throttle {
             self.say(&mut held, Line::Throttled, count);
             if let Some(last) = held.last_sent {
                 let next = last + self.slice();
@@ -153,18 +181,21 @@ impl InvalidRequests {
         }
         held.said = line;
         let window = self.window.as_secs();
+        let (throttle, ceiling) = self.lines();
+        let shares = self.shares.load(Ordering::Relaxed);
         match line {
             Line::Stopped => tracing::error!(
-                "discord: {count} invalid requests in the last {window} s, at the ceiling of {}: \
-                 nothing more is sent to Discord until the oldest leaves the window",
+                "discord: {count} invalid requests in the last {window} s, at this member's \
+                 ceiling of {ceiling} (1/{shares} of the address's {}): nothing more is sent to \
+                 Discord until the oldest leaves the window",
                 self.ceiling
             ),
             Line::Throttled => tracing::warn!(
-                "discord: {count} invalid requests in the last {window} s, past {}: every request \
-                 to Discord is spaced {} ms apart so the window stays under {}",
+                "discord: {count} invalid requests in the last {window} s, past this member's \
+                 {throttle} (1/{shares} of the address's {}): every request to Discord is spaced \
+                 {} ms apart so the window stays under {ceiling}",
                 self.throttle,
                 self.slice().as_millis(),
-                self.ceiling
             ),
             Line::Under => tracing::info!(
                 "discord: {count} invalid requests in the last {window} s: requests go unthrottled"
@@ -235,5 +266,29 @@ mod tests {
         assert_eq!(WINDOW.as_millis() / limit.slice().as_millis(), 3_000);
         let lone = InvalidRequests::new(7, 3, s(60));
         assert_eq!(lone.slice(), s(60), "a ceiling under the line stops at it");
+    }
+
+    /// **Members behind one address share its lines**: two members hold
+    /// half each, so together they stay under the address's ceiling; the
+    /// slice widens to keep each member's window under its own half.
+    #[test]
+    fn members_share_the_address_s_lines() {
+        let limit = InvalidRequests::default();
+        limit.share(2);
+        assert_eq!(limit.lines(), (2_500, 4_000));
+        assert_eq!(limit.slice(), Duration::from_millis(400));
+        limit.share(0);
+        assert_eq!(limit.lines(), (5_000, 8_000), "no members is this one");
+
+        // Throttle at 4 and stop at 6 for the address; two members, 2 and 3.
+        let limit = InvalidRequests::new(4, 6, s(100));
+        limit.share(2);
+        let t0 = Instant::now();
+        limit.answered(403, t0);
+        limit.answered(403, t0);
+        assert_eq!(limit.check(t0), Ok(()), "at its throttle, the first goes");
+        assert_eq!(limit.check(t0 + s(1)), Err(99.0), "then one a slice");
+        limit.answered(403, t0);
+        assert_eq!(limit.check(t0 + s(1)), Err(99.0), "at its ceiling");
     }
 }

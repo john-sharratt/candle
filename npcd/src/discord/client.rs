@@ -186,6 +186,12 @@ impl Client {
         }
     }
 
+    /// The address's invalid-request lines are shared among `members`
+    /// ([`InvalidRequests::share`]).
+    pub fn share_invalid(&self, members: usize) {
+        self.invalid.share(members);
+    }
+
     /// The bot `token` is, refusing a token whose user is not a bot.
     pub async fn me(&self, token: &str) -> Result<BotUser, DiscordError> {
         let user: BotUser = self.call(Method::GET, "/users/@me", token, None).await?;
