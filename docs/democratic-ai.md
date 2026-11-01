@@ -6,17 +6,17 @@
 
 Capability in artificial intelligence is concentrating. Not because anyone planned it, but because the economics point there: frontier training needs enormous capital, good data is expensive, and distribution compounds in favour of whoever is already large. A handful of organizations now hold the compute, the weights, the data, and the channels through which this technology reaches people.
 
-What they hold, along with those assets, is quieter and harder to see: the power to decide what gets built, who may use it, at what price, and which questions are worth answering at all. That is a decision touching hundreds of millions, made in a handful of rooms, on schedules that are not public. Concentration of economic and predictive power is a structural risk to open societies whatever else you call it, and the failure mode is the same: one decision, taken in one place, propagates everywhere at once, with no recourse and no alternative standing ready.
+What they hold with those assets is quieter and harder to see: the power to decide what gets built, who may use it, at what price, and which questions are worth answering at all. That is a decision touching hundreds of millions, made in a handful of rooms, on schedules that are not public. Concentration of economic and predictive power is a structural risk to open societies whatever else you call it, and the failure mode is the same: one decision, taken in one place, propagates everywhere at once, with no recourse and no alternative standing ready.
 
 ## The instinct worth listening to
 
 When people feel they have no say in a system that governs their lives, they look for ways to hold it themselves. That instinct built the personal computer, the community library, the land trust, the cooperative, and open source software. Household and personal AI is the same instinct arriving at a new technology: a model that runs on your own machine, a memory that lives in your house, a tool that answers to you rather than to an agreement that can change on a Tuesday.
 
-It is easy to dismiss this as nostalgia or hobbyism. It is the oldest reliable response to centralization, and it has produced most of the durable things we now use without asking where they came from.
+It is easy to dismiss this as nostalgia or hobbyism. It is the oldest reliable response to centralization, and it has produced most of the durable things we use without asking where they came from.
 
 ## What history teaches
 
-Movements built around one person die with that person. Not always, and not always at once: a founder can bend a project around their judgement for years, and while it works it looks like strength. But succession is the test, and succession almost always fails, because the thing that made the project coherent was never written down anywhere except in one head.
+Movements built around one person die with that person. Not always at once: a founder can bend a project around their judgement for years, and while it works it looks like strength. But succession is the test, and succession almost always fails, because the thing that made the project coherent was never written down anywhere except in one head.
 
 The institutions that outlast their founders are the ones where ownership was distributed from the beginning. Not granted later. Not delegated. Actually held, by the members, on day one, in a way that needs no one's permission to keep working.
 
