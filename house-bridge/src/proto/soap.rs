@@ -45,6 +45,15 @@ pub fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// An argument value made safe to place in element text: the three characters
+/// that would otherwise be read as markup, escaped. `&` goes first so the
+/// escapes it introduces are not escaped again.
+pub fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// A client that waits `answer` and is never redirected off the device.
 pub fn client(answer: Duration) -> Result<Client> {
     Ok(Client::builder()
@@ -104,5 +113,15 @@ mod tests {
         assert_eq!(tag(xml, "CurrentVolume").as_deref(), Some("23"));
         assert_eq!(tag(xml, "Meta").as_deref(), Some("<x>a &amp; b</x>"));
         assert_eq!(tag(xml, "Absent"), None);
+    }
+
+    /// **An argument's markup characters are escaped, and read back whole** —
+    /// a stream URL with a query string survives the envelope.
+    #[test]
+    fn an_argument_is_escaped_for_element_text() {
+        assert_eq!(escape("a & b <c>"), "a &amp; b &lt;c&gt;");
+        let url = "http://host/stream?a=1&b=2";
+        let body = format!("<CurrentURI>{}</CurrentURI>", escape(url));
+        assert_eq!(tag(&body, "CurrentURI").as_deref(), Some(url));
     }
 }
