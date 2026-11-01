@@ -22,6 +22,11 @@ if-addrs   = "0.15"
 # it. The CastMessage protobuf is small and hand-encoded in `proto::cast`.
 native-tls       = "0.2"
 tokio-native-tls = "0.3"
+# A Samsung Tizen TV is driven over a WebSocket (the remote-control channel on
+# port 8002, TLS with a pairing token), with the client name base64-encoded.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util      = "0.3"
+base64            = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

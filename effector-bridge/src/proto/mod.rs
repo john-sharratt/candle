@@ -7,9 +7,11 @@
 //! - [`eiscp`] — the Integra Serial Control Protocol framed over TCP (an AV
 //!   receiver).
 //! - [`cast`] — CASTv2, a protobuf framed over TLS (a Google Cast device).
+//! - [`webos`] — SSAP over a WebSocket (an LG webOS TV).
 //! - [`udp`] — a UDP broadcast on the house's own subnets (wake-on-LAN).
 
 pub mod cast;
 pub mod eiscp;
 pub mod soap;
 pub mod udp;
+pub mod webos;
