@@ -102,7 +102,7 @@ const DRAFTING: &[&str] = &["file_write", "file_edit"];
 /// the room. With `message` outside the family, four Makers told each other
 /// "the lift is broken" for fifty minutes, turn about between the channel and
 /// a shout, and none of them called the car.
-const SPEECH: &[&str] = &["tell", "ask", "whisper", "shout", "message"];
+const SPEECH: &[&str] = &["tell", "ask", "whisper", "shout", "message", "reply"];
 
 /// Token overlap at which two takings of an act mean the same.
 const CLOSE: f32 = 0.6;

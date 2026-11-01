@@ -321,8 +321,12 @@ handset, and the character uses it as it uses any group.
   from any bot or webhook are dropped, so two bots cannot talk each other into a loop.
   A mention is written out by name: `<@id>` becomes `@<name>` from the message's
   `mentions`, the bot's own as `@<character>`.
-- **The character answers** with its `message` act on the thread, and the bots' beat
-  posts it (§5.1). A message on the thread from anyone else in the world — a character
+- **The character answers** with its `reply` act on the thread, and the bots' beat
+  posts it (§5.1). `reply.to` offers only the conversations where somebody else spoke
+  last (`Choices::Awaiting`): a person on the channel is on a direct thread with the
+  character too, under the same name, so `message` to the asker's name answered a
+  channel's question in private. The message's line also says to answer it on the
+  channel ("Answer it with `reply` on <server> #<channel>…"). A message on the thread from anyone else in the world — a character
   it invited — is posted as a quoted line, `> **Name:** …`, as a person's console line
   is in a DM. A post Discord refuses with 403 (the bot may not write there) closes the
   thread, so the character stops being offered it, and is not retried.

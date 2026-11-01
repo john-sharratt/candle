@@ -249,6 +249,9 @@ const COST: &[(&str, Cost)] = &[
     // at all, so physical company is still an order of magnitude cheaper, while
     // ten sends a minute is a conversation rather than a correspondence.
     ("message", Cost::cools(6)),
+    // The same send, offered only where somebody is waiting: priced as
+    // `message`, so answering is never the cheaper way to keep texting.
+    ("reply", Cost::cools(6)),
 ];
 
 /// How long a body waits after doing something to **its own** body.

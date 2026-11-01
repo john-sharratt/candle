@@ -434,6 +434,15 @@ impl Sim {
         }
     }
 
+    /// `reply.to` — the conversations where somebody else spoke last, waiting
+    /// on this character. Empty without a handset.
+    pub fn awaiting_for(&self, me: &str, body: &str) -> Vec<String> {
+        match self.has_phone(body) {
+            true => self.threads.awaiting_names_for(me),
+            false => Vec::new(),
+        }
+    }
+
     /// `sign_off.to` — the conversations this character can actually leave.
     ///
     /// Its own threads, less the world's standing channels. Leaving a
