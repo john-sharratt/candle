@@ -10,12 +10,20 @@
 //! index, and no decode ever waits on anything.
 //!
 //! **A rule can never leave a turn with nothing to say.** A mask with no token in
-//! it would stop the decode dead, so a rule is built only if every state it can
-//! reach can be finished in this vocabulary: from each one, every byte that keeps
-//! the walk alive has a token of exactly that byte, and each accepting state has
-//! the closing quote. Anything else is refused at build ([`ValueRule::new`]) and
+//! it would stop the decode dead, so a state is *finishable* when some token from
+//! it closes the value or lands on another finishable state, and a mask admits
+//! only tokens of that kind. Every state a masked walk stands on therefore has a
+//! way out, in whole tokens of this vocabulary: a byte no token can reach is
+//! simply never offered, and a state only passed through inside one token needs
+//! no way out of its own, which is how a character of several bytes is written.
+//! A rule whose start cannot finish is refused at build ([`ValueRule::new`]) and
 //! the value decodes free. A value the executor would refuse is an error the
 //! model reads; a value that cannot be written is a turn that never ends.
+//!
+//! **Built over the vocabulary in byte order.** A token sharing a prefix with the
+//! last one resumes from that prefix's state, and a prefix the rule refuses skips
+//! every token under it by binary search, so a narrow rule visits only the few
+//! tokens it could admit.
 //!
 //! **A value under a rule has no escapes.** A backslash would make the next quote
 //! content rather than the close, which a walk over raw bytes cannot see, so no
@@ -38,6 +46,12 @@ use super::vocab::{TokenId, Vocab};
 /// The rules built so far, by vocabulary and pattern.
 type RuleMap = HashMap<(u64, String), Arc<ValueRule>>;
 
+/// A vocabulary's non-empty tokens in byte order.
+type Sorted = Vec<(TokenId, Vec<u8>)>;
+
+/// Each vocabulary's tokens in byte order, by fingerprint.
+type SortedMap = HashMap<u64, Arc<Sorted>>;
+
 /// The most automaton states a rule may have: each one holds a mask.
 const MAX_STATES: usize = 512;
 
@@ -53,8 +67,20 @@ pub enum RuleError {
     TooLarge,
     #[error("the pattern matches nothing")]
     Empty,
-    #[error("the vocabulary has no token for byte {byte:#04x}, which the pattern needs")]
-    Unspellable { byte: u8 },
+    #[error("the vocabulary has no token that opens a value")]
+    NoQuote,
+    #[error("no value the pattern matches can be written in this vocabulary's tokens")]
+    Unfinishable,
+}
+
+/// One byte of a walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The byte is not allowed here.
+    Dead,
+    /// The byte closes the value.
+    Closes,
+    On(ValueState),
 }
 
 /// Where a walk stands.
@@ -90,8 +116,11 @@ impl ValueRule {
     /// `Err` when it cannot be held to in this vocabulary: its caller leaves the
     /// value free.
     pub fn new(pattern: &str, vocab: &dyn Vocab) -> Result<ValueRule, RuleError> {
+        Self::over(pattern, &sorted(vocab))
+    }
+
+    fn over(pattern: &str, tokens: &Sorted) -> Result<ValueRule, RuleError> {
         let (next, accepting) = states_of(pattern)?;
-        let tokens = vocab.extensions(b"");
         let mut rule = ValueRule {
             pattern: pattern.to_string(),
             next,
@@ -100,13 +129,28 @@ impl ValueRule {
             spaced_mask: AllowedSet::from_tokens(Vec::new()),
             masks: Vec::new(),
         };
-        rule.check_spellable(&tokens)?;
+        if !tokens.iter().any(|(_, bytes)| bytes == b"\"") {
+            return Err(RuleError::NoQuote);
+        }
+        let finishable = rule.finishable(tokens);
+        if !finishable[0] {
+            return Err(RuleError::Unfinishable);
+        }
         let mask_at = |rule: &ValueRule, state| {
-            let admitted = tokens
-                .iter()
-                .filter(|(_, bytes)| rule.walk(state, bytes).is_some())
-                .map(|(token, _)| *token);
-            AllowedSet::from_tokens(admitted.collect())
+            let mut admitted = Vec::new();
+            rule.scan(state, tokens, |token, land| {
+                let keeps = match land {
+                    Step::On(ValueState::Inside(s)) => finishable[s as usize],
+                    // The opening space, whose only way on is the quote.
+                    Step::On(_) => true,
+                    Step::Closes => true,
+                    Step::Dead => false,
+                };
+                if keeps {
+                    admitted.push(token);
+                }
+            });
+            AllowedSet::from_tokens(admitted)
         };
         rule.open_mask = mask_at(&rule, ValueState::Open);
         rule.spaced_mask = mask_at(&rule, ValueState::Spaced);
@@ -114,6 +158,96 @@ impl ValueRule {
             .map(|state| mask_at(&rule, ValueState::Inside(state)))
             .collect();
         Ok(rule)
+    }
+
+    /// Which states some run of whole tokens can finish from. Each state's
+    /// landings are read once, and the set grown over them until it stops.
+    fn finishable(&self, tokens: &Sorted) -> Vec<bool> {
+        let mut closes = vec![false; self.next.len()];
+        let mut lands: Vec<Vec<u32>> = Vec::with_capacity(self.next.len());
+        for state in 0..self.next.len() {
+            let mut targets = Vec::new();
+            self.scan(
+                ValueState::Inside(state as u32),
+                tokens,
+                |_, land| match land {
+                    Step::Closes => closes[state] = true,
+                    Step::On(ValueState::Inside(s)) => targets.push(s),
+                    _ => {}
+                },
+            );
+            targets.sort_unstable();
+            targets.dedup();
+            lands.push(targets);
+        }
+        let mut done = closes;
+        loop {
+            let mut grew = false;
+            for state in 0..done.len() {
+                if !done[state] && lands[state].iter().any(|s| done[*s as usize]) {
+                    done[state] = true;
+                    grew = true;
+                }
+            }
+            if !grew {
+                return done;
+            }
+        }
+    }
+
+    /// Hand `visit` every token that survives from `start`, with where it lands.
+    /// `tokens` are in byte order: one sharing a prefix with the last resumes at
+    /// that prefix's state, and a refused or closing prefix decides every token
+    /// under it at once.
+    fn scan(&self, start: ValueState, tokens: &Sorted, mut visit: impl FnMut(TokenId, Step)) {
+        let mut path = vec![start];
+        let mut last: &[u8] = &[];
+        let mut i = 0;
+        'tokens: while i < tokens.len() {
+            let bytes = tokens[i].1.as_slice();
+            let shared = last.iter().zip(bytes).take_while(|(a, b)| a == b).count();
+            path.truncate(shared.min(path.len() - 1) + 1);
+            while path.len() <= bytes.len() {
+                let depth = path.len() - 1;
+                match self.step(path[depth], bytes[depth]) {
+                    Step::On(next) => path.push(next),
+                    settled => {
+                        let prefix = &bytes[..=depth];
+                        let under = tokens[i..].partition_point(|(_, b)| b.starts_with(prefix));
+                        if settled == Step::Closes {
+                            for (token, _) in &tokens[i..i + under] {
+                                visit(*token, Step::Closes);
+                            }
+                        }
+                        last = bytes;
+                        i += under;
+                        continue 'tokens;
+                    }
+                }
+            }
+            visit(tokens[i].0, Step::On(path[bytes.len()]));
+            last = bytes;
+            i += 1;
+        }
+    }
+
+    /// Where one byte takes a walk from `state`.
+    fn step(&self, state: ValueState, byte: u8) -> Step {
+        match state {
+            ValueState::Open if byte == b' ' => Step::On(ValueState::Spaced),
+            ValueState::Open | ValueState::Spaced => match byte {
+                b'"' => Step::On(ValueState::Inside(0)),
+                _ => Step::Dead,
+            },
+            ValueState::Inside(s) => match byte {
+                b'"' if self.accepting[s as usize] => Step::Closes,
+                b'"' | b'\\' => Step::Dead,
+                _ => match self.next[s as usize][byte as usize] {
+                    DEAD => Step::Dead,
+                    target => Step::On(ValueState::Inside(target)),
+                },
+            },
+        }
     }
 
     /// The process's one rule for `pattern` over `vocab`. A mode's tree compiles
@@ -126,37 +260,13 @@ impl ValueRule {
         if let Some(rule) = rules.load().get(&key) {
             return Ok(Arc::clone(rule));
         }
-        let rule = Arc::new(ValueRule::new(pattern, vocab)?);
+        let rule = Arc::new(ValueRule::over(pattern, &shared_sorted(vocab))?);
         rules.rcu(|held| {
             let mut held = RuleMap::clone(held);
             held.insert(key.clone(), Arc::clone(&rule));
             held
         });
         Ok(rule)
-    }
-
-    /// Every state can be finished one byte at a time, which is what makes an
-    /// empty mask unreachable whatever tokens the walk took to get there.
-    fn check_spellable(&self, tokens: &[(TokenId, Vec<u8>)]) -> Result<(), RuleError> {
-        let mut single = [false; 256];
-        for (_, bytes) in tokens {
-            if let [byte] = bytes.as_slice() {
-                single[*byte as usize] = true;
-            }
-        }
-        let need = |byte: u8| match single[byte as usize] {
-            true => Ok(()),
-            false => Err(RuleError::Unspellable { byte }),
-        };
-        need(b'"')?;
-        for transitions in &self.next {
-            for (byte, target) in transitions.iter().enumerate() {
-                if *target != DEAD {
-                    need(byte as u8)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The pattern this rule holds to.
@@ -194,23 +304,12 @@ impl ValueRule {
     /// value, `None` when they are not allowed there.
     fn walk(&self, state: ValueState, bytes: &[u8]) -> Option<Option<ValueState>> {
         let mut at = state;
-        for (i, &byte) in bytes.iter().enumerate() {
-            at = match at {
-                ValueState::Open if byte == b' ' => ValueState::Spaced,
-                ValueState::Open | ValueState::Spaced => match byte {
-                    b'"' => ValueState::Inside(0),
-                    _ => return None,
-                },
-                ValueState::Inside(s) => match byte {
-                    b'"' => return self.accepting[s as usize].then_some(None),
-                    b'\\' => return None,
-                    _ => match self.next[s as usize][byte as usize] {
-                        DEAD => return None,
-                        target => ValueState::Inside(target),
-                    },
-                },
+        for &byte in bytes {
+            at = match self.step(at, byte) {
+                Step::On(next) => next,
+                Step::Closes => return Some(None),
+                Step::Dead => return None,
             };
-            debug_assert!(i < bytes.len());
         }
         (!bytes.is_empty()).then_some(Some(at))
     }
@@ -220,6 +319,31 @@ impl ValueRule {
     pub fn advance(&self, state: ValueState, bytes: &[u8]) -> Option<ValueState> {
         self.walk(state, bytes).flatten()
     }
+}
+
+/// `vocab`'s non-empty tokens in byte order.
+fn sorted(vocab: &dyn Vocab) -> Sorted {
+    let mut tokens = vocab.extensions(b"");
+    tokens.retain(|(_, bytes)| !bytes.is_empty());
+    tokens.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    tokens
+}
+
+/// The process's one [`sorted`] copy of `vocab`, swapped in whole.
+fn shared_sorted(vocab: &dyn Vocab) -> Arc<Sorted> {
+    static SORTED: OnceLock<ArcSwap<SortedMap>> = OnceLock::new();
+    let held = SORTED.get_or_init(ArcSwap::default);
+    let key = vocab.fingerprint();
+    if let Some(tokens) = held.load().get(&key) {
+        return Arc::clone(tokens);
+    }
+    let tokens = Arc::new(sorted(vocab));
+    held.rcu(|map| {
+        let mut map = SortedMap::clone(map);
+        map.insert(key, Arc::clone(&tokens));
+        map
+    });
+    tokens
 }
 
 /// `pattern`'s states as a dense table, state 0 the start and every state alive.
@@ -391,35 +515,113 @@ mod tests {
         assert_eq!(refused("[a-z]{1000}"), RuleError::TooLarge);
     }
 
-    /// **A byte with no token of its own refuses the rule**, as the walk could
-    /// reach a state only that byte leaves.
+    /// A byte-level vocabulary with `drop`'s tokens gone and `add`'s present.
+    struct Edited {
+        base: TestVocab,
+        drop: &'static [u8],
+        add: Vec<(TokenId, Vec<u8>)>,
+    }
+
+    impl Vocab for Edited {
+        fn encode(&self, text: &str) -> Vec<TokenId> {
+            self.base.encode(text)
+        }
+        fn token_bytes(&self, token: TokenId) -> Vec<u8> {
+            self.base.token_bytes(token)
+        }
+        fn eos(&self) -> TokenId {
+            self.base.eos()
+        }
+        fn end_tokens(&self) -> Vec<TokenId> {
+            self.base.end_tokens()
+        }
+        fn fingerprint(&self) -> u64 {
+            self.base.fingerprint()
+        }
+        fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+            let mut all = self.base.extensions(prefix);
+            all.retain(|(_, bytes)| bytes.len() != 1 || !self.drop.contains(&bytes[0]));
+            all.extend(self.add.iter().cloned());
+            all
+        }
+    }
+
+    /// **A rule no value of which can be written is refused**; one with another
+    /// way through simply never offers the byte it cannot finish after.
     #[test]
-    fn an_unspellable_byte_refuses_the_rule() {
-        struct NoZ(TestVocab);
-        impl Vocab for NoZ {
-            fn encode(&self, text: &str) -> Vec<TokenId> {
-                self.0.encode(text)
-            }
-            fn token_bytes(&self, token: TokenId) -> Vec<u8> {
-                self.0.token_bytes(token)
-            }
-            fn eos(&self) -> TokenId {
-                self.0.eos()
-            }
-            fn end_tokens(&self) -> Vec<TokenId> {
-                self.0.end_tokens()
-            }
-            fn fingerprint(&self) -> u64 {
-                self.0.fingerprint()
-            }
-            fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
-                let mut all = self.0.extensions(prefix);
-                all.retain(|(_, bytes)| bytes != b"z");
-                all
+    fn a_rule_is_refused_only_when_no_value_can_be_written() {
+        let no_z = || Edited {
+            base: TestVocab::new(),
+            drop: b"z",
+            add: vec![],
+        };
+        let refused = ValueRule::new("az", &no_z()).map(|_| ());
+        assert_eq!(refused.unwrap_err(), RuleError::Unfinishable);
+
+        let vocab = no_z();
+        let rule = ValueRule::new("az|b", &vocab).unwrap();
+        let start = rule.advance(ValueState::Open, b"\"").unwrap();
+        assert!(rule.mask(start).contains(id(&vocab.base, "b")));
+        assert!(
+            !rule.mask(start).contains(id(&vocab.base, "a")),
+            "an `a` here would strand the turn"
+        );
+    }
+
+    /// **A negated class is written in whole tokens**: a lead byte with no token
+    /// of its own is reached inside a token that carries the whole character,
+    /// and its lone continuation is never offered. This refused every `[^"]`
+    /// rule on the live vocabulary, leaving those values free.
+    #[test]
+    fn a_character_of_several_bytes_needs_no_token_per_byte() {
+        let high: Vec<u8> = (0x80..=0xff).collect();
+        let vocab = Edited {
+            base: TestVocab::new(),
+            drop: high.leak(),
+            add: vec![(9_000, "é".as_bytes().to_vec())],
+        };
+        let rule = ValueRule::new(r#"[^"]*\.png"#, &vocab).unwrap();
+        let start = rule.advance(ValueState::Open, b"\"").unwrap();
+        assert!(rule.mask(start).contains(9_000));
+        let on = rule.advance(start, "é".as_bytes()).unwrap();
+        assert!(
+            !rule.mask(on).contains(id(&vocab.base, "\"")),
+            "not yet .png"
+        );
+        assert!(rule.mask(on).contains(id(&vocab.base, ".")));
+    }
+
+    /// **The sorted scan admits exactly what a token-by-token walk does**, on
+    /// tokens that share prefixes, close part-way, and run past the end.
+    #[test]
+    fn the_scan_agrees_with_the_walk() {
+        let tokens: Vec<&[u8]> = vec![
+            b"a", b"ab", b"abc", b"ab\"", b"ab\",", b"b", b"ba", b"\"", b"\",", b" ", b" \"",
+            b"\\", b"c",
+        ];
+        let mut sorted: Sorted = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as TokenId, b.to_vec()))
+            .collect();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        for pattern in ["ab", "a|ab", "[ab]+", "a*b"] {
+            let rule = ValueRule::over(pattern, &sorted).unwrap();
+            let mut starts = vec![ValueState::Open, ValueState::Spaced];
+            starts.extend((0..rule.next.len() as u32).map(ValueState::Inside));
+            for start in starts {
+                let mut scanned = Vec::new();
+                rule.scan(start, &sorted, |token, _| scanned.push(token));
+                scanned.sort_unstable();
+                let mut walked: Vec<TokenId> = sorted
+                    .iter()
+                    .filter(|(_, bytes)| rule.walk(start, bytes).is_some())
+                    .map(|(token, _)| *token)
+                    .collect();
+                walked.sort_unstable();
+                assert_eq!(scanned, walked, "{pattern} from {start:?}");
             }
         }
-        let refused = ValueRule::new("az", &NoZ(TestVocab::new())).map(|_| ());
-        assert_eq!(refused.unwrap_err(), RuleError::Unspellable { byte: b'z' });
     }
 
     /// A multi-byte token is admitted whole or not at all.
