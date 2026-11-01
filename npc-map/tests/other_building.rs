@@ -43,6 +43,7 @@ fn part(id: &str, kind: PartKind, name: &str, short: Option<&str>) -> Part {
         long: format!("What a {name} is, at length."),
         // Consulted rather than worked: nothing here has a state to be put into.
         modes: vec![],
+        link: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn area(id: &str, kind: AreaKind, name: &str, nodes: Vec<Node>) -> Area {
         arrival: None,
         teleport_to: None,
         spine: None,
+        mirrored: false,
         nodes,
     }
 }

@@ -135,6 +135,7 @@ use crate::self_check::{self, Report as SelfCheckReport};
 use crate::substrate_git::{self, Repositories};
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
+use crate::tool_availability::{announce_returned, unavailable, Unavailable};
 use crate::tool_round;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
@@ -608,6 +609,48 @@ fn turn_sampling(
 /// this sample has not been measured against the six-a-file one.
 const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
 
+/// A [`round_triggers`] held: its mode's level, its dial, the tools out.
+type HeldKey = (u8, String, Vec<&'static str>);
+
+/// [`turn_triggers`] with a call to any of `unavailable`'s tools taken out of the
+/// grammar. Held once per mode, dial and set: a set changes only as sessions open
+/// and close, and holding decodes the catalog's name arms. The base is what a
+/// round falls back to, as a tool the grammar leaves in is only refused.
+fn round_triggers(
+    state: &InferenceState,
+    think_mode: ThinkMode,
+    tools_mode: ToolMode,
+    unavailable: &Unavailable,
+) -> Arc<TriggerRegistry> {
+    let base = turn_triggers(state, think_mode, tools_mode);
+    if unavailable.tools.is_empty() {
+        return base;
+    }
+    let names: Vec<&'static str> = unavailable.tools.iter().copied().collect();
+    let key = (tools_mode.level(), format!("{think_mode:?}"), names);
+    let mut held = state
+        .held_stencils
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(triggers) = held.get(&key) {
+        return Arc::clone(triggers);
+    }
+    let allowed: Vec<String> = crate::tools::offered_tool_names(tools_mode)
+        .into_iter()
+        .filter(|name| !unavailable.tools.contains(name.as_str()))
+        .collect();
+    match state.engine.holding_tools(&base, &allowed) {
+        Ok(triggers) => {
+            held.insert(key, Arc::clone(&triggers));
+            triggers
+        }
+        Err(e) => {
+            tracing::warn!("tools out of a round were left in its grammar: {e}");
+            base
+        }
+    }
+}
+
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
 /// forced to the exact JSON shape of a tool `tools_mode` offers (name ∈ that
 /// mode's catalog, required params in order, valid JSON), and atop that the `<think>` block is steered per the
@@ -841,6 +884,9 @@ struct InferenceState {
     /// ([`crate::tools::catalog_for`]). A turn decodes under its mode's, so a
     /// tool call is forced to an offered tool's exact JSON shape.
     tool_stencils: [Arc<TriggerRegistry>; ToolMode::ALL.len()],
+    /// The turn triggers with tools out of the grammar ([`round_triggers`]), by
+    /// mode, dial and the tools taken out.
+    held_stencils: Mutex<HashMap<HeldKey, Arc<TriggerRegistry>>>,
     /// The Restricted stencil with every call held to `file_read` — what a
     /// file's reading decodes under, so it can call no other tool. Built once
     /// at startup beside the stencils it narrows.
@@ -1954,6 +2000,18 @@ impl InferenceState {
                     Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
                 }
             }
+
+            // The lines saying a tool is out for now, each sealed after the
+            // summary they follow, so a round picks any set of them for nothing.
+            let mut after_summary = prelude;
+            after_summary
+                .extend(tool_summary_section(ToolMode::Comprehensive).map(SectionId::reserved));
+            for (sid, line) in crate::tool_availability::line_sections() {
+                let text = format!("\n{line}");
+                if let Err(e) = base_conv.insert_section_with_prefix(sid, &text, &after_summary) {
+                    tracing::warn!(line, "tool availability line seal failed: {e}");
+                }
+            }
         }
 
         // Dedicated titler conversation. Lives on the `Reserved::Titler`
@@ -3049,6 +3107,7 @@ impl InferenceState {
             workspace,
             base_branches,
             tool_stencils,
+            held_stencils: Mutex::new(HashMap::new()),
             read_stencil,
             think_steering,
             passthrough: PassthroughCache::new(),
@@ -4433,6 +4492,8 @@ fn run_inference_stream(
         // Set once the repeat guard closes the loop: the turn that answers the
         // closing round is the last, and no call it makes runs.
         let mut closing = false;
+        // What the catalog offers this turn, and what is out of it for now.
+        let offered = crate::tools::offered_tool_names(tools_mode);
         for iteration in start_iteration.. {
             // The closing turn the cap gives runs below it ([`closes_at_cap`]);
             // a turn resumed at or past the cap ends here.
@@ -4486,6 +4547,10 @@ fn run_inference_stream(
             if state.journaling {
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
+            let withheld = unavailable(&state.tool_host.availability_facts(), &offered);
+            if let Some(summary) = tool_summary_section(tools_mode) {
+                round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
+            }
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(this_turn),
@@ -4498,7 +4563,7 @@ fn run_inference_stream(
                     None
                 },
                 selection: round_selection,
-                triggers: turn_triggers(&state, think_mode, tools_mode),
+                triggers: round_triggers(&state, think_mode, tools_mode, &withheld),
                 // The promises the last decode found ended come first: they
                 // ended before this round's reads were served.
                 tags: std::mem::take(&mut cs.promise_marks)
@@ -5162,6 +5227,8 @@ fn run_inference_stream(
             // results turn's marks read in the order the round ran.
             marks.extend(round_marks(&served));
             marks.extend(end_written_promises(&state, timeline, &results).await);
+            let now_out = unavailable(&state.tool_host.availability_facts(), &offered);
+            announce_returned(&mut results, &withheld, &now_out);
             if repeat_guard.screen(&mut results) == Verdict::Close {
                 tracing::warn!(
                     conv_id = %conv_id,
@@ -7615,7 +7682,8 @@ impl ZendSession {
         let summaries = ToolMode::ALL
             .into_iter()
             .filter_map(tool_summary_section)
-            .map(SectionId::reserved);
+            .map(SectionId::reserved)
+            .chain(crate::tool_availability::line_sections().map(|(id, _)| id));
         let mut streams = HashSet::new();
         let mut unregistered = 0usize;
         for id in state

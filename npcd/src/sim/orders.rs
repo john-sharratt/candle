@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::Outcome;
 
-/// How many filed reports are kept: the newest, for their posters to read.
+/// How many filed reports are kept for each poster: the newest, for it to
+/// read.
 pub const KEPT: usize = 50;
+
+/// The poster of a report filed for every character that gives orders — a
+/// standing mission's, which the table put up and nobody posted
+/// (`docs/zen_moon_mind.md` §12).
+pub const EVERY_POSTER: &str = "*";
 
 /// A report filed on a mission somebody posted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +35,14 @@ pub struct Filed {
     pub outcome: Outcome,
     /// What the carrier reported: what it found, or what stopped it.
     pub notes: String,
+}
+
+impl Filed {
+    /// Whether `poster` reads this report: its own, or one filed for every
+    /// poster ([`EVERY_POSTER`]).
+    pub fn is_for(&self, poster: &str) -> bool {
+        self.poster == poster || self.poster == EVERY_POSTER
+    }
 }
 
 /// Something the world owes a character's attention, delivered at its next
@@ -66,13 +80,27 @@ impl Orders {
         });
     }
 
-    /// A report on a posted mission: kept for its poster, who is told.
+    /// A report on a posted mission: kept for its poster, who is told. Each
+    /// poster's newest [`KEPT`] are kept, so one poster's many reports never
+    /// push out another's.
     pub fn filed(&mut self, report: Filed) {
         self.notices.push(Notice::Reported(report.clone()));
         self.next += 1;
+        let poster = report.poster.clone();
         self.filed.push((self.next, report));
-        let over = self.filed.len().saturating_sub(KEPT);
-        self.filed.drain(..over);
+        let theirs = self
+            .filed
+            .iter()
+            .filter(|(_, f)| f.poster == poster)
+            .count();
+        if theirs > KEPT {
+            let oldest = self
+                .filed
+                .iter()
+                .position(|(_, f)| f.poster == poster)
+                .expect("counted above");
+            self.filed.remove(oldest);
+        }
     }
 
     /// The notices owed since this was last asked, oldest first.
@@ -85,7 +113,7 @@ impl Orders {
         let through = self.read.get(poster).copied().unwrap_or(0);
         self.filed
             .iter()
-            .any(|(n, f)| *n > through && f.poster == poster)
+            .any(|(n, f)| *n > through && f.is_for(poster))
     }
 
     /// The reports `poster` has not read, newest first — read now.
@@ -100,7 +128,7 @@ impl Orders {
             .filed
             .iter()
             .rev()
-            .filter(|(n, f)| *n > through && f.poster == poster)
+            .filter(|(n, f)| *n > through && f.is_for(poster))
             .map(|(_, f)| f.clone())
             .collect();
         self.read.insert(poster.to_string(), self.next);
@@ -154,18 +182,41 @@ mod tests {
             ]
         );
         assert!(o.take_notices().is_empty(), "each is owed once");
+
+        // A report filed for every poster is read by each.
+        o.filed(filed(EVERY_POSTER, "survey the front room"));
+        assert!(o.unread_for("zen") && o.unread_for("someone-else"));
+        let briefs: Vec<String> = o.read_by("zen").into_iter().map(|f| f.brief).collect();
+        assert_eq!(briefs, ["survey the front room"]);
     }
 
-    /// **Only the newest [`KEPT`] reports are kept.**
+    /// **Only each poster's newest [`KEPT`] reports are kept** — and the
+    /// standing missions' many never push out a poster's own.
     #[test]
     fn only_the_newest_reports_are_kept() {
         let mut o = Orders::default();
+        o.filed(filed("zen", "watch earth"));
+        for n in 0..KEPT + 3 {
+            o.filed(filed(EVERY_POSTER, &format!("upkeep {n}")));
+        }
         for n in 0..KEPT + 3 {
             o.filed(filed("zen", &format!("job {n}")));
         }
-        let kept: Vec<String> = o.read_by("zen").into_iter().map(|f| f.brief).collect();
+        let kept: Vec<String> = o
+            .read_by("someone-else")
+            .into_iter()
+            .map(|f| f.brief)
+            .collect();
         assert_eq!(kept.len(), KEPT);
-        assert_eq!(kept[0], format!("job {}", KEPT + 2));
-        assert_eq!(kept[KEPT - 1], "job 3");
+        assert_eq!(kept[0], format!("upkeep {}", KEPT + 2));
+        let zens: Vec<String> = o
+            .read_by("zen")
+            .into_iter()
+            .map(|f| f.brief)
+            .filter(|b| b.starts_with("job"))
+            .collect();
+        assert_eq!(zens.len(), KEPT);
+        assert_eq!(zens[0], format!("job {}", KEPT + 2));
+        assert_eq!(zens[KEPT - 1], "job 3");
     }
 }

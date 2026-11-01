@@ -43,7 +43,7 @@ pub enum PartKind {
 }
 
 /// One kind of thing that stands in a room.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Part {
     pub id: String,
     pub kind: PartKind,
@@ -99,6 +99,24 @@ pub struct Part {
     /// world read the same on two runs.
     #[serde(default)]
     pub modes: Vec<String>,
+    /// The real thing this part stands for, when it is a terminal onto one —
+    /// what makes it reachable through a bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<PartLink>,
+}
+
+/// How a part reaches the real thing it stands for: the bridge profile that
+/// speaks to it, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartLink {
+    /// The bridge profile — `sonos`, `device`.
+    pub profile: String,
+    /// Its address on the network it was found on.
+    pub address: String,
+    /// Its hardware address, which outlasts a change of address: the same
+    /// device found again at another is the same part.
+    pub hardware: String,
 }
 
 impl Part {
@@ -128,7 +146,7 @@ impl Part {
 ///
 /// Written either as `- seat` or as `- { part: seat, count: 12 }`. The bare
 /// form is for the common case of one, which is most fixtures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Placement {
     Bare(String),
@@ -173,6 +191,7 @@ mod tests {
             short: None,
             long: "l".into(),
             modes: vec![],
+            link: None,
         }
     }
 

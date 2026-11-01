@@ -28,6 +28,7 @@ pub mod accounts;
 pub mod api;
 pub mod authority;
 pub mod authorize;
+pub mod bridge;
 pub mod clock;
 pub mod collections;
 pub mod compliance;

@@ -130,6 +130,10 @@ pub enum Origin {
         #[serde(default)]
         job: Option<String>,
     },
+    /// Put up by the table itself, on a schedule: the standing mission `id`,
+    /// for the room `room` (`area/node`) — see `engine::mission_gen::standing`
+    /// and `docs/zen_moon_mind.md` §12.
+    Standing { id: String, room: String },
     /// Written by the command table for one step of an operation's workflow
     /// (`generator` names which of the configured generators found the work,
     /// `target` the piece of the corpus it is about, `operation` the operation
@@ -239,6 +243,10 @@ pub struct Mission {
     /// recall while the mission is carried; it ends with the mission.
     #[serde(default)]
     pub year: Option<u32>,
+    /// The world-building acts carrying it grants (`docs/zen_moon_mind.md`
+    /// §14), in the room it is for — a standing mission's own.
+    #[serde(default)]
+    pub grants: Vec<String>,
 }
 
 impl Mission {
@@ -257,6 +265,7 @@ impl Mission {
             gate_refusal: None,
             work: None,
             year: None,
+            grants: Vec::new(),
         }
     }
 
@@ -264,6 +273,21 @@ impl Mission {
     pub fn with_work(mut self, work: Work) -> Self {
         self.work = Some(work);
         self
+    }
+
+    /// The same mission, granting `grants` in its room.
+    pub fn granting(mut self, grants: Vec<String>) -> Self {
+        self.grants = grants;
+        self
+    }
+
+    /// The room this mission is for — `area/node` — when it is a standing
+    /// mission's.
+    pub fn room(&self) -> Option<&str> {
+        match &self.origin {
+            Origin::Standing { room, .. } => Some(room),
+            _ => None,
+        }
     }
 
     /// The operation this mission carries a step of, and which step — `None`
@@ -2412,9 +2436,7 @@ mod tests {
                         "known routine: {routine}"
                     );
                 }
-                Origin::Lodged { .. } | Origin::Generated { .. } | Origin::Ordered { .. } => {
-                    panic!("bank produces Random origins")
-                }
+                other => panic!("bank produces Random origins, not {other:?}"),
             }
         }
     }
@@ -2451,9 +2473,7 @@ mod tests {
                     no_material.contains(&routine.as_str()),
                     "a lone character gets a routine needing no material, got {routine}"
                 ),
-                Origin::Lodged { .. } | Origin::Generated { .. } | Origin::Ordered { .. } => {
-                    panic!("bank produces Random origins")
-                }
+                other => panic!("bank produces Random origins, not {other:?}"),
             }
         }
     }

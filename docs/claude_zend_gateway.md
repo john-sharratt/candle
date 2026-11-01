@@ -736,8 +736,10 @@ is also entered on the thread as `Claude answered:` (§4), so it stands in the
 thread's record for every later task. A worker may ask again; it settles after
 every turn.
 
-**Stuck turns ask the same way.** The repeat guard closes a loop after two
-rounds of a repeated call, and the round cap at `MAX_TOOL_ROUNDS = 128`
+**Stuck turns ask the same way.** The repeat guard warns on a repeated call
+while it still runs, then refuses it alone, and closes a loop after three rounds
+of nothing but refusals, each saying so; the round cap closes at
+`MAX_TOOL_ROUNDS = 128`
 (`zend/src/repeat_guard.rs`, `zend/src/session.rs`); both end in
 a closing turn that may not call tools. The loop sends `StreamItem::Closing`
 when it closes (`CLOSED_BY_REPEATS`, `CLOSED_BY_CAP`), which the chat stream

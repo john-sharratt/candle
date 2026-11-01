@@ -4453,6 +4453,52 @@ fn collection_partial_selection_emits_summary_before_members() {
     assert!(ids.contains(&tool_d));
 }
 
+/// **A turn's notes follow the summary, in order, before the members**, and a
+/// note that was never sealed is left out rather than projected empty.
+#[test]
+fn notes_on_a_summary_project_right_after_it() {
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_system_collection("tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(tools, summary).unwrap();
+    let tool_b = b.id_for_system_section("tool_b").unwrap();
+    let (first, second, unsealed) = (
+        SectionId::reserved(Reserved::ToolUnavailable(0)),
+        SectionId::reserved(Reserved::ToolUnavailable(3)),
+        SectionId::reserved(Reserved::ToolUnavailable(4)),
+    );
+
+    let resolver = MockResolver::new()
+        .with_section_score(tool_b, 0.9)
+        .with_section_tokens(summary, 100)
+        .with_section_tokens(first, 12)
+        .with_section_tokens(second, 12);
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+    let mut selection = SelectionState::new();
+    selection.note_summary(summary, vec![first, second, unsealed]);
+    let p = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &selection);
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    let at = ids.iter().position(|&i| i == summary).unwrap();
+    assert_eq!(&ids[at..at + 3], &[summary, first, second], "{ids:?}");
+    assert!(!ids.contains(&unsealed), "{ids:?}");
+    let tool = ids.iter().position(|&i| i == tool_b).unwrap();
+    assert!(at + 2 < tool, "the notes come before the members: {ids:?}");
+
+    let none = b.project_with_selection(
+        target,
+        &resolver,
+        ProjectionMode::Decode,
+        &SelectionState::new(),
+    );
+    assert!(!none.sealed_sections().any(|s| s.id == first));
+}
+
 /// When the collection selects all its members (top-k ≥ member count), nothing
 /// was dropped, so the summary is omitted even though it is sealed.
 #[test]

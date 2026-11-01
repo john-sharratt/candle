@@ -284,6 +284,20 @@ impl MapSet {
         self.areas.values()
     }
 
+    /// Whether area `id` mirrors a real place: it is marked
+    /// [`Area::mirrored`], or something it is within is. Only a mirrored area
+    /// is changed by the world's own builders.
+    pub fn is_mirrored(&self, id: &str) -> bool {
+        let mut at = self.get(id);
+        while let Some(area) = at {
+            if area.mirrored {
+                return true;
+            }
+            at = area.within.as_deref().and_then(|up| self.get(up));
+        }
+        false
+    }
+
     /// What the address system plays in an area, taken from the nearest
     /// enclosing area that has anything to play.
     ///
@@ -674,6 +688,7 @@ mod tests {
             arrival: None,
             teleport_to: None,
             spine: None,
+            mirrored: false,
             nodes,
         }
     }

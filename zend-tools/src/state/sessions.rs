@@ -206,7 +206,41 @@ pub struct SessionRegistry {
     pub code: RwLock<HashMap<String, Arc<Mutex<CodeEntry>>>>,
 }
 
+/// Which kinds of session have at least one open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenSessions {
+    pub ssh: bool,
+    pub ssh_processes: bool,
+    pub telnet: bool,
+    pub http: bool,
+    pub tcp: bool,
+    pub udp: bool,
+    pub tls: bool,
+    pub sql: bool,
+    pub remote_fs: bool,
+    pub code: bool,
+}
+
 impl SessionRegistry {
+    /// Which kinds of session have at least one open, across every conversation.
+    pub fn open(&self) -> OpenSessions {
+        fn any<V>(map: &RwLock<HashMap<String, V>>) -> bool {
+            !map.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        }
+        OpenSessions {
+            ssh: any(&self.ssh),
+            ssh_processes: any(&self.ssh_processes),
+            telnet: any(&self.telnet),
+            http: any(&self.http),
+            tcp: any(&self.tcp),
+            udp: any(&self.udp),
+            tls: any(&self.tls),
+            sql: any(&self.sql),
+            remote_fs: any(&self.remote_fs),
+            code: any(&self.code),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

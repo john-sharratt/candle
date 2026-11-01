@@ -27,6 +27,7 @@
 //! | [`routes`] | the authority's routes |
 
 pub mod beat;
+pub mod building;
 pub mod cast;
 pub mod driver;
 pub mod follow;

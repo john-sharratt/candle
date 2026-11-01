@@ -57,6 +57,7 @@ pub mod bearings;
 pub mod bench;
 pub mod bodies;
 pub mod body;
+pub mod build;
 pub mod check;
 pub mod chronology;
 pub mod compose;

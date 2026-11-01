@@ -16,6 +16,7 @@ use serde_json::Value;
 use super::keys::unescape;
 use super::snapshot::{Records, SIM, SIM_MAPS};
 use super::split::{join, META};
+use crate::engine::build::replay::replay;
 use crate::sim::Sim;
 use crate::world::Hosted;
 
@@ -107,10 +108,14 @@ fn apply_world(w: &mut World, records: &Records) {
 pub fn apply(hosted: &Hosted, records: &Records) {
     let sim = sim_of(records);
     hosted.with_both(|w, s| {
-        apply_world(w, records);
+        // The state first, and what the world's builders made laid over the map
+        // from it (`docs/zen_moon_mind.md` §14) — so a body the records place in
+        // a built room finds the room there.
         if let Some(sim) = sim {
             s.take_in(sim);
         }
+        replay(w, &s.built.unlaid());
+        apply_world(w, records);
     });
     hosted.with_dms(|dms| dms.take_in(records));
     hosted.with_servers(|servers| servers.take_in(records));

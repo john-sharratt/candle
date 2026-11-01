@@ -98,6 +98,14 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # A regular dependency and not only a dev one, because the production fast path
 # needs it, not just the tests.
 tower      = { version = "0.5" }
+# The bridge's survey of the house network (`bridge::discover`,
+# `docs/zen_moon_mind.md` §13): the member's own interfaces and their netmasks,
+# so nothing beyond its subnet is ever a finding; the router's name for an
+# address; and the multicast sockets SSDP and mDNS are asked on. All three are
+# already in the tree beneath other crates, at these versions.
+if-addrs   = "0.15"
+dns-lookup = "2.1"
+socket2    = { version = "0.6", features = ["all"] }
 # Watching the mind directory, so an edited world file takes effect without a
 # restart. Same version zend watches its workspace with — filesystem event
 # semantics differ enough between major versions that two of them in one

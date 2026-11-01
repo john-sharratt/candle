@@ -1216,6 +1216,11 @@ mod tests {
             if crate::engine::body::is_device(name) {
                 continue;
             }
+            // The house's acts likewise run on the async path
+            // (`Runtime::bridge_act`, `Runtime::build_act`).
+            if crate::engine::body::is_of_the_house(name) {
+                continue;
+            }
             assert!(
                 crate::engine::body::is_of_the_body(name) || is_mine(name),
                 "`{name}` is in the catalog and nothing performs it"

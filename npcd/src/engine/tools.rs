@@ -50,6 +50,8 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
+use crate::bridge::BRIDGE_ACTS;
+use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::{acts, bench, mission, mission_acts, station};
 
@@ -169,6 +171,11 @@ pub enum Availability {
     /// get in and ride, with it elsewhere it is called and you wait to ride it.
     /// Absent once you have asked to ride, until you are set down.
     AtLanding,
+    /// Only while the body carries a mission that grants this act, in that
+    /// mission's room, and only where the world is a mirror of a real place —
+    /// the acts by which the world builds itself (`docs/zen_moon_mind.md` §14).
+    /// See [`Within::grants`].
+    Granted,
 }
 
 /// One parameter, as the model sees it.
@@ -960,6 +967,8 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(station::STATION_ACTS)
         .chain(bench::BENCH_ACTS)
         .chain(mission_acts::MISSION_ACTS)
+        .chain(BRIDGE_ACTS)
+        .chain(BUILD_ACTS)
         .copied()
         .collect()
 });
@@ -1087,6 +1096,8 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // facts about where the body is standing this moment — the
             // situation's to offer, not the prompt's.
             Availability::AtLift | Availability::AtLanding => false,
+            // A grant is the carried mission's, in its room — the situation's.
+            Availability::Granted => false,
         })
         .collect()
 }
@@ -1431,6 +1442,21 @@ pub enum Choices {
     /// post whole (`docs/zen_moon_mind.md` §8.3). Empty in a world with none,
     /// which takes the argument out and leaves the post to say its own steps.
     Jobs,
+    /// A house link in this room — what `survey_network` surveys from. Empty
+    /// where there is none, which takes the act away.
+    Links,
+    /// A part here linked to a Sonos player — what the Sonos acts work.
+    Sonos,
+    /// A device the last survey here found that no part stands for yet — what
+    /// `onboard_part` and `link_part` are grounded in.
+    Findings,
+    /// A part here that stands for no device yet — what `link_part` links.
+    Unlinked,
+    /// A device here onboarded from a survey — what `offboard_part` takes
+    /// out.
+    Onboarded,
+    /// A room off this one that may be undiscovered.
+    Doors,
     /// A floor the lift can carry this body to, by the level's name — never the
     /// one it is standing on. Bound to `lift_use`, and offered only while the
     /// body is on a landing (see [`Availability::AtLanding`]).
@@ -1746,6 +1772,19 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("move_to", "destination", Choices::Reachable),
     ("focus", "on", Choices::Rooms),
     ("order_post", "job", Choices::Jobs),
+    // The house's bridges (`bridge::acts`) and the world building itself
+    // (`engine::build`): each bound to what stands in this room, so an act is
+    // offered only where the thing it works is.
+    ("survey_network", "at", Choices::Links),
+    ("sonos_status", "device", Choices::Sonos),
+    ("sonos_play", "device", Choices::Sonos),
+    ("sonos_pause", "device", Choices::Sonos),
+    ("sonos_volume", "device", Choices::Sonos),
+    ("onboard_part", "from", Choices::Findings),
+    ("link_part", "part", Choices::Unlinked),
+    ("link_part", "from", Choices::Findings),
+    ("offboard_part", "part", Choices::Onboarded),
+    ("undiscover_door", "room", Choices::Doors),
     ("lift_use", "floor", Choices::Floors),
     ("time_travel", "year", Choices::Years),
     // ---- contact and obligation ----
@@ -1804,6 +1843,27 @@ pub struct Within {
     pub rooms: Vec<String>,
     /// The world's standing jobs, by name — [`Choices::Jobs`].
     pub jobs: Vec<String>,
+    /// The house links in this room, by name — [`Choices::Links`]. Empty in a
+    /// room with no network to survey.
+    pub links: Vec<String>,
+    /// The parts here linked to a Sonos player, by name — [`Choices::Sonos`].
+    pub sonos: Vec<String>,
+    /// The acts the carried mission grants here (`docs/zen_moon_mind.md` §14):
+    /// what [`Availability::Granted`] reads. Empty unless the body carries a
+    /// mission granting them, stands in its room, and the room is a mirror.
+    pub grants: Vec<String>,
+    /// The devices the last survey here found that no part stands for yet, by
+    /// label — [`Choices::Findings`].
+    pub findings: Vec<String>,
+    /// The parts here that stand for no device yet, by name —
+    /// [`Choices::Unlinked`].
+    pub unlinked: Vec<String>,
+    /// The devices here onboarded from a survey, by name — what may be
+    /// offboarded: [`Choices::Onboarded`].
+    pub onboarded: Vec<String>,
+    /// The rooms off this one that may be undiscovered — in the mirror, and
+    /// nobody in them — by name: [`Choices::Doors`].
+    pub doors: Vec<String>,
     /// Acts this body has taken too recently to take again — see
     /// [`crate::engine::cooldown`].
     ///
@@ -2093,6 +2153,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // body at the lift is offered exactly one of them.
             Availability::AtLift => within.at_lift && !within.lift_here,
             Availability::AtLanding => within.at_lift,
+            Availability::Granted => within.grants.iter().any(|g| g == t.name),
         })
         .filter(|t| performable(t, within))
         .map(|t| ToolSpec {
@@ -2312,6 +2373,12 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Years => within.years.clone(),
         Choices::Rooms => within.rooms.clone(),
         Choices::Jobs => within.jobs.clone(),
+        Choices::Links => within.links.clone(),
+        Choices::Sonos => within.sonos.clone(),
+        Choices::Findings => within.findings.clone(),
+        Choices::Unlinked => within.unlinked.clone(),
+        Choices::Onboarded => within.onboarded.clone(),
+        Choices::Doors => within.doors.clone(),
         Choices::Feelings => within.feelings.clone(),
         Choices::Carried => within.carried.clone(),
         Choices::Equippable => within.equippable.clone(),
@@ -3801,6 +3868,8 @@ mod tests {
             .chain(station::STATION_ACTS)
             .chain(bench::BENCH_ACTS)
             .chain(mission_acts::MISSION_ACTS)
+            .chain(BRIDGE_ACTS)
+            .chain(BUILD_ACTS)
             .map(|t| t.name)
             .collect();
         let n = declared.len();
@@ -3862,6 +3931,7 @@ mod tests {
             assert!(
                 crate::engine::body::is_of_the_body(t.name)
                     || crate::engine::body::is_device(t.name)
+                    || crate::engine::body::is_of_the_house(t.name)
                     || t.name == "wait",
                 "`{}` is offered but reaches no world — implement it in `body::perform`, route it \
                  through the effector device, or take it out of the catalog",

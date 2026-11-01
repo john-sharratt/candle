@@ -55,6 +55,7 @@ use crate::access;
 use crate::agent_exec::AgentExecutor;
 use crate::mcp::ownership::owner_of;
 use crate::substrate_git::agents as agents_for;
+use crate::tool_availability::Facts;
 use crate::tool_guidance;
 use crate::tool_round::{self, Step};
 use crate::types::ToolMode;
@@ -789,6 +790,16 @@ pub struct ToolHost {
 const CONVENTIONAL_DEFAULTS: [&str; 2] = ["main", "master"];
 
 impl ToolHost {
+    /// What decides which tools are out of a round
+    /// ([`crate::tool_availability`]): every context shares these stores.
+    pub fn availability_facts(&self) -> Facts {
+        let context = &self.contexts[ToolMode::Comprehensive.level() as usize];
+        Facts {
+            open: context.sessions.open(),
+            search_key: context.secrets.tavily_api_key().is_some(),
+        }
+    }
+
     /// Build a host whose file tools overlay `workspace`'s repositories, which
     /// reads fall through to when the session layer has no entry, whose every
     /// context carries `secrets` — read once by the daemon at launch
