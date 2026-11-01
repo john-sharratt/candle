@@ -59,6 +59,19 @@ enum AllowResult {
     Probs(Vec<f32>),
 }
 
+/// The tokens a bitmap allows, in order.
+fn tokens_of(bits: &[u32]) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    for (w, word) in bits.iter().enumerate() {
+        let mut rest = *word;
+        while rest != 0 {
+            tokens.push(w as u32 * 32 + rest.trailing_zeros());
+            rest &= rest - 1;
+        }
+    }
+    tokens
+}
+
 /// Result words the dispatch writes for `row`.
 fn allow_result_words(row: &AllowRow) -> usize {
     if row.temperature <= 0.0 {
@@ -277,13 +290,17 @@ struct SeqDials {
     /// gathering the kernel rows into a compacted copy first — a copy that, on
     /// a wave's head span, would claim a block of logits the wave never priced.
     logits_row: i32,
+    /// The device address of the row's allowed-token bitmap, low word first, or
+    /// zero for none (`SamplingConfig::allowed_bits`).
+    allowed_bits_lo: u32,
+    allowed_bits_hi: u32,
 }
 
 // The kernel reads this struct as a flat run of 4-byte words (all fields are
 // f32/i32), one per row of the batch, and casts back to the identically-laid-out
 // CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
-// kernel reads a row at the wrong stride, so pin it: 25 fields × 4 bytes.
-const _: () = assert!(std::mem::size_of::<SeqDials>() == 100);
+// kernel reads a row at the wrong stride, so pin it: 27 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 108);
 
 impl SeqDials {
     /// Read one row's dials from its config, resolving the same Option/gate logic
@@ -346,6 +363,8 @@ impl SeqDials {
             typical_eps: 0.0,
             typical_delta: 0.0,
             logits_row: logits_row as i32,
+            allowed_bits_lo: 0,
+            allowed_bits_hi: 0,
         }
     }
 
@@ -1219,12 +1238,21 @@ impl BatchedSampler {
                             self.issue_allow_list(logits2d, row.logits_row, config, state)?;
                         allow.push((r, pending, key));
                     }
+                    [] if on_cuda
+                        && config.allowed_bits.is_some()
+                        && !Self::bitmaps_beside(logits2d) =>
+                    {
+                        allow_rows.push((r, self.allow_row(row.logits_row, config, state), key));
+                    }
                     [] if on_cuda => kernel.push(r, state, config, row, typical, key),
                     [] => {
                         let raw = self.sample_row_cpu(logits2d, row, state, config, typical)?;
                         out[r] = Some(Scored {
                             raw,
-                            kind: RowKind::Free,
+                            kind: match config.allowed_bits {
+                                Some(_) => RowKind::Constrained,
+                                None => RowKind::Free,
+                            },
                             rng_after: state.rng_offset.wrapping_add(1),
                             key,
                         });
@@ -1245,7 +1273,12 @@ impl BatchedSampler {
             for (k, &(r, key)) in kernel.scored.iter().enumerate() {
                 out[r] = Some(Scored {
                     raw: tokens[k],
-                    kind: RowKind::Free,
+                    // A row under a bitmap is the grammar's, as an allow-list
+                    // row is: what it drew stands.
+                    kind: match kernel.configs[k].allowed_bits {
+                        Some(_) => RowKind::Constrained,
+                        None => RowKind::Free,
+                    },
                     rng_after: rngs[k],
                     key,
                 });
@@ -1274,6 +1307,54 @@ impl BatchedSampler {
         Ok(out)
     }
 
+    /// Whether a row of `logits` can read a bitmap: the forward priced the
+    /// bitmaps on the span the logits stand on. Rows held off the span have
+    /// none, and sample by name.
+    fn bitmaps_beside(logits: &Tensor) -> bool {
+        // The unit tests' logits stand on no wave, and they test the kernel.
+        cfg!(test) || logits.wave_ticket().is_some()
+    }
+
+    /// `rows`' dials with each masked row's bitmap address, and the buffer those
+    /// addresses name, carved beside `logits` and written from the host.
+    fn place_bitmaps(
+        &self,
+        logits: &Tensor,
+        rows: &KernelRows<'_>,
+    ) -> candle::Result<(Vec<SeqDials>, Option<Tensor>)> {
+        let mut dials = rows.seq_dials.clone();
+        if rows.masked.is_empty() {
+            return Ok((dials, None));
+        }
+        let Device::Cuda(dev) = &self.device else {
+            candle::bail!("place_bitmaps: the kernel rows run on CUDA");
+        };
+        let width = rows.vocab.div_ceil(32);
+        let bitmaps = logits.empty_beside((rows.masked.len(), width), DType::U32)?;
+        let stream = dev.cuda_stream();
+        let base = {
+            let (storage, layout) = bitmaps.storage_and_layout();
+            let candle::Storage::Cuda(c) = &*storage else {
+                candle::bail!("place_bitmaps: bitmaps must be on CUDA");
+            };
+            c.slice.device_ptr(&stream) + (layout.start_offset() * 4) as u64
+        };
+        // SAFETY: `u32`s read as their bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                rows.allowed_bits.as_ptr() as *const u8,
+                rows.allowed_bits.len() * 4,
+            )
+        };
+        dev.upload_raw(base, bytes)?;
+        for (i, &row) in rows.masked.iter().enumerate() {
+            let at = base + (i * width * 4) as u64;
+            dials[row].allowed_bits_lo = at as u32;
+            dials[row].allowed_bits_hi = (at >> 32) as u32;
+        }
+        Ok((dials, Some(bitmaps)))
+    }
+
     /// An allow-list row for [`Self::run_allow_rows`], with the processor its
     /// host half draws from — seeded from `state` as it stands now, as
     /// [`Self::issue_allow_list`] seeds one.
@@ -1283,7 +1364,10 @@ impl BatchedSampler {
         config: &SamplingConfig,
         state: &SequenceSamplingState,
     ) -> AllowRow {
-        let allow: Vec<u32> = config.stencil.iter().map(|&t| t as u32).collect();
+        let allow: Vec<u32> = match &config.allowed_bits {
+            Some(bits) => tokens_of(bits),
+            None => config.stencil.iter().map(|&t| t as u32).collect(),
+        };
         let banned_set: std::collections::HashSet<u32> =
             config.banned_tokens.iter().map(|&b| b as u32).collect();
         let banned = allow.iter().map(|t| banned_set.contains(t)).collect();
@@ -1527,6 +1611,12 @@ impl BatchedSampler {
                 state.advance_rng();
                 // An allow-list draws only allowed tokens.
                 (token, config.stencil.contains(&(token as i32)))
+            }
+            [] if config.allowed_bits.is_some() => {
+                let step = self.free_rng_step(state, config);
+                state.record_token(token, self.max_recent_len);
+                state.rng_offset = state.rng_offset.wrapping_add(step);
+                (token, true)
             }
             [] => {
                 let step = self.free_rng_step(state, config);
@@ -1923,6 +2013,10 @@ impl BatchedSampler {
         let (banned_tokens, num_banned, banned_per_seq) = banned_buffer(&rows.banned);
         let banned_tokens = &banned_tokens;
 
+        // Each masked row's bitmap, on the span beside the logits it masks. The
+        // tensor stands until the launch is queued; the span's reset reclaims it.
+        let (seq_dials, _bitmaps) = self.place_bitmaps(logits, rows)?;
+
         // No stencil here — constrained rows were resolved before the kernel.
         let stencil: &[i32] = &[];
         let stencil_size = 0i32;
@@ -2040,7 +2134,7 @@ impl BatchedSampler {
             &mut output_tokens,
             config.seed,
             &mut rng_offsets,
-            &rows.seq_dials,
+            &seq_dials,
         );
         launch_span.end();
         // Both cleared whether or not the launch succeeded, and the second
@@ -2405,7 +2499,7 @@ impl BatchedSampler {
 /// is empty, so unconstrained rows keep their exact logits.  Preserves the input
 /// dtype.
 fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tensor> {
-    if config.banned_tokens.is_empty() {
+    if config.banned_tokens.is_empty() && config.allowed_bits.is_none() {
         return Ok(logits.clone());
     }
     let dtype = logits.dtype();
@@ -2413,6 +2507,14 @@ fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tens
     let mut v: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     for &b in &config.banned_tokens {
         ban(&mut v, b as u32);
+    }
+    if let Some(bits) = &config.allowed_bits {
+        for (t, logit) in v.iter_mut().enumerate() {
+            let word = bits.get(t / 32).copied().unwrap_or(0);
+            if word >> (t % 32) & 1 == 0 {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
     }
     Tensor::from_vec(v, dims, logits.device())?.to_dtype(dtype)
 }
@@ -2487,6 +2589,10 @@ struct KernelRows<'a> {
     rng_offsets: Vec<u64>,
     suppress_penalties: Vec<f32>,
     seq_dials: Vec<SeqDials>,
+    /// The bitmaps of the rows that carry one, a vocabulary's width each.
+    allowed_bits: Vec<u32>,
+    /// Those rows, in the order of their bitmaps.
+    masked: Vec<usize>,
 }
 
 impl<'a> KernelRows<'a> {
@@ -2508,6 +2614,8 @@ impl<'a> KernelRows<'a> {
             rng_offsets: Vec::new(),
             suppress_penalties: Vec::new(),
             seq_dials: Vec::new(),
+            allowed_bits: Vec::new(),
+            masked: Vec::new(),
         }
     }
 
@@ -2635,6 +2743,14 @@ impl<'a> KernelRows<'a> {
             repeat_penalty: config.repeat_penalty_for(dry_live),
             ..SeqDials::from_config(config, row.logits_row)
         };
+        if let Some(bits) = &config.allowed_bits {
+            self.masked.push(r);
+            let width = self.vocab.div_ceil(32);
+            let end = self.allowed_bits.len() + width;
+            self.allowed_bits
+                .extend_from_slice(&bits[..bits.len().min(width)]);
+            self.allowed_bits.resize(end, 0);
+        }
         self.seq_dials.push(match typical {
             Some(typical) => dials.with_draft(row.draft, typical),
             None => dials,
@@ -3686,6 +3802,41 @@ mod tests {
         assert_eq!(tokens[0], 33, "single-token stencil forces its token");
     }
 
+    /// `tokens` as an allowed-token bitmap, as a wide set carries one.
+    fn bits_of(tokens: &[usize]) -> Arc<[u32]> {
+        let mut words = vec![0u32; VOCAB_SIZE.div_ceil(32)];
+        for &t in tokens {
+            words[t / 32] |= 1 << (t % 32);
+        }
+        words.into()
+    }
+
+    /// A row held off the span samples by name: a bitmap reads back as exactly
+    /// its tokens.
+    #[test]
+    fn a_bitmap_reads_back_as_its_tokens() {
+        assert_eq!(
+            tokens_of(&[0x8000_0001, 0, 1 << 3]),
+            vec![0, 31, 67],
+            "bit `t % 32` of word `t / 32`"
+        );
+        assert_eq!(tokens_of(&bits_of(&[10, 20, 96])), vec![10, 20, 96]);
+    }
+
+    /// A row under a bitmap draws its best allowed token, on the host path.
+    #[test]
+    fn a_row_under_a_bitmap_draws_inside_it() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.allowed_bits = Some(bits_of(&[10, 20]));
+        let mut state = make_state();
+        let logits = logits_from_rows(&[&[(50, 100.0), (20, 5.0), (10, 1.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 20);
+    }
+
     #[test]
     fn stencil_picks_best_within_allow_list() {
         // Global best (50) is outside the stencil; best *inside* {10,20} is 20.
@@ -4671,6 +4822,74 @@ mod tests {
             finish_allow_row(allow_row(vec![3, 4], 0.0), AllowResult::Index(2)).is_err(),
             "a position past the list is refused, not wrapped"
         );
+    }
+
+    /// **A bitmap binds its own row on the kernel path.** In one dispatch a row
+    /// beside it samples its spike, and each bitmap row its own allowed best: a
+    /// bitmap read from the wrong offset takes one row's mask to another.
+    #[test]
+    fn bitmaps_bind_their_own_rows_in_the_wave_on_cuda() {
+        let Ok(device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let sampler = make_sampler_on(&device, VOCAB_SIZE);
+        let mut data = vec![0.0f32; 3 * VOCAB_SIZE];
+        for row in 0..3 {
+            data[row * VOCAB_SIZE + 50] = 100.0;
+            data[row * VOCAB_SIZE + 20] = 5.0;
+            data[row * VOCAB_SIZE + 10] = 1.0;
+        }
+        let logits = Tensor::from_vec(data, (3, VOCAB_SIZE), &device).expect("logits");
+        let free = SamplingConfig::argmax();
+        let mut first = SamplingConfig::argmax();
+        first.allowed_bits = Some(bits_of(&[10, 20]));
+        let mut second = SamplingConfig::argmax();
+        second.allowed_bits = Some(bits_of(&[10]));
+        let (mut a, mut b, mut c) = (make_state(), make_state(), make_state());
+        let tokens = sampler
+            .sample_batch(
+                &logits,
+                &mut [&mut a, &mut b, &mut c],
+                &[&first, &free, &second],
+            )
+            .expect("sample");
+        assert_eq!(tokens, vec![20, 50, 10]);
+    }
+
+    /// What a step costs one row of a 248k vocabulary, free, under a bitmap and
+    /// on the allow-list the bitmap replaces. Prints timings.
+    #[test]
+    #[ignore = "a timing on a quiet card"]
+    fn a_bitmap_costs_a_step_this_much_on_cuda() {
+        const VOCAB: usize = 248_077;
+        let device = candle::Device::new_cuda(0).expect("a card");
+        let sampler = BatchedSampler::new(device.clone(), VOCAB, VOCAB, 32, vec![2].into(), None);
+        let mut data = vec![0.0f32; VOCAB];
+        for (t, logit) in data.iter_mut().enumerate() {
+            *logit = (t % 977) as f32 / 977.0;
+        }
+        let logits = Tensor::from_vec(data, (1, VOCAB), &device).expect("logits");
+        let allowed: Vec<u32> = (0..VOCAB as u32).filter(|t| t % 256 != 7).collect();
+        let set = crate::stencil::AllowedSet::from_tokens(allowed.clone());
+
+        let mut free = SamplingConfig::argmax();
+        free.temperature = 0.8;
+        let mut masked = free.clone();
+        masked.constrain_to(&set);
+        let listed = free
+            .clone()
+            .with_stencil(allowed.iter().map(|&t| t as i32).collect());
+
+        for (name, config) in [("free", &free), ("bitmap", &masked), ("list", &listed)] {
+            let mut state = make_state();
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                sampler
+                    .sample_batch(&logits, &mut [&mut state], &[config])
+                    .expect("sample");
+            }
+            println!("{name}: {:?} a step", started.elapsed() / 200);
+        }
     }
 
     /// On CUDA a sampled allow-list row draws inside its list, a banned

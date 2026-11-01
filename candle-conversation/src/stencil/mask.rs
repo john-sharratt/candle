@@ -10,19 +10,47 @@ use super::vocab::TokenId;
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
 
+/// The most tokens a set is sampled from by name. Past it the set also holds a
+/// bitmap, and a step under it samples the full vocabulary through that: a set
+/// this wide is mostly what the grammar leaves open, so what it costs a step
+/// should not grow with how much it allows. Matches the kernel's own direct
+/// allow-list bound.
+pub const NAMED_TOKENS_MAX: usize = 1024;
+
 /// A sorted, deduped set of permitted tokens — a branch frontier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedSet {
     tokens: Arc<[TokenId]>,
+    /// One bit per token up to the highest allowed, on a set of more than
+    /// [`NAMED_TOKENS_MAX`].
+    bits: Option<Arc<[u32]>>,
+}
+
+/// `tokens`, sorted, as a bitmap: bit `t % 32` of word `t / 32`.
+fn bitmap(tokens: &[TokenId]) -> Arc<[u32]> {
+    let top = tokens.last().map_or(0, |t| *t as usize);
+    let mut words = vec![0u32; top / 32 + 1];
+    for &t in tokens {
+        words[t as usize / 32] |= 1 << (t % 32);
+    }
+    words.into()
 }
 
 impl AllowedSet {
     pub fn from_tokens(mut tokens: Vec<TokenId>) -> Self {
         tokens.sort_unstable();
         tokens.dedup();
+        let bits = (tokens.len() > NAMED_TOKENS_MAX).then(|| bitmap(&tokens));
         AllowedSet {
             tokens: tokens.into(),
+            bits,
         }
+    }
+
+    /// The bitmap a step under this set samples through, on a set too wide to
+    /// name.
+    pub fn bits(&self) -> Option<&Arc<[u32]>> {
+        self.bits.as_ref()
     }
 
     pub fn tokens(&self) -> &[TokenId] {
@@ -81,6 +109,22 @@ mod tests {
         assert_eq!(s.len(), 3);
         assert!(s.contains(3));
         assert!(!s.contains(4));
+    }
+
+    /// A set up to the bound is named; one past it carries its tokens as bits,
+    /// bit `t % 32` of word `t / 32`.
+    #[test]
+    fn a_wide_set_holds_a_bitmap() {
+        let named = AllowedSet::from_tokens((0..NAMED_TOKENS_MAX as TokenId).collect());
+        assert!(named.bits().is_none());
+
+        let mut tokens: Vec<TokenId> = (0..NAMED_TOKENS_MAX as TokenId).collect();
+        tokens.push(2049);
+        let wide = AllowedSet::from_tokens(tokens);
+        let bits = wide.bits().expect("past the bound");
+        assert_eq!(bits.len(), 65);
+        assert_eq!((bits[0], bits[31]), (u32::MAX, u32::MAX));
+        assert_eq!((bits[32], bits[64]), (0, 1 << 1));
     }
 
     #[test]

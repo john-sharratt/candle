@@ -165,13 +165,13 @@ impl ValueRule {
     fn finishable(&self, tokens: &Sorted) -> Vec<bool> {
         let mut closes = vec![false; self.next.len()];
         let mut lands: Vec<Vec<u32>> = Vec::with_capacity(self.next.len());
-        for state in 0..self.next.len() {
+        for (state, closes) in closes.iter_mut().enumerate() {
             let mut targets = Vec::new();
             self.scan(
                 ValueState::Inside(state as u32),
                 tokens,
                 |_, land| match land {
-                    Step::Closes => closes[state] = true,
+                    Step::Closes => *closes = true,
                     Step::On(ValueState::Inside(s)) => targets.push(s),
                     _ => {}
                 },
@@ -321,10 +321,12 @@ impl ValueRule {
     }
 }
 
-/// `vocab`'s non-empty tokens in byte order.
+/// `vocab`'s tokens a value may be written in, in byte order. An end token's
+/// text would pass any open class, and would end the turn inside the call.
 fn sorted(vocab: &dyn Vocab) -> Sorted {
     let mut tokens = vocab.extensions(b"");
-    tokens.retain(|(_, bytes)| !bytes.is_empty());
+    let ends = vocab.end_tokens();
+    tokens.retain(|(token, bytes)| !bytes.is_empty() && !ends.contains(token));
     tokens.sort_unstable_by(|a, b| a.1.cmp(&b.1));
     tokens
 }
@@ -589,6 +591,16 @@ mod tests {
             "not yet .png"
         );
         assert!(rule.mask(on).contains(id(&vocab.base, ".")));
+    }
+
+    /// **An end token is never part of a value**: its text passes an open class
+    /// byte by byte, and sampling it would end the turn inside the call.
+    #[test]
+    fn an_end_token_is_never_admitted() {
+        let vocab = TestVocab::new().with_special("<end>", 1000).with_end(1000);
+        let rule = ValueRule::new(r#"[^"]*"#, &vocab).unwrap();
+        let start = rule.advance(ValueState::Open, b"\"").unwrap();
+        assert!(!rule.mask(start).contains(1000));
     }
 
     /// **The sorted scan admits exactly what a token-by-token walk does**, on
