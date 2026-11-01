@@ -463,9 +463,8 @@ is, so the document is in the system prompt from the worker's first round and
 no conversation prefills it. `generic`, the default, emits nothing: a
 conversation that is no worker carries the prompt it always did. The selector is
 a tree of its own, so a role adds one sealed section and multiplies no dial. An
-option stays short, at most 2,000 characters, and holds working rules only:
-turns sealed under it are borrowed into dialogues, and a worked exchange there
-would hijack them. Editing one is a commit and a zend release. The aggregator's
+option holds working rules only: turns sealed under it are borrowed into
+dialogues, and a worked exchange there would hijack them. Editing one is a commit and a zend release. The aggregator's
 guides (`docs/mcp_guides.md`) are the caller's and do not reach a worker.
 
 **A conversation carries its ancestors' journals.** The lineage runs project →
