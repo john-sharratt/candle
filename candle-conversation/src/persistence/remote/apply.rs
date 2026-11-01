@@ -2,6 +2,7 @@
 //! (`docs/replicated_substrate.md` §6.5).
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePayload};
@@ -14,6 +15,9 @@ use super::adopt::plan_adoptions;
 use super::incoming::Incoming;
 use super::outcome::{Checked, Refusal, RemoteBatch, RemoteOutcome};
 use crate::substrate::{StreamKey, Substrate, SubstrateLock};
+
+/// A remote batch that held the log's owner this long names its phases.
+const SLOW_BATCH: Duration = Duration::from_millis(250);
 
 /// Whether the record declares a turn. A turn's declaration is written even
 /// when a tombstone here covers it, dead at read like the rest of its
@@ -138,15 +142,20 @@ impl SubstratePersistence {
         checks: &[Checked],
         n_layers: usize,
     ) -> Result<RemoteBatch> {
+        let t0 = Instant::now();
         let mut work = Substrate::clone(&lock.read());
+        let t_clone = t0.elapsed();
         let decided = self.decide_remote(&mut work, records, checks)?;
+        let t_decide = t0.elapsed() - t_clone;
         let planned_reload = work.take_reload_due();
         let plans = if planned_reload {
             Vec::new()
         } else {
             plan_adoptions(self, &work, &decided.turns, n_layers)?
         };
+        let t_plan = t0.elapsed() - t_clone - t_decide;
         drop(work);
+        let t_edit_from = t0.elapsed();
         let (adopted, reload) = lock.update(|s| {
             for entry in &decided.applied {
                 s.apply_walker_entry(entry);
@@ -159,6 +168,25 @@ impl SubstratePersistence {
             };
             (adopted, reload)
         });
+        // **Which phase held the owner.** The batch runs on the log's owner,
+        // and everything else on the substrate waits for it: a slow one names
+        // its phases, so the work that can leave the owner is the work found
+        // slow, not guessed at.
+        let total = t0.elapsed();
+        if total >= SLOW_BATCH {
+            tracing::warn!(
+                target: "candle_conversation::persistence::remote",
+                records = records.len(),
+                written = decided.applied.len(),
+                total_ms = total.as_millis() as u64,
+                clone_ms = t_clone.as_millis() as u64,
+                decide_ms = t_decide.as_millis() as u64,
+                plan_ms = t_plan.as_millis() as u64,
+                drop_ms = (t_edit_from - t_clone - t_decide - t_plan).as_millis() as u64,
+                edit_ms = (total - t_edit_from).as_millis() as u64,
+                "a remote batch held the log's owner: its phases"
+            );
+        }
         Ok(RemoteBatch {
             outcomes: decided.outcomes,
             adopted,
