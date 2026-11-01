@@ -490,6 +490,10 @@ system_prompt:
         response are in this conversation. The length and reasoning guidance above applies
         to your answer, never to a call.
 
+        Keep the work in proportion to the task. Check a change with the narrowest thing
+        that shows it works, then stop: a small change is not a reason to run everything.
+        When a call fails, read why before calling again: the same call fails the same way.
+
         Every tool named in the catalog listing below is one of your tools, as fully as the
         ones whose signatures follow it. Signatures are shown only for the tools most likely
         to be needed; a listed tool without one is called the same way, by its name, with

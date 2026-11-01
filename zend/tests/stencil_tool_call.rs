@@ -500,11 +500,20 @@ fn drive(tree: Arc<StencilTree>, target: &str, vocab: &TestVocab) -> Result<Stri
                         allowed: set.tokens().to_vec(),
                     });
                 }
-                out.push(tok);
                 session
                     .observe(tok, &[bytes[pos]])
                     .map_err(DriveErr::Walk)?;
-                pos += 1;
+                // A value the rule holds to a set length closes itself: the
+                // session commits the quote with its last character.
+                let written = session.take_rewrite().unwrap_or_else(|| vec![bytes[pos]]);
+                if !bytes[pos..].starts_with(&written) {
+                    return Err(DriveErr::PrefillMismatch {
+                        pos,
+                        got: String::from_utf8_lossy(&written).into_owned(),
+                    });
+                }
+                out.extend(written.iter().map(|b| *b as u32));
+                pos += written.len();
             }
             StencilAction::FreeDecode { .. } => {
                 if pos >= bytes.len() {
@@ -554,7 +563,10 @@ fn minimal_value(p: &Param) -> String {
         return format!("\"{}\"", values[0]);
     }
     match p.ty {
-        ParamType::String => "\"\"".into(),
+        ParamType::String => match &p.pattern {
+            Some(pattern) => format!("\"{}\"", held_value(pattern)),
+            None => "\"\"".into(),
+        },
         // The smallest value the schema admits: a one-based page has no 0.
         ParamType::Integer | ParamType::Number => {
             format!("{}", p.minimum.unwrap_or(0.0).max(0.0) as i64)
@@ -575,6 +587,28 @@ fn minimal_value(p: &Param) -> String {
             Some(fields) => format!("{{{}}}", required_fields(fields)),
             None => "{}".into(),
         },
+    }
+}
+
+/// A value the pattern admits, for every pattern in `tool_constraints.yaml`. A
+/// new pattern fails here until it is given one.
+fn held_value(pattern: &str) -> &'static str {
+    match pattern {
+        "(?i)(javascript|js|node|nodejs|ecmascript)" => "js",
+        "[A-Za-z0-9_./+-]+" => "a",
+        "[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]" => "AAAAAAAAAAA",
+        r#"[^-\s~^:?*\["][^\s~^:?*\["]*"# | r#"[^-\s"][^\s"]*"# => "a",
+        "[0-9a-f]{40}([0-9a-f]{24})?" => "0000000000000000000000000000000000000000",
+        "[A-Za-z0-9_-]{4}" => "AAAA",
+        r#"(?i)[^"]*\.(png|jpe?g|webp|ico)"# => "a.png",
+        r#"https?://[^\s"]+"# => "http://a",
+        r#"sftp://[^/\s"]+[^\s"]*"# => "sftp://a",
+        r"[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}" => "10.0.0.0/8",
+        "([0-9a-fA-F]{2})*" | "[0-9a-fA-F]*" => "",
+        "[0-9a-fA-F]+" => "0",
+        "[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*" => "",
+        r#"[^"]*\.yaml"# => "a.yaml",
+        other => panic!("no minimal value for pattern {other:?}"),
     }
 }
 
