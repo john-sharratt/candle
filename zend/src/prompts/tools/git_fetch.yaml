@@ -51,3 +51,13 @@ examples:
 - am I behind origin<|im_end|>
 - prune the tracking refs for branches deleted on the remote<|im_end|>
 - check the remote for changes but do not merge anything<|im_end|>
+- |-
+  see whether anyone else has pushed before you carry on<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  My view of origin is only as new as the last fetch. git_fetch updates it without touching my work, and it needs the repository and the remote.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_fetch", "arguments": {"repo": "candle", "remote": "origin"}}
+  </tool_call><|projection|>

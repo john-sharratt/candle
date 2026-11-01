@@ -68,3 +68,23 @@ examples:
 - someone pushed to main, bring their work into mine<|im_end|>
 - catch my branch up with origin before I commit<|im_end|>
 - merge the release branch into this one<|im_end|>
+- |-
+  the commit was refused because origin moved<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A refused commit means the branch has commits I do not have yet. git_merge with no `from` brings in my branch as origin holds it now, and then I can commit again.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_merge", "arguments": {"repo": "candle"}}
+  </tool_call><|projection|>
+- |-
+  run_command says your branch has commits you do not have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A run is refused while my files and my branch disagree, and the fix it names is to merge first. Nothing about the command is wrong, so running it again would only be refused again.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_merge", "arguments": {"repo": "candle"}}
+  </tool_call><|projection|>

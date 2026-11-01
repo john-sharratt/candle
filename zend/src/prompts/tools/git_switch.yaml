@@ -77,3 +77,13 @@ examples:
 - make a hotfix branch from the release tag and work on it<|im_end|>
 - go back to main but keep my changes<|im_end|>
 - work on the branch my colleague pushed to origin<|im_end|>
+- |-
+  do this on its own branch, not on main<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This work should not land on main, so I need a new branch before I change anything. git_switch with `create` true makes it from the branch I am on and puts me on it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_switch", "arguments": {"repo": "candle", "branch": "feature/site-icon", "create": true}}
+  </tool_call><|projection|>
