@@ -751,6 +751,7 @@ mod tests {
                     webhook_id: None,
                     member: None,
                     mentions: vec![],
+                    referenced_message: None,
                 })
             )
         );

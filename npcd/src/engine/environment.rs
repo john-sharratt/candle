@@ -419,17 +419,27 @@ fn deliver_messages(
             continue;
         }
         for (thread, kind, messages) in waiting {
-            // **Somebody messaging you directly gets your attention; a group
-            // does not.** A direct thread is one person addressing this
-            // character and nobody else, which is the same claim on it as being
-            // spoken to in a room. A group of six would otherwise preempt
-            // whatever it was doing six times over a conversation it is only
-            // one of the audience for.
-            let salience = match kind {
-                phone::Kind::Direct => Salience::URGENT,
-                phone::Kind::Group => Salience::NORMAL,
-            };
             for m in messages {
+                // **Somebody messaging you directly gets your attention; a
+                // group does not — unless it is said to you by name.** A
+                // direct thread is one person addressing this character and
+                // nobody else, which is the same claim on it as being spoken to
+                // in a room, and so is a group line said to it (`Message::to`).
+                // The rest of a group of six would otherwise preempt whatever
+                // it was doing six times over a conversation it is only one of
+                // the audience for.
+                let to_me = m.to.as_deref() == Some(name.as_str());
+                let salience = match (kind, to_me) {
+                    (phone::Kind::Direct, _) | (phone::Kind::Group, true) => Salience::URGENT,
+                    (phone::Kind::Group, false) => Salience::NORMAL,
+                };
+                tracing::info!(
+                    npc = npc_id,
+                    thread = %thread,
+                    seq = m.seq,
+                    urgent = salience == Salience::URGENT,
+                    "a message is handed to the character's mind"
+                );
                 let kind = EventKind::Message {
                     thread: thread.clone(),
                     from: m.from,
@@ -911,6 +921,51 @@ mod tests {
         let told = elsewhere.into_inner().unwrap();
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(matches!(&told[0], (102, EventKind::Message { text, .. }) if text == "come up"));
+    }
+
+    /// **A group line said to one member is urgent for that member alone**;
+    /// the rest of the group, and the group's other talk, stay ordinary.
+    #[test]
+    fn a_group_line_said_to_one_member_is_urgent_for_that_member() {
+        let (h, b, s) = crew(3);
+        run(&s, 0);
+        h.with_sim(|sim| {
+            issue_handset(sim, "m1", "Maker-01");
+            issue_handset(sim, "m2", "Maker-02");
+            issue_handset(sim, "m3", "Maker-03");
+            let id = sim.threads.open_group(
+                "the bench",
+                &["Maker-01".into(), "Maker-02".into(), "Maker-03".into()],
+            );
+            sim.threads
+                .send_to(&id, "Maker-01", "Maker-02, come up", None, Some("Maker-02"))
+                .unwrap();
+            sim.threads
+                .send_on(&id, "Maker-01", "anyone?", None)
+                .unwrap();
+        });
+        let elsewhere = Mutex::new(Vec::new());
+        let tell = |npc: u64, _: u64, salience: Salience, kind: EventKind| {
+            if let EventKind::Message { text, .. } = kind {
+                elsewhere.lock().unwrap().push((npc, text, salience));
+            }
+        };
+        let reach = Reach {
+            here: &|_| false,
+            elsewhere: &tell,
+        };
+        advance_for(&h, &b, &s, &|_| 0, &reach);
+        let mut told = elsewhere.into_inner().unwrap();
+        told.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        assert_eq!(
+            told,
+            [
+                (102, "Maker-02, come up".to_string(), Salience::URGENT),
+                (102, "anyone?".to_string(), Salience::NORMAL),
+                (103, "Maker-02, come up".to_string(), Salience::NORMAL),
+                (103, "anyone?".to_string(), Salience::NORMAL),
+            ]
+        );
     }
 
     #[test]

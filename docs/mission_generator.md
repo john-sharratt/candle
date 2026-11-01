@@ -490,7 +490,10 @@ orders** (`sim::missions::Missions::set_unordered`):
   too.
 - **Stood down on arrival.** It is marked each time it is embodied, from its personality, so the
   personality's word is the one that stands. Marked while it carries a mission, it is stood down
-  from it and told the mission was withdrawn, and what was lodged for it is dropped.
+  from it and told the mission was withdrawn, and what was lodged for it is dropped. Only the
+  world's authority marks, and a member embodies its cast as a replica before it takes the
+  world's lease, so taking the lease marks the whole cast again (`Runtime::mark_orders_in`), as
+  reading the personalities again does.
 
 The guardian's loop-breaker still reaches it — "you keep covering the same ground" is the
 character's own thought, not work set for it — and so does an operator's broadcast or

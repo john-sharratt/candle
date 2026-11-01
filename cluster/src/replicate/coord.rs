@@ -139,6 +139,7 @@ impl Replicator {
                     through: a.through(),
                     missing: a.gaps().iter().map(|(s, e)| e - s + 1).sum(),
                     high_water: high.get(&origin).copied().unwrap_or(a.top()),
+                    top: a.top(),
                 })
                 .collect(),
             outbox: OutboxView { unsent, in_flight },

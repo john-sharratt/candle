@@ -34,6 +34,15 @@ pub struct DiscordMessage {
     /// by name.
     #[serde(default)]
     pub mentions: Vec<Mentioned>,
+    /// The message this one replies to, for a reply.
+    #[serde(default)]
+    pub referenced_message: Option<Box<Replied>>,
+}
+
+/// The message a reply answers — only who wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Replied {
+    pub author: Author,
 }
 
 /// Who wrote a message.
@@ -105,6 +114,32 @@ impl DiscordMessage {
         );
         lines.join("\n")
     }
+
+    /// Whether the message is said to the bot `user` that speaks as
+    /// `character`: it mentions the bot, replies to one of its posts, or calls
+    /// the character by name.
+    pub fn addresses(&self, user: u64, character: &str) -> bool {
+        self.mentions.iter().any(|m| m.id == user)
+            || self
+                .referenced_message
+                .as_ref()
+                .is_some_and(|r| r.author.id == user)
+            || names(&self.content, character)
+    }
+}
+
+/// Whether `text` says `name` as a word of its own, in any case: "Zen, are
+/// you there?" names Zen, "Zenith" does not.
+fn names(text: &str, name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let text = text.to_lowercase();
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    text.match_indices(&name).any(|(at, _)| {
+        !word(text[..at].chars().next_back()) && !word(text[at + name.len()..].chars().next())
+    })
 }
 
 /// Discord's epoch, the first second of 2015, in Unix milliseconds: what a
@@ -174,6 +209,7 @@ mod tests {
                 webhook_id: None,
                 member: None,
                 mentions: vec![],
+                referenced_message: None,
             }
         );
         assert_eq!(
@@ -248,6 +284,43 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// **A message is said to the bot** when it mentions the bot, replies to
+    /// one of its posts, or names its character as a word; anything else is
+    /// said around it.
+    #[test]
+    fn a_message_addresses_the_bot_by_mention_reply_or_name() {
+        let read = |v: serde_json::Value| serde_json::from_value::<DiscordMessage>(v).unwrap();
+        let base = |content: &str| {
+            json!({
+                "id": "1", "channel_id": "2", "guild_id": "3",
+                "author": {"id": "5", "username": "wren"},
+                "content": content,
+            })
+        };
+        let mut mention = base("<@222> hi");
+        mention["mentions"] = json!([{"id": "222", "username": "Zen", "bot": true}]);
+        assert!(read(mention).addresses(222, "Zen"));
+
+        let mut reply = base("yes");
+        reply["referenced_message"] = json!({
+            "id": "0", "channel_id": "2",
+            "author": {"id": "222", "username": "Zen", "bot": true},
+        });
+        assert!(read(reply).addresses(222, "Zen"));
+
+        assert!(read(base("zen, are you there?")).addresses(222, "Zen"));
+        assert!(read(base("Is that you, ZEN")).addresses(222, "Zen"));
+        assert!(!read(base("the zenith of it")).addresses(222, "Zen"));
+        assert!(!read(base("morning all")).addresses(222, "Zen"));
+
+        let mut other = base("<@6> hi");
+        other["mentions"] = json!([{"id": "6", "username": "kit"}]);
+        other["referenced_message"] = json!({
+            "id": "0", "channel_id": "2", "author": {"id": "6", "username": "kit"},
+        });
+        assert!(!read(other).addresses(222, "Zen"));
     }
 
     /// **A server shows its nickname first, then the global name, then the

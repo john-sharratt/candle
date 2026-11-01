@@ -307,7 +307,14 @@ handset, and the character uses it as it uses any group.
   in a channel with no record — a thread, a voice channel's chat — is not one the
   character talks in, and is dropped.
 - **A message in it** wakes the character like any group message (`deliver_messages`).
-  Its author is their speaking name (§3.2) when linked, and otherwise
+  One **said to the character** — it mentions the bot, replies to one of the bot's posts,
+  or names the character as a word ("Zen, are you there?") — is stored with
+  `Message::to` set to the character, and is told it as urgently as a DM; the rest of a
+  channel's talk stays at a group's ordinary salience, so a busy server does not preempt
+  the character on every line. Each hand-off to a character's mind is logged
+  (`a message is handed to the character's mind`, with thread, seq and urgency), and
+  `bot_thread_read` marks a message said to the character `to <name>`. Its author is
+  their speaking name (§3.2) when linked, and otherwise
   `<display name> (@<username>)` — the server's nickname, else the global name, else the
   username — which no character or account's name can be. Anyone the server lets write
   there is heard, linked or not; the server's members chose to invite the bot. Messages

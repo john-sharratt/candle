@@ -229,6 +229,13 @@ pub struct Message {
     /// mirrors, so the mirror never posts it back.
     #[serde(default)]
     pub origin: Option<Origin>,
+    /// The member it was said to, when it was said to one of a group by name
+    /// — a Discord message that mentions or answers a character's bot. That
+    /// member is told it as urgently as a direct message; the rest of the
+    /// group hear it as group talk. Left out of the record when absent, which
+    /// it nearly always is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 /// Where a message said on a thread came from, outside the world.
@@ -713,6 +720,18 @@ impl Threads {
         intent: &str,
         origin: Option<Origin>,
     ) -> Result<Vec<String>, String> {
+        self.send_to(id, from, intent, origin, None)
+    }
+
+    /// [`Threads::send_on`], said to member `to` of the thread by name.
+    pub fn send_to(
+        &mut self,
+        id: &str,
+        from: &str,
+        intent: &str,
+        origin: Option<Origin>,
+        to: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         if !self.threads.get(id).is_some_and(|t| t.open && t.has(from)) {
             return Err(format!("{from} is on no open conversation {id}."));
         }
@@ -729,6 +748,7 @@ impl Threads {
             seq: 0,
             at_ms: now_ms(),
             origin,
+            to: to.map(str::to_string),
         });
         Ok(t.others(from))
     }
@@ -1036,6 +1056,7 @@ mod tests {
                 message: 1_300_000_000_000_000_011,
                 channel: 1_300_000_000_000_000_012,
             }),
+            to: None,
         };
         let wire = serde_json::to_string(&m).unwrap();
         assert_eq!(
@@ -1045,6 +1066,20 @@ mod tests {
              \"message\":1300000000000000011,\"channel\":1300000000000000012}}"
         );
         assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), m);
+
+        let said_to = Message {
+            to: Some("Zen".into()),
+            ..m
+        };
+        let wire = serde_json::to_string(&said_to).unwrap();
+        assert_eq!(
+            wire,
+            "{\"from\":\"Wren\",\"intent\":\"hello\",\"seen_by\":[\"Wren\"],\"seq\":7,\
+             \"at_ms\":1800000000000,\"origin\":{\"kind\":\"discord\",\
+             \"message\":1300000000000000011,\"channel\":1300000000000000012},\
+             \"to\":\"Zen\"}"
+        );
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), said_to);
     }
 
     /// **A world saved before messages had names still opens**: its messages
@@ -1075,6 +1110,7 @@ mod tests {
             seq: 0,
             at_ms: 5,
             origin: None,
+            to: None,
         });
         assert_eq!(t.messages[1].seq, FIRST_SEQ);
     }

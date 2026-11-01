@@ -63,6 +63,7 @@ pub mod maintenance;
 pub mod manifest;
 mod model_binding;
 pub mod open_progress;
+mod own_hold;
 pub mod owner;
 pub mod payload_parts;
 pub mod pipeline;
@@ -131,6 +132,7 @@ use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
 use open_progress::MibMeter;
 pub use open_progress::{OpenProgress, OpenProgressHook, OpenStage};
+use own_hold::OwnHold;
 pub use owner::PersistenceOwner;
 use rebase::{RebaseEntry, RebaseMap};
 use record::verify_record_crc;
@@ -743,6 +745,8 @@ pub struct SubstratePersistence {
     /// is one a purge left; one above it is a record this process minted that
     /// has not reached the log yet ([`Self::own_sendable_through`]).
     open_top: u64,
+    /// How long the same gap has capped [`Self::own_sendable_through`].
+    own_hold: OwnHold,
     /// `oseq`s this process minted whose append failed: never coming, so no
     /// hold on [`Self::own_sendable_through`].
     own_unwritten: OriginApplied,
@@ -1461,6 +1465,7 @@ impl SubstratePersistence {
             unstamped,
             tap: None,
             open_top: own_written.top(),
+            own_hold: OwnHold::default(),
             own_unwritten: OriginApplied::default(),
             own_written,
         };
@@ -1964,7 +1969,9 @@ impl SubstratePersistence {
             if self.replica.applied.insert(id.origin, id.oseq) {
                 self.replica_dirty = true;
             }
-        } else if id.gen != GEN_DETACHED && self.own_written.insert(id.oseq) {
+        } else if id.gen == GEN_DETACHED {
+            self.own_hold.wrote_detached(id.oseq);
+        } else if self.own_written.insert(id.oseq) {
             if let Some(tap) = &self.tap {
                 tap(id.oseq);
             }
@@ -1998,12 +2005,13 @@ impl SubstratePersistence {
     /// coming ([`Self::mark_unwritten`]), so it does not hold the count back.
     pub fn own_sendable_through(&self) -> u64 {
         let written = &self.own_written;
-        written
+        let hold = written
             .gaps()
             .into_iter()
             .filter(|&(start, _)| start > self.open_top)
-            .find(|&(start, end)| !self.own_unwritten.contains_range(start, end))
-            .map_or(written.top(), |(start, _)| start - 1)
+            .find(|&(start, end)| !self.own_unwritten.contains_range(start, end));
+        self.own_hold.observe(hold, written.top(), self.open_top);
+        hold.map_or(written.top(), |(start, _)| start - 1)
     }
 
     /// `id`, minted by this node, will never be written: its append failed.

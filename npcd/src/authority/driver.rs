@@ -213,6 +213,10 @@ impl Runtime {
                 self.standing.set_busy(&world, None);
                 if !self.standing.role(&world).is_authority() {
                     self.take_world(&hosted, member);
+                    // The cast was embodied here as a replica, unmarked: its
+                    // personalities' marks are this authority's to set now.
+                    let rt = Arc::clone(self);
+                    tokio::spawn(async move { rt.mark_orders_in(&world).await });
                 }
             }
             LeaseEvent::Lost { .. } => {

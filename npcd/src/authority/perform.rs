@@ -178,9 +178,10 @@ impl Runtime {
                 from,
                 text,
                 origin,
+                to,
             } => OpReply::Done {
                 ok: self.hosted.get(world).is_some_and(|hosted| {
-                    channel_message(&hosted, npc, channel, &from, &text, origin)
+                    channel_message(&hosted, npc, channel, &from, &text, origin, to.as_deref())
                 }),
             },
             WorldOp::Notice { npc, text } => {
