@@ -1509,6 +1509,8 @@ Enumerate notes by key prefix or tag, without searching content — returns meta
 
 ## Network Sessions and Credentials
 
+**A tool that cannot succeed now is out of the round, and says so.** With no session of its kind open, a session tool can only answer `session_not_found`, so each round takes it out of the grammar and projects one line right after the catalog summary, which still names it: "tcp_session_send and tcp_session_recv are unavailable until tcp_session_open has opened a session." The lines are fixed text, sealed at startup as reserved sections, one per rule in `zend/src/tool_availability.rs`. A tool freed during a turn is announced as `tools_returned` on the result that freed it. A rule only names a state in which every call fails: the session stores are the daemon's, so "open" means open in any conversation.
+
 The web chat client supports persistent network sessions over five protocols: SSH, Telnet, HTTP, TCP, and UDP. Each protocol has its own session-management tool group, but all share the same lifecycle model, credential store, and confirmation flow described in this section. Tools in this and the following per-protocol sections are deliberately not exposed to Continue — Continue users have their own local terminal and HTTP client, and exposing the credential store across both clients would create cross-client state leakage.
 
 A session is a long-lived connection or client context held in backend memory, scoped to a single (user, conversation) pair. Sessions persist across model turns within a conversation, accumulate state appropriate to their protocol (cwd and env vars for SSH, cookies and auth headers for HTTP, bound sockets for UDP, etc.), and are torn down on idle timeout, explicit close, or backend restart.
