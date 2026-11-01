@@ -49,3 +49,33 @@ examples:
 - what would my next commit hold<|im_end|>
 - give me a summary of where I am in the repo<|im_end|>
 - how far ahead of origin is my branch in candle<|im_end|>
+- |-
+  check what is uncommitted before you commit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Before committing I should see exactly what a commit would hold. git_status lists every file I changed and its status, and `clean` says whether anything is left. The page is required and starts at 1.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "candle", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  did that commit go through<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I committed, so I want to confirm nothing is left and that the branch is level with origin. git_status gives `clean` and the `upstream` ahead and behind counts in one call.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "candle", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  which branch am I on in this repo<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  git_status names the branch and head as well as the changes, so one call answers this.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "app", "page": 1}}
+  </tool_call><|projection|>

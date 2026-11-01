@@ -69,11 +69,17 @@ pub enum Choice {
 }
 
 /// Whether `agent` can run a job needing `need`.
+///
+/// A job that names no repository — a device-bridge job, which works the house
+/// network, not a checkout (`docs/zen_moon_mind.md` §15) — needs no repo held
+/// and runs on any ready agent; a git job always names one, so it still routes
+/// to an agent that holds it.
 fn fits(agent: &MemberView, need: &Need) -> bool {
-    let holds = agent
-        .repos
-        .iter()
-        .any(|r| r.name == need.repo && (r.push || !need.push));
+    let holds = need.repo.is_empty()
+        || agent
+            .repos
+            .iter()
+            .any(|r| r.name == need.repo && (r.push || !need.push));
     let has = need.toolchain.as_ref().is_none_or(|t| {
         agent
             .capacity
@@ -222,6 +228,22 @@ mod tests {
 
     fn cargo() -> Need {
         need("candle", Some("cargo"), false)
+    }
+
+    /// **A repo-less job runs on any ready agent** — a device-bridge job holds
+    /// no checkout and needs no repository — while a job naming a repository
+    /// the agent does not hold still finds none.
+    #[test]
+    fn a_repo_less_job_fits_any_ready_agent() {
+        let a = agent(1, 4, 0, 1);
+        assert_eq!(
+            choose(&[&a], None, &need("", None, false), false),
+            Choice::Run(1)
+        );
+        assert_eq!(
+            choose(&[&a], None, &need("not-held", None, false), false),
+            Choice::NoAgent
+        );
     }
 
     /// A lineage's job goes back to its holder while the holder has a slot,

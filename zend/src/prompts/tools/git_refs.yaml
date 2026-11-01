@@ -64,3 +64,13 @@ examples:
 - does my branch have an upstream set<|im_end|>
 - do I have commits that have not been pushed yet<|im_end|>
 - what url does the mind repository send its commits to<|im_end|>
+- |-
+  which branches does this repo have<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  git_refs lists a repository's references. Both `kind` and `page` are required, and branches is the kind I want.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_refs", "arguments": {"repo": "candle", "kind": "branches", "page": 1}}
+  </tool_call><|projection|>

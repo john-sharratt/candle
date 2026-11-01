@@ -18,11 +18,12 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use agent::client::{AgentError, Agents, Ran as AgentRan};
+use agent::client::{AgentError, Agents, JobWatch, Ran as AgentRan};
 use agent::pusher::AgentPush;
 use agent::wire::RunJob;
 use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
+use zend_tools::run_watch;
 use zend_tools::sandboxes::{page, LogPage, Ran, SandboxesError};
 use zend_vfs::{
     ChangedFile, DiskWriteGrant, JobId, JobInfo, JobNotFound, JobRequest, JobStatus, Push,
@@ -53,9 +54,14 @@ impl AgentExecutor {
     fn wait_for(&self, lineage: &str, job: RunJob) -> Result<AgentRan, AgentError> {
         let agents = self.agents.clone();
         let lineage = lineage.to_string();
+        // Read here: the watcher belongs to this thread, and the job is driven
+        // on the runtime.
+        let watch = run_watch::current().map(|watch| -> JobWatch {
+            Arc::new(move |view, last| watch(format!("{} lines, last: {last}", view.lines)))
+        });
         let (tx, rx) = mpsc::channel();
         self.runtime.spawn(async move {
-            let _ = tx.send(agents.run(&lineage, job).await);
+            let _ = tx.send(agents.run(&lineage, job, watch).await);
         });
         rx.recv()
             .map_err(|_| AgentError::Transport("the job was dropped".into()))?

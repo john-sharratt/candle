@@ -16,6 +16,7 @@ use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 use zend_tools::tools::journal::address;
 
+use super::fit::clip_lines;
 use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
@@ -27,6 +28,8 @@ pub const NAME: &str = "journal_read";
 /// The most lines one page holds, as the journal's own reader allows.
 const MAX_LINES: u64 = 400;
 const DEFAULT_LINES: u64 = 200;
+/// How many characters of a worker's final answer one read answers.
+const ANSWER_PAGE: usize = 16_000;
 
 pub fn definition() -> Value {
     json!({
@@ -49,8 +52,9 @@ pub fn definition() -> Value {
             "properties": {
                 "journal": {"type": "string", "description": "`@<group>`, a memory path such as `topics/candle` or `here`, or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
-                "offset": {"type": "integer", "minimum": 1, "description": "The first line of a worker entry's page (1 by default)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."}
+                "offset": {"type": "integer", "minimum": 1, "description": "With `entry`, the first line of a worker entry's page; without it, the first entry of a thread's, project's or worker's journal (1 by default)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."},
+                "answer_from": {"type": "integer", "minimum": 0, "description": "For a worker's path: read its final answer instead, a page of characters from this one (0 to start)."}
             },
             "required": ["journal"],
             "additionalProperties": false
@@ -104,7 +108,12 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Path::Project(repo) => {
             let journal = project_journal(&repo);
             let notes = threads::notes(&records, &owner, &journal);
-            notes_answer(&journal, &notes, args.get("entry").and_then(Value::as_u64))
+            notes_answer(
+                &journal,
+                &notes,
+                args.get("entry").and_then(Value::as_u64),
+                first_entry(args),
+            )
         }
         Path::Thread(thread) => {
             if threads::thread(&records, &owner, &thread).is_none() {
@@ -115,17 +124,23 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                 &format!("T:{thread}"),
                 &notes,
                 args.get("entry").and_then(Value::as_u64),
+                first_entry(args),
             )
         }
         Path::Worker { thread, worker } => {
             let Some(w) = threads::worker(&records, &owner, &thread, &worker) else {
                 return Answer::error(format!("there is no worker `T:{thread}/{worker}`"));
             };
+            if let Some(from) = args.get("answer_from").and_then(Value::as_u64) {
+                return Answer::ok(answer_page(&w.path(), &w.final_text, from as usize));
+            }
             match args.get("entry").and_then(Value::as_u64) {
                 // A worker's journal is the model's to read: before it is
                 // loaded there is nothing to say, which is not "no entries".
                 None => match ctx.session.journal(&w.conv_id) {
-                    Some(view) => Answer::ok(render_worker(&w.path(), Some(&view))),
+                    Some(view) => {
+                        Answer::ok(render_worker(&w.path(), Some(&view), first_entry(args)))
+                    }
                     None => Answer::error(LOADING),
                 },
                 Some(entry) => {
@@ -146,9 +161,11 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                         limit as usize,
                     ) {
                         None => Answer::error("the model is still loading; try again shortly"),
-                        Some(Ok(page)) => Answer::ok(
-                            serde_json::to_string_pretty(&page).unwrap_or_else(|e| e.to_string()),
-                        ),
+                        // A tool result is one stored line, so a page of
+                        // lines can hold a whole file in one of them.
+                        Some(Ok(page)) => Answer::ok(clip_lines(
+                            &serde_json::to_string_pretty(&page).unwrap_or_else(|e| e.to_string()),
+                        )),
                         Some(Err(miss)) => {
                             Answer::error(format!("{}#{entry}: {}", w.path(), miss.code()))
                         }
@@ -217,12 +234,51 @@ fn one_entry(addressed: Option<u64>, entry: Option<u64>) -> Result<Option<u64>, 
     }
 }
 
-/// A thread's or project's journal at `path`: the whole of it, or with
-/// `entry` that one note — its entries are its record, with no turns behind
-/// them.
-fn notes_answer(path: &str, notes: &[Note], entry: Option<u64>) -> Answer {
+/// The first entry a journal's read starts at: `offset`, or the first.
+fn first_entry(args: &Value) -> usize {
+    args.get("offset")
+        .and_then(Value::as_u64)
+        .map_or(1, |o| o.max(1) as usize)
+}
+
+/// One page of a worker's final answer from character `from`, and where to
+/// read on.
+fn answer_page(path: &str, text: &str, from: usize) -> String {
+    let total = text.chars().count();
+    let to = (from + ANSWER_PAGE).min(total);
+    let page: String = text.chars().skip(from).take(ANSWER_PAGE).collect();
+    let mut out = format!(
+        "{path}'s answer, characters {}–{to} of {total}",
+        from.min(total)
+    );
+    if to < total {
+        out.push_str(&format!(
+            " (call again with `answer_from: {to}` to read on)"
+        ));
+    }
+    out.push('\n');
+    out.push_str(&page);
+    out
+}
+
+/// A thread's or project's journal at `path`: its entries from `first` on, or
+/// with `entry` that one note — its entries are its record, with no turns
+/// behind them.
+fn notes_answer(path: &str, notes: &[Note], entry: Option<u64>, first: usize) -> Answer {
     let Some(n) = entry else {
-        return Answer::ok(threads::render_journal(path, notes));
+        let all = threads::render_journal(path, notes);
+        if first <= 1 {
+            return Answer::ok(all);
+        }
+        let mut lines = all.lines();
+        let head = lines.next().unwrap_or_default().to_string();
+        let shown: Vec<&str> = lines.skip(first - 1).collect();
+        return Answer::ok(format!(
+            "{head}, entries {first}–{} of {}\n{}",
+            first + shown.len().saturating_sub(1),
+            notes.len(),
+            shown.join("\n")
+        ));
     };
     let lines = threads::note_lines(notes);
     match n.checked_sub(1).and_then(|i| lines.get(i as usize)) {
@@ -234,9 +290,9 @@ fn notes_answer(path: &str, notes: &[Note], entry: Option<u64>) -> Answer {
     }
 }
 
-/// A worker's journal as the tool prints it: each entry under its address,
-/// then its open items.
-pub fn render_worker(path: &str, view: Option<&Value>) -> String {
+/// A worker's journal as the tool prints it: each entry from `first` on under
+/// its address, then its open items.
+pub fn render_worker(path: &str, view: Option<&Value>, first: usize) -> String {
     let mut out = format!("Journal of {path}, written by that worker");
     let entries = view
         .and_then(|v| v.get("entries"))
@@ -246,7 +302,7 @@ pub fn render_worker(path: &str, view: Option<&Value>) -> String {
     if entries.is_empty() {
         out.push_str(" — no entries yet.");
     }
-    for e in &entries {
+    for e in entries.iter().skip(first.saturating_sub(1)) {
         let id = e.get("id").and_then(Value::as_u64).unwrap_or(0);
         let text = e.get("text").and_then(Value::as_str).unwrap_or("");
         out.push_str(&format!("\n\n{path}#{id}\n{text}"));
@@ -293,15 +349,36 @@ mod tests {
             },
         ];
         assert_eq!(
-            notes_answer("T:review", &notes, Some(2)).text,
+            notes_answer("T:review", &notes, Some(2), 1).text,
             "T:review#2 Decided: parts cite their files"
         );
-        let past = notes_answer("T:review", &notes, Some(3));
+        let past = notes_answer("T:review", &notes, Some(3), 1);
         assert!(past.is_error);
         assert_eq!(past.text, "T:review has no entry 3: it holds 2 entries");
-        assert!(notes_answer("T:review", &notes, None)
+        assert!(notes_answer("T:review", &notes, None, 1)
             .text
             .starts_with("Journal of T:review, written by Claude"));
+        assert_eq!(
+            notes_answer("T:review", &notes, None, 2).text,
+            "Journal of T:review, written by Claude, entries 2–2 of 2\n\
+             #2 Decided: parts cite their files"
+        );
+    }
+
+    /// **A long answer reads on a page at a time**, for a caller who cannot
+    /// reach the worker's conversation itself.
+    #[test]
+    fn a_workers_answer_reads_on_a_page_at_a_time() {
+        let text = "é".repeat(ANSWER_PAGE + 3);
+        let first = answer_page("T:r/v", &text, 0);
+        assert!(first.starts_with(
+            "T:r/v's answer, characters 0–16000 of 16003 (call again with `answer_from: 16000` \
+             to read on)\n"
+        ));
+        assert_eq!(
+            answer_page("T:r/v", &text, 16_000),
+            "T:r/v's answer, characters 16000–16003 of 16003\nééé"
+        );
     }
 
     #[test]
@@ -323,13 +400,18 @@ mod tests {
             "open": ["check the tail"],
         });
         assert_eq!(
-            render_worker("T:r/v", Some(&view)),
+            render_worker("T:r/v", Some(&view), 1),
             "Journal of T:r/v, written by that worker\n\nT:r/v#2\nEntry 2 — read it\n\n\
              Still open:\ncheck the tail"
         );
         assert_eq!(
-            render_worker("T:r/v", None),
+            render_worker("T:r/v", None, 1),
             "Journal of T:r/v, written by that worker — no entries yet."
+        );
+        assert_eq!(
+            render_worker("T:r/v", Some(&view), 2),
+            "Journal of T:r/v, written by that worker\n\nStill open:\ncheck the tail",
+            "an offset past the entries leaves its open items"
         );
     }
 }

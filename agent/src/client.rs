@@ -46,6 +46,16 @@ use crate::wire::{
 /// How long each wait on a running job is held open.
 const WAIT: Duration = Duration::from_secs(25);
 
+/// How much of a running job's log is read to find its last line.
+const LAST_LINE_BYTES: u64 = 512;
+
+/// The most of that line a watcher is told.
+const LAST_LINE_CHARS: usize = 120;
+
+/// Told, each time a wait on a running job wakes, how it stands and the last
+/// line of its log.
+pub type JobWatch = Arc<dyn Fn(&JobView, &str) + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AgentError {
     /// No agent can be reached, or none holds the job's repository and
@@ -258,13 +268,18 @@ impl Agents {
         serde_json::from_slice(&bytes).map_err(|e| AgentError::Transport(e.to_string()))
     }
 
-    pub async fn run(&self, lineage: &str, job: RunJob) -> Result<Ran, AgentError> {
+    pub async fn run(
+        &self,
+        lineage: &str,
+        job: RunJob,
+        watch: Option<JobWatch>,
+    ) -> Result<Ran, AgentError> {
         if let Some(jobs) = self.local() {
-            return run_in_process(jobs, job).await;
+            return run_in_process(jobs, job, watch).await;
         }
         let (at, mut view) = self.submit(lineage, job, None).await?;
         let At::Agent(agent) = at else {
-            return run_in_process_after(self.own()?, view).await;
+            return run_in_process_after(self.own()?, view, watch).await;
         };
         while !view.status.is_finished() {
             let (_, body) = self
@@ -280,6 +295,12 @@ impl Agents {
                 })
                 .await?;
             view = Self::view_of(&body)?;
+            if let (Some(watch), false) = (&watch, view.status.is_finished()) {
+                // A watcher's line is worth no failure of the run it watches.
+                let from = view.bytes.saturating_sub(LAST_LINE_BYTES);
+                let last = self.tail(At::Agent(agent), &view.id, from).await.ok();
+                watch(&view, &last.map_or_else(String::new, |c| last_line_of(&c)));
+            }
         }
         let log = self.log(At::Agent(agent), &view.id).await?;
         Ok(Ran {
@@ -656,16 +677,41 @@ async fn bridge_in_process(call: &BridgeCall) -> Bridged {
     }
 }
 
-async fn run_in_process(jobs: &Arc<Jobs>, job: RunJob) -> Result<Ran, AgentError> {
+async fn run_in_process(
+    jobs: &Arc<Jobs>,
+    job: RunJob,
+    watch: Option<JobWatch>,
+) -> Result<Ran, AgentError> {
     let view = jobs.submit(Submit::Run(job)).await.map_err(refused)?;
-    run_in_process_after(jobs, view).await
+    run_in_process_after(jobs, view, watch).await
+}
+
+/// The last line of `chunk`, cut to what a status line can carry.
+fn last_line_of(chunk: &LogChunk) -> String {
+    let bytes = chunk.bytes().unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.lines().rev().find(|l| !l.trim().is_empty());
+    line.unwrap_or_default()
+        .trim()
+        .chars()
+        .take(LAST_LINE_CHARS)
+        .collect()
 }
 
 /// Wait for job `view`, started on this process's agent, to end; it and its
 /// log.
-async fn run_in_process_after(jobs: &Arc<Jobs>, mut view: JobView) -> Result<Ran, AgentError> {
+async fn run_in_process_after(
+    jobs: &Arc<Jobs>,
+    mut view: JobView,
+    watch: Option<JobWatch>,
+) -> Result<Ran, AgentError> {
     while !view.status.is_finished() {
         view = jobs.wait(&view.id, WAIT).await.map_err(refused)?;
+        if let (Some(watch), false) = (&watch, view.status.is_finished()) {
+            let from = view.bytes.saturating_sub(LAST_LINE_BYTES);
+            let last = jobs.tail(&view.id, from).await.ok();
+            watch(&view, &last.map_or_else(String::new, |c| last_line_of(&c)));
+        }
     }
     let path = jobs.log(&view.id).map_err(refused)?;
     let log = tokio::fs::read(&path)

@@ -87,6 +87,19 @@ pub(super) fn carry(
 
     let mut settled = Vec::with_capacity(paths.len());
     for path in paths {
+        // A picture cannot be replayed as text, so a change that was its own
+        // commit is read by its bytes: the new tree holding them is the change
+        // landed, not a change that no longer fits.
+        if let Some(chain) = chains.get(&path).filter(|c| !c.conflict) {
+            if let Some(FileDelta::ReplaceBinary { content }) =
+                chain.deltas.last().map(|t| &t.delta)
+            {
+                if new.read_bytes(&path)?.as_ref() == Some(content) {
+                    settled.push((path, None));
+                    continue;
+                }
+            }
+        }
         let was = Side::of(old, &path)?;
         let ours = match chains.get(&path) {
             Some(chain) => match content(chain, &was, &path) {
@@ -262,6 +275,48 @@ mod tests {
 
     /// **A resolver's answer is recorded against the new copy, flag and
     /// all**, and a path named besides the changed ones is reconsidered too.
+    /// **A binary change its commit landed is gone from the store, not in
+    /// conflict.** It cannot be replayed as text, and read that way every
+    /// committed picture came back modified and conflicted, `clean: false`,
+    /// after a commit that held it exactly. One the new tree holds differently
+    /// really is in the way, and stays.
+    #[test]
+    fn a_committed_binary_change_leaves_no_conflict() {
+        let (old_dir, new_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mine, other) = (vec![0xff, 0x00, 0xfe], vec![0xff, 0x01]);
+        std::fs::write(old_dir.path().join("a.png"), [0xfd]).unwrap();
+        std::fs::write(new_dir.path().join("a.png"), &mine).unwrap();
+        std::fs::write(old_dir.path().join("b.png"), [0xfd]).unwrap();
+        std::fs::write(new_dir.path().join("b.png"), &other).unwrap();
+        let binary = |content: &Vec<u8>| {
+            chain(vec![FileDelta::ReplaceBinary {
+                content: content.clone(),
+            }])
+        };
+        let mut chains = HashMap::from([
+            ("a.png".to_string(), binary(&mine)),
+            ("b.png".to_string(), binary(&mine)),
+        ]);
+        carry(
+            &mut chains,
+            &View::Folder(old_dir.path()),
+            &View::Folder(new_dir.path()),
+            &[],
+            &mut |c: &Carried<'_>| {
+                Ok(Resolved {
+                    content: c.ours.map(str::to_string),
+                    conflict: false,
+                })
+            },
+        )
+        .unwrap();
+        assert!(!chains.contains_key("a.png"), "the commit holds it");
+        assert!(
+            chains["b.png"].conflict,
+            "the new tree holds something else"
+        );
+    }
+
     #[test]
     fn a_resolvers_answer_and_conflict_are_recorded() {
         let (old_dir, new_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

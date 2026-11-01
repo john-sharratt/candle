@@ -383,6 +383,9 @@ fn stream_sse(
                 .map_err(|e| anyhow::anyhow!(e))
                 .map(|data| Event::default().event("projection").data(data))],
 
+            // A running program's line is for a worker's watchers, not the
+            // tool cards, which know `running` and `done`.
+            Ok(StreamItem::Tool(status)) if status.phase == "progress" => Vec::new(),
             Ok(StreamItem::Tool(status)) => vec![serde_json::to_string(&status)
                 .map_err(|e| anyhow::anyhow!(e))
                 .map(|data| Event::default().event("tool").data(data))],

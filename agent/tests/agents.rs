@@ -399,7 +399,7 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
 
     let agents = Agents::new(member.clone(), None);
     let store = changed_store(&r);
-    let ran = agents.run("conv-1", run_job(&store)).await.unwrap();
+    let ran = agents.run("conv-1", run_job(&store), None).await.unwrap();
     assert_eq!(ran.at, At::Agent(0xa1));
     assert_eq!(ran.view.status, JobStatus::Exited { code: Some(0) });
     let changed = &ran.outcome.as_ref().unwrap().changed;
@@ -512,7 +512,7 @@ async fn an_agent_is_watched_and_switched_through_the_gateway() {
 
     let store = changed_store(&r);
     let job = run_job(&store);
-    let ran = agents.run("conv-3", job.clone()).await.unwrap();
+    let ran = agents.run("conv-3", job.clone(), None).await.unwrap();
     let at = agents.at(0xa1);
     assert_eq!(at, At::Agent(0xa1));
     let listing = agents.jobs_of(at, 10).await.unwrap();
@@ -544,7 +544,7 @@ async fn an_agent_is_watched_and_switched_through_the_gateway() {
     })
     .await;
     assert_eq!(agents.listing().await.unwrap()[0].state, "disabled");
-    let refused = agents.run("conv-3", run_job(&store)).await;
+    let refused = agents.run("conv-3", run_job(&store), None).await;
     assert!(
         matches!(refused, Err(AgentError::NoAgent(_))),
         "{refused:?}"
@@ -557,7 +557,7 @@ async fn an_agent_is_watched_and_switched_through_the_gateway() {
         hub.member(APP, 0xa1).is_some_and(|m| m.ready())
     })
     .await;
-    let again = agents.run("conv-3", run_job(&store)).await.unwrap();
+    let again = agents.run("conv-3", run_job(&store), None).await.unwrap();
     assert_eq!(again.view.status, JobStatus::Exited { code: Some(0) });
 }
 
@@ -578,7 +578,7 @@ async fn a_cut_off_member_watches_and_switches_its_own_agent() {
     assert_eq!(agents.at(node), At::InProcess);
 
     let store = changed_store(&r);
-    let ran = agents.run("conv-4", run_job(&store)).await.unwrap();
+    let ran = agents.run("conv-4", run_job(&store), None).await.unwrap();
     let listing = agents.jobs_of(At::InProcess, 10).await.unwrap();
     assert_eq!(listing.jobs[0].id, ran.view.id);
     assert_eq!(
@@ -593,7 +593,7 @@ async fn a_cut_off_member_watches_and_switches_its_own_agent() {
 
     assert!(!agents.switch(At::InProcess, false).await.unwrap());
     assert_eq!(agents.listing().await.unwrap()[0].state, "disabled");
-    let refused = agents.run("conv-4", run_job(&store)).await;
+    let refused = agents.run("conv-4", run_job(&store), None).await;
     assert!(
         matches!(refused, Err(AgentError::NoAgent(_))),
         "{refused:?}"
@@ -640,11 +640,11 @@ async fn a_cut_off_member_reaches_only_its_own_agent() {
     let member = zend_member(0x2);
     let store = changed_store(&r);
     let none = Agents::new(member.clone(), None)
-        .run("conv-2", run_job(&store))
+        .run("conv-2", run_job(&store), None)
         .await;
     assert!(matches!(none, Err(AgentError::NoAgent(_))), "{none:?}");
     let own = Agents::new(member.clone(), Some(jobs_over(&r, false)))
-        .run("conv-2", run_job(&store))
+        .run("conv-2", run_job(&store), None)
         .await
         .unwrap();
     assert_eq!(own.at, At::InProcess);
