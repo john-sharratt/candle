@@ -104,7 +104,7 @@ impl Tool for HttpSessionOpen {
                             .unwrap(),
                     );
                 }
-                "api_key" | "bearer_token" => {
+                "api_key" | "bearer_token" | "http_bearer" => {
                     default_headers.insert(
                         reqwest::header::AUTHORIZATION,
                         reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cred.secret))

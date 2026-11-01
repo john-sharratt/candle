@@ -209,7 +209,8 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 - **The status page** is `/gateway` on the gateway, its data `/gateway/status.json`
   (both an admin's; the data also answers `Authorization: Bearer <key>` with the key
   `web --new-status-key web/secrets/status.key` writes, named as the `cluster:` block's
-  `status_key_file`): each app's mode,
+  `status_key_file`; the ops key is its admin on that and on every route of every site
+  the gateway serves): each app's mode,
   members, lag and claims, the build floor, and the gateway's peers.
 
 ### keep

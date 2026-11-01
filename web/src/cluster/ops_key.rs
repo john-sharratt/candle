@@ -1,9 +1,10 @@
 //! The ops key (`docs/replicated_substrate.md` §12): the admin an operator on
 //! the gateway's box acts as without a browser session — for the emergency
-//! that cannot wait for a sign-in. A request presenting it is the configured
-//! admin on every route of the gateway's own (its page, its commands, every
-//! upgrade command), and that admin is the identity the gateway names to the
-//! member a command goes to.
+//! that cannot wait for a sign-in, and for watching the cluster from a shell.
+//! A request presenting it is the configured admin on every route of the
+//! gateway's own (its page, its commands, every upgrade command) and on every
+//! route of the sites it serves, and that admin is the identity the gateway
+//! names to the member the request goes to.
 //!
 //! It is a file on the gateway's box, so the authority it carries is the
 //! authority to read that file: the same an operator already has over the
@@ -42,7 +43,9 @@ impl OpsKey {
                 email: admin.trim().into(),
                 name: "ops key".into(),
                 picture: String::new(),
-                exp: 0,
+                // Never expires: it lasts as long as the key file does, and a
+                // route that reads an identity's expiry must not find it past.
+                exp: u64::MAX,
             },
         }
     }
@@ -50,6 +53,11 @@ impl OpsKey {
     /// The admin, when `headers` present the key.
     pub fn caller(&self, headers: &HeaderMap) -> Option<Identity> {
         self.key.presented(headers).then(|| self.admin.clone())
+    }
+
+    /// Whether `headers` present the key.
+    pub fn presented(&self, headers: &HeaderMap) -> bool {
+        self.key.presented(headers)
     }
 }
 
@@ -72,7 +80,7 @@ mod tests {
     /// **The key is the configured admin, and nothing else is.** A request
     /// presenting it is that admin to the role table — the check every one of
     /// the gateway's own routes makes — and one that does not, or presents a
-    /// different key, is nobody.
+    /// different key, is nobody. Its identity never expires.
     #[test]
     fn the_key_acts_as_its_admin_and_nothing_else_does() {
         let ops = OpsKey::new(
@@ -89,7 +97,9 @@ mod tests {
             (id.provider.as_str(), id.email.as_str()),
             (OPS_PROVIDER, "op@tokera.com")
         );
+        assert_eq!(id.exp, u64::MAX);
         assert_eq!(roles.of(Some(&id)), Role::Admin);
+        assert!(ops.presented(&bearer(&"cd".repeat(32))));
         assert_eq!(ops.caller(&bearer(&"ab".repeat(32))), None);
         assert_eq!(ops.caller(&HeaderMap::new()), None);
     }

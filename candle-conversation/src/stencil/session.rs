@@ -12,6 +12,7 @@ use super::mask::AllowedSet;
 use super::terminator::{Feed, Terminator, TerminatorState};
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::{Spill, Step, TokenTrie, TrieNodeId};
+use super::value_rule::ValueState;
 use super::vocab::TokenId;
 
 /// What the scheduler should do next for a sequence in a session.
@@ -109,6 +110,9 @@ pub struct StencilSession {
     /// The bytes to commit in place of the token `observe` just saw, when it
     /// could not be committed as written — see [`Self::take_rewrite`].
     rewrite: Option<Vec<u8>>,
+    /// Where the current span's value stands against its rule; `None` when it
+    /// has none, or a token left the rule and the rest of the value is free.
+    value: Option<ValueState>,
 }
 
 impl StencilSession {
@@ -120,6 +124,7 @@ impl StencilSession {
             cursor: Cursor::At(root),
             pushback: None,
             rewrite: None,
+            value: None,
         }
     }
 
@@ -187,7 +192,9 @@ impl StencilSession {
     /// when a lookahead delimiter is waiting to be applied: each of those makes
     /// the next action something other than a free decode of the same span.
     pub fn mid_free_span(&self) -> bool {
-        self.pushback.is_none() && matches!(self.cursor, Cursor::InFreeText { .. })
+        self.pushback.is_none()
+            && self.value.is_none()
+            && matches!(self.cursor, Cursor::InFreeText { .. })
     }
 
     /// The branch the cursor is in, and whether it waits on the branch's first
@@ -222,7 +229,8 @@ impl StencilSession {
                     StencilAction::MaskedDecode(set)
                 }
                 StencilNode::FreeText(span) => {
-                    let action = Self::free_decode_action(span, 0);
+                    self.value = Self::value_start(span);
+                    let action = Self::span_action(span, 0, self.value);
                     self.cursor = Cursor::InFreeText {
                         node,
                         term: span.term.start(),
@@ -241,7 +249,7 @@ impl StencilSession {
             }
             Cursor::InFreeText { node, emitted, .. } => {
                 let span = self.free_span(node);
-                Self::free_decode_action(span, emitted)
+                Self::span_action(span, emitted, self.value)
             }
             Cursor::Bailing => {
                 self.cursor = Cursor::Done;
@@ -253,6 +261,24 @@ impl StencilSession {
                 }
             }
             Cursor::Done => StencilAction::Exit,
+        }
+    }
+
+    /// Where a value under `span`'s rule starts: past the opening quote when
+    /// the grammar wrote it.
+    fn value_start(span: &FreeTextSpan) -> Option<ValueState> {
+        span.rule.as_ref().map(|_| match span.term {
+            Terminator::JsonString => ValueState::Inside(0),
+            _ => ValueState::Open,
+        })
+    }
+
+    /// What the next token of `span` decodes under: the rule's mask while the
+    /// value stands on it, else free.
+    fn span_action(span: &FreeTextSpan, emitted: u32, value: Option<ValueState>) -> StencilAction {
+        match (&span.rule, value) {
+            (Some(rule), Some(state)) => StencilAction::MaskedDecode(rule.mask(state).clone()),
+            _ => Self::free_decode_action(span, emitted),
         }
     }
 
@@ -485,6 +511,7 @@ impl StencilSession {
                         });
                     }
                 }
+                self.value = Self::value_after(&span, self.value, bytes);
                 Ok(self.feed_span(node, &span, term, emitted, token, bytes))
             }
             other => {
@@ -492,6 +519,16 @@ impl StencilSession {
                 Err(WalkError::NotDecoding)
             }
         }
+    }
+
+    /// Where `value` stands after `bytes` of `span`.
+    fn value_after(
+        span: &FreeTextSpan,
+        value: Option<ValueState>,
+        bytes: &[u8],
+    ) -> Option<ValueState> {
+        let rule = span.rule.as_ref()?;
+        rule.advance(value?, bytes)
     }
 
     /// Feed `bytes` — `token`'s, or the part of it inside the span — to the
@@ -551,6 +588,7 @@ impl StencilSession {
     fn spill_into(&mut self, spill: Spill, token: TokenId, bytes: &[u8]) -> Observe {
         let span = self.free_span(spill.next).clone();
         let term = span.term.start();
+        self.value = Self::value_after(&span, Self::value_start(&span), &spill.rest);
         let observe = self.feed_span(spill.next, &span, term, 1, token, &spill.rest);
         if let Some(rest) = self.rewrite.take() {
             let arm = bytes.len().saturating_sub(spill.rest.len());

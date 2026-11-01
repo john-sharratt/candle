@@ -37,6 +37,7 @@ fn param(name: &str, ty: ParamType, required: bool) -> Param {
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
+        pattern: None,
     }
 }
 

@@ -1,0 +1,215 @@
+# What the grammar holds a tool call to, beyond the shape its schema gives.
+#
+# Each entry overlays one tool's `parameters` for the stencil alone: the prompt
+# and the calibration markers read `parameters` as it is in the tool's own file,
+# so a change here neither grows the prompt nor recalibrates a tool.
+#
+# The rule for an entry: it may only block what the tool's executor would refuse
+# anyway, from the same source of truth. Nothing here is per-tool code; it is
+# schema, compiled the way any schema is.
+#
+# A `pattern` is a whole-value regular expression over the value's raw bytes. A
+# value under one cannot hold a backslash (`stencil::value_rule`), so a field that
+# legitimately carries escapes gets none: `run_command`'s `args`, a file's text,
+# code, a SQL query, a regular expression. Case-insensitive input says so with
+# `(?i)`, as the executor folds it.
+
+code_run:
+  properties:
+    language:
+      pattern: '(?i)(javascript|js|node|nodejs|ecmascript)'
+
+code_session_open:
+  properties:
+    language:
+      pattern: '(?i)(javascript|js|node|nodejs|ecmascript)'
+
+run_command:
+  properties:
+    # One program, never a command line: no shell reads it. A repository script
+    # (`./gradlew`, `scripts/check`) is a path, so paths stay in.
+    program:
+      pattern: '[A-Za-z0-9_./+-]+'
+
+run_output:
+  properties:
+    job:
+      pattern: '[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]'
+
+git_commit:
+  properties:
+    branch:
+      pattern: '[^-\s~^:?*\["][^\s~^:?*\["]*'
+    expected_head:
+      pattern: '[0-9a-f]{40}([0-9a-f]{24})?'
+
+git_ref:
+  properties:
+    expected:
+      pattern: '[0-9a-f]{40}([0-9a-f]{24})?'
+    name:
+      pattern: '[^-\s~^:?*\["][^\s~^:?*\["]*'
+
+git_switch:
+  properties:
+    branch:
+      pattern: '[^-\s~^:?*\["][^\s~^:?*\["]*'
+
+git_fetch:
+  properties:
+    branch:
+      pattern: '[^-\s~^:?*\["][^\s~^:?*\["]*'
+
+git_show:
+  allOf:
+    - if: {properties: {what: {enum: [file, blame]}}}
+      then: {required: [path]}
+
+file_edit:
+  allOf:
+    - if: {properties: {do: {enum: [replace, insert_before, insert_after]}}}
+      then: {required: [text]}
+    - if: {properties: {do: {const: move}}}
+      then: {required: [dest, where]}
+  properties:
+    at:
+      pattern: '[A-Za-z0-9_-]{4}'
+    to:
+      pattern: '[A-Za-z0-9_-]{4}'
+    dest:
+      pattern: '[A-Za-z0-9_-]{4}'
+
+file_image:
+  definitions:
+    ImageOutput:
+      properties:
+        path:
+          pattern: '(?i)[^"]*\.(png|jpe?g|webp|ico)'
+        width:
+          maximum: 4096
+        height:
+          maximum: 4096
+
+credential_save:
+  allOf:
+    - if:
+        properties:
+          type:
+            enum:
+              - ssh_key
+              - ssh_password
+              - http_basic
+              - sql_password
+              - telnet_password
+              - remote_fs_password
+      then: {required: [username]}
+    - if: {properties: {type: {const: http_header}}}
+      then: {required: [header_name]}
+
+random:
+  properties:
+    kind:
+      enum: [integer, float, choice, shuffle, dice]
+  allOf:
+    - if: {properties: {kind: {enum: [choice, shuffle]}}}
+      then: {required: [choices]}
+
+totp:
+  properties:
+    algorithm:
+      enum: [sha1, sha256, sha512]
+    digits:
+      minimum: 6
+      maximum: 8
+    period_sec:
+      minimum: 1
+
+web_fetch:
+  properties:
+    url:
+      pattern: 'https?://[^\s"]+'
+
+remote_fs_session_open:
+  properties:
+    uri:
+      pattern: 'sftp://[^/\s"]+[^\s"]*'
+
+ip_scan:
+  properties:
+    subnet:
+      pattern: '[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}'
+
+tcp_session_send:
+  properties:
+    data_hex:
+      pattern: '([0-9a-fA-F]{2})*'
+
+tls_session_send:
+  properties:
+    data_hex:
+      pattern: '([0-9a-fA-F]{2})*'
+
+udp_session_send:
+  properties:
+    data_hex:
+      pattern: '([0-9a-fA-F]{2})*'
+
+aead_encrypt:
+  properties:
+    key_hex:
+      pattern: '[0-9a-fA-F]+'
+    nonce_hex:
+      pattern: '[0-9a-fA-F]+'
+
+aead_decrypt:
+  properties:
+    key_hex:
+      pattern: '[0-9a-fA-F]+'
+    nonce_hex:
+      pattern: '[0-9a-fA-F]+'
+    ciphertext_hex:
+      pattern: '[0-9a-fA-F]*'
+
+hkdf_expand_label:
+  properties:
+    prk_hex:
+      pattern: '[0-9a-fA-F]+'
+    context_hex:
+      pattern: '[0-9a-fA-F]*'
+
+signature_verify:
+  properties:
+    signature_hex:
+      pattern: '[0-9a-fA-F]+'
+
+bytes_pack:
+  properties:
+    format:
+      pattern: '[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*'
+
+bytes_unpack:
+  properties:
+    format:
+      pattern: '[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*'
+
+journal_move:
+  properties:
+    line:
+      pattern: '[^"]*\.yaml'
+
+dns_lookup:
+  properties:
+    host:
+      maxLength: 253
+
+ping_icmp:
+  properties:
+    host:
+      pattern: '[^-\s"][^\s"]*'
+      maxLength: 253
+
+trace_route:
+  properties:
+    host:
+      pattern: '[^-\s"][^\s"]*'
+      maxLength: 253

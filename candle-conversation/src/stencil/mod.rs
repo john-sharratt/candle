@@ -48,6 +48,7 @@ mod tool_call;
 mod tree;
 mod trie;
 mod trigger;
+mod value_rule;
 mod vocab;
 mod yaml;
 

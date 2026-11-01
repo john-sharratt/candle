@@ -3961,12 +3961,16 @@ The **ops key** is the same kind of secret with an admin's reach: written by
 `web --new-ops-key <path>` and named by the `cluster:` block's
 `ops_key: {file, admin}`, a caller presenting it is the admin `admin` names on every
 route of the gateway's own — the page, `drain-gateway`/`undrain-gateway`, every
-upgrade command (§12.4), and the member commands the page sends — and that admin is
-the identity the gateway names to the member a command goes to, so the role table
-must list it (`web/src/cluster/ops_key.rs`). It exists for the emergency that cannot
-wait for a sign-in: whoever can read the key file on the gateway's box — the same
-person who can replace the binaries keep runs there — rolls a bad build back from a
-shell:
+upgrade command (§12.4), and the member commands the page sends — and on every route
+of the sites it serves, and that admin is the identity the gateway names to the member
+a request goes to, so the role table must list it (`web/src/cluster/ops_key.rs`). A
+request a member forwarded up is never lifted by a key it carries: the member vouches
+for its callers by its own rules. Neither key leaves the gateway: a request presenting
+either, accepted or not, is forwarded without its `Authorization` header. The ops key
+exists for an operator watching the cluster from a shell — Pulse, the logs, every app's
+own routes, as an admin sees them — and for the emergency that cannot wait for a
+sign-in: whoever can read the key file on the gateway's box — the same person who can
+replace the binaries keep runs there — rolls a bad build back from a shell:
 
 ```text
 # the plan: which members install what, and the builds it rejects

@@ -69,6 +69,7 @@ tokenizers = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
+regex-automata = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # The operating system install's `MachineGuid`, half of a substrate node's fingerprint

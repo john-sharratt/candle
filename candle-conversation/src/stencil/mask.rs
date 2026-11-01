@@ -4,6 +4,8 @@
 //! Standalone, these operate on a `&mut [f32]` logits slice; the integration
 //! applies the same operations per-row in the wave batch.
 
+use std::sync::Arc;
+
 use super::vocab::TokenId;
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
@@ -11,14 +13,16 @@ const NEG_INF: f32 = f32::NEG_INFINITY;
 /// A sorted, deduped set of permitted tokens — a branch frontier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedSet {
-    tokens: Vec<TokenId>,
+    tokens: Arc<[TokenId]>,
 }
 
 impl AllowedSet {
     pub fn from_tokens(mut tokens: Vec<TokenId>) -> Self {
         tokens.sort_unstable();
         tokens.dedup();
-        AllowedSet { tokens }
+        AllowedSet {
+            tokens: tokens.into(),
+        }
     }
 
     pub fn tokens(&self) -> &[TokenId] {
