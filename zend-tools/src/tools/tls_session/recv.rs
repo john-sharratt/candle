@@ -51,7 +51,7 @@ impl Tool for TlsSessionRecv {
 
         // Bound the blocking read so a quiet peer returns `timed_out` instead of
         // hanging. The timeout is set on the TcpStream beneath the TLS layer.
-        let timeout = Duration::from_secs_f64(req.recv_wait.unwrap_or(30.0));
+        let timeout = Duration::from_secs_f64(req.recv_wait.unwrap_or(30.0).clamp(0.1, 60.0));
         entry.stream.get_ref().set_read_timeout(Some(timeout)).ok();
 
         let cap = req.recv_amt.unwrap_or(65536).min(65536);

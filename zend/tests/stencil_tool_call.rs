@@ -11,9 +11,9 @@ use std::sync::{Arc, OnceLock};
 
 use candle_conversation::stencil::{
     compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HfVocab,
-    NodeSpec, Observe, Param, ParamType, StencilAction, StencilNode, StencilSession, StencilTree,
-    Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, ValueRule, Vocab, WalkError,
-    MAX_TOOL_CALLS_PER_TURN,
+    NodeSpec, Observe, Param, ParamType, Pick, StencilAction, StencilNode, StencilSession,
+    StencilTree, Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, ValueRule, Vocab,
+    WalkError, MAX_TOOL_CALLS_PER_TURN,
 };
 use zend_vfs::{RepoSpec, Workspace};
 
@@ -605,7 +605,11 @@ fn held_value(pattern: &str) -> &'static str {
         r#"sftp://[^/\s"]+[^\s"]*"# => "sftp://a",
         r"[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}" => "10.0.0.0/8",
         "([0-9a-fA-F]{2})*" | "[0-9a-fA-F]*" => "",
-        "[0-9a-fA-F]+" => "0",
+        "[0-9a-fA-F]+" | "([0-9a-fA-F]{2})+" => "00",
+        "[0-9a-fA-F]{24}" => "000000000000000000000000",
+        "[0-9a-fA-F]{32}" => "00000000000000000000000000000000",
+        "[0-9a-fA-F]{64}" => "0000000000000000000000000000000000000000000000000000000000000000",
+        "[A-Za-z0-9+/]+={0,2}" | "[A-Za-z0-9_-]+" => "AA",
         "[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*" => "",
         r#"[^"]*\.yaml"# => "a.yaml",
         other => panic!("no minimal value for pattern {other:?}"),
@@ -615,7 +619,13 @@ fn held_value(pattern: &str) -> &'static str {
 /// `"key": value` for every field a minimal call writes, in the tree's order.
 fn required_fields(params: &[Param]) -> String {
     let (required, optional): (Vec<&Param>, Vec<&Param>) = params.iter().partition(|p| p.required);
-    written(&required, optional)
+    // A choice among the optionals is owed its first member, which comes after
+    // the required fields.
+    let mut fields = written(&required, optional.clone());
+    if let Some(member) = optional.iter().find(|p| p.pick != Pick::None) {
+        fields.push(member);
+    }
+    fields
         .iter()
         .map(|p| format!("\"{}\": {}", p.name, minimal_value(p)))
         .collect::<Vec<_>>()
@@ -631,11 +641,18 @@ fn written<'p>(required: &[&'p Param], optional: Vec<&'p Param>) -> Vec<&'p Para
     let mut out = Vec::new();
     for (at, &p) in required.iter().enumerate() {
         out.push(p);
-        let discriminates = !p.requires.is_empty() && !p.nullable;
+        let discriminates = (!p.requires.is_empty() || !p.shapes.is_empty()) && !p.nullable;
         let first = p.enum_values.as_ref().and_then(|v| v.first());
         let Some(first) = first.filter(|_| discriminates) else {
             continue;
         };
+        // What the value brings stands in for its sibling, after the rest.
+        let brought: Vec<&Param> = p
+            .shapes
+            .iter()
+            .filter(|(value, _)| value == first)
+            .flat_map(|(_, fields)| fields)
+            .collect();
         let needs: Vec<&str> = p
             .requires
             .iter()
@@ -645,8 +662,14 @@ fn written<'p>(required: &[&'p Param], optional: Vec<&'p Param>) -> Vec<&'p Para
         let (promoted, still): (Vec<&Param>, Vec<&Param>) = optional
             .into_iter()
             .partition(|o| needs.contains(&o.name.as_str()));
-        let mut rest: Vec<&Param> = required[at + 1..].to_vec();
+        let brings = |r: &&Param| brought.iter().any(|b| b.name == r.name);
+        let mut rest: Vec<&Param> = required[at + 1..]
+            .iter()
+            .copied()
+            .filter(|r| !brings(r))
+            .collect();
         rest.extend(promoted);
+        rest.extend(brought.iter().copied());
         out.extend(written(&rest, still));
         return out;
     }
@@ -815,13 +838,8 @@ fn hallucinated_parameter_is_masked() {
     target.push_str("\", \"arguments\": {");
     // Required fields must come first (forced); include them minimally so we
     // reach the optional gate, then inject the bogus key.
-    let req: Vec<String> = spec
-        .params
-        .iter()
-        .filter(|p| p.required)
-        .map(|p| format!("\"{}\": {}", p.name, minimal_value(p)))
-        .collect();
-    target.push_str(&req.join(", "));
+    let req = required_fields(&spec.params);
+    target.push_str(&req);
     if !req.is_empty() {
         target.push_str(", ");
     }

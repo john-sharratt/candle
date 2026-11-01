@@ -50,6 +50,7 @@ fn body_tree(schema: &Value, v: &TestVocab) -> Arc<StencilTree> {
             max_tokens: None,
             requires: Vec::new(),
             shapes: Vec::new(),
+            pick: Default::default(),
             pattern: None,
         }],
     };

@@ -69,7 +69,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "bytes_transcode", "arguments": {"data": "89504e470d0a1a0a0000000d49484452", "from": "hex", "to": "base64"}}
+  <|projection|>{"name": "bytes_transcode", "arguments": {"from": "hex", "to": "base64", "data": "89504e470d0a1a0a0000000d49484452"}}
   </tool_call><|projection|>
 - |-
   decode the base64 value SGVsbG8sIFdvcmxkIQ== to a utf8 string<|im_end|>
@@ -79,7 +79,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "bytes_transcode", "arguments": {"data": "SGVsbG8sIFdvcmxkIQ==", "from": "base64", "to": "utf8"}}
+  <|projection|>{"name": "bytes_transcode", "arguments": {"from": "base64", "to": "utf8", "data": "SGVsbG8sIFdvcmxkIQ=="}}
   </tool_call><|projection|>
 - |-
   re-encode the utf8 string 'the quick brown fox' to base64url<|im_end|>
@@ -89,5 +89,5 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "bytes_transcode", "arguments": {"data": "the quick brown fox", "from": "utf8", "to": "base64url"}}
+  <|projection|>{"name": "bytes_transcode", "arguments": {"from": "utf8", "to": "base64url", "data": "the quick brown fox"}}
   </tool_call><|projection|>

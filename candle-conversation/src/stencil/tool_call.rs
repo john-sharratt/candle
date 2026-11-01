@@ -70,6 +70,18 @@ pub enum ParamType {
     Object,
 }
 
+/// What a field owes a choice among an object's optional fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pick {
+    #[default]
+    None,
+    /// `anyOf` of `required`: this or another member.
+    AtLeastOne,
+    /// `oneOf` of `required`: this or another member, and no second.
+    ExactlyOne,
+}
+
 /// One tool parameter — or, nested, one field of an object value or the schema
 /// every element of an array value follows.
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +144,11 @@ pub struct Param {
     /// number of distinct shapes and not the number of values.
     #[serde(default)]
     pub shapes: Vec<(String, Vec<Param>)>,
+    /// An optional field that is one of a choice the object must make: the
+    /// schema's `anyOf` or `oneOf` of `required`. The object cannot close until
+    /// a member of the choice is written.
+    #[serde(default)]
+    pub pick: Pick,
     /// `string`: the schema's `pattern`, a whole-value regular expression the
     /// value is held to token by token ([`super::value_rule::ValueRule`]).
     #[serde(default)]
@@ -313,6 +330,7 @@ fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> 
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
+        pick: Pick::None,
         pattern: None,
     })
 }
@@ -348,7 +366,96 @@ fn fields_of(schema: &Value, root: &Value) -> Vec<Param> {
             p.requires.push((value, fields));
         }
     }
+    for (field, value, brought) in value_shapes(schema, root) {
+        if let Some(p) = params.iter_mut().find(|p| p.name == field) {
+            p.shapes.push((value, brought));
+        }
+    }
+    for (rule, pick) in [("anyOf", Pick::AtLeastOne), ("oneOf", Pick::ExactlyOne)] {
+        for member in required_choice(schema, rule) {
+            if let Some(p) = params.iter_mut().find(|p| p.name == member && !p.required) {
+                p.pick = pick;
+                p.nullable = false;
+            }
+        }
+    }
     params
+}
+
+/// The fields an object's `anyOf` or `oneOf` of `required` chooses among: the
+/// field each single-`required` member names. Empty when it is any other kind
+/// of union, which [`param_of`] reads.
+fn required_choice<'a>(schema: &'a Value, rule: &str) -> Vec<&'a str> {
+    let Some(members) = schema.get(rule).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let named: Option<Vec<&str>> = members
+        .iter()
+        .map(|m| match m.get("required")?.as_array()?.as_slice() {
+            [only] => only.as_str(),
+            _ => None,
+        })
+        .collect();
+    named.unwrap_or_default()
+}
+
+/// The field one `if` tests, and the values it names: the `if` of
+/// [`value_requirements`] and [`value_shapes`]. `None` when it tests more than
+/// one field, or anything but values.
+fn tested_values(rule: &Value) -> Option<(&String, Vec<&str>)> {
+    let when = rule.pointer("/if/properties")?.as_object()?;
+    let mut tests = when.iter();
+    let (Some((field, test)), None) = (tests.next(), tests.next()) else {
+        return None;
+    };
+    let values = match (test.get("const"), test.get("enum")) {
+        (Some(one), _) => one.as_str().into_iter().collect(),
+        (None, Some(Value::Array(many))) => many.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    Some((field, values))
+}
+
+/// What each value of a field makes of a sibling, from an `allOf` of
+/// `{"if": {…}, "then": {"properties": {…}}}`, as `(F, V, fields)`: each field
+/// the sibling's own schema with the rule laid over it, so a `pattern` for one
+/// value leaves the type, and the other values, alone.
+///
+/// `bytes_transcode`'s `data` is hex or base64 by what `from` says. Its field
+/// comes after the value that decides it, or the rule cannot be applied.
+fn value_shapes(schema: &Value, root: &Value) -> Vec<(String, String, Vec<Param>)> {
+    let mut out = Vec::new();
+    let Some(rules) = schema.get("allOf").and_then(Value::as_array) else {
+        return out;
+    };
+    for rule in rules {
+        let Some(then) = rule.pointer("/then/properties").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some((field, values)) = tested_values(rule) else {
+            continue;
+        };
+        let brought: Vec<Param> = then
+            .iter()
+            .map(|(name, over)| {
+                let mut merged = schema
+                    .pointer(&format!("/properties/{name}"))
+                    .map_or_else(|| Value::Object(Default::default()), |s| s.clone());
+                if let (Value::Object(base), Value::Object(over)) = (&mut merged, over) {
+                    base.extend(over.clone());
+                }
+                Param {
+                    name: name.clone(),
+                    required: true,
+                    ..param_of(&merged, root)
+                }
+            })
+            .collect();
+        for value in values {
+            out.push((field.clone(), value.to_string(), brought.clone()));
+        }
+    }
+    out
 }
 
 /// What each value of a field requires, from an object schema's `allOf` of
@@ -369,21 +476,12 @@ fn value_requirements(schema: &Value) -> Vec<(String, String, Vec<String>)> {
         return out;
     };
     for rule in rules {
-        let (Some(when), Some(then)) = (
-            rule.pointer("/if/properties").and_then(Value::as_object),
-            rule.pointer("/then/required").and_then(Value::as_array),
-        ) else {
+        let Some(then) = rule.pointer("/then/required").and_then(Value::as_array) else {
             continue;
         };
         // One field tested, or the rule is not about one field's value.
-        let mut tests = when.iter();
-        let (Some((field, test)), None) = (tests.next(), tests.next()) else {
+        let Some((field, values)) = tested_values(rule) else {
             continue;
-        };
-        let values: Vec<&str> = match (test.get("const"), test.get("enum")) {
-            (Some(one), _) => one.as_str().into_iter().collect(),
-            (None, Some(Value::Array(many))) => many.iter().filter_map(Value::as_str).collect(),
-            _ => continue,
         };
         let fields: Vec<String> = then
             .iter()
@@ -492,6 +590,7 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         },
         requires: Vec::new(),
         shapes: Vec::new(),
+        pick: Pick::None,
         pattern,
     }
 }
@@ -1204,12 +1303,24 @@ struct ToolTreeBuilder<'a> {
 /// different optional lists.
 #[derive(Default)]
 struct FieldMemo {
-    /// `(optional index, emitted_any) -> gate entry`.
-    gates: HashMap<(usize, bool), SpecId>,
-    /// `optional index -> (lead-in, value entry)`. Every gate that offers an
-    /// optional leads its value to the same successor gate, so the value is
-    /// the same sub-tree whichever gate it was reached from.
-    values: HashMap<usize, (String, SpecId)>,
+    /// `(optional index, emitted_any, owed) -> gate entry`.
+    gates: HashMap<(usize, bool, Owed), SpecId>,
+    /// `(optional index, owed before it) -> (lead-in, value entry)`. Every gate
+    /// that offers an optional from the same standing leads its value to the
+    /// same successor gate, so the value is the same sub-tree whichever gate it
+    /// was reached from.
+    values: HashMap<(usize, Owed), (String, SpecId)>,
+}
+
+/// Where an object stands on the choice among its optionals ([`Pick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Owed {
+    /// No choice, or one that is made and allows more.
+    Nothing,
+    /// No member written yet: the close is withheld.
+    AMember,
+    /// An `ExactlyOne` member is written: no other is offered.
+    NoMore,
 }
 
 /// Whether the grammar can begin a value of this schema — offer every way it
@@ -1295,7 +1406,12 @@ impl<'a> ToolTreeBuilder<'a> {
         let Some((&p, rest)) = required.split_first() else {
             // Optional gates start with emitted_any = (a required field precedes them).
             let mut memo = FieldMemo::default();
-            return self.opt_gates(optional, 0, !first, close, end, &mut memo);
+            let owed = if optional.iter().any(|p| p.pick != Pick::None) {
+                Owed::AMember
+            } else {
+                Owed::Nothing
+            };
+            return self.opt_gates(optional, 0, !first, owed, close, end, &mut memo);
         };
         let decides = !p.requires.is_empty() || !p.shapes.is_empty();
         if let (true, Some(values), false) = (decides, &p.enum_values, p.nullable) {
@@ -1438,17 +1554,24 @@ impl<'a> ToolTreeBuilder<'a> {
         }
     }
 
-    /// The gate over optionals `idx..`, given whether a field was already emitted.
+    /// The gate over optionals `idx..`, given whether a field was already
+    /// emitted and where the object stands on its choice.
+    ///
+    /// **A gate that owes a member can always pay it.** While one is owed,
+    /// nothing past the last member is offered, so a walk cannot step over the
+    /// choice and arrive at a gate with no way on.
+    #[allow(clippy::too_many_arguments)]
     fn opt_gates(
         &mut self,
         opts: &[&Param],
         idx: usize,
         emitted_any: bool,
+        owed: Owed,
         close: &str,
         end: SpecId,
         memo: &mut FieldMemo,
     ) -> Result<SpecId, BuildError> {
-        if let Some(&id) = memo.gates.get(&(idx, emitted_any)) {
+        if let Some(&id) = memo.gates.get(&(idx, emitted_any, owed)) {
             return Ok(id);
         }
         // No more optionals: emit the close and finish.
@@ -1457,28 +1580,48 @@ impl<'a> ToolTreeBuilder<'a> {
                 text: close.to_string(),
                 next: end,
             });
-            memo.gates.insert((idx, emitted_any), id);
+            memo.gates.insert((idx, emitted_any, owed), id);
             return Ok(id);
         }
+        let last_member = opts.iter().rposition(|p| p.pick != Pick::None);
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(opts.len() - idx + 1);
         for (j, p) in opts.iter().enumerate().skip(idx) {
-            let (leadin, value) = match memo.values.get(&j) {
+            let offered = match owed {
+                Owed::AMember => last_member.is_some_and(|last| j <= last),
+                Owed::NoMore => p.pick == Pick::None,
+                Owed::Nothing => true,
+            };
+            if !offered {
+                continue;
+            }
+            let (leadin, value) = match memo.values.get(&(j, owed)) {
                 Some(built) => built.clone(),
                 None => {
                     // Include optional j: a field is emitted, so everything
                     // after has emitted_any = true.
-                    let after = self.opt_gates(opts, j + 1, true, close, end, memo)?;
+                    let settled = match (p.pick, owed) {
+                        (Pick::ExactlyOne, _) => Owed::NoMore,
+                        (Pick::AtLeastOne, _) => Owed::Nothing,
+                        (Pick::None, standing) => standing,
+                    };
+                    let after = self.opt_gates(opts, j + 1, true, settled, close, end, memo)?;
                     let built = self.build_value(p, after)?;
-                    memo.values.insert(j, built.clone());
+                    memo.values.insert((j, owed), built.clone());
                     built
                 }
             };
             arms.push((self.key(p, !emitted_any, &leadin), value));
         }
-        // The "stop" arm: close the object.
-        arms.push((close.to_string(), end));
-        let id = self.spec.push(NodeSpec::Branch { arms });
-        memo.gates.insert((idx, emitted_any), id);
+        // The "stop" arm: close the object, once it may.
+        if owed != Owed::AMember {
+            arms.push((close.to_string(), end));
+        }
+        let id = match <[(String, SpecId); 1]>::try_from(arms) {
+            // One way on is no choice.
+            Ok([(text, next)]) => self.spec.push(NodeSpec::Static { text, next }),
+            Err(arms) => self.spec.push(NodeSpec::Branch { arms }),
+        };
+        memo.gates.insert((idx, emitted_any, owed), id);
         Ok(id)
     }
 
@@ -2953,6 +3096,110 @@ mod tests {
             .params
             .iter()
             .all(|p| p.name == "from" || p.requires.is_empty()));
+    }
+
+    /// **A value can hold a sibling to its own rule**: `then.properties` keeps
+    /// the sibling's type and takes the rule's pattern, for that value alone.
+    #[test]
+    fn then_properties_bring_a_field_shaped_by_the_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string", "enum": ["hex", "utf8"]},
+                "data": {"type": "string"}
+            },
+            "required": ["from", "data"],
+            "allOf": [{
+                "if": {"properties": {"from": {"const": "hex"}}},
+                "then": {"properties": {"data": {"pattern": "[0-9a-f]+"}}}
+            }]
+        });
+        let tool = ToolSpec::from_json_schema("t", &schema);
+        let from = tool.params.iter().find(|p| p.name == "from").unwrap();
+        assert_eq!(from.shapes.len(), 1);
+        let (value, fields) = &from.shapes[0];
+        assert_eq!(value, "hex");
+        assert_eq!(fields[0].name, "data");
+        assert_eq!(fields[0].ty, ParamType::String);
+        assert_eq!(fields[0].pattern.as_deref(), Some("[0-9a-f]+"));
+        let plain = tool.params.iter().find(|p| p.name == "data").unwrap();
+        assert_eq!(plain.pattern, None, "the other values keep it free");
+        assert!(compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).is_ok());
+    }
+
+    fn picked(rule: &str) -> ToolSpec {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "a": {"type": ["string", "null"]},
+                "b": {"type": ["string", "null"]},
+                "c": {"type": "boolean"}
+            },
+            "required": ["id"]
+        });
+        schema[rule] = json!([{"required": ["a"]}, {"required": ["b"]}]);
+        ToolSpec::from_json_schema("t", &schema)
+    }
+
+    /// **`anyOf` of `required` is at least one, `oneOf` exactly one**, and each
+    /// member stops being nullable: `null` would satisfy it in name only.
+    #[test]
+    fn a_required_choice_is_read_onto_its_members() {
+        for (rule, pick) in [("anyOf", Pick::AtLeastOne), ("oneOf", Pick::ExactlyOne)] {
+            let tool = picked(rule);
+            let of = |n: &str| tool.params.iter().find(|p| p.name == n).unwrap();
+            assert_eq!(of("a").pick, pick);
+            assert_eq!(of("b").pick, pick);
+            assert!(!of("a").nullable);
+            assert_eq!(of("c").pick, Pick::None);
+            assert_eq!(of("id").pick, Pick::None);
+        }
+    }
+
+    /// **The close is not offered until a member is written.** After `id` the
+    /// only ways on are the members; after a member the call may close, and
+    /// under `oneOf` the other member is gone.
+    #[test]
+    fn a_required_choice_withholds_the_close() {
+        let closes = "}}\n</tool_call>";
+        for (rule, other_after_a) in [("anyOf", true), ("oneOf", false)] {
+            let spec = compile_tool_call_tree(&[picked(rule)], &ToolCallEnvelope::qwen3()).unwrap();
+            let gate_with = |wanted: &str| -> Vec<Vec<String>> {
+                spec.nodes
+                    .iter()
+                    .filter_map(|n| match n {
+                        NodeSpec::Branch { arms } => {
+                            let texts: Vec<String> = arms.iter().map(|(t, _)| t.clone()).collect();
+                            texts.iter().any(|t| t.contains(wanted)).then_some(texts)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let first: Vec<Vec<String>> = gate_with("\"a\"");
+            assert!(
+                first
+                    .iter()
+                    .any(|g| g.iter().all(|t| !t.starts_with(closes))),
+                "{rule}: a gate offers the member and no close: {first:?}"
+            );
+            let after_a = gate_with("\"c\"")
+                .into_iter()
+                .filter(|g| g.iter().any(|t| t.starts_with(closes)))
+                .collect::<Vec<_>>();
+            assert!(
+                !after_a.is_empty(),
+                "{rule}: once satisfied the call may close"
+            );
+            assert_eq!(
+                after_a
+                    .iter()
+                    .any(|g| g.iter().any(|t| t.contains("\"b\""))),
+                other_after_a,
+                "{rule}: {after_a:?}"
+            );
+        }
     }
 
     /// **A value cannot close the call before the fields it requires**: each
