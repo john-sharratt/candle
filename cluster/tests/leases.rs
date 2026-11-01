@@ -120,6 +120,32 @@ async fn a_world_lease_has_one_holder_and_moves_when_handed_back() {
     assert!(rb.holds(&key));
 }
 
+/// **A member has applied every record it wrote itself, a purge's gaps
+/// included.** A release names its holder's own `oseq`; the same member,
+/// restarted after draining for an install, is the next holder and waits for
+/// that `oseq` of its own. Read off the applied set's unbroken run, its own
+/// origin stopped at the first gap a purge left, below the release, and the
+/// world it had run waited for it for ever — 2026-11-01, WhiteWorld's npcd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_has_applied_its_own_records_past_a_purges_gap() {
+    let gw = gateway("gw");
+    let a = member(&[&gw], 1, store(1), MemoryVotes::new(), true);
+    until("ready", WITHIN, || a.ready()).await;
+    for i in 0..3u8 {
+        a.store.write(&[i], b"v");
+    }
+    a.store.purge_own(2);
+    assert_eq!(a.store.applied().through(1), 1, "the run stops at the gap");
+    let ra = a.app.replicator().unwrap().clone();
+    let through = ra.own_through();
+    assert_eq!(through, 3);
+    assert_eq!(
+        ra.applied_through(1),
+        through,
+        "its own release is already applied here"
+    );
+}
+
 /// **A member arriving in a group its substrate still counts as one cannot
 /// take a lease the first member holds**: the quorum counts every ready member
 /// it sees, so before `max_members` has risen it already needs the holder's

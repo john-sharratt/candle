@@ -9,7 +9,7 @@
 //! origin)`, the order §6.2 defines, so the same records give the same values
 //! in any arrival order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -91,6 +91,9 @@ struct Inner {
     records: BTreeMap<(u64, u64), Vec<u8>>,
     /// Other origins' records applied here or known gone.
     applied: AppliedSet,
+    /// This member's own `oseq`s a purge took (§7.8): gaps in what it
+    /// reports as written, as the substrate's own written set has them.
+    own_purged: BTreeSet<u64>,
     next_oseq: u64,
     /// The first `oseq` written cut off, while no rejoin has fixed it.
     detached_from: Option<u64>,
@@ -338,6 +341,14 @@ impl MemoryStore {
         self.inner().records.remove(&(origin, oseq));
     }
 
+    /// A purge took this member's own record `oseq` (§7.8): gone, and a gap
+    /// in the applied set's coverage of its own origin.
+    pub fn purge_own(&self, oseq: u64) {
+        let mut s = self.inner();
+        s.records.remove(&(self.node, oseq));
+        s.own_purged.insert(oseq);
+    }
+
     /// Records held.
     pub fn len(&self) -> usize {
         self.inner().records.len()
@@ -382,8 +393,15 @@ impl Store for MemoryStore {
         let s = self.inner();
         let mut set = s.applied.clone();
         let own = s.own_through();
-        if own > 0 {
-            set.insert_range(self.node, 1, own);
+        let mut from = 1;
+        for &gap in s.own_purged.range(..=own) {
+            if gap > from {
+                set.insert_range(self.node, from, gap - 1);
+            }
+            from = gap + 1;
+        }
+        if own >= from {
+            set.insert_range(self.node, from, own);
         }
         set
     }

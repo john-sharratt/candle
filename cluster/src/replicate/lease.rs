@@ -135,8 +135,15 @@ impl Replicator {
             .holds(key, now)
     }
 
-    /// Through which `oseq` this member has applied `origin`'s records.
+    /// Through which `oseq` this member has applied `origin`'s records. Of its
+    /// own, every one it has written: they are on its own disk, gaps a purge
+    /// left included (§7.8). The applied set's unbroken run stops at the first
+    /// such gap, so a member waiting on a release it made itself — drained for
+    /// an install, restarted under the same node — waited for ever there.
     pub fn applied_through(&self, origin: u64) -> u64 {
+        if origin == self.node() {
+            return self.own_through();
+        }
         self.store.applied().through(origin)
     }
 

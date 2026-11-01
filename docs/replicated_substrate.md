@@ -1571,6 +1571,14 @@ its own `oseq` at release. A gateway sends the key's next request only to a memb
 already holds those records (§2.2 there), and the member that releases forgets what it
 kept of the key in memory.
 
+**A member holds every record it wrote itself.** The next holder may be the member
+that released — drained for an install and back under the same node — and its wait for
+`through` is then on its own origin. That is answered from what it has written
+(`Replicator::applied_through`), never from the applied set's unbroken run, which stops
+at the first gap a purge left (§7.8) and would hold the wait below `through` for ever:
+on 2026-11-01 WhiteWorld's npcd, the only one in its group, came back from an install
+and ran no world for as long as it was up.
+
 A holder that left every cluster loses it without an `UNCLAIM`:
 
 - "Every cluster" is as the member taking over sees it, through the gateways it is
