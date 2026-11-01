@@ -194,7 +194,7 @@ async fn tail(State(api): State<Api>, Path(id): Path<String>, Query(q): Query<Of
     }
 }
 
-/// `POST /v1/bridge` — a device-bridge job. The agent runs [`house_bridge`] for
+/// `POST /v1/bridge` — a device-bridge job. The agent runs [`effector_bridge`] for
 /// it, so the network commands happen on this machine inside the house, and
 /// hands back the bridge's own line. A device refusing is `ok: false`, a
 /// result the caller reads — not a failed job; only a switched-off agent is a
@@ -203,7 +203,7 @@ async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Respons
     if !api.jobs.enabled() {
         return failed(JobError::Disabled);
     }
-    let nets = house_bridge::nets();
+    let nets = effector_bridge::nets();
     let worked = match call {
         BridgeCall::Work {
             profile,
@@ -211,8 +211,8 @@ async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Respons
             address,
             action,
             args,
-        } => house_bridge::work(&profile, &name, &address, &action, &args, &nets).await,
-        BridgeCall::Wake { name, mac } => house_bridge::wake(&name, &mac, &nets),
+        } => effector_bridge::work(&profile, &name, &address, &action, &args, &nets).await,
+        BridgeCall::Wake { name, mac } => effector_bridge::wake(&name, &mac, &nets),
     };
     let bridged = match worked {
         Ok(line) => Bridged { ok: true, line },

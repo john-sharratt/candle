@@ -337,7 +337,7 @@ pub struct Switching {
 }
 
 /// `POST /v1/bridge`: a member's device-bridge job (`docs/zen_moon_mind.md`
-/// §15). The agent runs `house_bridge` for it — the device I/O happening on a
+/// §15). The agent runs `effector_bridge` for it — the device I/O happening on a
 /// machine inside the house — the way it runs the git jobs.
 ///
 /// - **`work`** — do `action` (`status`, `play`, `volume`, …) on the device of

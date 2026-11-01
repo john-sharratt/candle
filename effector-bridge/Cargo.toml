@@ -1,5 +1,5 @@
 [package]
-name = "house-bridge"
+name = "effector-bridge"
 version = "0.1.0"
 edition = "2021"
 description = "The house's device bridges: protocol libraries, device profiles, and the one abstraction that works a device by its profile — run on an in-network agent (docs/zen_moon_mind.md §15)"
@@ -17,6 +17,11 @@ serde_json = { workspace = true }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio      = { version = "1", features = ["net", "io-util", "time", "rt"] }
 if-addrs   = "0.15"
+# Google Cast's control channel (CASTv2) is a protobuf framed over TLS on port
+# 8009; the device presents a self-signed certificate, so the connector accepts
+# it. The CastMessage protobuf is small and hand-encoded in `proto::cast`.
+native-tls       = "0.2"
+tokio-native-tls = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
