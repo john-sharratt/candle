@@ -635,6 +635,169 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
     );
 }
 
+/// **Two characters' DM is a backstage thread their owner reads**: under
+/// `#backstage`, which everyone may see and nobody may write in or its
+/// threads, a thread named for the two with their owner added once; each
+/// character's lines posted by the webhook — Zen's too, though it has a bot
+/// — and anything written there dropped. A world whose server does not
+/// mirror them opens none.
+#[tokio::test]
+async fn two_characters_dm_is_a_backstage_thread_their_owner_reads() {
+    use crate::discord::world::members::{HISTORY, LISTENER, SEND, SEND_IN_THREADS, VIEW};
+
+    let d = daemon(vec![Script::Serve]).await;
+    d.link(OWNER, WREN).await;
+    d.wick();
+    d.hosted.with_sim(|s| {
+        s.threads.reach("Zen", "Wick");
+    });
+    let dm = d.hosted.sim(|s| {
+        s.threads
+            .direct_between("Zen", "Wick")
+            .map(|t| t.id.clone())
+            .unwrap()
+    });
+    d.mirroring().await;
+    d.until("backstage opened", |d| {
+        d.hosted.mirror(|m| m.thread(&dm)).is_some()
+    })
+    .await;
+
+    let parent = d.hosted.mirror(|m| m.parent("backstage")).unwrap();
+    assert_eq!(
+        d.discord.overwrites_of(parent),
+        [
+            (BOT_USER, 1, LISTENER, 0),
+            (GUILD, 0, VIEW | HISTORY, SEND | SEND_IN_THREADS),
+        ]
+    );
+    let mirrored = d.hosted.mirror(|m| m.thread(&dm)).unwrap();
+    assert_eq!(
+        (mirrored.kind, mirrored.parent),
+        (Kind::Backstage, Some(parent))
+    );
+    let added: Vec<String> = d
+        .discord
+        .seen()
+        .into_iter()
+        .filter(|s| s.path.contains("/thread-members/"))
+        .map(|s| s.path)
+        .collect();
+    assert_eq!(
+        added,
+        [format!(
+            "/channels/{}/thread-members/{WREN}",
+            mirrored.channel_id
+        )]
+    );
+
+    d.hosted
+        .with_sim(|s| s.threads.send("Zen", "Wick", "report at dusk").unwrap());
+    d.until("posted backstage", |d| {
+        d.hooked()
+            .contains(&("Zen".to_string(), "report at dusk".to_string()))
+    })
+    .await;
+    d.gateway.dispatch(posted_in(
+        mirrored.channel_id,
+        later(),
+        WREN,
+        "a word from me",
+    ));
+    d.settle().await;
+    assert_eq!(d.said_on(&dm).len(), 1, "a word was written backstage");
+
+    let quiet = daemon(vec![Script::Serve]).await;
+    quiet.link(OWNER, WREN).await;
+    quiet.wick();
+    quiet.hosted.with_sim(|s| {
+        s.threads.reach("Zen", "Wick");
+    });
+    quiet.serve_world();
+    quiet.hosted.with_mirror(|m| {
+        let mut g = m.guild().cloned().unwrap();
+        g.backstage = false;
+        m.set_guild(Some(g));
+    });
+    quiet.online().await;
+    quiet.settle().await;
+    assert!(quiet.hosted.mirror(|m| m.parent("backstage")).is_none());
+}
+
+/// **The cursors go with the world** (§5.4): the member that held it wrote
+/// them with the world's records, and the member that takes it next — the
+/// records applied, its own listener online — posts on from where they
+/// stopped, and what the first posted is not posted again.
+#[tokio::test]
+async fn the_cursors_carry_over_to_the_next_holder() {
+    let first = daemon(vec![Script::Serve]).await;
+    first.mirroring().await;
+    first.on_channel("Wick", "posted by the first holder");
+    first.until("posted", |d| d.hooked().len() == 1).await;
+    first.rt.beat(&first.hosted);
+    let records = world_store::read(&first.a.npcs.substrate(), WORLD);
+    first.a.bots.close_all(&first.a).await;
+    let thread = first.the_channel();
+    let through = first
+        .hosted
+        .mirror(|m| m.thread(&thread))
+        .unwrap()
+        .mirrored_through;
+
+    let next = daemon(vec![Script::Serve]).await;
+    crate::world_state::apply(&next.hosted, &records);
+    assert_eq!(
+        next.hosted
+            .mirror(|m| m.thread(&thread))
+            .map(|m| m.mirrored_through),
+        Some(through),
+        "the cursor did not come with the records"
+    );
+    // The listener is the next member's own character there.
+    next.hosted.with_mirror(|m| {
+        let mut g = m.guild().cloned().unwrap();
+        g.listener = next.zen;
+        m.set_guild(Some(g));
+    });
+    next.online().await;
+    next.on_channel("Wick", "posted by the next");
+    next.until("posted on", |d| !d.hooked().is_empty()).await;
+    next.settle().await;
+    assert_eq!(
+        next.hooked(),
+        [("Wick".to_string(), "posted by the next".to_string())],
+        "the next holder posted what the first had"
+    );
+}
+
+/// **A bot shows typing while a person's DM waits on it**, and stops once
+/// the character answers.
+#[tokio::test]
+async fn a_bot_shows_typing_while_a_dm_waits_on_it() {
+    let d = daemon(vec![Script::Serve]).await;
+    d.link(OWNER, WREN).await;
+    d.online().await;
+    let typing = |d: &Daemon| {
+        d.discord
+            .seen()
+            .iter()
+            .filter(|s| s.method == "POST" && s.path == format!("/channels/{CHANNEL}/typing"))
+            .count()
+    };
+    d.gateway.dispatch(dm(later(), WREN, "are you there?"));
+    d.until("typing", |d| typing(d) == 1).await;
+    d.settle().await;
+    assert_eq!(typing(&d), 1, "typing was asked again inside eight seconds");
+
+    d.zen_says("I am here");
+    d.until("answered", |d| {
+        d.posts().iter().any(|(_, text)| text == "I am here")
+    })
+    .await;
+    d.settle().await;
+    assert_eq!(typing(&d), 1, "typing went on after the answer");
+}
+
 /// `method` on `/v1/world/<WORLD>/discord` as `sub`, through the engine's
 /// routes and their role check; the status and the body.
 async fn world_route(d: &Daemon, method: &str, sub: &str, body: Option<Value>) -> (u16, Value) {

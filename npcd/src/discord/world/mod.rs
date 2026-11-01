@@ -40,12 +40,14 @@
 //! | [`members`] | who a thread's members are on Discord, and what a channel lets them do |
 //! | [`groups`] | the named groups as channels only their members see |
 //! | [`dms`] | a person's DM with a character without a bot, as a private thread |
+//! | [`backstage`] | a DM between two characters, read-only for their owners |
 //! | [`reconcile`] | the five-minute pass: channels, members, gaps, bots |
 //! | [`speaker`] | who posts a message, and as whom |
 //! | [`outbound`] | what is said on a mirrored thread, posted to its channel |
 //! | [`inbound`] | a mirrored channel's message, heard in the world |
 //! | [`gap`] | what was written while no member ran the listener |
 
+pub mod backstage;
 pub mod channels;
 pub mod dms;
 pub mod gap;

@@ -4,7 +4,9 @@
 //! - **Channels.** Every named group has its channel and every channel's
 //!   overwrites are its thread's members; a group nobody remains on is
 //!   archived ([`super::groups`]). Every person's DM with a character
-//!   without a bot has its private thread ([`super::dms`]).
+//!   without a bot has its private thread ([`super::dms`]), and every DM
+//!   between two characters its backstage thread, in a world whose server
+//!   mirrors them ([`super::backstage`]).
 //! - **Gaps.** Every mirrored channel is read after its `last_seen_discord`
 //!   ([`super::gap`]) — what arrived while no member held the world.
 //! - **Bots.** Every character of the world with a bot online here is named
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::record::Guild;
-use super::{dms, gap, groups, members};
+use super::{backstage, dms, gap, groups, members};
 use crate::api::{now_ms, Authored};
 use crate::discord::online::Online;
 use crate::discord::profile;
@@ -41,6 +43,7 @@ pub async fn run(
     let people = members::linked_people(a).await;
     groups::reconcile(a, bot, hosted, guild, &people).await;
     dms::reconcile(a, bot, hosted, guild, &people).await;
+    backstage::reconcile(a, bot, hosted, guild).await;
     if let Err(e) = gap::fetch(a, bot).await {
         tracing::warn!(
             npc = bot.npc,

@@ -162,6 +162,7 @@ fn ok_permissions(held: &Held, method: &Method, path: &str, body: &Value) -> Opt
             )
         }
         (Method::PUT, t) if t.starts_with("thread-members/") => Some(empty()),
+        (Method::POST, "typing") => Some(empty()),
         (method, t) if t.starts_with("permissions/") => {
             let target = t.trim_start_matches("permissions/").to_string();
             let mut all = held.overwrites.lock().unwrap();
