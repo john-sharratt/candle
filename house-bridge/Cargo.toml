@@ -1,0 +1,22 @@
+[package]
+name = "house-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "The house's device bridges: protocol libraries, device profiles, and the one abstraction that works a device by its profile — run on an in-network agent (docs/zen_moon_mind.md §15)"
+
+[dependencies]
+# One answer in the workspace to each of these; versions as npcd declares them,
+# so the crate unifies with the daemon that submits to it and the agent that
+# runs it.
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# The device transports: HTTP/SOAP for UPnP players, raw TCP for AV receivers,
+# UDP for wake-on-LAN, and the member's own interfaces for the house-network
+# scope. Same versions the rest of the tree builds them with.
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio      = { version = "1", features = ["net", "io-util", "time", "rt"] }
+if-addrs   = "0.15"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

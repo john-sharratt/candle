@@ -85,11 +85,14 @@ impl Replicator {
             self.applied_upto.send_if_modified(advance);
             return;
         }
-        // Per record, in the batch's order: its socket and length when it was
-        // fetched for a catch-up.
-        let fetched: Vec<Option<(usize, u64)>> = records
+        // Per record, in the batch's order: its socket, identity and length
+        // when it was fetched for a catch-up.
+        let fetched: Vec<Option<(usize, u64, u64, u64)>> = records
             .iter()
-            .map(|(c, w, _)| w.reply_to.map(|_| (*c, w.bytes.len() as u64)))
+            .map(|(c, w, _)| {
+                w.reply_to
+                    .map(|_| (*c, w.origin, w.oseq, w.bytes.len() as u64))
+            })
             .collect();
         let batch: Vec<(u64, u64, Vec<u8>)> = records
             .into_iter()
@@ -104,8 +107,9 @@ impl Replicator {
         let Ok(Applied { taken, reload }) = applied else {
             return;
         };
-        {
-            let mut s = self.state();
+        let sends = {
+            let mut guard = self.state();
+            let s = &mut *guard;
             let applied = taken.iter().filter(|t| **t).count() as u64;
             s.stats.applied += applied;
             s.stats.refused += taken.len() as u64 - applied;
@@ -118,22 +122,38 @@ impl Replicator {
                 .into_iter()
                 .zip(&taken)
                 .filter_map(|(f, took)| f.filter(|_| *took));
-            for (c, len) in received {
-                let now = Instant::now();
-                let ids: Vec<u64> = s
+            // Each one landed frees its bytes from its catch-up's window at
+            // once, and the window refills: the slide (`catchup.rs`).
+            let now = Instant::now();
+            let mut next = s.next_request;
+            let mut sends: Vec<(usize, Fetch)> = Vec::new();
+            for (c, origin, oseq, len) in received {
+                let Some((&id, r)) = s
                     .catchups
-                    .iter()
-                    .filter(|(_, r)| r.socket == c && r.outstanding() > 0)
-                    .map(|(id, _)| *id)
-                    .take(1)
-                    .collect();
-                for id in ids {
-                    s.heard.insert(id, now);
-                    if let Some(r) = s.catchups.get_mut(&id) {
-                        r.record(len);
-                    }
+                    .iter_mut()
+                    .find(|(_, r)| r.socket == c && r.expects(origin, oseq))
+                else {
+                    continue;
+                };
+                let fetches = r.landed(origin, oseq, len, || {
+                    next += 1;
+                    next
+                });
+                s.heard.insert(id, now);
+                s.claimed.remove(&(origin, oseq));
+                for f in fetches {
+                    s.fetches.insert(f.request, id);
+                    sends.push((c, f));
                 }
             }
+            s.next_request = next;
+            sends
+                .into_iter()
+                .filter_map(|(c, f)| Some((s.sockets.get(c)?.clone()?, f)))
+                .collect::<Vec<_>>()
+        };
+        for (handle, f) in sends {
+            let _ = handle.control(Frame::Fetch(f));
         }
         if reload {
             self.reload().await;
@@ -215,6 +235,19 @@ impl Replicator {
             let finished = r
                 .finished()
                 .then_some((r.purpose, r.socket, r.asks_again(&applied)));
+            if finished.is_some() && r.progress().fetched > 0 {
+                let p = r.progress();
+                tracing::info!(
+                    purpose = ?r.purpose,
+                    answerer = ?p.answerer,
+                    records = p.fetched,
+                    bytes = p.fetched_bytes,
+                    left = p.left,
+                    secs = r.elapsed().as_secs_f64(),
+                    mb_s = r.rate_mb_s(),
+                    "a catch-up finished"
+                );
+            }
             s.next_request = next;
             for k in settled {
                 s.claimed.remove(&k);
