@@ -71,6 +71,7 @@ use std::time::{Instant, SystemTime};
 use super::appended::Appended;
 use super::blob::BlobKey;
 use super::identity::{MarkerIds, RecordIdentity};
+use super::live_indexes::{LiveIndexes, SegmentSizes};
 use super::liveness_audit::{keyed_by_payload, resident_key};
 use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
@@ -922,76 +923,81 @@ impl SubstratePersistence {
         substrate: &Substrate,
         force: bool,
     ) -> Result<Option<MaintenancePlan>> {
-        Ok(self
-            .choose_maintenance(substrate, force)?
-            .map(|chosen| self.plan_chosen(substrate, chosen)))
+        let indexes = self.live_indexes();
+        Ok(indexes
+            .choose_maintenance(substrate, &self.segment_sizes()?, force)
+            .map(|chosen| indexes.plan_chosen(substrate, chosen)))
     }
 
     /// [`Self::plan_maintenance`] restricted to dropping a fully-dead segment:
     /// what a member whose volume is full may still run, since a drop needs no
     /// scratch space (`docs/replicated_substrate.md` §7.7).
     pub fn plan_drop(&self, substrate: &Substrate) -> Result<Option<MaintenancePlan>> {
-        Ok(self
-            .choose_drop(substrate)?
-            .map(|chosen| self.plan_chosen(substrate, chosen)))
+        let indexes = self.live_indexes();
+        Ok(indexes
+            .choose_drop(substrate, &self.segment_sizes()?)
+            .map(|chosen| indexes.plan_chosen(substrate, chosen)))
     }
 
-    /// The first half of [`Self::plan_maintenance`]: the per-segment liveness
-    /// scan and the op it picks, or `None` for a no-op pass. Apart from
-    /// [`Self::plan_chosen`] so a caller can release its locks between them —
-    /// each half is a substrate read hold of half a second on a large store,
-    /// and a writer waits out whichever it meets rather than both. The chosen
-    /// op stays valid across the gap: only maintenance retires a segment, and
-    /// it runs one op at a time.
-    pub fn choose_maintenance(&self, substrate: &Substrate, force: bool) -> Result<Option<Chosen>> {
-        self.choose_with(substrate, |stats| pick_maintenance_op(stats, force))
+    /// Live record bytes per segment ([`LiveIndexes::segment_liveness`]).
+    pub fn segment_liveness(&self, substrate: &Substrate) -> HashMap<SegmentId, u64> {
+        self.live_indexes().segment_liveness(substrate)
+    }
+}
+
+impl LiveIndexes {
+    /// The first half of a plan: the per-segment liveness scan and the op it
+    /// picks, or `None` for a no-op pass. Apart from [`Self::plan_chosen`] so
+    /// the plan reads a later version of the substrate than the scan did. The
+    /// chosen op stays valid across the gap: only maintenance retires a
+    /// segment, and it runs one op at a time.
+    pub fn choose_maintenance(
+        &self,
+        substrate: &Substrate,
+        sizes: &SegmentSizes,
+        force: bool,
+    ) -> Option<Chosen> {
+        self.choose_with(substrate, sizes, |stats| pick_maintenance_op(stats, force))
     }
 
     /// [`Self::choose_maintenance`] restricted to dropping a fully-dead
-    /// segment ([`Self::plan_drop`]).
-    pub fn choose_drop(&self, substrate: &Substrate) -> Result<Option<Chosen>> {
-        self.choose_with(substrate, pick_drop)
+    /// segment ([`SubstratePersistence::plan_drop`]).
+    pub fn choose_drop(&self, substrate: &Substrate, sizes: &SegmentSizes) -> Option<Chosen> {
+        self.choose_with(substrate, sizes, pick_drop)
     }
 
     fn choose_with(
         &self,
         substrate: &Substrate,
+        sizes: &SegmentSizes,
         pick: impl Fn(&[SegmentStat]) -> Option<MaintenanceOp>,
-    ) -> Result<Option<Chosen>> {
-        if self.is_read_only() {
-            return Ok(None);
-        }
-        let sealed = self.segments.sealed_ids().to_vec();
-        if sealed.is_empty() {
-            return Ok(None);
+    ) -> Option<Chosen> {
+        if self.is_read_only() || sizes.sealed.is_empty() {
+            return None;
         }
         let t_liveness = Instant::now();
         let liveness = self.segment_liveness(substrate);
         let liveness_ms = t_liveness.elapsed().as_millis() as u64;
-        self.note_dead_ratio(
-            self.segments.total_record_bytes().unwrap_or(0),
-            liveness.values().sum(),
-        );
-        let now = SystemTime::now();
-        let mut stats = Vec::with_capacity(sealed.len());
-        for &id in &sealed {
-            stats.push(SegmentStat {
-                id,
-                total_bytes: self.segments.sealed_record_bytes(id)?,
-                live_bytes: liveness.get(&id).copied().unwrap_or(0),
-                age_secs: self.segments.sealed_age_secs(id, now)?,
-            });
-        }
-        Ok(pick(&stats).map(|op| Chosen {
+        self.note_dead_ratio(sizes.total_record_bytes, liveness.values().sum());
+        let stats: Vec<SegmentStat> = sizes
+            .sealed
+            .iter()
+            .map(|s| SegmentStat {
+                id: s.id,
+                total_bytes: s.total_bytes,
+                live_bytes: liveness.get(&s.id).copied().unwrap_or(0),
+                age_secs: s.age_secs,
+            })
+            .collect();
+        pick(&stats).map(|op| Chosen {
             op,
             stats,
             liveness_ms,
-        }))
+        })
     }
 
-    /// The second half of [`Self::plan_maintenance`]: everything `chosen`'s op
-    /// relocates and re-emits, gathered so the slow I/O phase runs without the
-    /// substrate lock.
+    /// The second half of a plan: everything `chosen`'s op relocates and
+    /// re-emits, gathered so the relocation's batches run from a list.
     pub fn plan_chosen(&self, substrate: &Substrate, chosen: Chosen) -> MaintenancePlan {
         let Chosen {
             op,
@@ -1124,7 +1130,9 @@ impl SubstratePersistence {
         };
         loc.copied()
     }
+}
 
+impl SubstratePersistence {
     /// **Phase 2** — the slow I/O: append the resident set, then relocate each
     /// target segment's live records into the active, then commit. Holds only
     /// the persistence lock; the caller does **not** hold the substrate lock
@@ -1814,12 +1822,14 @@ impl SubstratePersistence {
         tracing::trace!(op = ?plan.op, "substrate maintenance op applied");
         Ok(())
     }
+}
 
+impl LiveIndexes {
     /// The whole resident set an op re-emits: the substrate's
-    /// ([`gather_resident_set`]) and this handle's own — the `Replica` record,
+    /// ([`gather_resident_set`]) and the log's own — the `Replica` record,
     /// when the member has written or applied anything or deferred anything,
     /// and the `Rebase` record, when it has rejoined after writing cut off.
-    fn resident_set(&self, substrate: &Substrate) -> Vec<Resident> {
+    pub(super) fn resident_set(&self, substrate: &Substrate) -> Vec<Resident> {
         let mut out = gather_resident_set(substrate, &self.marker_ids, self.node());
         let replica = self.replica_record();
         if !replica.is_empty() {
@@ -1842,7 +1852,9 @@ impl SubstratePersistence {
         }
         out
     }
+}
 
+impl SubstratePersistence {
     /// Test/forced-op convenience: run all phases inline for a specific op under
     /// the caller's already-held substrate lock. A read-only handle refuses
     /// with [`PersistenceError::ReadOnly`].
@@ -1854,32 +1866,35 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
-        let resident = self.resident_to_carry(substrate, &op.targets());
+        let ix = self.live_indexes();
+        let resident = ix.resident_to_carry(substrate, &op.targets());
         let (
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,
-        ) = self.gather_relocations(substrate, &op.targets());
+        ) = ix.gather_relocations(substrate, &op.targets());
         let plan = MaintenancePlan {
             op: *op,
             resident,
             chunk_relocs,
             token_relocs,
-            index_page_relocs: self.gather_index_page_relocs(substrate, &op.targets()),
+            index_page_relocs: ix.gather_index_page_relocs(substrate, &op.targets()),
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,
-            npc_relocs: self.npc_relocations(&op.targets()),
-            vfs_relocs: self.vfs_relocations(substrate, &op.targets()),
-            blob_relocs: self.blob_relocations(&op.targets()),
+            npc_relocs: ix.npc_relocations(&op.targets()),
+            vfs_relocs: ix.vfs_relocations(substrate, &op.targets()),
+            blob_relocs: ix.blob_relocations(&op.targets()),
         };
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
         self.finish_maintenance(&plan)
     }
+}
 
+impl LiveIndexes {
     /// Character records physically inside a target segment.
     ///
     /// Read from this store's own `npc_locs` rather than the substrate, which
@@ -2459,7 +2474,9 @@ mod tests {
 
         // Relocation worklist contains exactly the tail (the dead copy is
         // invisible to the index).
-        let (_, _, snapshots, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (_, _, snapshots, _, _) = sp
+            .live_indexes()
+            .gather_relocations(&substrate, &[SegmentId(1)]);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].0, sid);
 
@@ -2471,7 +2488,9 @@ mod tests {
             reason: None,
         });
         assert!(substrate.recurrent_snapshot_loc(sid).is_none());
-        let (_, _, snapshots, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (_, _, snapshots, _, _) = sp
+            .live_indexes()
+            .gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             snapshots.is_empty(),
             "tombstoned snapshot must not relocate"
@@ -2932,7 +2951,9 @@ mod tests {
 
         // Phase 1 — plan (snapshot).
         let t = Instant::now();
-        let (chunk_relocs, _, _, _, _) = sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunk_relocs, _, _, _, _) = sp
+            .live_indexes()
+            .gather_relocations(&substrate, &[SegmentId(1)]);
         let plan_el = t.elapsed();
 
         // Reference: the naive per-record read path (`read_chunk` decodes +
@@ -3624,8 +3645,9 @@ mod tests {
             "the stream is an orphan: chunk present, no decl",
         );
         // gather_relocations must NOT relocate the orphan's chunk.
-        let (chunks, _tokens, _snapshots, _branch, _singletons) =
-            sp.gather_relocations(&substrate, &[SegmentId(1)]);
+        let (chunks, _tokens, _snapshots, _branch, _singletons) = sp
+            .live_indexes()
+            .gather_relocations(&substrate, &[SegmentId(1)]);
         assert!(
             chunks.is_empty(),
             "orphan chunks must not be relocated (would perpetuate the bloat + churn)",
@@ -3697,6 +3719,7 @@ mod tests {
         let carry = |sp: &SubstratePersistence, targets: &[u64]| {
             let targets: Vec<SegmentId> = targets.iter().map(|&t| SegmentId(t)).collect();
             let mut kinds: Vec<(RecordType, u64)> = sp
+                .live_indexes()
                 .resident_to_carry(&substrate, &targets)
                 .iter()
                 .map(|r| (r.rt, r.stream_id))
@@ -3720,6 +3743,7 @@ mod tests {
 
         // Its copy recorded in segment 12, keyed as an append keys it.
         let tombstone = sp
+            .live_indexes()
             .resident_set(&substrate)
             .into_iter()
             .find(|r| r.rt == RecordType::SectionTombstone)
@@ -4469,7 +4493,8 @@ mod tests {
 
             let tombstones =
                 |sp: &SubstratePersistence, substrate: &Substrate, targets: &[SegmentId]| {
-                    sp.resident_to_carry(substrate, targets)
+                    sp.live_indexes()
+                        .resident_to_carry(substrate, targets)
                         .iter()
                         .filter(|r| r.rt == RecordType::SectionTombstone)
                         .count()
@@ -4528,7 +4553,9 @@ mod tests {
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
         let plan = MaintenancePlan {
             op: MaintenanceOp::Compact(SegmentId(1)),
-            resident: sp.resident_to_carry(&substrate, &[SegmentId(1)]),
+            resident: sp
+                .live_indexes()
+                .resident_to_carry(&substrate, &[SegmentId(1)]),
             chunk_relocs: Vec::new(),
             token_relocs: Vec::new(),
             index_page_relocs: Vec::new(),

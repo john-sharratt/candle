@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use super::resolver::Conversation;
+use crate::persistence::live_indexes::LiveIndexes;
 use crate::persistence::liveness_audit::LivenessAudit;
 use crate::persistence::Result as PersistenceResult;
 
@@ -33,11 +34,13 @@ impl Conversation {
     }
 
     /// The bytes of live records in the log — what a full compaction copies,
-    /// and so needs free beside it.
+    /// and so needs free beside it. The scan runs here, against the log's
+    /// indexes taken in one short call ([`LiveIndexes`]); the owner serves
+    /// writes meanwhile.
     pub fn live_bytes(&self) -> u64 {
         let view = self.read();
-        self.persistence
-            .call(|p| p.segment_liveness(&view).values().sum())
+        let indexes: LiveIndexes = self.persistence.call(|p| p.live_indexes());
+        indexes.segment_liveness(&view).values().sum()
     }
 
     /// Every record type the substrate holds, by tag: what a build replacing
@@ -72,14 +75,16 @@ impl Conversation {
     /// The read-only liveness audit: what maintenance counts as live against
     /// what it carries. Changes nothing.
     ///
-    /// Only the plan runs on the log's owner, behind everything else it has to
-    /// do. The walk reads every segment and takes as long as the disk does
-    /// (fifteen minutes over BlackWorld's 346 GiB), so it runs here: on the
-    /// owner it stopped every write, read and replicated record for as long.
+    /// The owner only hands over its indexes and where the log ends, behind
+    /// everything else it has to do; the plan's scan and the walk run here.
+    /// The walk reads every segment and takes as long as the disk does
+    /// (fifteen minutes over BlackWorld's 346 GiB): on the owner it stopped
+    /// every write, read and replicated record for as long.
     pub fn liveness_audit(&self) -> PersistenceResult<LivenessAudit> {
         let view = self.read();
-        self.persistence
-            .call_behind(|p| p.liveness_audit_plan(&view))
-            .walk()
+        let (indexes, at): (LiveIndexes, _) = self
+            .persistence
+            .call_behind(|p| (p.live_indexes(), p.audit_segments()));
+        indexes.liveness_audit_plan(&view, at).walk()
     }
 }

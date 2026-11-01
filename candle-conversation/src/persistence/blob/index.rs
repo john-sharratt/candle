@@ -8,19 +8,19 @@
 //! A blob its tombstone outranks is forgotten (`super::forget_if_retired`).
 //! Built by the open walk, kept current by every append and every remote
 //! record applied, rebuilt after compaction; compaction and maintenance read
-//! it to know what to carry, and a read follows it to the bytes.
-
-use std::collections::BTreeMap;
+//! it to know what to carry, and a read follows it to the bytes. A persistent
+//! map, so maintenance scans an O(1) clone off the log's owner.
 
 use super::payload::BlobKey;
 use crate::persistence::identity::{RecordIdentity, Stamped};
 use crate::persistence::manifest::RecordLoc;
+use crate::substrate::pcoll::POrdMap;
 
 /// Every live blob's location, and the identity of the record there. See the
 /// module.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BlobIndex {
-    blobs: BTreeMap<BlobKey, Stamped<RecordLoc>>,
+    blobs: POrdMap<BlobKey, Stamped<RecordLoc>>,
 }
 
 impl BlobIndex {
