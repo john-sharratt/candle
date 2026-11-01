@@ -1447,6 +1447,8 @@ pub enum Choices {
     Links,
     /// A part here linked to a Sonos player — what the Sonos acts work.
     Sonos,
+    /// A part here linked to an AV receiver — what the receiver acts work.
+    Receiver,
     /// A device the last survey here found that no part stands for yet — what
     /// `onboard_part` and `link_part` are grounded in.
     Findings,
@@ -1780,6 +1782,13 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("sonos_play", "device", Choices::Sonos),
     ("sonos_pause", "device", Choices::Sonos),
     ("sonos_volume", "device", Choices::Sonos),
+    ("receiver_status", "device", Choices::Receiver),
+    ("receiver_on", "device", Choices::Receiver),
+    ("receiver_off", "device", Choices::Receiver),
+    ("receiver_mute", "device", Choices::Receiver),
+    ("receiver_unmute", "device", Choices::Receiver),
+    ("receiver_volume", "device", Choices::Receiver),
+    ("wake_device", "device", Choices::Onboarded),
     ("onboard_part", "from", Choices::Findings),
     ("link_part", "part", Choices::Unlinked),
     ("link_part", "from", Choices::Findings),
@@ -1848,6 +1857,8 @@ pub struct Within {
     pub links: Vec<String>,
     /// The parts here linked to a Sonos player, by name — [`Choices::Sonos`].
     pub sonos: Vec<String>,
+    /// The parts here linked to an AV receiver, by name — [`Choices::Receiver`].
+    pub receiver: Vec<String>,
     /// The acts the carried mission grants here (`docs/zen_moon_mind.md` §14):
     /// what [`Availability::Granted`] reads. Empty unless the body carries a
     /// mission granting them, stands in its room, and the room is a mirror.
@@ -2376,6 +2387,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Jobs => within.jobs.clone(),
         Choices::Links => within.links.clone(),
         Choices::Sonos => within.sonos.clone(),
+        Choices::Receiver => within.receiver.clone(),
         Choices::Findings => within.findings.clone(),
         Choices::Unlinked => within.unlinked.clone(),
         Choices::Onboarded => within.onboarded.clone(),

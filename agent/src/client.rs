@@ -39,7 +39,8 @@ use zend_vfs::{FetchBundle, JobStatus, PushResult, RemoteRefs, RunOutcome};
 use crate::jobs::{JobError, Jobs};
 use crate::member::{capacity, node_in, APP};
 use crate::wire::{
-    AgentJobs, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit, Switching,
+    AgentJobs, BridgeCall, Bridged, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit,
+    Switching,
 };
 
 /// How long each wait on a running job is held open.
@@ -233,6 +234,30 @@ impl Agents {
     }
 
     /// Run `job` for `lineage` and wait for it to end.
+    /// Work a device through a bridge (`docs/zen_moon_mind.md` §15): the member
+    /// sends the call up a `group:agent` stream and the gateway gives it to an
+    /// in-network agent, which runs the library and answers — the same path the
+    /// git jobs take. Cut off, with an agent in this process, it runs here.
+    pub async fn bridge(&self, call: &BridgeCall) -> Result<Bridged, AgentError> {
+        if self.local().is_some() {
+            return Ok(bridge_in_process(call).await);
+        }
+        let body = serde_json::to_vec(call).map_err(|e| AgentError::Transport(e.to_string()))?;
+        let (_at, bytes) = self
+            .call(Call {
+                method: Method::POST,
+                path: "/v1/bridge".to_string(),
+                body,
+                to: None,
+                lineage: None,
+                repo: None,
+                toolchain: None,
+                push: false,
+            })
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| AgentError::Transport(e.to_string()))
+    }
+
     pub async fn run(&self, lineage: &str, job: RunJob) -> Result<Ran, AgentError> {
         if let Some(jobs) = self.local() {
             return run_in_process(jobs, job).await;
@@ -604,6 +629,29 @@ fn refused(e: JobError) -> AgentError {
         other => AgentError::Refused {
             status: 400,
             why: other.to_string(),
+        },
+    }
+}
+
+/// Run a bridge call on this process's own library — a daemon cut off from
+/// every cluster, whose house is reached through the agent in its own process.
+async fn bridge_in_process(call: &BridgeCall) -> Bridged {
+    let nets = house_bridge::nets();
+    let worked = match call {
+        BridgeCall::Work {
+            profile,
+            name,
+            address,
+            action,
+            args,
+        } => house_bridge::work(profile, name, address, action, args, &nets).await,
+        BridgeCall::Wake { name, mac } => house_bridge::wake(name, mac, &nets),
+    };
+    match worked {
+        Ok(line) => Bridged { ok: true, line },
+        Err(e) => Bridged {
+            ok: false,
+            line: e.to_string(),
         },
     }
 }

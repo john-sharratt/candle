@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::jobs::{JobError, Jobs};
-use crate::wire::{Submit, Switching};
+use crate::wire::{BridgeCall, Bridged, Submit, Switching};
 
 /// Set on every request that arrived over the agent's socket.
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +73,9 @@ pub fn table() -> RouteTable {
         Route::new(&["GET"], "/v1/jobs/:id/log", Dispatch::Any),
         Route::new(&["GET"], "/v1/jobs/:id/tail", Dispatch::Any),
         Route::new(&["PUT"], "/v1/agent", Dispatch::Any),
+        // A device-bridge job runs on any in-network agent — it holds no repo
+        // and needs no toolchain, only the house network the agent stands on.
+        Route::new(&["POST"], "/v1/bridge", Dispatch::Any),
     ])
     .expect("the agent's routes are distinct")
 }
@@ -84,6 +87,7 @@ pub fn router(jobs: Arc<Jobs>, claim: Claim, switched: Switched) -> Router {
         .route("/v1/jobs/:id/log", get(log))
         .route("/v1/jobs/:id/tail", get(tail))
         .route("/v1/agent", put(switch))
+        .route("/v1/bridge", post(bridge))
         .layer(middleware::from_fn(members_only))
         .with_state(Api {
             jobs,
@@ -188,6 +192,36 @@ async fn tail(State(api): State<Api>, Path(id): Path<String>, Query(q): Query<Of
         Ok(chunk) => Json(chunk).into_response(),
         Err(e) => failed(e),
     }
+}
+
+/// `POST /v1/bridge` — a device-bridge job. The agent runs [`house_bridge`] for
+/// it, so the network commands happen on this machine inside the house, and
+/// hands back the bridge's own line. A device refusing is `ok: false`, a
+/// result the caller reads — not a failed job; only a switched-off agent is a
+/// job failure, answered like one.
+async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Response {
+    if !api.jobs.enabled() {
+        return failed(JobError::Disabled);
+    }
+    let nets = house_bridge::nets();
+    let worked = match call {
+        BridgeCall::Work {
+            profile,
+            name,
+            address,
+            action,
+            args,
+        } => house_bridge::work(&profile, &name, &address, &action, &args, &nets).await,
+        BridgeCall::Wake { name, mac } => house_bridge::wake(&name, &mac, &nets),
+    };
+    let bridged = match worked {
+        Ok(line) => Bridged { ok: true, line },
+        Err(e) => Bridged {
+            ok: false,
+            line: e.to_string(),
+        },
+    };
+    Json(bridged).into_response()
 }
 
 async fn switch(State(api): State<Api>, Json(to): Json<Switching>) -> Response {

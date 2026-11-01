@@ -290,7 +290,7 @@ mod tests {
                     maker: String::new(),
                     model: "Chromecast".into(),
                     services: vec!["_googlecast._tcp.local".into()],
-                    profile: "device".into(),
+                    profile: "cast".into(),
                 },
             ]
         );
