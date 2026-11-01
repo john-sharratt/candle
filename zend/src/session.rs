@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::client::Agents;
 use agent::jobs::Jobs;
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use cluster::member::{AppMember, ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
@@ -612,6 +612,9 @@ const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
 /// A [`round_triggers`] held: its mode's level, its dial, the tools out.
 type HeldKey = (u8, String, Vec<&'static str>);
 
+/// Every [`round_triggers`] held so far, swapped whole so a round never waits.
+type HeldStencils = HashMap<HeldKey, Arc<TriggerRegistry>>;
+
 /// [`turn_triggers`] with a call to any of `unavailable`'s tools taken out of the
 /// grammar. Held once per mode, dial and set: a set changes only as sessions open
 /// and close, and holding decodes the catalog's name arms. The base is what a
@@ -628,11 +631,7 @@ fn round_triggers(
     }
     let names: Vec<&'static str> = unavailable.tools.iter().copied().collect();
     let key = (tools_mode.level(), format!("{think_mode:?}"), names);
-    let mut held = state
-        .held_stencils
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(triggers) = held.get(&key) {
+    if let Some(triggers) = state.held_stencils.load().get(&key) {
         return Arc::clone(triggers);
     }
     let allowed: Vec<String> = crate::tools::offered_tool_names(tools_mode)
@@ -641,7 +640,11 @@ fn round_triggers(
         .collect();
     match state.engine.holding_tools(&base, &allowed) {
         Ok(triggers) => {
-            held.insert(key, Arc::clone(&triggers));
+            state.held_stencils.rcu(|held| {
+                let mut held = HeldStencils::clone(held);
+                held.insert(key.clone(), Arc::clone(&triggers));
+                held
+            });
             triggers
         }
         Err(e) => {
@@ -886,7 +889,7 @@ struct InferenceState {
     tool_stencils: [Arc<TriggerRegistry>; ToolMode::ALL.len()],
     /// The turn triggers with tools out of the grammar ([`round_triggers`]), by
     /// mode, dial and the tools taken out.
-    held_stencils: Mutex<HashMap<HeldKey, Arc<TriggerRegistry>>>,
+    held_stencils: ArcSwap<HeldStencils>,
     /// The Restricted stencil with every call held to `file_read` — what a
     /// file's reading decodes under, so it can call no other tool. Built once
     /// at startup beside the stencils it narrows.
@@ -3107,7 +3110,7 @@ impl InferenceState {
             workspace,
             base_branches,
             tool_stencils,
-            held_stencils: Mutex::new(HashMap::new()),
+            held_stencils: ArcSwap::default(),
             read_stencil,
             think_steering,
             passthrough: PassthroughCache::new(),

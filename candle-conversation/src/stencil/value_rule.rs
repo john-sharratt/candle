@@ -23,7 +23,9 @@
 //! scheme and host — has no use for one.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
+use arc_swap::ArcSwap;
 use regex_automata::dfa::{dense, Automaton};
 use regex_automata::nfa::thompson;
 use regex_automata::util::start::Config;
@@ -32,6 +34,9 @@ use regex_automata::{Anchored, MatchKind};
 
 use super::mask::AllowedSet;
 use super::vocab::{TokenId, Vocab};
+
+/// The rules built so far, by vocabulary and pattern.
+type RuleMap = HashMap<(u64, String), Arc<ValueRule>>;
 
 /// The most automaton states a rule may have: each one holds a mask.
 const MAX_STATES: usize = 512;
@@ -111,6 +116,25 @@ impl ValueRule {
         Ok(rule)
     }
 
+    /// The process's one rule for `pattern` over `vocab`. A mode's tree compiles
+    /// the same patterns as the others', and a rule's masks are the expensive
+    /// part: built once, and the map swapped whole, so no reader ever waits.
+    pub fn shared(pattern: &str, vocab: &dyn Vocab) -> Result<Arc<ValueRule>, RuleError> {
+        static RULES: OnceLock<ArcSwap<RuleMap>> = OnceLock::new();
+        let rules = RULES.get_or_init(ArcSwap::default);
+        let key = (vocab.fingerprint(), pattern.to_string());
+        if let Some(rule) = rules.load().get(&key) {
+            return Ok(Arc::clone(rule));
+        }
+        let rule = Arc::new(ValueRule::new(pattern, vocab)?);
+        rules.rcu(|held| {
+            let mut held = RuleMap::clone(held);
+            held.insert(key.clone(), Arc::clone(&rule));
+            held
+        });
+        Ok(rule)
+    }
+
     /// Every state can be finished one byte at a time, which is what makes an
     /// empty mask unreachable whatever tokens the walk took to get there.
     fn check_spellable(&self, tokens: &[(TokenId, Vec<u8>)]) -> Result<(), RuleError> {
@@ -138,6 +162,17 @@ impl ValueRule {
     /// The pattern this rule holds to.
     pub fn pattern(&self) -> &str {
         &self.pattern
+    }
+
+    /// How many tokens the widest of this rule's masks allows: what a step
+    /// under it sends to the device.
+    pub fn widest_mask(&self) -> usize {
+        self.masks.iter().map(AllowedSet::len).max().unwrap_or(0)
+    }
+
+    /// How many states the rule has.
+    pub fn states(&self) -> usize {
+        self.masks.len()
     }
 
     /// The mask at `state`.
