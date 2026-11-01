@@ -349,6 +349,10 @@ pub struct PairBody {
     /// The code shown on the TV, on the second call of an Android TV pairing.
     #[serde(default)]
     pub code: Option<String>,
+    /// The agent that started the pairing, echoed from the first call's answer
+    /// so the second call reaches the same one — it alone holds the session.
+    #[serde(default)]
+    pub agent: Option<u64>,
 }
 
 /// `POST /v1/pulse/pair` — pair with a device through an in-network agent and
@@ -379,8 +383,10 @@ pub async fn pair(
         address: body.address.clone(),
         code: body.code,
     };
-    let bridged = match agents.bridge(&call).await {
-        Ok(b) => b,
+    // Pin the second (code) call to the agent that started the pairing — only
+    // that agent holds the open session.
+    let (bridged, agent) = match agents.bridge_on(&call, body.agent).await {
+        Ok(ba) => ba,
         Err(e) => return err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
     };
     // Credentials earned — keep them on the device's world part so every later
@@ -395,7 +401,7 @@ pub async fn pair(
             return world_unreached(&e);
         }
     }
-    Json(json!({ "ok": bridged.ok, "line": bridged.line })).into_response()
+    Json(json!({ "ok": bridged.ok, "line": bridged.line, "agent": agent })).into_response()
 }
 
 /// `POST /v1/pulse/command-table` — open or shut the command table.

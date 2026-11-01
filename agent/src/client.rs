@@ -249,23 +249,37 @@ impl Agents {
     /// in-network agent, which runs the library and answers — the same path the
     /// git jobs take. Cut off, with an agent in this process, it runs here.
     pub async fn bridge(&self, call: &BridgeCall) -> Result<Bridged, AgentError> {
+        Ok(self.bridge_on(call, None).await?.0)
+    }
+
+    /// Run a [`BridgeCall`] on agent `to` (or any ready one when `None`), and
+    /// also return the agent that served it. Pairing uses this: its first call
+    /// goes anywhere and records the agent that holds the session; its second
+    /// call pins to that same agent, since the session lives only there.
+    pub async fn bridge_on(
+        &self,
+        call: &BridgeCall,
+        to: Option<u64>,
+    ) -> Result<(Bridged, Option<u64>), AgentError> {
         if self.local().is_some() {
-            return Ok(bridge_in_process(call).await);
+            return Ok((bridge_in_process(call).await, None));
         }
         let body = serde_json::to_vec(call).map_err(|e| AgentError::Transport(e.to_string()))?;
-        let (_at, bytes) = self
+        let (at, bytes) = self
             .call(Call {
                 method: Method::POST,
                 path: "/v1/bridge".to_string(),
                 body,
-                to: None,
+                to,
                 lineage: None,
                 repo: None,
                 toolchain: None,
                 push: false,
             })
             .await?;
-        serde_json::from_slice(&bytes).map_err(|e| AgentError::Transport(e.to_string()))
+        let bridged =
+            serde_json::from_slice(&bytes).map_err(|e| AgentError::Transport(e.to_string()))?;
+        Ok((bridged, at))
     }
 
     pub async fn run(
