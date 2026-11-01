@@ -1242,6 +1242,11 @@ impl BatchedSampler {
                         && config.allowed_bits.is_some()
                         && !Self::bitmaps_beside(logits2d) =>
                     {
+                        tracing::debug!(
+                            target: "candle_conversation::stencil",
+                            seq = row.seq,
+                            "a wide grammar mask sampled by name: its logits are off the span"
+                        );
                         allow_rows.push((r, self.allow_row(row.logits_row, config, state), key));
                     }
                     [] if on_cuda => kernel.push(r, state, config, row, typical, key),
@@ -1347,6 +1352,13 @@ impl BatchedSampler {
             )
         };
         dev.upload_raw(base, bytes)?;
+        tracing::debug!(
+            target: "candle_conversation::stencil",
+            rows = rows.masked.len(),
+            bytes = bytes.len(),
+            on_wave = logits.wave_ticket().is_some(),
+            "grammar bitmaps carved beside the logits"
+        );
         for (i, &row) in rows.masked.iter().enumerate() {
             let at = base + (i * width * 4) as u64;
             dials[row].allowed_bits_lo = at as u32;
