@@ -1,0 +1,53 @@
+name: service_deploy
+questions:
+- deploy this to whiteworld
+- try the merged build on blackworld
+- put main on whiteworld and see if it serves
+- trial the new motherd on the other machine
+- ship the gateway build to blackworld
+- does the build on main actually serve
+- deploy the connector to whiteworld
+- run a trial of main on that machine
+- roll the latest main onto one member
+- try this build through keep
+- the fix is merged, get it running on a machine
+- see whether main comes up on the second member
+- install the latest build on one machine with a rollback if it fails
+- start a trial of the daemon on another member
+- replace the running service with what main holds
+- test the release on a live machine before anyone rolls it out
+category: Commands
+description: 'Build a service as origin/main holds it on one machine''s agent, then try it there through keep, the supervisor that runs the machine''s services, and wait for the outcome. keep keeps the build once it reports serving, within ten minutes, and otherwise puts the previous binary back. Only origin/main is built: your branch reaches it by merging, and a branch is checked with run_command. Refused on the machine running this conversation, and on a machine holding an app''s only ready member. It tries one machine: rolling a build out to the others is the user''s decision. Use for: putting a merged build on a machine. Triggered by "deploy this", "try the build on whiteworld". Returns the artifact, whether it was proven or rolled back, and keep''s account. Takes many minutes.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: The machine to try it on, by name, as `blackworld`. Required.
+      minLength: 1
+      type: string
+    service:
+      description: 'The service to build and try: `motherd` (the daemon), `web` (the gateway) or `mcp` (the connector). Required.'
+      enum:
+      - motherd
+      - web
+      - mcp
+      type: string
+  required:
+  - host
+  - service
+  title: Request
+  type: object
+examples:
+- deploy main to whiteworld<|im_end|>
+- try the new gateway build on blackworld<|im_end|>
+- |-
+  it is merged, try it on the other machine<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The change is on main, so a trial is the next step. service_deploy builds main on that machine's agent and waits for keep's outcome. A rollback leaves the old build running, and I report it as it stands.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_deploy", "arguments": {"host": "whiteworld", "service": "motherd"}}
+  </tool_call><|projection|>

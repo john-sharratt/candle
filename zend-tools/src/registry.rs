@@ -1,4 +1,4 @@
-//! Static registry of all 106 tool implementations.
+//! Static registry of all 107 tool implementations.
 //!
 //! # How a tool is registered
 //!
@@ -1011,6 +1011,7 @@ use crate::tools::{
         SIGNATURE_SIGN, SIGNATURE_VERIFY,
     },
     datetime::REGISTRATION as DATETIME,
+    deploy::REGISTRATION as SERVICE_DEPLOY,
     file::{
         FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_IMAGE, FILE_LIST, FILE_MOVE, FILE_PRESENT,
         FILE_READ, FILE_SEARCH, FILE_WRITE,
@@ -1248,6 +1249,8 @@ fn register_all() -> &'static [RegisteredTool] {
         // runs to read.
         RUN_COMMAND.requires(NET_EXEC_DISK),
         RUN_OUTPUT.requires(EXEC),
+        // Deploy (1) — replaces a running service on a machine.
+        SERVICE_DEPLOY.requires(NET_EXEC_DISK),
     ];
     TOOLS
 }

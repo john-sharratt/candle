@@ -22,6 +22,7 @@
 //! | `file` | `file_{write,read,edit,list,search,grep,delete,image,present}` | VFS tools; `search`/`grep` find by name and by content, `image` makes resized copies |
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
+//! | `deploy` | `service_deploy` | Calls `TrialRunner` trait impl injected by daemon |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |
 //! | `journal` | `journal_read`, `journal_grep` | The conversation's own journal text, through `ToolContext::journal` |
 //! | `network_diag` | `dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info` | subprocess |
@@ -48,6 +49,7 @@ pub mod code;
 pub mod credentials;
 pub mod crypto;
 pub mod datetime;
+pub mod deploy;
 pub mod file;
 pub mod git;
 pub mod hash;

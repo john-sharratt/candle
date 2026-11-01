@@ -288,10 +288,22 @@ impl Agents {
         job: RunJob,
         watch: Option<JobWatch>,
     ) -> Result<Ran, AgentError> {
+        self.run_on(lineage, job, None, watch).await
+    }
+
+    /// Run `job` to its end on agent `to`, or wherever it is placed when
+    /// `None`.
+    pub async fn run_on(
+        &self,
+        lineage: &str,
+        job: RunJob,
+        to: Option<u64>,
+        watch: Option<JobWatch>,
+    ) -> Result<Ran, AgentError> {
         if let Some(jobs) = self.local() {
             return run_in_process(jobs, job, watch).await;
         }
-        let (at, mut view) = self.submit(lineage, job, None).await?;
+        let (at, mut view) = self.submit(lineage, job, to).await?;
         let At::Agent(agent) = at else {
             return run_in_process_after(self.own()?, view, watch).await;
         };

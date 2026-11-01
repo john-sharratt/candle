@@ -52,6 +52,7 @@ pub mod state;
 pub mod stops;
 pub mod tending;
 pub mod threads;
+pub mod trials;
 
 #[cfg(test)]
 mod latency_tests;

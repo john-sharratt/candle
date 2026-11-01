@@ -63,7 +63,7 @@ mod layer_toggle;
 pub mod mem;
 mod nudge;
 mod reply;
-mod repo_job;
+pub mod repo_job;
 mod repo_job_list;
 mod repo_job_log;
 mod service_control;

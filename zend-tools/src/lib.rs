@@ -97,5 +97,6 @@ pub use grants::{Capability, Grants, NotPermitted};
 pub use registry::RegisteredTool;
 pub use runner::{confirmation, replay, run};
 pub use tool::{
-    ConfirmationDetails, Replay, SubagentRequest, SubagentResponse, SubagentRunner, Tool, ToolError,
+    ConfirmationDetails, Replay, SubagentRequest, SubagentResponse, SubagentRunner, Tool,
+    ToolError, TrialRequest, TrialResponse, TrialRunner,
 };

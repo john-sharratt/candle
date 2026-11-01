@@ -115,8 +115,30 @@ pub async fn to_keep(
     body: Option<&Value>,
     read_for: Duration,
 ) -> Result<Reply, String> {
+    keep_with(
+        session,
+        caller.headers(),
+        method,
+        path,
+        host,
+        body,
+        read_for,
+    )
+    .await
+}
+
+/// [`to_keep`] stating `headers` as who it is for. keep answers the member a
+/// request came from, so a worker, which holds no person, states none.
+pub async fn keep_with(
+    session: &ZendSession,
+    mut headers: Vec<(HeaderName, HeaderValue)>,
+    method: Method,
+    path: &str,
+    host: &str,
+    body: Option<&Value>,
+    read_for: Duration,
+) -> Result<Reply, String> {
     let member = member(session)?;
-    let mut headers = caller.headers();
     headers.push((
         HeaderName::from_static(KEEP_HOST_HEADER),
         HeaderValue::from_str(host)

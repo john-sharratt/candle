@@ -1083,6 +1083,15 @@ by `zend-test` on an agent, and by hand on a machine kept out of the cluster
 (§14.1). **Promotion is not delegated either:** certifying a build, rolling it
 out, or rolling it back is a Decide command.
 
+**A worker deploys with `service_deploy {host, service}`** (`zend/src/mcp/trials.rs`):
+the build on the machine's agent, the stage and the trial as one call, which
+waits for keep's outcome. It builds `origin/main` alone. Only a coder running as
+an Admin may call it. A trial of `motherd` is refused on the machine running the
+worker, whose own call it would end, and where an app has no ready member
+elsewhere, which stays a person's decision through `service_trial`; a status
+that cannot be read refuses too. keep answers the member a request came from,
+so the call states no person.
+
 **The artifact keep runs** is a path on keep's own machine. A build job that
 names a `stage` — `target/release/motherd.exe` — has the agent copy that file
 to its `stage_dir`, the machine's `keep/stage/` (`agent/src/config.rs`), once
