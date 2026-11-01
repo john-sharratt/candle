@@ -15,6 +15,9 @@ const mockThreads = {};
 /// Characters' Discord bots, by character. See `getDiscord`.
 const mockBots = {};
 
+/// Each world's Discord server. See `getWorldDiscord`.
+const mockWorldServers = {};
+
 /// The caller's Discord link. See `linkDiscord`.
 const mockLink = { linked: null, pending: null };
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
@@ -716,6 +719,18 @@ export const MockAPI = {
   async getWorld(w) { return (await this.listWorlds()).worlds.find((x) => x.world_id === w); },
   async setWorld(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
   async setWorldTime(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
+  async getWorldDiscord(w) { return { guild: mockWorldServers[w] || null }; },
+  async setWorldDiscord(w, s) {
+    if (!mockBots[s.listener]) {
+      const e = new Error('the listener needs a Discord bot of its own');
+      e.detail = e.message;
+      throw e;
+    }
+    mockWorldServers[w] = { guild_id: s.guild_id, name: 'Life', listener: s.listener,
+      backstage: s.backstage };
+    return { guild: mockWorldServers[w] };
+  },
+  async clearWorldDiscord(w) { delete mockWorldServers[w]; return { guild: null }; },
   async listPersonalities(q) {
     // Ids are slugs and the anchor is `anchor`, matching
     // `personalities/<id>.yaml`. Both were invented shapes — numbered rows and
