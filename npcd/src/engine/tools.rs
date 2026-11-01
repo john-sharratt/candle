@@ -1449,6 +1449,15 @@ pub enum Choices {
     Sonos,
     /// A part here linked to an AV receiver — what the receiver acts work.
     Receiver,
+    /// A part here linked to a Cast device — what the cast acts work.
+    Cast,
+    /// A TV here the world pairs with and cannot work yet — what `pair_device`
+    /// begins. Empty once it is paired, so the act is offered only while there
+    /// is a TV to pair.
+    Pairable,
+    /// A Google TV here not yet paired — what `pair_code` finishes. A webOS TV
+    /// is absent, since it earns its key in one call and takes no code.
+    Pairing,
     /// A device the last survey here found that no part stands for yet — what
     /// `onboard_part` and `link_part` are grounded in.
     Findings,
@@ -1798,6 +1807,7 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("sonos_status", "device", Choices::Sonos),
     ("sonos_play", "device", Choices::Sonos),
     ("sonos_pause", "device", Choices::Sonos),
+    ("sonos_source", "device", Choices::Sonos),
     ("sonos_volume", "device", Choices::Sonos),
     ("receiver_status", "device", Choices::Receiver),
     ("receiver_on", "device", Choices::Receiver),
@@ -1805,6 +1815,28 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("receiver_mute", "device", Choices::Receiver),
     ("receiver_unmute", "device", Choices::Receiver),
     ("receiver_volume", "device", Choices::Receiver),
+    ("receiver_louder", "device", Choices::Receiver),
+    ("receiver_quieter", "device", Choices::Receiver),
+    ("receiver_input", "device", Choices::Receiver),
+    ("receiver_mode", "device", Choices::Receiver),
+    ("receiver_dim", "device", Choices::Receiver),
+    ("receiver_play", "device", Choices::Receiver),
+    ("receiver_pause", "device", Choices::Receiver),
+    ("receiver_next", "device", Choices::Receiver),
+    ("receiver_previous", "device", Choices::Receiver),
+    ("receiver_playing", "device", Choices::Receiver),
+    ("cast_status", "device", Choices::Cast),
+    ("cast_playing", "device", Choices::Cast),
+    ("cast_play", "device", Choices::Cast),
+    ("cast_pause", "device", Choices::Cast),
+    ("cast_stop", "device", Choices::Cast),
+    ("cast_mute", "device", Choices::Cast),
+    ("cast_unmute", "device", Choices::Cast),
+    ("cast_volume", "device", Choices::Cast),
+    ("cast_cast", "device", Choices::Cast),
+    ("cast_launch", "device", Choices::Cast),
+    ("pair_device", "device", Choices::Pairable),
+    ("pair_code", "device", Choices::Pairing),
     ("wake_device", "device", Choices::Onboarded),
     ("onboard_part", "from", Choices::Findings),
     ("link_part", "part", Choices::Unlinked),
@@ -1876,6 +1908,15 @@ pub struct Within {
     pub sonos: Vec<String>,
     /// The parts here linked to an AV receiver, by name — [`Choices::Receiver`].
     pub receiver: Vec<String>,
+    /// The parts here linked to a Cast device, by name — [`Choices::Cast`].
+    pub cast: Vec<String>,
+    /// The TVs here the world pairs with and has no key for yet, by name —
+    /// [`Choices::Pairable`]. What `pair_device` begins; empty once a TV is
+    /// paired, which takes the act away.
+    pub pairable: Vec<String>,
+    /// The Google TVs here not yet paired, by name — [`Choices::Pairing`]. What
+    /// `pair_code` finishes; a webOS TV never appears, since it takes no code.
+    pub pairing: Vec<String>,
     /// The acts the carried mission grants here (`docs/zen_moon_mind.md` §14):
     /// what [`Availability::Granted`] reads. Empty unless the body carries a
     /// mission granting them, stands in its room, and the room is a mirror.
@@ -2410,6 +2451,9 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Links => within.links.clone(),
         Choices::Sonos => within.sonos.clone(),
         Choices::Receiver => within.receiver.clone(),
+        Choices::Cast => within.cast.clone(),
+        Choices::Pairable => within.pairable.clone(),
+        Choices::Pairing => within.pairing.clone(),
         Choices::Findings => within.findings.clone(),
         Choices::Unlinked => within.unlinked.clone(),
         Choices::Onboarded => within.onboarded.clone(),
@@ -2629,6 +2673,70 @@ mod tests {
             };
             assert_eq!(p.max_tokens, bound, "`{}`", p.name);
         }
+    }
+
+    /// **A device act is offered only where its device stands, and its `device`
+    /// is bound to what is there.** Every bridge act binds `device` to the live
+    /// set of devices of that kind in the room, so the empty-set rule takes it
+    /// out of the grammar where there is none — which is what stops a character
+    /// inventing a device name for a device that is not present. Before this the
+    /// cast acts (and `sonos_source`, the extended receiver acts, and the two
+    /// pair acts) were free text and offered everywhere, so a cast standing in a
+    /// room with no devices spent its turns casting to a TV that was not there.
+    #[test]
+    fn a_device_act_is_offered_only_where_its_device_is() {
+        // A room with nothing in it offers none of them — the loop the cast was
+        // stuck in cannot form, because there is no act to emit.
+        let bare = specs_within(Mode::Physical, &Within::nowhere());
+        for gone in [
+            "cast_status",
+            "cast_cast",
+            "cast_volume",
+            "sonos_play",
+            "sonos_source",
+            "receiver_on",
+            "receiver_input",
+            "pair_device",
+            "pair_code",
+        ] {
+            assert!(
+                !bare.iter().any(|s| s.name == gone),
+                "`{gone}` was offered in a room with no device to work"
+            );
+        }
+
+        // With the devices standing here, each act is back and its `device` is
+        // the names present rather than a string the model fills in.
+        let furnished = Within {
+            cast: vec!["the TV".into()],
+            sonos: vec!["the Sonos".into()],
+            receiver: vec!["the stereo".into()],
+            pairable: vec!["the LG TV".into()],
+            pairing: vec!["the Google TV".into()],
+            ..Within::nowhere()
+        };
+        let specs = specs_within(Mode::Physical, &furnished);
+        let bound = |name: &str, want: &str| {
+            let t = specs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("`{name}` was dropped with its device present"));
+            let dev = t
+                .params
+                .iter()
+                .find(|p| p.name == "device")
+                .unwrap_or_else(|| panic!("`{name}` names no device"));
+            assert_eq!(
+                dev.enum_values.as_deref(),
+                Some(&[want.to_string()][..]),
+                "`{name}`'s device is free text, not bound to the device present"
+            );
+        };
+        bound("cast_status", "the TV");
+        bound("sonos_play", "the Sonos");
+        bound("receiver_on", "the stereo");
+        bound("pair_device", "the LG TV");
+        bound("pair_code", "the Google TV");
     }
 
     /// Every parameter in the catalog has a stencil type. `param_type` refuses

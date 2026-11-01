@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::engine::mission_gen::standing::HOUSE_LINK;
 use crate::world::Hosted;
-use finding::{ANDROIDTV, RECEIVER, SONOS};
+use finding::{ANDROIDTV, CAST, RECEIVER, SONOS};
 
 /// A reserved credential key, holding the id of the agent that began a Google
 /// TV's two-phase pairing, so `pair_code` finishes on that same agent (the TLS
@@ -93,6 +93,60 @@ pub fn sonos_of(parts: &[Here]) -> Vec<String> {
 /// The names of the parts among `parts` that stand for an AV receiver.
 pub fn receiver_of(parts: &[Here]) -> Vec<String> {
     on_profile(parts, RECEIVER)
+}
+
+/// The names of the parts among `parts` that stand for a Cast device.
+pub fn cast_of(parts: &[Here]) -> Vec<String> {
+    on_profile(parts, CAST)
+}
+
+/// Whether `link` holds a credential the world actually works the device with —
+/// any key that is not reserved bookkeeping. A device mid-pairing holds only a
+/// reserved key (see [`PAIRING_AGENT`]) and so still counts as having none.
+fn has_key(link: &PartLink) -> bool {
+    link.creds.keys().any(|k| !k.starts_with('_'))
+}
+
+/// Whether a Google TV's two-phase pairing has begun: the reserved note naming
+/// the agent that showed the code is recorded (see [`PAIRING_AGENT`]), set by
+/// the first call and dropped when the second finishes.
+fn pairing_begun(link: &PartLink) -> bool {
+    link.creds.contains_key(PAIRING_AGENT)
+}
+
+/// The names of the parts among `parts` that stand for a TV the world pairs
+/// with (a webOS or Google TV), has no key for yet, and has not already begun
+/// pairing — what `pair_device` begins. A TV already paired is absent (there is
+/// nothing to begin), and so is a Google TV mid-pairing: re-beginning it would
+/// orphan the open session and show a fresh code, so once begun only
+/// `pair_code` (see [`pairing_of`]) is offered until it finishes.
+pub fn pairable_of(parts: &[Here]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|p| {
+            p.link
+                .as_ref()
+                .is_some_and(|l| pairs(&l.profile) && !has_key(l) && !pairing_begun(l))
+        })
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// The names of the parts among `parts` that stand for a Google TV whose
+/// pairing has begun but is not yet finished — what `pair_code` completes with
+/// the code the TV is showing. A webOS TV pairs in one call and never takes a
+/// code, and a Google TV that has not begun has no session to finish, so
+/// neither appears here: `pair_code` follows `pair_device`, never precedes it.
+pub fn pairing_of(parts: &[Here]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|p| {
+            p.link
+                .as_ref()
+                .is_some_and(|l| l.profile == ANDROIDTV && pairing_begun(l) && !has_key(l))
+        })
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 /// The part here named `name` that stands for a device of `profile`, and its
@@ -435,5 +489,57 @@ mod tests {
             merged.get(PAIRING_AGENT).is_none(),
             "a reserved `_`-key is the world's own, never handed to a device"
         );
+    }
+
+    /// A `Here` standing for a device of `profile` with the given credentials.
+    fn device_part(name: &str, profile: &str, creds: &[(&str, &str)]) -> Here {
+        Here {
+            name: name.into(),
+            id: format!("device-{name}"),
+            link: Some(PartLink {
+                profile: profile.into(),
+                address: "192.168.0.1".into(),
+                hardware: String::new(),
+                creds: creds
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                notes: None,
+            }),
+        }
+    }
+
+    /// **Each device act's set is the devices of its kind standing here, and a
+    /// TV moves cleanly from `pair_device` to `pair_code` as its pairing
+    /// begins.** These are the sets the grammar binds a device act's `device`
+    /// to; an empty one takes the act out of the grammar, so what a room offers
+    /// is exactly what stands in it — and a Google TV mid-pairing is offered
+    /// only `pair_code`, never a second `pair_device` that would orphan its
+    /// session.
+    #[test]
+    fn the_device_sets_name_the_devices_of_each_kind_here() {
+        let parts = vec![
+            device_part("the Sonos", SONOS, &[]),
+            device_part("the stereo", RECEIVER, &[]),
+            device_part("the Chromecast", CAST, &[]),
+            // An unpaired LG TV: pairable (one call), never pairing (no code).
+            device_part("the LG TV", finding::WEBOS, &[]),
+            // A Google TV not yet begun: pairable, not yet pairing.
+            device_part("the den TV", ANDROIDTV, &[]),
+            // A Google TV mid-pairing holds the reserved agent note and no real
+            // key: no longer pairable (re-beginning would orphan it), now
+            // pairing.
+            device_part("the Google TV", ANDROIDTV, &[(PAIRING_AGENT, "7")]),
+            // A webOS TV already paired has a key, so no set names it.
+            device_part("the bedroom TV", finding::WEBOS, &[("client-key", "abcd")]),
+        ];
+        assert_eq!(sonos_of(&parts), vec!["the Sonos".to_string()]);
+        assert_eq!(receiver_of(&parts), vec!["the stereo".to_string()]);
+        assert_eq!(cast_of(&parts), vec!["the Chromecast".to_string()]);
+        assert_eq!(
+            pairable_of(&parts),
+            vec!["the LG TV".to_string(), "the den TV".to_string()]
+        );
+        assert_eq!(pairing_of(&parts), vec!["the Google TV".to_string()]);
     }
 }

@@ -318,12 +318,26 @@ pairing, an account — is given once, by its owner.
 
 **A bridge is how the world reaches a kind of real thing.** `npcd::bridge` holds one module per
 kind, each a **profile**: how a finding is recognised as one, and the acts a part linked to one
-offers, served at that part like any station act.
+offers, served at that part like any station act. **An act is offered only where its device
+stands** — each binds its `device` to the players, receivers or TVs linked in the room (the
+`Choices::Sonos` / `Receiver` / `Cast` / `Pairable` / `Pairing` sets in `npcd::engine::tools`),
+so a body is never shown an act for a device that is not there, and never invents one to work.
 
 | Profile | Recognised by | Acts |
 |---|---|---|
-| `sonos` | mDNS `_sonos._tcp`, or a UPnP description by Sonos | `sonos_status` (what is playing, volume), `sonos_play`, `sonos_pause`, `sonos_volume` — over the player's own UPnP control on port 1400 |
+| `sonos` | mDNS `_sonos._tcp`, or a UPnP description by Sonos | `sonos_status` (what is playing, volume), `sonos_play`, `sonos_pause`, `sonos_source` (start a stream from nothing), `sonos_volume` — over the player's own UPnP control on port 1400 |
+| `receiver` | an Onkyo, Integra or Pioneer AV receiver | `receiver_status`, `receiver_on`/`off`, `receiver_mute`/`unmute`, `receiver_volume`/`louder`/`quieter`, `receiver_input`, `receiver_mode`, `receiver_dim`, and transport `receiver_play`/`pause`/`next`/`previous`/`playing` — over eISCP on port 60128 |
+| `cast` | mDNS `_googlecast._tcp` — a Chromecast, or a Cast-built-in TV or speaker | `cast_status`, `cast_playing`, `cast_play`, `cast_pause`, `cast_stop`, `cast_mute`/`unmute`, `cast_volume`, `cast_cast` (a media URL), `cast_launch` (an app) — over CASTv2 on port 8009 |
+| `webos` | an LG webOS TV | `pair_device` — one call, accepted on the TV's own screen, earns the client-key the world keeps and works it with |
+| `androidtv` | a Google TV / Android TV | `pair_device` begins pairing (the TV shows a six-digit code) and `pair_code` finishes it with that code, earning the RSA client certificate the world keeps; the family only reads the code back, and nobody else need be at the TV |
 | `device` | anything else found | none: present or not, its names and maker |
+
+A found machine that can sleep — a PC or laptop with a hardware address — also offers
+`wake_device`, a Wake-on-LAN packet that brings it back on the network with nothing switched on
+at it. A webOS or Google TV pairs before the world can work it; the key it earns is kept on the
+device's world part (`keep_earned`), so every later command carries it and the stateless agent
+never holds a secret. Once begun, a Google TV is offered only `pair_code` until it finishes —
+re-beginning would orphan the open session and show a fresh code.
 
 A profile is code in candle, written against the device's own documented or openly offered
 interface. Building one for a kind of device the house has and the world cannot yet reach is
