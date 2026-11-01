@@ -21,7 +21,8 @@
 //!    refusal (`4004`, or a `401` on any call) stops the shard and writes the
 //!    bot's state refused.
 //! 3. **What the characters wrote is posted** to their DMs ([`outbound`])
-//!    and their channels ([`channel outbound`]).
+//!    and their channels ([`channel outbound`]), and every world whose
+//!    listener is online here is mirrored into its server ([`world`]).
 //!
 //! A shard never writes the world: it hands what it hears to this beat's
 //! queue, and the beat — on the authority — makes the world's writes. The
@@ -59,6 +60,7 @@ use crate::discord::server::{gap as channel_gap, guild, inbound as channel_inbou
 use crate::discord::state::{self, BotState, State};
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::trace::{failed, note, Trace};
+use crate::discord::world;
 use crate::engine::driver::EVERY as BEAT;
 use crate::tenant::HOST;
 
@@ -178,16 +180,17 @@ impl Bots {
             .values()
             .filter_map(|r| r.online.clone())
             .collect();
-        for bot in online {
+        for bot in &online {
             let unreachable = held.unreachable.entry(bot.npc).or_default();
-            let posted = match outbound::post(a, &bot, unreachable).await {
-                Ok(()) => channel_outbound::post(a, &bot).await,
+            let posted = match outbound::post(a, bot, unreachable).await {
+                Ok(()) => channel_outbound::post(a, bot).await,
                 Err(rejected) => Err(rejected),
             };
             if posted.is_err() {
                 refuse(a, &mut held, bot.npc).await;
             }
         }
+        world::tick(a, &online).await;
     }
 
     /// Close every shard, tombstoning each bot's state: this member is
@@ -331,6 +334,7 @@ impl Bots {
                     let told = held.told.entry(npc).or_default();
                     gap::fetch(a, &bot, told).await.is_err()
                         || channel_gap::fetch(a, &bot).await.is_err()
+                        || world::gap::fetch(a, &bot).await.is_err()
                 }
                 Event::NeedsContentIntent => {
                     r.online = None;
@@ -357,6 +361,17 @@ impl Bots {
                     false
                 }
                 Event::Message(m) => match online {
+                    // The world's server is its listener's to hear, and no
+                    // other bot's: its channels mirror the world's threads.
+                    Some(bot)
+                        if m.guild_id
+                            .is_some_and(|g| world::is_world_server(a, &bot, g)) =>
+                    {
+                        if let Some((hosted, _)) = world::listened(a, &bot) {
+                            world::inbound::hear(a, &bot, &hosted, &m).await;
+                        }
+                        false
+                    }
                     Some(bot) if m.guild_id.is_some() => {
                         channel_inbound::hear(a, &bot, &m).await;
                         false

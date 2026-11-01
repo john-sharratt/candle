@@ -137,6 +137,7 @@ use web::auth::{Identity, Role, Roles};
 
 use crate::api::{err, owner_of, Authored};
 use crate::authority::ops::{OpReply, WorldOp};
+use crate::discord::world::routes as world_discord;
 use crate::engine::bodies::{Channel, ChannelSent, MessageSent, Messages, Said, Say};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
@@ -388,6 +389,17 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::Creator,
             world(),
             post(post_posting),
+        )
+        // The world's own Discord server (`docs/npcd_discord.md` §4.4): set,
+        // read and taken away by a Creator, for the same reason the channel's
+        // write side is — it mirrors the world as a whole.
+        .route(
+            "/v1/world/:wid/discord",
+            Role::Creator,
+            world(),
+            get(world_discord::get_world_discord)
+                .put(world_discord::put_world_discord)
+                .delete(world_discord::delete_world_discord),
         )
         // ── the act vocabulary ──────────────────────────────────────────────
         //
@@ -1426,6 +1438,7 @@ pub(crate) async fn post_channel(
     let op = WorldOp::Channel {
         from: me.clone(),
         text: text.to_string(),
+        origin: None,
     };
     let heard = match rt.world_write(&wid, op).await {
         Ok(OpReply::Heard { by }) => by,

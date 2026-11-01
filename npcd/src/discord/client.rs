@@ -63,6 +63,36 @@ struct Made {
     id: u64,
 }
 
+/// A server, as `GET /guilds/{id}` answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GuildInfo {
+    #[serde(deserialize_with = "snowflake")]
+    pub id: u64,
+    pub name: String,
+}
+
+/// One of a server's channels, as `GET /guilds/{id}/channels` answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GuildChannel {
+    #[serde(deserialize_with = "snowflake")]
+    pub id: u64,
+    /// `0` a text channel, `4` a category, `5` an announcement channel.
+    #[serde(rename = "type")]
+    pub kind: u8,
+    /// Absent on a channel of a kind that has none.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A channel's webhook, as `POST /channels/{id}/webhooks` answers it: what
+/// posting through it needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Webhook {
+    #[serde(deserialize_with = "snowflake")]
+    pub id: u64,
+    pub token: String,
+}
+
 /// The most messages one read of a channel's history answers, as Discord
 /// caps it.
 pub const HISTORY_PAGE: u32 = 100;
@@ -176,6 +206,92 @@ impl Client {
         Ok(made.id)
     }
 
+    /// Server `guild_id`, as the bot sees it: refused when the bot is not in
+    /// it.
+    pub async fn guild(&self, token: &str, guild_id: u64) -> Result<GuildInfo, DiscordError> {
+        self.call(Method::GET, &format!("/guilds/{guild_id}"), token, None)
+            .await
+    }
+
+    /// Every channel of server `guild_id`.
+    pub async fn guild_channels(
+        &self,
+        token: &str,
+        guild_id: u64,
+    ) -> Result<Vec<GuildChannel>, DiscordError> {
+        self.call(
+            Method::GET,
+            &format!("/guilds/{guild_id}/channels"),
+            token,
+            None,
+        )
+        .await
+    }
+
+    /// Make a text channel called `name` in server `guild_id`; its id.
+    pub async fn create_channel(
+        &self,
+        token: &str,
+        guild_id: u64,
+        name: &str,
+    ) -> Result<u64, DiscordError> {
+        let made: Made = self
+            .call(
+                Method::POST,
+                &format!("/guilds/{guild_id}/channels"),
+                token,
+                Some(json!({ "name": name, "type": 0 })),
+            )
+            .await?;
+        Ok(made.id)
+    }
+
+    /// Make a webhook called `name` on channel `channel_id`, for the
+    /// characters without a bot of their own to speak through.
+    pub async fn create_webhook(
+        &self,
+        token: &str,
+        channel_id: u64,
+        name: &str,
+    ) -> Result<Webhook, DiscordError> {
+        self.call(
+            Method::POST,
+            &format!("/channels/{channel_id}/webhooks"),
+            token,
+            Some(json!({ "name": name })),
+        )
+        .await
+    }
+
+    /// Post `content` through webhook `hook` under the name `username`, with
+    /// the picture at `avatar_url` when there is one; the message's id. Asked
+    /// to `wait`, so Discord answers with the message it made. Authorised by
+    /// the webhook's own token in the path, not a bot's.
+    pub async fn execute_webhook(
+        &self,
+        hook: &Webhook,
+        username: &str,
+        avatar_url: Option<&str>,
+        content: &str,
+    ) -> Result<u64, DiscordError> {
+        let mut body = json!({
+            "content": content,
+            "username": username,
+            "allowed_mentions": { "parse": [] },
+        });
+        if let Some(url) = avatar_url {
+            body["avatar_url"] = Value::from(url);
+        }
+        let made: Made = self
+            .call_unauthorised(
+                Method::POST,
+                &format!("/webhooks/{}/{}?wait=true", hook.id, hook.token),
+                body,
+            )
+            .await?;
+        Ok(made.id)
+    }
+
     /// What was written in channel `channel_id` after message `after`, up to
     /// [`HISTORY_PAGE`] of it, oldest first.
     pub async fn messages_after(
@@ -205,14 +321,39 @@ impl Client {
         token: &str,
         body: Option<Value>,
     ) -> Result<T, DiscordError> {
+        self.send(method, path, Some(token), body).await
+    }
+
+    /// One request authorised by what its path carries — a webhook's token —
+    /// and its answer read as `T`.
+    async fn call_unauthorised<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Value,
+    ) -> Result<T, DiscordError> {
+        self.send(method, path, None, Some(body)).await
+    }
+
+    /// One request, as the bot `token` names when there is one, and its
+    /// answer read as `T`.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> Result<T, DiscordError> {
         if let Err(retry_after_s) = self.invalid.check(Instant::now()) {
             return Err(DiscordError::Paused { retry_after_s });
         }
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.base))
-            .header(AUTHORIZATION, format!("Bot {token}"))
             .header(USER_AGENT, AGENT);
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, format!("Bot {token}"));
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -379,6 +520,96 @@ mod tests {
                     "/channels/31/messages?after=901&limit=100",
                     Value::Null
                 ),
+            ]
+        );
+    }
+
+    /// **A world's server's calls are the requests Discord documents**: the
+    /// server and its channels read as the bot, a text channel made by name,
+    /// a webhook made on it, and a post through the webhook authorised by its
+    /// own token in the path — no bot's — under the speaker's name, waited
+    /// for, pinging nobody.
+    #[tokio::test]
+    async fn the_world_server_calls_are_the_documented_requests() {
+        let discord = fake::start(Mode::Ok).await;
+        let client = Client::at(&discord.url);
+        discord.channels(&[(610, 0, "general")]);
+
+        assert_eq!(
+            client.guild(TOKEN, 600).await,
+            Ok(GuildInfo {
+                id: 600,
+                name: fake::GUILD_NAME.into()
+            })
+        );
+        assert_eq!(
+            client.guild_channels(TOKEN, 600).await,
+            Ok(vec![GuildChannel {
+                id: 610,
+                kind: 0,
+                name: "general".into()
+            }])
+        );
+        assert_eq!(
+            client.create_channel(TOKEN, 600, "the-channel").await,
+            Ok(fake::FIRST_CHANNEL)
+        );
+        let hook = client
+            .create_webhook(TOKEN, fake::FIRST_CHANNEL, "Life")
+            .await
+            .unwrap();
+        assert_eq!(
+            hook,
+            Webhook {
+                id: fake::FIRST_CHANNEL + fake::HOOK_OFFSET,
+                token: fake::HOOK_TOKEN.into()
+            }
+        );
+        assert_eq!(
+            client
+                .execute_webhook(&hook, "Wick", Some("https://a/p.png"), "hello")
+                .await,
+            Ok(fake::FIRST_POSTED)
+        );
+        client
+            .execute_webhook(&hook, "Wren S", None, "hi")
+            .await
+            .unwrap();
+
+        let hook_path = format!("/webhooks/{}/{}?wait=true", hook.id, fake::HOOK_TOKEN);
+        let unauthorised = |body: Value| Seen {
+            method: "POST".into(),
+            path: hook_path.clone(),
+            authorization: String::new(),
+            user_agent: AGENT.into(),
+            body,
+        };
+        assert_eq!(
+            discord.seen(),
+            [
+                seen("GET", "/guilds/600", Value::Null),
+                seen("GET", "/guilds/600/channels", Value::Null),
+                seen(
+                    "POST",
+                    "/guilds/600/channels",
+                    json!({ "name": "the-channel", "type": 0 })
+                ),
+                seen(
+                    "POST",
+                    &format!("/channels/{}/webhooks", fake::FIRST_CHANNEL),
+                    json!({ "name": "Life" })
+                ),
+                unauthorised(json!({
+                    "content": "hello",
+                    "username": "Wick",
+                    "avatar_url": "https://a/p.png",
+                    "allowed_mentions": { "parse": [] },
+                })),
+                unauthorised(json!({
+                    "content": "hi",
+                    "username": "Wren S",
+                    "allowed_mentions": { "parse": [] },
+                })),
             ]
         );
     }

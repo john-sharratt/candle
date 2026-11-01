@@ -4282,6 +4282,9 @@ mod tests {
                 ("/v1/world/:wid/channel", "user"),
                 ("/v1/world/:wid/channel", "creator"),
                 ("/v1/world/:wid/posting", "creator"),
+                // The world's Discord server: a creator's, as the channel's
+                // write side is.
+                ("/v1/world/:wid/discord", "creator"),
                 // The command list is a user's. The catalog and its
                 // calibration are the host's `/v1/tools`.
                 ("/v1/commands", "user"),

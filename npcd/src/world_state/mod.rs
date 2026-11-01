@@ -33,10 +33,12 @@ pub use snapshot::{sim_records, world_records, Records};
 
 use crate::discord::dm::record::Dms;
 use crate::discord::server::record::Servers;
+use crate::discord::world::record::Mirror;
 use crate::world::Hosted;
 
-/// A hosted world's records as they stand now: its map's, its [`Sim`]'s, and
-/// its bots' DMs, servers and channels (`docs/npcd_discord.md` §4.2).
+/// A hosted world's records as they stand now: its map's, its [`Sim`]'s, its
+/// bots' DMs, servers and channels, and its own Discord server and what is
+/// mirrored there (`docs/npcd_discord.md` §4.2).
 ///
 /// [`Sim`]: crate::sim::Sim
 pub fn records_of(hosted: &Hosted) -> Records {
@@ -44,5 +46,6 @@ pub fn records_of(hosted: &Hosted) -> Records {
     records.extend(hosted.sim(sim_records));
     records.extend(hosted.dms(Dms::records));
     records.extend(hosted.servers(Servers::records));
+    records.extend(hosted.mirror(Mirror::records));
     records
 }

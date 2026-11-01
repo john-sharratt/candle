@@ -169,8 +169,14 @@ impl Runtime {
             WorldOp::Cancel { npc } => OpReply::Done {
                 ok: self.cancel_mission(npc, self.world_ms(npc)),
             },
-            WorldOp::Channel { from, text } => OpReply::Heard {
-                by: self.say_on_channel(world, &from, &text),
+            WorldOp::Channel { from, text, origin } => OpReply::Heard {
+                by: self.say_on_channel_from(world, &from, &text, origin),
+            },
+            WorldOp::Guild { guild } => OpReply::Done {
+                ok: self.hosted.get(world).is_some_and(|hosted| {
+                    hosted.with_mirror(|m| m.set_guild(guild));
+                    true
+                }),
             },
             WorldOp::ChannelMessage {
                 npc,

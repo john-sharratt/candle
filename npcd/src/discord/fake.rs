@@ -27,6 +27,15 @@ pub const OLD_NAME: &str = "Old Name";
 pub const DM_CHANNEL: u64 = 333;
 /// The id of the first message the fake posts; each next is one more.
 pub const FIRST_POSTED: u64 = 5000;
+/// What `GET /guilds/{id}` calls every server.
+pub const GUILD_NAME: &str = "zenworld";
+/// The id of the first channel the fake makes; each next is one more.
+pub const FIRST_CHANNEL: u64 = 7000;
+/// The token of every webhook the fake makes. Its id is the channel's plus
+/// [`HOOK_OFFSET`].
+pub const HOOK_TOKEN: &str = "hook-token";
+/// What a channel's id is raised by to name its webhook.
+pub const HOOK_OFFSET: u64 = 100_000;
 
 /// How the fake answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +92,15 @@ impl Fake {
     pub fn history(&self, channel: u64, messages: Vec<Value>) {
         self.held.history.lock().unwrap().insert(channel, messages);
     }
+
+    /// What `GET /guilds/{id}/channels` answers before any is made: `channels`,
+    /// as `(id, type, name)`.
+    pub fn channels(&self, channels: &[(u64, u8, &str)]) {
+        *self.held.channels.lock().unwrap() = channels
+            .iter()
+            .map(|(id, kind, name)| json!({ "id": id.to_string(), "type": kind, "name": name }))
+            .collect();
+    }
 }
 
 #[derive(Clone)]
@@ -92,6 +110,9 @@ struct Held {
     replies: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
     history: Arc<Mutex<BTreeMap<u64, Vec<Value>>>>,
     posted: Arc<Mutex<u64>>,
+    /// The server's channels, those made since included.
+    channels: Arc<Mutex<Vec<Value>>>,
+    made: Arc<Mutex<u64>>,
 }
 
 /// A fake answering as `mode`, on `127.0.0.1` and a port of its own.
@@ -102,6 +123,8 @@ pub async fn start(mode: Mode) -> Fake {
         replies: Arc::new(Mutex::new(VecDeque::new())),
         history: Arc::new(Mutex::new(BTreeMap::new())),
         posted: Arc::new(Mutex::new(FIRST_POSTED)),
+        channels: Arc::new(Mutex::new(Vec::new())),
+        made: Arc::new(Mutex::new(FIRST_CHANNEL)),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -162,8 +185,72 @@ async fn answer(
     }
 }
 
+/// The next message id the fake posts.
+fn next_posted(held: &Held) -> u64 {
+    let mut posted = held.posted.lock().unwrap();
+    let id = *posted;
+    *posted += 1;
+    id
+}
+
+/// What Discord answers a good request to a server, a channel's webhooks or
+/// a webhook, when `path` is one.
+fn ok_server(held: &Held, method: &Method, path: &str, body: &Value) -> Option<Response> {
+    let id_in = |prefix: &str, suffix: &str| {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .and_then(|id| id.parse::<u64>().ok())
+    };
+    if let Some(guild) = id_in("/guilds/", "/channels") {
+        return Some(match *method {
+            Method::POST => {
+                let mut made = held.made.lock().unwrap();
+                let id = *made;
+                *made += 1;
+                let channel = json!({
+                    "id": id.to_string(),
+                    "type": body["type"],
+                    "name": body["name"],
+                    "guild_id": guild.to_string(),
+                });
+                held.channels.lock().unwrap().push(channel.clone());
+                Json(channel).into_response()
+            }
+            _ => Json(Value::Array(held.channels.lock().unwrap().clone())).into_response(),
+        });
+    }
+    if let Some(guild) = id_in("/guilds/", "") {
+        return Some(Json(json!({ "id": guild.to_string(), "name": GUILD_NAME })).into_response());
+    }
+    if let Some(channel) = id_in("/channels/", "/webhooks") {
+        return Some(
+            Json(json!({
+                "id": (channel + HOOK_OFFSET).to_string(),
+                "token": HOOK_TOKEN,
+                "channel_id": channel.to_string(),
+            }))
+            .into_response(),
+        );
+    }
+    let (hook, _token) = path.strip_prefix("/webhooks/")?.split_once('/')?;
+    let channel = hook.parse::<u64>().ok()?.checked_sub(HOOK_OFFSET)?;
+    Some(
+        Json(json!({
+            "id": next_posted(held).to_string(),
+            "channel_id": channel.to_string(),
+            "webhook_id": hook,
+            "author": { "id": hook, "username": body["username"], "bot": true },
+            "content": body["content"],
+        }))
+        .into_response(),
+    )
+}
+
 /// What Discord answers a good request.
 fn ok(held: &Held, method: &Method, path: &str, body: &Value) -> Response {
+    if let Some(answer) = ok_server(held, method, path, body) {
+        return answer;
+    }
     let channel = path
         .strip_prefix("/channels/")
         .and_then(|rest| rest.strip_suffix("/messages"))
@@ -188,9 +275,7 @@ fn ok(held: &Held, method: &Method, path: &str, body: &Value) -> Response {
             Json(json!({ "id": DM_CHANNEL.to_string(), "type": 1 })).into_response()
         }
         (Method::POST, _, Some(channel)) => {
-            let mut posted = held.posted.lock().unwrap();
-            let id = *posted;
-            *posted += 1;
+            let id = next_posted(held);
             Json(json!({
                 "id": id.to_string(),
                 "channel_id": channel.to_string(),

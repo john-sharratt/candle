@@ -86,7 +86,22 @@ impl Sealer {
 
     /// The token sealed for character `npc_id`'s record in `sealed`.
     pub fn open(&self, npc_id: u64, sealed: &str) -> Result<String, Unsealable> {
-        let bytes = self.open_with(store::key(npc_id).as_bytes(), sealed)?;
+        self.open_for(&store::key(npc_id), sealed)
+    }
+
+    /// `secret`, sealed for the record called `record` under a fresh nonce —
+    /// a webhook's token, kept on its world's record of it.
+    pub fn seal_for(&self, record: &str, secret: &str) -> String {
+        let mut nonce = [0u8; NONCE];
+        OsRng
+            .try_fill_bytes(&mut nonce)
+            .expect("the OS must provide entropy");
+        self.seal_with(nonce, record.as_bytes(), secret.as_bytes())
+    }
+
+    /// The secret sealed for the record called `record` in `sealed`.
+    pub fn open_for(&self, record: &str, sealed: &str) -> Result<String, Unsealable> {
+        let bytes = self.open_with(record.as_bytes(), sealed)?;
         String::from_utf8(bytes).map_err(|_| Unsealable::NotText)
     }
 

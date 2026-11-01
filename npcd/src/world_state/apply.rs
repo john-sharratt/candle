@@ -103,8 +103,8 @@ fn apply_world(w: &mut World, records: &Records) {
 }
 
 /// Put `records` into `hosted`, under one hold of its lock — and its bots'
-/// DMs, servers and channels (`docs/npcd_discord.md` §4.2), which are not
-/// under it.
+/// DMs, servers and channels, and its own Discord server and what is
+/// mirrored there (`docs/npcd_discord.md` §4.2), which are not under it.
 pub fn apply(hosted: &Hosted, records: &Records) {
     let sim = sim_of(records);
     hosted.with_both(|w, s| {
@@ -119,6 +119,7 @@ pub fn apply(hosted: &Hosted, records: &Records) {
     });
     hosted.with_dms(|dms| dms.take_in(records));
     hosted.with_servers(|servers| servers.take_in(records));
+    hosted.with_mirror(|mirror| mirror.take_in(records));
 }
 
 #[cfg(test)]

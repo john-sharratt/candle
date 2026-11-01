@@ -30,9 +30,17 @@ use crate::discord::gateway::guild::{Guild, GuildChannel};
 use crate::discord::online::Online;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
+use crate::discord::world::is_world_server;
 use crate::world::Hosted;
 
 /// Server `g`, as a `GUILD_CREATE` hands it to `bot`.
+///
+/// **The world's own server is recorded and nothing more.** Its channels
+/// mirror the world's threads (`crate::discord::world`) and are the
+/// listener's to hear; a thread of one character's for each of them would be
+/// a second copy of every conversation. The record is what says the bot may
+/// post there as itself. A thread that stood for one of its channels before
+/// the server became the world's is closed.
 pub async fn learned(a: &Authored, bot: &Online, g: &Guild) {
     let Some((hosted, character)) = embodied(a, bot) else {
         return;
@@ -48,6 +56,17 @@ pub async fn learned(a: &Authored, bot: &Online, g: &Guild) {
             },
         )
     });
+    if is_world_server(a, bot, g.id) {
+        for (channel_id, _) in hosted.servers(|s| s.channels_in(npc, g.id)) {
+            gone(&hosted, npc, channel_id);
+        }
+        note(
+            a,
+            npc,
+            Note::new(now_ms(), Direction::In, "server", "the_worlds").guild(g.id),
+        );
+        return;
+    }
     let text: Vec<&GuildChannel> = g.text_channels().collect();
     for c in &text {
         thread::stand(&hosted, npc, &character, g.id, &g.name, c.id, &c.name);
@@ -139,6 +158,9 @@ pub fn channel(a: &Authored, bot: &Online, c: &GuildChannel) {
     let (Some(guild_id), true) = (c.guild_id, c.is_text()) else {
         return;
     };
+    if is_world_server(a, bot, guild_id) {
+        return;
+    }
     let Some((hosted, character)) = embodied(a, bot) else {
         return;
     };

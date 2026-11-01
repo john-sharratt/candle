@@ -20,7 +20,8 @@ bot provisioning of §4.3 (`seal`, `store`, `client`, `profile`, `invite`, `rout
 bot runtime of §3.3 and §6 (`gateway/` — `protocol`, `guild`, `shard` — `state`, `online`,
 `bots/`), linking (§3.2, `link/`), DMs both ways (§5, `dm/`), a bot in its servers'
 channels (§3.4, `server/`), the posting both share (`post/`), and seeing what the bridge
-did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`);
+did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
+and of part three the world's own server and its open channel (§4.4, `world/`);
 §8 says what comes next, in the order it is built. It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
@@ -395,8 +396,9 @@ record):
 
 | Record | Holds |
 |---|---|
-| `discord/guild` | `{ guild_id, listener: <npc_id>, backstage: bool }` — the world's server (§4.4) |
-| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` |
+| `discord/guild` | `{ guild_id, name, listener: <npc_id>, backstage: bool }` — the world's server (§4.4), and its name as Discord last gave it |
+| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel` |
+| `discord/webhook/<channel_id>` | `{ webhook_id, token }` — a mirrored channel's persona webhook (§3.1), its token sealed for this record as a bot token is (§4.3) |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
 | `discord/channel/<npc_id>/<channel_id>` | `{ guild_id, thread, mirrored_through, last_seen_discord }` — a server channel the bot is in, and its thread (§3.4) |
 | `discord/server/<npc_id>/<guild_id>` | `{ name }` — a server the bot is in, so joins and leaves while it was offline are told (§3.4) |
@@ -721,7 +723,22 @@ channel, group and webhook halves of §5, and it is built first and alone.
 
 **Part three — mirroring a world into its server**
 
-9. The world's server (§4.4) and the channel both ways.
+9. **Built:** the world's server (§4.4) and the channel both ways
+   (`npcd/src/discord/world/`). The listener finds `#the-channel` by name or
+   makes it, with its cursor at the thread's end, and makes the channel's persona
+   webhook; what the world says there is posted by the speaker's own bot when it
+   is online and in the server, and otherwise through the webhook under the
+   speaker's name, with a character's portrait through a signed image link
+   (`/v1/image/link/…`). A post on Discord by a linked person with the Creator
+   role is said on the channel (`WorldOp::Channel` with its `origin`); anyone
+   else's, and any bot's or webhook's, is dropped and said in the trace. Every
+   other bot in the world's server keeps its server record — what lets it post
+   there as itself — and stands no channel threads of its own. A webhook Discord
+   no longer has (`404`) is forgotten and made again. The listener's `READY`
+   reads what the mirrored channels missed. Tests against the fake gateway and
+   REST API: the channel made or found, its webhook sealed, each speaker,
+   inbound from each kind of author, a bot that is not the listener, and the
+   routes' three checks.
 10. Groups as channels, persona webhooks and private-thread "DMs", and the reconcile
    (§5.3).
 11. Authority moves for the listener and the channel cursors (§5.4), with a two-member

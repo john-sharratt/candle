@@ -2,9 +2,11 @@
 //! port of the test's own, and a daemon with no engine hosting the vault, in
 //! which Zen — [`OWNER`]'s character, with a bot — has a body.
 //!
-//! The DMs are tested here; a bot in its servers' channels in [`channels`].
+//! The DMs are tested here; a bot in its servers' channels in [`channels`],
+//! and a world mirrored into its own server in [`world`].
 
 mod channels;
+mod world;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -44,6 +46,8 @@ const WORLD: &str = "creators-vault";
 const OWNER: &str = "google-1";
 /// Somebody else, who may not.
 const STRANGER: &str = "google-2";
+/// Somebody with the Creator role, who may speak on a world's channel.
+const CREATOR: &str = "google-3";
 const TOKEN: &str = "MTEx.bot.token";
 /// Wren's Discord user, and the DM channel Discord gave Wren and Zen's bot.
 const WREN: u64 = 77;
@@ -68,6 +72,7 @@ fn identity(sub: &str) -> Identity {
         email: format!("{sub}@example.com"),
         name: match sub {
             OWNER => WREN_S.into(),
+            CREATOR => "Ada".into(),
             _ => "Somebody Else".into(),
         },
         picture: String::new(),
@@ -98,7 +103,8 @@ async fn daemon(scripts: Vec<Script>) -> Daemon {
         accounts,
         npcs,
         serde_yaml::from_str(&format!(
-            "people:\n  - sub: {OWNER}\n    role: user\n  - sub: {STRANGER}\n    role: user\n"
+            "people:\n  - sub: {OWNER}\n    role: user\n  - sub: {STRANGER}\n    role: user\n  \
+             - sub: {CREATOR}\n    role: creator\n"
         ))
         .unwrap(),
         Libraries::load(&Source::resolve(None).unwrap()),
@@ -120,7 +126,7 @@ async fn daemon(scripts: Vec<Script>) -> Daemon {
     rt.set_npcs(authored.npcs.clone());
     let a = authored.with_runtime(rt.clone());
 
-    for sub in [OWNER, STRANGER] {
+    for sub in [OWNER, STRANGER, CREATOR] {
         a.accounts.write().await.upsert(&identity(sub), 1).unwrap();
     }
     let made = a
