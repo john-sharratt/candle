@@ -8,34 +8,38 @@
 //! (`docs/replicated_substrate.md` §6.2). Built by the open walk, kept current
 //! by every append, rebuilt after compaction; compaction and maintenance read
 //! it to know what to carry, and a resume reads the events it points at.
+//!
+//! Persistent maps throughout, so maintenance scans an O(1) clone off the
+//! log's owner and an append after the clone copies only the path it changes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
 use super::payload::VfsEventId;
 use crate::persistence::manifest::RecordLoc;
+use crate::substrate::pcoll::{PMap, POrdMap, PSet};
 
 /// One conversation's file events and tombstones.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TimelineVfs {
     /// Live events.
-    events: BTreeMap<VfsEventId, RecordLoc>,
+    events: POrdMap<VfsEventId, RecordLoc>,
     /// Tombstones, by their own name.
-    tombstones: BTreeMap<VfsEventId, RecordLoc>,
+    tombstones: POrdMap<VfsEventId, RecordLoc>,
     /// Events a tombstone killed — so an event met after the tombstone that
     /// killed it, in log order, stays dead.
-    killed: HashSet<VfsEventId>,
+    killed: PSet<VfsEventId>,
     /// The writers of the events each tombstone kills.
-    killed_writers: HashMap<VfsEventId, BTreeSet<u64>>,
+    killed_writers: PMap<VfsEventId, BTreeSet<u64>>,
     /// Each writer's highest sequence number seen, live or not.
-    max_seq: HashMap<u64, u64>,
+    max_seq: PMap<u64, u64>,
 }
 
 impl TimelineVfs {
-    pub fn events(&self) -> &BTreeMap<VfsEventId, RecordLoc> {
+    pub fn events(&self) -> &POrdMap<VfsEventId, RecordLoc> {
         &self.events
     }
 
-    pub fn tombstones(&self) -> &BTreeMap<VfsEventId, RecordLoc> {
+    pub fn tombstones(&self) -> &POrdMap<VfsEventId, RecordLoc> {
         &self.tombstones
     }
 
@@ -54,18 +58,21 @@ impl TimelineVfs {
     }
 
     fn saw(&mut self, id: VfsEventId) {
-        let max = self.max_seq.entry(id.origin).or_insert(id.seq);
-        *max = (*max).max(id.seq);
+        let max = self
+            .max_seq
+            .get(&id.origin)
+            .map_or(id.seq, |&m| m.max(id.seq));
+        self.max_seq.insert(id.origin, max);
     }
 }
 
 /// Every conversation's file events and tombstones. See the module.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct VfsIndex {
-    timelines: HashMap<u64, TimelineVfs>,
+    timelines: PMap<u64, TimelineVfs>,
     /// Timelines whose `Tombstone` has been seen: nothing of theirs is live,
     /// whatever comes after it in the log.
-    dead: HashSet<u64>,
+    dead: PSet<u64>,
 }
 
 impl VfsIndex {
@@ -121,8 +128,8 @@ impl VfsIndex {
         self.dead.insert(timeline);
         match self.timelines.remove(&timeline) {
             Some(tl) => (
-                tl.events.into_keys().collect(),
-                tl.tombstones.into_keys().collect(),
+                tl.events.keys().copied().collect(),
+                tl.tombstones.keys().copied().collect(),
             ),
             None => (Vec::new(), Vec::new()),
         }

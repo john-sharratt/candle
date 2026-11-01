@@ -4,9 +4,10 @@
 //!
 //! - [`soap`] — UPnP SOAP over HTTP (the Sonos player, a generic media
 //!   renderer).
-//! - [`textline`] — a line-at-a-time TCP control protocol (an AV receiver).
+//! - [`eiscp`] — the Integra Serial Control Protocol framed over TCP (an AV
+//!   receiver).
 //! - [`udp`] — a UDP broadcast on the house's own subnets (wake-on-LAN).
 
+pub mod eiscp;
 pub mod soap;
-pub mod textline;
 pub mod udp;

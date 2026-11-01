@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::Conversation;
+use crate::persistence::live_indexes::LiveIndexes;
 use crate::persistence::maintenance::{MaintenancePlan, MaintenanceRun, RELOCATION_BATCH_BYTES};
 use crate::scheduler::note_persistence_maint_us;
 
@@ -62,13 +63,17 @@ pub struct MaintenanceOp {
 }
 
 impl Conversation {
-    /// Plan an op of the kind `pass` allows and start it, in two background
-    /// steps on the log's owner, each against a version of the substrate it
-    /// reads without waiting: the liveness scan that chooses the op, then the
-    /// gather of what it relocates, with the relocation watch started in that
-    /// second step so every write after the plan is known to the relocation.
-    /// Each step is about half a second on a large store; every call and write
-    /// waiting on the owner goes ahead of each.
+    /// Plan an op of the kind `pass` allows and start it. The liveness scan
+    /// that chooses the op and the gather of what it relocates both run here,
+    /// on the caller's thread, each against a version of the substrate and the
+    /// log's indexes ([`LiveIndexes`]) taken without waiting: the owner is
+    /// asked only for the indexes, in two short calls. The second starts the
+    /// relocation watch in the same call it takes the indexes the plan reads,
+    /// so every write the plan cannot see is one the relocation steps around.
+    ///
+    /// Run on the owner, the scan held every write and replication apply
+    /// behind it for as long as it took — 493 s on WhiteWorld on 2026-11-01,
+    /// which stalled the shared engine's wave and every character's turn.
     ///
     /// `None` when there is nothing to do, or an op is already in flight — an
     /// op runs in batches, so a second pass (the forced
@@ -83,46 +88,48 @@ impl Conversation {
                 "a maintenance op is already relocating — this pass plans none"
             );
         };
-        let substrate = self.read();
-        let chosen = self.persistence.call_behind(|p| {
+        let taken = self.persistence.call_behind(|p| {
             if p.relocation_in_flight() {
-                return Ok(Err(()));
-            }
-            match pass {
-                Pass::Gated => p.choose_maintenance(&substrate, false),
-                Pass::Forced => p.choose_maintenance(&substrate, true),
-                Pass::DropOnly => p.choose_drop(&substrate),
-            }
-            .map(Ok)
-        });
-        let chosen = match chosen
-            .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
-        {
-            Err(()) => {
-                in_flight();
                 return Ok(None);
             }
-            Ok(chosen) => chosen,
+            p.segment_sizes()
+                .map(|sizes| Some((p.live_indexes(), sizes)))
+        });
+        let Some((indexes, sizes)) =
+            taken.map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?
+        else {
+            in_flight();
+            return Ok(None);
         };
+        let substrate = self.read();
+        let chosen = match pass {
+            Pass::Gated => indexes.choose_maintenance(&substrate, &sizes, false),
+            Pass::Forced => indexes.choose_maintenance(&substrate, &sizes, true),
+            Pass::DropOnly => indexes.choose_drop(&substrate, &sizes),
+        };
+        drop((substrate, indexes));
         let Some(chosen) = chosen else {
             self.refresh_maintenance_status();
             return Ok(None);
         };
-        // The plan reads the latest version: the scan's took a while.
+        // The plan reads the latest version and indexes: the scan took a
+        // while. The version is read first, so every write it holds is in
+        // the indexes too, and every one after them is watched.
         let substrate = self.read();
-        let planned = self.persistence.call_behind(|p| {
+        let watched: Option<LiveIndexes> = self.persistence.call_behind(|p| {
             if p.relocation_in_flight() {
                 return None;
             }
-            let plan = p.plan_chosen(&substrate, chosen);
             p.watch_relocation();
-            Some((plan, p.dir().to_path_buf()))
+            Some(p.live_indexes())
         });
-        drop(substrate);
-        let Some((plan, dir)) = planned else {
+        let Some(indexes) = watched else {
             in_flight();
             return Ok(None);
         };
+        let plan = indexes.plan_chosen(&substrate, chosen);
+        drop(substrate);
+        let dir = indexes.dir().to_path_buf();
         let plan_ms = t_plan.elapsed().as_millis() as u64;
         // "In progress" for the GUI's spinner, across every pass the op spans.
         self.maintenance

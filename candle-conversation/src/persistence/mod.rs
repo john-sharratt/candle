@@ -56,6 +56,7 @@ pub mod joined;
 mod joined_tests;
 mod le_reader;
 pub mod listing;
+pub mod live_indexes;
 pub mod liveness_audit;
 mod log_facts;
 pub mod log_file;

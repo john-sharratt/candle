@@ -469,6 +469,21 @@ declared it again. The replaced segments are unlinked only after the re-apply.
 A segment maintenance op plans on a version, runs its batches as background
 calls on the owner, and applies its result in one edit.
 
+**The plan is made off the owner.** Choosing an op is a liveness scan of every
+live record, and planning it walks them again for what it carries; both read the
+substrate and the owner's own location indexes — metadata, resident records,
+characters, file events, blobs, markers. Those indexes are persistent maps, so
+the owner hands them over as one value (`LiveIndexes`, `persistence/live_indexes.rs`)
+in a call of a few pointer copies, and the scan and the plan run on the
+maintenance thread against it. The second call, the one whose indexes the plan
+reads, also starts the relocation watch, so every write the plan cannot see is
+one the relocation steps around. Run on the owner, the scan held every write and
+every replication apply behind it for as long as it took: 493 s on WhiteWorld on
+2026-11-01, which stalled the engine's wave zend and npcd share — 505 s with no
+character taking a turn. The same holds for every other scan of the indexes: the
+live-bytes figure (`Conversation::live_bytes`) and the liveness audit's plan
+read a `LiveIndexes`, not the owner.
+
 **Maintenance defers to replication.** Every remote batch is applied on the
 owner too, so a maintenance step running while a catch-up lands holds every
 apply behind it — 50 s on WhiteWorld on 2026-11-01, until the member's arrivals
@@ -488,8 +503,8 @@ interleaved with the owner's own state (the applied set, the minter, the append
 and its indexes) — so a batch holds the owner for as long as it takes, and one
 that holds it 250 ms or more names its phases (clone, decide, plan, edit) in the
 log. What those name is what leaves the owner: the decision moves to a
-snapshot of the owner's indexes once they are published (§9.5's planning needs
-the same), leaving the owner the appends and the edit.
+snapshot of the owner's indexes, as §9.5's planning already reads them, leaving
+the owner the appends and the edit.
 
 ## 10. Every race, closed
 

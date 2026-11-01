@@ -11,13 +11,13 @@
 //!
 //! The substrate keeps the identity of every keyed *value* beside the value
 //! ([`crate::substrate::StreamIds`], [`crate::substrate::TimelineIds`]); this
-//! table is the markers' counterpart.
-
-use std::collections::HashMap;
+//! table is the markers' counterpart. A persistent map, so maintenance plans
+//! its re-emission against an O(1) clone off the log's owner.
 
 use super::super::liveness_audit::{resident_key, ResidentKey};
 use super::super::record::RecordType;
 use super::record_identity::RecordIdentity;
+use crate::substrate::pcoll::PMap;
 
 /// Whether `rt` is a marker this table keeps.
 pub fn is_marker(rt: RecordType) -> bool {
@@ -30,7 +30,7 @@ pub fn is_marker(rt: RecordType) -> bool {
 /// Identity per marker key.
 #[derive(Clone, Debug, Default)]
 pub struct MarkerIds {
-    ids: HashMap<ResidentKey, RecordIdentity>,
+    ids: PMap<ResidentKey, RecordIdentity>,
 }
 
 impl MarkerIds {
