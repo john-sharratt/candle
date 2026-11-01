@@ -38,7 +38,7 @@
 //! character as the literal token "you", which is what the renderer keys off.
 
 use crate::clock::{WorldTime, DAY_MS};
-use crate::engine::event::{mind_control_line, Addressed, Event, EventKind};
+use crate::engine::event::{mind_control_line, unread_line, Addressed, Event, EventKind};
 
 /// How many people are named in `STATE` before the rest become "several others".
 /// The event lines name whoever actually acted this turn regardless, so the
@@ -95,6 +95,9 @@ fn event_line(e: &Event) -> Option<String> {
             let t = text.trim();
             (!t.is_empty()).then(|| t.to_string())
         }
+        // A count, already written as what the character is told: passed
+        // through.
+        EventKind::Unread { threads } => Some(unread_line(threads)),
         // Its own thought, not a happening: handed over as the character's
         // inner line so the narrator keeps it in the first person.
         EventKind::MindControl { text } => {

@@ -41,6 +41,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::unread::Reminded;
+
 /// The item that makes any of this reachable. Carried like anything else.
 pub const PHONE: &str = "handset";
 
@@ -247,7 +249,7 @@ pub enum Origin {
 }
 
 /// Now, in real milliseconds: when a message is said.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -395,6 +397,10 @@ pub struct Threads {
     /// anybody spoke on them. See [`Thread::touched`].
     #[serde(default)]
     clock: u64,
+    /// What each member was last reminded waits unread, and when — see
+    /// [`crate::sim::unread`].
+    #[serde(default)]
+    pub(crate) reminded: BTreeMap<String, Reminded>,
 }
 
 impl Threads {
