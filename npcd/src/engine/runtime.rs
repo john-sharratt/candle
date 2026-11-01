@@ -1777,7 +1777,7 @@ impl Runtime {
 
     /// The acts that are a word addressed to somebody, by the argument naming
     /// them.
-    const SPOKEN: &'static [&'static str] = &["ask", "tell", "message", "gesture", "give"];
+    const SPOKEN: &'static [&'static str] = &["ask", "tell", "message", "reply", "gesture", "give"];
 
     /// Sign off the steps of this character's mission that the word it just
     /// addressed to somebody was about, and say what is next. `None` when the

@@ -20,7 +20,7 @@
 //!   station routes use, so what the schema advertises is exactly what a `POST`
 //!   accepts. `sign_off` is listed apart because it is addressed *per-thread*.
 //! - `POST /phone/:verb` — act. The verb is the world act of the same name
-//!   (`message`/`invite`/`open_group`/`reach_out`); the body's declared params
+//!   (`message`/`reply`/`invite`/`open_group`/`reach_out`); the body's declared params
 //!   are read into the act's `args` and it is run through the real dispatch
 //!   ([`body::perform`]), mapped by [`enact_response`]. So the acts' own
 //!   gating — an empty set of threads or contacts is the act's refusal, `409` —
@@ -64,7 +64,7 @@ use crate::sim::phone::{Kind, Thread};
 /// send_image above the body layer (the image-guest / interaction path), which
 /// this route cannot reach; a later cut wires that path, and `/phone/send_image`
 /// is deferred until then rather than advertised as a route that only errors.
-const VERBS: &[&str] = &["message", "invite", "open_group", "reach_out"];
+const VERBS: &[&str] = &["message", "reply", "invite", "open_group", "reach_out"];
 
 /// `GET /phone` — the character's thread listing.
 ///
@@ -381,7 +381,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{schema}");
         assert_eq!(
             verb_keys(&schema),
-            ["invite", "message", "open_group", "reach_out", "sign_off"],
+            [
+                "invite",
+                "message",
+                "open_group",
+                "reach_out",
+                "reply",
+                "sign_off"
+            ],
             "{schema}"
         );
         assert!(
@@ -421,6 +428,10 @@ mod tests {
             (
                 "reach_out",
                 json!({ "to": "Maker-99", "intent": "found you" }),
+            ),
+            (
+                "reply",
+                json!({ "to": "the channel", "intent": "that I heard" }),
             ),
         ];
         for (verb, body) in cases {

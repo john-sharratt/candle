@@ -63,6 +63,7 @@ pub fn is_mine(tool: &str) -> bool {
             | "remind"
             | "record_verdict"
             | "message"
+            | "reply"
             | "invite"
             | "open_group"
             | "sign_off"
@@ -101,7 +102,9 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "promise" => promise(hosted, body, a),
         "remind" => remind(hosted, body, a),
         "record_verdict" => record_verdict(hosted, body, a),
-        "message" => message(hosted, body, a),
+        // The same send on the thread named: what differs is the set the
+        // thread is named from (`tools::Choices::Awaiting`).
+        "message" | "reply" => message(hosted, body, a),
         "invite" => invite(hosted, body, a),
         "open_group" => open_group(hosted, body, a),
         "sign_off" => sign_off(hosted, body, a),
@@ -340,7 +343,7 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
             names[0]
         )),
         (false, _) => Outcome::Did(format!(
-            "{}\nTo answer, `message` the conversation by that name.",
+            "{}\nTo answer, `reply` on the conversation it was said on, by that name.",
             said.join("\n")
         )),
     })
@@ -1555,8 +1558,8 @@ mod tests {
         let out = perform(&h, "c1", &act("read", json!({"what": "Soren"})));
         assert_eq!(
             out.line().unwrap(),
-            "On Soren: Soren: asks for the ore count\nTo answer, `message` the conversation \
-             by that name."
+            "On Soren: Soren: asks for the ore count\nTo answer, `reply` on the conversation \
+             it was said on, by that name."
         );
         let again = perform(&h, "c1", &act("read", json!({"what": "soren"})));
         assert!(!again.happened(), "{again:?}");
@@ -1568,7 +1571,8 @@ mod tests {
         let all = perform(&h, "c1", &act("read", json!({"what": "messages"})));
         assert_eq!(
             all.line().unwrap(),
-            "On Kit: Kit: says hello\nTo answer, `message` the conversation by that name."
+            "On Kit: Kit: says hello\nTo answer, `reply` on the conversation it was said on, \
+             by that name."
         );
         assert!(
             h.sim(|s| s.threads.unread_threads("Wren").is_empty()),
