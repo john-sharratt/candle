@@ -305,11 +305,14 @@ pub async fn work(
         }
         "launch" => {
             let app = arg(args, "app").ok_or_else(|| anyhow!("Say which app to open."))?;
-            r.tell(
-                "ssap://system.launcher/launch",
-                json!({ "id": app_id(&app) }),
-            )
-            .await?;
+            let mut payload = json!({ "id": app_id(&app) });
+            // An optional `content` deep-links into the app — for YouTube a bare
+            // video id becomes the `v=<id>` target the LG app expects.
+            if let Some(c) = arg(args, "content") {
+                let target = if c.contains('=') { c } else { format!("v={c}") };
+                payload["params"] = json!({ "contentTarget": target });
+            }
+            r.tell("ssap://system.launcher/launch", payload).await?;
             format!("The {name} opened {app}.")
         }
         "input" => {
