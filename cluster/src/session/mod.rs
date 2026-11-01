@@ -263,13 +263,38 @@ fn begin<T: PipeTx, R: PipeRx>(role: Role, behind: bool, tx: T, rx: R) -> Sessio
     let (ended_tx, ended) = oneshot::channel();
     let gauges = Arc::new(Gauges::default());
     let hearing = Hearing::new(rx.heard());
-    tokio::spawn(writer::run(tx, command_rx, gauges.clone()));
+    let (lost_tx, mut lost) = oneshot::channel();
+    let writing = writer::run(tx, command_rx, gauges.clone());
+    tokio::spawn(async move {
+        if writing.await {
+            let _ = lost_tx.send(());
+        }
+    });
     tokio::spawn({
         let commands = commands.clone();
         let registry = registry.clone();
         let hearing = hearing.clone();
         async move {
-            let how = reader::run(rx, hearing, role, behind, commands, registry, incoming_tx).await;
+            let reading = reader::run(
+                rx,
+                hearing,
+                role,
+                behind,
+                commands,
+                registry.clone(),
+                incoming_tx,
+            );
+            // A pipe lost to sending ends the session here: a reader goes on
+            // for as long as the peer sends.
+            let how = tokio::select! {
+                how = reading => how,
+                Ok(()) = &mut lost => {
+                    for (_, stream) in registry.lock().unwrap().drain() {
+                        stream.reset();
+                    }
+                    Ended::Dead
+                }
+            };
             let _ = ended_tx.send(how);
         }
     });
