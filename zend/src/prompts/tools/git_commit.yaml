@@ -161,7 +161,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "all_changes", "message": "Redraw the site icon from its source art"}}
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "all_changes", "message": "The parser accepts empty input"}}
   </tool_call><|projection|>
 - |-
   finish the job without asking me, commit it when it works<|im_end|>

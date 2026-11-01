@@ -85,5 +85,5 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "git_switch", "arguments": {"repo": "candle", "branch": "feature/site-icon", "create": true}}
+  <|projection|>{"name": "git_switch", "arguments": {"repo": "candle", "branch": "feature/parser-cleanup", "create": true}}
   </tool_call><|projection|>

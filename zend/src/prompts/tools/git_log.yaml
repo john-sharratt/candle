@@ -121,14 +121,14 @@ examples:
 - what does the docs branch on origin add over main<|im_end|>
 - which commits would I get from the perf branch that main does not have yet<|im_end|>
 - |-
-  see who changed these icon files last<|im_end|>
+  see who changed these files last<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
   The history of those files will show what changed them and when. git_log takes `paths` to narrow it, and the page is required, starting at 1.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "git_log", "arguments": {"repo": "candle", "paths": ["web/content/battlecities"], "page": 1}}
+  <|projection|>{"name": "git_log", "arguments": {"repo": "app", "paths": ["src/parser"], "page": 1}}
   </tool_call><|projection|>
 - |-
   check that your commit is on main<|im_end|>

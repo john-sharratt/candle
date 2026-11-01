@@ -19,7 +19,7 @@ questions:
 - check whether the typescript type-checker is happy
 - run the demo and paste what it prints
 category: Commands
-description: 'Run a program — a build, a test suite, a formatter, a script — in the named repository, on your branch with your uncommitted changes laid down, and wait for it to finish. `program` is the program alone (`npm`, `node`, `cargo`, `python`) and `args` its arguments, each passed exactly as written — `npm test` is program `npm` with args `["test"]`, and a script in the repository runs through its interpreter: program `node`, args `["scripts/report.js"]`. There is no shell, so no `&&`, pipes or redirects — run one program per call; a refusal names the programs that do run. Files the program changes come back into your uncommitted changes, as if you had edited them. git cannot be run here; use the git tools. Do not script a picture here: file_image resizes, converts and carries pictures between repositories, and a run cannot reach outside its own repository. Refused while your files and your branch disagree: when the branch has commits you do not have, git_merge them in first; when a merge brought commits your branch does not have yet, git_commit with `from: all_changes` publishes them first. Use for: running the tests after an edit, building, formatting, running a script or the program itself. Triggered by "run the tests", "does it build", "npm test", "cargo check". Returns the exit code, whether it timed out, the files it changed, the first page of what it printed and, past that, its last lines, where a failure or a summary is; read the pages between with run_output. Each argument is one entry of `args`, and a flag that takes a value has it as the next entry: a flag left last with no value, or given over and over, is refused before anything runs. When a run fails on its arguments, change them: the same call fails the same way. Run the narrowest thing that shows your change works, one package and a test filter: `cargo test -p web the_test`, not `cargo test` over the workspace, which takes many minutes and fails on things you did not touch. Go wider, or add `--include-ignored`, only when asked. Close `args` as soon as the command is complete: words of explanation are not arguments.'
+description: 'Run a program — a build, a test suite, a formatter, a script — in the named repository, on your branch with your uncommitted changes laid down, and wait for it to finish. `program` is the program alone (`npm`, `node`, `cargo`, `python`) and `args` its arguments, each passed exactly as written — `npm test` is program `npm` with args `["test"]`, and a script in the repository runs through its interpreter: program `node`, args `["scripts/report.js"]`. There is no shell, so no `&&`, pipes or redirects — run one program per call; a refusal names the programs that do run. Files the program changes come back into your uncommitted changes, as if you had edited them. git cannot be run here; use the git tools. Do not script a picture here: file_image resizes, converts and carries pictures between repositories, and a run cannot reach outside its own repository. Refused while your files and your branch disagree: when the branch has commits you do not have, git_merge them in first; when a merge brought commits your branch does not have yet, git_commit with `from: all_changes` publishes them first. Use for: running the tests after an edit, building, formatting, running a script or the program itself. Triggered by "run the tests", "does it build", "npm test", "cargo check". Returns the exit code, whether it timed out, the files it changed, the first page of what it printed and, past that, its last lines, where a failure or a summary is; read the pages between with run_output. Each argument is one entry of `args`, and a flag that takes a value has it as the next entry: a flag left last with no value, or given over and over, is refused before anything runs. When a run fails on its arguments, change them: the same call fails the same way. Run the narrowest thing that shows your change works: the tests that cover what you touched, not the whole suite, which takes far longer and fails on things you did not touch. Go wider only when your change reaches further, or when asked. Close `args` as soon as the command is complete: words of explanation are not arguments.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -58,34 +58,34 @@ examples:
 - run the script scripts/report.js with node<|im_end|>
 - run node src/index.js and show me what it prints<|im_end|>
 - |-
-  regenerate the icons and make sure the tests still pass<|im_end|>
+  fix the parser and make sure its tests still pass<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The files are changed, so now I need to run the tests to check them. run_command runs a program on my branch with my changes laid down. The program goes in `program` and each argument in `args`, one entry each, with no shell, so `cargo test -p web` is program cargo with args test, -p, web.<|projection|>
+  The files are changed, so now I need to run the tests that cover them. run_command runs a program on my branch with my changes laid down. The program goes in `program` and each argument in `args`, one entry each, with no shell, so `cargo test -p parser` is program cargo with args test, -p, parser.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--release"]}}
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["test", "-p", "parser"]}}
   </tool_call><|projection|>
 - |-
-  only the switcher test matters here, run just that one<|im_end|>
+  only one test matters here, run just that one<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A test filter is one argument after `test`. A flag that takes a value needs that value right after it: `-p` then the package, `--skip` then a name. Each flag once, and nothing left dangling at the end, or cargo fails before it runs anything.<|projection|>
+  A test filter is one more argument. A flag that takes a value needs that value right after it. Each flag once, and nothing left dangling at the end, or the program fails before it runs anything.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "the_switcher_icons", "--", "--skip", "slow"]}}
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["test", "-p", "parser", "empty_input", "--", "--skip", "slow"]}}
   </tool_call><|projection|>
 - |-
-  that failed with exit 101, the options were wrong<|im_end|>
+  that failed straight away, the options were wrong<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Exit 101 before any test ran means cargo refused the arguments, so running the same thing again gets the same refusal. I need to change the arguments: drop the repeated flag and keep each option once.<|projection|>
+  It failed before any test ran, so the program refused the arguments, and running the same thing again gets the same refusal. I need to change the arguments: drop the repeated flag and keep each option once.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--quiet"]}}
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["test", "-p", "parser", "--quiet"]}}
   </tool_call><|projection|>
 - |-
   check the file sizes with the script you just wrote<|im_end|>
@@ -115,7 +115,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "--release", "-p", "web", "--lib", "site::tokera"]}}
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["test", "-p", "parser", "tokenizer"]}}
   </tool_call><|projection|>
 - |-
   does it build after that edit<|im_end|>
@@ -125,7 +125,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["check", "-p", "web"], "timeout_secs": 1200}}
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["check", "-p", "parser"], "timeout_secs": 1200}}
   </tool_call><|projection|>
 - |-
   run the npm tests after your change<|im_end|>
@@ -141,7 +141,7 @@ examples:
   run the script that checks the file sizes<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A script in the repository runs through its interpreter: node is the program and the script path its argument. python -c with no code after it is refused, so a script file or a whole code argument, never the flag alone.<|projection|>
+  A script in the repository runs through its interpreter: node is the program and the script path its argument. An interpreter's code flag with nothing after it is refused, so a script file or a whole code argument, never the flag alone.<|projection|>
   </think>
 
   <tool_call>

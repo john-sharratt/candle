@@ -11,8 +11,8 @@ questions:
 - crop the screenshot to the top left corner and shrink it
 - shrink the picture to half its size
 - this image is too big, make it 800 wide
-- create apple-touch-icon.png from the logo
-- regenerate the android chrome icons
+- make a double-size copy of the logo for high density screens
+- regenerate the gallery thumbnails
 - scale the sprite up to 256
 - produce a 32x32 version of the icon
 - convert this ico source to a real ico file
@@ -21,8 +21,8 @@ questions:
 - resize the image
 - make it smaller
 - is there a way to resize a png here
-- cut a square out of this photo and make an icon of it
-- build the whole icon set from this one picture
+- cut a square out of this photo and make an avatar of it
+- make every size we need from this one picture
 - I want the transparent background kept when you resize it
 category: Files
 description: 'Make resized copies of a picture in the repository, keeping its transparency: PNG, JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your uncommitted changes. The picture may be in another repository (`source_repo`), which is how a picture gets from one repository into another. Use for: an icon set, a favicon, thumbnails, converting a picture to another format. Triggered by "resize the image", "make a favicon", "generate the icon sizes", "convert to webp". Returns the picture''s size and each copy''s path, bytes and size. A copy whose shape differs from the picture''s is refused: crop first.'
@@ -114,14 +114,14 @@ parameters:
   type: object
 examples:
 - |-
-  make the game repo's favicon from the art in the candle repo<|im_end|>
+  put a small copy of the art from the design repo into the site repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The picture is in candle and the copy belongs in the game's own repository, battle-cities. file_image reads from source_repo and writes into repo, so nothing has to be copied by hand. Calls write repo, path and outputs first, and source_repo goes last, after outputs closes.<|projection|>
+  The picture is in design and the copy belongs in the site repository. file_image reads from source_repo and writes into repo, so nothing has to be copied by hand. Calls write repo, path and outputs first, and source_repo goes last, after outputs closes.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_image", "arguments": {"repo": "battle-cities", "path": "art/source.png", "outputs": [{"path": "favicon-32x32.png", "width": 32, "height": 32}], "source_repo": "candle"}}
+  <|projection|>{"name": "file_image", "arguments": {"repo": "site", "path": "art/source.png", "outputs": [{"path": "images/source-128.png", "width": 128, "height": 128}], "source_repo": "design"}}
   </tool_call><|projection|>
 - |-
   resize logo.png to 64 by 64<|im_end|>
