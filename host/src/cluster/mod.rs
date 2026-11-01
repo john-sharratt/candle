@@ -11,6 +11,7 @@
 //! | [`listener`] | the own listener: forward up when joined, serve when cut off (§5.8) |
 //! | [`sticky`] | claiming a sticky key before serving it (§5.4) |
 //! | [`capacity`] | what `CAPACITY` reports (§5.3) |
+//! | [`readiness`] | whether this member is ready for its apps: every tenant loaded |
 //! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
@@ -38,6 +39,7 @@ pub mod held_body;
 pub mod in_flight;
 pub mod leave;
 pub mod listener;
+pub mod readiness;
 pub mod serve;
 pub mod sticky;
 pub mod store;
@@ -81,7 +83,6 @@ use capacity::{capacity, member_state, Rates, Wave};
 use in_flight::InFlight;
 
 use crate::telemetry::Telemetry;
-use crate::tenant::Reports;
 
 /// How often a member lets go of the claims it has not served for its idle
 /// timeout.
@@ -501,20 +502,6 @@ fn start_agent(
     }
     tracing::info!(node = %format!("{node:016x}"), "joined the cluster's agents in process");
     Ok(jobs)
-}
-
-/// Every second, tell each app's gateways whether its tenant is ready — the
-/// state `CAPACITY` carries, and what makes the app clustered.
-pub fn watch_readiness(tenants: Vec<(Arc<AppLink>, Arc<dyn Reports>)>) {
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(1));
-        loop {
-            tick.tick().await;
-            for (link, reports) in &tenants {
-                link.set_ready(reports.status().await.state == "ready");
-            }
-        }
-    });
 }
 
 impl Cluster {
