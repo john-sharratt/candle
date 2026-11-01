@@ -658,8 +658,12 @@ Discord counts them all against one 10,000, so each of the group's `n` npcd memb
 from the membership every beat. Members on separate addresses are held to less than their
 own address allows, which costs nothing until Discord is refusing. And no caller asks again
 on the next beat after a refusal: a world's mirror and a bot's DM hold off for the 429's
-`retry_after`, ten minutes after a 403 or a 401, thirty seconds otherwise, each doubled for
-every refusal in a row up to an hour (`npcd/src/discord/world/hold.rs`). A 401 (a token
+`retry_after`, thirty seconds after a 403 or a 401, five seconds otherwise, each doubled
+for every refusal in a row up to a quarter of an hour (`npcd/src/discord/world/hold.rs`):
+a permission granted in the server is used within a minute of the grant, and even the
+first rung spends 20 of Discord's 10,000 in ten minutes. Setting the world's server in
+the console (`PUT /v1/world/:wid/discord`) ends the world's hold, so the mirror asks again
+on its next beat. A 401 (a token
 revoked in the portal) marks that bot `refused` (§3.3) and stops its shard rather than
 retrying; a new token connected in the panel reopens it.
 

@@ -17,27 +17,34 @@
 //! - anything else for [`FAILED_FOR`].
 //!
 //! Each refusal in a row doubles the hold ([`backoff`]), to at most
-//! [`HOLD_MAX`]; a beat that gets through unrefused starts it again. A
-//! bot's own DM is held the same way, keyed `dm/<channel_id>`
-//! (`crate::discord::dm::outbound`).
+//! [`HOLD_MAX`]; a beat that gets through unrefused starts it again, and so
+//! does setting the world's server in the console — the person has just
+//! changed what Discord was refusing. A bot's own DM is held the same way,
+//! keyed `dm/<channel_id>` (`crate::discord::dm::outbound`).
+//!
+//! The holds start short: a permission granted a minute after the refusal
+//! is used within a minute. Even at the first rung, a refusal every 30 s is
+//! 20 invalid requests in Discord's ten minutes, against the 10,000 it bans
+//! at.
 
 use std::time::Duration;
 
 use crate::discord::error::DiscordError;
 
-/// How long a refusal only a person can lift holds the mirror.
-pub const REFUSED_FOR: Duration = Duration::from_secs(10 * 60);
+/// How long a first refusal only a person can lift holds the mirror.
+pub const REFUSED_FOR: Duration = Duration::from_secs(30);
 
-/// How long any other failure holds the mirror.
-pub const FAILED_FOR: Duration = Duration::from_secs(30);
+/// How long any other first failure holds the mirror.
+pub const FAILED_FOR: Duration = Duration::from_secs(5);
 
 /// The longest a mirror is held, however many refusals in a row.
-pub const HOLD_MAX: Duration = Duration::from_secs(60 * 60);
+pub const HOLD_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// How long the `refusals`th refusal in a row holds the mirror, `wait` the
 /// least its answer asks: doubled for each refusal before it, and never
 /// more than [`HOLD_MAX`]. A mirror refused again as soon as it asks backs
-/// off from seconds to an hour rather than asking at one fixed rate.
+/// off from seconds to a quarter of an hour rather than asking at one
+/// fixed rate.
 pub fn backoff(wait: Duration, refusals: u32) -> Duration {
     wait.saturating_mul(1u32 << refusals.saturating_sub(1).min(16))
         .min(HOLD_MAX)
@@ -63,7 +70,7 @@ mod tests {
     use super::*;
 
     /// **A rate limit holds for what it asks, a refusal a person must lift
-    /// for ten minutes, anything else for thirty seconds.**
+    /// for thirty seconds, anything else for five.**
     #[test]
     fn each_refusal_holds_the_mirror_as_long_as_it_asks() {
         assert_eq!(
@@ -99,19 +106,20 @@ mod tests {
         assert_eq!(after(&DiscordError::Transport("reset".into())), FAILED_FOR);
     }
 
-    /// **Each refusal in a row doubles the hold, to at most an hour.**
+    /// **Each refusal in a row doubles the hold, to at most a quarter of an
+    /// hour**: a missing permission is asked about at 30 s, 1, 2, 4 and
+    /// 8 minutes, then every 15.
     #[test]
-    fn refusals_in_a_row_double_the_hold_to_an_hour() {
+    fn refusals_in_a_row_double_the_hold_to_a_quarter_hour() {
         let s = Duration::from_secs;
-        assert_eq!(backoff(s(30), 1), s(30));
-        assert_eq!(backoff(s(30), 2), s(60));
-        assert_eq!(backoff(s(30), 3), s(120));
-        assert_eq!(backoff(s(30), 7), s(1920));
-        assert_eq!(backoff(s(30), 8), HOLD_MAX);
-        assert_eq!(backoff(s(30), 200), HOLD_MAX, "no overflow");
-        assert_eq!(backoff(REFUSED_FOR, 1), REFUSED_FOR);
-        assert_eq!(backoff(REFUSED_FOR, 3), s(2400));
-        assert_eq!(backoff(REFUSED_FOR, 4), HOLD_MAX);
+        assert_eq!(backoff(REFUSED_FOR, 1), s(30));
+        assert_eq!(backoff(REFUSED_FOR, 2), s(60));
+        assert_eq!(backoff(REFUSED_FOR, 3), s(120));
+        assert_eq!(backoff(REFUSED_FOR, 5), s(480));
+        assert_eq!(backoff(REFUSED_FOR, 6), HOLD_MAX);
+        assert_eq!(backoff(REFUSED_FOR, 200), HOLD_MAX, "no overflow");
+        assert_eq!(backoff(FAILED_FOR, 1), s(5));
+        assert_eq!(backoff(FAILED_FOR, 4), s(40));
         assert_eq!(backoff(s(7200), 1), HOLD_MAX, "capped from the first");
     }
 }
