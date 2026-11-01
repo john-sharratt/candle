@@ -172,22 +172,37 @@ export async function render(params, q) {
   async function discord() {
     const editable = mayEdit('creator');
     mount(host, h('div', { class: 'tiny dim' }, 'reading the world’s server…'));
-    const [{ guild } = {}, mine] = await Promise.all([
-      API.getWorldDiscord(w.world_id).catch(() => ({ guild: null })),
-      API.listNpcs({ world_id: w.world_id }).then((r) => r.items || []).catch(() => []),
-    ]);
-    // Only a character with its own bot can listen.
-    const withBots = (await Promise.all(mine.map((n) =>
-      API.getDiscord(n.npc_id).then((d) => (d.connected ? { ...n, bot: d } : null)).catch(() => null))))
-      .filter(Boolean);
+    // Every character here with a bot of its own, whoever owns it, with the
+    // servers its bot is in — the daemon's answer, so nothing is typed.
+    const { guild = null, listeners = [] } =
+      await API.getWorldDiscord(w.world_id).catch(() => ({}));
 
-    const server = h('input', { class: 'input mono', placeholder: 'the server’s id',
-      value: guild ? guild.guild_id : '', ...ro('creator') });
     const listener = h('select', { class: 'input', ...ro('creator', 'toggle') },
-      withBots.length
-        ? withBots.map((n) => h('option', { value: n.npc_id,
-          selected: guild && guild.listener === n.npc_id }, `${n.name} — @${n.bot.username}`))
-        : h('option', { value: '' }, 'none of your characters here has a bot'));
+      listeners.length
+        ? listeners.map((n) => h('option', { value: n.listener,
+          selected: guild && guild.listener === n.listener }, `${n.name} — @${n.bot}`))
+        : h('option', { value: '' }, 'no character here has a Discord bot'));
+    const server = h('select', { class: 'input', ...ro('creator', 'toggle') });
+    const invite = h('a', { class: 'btn sm ghost', target: '_blank', rel: 'noopener' });
+    /* The servers the chosen listener's bot is in, and the link that adds it
+     * to another — with every permission mirroring needs, so nothing is set
+     * by hand in Discord. A server it was just added to appears once its
+     * bot has heard of it: reopen this tab. */
+    const fill = () => {
+      const n = listeners.find((x) => x.listener === listener.value);
+      const servers = n ? n.servers : [];
+      mount(server, servers.length
+        ? servers.map((g) => h('option', { value: g.guild_id,
+          selected: guild && guild.guild_id === g.guild_id }, g.name))
+        : h('option', { value: '' }, 'its bot is in no server yet'));
+      invite.hidden = !n;
+      if (n) {
+        invite.href = n.invite_url;
+        invite.textContent = `Add @${n.bot} to a server ↗`;
+      }
+    };
+    listener.onchange = fill;
+    fill();
     const backstage = h('input', { type: 'checkbox',
       checked: guild ? guild.backstage : true, ...ro('creator', 'toggle') });
 
@@ -226,14 +241,16 @@ export async function render(params, q) {
           + 'members see, and a person’s DM with a character without a bot a private thread under #dms. '
           + 'Characters with a bot speak as it; the rest speak through a webhook under their own names.'),
         h('div', { class: 'grid g2', style: 'margin-top:12px' },
-          h('label', { class: 'field' }, h('span', {}, 'Server id — Discord’s Copy Server ID'), server),
-          h('label', { class: 'field' }, h('span', {}, 'Listener — reads the server for the world'), listener)),
+          h('label', { class: 'field' }, h('span', {}, 'Listener — reads the server for the world'), listener),
+          h('label', { class: 'field' }, h('span', {}, 'Server — one the listener’s bot is in'), server)),
+        h('div', { class: 'row', style: 'margin-top:6px' }, invite),
         h('label', { class: 'row', style: 'gap:9px;margin-top:10px;cursor:pointer' }, backstage,
           h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Backstage'),
             h('div', { class: 'tiny dim' }, 'mirror DMs between two characters, read-only, for their owners'))),
         h('div', { class: 'tiny dim', style: 'margin-top:10px;max-width:88ch' },
-          'The listener needs Message Content Intent turned on under Bot in the Developer Portal, and its '
-          + 'invite link used once to add it to the server.'),
+          'The listener needs Message Content Intent turned on under Bot in the Developer Portal. A bot '
+          + 'added before its invite asked for Manage Channels and Manage Roles needs adding again with '
+          + 'the link above, or those two given to its role in the server’s settings.'),
         h('div', { class: 'row', style: 'gap:8px;justify-content:flex-end;margin-top:12px' },
           editable ? null : h('span', { class: 'tiny dim' }, 'Setting a world’s server is a creator’s to do.'),
           remove, save)));

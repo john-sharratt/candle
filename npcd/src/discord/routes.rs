@@ -410,7 +410,7 @@ mod tests {
             "user_id": "222",
             "username": "Zen",
             "connected_ms": connected_ms,
-            "invite_url": "https://discord.com/oauth2/authorize?client_id=111&scope=bot&permissions=344134372416",
+            "invite_url": "https://discord.com/oauth2/authorize?client_id=111&scope=bot&permissions=344402807888",
             "status": "offline",
         });
         assert_eq!(v, expected);

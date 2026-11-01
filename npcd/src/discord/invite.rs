@@ -7,21 +7,25 @@
 ///
 /// | Bit | Permission | For |
 /// |---|---|---|
+/// | `1 << 4` | Manage Channels | the channels a world is mirrored into: `#the-channel`, a group's, `#dms`, `#backstage` |
 /// | `1 << 6` | Add Reactions | answering a message without a message |
 /// | `1 << 10` | View Channels | seeing the channels it is a member of |
 /// | `1 << 11` | Send Messages | speaking in them |
 /// | `1 << 14` | Embed Links | a link it posts showing as a preview |
 /// | `1 << 15` | Attach Files | a picture it posts |
 /// | `1 << 16` | Read Message History | what was said while it was away |
+/// | `1 << 28` | Manage Roles | a group's channel opened to exactly its members |
 /// | `1 << 29` | Manage Webhooks | the persona webhook characters without a bot speak through |
 /// | `1 << 36` | Create Private Threads | a "DM" with a character that has no bot |
 /// | `1 << 38` | Send Messages in Threads | speaking in those threads |
-pub const PERMISSIONS: u64 = (1 << 6)
+pub const PERMISSIONS: u64 = (1 << 4)
+    | (1 << 6)
     | (1 << 10)
     | (1 << 11)
     | (1 << 14)
     | (1 << 15)
     | (1 << 16)
+    | (1 << 28)
     | (1 << 29)
     | (1 << 36)
     | (1 << 38);
@@ -39,14 +43,14 @@ mod tests {
 
     #[test]
     fn the_permissions_are_exactly_these_bits() {
-        assert_eq!(PERMISSIONS, 344_134_372_416);
+        assert_eq!(PERMISSIONS, 344_402_807_888);
     }
 
     #[test]
     fn an_invite_names_the_application_the_scope_and_the_permissions() {
         assert_eq!(
             url("1234567890"),
-            "https://discord.com/oauth2/authorize?client_id=1234567890&scope=bot&permissions=344134372416"
+            "https://discord.com/oauth2/authorize?client_id=1234567890&scope=bot&permissions=344402807888"
         );
     }
 }
