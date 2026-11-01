@@ -6022,6 +6022,7 @@ impl Scheduler {
         if let Some(driver) = turn_driver.as_mut() {
             let (scaffold, action) = driver.opening();
             match &action {
+                // By name, whatever its width: this wave priced no bitmap.
                 StepMask::Branch(set) => {
                     sampling.stencil = set.tokens().iter().map(|&t| t as i32).collect();
                 }

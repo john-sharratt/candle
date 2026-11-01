@@ -47,6 +47,7 @@ use crate::engine::tick::Scheduler;
 use crate::engine::tools::{self, Mode};
 use crate::engine::whereabouts;
 use crate::sim::phone;
+use crate::sim::unread::Due;
 use crate::world::binding::Bindings;
 use crate::world::Hosted;
 
@@ -407,14 +408,22 @@ fn deliver_messages(
         };
         let at_ms = time(npc_id);
         // Taken and marked under one acquisition, so a message cannot be
-        // handed out twice by two moments overlapping.
-        let waiting = hosted.with_sim(|s| {
+        // handed out twice by two moments overlapping. The reminder of what
+        // still waits unread is judged under the same hold (`sim::unread`).
+        let (waiting, due) = hosted.with_sim(|s| {
             let waiting = s.threads.undelivered_for(&name);
             if !waiting.is_empty() {
                 s.threads.mark_delivered_for(&name);
             }
-            waiting
+            let due = s
+                .threads
+                .unread_due(&name, phone::now_ms(), !waiting.is_empty());
+            (waiting, due)
         });
+        if let Some(due) = due {
+            remind(npc_id, at_ms, due, sched, reach);
+            told += 1;
+        }
         if waiting.is_empty() {
             continue;
         }
@@ -456,6 +465,33 @@ fn deliver_messages(
         told += 1;
     }
     told
+}
+
+/// Remind a character what waits unread on its handset: as urgently as a
+/// direct message when any of it was said to the character, as group talk
+/// otherwise.
+fn remind(npc_id: u64, at_ms: u64, due: Due, sched: &Scheduler, reach: &Reach) {
+    let salience = match due.to_me {
+        true => Salience::URGENT,
+        false => Salience::NORMAL,
+    };
+    let waiting: usize = due.threads.iter().map(|(_, n)| n).sum();
+    tracing::info!(
+        npc = npc_id,
+        unread = waiting,
+        threads = due.threads.len(),
+        urgent = due.to_me,
+        "the character is reminded what waits unread"
+    );
+    let kind = EventKind::Unread {
+        threads: due.threads,
+    };
+    match (reach.here)(npc_id) {
+        true => {
+            sched.deliver(npc_id, at_ms, salience, kind);
+        }
+        false => (reach.elsewhere)(npc_id, at_ms, salience, kind),
+    }
 }
 
 /// What one moment of world time came to.

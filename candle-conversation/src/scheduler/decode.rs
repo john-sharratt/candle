@@ -431,9 +431,7 @@ impl Scheduler {
                     continue;
                 }
                 match state.pending_mask.take() {
-                    Some(StepMask::Branch(set)) => {
-                        configs[i].stencil = set.tokens().iter().map(|&t| t as i32).collect();
-                    }
+                    Some(StepMask::Branch(set)) => configs[i].constrain_to(&set),
                     Some(StepMask::Free { opens_value, .. }) => {
                         // A free-text span decodes normally.  A think-steer span's
                         // `</think>` and EOS are both intercepted by the session's
@@ -1015,6 +1013,16 @@ impl Scheduler {
         // The accept walk stacks each block position's rows beside the head's
         // logits on the forward's span, so the wave prices those stacks.
         self.session.set_accept_in_place(true);
+        // So do the bitmaps of the rows a grammar holds to a set too wide to
+        // name, each decided by now.
+        let stencil_rows = seq_ids
+            .iter()
+            .filter_map(|id| self.active_decodes.get(id))
+            .filter(
+                |s| matches!(&s.pending_mask, Some(StepMask::Branch(set)) if set.bits().is_some()),
+            )
+            .count();
+        self.session.set_stencil_rows(stencil_rows);
         let stencil_seqs = stencil.seqs();
         let t_wave = std::time::Instant::now();
         let forwarded = stencil.inputs().and_then(|stencil_inputs| {
@@ -1028,6 +1036,7 @@ impl Scheduler {
             )
         });
         self.session.set_accept_in_place(false);
+        self.session.set_stencil_rows(0);
         self.step_census.forward(t_wave.elapsed());
         // Held until the rollback: the rows below, the walk's stacks and the
         // rows the commit checks are all views on the forward's span.

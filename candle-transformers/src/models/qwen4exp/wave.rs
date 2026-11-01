@@ -2523,11 +2523,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             qsa_bytes,
             // As the step sets them: the look-ahead over every row, decodes
             // included, and the accept walk's selection on the head's span —
-            // priced as if it reads the logits in place, the wider case.
+            // priced as if it reads the logits in place, the wider case, and
+            // every scored row as if a grammar's bitmap held it.
             look_ahead_hops: look_ahead_hops(span_rows + decodes),
             decode_rows: decodes,
             scored_rows: scored,
             accept_rows: scored,
+            stencil_rows: scored,
             ..WaveWidth::prefill(span_rows, spans)
         };
         let scratch = launch_scratch_reserve(&self.model.device);
@@ -3553,6 +3555,7 @@ impl WaveSweep for Qwen4ExpBatched {
         let preparing = matches!(mode, SweepMode::Prepare);
         let in_step = matches!(mode, SweepMode::InStep(_));
         let accept_in_place = session.accept_in_place();
+        let stencil_rows = session.stencil_rows();
         // Flash-Next runs its layers under the Gated Residual, which carries no
         // adapter plumbing, so `project_qkv_gated` is called with an empty
         // `LayerLora`. Refused rather than ignored: dropping the name here would
@@ -3775,6 +3778,7 @@ impl WaveSweep for Qwen4ExpBatched {
                     // The caller's accept walk selects on the head's span only
                     // when it reads the logits there.
                     accept_rows: if accept_in_place { scored_rows } else { 0 },
+                    stencil_rows,
                     qsa_bytes: self.wave_qsa_bytes(
                         seq_ids,
                         &q_lens,

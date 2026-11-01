@@ -241,6 +241,15 @@ pub enum EventKind {
         from: String,
         text: String,
     },
+    /// Messages wait unread on the character's handset: each thread by the
+    /// name the character calls it, and how many.
+    ///
+    /// **Replaces** the previous one — see [`EventKind::replaces`]. A message
+    /// reaches a mind once, as it arrives, and a character busy with something
+    /// else moved past it and was never told again; this is the standing
+    /// reminder, restated while anything waits (`sim::unread`), and only the
+    /// newest is current.
+    Unread { threads: Vec<(String, usize)> },
     /// Where the character is and what is true there, right now.
     ///
     /// **Replaces** the previous one — see [`EventKind::replaces`]. A situation
@@ -303,6 +312,24 @@ pub enum EventKind {
     MindControl { text: String },
 }
 
+/// How an [`EventKind::Unread`] reminder reads: how many wait, on which
+/// threads, and the act that reads them.
+pub fn unread_line(threads: &[(String, usize)]) -> String {
+    let total: usize = threads.iter().map(|(_, n)| n).sum();
+    let noun = match total {
+        1 => "message",
+        _ => "messages",
+    };
+    let on: Vec<String> = threads
+        .iter()
+        .map(|(name, n)| format!("{name} ({n})"))
+        .collect();
+    format!(
+        "You have {total} unread {noun} on your phone: {}. To read them, `read`.",
+        on.join(", ")
+    )
+}
+
 /// How a [`EventKind::MindControl`] thought reads to the character.
 pub fn mind_control_line(text: &str) -> String {
     format!("A thought you can't shake: {}", text.trim())
@@ -316,6 +343,7 @@ impl EventKind {
             EventKind::Announcement { .. } => "announcement",
             EventKind::Speech { .. } => "speech",
             EventKind::Message { .. } => "message",
+            EventKind::Unread { .. } => "unread",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
             EventKind::Entity { .. } => "entity",
@@ -340,6 +368,9 @@ impl EventKind {
     pub fn replaces(&self) -> Option<String> {
         match self {
             EventKind::Situation { .. } => Some("situation".to_string()),
+            // What waits unread now; the last count is stale the moment there
+            // is a newer one.
+            EventKind::Unread { .. } => Some("unread".to_string()),
             // Its own band, beside the situation. Two standing instructions is
             // a character working to a task it has been taken off, which reads
             // as one that has forgotten what it was doing. A thought it can't
@@ -453,6 +484,7 @@ impl Event {
                     false => format!("{from} messages you, on {thread}: {t}"),
                 }
             }
+            EventKind::Unread { threads } => unread_line(threads),
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
             // rendering passes them through rather than decorating them.
@@ -493,6 +525,30 @@ impl fmt::Display for Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An unread reminder says how many, where, and the act that reads
+    /// them**, and replaces the one before it.
+    #[test]
+    fn an_unread_reminder_reads_as_a_count_and_replaces_the_last() {
+        let one = EventKind::Unread {
+            threads: vec![("John".into(), 1)],
+        };
+        let many = EventKind::Unread {
+            threads: vec![("zenworld #general".into(), 2), ("John".into(), 1)],
+        };
+        let prose = |k: &EventKind| Event::new(0, 0, Salience::NORMAL, k.clone()).prose();
+        assert_eq!(
+            prose(&one),
+            "You have 1 unread message on your phone: John (1). To read them, `read`."
+        );
+        assert_eq!(
+            prose(&many),
+            "You have 3 unread messages on your phone: zenworld #general (2), John (1). \
+             To read them, `read`."
+        );
+        assert_eq!(one.replaces().as_deref(), Some("unread"));
+        assert_eq!(one.tag(), "unread");
+    }
 
     #[test]
     fn salience_is_clamped_at_both_ends() {

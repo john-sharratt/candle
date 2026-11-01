@@ -795,6 +795,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // accept walk will select on this wave's head span.
         #[cfg(feature = "cuda")]
         let accept_in_place = session.accept_in_place();
+        let stencil_rows = session.stencil_rows();
         // Refused rather than ignored. Dropping the name here would serve the
         // BASE model under an adapter's name, which reads as a bad fine-tune
         // rather than as an unsupported architecture.
@@ -1006,6 +1007,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         // The caller's accept walk selects on the head's span
                         // only when it reads the logits there.
                         accept_rows: if accept_in_place { scored_rows } else { 0 },
+                        stencil_rows,
                         // This stack's attention is dense: no sparse selection.
                         qsa_bytes: 0,
                         // No look-ahead routers on this path.

@@ -9,6 +9,7 @@ use crate::line_ends::line_end_token_ids;
 use crate::models::Dialect;
 use crate::persistence::BoundSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
+use crate::stencil::AllowedSet;
 use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::ConversationTreeConfig;
@@ -271,6 +272,12 @@ pub struct SamplingConfig {
     /// Empty = no constraint.
     pub stencil: Vec<i32>,
 
+    /// Stencil constraint too wide to name: one bit per token, a clear bit
+    /// forbidden. The row samples the full vocabulary under it in the wave's
+    /// one dispatch, where an allow-list would carry most of the vocabulary to
+    /// the device and its probabilities back.
+    pub allowed_bits: Option<Arc<[u32]>>,
+
     /// This step samples without the repetition penalties — no presence,
     /// frequency, repeat, cross-turn or DRY history for its row. Set on one
     /// step's own copy of the config, by the grammar, where a token's having
@@ -354,6 +361,7 @@ impl Default for SamplingConfig {
             forced_eos_after: 0,
             banned_tokens: Vec::new(),
             stencil: Vec::new(),
+            allowed_bits: None,
             unpenalized_step: false,
             seed: 42,
             mode_sampling: None,
@@ -1147,6 +1155,19 @@ impl SamplingConfig {
     pub fn with_stencil(mut self, tokens: Vec<i32>) -> Self {
         self.stencil = tokens;
         self
+    }
+
+    /// Hold this step to `set`: by name, or through its bitmap on a set too wide
+    /// to name, with the repetition penalties lifted as a named row has them.
+    pub fn constrain_to(&mut self, set: &AllowedSet) {
+        match set.bits() {
+            Some(bits) => {
+                self.stencil.clear();
+                self.allowed_bits = Some(Arc::clone(bits));
+                self.unpenalized_step = true;
+            }
+            None => self.stencil = set.tokens().iter().map(|&t| t as i32).collect(),
+        }
     }
 
     /// Set RNG seed.
