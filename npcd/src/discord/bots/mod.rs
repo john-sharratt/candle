@@ -88,6 +88,9 @@ pub struct Bots {
     /// When each world's server was last reconciled here. A world this
     /// member has just taken has none, so its first beat reconciles it.
     reconciled: StdMutex<HashMap<String, Instant>>,
+    /// Until when each world's mirror holds off, after Discord refused it
+    /// (`crate::discord::world::hold`).
+    mirror_held: StdMutex<HashMap<String, Instant>>,
 }
 
 /// What the beat holds between beats.
@@ -134,7 +137,25 @@ impl Bots {
             }),
             trace: Trace::default(),
             reconciled: StdMutex::new(HashMap::new()),
+            mirror_held: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether world `world`'s mirror is holding off after a refusal.
+    pub fn mirror_held(&self, world: &str) -> bool {
+        self.mirror_held
+            .lock()
+            .expect("mirror hold lock")
+            .get(world)
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
+    /// Hold world `world`'s mirror off for `wait`.
+    pub fn hold_mirror(&self, world: &str, wait: Duration) {
+        self.mirror_held
+            .lock()
+            .expect("mirror hold lock")
+            .insert(world.to_string(), Instant::now() + wait);
     }
 
     /// Whether world `world`'s server is due its reconcile, `every` since the

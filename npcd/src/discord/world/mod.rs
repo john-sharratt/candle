@@ -37,6 +37,7 @@
 //! | [`record`] | `discord/guild`, `discord/thread/…` and `discord/webhook/…`, as the world keeps them |
 //! | [`routes`] | `GET`/`PUT`/`DELETE /v1/world/:wid/discord` |
 //! | [`channels`] | the mirrored channels, found or made, and their webhooks |
+//! | [`hold`] | how long the mirror holds off after Discord refused it |
 //! | [`members`] | who a thread's members are on Discord, and what a channel lets them do |
 //! | [`groups`] | the named groups as channels only their members see |
 //! | [`dms`] | a person's DM with a character without a bot, as a private thread |
@@ -52,6 +53,7 @@ pub mod channels;
 pub mod dms;
 pub mod gap;
 pub mod groups;
+pub mod hold;
 pub mod inbound;
 pub mod members;
 pub mod outbound;
@@ -96,12 +98,18 @@ pub async fn tick(a: &Arc<Authored>, online: &[Online]) {
         let Some((hosted, guild)) = listened(a, bot) else {
             continue;
         };
-        if !channels::ensure(a, bot, &hosted, &guild).await {
+        if a.bots.mirror_held(hosted.id()) {
+            continue;
+        }
+        if let Err(e) = channels::ensure(a, bot, &hosted, &guild).await {
+            a.bots.hold_mirror(hosted.id(), hold::after(&e));
             continue;
         }
         if a.bots.reconcile_due(hosted.id(), reconcile::EVERY) {
             reconcile::run(a, bot, &hosted, &guild, &by_npc).await;
         }
-        outbound::post(a, bot, &hosted, &guild, &by_npc).await;
+        if let Some(wait) = outbound::post(a, bot, &hosted, &guild, &by_npc).await {
+            a.bots.hold_mirror(hosted.id(), wait);
+        }
     }
 }
