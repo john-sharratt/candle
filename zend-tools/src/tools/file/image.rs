@@ -122,7 +122,7 @@ impl Tool for FileImage {
             .files
             .repo(req.source_repo.as_deref().unwrap_or(&req.repo))?
             .read_bytes(&req.path)?
-            .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
+            .ok_or_else(|| not_found(&req))?;
         let picture = decode(&source, &req.path)?;
         let (width, height) = picture.dimensions();
         let cut = cut(picture, req.crop)?;
@@ -148,6 +148,20 @@ impl Tool for FileImage {
             height,
             written,
         })
+    }
+}
+
+/// The picture `req` names is not there, said with the way out when it may be
+/// in another repository: told only "not found", a worker sent the same call
+/// five times and lost its tools.
+fn not_found(req: &ImageRequest) -> FileError {
+    match &req.source_repo {
+        Some(repo) => FileError::NotFound(format!("{} in repository `{repo}`", req.path)),
+        None => FileError::NotFound(format!(
+            "{} in repository `{}`. If the picture is in another repository, name it in \
+             `source_repo`; the copies still go in `repo`",
+            req.path, req.repo
+        )),
     }
 }
 
