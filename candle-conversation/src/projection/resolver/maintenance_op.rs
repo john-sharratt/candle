@@ -18,13 +18,15 @@
 //! every write made while it is paused — it exists for the writes that land
 //! between batches, and a paused op is that, for longer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::Conversation;
 use crate::persistence::live_indexes::LiveIndexes;
 use crate::persistence::maintenance::{MaintenancePlan, MaintenanceRun, RELOCATION_BATCH_BYTES};
+use crate::persistence::retired::{RetiredSegments, Unlinked};
 use crate::scheduler::note_persistence_maint_us;
 
 /// Which maintenance op a pass may pick.
@@ -229,8 +231,9 @@ impl Conversation {
         }
     }
 
-    /// Repoint the index at the relocated records in one substrate edit, then
-    /// unlink the drained sources on the log's owner, and log the op's timings.
+    /// Repoint the index at the relocated records in one substrate edit, take
+    /// the drained sources out of the log on its owner, unlink their files on
+    /// a thread of their own, and log the op's timings.
     fn complete_maintenance_op(&self, op: &mut MaintenanceOp) -> candle::Result<()> {
         let result = op.run.take_result();
         note_persistence_maint_us(op.held.as_micros() as u64);
@@ -241,10 +244,12 @@ impl Conversation {
         self.update(|s| result.apply_to_substrate(s));
         let apply_ms = t_apply.elapsed().as_millis() as u64;
         let t_finish = Instant::now();
-        self.persistence
+        let retired = self
+            .persistence
             .call_behind(|p| p.finish_maintenance(&op.plan))
             .map_err(|e| candle::Error::Msg(format!("substrate maintenance drop: {e}")))?;
         let finish_ms = t_finish.elapsed().as_millis() as u64;
+        unlink_apart(retired, op.dir.clone());
         // **Every phase's time, not only the relocation's.** `longest_hold_ms`
         // covers only the relocation batches. At `info`, once per op beside
         // the plan's own line: an op whose slow phase delays the writes queued
@@ -266,7 +271,50 @@ impl Conversation {
         );
         Ok(())
     }
+}
 
+/// Unlink an op's retired segment files on a thread of their own. Deleting a
+/// multi-GiB file took 14 s on WhiteWorld on 2026-11-01, on the log's owner,
+/// and every write on the substrate waited for it; the calling thread is the
+/// one that serves relief's flush, so it does not wait for it either. A file
+/// that will not go is left for the next pass, which reclaims stale segments.
+fn unlink_apart(retired: RetiredSegments, dir: PathBuf) {
+    if retired.paths().is_empty() {
+        return;
+    }
+    let logged = dir.clone();
+    let spawned = thread::Builder::new()
+        .name("segment-unlink".into())
+        .spawn(move || log_unlinked(&logged, retired.unlink()));
+    if let Err(e) = spawned {
+        tracing::warn!(
+            target: "candle_conversation::persistence::maintenance",
+            dir = %dir.display(),
+            "segment-maintenance: no thread to unlink the drained segments ({e}); \
+             they are left for the next pass"
+        );
+    }
+}
+
+fn log_unlinked(dir: &Path, done: Unlinked) {
+    for (path, e) in &done.failed {
+        tracing::warn!(
+            target: "candle_conversation::persistence::maintenance",
+            dir = %dir.display(),
+            path = %path.display(),
+            "segment-maintenance: a drained segment would not unlink ({e}); left for the next pass"
+        );
+    }
+    tracing::info!(
+        target: "candle_conversation::persistence::maintenance",
+        dir = %dir.display(),
+        removed = done.removed,
+        unlink_ms = done.took.as_millis() as u64,
+        "segment-maintenance: drained segments unlinked off the log's owner"
+    );
+}
+
+impl Conversation {
     /// Refresh the status cell from the persistence layer — this also clears
     /// `running`. Two O(1) reads on the owner; the status endpoint reads the
     /// cell, so it never waits on the owner.
@@ -310,6 +358,19 @@ mod tests {
         p.commit().unwrap();
         p.seal_active().unwrap();
         dir
+    }
+
+    /// Whether `path` is gone by `within`: a drained segment's file is
+    /// unlinked on a thread of its own, after the op completes.
+    fn unlinked_within(path: &Path, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     fn open(dir: &Path) -> Conversation {
@@ -361,8 +422,8 @@ mod tests {
             .unwrap());
         assert!(op.is_none());
         assert!(
-            !sealed_segment_1(dir.path()).exists(),
-            "segment 1 compacted away"
+            unlinked_within(&sealed_segment_1(dir.path()), Duration::from_secs(10)),
+            "segment 1 compacted away, its file unlinked apart"
         );
         assert!(!conv.maintenance_status().2, "the status clears");
         drop(conv);

@@ -54,6 +54,7 @@ use super::log_file::{read_record_at, LogFile, LogSource, Superblock, SUPERBLOCK
 use super::manifest::Manifest;
 use super::record::Record;
 use super::recovery;
+use super::retired::RetiredSegments;
 use super::sealed_reader::{ActiveSegment, SealedReader};
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::walker::WalkEntry;
@@ -785,12 +786,28 @@ impl SegmentedLog {
     /// file. The caller must have already relocated its live records into the
     /// active (background maintenance), so nothing references it.
     pub fn drop_sealed(&mut self, segment: SegmentId) -> Result<()> {
+        let mut retired = RetiredSegments::default();
+        self.retire_sealed(segment, &mut retired)?;
+        fs::remove_file(&retired.paths()[0])?;
+        Ok(())
+    }
+
+    /// Take sealed `segment` out of the log — close its pooled read handle and
+    /// stop naming it — leaving its file for `retired` to unlink. Deleting a
+    /// multi-GiB file can take seconds, and nothing of the log is needed to
+    /// do it, so it is done by whoever holds `retired`, never on the log's
+    /// owner. The caller must have already relocated its live records.
+    pub fn retire_sealed(
+        &mut self,
+        segment: SegmentId,
+        retired: &mut RetiredSegments,
+    ) -> Result<()> {
         if self.read_only {
             return Err(PersistenceError::ReadOnly);
         }
         self.pool.forget(segment);
-        fs::remove_file(self.dir.join(segment_name(segment)))?;
         self.sealed.retain(|&s| s != segment);
+        retired.push(self.dir.join(segment_name(segment)));
         Ok(())
     }
 

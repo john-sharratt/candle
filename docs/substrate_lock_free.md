@@ -484,6 +484,16 @@ character taking a turn. The same holds for every other scan of the indexes: the
 live-bytes figure (`Conversation::live_bytes`) and the liveness audit's plan
 read a `LiveIndexes`, not the owner.
 
+**The drained sources are unlinked off the owner.** The op's last call on the
+owner (`finish_maintenance`) takes the sources out of the log and its location
+indexes and hands their files back (`RetiredSegments`, `persistence/retired.rs`);
+a thread of their own deletes them. Deleting a multi-GiB segment is filesystem
+work with nothing of the log in it, and on the owner it held every write behind
+it — 4.6 s and 14 s on WhiteWorld on 2026-11-01. A crash before the unlink leaves
+a stale source behind, as a crash between the relocation and the drop always
+could: its records' carried copies keep their identities, so a recovery applies
+each value once, and the next pass reclaims it.
+
 **Maintenance defers to replication.** Every remote batch is applied on the
 owner too, so a maintenance step running while a catch-up lands holds every
 apply behind it — 50 s on WhiteWorld on 2026-11-01, until the member's arrivals
