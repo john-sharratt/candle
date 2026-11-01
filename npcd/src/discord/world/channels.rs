@@ -11,13 +11,16 @@
 //! its own speaks through; its token is sealed onto the world's record.
 //!
 //! A channel already recorded is not looked for again. Every call is the
-//! listener's; a failure is said in its trace, and the beat tries again.
+//! listener's; a failure is said in its trace and handed back, so the beat
+//! holds the world's mirror for as long as Discord's answer asks
+//! ([`super::hold`]) rather than asking again on the next beat.
 
 use std::sync::Arc;
 
 use super::record::{hook_name, Guild, Hook, Kind, Mirrored};
 use crate::api::{now_ms, Authored};
 use crate::discord::client::{Overwrite, Webhook};
+use crate::discord::error::DiscordError;
 use crate::discord::message::snowflake_at;
 use crate::discord::online::Online;
 use crate::discord::trace::note::{Direction, Note};
@@ -52,17 +55,21 @@ pub fn last_seq(hosted: &Hosted, thread: &str) -> u64 {
 }
 
 /// Find or make every mirrored channel of `guild`, and their webhooks.
-/// `false` when a call failed: the beat posts nothing until they stand.
-pub async fn ensure(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, guild: &Guild) -> bool {
+/// What Discord answered instead when a call failed: the beat posts nothing
+/// until they stand, and holds off asking again ([`super::hold`]).
+pub async fn ensure(
+    a: &Arc<Authored>,
+    bot: &Online,
+    hosted: &Hosted,
+    guild: &Guild,
+) -> Result<(), DiscordError> {
     let Some(thread) = channel_thread(hosted) else {
-        return true;
+        return Ok(());
     };
     let channel_id = match hosted.mirror(|m| m.thread(&thread)) {
         Some(mirrored) => mirrored.channel_id,
         None => {
-            let Some(channel_id) = find_or_make_with(a, bot, guild, CHANNEL_NAME, &[]).await else {
-                return false;
-            };
+            let channel_id = find_or_make_with(a, bot, guild, CHANNEL_NAME, &[]).await?;
             let mirrored = Mirrored::new(
                 channel_id,
                 Kind::Channel,
@@ -81,25 +88,25 @@ pub async fn ensure(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, guild: &Gu
             channel_id
         }
     };
-    hook(a, bot, hosted, guild, channel_id).await.is_some()
+    hook(a, bot, hosted, guild, channel_id).await.map(|_| ())
 }
 
 /// Channel `channel_id`'s webhook, made when the world has none for it;
-/// `None` when it could not be made.
+/// what Discord answered instead when it could not be made.
 pub async fn hook(
     a: &Authored,
     bot: &Online,
     hosted: &Hosted,
     guild: &Guild,
     channel_id: u64,
-) -> Option<Webhook> {
+) -> Result<Webhook, DiscordError> {
     if let Some(held) = hosted.mirror(|m| m.hook(channel_id)) {
         match a
             .discord_tokens
             .open_for(&hook_name(channel_id), &held.token)
         {
             Ok(token) => {
-                return Some(Webhook {
+                return Ok(Webhook {
                     id: held.webhook_id,
                     token,
                 })
@@ -128,7 +135,7 @@ pub async fn hook(
                 )
                 .channel(channel_id),
             );
-            return None;
+            return Err(e);
         }
     };
     let sealed = a
@@ -148,19 +155,19 @@ pub async fn hook(
         bot.npc,
         Note::new(now_ms(), Direction::Out, "mirror", "webhook_made").channel(channel_id),
     );
-    Some(made)
+    Ok(made)
 }
 
 /// The id of `guild`'s text channel called `name`, made with `overwrites`
-/// when it has none; `None` when Discord answered neither.
+/// when it has none; what Discord answered instead when it did neither.
 pub async fn find_or_make_with(
     a: &Authored,
     bot: &Online,
     guild: &Guild,
     name: &str,
     overwrites: &[Overwrite],
-) -> Option<u64> {
-    let fail = |what: &str, e: String| {
+) -> Result<u64, DiscordError> {
+    let fail = |what: &str, e: &DiscordError| {
         failed(
             a,
             bot.npc,
@@ -168,25 +175,16 @@ pub async fn find_or_make_with(
                 .guild(guild.guild_id),
         );
     };
-    let channels = match a.discord.guild_channels(&bot.token, guild.guild_id).await {
-        Ok(channels) => channels,
-        Err(e) => {
-            fail("channels not read", e.to_string());
-            return None;
-        }
-    };
-    if let Some(found) = channels.iter().find(|c| c.kind == TEXT && c.name == name) {
-        return Some(found.id);
-    }
-    match a
+    let channels = a
         .discord
+        .guild_channels(&bot.token, guild.guild_id)
+        .await
+        .inspect_err(|e| fail("channels not read", e))?;
+    if let Some(found) = channels.iter().find(|c| c.kind == TEXT && c.name == name) {
+        return Ok(found.id);
+    }
+    a.discord
         .create_channel(&bot.token, guild.guild_id, name, overwrites)
         .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            fail("channel not made", e.to_string());
-            None
-        }
-    }
+        .inspect_err(|e| fail("channel not made", e))
 }

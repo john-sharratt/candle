@@ -15,8 +15,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::channels::hook;
+use super::hold::{after, FAILED_FOR, REFUSED_FOR};
 use super::record::Guild;
 use super::speaker::{self, Speaker};
 use crate::api::Authored;
@@ -27,14 +29,18 @@ use crate::sim::phone::Message;
 use crate::world::Hosted;
 
 /// Post what is waiting on every mirrored thread of `hosted`, `bot` its
-/// listener and `online` every bot online here.
+/// listener and `online` every bot online here. How long the world's mirror
+/// is to hold off when Discord refused a post ([`super::hold`]): a thread
+/// left unposted is not asked again on the next beat.
 pub async fn post(
     a: &Arc<Authored>,
     bot: &Online,
     hosted: &Hosted,
     guild: &Guild,
     online: &HashMap<u64, &Online>,
-) {
+) -> Option<Duration> {
+    let mut hold: Option<Duration> = None;
+    let mut held = |wait: Duration| hold = Some(hold.map_or(wait, |h| h.max(wait)));
     'threads: for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
         if mirrored.archived {
             continue;
@@ -72,11 +78,14 @@ pub async fn post(
                         username,
                         avatar_url,
                     } => {
-                        let Some(webhook) =
-                            hook(a, bot, hosted, guild, mirrored.hook_channel()).await
-                        else {
-                            continue 'threads;
-                        };
+                        let webhook =
+                            match hook(a, bot, hosted, guild, mirrored.hook_channel()).await {
+                                Ok(webhook) => webhook,
+                                Err(e) => {
+                                    held(after(&e));
+                                    continue 'threads;
+                                }
+                            };
                         let as_who = (username.as_str(), avatar_url.as_deref());
                         let in_thread = mirrored.parent.is_some();
                         post_hook(a, bot, &webhook, as_who, in_thread, to, part).await
@@ -92,7 +101,14 @@ pub async fn post(
                         }
                         continue 'threads;
                     }
-                    Ok(Post::Forbidden | Post::Unposted) | Err(_) => continue 'threads,
+                    Ok(Post::Forbidden) | Err(_) => {
+                        held(REFUSED_FOR);
+                        continue 'threads;
+                    }
+                    Ok(Post::Unposted) => {
+                        held(FAILED_FOR);
+                        continue 'threads;
+                    }
                 }
             }
             posted(a, bot, to, last, parts.len());
@@ -104,4 +120,5 @@ pub async fn post(
             });
         }
     }
+    hold
 }

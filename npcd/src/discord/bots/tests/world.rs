@@ -798,6 +798,32 @@ async fn a_bot_shows_typing_while_a_dm_waits_on_it() {
     assert_eq!(typing(&d), 1, "typing went on after the answer");
 }
 
+/// **A refusal holds the mirror instead of asking again each beat**: a
+/// listener the server will not let read its channels is answered `403`
+/// once, and nothing more is asked of Discord for the world on the beats
+/// after — every `403` and `429` counts against the host's invalid-request
+/// limit.
+#[tokio::test]
+async fn a_refusal_holds_the_mirror_instead_of_asking_every_beat() {
+    let d = daemon(vec![Script::Serve]).await;
+    d.online().await;
+    d.discord.reply(
+        403,
+        json!({ "message": "Missing Permissions", "code": 50013 }),
+    );
+    d.serve_world();
+    d.settle().await;
+    d.settle().await;
+    let asked = d
+        .discord
+        .seen()
+        .iter()
+        .filter(|s| s.path == "/guilds/600/channels")
+        .count();
+    assert_eq!(asked, 1, "the refused call was asked again");
+    assert!(d.a.bots.mirror_held(WORLD));
+}
+
 /// `method` on `/v1/world/<WORLD>/discord` as `sub`, through the engine's
 /// routes and their role check; the status and the body.
 async fn world_route(d: &Daemon, method: &str, sub: &str, body: Option<Value>) -> (u16, Value) {

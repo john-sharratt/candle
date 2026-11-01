@@ -146,7 +146,9 @@ async fn parent(a: &Authored, bot: &Online, hosted: &Hosted, guild: &Guild) -> O
         everyone(guild.guild_id, VIEW | HISTORY, SEND | SEND_IN_THREADS),
         member(bot.user_id, LISTENER, 0),
     ];
-    let id = find_or_make_with(a, bot, guild, BACKSTAGE, &overwrites).await?;
+    let id = find_or_make_with(a, bot, guild, BACKSTAGE, &overwrites)
+        .await
+        .ok()?;
     hosted.with_mirror(|m| m.put_parent(BACKSTAGE, id));
     Some(id)
 }
