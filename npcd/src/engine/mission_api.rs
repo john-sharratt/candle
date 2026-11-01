@@ -9,7 +9,7 @@
 //! reporting — is the acts in [`crate::engine::mission_acts`], performed at the
 //! desk.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -288,6 +288,52 @@ pub async fn bridge(
     match agents.bridge(&call).await {
         Ok(b) => Json(json!({ "ok": b.ok, "line": b.line })).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
+    }
+}
+
+/// What a device-metadata write names and sets.
+#[derive(serde::Deserialize)]
+pub struct DeviceBody {
+    /// The world the device stands in.
+    pub world: String,
+    /// The device's network address — how the part standing for it is found.
+    pub address: String,
+    /// Notes to set, replacing what was there.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Credentials to merge in — a webOS key, an Android TV cert and key, a token.
+    #[serde(default)]
+    pub creds: BTreeMap<String, String>,
+}
+
+/// `POST /v1/pulse/device` — set a device's notes and credentials on the world
+/// part standing for it (`docs/zen_moon_mind.md` §15). The admin onboarding
+/// path: the metadata lives on the world, replicated, and is folded into every
+/// effector command so the stateless agent is handed what it needs. Admin.
+pub async fn device(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<DeviceBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("the device metadata");
+    };
+    let op = WorldOp::AmendDevice {
+        address: body.address,
+        notes: body.notes,
+        creds: body.creds,
+    };
+    match rt.world_write(&body.world, op).await {
+        Ok(OpReply::Done { ok: true }) => Json(json!({ "ok": true })).into_response(),
+        Ok(_) => err(
+            StatusCode::NOT_FOUND,
+            "no_device",
+            "no device in that world stands at that address",
+        ),
+        Err(e) => world_unreached(&e),
     }
 }
 

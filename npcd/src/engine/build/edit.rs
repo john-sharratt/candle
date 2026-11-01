@@ -62,6 +62,7 @@ fn link_of(finding: &Finding) -> PartLink {
         profile: finding.profile.clone(),
         address: finding.address.clone(),
         hardware: finding.hardware.clone(),
+        ..Default::default()
     }
 }
 

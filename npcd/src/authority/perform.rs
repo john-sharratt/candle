@@ -7,7 +7,12 @@ use std::sync::Arc;
 
 use axum::http::Method;
 use host::cluster::up::request_up;
+use std::collections::BTreeMap;
+
+use npc_map::mutate::MapEdit;
 use npc_map::world::Where;
+
+use crate::world::Hosted;
 
 use super::forward::{act_of, call_line};
 use super::npc_lease::{hand_back, leases_of, released};
@@ -216,6 +221,17 @@ impl Runtime {
             WorldOp::Posting { at, on, by, text } => OpReply::Posted {
                 lines: self.post_in_world(world, &at, &on, &by, &text),
             },
+            WorldOp::AmendDevice {
+                address,
+                notes,
+                creds,
+            } => {
+                let ok = self
+                    .hosted
+                    .get(world)
+                    .is_some_and(|hosted| amend_device(&hosted, &address, notes, creds));
+                OpReply::Done { ok }
+            }
             // **Leases are the authority's alone to change** (§9.3): a member
             // running the world cut off answers neither, and the character
             // stays where it is until the world's authority takes it.
@@ -441,4 +457,35 @@ impl Runtime {
             (ticked, added)
         })
     }
+}
+
+/// Set `notes` (replacing when given) and merge `creds` onto the device part
+/// standing for the thing at `address`, and keep the change. `false` when no
+/// part here stands for that address.
+fn amend_device(
+    hosted: &Hosted,
+    address: &str,
+    notes: Option<String>,
+    creds: BTreeMap<String, String>,
+) -> bool {
+    let found = hosted.read(|w| {
+        let map = w.map();
+        map.areas()
+            .flat_map(|a| a.nodes.iter())
+            .flat_map(|n| map.parts_at(n))
+            .find_map(|(p, _)| {
+                let link = p.link.as_ref()?;
+                (link.address == address).then(|| (p.id.clone(), link.clone()))
+            })
+    });
+    let Some((id, mut link)) = found else {
+        return false;
+    };
+    if notes.is_some() {
+        link.notes = notes;
+    }
+    link.creds.extend(creds);
+    hosted
+        .build(&[MapEdit::LinkPart { part: id, link }], None)
+        .is_ok()
 }
