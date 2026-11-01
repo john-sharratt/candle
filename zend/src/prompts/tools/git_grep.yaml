@@ -102,3 +102,13 @@ examples:
 - do a case-insensitive search of the tracked sources for this name<|im_end|>
 - look for that literal error message in the commit we shipped<|im_end|>
 - where is this macro defined on origin main<|im_end|>
+- |-
+  was that string in the code at the release tag<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  file_grep searches my working files, and this asks about a committed revision, so git_grep with `rev` is the right tool. It needs the pattern and a page.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_grep", "arguments": {"repo": "candle", "pattern": "battlecities.png", "rev": "v1.4.0", "fixed": true, "page": 1}}
+  </tool_call><|projection|>

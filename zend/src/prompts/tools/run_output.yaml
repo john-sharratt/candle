@@ -44,3 +44,23 @@ parameters:
 examples:
 - show me the rest of that test run's output<|im_end|>
 - what failed at the end of the build log?<|im_end|>
+- |-
+  the test run printed more than one page, what failed<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  run_command gave me only the first page, and a test summary comes at the end. The result said which page of how many, so I can ask run_output for the last page by the job it gave instead of running the tests again.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_output", "arguments": {"repo": "candle", "job": "9sAOIi2yhiY", "page": 9}}
+  </tool_call><|projection|>
+- |-
+  read the rest of that build's output<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The compiler errors are further down than the first page. The job id from the run is what reads them; a page past the end gives the last page, so I can ask for a high page.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_output", "arguments": {"repo": "candle", "job": "h057cT20eTA", "page": 99}}
+  </tool_call><|projection|>

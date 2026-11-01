@@ -153,3 +153,23 @@ examples:
 - publish what I just merged in from the feature branch<|im_end|>
 - add the retry logic with its tests, then separately add the metrics counter for it with its own test change, as two commits<|im_end|>
 - write the parser fix and commit it, then write the changelog entry for it and commit that on its own<|im_end|>
+- |-
+  the tests pass, commit and push this to main<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Everything I changed belongs in this commit, so `from: all_changes` takes it all. A commit here goes out on the branch, and the message says what changed and why.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "all_changes", "message": "Redraw the site icon from its source art"}}
+  </tool_call><|projection|>
+- |-
+  finish the job without asking me, commit it when it works<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The work is done and checked, and I have been told not to ask. My uncommitted changes are exactly the task, so I commit them all with a message saying what the change does.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "app", "from": "all_changes", "message": "Fix the report's date parsing"}}
+  </tool_call><|projection|>

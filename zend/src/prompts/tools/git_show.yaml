@@ -124,3 +124,23 @@ examples:
 - what exactly did commit df3294f change<|im_end|>
 - read the README as the docs branch on origin has it<|im_end|>
 - someone pushed a new branch, tell me what its commit actually changes<|im_end|>
+- |-
+  verify what actually went into that commit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  To check the commit itself rather than my files, git_show with `what` set to changes lists what it touched at that revision. The page is required.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "changes", "rev": "HEAD", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  read the old version of that file from before your change<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The file as an earlier revision had it comes from git_show with `what` set to file, the path and the rev. My working copy has already moved on, so file_read would give the wrong text.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "file", "rev": "HEAD~1", "path": "web/src/site/tokera/page.rs", "page": 1}}
+  </tool_call><|projection|>

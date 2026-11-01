@@ -56,3 +56,63 @@ examples:
 - format the source with the project's formatter<|im_end|>
 - run the script scripts/report.js with node<|im_end|>
 - run node src/index.js and show me what it prints<|im_end|>
+- |-
+  regenerate the icons and make sure the tests still pass<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The files are changed, so now I need to run the tests to check them. run_command runs a program on my branch with my changes laid down. The program goes in `program` and each argument in `args`, one entry each, with no shell, so `cargo test -p web` is program cargo with args test, -p, web.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--release"]}}
+  </tool_call><|projection|>
+- |-
+  only the switcher test matters here, run just that one<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A test filter is one argument after `test`. A flag that takes a value needs that value right after it: `-p` then the package, `--skip` then a name. Each flag once, and nothing left dangling at the end, or cargo fails before it runs anything.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "the_switcher_icons", "--", "--skip", "slow"]}}
+  </tool_call><|projection|>
+- |-
+  that failed with exit 101, the options were wrong<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Exit 101 before any test ran means cargo refused the arguments, so running the same thing again gets the same refusal. I need to change the arguments: drop the repeated flag and keep each option once.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--quiet"]}}
+  </tool_call><|projection|>
+- |-
+  does it build after that edit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I edited the source, so I should compile it before going on. cargo check is the quick way, and a build this size needs a longer timeout than the default.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["check", "-p", "web"], "timeout_secs": 1200}}
+  </tool_call><|projection|>
+- |-
+  run the npm tests after your change<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  My edit is in, so the test suite is next. npm is the program and test its one argument; there is no shell, so `npm test` does not go in `program` whole, and no `&&` or redirect either.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "npm", "args": ["test"]}}
+  </tool_call><|projection|>
+- |-
+  run the script that checks the file sizes<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A script in the repository runs through its interpreter: node is the program and the script path its argument. python -c with no code after it is refused, so a script file or a whole code argument, never the flag alone.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "node", "args": ["scripts/check-sizes.js"]}}
+  </tool_call><|projection|>
