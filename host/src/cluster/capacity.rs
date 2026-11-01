@@ -19,6 +19,9 @@
 //! - **`bulk_backlog`** is the bulk work its tenant has outstanding — zend's
 //!   ingest units — which the gateway's plan moves characters off the card
 //!   for (`docs/cooperative_admission.md` §4.4).
+//! - **`process_loading`** is whether any tenant in the process still loads,
+//!   set over this by the app's link (`super::readiness`): the plan lends such
+//!   a member no characters.
 
 use cluster::frame::{Capacity, MemberState};
 use cluster::machine::Machine;
@@ -154,6 +157,9 @@ pub fn capacity(
         tokens_per_step_milli: rates.map_or(0, |r| tokens(r.tokens_per_step * 1000.0)),
         guest_reach,
         bulk_backlog,
+        // The process's, not this tenant's: the link sets it from what every
+        // tenant reports (`super::readiness`).
+        process_loading: false,
     }
 }
 
