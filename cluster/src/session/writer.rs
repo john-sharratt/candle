@@ -52,11 +52,13 @@ async fn take<T: PipeTx>(tx: &mut T, lanes: &mut Lanes, command: Command) -> boo
     }
 }
 
+/// Write until told to stop. `true` when the pipe was lost under it, which
+/// nothing on the reading side will notice while the peer keeps talking.
 pub async fn run<T: PipeTx>(
     mut tx: T,
     mut commands: UnboundedReceiver<Command>,
     gauges: Arc<Gauges>,
-) {
+) -> bool {
     let mut lanes = Lanes::new();
     let mut counter = FrameCounter::default();
     // Catch-up frames wait for the socket to drain under its low-water mark,
@@ -69,13 +71,13 @@ pub async fn run<T: PipeTx>(
             match commands.try_recv() {
                 Ok(command) => {
                     if !take(&mut tx, &mut lanes, command).await {
-                        return;
+                        return false;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if lanes.is_empty() {
-                        return;
+                        return false;
                     }
                     break;
                 }
@@ -90,7 +92,7 @@ pub async fn run<T: PipeTx>(
             let (kind, len) = (crate::frame::name(next.frame.kind()), bytes.len());
             let handing = std::time::Instant::now();
             if tx.send(Message::Frame(bytes)).await.is_err() {
-                return;
+                return true;
             }
             // Every frame behind this one — a PING included — waited on it: a
             // hand-off this slow is a peer about to see "no frame for 45 s".
@@ -112,10 +114,10 @@ pub async fn run<T: PipeTx>(
         }
         tokio::select! {
             command = commands.recv() => match command {
-                None => return,
+                None => return false,
                 Some(command) => {
                     if !take(&mut tx, &mut lanes, command).await {
-                        return;
+                        return false;
                     }
                 }
             },

@@ -171,7 +171,12 @@ pub async fn put_world_discord(
         listener,
         backstage: body.backstage,
     };
-    write(&s, &wid, Some(guild.clone()), wire(Some(&guild))).await
+    let answer = write(&s, &wid, Some(guild.clone()), wire(Some(&guild))).await;
+    // Setting the server is the person answering what Discord refused —
+    // a permission granted, another server chosen — so the mirror asks again
+    // on its next beat rather than waiting out its hold.
+    s.bots.mirror_cleared(&wid);
+    answer
 }
 
 /// `DELETE /v1/world/:wid/discord`

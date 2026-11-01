@@ -64,6 +64,7 @@ pub mod mem;
 mod nudge;
 mod reply;
 mod repo_job;
+mod repo_job_list;
 mod repo_job_log;
 mod service_control;
 mod service_status;
@@ -181,6 +182,7 @@ pub fn definitions() -> Value {
         cluster_job_status::definition(),
         gateway_command::definition(),
         repo_job::definition(),
+        repo_job_list::definition(),
         repo_job_log::definition(),
         service_status::definition(),
         service_trial::definition(),
@@ -237,6 +239,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         cluster_job_status::NAME => cluster_job_status::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
         repo_job::NAME => repo_job::call(ctx, args).await,
+        repo_job_list::NAME => repo_job_list::call(ctx, args).await,
         repo_job_log::NAME => repo_job_log::call(ctx, args).await,
         service_status::NAME => service_status::call(ctx, args).await,
         service_trial::NAME => service_trial::call(ctx, args).await,
@@ -348,6 +351,7 @@ mod tests {
                 "cluster_job_status",
                 "gateway_command",
                 "repo_job_start",
+                "repo_job_list",
                 "repo_job_log",
                 "service_status",
                 "service_trial",
@@ -385,6 +389,7 @@ mod tests {
                 "cluster_logs",
                 "cluster_audit",
                 "cluster_job_status",
+                "repo_job_list",
                 "repo_job_log",
                 "service_status",
                 "layer_read",

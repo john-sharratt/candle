@@ -46,7 +46,7 @@ parameters:
     recv_amt:
       description: 'recv_amt mode: read exactly this many bytes (blocks until satisfied or EOF). Provide exactly one of recv_amt or recv_wait.'
       format: uint
-      maximum: 1048576.0
+      maximum: 65536.0
       minimum: 1.0
       type:
       - integer

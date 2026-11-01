@@ -80,6 +80,7 @@ pub mod replica;
 mod replica_tests;
 pub mod replication_load;
 pub mod resume;
+pub mod retired;
 pub mod rewritten;
 pub mod sealed_reader;
 pub mod segment;

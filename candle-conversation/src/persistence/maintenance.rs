@@ -27,8 +27,10 @@
 //!    substrate lock is released, so decode's in-RAM projection proceeds).
 //! 3. [`MaintenanceResult::apply_to_substrate`] — repoint the index at the
 //!    relocated records (brief **write** lock), with a supersession guard.
-//! 4. [`SubstratePersistence::finish_maintenance`] — unlink the drained sources
-//!    (persistence lock).
+//! 4. [`SubstratePersistence::finish_maintenance`] — take the drained sources
+//!    out of the log and its indexes (persistence lock), returning their files
+//!    as [`RetiredSegments`] for the caller to unlink **off the owner**:
+//!    deleting a multi-GiB file is filesystem work that can take seconds.
 //!
 //! Maintenance runs only on the single persistence thread, but the substrate
 //! writer thread can still append between phases (it takes the persistence
@@ -79,6 +81,7 @@ use super::record::{
     TombstonePayload, TurnCouplingPayload,
 };
 use super::relocation_watch::{Reemit, RelocationWatch};
+use super::retired::RetiredSegments;
 use super::segment::SegmentId;
 use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
@@ -900,7 +903,7 @@ impl SubstratePersistence {
         let op = plan.op;
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
-        self.finish_maintenance(&plan)?;
+        unlink_now(self.finish_maintenance(&plan)?)?;
         Ok(Some(op))
     }
 
@@ -1781,21 +1784,24 @@ impl SubstratePersistence {
         Ok(updates)
     }
 
-    /// **Phase 4** — unlink the drained source segments and record the op for
-    /// the status indicator. Runs under the persistence lock, after the index
-    /// apply. Safe because the index no longer points at any source (Phase 3
-    /// repointed the live records; the rest were dead). A read-only handle
-    /// refuses with [`PersistenceError::ReadOnly`].
-    pub fn finish_maintenance(&mut self, plan: &MaintenancePlan) -> Result<()> {
+    /// The op's last step: take the drained source segments out of the log
+    /// and its location indexes, and record the op for the status indicator.
+    /// Runs on the log's owner, after the index apply. Safe because the index
+    /// no longer points at any source (the apply repointed the live records;
+    /// the rest were dead). The sources' files come back as
+    /// [`RetiredSegments`], for the caller to unlink off the owner. A
+    /// read-only handle refuses with [`PersistenceError::ReadOnly`].
+    pub fn finish_maintenance(&mut self, plan: &MaintenancePlan) -> Result<RetiredSegments> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
         // The op ends here whether or not the unlink succeeds: nothing of it
-        // runs after this call.
+        // runs on the owner after this call.
         self.end_relocation_watch();
         let targets = plan.op.targets();
+        let mut retired = RetiredSegments::default();
         for &t in &targets {
-            self.segments.drop_sealed(t)?;
+            self.segments.retire_sealed(t, &mut retired)?;
         }
         // Drop metadata-location entries that pointed into the now-unlinked
         // segments. Live metadata whose current copy lived here was re-pointed
@@ -1820,7 +1826,7 @@ impl SubstratePersistence {
             .as_secs();
         self.last_maintenance = Some((plan.op.label(), unix));
         tracing::trace!(op = ?plan.op, "substrate maintenance op applied");
-        Ok(())
+        Ok(retired)
     }
 }
 
@@ -1890,7 +1896,16 @@ impl SubstratePersistence {
         };
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
-        self.finish_maintenance(&plan)
+        unlink_now(self.finish_maintenance(&plan)?)
+    }
+}
+
+/// Unlink `retired` on this thread, for the single-threaded callers that run
+/// an op end to end; a file that will not go is the op's error.
+fn unlink_now(retired: RetiredSegments) -> Result<()> {
+    match retired.unlink().failed.into_iter().next() {
+        Some((_, e)) => Err(e.into()),
+        None => Ok(()),
     }
 }
 
@@ -2584,7 +2599,7 @@ mod tests {
 
         result.apply_to_substrate(&mut substrate);
         assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(new));
-        sp.finish_maintenance(&plan).unwrap();
+        sp.finish_maintenance(&plan).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
         let decoded = SnapshotPayload::decode(&sp.read_record_payload(&new).unwrap()).unwrap();
         assert_eq!(decoded.turn_index, 2);
@@ -2604,6 +2619,61 @@ mod tests {
             vec![0x22u8; 24],
             "relocation carries the model's own state too"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The owner retires a drained segment; its file is unlinked apart.**
+    /// `finish_maintenance` deletes nothing: the log stops naming the source
+    /// and hands its file back. A crash before the unlink leaves the file
+    /// behind, and a reload over it still installs the relocated copy, not
+    /// the stale one.
+    #[test]
+    fn finish_retires_the_source_and_leaves_its_file_to_unlink() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+
+        let dir = tmp_dir("retire_apart");
+        let timeline: u64 = 92;
+        let sid = snapshot_stream_id(timeline);
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        for turn in [1, 2] {
+            let Stamped { value: loc, id } = sp
+                .write_snapshot(sid, &[&snapshot_payload(timeline, turn, turn as u8)])
+                .unwrap();
+            substrate.apply_snapshot_loc(sid, loc, id);
+        }
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+        let before = sp.segment_count();
+        let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+        sp.execute_maintenance(&plan)
+            .unwrap()
+            .apply_to_substrate(&mut substrate);
+
+        let retired = sp.finish_maintenance(&plan).unwrap();
+        assert_eq!(retired.paths(), [sealed_log(&dir, 1)]);
+        assert!(sealed_log(&dir, 1).exists(), "the owner unlinked the file");
+        assert_eq!(sp.segment_count(), before - 1, "the log still names seg 1");
+        drop(sp);
+
+        // A crash before the unlink: the stale source is still on disk.
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let tail = substrate.recurrent_snapshot_loc(sid).expect("tail");
+        assert_eq!(
+            tail.segment,
+            SegmentId(2),
+            "the relocated copy, not the stale one"
+        );
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2);
+        drop(sp);
+
+        let done = retired.unlink();
+        assert_eq!(done.removed, 1, "{:?}", done.failed);
+        assert!(!sealed_log(&dir, 1).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2680,7 +2750,7 @@ mod tests {
             "relocated off the compacted segment"
         );
         result.apply_to_substrate(&mut substrate);
-        sp.finish_maintenance(&plan).unwrap();
+        sp.finish_maintenance(&plan).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
 
         let moved = substrate
@@ -2782,7 +2852,7 @@ mod tests {
         // (the stale copy is dead there).
         result.apply_to_substrate(&mut substrate);
         assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(loc_c));
-        sp.finish_maintenance(&plan).unwrap();
+        sp.finish_maintenance(&plan).unwrap().unlink();
         assert!(
             !sealed_log(&dir, 1).exists(),
             "seg 1 dropped; the stale copy died with it"
@@ -2864,7 +2934,7 @@ mod tests {
         assert_eq!(sp.write_offset(), offset_before);
         assert_eq!(sp.accounting.dead_bytes(), dead_before);
         result.apply_to_substrate(&mut substrate);
-        sp.finish_maintenance(&plan).unwrap();
+        sp.finish_maintenance(&plan).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists());
         drop(sp);
 
@@ -3093,7 +3163,7 @@ mod tests {
             let op = plan.op();
             let result = sp.execute_maintenance(&plan).unwrap();
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(
                 op.targets().contains(&SegmentId(1)),
                 "the pass targets the segment holding the character, got {op:?}"
@@ -3190,7 +3260,7 @@ mod tests {
             let op = plan.op();
             let result = sp.execute_maintenance(&plan).unwrap();
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(
                 op.targets().contains(&SegmentId(1)),
                 "the pass targets the segment holding the object, got {op:?}"
@@ -3941,7 +4011,7 @@ mod tests {
                 "chunk 2's planned copy was superseded"
             );
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
         }
         {
@@ -4036,7 +4106,7 @@ mod tests {
             );
             assert!(sp.relocation_in_flight(), "in flight until the unlink");
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(!sp.relocation_in_flight());
         }
         {
@@ -4134,7 +4204,7 @@ mod tests {
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
         }
         {
@@ -4241,7 +4311,7 @@ mod tests {
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
             result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap();
+            sp.finish_maintenance(&plan).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
             assert_eq!(
                 sp.origination().next_oseq(),

@@ -88,6 +88,36 @@ examples:
   <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--quiet"]}}
   </tool_call><|projection|>
 - |-
+  check the file sizes with the script you just wrote<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Now run it. The script is written, so run_command with node and its path. Then I read what it printed and delete the scratch files before committing.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "node", "args": ["scratch_sizes.js"]}}
+  </tool_call><|projection|>
+- |-
+  verify the new files are right before you commit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Before committing I should verify the output. Re-run the check script once more: it prints what each file holds, then delete it, then commit.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "node", "args": ["scratch_check.js"]}}
+  </tool_call><|projection|>
+- |-
+  main moved, make sure it still passes after the merge<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The merge brought other commits in, so run the tests again briefly, only the filter that covers my change, then commit with from all_changes.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "--release", "-p", "web", "--lib", "site::tokera"]}}
+  </tool_call><|projection|>
+- |-
   does it build after that edit<|im_end|>
   <|im_start|>assistant
   <|projection|><think>

@@ -156,15 +156,17 @@ pub struct NpcdArgs {
     #[arg(long = "no-characters", action = ArgAction::SetFalse)]
     pub characters: bool,
 
-    /// From how many invalid answers (`401`/`403`/`429`) Discord gave this
-    /// process in the last ten minutes every request to it is spaced out
+    /// From how many invalid answers (`401`/`403`/`429`) from Discord in
+    /// the last ten minutes every request to it is spaced out
     /// (`discord::limit`). Discord bans the public address past 10,000, for
-    /// every member behind it: members sharing one address take a part each.
+    /// every member behind it, so this is the address's line: each npcd
+    /// member of the group holds an even share of it.
     #[arg(long, value_name = "COUNT", default_value_t = limit::THROTTLE)]
     pub discord_invalid_throttle: u32,
 
     /// At how many invalid answers in the last ten minutes nothing more is
-    /// sent to Discord until the window rolls on.
+    /// sent to Discord until the window rolls on: the address's line, shared
+    /// evenly among the group's npcd members.
     #[arg(long, value_name = "COUNT", default_value_t = limit::CEILING)]
     pub discord_invalid_ceiling: u32,
 }
@@ -515,7 +517,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         personality_portraits,
     );
     // Every bot's calls through one count of the invalid answers, at this
-    // member's lines (`discord::limit`).
+    // member's share of the address's lines (`discord::limit`).
     authored.discord = DiscordClient::limited(
         discord_client::PRODUCTION,
         InvalidRequests::new(

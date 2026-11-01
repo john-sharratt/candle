@@ -76,7 +76,7 @@ impl Tool for SshSessionPoll {
         if let Some(wait) = req.recv_wait_sec {
             if wait > 0.0 {
                 let step = Duration::from_millis(20);
-                let budget = Duration::from_secs_f64(wait);
+                let budget = Duration::from_secs_f64(wait.min(60.0));
                 let mut waited = Duration::ZERO;
                 while *proc.running.lock().unwrap() && waited < budget {
                     std::thread::sleep(step);

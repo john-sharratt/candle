@@ -234,6 +234,7 @@ pub(super) fn text(name: &str) -> CallParam {
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
+        pick: Default::default(),
         pattern: None,
     }
 }

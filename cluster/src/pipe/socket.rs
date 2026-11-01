@@ -12,10 +12,12 @@
 //! and is heard by whole messages.
 
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 use super::{Drain, Heard, Message, PipeClosed, PipeRx, PipeTx};
 use crate::close::Close;
@@ -38,6 +40,12 @@ pub trait Codec: Send + Sync + 'static {
 
 /// How many messages wait for the pump before a send waits.
 const PUMP_DEPTH: usize = 64;
+
+/// How long one message may take to flush before the socket is given up: long
+/// enough for a 1 MiB fragment over a link of 4 KB/s. Past it a socket is
+/// stalled, not slow: one held a member's lanes for an hour, 223 MB unsent,
+/// while everything the member sent still arrived.
+pub const SEND_STALL: Duration = Duration::from_secs(300);
 
 pub struct SocketTx {
     tx: mpsc::Sender<Message>,
@@ -86,7 +94,15 @@ async fn pump<C, S, E>(
             Message::Frame(bytes) => (C::binary(bytes), false),
             Message::Close(close) => (C::close(&close), true),
         };
-        let sent = sink.send(wire).await;
+        let Ok(sent) = timeout(SEND_STALL, sink.send(wire)).await else {
+            unsent.sub(len);
+            tracing::warn!(
+                bytes = len,
+                waited_s = SEND_STALL.as_secs(),
+                "a message was not taken by the socket: giving the socket up"
+            );
+            return;
+        };
         unsent.sub(len);
         if sent.is_err() || last {
             break;
@@ -179,6 +195,27 @@ mod tests {
         assert!(whole.is_err(), "no message is whole yet");
         assert!(heard.at().is_some(), "but its bytes have been heard");
         assert!(grx.heard().is_some_and(|h| h.at().is_some()));
+    }
+
+    /// **A message the socket will not take ends the send pump.** Nothing reads
+    /// the far end, so the flush never returns: the pump gives up after
+    /// [`SEND_STALL`] and a later send says the pipe is gone, which is what
+    /// ends the session. Nothing else would: bytes the peer sends keep its
+    /// reader hearing it, for as long as it likes.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_never_flushes_ends_the_pump() {
+        let (a, _unread) = duplex(1 << 10);
+        let socket = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
+        let (mut tx, _rx) = split::<Tungstenite, _, _>(socket, Heard::new());
+        tx.send(Message::Frame(vec![7; 1 << 20])).await.unwrap();
+        tokio::time::sleep(SEND_STALL - Duration::from_secs(1)).await;
+        tx.send(Message::Frame(vec![1])).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            tx.send(Message::Frame(vec![2])).await,
+            Err(PipeClosed),
+            "the pump has gone"
+        );
     }
 
     /// Frames cross a real WebSocket in order both ways, byte for byte; a

@@ -796,6 +796,33 @@ changes *which* tokens are produced and *how fast*, not their representation.
 | **Empty tool catalog** | No tree registered; `<tool_call>` isn't a trigger; tool calls decode freely. Logged once. |
 | **Tokenizer ≠ compiled tree** | Fingerprint mismatch fails loudly at load. |
 
+### 12.1 Traps: what can block, stick or loop a conversation
+
+A grammar can do three kinds of harm a refused call cannot: leave a call with no
+way on, keep a model repeating a call it cannot fix, or change what the model
+decided without saying so. Each is held off by a named rule, and each rule is
+tested where it lives.
+
+| Trap | What holds it off |
+|---|---|
+| **A gate with no way on** | Every `Branch` has at least two ways on, or one and a spill (`compile.rs`). A choice among optionals ([`Pick`]) offers nothing past its last member while one is owed, so `opt_gates` can always pay; a gate left with one way on becomes a `Static`. |
+| **A value that cannot finish** | A `ValueRule` needs a finishable fixpoint: every state of the walk reaches a close through the vocabulary, or the rule is refused at compile time, not during a call. End tokens spell no value. |
+| **A value that never ends** | Every free span has `forced_after > 0`, refused at compile otherwise. A string's limit is `maxLength` in tokens plus its delimiters, and `MAX_STRING_VALUE_TOKENS` above that. |
+| **An array that runs on** | Arrays unroll to `maxItems`, at most `MAX_ARRAY_ELEMENTS`, and the last level writes only the close. `run_command`'s `args` stops at 24. |
+| **A turn that loops on calls** | `MAX_TOOL_CALLS_PER_TURN` bounds a turn. Across turns the repeat guard answers the same failing call with a warning, and an argument repeated past `FLAG_REPEATS` is refused before anything runs. |
+| **A heal that changes the decision** | A token that closes a value and carries more (`",`, `"]`) commits only its close, because the next node writes the rest. What it carried is kept (`carried`) and narrows the next branch to the arms that continue it, so the model is not asked again from a bare quote. A rest that leads no arm narrows nothing, so this can never empty a mask. |
+| **A field order the model does not expect** | The grammar writes required fields first, in `required` order, then optionals. A tool's calibration examples must write its fields in that order, or a model that planned another order loses the field: `file_image`'s `source_repo` was shown second and could only be written last, and twelve calls in one run dropped it. |
+| **A constraint stricter than the tool** | An overlay in `tool_constraints.yaml` may only block what the executor refuses, from the same source of truth. Known exceptions are deliberate and cost no capability: `credential_save` leaves out the two aliases `api_key` and `ed25519_key`. |
+| **A tool that cannot succeed** | `tool_availability` takes it out of the round's name branch and says why in a sealed line, so a model is not left guessing ids. Each rule names a state in which every call to the tool fails. |
+| **A stencil fault** | An out-of-grammar token bails: the tree's bail tokens close the call and the session exits. A hold refused after the fact is logged at `ERROR` (§9.1). |
+
+**What a rule cannot see.** A pattern depends on one value and on values before
+it, so a rule needing a later field or a file's contents stays with the
+executor, whose refusal names the problem: `kdf_derive`'s salt, `bytes_pack`'s
+value count, a regular expression's validity. A rule that depends on a value
+works only when that value comes first, which is why `bytes_transcode` writes
+`from` before `data` in its grammar and its examples.
+
 ---
 
 ## 13. Public API and configuration
