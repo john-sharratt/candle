@@ -358,6 +358,17 @@ pub enum BridgeCall {
         name: String,
         mac: String,
     },
+    /// Pair with a device of `profile` at `address` to earn its credentials
+    /// (`docs/zen_moon_mind.md` §15). webOS pairs in one call (accept the prompt
+    /// on the TV). An Android TV is two: the first shows a code on the TV and
+    /// the agent holds the session open; the second carries that `code`. The
+    /// credentials come back in [`Bridged::creds`], for the world to keep.
+    Pair {
+        profile: String,
+        address: String,
+        #[serde(default)]
+        code: Option<String>,
+    },
 }
 
 /// What a [`BridgeCall`] came to: whether the device did it, and the line the
@@ -367,6 +378,10 @@ pub enum BridgeCall {
 pub struct Bridged {
     pub ok: bool,
     pub line: String,
+    /// Credentials a [`BridgeCall::Pair`] earned, for the world to store on the
+    /// device — empty for an ordinary `work`/`wake`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub creds: std::collections::BTreeMap<String, String>,
 }
 
 /// Why a [`PushLine`], [`Pushed`] or [`Fetched`] does not read as one.

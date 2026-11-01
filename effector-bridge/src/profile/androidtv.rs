@@ -7,6 +7,7 @@
 //! video opens YouTube on it), and wakes the TV by Wake-on-LAN. A TV off the
 //! house network is refused.
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 use anyhow::{anyhow, bail, Result};
@@ -116,6 +117,16 @@ pub async fn pair_start(address: &str, nets: &[LocalNet], client_name: &str) -> 
     Pairing::start(address, generate_identity(client_name)?, client_name).await
 }
 
+/// The credentials to keep from a finished pairing: the client certificate and
+/// its key, which the TV now trusts. The `cert`/`key` arguments carry them back
+/// to work the TV.
+pub fn creds_of(id: &Identity2) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("cert".to_string(), id.cert_pem.clone()),
+        ("key".to_string(), id.key_pem.clone()),
+    ])
+}
+
 /// Work `action` on the Android TV `name` at `address`. Control reads the paired
 /// `cert`/`key` PEM from `args`; `on` wakes by `mac`.
 pub async fn work(
@@ -220,5 +231,18 @@ mod tests {
             youtube_id("https://www.youtube.com/watch?v=aqz-KE-bpKQ&t=1s"),
             "aqz-KE-bpKQ"
         );
+    }
+
+    #[test]
+    fn creds_of_keeps_the_cert_and_key() {
+        let id = Identity2 {
+            cert_pem: "CERT".into(),
+            key_pem: "KEY".into(),
+            modulus: Vec::new(),
+            exponent: Vec::new(),
+        };
+        let creds = creds_of(&id);
+        assert_eq!(creds.get("cert").map(String::as_str), Some("CERT"));
+        assert_eq!(creds.get("key").map(String::as_str), Some("KEY"));
     }
 }

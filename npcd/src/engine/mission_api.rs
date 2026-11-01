@@ -337,6 +337,67 @@ pub async fn device(
     }
 }
 
+/// What a pairing request names.
+#[derive(serde::Deserialize)]
+pub struct PairBody {
+    /// The world the device stands in.
+    pub world: String,
+    /// The device's bridge profile — `webos`, `androidtv`.
+    pub profile: String,
+    /// The device's network address.
+    pub address: String,
+    /// The code shown on the TV, on the second call of an Android TV pairing.
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// `POST /v1/pulse/pair` — pair with a device through an in-network agent and
+/// keep the credentials it grants on its world part (`docs/zen_moon_mind.md`
+/// §15), the onboarding step. webOS pairs in one call (accept the prompt on the
+/// TV); an Android TV takes two — the first shows a code on the TV, the second
+/// carries that `code`. Admin.
+pub async fn pair(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<PairBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("pairing");
+    };
+    let Some(agents) = rt.agents() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_agent",
+            "no agent in the house to pair",
+        );
+    };
+    let call = BridgeCall::Pair {
+        profile: body.profile,
+        address: body.address.clone(),
+        code: body.code,
+    };
+    let bridged = match agents.bridge(&call).await {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
+    };
+    // Credentials earned — keep them on the device's world part so every later
+    // command carries them and the agent never has to.
+    if bridged.ok && !bridged.creds.is_empty() {
+        let op = WorldOp::AmendDevice {
+            address: body.address,
+            notes: None,
+            creds: bridged.creds,
+        };
+        if let Err(e) = rt.world_write(&body.world, op).await {
+            return world_unreached(&e);
+        }
+    }
+    Json(json!({ "ok": bridged.ok, "line": bridged.line })).into_response()
+}
+
 /// `POST /v1/pulse/command-table` — open or shut the command table.
 ///
 /// Opening it calls every character to the table — over the chat channel and

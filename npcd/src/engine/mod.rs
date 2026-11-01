@@ -518,6 +518,14 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Any,
             post(mission_api::device),
         )
+        // Pair with a device through an in-network agent and keep the
+        // credentials on its world part (`docs/zen_moon_mind.md` §15). Admin.
+        .route(
+            "/v1/pulse/pair",
+            Role::Admin,
+            Dispatch::Any,
+            post(mission_api::pair),
+        )
         // What the guardian has found and done. Admin: it names every
         // character, including ones the caller does not own.
         .route(
