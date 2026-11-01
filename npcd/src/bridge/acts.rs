@@ -406,35 +406,35 @@ pub const CAST_PLAYING: Tool = cast!(
 
 pub const CAST_PLAY: Tool = cast!(
     "cast_play",
-    "Resume play on the Cast device here, where it was paused.",
+    "Resume play on the Cast device here, from where it was paused.",
     "The show was paused and the room is ready to go on.",
     "The device holds where it was; starting it is the whole act."
 );
 
 pub const CAST_PAUSE: Tool = cast!(
     "cast_pause",
-    "Pause whatever the Cast device here is playing.",
+    "Pause whatever the Cast device here is playing, keeping its place.",
     "Somebody needs the room quiet and the TV is mid-show.",
     "Paused, it picks up where it was."
 );
 
 pub const CAST_STOP: Tool = cast!(
     "cast_stop",
-    "Stop whatever the Cast device here is playing.",
+    "Stop whatever the Cast device here is playing and end the session.",
     "The show is over and the room wants it off.",
     "Stopping is a single act the device does."
 );
 
 pub const CAST_MUTE: Tool = cast!(
     "cast_mute",
-    "Mute the Cast device here, so its sound stops at once.",
+    "Mute the Cast device here, so its sound stops at once and the show runs on.",
     "The phone is ringing and the TV needs to be quiet this moment.",
     "Muting stops the sound and keeps the place, so unmuting brings it back."
 );
 
 pub const CAST_UNMUTE: Tool = cast!(
     "cast_unmute",
-    "Unmute the Cast device here, bringing its sound back.",
+    "Unmute the Cast device here, bringing its sound back as it was.",
     "The call is over and the room wants the TV's sound back.",
     "The device is muted; unmuting is the act that undoes it."
 );
