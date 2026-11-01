@@ -1,5 +1,6 @@
 //! `run_command` — run a program in a repository's sandbox and wait for it.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -60,6 +61,10 @@ pub struct RunResponse {
     pub not_kept: Vec<NotKept>,
     /// The first page of what it printed, both streams in the order printed.
     pub output: LogPage,
+    /// The end of what it printed, where a failure or a summary is, when it
+    /// ran past the first page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_end: Option<LogPage>,
     /// The program printed more than the log keeps (64 MiB); the rest was
     /// counted, not kept.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -83,7 +88,8 @@ impl Tool for RunCommand {
          repository. Use for: running the tests after an edit, \
          building, formatting, running a script. Triggered by \"run the tests\", \"does it \
          build\", \"npm test\", \"cargo check\". Returns the exit code, the files it changed, \
-         and the first page of its output; read further pages with run_output.";
+         the first page of its output and, past that, its last lines; read the pages between \
+         with run_output.";
 
     type Request = RunRequest;
     type Response = RunResponse;
@@ -114,6 +120,7 @@ impl Tool for RunCommand {
             },
         )?;
         let output = page::read(&ran.log, 1).map_err(SandboxesError::Log)?;
+        let output_end = page::read_end(&ran.log).map_err(SandboxesError::Log)?;
         let outcome = ran.outcome;
         Ok(RunResponse {
             repo: req.repo,
@@ -137,6 +144,7 @@ impl Tool for RunCommand {
                 })
                 .collect(),
             output,
+            output_end,
             output_cut: outcome.output.truncated,
         })
     }
@@ -174,6 +182,7 @@ fn take_apart(program: String, args: Vec<String>) -> Result<(String, Vec<String>
         .collect();
     refuse_shell_syntax(&rest)?;
     refuse_code_flag_alone(&first, &rest)?;
+    refuse_broken_flags(&first, &rest)?;
     if rest.len() == args.len() {
         return Ok((program, args));
     }
@@ -261,6 +270,65 @@ fn refuse_code_flag_alone(program: &str, args: &[String]) -> Result<(), RunError
     }
 }
 
+/// cargo's and its test runner's flags that take a value in the next argument.
+const CARGO_VALUE_FLAGS: [&str; 13] = [
+    "-p",
+    "--package",
+    "--skip",
+    "--test",
+    "--bin",
+    "--example",
+    "--features",
+    "--target",
+    "-j",
+    "--jobs",
+    "--profile",
+    "--manifest-path",
+    "--test-threads",
+];
+
+/// How many times a long flag with no value may repeat before it is refused.
+const FLAG_REPEATS: usize = 2;
+
+/// A cargo flag left last with no value, or one long flag given over and over
+/// with none, is refused before anything runs. Measured on one run, 11 calls
+/// went to cargo with a trailing `--skip` or `-p`, or with `--quiet` dozens of
+/// times, each spending a build's start-up to come back exit 101 with the
+/// worker no nearer knowing which argument it was. A long flag followed by a
+/// value is not counted, so `--features a --features b` passes, and neither is
+/// a short one, as `-v -v -v` is how some tools count.
+fn refuse_broken_flags(program: &str, args: &[String]) -> Result<(), RunError> {
+    let cargo = Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("cargo"));
+    if let Some(flag) = args
+        .last()
+        .filter(|last| cargo && CARGO_VALUE_FLAGS.contains(&last.as_str()))
+    {
+        return Err(RunError::Shell(format!(
+            "`{flag}` is the last of your args, so the value it takes is missing: add the value \
+             as the next entry of `args`, or drop the flag"
+        )));
+    }
+    let bare = |i: usize| {
+        args[i].starts_with("--")
+            && args[i].len() > 2
+            && !args.get(i + 1).is_some_and(|next| !next.starts_with('-'))
+    };
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for i in (0..args.len()).filter(|i| bare(*i)) {
+        let count = seen.entry(args[i].as_str()).or_default();
+        *count += 1;
+        if *count > FLAG_REPEATS {
+            return Err(RunError::Shell(format!(
+                "`{}` is in your args more than {FLAG_REPEATS} times: give each flag once",
+                args[i]
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `program` names git, by name or by path, with or without `.exe`.
 fn is_git(program: &str) -> bool {
     Path::new(program)
@@ -285,6 +353,51 @@ mod tests {
 
     fn strings(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// **A cargo flag left without its value is refused before anything
+    /// runs**, and so is a long flag given over and over, each saying what to
+    /// do. A value after the flag, a repeat that carries values, and a short
+    /// flag counted up all pass, and another program's last flag is its own.
+    #[test]
+    fn flags_with_no_value_and_runaway_repeats_are_refused() {
+        let trailing = take_apart("cargo".into(), strings(&["test", "--", "--skip"]));
+        assert!(
+            matches!(&trailing, Err(RunError::Shell(why))
+                if why.starts_with("`--skip` is the last of your args")),
+            "{trailing:?}"
+        );
+        assert!(take_apart("cargo".into(), strings(&["test", "-p"])).is_err());
+        let repeated = take_apart(
+            "cargo".into(),
+            strings(&["test", "--quiet", "--quiet", "--quiet"]),
+        );
+        assert!(
+            matches!(&repeated, Err(RunError::Shell(why))
+                if why == "`--quiet` is in your args more than 2 times: give each flag once"),
+            "{repeated:?}"
+        );
+        for args in [
+            vec!["test", "-p", "web", "--", "--skip", "slow"],
+            vec!["test", "--quiet"],
+            vec!["test", "-p", "a", "-p", "b", "-p", "c", "-p", "d"],
+            vec![
+                "build",
+                "--features",
+                "a",
+                "--features",
+                "b",
+                "--features",
+                "c",
+            ],
+            vec!["test", "-v", "-v", "-v"],
+        ] {
+            assert!(
+                take_apart("cargo".into(), strings(&args)).is_ok(),
+                "{args:?}"
+            );
+        }
+        assert!(take_apart("grep".into(), strings(&["-p"])).is_ok());
     }
 
     /// A program alone, trimmed, passes; a command line is taken apart into
@@ -380,7 +493,7 @@ mod tests {
             );
         }
         assert!(take_apart("node".into(), strings(&["-e", "console.log(1)"])).is_ok());
-        assert!(take_apart("cargo".into(), strings(&["-p"])).is_ok());
+        assert!(take_apart("make".into(), strings(&["-p"])).is_ok());
     }
 
     #[test]

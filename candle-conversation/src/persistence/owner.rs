@@ -40,6 +40,7 @@ use crossbeam::channel::{self, Receiver, Select, Sender};
 
 use super::identity::Minter;
 use super::log_facts::LogFacts;
+use super::replication_load::ReplicationLoad;
 use super::sealed_reader::SealedReader;
 use super::writer::{self, WriteJob};
 use super::written_snapshots::WrittenSnapshots;
@@ -158,6 +159,7 @@ pub struct PersistenceOwner {
     sealed: SealedReader,
     minter: Minter,
     facts: LogFacts,
+    replication: ReplicationLoad,
 }
 
 impl std::fmt::Debug for PersistenceOwner {
@@ -192,6 +194,7 @@ impl PersistenceOwner {
             sealed,
             minter,
             facts,
+            replication: ReplicationLoad::default(),
         });
         let handle = thread::Builder::new()
             .name("substrate-persistence-owner".into())
@@ -233,6 +236,12 @@ impl PersistenceOwner {
     /// What the log publishes for reading without a call — see [`LogFacts`].
     pub fn facts(&self) -> &LogFacts {
         &self.facts
+    }
+
+    /// Whether replication is busy applying here — what maintenance defers to
+    /// ([`ReplicationLoad`]).
+    pub fn replication_load(&self) -> &ReplicationLoad {
+        &self.replication
     }
 
     /// The substrate's identity minter, shared with the log.

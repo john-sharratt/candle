@@ -1,17 +1,22 @@
 //! `repo_job_log {node, job, from?, grep?}`: read an agent job's log
-//! (`docs/claude_zend_gateway.md` §8.3), a page at a time by byte offset — the
-//! agent hands out at most 256 KiB per read — and, with `grep`, only the lines
-//! of the page that hold it. Admins only.
+//! (`docs/claude_zend_gateway.md` §8.3), a page at a time by byte offset, 32 KiB
+//! a page — and, with `grep`, only the lines of the agent's 256 KiB read that
+//! hold it. Admins only.
 
 use std::fmt::Display;
 
 use agent::wire::{JobView, Staged};
 use serde_json::{json, Value};
 
+use super::fit::around;
 use super::{string, Answer, Ctx};
 use crate::mcp::ops;
 
 pub const NAME: &str = "repo_job_log";
+
+/// The most bytes of log one read answers: a test run's log would otherwise
+/// land in the caller's context 256 KiB at a time.
+const PAGE_BYTES: usize = 32 * 1024;
 
 pub fn definition() -> Value {
     json!({
@@ -19,8 +24,8 @@ pub fn definition() -> Value {
         "annotations": {"readOnlyHint": true},
         "description": "Read a job `repo_job_start` started: how it stands — running or ended, its exit code, and \
             for a job that staged a build, where the build is — then its log from byte `from` (0 by \
-            default), a page of up to 256 KiB with the offset to read on from. With `grep`, only the page's \
-            lines that hold it (ignoring case), numbered as in the page. Read the last page for a test \
+            default), a page of up to 32 KiB with the offset to read on from. With `grep`, only the lines of \
+            the next 256 KiB that hold it (ignoring case), numbered as in that read. Read the last page for a test \
             summary or a build error. Admins only.",
         "inputSchema": {
             "type": "object",
@@ -65,7 +70,7 @@ pub fn render(
                 .lines()
                 .enumerate()
                 .filter(|(_, l)| l.to_lowercase().contains(&needle))
-                .map(|(i, l)| format!("{}: {l}", i + 1))
+                .map(|(i, l)| format!("{}: {}", i + 1, around(l, pattern)))
                 .collect();
             out.push_str(&format!("\n{} lines hold `{pattern}`", hits.len()));
             for h in hits {
@@ -118,10 +123,16 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(c) => c,
         Err(e) => return Answer::error(lost(job, node, &e)),
     };
-    let bytes = match chunk.bytes() {
+    let mut bytes = match chunk.bytes() {
         Ok(b) => b,
         Err(e) => return Answer::error(e.to_string()),
     };
+    let grep = args.get("grep").and_then(Value::as_str);
+    // A search reads the agent's whole chunk and answers only its hits; plain
+    // text is a page, and the offset it answers reads on from there.
+    if grep.is_none() {
+        bytes.truncate(PAGE_BYTES);
+    }
     Answer::ok(format!(
         "{head}\n{}",
         render(
@@ -130,7 +141,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
             bytes.len() as u64,
             chunk.size,
             chunk.ended,
-            args.get("grep").and_then(Value::as_str),
+            grep,
         )
     ))
 }

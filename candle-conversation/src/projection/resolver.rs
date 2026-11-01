@@ -5203,6 +5203,13 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))
     }
 
+    /// Replication is busy applying to this substrate, or not: segment
+    /// maintenance defers to it (`persistence::replication_load`). Said once a
+    /// second by the member replicating it.
+    pub fn note_replication_busy(&self, busy: bool) {
+        self.persistence.replication_load().note_now(busy);
+    }
+
     /// Advance the persistence thread's **background maintenance** on the
     /// segmented redo log — drop a fully-dead segment, compact a mostly-dead
     /// one, or combine two small adjacent ones
@@ -5220,13 +5227,19 @@ impl Conversation {
         start: bool,
         yield_now: &dyn Fn() -> bool,
     ) -> candle::Result<bool> {
-        if op.is_none() && start {
+        // While replication applies here, no op starts and one running steps
+        // aside after its next batch: every apply waits on the same owner
+        // (`persistence::replication_load`, bounded by its `MAX_DEFER`).
+        let replication = self.persistence.replication_load();
+        let deferring = replication.defers_now();
+        if op.is_none() && start && !deferring {
             *op = self.begin_maintenance_op(Pass::Gated)?;
         }
         let Some(running) = op.as_mut() else {
             return Ok(false);
         };
-        match self.advance_maintenance(running, yield_now) {
+        let yield_now = || yield_now() || replication.defers_now();
+        match self.advance_maintenance(running, &yield_now) {
             Ok(false) => Ok(false),
             done => {
                 *op = None;

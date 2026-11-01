@@ -325,7 +325,8 @@ pub fn unread_line(threads: &[(String, usize)]) -> String {
         .map(|(name, n)| format!("{name} ({n})"))
         .collect();
     format!(
-        "You have {total} unread {noun} on your phone: {}. To read them, `read`.",
+        "You have {total} unread {noun} on your phone: {}. To read them, `read` your \
+         messages, or one conversation by name; to answer, `message` it.",
         on.join(", ")
     )
 }
@@ -539,12 +540,14 @@ mod tests {
         let prose = |k: &EventKind| Event::new(0, 0, Salience::NORMAL, k.clone()).prose();
         assert_eq!(
             prose(&one),
-            "You have 1 unread message on your phone: John (1). To read them, `read`."
+            "You have 1 unread message on your phone: John (1). To read them, `read` your \
+             messages, or one conversation by name; to answer, `message` it."
         );
         assert_eq!(
             prose(&many),
             "You have 3 unread messages on your phone: zenworld #general (2), John (1). \
-             To read them, `read`."
+             To read them, `read` your messages, or one conversation by name; to answer, \
+             `message` it."
         );
         assert_eq!(one.replaces().as_deref(), Some("unread"));
         assert_eq!(one.tag(), "unread");

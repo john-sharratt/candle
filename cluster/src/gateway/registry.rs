@@ -21,7 +21,7 @@ use crate::frame::{Capacity, ClaimInfo, MemberInfo};
 use handover::Handover;
 
 pub use cards::{CardKey, CardLoad, Cards, Fences, HOSTING_APP, LATENCY_APP};
-pub use member::{MemberView, PeerAsk, SYNC_SLACK};
+pub use member::{Held, MemberView, PeerAsk, SYNC_SLACK};
 pub use pick::is_errand;
 
 #[cfg(test)]
@@ -215,12 +215,31 @@ impl Registry {
     /// member away wrote cut off is held by nobody serving, and a newcomer
     /// waiting on it would wait as long as that member is gone, while exactly
     /// as complete as the members answering.
-    pub fn in_sync(node: u64, acks: &[(u64, u64)], serving: &BTreeMap<u64, u64>) -> bool {
+    ///
+    /// **Nor a record its own origin lacks.** An `ACK` is gap-free, so one hole
+    /// pins it below everything held past the hole; when the origin itself
+    /// misses that record, nobody can ever fill it, and WhiteWorld's zend sat
+    /// syncing for good on 2026-11-01 holding all but one of BlackWorld's 74
+    /// million records — the one BlackWorld lacked too. So an origin is also
+    /// covered when the member holds up to what is served (`held`, from its
+    /// `COORD`) and misses no more of it than the origin does of itself
+    /// (`origin_missing`).
+    pub fn in_sync(
+        node: u64,
+        acks: &[(u64, u64)],
+        serving: &BTreeMap<u64, u64>,
+        held: &BTreeMap<u64, Held>,
+        origin_missing: &BTreeMap<u64, u64>,
+    ) -> bool {
         serving.iter().all(|(origin, top)| {
+            let reaches = |at: u64| at.saturating_add(SYNC_SLACK) >= *top;
             *origin == node
                 || acks
                     .iter()
-                    .any(|(o, through)| o == origin && through.saturating_add(SYNC_SLACK) >= *top)
+                    .any(|(o, through)| o == origin && reaches(*through))
+                || held.get(origin).is_some_and(|h| {
+                    reaches(h.top) && h.missing <= origin_missing.get(origin).copied().unwrap_or(0)
+                })
         })
     }
 

@@ -168,4 +168,9 @@ pub trait Store: Send + Sync + 'static {
     /// what it can no longer trust when it next opens, judged from the last
     /// time this was recorded (§7.8).
     fn mark_joined(&self);
+
+    /// Replication is busy applying here — a catch-up running, or a backlog of
+    /// arrivals — or not: said once a second, so the store's own background
+    /// work that would hold up applying waits for it.
+    fn note_busy(&self, busy: bool);
 }

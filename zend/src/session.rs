@@ -75,6 +75,7 @@ use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
 use serde_json::{json, Value};
 use web::auth::Roles;
+use zend_tools::run_watch::{self, RunWatch};
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::{JournalBook, JournalShelf};
 use zend_tools::SubagentRunner;
@@ -5203,7 +5204,21 @@ fn run_inference_stream(
                 &conv_id,
                 journal_shelf(&state, &conv_id, timeline),
             );
-            let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
+            // A program it runs is told on the stream as it goes: a watcher's
+            // line, dropped when the stream is full and never the model's.
+            let progress = tx.clone();
+            let watch: RunWatch = Arc::new(move |line| {
+                let _ = progress.try_send(Ok(StreamItem::Tool(ToolStatusOut {
+                    phase: "progress",
+                    tools: vec![line],
+                    results: Vec::new(),
+                    tokens: Vec::new(),
+                })));
+            });
+            let ran = tokio::task::spawn_blocking(move || {
+                run_watch::watching(watch, || tool_round::run(&ctx, round))
+            })
+            .await;
             // Whatever the round changed outlives this conversation's state.
             conv_overlay::save(&state.engine, timeline, &cs.files, &cs.mirror);
             let mut results = match ran {

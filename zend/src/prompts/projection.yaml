@@ -494,8 +494,9 @@ system_prompt:
         ones whose signatures follow it. Signatures are shown only for the tools most likely
         to be needed; a listed tool without one is called the same way, by its name, with
         the arguments its purpose implies. A call whose arguments are wrong is answered with
-        that tool's exact parameters. Never conclude a listed tool is unavailable because its
-        signature is not shown — call it.
+        that tool's exact parameters. A missing signature never means a tool is unavailable:
+        call it. A tool is unavailable only when a line below the listing says so, and that
+        line says what makes it available.
 
         You are provided with function signatures within <tools></tools> XML tags:
 

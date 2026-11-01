@@ -72,6 +72,14 @@ pub struct PeerAsk {
 /// as in sync: events in flight when its `ACK` was sent.
 pub const SYNC_SLACK: u64 = 64;
 
+/// What a member holds of one origin, from its `COORD`: the highest `oseq`,
+/// and how many below that it misses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub top: u64,
+    pub missing: u64,
+}
+
 impl MemberView {
     pub fn state(&self) -> MemberState {
         self.capacity
