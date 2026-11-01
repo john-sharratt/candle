@@ -109,6 +109,7 @@ impl Replicator {
         self.cut_off_if_alone().await;
         self.refresh_group().await;
         self.mark_joined().await;
+        self.note_load();
         // In fault mode a member applies nothing, so it acknowledges nothing
         // and asks for nothing; leaving starts its catch-ups (§7.7).
         if self.faulted() {

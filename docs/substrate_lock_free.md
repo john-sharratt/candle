@@ -469,11 +469,27 @@ declared it again. The replaced segments are unlinked only after the re-apply.
 A segment maintenance op plans on a version, runs its batches as background
 calls on the owner, and applies its result in one edit.
 
+**Maintenance defers to replication.** Every remote batch is applied on the
+owner too, so a maintenance step running while a catch-up lands holds every
+apply behind it — 50 s on WhiteWorld on 2026-11-01, until the member's arrivals
+were full and it stopped reading its sockets. The replicator says once a second
+whether it is busy applying (a catch-up running, or a quarter of its arrivals
+waiting: `Store::note_busy`), and while it is, no op starts and one running steps
+aside between batches (`persistence/replication_load.rs`) — for at most
+`MAX_DEFER`, ten minutes, at a stretch, since maintenance is what reclaims the
+disk.
+
 ### 9.6 Replication apply
 
-A remote batch is decided on a private clone of the version (dominance,
-outranks, adoption plans), appended on the owner, and published in one edit, so
-no reader sees half a batch and nothing waits on the batch.
+A remote batch is decided against a private clone of the version (dominance,
+outranks, adoption plans) and published in one edit, so no reader sees half a
+batch. The whole of it runs as one call on the owner today — the decision is
+interleaved with the owner's own state (the applied set, the minter, the append
+and its indexes) — so a batch holds the owner for as long as it takes, and one
+that holds it 250 ms or more names its phases (clone, decide, plan, edit) in the
+log. What those name is what leaves the owner: the decision moves to a
+snapshot of the owner's indexes once they are published (§9.5's planning needs
+the same), leaving the owner the appends and the edit.
 
 ## 10. Every race, closed
 

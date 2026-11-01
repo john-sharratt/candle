@@ -32,6 +32,32 @@ impl Replicator {
         let store = self.store.clone();
         let node = self.node;
         tokio::task::spawn_blocking(move || {
+            // What the requester holds of this member's own origin says which
+            // of its gaps that member lacks; one every member lacks is gone,
+            // and listed gone in this very answer (`own_gaps.rs`).
+            let held = store.applied();
+            if let Some(own) = held.origin(node) {
+                let gone = {
+                    let mut s = me.state();
+                    let others = s.other_members(node);
+                    s.own_gaps.saw(
+                        asked.reply_to,
+                        asked.since.origin(node),
+                        own,
+                        store.own_through(),
+                    );
+                    s.own_gaps.gone(&others)
+                };
+                for (from, to) in &gone {
+                    tracing::warn!(
+                        node,
+                        from,
+                        to,
+                        "an own record no member holds is gone: every other member lacks it"
+                    );
+                    store.gone(node, &(*from..=*to).collect::<Vec<_>>());
+                }
+            }
             let mine = store.applied();
             for (origin, from, to) in answer_ranges(&mine, &asked.since) {
                 if !ticket.live() {
