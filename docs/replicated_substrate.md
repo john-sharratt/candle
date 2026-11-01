@@ -1116,7 +1116,7 @@ misread, and on an admitted socket closes it 4400.
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
 | `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
-| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) · `u32 bulk_backlog` (protocol 7) |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) · `u32 decode_step_wide_us` (protocol 3) · `u32 prefill_tok_s_wide` (protocol 4) · `u32 prompt_tokens` · `u32 reply_tokens` · `u32 tokens_per_step_milli` (protocol 5) · `u32 guest_reach` (protocol 6) · `u32 bulk_backlog` (protocol 7) · `bool process_loading` (protocol 8; another tenant of its process still loading, `cooperative_admission.md` §4.4) |
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding: each route's methods, path, dispatch, mirror and, from protocol 6, `u8 reach`) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
