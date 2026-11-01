@@ -59,11 +59,17 @@ pub async fn show(a: &Arc<Authored>, bot: &Online, typed: &mut Typed) -> Result<
         {
             continue;
         }
-        match a.discord.trigger_typing(&bot.token, dm.channel_id).await {
-            Ok(()) => {
-                typed.insert(dm.channel_id, Instant::now());
-            }
-            Err(e) => Rejected::or_logged(bot.npc, "typing", e)?,
+        // Stamped whatever Discord answers, so a refused DM is asked again
+        // after a renewal, not on the next beat; a refusal is not asked
+        // again for as long as typing could last.
+        let result = a.discord.trigger_typing(&bot.token, dm.channel_id).await;
+        let next = match result {
+            Ok(()) => Instant::now(),
+            Err(_) => Instant::now() + TYPING_FOR,
+        };
+        typed.insert(dm.channel_id, next);
+        if let Err(e) = result {
+            Rejected::or_logged(bot.npc, "typing", e)?;
         }
     }
     Ok(())

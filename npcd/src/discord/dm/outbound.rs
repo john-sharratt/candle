@@ -8,8 +8,10 @@
 //! quoted line (`> Wren (console): …`), since a bot cannot post as a person —
 //! each cut to Discord's 2,000 characters. The cursor moves past a message
 //! only once all of it was posted. A `429` waits `retry_after` and tries
-//! again; anything else leaves the cursor for the next beat, so a gap is
-//! retried, never skipped.
+//! again; anything else leaves the cursor where it is, so a gap is retried,
+//! never skipped — after a hold that doubles with each refusal in a row
+//! (`crate::discord::world::hold`), so a refused DM is not asked again on
+//! every beat.
 //!
 //! A linked person the character writes to with no DM yet gets one opened
 //! (`POST /users/@me/channels`): what the character has written to them
@@ -32,6 +34,7 @@ use crate::discord::post::{post as send, posted, Post, Target};
 use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
+use crate::discord::world::hold::{FAILED_FOR, REFUSED_FOR};
 use crate::engine::speaking_as;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
@@ -168,6 +171,13 @@ async fn deliver(
     character: &str,
     waiting: Waiting,
 ) -> Result<(), Rejected> {
+    // A DM Discord refused holds off as a world's mirror does
+    // (`crate::discord::world::hold`): asked again on every beat, a person
+    // who closed their DMs costs two invalid requests a second.
+    let held = format!("dm/{}", dm.channel_id);
+    if a.bots.mirror_held(&held) {
+        return Ok(());
+    }
     for m in waiting.messages {
         let text = match m.from == character {
             true => m.intent.clone(),
@@ -184,12 +194,20 @@ async fn deliver(
         for part in &parts {
             match send(a, bot, to, part).await? {
                 Post::Posted(id) => last = id,
-                Post::Forbidden | Post::Gone | Post::Unposted => return Ok(()),
+                Post::Forbidden | Post::Gone => {
+                    a.bots.hold_mirror(&held, REFUSED_FOR);
+                    return Ok(());
+                }
+                Post::Unposted => {
+                    a.bots.hold_mirror(&held, FAILED_FOR);
+                    return Ok(());
+                }
             }
         }
         posted(a, bot, to, last, parts.len());
         dm.mirrored_through = m.seq;
         hosted.with_dms(|d| d.put(bot.npc, account, dm));
+        a.bots.mirror_cleared(&held);
     }
     Ok(())
 }

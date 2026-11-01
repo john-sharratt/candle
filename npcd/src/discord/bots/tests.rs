@@ -582,9 +582,10 @@ async fn a_429_is_waited_out_and_the_posts_stay_in_order() {
     );
 }
 
-/// **A 500 leaves the cursor where it was**, and the next beat posts it.
+/// **A 500 leaves the cursor where it was, and holds the DM off**: the next
+/// beat asks nothing, and the first beat after the hold posts it.
 #[tokio::test]
-async fn a_500_is_posted_again_on_the_next_beat() {
+async fn a_500_is_posted_again_once_its_hold_is_over() {
     let d = daemon(vec![Script::Serve]).await;
     d.link(OWNER, WREN).await;
     d.online().await;
@@ -602,6 +603,10 @@ async fn a_500_is_posted_again_on_the_next_beat() {
         "the cursor moved past a failure"
     );
     assert_eq!(d.posts().len(), 1);
+    d.a.bots.tick(&d.a).await;
+    assert_eq!(d.posts().len(), 1, "a failed DM was asked again at once");
+    // The hold over.
+    d.a.bots.mirror_cleared(&format!("dm/{CHANNEL}"));
     d.a.bots.tick(&d.a).await;
     assert_eq!(d.dm().unwrap().mirrored_through, 2);
     assert_eq!(

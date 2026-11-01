@@ -11,9 +11,10 @@
 //!
 //! A refusal is answered once, as a [`DiscordError`]; nothing here retries.
 
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, AUTHORIZATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client as Http, Method, StatusCode};
@@ -140,12 +141,22 @@ pub struct Webhook {
 pub const HISTORY_PAGE: u32 = 100;
 
 /// Discord's REST API, from one base. Its clones share one count of the
-/// host's invalid requests ([`InvalidRequests`]).
+/// host's invalid requests ([`InvalidRequests`]), and one record of the
+/// rate limits Discord set.
+///
+/// **A `429` is honoured for as long as it asks.** Discord rate-limits per
+/// bot and per webhook; once it answers `429` with a `retry_after`, nothing
+/// more is sent with that bot's token, or through that webhook, until the
+/// time is up. A call made sooner is refused here, as
+/// [`DiscordError::RateLimited`] with the time still to wait, and never
+/// reaches Discord — so it is neither another `429` nor another invalid
+/// request against the host's count.
 #[derive(Clone)]
 pub struct Client {
     http: Http,
     base: String,
     invalid: Arc<InvalidRequests>,
+    limited: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl Debug for Client {
@@ -171,6 +182,7 @@ impl Client {
             http: Http::new(),
             base: base.trim_end_matches('/').to_string(),
             invalid: Arc::new(invalid),
+            limited: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -514,7 +526,21 @@ impl Client {
         token: Option<&str>,
         body: Option<Value>,
     ) -> Result<T, DiscordError> {
-        if let Err(retry_after_s) = self.invalid.check(Instant::now()) {
+        // Whose rate limit this call is under: the bot's, by its token, or
+        // a webhook's, by its id in the path.
+        let whose = match token {
+            Some(token) => format!("bot {token}"),
+            None => path.split('?').next().unwrap_or(path).to_string(),
+        };
+        let now = Instant::now();
+        if let Some(until) = self.limited.lock().unwrap().get(&whose).copied() {
+            if now < until {
+                return Err(DiscordError::RateLimited {
+                    retry_after_s: (until - now).as_secs_f64(),
+                });
+            }
+        }
+        if let Err(retry_after_s) = self.invalid.check(now) {
             return Err(DiscordError::Paused { retry_after_s });
         }
         let mut request = self
@@ -541,8 +567,20 @@ impl Client {
             .await
             .map_err(|e| DiscordError::Transport(e.without_url().to_string()))?;
         if !status.is_success() {
-            return Err(refusal(status, &headers, &text));
+            let refused = refusal(status, &headers, &text);
+            let mut limited = self.limited.lock().unwrap();
+            match &refused {
+                DiscordError::RateLimited { retry_after_s } => {
+                    let wait = Duration::from_secs_f64(retry_after_s.max(0.0));
+                    limited.insert(whose, Instant::now() + wait);
+                }
+                _ => {
+                    limited.remove(&whose);
+                }
+            }
+            return Err(refused);
         }
+        self.limited.lock().unwrap().remove(&whose);
         // A `204` has no body: read as `null`, which a call wanting nothing
         // takes.
         let text = match text.trim().is_empty() {
@@ -803,6 +841,32 @@ mod tests {
         assert_eq!(discord.seen().len(), 2);
     }
 
+    /// **A `429` is honoured for as long as it asks, for that bot alone**:
+    /// asked again before its `retry_after`, the call is refused here with
+    /// the time still to wait and Discord is not sent it; another bot's call
+    /// goes.
+    #[tokio::test]
+    async fn a_429_is_honoured_for_as_long_as_it_asks() {
+        let discord = fake::start(Mode::RateLimited).await;
+        let client = Client::at(&discord.url);
+        assert_eq!(
+            client.me(TOKEN).await,
+            Err(DiscordError::RateLimited { retry_after_s: 2.5 })
+        );
+        match client.clone().me(TOKEN).await {
+            Err(DiscordError::RateLimited { retry_after_s }) => {
+                assert!(
+                    retry_after_s > 0.0 && retry_after_s <= 2.5,
+                    "{retry_after_s}"
+                )
+            }
+            other => panic!("asked again inside its retry_after: {other:?}"),
+        }
+        assert_eq!(discord.seen().len(), 1, "the early call reached Discord");
+        let _ = client.me("another.token").await;
+        assert_eq!(discord.seen().len(), 2, "another bot was held too");
+    }
+
     #[tokio::test]
     async fn a_429_says_how_long_to_wait() {
         let discord = fake::start(Mode::RateLimited).await;
@@ -825,7 +889,7 @@ mod tests {
         let discord = fake::start(Mode::Unauthorized).await;
         let client = Client::limited(
             &discord.url,
-            InvalidRequests::new(2, Duration::from_secs(600)),
+            InvalidRequests::new(2, 2, Duration::from_secs(600)),
         );
         assert_eq!(client.me(TOKEN).await, Err(DiscordError::TokenRejected));
         assert_eq!(

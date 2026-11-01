@@ -63,6 +63,7 @@ use crate::discord::state::{self, BotState, State};
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::trace::{failed, note, Trace};
 use crate::discord::world;
+use crate::discord::world::hold;
 use crate::engine::driver::EVERY as BEAT;
 use crate::tenant::HOST;
 
@@ -88,9 +89,17 @@ pub struct Bots {
     /// When each world's server was last reconciled here. A world this
     /// member has just taken has none, so its first beat reconciles it.
     reconciled: StdMutex<HashMap<String, Instant>>,
-    /// Until when each world's mirror holds off, after Discord refused it
-    /// (`crate::discord::world::hold`).
-    mirror_held: StdMutex<HashMap<String, Instant>>,
+    /// Each world's mirror held off after Discord refused it
+    /// (`crate::discord::world::hold`): until when, and how many refusals
+    /// in a row, which the next hold doubles for.
+    mirror_held: StdMutex<HashMap<String, MirrorHold>>,
+}
+
+/// One world's mirror hold.
+#[derive(Debug, Clone, Copy)]
+struct MirrorHold {
+    until: Instant,
+    refusals: u32,
 }
 
 /// What the beat holds between beats.
@@ -147,15 +156,33 @@ impl Bots {
             .lock()
             .expect("mirror hold lock")
             .get(world)
-            .is_some_and(|until| Instant::now() < *until)
+            .is_some_and(|h| Instant::now() < h.until)
     }
 
-    /// Hold world `world`'s mirror off for `wait`.
-    pub fn hold_mirror(&self, world: &str, wait: Duration) {
+    /// Hold world `world`'s mirror off after a refusal that asks for at
+    /// least `wait`, doubled for each refusal in a row before it
+    /// ([`hold::backoff`]); how long it holds.
+    pub fn hold_mirror(&self, world: &str, wait: Duration) -> Duration {
+        let mut held = self.mirror_held.lock().expect("mirror hold lock");
+        let refusals = held.get(world).map_or(0, |h| h.refusals) + 1;
+        let hold = hold::backoff(wait, refusals);
+        held.insert(
+            world.to_string(),
+            MirrorHold {
+                until: Instant::now() + hold,
+                refusals,
+            },
+        );
+        hold
+    }
+
+    /// World `world`'s mirror got through a beat unrefused: the next
+    /// refusal starts the doubling again.
+    pub fn mirror_cleared(&self, world: &str) {
         self.mirror_held
             .lock()
             .expect("mirror hold lock")
-            .insert(world.to_string(), Instant::now() + wait);
+            .remove(world);
     }
 
     /// Whether world `world`'s server is due its reconcile, `every` since the
