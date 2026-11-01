@@ -276,9 +276,15 @@ pub(crate) async fn pair(
             ("androidtv", None) => {
                 let session = androidtv::pair_start(address, nets, "effector-bridge").await?;
                 pairings().lock().await.insert(address.to_string(), session);
-                Ok(refused(
-                    "The TV is showing a six-digit code. Pair again with that code.".into(),
-                ))
+                // Beginning succeeded: the TV is showing its code. `ok: true`
+                // with no credentials yet — the second call earns those. A
+                // genuine failure to begin propagates through `?` and comes
+                // back `ok: false`, so the two are never confused downstream.
+                Ok(Bridged {
+                    ok: true,
+                    line: "The TV is showing a six-digit code. Pair again with that code.".into(),
+                    creds: Default::default(),
+                })
             }
             ("androidtv", Some(code)) => match pairings().lock().await.remove(address) {
                 Some(session) => Ok(Bridged {

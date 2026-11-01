@@ -119,6 +119,14 @@ pub fn workable(profile: &str) -> bool {
     matches!(profile, SONOS | RECEIVER | CAST | WEBOS | ANDROIDTV)
 }
 
+/// Whether a device of `profile` earns its credentials by pairing before the
+/// world can work it — an LG webOS TV (accept on the screen, one client-key)
+/// and a Google TV (a six-digit code, an RSA client certificate). The others
+/// need no secret.
+pub fn pairs(profile: &str) -> bool {
+    matches!(profile, WEBOS | ANDROIDTV)
+}
+
 /// The profile that reaches a device saying what `f` says.
 ///
 /// **Most specific first.** A Sonos and many TVs are also MediaRenderers; a
@@ -274,6 +282,16 @@ mod tests {
         }
         for p in [RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {
             assert!(!workable(p), "{p} should be see-only");
+        }
+    }
+
+    #[test]
+    fn only_the_two_tvs_pair() {
+        for p in [WEBOS, ANDROIDTV] {
+            assert!(pairs(p), "{p} earns a credential by pairing");
+        }
+        for p in [SONOS, RECEIVER, CAST, RENDERER, GATEWAY, PRINTER, DEVICE] {
+            assert!(!pairs(p), "{p} needs no pairing");
         }
     }
 }

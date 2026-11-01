@@ -528,6 +528,65 @@ pub const CAST_LAUNCH: Tool = Tool {
     }],
 };
 
+pub const PAIR_DEVICE: Tool = Tool {
+    name: "pair_device",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Begin pairing a TV here that the world cannot work yet because it has never been paired \
+         — an LG TV or a Google TV. An LG TV shows an \"accept\" box on its own screen, so tell \
+         the family to accept it; a Google TV shows a six-digit code, which the family must read \
+         back to you, and you then finish with `pair_code`. Do this when the survey put a TV in \
+         the room but the world has no key for it.",
+    params: &[Param {
+        name: "device",
+        ty: "string",
+        required: true,
+        description: "The TV here to pair, by name, as the room calls it.",
+    }],
+    examples: &[Example {
+        situation: "The survey put a Google TV in the room and the world has no key to work it.",
+        call: r#"{"device":"the TV"}"#,
+        because: "A TV the world has never paired with answers nothing; pairing is what earns the \
+                  key, and nobody need be at the TV but to read a code back.",
+    }],
+};
+
+pub const PAIR_CODE: Tool = Tool {
+    name: "pair_code",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description:
+        "Finish pairing a Google TV here with the six-digit code it is showing — the code the \
+         family read back to you after you began with `pair_device`. This earns the key the \
+         world keeps, and from then on it can work the TV with nobody at it.",
+    params: &[
+        Param {
+            name: "device",
+            ty: "string",
+            required: true,
+            description: "The Google TV here being paired, by name.",
+        },
+        Param {
+            name: "code",
+            ty: "string",
+            required: true,
+            description: "The six-digit code the TV is showing, as the family read it back.",
+        },
+    ],
+    examples: &[Example {
+        situation:
+            "You began pairing the Google TV, it showed a code, and the family read you \"4C2A19\".",
+        call: r#"{"device":"the TV","code":"4C2A19"}"#,
+        because:
+            "The code is what proves the pairing to the TV; giving it back is what earns the key.",
+    }],
+};
+
 pub const WAKE_DEVICE: Tool = Tool {
     name: "wake_device",
     at: &[],
@@ -582,6 +641,8 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     CAST_VOLUME,
     CAST_CAST,
     CAST_LAUNCH,
+    PAIR_DEVICE,
+    PAIR_CODE,
     WAKE_DEVICE,
 ];
 

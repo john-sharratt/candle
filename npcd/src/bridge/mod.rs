@@ -9,8 +9,11 @@ pub mod acts;
 pub mod discover;
 pub mod finding;
 
+use std::collections::BTreeMap;
+
 use agent::client::Agents;
 use agent::wire::BridgeCall;
+use effector_bridge::finding::pairs;
 use effector_bridge::work::profile_act;
 use npc_map::part::PartLink;
 use npc_map::schema::Where;
@@ -18,7 +21,13 @@ use serde_json::{Map, Value};
 
 use crate::engine::mission_gen::standing::HOUSE_LINK;
 use crate::world::Hosted;
-use finding::{RECEIVER, SONOS};
+use finding::{ANDROIDTV, RECEIVER, SONOS};
+
+/// A reserved credential key, holding the id of the agent that began a Google
+/// TV's two-phase pairing, so `pair_code` finishes on that same agent (the TLS
+/// session lives only there). Reserved keys begin with `_`; [`with_link`] never
+/// hands one to a device.
+const PAIRING_AGENT: &str = "_pairing_agent";
 
 pub use acts::{is_mine, BRIDGE_ACTS};
 
@@ -95,6 +104,15 @@ fn linked_here(hosted: &Hosted, body: &str, name: &str, profile: &str) -> Option
     })
 }
 
+/// The part here named `name` that stands for a device the world pairs with (a
+/// webOS or Google TV), with its id and link.
+fn pairable_here(hosted: &Hosted, body: &str, name: &str) -> Option<(String, PartLink)> {
+    parts_here(hosted, body).into_iter().find_map(|p| {
+        let link = p.link?;
+        (p.name.eq_ignore_ascii_case(name) && pairs(&link.profile)).then_some((p.id, link))
+    })
+}
+
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     let s = args.get(key)?.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
@@ -103,10 +121,15 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
 /// The act's arguments with the device's stored credentials and hardware
 /// address folded in — so the agent is handed what it needs to work the device
 /// (a webOS key, an Android TV certificate, the wake MAC) and the world keeps
-/// the secrets, not the stateless agent. An argument the caller set wins.
+/// the secrets, not the stateless agent. An argument the caller set wins. A
+/// reserved key (one beginning `_`, like [`PAIRING_AGENT`]) is the world's own
+/// bookkeeping and is never handed to a device.
 fn with_link(args: &Map<String, Value>, link: &PartLink) -> Map<String, Value> {
     let mut merged = args.clone();
     for (name, value) in &link.creds {
+        if name.starts_with('_') {
+            continue;
+        }
         merged
             .entry(name.clone())
             .or_insert_with(|| Value::from(value.clone()));
@@ -119,10 +142,24 @@ fn with_link(args: &Map<String, Value>, link: &PartLink) -> Map<String, Value> {
     merged
 }
 
-/// What came of a bridge act: whether it landed, and the line its body reads.
+/// What came of a bridge act: whether it landed, the line its body reads, and
+/// any credentials it earned for the world to keep on the part.
 pub struct Done {
     pub landed: bool,
     pub answer: String,
+    /// What a pairing earned, for the runtime to write onto the part here —
+    /// `None` for every act that earns nothing. See [`Earned`].
+    pub earned: Option<Earned>,
+}
+
+/// Credentials a pairing earned, to keep on the device's part: `set` is merged
+/// into the part's stored credentials and `drop` names keys to remove (the
+/// transient [`PAIRING_AGENT`] once a Google TV is through). The runtime writes
+/// these, since it holds the map store the enact path does not.
+pub struct Earned {
+    pub part: String,
+    pub set: BTreeMap<String, String>,
+    pub drop: Vec<String>,
 }
 
 impl Done {
@@ -130,12 +167,22 @@ impl Done {
         Done {
             landed: true,
             answer: answer.into(),
+            earned: None,
         }
     }
     fn refused(answer: impl Into<String>) -> Done {
         Done {
             landed: false,
             answer: answer.into(),
+            earned: None,
+        }
+    }
+    /// A pairing step that landed and left credentials for the world to keep.
+    fn earned(answer: impl Into<String>, earned: Earned) -> Done {
+        Done {
+            landed: true,
+            answer: answer.into(),
+            earned: Some(earned),
         }
     }
 }
@@ -208,6 +255,42 @@ pub async fn enact(
             )
             .await
         }
+        // Pairing a TV that has never been paired — the world earns the key.
+        // `pair_device` begins it (a webOS TV in one go once the family accept
+        // on screen; a Google TV shows a code); `pair_code` finishes a Google
+        // TV with the code the family read back.
+        "pair_device" => {
+            let Some(name) = text(args, "device") else {
+                return Done::refused("Say which TV to pair.");
+            };
+            let Some((part, link)) = pairable_here(hosted, body, &name) else {
+                return Done::refused(format!(
+                    "There is no TV called {name} here that the world pairs with."
+                ));
+            };
+            pair(agents, &name, part, link, None).await
+        }
+        "pair_code" => {
+            let Some(name) = text(args, "device") else {
+                return Done::refused("Say which TV the code is for.");
+            };
+            let Some(code) = text(args, "code") else {
+                return Done::refused("Say the six-digit code the TV is showing.");
+            };
+            let Some((part, link)) = pairable_here(hosted, body, &name) else {
+                return Done::refused(format!(
+                    "There is no TV called {name} here that the world pairs with."
+                ));
+            };
+            // Only a Google TV takes a code; an LG TV pairs in one step with
+            // `pair_device`, so a code for one is a mistake, not a fresh pairing.
+            if link.profile != ANDROIDTV {
+                return Done::refused(format!(
+                    "The {name} pairs in one step with `pair_device` — it needs no code."
+                ));
+            }
+            pair(agents, &name, part, link, Some(code)).await
+        }
         // The device profiles' acts — `sonos_play`, `receiver_volume`, … — each
         // bound to a device standing here. The part names the device's profile
         // and address; the act is handed to an in-network agent to carry out.
@@ -255,6 +338,71 @@ pub async fn submit(agents: Option<Agents>, name: &str, call: BridgeCall) -> Don
     }
 }
 
+/// Pair with the TV `name` here, earning the credential the world keeps on its
+/// part. webOS pairs in one call (the family accept on the TV's own screen); a
+/// Google TV takes two — `pair_device` (no `code`) begins it and records which
+/// agent holds the session, and `pair_code` (with the `code`) finishes on that
+/// same agent, since the pairing session lives only there.
+async fn pair(
+    agents: Option<Agents>,
+    name: &str,
+    part: String,
+    link: PartLink,
+    code: Option<String>,
+) -> Done {
+    let Some(agents) = agents else {
+        return Done::refused(
+            "No agent in the house can pair it right now. Try again in a moment.",
+        );
+    };
+    // The finishing call pins to the agent the beginning call recorded.
+    let to = code
+        .as_ref()
+        .and(link.creds.get(PAIRING_AGENT))
+        .and_then(|a| a.parse::<u64>().ok());
+    let call = BridgeCall::Pair {
+        profile: link.profile.clone(),
+        address: link.address.clone(),
+        code: code.clone(),
+    };
+    let (bridged, served_by) = match agents.bridge_on(&call, to).await {
+        Ok(pair) => pair,
+        Err(e) => return Done::refused(format!("The {name} could not be reached: {e}")),
+    };
+    // The response decides, not the request: a device that could not be
+    // reached or refused the pairing is `ok: false`, whichever step it was.
+    if !bridged.ok {
+        return Done::refused(bridged.line);
+    }
+    // A Google TV's beginning succeeds with no credentials yet — it has only
+    // shown its code. Keep which agent holds the session (so `pair_code`
+    // finishes there) and ask the family for the code.
+    if bridged.creds.is_empty() {
+        let set = served_by
+            .map(|a| BTreeMap::from([(PAIRING_AGENT.to_string(), a.to_string())]))
+            .unwrap_or_default();
+        return Done::earned(
+            "The TV is showing a six-digit code. Ask the family to read it back, then finish \
+             with `pair_code`.",
+            Earned {
+                part,
+                set,
+                drop: Vec::new(),
+            },
+        );
+    }
+    // webOS in one call, or a Google TV's finish: the key is earned. Keep it,
+    // and clear the transient note of the pairing agent.
+    Done::earned(
+        bridged.line,
+        Earned {
+            part,
+            set: bridged.creds,
+            drop: vec![PAIRING_AGENT.to_string()],
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +413,8 @@ mod tests {
         let mut creds = BTreeMap::new();
         creds.insert("cert".to_string(), "PEM".to_string());
         creds.insert("key".to_string(), "KEY".to_string());
+        // A reserved key — the world's own bookkeeping — must never reach a device.
+        creds.insert(PAIRING_AGENT.to_string(), "7".to_string());
         let link = PartLink {
             profile: "androidtv".into(),
             address: "192.168.0.214".into(),
@@ -281,5 +431,9 @@ mod tests {
         assert_eq!(merged.get("key").unwrap(), "CALLER");
         assert_eq!(merged.get("mac").unwrap(), "14:ae:85:71:eb:44");
         assert_eq!(merged.get("video").unwrap(), "abc");
+        assert!(
+            merged.get(PAIRING_AGENT).is_none(),
+            "a reserved `_`-key is the world's own, never handed to a device"
+        );
     }
 }

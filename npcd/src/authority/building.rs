@@ -2,7 +2,9 @@
 //! (`docs/zen_moon_mind.md` §13–§15): awaited, because a bridge reaches the
 //! network and a building act keeps what it changes.
 
-use crate::bridge;
+use npc_map::MapEdit;
+
+use crate::bridge::{self, Earned};
 use crate::effector::reshape::keep_for;
 use crate::engine::act::Act;
 use crate::engine::build;
@@ -25,6 +27,9 @@ impl Runtime {
                 s.missions
                     .observe(&body, done.answer.lines().next().unwrap_or(""))
             });
+            if let Some(earned) = &done.earned {
+                self.keep_earned(&hosted, npc, earned).await;
+            }
             if act.tool == "survey_network" {
                 self.relink(&hosted, npc, &place).await;
                 sign_off(&hosted, &body, SURVEY_STEP);
@@ -36,6 +41,42 @@ impl Runtime {
             }
         }
         recorded(act, done.landed, done.answer)
+    }
+
+    /// Keep the credentials a pairing earned on the device's part: merge
+    /// `earned.set` into its stored credentials and remove the keys in
+    /// `earned.drop` (the transient pairing-agent note once a Google TV is
+    /// through). The map store is the runtime's, not the enact path's, so the
+    /// write happens here, the way a relinked device's does.
+    async fn keep_earned(&self, hosted: &Hosted, npc: u64, earned: &Earned) {
+        // Nothing to write (an in-process Google TV begin earns no agent note):
+        // do not spend a persisted map edit and a replication on a no-op.
+        if earned.set.is_empty() && earned.drop.is_empty() {
+            return;
+        }
+        let Some(mut link) =
+            hosted.read(|w| w.map().part(&earned.part).and_then(|p| p.link.clone()))
+        else {
+            tracing::warn!(world = hosted.id(), part = %earned.part, "paired a part that is no longer here");
+            return;
+        };
+        link.creds.extend(earned.set.clone());
+        for key in &earned.drop {
+            link.creds.remove(key);
+        }
+        let edit = MapEdit::LinkPart {
+            part: earned.part.clone(),
+            link,
+        };
+        let keep = keep_for(self, hosted, npc).await;
+        match hosted.build(&[edit], keep) {
+            Ok(_) => {
+                tracing::info!(world = hosted.id(), part = %earned.part, "a pairing's key was kept")
+            }
+            Err(why) => {
+                tracing::warn!(world = hosted.id(), part = %earned.part, %why, "a pairing's key could not be kept")
+            }
+        }
     }
 
     /// **A device that moved is followed**: each part standing for a device
