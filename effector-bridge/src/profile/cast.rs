@@ -49,6 +49,26 @@ fn content_type(url: &str) -> &'static str {
     }
 }
 
+/// The YouTube video id from a bare id, a `watch?v=` URL, or a `youtu.be` link.
+fn youtube_id(v: &str) -> String {
+    let v = v.trim();
+    if let Some(i) = v.find("v=") {
+        return v[i + 2..]
+            .split(['&', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    if let Some(i) = v.rfind("youtu.be/") {
+        return v[i + 9..]
+            .split(['?', '&', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    v.to_string()
+}
+
 /// The running app on a receiver, from a `RECEIVER_STATUS`.
 #[derive(Debug, Default, Clone)]
 struct App {
@@ -455,6 +475,25 @@ impl Cast {
         .await
     }
 
+    /// Launch an app over DIAL (plain HTTP on 8008) with an optional form body
+    /// — how a cast device plays a YouTube video (`v=<id>`), where a CASTv2
+    /// launch alone does not keep the app running.
+    async fn dial(&self, app: &str, content: Option<String>) -> Result<()> {
+        let url = format!("http://{}:8008/apps/{app}", self.address);
+        let client = reqwest::Client::builder().timeout(ANSWER).build()?;
+        let mut req = client.post(&url);
+        if let Some(c) = content {
+            req = req
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(c);
+        }
+        let status = req.send().await?.status();
+        if !status.is_success() {
+            bail!("the device would not launch {app}: {status}");
+        }
+        Ok(())
+    }
+
     async fn now_playing(&self, name: &str) -> Result<String> {
         let mut c = self.conn().await?;
         let app = match self.receiver_status(&mut c, 1).await?.app {
@@ -557,6 +596,17 @@ pub async fn work(
             let got = cast.launch(&app).await?;
             format!("The {name} is on {got}.")
         }
+        "youtube" => {
+            let video = arg("video").ok_or_else(|| anyhow!("Say the YouTube video id or link."))?;
+            let id = youtube_id(&video);
+            cast.dial("YouTube", Some(format!("v={id}"))).await?;
+            format!("The {name} is playing YouTube {id}.")
+        }
+        "dial" => {
+            let app = arg("app").ok_or_else(|| anyhow!("Say which app to launch."))?;
+            cast.dial(&app, arg("content")).await?;
+            format!("The {name} launched {app}.")
+        }
         "quit" => {
             cast.quit().await?;
             format!("The {name}'s app was closed.")
@@ -579,6 +629,19 @@ mod tests {
             "application/vnd.apple.mpegurl"
         );
         assert_eq!(content_type("http://h/stream"), "video/mp4");
+    }
+
+    #[test]
+    fn youtube_ids_are_pulled_from_links() {
+        assert_eq!(youtube_id("aqz-KE-bpKQ"), "aqz-KE-bpKQ");
+        assert_eq!(
+            youtube_id("https://www.youtube.com/watch?v=aqz-KE-bpKQ&t=30s"),
+            "aqz-KE-bpKQ"
+        );
+        assert_eq!(
+            youtube_id("https://youtu.be/aqz-KE-bpKQ?si=x"),
+            "aqz-KE-bpKQ"
+        );
     }
 
     #[test]
