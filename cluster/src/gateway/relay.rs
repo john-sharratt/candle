@@ -8,10 +8,30 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::hub::{hex, Hub, CATCHUP_CAP, LAG_CAP};
-use super::registry::Registry;
+use super::registry::{Held, Registry};
+use crate::coord::CoordState;
 use crate::fragment::Whole;
 use crate::frame::{Done, Frame, Lost, MemberState, Receipt};
 use crate::session::SessionHandle;
+
+/// What a member's `COORD` says it holds of each origin: the highest `oseq` and
+/// how many below it are missing. Nothing for a member that has sent none.
+fn held_of(coord: Option<&CoordState>) -> BTreeMap<u64, Held> {
+    coord
+        .into_iter()
+        .flat_map(|c| c.applied.iter())
+        .filter_map(|line| {
+            let origin = u64::from_str_radix(&line.origin, 16).ok()?;
+            Some((
+                origin,
+                Held {
+                    top: line.top,
+                    missing: line.missing,
+                },
+            ))
+        })
+        .collect()
+}
 
 impl Hub {
     /// A record from `from`: relayed live to the app's other members, or to
@@ -172,7 +192,27 @@ impl Hub {
                     .member(app, node)
                     .map(|m| m.applied.clone())
                     .unwrap_or_default();
-                Registry::in_sync(node, &acks, &serving)
+                // What it holds of each origin past a hole, and what each
+                // serving origin misses of itself: both from `COORD`.
+                let held = held_of(
+                    s.sockets
+                        .get(&(app.to_string(), node))
+                        .and_then(|x| x.coord.as_ref()),
+                );
+                let mut origin_missing: BTreeMap<u64, u64> = BTreeMap::new();
+                for m in s.registry.members(app) {
+                    if m.node == node || !m.routable() {
+                        continue;
+                    }
+                    let coord = s
+                        .sockets
+                        .get(&(app.to_string(), m.node))
+                        .and_then(|x| x.coord.as_ref());
+                    if let Some(own) = held_of(coord).get(&m.node) {
+                        origin_missing.insert(m.node, own.missing);
+                    }
+                }
+                Registry::in_sync(node, &acks, &serving, &held, &origin_missing)
             };
             if synced {
                 s.registry.set_syncing(app, node, false);
