@@ -17,6 +17,7 @@ pub struct RecvRequest {
     /// Maximum number of bytes to read in one call (capped at 65536).
     pub recv_amt: Option<usize>,
     /// Seconds to wait for data before returning with `timed_out: true`. Defaults to 30.
+    #[validate(range(min = 0.1, max = 60.0))]
     pub recv_wait: Option<f64>,
     /// Encoding for the returned bytes. "hex" forces hex; "auto" (default) returns UTF-8 text when valid, else hex.
     #[schemars(with = "Option<super::super::RecvEncoding>")]

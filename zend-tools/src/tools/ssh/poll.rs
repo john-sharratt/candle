@@ -17,6 +17,7 @@ pub struct PollRequest {
     pub process_id: String,
     /// Seconds to wait for the process to finish before returning. Defaults to 0
     /// (return immediately with whatever output has accumulated).
+    #[validate(range(min = 0.0, max = 300.0))]
     pub recv_wait_sec: Option<f64>,
     /// Signal to deliver if the process is still running: "TERM", "KILL", or "INT".
     pub signal: Option<String>,
@@ -87,8 +88,9 @@ impl Tool for SshSessionPoll {
         let running = *proc.running.lock().unwrap();
         let exit_code = *proc.exit_code.lock().unwrap();
 
-        // A signal can only be delivered to a process that is still running.
-        let signal_sent = req.signal.is_some() && running;
+        // The SSH channel behind a process exposes no way to send a signal, so
+        // a request for one is answered as not sent, whatever its state.
+        let signal_sent = false;
 
         // Elapsed wall-clock since the process started.
         let duration_so_far_ms = chrono::DateTime::parse_from_rfc3339(&proc.started_at)

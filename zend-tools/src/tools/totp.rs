@@ -36,8 +36,10 @@ pub struct Request {
     #[validate(length(min = 1))]
     pub credential_name: String,
     /// Number of digits in the generated code. Defaults to 6.
+    #[validate(range(min = 6, max = 8))]
     pub digits: Option<u32>,
     /// Time step in seconds for code rotation. Defaults to 30.
+    #[validate(range(min = 1))]
     pub period_sec: Option<u32>,
     /// Hash algorithm. One of: "sha1", "sha256", "sha512". Defaults to "sha1".
     pub algorithm: Option<String>,

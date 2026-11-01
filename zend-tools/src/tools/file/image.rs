@@ -123,6 +123,7 @@ impl Tool for FileImage {
             .repo(req.source_repo.as_deref().unwrap_or(&req.repo))?
             .read_bytes(&req.path)?
             .ok_or_else(|| not_found(&req))?;
+        refuse_overwriting_source(&req)?;
         let picture = decode(&source, &req.path)?;
         let (width, height) = picture.dimensions();
         let cut = cut(picture, req.crop)?;
@@ -163,6 +164,32 @@ fn not_found(req: &ImageRequest) -> FileError {
             req.path, req.repo
         )),
     }
+}
+
+/// A copy written over the picture it is made from is refused: measured live,
+/// a worker shrank `favicon.ico` to 16×16 and rewrote its 1024-pixel source art
+/// this way, each time by naming the output after the input.
+fn refuse_overwriting_source(req: &ImageRequest) -> Result<(), FileError> {
+    let source_repo = req.source_repo.as_deref().unwrap_or(&req.repo);
+    let same = |path: &str| source_repo == req.repo && same_path(path, &req.path);
+    match req.outputs.iter().find(|output| same(&output.path)) {
+        Some(output) => Err(FileError::InvalidArguments(format!(
+            "{} is the picture these copies are made from: give the copy a path of its own",
+            output.path
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Whether two repository paths name one file, however they are spelled.
+fn same_path(a: &str, b: &str) -> bool {
+    let tidy = |p: &str| {
+        p.replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    };
+    tidy(a) == tidy(b)
 }
 
 fn decode(bytes: &[u8], path: &str) -> Result<DynamicImage, FileError> {
@@ -354,6 +381,28 @@ mod tests {
         .unwrap();
         assert_eq!(wide.dimensions(), (64, 32));
         assert!(encode(&wide, &output("a.png", 32, 16)).is_ok());
+    }
+
+    /// **A copy cannot be written over its own source**, however it is spelled;
+    /// the same path in another repository is another file.
+    #[test]
+    fn a_copy_over_its_source_is_refused() {
+        let request = |source_repo: Option<&str>, to: &str| ImageRequest {
+            repo: "game".into(),
+            path: "web/icon.png".into(),
+            source_repo: source_repo.map(str::to_string),
+            crop: None,
+            outputs: vec![output("a.png", 8, 8), output(to, 8, 8)],
+        };
+        for to in ["web/icon.png", "./web/icon.png", "web\\ICON.png"] {
+            assert!(
+                refuse_overwriting_source(&request(None, to)).is_err(),
+                "{to}"
+            );
+        }
+        assert!(refuse_overwriting_source(&request(None, "web/other.png")).is_ok());
+        let across = request(Some("art"), "web/icon.png");
+        assert!(refuse_overwriting_source(&across).is_ok());
     }
 
     /// A crop past the picture's edge, a zero side and an unknown extension
