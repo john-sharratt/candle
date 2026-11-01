@@ -230,6 +230,7 @@ mod tests {
                 profile: "sonos".into(),
                 address: "192.168.0.89".into(),
                 hardware: "f0:f6:c1:a0:79:b4".into(),
+                ..Default::default()
             }),
         };
         let define = MapEdit::DefinePart(Box::new(speaker.clone()));
@@ -280,6 +281,7 @@ mod tests {
                 profile: "device".into(),
                 address: "192.168.0.214".into(),
                 hardware: "14:ae:85:71:eb:44".into(),
+                ..Default::default()
             },
         };
         let linked = defined.apply(&link).unwrap();

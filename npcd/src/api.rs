@@ -4312,6 +4312,8 @@ mod tests {
                 // The operator's house bridge — work a device through an
                 // in-network agent, admin like the table.
                 ("/v1/pulse/bridge", "admin"),
+                // Set a device's notes and credentials on its world part, admin.
+                ("/v1/pulse/device", "admin"),
                 // What the guardian has found and done — names every
                 // character, so admin.
                 ("/v1/pulse/guardian", "admin"),

@@ -386,6 +386,7 @@ mod tests {
             profile: "sonos".into(),
             address: "192.168.0.89".into(),
             hardware: "f0:f6:c1:a0:79:b4".into(),
+            ..Default::default()
         };
         let linked = defined
             .apply(&MapEdit::LinkPart {

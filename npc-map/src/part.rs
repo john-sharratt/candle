@@ -27,6 +27,8 @@
 //! at different lengths. A level that inlined every long description would be
 //! unreadable; a tool offered without one would be unusable.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// What sort of thing a part is, which decides how a description counts it.
@@ -107,7 +109,7 @@ pub struct Part {
 
 /// How a part reaches the real thing it stands for: the bridge profile that
 /// speaks to it, and where it is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartLink {
     /// The bridge profile — `sonos`, `device`.
@@ -117,6 +119,15 @@ pub struct PartLink {
     /// Its hardware address, which outlasts a change of address: the same
     /// device found again at another is the same part.
     pub hardware: String,
+    /// What the world keeps to work this device — a webOS client key, an
+    /// Android TV certificate and key, a token. The effector command carries
+    /// these to the agent at the moment of use; the stateless agent keeps none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub creds: BTreeMap<String, String>,
+    /// Free notes about the device — what is on each input, which account or
+    /// profile to use, anything a person or a bot should know to work it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 impl Part {

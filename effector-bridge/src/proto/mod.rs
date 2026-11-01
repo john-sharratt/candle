@@ -10,6 +10,7 @@
 //! - [`webos`] — SSAP over a WebSocket (an LG webOS TV).
 //! - [`udp`] — a UDP broadcast on the house's own subnets (wake-on-LAN).
 
+pub mod androidtv;
 pub mod cast;
 pub mod eiscp;
 pub mod soap;

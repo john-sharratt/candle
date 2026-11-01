@@ -10,6 +10,8 @@
 //! where the character is. **What a person or an operator writes** about one
 //! character — a message, standing beside it, a mission — is one each.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::discord::world::record::Guild;
@@ -123,6 +125,16 @@ pub enum WorldOp {
     HandBack { npc: u64, through: u64 },
     /// An admin frees a character's lease, for a holder that will not return.
     Release { npc: u64 },
+    /// Notes or credentials set on a device part, named by its network address
+    /// (`docs/zen_moon_mind.md` §15): what the world keeps to describe and work
+    /// it. `notes` replaces when given; `creds` are merged in.
+    AmendDevice {
+        address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        creds: BTreeMap<String, String>,
+    },
 }
 
 /// What the world answered.

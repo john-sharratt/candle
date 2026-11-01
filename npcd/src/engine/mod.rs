@@ -509,6 +509,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Any,
             post(mission_api::bridge),
         )
+        // Set a device's notes and credentials on the world part standing for
+        // it (`docs/zen_moon_mind.md` §15) — the onboarding metadata the world
+        // keeps and folds into every effector command. Admin.
+        .route(
+            "/v1/pulse/device",
+            Role::Admin,
+            Dispatch::Any,
+            post(mission_api::device),
+        )
         // What the guardian has found and done. Admin: it names every
         // character, including ones the caller does not own.
         .route(

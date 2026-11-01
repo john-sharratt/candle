@@ -100,6 +100,25 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// The act's arguments with the device's stored credentials and hardware
+/// address folded in — so the agent is handed what it needs to work the device
+/// (a webOS key, an Android TV certificate, the wake MAC) and the world keeps
+/// the secrets, not the stateless agent. An argument the caller set wins.
+fn with_link(args: &Map<String, Value>, link: &PartLink) -> Map<String, Value> {
+    let mut merged = args.clone();
+    for (name, value) in &link.creds {
+        merged
+            .entry(name.clone())
+            .or_insert_with(|| Value::from(value.clone()));
+    }
+    if !link.hardware.is_empty() {
+        merged
+            .entry("mac".to_string())
+            .or_insert_with(|| Value::from(link.hardware.clone()));
+    }
+    merged
+}
+
 /// What came of a bridge act: whether it landed, and the line its body reads.
 pub struct Done {
     pub landed: bool,
@@ -200,6 +219,7 @@ pub async fn enact(
             let Some(link) = linked_here(hosted, body, &name, profile) else {
                 return Done::refused(format!("There is no {profile} called {name} here."));
             };
+            let merged = with_link(args, &link);
             submit(
                 agents,
                 &name,
@@ -208,7 +228,7 @@ pub async fn enact(
                     name: name.clone(),
                     address: link.address,
                     action: action.to_string(),
-                    args: args.clone(),
+                    args: merged,
                 },
             )
             .await
@@ -232,5 +252,34 @@ pub async fn submit(agents: Option<Agents>, name: &str, call: BridgeCall) -> Don
         Ok(b) if b.ok => Done::did(b.line),
         Ok(b) => Done::refused(b.line),
         Err(e) => Done::refused(format!("The {name} could not be reached: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_links_credentials_and_mac_fold_into_the_call() {
+        let mut creds = BTreeMap::new();
+        creds.insert("cert".to_string(), "PEM".to_string());
+        creds.insert("key".to_string(), "KEY".to_string());
+        let link = PartLink {
+            profile: "androidtv".into(),
+            address: "192.168.0.214".into(),
+            hardware: "14:ae:85:71:eb:44".into(),
+            creds,
+            notes: None,
+        };
+        let mut args = Map::new();
+        args.insert("video".into(), Value::from("abc"));
+        // A credential the caller already set wins over the stored one.
+        args.insert("key".into(), Value::from("CALLER"));
+        let merged = with_link(&args, &link);
+        assert_eq!(merged.get("cert").unwrap(), "PEM");
+        assert_eq!(merged.get("key").unwrap(), "CALLER");
+        assert_eq!(merged.get("mac").unwrap(), "14:ae:85:71:eb:44");
+        assert_eq!(merged.get("video").unwrap(), "abc");
     }
 }

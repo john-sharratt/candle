@@ -4,6 +4,7 @@
 //! an action and its arguments and does it, so [`crate::work`] can reach any
 //! profile the same way.
 
+pub mod androidtv;
 pub mod cast;
 pub mod receiver;
 pub mod sonos;
