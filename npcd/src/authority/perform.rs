@@ -10,6 +10,7 @@ use host::cluster::up::request_up;
 use std::collections::BTreeMap;
 
 use npc_map::mutate::MapEdit;
+use npc_map::part::PartLink;
 use npc_map::world::Where;
 
 use crate::world::Hosted;
@@ -481,11 +482,44 @@ fn amend_device(
     let Some((id, mut link)) = found else {
         return false;
     };
+    amend_link(&mut link, notes, creds);
+    hosted
+        .build(&[MapEdit::LinkPart { part: id, link }], None)
+        .is_ok()
+}
+
+/// Set `notes` on a link when given (replacing), and merge `creds` in.
+fn amend_link(link: &mut PartLink, notes: Option<String>, creds: BTreeMap<String, String>) {
     if notes.is_some() {
         link.notes = notes;
     }
     link.creds.extend(creds);
-    hosted
-        .build(&[MapEdit::LinkPart { part: id, link }], None)
-        .is_ok()
+}
+
+#[cfg(test)]
+mod amend_tests {
+    use super::*;
+
+    #[test]
+    fn notes_replace_and_creds_merge() {
+        let mut link = PartLink {
+            profile: "webos".into(),
+            address: "192.168.0.48".into(),
+            hardware: String::new(),
+            creds: BTreeMap::from([("key".into(), "OLD".into())]),
+            notes: None,
+        };
+        amend_link(
+            &mut link,
+            Some("HDMI1 = Chromecast".into()),
+            BTreeMap::from([("key".into(), "NEW".into()), ("cert".into(), "C".into())]),
+        );
+        assert_eq!(link.notes.as_deref(), Some("HDMI1 = Chromecast"));
+        assert_eq!(link.creds.get("key").unwrap(), "NEW"); // merge overwrites
+        assert_eq!(link.creds.get("cert").unwrap(), "C");
+        // No notes given leaves the existing note, and empty creds change nothing.
+        amend_link(&mut link, None, BTreeMap::new());
+        assert_eq!(link.notes.as_deref(), Some("HDMI1 = Chromecast"));
+        assert_eq!(link.creds.len(), 2);
+    }
 }

@@ -308,3 +308,25 @@ async fn switch(State(api): State<Api>, Json(to): Json<Switching>) -> Response {
     })
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pairing_an_unknown_profile_is_refused() {
+        let b = pair("toaster", "192.168.0.9", None, &[]).await;
+        assert!(!b.ok);
+        assert!(b.line.contains("toaster"));
+        assert!(b.creds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_pairing_with_no_session_is_refused() {
+        // A code for an address no pairing was started for — the agent holds no
+        // session, so it is refused rather than mispaired.
+        let b = pair("androidtv", "203.0.113.7", Some("ABCDEF".into()), &[]).await;
+        assert!(!b.ok);
+        assert!(b.line.to_lowercase().contains("no pairing"));
+    }
+}
