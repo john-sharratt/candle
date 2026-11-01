@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use super::hub::is_service;
 use crate::close::{Close, CloseCode};
 use crate::frame::{BuildId, Hello, ModelId};
+use crate::handshake::PROTO;
 
 /// How far a member's clock may be from the gateway's (§3.4, 4417).
 pub const MAX_SKEW_MS: u64 = 60_000;
@@ -52,6 +53,8 @@ pub struct Admitted {
     pub floor: Option<BuildId>,
     /// Below the floor, admitted to take the floor's build (§3.5).
     pub upgrading: bool,
+    /// On an older protocol: its session carries only what crosses protocols.
+    pub behind: bool,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +80,44 @@ impl Admission {
     ) -> Result<Admitted, Close> {
         let app = hello.app.as_str();
         let policy = self.apps.entry(app.to_string()).or_default();
+
+        // An older protocol is a forced upgrade: the group cannot talk to it,
+        // so it takes the floor's build at once, with no certification and no
+        // grace. The floor is only ever set by a member on this protocol, so
+        // the first one to join moves everyone behind it. Until one holds a
+        // build, it redials.
+        if hello.proto < PROTO {
+            let reachable = policy
+                .floor
+                .as_ref()
+                .filter(|(floor, ..)| {
+                    floored(app)
+                        && !hello.build.is_local()
+                        && hello.build.count < floor.count
+                        && held(floor)
+                })
+                .map(|(floor, ..)| floor.clone());
+            let Some(floor) = reachable else {
+                return Err(Close::new(
+                    CloseCode::Protocol,
+                    format!(
+                        "protocol {} is not supported; this gateway speaks {PROTO} and no {app} \
+                         member holds a build to upgrade to",
+                        hello.proto
+                    ),
+                ));
+            };
+            self.next_session += 1;
+            let session = self.next_session;
+            let replaces = policy.sessions.insert(hello.node, session);
+            return Ok(Admitted {
+                session,
+                replaces,
+                floor: Some(floor),
+                upgrading: true,
+                behind: true,
+            });
+        }
 
         // The build floor, on `count` alone; a local build is never below it
         // (§3.10).
@@ -150,6 +191,7 @@ impl Admission {
             replaces,
             floor,
             upgrading,
+            behind: false,
         })
     }
 
@@ -218,7 +260,7 @@ mod tests {
 
     fn hello(app: &str, node: u64, build: BuildId, model: Option<ModelId>, now_ms: u64) -> Hello {
         Hello {
-            proto: 1,
+            proto: PROTO,
             app: app.into(),
             node,
             host: format!("m{node}"),
@@ -304,6 +346,42 @@ mod tests {
         assert_eq!(low.floor.map(|f| f.count), Some(4815));
         let level = a.decide(&zend(5, build(4815, "")), NOW, |_| true).unwrap();
         assert!(!level.upgrading);
+    }
+
+    /// **A protocol bump upgrades the group by itself.** Behind this gateway's
+    /// protocol a member waits (4426, which redials) and never sets the floor;
+    /// the first member on this protocol does, and from then on the one behind
+    /// is admitted to take its build — certified or not — with no lock taken.
+    /// A service, a local build, and a member with nothing to reach still wait.
+    #[test]
+    fn a_member_behind_the_protocol_takes_the_first_build_on_it() {
+        let mut a = Admission::new();
+        let behind = |node, b| {
+            let mut h = zend(node, b);
+            h.proto = PROTO - 1;
+            h
+        };
+        let waits = a.decide(&behind(1, build(4800, "")), NOW, |_| true);
+        assert_eq!(waits.unwrap_err().code, 4426);
+        assert!(a.floor("zend").is_none(), "it never sets the floor");
+
+        admit(&mut a, zend(2, build(4815, ""))).unwrap();
+        let unheld = a.decide(&behind(1, build(4800, "")), NOW, |_| false);
+        assert_eq!(unheld.unwrap_err().code, 4426);
+
+        let lane = a
+            .decide(&behind(1, build(4800, "")), NOW, |b| b.count == 4815)
+            .unwrap();
+        assert!(lane.upgrading && lane.behind);
+        assert_eq!(lane.floor.map(|f| f.count), Some(4815));
+
+        let local = a.decide(&behind(3, build(4800, "abcd")), NOW, |_| true);
+        assert_eq!(local.unwrap_err().code, 4426);
+        let level = a.decide(&behind(4, build(4815, "")), NOW, |_| true);
+        assert_eq!(level.unwrap_err().code, 4426, "nothing to upgrade to");
+        let mut service = hello("mcp", 5, build(4800, ""), None, NOW);
+        service.proto = PROTO - 1;
+        assert_eq!(a.decide(&service, NOW, |_| true).unwrap_err().code, 4426);
     }
 
     /// Neither a local build nor a rejected one sets the floor; the first

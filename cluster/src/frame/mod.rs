@@ -478,4 +478,6 @@ pub fn name(kind: Kind) -> &'static str {
 }
 
 #[cfg(test)]
+mod crossing_tests;
+#[cfg(test)]
 mod tests;

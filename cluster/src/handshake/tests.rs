@@ -139,11 +139,12 @@ async fn a_forged_member_proof_is_closed_4401_by_the_gateway() {
 }
 
 #[tokio::test]
-async fn another_protocol_version_is_closed_4426() {
-    // A member a build behind the gateway: the case a cut-over meets.
-    let older = PROTO - 1;
+async fn a_newer_protocol_is_closed_4426() {
+    // A member started ahead of its gateway's restart: it redials until the
+    // gateway speaks what it speaks.
+    let newer = PROTO + 1;
     let mut h = hello(5);
-    h.proto = older;
+    h.proto = newer;
     let (m, g) = run(key(), key(), h, |_| panic!("never admitted")).await;
     let Err(HandshakeError::Closed(close)) = m else {
         panic!("{m:?}")
@@ -151,9 +152,24 @@ async fn another_protocol_version_is_closed_4426() {
     assert_eq!(close.code, 4426);
     assert_eq!(
         close.reason,
-        format!("protocol {older} is not supported; this gateway speaks {PROTO}")
+        format!("protocol {newer} is not supported; this gateway speaks {PROTO}")
     );
     assert!(matches!(g, Err(HandshakeError::Refused(c)) if c.code == 4426));
+}
+
+/// An older protocol is proved like any other and reaches admission, which
+/// alone knows whether the member can be taken in to upgrade.
+#[tokio::test]
+async fn an_older_protocol_reaches_admission() {
+    let mut h = hello(5);
+    h.proto = PROTO - 1;
+    let (m, g) = run(key(), key(), h, |h| {
+        assert_eq!(h.proto, PROTO - 1);
+        Ok(admission(42))
+    })
+    .await;
+    assert_eq!(m.unwrap().session, 42);
+    assert_eq!(g.unwrap().0.proto, PROTO - 1);
 }
 
 #[tokio::test]

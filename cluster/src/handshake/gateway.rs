@@ -6,12 +6,13 @@ use crate::close::{Close, CloseCode};
 use crate::frame::{Admit, Challenge, Frame, Hello};
 use crate::pipe::{PipeRx, PipeTx};
 
-/// Take a member's `HELLO`, refuse an unsupported protocol (4426), challenge
-/// it, check its proof (4401), and then ask `decide` — the build floor, the
-/// model lock, the clock and the node's session (§3.3–§3.6) — for its `ADMIT`
-/// or the close that refuses it. `seen` is shown the `HELLO` as it arrives,
-/// before anything is checked, so a refusal can name who it refused. Returns
-/// the member's `HELLO` and its `ADMIT`.
+/// Take a member's `HELLO`, refuse a protocol newer than this gateway's (4426),
+/// challenge it, check its proof (4401), and then ask `decide` — the build
+/// floor, the model lock, the clock and the node's session (§3.3–§3.6) — for
+/// its `ADMIT` or the close that refuses it. An older protocol reaches `decide`:
+/// whether that member can be admitted to upgrade is its question (§3.5). `seen`
+/// is shown the `HELLO` as it arrives, before anything is checked, so a refusal
+/// can name who it refused. Returns the member's `HELLO` and its `ADMIT`.
 pub async fn admit<T, R, S, D>(
     tx: &mut T,
     rx: &mut R,
@@ -30,7 +31,7 @@ where
         other => return Err(unexpected(tx, &other, "HELLO").await),
     };
     seen(&hello);
-    if hello.proto != PROTO {
+    if hello.proto > PROTO {
         return Err(refuse(
             tx,
             Close::new(

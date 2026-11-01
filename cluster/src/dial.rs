@@ -1,8 +1,7 @@
 //! A member's dial loop for one socket (§3.2): connect, handshake, run the
 //! session; after any close that is not terminal, wait the backoff and dial
-//! again. An admission resets the backoff. 4409 and 4426 stop this socket;
-//! 4410 stops every socket of the app, which the loop reports for its owner
-//! to act on.
+//! again. An admission resets the backoff. 4409 stops this socket; 4410 stops
+//! every socket of the app, which the loop reports for its owner to act on.
 
 use std::future::Future;
 use std::time::Duration;
@@ -32,7 +31,7 @@ pub trait Connect: Send {
 /// Why a dial loop stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stopped {
-    /// This socket stops; the member's others carry on (4409, 4426).
+    /// This socket stops; the member's others carry on (4409).
     Socket(Close),
     /// The app stops on every cluster until the binary is replaced (4410).
     App(Close),
@@ -246,17 +245,22 @@ mod tests {
         assert!(matches!(attempts[7], Attempt::Session(Ended::Dropped)));
     }
 
+    /// A refusal one end's replacement clears is waited out at the cap: a
+    /// member a gateway refused for its protocol is admitted the moment the
+    /// other end moves, with no restart.
     #[tokio::test(start_paused = true)]
-    async fn model_and_skew_refusals_wait_at_the_cap_and_4426_stops_the_socket() {
+    async fn model_skew_and_protocol_refusals_wait_at_the_cap_and_4409_stops_the_socket() {
         let (stopped, gaps, _) = run(vec![
             Gate::Close(CloseCode::Model),
             Gate::Close(CloseCode::Skew),
             Gate::Close(CloseCode::Protocol),
+            Gate::Close(CloseCode::Replaced),
         ])
         .await;
+        assert_eq!(gaps.len(), 3);
         for gap in gaps {
             assert!(gap >= Duration::from_secs(4) && gap <= Duration::from_secs(8));
         }
-        assert!(matches!(stopped, Stopped::Socket(c) if c.code == 4426));
+        assert!(matches!(stopped, Stopped::Socket(c) if c.code == 4409));
     }
 }

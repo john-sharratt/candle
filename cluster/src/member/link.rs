@@ -2,7 +2,7 @@
 //! least one of its sockets is admitted and ready, cut off when none is. At
 //! startup it is neither until every cluster has failed one attempt or it has
 //! been dialling for 10 s — a laptop off the network then serves locally at
-//! once. A terminal refusal (4410, 4426) stops it with the reason.
+//! once. A terminal refusal (4410) stops it with the reason.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
