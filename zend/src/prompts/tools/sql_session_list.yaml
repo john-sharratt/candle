@@ -25,7 +25,7 @@ questions:
 - give me the database session for app.db
 - how many DB connections are live in this conversation
 category: SQL sessions
-description: Enumerate the database sessions currently open in this conversation, with each database path and connection state.
+description: Enumerate the database sessions currently open in this conversation, with each database path and connection state. Use to find a session you opened earlier rather than opening a second one on the same database.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

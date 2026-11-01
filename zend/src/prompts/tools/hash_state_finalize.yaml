@@ -25,7 +25,7 @@ questions:
 - wrap up the multi-part digest and show the hex
 - complete the streaming hash computation
 category: Hash streaming
-description: Conclude a streaming hash computation and emit the final digest over everything absorbed so far, discarding the accumulated state by default.
+description: Conclude a streaming hash computation and emit the final digest over everything absorbed so far, discarding the accumulated state by default. Call it last, after every hash_state_update, and only for a hash begun with hash_state_init.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

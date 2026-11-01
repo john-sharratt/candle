@@ -25,7 +25,7 @@ questions:
 - open an interpreter session for javascript
 - set up a persistent scripting session
 category: Code execution
-description: Open a persistent JavaScript session. Runs in-process on an embedded, sandboxed pure-Rust engine — no Node or external interpreter required. Variable, function, and const definitions persist across code_session_exec calls. Close with code_session_close when done.
+description: Open a persistent JavaScript session. Runs in-process on an embedded, sandboxed pure-Rust engine — no Node or external interpreter required. Variable, function, and const definitions persist across code_session_exec calls. Close with code_session_close when done. Use when several snippets must share state; for one snippet, code_run needs no session. It runs JavaScript only and cannot start a program, so builds and tests go to run_command.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

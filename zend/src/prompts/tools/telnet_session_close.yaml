@@ -25,7 +25,7 @@ questions:
 - close out the telnet session, I'm done configuring
 - shut the Telnet connection down
 category: Telnet sessions
-description: End a Telnet terminal session to a network device, releasing the plaintext terminal connection.
+description: End a Telnet terminal session to a network device, releasing the plaintext terminal connection. Call it when the device work is done, so the device's own session limit is not held.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

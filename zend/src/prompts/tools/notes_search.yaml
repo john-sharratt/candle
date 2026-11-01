@@ -25,7 +25,7 @@ questions:
 - do I have a note that talks about the staging server
 - find notes containing this phrase
 category: Notes
-description: Find stored notes by a content substring or tag match, returning ranked hits with text snippets. Use when the note's exact key is unknown; supply a query, tags, or both.
+description: Find stored notes by a content substring or tag match, returning ranked hits with text snippets. Use when the note's exact key is unknown; supply a query, tags, or both. It searches notes only. Code and files are searched by file_grep and file_search, and your journal by journal_grep.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

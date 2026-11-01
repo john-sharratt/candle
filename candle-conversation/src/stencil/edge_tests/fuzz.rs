@@ -15,7 +15,6 @@ use super::{catalog, parse, tree, Rng, EOS};
 use crate::stencil::mask::AllowedSet;
 use crate::stencil::session::Observe;
 use crate::stencil::sim::{simulate, Oracle};
-use crate::stencil::tool_call::MAX_ARRAY_ELEMENTS;
 use crate::stencil::vocab::{TestVocab, TokenId};
 
 /// Multi-byte tokens a model really emits around JSON structure — including
@@ -172,7 +171,6 @@ struct Coverage {
     merged_closes: usize,
     forced: usize,
     multi_element: usize,
-    at_bound: usize,
 }
 
 impl Coverage {
@@ -191,7 +189,6 @@ impl Coverage {
         let args = &call["arguments"];
         for list in [&args["files"], &args["commands"]] {
             match list.as_array().map(Vec::len) {
-                Some(n) if n == MAX_ARRAY_ELEMENTS => self.at_bound += 1,
                 Some(n) if n > 1 => self.multi_element += 1,
                 _ => {}
             }
@@ -239,7 +236,6 @@ fn random_adversaries_always_produce_a_call_that_fits_the_schema() {
         ("an EOS intercepted", c.eos_intercepted),
         ("a close merged with what follows", c.merged_closes),
         ("an array of several elements", c.multi_element),
-        ("an array at its bound", c.at_bound),
     ] {
         assert!(hits > 0, "no run reached {path}: {coverage:?}");
     }

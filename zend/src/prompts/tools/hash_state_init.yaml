@@ -25,7 +25,7 @@ questions:
 - create a running hash I can add data to
 - start a multi-part digest session
 category: Hash streaming
-description: Begin an incremental, streaming hash computation — data is fed in chunks rather than all at once. Returns a state id for the subsequent hash_state_update and hash_state_finalize calls. Use when the input is too large to hold in memory at once.
+description: Begin an incremental, streaming hash computation — data is fed in chunks rather than all at once. Returns a state id for the subsequent hash_state_update and hash_state_finalize calls. Use when the input is too large to hold in memory at once. When the whole input is in hand, hash_compute does it in one call.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

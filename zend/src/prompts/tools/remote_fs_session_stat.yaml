@@ -25,7 +25,7 @@ questions:
 - get the metadata for the remote file, don't transfer it
 - what are the timestamps on that file over SFTP
 category: Remote filesystem
-description: Retrieve metadata — size, type, permissions, timestamps — for one file or directory on a remote host over SFTP, without transferring contents.
+description: Retrieve metadata — size, type, permissions, timestamps — for one file or directory on a remote host over SFTP, without transferring contents. Use it to check that a path exists or how large it is before fetching it with remote_fs_session_get.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

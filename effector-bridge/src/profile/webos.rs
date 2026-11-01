@@ -5,6 +5,7 @@
 //! reads what is on. Control needs the `client-key` the TV grants on pairing;
 //! the `pair` action obtains it. A TV off the house network is refused.
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 use anyhow::{anyhow, bail, Result};
@@ -201,6 +202,19 @@ fn arg(args: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Pair with the TV: open with no key so it shows its prompt, and on the
+/// person's accept keep the `client-key` it grants. One round trip — the only
+/// interaction is the on-screen accept. The credential is `{ "key": … }`, which
+/// the world stores and the `key` argument later carries back.
+pub async fn pair(address: &str, nets: &[LocalNet]) -> Result<BTreeMap<String, String>> {
+    WebOs::at(address, nets)?;
+    let remote = Remote::open(address, None).await?;
+    let key = remote
+        .client_key()
+        .ok_or_else(|| anyhow!("the TV granted no key"))?;
+    Ok(BTreeMap::from([("key".to_string(), key.to_string())]))
 }
 
 /// Work `action` on the webOS TV `name` at `address`. Control actions read the

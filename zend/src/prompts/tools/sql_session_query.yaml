@@ -25,7 +25,7 @@ questions:
 - query the top 10 customers by revenue
 - delete the stale rows from that table
 category: SQL sessions
-description: Execute a SQL statement in an open session. Returns rows and columns for SELECT; rows_affected and last_insert_rowid for INSERT/UPDATE/DELETE. Supports positional parameters via the params array (? placeholders).
+description: Execute a SQL statement in an open session. Returns rows and columns for SELECT; rows_affected and last_insert_rowid for INSERT/UPDATE/DELETE. Supports positional parameters via the params array (? placeholders). Pass values through `params` rather than writing them into the statement. A statement that changes rows changes them at once, so read first when you are not sure what it will touch.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

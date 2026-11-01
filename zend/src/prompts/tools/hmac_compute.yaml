@@ -25,7 +25,7 @@ questions:
 - calculate the keyed MAC over this data
 - hmac this message using sha1 and the key below
 category: Cryptography
-description: Compute a keyed HMAC authentication tag over a message (sha256, sha512, or sha1). Use to sign API requests or to confirm a message arrived unaltered from a party holding the shared secret key.
+description: Compute a keyed HMAC authentication tag over a message (sha256, sha512, or sha1). Use to sign API requests or to confirm a message arrived unaltered from a party holding the shared secret key. With no key involved, a plain digest is hash_compute. With a public and a private key, it is signature_sign and signature_verify.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

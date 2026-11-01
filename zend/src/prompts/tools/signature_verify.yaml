@@ -25,7 +25,7 @@ questions:
 - check whether this signed message has been altered
 - verify the signature matches the public key and data
 category: Cryptography
-description: Check whether a digital signature over a message was genuinely produced by the holder of a given public key (ed25519 or p256_sha256). Returns whether the signature is authentic.
+description: Check whether a digital signature over a message was genuinely produced by the holder of a given public key (ed25519 or p256_sha256). Returns whether the signature is authentic. Use when you hold the message, the signature and the public key. A failed check means the signature does not match, and repeating it with the same values gives the same answer.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

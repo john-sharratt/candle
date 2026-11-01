@@ -25,7 +25,7 @@ questions:
 - fire off this script on the SSH host in the background
 - run this over ssh async so I can poll it later
 category: SSH sessions
-description: Start a long-running command on a remote SSH session without blocking. Returns process_id; use ssh_session_poll to check status and read output.
+description: Start a long-running command on a remote SSH session without blocking. Returns process_id; use ssh_session_poll to check status and read output. Use for a command that outlasts one call. A short command is simpler with ssh_session_exec.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

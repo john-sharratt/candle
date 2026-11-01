@@ -25,7 +25,7 @@ questions:
 - make the remote directory over sftp
 - set up a new directory on the SFTP server
 category: Remote filesystem
-description: Create a new directory on a remote host's filesystem over SFTP.
+description: Create a new directory on a remote host's filesystem over SFTP, in an open remote_fs_session_open session. A repository needs no such step, because write makes the folders a file's path names.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

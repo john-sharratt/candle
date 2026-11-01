@@ -25,7 +25,7 @@ questions:
 - give me a remote-fs session on that server
 - connect over SFTP to move files around
 category: Remote filesystem
-description: 'Open a remote filesystem session via URI. Only sftp:// is supported (e.g. sftp://user@host:22/base/path). Requires an ssh_key or ssh_password credential. Operations: list_dir, stat, get (→ VFS), put (← VFS), delete, mkdir, rename. Use ssh_session_exec for arbitrary remote commands.'
+description: 'Open a remote filesystem session via URI. Only sftp:// is supported (e.g. sftp://user@host:22/base/path). Requires an ssh_key or ssh_password credential. Operations: list_dir, stat, get (→ VFS), put (← VFS), delete, mkdir, rename. Use ssh_session_exec for arbitrary remote commands. This is for a machine reached over SFTP: the files of a repository are read with file_read and changed with file_edit, never through here.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

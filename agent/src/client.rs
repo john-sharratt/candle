@@ -658,6 +658,14 @@ fn refused(e: JobError) -> AgentError {
 /// every cluster, whose house is reached through the agent in its own process.
 async fn bridge_in_process(call: &BridgeCall) -> Bridged {
     let nets = effector_bridge::nets();
+    if let BridgeCall::Pair {
+        profile,
+        address,
+        code,
+    } = call
+    {
+        return crate::routes::pair(profile, address, code.clone(), &nets).await;
+    }
     let worked = match call {
         BridgeCall::Work {
             profile,
@@ -667,12 +675,18 @@ async fn bridge_in_process(call: &BridgeCall) -> Bridged {
             args,
         } => effector_bridge::work(profile, name, address, action, args, &nets).await,
         BridgeCall::Wake { name, mac } => effector_bridge::wake(name, mac, &nets),
+        BridgeCall::Pair { .. } => unreachable!("pairing is handled above"),
     };
     match worked {
-        Ok(line) => Bridged { ok: true, line },
+        Ok(line) => Bridged {
+            ok: true,
+            line,
+            creds: Default::default(),
+        },
         Err(e) => Bridged {
             ok: false,
             line: e.to_string(),
+            creds: Default::default(),
         },
     }
 }

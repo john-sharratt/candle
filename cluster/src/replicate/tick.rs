@@ -3,12 +3,14 @@
 //! the periodic catch-up while a socket is down, catch-ups whose answerer went
 //! quiet, and cutting off when no socket is left.
 
+use std::future::Future;
 use std::mem::replace;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use applied_set::AppliedSet;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use super::catchup::Purpose;
 use super::replicator::{Phase, Replicator};
@@ -22,8 +24,30 @@ const TICK: Duration = Duration::from_millis(100);
 /// How often the slower work runs.
 const SECOND: Duration = Duration::from_secs(1);
 
+/// A step of the slower work taking this long is logged, and again each time
+/// this passes while it still waits.
+const STEP_WATCH: Duration = Duration::from_secs(30);
+
 /// A catch-up whose answerer has said nothing for this long is asked again.
 pub const QUIET: Duration = Duration::from_secs(30);
+
+/// Run `step`, saying so while it has not finished. Everything after a step
+/// waits on it: a tick that stopped left a gap catch-up silent for an hour,
+/// never dropped, with the log saying nothing about where it stood.
+async fn watched<F: Future>(step: &'static str, fut: F) -> F::Output {
+    let started = Instant::now();
+    let mut fut = pin!(fut);
+    loop {
+        match timeout(STEP_WATCH, &mut fut).await {
+            Ok(out) => return out,
+            Err(_) => tracing::warn!(
+                step,
+                waited_s = started.elapsed().as_secs(),
+                "the replicator's tick is waiting on a step: nothing after it runs"
+            ),
+        }
+    }
+}
 
 /// Unanswered admission catch-ups after which a socket is taken as caught up.
 ///
@@ -104,11 +128,11 @@ impl Replicator {
     }
 
     async fn second(self: &Arc<Self>) {
-        self.check_disk().await;
-        self.send_coord().await;
-        self.cut_off_if_alone().await;
-        self.refresh_group().await;
-        self.mark_joined().await;
+        watched("check_disk", self.check_disk()).await;
+        watched("send_coord", self.send_coord()).await;
+        watched("cut_off_if_alone", self.cut_off_if_alone()).await;
+        watched("refresh_group", self.refresh_group()).await;
+        watched("mark_joined", self.mark_joined()).await;
         self.note_load();
         // In fault mode a member applies nothing, so it acknowledges nothing
         // and asks for nothing; leaving starts its catch-ups (§7.7).
@@ -117,7 +141,7 @@ impl Replicator {
         }
         let store = self.store.clone();
         let read = tokio::task::spawn_blocking(move || (store.applied(), store.own_through()));
-        let Ok((applied, own_through)) = read.await else {
+        let Ok((applied, own_through)) = watched("applied", read).await else {
             return;
         };
         let now = Instant::now();

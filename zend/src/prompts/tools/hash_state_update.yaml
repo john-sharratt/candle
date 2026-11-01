@@ -25,7 +25,7 @@ questions:
 - append this chunk to the in-progress hash
 - update the streaming hash with this piece
 category: Hash streaming
-description: Absorb another chunk of data into an in-progress streaming hash computation. Call repeatedly to feed a large input piece by piece before hash_state_finalize emits the digest.
+description: Absorb another chunk of data into an in-progress streaming hash computation. Call repeatedly to feed a large input piece by piece before hash_state_finalize emits the digest. Takes the state id hash_state_init returned, and the pieces must arrive in order, because the digest depends on it.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

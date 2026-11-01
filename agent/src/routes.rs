@@ -20,7 +20,8 @@
 //! [`AgentJobs`]: crate::wire::AgentJobs
 //! [`LogChunk`]: crate::wire::LogChunk
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -33,8 +34,12 @@ use axum::{Json, Router};
 use cluster::dispatch::{Dispatch, KeySource, Route, RouteTable};
 use cluster::gateway::LINEAGE_HEADER;
 use cluster::member::FROM_MEMBER;
+use effector_bridge::profile::{androidtv, webos};
+use effector_bridge::proto::androidtv::Pairing;
+use effector_bridge::LocalNet;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::jobs::{JobError, Jobs};
 use crate::wire::{BridgeCall, Bridged, Submit, Switching};
@@ -204,6 +209,14 @@ async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Respons
         return failed(JobError::Disabled);
     }
     let nets = effector_bridge::nets();
+    if let BridgeCall::Pair {
+        profile,
+        address,
+        code,
+    } = call
+    {
+        return Json(pair(&profile, &address, code, &nets).await).into_response();
+    }
     let worked = match call {
         BridgeCall::Work {
             profile,
@@ -213,15 +226,75 @@ async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Respons
             args,
         } => effector_bridge::work(&profile, &name, &address, &action, &args, &nets).await,
         BridgeCall::Wake { name, mac } => effector_bridge::wake(&name, &mac, &nets),
+        BridgeCall::Pair { .. } => unreachable!("pairing is handled above"),
     };
     let bridged = match worked {
-        Ok(line) => Bridged { ok: true, line },
+        Ok(line) => Bridged {
+            ok: true,
+            line,
+            creds: Default::default(),
+        },
         Err(e) => Bridged {
             ok: false,
             line: e.to_string(),
+            creds: Default::default(),
         },
     };
     Json(bridged).into_response()
+}
+
+/// Android TV pairing sessions held open between the code appearing on the TV
+/// and that code coming back, keyed by the TV's address. The session carries a
+/// live TLS connection, so it lives on the agent that started it.
+fn pairings() -> &'static Mutex<HashMap<String, Pairing>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Pairing>>> = OnceLock::new();
+    SESSIONS.get_or_init(Default::default)
+}
+
+/// Pair with a device and hand back the credentials to keep. webOS pairs in one
+/// call (the person accepts on the TV). An Android TV takes two: no `code`
+/// starts it and holds the session while the TV shows a code; the `code` then
+/// finishes it.
+pub(crate) async fn pair(
+    profile: &str,
+    address: &str,
+    code: Option<String>,
+    nets: &[LocalNet],
+) -> Bridged {
+    let refused = |line: String| Bridged {
+        ok: false,
+        line,
+        creds: Default::default(),
+    };
+    let done: anyhow::Result<Bridged> = async {
+        match (profile, code) {
+            ("webos", _) => Ok(Bridged {
+                ok: true,
+                line: "Paired with the webOS TV.".into(),
+                creds: webos::pair(address, nets).await?,
+            }),
+            ("androidtv", None) => {
+                let session = androidtv::pair_start(address, nets, "effector-bridge").await?;
+                pairings().lock().await.insert(address.to_string(), session);
+                Ok(refused(
+                    "The TV is showing a six-digit code. Pair again with that code.".into(),
+                ))
+            }
+            ("androidtv", Some(code)) => match pairings().lock().await.remove(address) {
+                Some(session) => Ok(Bridged {
+                    ok: true,
+                    line: "Paired with the Google TV.".into(),
+                    creds: androidtv::creds_of(&session.finish(&code).await?),
+                }),
+                None => Ok(refused(
+                    "No pairing is in progress for that TV — start one first.".into(),
+                )),
+            },
+            (other, _) => Ok(refused(format!("There is no pairing for a {other}."))),
+        }
+    }
+    .await;
+    done.unwrap_or_else(|e| refused(e.to_string()))
 }
 
 async fn switch(State(api): State<Api>, Json(to): Json<Switching>) -> Response {

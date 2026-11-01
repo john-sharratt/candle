@@ -25,7 +25,7 @@ questions:
 - give me the UDP session pointed at the DNS server
 - list the connectionless sockets I have open
 category: UDP sessions
-description: Enumerate the UDP datagram sockets currently bound in this conversation, with each default peer.
+description: Enumerate the UDP datagram sockets currently bound in this conversation, with each default peer. Use to find a session_id you opened earlier with udp_session_open.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

@@ -25,7 +25,7 @@ questions:
 - retrieve the contents of that stored note by key
 - give me everything in the note keyed project-brief
 category: Notes
-description: Retrieve the full body content of one stored note by its exact key. Notes persist across conversations.
+description: Retrieve the full body content of one stored note by its exact key. Notes persist across conversations. Use when you know the key; notes_list and notes_search find one when you do not. Notes are a store of their own, separate from your journal and from the files of a repository, which file_read reads.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:

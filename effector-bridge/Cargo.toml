@@ -27,6 +27,16 @@ tokio-native-tls = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util      = "0.3"
 base64            = "0.22"
+# A Google TV speaks the Android TV Remote v2 protocol — mutual TLS with a
+# generated RSA client certificate, a PIN-pairing handshake whose secret hashes
+# both certs' RSA modulus/exponent, and protobuf messages. The protocol mandates
+# RSA, which ring cannot generate, so the pure-Rust rsa crate makes the key,
+# rcgen wraps it in a self-signed cert, and x509-parser reads the TV's cert.
+rsa          = "0.9"
+rand         = "0.8"
+rcgen        = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+x509-parser  = "0.18"
+sha2         = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

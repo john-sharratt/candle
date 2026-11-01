@@ -9,7 +9,7 @@
 //! reporting — is the acts in [`crate::engine::mission_acts`], performed at the
 //! desk.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -289,6 +289,113 @@ pub async fn bridge(
         Ok(b) => Json(json!({ "ok": b.ok, "line": b.line })).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
     }
+}
+
+/// What a device-metadata write names and sets.
+#[derive(serde::Deserialize)]
+pub struct DeviceBody {
+    /// The world the device stands in.
+    pub world: String,
+    /// The device's network address — how the part standing for it is found.
+    pub address: String,
+    /// Notes to set, replacing what was there.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Credentials to merge in — a webOS key, an Android TV cert and key, a token.
+    #[serde(default)]
+    pub creds: BTreeMap<String, String>,
+}
+
+/// `POST /v1/pulse/device` — set a device's notes and credentials on the world
+/// part standing for it (`docs/zen_moon_mind.md` §15). The admin onboarding
+/// path: the metadata lives on the world, replicated, and is folded into every
+/// effector command so the stateless agent is handed what it needs. Admin.
+pub async fn device(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<DeviceBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("the device metadata");
+    };
+    let op = WorldOp::AmendDevice {
+        address: body.address,
+        notes: body.notes,
+        creds: body.creds,
+    };
+    match rt.world_write(&body.world, op).await {
+        Ok(OpReply::Done { ok: true }) => Json(json!({ "ok": true })).into_response(),
+        Ok(_) => err(
+            StatusCode::NOT_FOUND,
+            "no_device",
+            "no device in that world stands at that address",
+        ),
+        Err(e) => world_unreached(&e),
+    }
+}
+
+/// What a pairing request names.
+#[derive(serde::Deserialize)]
+pub struct PairBody {
+    /// The world the device stands in.
+    pub world: String,
+    /// The device's bridge profile — `webos`, `androidtv`.
+    pub profile: String,
+    /// The device's network address.
+    pub address: String,
+    /// The code shown on the TV, on the second call of an Android TV pairing.
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// `POST /v1/pulse/pair` — pair with a device through an in-network agent and
+/// keep the credentials it grants on its world part (`docs/zen_moon_mind.md`
+/// §15), the onboarding step. webOS pairs in one call (accept the prompt on the
+/// TV); an Android TV takes two — the first shows a code on the TV, the second
+/// carries that `code`. Admin.
+pub async fn pair(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<PairBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("pairing");
+    };
+    let Some(agents) = rt.agents() else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_agent",
+            "no agent in the house to pair",
+        );
+    };
+    let call = BridgeCall::Pair {
+        profile: body.profile,
+        address: body.address.clone(),
+        code: body.code,
+    };
+    let bridged = match agents.bridge(&call).await {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, "agent", &e.to_string()),
+    };
+    // Credentials earned — keep them on the device's world part so every later
+    // command carries them and the agent never has to.
+    if bridged.ok && !bridged.creds.is_empty() {
+        let op = WorldOp::AmendDevice {
+            address: body.address,
+            notes: None,
+            creds: bridged.creds,
+        };
+        if let Err(e) = rt.world_write(&body.world, op).await {
+            return world_unreached(&e);
+        }
+    }
+    Json(json!({ "ok": bridged.ok, "line": bridged.line })).into_response()
 }
 
 /// `POST /v1/pulse/command-table` — open or shut the command table.

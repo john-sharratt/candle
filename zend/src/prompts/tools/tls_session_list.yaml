@@ -25,7 +25,7 @@ questions:
 - give me the TLS session for the LDAPS host
 - list the encrypted sockets in this conversation
 category: TLS sessions
-description: Enumerate the TLS-encrypted connections currently open in this conversation, with each peer host and certificate identity.
+description: Enumerate the TLS-encrypted connections currently open in this conversation, with each peer host and certificate identity. Use to find a session_id you opened earlier with tls_session_open.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
