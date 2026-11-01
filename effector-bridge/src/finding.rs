@@ -15,6 +15,8 @@ pub const SONOS: &str = "sonos";
 pub const CAST: &str = "cast";
 /// An LG webOS TV ([`crate::profile::webos`]).
 pub const WEBOS: &str = "webos";
+/// A Google TV / Android TV ([`crate::profile::androidtv`]).
+pub const ANDROIDTV: &str = "androidtv";
 /// A UPnP MediaRenderer: a TV or player with AVTransport and RenderingControl.
 pub const RENDERER: &str = "renderer";
 /// A Pioneer or Onkyo AV receiver ([`crate::profile::receiver`]).
@@ -101,6 +103,7 @@ pub fn reach(profile: &str) -> &'static str {
         RECEIVER => "the world can work it (an AV receiver)",
         CAST => "the world can work it (a Cast device)",
         WEBOS => "the world can work it (an LG webOS TV)",
+        ANDROIDTV => "the world can work it (a Google TV)",
         RENDERER => "the world can see it (a media player)",
         GATEWAY => "the world can see it (the router)",
         AIRPLAY => "the world can see it (AirPlay)",
@@ -113,7 +116,7 @@ pub fn reach(profile: &str) -> &'static str {
 /// Whether a part linked with `profile` has acts the world can take at it —
 /// what makes it a terminal rather than a thing merely seen.
 pub fn workable(profile: &str) -> bool {
-    matches!(profile, SONOS | RECEIVER | CAST | WEBOS)
+    matches!(profile, SONOS | RECEIVER | CAST | WEBOS | ANDROIDTV)
 }
 
 /// The profile that reaches a device saying what `f` says.
@@ -136,6 +139,10 @@ pub fn profile_of(f: &Finding) -> &'static str {
         SONOS
     } else if said(&["pioneer", "onkyo"]) {
         RECEIVER
+    } else if said(&["androidtvremote", "android tv", "google tv"]) {
+        // A Google TV also announces Cast; the remote protocol drives it more
+        // fully, so it is matched first.
+        ANDROIDTV
     } else if said(&["googlecast", "google cast"]) {
         CAST
     } else if said(&["webos", "lge-com", "lg smart tv"]) {
@@ -217,6 +224,15 @@ mod tests {
             )),
             WEBOS
         );
+        // A Google TV announces both the remote protocol and Cast; the remote wins.
+        assert_eq!(
+            profile_of(&with(
+                &["_androidtvremote2._tcp.local", "_googlecast._tcp.local"],
+                "Google Inc.",
+                "Chromecast"
+            )),
+            ANDROIDTV
+        );
         assert_eq!(
             profile_of(&with(
                 &["urn:schemas-upnp-org:device:MediaRenderer:1"],
@@ -253,7 +269,7 @@ mod tests {
 
     #[test]
     fn only_a_workable_profile_is_a_terminal() {
-        for p in [SONOS, RECEIVER, CAST, WEBOS] {
+        for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV] {
             assert!(workable(p), "{p} should be workable");
         }
         for p in [RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {

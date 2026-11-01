@@ -8,8 +8,8 @@
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 
-use crate::finding::{CAST, RECEIVER, SONOS, WEBOS};
-use crate::profile::{cast, receiver, sonos, webos};
+use crate::finding::{ANDROIDTV, CAST, RECEIVER, SONOS, WEBOS};
+use crate::profile::{androidtv, cast, receiver, sonos, webos};
 use crate::proto::udp::{self, WAKE_PORT};
 use crate::scope::LocalNet;
 
@@ -17,7 +17,7 @@ use crate::scope::LocalNet;
 /// profile and the action — `sonos_play` → (`sonos`, `play`). `None` for any
 /// other tool, including the cross-device `wake_device` and the survey.
 pub fn profile_act(tool: &str) -> Option<(&'static str, &str)> {
-    for p in [SONOS, RECEIVER, CAST, WEBOS] {
+    for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV] {
         if let Some(action) = tool.strip_prefix(&format!("{p}_")) {
             return Some((p, action));
         }
@@ -41,6 +41,7 @@ pub async fn work(
         RECEIVER => receiver::work(name, address, action, args, nets).await,
         CAST => cast::work(name, address, action, args, nets).await,
         WEBOS => webos::work(name, address, action, args, nets).await,
+        ANDROIDTV => androidtv::work(name, address, action, args, nets).await,
         other => bail!("the world has no way to work a {other}"),
     }
 }
