@@ -19,6 +19,9 @@ use serde::Serialize;
 /// Lines in one page of a job's output.
 pub const PAGE_LINES: usize = 200;
 
+/// Lines of the end of a job's output a run's result carries.
+pub const END_LINES: usize = 60;
+
 /// Characters of one line shown before it is cut.
 pub const MAX_LINE_CHARS: usize = 500;
 
@@ -46,6 +49,38 @@ pub struct LogPage {
 pub fn read(path: &Path, page: usize) -> io::Result<LogPage> {
     let bytes = std::fs::read(path)?;
     Ok(of(&String::from_utf8_lossy(&bytes), page))
+}
+
+/// The end of the log at `path`, when it runs past the first page.
+pub fn read_end(path: &Path) -> io::Result<Option<LogPage>> {
+    let bytes = std::fs::read(path)?;
+    Ok(end_of(&String::from_utf8_lossy(&bytes)))
+}
+
+/// The last [`END_LINES`] lines of `log` past its first page: where a run's
+/// failures and its summary are, and what a reader of page 1 asks for next.
+/// `None` when the first page already holds them all.
+pub fn end_of(log: &str) -> Option<LogPage> {
+    let plain = ANSI.replace_all(log, "");
+    let lines: Vec<&str> = plain.lines().collect();
+    let total_lines = lines.len();
+    if total_lines <= PAGE_LINES {
+        return None;
+    }
+    let start = total_lines.saturating_sub(END_LINES).max(PAGE_LINES);
+    let pages = total_lines.div_ceil(PAGE_LINES);
+    Some(LogPage {
+        page: pages,
+        pages,
+        first_line: start + 1,
+        last_line: total_lines,
+        total_lines,
+        text: lines[start..]
+            .iter()
+            .map(|line| clip(line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
 }
 
 /// Page `page` (from 1) of `log`, clamped into range.
@@ -113,6 +148,19 @@ mod tests {
     }
 
     /// A page past the end is the last page, never an empty one.
+    /// **A run's end comes back with its start**: the last lines past the first
+    /// page, never overlapping it, and nothing when the first page holds it all.
+    #[test]
+    fn the_end_of_a_log_is_its_last_lines_past_the_first_page() {
+        assert_eq!(end_of(&numbered(200)), None);
+        let short = end_of(&numbered(230)).unwrap();
+        assert_eq!((short.first_line, short.last_line), (201, 230));
+        let long = end_of(&numbered(450)).unwrap();
+        assert_eq!((long.first_line, long.last_line), (391, 450));
+        assert_eq!((long.page, long.pages, long.total_lines), (3, 3, 450));
+        assert_eq!(long.text.lines().count(), END_LINES);
+    }
+
     #[test]
     fn a_page_past_the_end_is_the_last() {
         let page = of(&numbered(250), 9);
