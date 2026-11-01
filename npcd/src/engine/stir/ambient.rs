@@ -24,6 +24,16 @@
 //! actually in*. The conditional pools are consulted first and the general pool
 //! carries the rest.
 //!
+//! # Every line carries its own ordinary cause
+//!
+//! A remark that leaves its cause out — a door opening with nobody coming
+//! through, a chair turning on its own, a smell with no source — reads as
+//! something unseen in the room, and a character hearing a few of those in a
+//! row stops working and starts hunting for it. So no line here leaves its
+//! cause to the imagination: the door opens because somebody goes through it,
+//! the chair settles because it was pushed back in a hurry. The building is
+//! dull company on purpose.
+//!
 //! # And it deals from a bag
 //!
 //! Same reasoning as [`crate::engine::stir::broadcast`]: drawing at random from
@@ -39,11 +49,11 @@ const IDLE: &[&str] = &[
     // Machines and electronics, at rest.
     "A cabinet fan somewhere under the bench changes speed and settles.",
     "A terminal on the side bench scrolls two lines of log and stops.",
-    "The screen on the wall panel wakes at nothing and dims itself again.",
+    "The screen on the wall panel wakes for its scheduled check and dims itself again.",
     "A hard drive in the rack chatters briefly and goes quiet.",
     "An indicator on a junction box blinks twice, amber, and returns to green.",
     "A power brick under the desk gives off a faint whine that comes and goes.",
-    "The keyboard on the bench terminal has one key lit that should not be.",
+    "The keyboard on the bench terminal still has the caps-lock key lit from whoever used it last.",
     "A cable reel on the wall unwinds a quarter turn under its own weight.",
     "The printer in the corner draws in a sheet, thinks about it, and gives it back.",
     "A monitor in the next bay flickers through its self-test and settles.",
@@ -56,7 +66,7 @@ const IDLE: &[&str] = &[
     "Two indicator lights on the far wall come into step and drift apart again.",
     "A tape drive in the corner spools, stops, and spools the other way.",
     // Doors, hatches, floors, walls.
-    "A door two rooms away opens and closes without anybody coming through.",
+    "A door two rooms away opens and closes as somebody goes through it.",
     "The floor plate by the doorway rocks a fraction when weight comes off it.",
     "A hatch cover settles against its frame with a soft metallic knock.",
     "A door somewhere down the corridor sighs as the pressure on the two sides of it evens out.",
@@ -64,13 +74,13 @@ const IDLE: &[&str] = &[
     "The threshold strip at the door has worked loose at one end.",
     "A handrail somewhere takes a knock and rings for a moment.",
     "The floor grating gives its usual note under a shift of weight.",
-    "A door catch releases on its own and the door stands an inch open.",
+    "A door catch that never quite seats lets the door rest an inch open.",
     "Dust comes off the top of the door frame in a thin line.",
     "The rubber on the doorway seal has taken a set and no longer sits flat.",
     "The lift shaft ticks somewhere behind the wall as the car settles.",
     // Pipes, ducts, and the fabric.
     "A pipe behind the wall carries a knock along its length and away.",
-    "Something in the ductwork overhead shifts and is quiet again.",
+    "The ductwork overhead ticks as the air in it warms.",
     "The lagging on an overhead run creaks as it cools.",
     "A bracket somewhere in the ceiling void takes up a fraction of slack.",
     "Water moves in a pipe overhead, briefly, going somewhere else.",
@@ -80,17 +90,17 @@ const IDLE: &[&str] = &[
     "Somewhere above the ceiling a valve closes and the flow stops.",
     "The trunking along the skirting has come away from the wall at one clip.",
     // Objects, furniture, paper.
-    "A stack of printed pages slides an inch across the bench and stops.",
+    "A stack of printed pages, set down crooked, slides an inch across the bench and stops.",
     "Somebody's mug on the far bench has gone cold and left a ring.",
     "A pen rolls to the edge of the table and does not go over.",
-    "The chair at the terminal turns a few degrees on its own.",
+    "The chair at the terminal, pushed back in a hurry, settles a few degrees round.",
     "A drawer that was not closed properly slides open an inch.",
     "A clipboard slips off its hook and swings on the lanyard.",
     "The corner of a wall notice has come unstuck and curls forward.",
     "A tool left on the bench edge shifts and settles into the groove.",
     "A cardboard box on the floor gives up a fold and sags.",
     "Loose change or washers rattle in a tray as something passes.",
-    "A folded chart on the side table opens itself out one crease.",
+    "A folded chart on the side table relaxes open along one crease.",
     "The label on a bin has faded to the point of saying nothing.",
     "A roll of tape unsticks a turn of itself with a small tearing sound.",
     "Somebody's jacket on the back of the chair slides down another inch.",
@@ -102,20 +112,20 @@ const IDLE: &[&str] = &[
     "Footsteps cross the ceiling overhead, unhurried, from one side to the other.",
     "A trolley goes along a corridor somewhere with one bad wheel.",
     "Something heavy is set down on the level above and the floor registers it.",
-    "A door slams two levels down and the sound comes up the shaft.",
+    "A door shuts two levels down and the sound comes up the shaft.",
     "The lift moves in its shaft without stopping at this level.",
     "Somebody whistles four notes in the corridor and stops.",
-    "A voice on another level calls a name and gets no answer anybody can hear.",
+    "A voice on another level calls a name, and somebody calls back.",
     "Machinery starts up somewhere far off and settles into a steady note.",
     "The lift shaft carries a scrape of the car's cable somewhere overhead.",
     "Two sets of footsteps go past the door in step and then out of it.",
     "A tool is dropped on a hard floor somewhere below and bounces twice.",
     "Somebody swears quietly on the other side of the wall.",
-    "The lift doors open on an empty landing and close again.",
+    "The lift doors open, somebody steps out with a box of parts, and they close again.",
     // Small mechanical events.
     "A spring-loaded catch somewhere lets go with a flat snap.",
-    "Something small and metal drops onto the floor and rolls under a bench.",
-    "A castor on the trolley turns itself to face the other way.",
+    "A washer drops off the edge of the bench and rolls under it.",
+    "A castor on the trolley swivels round as the trolley settles.",
     "A latch rattles in its keeper as the pressure shifts.",
     "The bench vice handle swings down against the jaw with a clank.",
     "A magnetic strip on the wall gives up one of its tools.",
@@ -130,16 +140,16 @@ const IDLE: &[&str] = &[
     "The temperature in the room has gone up a degree without any announcement.",
     "A warm current comes off the back of the rack and rises past the light.",
     "The air near the door is noticeably fresher than the air by the wall.",
-    "A smell of hot plastic comes and goes with no source anybody could point at.",
+    "A charger on the bench gives off the faint warm smell chargers do.",
     // Light and the look of things.
-    "The light off the wall panel puts a moving shape on the ceiling.",
-    "A reflection crosses the dark half of a screen and is gone.",
+    "The wall panel's display puts a soft patch of colour on the ceiling.",
+    "The dark half of a screen reflects the light fitting overhead.",
     "Dust turns slowly in the light coming off the ceiling fitting.",
-    "The shadow under the bench moves as something overhead changes brightness.",
+    "The light overhead brightens a touch as the fitting warms up.",
     "A bright spot on the floor shifts an inch as a fitting settles.",
     "The polished edge of the bench throws a line of light along the wall.",
-    "Everything in the room takes on a slightly greener cast for a moment.",
-    "A screen behind the bench goes to black and shows the room reflected in it.",
+    "The light in the room warms a shade as the fittings follow the hour.",
+    "A screen behind the bench goes to its sleep screen, a slow clock.",
 ];
 
 /// Cold enough to be worth a remark.
@@ -157,13 +167,13 @@ const COLD: &[&str] = &[
 
 /// Dark enough to change what the room looks like.
 const DARK: &[&str] = &[
-    "The indicator lights on the rack are suddenly the brightest thing in the room.",
-    "Shapes at the far end of the room have stopped being distinct from each other.",
+    "The indicator lights on the rack are the brightest thing in the room while the lights are down.",
+    "The far end of the room is hard to make out until the lights come back.",
     "A screen's glow is doing all the work of lighting the bench.",
-    "The doorway is a lighter rectangle in a wall that has otherwise gone flat.",
-    "Everything in the room has lost its colour and kept its outline.",
-    "A reflection on the far wall is the only way of telling where the wall is.",
-    "The gloom at the back of the room has swallowed the shelving entirely.",
+    "The doorway is a lighter rectangle, lit from the corridor.",
+    "The room has gone dim and grey, like a workshop after hours.",
+    "The light from the corridor shows where the far wall is.",
+    "The shelving at the back of the room is in shadow until the lights come back.",
 ];
 
 /// Damp enough to be in the air.
@@ -191,8 +201,8 @@ const WORKING: &[&str] = &[
 const QUIET: &[&str] = &[
     "The room is quiet enough that the hum of the light is audible.",
     "A clock or a counter somewhere is ticking, and has been for some time.",
-    "The quiet in the room has got deep enough to have a texture.",
-    "Every small sound in the room is arriving with its echo attached.",
+    "The room is pleasantly quiet.",
+    "Small sounds carry in the quiet of the room.",
     "The loudest thing in the room is the air moving past the door frame.",
 ];
 

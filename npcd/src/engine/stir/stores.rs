@@ -119,12 +119,12 @@ impl Fixture for Stores {
             }
             (_, _, 3) => "A stack of crates in the stores settles half an inch and stops.",
             (_, _, 4) => {
-                "The stores door swings a few degrees on its own and comes to rest \
-                          against the stop."
+                "The stores door, never quite latched, swings a few degrees in the \
+                          draught and comes to rest against the stop."
             }
             (_, _, 5) => {
-                "Something rolls off a shelf in the stores and comes to a halt on the \
-                          floor."
+                "A tin of fasteners rolls off a shelf in the stores and comes to a halt on \
+                          the floor."
             }
             (_, _, 6) => "A label peels away from a crate in the stores and drops.",
             (_, _, 7) => {

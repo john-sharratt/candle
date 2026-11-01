@@ -657,17 +657,16 @@ mod tests {
         assert_eq!(seen.len(), 1);
     }
 
-    /// **What is published and an audit's walk need no owner.** The owner is
-    /// held for the whole test by a call that waits for them to finish: on the
-    /// queue, either would wait for the other for ever. This is what stopped a
-    /// member's upgrades and replication for the length of an audit.
+    /// **What is published, an audit's plan and its walk need no owner.** The
+    /// owner is held for the whole test by a call that waits for them to
+    /// finish: on the queue, any of them would wait for the other for ever.
+    /// This is what stopped a member's upgrades and replication for the length
+    /// of an audit, and every write behind a maintenance plan's scan.
     #[test]
-    fn status_and_an_audit_walk_go_on_while_the_owner_is_held() {
+    fn status_and_an_audit_go_on_while_the_owner_is_held() {
         let (_dir, owner, substrate) = owner();
-        let plan = {
-            let view = substrate.read();
-            owner.call_behind(|p| p.liveness_audit_plan(&view))
-        };
+        let view = substrate.read();
+        let (indexes, at) = owner.call_behind(|p| (p.live_indexes(), p.audit_segments()));
         let (entered, held) = channel::bounded(1);
         let (release, finish) = channel::bounded::<()>(1);
         let holder = {
@@ -685,9 +684,11 @@ mod tests {
             assert!(!facts.out_of_space());
             let _ = facts.held_record_tags();
             assert_eq!(facts.dead_ratio(), None);
-            plan.walk().unwrap().gone
+            let live: u64 = indexes.segment_liveness(&view).values().sum();
+            let gone = indexes.liveness_audit_plan(&view, at).walk().unwrap().gone;
+            (live, gone)
         });
-        let gone = worker.join().unwrap();
+        let (_live, gone) = worker.join().unwrap();
         assert!(gone.is_empty());
         release.send(()).unwrap();
         holder.join().unwrap();

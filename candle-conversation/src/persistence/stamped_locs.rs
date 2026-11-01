@@ -11,24 +11,27 @@
 //! A key can hold a **withdrawn** value — a snapshot retraction, which is a
 //! record and outranks what it withdraws, but names no location. It reads as
 //! absent, and still refuses any older record offered after it.
+//!
+//! A persistent map, so a clone is O(1): maintenance plans against a clone
+//! taken on the log's owner and scans it on its own thread
+//! (`docs/substrate_lock_free.md` §9.5).
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::hash::Hash;
 
 use super::identity::{RecordIdentity, Stamped};
 use super::manifest::RecordLoc;
+use crate::substrate::pcoll::PMap;
 
 /// See the module docs.
 #[derive(Clone, Debug)]
-pub struct StampedLocs<K> {
-    map: HashMap<K, Stamped<Option<RecordLoc>>>,
+pub struct StampedLocs<K: Hash + Eq + Clone> {
+    map: PMap<K, Stamped<Option<RecordLoc>>>,
 }
 
-impl<K> Default for StampedLocs<K> {
+impl<K: Hash + Eq + Clone> Default for StampedLocs<K> {
     fn default() -> Self {
         StampedLocs {
-            map: HashMap::new(),
+            map: PMap::default(),
         }
     }
 }
@@ -42,17 +45,12 @@ impl<K: Hash + Eq + Copy> StampedLocs<K> {
     /// It is taken when it supersedes what the key holds; answers whether it
     /// was.
     pub fn offer(&mut self, key: K, loc: Option<RecordLoc>, id: RecordIdentity) -> bool {
-        match self.map.entry(key) {
-            Entry::Occupied(mut e) => {
-                if !id.supersedes(&e.get().id) {
-                    return false;
-                }
-                e.insert(Stamped { value: loc, id });
-            }
-            Entry::Vacant(e) => {
-                e.insert(Stamped { value: loc, id });
+        if let Some(held) = self.map.get(&key) {
+            if !id.supersedes(&held.id) {
+                return false;
             }
         }
+        self.map.insert(key, Stamped { value: loc, id });
         true
     }
 
@@ -94,6 +92,15 @@ impl<K: Hash + Eq + Copy> StampedLocs<K> {
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &RecordLoc) -> bool) {
         self.map
             .retain(|k, s| s.value.as_ref().is_none_or(|loc| keep(k, loc)));
+    }
+
+    /// How many keys are held, withdrawn ones included.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn clear(&mut self) {

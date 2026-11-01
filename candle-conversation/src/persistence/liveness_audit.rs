@@ -18,9 +18,11 @@
 //! segment and record type. It reads; it writes nothing.
 //!
 //! **Two halves, because the walk is as long as the disk is slow.** What the
-//! count and the carry say comes from the log's indexes, so
-//! [`SubstratePersistence::liveness_audit_plan`] takes it on the log's owner.
-//! [`AuditPlan::walk`] then needs only the files, and runs anywhere. A sealed
+//! count and the carry say comes from the log's indexes, so the owner hands
+//! them over ([`LiveIndexes`], with [`SubstratePersistence::audit_segments`])
+//! in one short call and [`LiveIndexes::liveness_audit_plan`] reads them on the
+//! caller's thread. [`AuditPlan::walk`] then needs only the files, and runs
+//! anywhere. A sealed
 //! segment never changes, and the active one is read to the commit the plan saw,
 //! so the walk meets the log as the plan left it; a segment maintenance unlinks
 //! before the walk reaches it is reported in [`LivenessAudit::gone`].
@@ -30,6 +32,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use super::identity::RecordIdentity;
+use super::live_indexes::LiveIndexes;
 use super::log_file::{LogFile, LogSource, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{decode_conv_state_payload, decode_label_payload};
@@ -224,24 +227,51 @@ pub struct AuditPlan {
     emitted: HashSet<ResidentKey>,
 }
 
+/// The segments an audit walks and where the active one's commit ends, as
+/// they stood when its indexes were taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditSegments {
+    pub sealed: Vec<SegmentId>,
+    pub active: SegmentId,
+    pub active_end: u64,
+}
+
 impl SubstratePersistence {
     /// Audit the liveness count against the carry over every segment. Read-only.
     pub fn liveness_audit(&self, substrate: &Substrate) -> Result<LivenessAudit> {
-        self.liveness_audit_plan(substrate).walk()
+        self.live_indexes()
+            .liveness_audit_plan(substrate, self.audit_segments())
+            .walk()
     }
 
-    /// The half of an audit that reads the log's indexes.
-    pub fn liveness_audit_plan(&self, substrate: &Substrate) -> AuditPlan {
-        let sealed: Vec<SegmentId> = self.segments.sealed_ids().to_vec();
+    /// The segments an audit walks. Taken in the same call as the
+    /// [`LiveIndexes`] its plan reads.
+    pub fn audit_segments(&self) -> AuditSegments {
         let active = self.segments.active_id();
-        let active_end = self
-            .sealed_reader()
-            .committed_end(active)
-            .unwrap_or(SUPERBLOCK_SIZE);
+        AuditSegments {
+            sealed: self.segments.sealed_ids().to_vec(),
+            active,
+            active_end: self
+                .sealed_reader()
+                .committed_end(active)
+                .unwrap_or(SUPERBLOCK_SIZE),
+        }
+    }
+}
+
+impl LiveIndexes {
+    /// The half of an audit that reads the log's indexes, off the owner.
+    pub fn liveness_audit_plan(&self, substrate: &Substrate, at: AuditSegments) -> AuditPlan {
+        let AuditSegments {
+            sealed,
+            active,
+            active_end,
+        } = at;
         let mut segments = sealed.clone();
         segments.push(active);
 
-        let counted: HashSet<(SegmentId, u64)> = self
+        let ix = self;
+        let counted: HashSet<(SegmentId, u64)> = ix
             .counted_live_records(substrate)
             .0
             .iter()
@@ -251,7 +281,7 @@ impl SubstratePersistence {
         // What a compaction of every segment at once would relocate.
         let mut carried: HashSet<(SegmentId, u64)> = HashSet::new();
         let (chunks, tokens, snapshots, branches, singletons) =
-            self.gather_relocations(substrate, &segments);
+            ix.gather_relocations(substrate, &segments);
         carried.extend(chunks.iter().map(|(_, _, l)| (l.segment, l.offset)));
         for loc in tokens
             .iter()
@@ -261,33 +291,33 @@ impl SubstratePersistence {
         {
             carried.insert((loc.segment, loc.offset));
         }
-        for (_, loc) in self.npc_relocations(&segments) {
+        for (_, loc) in ix.npc_relocations(&segments) {
             carried.insert((loc.segment, loc.offset));
         }
-        for r in self.vfs_relocations(substrate, &segments) {
+        for r in ix.vfs_relocations(substrate, &segments) {
             carried.insert((r.loc.segment, r.loc.offset));
         }
-        for (_, loc) in self.blob_relocations(&segments) {
+        for (_, loc) in ix.blob_relocations(&segments) {
             carried.insert((loc.segment, loc.offset));
         }
-        for (_, loc) in self.gather_index_page_relocs(substrate, &segments) {
+        for (_, loc) in ix.gather_index_page_relocs(substrate, &segments) {
             carried.insert((loc.segment, loc.offset));
         }
         // Each is written afresh from what it says, not found by a key: the
         // record the log holds now is the one a rewrite replaces.
-        for (&(rt, _, _), loc) in self.metadata_locs.iter() {
+        for (&(rt, _, _), loc) in ix.metadata_locs.iter() {
             if matches!(rt, RecordType::Replica | RecordType::Rebase) {
                 carried.insert((loc.segment, loc.offset));
             }
         }
         // What the resident re-emission writes, by key.
         let emitted: HashSet<ResidentKey> =
-            gather_resident_set(substrate, self.marker_ids(), self.node())
+            gather_resident_set(substrate, &ix.marker_ids, ix.node())
                 .iter()
                 .filter_map(|r| resident_key(r.rt, r.stream_id, &r.payload, &r.id))
                 .collect();
         AuditPlan {
-            dir: self.dir().to_path_buf(),
+            dir: ix.dir().to_path_buf(),
             sealed,
             active,
             active_end,
@@ -502,7 +532,9 @@ mod tests {
         label(&mut sp, 1);
         sp.commit().unwrap();
         label(&mut sp, 2);
-        let plan = sp.liveness_audit_plan(&substrate);
+        let plan = sp
+            .live_indexes()
+            .liveness_audit_plan(&substrate, sp.audit_segments());
         sp.commit().unwrap();
         label(&mut sp, 3);
         sp.commit().unwrap();
@@ -544,7 +576,9 @@ mod tests {
         sp.seal_active().unwrap();
         label(&mut sp, 2);
         sp.commit().unwrap();
-        let plan = sp.liveness_audit_plan(&substrate);
+        let plan = sp
+            .live_indexes()
+            .liveness_audit_plan(&substrate, sp.audit_segments());
         sp.segments.drop_sealed(first).unwrap();
         let audit = plan.walk().unwrap();
         assert_eq!(audit.gone, [first]);

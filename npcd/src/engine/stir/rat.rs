@@ -146,16 +146,16 @@ impl Fixture for Rat {
                     return Some(
                         Stirring::new(
                             "rat",
-                            format!("Something bolts across the floor {knock}."),
+                            format!("A rat bolts across the floor {knock}."),
                             Salience::URGENT,
                         )
                         .tagged(&[Cond::Vermin, Cond::Loud]),
                     );
                 }
                 Where::AtTheStores => {
-                    "Something goes out of the stores at speed, knocking a shelf as it leaves."
+                    "The rat goes out of the stores at speed, knocking a shelf as it leaves."
                 }
-                _ => "Something bolts along the inside of the wall and is gone.",
+                _ => "A rat bolts along the inside of the wall and is gone.",
             };
             return Some(Stirring::new("rat", line, Salience::NORMAL).tagged(&[Cond::Vermin]));
         }
@@ -204,16 +204,16 @@ impl Fixture for Rat {
 
         let line: &str = match (was, next) {
             (Where::Hidden, Where::InTheWalls) => {
-                "Something moves in the duct overhead, unhurried, and stops."
+                "A rat moves in the duct overhead, unhurried, and stops."
             }
             (Where::InTheWalls, Where::InTheWalls) => self
                 .rng
                 .pick(&[
-                    "Something is working at the insulation behind a wall panel.",
-                    "A scratching starts up inside the wall and keeps going.",
-                    "Something small crosses the ceiling void, from one side of the room to the other.",
+                    "A rat is working at the insulation behind a wall panel.",
+                    "A rat scratches about inside the wall for a while.",
+                    "A rat crosses the ceiling void, from one side of the room to the other.",
                 ])
-                .unwrap_or(&"A scratching starts up inside the wall and keeps going."),
+                .unwrap_or(&"A rat scratches about inside the wall for a while."),
             (Where::InTheWalls, Where::InTheOpen) => {
                 "A rat comes out along the base of the wall and stops in the open."
             }
@@ -230,17 +230,15 @@ impl Fixture for Rat {
             }
             (Where::AtTheStores, Where::AtTheStores) => {
                 self.gnawed += 1;
-                "Something is at work in the stores, on the far side of the shelving."
+                "The rat is at work in the stores, on the far side of the shelving."
             }
             (Where::AtTheStores, _) | (Where::InTheOpen, _) => {
                 "The rat goes back into the wall and the room is its own again."
             }
             // Anywhere else out of the walls is back into cover: the ladder
             // only goes one rung at a time, so there is nowhere else to reach.
-            (Where::InTheWalls, _) => {
-                "The scratching inside the wall stops, and does not start again."
-            }
-            (Where::Bolting, _) => "The building is quiet where something was moving a moment ago.",
+            (Where::InTheWalls, _) => "The rat inside the wall goes quiet and moves off.",
+            (Where::Bolting, _) => "The rat has gone, and the building is quiet again.",
             (Where::Hidden, _) => return None,
         };
 
