@@ -5,7 +5,10 @@
 //! rather than into a character somebody owns.
 //!
 //! - `GET` answers `{"guild": null}`, or the server: its id, its name, the
-//!   listener and whether character-to-character DMs are mirrored.
+//!   listener and whether character-to-character DMs are mirrored; and
+//!   `listeners`, each character of the world with a bot of its own, with
+//!   the servers its bot is in and the link that adds it to another — what
+//!   the console picks the server and the listener from.
 //! - `PUT {guild_id, listener, backstage}` sets it, once three checks pass:
 //!   the listener is a character with a body in the world, it has a bot
 //!   connected, and that bot is in the server — Discord's answer to
@@ -30,8 +33,9 @@ use super::record::Guild;
 use crate::api::{err, owner_of, Authored};
 use crate::authority::ops::{OpReply, WorldOp};
 use crate::discord::error::DiscordError;
-use crate::discord::store;
+use crate::discord::{invite, store};
 use crate::npcs::{npc_id_of_wire, npc_id_wire};
+use crate::world::Hosted;
 
 /// What `PUT` takes.
 #[derive(Debug, Deserialize)]
@@ -58,10 +62,42 @@ pub async fn get_world_discord(
     if let Err(r) = owner_of(&s, &headers).await {
         return *r;
     }
-    let Some(hosted) = s.runtime.as_ref().and_then(|rt| rt.hosted.get(&wid)) else {
+    let Some(rt) = s.runtime.as_ref() else {
         return no_world();
     };
-    Json(wire(hosted.mirror(|m| m.guild().cloned()).as_ref())).into_response()
+    let Some(hosted) = rt.hosted.get(&wid) else {
+        return no_world();
+    };
+    let mut answer = wire(hosted.mirror(|m| m.guild().cloned()).as_ref());
+    answer["listeners"] = listeners(&s, &hosted, rt.bodies.in_world(&wid));
+    Json(answer).into_response()
+}
+
+/// Who could listen to a server for the world: each character with a body
+/// in it and a bot of its own — whoever owns it — with the servers its bot
+/// is in, as its records hold them, and the link that adds it to another.
+fn listeners(s: &Authored, hosted: &Hosted, bound: Vec<(u64, String)>) -> Value {
+    let shared = s.npcs.substrate();
+    let found: Vec<Value> = bound
+        .into_iter()
+        .filter_map(|(npc, body)| {
+            let bot = store::get(&shared, npc)?;
+            let name = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
+            let servers: Vec<Value> = hosted
+                .servers(|x| x.servers_of(npc))
+                .into_iter()
+                .map(|(guild_id, server)| json!({ "guild_id": guild_id.to_string(), "name": server.name }))
+                .collect();
+            Some(json!({
+                "listener": npc_id_wire(npc),
+                "name": name,
+                "bot": bot.username,
+                "invite_url": invite::url(&bot.application_id),
+                "servers": servers,
+            }))
+        })
+        .collect();
+    Value::Array(found)
 }
 
 /// `PUT /v1/world/:wid/discord`

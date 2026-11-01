@@ -15,6 +15,9 @@ const mockThreads = {};
 /// Characters' Discord bots, by character. See `getDiscord`.
 const mockBots = {};
 
+/// Each world's Discord server. See `getWorldDiscord`.
+const mockWorldServers = {};
+
 /// The caller's Discord link. See `linkDiscord`.
 const mockLink = { linked: null, pending: null };
 const flag = (k) => { try { return new URLSearchParams(location.search).has(k); } catch (_) { return false; } };
@@ -631,7 +634,7 @@ export const MockAPI = {
     mockBots[id] = {
       connected: true, application_id: '1300000000000000001', user_id: '1300000000000000002',
       username: n.name, connected_ms: Date.now(),
-      invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344134372416',
+      invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344402807888',
       status: intentOff ? 'needs_content_intent' : 'online',
       ...(intentOff ? {} : { world: 'Life' }),
     };
@@ -716,6 +719,24 @@ export const MockAPI = {
   async getWorld(w) { return (await this.listWorlds()).worlds.find((x) => x.world_id === w); },
   async setWorld(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
   async setWorldTime(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
+  async getWorldDiscord(w) {
+    const listeners = Object.entries(mockBots).map(([id, b]) => ({
+      listener: id, name: (NPCS.find((n) => n.npc_id === id) || {}).name || id, bot: b.username,
+      invite_url: b.invite_url, servers: [{ guild_id: '600', name: 'Life' }],
+    }));
+    return { guild: mockWorldServers[w] || null, listeners };
+  },
+  async setWorldDiscord(w, s) {
+    if (!mockBots[s.listener]) {
+      const e = new Error('the listener needs a Discord bot of its own');
+      e.detail = e.message;
+      throw e;
+    }
+    mockWorldServers[w] = { guild_id: s.guild_id, name: 'Life', listener: s.listener,
+      backstage: s.backstage };
+    return { guild: mockWorldServers[w] };
+  },
+  async clearWorldDiscord(w) { delete mockWorldServers[w]; return { guild: null }; },
   async listPersonalities(q) {
     // Ids are slugs and the anchor is `anchor`, matching
     // `personalities/<id>.yaml`. Both were invented shapes — numbered rows and

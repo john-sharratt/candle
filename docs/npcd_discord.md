@@ -21,8 +21,10 @@ bot runtime of §3.3 and §6 (`gateway/` — `protocol`, `guild`, `shard` — `s
 `bots/`), linking (§3.2, `link/`), DMs both ways (§5, `dm/`), a bot in its servers'
 channels (§3.4, `server/`), the posting both share (`post/`), and seeing what the bridge
 did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
-and of part three the world's own server and its open channel (§4.4, `world/`);
-§8 says what comes next, in the order it is built. It sits on npcd's
+and part three: the world's own server mirrored — its open channel, groups,
+private-thread DMs and backstage — with the reconcile, the carry-over of its cursors,
+and typing (§4.4, §5.3–5.4, `world/`, `dm/typing.rs`). §8 records the order it was
+built in. It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
@@ -397,7 +399,8 @@ record):
 | Record | Holds |
 |---|---|
 | `discord/guild` | `{ guild_id, name, listener: <npc_id>, backstage: bool }` — the world's server (§4.4), and its name as Discord last gave it |
-| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel` |
+| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, parent?, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a private thread under `#dms`, or `backstage`; `parent` the channel a private thread is under, whose webhook posts into it; `archived` a group nobody remains on |
+| `discord/parent/<name>` | `{ channel_id }` — `#dms` or `#backstage`, the channel private threads are made under |
 | `discord/webhook/<channel_id>` | `{ webhook_id, token }` — a mirrored channel's persona webhook (§3.1), its token sealed for this record as a bot token is (§4.3) |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
 | `discord/channel/<npc_id>/<channel_id>` | `{ guild_id, thread, mirrored_through, last_seen_discord }` — a server channel the bot is in, and its thread (§3.4) |
@@ -446,9 +449,10 @@ A token Discord refuses is `400 {"error": "discord_token_rejected"}` (a user's t
 `discord_not_a_bot`); a rate limit is `429 discord_rate_limited` with `retry_after` and a
 `Retry-After` header; any other failure is `502`. None is retried, for the per-IP limit
 (§2), and nothing is written unless every call succeeded. `invite_url` is
-`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344134372416`:
+`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344402807888`:
 View Channels, Send Messages, Read Message History, Embed Links, Attach Files, Add
-Reactions, Send Messages in Threads, Create Private Threads and Manage Webhooks
+Reactions, Send Messages in Threads, Create Private Threads, Manage Webhooks, and — for
+a listener mirroring a world (§4.4) — Manage Channels and Manage Roles
 (`npcd/src/discord/invite.rs`).
 
 In the console it is the **Discord** panel at the top of the character's Messages tab.
@@ -739,14 +743,41 @@ channel, group and webhook halves of §5, and it is built first and alone.
    REST API: the channel made or found, its webhook sealed, each speaker,
    inbound from each kind of author, a bot that is not the listener, and the
    routes' three checks.
-10. Groups as channels, persona webhooks and private-thread "DMs", and the reconcile
-   (§5.3).
-11. Authority moves for the listener and the channel cursors (§5.4), with a two-member
-   test that a cursor carries over.
-12. Backstage threads for character-to-character DMs.
-13. Typing: from when a DM from Discord is delivered to the character until it answers
-    or its turn ends — two minutes at most — its bot shows typing in that DM
-    (`POST /channels/{id}/typing`, renewed every 8 s).
+10. **Built:** groups as channels, persona webhooks and private-thread "DMs", and the
+   reconcile (§5.3). A group's channel is always made, never found by name, with
+   `@everyone` denied it, the listener let in with Manage Webhooks and Create Private
+   Threads, and each member on Discord — a character's bot, a linked person — let see,
+   read and write; the reconcile lets in a new member, takes out one who left, and
+   archives a group nobody remains on (its members keep reading it, may not write, and
+   nothing more is posted). A linked person's DM with a character without a bot is a
+   private thread under `#dms` (everyone may see `#dms`, nobody may write in it but in
+   its threads), named `<character> & <person>`, the person added; the character's lines
+   are posted into it through `#dms`'s webhook (`?thread_id=`), and the person's are a
+   message to the character (`WorldOp::Message`). On a group a linked member's post is
+   said on the thread (`WorldOp::Mirrored`). The reconcile runs on the first beat after
+   a member takes the world and every five minutes, and also reads every mirrored
+   channel's gap and renames or repictures a bot whose character changed — a bot's
+   record keeps the portrait it was `pictured` with, so an avatar is sent only when it
+   differs.
+11. **Built:** authority moves for the listener and the channel cursors (§5.4). The
+   mirror's records go with the world's; the member that takes the world reconciles on
+   its first beat (a member that loses it forgets when it last did), and a test hands
+   one member's records to another and checks the next holder posts on from the cursor
+   and nothing twice. A webhook whose sealed token does not open on the new holder — a
+   member with no cluster key in common — is made again.
+12. **Built:** backstage threads for character-to-character DMs, in a world whose
+   `discord/guild` says `backstage`: a private thread under `#backstage` (everyone may
+   see it, nobody may write in it or its threads) named for the two characters, each
+   owner who has linked Discord added. Every line in a private thread — a DM's or a
+   backstage one — is posted through its parent's webhook, a character's with its own
+   bot too, since a bot is no member of the thread; anything written backstage is
+   dropped (`read_only_dropped`).
+13. **Built:** typing. While a person's DM from Discord is the last thing said to the
+   character and under two minutes old, its bot shows typing in that DM
+   (`POST /channels/{id}/typing`, renewed every 8 s); the character's answer, being
+   the last thing said then, ends it (`npcd/src/discord/dm/typing.rs`). A turn that ends
+   without an answer is not seen from the bots' beat, so the two minutes are the
+   bound.
 
 ---
 

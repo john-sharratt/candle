@@ -87,6 +87,7 @@ fn bot(a: &Authored, zen: u64, connected_ms: u64) -> Bot {
         username: "Zen".into(),
         token: a.discord_tokens.seal(zen, TOKEN),
         connected_ms,
+        pictured: None,
     }
 }
 
@@ -457,7 +458,8 @@ async fn echoes_and_server_messages_are_not_heard() {
             .collect::<Vec<_>>(),
         ["the real one"]
     );
-    assert_eq!(d.discord.seen(), []);
+    // The bot shows typing for what it heard, and posts nothing.
+    assert_eq!(d.posts(), []);
 }
 
 // ── both ways ────────────────────────────────────────────────────────────
@@ -502,11 +504,7 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
         })
     );
     d.settle().await;
-    assert_eq!(
-        d.discord.seen(),
-        [],
-        "a message from Discord was posted back"
-    );
+    assert_eq!(d.posts(), [], "a message from Discord was posted back");
 
     d.zen_says("I am. What do you need?");
     assert_eq!(d.thread()[1].origin, None);
@@ -514,10 +512,19 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
         d.dm().is_some_and(|dm| dm.mirrored_through == 2)
     })
     .await;
+    // Typing while the DM waited on it, then the answer.
     let agent = d.discord.seen()[0].user_agent.clone();
     assert_eq!(
         d.discord.seen(),
-        [post(CHANNEL, "I am. What do you need?", &agent)]
+        [
+            as_bot(
+                "POST",
+                &format!("/channels/{CHANNEL}/typing"),
+                Value::Null,
+                &agent
+            ),
+            post(CHANNEL, "I am. What do you need?", &agent),
+        ]
     );
 
     // The record is the world's, written with the rest of it.

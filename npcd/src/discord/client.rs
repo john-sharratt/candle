@@ -84,6 +84,48 @@ pub struct GuildChannel {
     pub name: String,
 }
 
+/// One permission overwrite on a channel: whose it is — a role's, the
+/// server's own id being `@everyone`, or a member's — and what it allows and
+/// denies, as Discord's permission bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overwrite {
+    pub id: u64,
+    /// `0` a role's, `1` a member's.
+    pub kind: u8,
+    pub allow: u64,
+    pub deny: u64,
+}
+
+impl Overwrite {
+    /// As Discord takes and gives it: ids and bits as strings.
+    fn wire(&self) -> Value {
+        json!({
+            "id": self.id.to_string(),
+            "type": self.kind,
+            "allow": self.allow.to_string(),
+            "deny": self.deny.to_string(),
+        })
+    }
+}
+
+/// An overwrite as Discord answers it.
+#[derive(Deserialize)]
+struct OverwriteWire {
+    #[serde(deserialize_with = "snowflake")]
+    id: u64,
+    #[serde(rename = "type")]
+    kind: u8,
+    allow: String,
+    deny: String,
+}
+
+/// A channel's overwrites, as `GET /channels/{id}` answers them.
+#[derive(Deserialize)]
+struct ChannelWire {
+    #[serde(default)]
+    permission_overwrites: Vec<OverwriteWire>,
+}
+
 /// A channel's webhook, as `POST /channels/{id}/webhooks` answers it: what
 /// posting through it needs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -228,22 +270,134 @@ impl Client {
         .await
     }
 
-    /// Make a text channel called `name` in server `guild_id`; its id.
+    /// Make a text channel called `name` in server `guild_id`, with
+    /// `overwrites` when there are any; its id.
     pub async fn create_channel(
         &self,
         token: &str,
         guild_id: u64,
         name: &str,
+        overwrites: &[Overwrite],
     ) -> Result<u64, DiscordError> {
+        let mut body = json!({ "name": name, "type": 0 });
+        if !overwrites.is_empty() {
+            body["permission_overwrites"] = overwrites.iter().map(Overwrite::wire).collect();
+        }
         let made: Made = self
             .call(
                 Method::POST,
                 &format!("/guilds/{guild_id}/channels"),
                 token,
-                Some(json!({ "name": name, "type": 0 })),
+                Some(body),
             )
             .await?;
         Ok(made.id)
+    }
+
+    /// Channel `channel_id`'s permission overwrites.
+    pub async fn overwrites(
+        &self,
+        token: &str,
+        channel_id: u64,
+    ) -> Result<Vec<Overwrite>, DiscordError> {
+        let channel: ChannelWire = self
+            .call(Method::GET, &format!("/channels/{channel_id}"), token, None)
+            .await?;
+        Ok(channel
+            .permission_overwrites
+            .into_iter()
+            .map(|o| Overwrite {
+                id: o.id,
+                kind: o.kind,
+                allow: o.allow.parse().unwrap_or(0),
+                deny: o.deny.parse().unwrap_or(0),
+            })
+            .collect())
+    }
+
+    /// Set `overwrite` on channel `channel_id`, in place of any it had for
+    /// the same id.
+    pub async fn put_overwrite(
+        &self,
+        token: &str,
+        channel_id: u64,
+        overwrite: &Overwrite,
+    ) -> Result<(), DiscordError> {
+        let mut body = overwrite.wire();
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("id");
+        }
+        self.call_empty(
+            Method::PUT,
+            &format!("/channels/{channel_id}/permissions/{}", overwrite.id),
+            token,
+            Some(body),
+        )
+        .await
+    }
+
+    /// Take channel `channel_id`'s overwrite for `target` away.
+    pub async fn delete_overwrite(
+        &self,
+        token: &str,
+        channel_id: u64,
+        target: u64,
+    ) -> Result<(), DiscordError> {
+        self.call_empty(
+            Method::DELETE,
+            &format!("/channels/{channel_id}/permissions/{target}"),
+            token,
+            None,
+        )
+        .await
+    }
+
+    /// Make a private thread called `name` under channel `channel_id`,
+    /// that only who is added to it sees and nobody on it may invite to; its
+    /// id.
+    pub async fn create_private_thread(
+        &self,
+        token: &str,
+        channel_id: u64,
+        name: &str,
+    ) -> Result<u64, DiscordError> {
+        let made: Made = self
+            .call(
+                Method::POST,
+                &format!("/channels/{channel_id}/threads"),
+                token,
+                Some(json!({ "name": name, "type": 12, "invitable": false })),
+            )
+            .await?;
+        Ok(made.id)
+    }
+
+    /// Show the bot typing in channel `channel_id`, for the next ten seconds
+    /// or until it posts there.
+    pub async fn trigger_typing(&self, token: &str, channel_id: u64) -> Result<(), DiscordError> {
+        self.call_empty(
+            Method::POST,
+            &format!("/channels/{channel_id}/typing"),
+            token,
+            None,
+        )
+        .await
+    }
+
+    /// Add Discord user `user_id` to thread `thread_id`.
+    pub async fn add_thread_member(
+        &self,
+        token: &str,
+        thread_id: u64,
+        user_id: u64,
+    ) -> Result<(), DiscordError> {
+        self.call_empty(
+            Method::PUT,
+            &format!("/channels/{thread_id}/thread-members/{user_id}"),
+            token,
+            None,
+        )
+        .await
     }
 
     /// Make a webhook called `name` on channel `channel_id`, for the
@@ -264,14 +418,16 @@ impl Client {
     }
 
     /// Post `content` through webhook `hook` under the name `username`, with
-    /// the picture at `avatar_url` when there is one; the message's id. Asked
-    /// to `wait`, so Discord answers with the message it made. Authorised by
-    /// the webhook's own token in the path, not a bot's.
+    /// the picture at `avatar_url` when there is one, into `thread` of the
+    /// webhook's channel when one is named; the message's id. Asked to
+    /// `wait`, so Discord answers with the message it made. Authorised by the
+    /// webhook's own token in the path, not a bot's.
     pub async fn execute_webhook(
         &self,
         hook: &Webhook,
         username: &str,
         avatar_url: Option<&str>,
+        thread: Option<u64>,
         content: &str,
     ) -> Result<u64, DiscordError> {
         let mut body = json!({
@@ -282,10 +438,11 @@ impl Client {
         if let Some(url) = avatar_url {
             body["avatar_url"] = Value::from(url);
         }
+        let into = thread.map_or_else(String::new, |t| format!("&thread_id={t}"));
         let made: Made = self
             .call_unauthorised(
                 Method::POST,
-                &format!("/webhooks/{}/{}?wait=true", hook.id, hook.token),
+                &format!("/webhooks/{}/{}?wait=true{into}", hook.id, hook.token),
                 body,
             )
             .await?;
@@ -322,6 +479,19 @@ impl Client {
         body: Option<Value>,
     ) -> Result<T, DiscordError> {
         self.send(method, path, Some(token), body).await
+    }
+
+    /// One request, as the bot, that Discord answers with no body (`204`).
+    async fn call_empty(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> Result<(), DiscordError> {
+        self.send::<Value>(method, path, Some(token), body)
+            .await
+            .map(|_| ())
     }
 
     /// One request authorised by what its path carries — a webhook's token —
@@ -373,7 +543,13 @@ impl Client {
         if !status.is_success() {
             return Err(refusal(status, &headers, &text));
         }
-        serde_json::from_str(&text)
+        // A `204` has no body: read as `null`, which a call wanting nothing
+        // takes.
+        let text = match text.trim().is_empty() {
+            true => "null",
+            false => text.as_str(),
+        };
+        serde_json::from_str(text)
             .map_err(|e| DiscordError::Transport(format!("an answer that is not Discord's: {e}")))
     }
 }
@@ -551,7 +727,7 @@ mod tests {
             }])
         );
         assert_eq!(
-            client.create_channel(TOKEN, 600, "the-channel").await,
+            client.create_channel(TOKEN, 600, "the-channel", &[]).await,
             Ok(fake::FIRST_CHANNEL)
         );
         let hook = client
@@ -567,12 +743,12 @@ mod tests {
         );
         assert_eq!(
             client
-                .execute_webhook(&hook, "Wick", Some("https://a/p.png"), "hello")
+                .execute_webhook(&hook, "Wick", Some("https://a/p.png"), None, "hello")
                 .await,
             Ok(fake::FIRST_POSTED)
         );
         client
-            .execute_webhook(&hook, "Wren S", None, "hi")
+            .execute_webhook(&hook, "Wren S", None, None, "hi")
             .await
             .unwrap();
 

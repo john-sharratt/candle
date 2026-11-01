@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub const SONOS: &str = "sonos";
 /// A Google Cast device — a Chromecast, a Cast-built-in TV or speaker.
 pub const CAST: &str = "cast";
+/// An LG webOS TV ([`crate::profile::webos`]).
+pub const WEBOS: &str = "webos";
 /// A UPnP MediaRenderer: a TV or player with AVTransport and RenderingControl.
 pub const RENDERER: &str = "renderer";
 /// A Pioneer or Onkyo AV receiver ([`crate::profile::receiver`]).
@@ -98,6 +100,7 @@ pub fn reach(profile: &str) -> &'static str {
         SONOS => "the world can work it (Sonos)",
         RECEIVER => "the world can work it (an AV receiver)",
         CAST => "the world can work it (a Cast device)",
+        WEBOS => "the world can work it (an LG webOS TV)",
         RENDERER => "the world can see it (a media player)",
         GATEWAY => "the world can see it (the router)",
         AIRPLAY => "the world can see it (AirPlay)",
@@ -110,7 +113,7 @@ pub fn reach(profile: &str) -> &'static str {
 /// Whether a part linked with `profile` has acts the world can take at it —
 /// what makes it a terminal rather than a thing merely seen.
 pub fn workable(profile: &str) -> bool {
-    matches!(profile, SONOS | RECEIVER | CAST)
+    matches!(profile, SONOS | RECEIVER | CAST | WEBOS)
 }
 
 /// The profile that reaches a device saying what `f` says.
@@ -135,6 +138,8 @@ pub fn profile_of(f: &Finding) -> &'static str {
         RECEIVER
     } else if said(&["googlecast", "google cast"]) {
         CAST
+    } else if said(&["webos", "lge-com", "lg smart tv"]) {
+        WEBOS
     } else if said(&["internetgatewaydevice", "wandevice", "wanconnectiondevice"]) {
         GATEWAY
     } else if said(&["mediarenderer", "avtransport"]) {
@@ -206,6 +211,14 @@ mod tests {
         assert_eq!(profile_of(&with(&[], "Pioneer", "VSX-935")), RECEIVER);
         assert_eq!(
             profile_of(&with(
+                &["urn:lge-com:service:webos-second-screen:1"],
+                "LG Electronics",
+                "LG Smart TV"
+            )),
+            WEBOS
+        );
+        assert_eq!(
+            profile_of(&with(
                 &["urn:schemas-upnp-org:device:MediaRenderer:1"],
                 "Samsung",
                 "QN90"
@@ -240,7 +253,7 @@ mod tests {
 
     #[test]
     fn only_a_workable_profile_is_a_terminal() {
-        for p in [SONOS, RECEIVER, CAST] {
+        for p in [SONOS, RECEIVER, CAST, WEBOS] {
             assert!(workable(p), "{p} should be workable");
         }
         for p in [RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {

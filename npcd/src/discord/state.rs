@@ -144,6 +144,7 @@ mod tests {
             username: "Zen".into(),
             token: "c2VhbGVk".into(),
             connected_ms,
+            pictured: None,
         }
     }
 

@@ -86,19 +86,23 @@ pub async fn post(
 }
 
 /// Post `text` to `to` through `hook`, under `username` and the picture at
-/// `avatar_url`, on behalf of `bot` — the listener, whose trace says it. A
-/// `429` is waited out and tried again, as [`post`]'s is.
+/// `avatar_url`, on behalf of `bot` — the listener, whose trace says it. `to`
+/// is a thread of the webhook's channel when `in_thread` says so. A `429` is
+/// waited out and tried again, as [`post`]'s is.
 pub async fn post_hook(
     a: &Authored,
     bot: &Online,
     hook: &Webhook,
-    username: &str,
-    avatar_url: Option<&str>,
+    as_who: (&str, Option<&str>),
+    in_thread: bool,
     to: Target<'_>,
     text: &str,
 ) -> Result<Post, Rejected> {
+    let (username, avatar_url) = as_who;
+    let thread = in_thread.then_some(to.channel);
     tried(a, bot, to, || {
-        a.discord.execute_webhook(hook, username, avatar_url, text)
+        a.discord
+            .execute_webhook(hook, username, avatar_url, thread, text)
     })
     .await
 }

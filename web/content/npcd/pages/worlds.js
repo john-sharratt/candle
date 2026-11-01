@@ -127,6 +127,7 @@ export async function render(params, q) {
     ['collections', 'Sections'],
     ['setting', 'Setting & knowledge'],
     ['clock', 'Narrative clock'],
+    ['discord', 'Discord'],
   ];
   el.appendChild(h('div', { class: 'row', style: 'gap:4px;margin-bottom:18px;flex-wrap:wrap' },
     TABS.map(([k, label]) => h('button', {
@@ -159,7 +160,101 @@ export async function render(params, q) {
   el.appendChild(host);
 
   // An unknown tab lands on the sections, the same place a bare URL does.
-  ({ layers, collections, setting, clock }[tab] || collections)();
+  ({ layers, collections, setting, clock, discord }[tab] || collections)();
+
+  /* The world's own Discord server (docs/npcd_discord.md §4.4).
+   *
+   * A Creator's: setting it mirrors the whole world — its channel, its groups,
+   * the DMs of characters without a bot — into one server. The listener is a
+   * character here with a bot of its own, which reads the server for the
+   * world; the daemon checks it is in the world, has a bot, and that the bot
+   * is in the server, and says which check failed. */
+  async function discord() {
+    const editable = mayEdit('creator');
+    mount(host, h('div', { class: 'tiny dim' }, 'reading the world’s server…'));
+    // Every character here with a bot of its own, whoever owns it, with the
+    // servers its bot is in — the daemon's answer, so nothing is typed.
+    const { guild = null, listeners = [] } =
+      await API.getWorldDiscord(w.world_id).catch(() => ({}));
+
+    const listener = h('select', { class: 'input', ...ro('creator', 'toggle') },
+      listeners.length
+        ? listeners.map((n) => h('option', { value: n.listener,
+          selected: guild && guild.listener === n.listener }, `${n.name} — @${n.bot}`))
+        : h('option', { value: '' }, 'no character here has a Discord bot'));
+    const server = h('select', { class: 'input', ...ro('creator', 'toggle') });
+    const invite = h('a', { class: 'btn sm ghost', target: '_blank', rel: 'noopener' });
+    /* The servers the chosen listener's bot is in, and the link that adds it
+     * to another — with every permission mirroring needs, so nothing is set
+     * by hand in Discord. A server it was just added to appears once its
+     * bot has heard of it: reopen this tab. */
+    const fill = () => {
+      const n = listeners.find((x) => x.listener === listener.value);
+      const servers = n ? n.servers : [];
+      mount(server, servers.length
+        ? servers.map((g) => h('option', { value: g.guild_id,
+          selected: guild && guild.guild_id === g.guild_id }, g.name))
+        : h('option', { value: '' }, 'its bot is in no server yet'));
+      invite.hidden = !n;
+      if (n) {
+        invite.href = n.invite_url;
+        invite.textContent = `Add @${n.bot} to a server ↗`;
+      }
+    };
+    listener.onchange = fill;
+    fill();
+    const backstage = h('input', { type: 'checkbox',
+      checked: guild ? guild.backstage : true, ...ro('creator', 'toggle') });
+
+    const save = only('creator', () => h('button', { class: 'btn primary' }, guild ? 'Save' : 'Set the server'));
+    if (save) save.onclick = async () => {
+      try {
+        await API.setWorldDiscord(w.world_id, {
+          guild_id: server.value.trim(), listener: listener.value, backstage: backstage.checked,
+        });
+        toast('the world’s server is set', 'ok');
+        go('/world/' + w.world_id + '?tab=discord');
+      } catch (e) { toast(e.detail || e.message || 'not set', 'err'); }
+    };
+    const remove = guild ? only('creator', () => h('button', { class: 'btn ghost' }, 'Stop mirroring')) : null;
+    if (remove) remove.onclick = () => confirmDialog({
+      title: 'Stop mirroring this world?',
+      message: 'Nothing more is posted to the server or heard from it. The characters’ own bots go on.',
+      confirmText: 'Stop mirroring',
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await API.clearWorldDiscord(w.world_id);
+          toast('mirroring stopped', 'ok');
+          go('/world/' + w.world_id + '?tab=discord');
+        } catch (e) { toast(e.detail || e.message || 'not stopped', 'err'); }
+      },
+    });
+
+    mount(host,
+      h('div', { class: 'panel' },
+        h('div', { class: 'row', style: 'justify-content:space-between' },
+          h('h3', { style: 'margin:0' }, guild ? `Mirrored into ${guild.name}` : 'Not mirrored'),
+          roChip('creator')),
+        h('div', { class: 'tiny dim', style: 'max-width:88ch;margin-top:6px' },
+          'With a server set, the world’s channel is #the-channel there, each group a channel only its '
+          + 'members see, and a person’s DM with a character without a bot a private thread under #dms. '
+          + 'Characters with a bot speak as it; the rest speak through a webhook under their own names.'),
+        h('div', { class: 'grid g2', style: 'margin-top:12px' },
+          h('label', { class: 'field' }, h('span', {}, 'Listener — reads the server for the world'), listener),
+          h('label', { class: 'field' }, h('span', {}, 'Server — one the listener’s bot is in'), server)),
+        h('div', { class: 'row', style: 'margin-top:6px' }, invite),
+        h('label', { class: 'row', style: 'gap:9px;margin-top:10px;cursor:pointer' }, backstage,
+          h('div', {}, h('div', { style: 'font-size:.86rem;font-weight:600' }, 'Backstage'),
+            h('div', { class: 'tiny dim' }, 'mirror DMs between two characters, read-only, for their owners'))),
+        h('div', { class: 'tiny dim', style: 'margin-top:10px;max-width:88ch' },
+          'The listener needs Message Content Intent turned on under Bot in the Developer Portal. A bot '
+          + 'added before its invite asked for Manage Channels and Manage Roles needs adding again with '
+          + 'the link above, or those two given to its role in the server’s settings.'),
+        h('div', { class: 'row', style: 'gap:8px;justify-content:flex-end;margin-top:12px' },
+          editable ? null : h('span', { class: 'tiny dim' }, 'Setting a world’s server is a creator’s to do.'),
+          remove, save)));
+  }
 
   // ── substrate layers ──────────────────────────────────────────────────────
 

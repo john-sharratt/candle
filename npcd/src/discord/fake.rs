@@ -101,6 +101,82 @@ impl Fake {
             .map(|(id, kind, name)| json!({ "id": id.to_string(), "type": kind, "name": name }))
             .collect();
     }
+
+    /// Channel `channel`'s permission overwrites, as `(id, type, allow,
+    /// deny)`, sorted by id.
+    pub fn overwrites_of(&self, channel: u64) -> Vec<(u64, u8, u64, u64)> {
+        let mut out: Vec<(u64, u8, u64, u64)> = self
+            .held
+            .overwrites
+            .lock()
+            .unwrap()
+            .get(&channel)
+            .map(|os| {
+                os.iter()
+                    .map(|o| {
+                        let n = |f: &str| o[f].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        (
+                            n("id"),
+                            o["type"].as_u64().unwrap_or(0) as u8,
+                            n("allow"),
+                            n("deny"),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+}
+
+/// The next id the fake gives a channel or thread it makes.
+fn next_made(held: &Held) -> u64 {
+    let mut made = held.made.lock().unwrap();
+    let id = *made;
+    *made += 1;
+    id
+}
+
+/// What Discord answers a good request about a channel's permissions,
+/// threads and members, when `path` is one.
+fn ok_permissions(held: &Held, method: &Method, path: &str, body: &Value) -> Option<Response> {
+    let rest = path.strip_prefix("/channels/")?;
+    let (channel, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let channel: u64 = channel.parse().ok()?;
+    let empty = || StatusCode::NO_CONTENT.into_response();
+    match (method.clone(), tail) {
+        (Method::GET, "") => Some(
+            Json(json!({
+                "id": channel.to_string(),
+                "permission_overwrites": held.overwrites.lock().unwrap()
+                    .get(&channel).cloned().unwrap_or_default(),
+            }))
+            .into_response(),
+        ),
+        (Method::POST, "threads") => {
+            let id = next_made(held);
+            Some(
+                Json(json!({ "id": id.to_string(), "type": 12, "name": body["name"] }))
+                    .into_response(),
+            )
+        }
+        (Method::PUT, t) if t.starts_with("thread-members/") => Some(empty()),
+        (Method::POST, "typing") => Some(empty()),
+        (method, t) if t.starts_with("permissions/") => {
+            let target = t.trim_start_matches("permissions/").to_string();
+            let mut all = held.overwrites.lock().unwrap();
+            let on = all.entry(channel).or_default();
+            on.retain(|o| o["id"] != json!(target));
+            if method == Method::PUT {
+                let mut o = body.clone();
+                o["id"] = json!(target);
+                on.push(o);
+            }
+            Some(empty())
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -113,6 +189,8 @@ struct Held {
     /// The server's channels, those made since included.
     channels: Arc<Mutex<Vec<Value>>>,
     made: Arc<Mutex<u64>>,
+    /// Each channel's permission overwrites, as Discord answers them.
+    overwrites: Arc<Mutex<BTreeMap<u64, Vec<Value>>>>,
 }
 
 /// A fake answering as `mode`, on `127.0.0.1` and a port of its own.
@@ -125,6 +203,7 @@ pub async fn start(mode: Mode) -> Fake {
         posted: Arc::new(Mutex::new(FIRST_POSTED)),
         channels: Arc::new(Mutex::new(Vec::new())),
         made: Arc::new(Mutex::new(FIRST_CHANNEL)),
+        overwrites: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -204,9 +283,10 @@ fn ok_server(held: &Held, method: &Method, path: &str, body: &Value) -> Option<R
     if let Some(guild) = id_in("/guilds/", "/channels") {
         return Some(match *method {
             Method::POST => {
-                let mut made = held.made.lock().unwrap();
-                let id = *made;
-                *made += 1;
+                let id = next_made(held);
+                if let Some(os) = body["permission_overwrites"].as_array() {
+                    held.overwrites.lock().unwrap().insert(id, os.clone());
+                }
                 let channel = json!({
                     "id": id.to_string(),
                     "type": body["type"],
@@ -249,6 +329,9 @@ fn ok_server(held: &Held, method: &Method, path: &str, body: &Value) -> Option<R
 /// What Discord answers a good request.
 fn ok(held: &Held, method: &Method, path: &str, body: &Value) -> Response {
     if let Some(answer) = ok_server(held, method, path, body) {
+        return answer;
+    }
+    if let Some(answer) = ok_permissions(held, method, path, body) {
         return answer;
     }
     let channel = path

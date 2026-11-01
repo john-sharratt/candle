@@ -9,17 +9,22 @@
 //! 2. dropped if its channel mirrors no thread;
 //! 3. dropped if it is already in the world: at or below the channel's
 //!    `last_seen_discord`, or recorded as an origin on its thread;
-//! 4. dropped if its author is linked to no account, or to one without the
-//!    Creator role — the role the console's own route asks of anyone
-//!    speaking on the open channel (§3.2);
-//! 5. otherwise said on the open channel as that person, as the console's
-//!    route says it, with the Discord message as its origin.
+//! 4. dropped if it was written in a backstage thread, which its owners
+//!    read and nobody writes in;
+//! 5. dropped if its author is linked to no account; on the open channel, to
+//!    one without the Creator role — the role the console's own route asks of
+//!    anyone speaking there (§3.2); on a group or a DM, to one not on it;
+//! 6. otherwise said as that person, with the Discord message as its origin:
+//!    on the open channel as the console's route says it, on a group's
+//!    thread, and in a DM as a message to its character
+//!    (`WorldOp::Message`), as a DM to a bot is.
 //!
 //! The channel's `last_seen_discord` moves past every message judged past
 //! the first three steps, so the gap fetch reads none of them again.
 
 use std::sync::Arc;
 
+use super::members::character as character_of;
 use super::record::Kind;
 use crate::accounts::public_id;
 use crate::api::{now_ms, Authored};
@@ -48,6 +53,11 @@ pub enum Heard {
     Unlinked,
     /// Its author's account may not speak on the open channel.
     NotCreator,
+    /// Its author is not on the group or DM it was written in.
+    NotMember,
+    /// It was written in a mirror nobody on Discord writes in: a backstage
+    /// thread.
+    ReadOnly,
     /// It is in the world now, from this name, as message `seq` of thread
     /// `thread`.
     Applied {
@@ -68,6 +78,8 @@ impl Heard {
             Heard::Again => "duplicate",
             Heard::Unlinked => "unlinked_dropped",
             Heard::NotCreator => "not_creator_dropped",
+            Heard::NotMember => "not_member_dropped",
+            Heard::ReadOnly => "read_only_dropped",
             Heard::Applied { .. } => "applied",
             Heard::Unapplied => "unapplied",
         }
@@ -109,7 +121,7 @@ async fn judge(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, m: &DiscordMess
     if m.id <= mirrored.last_seen_discord || recorded {
         return Heard::Again;
     }
-    let heard = speak(a, bot, &thread, mirrored.kind, m, origin).await;
+    let heard = speak(a, bot, hosted, (&thread, mirrored.kind), m, origin).await;
     if heard != Heard::Unapplied {
         hosted.with_mirror(|x| {
             if let Some(mut now) = x.thread(&thread) {
@@ -132,25 +144,36 @@ async fn judge(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, m: &DiscordMess
     }
 }
 
-/// Say `m` on `thread`, a mirror of `kind`, as its author.
+/// Say `m` on `thread` of `hosted`, a mirror of `kind`, as its author.
 async fn speak(
     a: &Arc<Authored>,
     bot: &Online,
-    thread: &str,
-    kind: Kind,
+    hosted: &Hosted,
+    (thread, kind): (&str, Kind),
     m: &DiscordMessage,
     origin: Origin,
 ) -> Heard {
+    if kind == Kind::Backstage {
+        return Heard::ReadOnly;
+    }
     let Some(account) = index::account_of(&a.npcs.substrate(), &m.author.id.to_string()) else {
         return Heard::Unlinked;
     };
     let Some(identity) = a.accounts.read().await.identity(&account) else {
         return Heard::Unlinked;
     };
-    if !a.roles.of(Some(&identity)).is_creator() {
-        return Heard::NotCreator;
-    }
     let from = speaking_as(&identity, &public_id(&account), &a.roles);
+    let members: Vec<String> = hosted.sim(|s| {
+        s.threads
+            .get(thread)
+            .map(|t| t.members.clone())
+            .unwrap_or_default()
+    });
+    match kind {
+        Kind::Channel if !a.roles.of(Some(&identity)).is_creator() => return Heard::NotCreator,
+        Kind::Group | Kind::Dm if !members.contains(&from) => return Heard::NotMember,
+        _ => {}
+    }
     let character = embodied(a, bot).map(|(_, name)| name).unwrap_or_default();
     let text = written_out(&m.text(), &m.mentions, bot.user_id, &character);
     if text.is_empty() {
@@ -166,6 +189,25 @@ async fn speak(
             text,
             origin: Some(origin),
         },
+        Kind::Group => WorldOp::Mirrored {
+            thread: thread.to_string(),
+            from: from.clone(),
+            text,
+            origin,
+        },
+        Kind::Dm => {
+            let other = members.iter().find(|n| **n != from);
+            let Some(npc) = other.and_then(|n| character_of(a, hosted, n)) else {
+                return Heard::NotMember;
+            };
+            WorldOp::Message {
+                npc,
+                from: from.clone(),
+                text,
+                origin: Some(origin),
+            }
+        }
+        Kind::Backstage => return Heard::ReadOnly,
     };
     let rt = a.runtime.as_ref().expect("a listener is the runtime's");
     if let Err(e) = rt.world_write(&bot.world, op).await {

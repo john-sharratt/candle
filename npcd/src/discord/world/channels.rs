@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::record::{hook_name, Guild, Hook, Kind, Mirrored};
 use crate::api::{now_ms, Authored};
-use crate::discord::client::Webhook;
+use crate::discord::client::{Overwrite, Webhook};
 use crate::discord::message::snowflake_at;
 use crate::discord::online::Online;
 use crate::discord::trace::note::{Direction, Note};
@@ -60,15 +60,15 @@ pub async fn ensure(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, guild: &Gu
     let channel_id = match hosted.mirror(|m| m.thread(&thread)) {
         Some(mirrored) => mirrored.channel_id,
         None => {
-            let Some(channel_id) = find_or_make(a, bot, guild, CHANNEL_NAME).await else {
+            let Some(channel_id) = find_or_make_with(a, bot, guild, CHANNEL_NAME, &[]).await else {
                 return false;
             };
-            let mirrored = Mirrored {
+            let mirrored = Mirrored::new(
                 channel_id,
-                kind: Kind::Channel,
-                mirrored_through: last_seq(hosted, &thread),
-                last_seen_discord: snowflake_at(now_ms()),
-            };
+                Kind::Channel,
+                last_seq(hosted, &thread),
+                snowflake_at(now_ms()),
+            );
             hosted.with_mirror(|m| m.put_thread(&thread, mirrored));
             note(
                 a,
@@ -151,9 +151,15 @@ pub async fn hook(
     Some(made)
 }
 
-/// The id of `guild`'s text channel called `name`, made when it has none;
-/// `None` when Discord answered neither.
-async fn find_or_make(a: &Authored, bot: &Online, guild: &Guild, name: &str) -> Option<u64> {
+/// The id of `guild`'s text channel called `name`, made with `overwrites`
+/// when it has none; `None` when Discord answered neither.
+pub async fn find_or_make_with(
+    a: &Authored,
+    bot: &Online,
+    guild: &Guild,
+    name: &str,
+    overwrites: &[Overwrite],
+) -> Option<u64> {
     let fail = |what: &str, e: String| {
         failed(
             a,
@@ -174,7 +180,7 @@ async fn find_or_make(a: &Authored, bot: &Online, guild: &Guild, name: &str) -> 
     }
     match a
         .discord
-        .create_channel(&bot.token, guild.guild_id, name)
+        .create_channel(&bot.token, guild.guild_id, name, overwrites)
         .await
     {
         Ok(id) => Some(id),

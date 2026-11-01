@@ -106,12 +106,17 @@ pub async fn put_discord(
         },
     };
 
+    let pictured = avatar
+        .is_some()
+        .then(|| record["portrait"]["image_id"].as_str().map(str::to_string))
+        .flatten();
     let bot = Bot {
         application_id: app.id,
         user_id: me.id,
         username,
         token: s.discord_tokens.seal(npc_id, token),
         connected_ms: now_ms(),
+        pictured,
     };
     if let Err(e) = store::put(&s.npcs.substrate(), npc_id, &bot) {
         tracing::error!(npc = npc_id, error = %e, "discord: the bot was not written");
@@ -405,7 +410,7 @@ mod tests {
             "user_id": "222",
             "username": "Zen",
             "connected_ms": connected_ms,
-            "invite_url": "https://discord.com/oauth2/authorize?client_id=111&scope=bot&permissions=344134372416",
+            "invite_url": "https://discord.com/oauth2/authorize?client_id=111&scope=bot&permissions=344402807888",
             "status": "offline",
         });
         assert_eq!(v, expected);
@@ -470,6 +475,7 @@ mod tests {
             username: "Zen".into(),
             token: "c2VhbGVk".into(),
             connected_ms: 10,
+            pictured: None,
         };
         store::put(&st.npcs.substrate(), npc_id, &bot).unwrap();
         let shared = st.npcs.substrate();

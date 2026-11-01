@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::members;
 use crate::api::{now_ms, Authored};
 use crate::discord::online::Online;
 use crate::images::Kept;
@@ -38,22 +39,24 @@ pub fn of<'a>(
     from: &str,
     online: &HashMap<u64, &'a Online>,
 ) -> Speaker<'a> {
-    let npc = character(a, hosted, from);
+    let npc = members::character(a, hosted, from);
     if let Some(bot) = npc.and_then(|npc| online.get(&npc)) {
         if hosted.servers(|s| s.server(bot.npc, guild_id)).is_some() {
             return Speaker::Bot(bot);
         }
     }
+    hooked(a, hosted, from)
+}
+
+/// The webhook, posting what `from` said under their name and portrait —
+/// whoever they are. What a private thread is posted by: a bot is no member
+/// of one, and may not write there.
+pub fn hooked<'a>(a: &Authored, hosted: &Hosted, from: &str) -> Speaker<'a> {
+    let npc = members::character(a, hosted, from);
     Speaker::Hook {
         username: webhook_name(from),
         avatar_url: npc.and_then(|npc| portrait_url(a, npc)),
     }
-}
-
-/// The character called `from` in `hosted`, when one is.
-fn character(a: &Authored, hosted: &Hosted, from: &str) -> Option<u64> {
-    let body = hosted.read(|w| w.actors().find(|x| x.name == from).map(|x| x.id.clone()))?;
-    a.runtime.as_ref()?.bodies.mind_of(hosted.id(), &body)
 }
 
 /// A link Discord can fetch character `npc`'s portrait at, when it has one.

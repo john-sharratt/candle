@@ -15,8 +15,17 @@
 //!   bot when it has one online, and otherwise through the channel's persona
 //!   webhook, under the speaker's name and with its portrait;
 //! - **in** ([`inbound`]): what the listener's shard heard in a mirrored
-//!   channel is said in the world, by a linked person with the Creator role,
-//!   as the console's route would say it.
+//!   channel is said in the world: on the open channel by a linked person
+//!   with the Creator role, as the console's route would say it; on a group
+//!   by a linked member of it; in a DM's private thread by its person, as a
+//!   message to the character.
+//!
+//! Every five minutes, and on the first beat after a member takes the world,
+//! the reconcile ([`reconcile`]) opens what the world has that the server
+//! does not — a group's channel ([`groups`]), a DM's private thread
+//! ([`dms`]) — keeps each group's members in step, archives a group nobody
+//! remains on, reads what the channels missed, and names and pictures the
+//! bots.
 //!
 //! What was written there while no member ran the listener is read when it
 //! comes online ([`gap`]). Every other bot in the world's server drops its
@@ -28,15 +37,25 @@
 //! | [`record`] | `discord/guild`, `discord/thread/…` and `discord/webhook/…`, as the world keeps them |
 //! | [`routes`] | `GET`/`PUT`/`DELETE /v1/world/:wid/discord` |
 //! | [`channels`] | the mirrored channels, found or made, and their webhooks |
+//! | [`members`] | who a thread's members are on Discord, and what a channel lets them do |
+//! | [`groups`] | the named groups as channels only their members see |
+//! | [`dms`] | a person's DM with a character without a bot, as a private thread |
+//! | [`backstage`] | a DM between two characters, read-only for their owners |
+//! | [`reconcile`] | the five-minute pass: channels, members, gaps, bots |
 //! | [`speaker`] | who posts a message, and as whom |
 //! | [`outbound`] | what is said on a mirrored thread, posted to its channel |
 //! | [`inbound`] | a mirrored channel's message, heard in the world |
 //! | [`gap`] | what was written while no member ran the listener |
 
+pub mod backstage;
 pub mod channels;
+pub mod dms;
 pub mod gap;
+pub mod groups;
 pub mod inbound;
+pub mod members;
 pub mod outbound;
+pub mod reconcile;
 pub mod record;
 pub mod routes;
 pub mod speaker;
@@ -69,7 +88,8 @@ pub fn is_world_server(a: &Authored, bot: &Online, guild_id: u64) -> bool {
 }
 
 /// One beat of every world whose listener is among `online`: its channels
-/// found or made, then what was said in the world posted.
+/// found or made, the reconcile when it is due, then what was said in the
+/// world posted.
 pub async fn tick(a: &Arc<Authored>, online: &[Online]) {
     let by_npc: HashMap<u64, &Online> = online.iter().map(|b| (b.npc, b)).collect();
     for bot in online {
@@ -78,6 +98,9 @@ pub async fn tick(a: &Arc<Authored>, online: &[Online]) {
         };
         if !channels::ensure(a, bot, &hosted, &guild).await {
             continue;
+        }
+        if a.bots.reconcile_due(hosted.id(), reconcile::EVERY) {
+            reconcile::run(a, bot, &hosted, &guild, &by_npc).await;
         }
         outbound::post(a, bot, &hosted, &guild, &by_npc).await;
     }
