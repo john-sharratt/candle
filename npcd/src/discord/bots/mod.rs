@@ -42,8 +42,8 @@ mod tests;
 pub mod wanted;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
@@ -83,6 +83,9 @@ pub struct Bots {
     /// What each bot's bridge did, and how its shard stands — apart from
     /// `held`, so a read does not wait out a beat's posts.
     trace: Trace,
+    /// When each world's server was last reconciled here. A world this
+    /// member has just taken has none, so its first beat reconciles it.
+    reconciled: StdMutex<HashMap<String, Instant>>,
 }
 
 /// What the beat holds between beats.
@@ -126,7 +129,31 @@ impl Bots {
                 halted: HashMap::new(),
             }),
             trace: Trace::default(),
+            reconciled: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether world `world`'s server is due its reconcile, `every` since the
+    /// last here, or never reconciled here; stamped now when it is.
+    pub fn reconcile_due(&self, world: &str, every: Duration) -> bool {
+        let mut last = self.reconciled.lock().expect("reconciled lock");
+        let now = Instant::now();
+        let due = last
+            .get(world)
+            .is_none_or(|at| now.duration_since(*at) >= every);
+        if due {
+            last.insert(world.to_string(), now);
+        }
+        due
+    }
+
+    /// Forget when world `world` was last reconciled here: this member lost
+    /// it, so the next time it takes it the reconcile runs at once.
+    pub fn forget_reconciled(&self, world: &str) {
+        self.reconciled
+            .lock()
+            .expect("reconciled lock")
+            .remove(world);
     }
 
     /// What each bot's bridge did here, and how its shard stands.
@@ -230,6 +257,7 @@ impl Bots {
             };
             r.shard.close().await;
             self.trace.detach(npc);
+            self.forget_reconciled(&r.world);
             if let Err(e) = state::remove(&shared, npc) {
                 tracing::error!(npc, "discord: {e:#}");
             }

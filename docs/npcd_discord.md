@@ -397,7 +397,8 @@ record):
 | Record | Holds |
 |---|---|
 | `discord/guild` | `{ guild_id, name, listener: <npc_id>, backstage: bool }` — the world's server (§4.4), and its name as Discord last gave it |
-| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel` |
+| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, parent?, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a private thread under `#dms`, or `backstage`; `parent` the channel a private thread is under, whose webhook posts into it; `archived` a group nobody remains on |
+| `discord/parent/<name>` | `{ channel_id }` — `#dms` or `#backstage`, the channel private threads are made under |
 | `discord/webhook/<channel_id>` | `{ webhook_id, token }` — a mirrored channel's persona webhook (§3.1), its token sealed for this record as a bot token is (§4.3) |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
 | `discord/channel/<npc_id>/<channel_id>` | `{ guild_id, thread, mirrored_through, last_seen_discord }` — a server channel the bot is in, and its thread (§3.4) |
@@ -739,8 +740,22 @@ channel, group and webhook halves of §5, and it is built first and alone.
    REST API: the channel made or found, its webhook sealed, each speaker,
    inbound from each kind of author, a bot that is not the listener, and the
    routes' three checks.
-10. Groups as channels, persona webhooks and private-thread "DMs", and the reconcile
-   (§5.3).
+10. **Built:** groups as channels, persona webhooks and private-thread "DMs", and the
+   reconcile (§5.3). A group's channel is always made, never found by name, with
+   `@everyone` denied it, the listener let in with Manage Webhooks and Create Private
+   Threads, and each member on Discord — a character's bot, a linked person — let see,
+   read and write; the reconcile lets in a new member, takes out one who left, and
+   archives a group nobody remains on (its members keep reading it, may not write, and
+   nothing more is posted). A linked person's DM with a character without a bot is a
+   private thread under `#dms` (everyone may see `#dms`, nobody may write in it but in
+   its threads), named `<character> & <person>`, the person added; the character's lines
+   are posted into it through `#dms`'s webhook (`?thread_id=`), and the person's are a
+   message to the character (`WorldOp::Message`). On a group a linked member's post is
+   said on the thread (`WorldOp::Mirrored`). The reconcile runs on the first beat after
+   a member takes the world and every five minutes, and also reads every mirrored
+   channel's gap and renames or repictures a bot whose character changed — a bot's
+   record keeps the portrait it was `pictured` with, so an avatar is sent only when it
+   differs.
 11. Authority moves for the listener and the channel cursors (§5.4), with a two-member
    test that a cursor carries over.
 12. Backstage threads for character-to-character DMs.

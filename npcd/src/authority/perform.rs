@@ -172,6 +172,20 @@ impl Runtime {
             WorldOp::Channel { from, text, origin } => OpReply::Heard {
                 by: self.say_on_channel_from(world, &from, &text, origin),
             },
+            WorldOp::Mirrored {
+                thread,
+                from,
+                text,
+                origin,
+            } => OpReply::Done {
+                ok: self.hosted.get(world).is_some_and(|hosted| {
+                    hosted.with_sim(|s| {
+                        s.threads
+                            .send_on(&thread, &from, &text, Some(origin))
+                            .is_ok()
+                    })
+                }),
+            },
             WorldOp::Guild { guild } => OpReply::Done {
                 ok: self.hosted.get(world).is_some_and(|hosted| {
                     hosted.with_mirror(|m| m.set_guild(guild));

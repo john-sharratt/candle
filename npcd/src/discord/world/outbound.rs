@@ -1,10 +1,11 @@
 //! What is said on a mirrored thread, posted to its channel in the world's
 //! server (`docs/npcd_discord.md` §5.1).
 //!
-//! Each beat, for each mirrored thread: every message past its
+//! Each beat, for each mirrored thread not archived: every message past its
 //! `mirrored_through` that came from no outside origin is posted, in order,
 //! by its speaker ([`speaker`]) — a character's own bot, or the channel's
-//! webhook under the speaker's name — each cut to Discord's 2,000
+//! webhook under the speaker's name, and for a private thread its parent
+//! channel's webhook into the thread — each cut to Discord's 2,000
 //! characters. The cursor moves past a message only once all of it was
 //! posted; a failure leaves it for the next beat, so a gap is retried, never
 //! skipped. A webhook Discord no longer has (`404`) is forgotten, and the
@@ -35,6 +36,9 @@ pub async fn post(
     online: &HashMap<u64, &Online>,
 ) {
     'threads: for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
+        if mirrored.archived {
+            continue;
+        }
         let waiting: Vec<Message> = hosted.sim(|s| {
             s.threads
                 .get(&thread)
@@ -65,11 +69,14 @@ pub async fn post(
                         username,
                         avatar_url,
                     } => {
-                        let Some(webhook) = hook(a, bot, hosted, guild, mirrored.channel_id).await
+                        let Some(webhook) =
+                            hook(a, bot, hosted, guild, mirrored.hook_channel()).await
                         else {
                             continue 'threads;
                         };
-                        post_hook(a, bot, &webhook, username, avatar_url.as_deref(), to, part).await
+                        let as_who = (username.as_str(), avatar_url.as_deref());
+                        let in_thread = mirrored.parent.is_some();
+                        post_hook(a, bot, &webhook, as_who, in_thread, to, part).await
                     }
                 };
                 match sent {
@@ -78,7 +85,7 @@ pub async fn post(
                     // beat makes another.
                     Ok(Post::Gone) => {
                         if matches!(who, Speaker::Hook { .. }) {
-                            hosted.with_mirror(|m| m.remove_hook(mirrored.channel_id));
+                            hosted.with_mirror(|m| m.remove_hook(mirrored.hook_channel()));
                         }
                         continue 'threads;
                     }

@@ -37,6 +37,17 @@ pub const THREAD_PREFIX: &str = "discord/thread/";
 /// Where the webhooks are among a world's records.
 pub const HOOK_PREFIX: &str = "discord/webhook/";
 
+/// Where the channels private threads are made under are among a world's
+/// records: `#dms` and `#backstage`, by name.
+pub const PARENT_PREFIX: &str = "discord/parent/";
+
+/// A channel private threads are made under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Parent {
+    pub channel_id: u64,
+}
+
 /// A world's Discord server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,18 +67,59 @@ pub struct Guild {
 pub enum Kind {
     /// The world's open channel, `#the-channel`.
     Channel,
+    /// A named group: a text channel only its members see.
+    Group,
+    /// A person and a character without a bot of its own: a private thread
+    /// under `#dms`.
+    Dm,
+    /// Two characters: a private thread under `#backstage`, read by their
+    /// owners.
+    Backstage,
 }
 
 /// One thread of the world, mirrored into a channel of its server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mirrored {
+    /// The channel, or the private thread, it is posted in.
     pub channel_id: u64,
     pub kind: Kind,
     /// The seq of the last message of the thread posted to the channel.
     pub mirrored_through: u64,
     /// The id of the last Discord message taken in from the channel.
     pub last_seen_discord: u64,
+    /// For a private thread, the channel it is under — whose webhook posts
+    /// into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    /// A group nobody remains on: kept read-only, and posted to no more.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Mirrored {
+    /// A channel or thread of `kind`, posted from after seq `from` and read
+    /// from after Discord message `seen`.
+    pub fn new(channel_id: u64, kind: Kind, from: u64, seen: u64) -> Self {
+        Self {
+            channel_id,
+            kind,
+            mirrored_through: from,
+            last_seen_discord: seen,
+            parent: None,
+            archived: false,
+        }
+    }
+
+    /// The channel whose webhook posts here: its parent, for a private
+    /// thread, and itself otherwise.
+    pub fn hook_channel(&self) -> u64 {
+        self.parent.unwrap_or(self.channel_id)
+    }
 }
 
 /// A channel's persona webhook.
@@ -85,6 +137,7 @@ pub struct Mirror {
     guild: Option<Guild>,
     threads: BTreeMap<String, Mirrored>,
     hooks: BTreeMap<u64, Hook>,
+    parents: BTreeMap<String, Parent>,
 }
 
 /// The record name of thread `thread`'s mirror.
@@ -132,8 +185,20 @@ impl Mirror {
         if !same {
             self.threads.clear();
             self.hooks.clear();
+            self.parents.clear();
         }
         self.guild = guild;
+    }
+
+    /// The channel called `name` that private threads are made under.
+    pub fn parent(&self, name: &str) -> Option<u64> {
+        self.parents.get(name).map(|p| p.channel_id)
+    }
+
+    /// Record channel `channel_id` as the one called `name` that private
+    /// threads are made under.
+    pub fn put_parent(&mut self, name: &str, channel_id: u64) {
+        self.parents.insert(name.to_string(), Parent { channel_id });
     }
 
     /// Thread `thread`'s mirror.
@@ -197,7 +262,13 @@ impl Mirror {
                 serde_json::to_value(h).expect("a webhook serialises"),
             )
         });
-        guild.chain(threads).chain(hooks).collect()
+        let parents = self.parents.iter().map(|(name, p)| {
+            (
+                format!("{PARENT_PREFIX}{name}"),
+                serde_json::to_value(p).expect("a parent serialises"),
+            )
+        });
+        guild.chain(threads).chain(hooks).chain(parents).collect()
     }
 
     /// The server, threads and webhooks `records` hold, in place of these:
@@ -218,6 +289,7 @@ impl Mirror {
             .into_iter()
             .filter_map(|(id, h)| Some((id.parse().ok()?, h)))
             .collect();
+        self.parents = decoded(records, PARENT_PREFIX);
     }
 }
 
@@ -237,12 +309,28 @@ mod tests {
     }
 
     fn mirrored(channel_id: u64) -> Mirrored {
-        Mirrored {
-            channel_id,
-            kind: Kind::Channel,
-            mirrored_through: 3,
-            last_seen_discord: 900,
-        }
+        Mirrored::new(channel_id, Kind::Channel, 3, 900)
+    }
+
+    /// **A private thread names its parent, and an archived group says so**;
+    /// neither field is written when it says nothing.
+    #[test]
+    fn a_private_threads_parent_and_an_archive_are_written_only_when_set() {
+        let mut dm = Mirrored::new(7100, Kind::Dm, 0, 1);
+        dm.parent = Some(7001);
+        let mut group = Mirrored::new(7200, Kind::Group, 2, 3);
+        group.archived = true;
+        assert_eq!(
+            serde_json::to_value(dm).unwrap(),
+            json!({ "channel_id": 7100, "kind": "dm", "mirrored_through": 0,
+                    "last_seen_discord": 1, "parent": 7001 })
+        );
+        assert_eq!(
+            serde_json::to_value(group).unwrap(),
+            json!({ "channel_id": 7200, "kind": "group", "mirrored_through": 2,
+                    "last_seen_discord": 3, "archived": true })
+        );
+        assert_eq!((dm.hook_channel(), group.hook_channel()), (7001, 7200));
     }
 
     /// **The server is `discord/guild`, a thread `discord/thread/<thid>` and
@@ -314,6 +402,14 @@ mod tests {
         back.put_thread("stale", mirrored(1));
         back.take_in(&records);
         assert_eq!(back, m);
+
+        m.put_parent("dms", 7001);
+        assert_eq!(
+            m.records().get("discord/parent/dms"),
+            Some(&json!({ "channel_id": 7001 }))
+        );
+        back.take_in(&m.records());
+        assert_eq!(back.parent("dms"), Some(7001));
     }
 
     /// **Another server forgets the last one's channels**, and the same one

@@ -87,6 +87,7 @@ fn bot(a: &Authored, zen: u64, connected_ms: u64) -> Bot {
         username: "Zen".into(),
         token: a.discord_tokens.seal(zen, TOKEN),
         connected_ms,
+        pictured: None,
     }
 }
 
