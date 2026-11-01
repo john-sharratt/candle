@@ -53,6 +53,7 @@ use super::nudges;
 use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::resuming;
+use super::roles::WorkerKind;
 use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
@@ -213,15 +214,15 @@ pub fn summary_line(entry: &str, max: usize) -> String {
 }
 
 /// Start `prompt` on a new worker named after `wanted` under `thread`,
-/// decoding at `priority` and thinking at `effort`; the worker's record,
-/// `running`.
+/// decoding at `priority`, thinking at `effort` and doing `kind`'s work; the
+/// worker's record, `running`.
 pub fn start(
     session: &Arc<ZendSession>,
     caller: &Caller,
     thread: &str,
     wanted: &str,
     prompt: &str,
-    (priority, effort): (Priority, Effort),
+    (priority, effort, kind): (Priority, Effort, WorkerKind),
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -242,7 +243,7 @@ pub fn start(
         thread,
         name,
         prompt,
-        (caller.role, priority, effort),
+        (caller.role, priority, effort, kind),
         now,
     );
     note(
@@ -282,14 +283,14 @@ fn taken(records: &dyn Records, owner: &str, thread: &str, now: u64) -> Vec<(Str
 }
 
 /// A new worker's record, `running`, its turn beginning `now`, running as
-/// `role` at `priority`, thinking at `effort`.
+/// `role` at `priority`, thinking at `effort`, doing `kind`'s work.
 fn fresh(
     session: &ZendSession,
     owner: &str,
     thread: &str,
     name: String,
     prompt: &str,
-    (role, priority, effort): (AccessRole, Priority, Effort),
+    (role, priority, effort, kind): (AccessRole, Priority, Effort, WorkerKind),
     now: u64,
 ) -> Worker {
     let conv_id = threads::conv_id(owner, thread, &name);
@@ -303,6 +304,7 @@ fn fresh(
         role,
         priority,
         effort,
+        kind,
         started_ms: now,
         turn_ms: now,
         beat_ms: now,
@@ -346,7 +348,7 @@ pub fn start_part(
         &parent.thread,
         name,
         prompt,
-        (parent.role, parent.priority, parent.effort),
+        (parent.role, parent.priority, parent.effort, parent.kind),
         now,
     );
     let message = format!("{prompt}{}", part_close(&parent.path()));
@@ -1815,6 +1817,7 @@ mod tests {
             role: AccessRole::Admin,
             priority: Priority::Normal,
             effort: Effort::Deep,
+            kind: WorkerKind::Coder,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 0,

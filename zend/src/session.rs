@@ -5482,17 +5482,26 @@ async fn carry_journal(
 }
 
 /// The journals `conv_id` inherits, as the sections that carry them — none for
-/// a conversation not owned through `/mcp`: its project's, its thread's, and
-/// for a part each worker's above it (`docs/claude_zend_gateway.md` §5.1).
+/// a conversation not owned through `/mcp`: its kind's document, then its
+/// project's journal, its thread's, and for a part each worker's above it
+/// (`docs/claude_zend_gateway.md` §5.1).
 fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherited> {
-    let Some((_, thread, name)) = conv_names(conv_id) else {
+    let Some((owner, thread, name)) = conv_names(conv_id) else {
         return Vec::new();
     };
+    let records = state.engine.conversation().shared();
     let nearest_first: Vec<lineage::Ancestor> = journals_above(state, conv_id)
         .into_iter()
         .map(|a| a.ancestor)
         .collect();
-    lineage::sections(&format!("T:{thread}/{name}"), &nearest_first)
+    threads::worker(&records, owner, thread, name)
+        .map(|w| w.kind.section())
+        .into_iter()
+        .chain(lineage::sections(
+            &format!("T:{thread}/{name}"),
+            &nearest_first,
+        ))
+        .collect()
 }
 
 /// One journal above a conversation: the ancestor it is, the bare name it
