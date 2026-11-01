@@ -83,6 +83,7 @@ pub mod grants;
 pub mod net;
 mod numfmt;
 pub mod registry;
+pub mod run_watch;
 pub mod runner;
 pub mod sandboxes;
 #[cfg(test)]

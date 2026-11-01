@@ -41,6 +41,9 @@ pub struct Activity {
     /// Tool calls made, by tool name.
     pub tools: BTreeMap<String, u32>,
     pub now: Doing,
+    /// How the program a tool call is waiting on stands, while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
 }
 
 impl Activity {
@@ -72,10 +75,16 @@ impl Activity {
                     *self.tools.entry(name.clone()).or_default() += 1;
                 }
                 self.now = Doing::Calling(status.tools.clone());
+                self.run = None;
+                true
+            }
+            StreamItem::Tool(status) if status.phase == "progress" => {
+                self.run = status.tools.first().cloned();
                 true
             }
             StreamItem::Tool(_) => {
                 self.now = Doing::Reading;
+                self.run = None;
                 false
             }
             StreamItem::TurnEnd { .. } => {
@@ -109,8 +118,12 @@ impl Activity {
                 list.join(", ")
             )
         };
+        let run = self
+            .run
+            .as_ref()
+            .map_or_else(String::new, |run| format!(" ({run})"));
         format!(
-            "running {}, {} round{}: {} thinking tokens, {tools}; now {}",
+            "running {}, {} round{}: {} thinking tokens, {tools}; now {}{run}",
             duration(elapsed_ms),
             self.rounds,
             plural(u64::from(self.rounds)),
@@ -204,6 +217,24 @@ mod tests {
             "running 4m10s, 0 rounds: 1,934 thinking tokens, 3 tool calls (web_fetch 2, \
              web_search 1); now thinking"
         );
+    }
+
+    /// **A long tool call says how its program stands**, and stops saying so
+    /// when its results are back.
+    #[test]
+    fn a_running_programs_progress_joins_the_sentence() {
+        let mut a = Activity::default();
+        a.observe(&tools("running", &["run_command"]));
+        assert!(a.observe(&tools("progress", &["1,243 lines, last: test foo ... ok"])));
+        assert_eq!(a.tools["run_command"], 1, "progress is no tool call");
+        assert_eq!(a.now, Doing::Calling(vec!["run_command".into()]));
+        assert_eq!(
+            a.sentence(10_000),
+            "running 10s, 0 rounds: 0 thinking tokens, 1 tool call (run_command 1); now calling \
+             run_command (1,243 lines, last: test foo ... ok)"
+        );
+        a.observe(&tools("done", &["run_command"]));
+        assert_eq!(a.run, None);
     }
 
     #[test]
