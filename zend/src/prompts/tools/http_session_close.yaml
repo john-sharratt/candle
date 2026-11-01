@@ -25,7 +25,7 @@ questions:
 - close out the REST session
 - terminate the HTTP session with that base URL
 category: HTTP sessions
-description: Release the cookie jar and connection pool for an HTTP session. Idempotent. Use when finished with an API workflow or before starting a fresh session with different auth. Triggered by "close the HTTP session", "disconnect from the API", "end the session", "log out of the API".
+description: Release the cookie jar and connection pool for an HTTP session. Idempotent. Use when finished with an API workflow or before starting a fresh session with different auth. Triggered by "close the HTTP session", "disconnect from the API", "end the session", "log out of the API". Closing forgets the session's cookies, so a later call to the same API starts unauthenticated.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

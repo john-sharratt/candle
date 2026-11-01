@@ -25,7 +25,7 @@ questions:
 - what's the HKDF-Extract output for this salt and IKM
 - compute the RFC 5869 extract step with sha512
 category: Cryptography
-description: 'HKDF-Extract (RFC 5869): condense raw, possibly non-uniform input key material into one uniformly-random pseudorandom key — the first stage of the HKDF derivation chain. Supports sha256 and sha512.'
+description: 'HKDF-Extract (RFC 5869): condense raw, possibly non-uniform input key material into one uniformly-random pseudorandom key — the first stage of the HKDF derivation chain. Supports sha256 and sha512. Use on key material such as a shared secret, and pass its `prk_hex` to hkdf_expand_label for TLS 1.3 work. A password is stretched by kdf_derive instead, and ordinary file or code work never calls for this.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

@@ -25,7 +25,7 @@ questions:
 - how many hops away is this host, and what are they
 - find where the route to this domain breaks
 category: Network diagnostics
-description: Map the router-by-router path packets take to reach a host, reporting every intermediate hop and its latency. Use to locate where along the route traffic fails or slows.
+description: Map the router-by-router path packets take to reach a host, reporting every intermediate hop and its latency. Use to locate where along the route traffic fails or slows. A hop that shows no reply can simply refuse to answer probes, so read the hops after it before blaming it. Whether a host is up at all is a ping_icmp question.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

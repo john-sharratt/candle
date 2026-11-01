@@ -323,6 +323,7 @@ fn lower_branch(
             trie = trie.spill_from(arm, spills);
         }
     }
+    let trie = trie.with_leads(|token| vocab.decode(&[token]).first().copied());
     let branch = push(arena, StencilNode::Branch { trie });
     if static_toks.is_empty() {
         Ok(branch)

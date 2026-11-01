@@ -839,9 +839,24 @@ async fn a_creator_sets_reads_and_takes_away_the_worlds_server() {
         Some(json!({ "guild_id": guild, "listener": listener, "backstage": false }))
     };
 
+    // Zen can listen: a body here and a bot, in the servers its records hold.
+    d.hosted.with_servers(|s| {
+        s.put_server(
+            d.zen,
+            GUILD,
+            crate::discord::server::record::Server {
+                name: "Life".into(),
+            },
+        )
+    });
+    let listeners = json!([{
+        "listener": zen, "name": "Zen", "bot": "Zen",
+        "invite_url": crate::discord::invite::url("111"),
+        "servers": [{ "guild_id": "600", "name": "Life" }],
+    }]);
     assert_eq!(
         world_route(&d, "GET", CREATOR, None).await,
-        (200, json!({ "guild": null }))
+        (200, json!({ "guild": null, "listeners": listeners }))
     );
     let (status, _) = world_route(&d, "PUT", OWNER, set(&zen, "600")).await;
     assert_eq!(status, 403, "a user set the world's server");
@@ -877,7 +892,9 @@ async fn a_creator_sets_reads_and_takes_away_the_worlds_server() {
         world_route(&d, "PUT", CREATOR, set(&zen, " 600 ")).await,
         (200, guild.clone())
     );
-    assert_eq!(world_route(&d, "GET", CREATOR, None).await, (200, guild));
+    let mut read = guild.clone();
+    read["listeners"] = listeners;
+    assert_eq!(world_route(&d, "GET", CREATOR, None).await, (200, read));
     assert_eq!(
         d.hosted.mirror(|m| m.guild().cloned()),
         Some(Guild {

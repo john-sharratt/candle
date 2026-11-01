@@ -220,6 +220,10 @@ export const LiveAPI = {
   getWorld:      (w) => j(`/v1/world/${w}`),
   setWorld:      (w, c) => j(`/v1/world/${w}`, { method: 'PUT', body: c }),
   setWorldTime:  (w, t) => j(`/v1/world/${w}/time`, { method: 'PUT', body: t }),
+  /* The world's own Discord server (docs/npcd_discord.md §4.4): a Creator's. */
+  getWorldDiscord:   (w) => j(`/v1/world/${w}/discord`),
+  setWorldDiscord:   (w, s) => j(`/v1/world/${w}/discord`, { method: 'PUT', body: s }),
+  clearWorldDiscord: (w) => j(`/v1/world/${w}/discord`, { method: 'DELETE' }),
   /* `q` as for `listWorlds`: a hidden personality is not sent until a whole
    * word of it names one, so the filter has to reach the server. */
   listPersonalities: (q, reveal) =>

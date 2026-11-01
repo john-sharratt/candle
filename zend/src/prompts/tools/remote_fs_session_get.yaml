@@ -25,7 +25,7 @@ questions:
 - download the backup archive from the remote filesystem
 - get the log file off the SFTP host
 category: Remote filesystem
-description: Download a file from the remote SFTP filesystem into the session VFS, in the named repo. Returns the repo and VFS path where content was written.
+description: Download a file from the remote SFTP filesystem into the session VFS, in the named repo. Returns the repo and VFS path where content was written. Read it from there with file_read. The copy joins your uncommitted changes, so a downloaded file you do not mean to commit comes out with file_delete first.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

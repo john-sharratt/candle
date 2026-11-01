@@ -25,7 +25,7 @@ questions:
 - open a datagram socket, not a TCP stream
 - create a UDP endpoint for this protocol
 category: UDP sessions
-description: Open a UDP socket for datagrams. Optionally connect to a default peer. Returns session_id for subsequent sends/receives.
+description: Open a UDP socket for datagrams. Optionally connect to a default peer. Returns session_id for subsequent sends/receives with udp_session_send and udp_session_recv. UDP has no connection and no delivery guarantee, so use tcp_session_open when every byte must arrive.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

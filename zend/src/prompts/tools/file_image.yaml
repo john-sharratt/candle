@@ -39,7 +39,7 @@ parameters:
       minLength: 1
       type: string
     source_repo:
-      description: The repository `path` is in, when it is not `repo`, which is how a picture gets from one repository into another. The copies always go in `repo`. Optional.
+      description: The repository `path` is in, when it is not `repo`, which is how a picture gets from one repository into another. The copies always go in `repo`. Written last, after `outputs`. Optional.
       minLength: 1
       type: string
     crop:
@@ -117,11 +117,11 @@ examples:
   make the game repo's favicon from the art in the candle repo<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The picture is in candle and the copy belongs in the game's own repository, battle-cities. file_image reads from source_repo and writes into repo, so nothing has to be copied by hand.<|projection|>
+  The picture is in candle and the copy belongs in the game's own repository, battle-cities. file_image reads from source_repo and writes into repo, so nothing has to be copied by hand. Calls write repo, path and outputs first, and source_repo goes last, after outputs closes.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_image", "arguments": {"repo": "battle-cities", "source_repo": "candle", "path": "art/source.png", "outputs": [{"path": "favicon-32x32.png", "width": 32, "height": 32}]}}
+  <|projection|>{"name": "file_image", "arguments": {"repo": "battle-cities", "path": "art/source.png", "outputs": [{"path": "favicon-32x32.png", "width": 32, "height": 32}], "source_repo": "candle"}}
   </tool_call><|projection|>
 - |-
   resize logo.png to 64 by 64<|im_end|>

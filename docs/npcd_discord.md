@@ -449,9 +449,10 @@ A token Discord refuses is `400 {"error": "discord_token_rejected"}` (a user's t
 `discord_not_a_bot`); a rate limit is `429 discord_rate_limited` with `retry_after` and a
 `Retry-After` header; any other failure is `502`. None is retried, for the per-IP limit
 (§2), and nothing is written unless every call succeeded. `invite_url` is
-`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344134372416`:
+`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344402807888`:
 View Channels, Send Messages, Read Message History, Embed Links, Attach Files, Add
-Reactions, Send Messages in Threads, Create Private Threads and Manage Webhooks
+Reactions, Send Messages in Threads, Create Private Threads, Manage Webhooks, and — for
+a listener mirroring a world (§4.4) — Manage Channels and Manage Roles
 (`npcd/src/discord/invite.rs`).
 
 In the console it is the **Discord** panel at the top of the character's Messages tab.

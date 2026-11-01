@@ -25,7 +25,7 @@ questions:
 - close out the datagram endpoint
 - free the bound UDP port on that session
 category: UDP sessions
-description: Release a UDP datagram socket and free its bound port. Connectionless — no peer is notified.
+description: Release a UDP datagram socket and free its bound port. Connectionless — no peer is notified. Call it when the exchange is finished, so the port can be bound again.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

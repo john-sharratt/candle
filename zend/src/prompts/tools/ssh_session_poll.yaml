@@ -25,7 +25,7 @@ questions:
 - check progress of the long-running ssh task
 - any new output from that background process on the server
 category: SSH sessions
-description: Poll a running async SSH process for output. Returns stdout/stderr chunks, running status, and exit code when done.
+description: Poll a running async SSH process for output. Returns stdout/stderr chunks, running status, and exit code when done. Takes the process_id ssh_session_exec_async returned. Poll only when you have a reason to expect progress, because each poll is a round.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

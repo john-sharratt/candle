@@ -25,7 +25,7 @@ questions:
 - give me the http session for api.example.com
 - what API connections exist right now
 category: HTTP sessions
-description: List active HTTP sessions for the current conversation — session_id, base_url, credential name, opened_at, last_activity. Use to find session_ids by base URL or to see which APIs are currently configured. Triggered by "list HTTP sessions", "what API connections are open", "show my API sessions".
+description: List active HTTP sessions for the current conversation — session_id, base_url, credential name, opened_at, last_activity. Use to find session_ids by base URL or to see which APIs are currently configured. Triggered by "list HTTP sessions", "what API connections are open", "show my API sessions". A one-off request needs no session, because http_request or web_fetch does it alone.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

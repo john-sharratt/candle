@@ -829,6 +829,85 @@ mod tests {
         );
     }
 
+    const ARGS: &str = r#"[{"name":"run","params":[
+        {"name":"args","type":"array","required":true,"items":{"type":"string"}}]}]"#;
+
+    /// A driver inside `run`'s `args`, with the element `a` written and its
+    /// closing quote still to come.
+    fn driver_in_an_element(v: &TestVocab) -> StencilDriver {
+        let tools = parse_tools(ARGS).unwrap();
+        let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
+        let mut driver = StencilDriver::new(Arc::new(compile(&spec, v).unwrap()));
+        let target = b"<tool_call>\n{\"name\": \"run\", \"arguments\": {\"args\": [\"a";
+        let mut pos = 0;
+        while pos < target.len() {
+            match driver.step() {
+                StepMask::Prefill(run) => pos += v.decode(&run).len(),
+                StepMask::Branch(_) | StepMask::Free { .. } => {
+                    driver.accept(target[pos] as TokenId, &[target[pos]]);
+                    pos += 1;
+                }
+                StepMask::Done => panic!("the call ended early"),
+            }
+        }
+        driver
+    }
+
+    /// **A token that closes a string says what comes next, and that decision
+    /// is the model's.** `",` commits as `"`, but the comma it carried means
+    /// another element follows. Asked again from a bare quote, a model reached
+    /// for the close instead: `["test", "-p", "web"]` came out `["test", "-p"]`
+    /// on six calls of six, with `web` in its reasoning each time.
+    #[test]
+    fn a_string_closed_with_a_comma_goes_on_to_the_next_element() {
+        let v = TestVocab::new().with_special("\",", 300);
+        let mut d = driver_in_an_element(&v);
+        assert_eq!(
+            d.accept(300, b"\","),
+            Healed::Rewrite {
+                bytes: b"\"".to_vec()
+            }
+        );
+        let StepMask::Branch(set) = d.step() else {
+            panic!("an array goes on or closes by a masked choice");
+        };
+        assert!(set.contains(b',' as TokenId), "{set:?}");
+        assert!(!set.contains(b']' as TokenId), "{set:?}");
+    }
+
+    /// **The same decision the other way.** `"]` closes the array; asked again,
+    /// a model went on and wrote `--test-threads=1` a dozen times over.
+    #[test]
+    fn a_string_closed_with_a_bracket_closes_the_array() {
+        let v = TestVocab::new().with_special("\"]", 300);
+        let mut d = driver_in_an_element(&v);
+        assert_eq!(
+            d.accept(300, b"\"]"),
+            Healed::Rewrite {
+                bytes: b"\"".to_vec()
+            }
+        );
+        let StepMask::Branch(set) = d.step() else {
+            panic!("an array goes on or closes by a masked choice");
+        };
+        assert!(set.contains(b']' as TokenId), "{set:?}");
+        assert!(!set.contains(b',' as TokenId), "{set:?}");
+    }
+
+    /// A token whose rest leads nothing the branch offers narrows nothing: the
+    /// model chooses from every arm, and no call can be left with no way on.
+    #[test]
+    fn a_rest_that_leads_no_arm_leaves_the_choice_whole() {
+        let v = TestVocab::new().with_special("\"x", 300);
+        let mut d = driver_in_an_element(&v);
+        d.accept(300, b"\"x");
+        let StepMask::Branch(set) = d.step() else {
+            panic!("an array goes on or closes by a masked choice");
+        };
+        assert!(set.contains(b',' as TokenId), "{set:?}");
+        assert!(set.contains(b']' as TokenId), "{set:?}");
+    }
+
     #[test]
     fn string_exit_merged_with_close_brace() {
         // No optional → the value is followed by the object close; the model

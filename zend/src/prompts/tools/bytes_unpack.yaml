@@ -25,7 +25,7 @@ questions:
 - take these bytes apart using the format <QQd
 - reverse the packing on this binary payload
 category: Byte encoding
-description: Decode a raw byte buffer back into structured values — fixed-width integers, floats, and strings — using a struct-style format string. The inverse of bytes_pack. Always call this tool to decode the bytes; never work them out by hand.
+description: Decode a raw byte buffer back into structured values — fixed-width integers, floats, and strings — using a struct-style format string. The inverse of bytes_pack. Always call this tool to decode the bytes; never work them out by hand. It takes bytes you hold as text and does not open a file, so reading a picture's size is file_image's job, not this tool's. Changing only the encoding of a value is bytes_transcode.
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   definitions:

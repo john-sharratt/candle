@@ -25,7 +25,7 @@ questions:
 - get me telnet access to that appliance
 - connect to the switch's telnet interface
 category: Telnet sessions
-description: Open a Telnet session to a network device or host. Use for legacy network equipment, serial consoles, or any TCP text protocol. Returns session_id for subsequent sends.
+description: Open a Telnet session to a network device or host. Use for legacy network equipment, serial consoles, or any TCP text protocol. Returns session_id for subsequent sends with telnet_send. Telnet is unencrypted, so prefer ssh_open when the device offers it.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

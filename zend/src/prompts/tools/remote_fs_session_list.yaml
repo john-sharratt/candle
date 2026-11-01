@@ -25,7 +25,7 @@ questions:
 - give me the remote-fs session for that host
 - list the SFTP transports currently connected
 category: Remote filesystem
-description: Enumerate the remote-filesystem sessions currently connected to hosts over SFTP in this conversation.
+description: Enumerate the remote-filesystem sessions currently connected to hosts over SFTP in this conversation. Use to find a session you opened earlier. To list a directory on the host use remote_fs_session_list_dir.
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
