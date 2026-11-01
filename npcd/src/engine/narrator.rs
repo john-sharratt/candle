@@ -64,10 +64,12 @@ fn event_line(e: &Event) -> Option<String> {
             Some(format!("{speaker} — {rel} — meaning: \"{}\"", text.trim()))
         }
         EventKind::Message { thread, from, text } => {
+            // A group's line names it as where the answer goes: the sender is
+            // on a direct thread too, under the same name (see `Event::prose`).
             let on = if thread == from {
                 String::new()
             } else {
-                format!(" (on {thread})")
+                format!(" (on {thread}, to be answered on {thread})")
             };
             Some(format!(
                 "{from} — messages you{on} — meaning: \"{}\"",

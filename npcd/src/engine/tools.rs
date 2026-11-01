@@ -1554,6 +1554,19 @@ pub enum Choices {
     /// something the world can *do* to somebody rather than a flag anybody has
     /// to remember to set.
     Threads,
+    /// The conversations where somebody else spoke last — each one waiting on
+    /// this character — as it names them, most recently spoken first.
+    ///
+    /// What `reply` binds to, and why `reply` exists beside `message`: a person
+    /// on a group with this character is on a direct thread with it too, under
+    /// the same name, so a group's question answered with `message` to the
+    /// asker's name went to the direct thread. Zen answered a Discord channel's
+    /// question in private. Bound to the threads awaiting an answer, the call
+    /// names the conversation the question was asked on, and the direct thread
+    /// is on offer only while something said there waits too.
+    ///
+    /// Empty when nothing waits, which takes `reply` out of the grammar.
+    Awaiting,
     /// The conversations this character can actually **leave**.
     ///
     /// [`Choices::Threads`] less the world's standing channels, and the
@@ -1756,6 +1769,10 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("send_image", "to", Choices::Threads),
     // ---- the phone ----
     ("message", "to", Choices::Threads),
+    // Not `Threads`: an answer goes on the conversation that is waiting for
+    // it, never on one the asker merely shares a name with. See
+    // [`Choices::Awaiting`].
+    ("reply", "to", Choices::Awaiting),
     // Not `Threads`: a character may bring somebody into a conversation, and
     // may not bring them into the one they are already on. The world's channel
     // holds everybody, so it is never a place anybody can be invited to. See
@@ -1937,6 +1954,9 @@ pub struct Within {
     pub postures: Vec<String>,
     /// The conversations on this character's phone, as it names them.
     pub threads: Vec<String>,
+    /// The subset of [`Self::threads`] where somebody else spoke last — see
+    /// [`Choices::Awaiting`].
+    pub awaiting: Vec<String>,
     /// The subset of [`Self::threads`] it is able to leave — see
     /// [`Choices::Leavable`].
     pub leavable: Vec<String>,
@@ -2099,6 +2119,7 @@ impl Within {
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
         self.threads = sim.threads_for(&self.me, body);
+        self.awaiting = sim.awaiting_for(&self.me, body);
         self.leavable = sim.leavable_for(&self.me, body);
         self.invitable = sim.invitable_for(&self.me, body);
         self.invitees = sim.invitees_for(&self.me, body);
@@ -2410,6 +2431,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Presentable => within.presentable.clone(),
         Choices::Postures => within.postures.clone(),
         Choices::Threads => within.threads.clone(),
+        Choices::Awaiting => within.awaiting.clone(),
         Choices::Leavable => within.leavable.clone(),
         Choices::Invitable => within.invitable.clone(),
         Choices::Invitees => within.invitees.clone(),

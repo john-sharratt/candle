@@ -36,6 +36,7 @@
 //! have with them. Two threads over one pair is how a message lands in the one
 //! nobody is reading.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -848,6 +849,27 @@ impl Threads {
         self.of(who).into_iter().map(|t| t.unread_for(who)).sum()
     }
 
+    /// The threads where somebody other than `who` spoke last since `who`
+    /// joined, by the name `who` calls them, most recently spoken first — what
+    /// `reply` may answer on. Read or not: a question read and not yet
+    /// answered is still waiting. One whose last word is `who`'s own is
+    /// answered, and is not on offer.
+    pub fn awaiting_names_for(&self, who: &str) -> Vec<String> {
+        let mut waiting: Vec<&Thread> = self
+            .of(who)
+            .into_iter()
+            .filter(|t| {
+                let from_index = t.joined_at.get(who).copied().unwrap_or(0);
+                t.messages
+                    .get(from_index..)
+                    .and_then(|said| said.last())
+                    .is_some_and(|m| m.from != who)
+            })
+            .collect();
+        waiting.sort_by_key(|t| Reverse(t.touched));
+        waiting.into_iter().map(|t| t.as_named_to(who)).collect()
+    }
+
     /// Which threads have something waiting, by the name their reader uses.
     pub fn waiting_names_for(&self, who: &str) -> Vec<String> {
         self.of(who)
@@ -1374,6 +1396,46 @@ mod tests {
         assert_eq!(t.kind(), Kind::Group);
         assert_eq!(p.names_for("Zen"), ["zenworld #general"]);
         assert_eq!(p.iter().filter(|t| !t.permanent).count(), KEEP_THREADS);
+    }
+
+    /// **What waits on a character is the conversation it was asked on, not
+    /// the asker's name.** The asker is on the channel and on a direct thread
+    /// with the character under one name; the channel's question is on offer
+    /// to answer and the direct thread, last spoken on by the character, is
+    /// not. Answered, the channel leaves the set; read and unanswered, it
+    /// stays.
+    #[test]
+    fn what_awaits_an_answer_is_the_conversation_it_was_asked_on() {
+        let asker = "Johnathan Sharratt (The Creator)";
+        let mut p = Threads::new();
+        let general = p.open_standing("zenworld #general", &names(&["Zen", asker]));
+        p.reach(asker, "Zen");
+        p.send(asker, "Zen", "are you there?").unwrap();
+        p.send("Zen", asker, "I am here.").unwrap();
+        assert!(
+            p.awaiting_names_for("Zen").is_empty(),
+            "everything answered"
+        );
+
+        p.send_on(&general, asker, "zen, what do you see?", None)
+            .unwrap();
+        assert_eq!(p.awaiting_names_for("Zen"), ["zenworld #general"]);
+        p.read("Zen", "zenworld #general").unwrap();
+        assert_eq!(
+            p.awaiting_names_for("Zen"),
+            ["zenworld #general"],
+            "read is not answered"
+        );
+
+        p.send(asker, "Zen", "and how are you?").unwrap();
+        assert_eq!(
+            p.awaiting_names_for("Zen"),
+            [asker, "zenworld #general"],
+            "most recently spoken first"
+        );
+        p.send_on(&general, "Zen", "the perimeter is quiet", None)
+            .unwrap();
+        assert_eq!(p.awaiting_names_for("Zen"), [asker]);
     }
 
     /// **Somebody who writes on it joins at its end**, as an invitation

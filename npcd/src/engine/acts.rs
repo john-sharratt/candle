@@ -1253,6 +1253,63 @@ pub const MESSAGE: Tool = Tool {
     ],
 };
 
+/// Answer a conversation that is waiting on you, on that conversation.
+///
+/// # Why it is not `message`
+///
+/// It sends exactly what `message` sends, on the thread it names; what differs
+/// is the set it names one from ([`crate::engine::tools::Choices::Awaiting`]).
+/// Somebody on a group with this character is on a direct thread with it too,
+/// under the same name, and `message` took a person's name for the direct
+/// thread — so a question asked on a Discord channel was answered, every time,
+/// in private. Bound to the conversations where somebody else spoke last, the
+/// answer goes where the question was asked, and a thread nobody is waiting
+/// on is not one it can be sent to.
+pub const REPLY: Tool = Tool {
+    name: "reply",
+    at: &[],
+    category: "Messaging",
+    plane: Plane::Speech,
+    availability: Availability::Always,
+    description: "Answer somebody who is waiting on you, on the conversation they said it on. \
+                  Every conversation offered here has somebody else's word last — a question, \
+                  a request, news — and the answer reaches everybody on it, as `message` does. \
+                  When somebody asks you something on a group or a channel, this is how you \
+                  answer them there, where everybody who saw the question sees the answer. As \
+                  with speaking, you give what you MEAN and the wording follows.",
+    params: &[
+        Param {
+            name: "to",
+            ty: "string",
+            required: true,
+            description: "The conversation you are answering — the one the thing you are \
+                          answering was said on.",
+        },
+        Param {
+            name: "intent",
+            ty: "string",
+            required: true,
+            description: "What you mean to get across. Substance, not the message itself.",
+        },
+    ],
+    examples: &[
+        Example {
+            situation: "Somebody asked you on the server's channel what you can see from the \
+                        watch room.",
+            call: r#"{"to":"zenworld #general","intent":"that the perimeter is quiet and the flicker was the bench light"}"#,
+            because: "Asked on the channel, answered on the channel: everybody who saw the \
+                      question sees the answer. Sent to the asker's own name it would go to \
+                      your private conversation with them instead.",
+        },
+        Example {
+            situation: "Soren messaged you privately to ask whether the survey is finished.",
+            call: r#"{"to":"Soren","intent":"that it is finished and filed"}"#,
+            because: "A private question has its private conversation waiting on you, so that \
+                      is the one to answer on.",
+        },
+    ],
+};
+
 /// Bring somebody onto one of your threads.
 ///
 /// **This is the whole of group messaging.** A thread with two people on it is a
@@ -1340,6 +1397,7 @@ pub const OPEN_GROUP: Tool = Tool {
 
 /// Everything in this module, in the order it is offered.
 pub const WORLD_ACTS: &[Tool] = &[
+    REPLY,
     MESSAGE,
     INVITE,
     OPEN_GROUP,

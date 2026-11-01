@@ -326,7 +326,7 @@ pub fn unread_line(threads: &[(String, usize)]) -> String {
         .collect();
     format!(
         "You have {total} unread {noun} on your phone: {}. To read them, `read` your \
-         messages, or one conversation by name; to answer, `message` it.",
+         messages, or one conversation by name; to answer, `reply` on it.",
         on.join(", ")
     )
 }
@@ -476,13 +476,29 @@ impl Event {
             // Reported rather than quoted, for the reason `Speech` gives: what
             // a phone carries is intent, and quoting it would fabricate wording
             // nobody chose.
+            //
+            // **A group's line says where to answer it.** The sender is on the
+            // group and on a direct thread with this character under the same
+            // name, so a character told "Johnathan messages you, on ZenWorld
+            // #general" answered `message` Johnathan — the direct thread — and
+            // a channel's question was answered in private. The thread leads,
+            // and the line names it as the place the answer goes.
             EventKind::Message { thread, from, text } => {
                 let t = third_person(text.trim());
                 match thread == from {
                     // A direct thread is named for the other party, so saying
                     // both would read as "Wren, on Wren".
                     true => format!("{from} messages you: {t}"),
-                    false => format!("{from} messages you, on {thread}: {t}"),
+                    false => {
+                        let end = match t.ends_with(['.', '!', '?']) {
+                            true => "",
+                            false => ".",
+                        };
+                        format!(
+                            "On {thread}, {from} messages you: {t}{end} Answer it with `reply` \
+                             on {thread}, where it was said, not to {from} alone."
+                        )
+                    }
                 }
             }
             EventKind::Unread { threads } => unread_line(threads),
@@ -541,16 +557,47 @@ mod tests {
         assert_eq!(
             prose(&one),
             "You have 1 unread message on your phone: John (1). To read them, `read` your \
-             messages, or one conversation by name; to answer, `message` it."
+             messages, or one conversation by name; to answer, `reply` on it."
         );
         assert_eq!(
             prose(&many),
             "You have 3 unread messages on your phone: zenworld #general (2), John (1). \
              To read them, `read` your messages, or one conversation by name; to answer, \
-             `message` it."
+             `reply` on it."
         );
         assert_eq!(one.replaces().as_deref(), Some("unread"));
         assert_eq!(one.tag(), "unread");
+    }
+
+    /// **A group's message says where to answer it**: on the group, with
+    /// `reply`, not to the sender alone — who is on a direct thread with the
+    /// character under the same name. A direct one needs no such line.
+    #[test]
+    fn a_group_message_says_to_answer_it_on_the_group() {
+        let prose = |thread: &str, text: &str| {
+            Event::new(
+                0,
+                0,
+                Salience::URGENT,
+                EventKind::Message {
+                    thread: thread.into(),
+                    from: "John".into(),
+                    text: text.into(),
+                },
+            )
+            .prose()
+        };
+        assert_eq!(
+            prose("zenworld #general", "are you there"),
+            "On zenworld #general, John messages you: are you there. Answer it with `reply` \
+             on zenworld #general, where it was said, not to John alone."
+        );
+        assert_eq!(
+            prose("zenworld #general", "are you there?"),
+            "On zenworld #general, John messages you: are you there? Answer it with `reply` \
+             on zenworld #general, where it was said, not to John alone."
+        );
+        assert_eq!(prose("John", "hello"), "John messages you: hello");
     }
 
     #[test]

@@ -23,6 +23,7 @@ use web::auth::Role;
 use super::activity::Activity;
 use super::names::{parent_of, Path};
 use super::records::Records;
+use super::roles::WorkerKind;
 
 /// Orders the notes one process writes within one millisecond.
 static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -152,6 +153,10 @@ pub struct Worker {
     /// How hard its turns think; a part thinks as its worker does.
     #[serde(default)]
     pub effort: Effort,
+    /// The kind of work it does, which picks the document it carries; a part
+    /// does what its worker does.
+    #[serde(default)]
+    pub kind: WorkerKind,
     pub started_ms: u64,
     /// When its current turn began: a part this worker started in an earlier
     /// turn is never mistaken for the answer to a call in this one.
@@ -572,6 +577,7 @@ mod tests {
             role: Role::User,
             priority: Priority::Normal,
             effort: Effort::Deep,
+            kind: WorkerKind::Coder,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 1_000,
