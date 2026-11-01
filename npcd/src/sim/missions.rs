@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::operations::{Operation, Operations};
-use super::orders::{Filed, Notice, Orders};
+use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use crate::engine::mission::bank::{self, Duty, Facts};
 use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
@@ -180,6 +180,15 @@ pub struct Missions {
     /// [`super::orders`].
     #[serde(default)]
     orders: Orders,
+    /// When each standing mission was last done in each room, by `id@room` —
+    /// `None` for one reported done and not yet stamped by the table's loop,
+    /// which keeps the clock ([`Self::stamp_standing`]).
+    #[serde(default)]
+    standing: BTreeMap<String, Option<u64>>,
+    /// When each standing mission last failed in each room, by `id@room`,
+    /// stamped the same way — until it is done there.
+    #[serde(default)]
+    standing_failed: BTreeMap<String, Option<u64>>,
     /// The world's own routines, from `<mind>/missions/<world>.yaml` —
     /// drawn in place of the built-in [`bank`] when there are any. The mind's,
     /// read afresh rather than saved, like the workflows.
@@ -424,6 +433,47 @@ impl Missions {
         self.orders.take_notices()
     }
 
+    /// Put a standing mission up on the table, for whoever takes work when
+    /// nothing else waits. Whoever waits at the table is told.
+    pub fn put_up_standing(&mut self, mission: Mission) {
+        self.orders.posted(None, &mission.prompt);
+        self.pool.push(mission);
+    }
+
+    /// Whether standing mission `id` is up or carried in `room` — the one per
+    /// room there may be at a time.
+    pub fn standing_out(&self, id: &str, room: &str) -> bool {
+        let is = |m: &Mission| matches!(&m.origin, Origin::Standing { id: i, room: r } if i == id && r == room);
+        self.pool.iter().any(is)
+            || self.active.values().any(is)
+            || self.lodged.values().flatten().any(is)
+    }
+
+    /// When standing mission `id` was last done in `room`: `None` never,
+    /// `Some(None)` done and not yet stamped.
+    pub fn standing_done(&self, id: &str, room: &str) -> Option<Option<u64>> {
+        self.standing.get(&format!("{id}@{room}")).copied()
+    }
+
+    /// When standing mission `id` last failed in `room`, as
+    /// [`Self::standing_done`] — `None` when it has not failed since it was
+    /// last done.
+    pub fn standing_failed(&self, id: &str, room: &str) -> Option<Option<u64>> {
+        self.standing_failed.get(&format!("{id}@{room}")).copied()
+    }
+
+    /// Stamp every standing mission done or failed since the last stamp as
+    /// done or failed at `now_ms`.
+    pub fn stamp_standing(&mut self, now_ms: u64) {
+        for at in self
+            .standing
+            .values_mut()
+            .chain(self.standing_failed.values_mut())
+        {
+            at.get_or_insert(now_ms);
+        }
+    }
+
     /// Whether a report on what `poster` posted waits unread.
     pub fn unread_for(&self, poster: &str) -> bool {
         self.orders.unread_for(poster)
@@ -466,9 +516,10 @@ impl Missions {
     }
 
     /// Whether nothing waits on the table: nothing open to take, and nothing
-    /// lodged for anybody.
+    /// lodged for anybody. The world's standing upkeep is not work waiting —
+    /// it is what is done when there is none.
     pub fn table_empty(&self) -> bool {
-        self.pool.is_empty() && self.lodged.values().all(Vec::is_empty)
+        self.pool.iter().all(is_standing) && self.lodged.values().all(Vec::is_empty)
     }
 
     /// The world's own routines — in a world that draws nothing, the standing
@@ -480,20 +531,33 @@ impl Missions {
     /// Whether a mission waits at the table that `body` may take — see
     /// [`Self::take_pooled`].
     pub fn has_pooled_for(&self, body: &str) -> bool {
-        !self.is_unordered(body)
-            && self.pool.iter().any(|m| match m.operation() {
-                Some((id, _)) => self.operations.may_take(id, body),
-                None => true,
-            })
+        !self.is_unordered(body) && self.pool.iter().any(|m| self.may_take(body, m))
+    }
+
+    /// Whether `body` may take mission `m` from the table: anybody may, but
+    /// a step of an operation only somebody its workflow lets take it.
+    fn may_take(&self, body: &str, m: &Mission) -> bool {
+        match m.operation() {
+            Some((id, _)) => self.operations.may_take(id, body),
+            None => true,
+        }
     }
 
     /// The oldest generated mission waiting at the table that `body` may take,
     /// now carried by it. A review is never taken by the Maker who drafted it.
+    ///
+    /// **A standing mission is given out last** (`docs/zen_moon_mind.md`
+    /// §12): taken only when nothing else waiting may be.
     fn take_pooled(&mut self, body: &str) -> Option<Mission> {
-        let at = self.pool.iter().position(|m| match m.operation() {
-            Some((id, _)) => self.operations.may_take(id, body),
-            None => true,
-        })?;
+        let at = self
+            .pool
+            .iter()
+            .position(|m| self.may_take(body, m) && !is_standing(m))
+            .or_else(|| {
+                self.pool
+                    .iter()
+                    .position(|m| self.may_take(body, m) && is_standing(m))
+            })?;
         let mission = self.pool.remove(at);
         if let Some(entry) = target_of(&mission).and_then(|k| self.targets.get_mut(k)) {
             entry.state = Settled::Carried;
@@ -831,9 +895,15 @@ impl Missions {
     /// free Maker had already carried: it drew routine after routine — the
     /// pressure door, read six times in twenty minutes — and no new work was
     /// ever written for it.
+    ///
+    /// The world's standing upkeep is not stock: a table holding only that is
+    /// a table with no work on it.
     pub fn stocked_for(&self, makers: &[String], keep: usize) -> bool {
-        let n = self.pool.len();
-        n >= keep + makers.len() || (n >= keep && makers.iter().all(|m| self.has_pooled_for(m)))
+        let work = || self.pool.iter().filter(|m| !is_standing(m));
+        let n = work().count();
+        let has_work_for =
+            |body: &str| !self.is_unordered(body) && work().any(|m| self.may_take(body, m));
+        n >= keep + makers.len() || (n >= keep && makers.iter().all(|m| has_work_for(m)))
     }
 
     /// Strike, from every mission carried, waiting at the table or lodged, each
@@ -1195,15 +1265,36 @@ impl Missions {
             Some((id, _)) => self.settle_if_over(id),
             None => self.settle(&mission, outcome, notes),
         }
-        // A posted mission's report is its poster's.
-        if let Origin::Ordered { poster, .. } = &mission.origin {
-            self.orders.filed(Filed {
+        // A posted mission's report is its poster's; a standing mission's is
+        // filed for whoever gives orders here, and, done, it is done there.
+        match &mission.origin {
+            Origin::Ordered { poster, .. } => self.orders.filed(Filed {
                 poster: poster.clone(),
                 carrier: body.to_string(),
                 brief: mission.prompt.clone(),
                 outcome,
                 notes: notes.to_string(),
-            });
+            }),
+            Origin::Standing { id, room } => {
+                let key = format!("{id}@{room}");
+                match outcome {
+                    Outcome::Pass => {
+                        self.standing_failed.remove(&key);
+                        self.standing.insert(key, None);
+                    }
+                    Outcome::Fail => {
+                        self.standing_failed.insert(key, None);
+                    }
+                }
+                self.orders.filed(Filed {
+                    poster: EVERY_POSTER.to_string(),
+                    carrier: body.to_string(),
+                    brief: mission.prompt.clone(),
+                    outcome,
+                    notes: notes.to_string(),
+                });
+            }
+            _ => {}
         }
         self.done.insert(body.to_string(), mission.clone());
         self.close(body, &mission);
@@ -1262,6 +1353,12 @@ impl Missions {
             entry.note = notes.to_string();
         }
     }
+}
+
+/// Whether `m` is one of the world's standing missions
+/// (`docs/zen_moon_mind.md` §12).
+fn is_standing(m: &Mission) -> bool {
+    matches!(m.origin, Origin::Standing { .. })
 }
 
 /// The target a generated mission is about.

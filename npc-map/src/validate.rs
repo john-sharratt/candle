@@ -364,6 +364,7 @@ mod tests {
             arrival: None,
             teleport_to: None,
             spine: None,
+            mirrored: false,
             nodes,
         }
     }
@@ -497,6 +498,7 @@ mod tests {
             short: None,
             long: "a seat".into(),
             modes: vec![],
+            link: None,
         };
         let mut a = area(vec![node("hall", NodeKind::Core, &[])]);
         a.nodes[0].parts = vec![Placement::Counted {

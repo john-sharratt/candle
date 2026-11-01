@@ -13,12 +13,13 @@ use super::forward::{act_of, call_line};
 use super::npc_lease::{hand_back, leases_of, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
+use crate::bridge;
 use crate::discord::server::apply::channel_message;
 use crate::engine::act::Act;
-use crate::engine::body;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
+use crate::engine::{body, build};
 
 /// An act made, for the feed and the character, and whether it moved the
 /// character's mission.
@@ -233,8 +234,10 @@ impl Runtime {
         let world = hosted.id().to_string();
         // An act that happens inside a head touches no world, wherever the
         // world runs.
-        let of_the_world =
-            body::is_of_the_body(act.tool) || body::is_device(act.tool) || body::composes(act.tool);
+        let of_the_world = body::is_of_the_body(act.tool)
+            || body::is_device(act.tool)
+            || body::composes(act.tool)
+            || body::is_of_the_house(act.tool);
         if self.standing.writes(&world) || !of_the_world {
             return self.perform_here(npc, act, pinned).await;
         }
@@ -302,6 +305,10 @@ impl Runtime {
             self.enact_device(npc, act, pinned).await
         } else if body::composes(act.tool) {
             self.compose(npc, act).await
+        } else if bridge::is_mine(act.tool) {
+            self.bridge_act(npc, act).await
+        } else if build::is_mine(act.tool) {
+            self.build_act(npc, act).await
         } else {
             self.record_act(npc, act)
         };

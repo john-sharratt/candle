@@ -23,6 +23,7 @@ use super::corpus::Corpus;
 use super::gates;
 use super::material;
 use super::reading;
+use super::standing;
 use super::step;
 use super::target::{self, Kind, Target};
 use super::world::{Draw, WorldMissions};
@@ -722,6 +723,7 @@ pub fn spawn(rt: Arc<Runtime>) {
     tokio::spawn(async move {
         let mut told: Option<String> = None;
         let mut told_world: BTreeMap<String, String> = BTreeMap::new();
+        let mut told_standing: BTreeMap<String, String> = BTreeMap::new();
         loop {
             tokio::time::sleep(TICK).await;
             if rt.stopping() {
@@ -747,6 +749,37 @@ pub fn spawn(rt: Arc<Runtime>) {
                 let Some(hosted) = rt.hosted.get(&id) else {
                     continue;
                 };
+                // **The world's own standing work**, put up by its authority in
+                // every room it is due in, while the table is open
+                // (`docs/zen_moon_mind.md` §12).
+                if rt.standing.role(&id).is_authority() && hosted.sim(|s| s.table_open) {
+                    match standing::load(&mind, &id) {
+                        Ok(defs) if defs.is_empty() => {
+                            told_standing.remove(&id);
+                        }
+                        Ok(defs) => {
+                            told_standing.remove(&id);
+                            let put = hosted.with_both(|w, s| {
+                                s.missions.stamp_standing(now_ms());
+                                let due = standing::due(&defs, w.map(), &s.missions, now_ms());
+                                let n = due.len();
+                                for m in due {
+                                    s.missions.put_up_standing(m);
+                                }
+                                n
+                            });
+                            if put > 0 {
+                                tracing::info!(world = %id, missions = put, "standing missions put up");
+                            }
+                        }
+                        Err(e) => {
+                            if told_standing.get(&id) != Some(&e) {
+                                tracing::warn!(world = %id, "a world's standing missions: {e}");
+                                told_standing.insert(id.clone(), e);
+                            }
+                        }
+                    }
+                }
                 // **A world with its own missions runs on them alone.** Its
                 // routines replace the bank's, and the record's generators and
                 // workflows are not this world's: work they opened before the

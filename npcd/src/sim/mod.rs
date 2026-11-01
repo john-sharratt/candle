@@ -33,9 +33,11 @@
 //! than assert that one is plausible.
 
 pub mod bench;
+pub mod built;
 pub mod decisions;
 pub mod device;
 pub mod field;
+pub mod findings;
 pub mod item;
 pub mod ledger;
 pub mod missing;
@@ -124,6 +126,15 @@ pub struct Sim {
     /// `focus`es on any room at once, and neither walks nor rides the lift.
     #[serde(default)]
     attending: BTreeSet<String>,
+    /// What the last survey of each room found — see [`findings`].
+    #[serde(default)]
+    pub findings: findings::Findings,
+    /// Every change the world's builders made to its map, in order
+    /// (`docs/zen_moon_mind.md` §14) — laid over the authored map again
+    /// whenever the world is loaded, so what was built stands across a
+    /// restart and on every member. See [`built`].
+    #[serde(default)]
+    pub built: built::Built,
 }
 
 impl Sim {
@@ -750,6 +761,7 @@ impl Sim {
             other.bench.set_mind(mind.clone());
         }
         other.missions.adopt_workflows(&mut self.missions);
+        other.built.carry_laid(&self.built);
         *self = other;
     }
 

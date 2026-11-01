@@ -1159,7 +1159,9 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     // Being at the lift, or in it, is where the body is standing,
                     // not a fact about the channel — said in `needs` instead.
                     | Availability::AtLift
-                    | Availability::AtLanding => true,
+                    | Availability::AtLanding
+                    // A grant is the carried mission's, not the channel's.
+                    | Availability::Granted => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
                     Availability::MessagingOnly => m.remote(),
                     Availability::Pictorial => m.carries_pictures(),
@@ -1226,6 +1228,9 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     },
                     Availability::AtLift => json!("at the lift, with it on another floor"),
                     Availability::AtLanding => json!("at the lift, wherever the car is"),
+                    Availability::Granted => {
+                        json!("a mission that grants it, in that mission's room in a mirrored place")
+                    }
                 },
                 // Every station, named, however many there are. The `needs`
                 // line above summarises for the table; this is what the detail

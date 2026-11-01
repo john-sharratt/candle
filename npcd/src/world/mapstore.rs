@@ -25,6 +25,7 @@
 //! load re-weaves — the round-trip is stable.
 
 use anyhow::{Context, Result};
+use npc_map::part::Part;
 use npc_map::{MapEdit, MapSet};
 
 use crate::sim::shelf::Shelf;
@@ -46,16 +47,53 @@ impl Keep {
             false => format!("{}/{id}.yaml", self.folder.trim_end_matches('/')),
         }
     }
+
+    /// Where part `id`'s file is on the shelf, in `parts/` beside the areas:
+    /// the file that defines it already, whatever it is named, or else one
+    /// named for it — so a part is never defined twice.
+    fn part_path_of(&self, id: &str) -> String {
+        let dir = match self.folder.is_empty() {
+            true => "parts".to_string(),
+            false => format!("{}/parts", self.folder.trim_end_matches('/')),
+        };
+        let defines = |path: &str| {
+            self.shelf
+                .read(path)
+                .and_then(|text| serde_yaml::from_str::<Part>(&text).ok())
+                .is_some_and(|p| p.id == id)
+        };
+        self.shelf
+            .list(&dir)
+            .into_iter()
+            .filter(|name| name.ends_with(".yaml") && !name.starts_with('.'))
+            .map(|name| format!("{dir}/{name}"))
+            .find(|path| defines(path))
+            .unwrap_or_else(|| format!("{dir}/{id}.yaml"))
+    }
 }
 
-/// Keep the one area a reshape touched.
+/// Keep the one area a reshape touched — or, for a part defined, the part's
+/// own file.
 ///
 /// For a removal, the area's file is removed (an already-absent file is fine —
 /// the end state is the same). For every other edit, the touched area is
 /// re-serialised from `map`. `map` is the map *after* the reshape, so the area
 /// read back here is the reshaped one.
 pub fn persist(keep: &Keep, edit: &MapEdit, map: &MapSet) -> Result<()> {
-    let area_id = edit.area();
+    if let Some(id) = edit.catalogue_part() {
+        let part = map
+            .part(id)
+            .with_context(|| format!("part `{id}` is gone after a reshape that defined it"))?;
+        let yaml = serde_yaml::to_string(part).context("serialising the part")?;
+        return keep
+            .shelf
+            .commit(&[(keep.part_path_of(id), Some(yaml))])
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("keeping part `{id}`"));
+    }
+    let Some(area_id) = edit.area() else {
+        return Ok(());
+    };
     let path = keep.path_of(area_id);
     if edit.removes_area() {
         return keep
@@ -117,6 +155,7 @@ mod tests {
             arrival: None,
             teleport_to: None,
             spine: None,
+            mirrored: false,
             nodes,
         }
     }
@@ -168,6 +207,98 @@ mod tests {
             hall.exits.contains(&"green".to_string()),
             "the reloaded map did not have the new room woven in: {:?}",
             hall.exits
+        );
+    }
+
+    /// **A part onboarded is kept as its own file in `parts/`**, and placed in
+    /// its room's area file: loaded afresh, the room holds it, link and all.
+    #[test]
+    fn a_defined_and_placed_part_survives_a_reload() {
+        use npc_map::part::{Part, PartKind, PartLink, Placement};
+        use npc_map::schema::Where;
+        let (dir, set) = base();
+        let speaker = Part {
+            id: "sonos-f0f6c1".into(),
+            kind: PartKind::Fixture,
+            name: "Sonos speaker".into(),
+            plural: None,
+            binds: None,
+            short: None,
+            long: "A Sonos player.".into(),
+            modes: vec![],
+            link: Some(PartLink {
+                profile: "sonos".into(),
+                address: "192.168.0.89".into(),
+                hardware: "f0:f6:c1:a0:79:b4".into(),
+            }),
+        };
+        let define = MapEdit::DefinePart(Box::new(speaker.clone()));
+        let defined = set.apply(&define).unwrap();
+        persist(&on_disk(dir.path()), &define, &defined).unwrap();
+        let place = MapEdit::PlacePart {
+            at: Where::new("a", "hall"),
+            placement: Placement::Bare("sonos-f0f6c1".into()),
+        };
+        let placed = defined.apply(&place).unwrap();
+        persist(&on_disk(dir.path()), &place, &placed).unwrap();
+
+        assert!(dir.path().join("parts/sonos-f0f6c1.yaml").exists());
+        let reloaded = MapSet::load_dir(dir.path()).expect("the written map reloads");
+        assert_eq!(reloaded.part("sonos-f0f6c1").unwrap().link, speaker.link);
+        let hall = reloaded.get("a").unwrap().node("hall").unwrap();
+        assert_eq!(hall.parts[0].part(), "sonos-f0f6c1");
+        assert!(defined.apply(&define).is_err(), "a part is defined once");
+    }
+
+    /// **A part is kept in the file that defines it**, whatever that file is
+    /// named — linking an authored part never writes it a second time.
+    #[test]
+    fn a_linked_part_is_kept_in_the_file_that_defines_it() {
+        use npc_map::part::{Part, PartKind, PartLink};
+        let (dir, set) = base();
+        let cast = Part {
+            id: "cast".into(),
+            kind: PartKind::Fixture,
+            name: "Chromecast".into(),
+            plural: None,
+            binds: None,
+            short: None,
+            long: "The Chromecast on the television.".into(),
+            modes: vec![],
+            link: None,
+        };
+        std::fs::create_dir_all(dir.path().join("parts")).unwrap();
+        std::fs::write(
+            dir.path().join("parts/chromecast.yaml"),
+            serde_yaml::to_string(&cast).unwrap(),
+        )
+        .unwrap();
+        let defined = set.apply(&MapEdit::DefinePart(Box::new(cast))).unwrap();
+        let link = MapEdit::LinkPart {
+            part: "cast".into(),
+            link: PartLink {
+                profile: "device".into(),
+                address: "192.168.0.214".into(),
+                hardware: "14:ae:85:71:eb:44".into(),
+            },
+        };
+        let linked = defined.apply(&link).unwrap();
+        persist(&on_disk(dir.path()), &link, &linked).unwrap();
+
+        assert!(
+            !dir.path().join("parts/cast.yaml").exists(),
+            "not defined twice"
+        );
+        let reloaded = MapSet::load_dir(dir.path()).expect("the written map reloads");
+        assert_eq!(
+            reloaded
+                .part("cast")
+                .unwrap()
+                .link
+                .as_ref()
+                .unwrap()
+                .address,
+            "192.168.0.214"
         );
     }
 

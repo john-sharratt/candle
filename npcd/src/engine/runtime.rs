@@ -122,7 +122,7 @@ use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
 use crate::projection;
-use crate::sim::orders::Notice;
+use crate::sim::orders::{Notice, EVERY_POSTER};
 use crate::sim::phone::Origin;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
@@ -2142,7 +2142,10 @@ impl Runtime {
                     .collect()
             }),
             ..Default::default()
-        };
+        }
+        // What the house's bridges can work here, and what the carried mission
+        // lets this body build (`docs/zen_moon_mind.md` §13–§15).
+        .in_the_house(&hosted, &body);
         // What the world's own state adds: what this body carries, what stands
         // in the room with it, what is outside. An empty answer to any of them
         // takes the acts that need it out of the grammar, which is how a world
@@ -2414,9 +2417,25 @@ impl Runtime {
                 }
             }
             Notice::Reported(filed) => {
-                let Some(npc_id) = self.bodies.mind_of(world, &filed.poster) else {
-                    return;
+                // A standing mission's report is for every body here that
+                // gives orders; a posted one's for its poster.
+                let posters: Vec<u64> = match filed.poster == EVERY_POSTER {
+                    true => self
+                        .bodies
+                        .in_world(world)
+                        .into_iter()
+                        .filter(|(_, body)| hosted.sim(|s| s.missions.is_unordered(body)))
+                        .map(|(npc_id, _)| npc_id)
+                        .collect(),
+                    false => self
+                        .bodies
+                        .mind_of(world, &filed.poster)
+                        .into_iter()
+                        .collect(),
                 };
+                if posters.is_empty() {
+                    return;
+                }
                 let carrier = hosted
                     .read(|w| w.actor(&filed.carrier).map(|a| a.name.clone()))
                     .unwrap_or_else(|| filed.carrier.clone());
@@ -2428,14 +2447,14 @@ impl Runtime {
                     true => " The table is empty: nothing you posted waits to be taken.",
                     false => "",
                 };
-                tell(
-                    npc_id,
-                    format!(
-                        "{carrier} has {how}: {}. The report is at the order table — \
-                         `order_results`.{empty}",
-                        filed.brief.trim_end_matches('.')
-                    ),
+                let line = format!(
+                    "{carrier} has {how}: {}. The report is at the order table — \
+                     `order_results`.{empty}",
+                    filed.brief.trim_end_matches('.')
                 );
+                for npc_id in posters {
+                    tell(npc_id, line.clone());
+                }
             }
         }
     }
