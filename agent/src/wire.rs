@@ -336,6 +336,39 @@ pub struct Switching {
     pub enabled: bool,
 }
 
+/// `POST /v1/bridge`: a member's device-bridge job (`docs/zen_moon_mind.md`
+/// §15). The agent runs `house_bridge` for it — the device I/O happening on a
+/// machine inside the house — the way it runs the git jobs.
+///
+/// - **`work`** — do `action` (`status`, `play`, `volume`, …) on the device of
+///   `profile` named `name` at `address`, with `args`.
+/// - **`wake`** — wake the sleeping machine `name` by its hardware address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeCall {
+    Work {
+        profile: String,
+        name: String,
+        address: String,
+        action: String,
+        #[serde(default)]
+        args: serde_json::Map<String, serde_json::Value>,
+    },
+    Wake {
+        name: String,
+        mac: String,
+    },
+}
+
+/// What a [`BridgeCall`] came to: whether the device did it, and the line the
+/// caller reads — the bridge's own words, refusal included (a device that will
+/// not answer is `ok: false`, not a failed job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bridged {
+    pub ok: bool,
+    pub line: String,
+}
+
 /// Why a [`PushLine`], [`Pushed`] or [`Fetched`] does not read as one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]

@@ -22,6 +22,10 @@ clap         = { workspace = true }
 cluster      = { path = "../cluster" }
 cluster-dial = { path = "../cluster-dial" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The house's device bridges (`docs/zen_moon_mind.md` §15): the library this
+# agent runs for a member's bridge job, the way it runs the git jobs — the
+# device I/O happens here, on a machine inside the house.
+house-bridge = { path = "../house-bridge" }
 http-body-util = "0.1"
 hyper        = { version = "1", features = ["server", "client", "http1"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
