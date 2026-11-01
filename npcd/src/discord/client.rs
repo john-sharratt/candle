@@ -372,6 +372,18 @@ impl Client {
         Ok(made.id)
     }
 
+    /// Show the bot typing in channel `channel_id`, for the next ten seconds
+    /// or until it posts there.
+    pub async fn trigger_typing(&self, token: &str, channel_id: u64) -> Result<(), DiscordError> {
+        self.call_empty(
+            Method::POST,
+            &format!("/channels/{channel_id}/typing"),
+            token,
+            None,
+        )
+        .await
+    }
+
     /// Add Discord user `user_id` to thread `thread_id`.
     pub async fn add_thread_member(
         &self,

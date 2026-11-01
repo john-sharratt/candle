@@ -21,8 +21,10 @@ bot runtime of §3.3 and §6 (`gateway/` — `protocol`, `guild`, `shard` — `s
 `bots/`), linking (§3.2, `link/`), DMs both ways (§5, `dm/`), a bot in its servers'
 channels (§3.4, `server/`), the posting both share (`post/`), and seeing what the bridge
 did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
-and of part three the world's own server and its open channel (§4.4, `world/`);
-§8 says what comes next, in the order it is built. It sits on npcd's
+and part three: the world's own server mirrored — its open channel, groups,
+private-thread DMs and backstage — with the reconcile, the carry-over of its cursors,
+and typing (§4.4, §5.3–5.4, `world/`, `dm/typing.rs`). §8 records the order it was
+built in. It sits on npcd's
 messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
 `say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
@@ -756,12 +758,25 @@ channel, group and webhook halves of §5, and it is built first and alone.
    channel's gap and renames or repictures a bot whose character changed — a bot's
    record keeps the portrait it was `pictured` with, so an avatar is sent only when it
    differs.
-11. Authority moves for the listener and the channel cursors (§5.4), with a two-member
-   test that a cursor carries over.
-12. Backstage threads for character-to-character DMs.
-13. Typing: from when a DM from Discord is delivered to the character until it answers
-    or its turn ends — two minutes at most — its bot shows typing in that DM
-    (`POST /channels/{id}/typing`, renewed every 8 s).
+11. **Built:** authority moves for the listener and the channel cursors (§5.4). The
+   mirror's records go with the world's; the member that takes the world reconciles on
+   its first beat (a member that loses it forgets when it last did), and a test hands
+   one member's records to another and checks the next holder posts on from the cursor
+   and nothing twice. A webhook whose sealed token does not open on the new holder — a
+   member with no cluster key in common — is made again.
+12. **Built:** backstage threads for character-to-character DMs, in a world whose
+   `discord/guild` says `backstage`: a private thread under `#backstage` (everyone may
+   see it, nobody may write in it or its threads) named for the two characters, each
+   owner who has linked Discord added. Every line in a private thread — a DM's or a
+   backstage one — is posted through its parent's webhook, a character's with its own
+   bot too, since a bot is no member of the thread; anything written backstage is
+   dropped (`read_only_dropped`).
+13. **Built:** typing. While a person's DM from Discord is the last thing said to the
+   character and under two minutes old, its bot shows typing in that DM
+   (`POST /channels/{id}/typing`, renewed every 8 s); the character's answer, being
+   the last thing said then, ends it (`npcd/src/discord/dm/typing.rs`). A turn that ends
+   without an answer is not seen from the bots' beat, so the two minutes are the
+   bound.
 
 ---
 

@@ -124,7 +124,7 @@ pub async fn post(
 }
 
 /// The name account `account`'s person speaks by in the world.
-async fn speaking_name(a: &Authored, account: &str) -> Option<String> {
+pub(super) async fn speaking_name(a: &Authored, account: &str) -> Option<String> {
     let identity = a.accounts.read().await.identity(account)?;
     Some(speaking_as(&identity, &public_id(account), &a.roles))
 }

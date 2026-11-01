@@ -21,8 +21,9 @@
 //!    refusal (`4004`, or a `401` on any call) stops the shard and writes the
 //!    bot's state refused.
 //! 3. **What the characters wrote is posted** to their DMs ([`outbound`])
-//!    and their channels ([`channel outbound`]), and every world whose
-//!    listener is online here is mirrored into its server ([`world`]).
+//!    and their channels ([`channel outbound`]), a bot is shown typing in a
+//!    DM a person waits on ([`typing`]), and every world whose listener is
+//!    online here is mirrored into its server ([`world`]).
 //!
 //! A shard never writes the world: it hands what it hears to this beat's
 //! queue, and the beat — on the authority — makes the world's writes. The
@@ -51,6 +52,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use crate::api::{now_ms, Authored};
 use crate::discord::dm::outbound::{self, Unreachable};
 use crate::discord::dm::told::Told;
+use crate::discord::dm::typing::{self, Typed};
 use crate::discord::dm::{gap, inbound};
 use crate::discord::gateway::protocol::{self, INTENTS};
 use crate::discord::gateway::shard::{Config, Event, Shard, CONTENT_RETRY};
@@ -93,6 +95,7 @@ struct Held {
     heard: mpsc::UnboundedReceiver<(u64, Event)>,
     running: HashMap<u64, Running>,
     told: HashMap<u64, Told>,
+    typed: HashMap<u64, Typed>,
     unreachable: HashMap<u64, Unreachable>,
     /// For each character, the `connected_ms` of a bot the gateway will not
     /// serve or whose token does not open: not tried again until another is
@@ -125,6 +128,7 @@ impl Bots {
                 heard,
                 running: HashMap::new(),
                 told: HashMap::new(),
+                typed: HashMap::new(),
                 unreachable: HashMap::new(),
                 halted: HashMap::new(),
             }),
@@ -211,6 +215,11 @@ impl Bots {
             let unreachable = held.unreachable.entry(bot.npc).or_default();
             let posted = match outbound::post(a, bot, unreachable).await {
                 Ok(()) => channel_outbound::post(a, bot).await,
+                Err(rejected) => Err(rejected),
+            };
+            let typed = held.typed.entry(bot.npc).or_default();
+            let posted = match posted {
+                Ok(()) => typing::show(a, bot, typed).await,
                 Err(rejected) => Err(rejected),
             };
             if posted.is_err() {

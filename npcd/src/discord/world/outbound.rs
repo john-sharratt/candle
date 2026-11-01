@@ -59,7 +59,10 @@ pub async fn post(
                 thread: &thread,
                 seq: m.seq,
             };
-            let who = speaker::of(a, hosted, guild.guild_id, &m.from, online);
+            let who = match mirrored.parent {
+                Some(_) => speaker::hooked(a, hosted, &m.from),
+                None => speaker::of(a, hosted, guild.guild_id, &m.from, online),
+            };
             let parts = split(&m.intent, LIMIT);
             let mut last = 0;
             for part in &parts {

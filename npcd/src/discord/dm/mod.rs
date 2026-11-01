@@ -8,9 +8,11 @@
 //! | [`inbound`] | a DM heard in the world |
 //! | [`outbound`] | the character's answers posted to its DMs |
 //! | [`gap`] | what was written while no member ran the bot |
+//! | [`typing`] | the bot shown typing while a person waits on it |
 
 pub mod gap;
 pub mod inbound;
 pub mod outbound;
 pub mod record;
 pub mod told;
+pub mod typing;
