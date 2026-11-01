@@ -64,9 +64,12 @@ pub mod speaker;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::api::Authored;
+use crate::api::{now_ms, Authored};
 use crate::discord::online::Online;
+use crate::discord::trace::failed;
+use crate::discord::trace::note::{Direction, Note};
 use crate::world::Hosted;
 
 use self::record::Guild;
@@ -102,14 +105,31 @@ pub async fn tick(a: &Arc<Authored>, online: &[Online]) {
             continue;
         }
         if let Err(e) = channels::ensure(a, bot, &hosted, &guild).await {
-            a.bots.hold_mirror(hosted.id(), hold::after(&e));
+            held(a, bot, hosted.id(), hold::after(&e));
             continue;
         }
         if a.bots.reconcile_due(hosted.id(), reconcile::EVERY) {
             reconcile::run(a, bot, &hosted, &guild, &by_npc).await;
         }
-        if let Some(wait) = outbound::post(a, bot, &hosted, &guild, &by_npc).await {
-            a.bots.hold_mirror(hosted.id(), wait);
+        match outbound::post(a, bot, &hosted, &guild, &by_npc).await {
+            Some(wait) => held(a, bot, hosted.id(), wait),
+            None => a.bots.mirror_cleared(hosted.id()),
         }
     }
+}
+
+/// Hold world `world`'s mirror after a refusal asking for at least `wait`,
+/// and say for how long in `bot`'s trace.
+fn held(a: &Authored, bot: &Online, world: &str, wait: Duration) {
+    let hold = a.bots.hold_mirror(world, wait);
+    failed(
+        a,
+        bot.npc,
+        Note::new(
+            now_ms(),
+            Direction::Out,
+            "mirror",
+            &format!("held {}s after a refusal", hold.as_secs()),
+        ),
+    );
 }

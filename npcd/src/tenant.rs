@@ -43,6 +43,8 @@ use crate::authorize::{self, Signer};
 use crate::clock;
 use crate::collections::Libraries;
 use crate::discord::bots;
+use crate::discord::client::{self as discord_client, Client as DiscordClient};
+use crate::discord::limit::{self, InvalidRequests};
 use crate::discord::seal::{self, Sealer};
 use crate::effector::router::{router as effector_router, Local};
 use crate::effector::token::Tokens;
@@ -153,6 +155,18 @@ pub struct NpcdArgs {
     /// runs here, even with every other member away.
     #[arg(long = "no-characters", action = ArgAction::SetFalse)]
     pub characters: bool,
+
+    /// From how many invalid answers (`401`/`403`/`429`) Discord gave this
+    /// process in the last ten minutes every request to it is spaced out
+    /// (`discord::limit`). Discord bans the public address past 10,000, for
+    /// every member behind it: members sharing one address take a part each.
+    #[arg(long, value_name = "COUNT", default_value_t = limit::THROTTLE)]
+    pub discord_invalid_throttle: u32,
+
+    /// At how many invalid answers in the last ten minutes nothing more is
+    /// sent to Discord until the window rolls on.
+    #[arg(long, value_name = "COUNT", default_value_t = limit::CEILING)]
+    pub discord_invalid_ceiling: u32,
 }
 
 /// `--mind-branch`'s default.
@@ -210,6 +224,8 @@ impl Default for NpcdArgs {
             wipe_conversations: false,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             characters: true,
+            discord_invalid_throttle: limit::THROTTLE,
+            discord_invalid_ceiling: limit::CEILING,
         }
     }
 }
@@ -497,6 +513,16 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         mind,
         images,
         personality_portraits,
+    );
+    // Every bot's calls through one count of the invalid answers, at this
+    // member's lines (`discord::limit`).
+    authored.discord = DiscordClient::limited(
+        discord_client::PRODUCTION,
+        InvalidRequests::new(
+            args.discord_invalid_throttle,
+            args.discord_invalid_ceiling,
+            limit::WINDOW,
+        ),
     );
     // A link one member signs, another member may be asked to open.
     if let Some(join) = &ctx.cluster {

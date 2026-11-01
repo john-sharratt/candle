@@ -523,7 +523,10 @@ stays unposted, and Discord is not asked again until the character writes again)
 record is then written with `last_seen_discord` the lowest snowflake of that moment, so
 the gap fetch reads only what the person writes from then on.
 
-A post that fails with 429 waits `retry_after` (at most 30 s, three tries a beat); one
+A post that fails with 429 waits `retry_after` (at most 30 s, three tries a beat). The
+client itself honours every 429 for as long as it asks: until its `retry_after` is up,
+a call with that bot's token, or to that webhook, is refused locally with the time
+still to wait and never reaches Discord. One
 that fails otherwise leaves the cursor where it was, and the next beat tries again — so
 a gap is retried, never skipped. Posting is per channel and in order. Every post sends
 `allowed_mentions: {parse: []}`: what a character says pings nobody.
@@ -644,8 +647,15 @@ way (`npcd/src/discord/gateway/fake.rs`). `serenity` builds a whole client per t
 and is the heavier fit.
 
 The **per-IP invalid-request limit is shared by every token**, so the bridge keeps one
-counter for the host: past 5,000 401/403/429 responses in ten minutes it stops sending
-for the rest of the window and says so (`npcd/src/discord/limit.rs`). A 401 (a token
+counter for the process (`npcd/src/discord/limit.rs`): a rolling window of the 401/403/429
+answers of the last ten minutes. From `--discord-invalid-throttle` (5,000) every request is
+spaced one per `600 s / (ceiling − throttle)` — 200 ms — so even a window of nothing but
+refusals cannot reach `--discord-invalid-ceiling` (8,000), at which nothing is sent until the
+oldest answer leaves the window. Each crossing is logged once. Every member behind one public
+address shares Discord's 10,000, so each is given its own part of it. And no caller asks again
+on the next beat after a refusal: a world's mirror and a bot's DM hold off for the 429's
+`retry_after`, ten minutes after a 403 or a 401, thirty seconds otherwise, each doubled for
+every refusal in a row up to an hour (`npcd/src/discord/world/hold.rs`). A 401 (a token
 revoked in the portal) marks that bot `refused` (§3.3) and stops its shard rather than
 retrying; a new token connected in the panel reopens it.
 

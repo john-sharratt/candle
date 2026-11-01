@@ -15,6 +15,11 @@
 //!   not given (`403`), a token Discord rejected (`401`) — for
 //!   [`REFUSED_FOR`];
 //! - anything else for [`FAILED_FOR`].
+//!
+//! Each refusal in a row doubles the hold ([`backoff`]), to at most
+//! [`HOLD_MAX`]; a beat that gets through unrefused starts it again. A
+//! bot's own DM is held the same way, keyed `dm/<channel_id>`
+//! (`crate::discord::dm::outbound`).
 
 use std::time::Duration;
 
@@ -25,6 +30,18 @@ pub const REFUSED_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// How long any other failure holds the mirror.
 pub const FAILED_FOR: Duration = Duration::from_secs(30);
+
+/// The longest a mirror is held, however many refusals in a row.
+pub const HOLD_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How long the `refusals`th refusal in a row holds the mirror, `wait` the
+/// least its answer asks: doubled for each refusal before it, and never
+/// more than [`HOLD_MAX`]. A mirror refused again as soon as it asks backs
+/// off from seconds to an hour rather than asking at one fixed rate.
+pub fn backoff(wait: Duration, refusals: u32) -> Duration {
+    wait.saturating_mul(1u32 << refusals.saturating_sub(1).min(16))
+        .min(HOLD_MAX)
+}
 
 /// Discord's status for a request the bot is not allowed to make.
 const FORBIDDEN: u16 = 403;
@@ -80,5 +97,21 @@ mod tests {
         };
         assert_eq!(after(&down), FAILED_FOR);
         assert_eq!(after(&DiscordError::Transport("reset".into())), FAILED_FOR);
+    }
+
+    /// **Each refusal in a row doubles the hold, to at most an hour.**
+    #[test]
+    fn refusals_in_a_row_double_the_hold_to_an_hour() {
+        let s = Duration::from_secs;
+        assert_eq!(backoff(s(30), 1), s(30));
+        assert_eq!(backoff(s(30), 2), s(60));
+        assert_eq!(backoff(s(30), 3), s(120));
+        assert_eq!(backoff(s(30), 7), s(1920));
+        assert_eq!(backoff(s(30), 8), HOLD_MAX);
+        assert_eq!(backoff(s(30), 200), HOLD_MAX, "no overflow");
+        assert_eq!(backoff(REFUSED_FOR, 1), REFUSED_FOR);
+        assert_eq!(backoff(REFUSED_FOR, 3), s(2400));
+        assert_eq!(backoff(REFUSED_FOR, 4), HOLD_MAX);
+        assert_eq!(backoff(s(7200), 1), HOLD_MAX, "capped from the first");
     }
 }
