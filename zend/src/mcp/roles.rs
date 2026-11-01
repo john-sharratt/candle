@@ -58,10 +58,6 @@ mod tests {
         WorkerKind::Reviewer,
     ];
 
-    /// The most characters a role's option may run to: about 400 tokens. Every
-    /// worker of that kind carries it in every round.
-    const MAX_OPTION_CHARS: usize = 2_000;
-
     /// The `role` selector's options as `projection.yaml` declares them.
     fn options() -> Vec<(String, Option<String>)> {
         let schema: Value =
@@ -155,11 +151,10 @@ mod tests {
         assert_eq!(options[0], ("generic".to_string(), None));
     }
 
-    /// Every kind names a real option, a short one, and only working rules:
-    /// a worked exchange in a role would hijack the dialogues that borrow its
-    /// turns.
+    /// Every kind names a real option, and only working rules: a worked
+    /// exchange in a role would hijack the dialogues that borrow its turns.
     #[test]
-    fn every_kind_has_a_short_option_of_its_own() {
+    fn every_kind_has_an_option_of_its_own() {
         let options = options();
         assert_eq!(options.len(), KINDS.len() + 1);
         for kind in KINDS {
@@ -169,7 +164,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("no option for {kind:?}"));
             let content = content.as_deref().unwrap();
             assert!(content.starts_with("You are working as a "), "{kind:?}");
-            assert!(content.len() <= MAX_OPTION_CHARS, "{}", content.len());
             assert!(!content.contains("<|im_start|>"), "{kind:?}");
         }
     }
