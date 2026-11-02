@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod tapping;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

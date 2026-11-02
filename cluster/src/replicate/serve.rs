@@ -37,15 +37,14 @@ impl Replicator {
             // and listed gone in this very answer (`own_gaps.rs`).
             let held = store.applied();
             if let Some(own) = held.origin(node) {
+                // Read before the state is taken: the store's answer can wait
+                // on a write whose tap takes the state.
+                let written = store.own_through();
                 let gone = {
                     let mut s = me.state();
                     let others = s.other_members(node);
-                    s.own_gaps.saw(
-                        asked.reply_to,
-                        asked.since.origin(node),
-                        own,
-                        store.own_through(),
-                    );
+                    s.own_gaps
+                        .saw(asked.reply_to, asked.since.origin(node), own, written);
                     s.own_gaps.gone(&others)
                 };
                 for (from, to) in &gone {
