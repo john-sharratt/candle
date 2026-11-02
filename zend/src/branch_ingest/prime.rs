@@ -29,6 +29,7 @@
 //! missing anchor is skipped; the chain continues from the link before it.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::substrate::Substrate;
@@ -68,6 +69,16 @@ pub fn is_link_file(path: &str) -> bool {
 pub enum Link<'a> {
     Folder(&'a UnitItem),
     File(&'a FileItem),
+}
+
+impl Link<'_> {
+    /// The folder or file this link reads.
+    fn name(&self) -> &str {
+        match self {
+            Link::Folder(u) => &u.unit.dir,
+            Link::File(f) => &f.file.path,
+        }
+    }
 }
 
 /// The chain's links, in order: for each of `repos` — `(name, default
@@ -193,6 +204,14 @@ impl BranchIngest {
             if crate::ingest_cancel::cancelled() {
                 break;
             }
+            let began = Instant::now();
+            tracing::info!(
+                target: "zend::priming_chain",
+                link = done + 1,
+                of = chain.len(),
+                unit = %link.name(),
+                "reading a chain link",
+            );
             let read = match (link, folders, files) {
                 (Link::Folder(u), Some(layer), _) => repo_scan::ingest_link(
                     ctx,
@@ -222,6 +241,14 @@ impl BranchIngest {
                 )?,
                 _ => None,
             };
+            tracing::info!(
+                target: "zend::priming_chain",
+                link = done + 1,
+                of = chain.len(),
+                took_ms = began.elapsed().as_millis() as u64,
+                chained = read.is_some(),
+                "chain link done",
+            );
             if read.is_some() {
                 end = read;
             }

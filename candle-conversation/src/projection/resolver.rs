@@ -42,7 +42,7 @@ use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDi
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
-use crate::persistence::identity::Minter;
+use crate::persistence::identity::{Minter, RecordIdentity, GEN_DETACHED};
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
@@ -89,6 +89,10 @@ use candle_nn::kv_cache::{SealedSequence, Sweep};
 /// converge in a few dozen steps, so this caps the one-time cost without changing
 /// the warmed levels materially.
 const WARM_REPLAY_MAX_TURNS: usize = 512;
+
+/// How many times a metadata edit starts again before it gives up: far past
+/// any run of members writing one field at once.
+const EDIT_TRIES: usize = 64;
 
 /// Self-probes per ingested timeline (file / cluster) when warming the append-only
 /// belief groups' hit levels from their own turns (see
@@ -3685,6 +3689,13 @@ impl Conversation {
     /// lose to it field by field: it starts again under a fresh identity. An
     /// identity that writes nothing is marked never-coming, so no peer waits
     /// on it. `next` may run more than once and must not act on anything.
+    ///
+    /// **Every new start gets further.** The identity it lost to is taken into
+    /// the minter, so the next one outranks it. A field this member wrote cut
+    /// off holds the provisional generation, which no identity outranks once
+    /// the member has rejoined, until the rejoin's reload: it is settled under
+    /// the generation minted now. Trying again alone never returned, and said
+    /// nothing. Past [`EDIT_TRIES`] the edit gives up, loudly, and stores nothing.
     pub fn update_conversation_metadata(
         &self,
         timeline: TimelineId,
@@ -3694,13 +3705,13 @@ impl Conversation {
         enum Edit {
             Stored(String),
             Unchanged,
-            Overtaken,
+            Overtaken(Option<RecordIdentity>),
         }
-        loop {
+        for _ in 0..EDIT_TRIES {
             let identity = self.minter.mint(0);
             let edit = self.update(|s| {
                 if !s.custom_field_takes(timeline, key, identity) {
-                    return Edit::Overtaken;
+                    return Edit::Overtaken(s.custom_field_id(timeline, key));
                 }
                 let current = s.custom_of(timeline).and_then(|m| m.get(key).cloned());
                 match next(s, current.as_deref()) {
@@ -3726,9 +3737,23 @@ impl Conversation {
                     self.persistence.enqueue(WriteJob::Abandoned { identity });
                     return None;
                 }
-                Edit::Overtaken => self.persistence.enqueue(WriteJob::Abandoned { identity }),
+                Edit::Overtaken(held) => {
+                    self.persistence.enqueue(WriteJob::Abandoned { identity });
+                    let Some(held) = held else { continue };
+                    self.minter.observe(&held);
+                    if held.gen == GEN_DETACHED && identity.gen != GEN_DETACHED {
+                        self.update(|s| s.settle_custom_field(timeline, key, identity.gen));
+                    }
+                }
             }
         }
+        tracing::error!(
+            timeline = timeline.raw(),
+            key,
+            tries = EDIT_TRIES,
+            "a metadata edit could not outrank the value it edits: nothing was stored"
+        );
+        None
     }
 
     /// `timeline`'s `custom` metadata bag, or `None` if unregistered.

@@ -6933,6 +6933,28 @@ impl Substrate {
             .is_none_or(|held| id.supersedes(held))
     }
 
+    /// The identity of the record that set `key` of `timeline`'s `custom`
+    /// metadata, when one has.
+    pub fn custom_field_id(&self, timeline: TimelineId, key: &str) -> Option<RecordIdentity> {
+        self.timelines.get(&timeline)?.ids.custom.get(key).copied()
+    }
+
+    /// Hold `key` of `timeline`'s `custom` metadata under generation `gen`, the
+    /// one a rejoin fixed for the cut-off record that set it, as the reload that
+    /// follows the rejoin will. Until then its provisional generation outranks
+    /// everything this member mints.
+    pub fn settle_custom_field(&mut self, timeline: TimelineId, key: &str, gen: u64) {
+        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+            return;
+        };
+        if let Some(held) = entry.ids.custom.get(key).copied() {
+            entry
+                .ids
+                .custom
+                .insert(key.to_string(), RecordIdentity { gen, ..held });
+        }
+    }
+
     /// Metadata key a **calibration** conversation carries: the raw timeline
     /// id of the conversation it calibrates. Its turns are questions that
     /// conversation's content answers, each prefilled alone, and their

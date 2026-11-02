@@ -69,6 +69,42 @@ fn own_records_are_tapped_once_and_cut_off_ones_at_the_rejoin() {
     assert_eq!(*seen_again.lock().unwrap(), vec![cut_off + 1]);
 }
 
+/// **A field written cut off does not spin the next edit of it.** The rejoin
+/// fixes the record and mints under the decided generation, while the substrate
+/// holds the value under the provisional one until its reload. Every identity
+/// minted in between ranks below it, so an edit that only tried again never
+/// returned, and said nothing: WhiteWorld's load sat in its first chain link
+/// for 5.6 hours (2026-11-01).
+#[test]
+fn an_edit_of_a_field_written_cut_off_returns() {
+    let dir = TempDir::new().unwrap();
+    let conv = open(&dir);
+    let timeline = conv.mint_timeline(LayerId::new(1), GroupId::new(1));
+    conv.detach();
+    conv.set_conversation_metadata(timeline, "forked_from", "7")
+        .unwrap();
+    conv.wait_written(conv.write_ticket());
+    conv.rejoin_at(4).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let editing = conv.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            editing
+                .update_conversation_metadata(timeline, "forked_from", |_, _| Some(String::new())),
+        );
+    });
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the edit is still spinning"),
+        Some(String::new())
+    );
+    assert_eq!(
+        conv.conversation_metadata_value(timeline, "forked_from"),
+        Some(String::new())
+    );
+}
+
 /// A write through the writer thread is in the log, and tapped, once its
 /// ticket is waited for.
 #[test]
