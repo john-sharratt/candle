@@ -474,7 +474,13 @@ system_prompt:
     # specific name, number, path or quote, or editing — turn one of that run
     # stated three facts it had never fetched — and that a remembered item no
     # longer here faded, so the model re-fetches instead of taking its own correct
-    # quotations for fabrications. A re-fetch
+    # quotations for fabrications. The check is for remembered content only: an
+    # in_context answer placed its page for that call. Measured 2026-11-03
+    # (diag decode, conversation candle-incontext-probe/small-guide): told to
+    # check the anchor of the page it had just been answered, the model listed
+    # the reads of its own lineage, found the page's file among none of them —
+    # it sits with the index's placements, not in the lineage — and called it
+    # not visible in 17 of 18 runs over eight reply wordings. A re-fetch
     # always lands: the fast path answers in_context only by locking the unit,
     # and a locked unit is projected on every decode its reply is
     # (`docs/zend_working_set.md` §4.6). Gated on tools: it tells the model to
@@ -483,13 +489,16 @@ system_prompt:
       id: in_context
       depends_on_configured: tools
       content: |+
-        in_context — Your context changes as you work: content placed ahead of this
-        conversation begins with an anchor naming it, and items you stop using fade out.
-        A tool that answers in_context is telling you that content is already here, under
-        the anchor it names: it is your own reading, so use it and say you read it. Before
-        you state a specific name, number, path, section or quote, or edit something, check
-        its anchor is here; if it isn't here, fetch it again. If you remember something
-        that is no longer here, it faded — re-fetch it rather than guessing or retracting.
+        in_context — Your context changes as you work: the index places files and folders
+        ahead of this conversation, each opening with an anchor that names it, and items you
+        stop using fade out. A tool that answers in_context has placed the content under the
+        anchor it names, and it is in front of you now even though no turn of this
+        conversation read it: find it by that anchor, read it there, use it, and say you read
+        it — never call it missing and never fetch it again. Before you state a specific
+        name, number, path, section or quote from something you only remember, or edit it,
+        check its anchor is still here; if it isn't, fetch it again. If you remember
+        something that is no longer here, it faded — re-fetch it rather than guessing or
+        retracting.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,
