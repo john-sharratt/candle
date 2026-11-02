@@ -38,6 +38,8 @@
 //!
 //! Anything that survives this is guaranteed to project without errors.
 
+use std::sync::Arc;
+
 use super::adaptive::ScanPolicy;
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
@@ -50,6 +52,7 @@ use super::schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
+use super::script::ProjectionScript;
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
@@ -251,6 +254,9 @@ pub struct Builder {
     /// schema is reconstructable via [`Builder::from_yaml`]). `None` for
     /// programmatic [`Builder::from_schema`] construction.
     source_yaml: Option<String>,
+    /// Recorded projections to play back instead of choosing. Only the
+    /// diagnostic decode carries one ([`Self::with_script`]).
+    script: Option<Arc<ProjectionScript>>,
 }
 
 impl Builder {
@@ -331,6 +337,7 @@ impl Builder {
             schema,
             name_maps: maps,
             source_yaml: Some(resolved),
+            script: None,
         })
     }
 
@@ -407,6 +414,7 @@ impl Builder {
             schema,
             name_maps: NameMaps::default(),
             source_yaml: None,
+            script: None,
         })
     }
 
@@ -1197,16 +1205,49 @@ impl Builder {
         decode_pos: Option<usize>,
         sink: &mut dyn FnMut(SelectionDiagnostics),
     ) -> Projection {
-        run_with_sink(
+        let choice = self
+            .script
+            .as_ref()
+            .and_then(|s| s.choice_at(decode_pos.unwrap_or(0)));
+        let Some(choice) = choice else {
+            return run_with_sink(
+                &self.schema,
+                target,
+                resolver,
+                mode,
+                selection,
+                prior,
+                decode_pos,
+                sink,
+            );
+        };
+        let mut selection = selection.clone();
+        selection.script_members(Arc::clone(&choice.members));
+        let mut projection = run_with_sink(
             &self.schema,
             target,
             resolver,
             mode,
-            selection,
+            &selection,
             prior,
             decode_pos,
             sink,
-        )
+        );
+        choice.place_turns(&mut projection);
+        projection
+    }
+
+    /// This builder, playing `script` back in place of choosing its projections.
+    pub fn with_script(&self, script: ProjectionScript) -> Self {
+        Self {
+            script: Some(Arc::new(script)),
+            ..self.clone()
+        }
+    }
+
+    /// The script this builder plays back.
+    pub fn script(&self) -> Option<&ProjectionScript> {
+        self.script.as_deref()
     }
 
     /// Token-window budget configured for `layer`.  Used by the
@@ -1475,6 +1516,7 @@ impl Builder {
             schema,
             name_maps,
             source_yaml: None,
+            script: None,
         }
     }
 }

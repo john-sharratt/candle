@@ -118,10 +118,10 @@ impl SchedulerRequest {
             | Self::MemoryCatchUp { sequence_id, .. }
             | Self::PrimingProjection { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
-            | Self::ProbeWideSigs { sequence_id, .. } => vec![*sequence_id],
+            | Self::ProbeWideSigs { sequence_id, .. }
+            | Self::ReadRecurrentMemory { sequence_id, .. } => vec![*sequence_id],
             #[cfg(any(test, feature = "test-helpers"))]
-            Self::ReadRecurrentMemory { sequence_id, .. }
-            | Self::ReadTurnKvDigest { sequence_id, .. } => vec![*sequence_id],
+            Self::ReadTurnKvDigest { sequence_id, .. } => vec![*sequence_id],
             Self::InstallRecurrentState { sequence_ids, .. } => sequence_ids.clone(),
             Self::NewEphemeralSequence { .. }
             | Self::ResumeSequence { .. }
@@ -183,11 +183,10 @@ impl SchedulerRequest {
             | Self::DetachSubstrate { .. }
             | Self::Wake
             | Self::Settle { .. }
+            | Self::ReadRecurrentMemory { .. }
             | Self::Shutdown => None,
             #[cfg(any(test, feature = "test-helpers"))]
-            Self::ReadRecurrentMemory { .. }
-            | Self::ReadTurnKvDigest { .. }
-            | Self::CountRecurrentMemories { .. } => None,
+            Self::ReadTurnKvDigest { .. } | Self::CountRecurrentMemories { .. } => None,
         }
     }
 }

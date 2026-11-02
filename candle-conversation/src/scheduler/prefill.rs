@@ -6081,8 +6081,10 @@ impl Scheduler {
         };
         // A replayed turn opens with its recording's first id, whatever the
         // prefill's logits chose.
-        let first_token = match (work.recorded_reply.as_deref(), self.eos_tokens.first()) {
-            (Some(reply), Some(&eos)) => replayed_step(reply, 0, eos),
+        let first_token = match (work.recorded_reply.as_ref(), self.eos_tokens.first()) {
+            (Some(reply), Some(&eos)) if !reply.free_after || !reply.ids.is_empty() => {
+                replayed_step(&reply.ids, 0, eos)
+            }
             _ => sampled,
         };
 
@@ -6253,7 +6255,7 @@ impl Scheduler {
                     triggers: work.triggers,
                     stencil: None,
                     pending_mask: None,
-                    recorded_reply: work.recorded_reply.map(Replay::new),
+                    recorded_reply: work.recorded_reply.map(Replay::from),
                 };
                 if replies {
                     // The turn's first token opens a page at the prefill/decode
@@ -6391,7 +6393,7 @@ impl Scheduler {
             triggers: work.triggers,
             stencil,
             pending_mask: None,
-            recorded_reply: work.recorded_reply.map(Replay::new),
+            recorded_reply: work.recorded_reply.map(Replay::from),
         };
         // The turn's first token opens a page at the prefill/decode boundary, so
         // the reasoning starts one of its own.

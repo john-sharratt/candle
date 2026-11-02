@@ -46,6 +46,7 @@ pub mod convnext;
 pub mod csm;
 pub mod dac;
 pub mod debertav2;
+pub mod decode_diag;
 pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;

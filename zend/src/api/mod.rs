@@ -31,6 +31,7 @@ pub mod chat;
 mod chat_frames;
 mod compressed;
 pub mod conversations;
+pub mod diag;
 pub mod files;
 pub mod journal;
 pub mod journals;
@@ -267,6 +268,18 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             post(projections::context),
         )
         .route(
+            "/v1/conversations/:id/diag/decode",
+            Role::User,
+            conversation(),
+            post(diag::start),
+        )
+        .route(
+            "/v1/conversations/:id/diag/decode/:run",
+            Role::User,
+            conversation(),
+            get(diag::dump),
+        )
+        .route(
             "/v1/conversations/:id/prompt-tokens",
             Role::User,
             conversation(),
@@ -395,6 +408,8 @@ mod tests {
                 ("/v1/conversations/:id/live", "user"),
                 ("/v1/conversations/:id/projections/:turn/:event", "user"),
                 ("/v1/conversations/:id/projection-context", "user"),
+                ("/v1/conversations/:id/diag/decode", "user"),
+                ("/v1/conversations/:id/diag/decode/:run", "user"),
                 ("/v1/conversations/:id/prompt-tokens", "user"),
                 ("/v1/conversations/:id/journal", "user"),
                 ("/v1/conversations/:id/journal/draft", "user"),
@@ -436,6 +451,8 @@ mod tests {
             ("GET", "/v1/conversations/c-1/live"),
             ("GET", "/v1/conversations/c-1/projections/3/4"),
             ("POST", "/v1/conversations/c-1/projection-context"),
+            ("POST", "/v1/conversations/c-1/diag/decode"),
+            ("GET", "/v1/conversations/c-1/diag/decode/1"),
             ("GET", "/v1/conversations/c-1/prompt-tokens"),
             ("GET", "/v1/conversations/c-1/journal"),
             ("POST", "/v1/conversations/c-1/journal/draft"),

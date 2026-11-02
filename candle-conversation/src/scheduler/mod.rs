@@ -35,6 +35,7 @@ mod compaction_stall;
 mod creep_slice;
 mod decode;
 mod detached;
+mod diag;
 mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
@@ -144,7 +145,7 @@ use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
 };
-use crate::recorded_reply::Replay;
+use crate::recorded_reply::{RecordedReply, Replay};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
@@ -171,6 +172,7 @@ use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, SequenceStats,
     WINDOW_DIVERGENCE_MARKER,
 };
+use candle_transformers::models::decode_diag;
 use candle_transformers::models::delta_net::ExportedLayerState;
 use candle_transformers::models::draft_depth::DraftDepth;
 use candle_transformers::models::piece_key::PieceKey;
@@ -411,8 +413,9 @@ pub(crate) enum SchedulerRequest {
         free_tool_calls_from_penalties: bool,
         /// The reply this turn decodes in place of sampling — a recorded turn
         /// replayed ([`crate::TurnOptions::recorded_turn`]). Committed one id
-        /// per step, then the end of turn. `None` = an ordinary sampled decode.
-        recorded_reply: Option<Vec<u32>>,
+        /// per step, then the end of turn or free decoding. `None` = an ordinary
+        /// sampled decode.
+        recorded_reply: Option<RecordedReply>,
     },
 
     /// Free a sequence slot.
@@ -722,7 +725,6 @@ pub(crate) enum SchedulerRequest {
     ///
     /// Reply is `None` for a model that carries no such memory, and for a slot
     /// that has none yet.
-    #[cfg(any(test, feature = "test-helpers"))]
     ReadRecurrentMemory {
         sequence_id: SequenceId,
         response_tx: Sender<Result<Option<Vec<ExportedLayerState>>, ConversationError>>,
@@ -935,7 +937,6 @@ impl SchedulerRequest {
             Self::OffloadCollectionMembers { .. } => "req:offload_collection_members",
             Self::ExtractRawKvq { .. } => "req:extract_raw_kvq",
             Self::ProbeWideSigs { .. } => "req:probe_wide_sigs",
-            #[cfg(any(test, feature = "test-helpers"))]
             Self::ReadRecurrentMemory { .. } => "req:read_recurrent_memory",
             #[cfg(any(test, feature = "test-helpers"))]
             Self::ReadTurnKvDigest { .. } => "req:read_turn_kv_digest",
@@ -2225,7 +2226,7 @@ pub(super) struct PrefillWork {
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
     pub(super) free_tool_calls_from_penalties: bool,
     /// The recorded reply this turn replays — see [`DecodeState::recorded_reply`].
-    pub(super) recorded_reply: Option<Vec<u32>>,
+    pub(super) recorded_reply: Option<RecordedReply>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -5439,7 +5440,6 @@ impl Scheduler {
                 true
             }
 
-            #[cfg(any(test, feature = "test-helpers"))]
             SchedulerRequest::ReadRecurrentMemory {
                 sequence_id,
                 response_tx,

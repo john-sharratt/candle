@@ -53,11 +53,13 @@ use super::index_keys::{
 };
 use super::qsa::IndexerWeights;
 use super::qsa_select::{
-    max_entries_for, max_gathered_for, max_keep, selected_width, Strata, MAX_RATIO,
+    entry_block, entry_cells, max_entries_for, max_gathered_for, max_keep, selected_width, Strata,
+    MAX_RATIO,
 };
 use super::resident_page::ResidentPage;
 use super::rows_matmul::rows_matmul_t;
 use super::spec::SpecCapture;
+use crate::models::decode_diag::{self, RawSelection};
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::operand_guard::{expect_dense, expect_dense_dtype};
@@ -1881,6 +1883,44 @@ impl SelectionTable {
         })
     }
 
+    /// Read back `row` of the table and its scores for a diagnostic decode.
+    /// Fences: only an armed decode comes here.
+    #[allow(clippy::too_many_arguments)]
+    fn record_row(
+        &self,
+        kv: usize,
+        row: usize,
+        score_row: usize,
+        candidates: usize,
+        query_position: usize,
+        scores: &Tensor,
+        block_start: &dyn Fn(usize) -> usize,
+    ) -> Result<()> {
+        let count = self.cnt.narrow(0, row, 1)?.to_vec1::<u32>()?[0] as usize;
+        let entries = self
+            .entries
+            .narrow(0, row, 1)?
+            .narrow(1, 0, count)?
+            .flatten_all()?
+            .to_vec1::<u32>()?
+            .into_iter()
+            .map(|e| (entry_block(e), entry_cells(e)))
+            .collect::<Vec<_>>();
+        let scores = scores
+            .narrow(0, score_row, 1)?
+            .narrow(1, 0, candidates)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        decode_diag::record(&RawSelection {
+            kv,
+            query_position,
+            scores: &scores,
+            entries: &entries,
+            block_start,
+        });
+        Ok(())
+    }
+
     /// The selection, as the attention kernels take it.
     pub fn into_selection(self) -> Result<QsaSelection> {
         QsaSelection::new(self.entries, self.cnt, self.ratio)
@@ -2551,10 +2591,12 @@ pub fn select_layer(
     }
 
     // Row `spans[i]` covers positions `offsets[i] ..< offsets[i] + len`.
-    let engages = spans
-        .iter()
-        .zip(offsets)
-        .any(|(span, &off)| selection_engages(off + span.len, idx_cfg, compress_ratio));
+    // The dense control of a diagnostic decode: no selection, every cell read.
+    let engages = !decode_diag::dense()
+        && spans
+            .iter()
+            .zip(offsets)
+            .any(|(span, &off)| selection_engages(off + span.len, idx_cfg, compress_ratio));
 
     // Absolute position of every row, in the wave's packed order, and each
     // span's rung — picked from its reach exactly as the attention's header
@@ -2746,6 +2788,25 @@ pub fn select_layer(
                 idx_cfg.top_k,
                 base,
             )?;
+            if decode_diag::armed() {
+                for span in run_spans {
+                    if decode_diag::watching(span.seq) {
+                        let row = span.start + span.len - 1;
+                        let cache = idx_map.get(&span.seq).and_then(|c| c.get(kv));
+                        if let Some(cache) = cache {
+                            table.record_row(
+                                kv,
+                                row,
+                                row - base,
+                                cand[row - base] as usize,
+                                positions[row],
+                                &scores,
+                                &|b| cache.block_start(b, compress_ratio),
+                            )?;
+                        }
+                    }
+                }
+            }
         }
     }
     // The page layout the attention kernels walk, built only when some sequence

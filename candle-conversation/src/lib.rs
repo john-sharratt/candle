@@ -187,6 +187,7 @@ pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
+pub use candle_transformers::models::decode_diag;
 /// The CPU expert split's knobs and measured costs, for a daemon's config and
 /// its admin route (`docs/cpu_expert_compute.md` §5.3.1).
 pub use candle_transformers::models::expert_lre::cpu_pool::params as expert_split;

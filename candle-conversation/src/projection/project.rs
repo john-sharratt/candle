@@ -1020,9 +1020,21 @@ pub struct SelectionState {
     chosen: HashMap<String, Vec<String>>,
     /// Sealed sections to project right after a catalog summary, by summary.
     summary_notes: HashMap<SectionId, Vec<SectionId>>,
+    /// The members a played-back projection selected, by name, in place of
+    /// any selection (`super::script`).
+    scripted_members: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 impl SelectionState {
+    /// Select exactly `members` from every collection, as a recording did.
+    pub(super) fn script_members(
+        &mut self,
+        members: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> &mut Self {
+        self.scripted_members = Some(members);
+        self
+    }
+
     /// Project `notes`, sealed sections, right after the catalog summary
     /// `summary`, where a turn reads what the listing means for it now.
     /// Replaces any earlier notes on it.
@@ -2696,6 +2708,14 @@ fn select_collection_sections<R: ContentResolver>(
     if coll.sections.is_empty() {
         return Vec::new();
     }
+    if let Some(members) = &selection_state.scripted_members {
+        let mut out = Vec::new();
+        for s in coll.sections.iter().filter(|s| members.contains(&s.name)) {
+            push_member_glue(&mut out, coll);
+            push_section_segment(&mut out, s);
+        }
+        return out;
+    }
     match &coll.selection {
         SelectionRule::AlwaysVisible => {
             let mut out = Vec::with_capacity(coll.sections.len());
@@ -2906,7 +2926,12 @@ fn select_tree_collection_segments<R: ContentResolver>(
     scoring: &CollectionScoring,
     selection_state: &SelectionState,
 ) -> Vec<ProjectionSegment> {
-    let selected = select_collection_indices(&tc.collection, resolver, scoring, selection_state);
+    let selected = match &selection_state.scripted_members {
+        Some(members) => (0..tc.collection.sections.len())
+            .filter(|&i| members.contains(&tc.collection.sections[i].name))
+            .collect(),
+        None => select_collection_indices(&tc.collection, resolver, scoring, selection_state),
+    };
     let mut out = Vec::with_capacity(selected.len());
     for i in selected {
         if let Some(v) = tc.member_variant(i, active_key) {

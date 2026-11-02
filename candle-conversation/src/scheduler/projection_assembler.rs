@@ -57,6 +57,8 @@ use crate::projection::{
     Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
 use crate::scheduler::injected_piece::InjectedPiece;
+use candle_transformers::models::decode_diag::PieceSpan;
+
 use crate::scheduler::pending_ranges::PendingRanges;
 use crate::scheduler::piece_identity::{
     alignment_identities, chained_identities, piece_label, PieceReads,
@@ -115,6 +117,26 @@ pub(super) struct SlotState {
     /// the first piece that differs (`super::piece_identity`). Emptied by an
     /// incomplete assembly, whose slot does not hold what its pieces describe.
     pub(super) placed_pieces: Vec<PlacedPiece>,
+}
+
+impl SlotState {
+    /// The placed pieces by position, each named by the turn or section it is.
+    pub(super) fn placed_spans(&self) -> Vec<PieceSpan> {
+        self.placed_pieces
+            .iter()
+            .map(|p| PieceSpan {
+                label: match p.range {
+                    Some(PieceRange::Turn(timeline, index)) => {
+                        format!("turn:{}:{}", timeline.raw(), index.0)
+                    }
+                    Some(PieceRange::Section(id)) => format!("section:{}", id.raw()),
+                    None => "glue".to_string(),
+                },
+                start: (p.pos_after - p.tokens) as usize,
+                end: p.pos_after as usize,
+            })
+            .collect()
+    }
 }
 
 /// One piece an assembly placed: what it is, what it occupies, and the slot as

@@ -115,6 +115,11 @@ pub struct TurnOptions {
     /// what is replayed — and the turn fails the moment one of them departs
     /// from the recording. `None` = an ordinary sampled decode.
     pub recorded_turn: Option<Vec<u32>>,
+
+    /// Force only this many ids of [`Self::recorded_turn`], then sample on up
+    /// to [`Self::max_tokens`] — the decode from a point inside a recording.
+    /// `None` replays the whole of it and ends where it ended.
+    pub forced_tokens: Option<usize>,
 }
 
 impl TurnOptions {

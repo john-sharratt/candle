@@ -9,7 +9,7 @@ use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
 use crate::index_pages::StoredPages;
 use crate::provenance::boundaries::BoundaryRule;
-use crate::recorded_reply::recorded_reply;
+use crate::recorded_reply::{recorded_reply, RecordedReply};
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
@@ -2337,7 +2337,7 @@ impl TurnSubmitter {
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
             free_tool_calls_from_penalties,
-            options.recorded_turn,
+            options.recorded_turn.map(|g| (g, options.forced_tokens)),
         )?;
         Ok((handle, user_tokens))
     }
@@ -2693,7 +2693,7 @@ impl TurnSubmitter {
         triggers: Arc<TriggerRegistry>,
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
-        recorded_turn: Option<Vec<u32>>,
+        recorded_turn: Option<(Vec<u32>, Option<usize>)>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2763,11 +2763,18 @@ impl TurnSubmitter {
         // grammar run as they did live: what they played is in the recording,
         // and where they cut pages is part of what is being replayed.
         let (reply, max_decode_tokens) = match recorded_turn {
-            Some(grid) => {
-                let reply = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
+            Some((grid, forced_tokens)) => {
+                let mut ids = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
                     .map_err(ConversationError::Other)?;
-                let steps = reply.len() + 1;
-                (Some(reply), steps)
+                let steps = match forced_tokens {
+                    Some(forced) => {
+                        ids.truncate(forced);
+                        max_decode_tokens
+                    }
+                    None => ids.len() + 1,
+                };
+                let free_after = forced_tokens.is_some();
+                (Some(RecordedReply { ids, free_after }), steps)
             }
             None => (None, max_decode_tokens),
         };
@@ -4321,11 +4328,10 @@ impl Sequence {
     /// This conversation's **live** recurrent memory, right now, without sealing
     /// a turn to see it.
     ///
-    /// `None` when the model carries no such memory. Test observability: the
-    /// only other view is the record a seal writes, which forces a test to
-    /// advance the conversation to observe it — changing what it is measuring —
-    /// and makes "does a freed conversation still hold memory?" unaskable.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// `None` when the model carries no such memory. The only other view is the
+    /// record a seal writes, which forces a caller to advance the conversation
+    /// to observe it — changing what it is measuring — and makes "does a freed
+    /// conversation still hold memory?" unaskable.
     pub fn memory(&self) -> crate::Result<Option<Vec<ExportedLayerState>>> {
         let (tx, rx) = flume::bounded(1);
         self.scheduler_tx

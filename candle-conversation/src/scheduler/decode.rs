@@ -177,9 +177,13 @@ impl Scheduler {
                 // A run it does not hold would seal a turn that never happened,
                 // so the turn fails here instead.
                 let departed = self.active_decodes.get(&id).and_then(|s| {
-                    let reply = s.recorded_reply.as_ref()?.ids();
+                    let replay = s.recorded_reply.as_ref()?;
                     let at = s.generated_tokens.len();
-                    departure(reply, at, &run[..], |t| self.eos_tokens.contains(&t)).map(|k| at + k)
+                    if !replay.forces(at) {
+                        return None;
+                    }
+                    departure(replay.ids(), at, &run[..], |t| self.eos_tokens.contains(&t))
+                        .map(|k| at + k)
                 });
                 if let Some(at) = departed {
                     self.fail_all_decodes(
@@ -731,6 +735,9 @@ impl Scheduler {
                     .partition(|r| rides(self, r.seq));
             stencil.rows = carried;
             self.stencil_rows.extend(held);
+        }
+        if decode_diag::armed() {
+            self.diag_step(&mut seq_ids, stencil);
         }
         self.step_rows = seq_ids.len() + stencil.rows.len();
 
@@ -1628,14 +1635,19 @@ impl Scheduler {
         logits_vec: &[Tensor],
     ) -> Vec<HealPrefill> {
         let mut heal_prefills = Vec::new();
+        if decode_diag::armed() {
+            self.diag_commit(seq_ids, next_tokens, logits_vec);
+        }
         // A replayed turn commits its recording, whatever was sampled — here,
         // ahead of every stage below, so each one sees the token the turn takes.
         if let Some(&eos) = self.eos_tokens.first() {
             for (i, seq_id) in seq_ids.iter().enumerate() {
                 let replay = self.active_decodes.get(seq_id).and_then(|s| {
+                    let at = s.generated_tokens.len();
                     s.recorded_reply
                         .as_ref()
-                        .map(|replay| (replay.ids(), s.generated_tokens.len()))
+                        .filter(|replay| replay.forces(at))
+                        .map(|replay| (replay.ids(), at))
                 });
                 if let Some((reply, at)) = replay {
                     next_tokens[i] = replayed_step(reply, at, eos);
@@ -2289,7 +2301,16 @@ impl Scheduler {
                     if step == Step::OpenedToolCall {
                         state.wrote_tool_call = true;
                     }
-                    if step.fires() {
+                    // A played-back turn reprojects where its recording did.
+                    let fires = match state
+                        .reprojection
+                        .as_ref()
+                        .and_then(|p| p.projection.script())
+                    {
+                        Some(script) => script.fires_at(count),
+                        None => step.fires(),
+                    };
+                    if fires {
                         Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                     }
                 }
@@ -2367,6 +2388,7 @@ impl Scheduler {
             return;
         }
         let _t_drain = super::PhaseTimer::new("drain_reprojections");
+        let _diag = decode_diag::reproject_span();
         let pending = std::mem::take(&mut self.pending_reprojections);
 
         // Phase 1 — prepare each view: provenance scan + projection + tier elevate +
@@ -2377,6 +2399,9 @@ impl Scheduler {
             // The view may have finished (EOS/health) between trigger and drain.
             if self.active_decodes.get(&view_id).is_none_or(|s| s.finished) {
                 continue;
+            }
+            if decode_diag::fresh() {
+                self.diag_forget_placement(view_id);
             }
             match self.reproject_view_prepare(view_id) {
                 Ok(Some(inflight)) => inflights.push(inflight),

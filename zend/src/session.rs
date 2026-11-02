@@ -151,6 +151,7 @@ use crate::working_set::seeds::Seeding;
 use crate::working_set::{dialogue_config, round_marks};
 use crate::workspace::UPLOADS_REPO;
 
+pub mod diag;
 mod memory_writer;
 mod replay;
 pub use replay::{

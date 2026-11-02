@@ -57,20 +57,48 @@ pub(crate) fn recorded_reply(
 #[derive(Debug, Clone)]
 pub(crate) struct Replay {
     ids: Vec<u32>,
+    free_after: bool,
     refused_at: Option<usize>,
 }
 
-impl Replay {
-    pub(crate) fn new(ids: Vec<u32>) -> Self {
+/// The ids a turn commits in place of what it samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedReply {
+    pub(crate) ids: Vec<u32>,
+    /// When the ids are spent the turn samples on, rather than ending: the
+    /// diagnostic decode, which reaches a point in a recording and then asks
+    /// what the model does from there.
+    pub(crate) free_after: bool,
+}
+
+impl From<RecordedReply> for Replay {
+    fn from(reply: RecordedReply) -> Self {
         Self {
-            ids,
+            ids: reply.ids,
+            free_after: reply.free_after,
             refused_at: None,
         }
+    }
+}
+
+impl Replay {
+    #[cfg(test)]
+    pub(crate) fn new(ids: Vec<u32>) -> Self {
+        RecordedReply {
+            ids,
+            free_after: false,
+        }
+        .into()
     }
 
     /// The recorded reply.
     pub(crate) fn ids(&self) -> &[u32] {
         &self.ids
+    }
+
+    /// Whether step `at` still commits the recording rather than sampling.
+    pub(crate) fn forces(&self, at: usize) -> bool {
+        !self.free_after || at < self.ids.len()
     }
 
     /// Note that steering refused the recorded id at `at`, and say whether the
@@ -116,6 +144,21 @@ pub(crate) fn departure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_replay_stops_forcing_where_its_ids_end() {
+        let free: Replay = RecordedReply {
+            ids: vec![4, 5],
+            free_after: true,
+        }
+        .into();
+        assert!(free.forces(1));
+        assert!(!free.forces(2));
+        assert!(
+            Replay::new(vec![4, 5]).forces(2),
+            "a whole replay ends on eos"
+        );
+    }
 
     #[test]
     fn the_reply_is_what_lies_between_the_prefill_and_the_tail() {

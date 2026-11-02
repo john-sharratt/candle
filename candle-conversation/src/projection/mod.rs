@@ -222,6 +222,7 @@ mod resolver;
 pub mod scan_stats;
 mod schema;
 mod score;
+mod script;
 mod selection;
 mod swap_cap;
 pub mod warm_pool;
@@ -288,4 +289,5 @@ pub use schema::{
     SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
+pub use script::ProjectionScript;
 pub use working_set_pick::{Standing, WorkingSetMembers};

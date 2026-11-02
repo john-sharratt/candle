@@ -44,7 +44,7 @@ use candle_conversation::{
 
 use super::{
     think_mode_from_selection, timeline_for, turn_projection, turn_sampling, turn_triggers,
-    ZendSession,
+    InferenceState, Sequence, ZendSession,
 };
 use crate::api::chat::tool_round_selection;
 use crate::tools::tool_round_text;
@@ -260,6 +260,50 @@ pub fn turn_selection(
     }
 }
 
+/// Decode `turns` again onto `conv`, each under the triggers and sampling config
+/// the chat gave it, its recorded ids forced. `before` runs ahead of each turn.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn replay_history(
+    state: &InferenceState,
+    conv: &mut Sequence,
+    turns: &[RecordedTurn],
+    recorded: &[SealedTurn],
+    reply: &SelectionState,
+    tools_mode: ToolMode,
+    demonstration: Demonstration,
+    before: &mut dyn FnMut(usize, &mut Sequence),
+) -> anyhow::Result<()> {
+    for (index, turn) in turns.iter().enumerate() {
+        let Some(sealed) = recorded.get(index) else {
+            bail!("turn {index} has no sealed record to replay");
+        };
+        before(index, conv);
+        let selection = turn_selection(reply, &turn.user, demonstration);
+        let options = TurnOptions {
+            sampling: Some(turn_sampling(
+                conv,
+                Some(SamplingConfig::argmax()),
+                &selection,
+                &state.think_closer_phrase,
+                0,
+            )),
+            triggers: turn_triggers(state, think_mode_from_selection(&selection), tools_mode),
+            selection,
+            recorded_turn: Some(sealed.token_ids.clone()),
+            ..Default::default()
+        };
+        let handle = conv
+            .submit_turn_with_options(tool_round_text(&turn.user), options)
+            .with_context(|| format!("replaying turn {index}"))?;
+        let response = handle
+            .wait()
+            .with_context(|| format!("replaying turn {index}"))?;
+        conv.finish_turn(handle, &response)
+            .with_context(|| format!("sealing replayed turn {index}"))?;
+    }
+    Ok(())
+}
+
 impl ZendSession {
     /// Wait until the model has loaded — what a submit waits for before its
     /// first turn.
@@ -325,40 +369,18 @@ impl ZendSession {
                 .with_context(|| format!("forking run {run}'s conversation"))?;
             conv.set_projection(turn_projection(&state, &replay_id, None, spec.tools_mode));
 
-            // The history, each turn decoded again under the triggers and
-            // sampling config the chat gave it, its recorded ids forced.
             let replay_start = Instant::now();
-            for (index, turn) in turns[..spec.resume_turn].iter().enumerate() {
-                let Some(sealed) = recorded.get(index) else {
-                    bail!("turn {index} has no sealed record to replay");
-                };
-                let selection = turn_selection(&spec.selection, &turn.user, spec.demonstration);
-                let options = TurnOptions {
-                    sampling: Some(turn_sampling(
-                        &conv,
-                        Some(SamplingConfig::argmax()),
-                        &selection,
-                        &state.think_closer_phrase,
-                        0,
-                    )),
-                    triggers: turn_triggers(
-                        &state,
-                        think_mode_from_selection(&selection),
-                        spec.tools_mode,
-                    ),
-                    selection,
-                    recorded_turn: Some(sealed.token_ids.clone()),
-                    ..Default::default()
-                };
-                let handle = conv
-                    .submit_turn_with_options(tool_round_text(&turn.user), options)
-                    .with_context(|| format!("run {run}: replaying turn {index}"))?;
-                let response = handle
-                    .wait()
-                    .with_context(|| format!("run {run}: replaying turn {index}"))?;
-                conv.finish_turn(handle, &response)
-                    .with_context(|| format!("run {run}: sealing replayed turn {index}"))?;
-            }
+            replay_history(
+                &state,
+                &mut conv,
+                &turns[..spec.resume_turn],
+                &recorded,
+                &spec.selection,
+                spec.tools_mode,
+                spec.demonstration,
+                &mut |_, _| {},
+            )
+            .with_context(|| format!("run {run}"))?;
             let replay_secs = replay_start.elapsed().as_secs_f64();
             let history = compare_turns(
                 &recorded,
