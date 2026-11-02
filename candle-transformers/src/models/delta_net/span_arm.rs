@@ -142,12 +142,39 @@ impl SpanArms {
         let Some(arm) = self.arms.get_mut(&seq) else {
             return SpanHook::None;
         };
-        if arm.at != at || arm.len != len || arm.served.contains(&layer) {
+        if arm.at != at || arm.len != len {
+            // A long span of an armed sequence that is not the armed one: the
+            // cut and the arm disagree, and the arm would never be served.
+            if len > TIMELINE_ROWS {
+                tracing::warn!(
+                    target: "candle_transformers::delta_net::span_arm",
+                    seq,
+                    layer,
+                    at,
+                    len,
+                    armed_at = arm.at,
+                    armed_len = arm.len,
+                    "a long span of an armed sequence is not the armed span"
+                );
+            }
+            return SpanHook::None;
+        }
+        if arm.served.contains(&layer) {
             return SpanHook::None;
         }
         let Some(rows) = arm.rows.get(&layer) else {
             return SpanHook::None;
         };
+        if arm.ran.is_empty() && arm.served.is_empty() {
+            tracing::info!(
+                target: "candle_transformers::delta_net::span_arm",
+                seq,
+                at,
+                len,
+                capture = arm.capture,
+                "armed span reached the mixer"
+            );
+        }
         if !arm.ran.contains(&layer) {
             arm.ran.push(layer);
         }

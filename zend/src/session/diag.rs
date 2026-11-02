@@ -446,6 +446,11 @@ impl ZendSession {
         } else {
             Vec::new()
         };
+        tracing::info!(
+            run = run_index,
+            spans = ?recurrent_spans.iter().map(|s| s.bytes.clone()).collect::<Vec<_>>(),
+            "diag: the target's replay spans"
+        );
         let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
         let (explicit, seed) = match run.sampling {

@@ -4165,6 +4165,15 @@ impl Scheduler {
                 continue;
             };
             let at = self.session.sequence_offset(*seq_id).unwrap_or(0);
+            tracing::info!(
+                target: "candle_conversation::scheduler::recurrent_span",
+                seq = *seq_id,
+                at,
+                len = span.tokens.len(),
+                offset = p.offset,
+                capture = matches!(span.kind, ArmKind::Capture),
+                "arming a recurrent span"
+            );
             if let Err(e) = self
                 .model
                 .arm_recurrent_span(*seq_id, at, span.tokens.len(), span.kind)
