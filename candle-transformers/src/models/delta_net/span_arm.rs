@@ -143,9 +143,11 @@ impl SpanArms {
             return SpanHook::None;
         };
         if arm.at != at || arm.len != len {
-            // A long span of an armed sequence that is not the armed one: the
-            // cut and the arm disagree, and the arm would never be served.
-            if len > TIMELINE_ROWS {
+            // A long span of an armed sequence that is not the armed one, while
+            // the arm still waits for layers: the cut and the arm disagree, and
+            // the arm would never be served. A capture every layer has served
+            // stays armed only until it is taken, and says nothing.
+            if len > TIMELINE_ROWS && !arm.complete() {
                 tracing::warn!(
                     target: "candle_transformers::delta_net::span_arm",
                     seq,

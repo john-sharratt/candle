@@ -1827,7 +1827,8 @@ mod warm_sizing_tests {
     fn the_pinned_expert_tier_fits_the_machine() {
         let total = 31 * GIB + GIB / 2;
         let weights = 2 * GIB + GIB / 2;
-        let budget = candle::vram::host_ram_budget_from(total, 0, weights, 30, 1024 * 1024 * 1024);
+        let budget =
+            candle::vram::host_ram_budget_from(total, 0, weights, 30, 1024 * 1024 * 1024, None);
         let already = 640 * 1024 * 1024;
         let s = warm_sizing_from(
             SLOT,
