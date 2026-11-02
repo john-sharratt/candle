@@ -243,6 +243,36 @@ capture, which only calibration does.
 
 ## 7. Applying a record in a live conversation
 
+### 7.0 The page is placed before the reply prefills
+
+The injection rests on the live turn running in the calibration fork's order:
+the page, then the call, then the reply. It does, and §10 pins it with a test:
+
+1. The round's calls are screened before any runs (`session.rs`, the
+   `fast_path::screen` call ahead of dispatch). A hit is returned only once
+   `working_set_lock` has locked the page's unit into the dialogue's working set.
+2. The tools run, and the results become the next turn's user half
+   (`current_message = format_tool_responses(&results)`).
+3. That turn is submitted, and its **opening projection** runs at submit, before
+   anything of it is prefilled (`SchedulerRequest::SubmitTurn`,
+   `project_with_mode_and_sink` at decode position 0, `scheduler/mod.rs`). The
+   `working_set` selection rule reads the working set as it stands then
+   (`ContentResolver::working_set_members`, `docs/zend_working_set.md` §4.4), so
+   the lock from step 1 is in it. The submit projection is skipped only for
+   ingest timelines (`skip_projection` requires `disable_reprojection`), never for
+   a dialogue.
+4. The projection's turns are elevated and placed into the slot
+   (`apply_projection`). A promised turn that cannot be placed fails the
+   projection instead of dropping out of it (`is_promised`,
+   `projection_assembler.rs`), so the page is never silently missing.
+5. Only then does the turn's user half — the reply — prefill, and the reply
+   span's replay (§7.2) runs in that prefill.
+
+So the page's K/V is in place when the reply prefills, and the reply's state
+comes from the record in the same pass; nothing waits for a mid-decode
+reprojection. On the probe conversation the opening projection of the served
+turn (`/projections/1/0`) carries the page's reading.
+
 ### 7.1 Serve
 
 When the fast path serves a page (`Screen::read_hit`), it already knows the unit
@@ -354,6 +384,14 @@ Kernel parity, on the card:
 - **Live outputs are untouched.** A span with a record and one without produce
   the same span outputs and K/V bit for bit; only the state past the span
   differs.
+
+Order, in `candle-conversation` against a real substrate:
+
+- **The served page precedes the reply.** Lock a unit into a dialogue's working
+  set, submit a turn whose user half is the served reply, and assert from the
+  turn's opening projection event and its placed pieces that the unit's turns are
+  placed and that every one of their positions precedes the user half's first
+  token. A unit locked after the submit is not in that opening projection.
 
 Behavioural gate, through the diagnostic decode:
 
