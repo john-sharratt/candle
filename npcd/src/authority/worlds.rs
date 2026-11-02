@@ -60,6 +60,12 @@ pub struct Standing {
     /// Worlds taken in this boot from the objects kept before world records:
     /// all of them, and those whose records are not written yet.
     legacy: Mutex<(BTreeSet<String>, BTreeSet<String>)>,
+    /// The ids each world had before it was renamed, from the worlds' files
+    /// (`docs/world_rename.md` §2).
+    formers: Mutex<BTreeMap<String, Vec<String>>>,
+    /// Worlds taken in this boot from a former id, with it, whose records are
+    /// not written yet — the former is retired once they are.
+    renamed: Mutex<BTreeMap<String, String>>,
     member: OnceLock<Arc<AppMember>>,
 }
 
@@ -86,6 +92,8 @@ impl Standing {
             arriving: Mutex::new(HashMap::new()),
             sending: Mutex::new(HashSet::new()),
             legacy: Mutex::new((BTreeSet::new(), BTreeSet::new())),
+            formers: Mutex::new(BTreeMap::new()),
+            renamed: Mutex::new(BTreeMap::new()),
             member: OnceLock::new(),
         };
         if clustered {
@@ -357,6 +365,46 @@ impl Standing {
         let mut legacy = self.legacy.lock().unwrap();
         legacy.1.remove(world).then(|| legacy.1.is_empty())
     }
+
+    /// The worlds' former ids, as their files name them now.
+    pub fn set_formers(&self, formers: BTreeMap<String, Vec<String>>) {
+        *self.formers.lock().unwrap() = formers;
+    }
+
+    /// The ids world `world` had before it was renamed.
+    pub fn formerly_of(&self, world: &str) -> Vec<String> {
+        self.formers
+            .lock()
+            .unwrap()
+            .get(world)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether `world` is a former id of a world renamed: never hosted, never
+    /// ceased (`docs/world_rename.md` §2–§3).
+    pub fn is_former(&self, world: &str) -> bool {
+        self.formers
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .any(|old| old == world)
+    }
+
+    /// `world` was taken in from its former id `old`.
+    pub fn mark_renamed(&self, world: &str, old: &str) {
+        self.renamed
+            .lock()
+            .unwrap()
+            .insert(world.to_string(), old.to_string());
+    }
+
+    /// `world`'s records are written: the former id it was taken in from, the
+    /// first time, to be retired.
+    pub fn renamed_written(&self, world: &str) -> Option<String> {
+        self.renamed.lock().unwrap().remove(world)
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +448,24 @@ mod tests {
         assert_eq!(w.legacy_written("a"), None, "once");
         assert_eq!(w.legacy_written("b"), Some(true));
         assert!(w.from_legacy("a"), "still read for its characters' places");
+    }
+
+    /// **A world renamed knows its former ids, and its former is retired once
+    /// it has written**: the former is never a world of its own; it is handed
+    /// back for retiring once, after the first write.
+    #[test]
+    fn a_renamed_world_retires_its_former_once() {
+        let w = Standing::new(false);
+        w.set_formers(BTreeMap::from([(
+            "moon".to_string(),
+            vec!["life".to_string()],
+        )]));
+        assert_eq!(w.formerly_of("moon"), ["life"]);
+        assert!(w.is_former("life"));
+        assert!(!w.is_former("moon"));
+        w.mark_renamed("moon", "life");
+        assert_eq!(w.renamed_written("moon").as_deref(), Some("life"));
+        assert_eq!(w.renamed_written("moon"), None, "once");
     }
 
     /// A character being handed back takes no turn; one mid-turn is known

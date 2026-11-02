@@ -920,6 +920,25 @@ impl Npcs {
         })
     }
 
+    /// Move every character of world `from` to world `to` — the world renamed
+    /// (`docs/world_rename.md` §3): each record keeps everything but its
+    /// `world_id`. Returns how many moved; none once they all have.
+    pub fn rehome(&self, from: &str, to: &str, now_ms: u64) -> Result<usize, NpcError> {
+        self.write(|cast| {
+            let moved: Vec<NpcPayload> = cast
+                .export_all()
+                .into_iter()
+                .filter(|n| n.world_id == from)
+                .map(|mut n| {
+                    n.world_id = to.to_string();
+                    bumped(n, now_ms)
+                })
+                .collect();
+            let n = moved.len();
+            Ok((moved, n))
+        })
+    }
+
     /// Restore backed-up character records into a fresh substrate.
     ///
     /// Each payload is written verbatim — its id, owner, revision and last place
@@ -1619,6 +1638,34 @@ mod tests {
             },
         );
         assert_eq!(all.len(), 2);
+    }
+
+    /// **A renamed world takes its characters with it**: each of the old id
+    /// moves to the new, keeping its name and revision line; another world's
+    /// stay; a second move finds none.
+    #[test]
+    fn a_renamed_world_takes_its_characters_with_it() {
+        let dir = tmp();
+        let n = Npcs::load(&dir).unwrap();
+        n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
+        let ilse = json!({ "name": "Ilse", "world_id": "earth", "personality_id": "commander" });
+        n.create(&ident("u1"), ME, &ilse, 1_001).unwrap();
+        let before = n.view().export_all();
+        let varek = before.iter().find(|p| p.name == "Varek").unwrap().clone();
+
+        assert_eq!(n.rehome(&varek.world_id, "moon", 2_000).unwrap(), 1);
+        let after = n.view();
+        let moved = after.payload(varek.npc_id).unwrap();
+        assert_eq!(moved.world_id, "moon");
+        assert_eq!(moved.name, "Varek");
+        assert_eq!(moved.revision, varek.revision + 1);
+        let ilse = after
+            .export_all()
+            .into_iter()
+            .find(|p| p.name == "Ilse")
+            .unwrap();
+        assert_eq!(ilse.world_id, "earth", "another world's character stays");
+        assert_eq!(n.rehome(&varek.world_id, "moon", 3_000).unwrap(), 0);
     }
 
     #[test]

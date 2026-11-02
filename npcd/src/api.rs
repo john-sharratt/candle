@@ -81,6 +81,7 @@ use crate::registry::authored::{PERSONALITIES, WORLDS};
 use crate::registry::{self, PutError, Record, Registry};
 use crate::sim::shelf::{Published, Shelf};
 use crate::visibility;
+use crate::world_state::renamed;
 use host::guard::Api;
 
 /// Both authored collections, shared with the HTTP layer.
@@ -252,6 +253,25 @@ impl Authored {
         *self.libraries.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(libraries);
     }
 
+    /// Tell `rt` the ids the worlds had before they were renamed, as their files
+    /// name them now, and move each former id's characters to the world that
+    /// names it (`docs/world_rename.md` §3).
+    pub async fn renamings(&self, rt: &Runtime) {
+        let formers = renamed::formers(&*self.worlds.read().await);
+        for (new, olds) in &formers {
+            for old in olds {
+                match self.npcs.rehome(old, new, now_ms()) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("world `{new}`: {n} characters moved from `{old}`"),
+                    Err(e) => tracing::error!(
+                        "world `{new}`: the characters of `{old}` were not moved: {e:?}"
+                    ),
+                }
+            }
+        }
+        rt.standing.set_formers(formers);
+    }
+
     /// Read the worlds and personalities again from the folder, as it stands
     /// now: after the mind folder moves to a newer record, or a write to a
     /// mind that keeps no drafts. A world that is gone stops running.
@@ -267,8 +287,20 @@ impl Authored {
             tracing::warn!("personalities could not be read again: {e:#}");
         }
         if let Some(rt) = self.runtime.as_ref() {
+            self.renamings(rt).await;
             for wid in &gone {
-                rt.remove_world(wid);
+                // **A former id is renamed, not removed** (`docs/world_rename.md`
+                // §3): it stops running here, and its records stay for the
+                // world that names it to take in.
+                match rt.standing.is_former(wid) {
+                    true => {
+                        rt.unhost(wid);
+                        tracing::info!("world `{wid}`: renamed — stopped, its records kept");
+                    }
+                    false => {
+                        rt.remove_world(wid);
+                    }
+                }
             }
             // A personality's `takes_orders` reaches characters already standing
             // in their worlds.

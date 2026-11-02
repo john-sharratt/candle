@@ -997,12 +997,26 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
 /// beside `worlds/<world_id>.yaml`. A map that does not hold together is an
 /// authoring mistake to fix, not a reason for the rest to go unhosted.
 async fn host_worlds(runtime: &Arc<Runtime>, authored: &Arc<Authored>, authored_dir: &Path) {
+    // The renames first, so a world renamed takes its former in as it is
+    // hosted, and a former id is never a world of its own
+    // (`docs/world_rename.md` §2).
+    authored.renamings(runtime).await;
     let ids: Vec<String> = authored
         .worlds
         .read()
         .await
         .iter()
         .map(|r| r.id.clone())
+        .filter(|id| {
+            let former = runtime.standing.is_former(id);
+            if former {
+                tracing::error!(
+                    "world `{id}`: refused — another world names it as its former id, so \
+                     worlds/{id}.yaml must go"
+                );
+            }
+            !former
+        })
         .collect();
     for (id, hosted) in runtime.host_authored(authored_dir, ids.iter().map(String::as_str)) {
         match hosted {

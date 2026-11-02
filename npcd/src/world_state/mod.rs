@@ -23,6 +23,7 @@ pub mod apply;
 pub mod diff;
 pub mod keys;
 pub mod legacy;
+pub mod renamed;
 pub mod snapshot;
 pub mod split;
 pub mod store;

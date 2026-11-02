@@ -35,9 +35,9 @@ formerly: [life]
 ```
 
 `formerly` is a list, because a world renamed twice keeps both. A world id named
-in any world's `formerly` is **never a world of its own again**: the registry
-refuses a `worlds/<old>.yaml` beside a world that names it as former, naming
-both files.
+in any world's `formerly` is **never a world of its own again**: a
+`worlds/<old>.yaml` left beside a world that names it as former is refused at
+hosting, with an error naming the file to remove (`tenant::host_worlds`).
 
 ## 3. Taken in once, by the authority
 
@@ -49,9 +49,8 @@ records was taken in (`world_state::legacy`):
    `world/<new>/` with the same entity and payload, in one substrate batch.
 2. **Characters.** Every NPC record with `world_id: <old>` is written with
    `world_id: <new>`.
-3. **The old records are tombstoned**, in the same batch as the new ones are
-   written — so a crash leaves either the old world whole or the new one, never
-   half of each, and replicas take the batch as one.
+3. **The old records are tombstoned** once the new ones are written — never
+   before, so a crash between the two leaves both whole, never neither (§5).
 4. The world then loads from its records as any world does: the same sim, the
    same characters in the same rooms, the same Discord server and channels
    (their records moved with it; the channels in Discord are untouched).
@@ -77,11 +76,25 @@ records ceased (`cease_world`) — except one named in another world's
    are as they were, the Discord mirror posts into the same channels, and no
    object under `world/<old>/` is live.
 
-## 5. Tests
+## 5. Where it lives, and its tests
 
-- A world with `formerly` and no records takes in its former's records and NPC
-  bindings, byte for byte, and the old objects are tombstoned in the same
-  batch.
-- A world that already has records takes nothing in.
-- A former world's records are not ceased when its file is gone.
-- A `worlds/<old>.yaml` beside a world naming `<old>` as former is refused.
+- `world_state::renamed` — the formers read off the worlds' files, the take-in
+  and the retire. Tests: a world names the ids it had; a renamed world takes in
+  its former record for record, the former is retired, and a late write under
+  an earlier epoch stays dead.
+- `authority::beat` — `restore` takes the former in when the world has no
+  records of its own; `write_world`'s first success retires it. Test: a world
+  renamed comes up with its bodies where they stood and its table as it was,
+  writes its own records, and the former's are gone — once.
+- `authority::worlds::Standing` — the formers, and which world is owed a
+  retire. Test: it is handed back once.
+- `Npcs::rehome` — the characters moved, by `Authored::renamings` at startup
+  and at every reload. Test: each character of the old id moves, another
+  world's stays, a second move finds none.
+- `Authored::reload_authored` — a gone world that is a former id is unhosted,
+  never ceased.
+
+The take-in is two writes, not one batch: the new world's records at its
+authority's first beat, then the former's tombstones. A failure between them
+leaves both, and the next boot finds the new world's records and takes nothing
+in; the former is retired by hand (`store::cease_world`) or on a later rename.

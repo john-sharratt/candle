@@ -25,7 +25,7 @@ use crate::engine::environment::{self, Reach};
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::runtime::Runtime;
 use crate::world::Hosted;
-use crate::world_state::{apply, diff, legacy, records_of, store};
+use crate::world_state::{apply, diff, legacy, records_of, renamed, store};
 
 fn nobody_else(_: u64, _: u64, _: Salience, _: EventKind) {}
 
@@ -52,7 +52,13 @@ impl Runtime {
         }
         let records = store::read(&shared, id);
         if records.is_empty() {
-            if legacy::take_in(&shared, hosted) {
+            // **A world renamed comes up as it was under its former id**
+            // (`docs/world_rename.md` §3); its former is retired once this
+            // world has written its own records.
+            if let Some(old) = renamed::take_in(&shared, hosted, &self.standing.formerly_of(id)) {
+                tracing::info!("world `{id}`: taken in from its former id `{old}`");
+                self.standing.mark_renamed(id, &old);
+            } else if legacy::take_in(&shared, hosted) {
                 tracing::info!("world `{id}`: taken in from the objects kept before world records");
                 self.standing.mark_legacy(id);
             }
@@ -144,6 +150,17 @@ impl Runtime {
                 if let Some(last) = self.standing.legacy_written(world) {
                     if let Err(e) = legacy::retire(&shared, world, last) {
                         tracing::error!("world `{world}`: the old objects were not retired: {e}");
+                    }
+                }
+                if let Some(old) = self.standing.renamed_written(world) {
+                    let above = epoch_for(now_ms(), store::highest_epoch(&shared, &old));
+                    match renamed::retire(&shared, &old, above) {
+                        Ok(n) => tracing::info!(
+                            "world `{world}`: its former id `{old}` retired, {n} records tombstoned"
+                        ),
+                        Err(e) => tracing::error!(
+                            "world `{world}`: its former id `{old}` was not retired: {e}"
+                        ),
                     }
                 }
             }
@@ -257,9 +274,11 @@ mod tests {
     use npc_map::world::Where;
     use tempfile::TempDir;
 
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::mind::Mind;
-    use crate::world_state::{records_of, sim_records};
+    use crate::world_state::{records_of, sim_records, Records};
 
     const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
     const WORLD: &str = "creators-vault";
@@ -330,6 +349,43 @@ mod tests {
             !store::read(&s, WORLD).is_empty(),
             "hosted again, it writes above its own tombstones"
         );
+    }
+
+    /// **A world renamed comes up as it was under its former id, and the former
+    /// is retired after its first write** (`docs/world_rename.md` §3): hosted
+    /// with no records of its own, it takes in the former's — the bodies where
+    /// they stood, the table as it was left — writes them as its own on its
+    /// first beat, and the former's are then gone.
+    #[tokio::test]
+    async fn a_renamed_world_comes_up_as_it_was_and_retires_its_former() {
+        let dir = TempDir::new().unwrap();
+        let (rt, s) = daemon(&dir);
+        let world = rt.host(WORLD, Path::new(ROOMS)).unwrap();
+        rt.hold_world(WORLD, true);
+        world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
+        world.with_sim(|s| s.table_open = false);
+        let kept = records_of(&world);
+        store::write(&s, "old-vault", &diff(&Records::new(), &kept), 5).unwrap();
+        assert!(rt.remove_world(WORLD));
+
+        rt.standing.set_formers(BTreeMap::from([(
+            WORLD.to_string(),
+            vec!["old-vault".to_string()],
+        )]));
+        let renamed = rt.host(WORLD, Path::new(ROOMS)).unwrap();
+        rt.hold_world(WORLD, true);
+        renamed.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        rt.restore(&renamed);
+        assert_eq!(renamed.place_of("m1"), "vault-casting/green-room");
+        assert!(!renamed.sim(|s| s.table_open));
+
+        rt.beat(&renamed);
+        assert_eq!(store::read(&s, WORLD), records_of(&renamed));
+        assert!(
+            store::read(&s, "old-vault").is_empty(),
+            "the former is retired"
+        );
+        assert_eq!(rt.standing.renamed_written(WORLD), None, "once");
     }
 
     /// A beat that changed nothing writes nothing.
