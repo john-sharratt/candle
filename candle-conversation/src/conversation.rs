@@ -3638,6 +3638,22 @@ impl Sequence {
         }
     }
 
+    /// Advance this conversation's recurrent memory over `tokens`, all of its
+    /// own turns as their left context, adding no K/V: the catch-up a splice
+    /// runs, for tokens this conversation holds some other way.
+    pub fn catch_memory_up_over(&self, tokens: Vec<u32>) -> crate::Result<bool> {
+        let (tx, rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::MemoryCatchUp {
+                sequence_id: self.id,
+                tokens: TokenBuffer::from(tokens),
+                adopted_from: u32::MAX,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
+    }
+
     /// [`Self::splice_scope_turns`] for a chain of any length: adopt every turn
     /// onto this conversation's timeline in order, couple all but the last (each
     /// prefilled turn belongs with the one answering it), and tombstone the fork.

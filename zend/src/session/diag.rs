@@ -49,6 +49,10 @@ pub struct DiagRun {
     pub sampling: ReplaySampling,
     /// Turns taken out of the target's projections, by `(timeline, index)`.
     pub without: Vec<(u64, u32)>,
+    /// Turns the recurrent memory is taken over before the target, by
+    /// `(timeline, index)`: the control for K/V the attention layers hold and
+    /// the recurrent layers never saw.
+    pub catch_up: Vec<(u64, u32)>,
 }
 
 /// What to decode.
@@ -107,6 +111,7 @@ pub struct DiagOutcome {
     pub control: Control,
     pub seed: Option<u64>,
     pub without: Vec<(u64, u32)>,
+    pub catch_up: Vec<(u64, u32)>,
     pub replay_secs: f64,
     pub decode_secs: f64,
     pub prefill_ms: f64,
@@ -328,6 +333,15 @@ impl ZendSession {
         .map(|t| t.turn)
         .collect();
 
+        for &(raw, index) in &run.catch_up {
+            let tl = TimelineId::from_raw(raw).context("a catch-up turn's timeline")?;
+            let Some(turn) = conv.sealed_turns(tl).into_iter().find(|t| t.index == index) else {
+                bail!("no turn {index} on timeline {raw} to catch up over");
+            };
+            conv.catch_memory_up_over(turn.token_ids)
+                .context("catching the memory up")?;
+        }
+
         // The target: its recorded points up to the end, then one live.
         let without: HashSet<(u64, u32)> = run.without.iter().copied().collect();
         let suffix: Vec<u32> = state
@@ -433,6 +447,7 @@ impl ZendSession {
             control: run.control,
             seed,
             without: run.without.clone(),
+            catch_up: run.catch_up.clone(),
             replay_secs,
             decode_secs,
             prefill_ms: response.stats.prefill_ms,

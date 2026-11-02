@@ -37,6 +37,9 @@ pub struct RunBody {
     /// `[timeline, index]` of turns to take out of the target's projections.
     #[serde(default)]
     pub without: Vec<(u64, u32)>,
+    /// `[timeline, index]` of turns the recurrent memory is taken over first.
+    #[serde(default)]
+    pub catch_up: Vec<(u64, u32)>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +96,7 @@ pub async fn start(
                 control: control(r.control.as_deref())?,
                 sampling: r.seed.map_or(ReplaySampling::Argmax, ReplaySampling::Seed),
                 without: r.without.clone(),
+                catch_up: r.catch_up.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()
