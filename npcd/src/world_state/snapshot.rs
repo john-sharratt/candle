@@ -3,20 +3,25 @@
 //!
 //! | Entity | Record |
 //! |---|---|
-//! | each body standing still | `body/<body>`: its place and the station it holds |
+//! | each body | `body/<body>`: its place, the station it holds, and the journey it is on |
 //! | the lift car | `lift`: its floor, doors and stops, who is aboard and who is waiting for it, each with the floor it is bound for |
 //! | each entry of the world's entity maps — a mission, an operation, a body's working set, a pack, a device, a thread, a posting… | `sim/<map path>/<key>` ([`SIM_MAPS`]) |
 //! | everything else the world holds — the command table, the tower, the roster, the ledger's lists | `sim/meta` |
 //!
-//! A body on its way between rooms has no record written: its walk is what the
-//! world is doing, and the steps go as pulses. Its record is written where it
-//! stops. Where this machine keeps the benches' documents is not part of the
-//! world, so it is not in the record.
+//! A body on its way between rooms is written at the end of each leg with the
+//! rest of its way: a member that runs its character without running the
+//! world builds the turn it is given there from its own copy, and a copy that
+//! had it still standing where it set out offered it the rooms it had left.
+//! What the records hold is [`World::state`], which names every field of the
+//! world, so nothing a copy builds a turn from is left out of them. Where this
+//! machine keeps the benches' documents is not part of the world, so it is not
+//! in the record.
 
 use std::collections::BTreeMap;
 
 use npc_map::lift::Doors;
-use npc_map::world::World;
+use npc_map::state::{BodyState, LiftState, State, WalkState};
+use npc_map::world::{Where, World};
 use serde_json::{json, Value};
 
 use super::keys::escape;
@@ -61,30 +66,49 @@ pub fn doors_name(d: Doors) -> &'static str {
     }
 }
 
-/// The records of the bodies standing still, and the lift.
+/// A place as a record names it: `<area>/<node>`.
+pub fn place_name(at: &Where) -> String {
+    format!("{}/{}", at.area, at.node)
+}
+
+/// The records of every body and of the lift — everything the world's copies
+/// share ([`World::state`]).
 pub fn world_records(w: &World) -> Records {
+    let State { bodies, lift } = w.state();
     let mut out = Records::new();
-    for actor in w.actors().filter(|a| a.walk.is_none()) {
+    for (id, body) in bodies {
+        let BodyState { at, hold, walk } = body;
         out.insert(
-            format!("body/{}", escape(&actor.id)),
+            format!("body/{}", escape(&id)),
             json!({
-                "at": format!("{}/{}", actor.at.area, actor.at.node),
-                "hold": actor.hold.as_ref().map(|h| json!({
-                    "part": h.part,
-                    "subject": h.subject,
+                "at": place_name(&at),
+                "hold": hold.map(|(part, subject)| json!({
+                    "part": part,
+                    "subject": subject,
+                })),
+                "walk": walk.map(|WalkState { toward, ahead }| json!({
+                    "toward": place_name(&toward),
+                    "ahead": ahead.iter().map(place_name).collect::<Vec<_>>(),
                 })),
             }),
         );
     }
-    if let Some(lift) = w.lift() {
+    if let Some(LiftState {
+        floor,
+        doors,
+        stops,
+        riders,
+        waiting,
+    }) = lift
+    {
         out.insert(
             "lift".into(),
             json!({
-                "floor": lift.floor(),
-                "doors": doors_name(lift.doors()),
-                "stops": lift.stops(),
-                "riders": w.lift_riders(),
-                "waiting": w.lift_waiting(),
+                "floor": floor,
+                "doors": doors_name(doors),
+                "stops": stops,
+                "riders": riders,
+                "waiting": waiting,
             }),
         );
     }
@@ -129,8 +153,10 @@ pub(super) mod tests {
         Where::new("vault-casting", node)
     }
 
+    /// A body standing is its place; one on its way is where it has got to
+    /// and the rest of its way.
     #[test]
-    fn a_standing_body_is_a_record_and_a_walking_one_is_not() {
+    fn a_walking_body_s_record_holds_the_rest_of_its_way() {
         let records = vault().with(|w| {
             w.enter("a", "A", at("band-one")).unwrap();
             w.enter("b", "B", at("band-one")).unwrap();
@@ -139,9 +165,24 @@ pub(super) mod tests {
         });
         assert_eq!(
             records.get("body/a"),
-            Some(&json!({"at": "vault-casting/band-one", "hold": null}))
+            Some(&json!({"at": "vault-casting/band-one", "hold": null, "walk": null}))
         );
-        assert!(!records.contains_key("body/b"), "on its way");
+        assert_eq!(
+            records.get("body/b"),
+            Some(&json!({
+                "at": "vault-casting/band-one",
+                "hold": null,
+                "walk": {
+                    "toward": "vault-casting/green-room",
+                    "ahead": [
+                        "vault-casting/ring-north",
+                        "vault-casting/ring-east",
+                        "vault-casting/ring-south",
+                        "vault-casting/green-room",
+                    ],
+                },
+            }))
+        );
     }
 
     /// The command table is in the world's meta record; each thread, each

@@ -7,11 +7,14 @@
 //! machine keeps of its own aside ([`Sim::take_in`]) — and left as the world has
 //! it when they do not, so a world hosted for the first time keeps its seed. A
 //! body record places a body that is in the world; one that is not yet is kept
-//! for when it is embodied ([`place_of`]).
+//! for when it is embodied ([`place_of`]). A body's record carries the journey
+//! it is on and the lift's who is aboard and waiting, so a replica building a
+//! turn for a character it runs builds it from where the authority has it.
 
 use std::collections::BTreeMap;
 
 use npc_map::lift::Doors;
+use npc_map::state::{BodyState, LiftState, WalkState};
 use npc_map::world::{Where, World};
 use serde_json::Value;
 
@@ -53,45 +56,57 @@ pub fn sim_of(records: &Records) -> Option<Sim> {
     }
 }
 
+/// Each body the records place, then the lift — after the bodies, so a rider
+/// the lift's record has aboard is aboard however its body's record moved it.
+/// A body not in the world, or placed somewhere the map does not have, is
+/// left as it is.
 fn apply_world(w: &mut World, records: &Records) {
     for (name, v) in records {
-        let Some(body) = name.strip_prefix("body/").map(unescape) else {
+        let Some(id) = name.strip_prefix("body/").map(unescape) else {
             continue;
         };
-        if w.actor(&body).is_none() {
+        if w.actor(&id).is_none() {
             continue;
         }
-        let at = v
-            .get("at")
-            .and_then(Value::as_str)
-            .and_then(Where::parse)
-            .filter(|at| w.map().node_at(at).is_some());
-        if let Some(at) = at {
-            if w.actor(&body).is_some_and(|a| a.at != at) {
-                let _ = w.restore_place(&body, at);
-            }
-        }
-        let hold = v.get("hold").filter(|h| !h.is_null()).and_then(|h| {
-            let part = h.get("part")?.as_str()?.to_string();
-            let subject = h.get("subject").and_then(Value::as_str).map(String::from);
-            Some((part, subject))
-        });
-        let held = w
-            .actor(&body)
-            .and_then(|a| a.hold.as_ref())
-            .map(|h| (h.part.clone(), h.subject.clone()));
-        if held != hold {
-            let _ = w.restore_hold(&body, hold);
+        if let Some(body) = body_of(v) {
+            let _ = w.restore_body(&id, &body);
         }
     }
-    if let Some(lift) = records.get("lift") {
-        let floor = lift.get("floor").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let doors = match lift.get("doors").and_then(Value::as_str) {
-            Some("closed") => Doors::Closed,
-            _ => Doors::Open,
-        };
-        let stops: Vec<usize> = lift
-            .get("stops")
+    if let Some(car) = records.get("lift").map(lift_of) {
+        w.restore_lift(&car);
+    }
+}
+
+/// A place a record names (`<area>/<node>`).
+fn place(v: &Value) -> Option<Where> {
+    v.as_str().and_then(Where::parse)
+}
+
+/// A body's record, read back.
+fn body_of(v: &Value) -> Option<BodyState> {
+    let at = place(v.get("at")?)?;
+    let hold = v.get("hold").filter(|h| !h.is_null()).and_then(|h| {
+        let part = h.get("part")?.as_str()?.to_string();
+        let subject = h.get("subject").and_then(Value::as_str).map(String::from);
+        Some((part, subject))
+    });
+    let walk = v.get("walk").filter(|w| !w.is_null()).and_then(|w| {
+        let toward = place(w.get("toward")?)?;
+        let ahead = w
+            .get("ahead")?
+            .as_array()?
+            .iter()
+            .map(place)
+            .collect::<Option<Vec<_>>>()?;
+        Some(WalkState { toward, ahead })
+    });
+    Some(BodyState { at, hold, walk })
+}
+
+/// The lift's record, read back.
+fn lift_of(v: &Value) -> LiftState {
+    let floors = |field: &str| -> Vec<usize> {
+        v.get(field)
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
@@ -99,28 +114,28 @@ fn apply_world(w: &mut World, records: &Records) {
                     .map(|f| f as usize)
                     .collect()
             })
-            .unwrap_or_default();
-        w.restore_lift(
-            floor,
-            doors,
-            &stops,
-            bound_for(lift, "riders"),
-            bound_for(lift, "waiting"),
-        );
+            .unwrap_or_default()
+    };
+    let bound_for = |field: &str| -> BTreeMap<String, usize> {
+        v.get(field)
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(body, f)| Some((body.clone(), f.as_u64()? as usize)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    LiftState {
+        floor: v.get("floor").and_then(Value::as_u64).unwrap_or(0) as usize,
+        doors: match v.get("doors").and_then(Value::as_str) {
+            Some("closed") => Doors::Closed,
+            _ => Doors::Open,
+        },
+        stops: floors("stops"),
+        riders: bound_for("riders"),
+        waiting: bound_for("waiting"),
     }
-}
-
-/// The bodies a lift record lists under `field`, each with the floor it is
-/// bound for.
-fn bound_for(lift: &Value, field: &str) -> BTreeMap<String, usize> {
-    lift.get(field)
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(body, f)| Some((body.clone(), f.as_u64()? as usize)))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Put `records` into `hosted`, under one hold of its lock — and its bots'
@@ -221,6 +236,49 @@ mod tests {
             assert_eq!(w.lift_within("a"), (false, false, Vec::new()));
         });
         assert_eq!(replica.read(world_records), records, "the same lift");
+    }
+
+    /// **A replica given the records is the world the authority has.**
+    /// Everything the copies share ([`World::state`]) — a body standing, one
+    /// at a station, one on its way to another level, the lift with a body
+    /// aboard and one waiting — written by one world and taken in by another
+    /// built from the same map reads back the same, and so writes the same
+    /// records.
+    #[test]
+    fn a_replica_given_the_records_has_the_world_the_authority_has() {
+        let source = vault();
+        let (shaft, top) = source.read(|w| (w.shaft().to_vec(), w.shaft().len() - 1));
+        source.with(|w| {
+            for (id, place) in [
+                ("stands", at("green-room")),
+                ("holds", at("band-one")),
+                ("walks", at("green-room")),
+                ("aboard", shaft[0].clone()),
+                ("waits", shaft[top].clone()),
+            ] {
+                w.enter(id, id, place).unwrap();
+            }
+            w.take("holds", Some("cindy")).unwrap();
+            w.call_lift(0);
+            while !w.lift().unwrap().boardable_at(0) {
+                w.tick();
+            }
+            assert!(w.ride_lift("aboard", top));
+            assert!(w.ride_lift("waits", 0));
+            w.set_off("walks", shaft[top].clone()).unwrap();
+        });
+        let records = source.read(world_records);
+        assert!(records["body/walks"]["walk"].is_object(), "{records:?}");
+
+        let replica = vault();
+        replica.with(|w| {
+            for id in ["stands", "holds", "walks", "aboard", "waits"] {
+                w.enter(id, id, at("green-room")).unwrap();
+            }
+        });
+        apply(&replica, &records);
+        assert_eq!(replica.read(World::state), source.read(World::state));
+        assert_eq!(replica.read(world_records), records);
     }
 
     /// **A bot's DM is one of the world's records**: written with them,

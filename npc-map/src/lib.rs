@@ -45,6 +45,7 @@ pub mod perceive;
 pub mod route;
 pub mod salience;
 pub mod schema;
+pub mod state;
 pub mod stream;
 pub mod text;
 pub mod validate;

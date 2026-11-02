@@ -61,13 +61,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lift::{Doors, Lift, Moment};
+use crate::lift::{Lift, Moment};
 use crate::load::MapSet;
 use crate::mutate::MapEdit;
 use crate::part::PartKind;
 use crate::route;
 use crate::salience::Weight;
 use crate::schema::{AreaKind, Node, NodeKind};
+use crate::state::{BodyState, LiftState, State, WalkState};
 
 pub use crate::schema::Where;
 
@@ -1568,81 +1569,155 @@ impl World {
         self.now
     }
 
-    /// Set `id` where a record of the world says it stands, ending any walk.
-    /// Nothing is logged: the moves a body makes are told as they happen
-    /// ([`Self::witness`]), and this only settles where it ended up.
-    pub fn restore_place(&mut self, id: &str, to: Where) -> Done {
-        if self.node(&to).is_none() {
-            return Err(Refused::NoSuchPlace(to));
-        }
-        let actor = self
-            .actors
-            .get_mut(id)
-            .ok_or(Refused::NoSuchActor(id.into()))?;
-        actor.at = to;
-        actor.walk = None;
-        // Moved by other means than the lift, as `land` has it: no ride is
-        // pending any more.
-        self.riders.remove(id);
-        self.waiting.remove(id);
-        Ok(())
-    }
-
-    /// Who is aboard the car, and the floor each is bound for.
-    pub fn lift_riders(&self) -> &BTreeMap<String, usize> {
-        &self.riders
-    }
-
-    /// Who is waiting on a landing for the car, and the floor each will ride to.
-    pub fn lift_waiting(&self) -> &BTreeMap<String, usize> {
-        &self.waiting
-    }
-
-    /// Set the lift where a record of it says it was ([`Lift::restore`]), and
-    /// who was aboard it and waiting for it. Nothing is logged: nobody in the
-    /// building did anything. Whether the world has a lift.
+    /// Everything about this world its copies share ([`crate::state`]).
     ///
-    /// **Who is riding is part of the lift's record, not of one machine's
-    /// memory.** A world's characters can run on a member that follows it, and
-    /// that member offers each its turn from its own copy of the world: with
-    /// the riders left out, a body its authority had aboard was offered the
-    /// rooms of its landing as if it had never asked, walked off, and so gave
-    /// up the ride — four drones went back and forth between the lift and the
-    /// nest hall, each telling the others the car had passed it by. A rider
-    /// bound for a floor off the shaft is dropped, as the car's own stops are.
-    pub fn restore_lift(
-        &mut self,
-        at: usize,
-        doors: Doors,
-        stops: &[usize],
-        riders: BTreeMap<String, usize>,
-        waiting: BTreeMap<String, usize>,
-    ) -> bool {
-        let Some(lift) = self.lift.as_mut() else {
-            return false;
-        };
-        lift.restore(at, doors, stops);
-        let floors = self.shaft.len();
-        self.riders = riders.into_iter().filter(|(_, f)| *f < floors).collect();
-        self.waiting = waiting.into_iter().filter(|(_, f)| *f < floors).collect();
-        true
+    /// **Every field is named, none with `..`.** A world's characters can run
+    /// on a member that follows it, built each turn from that member's copy, so
+    /// a field one copy keeps and the others never hear of is a turn built from
+    /// a world that is not there. Riders left out of the lift's record were
+    /// exactly that: a drone its authority had aboard was offered the rooms of
+    /// its landing as if it had never asked, walked off, and gave up the ride,
+    /// and four drones went back and forth between the lift and the nest hall.
+    /// A field added to the world, a body, a hold or a walk does not compile
+    /// here until it is said to be shared or one copy's own.
+    pub fn state(&self) -> State {
+        let World {
+            // The map is its files and what the world's builders made, laid
+            // over it from the world's records — shared, but not from here.
+            map: _,
+            actors,
+            // Names come with each body as it is embodied, in every copy.
+            names: _,
+            // What happened reaches the others as it happens (`witness`), each
+            // copy stamping it on its own clock.
+            log: _,
+            now: _,
+            lift,
+            // Derived from the map.
+            shaft: _,
+            riders,
+            waiting,
+            // A decision is made where the mind making it runs, and travels
+            // with the act it chose (`deliberation`, `restore_decision`).
+            deciding: _,
+        } = self;
+        let bodies = actors
+            .iter()
+            .map(|(id, actor)| {
+                let Actor {
+                    id: _,
+                    name: _,
+                    at,
+                    hold,
+                    walk,
+                    // How far this copy's reader of the body has read its log.
+                    looked: _,
+                } = actor;
+                let hold = hold.as_ref().map(|h| {
+                    let Hold {
+                        subject,
+                        part,
+                        // On this copy's clock.
+                        since: _,
+                    } = h;
+                    (part.clone(), subject.clone())
+                });
+                let walk = walk.as_ref().map(|w| {
+                    let Walk {
+                        toward,
+                        ahead,
+                        // On this copy's clock.
+                        set_out: _,
+                    } = w;
+                    WalkState {
+                        toward: toward.clone(),
+                        ahead: ahead.iter().cloned().collect(),
+                    }
+                });
+                let body = BodyState {
+                    at: at.clone(),
+                    hold,
+                    walk,
+                };
+                (id.clone(), body)
+            })
+            .collect();
+        let lift = lift.as_ref().map(|car| LiftState {
+            floor: car.floor(),
+            doors: car.doors(),
+            stops: car.stops(),
+            riders: riders.clone(),
+            waiting: waiting.clone(),
+        });
+        State { bodies, lift }
     }
 
-    /// Set what `id` is holding where a record of it says — the station
-    /// `part`, and the subject it claimed — or nothing. Nothing is logged:
-    /// this is the world being told where it stood, not a body sitting down.
-    pub fn restore_hold(&mut self, id: &str, hold: Option<(String, Option<String>)>) -> Done {
+    /// Set `id` as another copy of the world has it: where it stands, what it
+    /// holds, and the journey it is on. Nothing is logged: the moves a body
+    /// makes are told as they happen ([`Self::witness`]), and this only
+    /// settles where they got it. A walk through a place the map does not
+    /// have is dropped; a body moved is off any landing it was riding from,
+    /// until the lift's own state says otherwise ([`Self::restore_lift`]).
+    pub fn restore_body(&mut self, id: &str, body: &BodyState) -> Done {
+        if self.node(&body.at).is_none() {
+            return Err(Refused::NoSuchPlace(body.at.clone()));
+        }
+        let walk = body.walk.as_ref().filter(|w| {
+            self.node(&w.toward).is_some() && w.ahead.iter().all(|p| self.node(p).is_some())
+        });
         let now = self.now;
         let actor = self
             .actors
             .get_mut(id)
             .ok_or(Refused::NoSuchActor(id.into()))?;
-        actor.hold = hold.map(|(part, subject)| Hold {
-            subject,
-            part,
-            since: now,
-        });
+        let moved = actor.at != body.at;
+        actor.at = body.at.clone();
+        let same_walk = match (&actor.walk, walk) {
+            (Some(had), Some(w)) => had.toward == w.toward && had.ahead.iter().eq(w.ahead.iter()),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_walk {
+            actor.walk = walk.map(|w| Walk {
+                toward: w.toward.clone(),
+                ahead: w.ahead.iter().cloned().collect(),
+                set_out: now,
+            });
+        }
+        let held = actor.hold.as_ref().map(|h| (&h.part, &h.subject));
+        if held != body.hold.as_ref().map(|(p, s)| (p, s)) {
+            actor.hold = body.hold.clone().map(|(part, subject)| Hold {
+                subject,
+                part,
+                since: now,
+            });
+        }
+        if moved {
+            self.riders.remove(id);
+            self.waiting.remove(id);
+        }
         Ok(())
+    }
+
+    /// Set the lift as another copy of the world has it ([`Lift::restore`]),
+    /// and who is aboard it and waiting for it. Nothing is logged: nobody in
+    /// the building did anything. A rider bound for a floor off the shaft is
+    /// dropped, as the car's own stops are. Whether the world has a lift.
+    pub fn restore_lift(&mut self, car: &LiftState) -> bool {
+        let Some(lift) = self.lift.as_mut() else {
+            return false;
+        };
+        lift.restore(car.floor, car.doors, &car.stops);
+        let floors = self.shaft.len();
+        let on_shaft = |m: &BTreeMap<String, usize>| -> BTreeMap<String, usize> {
+            m.iter()
+                .filter(|(_, f)| **f < floors)
+                .map(|(b, f)| (b.clone(), *f))
+                .collect()
+        };
+        self.riders = on_shaft(&car.riders);
+        self.waiting = on_shaft(&car.waiting);
+        true
     }
 
     /// Get up, and let go of whatever was claimed.
@@ -1930,18 +2005,73 @@ mod tests {
             Happening::Said { words, .. } if words == "from the other machine")));
     }
 
-    /// A record's place settles a body silently, ending its walk.
+    /// A body restored from another copy settles silently, its walk ended
+    /// when that copy has it standing.
     #[test]
-    fn a_restored_place_moves_nobody_audibly() {
+    fn a_restored_body_moves_nobody_audibly() {
         let mut w = one_speaker();
         w.enter("m2", "Maker-02", at("band-one")).unwrap();
         w.set_off("m2", at("green-room")).unwrap();
         let logged = w.log().len();
-        w.restore_place("m2", at("green-room")).unwrap();
+        let standing = |place: &str| BodyState {
+            at: at(place),
+            hold: None,
+            walk: None,
+        };
+        w.restore_body("m2", &standing("green-room")).unwrap();
         assert_eq!(w.log().len(), logged, "nothing logged");
         assert_eq!(w.actor("m2").unwrap().at, at("green-room"));
         assert!(w.actor("m2").unwrap().walk.is_none());
-        assert!(w.restore_place("m2", at("no-such-room")).is_err());
+        assert!(w.restore_body("m2", &standing("no-such-room")).is_err());
+    }
+
+    /// **A copy given another's state is that state.** Everything a copy of a
+    /// world shares — a body standing, one holding a station, one partway
+    /// along a walk, the lift on its way with one body aboard and another
+    /// waiting for it — read off one world and put into another built from
+    /// the same map, reads back the same.
+    #[test]
+    fn a_world_s_state_put_into_another_copy_reads_back_the_same() {
+        let mut source = vault();
+        let shaft: Vec<Where> = source.shaft().to_vec();
+        let top = shaft.len() - 1;
+        for (id, place) in [
+            ("stands", at("green-room")),
+            ("holds", at("band-one")),
+            ("walks", at("green-room")),
+            ("aboard", shaft[0].clone()),
+            ("waits", shaft[top].clone()),
+        ] {
+            source.enter(id, id, place).unwrap();
+        }
+        source.take("holds", Some("cindy")).unwrap();
+        source.call_lift(0);
+        while !source.lift().unwrap().boardable_at(0) {
+            source.tick();
+        }
+        assert!(source.ride_lift("aboard", top));
+        assert!(source.ride_lift("waits", 0));
+        source.set_off("walks", shaft[top].clone()).unwrap();
+        let state = source.state();
+        assert!(state.bodies["walks"].walk.is_some(), "on its way");
+        let car = state.lift.as_ref().unwrap();
+        assert_eq!(car.riders.get("aboard"), Some(&top));
+        assert_eq!(car.waiting.get("waits"), Some(&0));
+        assert_eq!(car.stops, vec![top]);
+        assert_eq!(
+            state.bodies["holds"].hold.as_ref().map(|h| h.1.as_deref()),
+            Some(Some("cindy"))
+        );
+
+        let mut copy = vault();
+        for id in state.bodies.keys() {
+            copy.enter(id, id, at("green-room")).unwrap();
+        }
+        for (id, body) in &state.bodies {
+            copy.restore_body(id, body).unwrap();
+        }
+        assert!(copy.restore_lift(car));
+        assert_eq!(copy.state(), state);
     }
 
     /// A decision begun in one copy of a world, carried to another, lets a
