@@ -36,6 +36,8 @@ include_dir  = { version = "0.7" }
 # The process zend runs in: logging, the model, the HTTP server, the shared
 # endpoints (`docs/shared_model_host.md`). zend is one of its tenants.
 host         = { path = "../host" }
+# The counting global allocator the `zend` binary installs (`docs/memory_census.md`).
+heap-census  = { path = "../heap-census" }
 # How each route is dispatched under a cluster, and the passthrough key the
 # gateway routes a conversation by (`docs/replicated_substrate.md` §5.2).
 cluster      = { path = "../cluster" }

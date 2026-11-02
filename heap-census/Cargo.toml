@@ -1,0 +1,24 @@
+[package]
+name = "heap-census"
+version = "0.1.0"
+edition = "2021"
+description = "What a process holds: a counting global allocator by size class, the OS's commit and heap figures, and the verdict on growth (docs/memory_census.md)"
+
+# No heavy dependencies: the allocator is linked into every daemon binary, and
+# its tests run without an engine or a card.
+[dependencies]
+serde = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

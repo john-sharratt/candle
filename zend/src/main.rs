@@ -20,9 +20,15 @@
 
 use clap::Parser;
 use cluster::version::info::ZEND;
+use heap_census::Counting;
 use host::build_info::first;
 use host::{run, HostArgs, HostConfig, Tenant};
 use zend::cli::ZendArgs;
+
+/// Every allocation counted by size class, for the memory census
+/// (`docs/memory_census.md`).
+#[global_allocator]
+static HEAP: Counting = Counting;
 
 #[derive(Parser, Debug)]
 #[command(

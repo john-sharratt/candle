@@ -292,6 +292,10 @@ impl SubstratePersistence {
             size: at.size,
         };
         self.index_remote(&entry);
+        // Counted the moment it is written, so a batch an error stops later
+        // still counts what it wrote.
+        self.applied_mix
+            .note(h.record_type, entry.record.payload.len());
         substrate.apply_walker_entry(&entry);
         // A blob and its tombstone arrive in either order; whichever comes
         // second finds the other, and the tombstone kills what it outranks.

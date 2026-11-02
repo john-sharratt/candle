@@ -67,6 +67,16 @@ pub struct Series {
     pub host_used_mib: Column,
     pub rss_mib: Column,
 
+    // The memory census (`docs/memory_census.md` §6.2): with these on one chart
+    // the growth verdict reads by eye — commit and heap committed climbing over
+    // a flat live line is retention.
+    pub private_mib: Column,
+    pub heap_live_mib: Column,
+    pub heap_committed_mib: Column,
+    pub untracked_mib: Column,
+    /// MiB a second the counting allocator handed out since the sample before.
+    pub heap_churn_mib_s: Column,
+
     // Reported by the inference engine. `null` until there is one.
     pub weights_mib: Column,
     pub kv_mib: Column,
@@ -159,6 +169,11 @@ impl Ring {
             host_total_mib: mib(&|x| x.host.total_mib.map(|v| v as f64)),
             host_used_mib: mib(&|x| x.host_used_mib()),
             rss_mib: mib(&|x| x.host.rss_mib.map(|v| v as f64)),
+            private_mib: mib(&|x| x.host.private_mib.map(|v| v as f64)),
+            heap_live_mib: mib(&|x| x.host.heap_live_mib.map(|v| v as f64)),
+            heap_committed_mib: mib(&|x| x.host.heap_committed_mib.map(|v| v as f64)),
+            untracked_mib: mib(&|x| x.host.untracked_mib.map(|v| v as f64)),
+            heap_churn_mib_s: churn(&s),
 
             weights_mib: mib(&|x| x.eng(|e| e.weights_mib)),
             kv_mib: mib(&|x| x.eng(|e| e.kv_mib)),
@@ -205,6 +220,26 @@ fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// MiB a second the allocator handed out between each sample and the one
+/// before it; the first sample, and any beside one without the allocator, has
+/// none.
+fn churn(samples: &[&Sample]) -> Column {
+    let col: Vec<Option<f64>> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let prev = samples.get(i.checked_sub(1)?)?;
+            let dt = x.at.saturating_duration_since(prev.at).as_secs_f64();
+            let grew = x
+                .host
+                .heap_allocated_mib?
+                .checked_sub(prev.host.heap_allocated_mib?)?;
+            (dt > 0.0).then(|| round1(grew as f64 / dt))
+        })
+        .collect();
+    col.iter().any(Option::is_some).then_some(col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,9 +263,43 @@ mod tests {
                 total_mib: Some(65_457),
                 free_mib: Some(40_000),
                 rss_mib: Some(28),
+                ..Host::default()
             },
             engine,
         }
+    }
+
+    /// **The census columns carry their samples, and churn is MiB a second
+    /// between consecutive samples**; a window without the allocator has none.
+    #[test]
+    fn the_census_columns_and_churn() {
+        let base = Instant::now();
+        let mut r = Ring::new();
+        for (i, allocated) in [1_000u64, 1_100, 1_400].into_iter().enumerate() {
+            let mut x = s(at(base, i as u64 * 2), 1_000, None);
+            x.host.private_mib = Some(200_000 + i as u64);
+            x.host.heap_live_mib = Some(30_000);
+            x.host.heap_allocated_mib = Some(allocated);
+            x.host.heap_committed_mib = Some(60_000);
+            x.host.untracked_mib = Some(65_000);
+            r.push(x);
+        }
+        let ser = r.series();
+        assert_eq!(
+            ser.private_mib.unwrap(),
+            vec![Some(200_000.0), Some(200_001.0), Some(200_002.0)]
+        );
+        assert_eq!(ser.heap_live_mib.unwrap(), vec![Some(30_000.0); 3]);
+        assert_eq!(
+            ser.heap_churn_mib_s.unwrap(),
+            vec![None, Some(50.0), Some(150.0)]
+        );
+
+        let mut bare = Ring::new();
+        bare.push(s(base, 1_000, None));
+        bare.push(s(at(base, 2), 1_000, None));
+        assert_eq!(bare.series().heap_churn_mib_s, None);
+        assert_eq!(bare.series().private_mib, None);
     }
 
     #[test]

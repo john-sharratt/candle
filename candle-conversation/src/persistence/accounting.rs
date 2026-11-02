@@ -308,6 +308,12 @@ impl RecordAccounting {
         self.dead_bytes
     }
 
+    /// Live records tracked, for the memory census: one entry per live record
+    /// key, kept until compaction resets it.
+    pub fn entries(&self) -> usize {
+        self.live_sizes.len()
+    }
+
     /// Drop all state — called when the log is rewritten (compaction)
     /// right before the new file is re-walked into fresh accounting.
     pub fn reset(&mut self) {

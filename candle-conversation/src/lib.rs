@@ -115,6 +115,7 @@ mod sequence_handle;
 mod stats;
 pub mod stencil;
 pub mod store;
+pub mod store_gauges;
 pub mod substrate;
 pub mod summary_tree;
 pub mod tenant_rank;

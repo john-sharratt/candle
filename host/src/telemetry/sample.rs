@@ -90,7 +90,7 @@ mod tests {
         Host {
             total_mib: total,
             free_mib: free,
-            rss_mib: None,
+            ..Host::default()
         }
     }
 

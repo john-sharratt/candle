@@ -16,5 +16,5 @@ mod payload;
 
 pub use applied_set::{AppliedSet, OriginApplied};
 pub use listed_header::ListedHeader;
-pub use location_index::{Located, LocationIndex};
+pub use location_index::{Located, LocationIndex, OriginGauge};
 pub use payload::{DeferredRecord, ReplicaPayload};

@@ -10,8 +10,12 @@
 //! low is not the thing consuming it.
 
 use candle_conversation::memory_report::{latest, MemoryReport};
+use candle_conversation::store_gauges::{all as store_gauges, StoreGauge};
+use heap_census::report::{report as heap_report, HeapReport};
 use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+use crate::memory_census::{latest as census_latest, CensusNow};
 
 /// Response body for `GET /v1/memory`.
 #[derive(Serialize)]
@@ -23,6 +27,10 @@ pub struct MemoryDump {
     pub report_age_ms: Option<u64>,
     pub host_now: HostNow,
     pub process: ProcessNow,
+    /// Each tenant's store, structure by structure, as its persistence pass
+    /// last gauged it (`docs/memory_census.md` §5). Empty until each has been
+    /// gauged, a minute after it opens.
+    pub substrates: Vec<StoreGauge>,
 }
 
 /// OS memory at request time, in bytes.
@@ -44,6 +52,14 @@ pub struct ProcessNow {
     /// and easy to misread: a process that has merely *reserved* a large range
     /// has not taken that memory from anything.
     pub virtual_bytes: u64,
+    /// The memory census (`docs/memory_census.md`): the commit charge, the
+    /// heap's own summary as the census last read it, and the counting
+    /// allocator's live bytes by size class.
+    pub heap: HeapReport,
+    /// The census's last reading: untracked memory, the machine's commit, and
+    /// the growth verdict over the last half hour. Absent before the first
+    /// reading, a minute after start.
+    pub census: Option<CensusNow>,
 }
 
 /// Read the OS and this process. A fresh `System` refreshed only for what is
@@ -70,6 +86,10 @@ pub fn dump() -> MemoryDump {
         Some((r, age)) => (Some(r), Some(age)),
         None => (None, None),
     };
+    // The heap's summary as the census last read it: reading it here would
+    // hold the heap's lock for every poll of this page.
+    let census = census_latest();
+    let heap = heap_report(census.as_ref().and_then(|c| c.os_heap));
     MemoryDump {
         report,
         report_age_ms,
@@ -81,7 +101,10 @@ pub fn dump() -> MemoryDump {
         process: ProcessNow {
             working_set_bytes,
             virtual_bytes,
+            heap,
+            census,
         },
+        substrates: store_gauges(),
     }
 }
 
@@ -97,6 +120,20 @@ mod tests {
         assert!(d.host_now.free_bytes <= d.host_now.available_bytes);
         // The test binary is a process, so it has a working set.
         assert!(d.process.working_set_bytes > 0);
+    }
+
+    /// **The census rides in the process block**: the commit charge always,
+    /// and no allocator section in a binary that did not install the counting
+    /// allocator — absent, not zero.
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn the_census_rides_in_the_process_block() {
+        let json = serde_json::to_value(dump()).unwrap();
+        assert!(json["process"]["heap"]["private_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            json["process"]["heap"]["allocator"],
+            serde_json::Value::Null
+        );
     }
 
     /// With no engine in this process the engine section stays absent rather

@@ -14,9 +14,13 @@
 //! reported zero: "no card here" and "the card is idle" are different facts and
 //! the difference is exactly what somebody reading this page needs.
 
+use heap_census::os::private_bytes;
+use heap_census::report::allocator_totals;
 use nvml_wrapper::Nvml;
 use serde::Serialize;
 use sysinfo::System;
+
+use crate::memory_census::latest as census_latest;
 
 /// What the card is, and what is on it.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -48,6 +52,17 @@ pub struct Host {
     /// This process, not the machine — the number an operator wants when the
     /// question is whether *the daemon* is the thing eating memory.
     pub rss_mib: Option<u64>,
+    /// This process's commit charge: what it holds, resident or not.
+    pub private_mib: Option<u64>,
+    /// What the counting allocator says our code holds, when it is installed.
+    pub heap_live_mib: Option<u64>,
+    /// Everything the counting allocator has handed out, ever: its rate of
+    /// change is the churn.
+    pub heap_allocated_mib: Option<u64>,
+    /// What the process heap has committed, as the census last read it.
+    pub heap_committed_mib: Option<u64>,
+    /// The commit charge the census does not explain, as it last read it.
+    pub untracked_mib: Option<u64>,
 }
 
 /// Holds the NVML handle open for the life of the daemon.
@@ -136,10 +151,23 @@ pub fn sample_host() -> Host {
         })
     };
 
+    // The commit charge and the allocator's counts are read fresh — neither
+    // locks anything. The heap's own summary does, so its figures are the
+    // census's last minute, not this sample's.
+    let allocator = allocator_totals();
+    let census = census_latest();
     Host {
         total_mib: Some(mib(sys.total_memory())),
         free_mib: Some(mib(sys.available_memory())),
         rss_mib: rss,
+        private_mib: private_bytes().map(mib),
+        heap_live_mib: allocator.map(|(live, _)| mib(live)),
+        heap_allocated_mib: allocator.map(|(_, allocated)| mib(allocated)),
+        heap_committed_mib: census
+            .as_ref()
+            .and_then(|c| c.os_heap)
+            .map(|h| mib(h.committed_bytes)),
+        untracked_mib: census.and_then(|c| c.untracked_bytes).map(mib),
     }
 }
 

@@ -7,9 +7,11 @@
 use std::collections::BTreeMap;
 
 use super::resolver::Conversation;
+use crate::persistence::gauge::PersistenceGauge;
 use crate::persistence::live_indexes::LiveIndexes;
 use crate::persistence::liveness_audit::LivenessAudit;
 use crate::persistence::Result as PersistenceResult;
+use crate::substrate::gauge::SubstrateGauge;
 
 /// A substrate's timeline tombstones, by how far each is from expiring (§6.8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +61,18 @@ impl Conversation {
             }
             counts
         })
+    }
+
+    /// What this store holds in memory, structure by structure, for the memory
+    /// census (`docs/memory_census.md` §5): the substrate's maps from the
+    /// latest version, and the persistence layer's from the owner. O(entries),
+    /// so taken once a minute ([`crate::store_gauges`]), and as background work
+    /// on the owner: served only when no call and no write is waiting, so the
+    /// walk over the location index never holds a request behind it.
+    pub fn memory_gauge(&self) -> (SubstrateGauge, PersistenceGauge) {
+        let substrate = self.read().gauge();
+        let persistence = self.persistence.call_behind(|p| p.gauge());
+        (substrate, persistence)
     }
 
     /// The timeline tombstones held, and how many of them a complete

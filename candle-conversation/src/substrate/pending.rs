@@ -12,6 +12,8 @@
 //! The records waiting here are durable state like any other, so a rewrite of
 //! the log carries them ([`PendingChildren::records`]).
 
+use serde::Serialize;
+
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{
     encode_conv_state_payload, encode_label_payload, ConvMeta, ConvState,
@@ -65,10 +67,27 @@ impl PendingChild {
     }
 }
 
+/// What [`PendingChildren`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct PendingGauge {
+    pub timelines: u64,
+    pub records: u64,
+    pub payload_bytes: u64,
+}
+
+/// One record waiting: what it is, its identity, and the bytes it encodes to,
+/// measured once as it is held.
+type Waiting = (PendingChild, RecordIdentity, u64);
+
 /// The records waiting, by the raw id of the timeline they name.
 #[derive(Debug, Clone, Default)]
 pub struct PendingChildren {
-    by_timeline: PMap<u64, PVec<(PendingChild, RecordIdentity)>>,
+    by_timeline: PMap<u64, PVec<Waiting>>,
+    /// Records held, kept as they are held and released, so the census reads
+    /// it without a walk.
+    records: u64,
+    /// The bytes those records encode to.
+    payload_bytes: u64,
 }
 
 impl PendingChildren {
@@ -77,18 +96,41 @@ impl PendingChildren {
     /// once.
     pub fn hold(&mut self, timeline: u64, child: PendingChild, id: RecordIdentity) {
         let waiting = self.by_timeline.entry(timeline).or_default();
-        if !id.is_none() && waiting.iter().any(|(_, held)| *held == id) {
+        if !id.is_none() && waiting.iter().any(|(_, held, _)| *held == id) {
             return;
         }
-        waiting.push_back((child, id));
+        let len = child.encode(timeline).1.len() as u64;
+        waiting.push_back((child, id, len));
+        self.records += 1;
+        self.payload_bytes += len;
     }
 
     /// Everything waiting for `timeline`, which it now takes.
     pub fn release(&mut self, timeline: u64) -> Vec<(PendingChild, RecordIdentity)> {
-        self.by_timeline
-            .remove(&timeline)
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default()
+        let Some(waiting) = self.by_timeline.remove(&timeline) else {
+            return Vec::new();
+        };
+        waiting
+            .into_iter()
+            .map(|(child, id, len)| {
+                self.records -= 1;
+                self.payload_bytes -= len;
+                (child, id)
+            })
+            .collect()
+    }
+
+    /// What is waiting, for the memory census (`docs/memory_census.md` §5):
+    /// the timelines not yet registered, the records held for them, and the
+    /// bytes those records encode to. Nothing here is released until its
+    /// timeline registers, so a timeline that never does keeps its records for
+    /// good. Read from counts kept as records are held, so it walks nothing.
+    pub fn gauge(&self) -> PendingGauge {
+        PendingGauge {
+            timelines: self.by_timeline.len() as u64,
+            records: self.records,
+            payload_bytes: self.payload_bytes,
+        }
     }
 
     /// Every waiting record as a rewrite writes it back: `(timeline, type,
@@ -98,7 +140,7 @@ impl PendingChildren {
         timelines.sort_unstable();
         let mut out = Vec::new();
         for tl in timelines {
-            for (child, id) in &self.by_timeline[tl] {
+            for (child, id, _) in &self.by_timeline[tl] {
                 let (rt, payload) = child.encode(*tl);
                 out.push((*tl, rt, payload, *id));
             }
@@ -130,6 +172,38 @@ mod tests {
         p.hold(9, PendingChild::Coupling(4), id(2));
         assert_eq!(p.release(9).len(), 2);
         assert!(p.release(9).is_empty(), "a release takes everything held");
+    }
+
+    /// **The gauge counts every record still waiting, and its bytes**; a
+    /// release takes its timeline's out of the count.
+    #[test]
+    fn the_gauge_counts_what_waits() {
+        let mut p = PendingChildren::default();
+        p.hold(9, PendingChild::Coupling(4), id(1));
+        p.hold(9, PendingChild::DebugId("abc".into()), id(2));
+        p.hold(11, PendingChild::Coupling(7), id(3));
+        // Each child is sized as it encodes under its own timeline.
+        let size = |c: PendingChild, tl: u64| c.encode(tl).1.len() as u64;
+        let first = size(PendingChild::Coupling(4), 9);
+        let debug = size(PendingChild::DebugId("abc".into()), 9);
+        let other = size(PendingChild::Coupling(7), 11);
+        assert_eq!(
+            p.gauge(),
+            PendingGauge {
+                timelines: 2,
+                records: 3,
+                payload_bytes: first + debug + other
+            }
+        );
+        p.release(9);
+        assert_eq!(
+            p.gauge(),
+            PendingGauge {
+                timelines: 1,
+                records: 1,
+                payload_bytes: other
+            }
+        );
     }
 
     /// What a rewrite writes back is the record each child came from.

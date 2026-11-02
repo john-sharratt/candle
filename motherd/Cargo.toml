@@ -17,6 +17,8 @@ cluster    = { path = "../cluster" }
 serde      = { workspace = true }
 serde_yaml = "0.9"
 host       = { path = "../host" }
+# The counting global allocator (`docs/memory_census.md`).
+heap-census = { path = "../heap-census" }
 zend       = { path = "../zend" }
 npcd       = { path = "../npcd" }
 

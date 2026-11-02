@@ -9,6 +9,7 @@ members = [
     "candle-core",
     "doc-units",
     "embed-watch",
+    "heap-census",
     "zend",
     "zend-load",
     "candle-datasets",

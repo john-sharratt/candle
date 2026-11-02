@@ -47,6 +47,7 @@ mod custom_object_tests;
 mod deleted_set;
 mod dominance;
 mod ended_sections;
+pub mod gauge;
 mod label_records;
 mod lock;
 #[cfg(test)]
@@ -112,8 +113,9 @@ use ended_sections::EndedSections;
 use label_records::label_records;
 pub use lock::{SubstrateLock, SubstrateReadGuard};
 use pcoll::{arc_mut, ord_arc_mut, PMap, POrdMap, POrdSet, PSet, PVec};
+pub use pending::PendingGauge;
 use pending::{PendingChild, PendingChildren};
-pub use residence::{HotKv, Residence, ResidenceSlab};
+pub use residence::{HotKv, Residence, ResidenceGauge, ResidenceSlab};
 use residence::{COLD_PENDING, EVICT_WHEN_COLD, NO_COLD_PERSIST, PENDING_QUANTIZE, SPLICE_SOURCE};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};

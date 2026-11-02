@@ -18,6 +18,9 @@
 
 use std::collections::HashMap;
 use std::iter::repeat_n;
+use std::mem::size_of;
+
+use serde::Serialize;
 
 use super::super::record::{RecordHeader, ALIGN};
 use super::super::segment::SegmentId;
@@ -151,12 +154,47 @@ impl LocationIndex {
     pub fn clear(&mut self) {
         self.origins.clear();
     }
+
+    /// What the index holds, origin by origin, for the memory census
+    /// (`docs/memory_census.md` §5): its slots, the capacity behind them, and
+    /// how many still name a record. The vector never shrinks, so `len` past
+    /// `held` is space kept for records no longer here. O(slots).
+    pub fn gauge(&self) -> Vec<OriginGauge> {
+        let mut out: Vec<OriginGauge> = self
+            .origins
+            .iter()
+            .map(|(&origin, o)| OriginGauge {
+                origin,
+                len: o.slots.len() as u64,
+                capacity: o.slots.capacity() as u64,
+                held: o.slots.iter().filter(|s| s.loc != 0).count() as u64,
+                bytes: (o.slots.capacity() * SLOT_BYTES) as u64,
+            })
+            .collect();
+        out.sort_by_key(|g| g.origin);
+        out
+    }
+}
+
+/// The bytes one slot takes.
+pub const SLOT_BYTES: usize = size_of::<Slot>();
+
+/// One origin's share of the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OriginGauge {
+    pub origin: u64,
+    /// Slots, from the first `oseq` held to the last.
+    pub len: u64,
+    /// Slots allocated.
+    pub capacity: u64,
+    /// Slots naming a record this member holds.
+    pub held: u64,
+    /// The capacity in bytes.
+    pub bytes: u64,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
-
     use super::*;
     use crate::persistence::record::RecordType;
 
@@ -189,6 +227,29 @@ mod tests {
     #[test]
     fn an_entry_is_forty_eight_bytes() {
         assert_eq!(size_of::<Slot>(), 48);
+        assert_eq!(SLOT_BYTES, 48);
+    }
+
+    /// **The gauge counts what the index keeps, held or not**: a thousand
+    /// records indexed and their segment dropped leave a thousand slots that
+    /// name nothing — the index never shrinks, and the gauge says so.
+    #[test]
+    fn the_gauge_counts_slots_kept_for_records_gone() {
+        let mut idx = LocationIndex::default();
+        for oseq in 1..=1000 {
+            idx.insert(&head(7, oseq), at(1, oseq));
+        }
+        idx.insert(&head(9, 5), at(2, 0));
+        let g = idx.gauge();
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[0].origin, g[0].len, g[0].held), (7, 1000, 1000));
+        assert!(g[0].capacity >= 1000);
+        assert_eq!(g[0].bytes, g[0].capacity * 48);
+        assert_eq!((g[1].origin, g[1].len, g[1].held), (9, 1, 1));
+
+        idx.forget_segments(&[SegmentId(1)]);
+        let g = idx.gauge();
+        assert_eq!((g[0].len, g[0].held), (1000, 0), "kept for records gone");
     }
 
     #[test]

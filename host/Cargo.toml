@@ -58,6 +58,9 @@ hyper               = { version = "1", features = ["server", "client", "http1"] 
 hyper-util          = { version = "0.1", features = ["server", "server-auto", "http1", "http2", "tokio"] }
 tower               = { version = "0.5" }
 http-body-util      = "0.1"
+# The memory census: the counting allocator's figures, the OS's commit and heap
+# summary, and the growth verdict (`docs/memory_census.md`).
+heap-census         = { path = "../heap-census" }
 candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 

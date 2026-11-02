@@ -35,6 +35,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use candle_nn::kv_cache::{rewrite_sealed, SealedSequence, Sweep};
 use crossbeam::queue::SegQueue;
+use serde::Serialize;
 
 use crate::persistence::streams::StreamId;
 
@@ -374,6 +375,15 @@ impl Residence {
     }
 }
 
+/// What [`ResidenceSlab::gauge`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct ResidenceGauge {
+    pub slots: u64,
+    pub hot: u64,
+    pub warm: u64,
+    pub dead: u64,
+}
+
 /// Every residence of a substrate, and the tier sets the passes walk.
 ///
 /// Shared by every version of the substrate's root: a residence allocated under
@@ -463,6 +473,19 @@ impl ResidenceSlab {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// What the slab holds, for the memory census (`docs/memory_census.md`
+    /// §5): every slot ever allocated, the hot and warm sets, and the slots
+    /// marked dead. A slot is never freed — a discard marks it dead — so
+    /// `dead` is the space kept for residences nothing names. O(slots).
+    pub fn gauge(&self) -> ResidenceGauge {
+        ResidenceGauge {
+            slots: self.slots.count() as u64,
+            hot: self.hot.len() as u64,
+            warm: self.warm.len() as u64,
+            dead: self.slots.iter().filter(|(_, r)| r.is_dead()).count() as u64,
+        }
     }
 
     /// Every residence, with its index.
@@ -840,6 +863,32 @@ mod tests {
             .map(|i| slab.alloc(StreamId(i as u64 + 1), None, 0))
             .collect();
         (slab, idx)
+    }
+
+    /// **The gauge counts every slot ever allocated, and the dead among
+    /// them**: a kill marks a slot dead and keeps it.
+    #[test]
+    fn the_gauge_counts_slots_kept_after_a_kill() {
+        let (slab, idx) = slab_with(3);
+        assert_eq!(
+            slab.gauge(),
+            ResidenceGauge {
+                slots: 3,
+                hot: 0,
+                warm: 0,
+                dead: 0
+            }
+        );
+        let _ = slab.kill(idx[0]);
+        assert_eq!(
+            slab.gauge(),
+            ResidenceGauge {
+                slots: 3,
+                hot: 0,
+                warm: 0,
+                dead: 1
+            }
+        );
     }
 
     /// A residence never holds a payload once dead: an install after the kill

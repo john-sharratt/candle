@@ -30,6 +30,7 @@ pub mod adoption;
 #[cfg(test)]
 mod adoption_tests;
 pub mod appended;
+pub mod applied_mix;
 pub mod blob;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
@@ -45,6 +46,7 @@ pub mod elevate;
 #[cfg(test)]
 mod expiry_tests;
 pub mod flush;
+pub mod gauge;
 pub mod header_index;
 mod held_groups;
 mod held_types;
@@ -118,6 +120,7 @@ use crate::substrate::{file_store_key, Substrate, SubstrateLock, TurnMark};
 use accounting::RecordAccounting;
 use adoption::Adoption;
 use appended::Appended;
+use applied_mix::AppliedMix;
 use blob::{blob_bytes, retired_blob, BlobIndex, BlobKey};
 use chunk_plan::ChunkedReadPlan;
 use compaction::Housekeeping;
@@ -731,6 +734,9 @@ pub struct SubstratePersistence {
     /// Where every record with an identity is, kept current through every
     /// append, relocation and rewrite (§6.2).
     locations: LocationIndex,
+    /// What this store has applied from other members since it opened, by
+    /// record type — for the memory census ([`gauge`]).
+    applied_mix: AppliedMix,
     /// The generations fixed for what this node wrote cut off (§6.7), applied
     /// to its own records wherever it reads them back.
     rebases: RebaseMap,
@@ -1464,6 +1470,7 @@ impl SubstratePersistence {
                 && !read_only,
             replica,
             locations,
+            applied_mix: AppliedMix::default(),
             rebases,
             unstamped,
             tap: None,
