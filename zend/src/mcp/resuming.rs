@@ -58,7 +58,8 @@ fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
             }
             // The lease the worker's turns run under, handed to them: a member
             // that loses it finds the task running on the next pass, or takes
-            // it if this one failed.
+            // it if this one failed. One still rejoining gets no lease, so a
+            // record that only lags here starts nothing.
             let Share::Mine(lease) = ingest_lease::share_worker(&w.conv_id) else {
                 continue;
             };

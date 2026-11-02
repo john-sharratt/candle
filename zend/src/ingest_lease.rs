@@ -28,6 +28,13 @@
 //! it cannot decide this: on 2026-10-31 WhiteWorld's boot scan took a worker
 //! back four seconds before BlackWorld's sweep did, each on a copy of the record
 //! saying nobody ran it, and both wrote the conversation.
+//!
+//! **A worker never runs without its lease.** A unit read twice costs a reading,
+//! and the lower stamp keeps one; a worker run twice writes one conversation
+//! from two members and can commit from a base gone stale. So a member in a
+//! cluster that cannot propose — rejoining, drained, in fault mode — leaves a
+//! worker's turns to whoever can. On 2026-11-01 WhiteWorld, rejoining after an
+//! upgrade, took a live BlackWorld worker this way and ran it for nine minutes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,9 +189,14 @@ pub fn share_calibration(marker: &str) -> Share {
 
 /// Lease the turns of the worker conversation `conv_id`. [`Share::Mine`] when
 /// this member should run them, having waited for the turns the last holder
-/// wrote. Blocks for the vote, so it is not called on the runtime.
+/// wrote; [`Share::Theirs`] too when it cannot propose. Blocks for the vote, so
+/// it is not called on the runtime.
 pub fn share_worker(conv_id: &str) -> Share {
-    share_key(worker_key(conv_id))
+    let seat = SEAT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match seat {
+        Some(seat) => claim_worker(seat, worker_key(conv_id)),
+        None => Share::Mine(Guard::local()),
+    }
 }
 
 fn share_key(key: Vec<u8>) -> Share {
@@ -195,11 +207,28 @@ fn share_key(key: Vec<u8>) -> Share {
     }
 }
 
+/// [`ask`] for a unit, which this member reads itself when it cannot propose.
 fn claim(seat: Arc<dyn LeaseSeat>, key: Vec<u8>) -> Share {
+    ask(seat, key).unwrap_or_else(|| Share::Mine(Guard::local()))
+}
+
+/// [`ask`] for a worker's turns, which are left alone when it cannot propose.
+fn claim_worker(seat: Arc<dyn LeaseSeat>, key: Vec<u8>) -> Share {
+    ask(seat, key).unwrap_or(Share::Theirs)
+}
+
+/// Put `key` to the vote, and what came of it. `None` when this member may not
+/// propose at all.
+fn ask(seat: Arc<dyn LeaseSeat>, key: Vec<u8>) -> Option<Share> {
     let mut events = seat.subscribe();
     if !seat.try_acquire(&key) {
-        return Share::Mine(Guard::local());
+        return None;
     }
+    Some(voted(seat, key, &mut events))
+}
+
+/// Wait for the vote on `key`, already asked for.
+fn voted(seat: Arc<dyn LeaseSeat>, key: Vec<u8>, events: &mut Receiver<LeaseEvent>) -> Share {
     let deadline = Instant::now() + CLAIM_WAIT;
     loop {
         if seat.holds(&key) {
@@ -549,6 +578,30 @@ mod tests {
         };
         assert!(!guard.recheck());
         assert!(a.held.lock().unwrap().is_empty());
+    }
+
+    /// **A member that cannot propose leaves a worker's turns alone**, where it
+    /// would read a unit: its copy of the record may only be behind, and the
+    /// worker may be running on the member that holds the lease.
+    #[test]
+    fn a_member_that_cannot_propose_leaves_a_worker_alone() {
+        let held = Arc::new(Mutex::new(HashMap::new()));
+        let a = Fake::pair(1, held);
+        let rejoining = Arc::new(Fake {
+            id: 2,
+            allow: false,
+            held: Arc::clone(&a.held),
+            applied: Mutex::new(0),
+            tx: a.tx.clone(),
+        });
+        let key = worker_key("mcp:owner:thread/task");
+        assert!(matches!(
+            claim_worker(rejoining, key.clone()),
+            Share::Theirs
+        ));
+        let Share::Mine(_running) = claim_worker(a, key) else {
+            panic!("a member that can propose takes it");
+        };
     }
 
     #[test]
