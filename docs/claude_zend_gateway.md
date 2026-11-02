@@ -198,6 +198,11 @@ the access they have.
 
 ### 3.3 Long work
 
+**A run is judged by `repo_task_report`.** The counts a worker's activity
+sentence is made from also keep the time spent in tools, every failed call by
+how it failed, and when it first changed a file and first committed. They live
+on the worker's record and cover its latest turn.
+
 **The work never runs inside a tool call.** A task's turn, and every part its
 worker starts with `sub_run` (§6.1), runs on zend to completion whether or not
 anyone is waiting, as every zend turn does; a worker waits on its own parts

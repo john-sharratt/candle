@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::session::StreamItem;
 
@@ -44,9 +45,86 @@ pub struct Activity {
     /// How the program a tool call is waiting on stands, while it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    /// When the batch of tool calls now running began, in epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_ms: Option<u64>,
+    /// Milliseconds spent in tool calls, the rest of the turn being the model's.
+    #[serde(default)]
+    pub tool_ms: u64,
+    /// Failed calls by `<tool> <how>`: the error's code, or `exit <code>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed: BTreeMap<String, u32>,
+    /// When a call first changed a file, in epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_change_ms: Option<u64>,
+    /// When the first commit landed, in epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_commit_ms: Option<u64>,
+}
+
+/// The tools that change a conversation's files.
+const CHANGES_FILES: [&str; 5] = [
+    "write",
+    "file_edit",
+    "file_delete",
+    "file_move",
+    "file_image",
+];
+
+/// How `result` failed, if it did: its error's code, or its program's exit.
+fn failure(result: &Value) -> Option<String> {
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Some(error.to_string());
+    }
+    match result.get("exit_code").and_then(Value::as_i64) {
+        Some(0) | None => None,
+        Some(code) => Some(format!("exit {code}")),
+    }
+}
+
+/// Whether `tool`'s `result`, which did not fail, changed a file: `file_image`
+/// asked for no copies only reads.
+fn changed_a_file(tool: &str, result: &Value) -> bool {
+    CHANGES_FILES.contains(&tool)
+        && result
+            .get("written")
+            .and_then(Value::as_array)
+            .is_none_or(|written| !written.is_empty())
 }
 
 impl Activity {
+    /// [`Self::observe`], also timing the tool calls at `now_ms` and keeping
+    /// how each came out: what `repo_task_report` reads.
+    pub fn observe_at(&mut self, item: &StreamItem, now_ms: u64) -> bool {
+        if let StreamItem::Tool(status) = item {
+            match status.phase {
+                "running" => self.batch_ms = Some(now_ms),
+                "done" => {
+                    let began = self.batch_ms.take().unwrap_or(now_ms);
+                    self.tool_ms += now_ms.saturating_sub(began);
+                    for (tool, result) in status.tools.iter().zip(&status.results) {
+                        self.note_result(tool, result, now_ms);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.observe(item)
+    }
+
+    fn note_result(&mut self, tool: &str, result: &Value, now_ms: u64) {
+        if let Some(how) = failure(result) {
+            *self.failed.entry(format!("{tool} {how}")).or_default() += 1;
+            return;
+        }
+        if changed_a_file(tool, result) {
+            self.first_change_ms.get_or_insert(now_ms);
+        }
+        if tool == "git_commit" {
+            self.first_commit_ms.get_or_insert(now_ms);
+        }
+    }
+
     /// Fold one item of the turn's stream in. Whether it is a step worth
     /// telling at once — a round ended, or a batch of tool calls began — rather
     /// than on the next beat.
@@ -217,6 +295,57 @@ mod tests {
             "running 4m10s, 0 rounds: 1,934 thinking tokens, 3 tool calls (web_fetch 2, \
              web_search 1); now thinking"
         );
+    }
+
+    /// **Tool calls are timed and how each came out is kept**: an error by its
+    /// code, a program by its exit, and the first change and commit by when.
+    /// A `file_image` that only read changed nothing.
+    #[test]
+    fn how_each_call_came_out_is_kept() {
+        let done = |names: &[&str], results: Vec<Value>| {
+            StreamItem::Tool(ToolStatusOut {
+                phase: "done",
+                tools: names.iter().map(|n| n.to_string()).collect(),
+                results,
+                tokens: Vec::new(),
+            })
+        };
+        let mut a = Activity::default();
+        a.observe_at(&tools("running", &["file_image", "run_command"]), 1_000);
+        a.observe_at(
+            &done(
+                &["file_image", "run_command"],
+                vec![
+                    serde_json::json!({"written": []}),
+                    serde_json::json!({"error": "no_agent"}),
+                ],
+            ),
+            3_500,
+        );
+        assert_eq!(a.tool_ms, 2_500);
+        assert_eq!(a.first_change_ms, None);
+        a.observe_at(&tools("running", &["run_command", "file_edit"]), 4_000);
+        a.observe_at(
+            &done(
+                &["run_command", "file_edit"],
+                vec![
+                    serde_json::json!({"exit_code": 101}),
+                    serde_json::json!({"written": 1}),
+                ],
+            ),
+            4_100,
+        );
+        a.observe_at(&tools("running", &["git_commit"]), 5_000);
+        a.observe_at(
+            &done(&["git_commit"], vec![serde_json::json!({"id": "abc"})]),
+            5_200,
+        );
+        assert_eq!(a.tool_ms, 2_800);
+        assert_eq!(a.first_change_ms, Some(4_100));
+        assert_eq!(a.first_commit_ms, Some(5_200));
+        assert_eq!(a.failed["run_command no_agent"], 1);
+        assert_eq!(a.failed["run_command exit 101"], 1);
+        assert_eq!(a.tools["run_command"], 2);
     }
 
     /// **A long tool call says how its program stands**, and stops saying so

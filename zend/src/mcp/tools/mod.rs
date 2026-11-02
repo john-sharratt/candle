@@ -66,6 +66,7 @@ mod reply;
 pub mod repo_job;
 mod repo_job_list;
 mod repo_job_log;
+mod repo_task_report;
 mod service_control;
 mod service_status;
 mod service_trial;
@@ -156,6 +157,7 @@ pub fn definitions() -> Value {
         attach::definition(),
         task::definition(),
         wait::definition(),
+        repo_task_report::definition(),
         reply::definition(),
         nudge::definition(),
         stop::definition(),
@@ -214,6 +216,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         attach::NAME => blocking(ctx, args, attach::call).await,
         task::NAME => task::call(ctx, args).await,
         wait::NAME => wait::call(ctx, args).await,
+        repo_task_report::NAME => blocking(ctx, args, repo_task_report::call).await,
         reply::NAME => reply::call(ctx, args).await,
         nudge::NAME => blocking(ctx, args, nudge::call).await,
         stop::NAME => stop::call(ctx, args).await,
@@ -325,6 +328,7 @@ mod tests {
                 "thread_attach",
                 "repo_task_start",
                 "repo_task_wait",
+                "repo_task_report",
                 "repo_task_reply",
                 "repo_task_nudge",
                 "repo_task_stop",
@@ -382,6 +386,7 @@ mod tests {
             [
                 "get_user_context",
                 "repo_task_wait",
+                "repo_task_report",
                 "journal_read",
                 "journal_grep",
                 "thread_list",

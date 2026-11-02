@@ -1314,7 +1314,7 @@ impl Live {
             .activity
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .observe(item);
+            .observe_at(item, now_ms());
         if step {
             self.moved.notify_one();
         }
