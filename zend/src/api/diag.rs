@@ -40,6 +40,9 @@ pub struct RunBody {
     /// `[timeline, index]` of turns the recurrent memory is taken over first.
     #[serde(default)]
     pub catch_up: Vec<(u64, u32)>,
+    /// The target turn's user half in place of the recorded one.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +100,7 @@ pub async fn start(
                 sampling: r.seed.map_or(ReplaySampling::Argmax, ReplaySampling::Seed),
                 without: r.without.clone(),
                 catch_up: r.catch_up.clone(),
+                user: r.user.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()

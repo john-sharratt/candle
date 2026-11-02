@@ -53,6 +53,10 @@ pub struct DiagRun {
     /// `(timeline, index)`: the control for K/V the attention layers hold and
     /// the recurrent layers never saw.
     pub catch_up: Vec<(u64, u32)>,
+    /// The target turn's user half in place of the recorded one. Its recorded
+    /// ids then belong to another prompt, so the reply decodes free from its
+    /// first token.
+    pub user: Option<String>,
 }
 
 /// What to decode.
@@ -377,11 +381,14 @@ impl ZendSession {
             )),
             triggers: turn_triggers(&state, think_mode, spec.tools_mode),
             selection,
-            recorded_turn: Some(target_sealed.token_ids.clone()),
+            recorded_turn: run.user.is_none().then(|| target_sealed.token_ids.clone()),
             forced_tokens: Some(spec.token),
             forced_suffix: suffix,
             ..Default::default()
         };
+        if run.user.is_some() && from > 0 {
+            bail!("a run with its own user half decodes free: it takes no token or prompt");
+        }
 
         if !decode_diag::arm(Arm {
             control: run.control,
@@ -394,7 +401,10 @@ impl ZendSession {
         let armed = Armed;
         let decode_start = Instant::now();
         let handle = conv
-            .submit_turn_with_options(tool_round_text(&target.user), options)
+            .submit_turn_with_options(
+                tool_round_text(run.user.as_deref().unwrap_or(&target.user)),
+                options,
+            )
             .context("submitting the target turn")?;
         let mut points_reached = Vec::new();
         let mut finished = None;
