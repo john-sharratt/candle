@@ -5,6 +5,10 @@
 //! is pre-sealed at startup, so a worker's first round already reads its
 //! document and nothing is prefilled for it. A conversation that is no worker
 //! takes the selector's default, `generic`, which emits nothing.
+//!
+//! [`WorkerKind::Chat`] is no task's kind: it is Zen's side of a session's chat
+//! (`docs/zen_chat.md`), made by `zen_chat_send` alone, so `repo_task_start`
+//! cannot ask for it.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,9 +23,18 @@ pub enum WorkerKind {
     Coder,
     Researcher,
     Reviewer,
+    /// Zen answering Claude on a session's chat: its message is the text as
+    /// sent, its answer is ready when its turn ends, and nothing of it is kept
+    /// on a thread.
+    Chat,
 }
 
 impl WorkerKind {
+    /// Whether it is Zen's side of a chat rather than a task.
+    pub fn is_chat(self) -> bool {
+        self == Self::Chat
+    }
+
     /// The kind a call names, `coder` when it names none.
     pub fn of(name: Option<&str>) -> Result<Self, String> {
         match name {
@@ -40,6 +53,7 @@ impl WorkerKind {
             Self::Coder => "coder",
             Self::Researcher => "researcher",
             Self::Reviewer => "reviewer",
+            Self::Chat => "chat",
         }
     }
 }
@@ -52,10 +66,11 @@ mod tests {
 
     use super::*;
 
-    const KINDS: [WorkerKind; 3] = [
+    const KINDS: [WorkerKind; 4] = [
         WorkerKind::Coder,
         WorkerKind::Researcher,
         WorkerKind::Reviewer,
+        WorkerKind::Chat,
     ];
 
     /// The `role` selector's options as `projection.yaml` declares them.
@@ -123,24 +138,31 @@ mod tests {
                 ("generic", 0),
                 ("coder", 1),
                 ("researcher", 1),
-                ("reviewer", 1)
+                ("reviewer", 1),
+                ("chat", 1)
             ]
         );
     }
 
     /// **A task codes unless asked**, and a kind nobody defined is refused
-    /// rather than leaving a worker on no document.
+    /// rather than leaving a worker on no document. A task can never be a
+    /// chat: that kind is the chat's own.
     #[test]
     fn a_call_names_a_kind_or_gets_coder() {
         assert_eq!(WorkerKind::of(None).unwrap(), WorkerKind::Coder);
         assert_eq!(
             ["coder", "researcher", "reviewer"].map(|k| WorkerKind::of(Some(k)).unwrap()),
-            KINDS
+            KINDS[..3]
         );
         assert_eq!(
             WorkerKind::of(Some("tester")).unwrap_err(),
             "`role` is `coder`, `researcher` or `reviewer`, not `tester`"
         );
+        assert_eq!(
+            WorkerKind::of(Some("chat")).unwrap_err(),
+            "`role` is `coder`, `researcher` or `reviewer`, not `chat`"
+        );
+        assert!(WorkerKind::Chat.is_chat() && !WorkerKind::Coder.is_chat());
     }
 
     /// **`generic` is today's prompt to the byte**: it emits nothing, so a

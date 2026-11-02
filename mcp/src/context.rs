@@ -80,6 +80,12 @@ const MEMORY: [&str; 14] = [
     "group_default",
 ];
 
+/// Zen chat's tools (`docs/zen_chat.md` §4): what they carry is deleted with
+/// the chat when its session is done, so none of it is ever an episode — an
+/// episode's summary is the call's first string argument, which for a send is
+/// the message itself.
+const CHAT: [&str; 3] = ["zen_chat_send", "zen_chat_read", "zen_chat_close"];
+
 /// The longest summary an episode is sent with, as the memory keeps it.
 const MAX_SUMMARY: usize = 160;
 
@@ -155,7 +161,11 @@ pub fn after(
     delivered: bool,
 ) -> After {
     After {
-        record: !failed && from_backend && !read_only && !MEMORY.contains(&name),
+        record: !failed
+            && from_backend
+            && !read_only
+            && !MEMORY.contains(&name)
+            && !CHAT.contains(&name),
         stamp: !begins || delivered || (name == GET && !failed),
     }
 }
@@ -432,6 +442,22 @@ mod tests {
         );
         for memory in MEMORY {
             assert!(!record(memory, false, true, false), "{memory}");
+        }
+    }
+
+    /// **No chat tool is ever an episode**: a chat is deleted when its
+    /// session is done, and an episode would keep its message on the memory.
+    #[test]
+    fn no_chat_tool_is_ever_an_episode() {
+        for tool in CHAT {
+            assert!(
+                !after(tool, false, false, true, false, false).record,
+                "{tool}"
+            );
+            assert!(
+                !after(tool, true, false, true, false, true).record,
+                "{tool}"
+            );
         }
     }
 

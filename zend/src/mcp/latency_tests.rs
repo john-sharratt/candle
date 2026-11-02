@@ -177,6 +177,7 @@ fn round(i: usize) -> Vec<(&'static str, &'static str, Value)> {
             "journal_grep",
             json!({"journal": "*", "pattern": "tea"}),
         ),
+        ("zen_chat_read", "zen_chat_read", json!({"wait_s": 0})),
         // A focus that changes nothing is refused: each round moves it.
         (
             "journal_focus",
@@ -198,7 +199,17 @@ fn p95(times: &mut [Duration]) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a latency gate: run on its own, on a quiet machine"]
 async fn every_tool_without_a_model_answers_within_its_budget() {
-    let (_dirs, ctx) = session();
+    let (_dirs, mut ctx) = session();
+    // A chat open on the session, so `zen_chat_read` reads one — its answer
+    // waiting on a model that never loads here, as one still being given.
+    let opened = tools::call(
+        &ctx,
+        "zen_chat_send",
+        &json!({"text": "How big is the arena?", "wait_s": 0}),
+    )
+    .await;
+    assert!(!opened.is_error, "{}", opened.text);
+    ctx.mcp = ctx.store.get(&ctx.mcp_id, now_ms()).unwrap();
     let mut times: Vec<(&'static str, Vec<Duration>)> = Vec::new();
     for i in 0..ROUNDS {
         for (label, name, args) in round(i) {

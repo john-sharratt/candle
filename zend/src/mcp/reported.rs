@@ -42,6 +42,11 @@ pub fn last(records: &dyn Records, owner: &str, thread: &str, name: &str) -> Opt
         .and_then(|v| v.get("entry").and_then(Value::as_u64))
 }
 
+/// End the worker's mark, with the worker it is kept for.
+pub fn forget(records: &dyn Records, owner: &str, thread: &str, name: &str) -> anyhow::Result<()> {
+    records.cease(&key(owner, thread, name))
+}
+
 /// Record that the worker's entries up to `entry` have been reported.
 pub fn mark(
     records: &dyn Records,

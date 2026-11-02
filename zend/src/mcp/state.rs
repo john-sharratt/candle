@@ -37,10 +37,21 @@ pub const DEFAULT_WAIT_S: u64 = 45;
 /// What a session holds the thread `thread_attach` bound it to under.
 pub const ATTACHED: &str = "attached";
 
+/// What a session holds its chat's id under (`docs/zen_chat.md` §2); empty
+/// once the chat is closed.
+pub const CHAT: &str = "chat";
+
 const PREFIX: &str = "mcp/session/";
 
 fn key(id: &str) -> String {
     format!("{PREFIX}{id}")
+}
+
+/// What the session `id`'s record holds under `held`: `None` when no record
+/// of it is kept — it was closed or swept — or it holds nothing there.
+pub fn held_by(records: &dyn Records, id: &str, held: &str) -> Option<String> {
+    let s: Session = serde_json::from_value(records.get(&key(id))?).ok()?;
+    s.held(held).map(str::to_string)
 }
 
 /// When each session was last used, as this process has seen it and its
@@ -258,6 +269,23 @@ mod tests {
         assert_eq!(r.get(&id, 13).unwrap().owner, "o");
         r.close(&id).unwrap();
         assert!(r.get(&id, 14).is_none());
+    }
+
+    /// **What a session holds is read by its id alone**, as the chat sweep
+    /// reads it: gone once the session is closed.
+    #[test]
+    fn what_a_session_holds_is_read_by_its_id() {
+        let r = store();
+        let id = r.open("o", Client::Other, "2025-11-25", 10).unwrap();
+        assert_eq!(held_by(&r.records, &id, CHAT), None);
+        let s = r.get(&id, 11).unwrap();
+        r.hold(&id, &s, CHAT, "0123456789abcdef", 12).unwrap();
+        assert_eq!(
+            held_by(&r.records, &id, CHAT).as_deref(),
+            Some("0123456789abcdef")
+        );
+        r.close(&id).unwrap();
+        assert_eq!(held_by(&r.records, &id, CHAT), None);
     }
 
     /// **Each session of the aggregator in front has its own attached

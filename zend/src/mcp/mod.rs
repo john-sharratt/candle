@@ -31,11 +31,13 @@
 //! | [`records`] | The small records kept in the substrate |
 //! | [`state`] | Sessions as records, the attached thread, the change signal |
 //! | [`tending`] | The sessions' noted use written in, and the stale swept, off the request path |
+//! | [`chats`] | Zen chat: a private conversation for the life of a session, disposed of after (`docs/zen_chat.md`) |
 
 pub mod activity;
 pub mod archiving;
 pub mod audit;
 pub mod caller;
+pub mod chats;
 pub mod lineage;
 pub mod memory;
 pub mod names;

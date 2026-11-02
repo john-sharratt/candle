@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
+use super::chats::naming::is_chat_thread;
 use super::records::Records;
 use super::threads::{self, Note, State, Thread, Worker};
 use super::workers::{self, now_ms};
@@ -307,7 +308,11 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
     let due =
         |w: &Worker| unarchived(w) && ((lost(w) && silent(last_active(w))) || idle(last_active(w)));
     let (mut workers_archived, mut threads_archived) = (0, 0);
-    for (owner, t) in threads::every_thread(records) {
+    // A chat is never archived: disposal is its end (`docs/zen_chat.md` §3).
+    let every = threads::every_thread(records)
+        .into_iter()
+        .filter(|(_, t)| !is_chat_thread(&t.name));
+    for (owner, t) in every {
         let workers: Vec<Worker> = threads::workers(records, &owner, &t.name)
             .into_iter()
             .map(|w| w.observed(now))

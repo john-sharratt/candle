@@ -48,6 +48,8 @@ use super::activity::{Activity, Doing};
 use super::archiving;
 use super::audit::{Audit, Turn};
 use super::caller::Caller;
+use super::chats::naming::is_chat_thread;
+use super::chats::talk;
 use super::names;
 use super::nudges;
 use super::ops::NODE_HEADER;
@@ -130,7 +132,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn loading() -> String {
+pub(super) fn loading() -> String {
     "the model is still loading; try again when `cluster_status` says it is ready".into()
 }
 
@@ -284,7 +286,7 @@ fn taken(records: &dyn Records, owner: &str, thread: &str, now: u64) -> Vec<(Str
 
 /// A new worker's record, `running`, its turn beginning `now`, running as
 /// `role` at `priority`, thinking at `effort`, doing `kind`'s work.
-fn fresh(
+pub(super) fn fresh(
     session: &ZendSession,
     owner: &str,
     thread: &str,
@@ -409,16 +411,7 @@ pub fn answer(
     // Continuing a worker is work on its thread: it reopens a thread archived
     // while the worker was left whole.
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
-    worker.state = State::Running;
-    worker.role = caller.role;
-    worker.beat_ms = now;
-    worker.turn_ms = now;
-    worker.ended_ms = None;
-    worker.resumable = false;
-    worker.audit = None;
-    worker.question = None;
-    worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
-    worker.entries = Vec::new();
+    ready_for_turn(session, &mut worker, caller.role, now);
     note(
         &records,
         &owner,
@@ -429,11 +422,47 @@ pub fn answer(
     begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
 }
 
+/// `worker`, which settled, made ready for its next turn, run as `role` from
+/// `now`: running again, its last ending's marks cleared, and its entries
+/// counted from its journal's newest.
+pub(super) fn ready_for_turn(
+    session: &ZendSession,
+    worker: &mut Worker,
+    role: AccessRole,
+    now: u64,
+) {
+    worker.state = State::Running;
+    worker.role = role;
+    worker.beat_ms = now;
+    worker.turn_ms = now;
+    worker.ended_ms = None;
+    worker.resumable = false;
+    worker.audit = None;
+    worker.question = None;
+    worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
+    worker.entries = Vec::new();
+}
+
 /// What a task cut off by a restart is told first.
 const RESUMED: &str = "Your work was cut off, so your last turn may not have finished. Your \
     conversation and your journal are intact; changes you had not committed may be gone. Check \
     where the work stands (`git_status`, reading what you wrote) before repeating anything, then \
     finish the task below. It is your task, whatever else you remember.";
+
+/// What Zen's side of a chat, cut off, is told first: a chat worker's prompt is
+/// the message it was answering, not a task.
+const CHAT_RESUMED: &str = "Your answer was cut off by a restart, so it may not have finished. \
+    Answer the message below again, whole, as your next message in the chat.";
+
+/// What a turn's message ends with: for a task, how to ask Claude; for a chat,
+/// nothing — Zen answers Claude in the chat itself.
+fn closing_of(kind: WorkerKind) -> &'static str {
+    if kind.is_chat() {
+        ""
+    } else {
+        ASKING
+    }
+}
 
 /// How many of a cut-off task's journal entries it is reminded of.
 const RESUMED_ENTRIES: usize = 8;
@@ -446,6 +475,12 @@ const RESUMED_ENTRY_QUOTE: usize = 300;
 /// given", a worker 88 turns in took up something else it could see, reported
 /// that done, and the task it had was never finished (2026-10-31).
 fn resumed_message(worker: &Worker) -> String {
+    if worker.kind.is_chat() {
+        return format!(
+            "{CHAT_RESUMED}\n\nThe message you were answering:\n{}",
+            worker.prompt
+        );
+    }
     let mut message = format!("{RESUMED}\n\nYour task:\n{}", worker.prompt);
     let skipped = worker.entries.len().saturating_sub(RESUMED_ENTRIES);
     let kept = &worker.entries[skipped..];
@@ -505,6 +540,11 @@ pub fn resume(
 ) -> Result<bool, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let _held = holding();
+    // Read under the lock a disposal marks a chat closing under, so a chat
+    // being disposed of is never started again.
+    if !resuming::chat_open(&records, owner, thread) {
+        return Ok(false);
+    }
     let Some(found) = threads::worker(&records, owner, thread, name) else {
         return Ok(false);
     };
@@ -521,7 +561,7 @@ pub fn resume(
             nudges::queue(&records, &worker.conv_id, &told, now).map_err(|e| e.to_string())?;
             First::Interrupted { call_turn }
         }
-        None => First::Message(format!("{told}{ASKING}")),
+        None => First::Message(format!("{told}{}", closing_of(worker.kind))),
     };
     begin_held(session, &records, owner, worker, first, Some(lease))?;
     Ok(true)
@@ -657,7 +697,9 @@ pub fn stop(
     Ok(worker)
 }
 
-/// Enter a line about `worker` on its thread's journal.
+/// Enter a line about `worker` on its thread's journal — none for Zen's side
+/// of a chat, whose thread keeps no copy of what was said
+/// (`docs/zen_chat.md` §2).
 fn note(
     records: &dyn Records,
     owner: &str,
@@ -665,6 +707,9 @@ fn note(
     label: &str,
     text: String,
 ) -> Result<(), String> {
+    if is_chat_thread(&worker.thread) {
+        return Ok(());
+    }
     threads::add_note(
         records,
         owner,
@@ -681,7 +726,7 @@ fn note(
 }
 
 /// Keep `worker` as running and start its turn on `message`.
-fn begin(
+pub(super) fn begin(
     session: &Arc<ZendSession>,
     records: &dyn Records,
     owner: &str,
@@ -803,13 +848,22 @@ async fn hold_turns(conv_id: &str) -> Option<Guard> {
 }
 
 /// End `worker`, whose turns this member could not get the lease on.
-fn give_up(records: &dyn Records, owner: &str, worker: &mut Worker) {
+fn give_up(session: &Arc<ZendSession>, records: &dyn Records, owner: &str, worker: &mut Worker) {
     let why = "another member holds this task's turns, so it was not started here";
     worker.state = State::Error;
     worker.error = Some(why.into());
     worker.ended_ms = Some(now_ms());
+    // A chat hears of it as of any answer that failed, and one closed while
+    // it waited is disposed of now.
+    let chat = worker.kind.is_chat() && !worker.is_part();
+    if chat {
+        talk::answered(records, owner, worker);
+    }
     if let Err(e) = threads::put_worker(records, owner, worker) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
+    }
+    if chat {
+        talk::settled(session, owner, worker);
     }
     if let Err(e) = note(
         records,
@@ -1082,7 +1136,7 @@ async fn run(
     if lease.is_none() {
         beating.abort();
         let _ = beating.await;
-        give_up(&records, &owner, &mut worker);
+        give_up(&session, &records, &owner, &mut worker);
         session.mcp().bump();
         return;
     }
@@ -1154,7 +1208,7 @@ async fn run(
                 if lease.is_none() {
                     beating.abort();
                     let _ = beating.await;
-                    give_up(&records, &owner, &mut worker);
+                    give_up(&session, &records, &owner, &mut worker);
                     session.mcp().bump();
                     return;
                 }
@@ -1177,8 +1231,11 @@ async fn run(
             }
         }
         worker.no_entry = None;
+        // A chat's answer is ready when its turn ends: no draft stands between
+        // Claude and the reply (`docs/zen_chat.md` §2).
         let drafted = match ended {
             Ended::Failed(_) => None,
+            _ if worker.kind.is_chat() => None,
             _ => Some(finish_journal(&session, &worker.conv_id).await),
         };
         // A stop that came after the turn's last tool round — while it
@@ -1197,6 +1254,9 @@ async fn run(
         }
         if worker.is_part() {
             break settle_part(&mut worker, ended);
+        }
+        if worker.kind.is_chat() {
+            break settle_chat(&mut worker, ended);
         }
         let settled = settle(&mut worker, ended);
         if worker.state != State::Done {
@@ -1274,9 +1334,11 @@ async fn run(
         worker.ended_ms = Some(now_ms());
         // A finished task is kept whole, to be continued with `repo_task_reply`,
         // until its thread is archived or it sits a day idle
-        // (`super::archiving`); a part and a failed task are archived now.
+        // (`super::archiving`); a part and a failed task are archived now. A
+        // chat's conversation is never distilled: disposal tombstones it
+        // (`docs/zen_chat.md` §4).
         worker.resumable = worker.state == State::Done && !worker.is_part();
-        if !worker.resumable {
+        if !worker.resumable && !worker.kind.is_chat() {
             match session.archive_worker(&worker.conv_id) {
                 Some(Ok(())) | None => {}
                 Some(Err(e)) => tracing::warn!(
@@ -1285,6 +1347,12 @@ async fn run(
                 ),
             }
         }
+    }
+    let chat = worker.kind.is_chat() && !worker.is_part();
+    // Said on the chat before the record says the answer ended, so a reader
+    // woken by the record finds the message there.
+    if chat {
+        talk::answered(&records, &owner, &worker);
     }
     if let Err(e) = threads::put_worker(&records, &owner, &worker) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
@@ -1295,6 +1363,11 @@ async fn run(
         if let Err(e) = note(&records, &owner, &worker, label, outcome) {
             tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
         }
+    }
+    // A chat closed while Zen answered is disposed of once the answer has
+    // ended.
+    if chat {
+        talk::settled(&session, &owner, &worker);
     }
     session.mcp().bump();
 }
@@ -1503,6 +1576,27 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
                     ("Task ended:", line)
                 }
             }
+        }
+    }
+}
+
+/// Settle Zen's side of a chat on how its turn `ended`: `done` with its reply —
+/// a closed loop's text still its reply, and a question block no question,
+/// since Zen asks Claude in the chat itself — or `error`. The line is for no
+/// journal: a chat's thread keeps none ([`note`]).
+fn settle_chat(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
+    worker.stopped = ended.stopped();
+    match ended {
+        Ended::Failed(error) => {
+            let line = format!("error: {}", first_line(&error, 200));
+            worker.error = Some(error);
+            worker.state = State::Error;
+            ("Chat answer:", line)
+        }
+        Ended::Closed { text, .. } | Ended::Replied(text) => {
+            worker.final_text = final_reply(&text);
+            worker.state = State::Done;
+            ("Chat answer:", "done".into())
         }
     }
 }
@@ -2194,6 +2288,68 @@ mod tests {
         settle_part(&mut p, Ended::Failed("boom".into()));
         assert_eq!((p.state, p.error.as_deref()), (State::Error, Some("boom")));
         assert!(!p.state.live());
+    }
+
+    /// **Zen's side of a chat settles done with its reply, never as a
+    /// question** — Zen asks Claude in the chat itself — and its message ends
+    /// with no question block; resumed, it is told the message it was
+    /// answering, not a task.
+    #[test]
+    fn a_chat_turn_settles_done_with_its_reply() {
+        let chat = || Worker {
+            thread: "~0123456789abcdef".into(),
+            name: "zen".into(),
+            kind: WorkerKind::Chat,
+            prompt: "how big is the arena?".into(),
+            ..worker()
+        };
+        let mut w = chat();
+        settle_chat(
+            &mut w,
+            Ended::Replied("<think>x</think>Which arena?\nQUESTION: which?".into()),
+        );
+        assert_eq!(w.state, State::Done);
+        assert_eq!(w.final_text, "Which arena?\nQUESTION: which?");
+        assert_eq!(w.question, None);
+
+        let mut w = chat();
+        settle_chat(
+            &mut w,
+            Ended::Closed {
+                text: "About 30 GiB.".into(),
+                by: CLOSED_BY_CLAUDE,
+            },
+        );
+        assert_eq!((w.state, w.stopped), (State::Done, true));
+        assert_eq!(w.final_text, "About 30 GiB.");
+
+        let mut w = chat();
+        settle_chat(&mut w, Ended::Failed("boom".into()));
+        assert_eq!((w.state, w.error.as_deref()), (State::Error, Some("boom")));
+
+        assert_eq!(closing_of(WorkerKind::Chat), "");
+        assert_eq!(closing_of(WorkerKind::Coder), ASKING);
+        assert_eq!(
+            resumed_message(&chat()),
+            format!("{CHAT_RESUMED}\n\nThe message you were answering:\nhow big is the arena?")
+        );
+    }
+
+    /// **A chat's thread keeps no journal line**; a task's thread does.
+    #[test]
+    fn a_chat_workers_notes_are_not_entered() {
+        let r = MemRecords::default();
+        let chat = Worker {
+            thread: "~0123456789abcdef".into(),
+            name: "zen".into(),
+            kind: WorkerKind::Chat,
+            ..worker()
+        };
+        note(&r, "o", &chat, "Claude started:", "hello".into()).unwrap();
+        assert_eq!(threads::note_count(&r, "o", "~0123456789abcdef"), 0);
+        let task = worker();
+        note(&r, "o", &task, "Claude started:", "verify".into()).unwrap();
+        assert_eq!(threads::note_count(&r, "o", &task.thread), 1);
     }
 
     #[test]
