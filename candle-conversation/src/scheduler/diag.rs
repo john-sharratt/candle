@@ -50,7 +50,11 @@ impl Scheduler {
             .collect::<Vec<_>>();
         decode_diag::set_step(seqs, step as u64, rows);
         let parent = self.turn_views.get(&lead).map_or(lead, |v| v.parent_id);
-        if let Some(slot) = self.slot_projection_state.get(&parent) {
+        if let Some(slot) = self
+            .slot_projection_state
+            .get(&parent)
+            .filter(|_| step < arm.live_at)
+        {
             decode_diag::set_pieces(slot.placed_spans());
         }
     }

@@ -134,6 +134,9 @@ pub struct Arm {
     pub timeline: u64,
     /// The generated-token count recording starts from.
     pub from: usize,
+    /// The generated-token count the closing live reprojection falls on; the
+    /// slot it builds is not the one the decode read.
+    pub live_at: usize,
 }
 
 struct Watch {
@@ -509,6 +512,7 @@ mod tests {
             control: Control::Dense,
             timeline: 9,
             from: 3,
+            live_at: 8,
         };
         assert!(arm(spec));
         assert!(armed());

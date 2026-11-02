@@ -2337,7 +2337,9 @@ impl TurnSubmitter {
             // quotations or prose is a property of what this conversation *is*,
             // and a per-turn switch would be a way to get it wrong on one turn.
             free_tool_calls_from_penalties,
-            options.recorded_turn.map(|g| (g, options.forced_tokens)),
+            options
+                .recorded_turn
+                .map(|g| (g, options.forced_tokens, options.forced_suffix)),
         )?;
         Ok((handle, user_tokens))
     }
@@ -2693,7 +2695,7 @@ impl TurnSubmitter {
         triggers: Arc<TriggerRegistry>,
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
-        recorded_turn: Option<(Vec<u32>, Option<usize>)>,
+        recorded_turn: Option<(Vec<u32>, Option<usize>, Vec<u32>)>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2763,12 +2765,13 @@ impl TurnSubmitter {
         // grammar run as they did live: what they played is in the recording,
         // and where they cut pages is part of what is being replayed.
         let (reply, max_decode_tokens) = match recorded_turn {
-            Some((grid, forced_tokens)) => {
+            Some((grid, forced_tokens, forced_suffix)) => {
                 let mut ids = recorded_reply(&grid, &prefill_tokens, &post_decode_tokens)
                     .map_err(ConversationError::Other)?;
                 let steps = match forced_tokens {
                     Some(forced) => {
                         ids.truncate(forced);
+                        ids.extend(forced_suffix);
                         max_decode_tokens
                     }
                     None => ids.len() + 1,

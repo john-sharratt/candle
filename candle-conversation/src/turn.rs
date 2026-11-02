@@ -120,6 +120,10 @@ pub struct TurnOptions {
     /// to [`Self::max_tokens`] — the decode from a point inside a recording.
     /// `None` replays the whole of it and ends where it ended.
     pub forced_tokens: Option<usize>,
+
+    /// Ids forced after those [`Self::forced_tokens`] kept, before sampling
+    /// starts: a question put to the model from inside its own reply.
+    pub forced_suffix: Vec<u32>,
 }
 
 impl TurnOptions {

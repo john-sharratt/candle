@@ -43,6 +43,9 @@ pub struct RunBody {
 pub struct DecodeBody {
     pub turn: usize,
     pub token: usize,
+    /// Text forced after `token` ids, for the model to finish.
+    #[serde(default)]
+    pub prompt: String,
     pub n: usize,
     pub runs: Vec<RunBody>,
     #[serde(default)]
@@ -101,6 +104,7 @@ pub async fn start(
         conv_id: id,
         turn: body.turn,
         token: body.token,
+        prompt: body.prompt,
         n: body.n,
         selection,
         tools_mode,

@@ -59,6 +59,10 @@ pub struct DiagSpec {
     pub turn: usize,
     /// The ids of the target's reply forced before sampling starts.
     pub token: usize,
+    /// Text forced after those ids, the opening of a sentence for the model to
+    /// finish: whether it finishes it from the context is a test of reading
+    /// that does not rest on what the model says it can see.
+    pub prompt: String,
     /// Tokens to decode from there.
     pub n: usize,
     /// The turn's dials, as the chat builds them.
@@ -326,9 +330,17 @@ impl ZendSession {
 
         // The target: its recorded points up to the end, then one live.
         let without: HashSet<(u64, u32)> = run.without.iter().copied().collect();
-        let end = spec.token + spec.n;
+        let suffix: Vec<u32> = state
+            .tokenizer
+            .encode(spec.prompt.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("tokenizing the prompt: {e}"))?
+            .get_ids()
+            .to_vec();
+        let from = spec.token + suffix.len();
+        let end = from + spec.n;
+        let live_at = end.saturating_sub(1).max(1);
         let script = script_of(&events[spec.turn], &conv)
-            .ending_live_at(end.saturating_sub(1).max(1))
+            .ending_live_at(live_at)
             .without(&without);
         let points_recorded = script.len() - 1;
         let dropped_turns = script.dropped_turns;
@@ -353,13 +365,15 @@ impl ZendSession {
             selection,
             recorded_turn: Some(target_sealed.token_ids.clone()),
             forced_tokens: Some(spec.token),
+            forced_suffix: suffix,
             ..Default::default()
         };
 
         if !decode_diag::arm(Arm {
             control: run.control,
             timeline: timeline.raw(),
-            from: spec.token,
+            from,
+            live_at,
         }) {
             bail!("another diagnostic decode holds the capture");
         }
