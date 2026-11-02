@@ -4,6 +4,7 @@
 use serde_json::{json, Value};
 
 use super::{Answer, Ctx};
+use crate::mcp::chats::naming::is_chat_thread;
 use crate::mcp::threads::{self, State, Thread, Worker};
 use crate::mcp::workers::{first_line, now_ms};
 
@@ -73,8 +74,11 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let owner = ctx.caller.key();
     let now = now_ms();
+    // A chat's thread is the chat's own, and is no thread of work
+    // (`docs/zen_chat.md` §4).
     let lines: Vec<String> = threads::threads(&records, &owner)
         .into_iter()
+        .filter(|t| !is_chat_thread(&t.name))
         .filter(|t| include_archived || !t.archived)
         .map(|t| {
             // A thread's tasks are Claude's; the parts its workers started

@@ -314,7 +314,7 @@ pub fn worker_key(owner: &str, thread: &str, name: &str) -> String {
     format!("{}{name}", worker_prefix(owner, thread))
 }
 
-fn note_prefix(owner: &str, thread: &str) -> String {
+pub fn note_prefix(owner: &str, thread: &str) -> String {
     format!("mcp/note/{owner}/{thread}/")
 }
 

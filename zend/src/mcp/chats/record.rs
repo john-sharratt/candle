@@ -1,0 +1,210 @@
+//! A chat and its messages, as records (`docs/zen_chat.md` §2).
+//!
+//! - **The chat** is `mcp/chat/<owner>/<id>`: the session it belongs to, when
+//!   it opened, when a message was last said on it, and whether it is closing.
+//! - **Its messages** are one record each under `mcp/chat-said/<owner>/<id>/`,
+//!   keyed by time and a sequence, so key order is the order they were said and
+//!   two said in one millisecond never race to rewrite one record. A message's
+//!   number is its place in that order, from 1.
+//!
+//! Every key starts with the owner's key, so one person's chats are never
+//! another's.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::mcp::records::Records;
+
+/// Orders the messages one process keeps within one millisecond.
+static SAID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// What every chat's record key starts with.
+const CHAT_PREFIX: &str = "mcp/chat/";
+
+/// A chat's record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chat {
+    pub id: String,
+    /// The MCP session it belongs to, by the id the session is kept under.
+    pub session: String,
+    pub opened_ms: u64,
+    /// When the last message was said on it: what its idle time counts from.
+    pub last_ms: u64,
+    /// It is being disposed of: closed by Claude, or found due by the sweep
+    /// while Zen was answering.
+    #[serde(default)]
+    pub closing: bool,
+}
+
+/// Who said a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speaker {
+    Claude,
+    Zen,
+}
+
+impl Speaker {
+    /// How a message's line names who said it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Zen => "Zen",
+        }
+    }
+}
+
+/// One message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Said {
+    pub at_ms: u64,
+    pub by: Speaker,
+    pub text: String,
+    /// It is the failure Zen's turn ended in, said as Zen's message.
+    #[serde(default)]
+    pub failed: bool,
+}
+
+pub fn chat_key(owner: &str, id: &str) -> String {
+    format!("{CHAT_PREFIX}{owner}/{id}")
+}
+
+pub fn said_prefix(owner: &str, id: &str) -> String {
+    format!("mcp/chat-said/{owner}/{id}/")
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Option<T> {
+    serde_json::from_value(value).ok()
+}
+
+pub fn chat(records: &dyn Records, owner: &str, id: &str) -> Option<Chat> {
+    records.get(&chat_key(owner, id)).and_then(decode)
+}
+
+pub fn put_chat(records: &dyn Records, owner: &str, chat: &Chat) -> anyhow::Result<()> {
+    records.put(&chat_key(owner, &chat.id), serde_json::to_value(chat)?)
+}
+
+/// Every chat of every owner, each with the owner key it is kept under. A
+/// record that does not read as a chat is left out.
+pub fn every_chat(records: &dyn Records) -> Vec<(String, Chat)> {
+    records
+        .under(CHAT_PREFIX)
+        .into_iter()
+        .filter_map(|(key, v)| {
+            let (owner, _) = key.strip_prefix(CHAT_PREFIX)?.split_once('/')?;
+            Some((owner.to_string(), decode(v)?))
+        })
+        .collect()
+}
+
+/// Keep `said` as the chat's next message.
+pub fn say(records: &dyn Records, owner: &str, id: &str, said: &Said) -> anyhow::Result<()> {
+    // Time first, zero-padded, so key order is the order they were said; the
+    // sequence after it keeps two of one millisecond in order.
+    let seq = SAID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let key = format!("{}{:016}-{seq:010}", said_prefix(owner, id), said.at_ms);
+    records.put(&key, serde_json::to_value(said)?)
+}
+
+/// The chat's messages, oldest first, each with its record key.
+pub fn said_keyed(records: &dyn Records, owner: &str, id: &str) -> Vec<(String, Said)> {
+    records
+        .under(&said_prefix(owner, id))
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, decode(v)?)))
+        .collect()
+}
+
+/// The chat's messages, oldest first.
+pub fn said(records: &dyn Records, owner: &str, id: &str) -> Vec<Said> {
+    said_keyed(records, owner, id)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::records::MemRecords;
+
+    fn said_at(at_ms: u64, by: Speaker, text: &str) -> Said {
+        Said {
+            at_ms,
+            by,
+            text: text.into(),
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn a_chat_is_kept_under_its_owner_and_reads_back_as_written() {
+        let r = MemRecords::default();
+        let c = Chat {
+            id: "0123456789abcdef".into(),
+            session: "s1".into(),
+            opened_ms: 10,
+            last_ms: 10,
+            closing: false,
+        };
+        put_chat(&r, "o", &c).unwrap();
+        assert_eq!(
+            r.under("mcp/").first().map(|(k, _)| k.as_str()),
+            Some("mcp/chat/o/0123456789abcdef")
+        );
+        assert_eq!(chat(&r, "o", &c.id), Some(c.clone()));
+        assert_eq!(chat(&r, "p", &c.id), None, "owners never meet");
+        assert_eq!(every_chat(&r), vec![("o".to_string(), c)]);
+    }
+
+    /// **Messages read back in the order they were said**, two of one
+    /// millisecond kept apart, and none of them is taken for a chat.
+    #[test]
+    fn messages_read_back_in_the_order_they_were_said() {
+        let r = MemRecords::default();
+        say(
+            &r,
+            "o",
+            "c1",
+            &said_at(5, Speaker::Claude, "how big is the arena?"),
+        )
+        .unwrap();
+        say(&r, "o", "c1", &said_at(5, Speaker::Zen, "about 30 GiB")).unwrap();
+        say(&r, "o", "c1", &said_at(9, Speaker::Claude, "thanks")).unwrap();
+        say(&r, "o", "c2", &said_at(1, Speaker::Claude, "another chat")).unwrap();
+        let got = said(&r, "o", "c1");
+        assert_eq!(
+            got.iter()
+                .map(|s| (s.by.name(), s.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Claude", "how big is the arena?"),
+                ("Zen", "about 30 GiB"),
+                ("Claude", "thanks")
+            ]
+        );
+        assert!(said_keyed(&r, "o", "c1")[0]
+            .0
+            .starts_with("mcp/chat-said/o/c1/0000000000000005-"));
+        assert!(every_chat(&r).is_empty(), "a message is no chat");
+    }
+
+    #[test]
+    fn a_message_reads_back_as_its_bytes() {
+        let s = Said {
+            at_ms: 7,
+            by: Speaker::Zen,
+            text: "the model is still loading".into(),
+            failed: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"at_ms":7,"by":"zen","text":"the model is still loading","failed":true}"#
+        );
+        let kept: Said = serde_json::from_str(r#"{"at_ms":7,"by":"claude","text":"hi"}"#).unwrap();
+        assert_eq!(kept, said_at(7, Speaker::Claude, "hi"));
+    }
+}

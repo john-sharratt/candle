@@ -95,6 +95,16 @@ compacted.
   waiting questions; check running workers; summarise where things stand
   before acting.
 
+### A8. `zen-chat`
+**Use when:** asking Zen something directly, for an answer to use now.
+**Tools:** `zen_chat_send`, `zen_chat_read`, `zen_chat_close`
+- A private chat for the life of the session, deleted after (`docs/zen_chat.md`):
+  nothing on it is kept, so what must last is noted elsewhere.
+- A task, not a chat, for work that changes a repository or must be checked and
+  kept.
+- Close it when done; one left alone is deleted twelve hours after its last
+  message.
+
 ---
 
 ## B. Code

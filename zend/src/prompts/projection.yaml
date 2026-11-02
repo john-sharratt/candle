@@ -396,6 +396,14 @@ system_prompt:
 
                 Give a verdict first, then the findings, worst first. No findings is a good result: say so and say what you read.
 
+            - id: chat
+              content: |+
+                You are working as a chat partner: Claude, an AI working for the user in a session of its own, is writing to you on a private chat, and each of its messages is the next message here. Answer it the way you would answer a colleague's message: what it asked, plainly, and no longer than it needs.
+
+                Use your tools when the answer needs evidence from the repositories, the journals or the web, and cite what you read, `file:line` for code; say so when you answer from memory. Change nothing unless Claude asks you to. When something Claude needs is not yours to decide, say what it is and what you would choose, and stop there: Claude answers in its next message.
+
+                The chat lasts as long as Claude's session and is then deleted, with everything said on it. Anything that must outlast it belongs in a journal or a repository, written there only when Claude asks.
+
     # The carve-out quotes the OPENERS the placed requests really start with, and
     # `history_stance_disowns_the_real_placed_request_openers` holds it to them by
     # rendering a request from each ingest and asserting it starts with the quoted

@@ -78,6 +78,9 @@ mod timeline_read;
 mod user_context;
 mod user_episode;
 pub(crate) mod wait;
+mod zen_chat_close;
+mod zen_chat_read;
+mod zen_chat_send;
 
 /// What a tool answers when it needs the model and zend is still loading it.
 pub const LOADING: &str = "the model is still loading; try again shortly";
@@ -177,6 +180,9 @@ pub fn definitions() -> Value {
         group_default::definition(),
         threads::definition(),
         archive::definition(),
+        zen_chat_send::definition(),
+        zen_chat_read::definition(),
+        zen_chat_close::definition(),
         cluster_status::definition(),
         cluster_logs::definition(),
         cluster_audit::definition(),
@@ -235,6 +241,9 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         group_default::NAME => blocking(ctx, args, group_default::call).await,
         threads::NAME => blocking(ctx, args, threads::call).await,
         archive::NAME => blocking(ctx, args, archive::call).await,
+        zen_chat_send::NAME => zen_chat_send::call(ctx, args).await,
+        zen_chat_read::NAME => zen_chat_read::call(ctx, args).await,
+        zen_chat_close::NAME => blocking(ctx, args, zen_chat_close::call).await,
         cluster_status::NAME => cluster_status::call(ctx, args).await,
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
@@ -348,6 +357,9 @@ mod tests {
                 "group_default",
                 "thread_list",
                 "thread_archive",
+                "zen_chat_send",
+                "zen_chat_read",
+                "zen_chat_close",
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
@@ -390,6 +402,7 @@ mod tests {
                 "journal_read",
                 "journal_grep",
                 "thread_list",
+                "zen_chat_read",
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",

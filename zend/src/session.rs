@@ -118,6 +118,7 @@ use crate::journal::{carry, draft, origin, pressure};
 use crate::layers::keys::SUBJECT_KEY;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
+use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
@@ -8161,6 +8162,7 @@ impl ZendSession {
             archiving::start_sweeping(self, rt);
             resuming::start_resuming(self, rt);
             tending::start_tending(self, rt);
+            chat_sweep::start_sweeping(self, rt);
         }
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.

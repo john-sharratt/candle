@@ -14,6 +14,9 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 use super::archiving::{lost, LOST_ARCHIVE_MS};
+use super::chats::naming::id_of;
+use super::chats::record::chat;
+use super::records::Records;
 use super::threads::{self, Worker};
 use super::workers;
 use crate::ingest_lease::{self, Share};
@@ -44,6 +47,15 @@ pub fn due(w: &Worker, now: u64) -> bool {
         && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
 }
 
+/// Whether the thread `thread` may have its lost tasks started again: any
+/// thread but a chat's, and a chat's while it is kept and not closing.
+pub fn chat_open(records: &dyn Records, owner: &str, thread: &str) -> bool {
+    match id_of(thread) {
+        None => true,
+        Some(id) => chat(records, owner, id).is_some_and(|c| !c.closing),
+    }
+}
+
 /// Start again, on one member, every lost task. How many this one took.
 fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
     let Some(records) = session.shared_substrate() else {
@@ -51,6 +63,10 @@ fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
     };
     let mut resumed = 0;
     for (owner, t) in threads::every_thread(&records) {
+        // A chat being disposed of is not started again.
+        if !chat_open(&records, &owner, &t.name) {
+            continue;
+        }
         for w in threads::workers(&records, &owner, &t.name) {
             let w = w.observed(now);
             if !due(&w, now) {
@@ -105,6 +121,8 @@ pub fn start_resuming(session: &Arc<ZendSession>, runtime: &Handle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::chats::record::{put_chat, Chat};
+    use crate::mcp::records::MemRecords;
     use crate::mcp::threads::{State, BEAT_LOST_MS};
 
     fn worker(name: &str, resumes: u32) -> Worker {
@@ -144,5 +162,26 @@ mod tests {
         let late = 1_000 + LOST_ARCHIVE_MS;
         assert!(!due(&worker("a", 0).observed(late), late), "given up on");
         assert_eq!(worker("a", 0).observed(1_000).state, State::Running);
+    }
+
+    /// **A chat being disposed of is not started again**, nor one no longer
+    /// kept; a chat still open is, like any thread.
+    #[test]
+    fn only_an_open_chat_has_its_lost_answer_started_again() {
+        let r = MemRecords::default();
+        assert!(chat_open(&r, "o", "review"));
+        assert!(!chat_open(&r, "o", "~0123456789abcdef"), "not kept");
+        let mut c = Chat {
+            id: "0123456789abcdef".into(),
+            session: "s".into(),
+            opened_ms: 0,
+            last_ms: 0,
+            closing: false,
+        };
+        put_chat(&r, "o", &c).unwrap();
+        assert!(chat_open(&r, "o", "~0123456789abcdef"));
+        c.closing = true;
+        put_chat(&r, "o", &c).unwrap();
+        assert!(!chat_open(&r, "o", "~0123456789abcdef"));
     }
 }
