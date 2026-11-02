@@ -169,14 +169,29 @@ pub const ORDER_POST: Tool = Tool {
             description: "Who is to carry it, by name. Left out, the first to come for work \
                           takes it.",
         },
+        Param {
+            name: "args",
+            ty: "string",
+            required: false,
+            description: "When you post a standing job that takes arguments, its arguments — one \
+                          \"name: value\" to a line — filled into its brief and steps.",
+        },
     ],
-    examples: &[Example {
-        situation: "The sensor panel showed a fault on the Sharratts' level, and nobody has \
-                    looked at it.",
-        call: r#"{"brief":"Find out what the fault on the groups level is and whether the Sharratts are affected.","steps":"go to the ward room\nscan the sensor panel and read what state it is in\nscan the status board and read what state it is in"}"#,
-        because: "Something seen and set as work is something that gets done; something seen and \
-                  only thought about is not.",
-    }],
+    examples: &[
+        Example {
+            situation: "The sensor panel showed a fault on the Sharratts' level, and nobody has \
+                        looked at it.",
+            call: r#"{"brief":"Find out what the fault on the groups level is and whether the Sharratts are affected.","steps":"go to the ward room\nscan the sensor panel and read what state it is in\nscan the status board and read what state it is in"}"#,
+            because: "Something seen and set as work is something that gets done; something seen \
+                      and only thought about is not.",
+        },
+        Example {
+            situation: "The family asked for a film on the television, and \"play-a-film\" is one \
+                        of the standing jobs.",
+            call: r#"{"job":"play-a-film","args":"title: Dune\ndevice: the living room TV"}"#,
+            because: "A standing job carries its own steps; you give only what it is about.",
+        },
+    ],
 };
 
 /// Read what has come back from the missions posted on the table.

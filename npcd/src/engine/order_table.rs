@@ -7,15 +7,46 @@
 //! table only to a character that takes no orders; the work they post is carried
 //! by the others through `collect_mission` and `report_done`, as any mission is.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 use crate::engine::body::Outcome;
-use crate::engine::mission::{Mission, Origin, Outcome as Verdict, Todo};
+use crate::engine::mission::{Origin, Outcome as Verdict};
+use crate::engine::mission_gen::world::{mission_of, Filled};
 use crate::world::Hosted;
 
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     let s = args.get(key)?.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The arguments of a template post — the `args` string, one `name: value` to a
+/// line — as a map. A line with no `:` is skipped, and the fill then names the
+/// argument it did not get.
+fn parse_args(args: &Map<String, Value>) -> BTreeMap<String, String> {
+    let Some(s) = text(args, "args") else {
+        return BTreeMap::new();
+    };
+    s.lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            let (k, v) = (k.trim(), v.trim());
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// A fill error turned into a refusal sentence: a capital to open, a full stop
+/// to close.
+fn sentence(mut e: String) -> String {
+    if let Some(first) = e.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    if !e.ends_with('.') {
+        e.push('.');
+    }
+    e
 }
 
 /// Whether `body` is somebody a world gives orders to: a character's body —
@@ -33,15 +64,18 @@ fn takes_orders(hosted: &Hosted, body: &str) -> bool {
 /// report was done — and reported having done nothing.
 pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let job = text(args, "job");
-    let (brief, steps) = match &job {
-        Some(id) => match hosted.sim(|s| s.missions.routine(id).cloned()) {
-            Some(r) => (r.brief, r.steps),
-            None => {
+    let filled = match &job {
+        Some(id) => {
+            let Some(routine) = hosted.sim(|s| s.missions.routine(id).cloned()) else {
                 return Outcome::Refused(format!(
                     "There is no standing job called \"{id}\" to post."
-                ))
+                ));
+            };
+            match routine.fill(&parse_args(args)) {
+                Ok(filled) => filled,
+                Err(e) => return Outcome::Refused(sentence(e)),
             }
-        },
+        }
         None => {
             let Some(brief) = text(args, "brief") else {
                 return Outcome::Refused(
@@ -64,10 +98,15 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                         .into(),
                 );
             }
-            (brief, steps)
+            Filled {
+                brief,
+                steps,
+                grants: Vec::new(),
+                work: None,
+            }
         }
     };
-    let steps: Vec<Todo> = steps.into_iter().map(Todo::new).collect();
+    let brief = filled.brief.clone();
     let (me, room) = hosted
         .read(|w| {
             let actor = w.actor(body)?;
@@ -98,18 +137,14 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             }
         }
     };
-    let mut todo = steps;
-    todo.push(Todo::report(format!(
-        "go back to the table in {room} and report it"
-    )));
-    let mission = Mission::new(
-        brief.as_str(),
-        todo,
+    let mission = mission_of(
+        filled,
         Origin::Ordered {
             by: me,
             poster: body.to_string(),
             job,
         },
+        Some(&room),
     );
     let for_whom = match &to {
         Some((_, named)) => format!("for {named}"),
@@ -350,6 +385,51 @@ mod tests {
         assert_eq!(
             post(&h, "zen", &args(json!({"job": "hatchery"}))),
             Outcome::Refused("There is no standing job called \"hatchery\" to post.".into())
+        );
+    }
+
+    /// **A standing job that takes arguments is filled when it is posted** — its
+    /// `{name}`s replaced in the brief and steps — and a missing argument is
+    /// refused by name.
+    #[test]
+    fn a_job_is_posted_with_its_arguments() {
+        let h = vault();
+        let film = Routine {
+            id: "play-a-film".into(),
+            brief: "Put {title} on {device}.".into(),
+            steps: vec!["put {title} on {device}".into()],
+            params: vec!["title".into(), "device".into()],
+            ..Default::default()
+        };
+        h.with_sim(|s| s.missions.set_routines(vec![film], Draw::None));
+        assert!(post(
+            &h,
+            "zen",
+            &args(json!({
+                "job": "play-a-film",
+                "args": "title: Dune\ndevice: the living room TV"
+            })),
+        )
+        .happened());
+        let m = h
+            .with_sim(|s| s.missions.collect("wick", &Facts::default()).cloned())
+            .unwrap();
+        assert_eq!(m.prompt, "Put Dune on the living room TV.");
+        let steps: Vec<&str> = m.todo.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                "put Dune on the living room TV",
+                "go back to the table in the command room and report it"
+            ]
+        );
+        assert_eq!(
+            post(
+                &h,
+                "zen",
+                &args(json!({"job": "play-a-film", "args": "title: Dune"})),
+            ),
+            Outcome::Refused("The mission `play-a-film` needs an argument for `device`.".into())
         );
     }
 
