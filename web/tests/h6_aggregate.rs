@@ -143,7 +143,7 @@ async fn h6_an_eight_member_aggregate_answers_at_its_deadline() {
     let hub = Hub::new(key(), "gw-h6");
     let cfg = Config::from_yaml(
         r#"
-cluster: {group_key_file: "unused.key"}
+cluster: {group_key_file: "unused.key", machines_file: "../host/machines.yaml"}
 sites:
   - name: zend
     default: true

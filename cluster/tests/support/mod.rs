@@ -21,6 +21,7 @@ use cluster::dispatch::{Dispatch, Route, RouteTable};
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
+use cluster::machines::MachineTable;
 use cluster::member::{AppMember, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use cluster::pipe::{Message, PipeRx};
@@ -34,8 +35,25 @@ pub fn key() -> GroupKey {
     GroupKey::from_bytes([5; 32])
 }
 
+/// A gateway whose machine table names every machine a test member runs on —
+/// `m1` to `m64`, ranked by their number, each taking 64 units, drawing, and
+/// hosting a share of the cast (`docs/static_placement.md` §2).
 pub fn gateway(name: &str) -> Arc<Hub> {
-    Hub::new(key(), name)
+    let hub = Hub::new(key(), name);
+    hub.set_machines(machines());
+    hub
+}
+
+/// The machine table [`gateway`] places by.
+pub fn machines() -> MachineTable {
+    let yaml: String = (1..=64)
+        .map(|n| {
+            format!(
+                "m{n}:\n  conversations: {{rank: {n}, min: 64}}\n  pictures: {n}\n  characters: 1\n"
+            )
+        })
+        .collect();
+    MachineTable::from_yaml(&yaml).unwrap()
 }
 
 /// A member's receiving half that stops reading while `paused` — a member too

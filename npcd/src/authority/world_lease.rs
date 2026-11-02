@@ -1,10 +1,13 @@
 //! The world lease (`docs/replicated_substrate.md` §9.2, §9.6): `world/<wid>`,
-//! held by Paxos among the npcd members. Rendezvous over the members names who
-//! *proposes* for it; it never takes it from a holder. The holder renews it
-//! every 10 s while rendezvous still names it, and hands it over — releasing it
-//! with its own `oseq` — when rendezvous names another, which then takes it.
+//! held by Paxos among the npcd members. **A world stays where its lease is**
+//! (`docs/static_placement.md` §6): the holder renews it every 10 s for as long
+//! as it runs, and nothing — no rank, plan or rendezvous — takes it away. A
+//! world nobody holds is asked for by its proposer, the ready member admitted
+//! at the greatest power ([`proposer`]); it never takes it from a holder.
 
 use std::time::Duration;
+
+use cluster::consensus::rendezvous::Weighted;
 
 /// The Paxos key of world `wid`'s lease.
 pub fn lease_key(wid: &str) -> Vec<u8> {
@@ -16,25 +19,34 @@ pub fn world_of(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(key).ok()?.strip_prefix("world/")
 }
 
+/// Who asks for a world nobody holds, among the `ready` members as they were
+/// admitted: the greatest weight, then the lower node — so of BlackWorld (734)
+/// and WhiteWorld (245), BlackWorld. A member of weight 0 takes no lease and
+/// proposes for none.
+pub fn proposer(ready: &[Weighted]) -> Option<u64> {
+    ready
+        .iter()
+        .filter(|m| m.weight > 0.0)
+        .max_by(|a, b| a.weight.total_cmp(&b.weight).then(b.node.cmp(&a.node)))
+        .map(|m| m.node)
+}
+
 /// What to do about one world's lease this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Ask for it: rendezvous names this member and it does not hold it.
+    /// Ask for it: this member is the proposer and does not hold it.
     Acquire,
-    /// Renew it: held, still named, and due.
+    /// Renew it: held, and due.
     Renew,
-    /// Hand it over: held, and rendezvous names another member now.
-    HandOver,
     /// Nothing this tick.
     Wait,
 }
 
-/// The step for a world whose proposer rendezvous names as `proposer`, which
-/// this member, `me`, holds or not, last asked for `since` ago.
+/// The step for a world whose proposer is `proposer`, which this member, `me`,
+/// holds or not, last asked for `since` ago. A holder renews whoever proposes:
+/// the world stays where it is.
 pub fn step(me: u64, proposer: Option<u64>, held: bool, since: Duration, every: Duration) -> Step {
-    let named = proposer == Some(me);
-    match (held, named) {
-        (true, false) if proposer.is_some() => Step::HandOver,
+    match (held, proposer == Some(me)) {
         (true, _) if since >= every => Step::Renew,
         (true, _) => Step::Wait,
         (false, true) if since >= ASK_AGAIN => Step::Acquire,
@@ -59,8 +71,10 @@ mod tests {
 
     const EVERY: Duration = Duration::from_secs(10);
 
+    /// **The proposer asks, and a holder renews whoever proposes**: a world
+    /// stays where its lease is.
     #[test]
-    fn the_proposer_asks_the_holder_renews_and_hands_over() {
+    fn the_proposer_asks_and_the_holder_keeps_it() {
         let s = Duration::from_secs;
         assert_eq!(step(1, Some(1), false, s(5), EVERY), Step::Acquire);
         assert_eq!(
@@ -75,12 +89,30 @@ mod tests {
         );
         assert_eq!(step(1, Some(1), true, s(3), EVERY), Step::Wait);
         assert_eq!(step(1, Some(1), true, s(10), EVERY), Step::Renew);
-        assert_eq!(step(1, Some(2), true, s(3), EVERY), Step::HandOver);
         assert_eq!(
-            step(1, None, true, s(10), EVERY),
+            step(1, Some(2), true, s(10), EVERY),
             Step::Renew,
-            "nobody else to hand to"
+            "another proposes: the holder keeps it"
         );
+        assert_eq!(step(1, None, true, s(10), EVERY), Step::Renew);
+    }
+
+    /// **The proposer is the member admitted at the greatest power**, the lower
+    /// node on a tie; a member that takes no lease proposes for none.
+    #[test]
+    fn the_proposer_is_the_strongest_ready_member() {
+        let w = |node, weight| Weighted { node, weight };
+        assert_eq!(
+            proposer(&[w(0xb2e6, 245.0), w(0xdb1f, 734.0)]),
+            Some(0xdb1f)
+        );
+        assert_eq!(
+            proposer(&[w(9, 100.0), w(3, 100.0)]),
+            Some(3),
+            "the lower node"
+        );
+        assert_eq!(proposer(&[w(1, 0.0)]), None, "takes no lease");
+        assert_eq!(proposer(&[]), None);
     }
 
     #[test]

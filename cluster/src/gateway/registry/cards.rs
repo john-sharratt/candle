@@ -6,12 +6,17 @@ use std::collections::{BTreeMap, HashMap};
 use super::{MemberView, Registry};
 use crate::gateway::planner::{CardView, Host};
 
-/// The app whose requests are latency work for the plan (§4.4): a live chat, a
-/// passthrough or MCP conversation.
+/// The app whose requests are live conversations for the plan
+/// (`docs/static_placement.md` §5.1): a chat, a passthrough or MCP
+/// conversation.
 pub const LATENCY_APP: &str = "zend";
 
-/// The app whose members host characters, which the plan lends (§4.4).
+/// The app whose members host characters, which the plan lends (§5).
 pub const HOSTING_APP: &str = "npcd";
+
+/// The apps whose members run the model, whose units the machine table places
+/// (`docs/static_placement.md` §3.2).
+pub const MODEL_APPS: [&str; 2] = [LATENCY_APP, HOSTING_APP];
 
 /// A card, by what its members' `HELLO`s named.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -39,8 +44,6 @@ impl CardKey {
 pub struct CardLoad {
     /// Requests handed to its members and not yet answered.
     pub in_flight: u32,
-    /// Requests handed to its members since each one's last `CAPACITY`.
-    pub placed: u32,
     /// Draws among `in_flight`.
     pub drawing: u32,
     /// Of `in_flight`, those of [`LATENCY_APP`].
@@ -48,34 +51,23 @@ pub struct CardLoad {
 }
 
 impl CardLoad {
-    /// The units handed to the card that its reported figures cannot hold
-    /// yet: placed since its last `CAPACITY`, and still in flight.
-    pub fn pending(&self) -> u32 {
-        self.placed.min(self.in_flight)
+    /// The units of work on the card that a placement counts against its
+    /// machine's `max` (`docs/static_placement.md` §3.1): every app's requests
+    /// in flight there, but its draws, which hold the card in their own way.
+    pub fn work(&self) -> u32 {
+        self.in_flight.saturating_sub(self.drawing)
     }
 }
 
 /// Every card's load, by key.
 pub type Cards = HashMap<CardKey, CardLoad>;
 
-/// The thousandths of each fenced card the NPC floor holds back from latency
-/// work (§4.4), as the plan last set them. A card not listed holds none back.
-pub type Fences = HashMap<CardKey, u32>;
-
 impl Registry {
-    /// The plan's fences, which latency placement reads from now on.
-    pub fn set_fences(&mut self, fences: Fences) {
-        self.fences = fences;
-    }
-
-    pub fn fences(&self) -> &Fences {
-        &self.fences
-    }
-
-    /// Every card as the plan reads it (§4.4): its latency units in flight,
-    /// the bulk work its members report outstanding, and its npcd members —
-    /// each eligible to host only while it may be routed to and nothing in its
-    /// process still loads (rule 1, [`MemberView::may_host`]).
+    /// Every card as the plan reads it (`docs/static_placement.md` §5): its
+    /// latency units in flight, and its npcd members — each with its machine's
+    /// share of the cast, zero for one that takes no lease, and eligible to
+    /// host only while it may be routed to and nothing in its process still
+    /// loads (rule 1, [`MemberView::may_host`]).
     pub fn card_views(&self) -> Vec<CardView> {
         let loads = self.cards();
         let mut views: BTreeMap<CardKey, CardView> = BTreeMap::new();
@@ -84,15 +76,15 @@ impl Registry {
             let view = views.entry(key.clone()).or_insert_with(|| CardView {
                 latency: loads.get(&key).map_or(0, |l| l.latency),
                 key,
-                bulk: 0,
                 hosts: Vec::new(),
             });
-            let bulk = m.capacity.as_ref().map_or(0, |c| c.bulk_backlog);
-            view.bulk = view.bulk.max(bulk);
             if m.app == HOSTING_APP {
                 view.hosts.push(Host {
                     node: m.node,
-                    weight: m.weight,
+                    share: match m.weight {
+                        0 => 0,
+                        _ => self.machines.characters(&m.host),
+                    },
                     eligible: m.may_host(),
                 });
             }
@@ -106,7 +98,6 @@ impl Registry {
         for m in self.apps.values().flat_map(|a| a.members.values()) {
             let load = cards.entry(CardKey::of(m)).or_default();
             load.in_flight += m.in_flight;
-            load.placed += m.placed;
             load.drawing += m.drawing;
             if m.app == LATENCY_APP {
                 load.latency += m.in_flight;

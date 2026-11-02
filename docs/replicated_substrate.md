@@ -1478,59 +1478,22 @@ its reach) then tells the caller the largest draw the app serves, in the shape t
 route answers in. A key's holder keeps the key whatever its reach, and refuses a draw
 its card cannot hold the same way.
 
-**Among the cards that reach it, a draw goes to the strongest not drawing, and in turn
-the rest.** In place of `Best`'s power per request, a draw — fresh, a key nobody holds,
-or a canary's baseline — goes to the member with the fewest draws in flight, then the
-largest `guest_reach` (the card itself), then the most live `power`, then the lower
-node. The gateway counts a member's draws as it counts its `in_flight` below: at the
-pick, and until the answer ends. An edit that draws (`image_edit` by a prompt, or taking
-the background away) counts as a draw wherever its key sends it; one that does not name
-both sides is sized 0, which every card reaches, and its member fits it. So one draw at
-a time lands on the strongest card, and a burst goes round every card that reaches it,
-strongest first each round. A card draws one picture at a time whatever else it answers,
-which is why its draws, not its requests, are what a draw spreads by. The count is each
-gateway's own: draws placed through another gateway are not in it.
-
 The gateway adds what no `CAPACITY` can say in time: **`in_flight`**, the requests it
 has handed each member and the member is still answering. A request routed `Best`,
 sticky or owner is counted at the pick — in the same hold of the registry, so two picks
 at once each see the other — and until the last byte of its answer: a chat streams for
 as long as it decodes. An upgraded connection is a session, not a request, and is not
-counted.
+counted. A member's draws are counted the same way.
 
-`Best` picks the ready member with the most power to spare per request,
-`power / (1 + in_flight)`, among those with room — idle, or with more free slots than
-requests in flight, on a card that is not full (`docs/cooperative_admission.md` §4.2).
-When none has room, the request waits at the gateway (§4.3 there). Of equal shares an idle
-member wins, then the lowest node. A member's own background work — ingest, a
-calibration pass — is not a request and does not count: the dialogue a request serves
-decodes at `High` priority, 64 shares to background work's one (`DecodePriority`). So the strongest member takes new conversations until its share per
-request falls to another's, and a burst spreads over the members as it arrives rather
-than all reading the same second-old `CAPACITY`. Agents rank by idle cores (§11.3).
-
-**Once every candidate has learned what a turn costs it, `Best` ranks by when the turn
-would finish instead** (`docs/cooperative_admission.md` §2.1, protocol 4). `CAPACITY`
-then also carries the member's **`prefill_tok_s`**, its prefill rate at the width its
-scheduler runs, **`decode_step_next_us`**, its decode step with one row more than
-it decodes, and **`decode_step_wide_us`** and **`prefill_tok_s_wide`**, its decode
-step and prefill rate with `PLACEMENT_WIDE` (16) rows more. All four come from the
-rates its admission learns from every forward. A turn's finish on a member is:
-
-- its `prefill_backlog`, plus a nominal prompt of 2,048 tokens for each request
-  handed to it since its last `CAPACITY` and still in flight, and for this one, at
-  the time per token those requests and this one leave it: on the line through
-  `1 / prefill_tok_s` (one row) and `1 / prefill_tok_s_wide` (16), extended past
-  it, and flat when the wide rate is no slower;
-- then a nominal 512-token reply at the step with those requests and this one added:
-  on the line through `decode_step_next_us` (one row) and `decode_step_wide_us` (16),
-  extended past it, and flat when the wide step is no slower.
-
-The nominal sizes are the same for every member: the gateway sees a request's new
-message, not the prompt a member's projection makes of the conversation. The soonest
-finish wins, among those with room. A member that has not yet learned both rates says
-zero; it takes a turn while it is answering none — one at a time, to learn from — and
-the rest go by finish among those that have. With none learned, the pick is by power per
-request.
+**`Best` places by the machine table, not by these figures** (`docs/static_placement.md`):
+a unit of the model's apps fills each machine to its `min` in rank order, then goes
+round to each one's `max`, then waits at the gateway; a draw goes to a card that is
+not drawing, one with nothing in flight first, then by the machine's picture
+preference; a unit of an app that runs no model goes to the member with the fewest
+requests in flight. `power`, `idle` and the learned rates `CAPACITY` also carries
+(`prefill_tok_s`, `decode_step_next_us`, `decode_step_wide_us`, `prefill_tok_s_wide`)
+are shown on the status page, and a member's own admission uses its rates; placement
+reads none of them. Agents rank by idle cores (§11.3).
 
 ### 5.4 Affinity is a claim the member holds
 
@@ -3418,11 +3381,10 @@ characters. Nothing gets corrupted:
 What a cut-off character lived through stays in its memory as something it experienced,
 even though the world forgets the place it happened.
 
-### 9.5 Rendezvous: who asks, and where characters are lent
+### 9.5 Rendezvous: where characters are lent, and who asks for a world
 
-Rendezvous names who *proposes* for a world's lease (§9.2), and where an authority
-lends a character (§9.3). It never takes a lease from its holder. For key `k` (a world id
-or an `npc_id`), and the npcd members a member sees across all its clusters (the union of
+Rendezvous names where an authority lends a character (§9.3). For key `k` (an
+`npc_id`), and the npcd members a member sees across all its clusters (the union of
 their `MEMBERS` lists), each with weight `w`:
 
 ```
@@ -3436,15 +3398,15 @@ owner(k) = argmax over members m of   -w_m / ln(u(k, m))
   same clusters see the same members and agree.
 - A member joining or leaving moves only the keys whose winner changed.
 - Each member holds a share of the keys proportional to its power.
-- For a world, `w` is the member's `weight` in `MEMBERS`: its `power` as it stood at
-  admission, fixed for the session. Neither the second-by-second idle flag nor the
-  drifting measured power (§5.3) feeds it, so neither load churn nor a better
-  measurement moves worlds while the membership stands.
-- For a character, `w` is the member's weight in the gateway's last `PLAN`
-  (`docs/cooperative_admission.md` §4.4): its power while its card is not busy with
-  latency or bulk work, and nothing — or only its share of the NPC floor — while it
-  is. The plan changes slowly (§4.5 there), so characters move only when a card's
-  load has changed and held. With no plan yet, a character's `w` is the world's.
+- `w` is the member's weight in the gateway's last `PLAN`
+  (`docs/static_placement.md` §5): its machine's `characters` share while its card
+  is free of live conversations, and nothing while it is busy and a free card can
+  host. With no plan yet, `w` is the member's `weight` in `MEMBERS`.
+
+**Who asks for a world.** Not rendezvous: a world nobody holds is asked for by the
+ready member admitted at the greatest `weight` in `MEMBERS`, then the lower node
+(`npcd/src/authority/world_lease.rs`, `proposer`). It never takes a lease from its
+holder, and a held world stays where it is (`docs/static_placement.md` §6).
 
 **A member that takes no lease.** An npcd configured `characters: false`
 (`--no-characters`) says `power` 0 in its `HELLO`, so it is listed at weight 0, and
@@ -3464,8 +3426,10 @@ refused it.
 
 ### 9.6 Moving a world and routing to it
 
-**Handing a world over**, when rendezvous over the current membership names a new
-proposer:
+**A world stays where its lease is** (`docs/static_placement.md` §6): its holder
+renews it for as long as it runs, and no change of membership hands it over. It moves
+only when its holder lets it go — a member that runs no characters hands each world
+it holds over — or loses it:
 
 1. The authority finishes the beat, writes every pending state record, and sends
    `RELEASE { key, ballot, through }` to every member (§5.9). `through` is its `oseq`
@@ -3478,9 +3442,9 @@ proposer:
    NPC leases.
 
 An authority that is partitioned away cannot renew, so its lease simply runs out
-(§9.2). It switches to disconnected mode itself (§9.4). The proposer rendezvous names
-among the remaining members then takes the world in the first round after the
-acceptors' timers expire.
+(§9.2). It switches to disconnected mode itself (§9.4). The proposer among the
+remaining members then takes the world in the first round after the acceptors' timers
+expire, and keeps it when the old authority returns.
 
 **Routing.** Lease holders announce their leases as `CLAIM`s on every cluster, and
 gateways route by them as they route `Sticky` (§5.4):

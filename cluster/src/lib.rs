@@ -44,6 +44,7 @@ pub mod gateway;
 pub mod handshake;
 pub mod launch;
 pub mod machine;
+pub mod machines;
 pub mod member;
 pub mod offline;
 pub mod peer;

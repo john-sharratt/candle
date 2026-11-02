@@ -1,11 +1,12 @@
 //! A member's world leases (`docs/replicated_substrate.md` §9.2, §9.4, §9.6),
 //! driven twice a second and on every lease event.
 //!
-//! - **Each world's lease** is asked for by the member rendezvous names as its
-//!   proposer, once the records of the member that handed it back are applied;
-//!   renewed by its holder every 10 s while rendezvous still names it; and
-//!   handed over — the beat's state written, then released with this member's
-//!   own `oseq` — when rendezvous names another.
+//! - **Each world's lease** is asked for, while nobody holds it, by its
+//!   proposer — the ready member admitted at the greatest power — once the
+//!   records of the member that handed it back are applied; and renewed by its
+//!   holder every 10 s for as long as it runs (`docs/static_placement.md` §6).
+//!   A member that runs no characters hands each it holds over — the beat's
+//!   state written, then released with this member's own `oseq`.
 //! - **Gaining a world** reloads it from its records, under an epoch above
 //!   every one its records carry, and claims its id so its routes come here.
 //! - **The cast** is read again every 2 s for characters written on other
@@ -19,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cluster::consensus::rendezvous::owner;
 use cluster::member::{AppMember, Link};
 use cluster::replicate::{LeaseEvent, Phase, Replicator, LEASE_TTL, RENEW_EVERY};
 use tokio::sync::broadcast::error::RecvError;
@@ -27,7 +27,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use super::npc_lease::hex;
 use super::role::Role;
-use super::world_lease::{epoch_for, lease_key, step, world_of, Step};
+use super::world_lease::{epoch_for, lease_key, proposer, step, world_of, Step};
 use crate::api::now_ms;
 use crate::engine::runtime::Runtime;
 use crate::world::Hosted;
@@ -151,15 +151,14 @@ impl Runtime {
                     continue;
                 }
             }
-            let proposer = owner(world.as_bytes(), &ready);
+            let asks = proposer(&ready);
             let since = asked.get(&world).map_or(Duration::MAX, |at| at.elapsed());
-            match step(me, proposer, held, since, RENEW_EVERY) {
+            match step(me, asks, held, since, RENEW_EVERY) {
                 Step::Acquire => {
                     // **A lease is never taken from its holder** (§9.5): while
-                    // the member holding it is in the group, the proposer waits
-                    // for it to hand the world over. Asking again meanwhile
-                    // would only raise the ballot under the holder's renewal
-                    // and run its lease out.
+                    // the member holding it is in the group, the proposer waits.
+                    // Asking meanwhile would only raise the ballot under the
+                    // holder's renewal and run its lease out.
                     //
                     // The holder is known two ways. Its claim on the world's id
                     // reaches every member in its admission, before it may
@@ -193,7 +192,6 @@ impl Runtime {
                     r.acquire(&key, LEASE_TTL);
                     asked.insert(world.clone(), Instant::now());
                 }
-                Step::HandOver => self.hand_over(&hosted, member, r),
                 Step::Wait => {}
             }
         }
@@ -261,9 +259,9 @@ impl Runtime {
         );
     }
 
-    /// Rendezvous names another member for `hosted`: write what is pending,
-    /// follow the world from now on, and release the lease with how far this
-    /// member's writes reach.
+    /// This member runs no characters and holds `hosted`'s lease: write what is
+    /// pending, follow the world from now on, and release the lease with how far
+    /// this member's writes reach, for the proposer to take.
     fn hand_over(&self, hosted: &Hosted, member: &AppMember, r: &Arc<Replicator>) {
         let world = hosted.id();
         if let Role::Authority { epoch } = self.standing.role(world) {

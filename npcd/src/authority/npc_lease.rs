@@ -152,6 +152,13 @@ pub fn moves(current: &BTreeMap<u64, NpcLease>, lent: &BTreeMap<u64, NpcLease>) 
 /// world in `cast`, its lease from `current` renewed, moved or lent; a
 /// character no longer in the cast has none. `joined` are the members in the
 /// group now.
+///
+/// **A move, once asked, completes** (`docs/static_placement.md` §5.5): a
+/// lease's `next` stands until the holder hands the character back, whatever
+/// rendezvous names meanwhile — the holder again, or a third member — and is
+/// withdrawn only when `next` itself can no longer host (gone from the group,
+/// or weighed nothing). On 2026-11-02 a member flipping in and out of lag set
+/// and cleared Umbra's `next` every minute or two, and it ran nowhere.
 pub fn lend(
     cast: &[u64],
     current: &BTreeMap<u64, NpcLease>,
@@ -173,13 +180,20 @@ pub fn lend(
             Some(l) if l.holder.is_empty() => fresh(want, now_ms),
             Some(l) => {
                 let holder = node_of(&l.holder);
+                // A move already asked stands while its next holder can host.
+                let asked = l
+                    .next
+                    .as_deref()
+                    .and_then(node_of)
+                    .filter(|n| joined.contains(n) && hosts(members, *n));
                 match holder {
                     // Away: held as it stands, not renewed, not lent again.
                     Some(h) if !joined.contains(&h) => l.clone(),
-                    // Here, and where rendezvous wants it: renewed while it
-                    // has less than half its term left, and a move asked
-                    // before rendezvous changed back is called off.
-                    Some(h) if h == want => {
+                    // Here, and where rendezvous wants it, with no move asked
+                    // that can still be made: renewed while it has less than
+                    // half its term left, and a move whose next holder can no
+                    // longer host is withdrawn.
+                    Some(h) if h == want && asked.is_none() => {
                         if l.expires_ms.saturating_sub(now_ms) < NPC_TTL_MS / 2 || l.next.is_some()
                         {
                             NpcLease {
@@ -190,8 +204,9 @@ pub fn lend(
                             l.clone()
                         }
                     }
-                    // Here, and rendezvous wants it elsewhere: renewed, with
-                    // the next holder named, until the holder hands it back.
+                    // Here, and moving — to the next holder already asked, or
+                    // to where rendezvous wants it now: renewed, with the next
+                    // holder named, until the holder hands it back.
                     Some(_) => NpcLease {
                         holder: l.holder.clone(),
                         expires_ms: if l.expires_ms.saturating_sub(now_ms) < NPC_TTL_MS / 2 {
@@ -199,7 +214,7 @@ pub fn lend(
                         } else {
                             l.expires_ms
                         },
-                        next: Some(hex(want)),
+                        next: Some(hex(asked.unwrap_or(want))),
                         after: l.after,
                     },
                     None => fresh(want, now_ms),
@@ -209,6 +224,11 @@ pub fn lend(
         out.insert(nid, lease);
     }
     out
+}
+
+/// Whether `node` is among `members` with a weight: one the plan lends to.
+fn hosts(members: &[Weighted], node: u64) -> bool {
+    members.iter().any(|m| m.node == node && m.weight > 0.0)
 }
 
 fn fresh(holder: u64, now_ms: u64) -> NpcLease {
@@ -328,6 +348,68 @@ mod tests {
         current.insert(nid, moved.clone());
         let renewed = lend(&[nid], &current, &after, &joined(&[1, 2]), NOW + 50_000);
         assert_eq!(renewed[&nid].after, moved.after);
+    }
+
+    /// **A move, once asked, completes** (`docs/static_placement.md` §5.5):
+    /// rendezvous naming the holder again, or a third member, leaves the next
+    /// holder asked; only a next holder that can no longer host — gone from the
+    /// group, or weighed nothing — withdraws the move, and the holder keeps the
+    /// character.
+    #[test]
+    fn a_move_asked_stands_until_its_next_holder_cannot_host() {
+        let both = members(&[1, 2]);
+        let nid = (1..).find(|n| lent_to(*n, &both) == Some(2)).unwrap();
+        let held = lend(&[nid], &BTreeMap::new(), &members(&[1]), &joined(&[1]), NOW);
+        let moving = lend(&[nid], &held, &both, &joined(&[1, 2]), NOW + 1_000);
+        assert_eq!(moving[&nid].next.as_deref(), Some(hex(2).as_str()));
+
+        // The plan flips back to the holder: the move stands.
+        let back = (1..)
+            .map(|w| {
+                vec![
+                    Weighted {
+                        node: 1,
+                        weight: f64::from(w),
+                    },
+                    Weighted {
+                        node: 2,
+                        weight: 1.0,
+                    },
+                ]
+            })
+            .find(|ms| lent_to(nid, ms) == Some(1))
+            .unwrap();
+        let still = lend(&[nid], &moving, &back, &joined(&[1, 2]), NOW + 2_000);
+        assert_eq!(still[&nid].holder, hex(1));
+        assert_eq!(
+            still[&nid].next.as_deref(),
+            Some(hex(2).as_str()),
+            "the holder named again: the move stands"
+        );
+
+        // A third member named: the move asked still stands.
+        let three = members(&[1, 2, 3]);
+        let third = lend(&[nid], &moving, &three, &joined(&[1, 2, 3]), NOW + 3_000);
+        assert_eq!(third[&nid].next.as_deref(), Some(hex(2).as_str()));
+
+        // The next holder weighed nothing: withdrawn, renewed where it is.
+        let unweighed = vec![
+            Weighted {
+                node: 1,
+                weight: 1.0,
+            },
+            Weighted {
+                node: 2,
+                weight: 0.0,
+            },
+        ];
+        let withdrawn = lend(&[nid], &moving, &unweighed, &joined(&[1, 2]), NOW + 4_000);
+        assert_eq!(withdrawn[&nid].holder, hex(1));
+        assert_eq!(withdrawn[&nid].next, None, "its next holder cannot host");
+
+        // The next holder gone from the group: withdrawn too.
+        let gone = lend(&[nid], &moving, &members(&[1]), &joined(&[1]), NOW + 5_000);
+        assert_eq!(gone[&nid].next, None);
     }
 
     /// **Characters are lent by the plan's weights** (§4.4 of

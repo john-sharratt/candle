@@ -208,6 +208,7 @@ pub fn launch_available_ram() -> Option<u64> {
 /// headroom that "worked" is indistinguishable from one that missed by 40 MB
 /// unless the trough is recorded as it happens.
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 static AVAIL_LOW_WATER: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -308,9 +309,27 @@ pub fn pages_in_per_sec() -> Option<f64> {
 ///   buffer           = max(pct% × total, 4 GiB)      — caps the WEIGHTS only
 ///   weights_reserved = min(weights_mmap, total − buffer)
 ///   tier_pool        = total − weights_reserved − PAGEABLE_RESERVE − os_keep
-///   expert_pinned    = tier_pool
-///   kv_warm_budget   = KV_WARM_FLOOR            — pageable, outside the pool
+///                            − KV_WARM_FLOOR
+///   expert_pinned    = the machine table's pin, else tier_pool
+///   kv_warm_budget   = KV_WARM_FLOOR            — pageable, beside the pool
 /// ```
+///
+/// # The warm K/V floor comes out of the machine
+///
+/// It is pageable, and was left out of the sum for that reason: the OS pages
+/// it rather than refusing. But RAM the OS must page to keep is RAM the machine
+/// does not have — on WhiteWorld, 2026-11-02, a pool sized without it pinned
+/// 47.9 GB of a 64 GB machine and the engine paged at ~20,000 pages a second.
+///
+/// # A machine whose engine holds more says so
+///
+/// What the engine itself holds unpinned — warm K/V past its floor, held
+/// payloads, the substrate's in-memory state — follows its traffic, not its
+/// RAM: 10.8 GB of held payloads on WhiteWorld against a laptop's gate that
+/// held next to none. No reserve derived from the machine is right for both, so
+/// a machine whose engine needs more than [`PAGEABLE_RESERVE`] covers states
+/// its pin in `host/machines.yaml` (`docs/static_placement.md` §7), and that is
+/// the budget, exactly ([`state_expert_pin`]).
 ///
 /// # One pool, split once — because there are TWO warm tiers
 ///
@@ -438,8 +457,8 @@ const OS_KEEP_BYTES: u64 = 1024 * 1024 * 1024;
 /// only one of them subtracts is not a reserve.
 pub const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
 
-/// The warm KV tier's budget: a fixed amount of **pageable** RAM, outside the
-/// tier pool and independent of it.
+/// The warm KV tier's budget: a fixed amount of **pageable** RAM, beside the
+/// tier pool and taken out of the machine before it.
 ///
 /// **Both tiers are caches with cold tiers**, so how RAM divides between them is
 /// a performance trade rather than a correctness one. An expert miss is a
@@ -462,15 +481,28 @@ pub const PAGEABLE_RESERVE: u64 = 10 * 1024 * 1024 * 1024;
 /// only live conversation history.
 pub const KV_WARM_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The expert pin this machine's table entry states, once
+/// [`state_expert_pin`] has been told it.
+static STATED_EXPERT_PIN: OnceLock<u64> = OnceLock::new();
+
+/// The bytes the expert cache may page-lock on this machine, as the machine
+/// table states them (`docs/static_placement.md` §7). Set once, at startup,
+/// before the model loads; a machine the table gives no pin never calls it and
+/// its budget is derived. The first value set is kept.
+pub fn state_expert_pin(bytes: u64) {
+    let _ = STATED_EXPERT_PIN.set(bytes);
+}
+
 /// Pure budget arithmetic — see [`HostRamBudget`]. Exposed separately from
 /// [`host_ram_budget`] so both machines' numbers pin down in unit tests without
-/// touching the process-global gauges.
+/// touching the process-global gauges. `stated` is the machine table's pin.
 pub fn host_ram_budget_from(
     total: u64,
     pinned: u64,
     weights_mmap: u64,
     pct: u64,
     os_keep: u64,
+    stated: Option<u64>,
 ) -> HostRamBudget {
     const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
     let buffer = (total / 100 * pct).max(FOUR_GIB);
@@ -489,7 +521,8 @@ pub fn host_ram_budget_from(
     let tier_pool = total
         .saturating_sub(weights_reserved)
         .saturating_sub(PAGEABLE_RESERVE)
-        .saturating_sub(os_keep);
+        .saturating_sub(os_keep)
+        .saturating_sub(KV_WARM_FLOOR);
     HostRamBudget {
         total_bytes: total,
         buffer_bytes: buffer,
@@ -499,11 +532,12 @@ pub fn host_ram_budget_from(
         pageable_reserve_bytes: PAGEABLE_RESERVE,
         tier_pool_bytes: tier_pool,
         kv_warm_budget_bytes: KV_WARM_FLOOR,
-        expert_pinned_budget_bytes: tier_pool,
+        expert_pinned_budget_bytes: stated.unwrap_or(tier_pool),
     }
 }
 
-/// The live budget for `total_ram`, reading the pinned and weights gauges.
+/// The live budget for `total_ram`, reading the pinned and weights gauges and
+/// the machine table's pin.
 pub fn host_ram_budget(total_ram: u64) -> HostRamBudget {
     host_ram_budget_from(
         total_ram,
@@ -511,6 +545,7 @@ pub fn host_ram_budget(total_ram: u64) -> HostRamBudget {
         super::weights_mmap_bytes(),
         BUFFER_PCT,
         OS_KEEP_BYTES,
+        STATED_EXPERT_PIN.get().copied(),
     )
 }
 
@@ -544,10 +579,11 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    /// **What the budget pins must fit the machine.** The pinned expert tier,
-    /// the weights and the reserves are exactly the machine — no more. Warm KV
-    /// is pageable and deliberately outside that sum: its floor is held even
-    /// when the pool is empty, and the OS pages it rather than refusing.
+    /// **What the budget promises must fit the machine.** The pinned expert
+    /// tier, the weights, the reserves and the warm K/V floor are exactly the
+    /// machine — no more. The floor is pageable, but RAM the OS must page to
+    /// keep is RAM the machine does not have: left out of this sum, WhiteWorld's
+    /// 64 GB pinned 47.9 GB of experts and paged at ~20,000 pages a second.
     ///
     /// The old budget could not make this assertion. It computed
     /// `kv_warm = total − pinned − weights − os_keep` and left the pageable
@@ -556,18 +592,25 @@ mod tests {
     /// of promises against 31.5 GiB of RAM, with nothing left for the page
     /// cache, the mapped checkpoint, or any other process.
     #[test]
-    fn the_pinned_partition_never_promises_more_than_the_machine_has() {
+    fn the_partition_never_promises_more_than_the_machine_has() {
         for total_gib in [16.0f64, 31.5, 64.0, 186.0] {
             let total = (total_gib * GIB as f64) as u64;
             let weights = (2.4 * GIB as f64) as u64;
-            let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
-            let promised = b.expert_pinned_budget_bytes
-                + b.weights_reserved_bytes
+            let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, None);
+            let fixed = b.weights_reserved_bytes
                 + b.pageable_reserve_bytes
-                + OS_KEEP_BYTES;
-            assert!(
-                promised <= total,
-                "on a {total_gib} GiB box the budget pins {promised} of {total}",
+                + OS_KEEP_BYTES
+                + b.kv_warm_budget_bytes;
+            // A machine whose fixed obligations alone exceed it — 16 GiB holds
+            // 17.4 — pins nothing: the pool is empty, not wrapped.
+            if fixed >= total {
+                assert_eq!(b.expert_pinned_budget_bytes, 0, "{total_gib} GiB");
+                continue;
+            }
+            let promised = b.expert_pinned_budget_bytes + fixed;
+            assert_eq!(
+                promised, total,
+                "on a {total_gib} GiB box the budget promises {promised} of {total}",
             );
             assert_eq!(
                 b.expert_pinned_budget_bytes, b.tier_pool_bytes,
@@ -587,7 +630,7 @@ mod tests {
     fn dev_box_splits_its_tier_pool() {
         let total = (31.5 * GIB as f64) as u64;
         let weights = (2.4 * GIB as f64) as u64;
-        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, None);
 
         assert_eq!(
             b.buffer_bytes,
@@ -597,13 +640,13 @@ mod tests {
         assert!(!b.weights_capped);
         assert_eq!(
             b.tier_pool_bytes,
-            total - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES,
+            total - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES - KV_WARM_FLOOR,
         );
-        // ~18.1 GiB of pool, all expert; 4 GiB of pageable KV beside it.
+        // ~14.1 GiB of pool, all expert; 4 GiB of pageable KV beside it.
         let ex = b.expert_pinned_budget_bytes as f64 / GIB as f64;
         assert_eq!(b.kv_warm_budget_bytes, 4 * GIB);
         assert!(
-            (17.9..18.3).contains(&ex),
+            (13.9..14.3).contains(&ex),
             "expert budget reads {ex:.2} GiB"
         );
         // **The expert tier must not shrink to pay for the honest accounting.**
@@ -629,13 +672,14 @@ mod tests {
     fn the_partition_is_the_same_before_and_after_the_pool_is_pinned() {
         let total = (31.5 * GIB as f64) as u64;
         let weights = (2.4 * GIB as f64) as u64;
-        let before = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+        let before = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, None);
         let after = host_ram_budget_from(
             total,
             (13.5 * GIB as f64) as u64,
             weights,
             30,
             OS_KEEP_BYTES,
+            None,
         );
         assert_eq!(
             before.kv_warm_budget_bytes, after.kv_warm_budget_bytes,
@@ -657,7 +701,7 @@ mod tests {
     fn a_machine_smaller_than_its_reserves_yields_an_empty_pool() {
         let total = 8 * GIB;
         let weights = 6 * GIB;
-        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES);
+        let b = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, None);
         assert!(b.weights_capped, "the model cannot fit beside the buffer");
         assert_eq!(
             b.tier_pool_bytes, 0,
@@ -679,14 +723,33 @@ mod tests {
     /// its pageable floor beside it.
     #[test]
     fn big_box_gives_the_pool_to_the_experts() {
-        let b = host_ram_budget_from(186 * GIB, 12 * GIB, 18 * GIB, 30, 2 * GIB);
+        let b = host_ram_budget_from(186 * GIB, 12 * GIB, 18 * GIB, 30, 2 * GIB, None);
         assert!(!b.weights_capped);
         assert_eq!(
             b.tier_pool_bytes,
-            186 * GIB - 18 * GIB - PAGEABLE_RESERVE - 2 * GIB,
+            186 * GIB - 18 * GIB - PAGEABLE_RESERVE - 2 * GIB - KV_WARM_FLOOR,
         );
+        assert_eq!(b.tier_pool_bytes, 152 * GIB);
         assert_eq!(b.expert_pinned_budget_bytes, b.tier_pool_bytes);
         assert_eq!(b.kv_warm_budget_bytes, KV_WARM_FLOOR);
+    }
+
+    /// **A pin the machine table states is the budget, exactly**, whatever the
+    /// pool would have been — WhiteWorld's 28 GiB on its 64 GB, where the
+    /// derived pool reads ~46.6 GiB — and the pool is still reported as derived.
+    #[test]
+    fn a_stated_pin_is_the_budget() {
+        let total = 64 * GIB;
+        let weights = (2.4 * GIB as f64) as u64;
+        let derived = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, None);
+        let stated = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, Some(28 * GIB));
+        assert_eq!(stated.expert_pinned_budget_bytes, 28 * GIB);
+        assert_eq!(stated.tier_pool_bytes, derived.tier_pool_bytes);
+        assert_eq!(
+            derived.tier_pool_bytes,
+            64 * GIB - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES - KV_WARM_FLOOR,
+        );
+        assert_eq!(stated.kv_warm_budget_bytes, KV_WARM_FLOOR);
     }
 
     /// A model bigger than `total − buffer` is capped — the machine must swap
@@ -698,7 +761,7 @@ mod tests {
     /// pageable floor.
     #[test]
     fn oversized_weights_leave_no_tier_pool() {
-        let b = host_ram_budget_from(16 * GIB, 0, 30 * GIB, 30, 2 * GIB);
+        let b = host_ram_budget_from(16 * GIB, 0, 30 * GIB, 30, 2 * GIB, None);
         assert!(b.weights_capped);
         // buffer = max(30% x 16, 4) = 4.8 GiB; cap = 11.2 GiB.
         assert_eq!(b.weights_reserved_bytes, 16 * GIB - (16 * GIB / 100 * 30));

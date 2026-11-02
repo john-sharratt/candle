@@ -26,6 +26,9 @@ sha2        = "0.10"
 rand        = { workspace = true }
 # The status page's data, as JSON.
 serde       = { workspace = true }
+# The machine table (`host/machines.yaml`), which the gateway and every
+# daemon read the same way.
+serde_yaml  = { workspace = true }
 # A member's `CAPACITY`: cores, load and free memory (§5.3, §11.2).
 sysinfo     = { version = "0.31", default-features = false, features = ["system"] }
 thiserror   = { workspace = true }

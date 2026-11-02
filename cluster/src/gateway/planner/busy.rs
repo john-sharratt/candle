@@ -1,68 +1,30 @@
-//! Rule 5's triggers (`docs/cooperative_admission.md` §4.5): when a card is
-//! busy with latency or bulk work, judged so that a pause in either moves
-//! nothing — busy quickly, free slowly.
+//! When a card is busy (`docs/static_placement.md` §5.1): from its first live
+//! conversation, until it has had none for [`RETURN_AFTER`].
 
 use std::time::{Duration, Instant};
 
-/// How long a card stays latency-busy after the last latency unit on it: a
-/// conversation pauses while its person reads and types.
-pub const LATENCY_LINGER: Duration = Duration::from_secs(10 * 60);
+/// How long a card stays busy after its last live conversation: the pause
+/// while a person reads a reply and types the next message.
+pub const RETURN_AFTER: Duration = Duration::from_secs(120);
 
-/// How long bulk work must have been outstanding before the card is
-/// bulk-busy: a single commit's re-ingest moves nothing.
-pub const BULK_ONSET: Duration = Duration::from_secs(60);
-
-/// How long a card stays bulk-busy after its bulk work empties: ingest ends
-/// and restarts unit by unit.
-pub const BULK_LINGER: Duration = Duration::from_secs(5 * 60);
-
-/// One card's triggers, as the plan has seen them.
+/// One card's busy state, as the plan has seen it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Busy {
-    latency_last: Option<Instant>,
-    bulk_since: Option<Instant>,
-    bulk_last: Option<Instant>,
-    bulk_on: bool,
+    last: Option<Instant>,
 }
 
 impl Busy {
-    /// What the card was doing at `now`: latency work in flight, bulk work
-    /// outstanding.
-    pub fn observe(&mut self, now: Instant, latency: bool, bulk: bool) {
-        if latency {
-            self.latency_last = Some(now);
-        }
-        if bulk {
-            let since = *self.bulk_since.get_or_insert(now);
-            self.bulk_last = Some(now);
-            if now.duration_since(since) >= BULK_ONSET {
-                self.bulk_on = true;
-            }
-        } else {
-            self.bulk_since = None;
-            if self
-                .bulk_last
-                .is_none_or(|last| now.duration_since(last) >= BULK_LINGER)
-            {
-                self.bulk_on = false;
-            }
+    /// Whether a live conversation was in flight on the card at `now`.
+    pub fn observe(&mut self, now: Instant, live: bool) {
+        if live {
+            self.last = Some(now);
         }
     }
 
-    /// Latency work has been on the card within [`LATENCY_LINGER`].
-    pub fn latency(&self, now: Instant) -> bool {
-        self.latency_last
-            .is_some_and(|last| now.duration_since(last) < LATENCY_LINGER)
-    }
-
-    /// Bulk work has held past [`BULK_ONSET`], and not been empty for
-    /// [`BULK_LINGER`] since.
-    pub fn bulk(&self) -> bool {
-        self.bulk_on
-    }
-
+    /// A live conversation has been on the card within [`RETURN_AFTER`].
     pub fn busy(&self, now: Instant) -> bool {
-        self.latency(now) || self.bulk()
+        self.last
+            .is_some_and(|last| now.duration_since(last) < RETURN_AFTER)
     }
 }
 
@@ -72,42 +34,18 @@ mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
-    /// **Busy at the first latency unit, free ten minutes after the last**: a
-    /// person reading between turns keeps the card busy.
+    /// **Busy at the first live conversation, free two minutes after the
+    /// last**: a person reading between turns keeps the card busy.
     #[test]
-    fn latency_is_busy_at_once_and_free_slowly() {
+    fn busy_at_once_and_free_two_minutes_after() {
         let t0 = Instant::now();
         let mut b = Busy::default();
-        b.observe(t0, false, false);
+        b.observe(t0, false);
         assert!(!b.busy(t0));
-        b.observe(t0 + 5 * S, true, false);
-        assert!(b.latency(t0 + 5 * S));
-        b.observe(t0 + 10 * S, false, false);
-        assert!(b.busy(t0 + 10 * 60 * S), "within the linger");
-        b.observe(t0 + 605 * S, false, false);
-        assert!(!b.busy(t0 + 605 * S), "ten minutes after the last unit");
-    }
-
-    /// **Bulk is busy once it has held a minute, and free five minutes after
-    /// it empties**: a single re-ingest moves nothing, and a pause between
-    /// units does not end it.
-    #[test]
-    fn bulk_holds_a_minute_and_lingers_five() {
-        let t0 = Instant::now();
-        let mut b = Busy::default();
-        b.observe(t0, false, true);
-        b.observe(t0 + 30 * S, false, true);
-        assert!(!b.bulk(), "thirty seconds is a re-ingest");
-        b.observe(t0 + 35 * S, false, false);
-        b.observe(t0 + 40 * S, false, true);
-        b.observe(t0 + 95 * S, false, true);
-        assert!(!b.bulk(), "the minute restarts after an empty look");
-        b.observe(t0 + 100 * S, false, true);
-        assert!(b.bulk(), "held a minute");
-        b.observe(t0 + 105 * S, false, false);
-        b.observe(t0 + 300 * S, false, false);
-        assert!(b.bulk(), "empty, but within the linger");
-        b.observe(t0 + 405 * S, false, false);
-        assert!(!b.bulk(), "five minutes empty");
+        b.observe(t0 + 5 * S, true);
+        assert!(b.busy(t0 + 5 * S));
+        b.observe(t0 + 10 * S, false);
+        assert!(b.busy(t0 + 124 * S), "within two minutes of the last");
+        assert!(!b.busy(t0 + 125 * S), "two minutes after the last");
     }
 }

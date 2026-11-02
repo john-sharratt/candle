@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use cluster::gateway::upgrades::{CANARY_DEFAULT, GRACE_DEFAULT};
 use cluster::gateway::APPS;
+use cluster::machines::MachineTable;
 use serde::Deserialize;
 
 use crate::auth::Roles;
@@ -124,6 +125,16 @@ pub struct Cluster {
     /// other agent can run it, or when the job names them.
     #[serde(default)]
     pub standby_agents: Vec<String>,
+    /// The machine table, `host/machines.yaml` — the one file every daemon
+    /// compiles in (`host::machines::MACHINES`), so the gateway places work by
+    /// the same table the members size themselves by
+    /// (`docs/static_placement.md` §2). Resolved against this config and read
+    /// into [`machines`](Self::machines); named but missing or unparseable is
+    /// fatal, since a gateway with no table gives every machine no work.
+    pub machines_file: PathBuf,
+    /// What each machine takes, from [`machines_file`](Self::machines_file).
+    #[serde(skip)]
+    pub machines: MachineTable,
 }
 
 /// One peer gateway in `cluster.peers`.
@@ -689,6 +700,21 @@ impl Config {
                     ops.file = base.join(&ops.file);
                 }
             }
+            if cluster.machines_file.is_relative() {
+                cluster.machines_file = base.join(&cluster.machines_file);
+            }
+            let text = std::fs::read_to_string(&cluster.machines_file).with_context(|| {
+                format!(
+                    "reading the machine table {}",
+                    cluster.machines_file.display()
+                )
+            })?;
+            cluster.machines = MachineTable::from_yaml(&text).with_context(|| {
+                format!(
+                    "parsing the machine table {}",
+                    cluster.machines_file.display()
+                )
+            })?;
             // Peers share certificates through the ACME store, which only a
             // gateway with a TLS entrance has; its node id lives there too.
             if !cluster.peers.is_empty() && self.server.tls.is_none() {
@@ -934,7 +960,10 @@ sites:
     /// group key; the key's path resolves against the config.
     #[test]
     fn a_cluster_route_needs_an_app_an_upstream_and_a_key() {
-        let ok = "cluster: {group_key_file: \"secrets/group.key\"}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n";
+        let ok = &format!(
+            "cluster: {{group_key_file: \"secrets/group.key\", {}}}\nsites:\n  - name: a\n    default: true\n    api:\n      - {{prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}}\n",
+            machines_file()
+        );
         let c = Config::from_yaml(ok, Path::new("/srv/web")).expect("valid");
         assert_eq!(c.sites[0].api[0].cluster.as_deref(), Some("zend"));
         let cluster = c.cluster.clone().unwrap();
@@ -997,14 +1026,68 @@ sites:
         );
         for bad in [
             // No such app.
-            "cluster: {group_key_file: k}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: other}\n",
+            format!("cluster: {{group_key_file: k, {}}}\nsites:\n  - name: a\n    default: true\n    api:\n      - {{prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: other}}\n", machines_file()),
             // Nowhere to go while no member is ready.
-            "cluster: {group_key_file: k}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: local, cluster: zend}\n",
+            format!("cluster: {{group_key_file: k, {}}}\nsites:\n  - name: a\n    default: true\n    api:\n      - {{prefix: /, upstream: local, cluster: zend}}\n", machines_file()),
             // No key for a member to prove.
-            "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n",
+            "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n".to_string(),
         ] {
-            assert!(Config::from_yaml(bad, Path::new(".")).is_err(), "{bad}");
+            assert!(Config::from_yaml(&bad, Path::new(".")).is_err(), "{bad}");
         }
+    }
+
+    /// `machines_file: '<the shipped machine table>'`, for a config read
+    /// against a base where no table lies.
+    fn machines_file() -> String {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../host/machines.yaml");
+        format!("machines_file: '{}'", shipped.display())
+    }
+
+    /// **A cluster names its machine table, and the table is read**: a block
+    /// without one, a table missing, or one that does not parse is refused,
+    /// since a gateway with no table gives every machine no work. The shipped
+    /// config names the table every daemon compiles in.
+    #[test]
+    fn a_cluster_reads_its_machine_table() {
+        let site = "sites:\n  - {name: a, roots: ['.'], default: true}\n";
+        let c = Config::from_yaml(
+            &format!(
+                "cluster: {{group_key_file: k, {}}}\n{site}",
+                machines_file()
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        let table = c.cluster.unwrap().machines;
+        assert!(table.conversations("BlackWorld").is_some(), "{table:?}");
+
+        for bad in [
+            "cluster: {group_key_file: k}\n".to_string(),
+            "cluster: {group_key_file: k, machines_file: absent.yaml}\n".to_string(),
+        ] {
+            assert!(
+                Config::from_yaml(&format!("{bad}{site}"), Path::new(".")).is_err(),
+                "{bad}"
+            );
+        }
+        let dir = tmpdir();
+        std::fs::write(dir.join("machines.yaml"), "M:\n  power: 3\n").unwrap();
+        assert!(Config::from_yaml(
+            &format!("cluster: {{group_key_file: k, machines_file: machines.yaml}}\n{site}"),
+            &dir
+        )
+        .is_err());
+
+        let text = include_str!("../web.yaml");
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("machines_file:"))
+            .expect("web.yaml names a machine table");
+        let rel = line["machines_file:".len()..].trim().trim_matches('"');
+        let shipped =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap();
+        assert_eq!(shipped, include_str!("../../host/machines.yaml"));
     }
 
     /// Peers are listed by URL, with the name a LAN address is verified
@@ -1013,7 +1096,10 @@ sites:
     #[test]
     fn peers_need_the_tls_entrance() {
         let site = "sites:\n  - {name: a, roots: ['.'], default: true}\n";
-        let peers = "cluster: {group_key_file: k, peers: [{url: \"https://192.168.0.6:9443\", name: tokera.com}, {url: \"https://gw2.tokera.com\"}]}\n";
+        let peers = &format!(
+            "cluster: {{group_key_file: k, {}, peers: [{{url: \"https://192.168.0.6:9443\", name: tokera.com}}, {{url: \"https://gw2.tokera.com\"}}]}}\n",
+            machines_file()
+        );
         let tls = "server:\n  tls: {bind: \"0.0.0.0:9443\", acme: {store: acme}}\n";
         let c = Config::from_yaml(&format!("{tls}{peers}{site}"), Path::new(".")).unwrap();
         assert_eq!(

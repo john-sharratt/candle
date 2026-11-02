@@ -220,6 +220,10 @@ cluster:
   # other agent can run it, or when the job names them. AlienWorld is the
   # laptop, which runs an agent and no model member.
   standby_agents: ["AlienWorld"]
+  # What each machine takes — conversations, pictures, its share of the cast
+  # (docs/static_placement.md §2): the table every daemon compiles in, so the
+  # gateway places by the same file the members size themselves by.
+  machines_file: "../host/machines.yaml"
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────

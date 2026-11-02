@@ -10,6 +10,7 @@ mod handover;
 mod member;
 mod pick;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use applied_set::AppliedSet;
@@ -18,18 +19,15 @@ use super::agents::named_standby;
 use super::claims::Claims;
 use crate::dispatch::RouteTable;
 use crate::frame::{Capacity, ClaimInfo, MemberInfo};
+use crate::machines::MachineTable;
 use handover::Handover;
 
-pub use cards::{CardKey, CardLoad, Cards, Fences, HOSTING_APP, LATENCY_APP};
+pub use cards::{CardKey, CardLoad, Cards, HOSTING_APP, LATENCY_APP, MODEL_APPS};
 pub use member::{Held, MemberView, PeerAsk, SYNC_SLACK};
 pub use pick::is_errand;
 
 #[cfg(test)]
 use super::agents::{Choice, Need};
-#[cfg(test)]
-use super::placement::{
-    finish_us, step_with_us, token_ns_with, TurnSize, NOMINAL_PROMPT_TOKENS, NOMINAL_REPLY_TOKENS,
-};
 #[cfg(test)]
 use crate::dispatch::Dispatch;
 #[cfg(test)]
@@ -69,8 +67,16 @@ struct AppMembers {
 #[derive(Debug, Default)]
 pub struct Registry {
     apps: HashMap<String, AppMembers>,
-    /// The plan's fences (`docs/cooperative_admission.md` §4.4).
-    fences: Fences,
+    /// What each machine takes (`docs/static_placement.md` §2). A machine it
+    /// does not name is given no work.
+    machines: MachineTable,
+    /// The cards held for a draw waiting at the gateway for their turns to end
+    /// (`docs/static_placement.md` §4), as the hub last derived them from its
+    /// queue.
+    reserved: BTreeSet<CardKey>,
+    /// The machine the round robin last gave a unit to (§3.2), as
+    /// `(rank, node)`.
+    cursor: Cell<Option<(u32, u64)>>,
     /// The hosts whose agents stand by (§11.3): given a job only when no
     /// other agent can run it.
     standby: BTreeSet<String>,
@@ -84,6 +90,21 @@ impl Registry {
     /// Name the hosts whose agents stand by.
     pub fn set_standby(&mut self, hosts: BTreeSet<String>) {
         self.standby = hosts;
+    }
+
+    /// The machine table placement and the plan read from now on.
+    pub fn set_machines(&mut self, machines: MachineTable) {
+        self.machines = machines;
+    }
+
+    pub fn machines(&self) -> &MachineTable {
+        &self.machines
+    }
+
+    /// Hold `cards` for the draws waiting for them: they take no new unit but a
+    /// draw until the hub says otherwise.
+    pub fn set_reserved(&mut self, cards: BTreeSet<CardKey>) {
+        self.reserved = cards;
     }
 
     /// Whether the agents on `host` stand by.
@@ -138,7 +159,6 @@ impl Registry {
         m.capacity = Some(capacity);
         // What it was handed is in what it reports now.
         m.handed = 0;
-        m.placed = 0;
         changed
     }
 
@@ -163,7 +183,7 @@ impl Registry {
             m.applied = applied;
         }
         // A release every placeable member now holds places like no release
-        // at all — `Best` among them — so it is forgotten here rather than
+        // at all — like any unit among them — so it is forgotten here rather than
         // waiting for its key's next request, which may never come: a
         // conversation not resumed, a picture never edited. What stands is
         // only what is still replicating.
@@ -294,7 +314,6 @@ impl Registry {
     pub fn begin(&mut self, app: &str, node: u64, draw: bool) -> Option<u64> {
         let m = self.app(app).members.get_mut(&node)?;
         m.in_flight += 1;
-        m.placed += 1;
         if draw {
             m.drawing += 1;
         }

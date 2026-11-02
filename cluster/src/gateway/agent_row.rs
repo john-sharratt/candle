@@ -135,7 +135,6 @@ mod tests {
             in_flight: 0,
             drawing: 0,
             handed: 0,
-            placed: 0,
             closing: false,
         };
         assert_eq!(

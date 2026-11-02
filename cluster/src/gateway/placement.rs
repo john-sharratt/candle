@@ -1,36 +1,41 @@
-//! Which of the members a request may go to receives it: the placement policy
-//! (§5.3, `docs/cooperative_admission.md` §4). The registry decides who is
-//! eligible — ready, holding the key's state, within a draw's reach — and
-//! hands the pool here, with what is placed on each card; this decides among
+//! Which of the members a request may go to receives it: the static placement
+//! of `docs/static_placement.md`. The registry decides who is eligible — ready,
+//! holding the key's state, within a draw's reach — and hands the pool here,
+//! with what is placed on each card and the machine table; this decides among
 //! them, or says that none has room.
 
-mod best;
+mod conversation;
 mod draw;
-mod finish;
+mod least;
 mod reach;
 mod room;
-mod turn_size;
 
-#[cfg(test)]
-pub(crate) use finish::token_ns_with;
-pub(crate) use finish::{finish_us, step_with_us};
 pub(crate) use reach::{guest_reach, within_reach};
-pub(crate) use room::{has_room, held, width};
-pub use turn_size::TurnSize;
-#[cfg(test)]
-pub use turn_size::{NOMINAL_PROMPT_TOKENS, NOMINAL_REPLY_TOKENS};
+pub(crate) use room::has_room;
 
-use best::best_of;
+use std::cell::Cell;
+use std::collections::BTreeSet;
+
+use conversation::conversation_of;
 use draw::draw_of;
+pub(crate) use draw::draw_target;
+use least::least_of;
 
-use super::registry::{CardKey, CardLoad, Cards, Fences, MemberView};
-use crate::frame::Capacity;
+use super::registry::{CardKey, CardLoad, Cards, MemberView, MODEL_APPS};
+use crate::machines::MachineTable;
 
 /// What a placement weighs beside the members themselves: what the gateway has
-/// placed on each card, and the share of each card the fence holds back.
+/// placed on each card, what each machine takes, the cards held for a waiting
+/// draw, and where the round robin stands.
 pub(crate) struct Weigh<'a> {
     pub cards: &'a Cards,
-    pub fences: &'a Fences,
+    pub machines: &'a MachineTable,
+    /// Cards held for a draw that waits for their turns to end
+    /// (`docs/static_placement.md` §4): they take no new unit but a draw.
+    pub reserved: &'a BTreeSet<CardKey>,
+    /// The machine the round robin last gave a unit to, as `(rank, node)`
+    /// (§3.2).
+    pub cursor: &'a Cell<Option<(u32, u64)>>,
 }
 
 impl Weigh<'_> {
@@ -39,9 +44,9 @@ impl Weigh<'_> {
         self.cards.get(&CardKey::of(m)).copied().unwrap_or_default()
     }
 
-    /// The thousandths of `m`'s card the fence holds back.
-    pub fn fence(&self, m: &MemberView) -> u32 {
-        self.fences.get(&CardKey::of(m)).copied().unwrap_or(0)
+    /// Whether `m`'s card is held for a waiting draw.
+    pub fn reserved(&self, m: &MemberView) -> bool {
+        self.reserved.contains(&CardKey::of(m))
     }
 }
 
@@ -49,24 +54,29 @@ impl Weigh<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Placed {
     To(u64),
-    /// Every eligible card is full: the unit waits at the gateway (§4.3).
+    /// Every eligible card is full: the unit waits at the gateway (§3.4).
     Full,
     /// Nobody is eligible.
     Nobody,
 }
 
-/// The member of `pool` a request goes to: a draw by [`draw_of`], anything
-/// else by [`best_of`].
-pub(crate) fn place(pool: Vec<&MemberView>, draw: Option<u64>, weigh: &Weigh<'_>) -> Placed {
+/// The member of `pool`, members of `app`, a request goes to: a draw by
+/// [`draw_of`], any other unit of the model's apps by [`conversation_of`], and
+/// a unit of an app that runs no model by [`least_of`].
+pub(crate) fn place(
+    app: &str,
+    pool: Vec<&MemberView>,
+    draw: Option<u64>,
+    weigh: &Weigh<'_>,
+) -> Placed {
     if pool.is_empty() {
         return Placed::Nobody;
     }
-    match draw {
-        Some(_) => draw_of(pool, weigh).map_or(Placed::Nobody, Placed::To),
-        None => best_of(pool, weigh),
+    if !MODEL_APPS.contains(&app) {
+        return least_of(pool);
     }
-}
-
-fn capacity_of(m: &MemberView) -> &Capacity {
-    m.capacity.as_ref().expect("a ready member sent capacity")
+    match draw {
+        Some(_) => draw_of(pool, weigh),
+        None => conversation_of(pool, weigh),
+    }
 }

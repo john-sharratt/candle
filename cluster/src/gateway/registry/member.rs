@@ -52,11 +52,6 @@ pub struct MemberView {
     /// counts it, so a burst of jobs is spread instead of all reading the
     /// same free slot.
     pub handed: u32,
-    /// Requests handed to it since its last `CAPACITY`: prompts its reported
-    /// backlog does not hold yet. A request handed earlier is either queued,
-    /// and in that backlog, or past its prefill and decoding, and in its
-    /// decode step — so `finish_us` charges a nominal prompt for these alone.
-    pub placed: u32,
     /// Its session has ended and the socket's cleanup has not yet run its
     /// leave: no stream can open to it, so it is routed nothing. A request
     /// picked for it in that window was answered `503` while another member

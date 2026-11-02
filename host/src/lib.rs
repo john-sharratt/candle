@@ -38,6 +38,7 @@ pub mod expert_split;
 pub mod guard;
 pub mod loading;
 pub mod logs;
+pub mod machines;
 pub mod model;
 pub mod process;
 pub mod run;

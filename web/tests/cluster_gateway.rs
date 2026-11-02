@@ -23,6 +23,7 @@ use cluster::dispatch::{Dispatch, KeySource, Merge, Route, RouteTable};
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
+use cluster::machines::MachineTable;
 use cluster::member::{AppMember, Check, Identity, Link};
 use cluster::pipe::socket::{split, SocketRx, SocketTx};
 use cluster::pipe::tungstenite::Tungstenite;
@@ -325,7 +326,7 @@ async fn gateway_keyed(
 ) -> (SocketAddr, Arc<Hub>) {
     let yaml = format!(
         r#"
-cluster: {{group_key_file: "secrets/group.key"}}
+cluster: {{group_key_file: "secrets/group.key", machines_file: "../host/machines.yaml"}}
 sites:
   - name: zend
     hosts: ["code.test"]
@@ -342,6 +343,19 @@ sites:
     }])
     .unwrap();
     let hub = Hub::new(key(), "gw-test");
+    // The tests' members run on `m1` to `m9`; `m2` ranks first and is filled
+    // to two units before `m1` takes any (`docs/static_placement.md` §3.2),
+    // and the rest follow by their number.
+    let others: String = (3..=9)
+        .map(|n| format!("m{n}:\n  conversations: {{rank: {n}, min: 8}}\n"))
+        .collect();
+    hub.set_machines(
+        MachineTable::from_yaml(&format!(
+            "m1:\n  conversations: {{rank: 2, min: 8}}\n\
+             m2:\n  conversations: {{rank: 1, min: 2, max: 8}}\n{others}"
+        ))
+        .unwrap(),
+    );
     let ops_key = ops_key.map(|k| OpsKey::new(k, OPS_ADMIN));
     let router = Builder::new(cfg)
         .cluster(Gateway::with_hub_and_keys(hub.clone(), status_key, ops_key))
@@ -470,8 +484,8 @@ async fn while_every_member_loads_the_first_to_join_answers() {
     );
 }
 
-/// **Dispatch, claims and pinning** (§5.2–§5.4): `Best` takes the most
-/// powerful member; a sticky key stays with the member that claimed it;
+/// **Dispatch, claims and pinning** (§5.2–§5.4): `Best` takes the member the
+/// machine table ranks first; a sticky key stays with the member that claimed it;
 /// a body key is read from the buffered body; a page's UI requests stay on one
 /// member through its cookie, which API requests ignore; the cookie and the
 /// session token never reach a member; `x-tokera-node` is an admin's.
@@ -744,13 +758,13 @@ fn in_flight(hub: &Hub, node: &str) -> u32 {
         .map_or(0, |m| m.in_flight)
 }
 
-/// **`Best` divides power by the requests in flight** (§5.3), counted from the
-/// pick until the answer's last byte: two streams still answering on the
-/// 300-power member leave it 100 a request, level with the idle 100, so the
-/// next request goes to the other; once the clients go away the streams end,
-/// and the stronger member takes new work again.
+/// **`Best` fills the first-ranked member to its `min`, counting the requests
+/// in flight** (`docs/static_placement.md` §3.2) from the pick until the
+/// answer's last byte: two streams still answering on the member ranked first
+/// fill it to its two, so the next request goes to the other; once the clients
+/// go away the streams end, and the first-ranked member takes new work again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn best_spreads_by_the_requests_in_flight() {
+async fn best_fills_the_first_member_to_its_min() {
     let dumb = spawn(dumb_daemon()).await;
     let (gw, hub) = gateway(dumb).await;
     let a = member(gw, 1, 100);
@@ -765,7 +779,7 @@ async fn best_spreads_by_the_requests_in_flight() {
     assert_eq!(
         fetch(gw, "/v1/where").await.json()["by"],
         "member-1",
-        "300 / 3 against 100 / 1: level, and the lower node takes it"
+        "member 2 is at its min: member 1, below its own, takes it"
     );
     assert_eq!(in_flight(&hub, "0000000000000001"), 0, "that answer ended");
 

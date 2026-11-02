@@ -42,6 +42,8 @@
 //! cap: it crosses an empty lane.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+
+use crate::machines::MachineTable;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -57,9 +59,11 @@ use super::load::{Load, Picked};
 use super::log::{CoordLog, Entry};
 use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
-use super::planner::{Planned, Planner, NPC_FLOOR_PERCENT};
+use super::planner::{Planned, Planner};
 use super::queue::{Placing, Queue, RouteAt, Urgency, HOLD};
-use super::registry::{is_errand, MemberView, PeerAsk, Pick, Registry, HOSTING_APP};
+use super::registry::{
+    is_errand, CardKey, MemberView, PeerAsk, Pick, Registry, HOSTING_APP, LATENCY_APP,
+};
 use super::status::{
     mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
@@ -223,23 +227,35 @@ pub(super) fn hex(node: u64) -> String {
     format!("{node:016x}")
 }
 
-/// The plan's log lines (`docs/cooperative_admission.md` §4.6): every card on
-/// each plan, and the weights when they moved.
+/// Plan the cast now, under the state's hold, and send a changed plan to every
+/// npcd member (`docs/static_placement.md` §5).
+fn plan_in(s: &mut State, now: Instant) {
+    let views = s.registry.card_views();
+    let planned = s.planner.plan(now, &views);
+    if planned.changed {
+        for ((a, _), socket) in &s.sockets {
+            if a == HOSTING_APP {
+                let _ = socket.handle.control(Frame::Plan(PlanFrame {
+                    epoch: planned.epoch,
+                    weights: planned.weights.clone(),
+                }));
+            }
+        }
+    }
+    log_plan(&planned);
+}
+
+/// The plan's log lines (`docs/static_placement.md` §5): every card on each
+/// plan, and the weights when they moved.
 fn log_plan(planned: &Planned) {
     let cards: Vec<String> = planned
         .cards
         .iter()
-        .map(|c| {
-            format!(
-                "{:?} latency={} bulk={} busy={} fence_milli={} quarters={}/{}",
-                c.key, c.latency, c.bulk, c.busy, c.fence_milli, c.quarters, c.target
-            )
-        })
+        .map(|c| format!("{:?} latency={} busy={}", c.key, c.latency, c.busy))
         .collect();
     tracing::info!(
         target: "cluster::gateway::plan",
         epoch = planned.epoch,
-        floor_percent = NPC_FLOOR_PERCENT,
         cards = %cards.join("; "),
         "cards"
     );
@@ -532,7 +548,6 @@ impl Hub {
                 in_flight: 0,
                 drawing: 0,
                 handed: 0,
-                placed: 0,
                 closing: false,
             });
         }
@@ -1057,6 +1072,12 @@ impl Hub {
         self.state().registry.set_standby(hosts);
     }
 
+    /// The machine table placement and the plan read from now on
+    /// (`docs/static_placement.md` §2).
+    pub fn set_machines(&self, machines: MachineTable) {
+        self.state().registry.set_machines(machines);
+    }
+
     /// `raise-floor` (§12.4): end `app`'s grace period now.
     pub fn raise_floor(&self, app: &str) -> Result<(), String> {
         if !rolls_out(app) {
@@ -1304,6 +1325,7 @@ impl Hub {
             registry,
             upgrades,
             sockets,
+            queue,
             ..
         } = s;
         // A session that has ended is still listed until its socket's cleanup
@@ -1321,6 +1343,15 @@ impl Hub {
                 return Picked { pick, load: None };
             }
         }
+        // A draw waiting for the units on its card to end holds that card: it
+        // takes no new unit but a draw until the draw is placed or gone
+        // (`docs/static_placement.md` §4). Derived from the queue as it stands,
+        // so a reservation ends with the draw that made it.
+        let reserved: BTreeSet<CardKey> = queue
+            .waiting()
+            .filter_map(|ask| registry.draw_target(&ask.app, ask.draw?))
+            .collect();
+        registry.set_reserved(reserved);
         let canary = upgrades.canary(app);
         let peer_of = sender.filter(|_| matches!(dispatch, Dispatch::Best));
         let pick = match (canary, peer_of) {
@@ -1348,14 +1379,27 @@ impl Hub {
                 .map(|session| Load::new(Arc::clone(self), app, node, session, draw.is_some())),
             _ => None,
         };
+        // **The first live conversation on a card plans the cast at once**
+        // (`docs/static_placement.md` §5.3): its characters leave within a turn,
+        // not on the next tick.
+        if let (Pick::Member(node), true, true) = (&pick, work, app == LATENCY_APP) {
+            let card = registry.member(app, *node).map(CardKey::of);
+            let now = Instant::now();
+            if card.is_some_and(|c| !s.planner.busy(&c, now)) {
+                plan_in(s, now);
+            }
+        }
         Picked { pick, load }
     }
 
     /// [`Self::pick_from`], waiting at the gateway while every card the unit
-    /// may go to is full (`docs/cooperative_admission.md` §4.3): answered with
-    /// the pick once a card has room, most urgent and then oldest first, or
-    /// `None` once the unit has waited [`HOLD`].
+    /// may go to is full (`docs/static_placement.md` §3.4): answered with the
+    /// pick once a card has room, most urgent and then oldest first. A
+    /// conversation and a draw wait as long as their client does; any other
+    /// unit is answered `None` once it has waited [`HOLD`].
     pub async fn place(self: &Arc<Self>, placing: Placing) -> Option<Picked> {
+        let urgency = Urgency::of(&placing.app, placing.sender);
+        let draw = placing.draw.is_some();
         let (seq, mut rx) = {
             let mut s = self.state();
             let picked = self.pick_in(
@@ -1372,7 +1416,6 @@ impl Hub {
                 return Some(picked);
             }
             let (tx, rx) = oneshot::channel();
-            let urgency = Urgency::of(&placing.app, placing.sender);
             let app = placing.app.clone();
             let seq = s.queue.push(placing, Instant::now(), tx);
             tracing::info!(
@@ -1384,6 +1427,11 @@ impl Hub {
             );
             (seq, rx)
         };
+        // A conversation, and a draw — a card draws one at a time, so a burst
+        // waits here for the cards to come free — wait as long as their client.
+        if urgency == Urgency::Latency || draw {
+            return rx.await.ok();
+        }
         let since = Instant::now();
         match timeout(HOLD, &mut rx).await {
             Ok(Ok(picked)) => Some(picked),
@@ -1410,39 +1458,26 @@ impl Hub {
         self.state().queue.len()
     }
 
-    /// Plan the movable work, once each [`super::planner::PLAN_EVERY`]
-    /// whichever socket's tick asks (§4.4): the fences go to latency
-    /// placement at once, and a changed plan to every npcd member.
+    /// Plan the cast, once each [`super::planner::PLAN_EVERY`] whichever
+    /// socket's tick asks (`docs/static_placement.md` §5): a changed plan goes
+    /// to every npcd member.
     pub(super) fn plan_tick(&self) {
-        let planned = {
-            let mut s = self.state();
-            let now = Instant::now();
-            if !s.planner.due(now) {
-                return;
-            }
-            let views = s.registry.card_views();
-            let planned = s.planner.plan(now, &views);
-            s.registry.set_fences(planned.fences.clone());
-            if planned.changed {
-                for ((a, _), socket) in &s.sockets {
-                    if a == HOSTING_APP {
-                        let _ = socket.handle.control(Frame::Plan(PlanFrame {
-                            epoch: planned.epoch,
-                            weights: planned.weights.clone(),
-                        }));
-                    }
-                }
-            }
-            planned
-        };
-        log_plan(&planned);
+        let mut s = self.state();
+        let now = Instant::now();
+        if !s.planner.due(now) {
+            return;
+        }
+        plan_in(&mut s, now);
     }
 
-    /// Place every waiting unit that now fits (§4.3), most urgent and then
+    /// Place every waiting unit that now fits (§3.4), most urgent and then
     /// oldest first; one that still fits nowhere waits on, and does not hold
-    /// back those behind it that fit elsewhere. Called whenever a card's count
-    /// falls and whenever a `CAPACITY` arrives. A unit placed for a client gone
-    /// meanwhile is uncounted as its pick drops — here, outside the state.
+    /// back those behind it that fit elsewhere. Each is taken out alone, so the
+    /// rest go on holding their cards while it is placed — a draw waiting for
+    /// a card keeps it from the conversations released ahead of it. Called
+    /// whenever a card's count falls and whenever a `CAPACITY` arrives. A unit
+    /// placed for a client gone meanwhile is uncounted as its pick drops —
+    /// here, outside the state.
     pub(super) fn release_waiting(self: &Arc<Self>) {
         let mut placed = Vec::new();
         {
@@ -1450,7 +1485,10 @@ impl Hub {
             if s.queue.len() == 0 {
                 return;
             }
-            for w in s.queue.take_in_order() {
+            for seq in s.queue.order() {
+                let Some(w) = s.queue.take(seq) else {
+                    continue;
+                };
                 let picked = self.pick_in(
                     &mut s,
                     &w.ask.app,

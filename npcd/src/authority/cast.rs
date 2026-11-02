@@ -132,7 +132,17 @@ impl Runtime {
                     }
                     continue;
                 }
+                let moving = lease.is_some_and(|l| l.next.is_some());
                 match (mine, awake) {
+                    // **Held here, not running, and asked to move: handed back
+                    // now**, with no turn to wait for. Woken first, it waited on
+                    // its last holder's writes before it could move on; never
+                    // woken, it was never handed back, and ran nowhere.
+                    (true, false) if moving && !handing => {
+                        if self.standing.begin_handing(npc) {
+                            self.hand_back(&world, npc);
+                        }
+                    }
                     (true, false) if !handing => {
                         let ready = lease
                             .and_then(|l| l.after)
@@ -153,7 +163,6 @@ impl Runtime {
                         }
                     }
                     (true, true) => {
-                        let moving = lease.is_some_and(|l| l.next.is_some());
                         if moving && !self.standing.turning(npc) && self.standing.begin_handing(npc)
                         {
                             self.hand_back(&world, npc);

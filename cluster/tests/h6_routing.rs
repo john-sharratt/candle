@@ -5,7 +5,6 @@
 //! aggregate with one member past its deadline, runs against the gateway's
 //! HTTP in `web/tests/h6_aggregate.rs`.)
 
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -15,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use cluster::dispatch::{Dispatch, Merge};
 use cluster::frame::{BuildId, Capacity, Epoch, MemberState};
 use cluster::gateway::{MemberView, Pick, Registry};
+use cluster::machines::MachineTable;
 
 const DECISIONS: usize = 100_000;
 const BUDGET: Duration = Duration::from_secs(1);
@@ -45,15 +45,15 @@ impl Model {
     }
 
     /// Nothing is in flight here — the registry is asked directly, never
-    /// through a hub — so each share of power is the whole power, and every
-    /// card has room: a card with nothing placed on it is never full
-    /// (`docs/cooperative_admission.md` §4.2), whatever its slots say. The
-    /// highest power; of equals, an idle one; then the lowest node.
+    /// through a hub — so every machine is below its `min` and the
+    /// deterministic fill (`docs/static_placement.md` §3.2) gives the unit to
+    /// the lowest-ranked ready member, whatever its power, idleness and slots
+    /// say; of equal ranks, the lowest node.
     fn best(&self) -> Option<u64> {
-        let ready = self.ready();
-        let mut pool: Vec<&(u64, Cap)> = ready.iter().collect();
-        pool.sort_by_key(|(n, c)| (Reverse(c.power), Reverse(c.idle), *n));
-        pool.first().map(|(n, _)| *n)
+        self.ready()
+            .iter()
+            .map(|(n, _)| *n)
+            .min_by_key(|n| (rank(*n), *n))
     }
 
     fn rr(&mut self) -> Option<u64> {
@@ -96,6 +96,20 @@ impl Model {
     }
 }
 
+/// Node `n`'s machine's rank: every rank distinct, and in no order of the
+/// nodes.
+fn rank(node: u64) -> u64 {
+    node * 7 % 13
+}
+
+/// The table naming every machine the nodes run on, each ranked by [`rank`].
+fn table() -> MachineTable {
+    let yaml: String = (1..=12u64)
+        .map(|n| format!("m{n}:\n  conversations: {{rank: {}, min: 1}}\n", rank(n)))
+        .collect();
+    MachineTable::from_yaml(&yaml).unwrap()
+}
+
 fn view(node: u64, session: u64) -> MemberView {
     MemberView {
         node,
@@ -120,7 +134,6 @@ fn view(node: u64, session: u64) -> MemberView {
         in_flight: 0,
         drawing: 0,
         handed: 0,
-        placed: 0,
         closing: false,
     }
 }
@@ -147,6 +160,7 @@ fn h6_routing_decisions_match_the_reference() {
     let started = Instant::now();
     let mut rng = StdRng::seed_from_u64(6);
     let mut registry = Registry::new();
+    registry.set_machines(table());
     let mut model = Model::default();
     let mut session = 0u64;
     let mut ms = 1u64;

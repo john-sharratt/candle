@@ -1,0 +1,43 @@
+# The machine table (docs/static_placement.md §2): what each machine of the
+# deployment takes. One file, identical on every machine: the daemons compile
+# it in (`host::machines::MACHINES`) and the gateway reads it
+# (`cluster.machines_file` in web/web.yaml), so the two cannot disagree.
+#
+# A machine is named as its operating system names itself — the host name its
+# members report — in any case. One the table does not name is admitted and
+# given no work.
+#
+#   conversations       rank — the order the deterministic fill visits machines
+#                       in, lower first; min — how many live units it is filled
+#                       to before any round robin; max — the most it takes
+#                       (min when absent). Absent: it takes none.
+#   pictures            its picture preference, lower first. Absent: it draws
+#                       nothing.
+#   characters          its share of the cast while it is free of
+#                       conversations. Absent or 0: it hosts no character.
+#   pinned_experts_gib  how much host RAM its expert cache may page-lock.
+#                       Absent: derived from the machine
+#                       (candle-core/src/vram/host_probe.rs).
+#
+# Changing a number is changing the deployment: it takes a restart of the
+# gateway and a build of the daemons.
+
+# The RTX PRO 5000 (72 GB), 194 GB of host RAM, PCIe 5.0: conversations first,
+# and most of the cast while nothing is live.
+BlackWorld:
+  conversations: {rank: 1, min: 4, max: 8}
+  pictures: 2
+  characters: 3
+
+# The RTX 3090 (24 GB), 64 GB of host RAM, PCIe 3.0: one conversation once
+# BlackWorld holds four, pictures first, and the cast while BlackWorld is busy.
+# Its expert pin is stated: derived, it took 47.9 GB of the 64 and the engine's
+# own heap paged at ~20,000 pages a second (2026-11-02).
+WhiteWorld:
+  conversations: {rank: 2, min: 1, max: 2}
+  pictures: 1
+  characters: 1
+  pinned_experts_gib: 28
+
+# The laptop: an agent, no model member.
+AlienWorld: {}

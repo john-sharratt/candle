@@ -79,53 +79,20 @@ sending, provided that member already holds the turn before it (§2.2).
 
 ## 2. Mechanisms
 
-### 2.1 Advertised load figures
+### 2.1 Where a turn goes: the machine table
 
-Each member says in `CAPACITY`, as it runs, what more work would cost it, from
-its own measurements (§1):
+A turn goes where the deployment's machine table says (`docs/static_placement.md`
+§3): each machine filled to its `min` in rank order, then round to each one's
+`max`, then a wait at the gateway. The members still learn and advertise their
+rates in `CAPACITY` (`prefill_tok_s`, `decode_step_next_us`, `decode_step_wide_us`,
+`prefill_tok_s_wide`, `prefill_backlog`); their own admission uses them, and the
+status page shows them. Placement reads none of them.
 
-- **decode-heavy and prefill-heavy** — how loaded it is on each: the rows it is
-  decoding and the prompt tokens it has queued;
-- **the marginal value of one more of each** — what one more decoding turn,
-  and one more prompt, would do to its own throughput at its current
-  residency, from its own fitted curve.
-
-The gateway compares these numbers and nothing else. It models nothing of a
-member's insides; the member that knows its card is the one that says what
-the card can do.
-
-How it is built (protocol 4): `CAPACITY` carries `prefill_backlog` (queued
-prompt tokens), `prefill_tok_s`, `decode_step_next_us`, `decode_step_wide_us`
-and `prefill_tok_s_wide`. The last four are what the member's admission has
-learned (`phase_ring::learned_rates`): the prefill rate at the width it runs,
-the decode step with one more row, and the decode step and prefill rate with
-`PLACEMENT_WIDE` (16) more rows. The gateway's `Best` estimates each
-candidate's finish for a turn of the size the members report (protocol 5:
-`CAPACITY`'s `prompt_tokens` and `reply_tokens`, the mean prompt of the turns a
-member's scheduler begins and the reply such a turn decodes — one size for every
-candidate, the mean of what they report, 2,048 and 512 where none has learned
-one): the backlog, plus one prompt for each
-request handed to it since its last `CAPACITY` and for this one, at the time
-per token those requests and this one leave it; then the reply at the step
-they make, over as many steps as the reply takes at the tokens a step commits
-on that card (`tokens_per_step_milli`, above a token where it speculates; a
-token when unlearned) — per card, since what a step commits is the card's
-where the turn's size is the turn's. Both are on the line through the one-more and wide figures — time
-per token for prefill, so the extension never reaches a rate of zero —
-extended past the wide point, and flat when the wide figure is no slower. A
-request handed earlier is not charged again: it is queued, and in the
-backlog, or decoding, and in the step. A card that copies every routed expert
-steepens with width, so a burst priced at its idle step alone lands whole on
-it (run 24's shift-decode-2: 48 turns at 41.2 chunks/s, the step 70 ms
-advertised and 450–580 ms delivered); and a placed turn decodes beside the
-prompts behind it, so prefill slows too (run 35's heavy-read: 24 turns charged
-at an idle 1,771 tok/s that then drained 213–463, all on one member). It picks the soonest
-(`gateway/registry.rs`, `finish_us`). A candidate that has not learned both
-rates — one fresh from a restart — is probed: it takes a turn while it is
-answering none, one at a time, which is what it learns from, and every other
-turn goes by finish among those that have. Ranked by power instead, run 36's
-restarted WhiteWorld took 12 of heavy-decode's 48 turns at 25–45 s each
-against BlackWorld's 10–18 s. With none learned, it ranks by power per request.
+Placement by advertised finish, which this replaced, was undone by the figures it
+read. On 2026-11-02 a live turn went to WhiteWorld on a predicted 28.3 s against
+BlackWorld's 31.0 s: BlackWorld had been charged 5,074 tokens of the characters'
+work, which the live turn outranks, and WhiteWorld — paging — advertised a prefill
+rate it no longer had. The turn took seven minutes.
 
 ### 2.2 A lease per turn, placed among the replicated
 
@@ -277,36 +244,33 @@ conversation, one turn of a character, one ingest unit, or one draw. The rules
 are the gateway's alone: they decide **where** a unit runs and never **how** a
 card runs it. A card's admission and its priority bands
 (`DecodePriority`) are a black box to them. When two rules disagree, the lower
-number wins.
+number wins. The policies §3 compared placed by measured figures; what places
+now is the machine table (rule 2).
 
 1. **Place only on current state, and only at boundaries.** A unit goes only to
    a member that holds its state through its latest turn, and runs there to its
    end.
-2. **The soonest finish wins.** A unit goes to the eligible card that would
-   finish it soonest.
+2. **The machine table decides.** A unit goes where `host/machines.yaml` puts it
+   (`docs/static_placement.md` §3–§4): the fill to each machine's `min` in rank
+   order, then round to its `max`; a draw by the picture preference.
 3. **Never overfill a card.** Every unit on a card counts against it, whichever
    app placed it. Work that fits on no card waits at the gateway, most urgent
    first.
-4. **Latency first, behind a fence.** Latency work takes the cards it needs.
-   Movable work — characters, ingest — fills what is left. The NPC floor's
-   capacity is fenced off, and latency work never takes it.
-5. **Change slowly.** A card's share of movable work moves only after its
-   trigger has held for a while, and in coarse steps.
-
-A draw needs no rule of its own: it is a unit only some cards can take (§5.3 of
-`replicated_substrate.md`, reach), and a card counts as full while it draws, so
-rule 2 sends it to the strongest card not drawing. Its content check is a
-latency unit placed away from the card that draws.
+4. **Conversations first.** A card busy with a live conversation hosts no
+   character while a free card can (`docs/static_placement.md` §5).
+5. **Move only on what has held.** A member's fitness to host must hold for a
+   minute before the cast moves for it; a card stays busy for two minutes after
+   its last conversation.
 
 ### 4.1 Where each rule is enforced
 
 | Rule | Enforced by |
 |---|---|
-| 1 | zend: a claim per turn, the next turn only among members holding the conversation complete (§2.2). npcd: a character moves only at its turn boundary (`hand_back`), and the plan (§4.4) lends nothing to a member that is syncing or lagging. A picture goes among the members holding it. |
-| 2 | `Best` by finish (`cluster/src/gateway/placement/best.rs`, §2.1); a draw by `placement/draw.rs` |
+| 1 | zend: a claim per turn, the next turn only among members holding the conversation complete (§2.2). npcd: a character moves only at its turn boundary (`hand_back`), and the plan lends nothing to a member that is syncing or lagging. A picture goes among the members holding it. |
+| 2 | `cluster/src/gateway/placement/{conversation,draw}.rs` |
 | 3 | the card count and the queue (§4.2, §4.3) |
-| 4 | the planner (§4.4) |
-| 5 | the planner's hysteresis (§4.5) |
+| 4 | the planner (`cluster/src/gateway/planner.rs`) |
+| 5 | the planner's `SETTLE` and `RETURN_AFTER` |
 
 ### 4.2 A card, and when it is full
 
@@ -318,30 +282,12 @@ gateway — is a card of its own.
 
 **What a card has placed** is the sum over its members, across every app, of
 the requests the gateway has handed them and they have not finished
-(`in_flight`), of those handed since their last `CAPACITY` (`placed`), and of
-the draws among them (`drawing`).
+(`in_flight`), and of the draws among them (`drawing`).
 
-**A card is full for a unit when:**
-
-- it is drawing, for anything but a draw (a draw holds the card's admission
-  while it runs); or
-- one more row would take its decode step past the **latency target**,
-  `LATENCY_STEP_US` = 500 ms — two tokens a second for every stream on the card.
-  Loaded cards run well above an idle gate's step (run 24's BlackWorld at 364 ms
-  with 48,918 tokens queued, run 35's WhiteWorld at 208 ms for one row) and still
-  serve; a stream slower than two tokens a second serves nobody. The step with
-  `n` more rows is the line
-  through the card's advertised one-more and sixteen-more steps (§2.1,
-  `step_with_us`). The rows the card may take beyond what it decodes now are the
-  largest `n` that stays under the target, less the rows the fence holds back
-  (§4.4), less the units handed to it since its last `CAPACITY`. A card whose
-  wide step is no slower than its one-more step has no width limit from the
-  line; its free slots (`slots_free`) bound it as before.
-
-**A card with nothing placed is never full** — except while it draws. Its own
-background work can slow its step past the target, and the gateway cannot see
-inside the card to tell; refusing it the first unit would leave that unit
-waiting on work the planner is about to move away.
+**A card is full for a unit when** it is drawing (a draw holds the card's
+admission while it runs), when it is held for a waiting draw, or when its
+machine's units of work — `in_flight` less the draws — have reached the
+machine's `max` (`docs/static_placement.md` §3.2).
 
 **A key's holder is never refused.** A request whose key a member holds goes to
 it (rule 1 before rule 3). It counts against the card, and is never queued.
@@ -355,60 +301,47 @@ gateway:
   live chat, a passthrough or MCP conversation — and a member's ask for a peer
   (a draw's content check). **Deadline** is every other request.
 - **Release.** Whenever a card's count falls (an answer ends) or a `CAPACITY`
-  arrives, the gateway walks the queue in order and places each unit that now
-  fits. One that still does not fit stays, and does not hold back those behind
-  it that fit elsewhere.
-- **Bound.** A unit that has waited 30 s — the catch-up hold of §5.4 — is
-  answered `503` with `Retry-After`. A client that goes away is dropped from
-  the queue; a unit placed for a client already gone is uncounted at once.
+  arrives, the gateway takes each waiting unit out in order and places it. One
+  that still does not fit is put back, and does not hold back those behind it
+  that fit elsewhere.
+- **Bound.** A conversation and a draw wait as long as their client does. Any
+  other unit that has waited 30 s — the catch-up hold of §5.4 — is answered
+  `503` with `Retry-After`. A client that goes away is dropped from the queue;
+  a unit placed for a client already gone is uncounted at once.
 
 ### 4.4 The plan
 
-Every 5 s the gateway plans the movable work. For each card it reads:
+The gateway plans the cast every 5 s, and at once when a card is handed its
+first live conversation. Each npcd member is weighed by its machine's
+`characters` share; a card busy with a live conversation lends nothing while a
+free card can host, and every card lends by its share when every hosting card is
+busy. The full rule is `docs/static_placement.md` §5.
 
-- **latency load**: the zend requests in flight on it;
-- **bulk load**: the ingest zend's member on that card reports outstanding
-  (`CAPACITY.bulk_backlog`, protocol 7);
-- **power**, as `CAPACITY` says (§5.3 of `replicated_substrate.md`).
-
-A card is **busy** when its latency or bulk load has held (§4.5). Then:
-
-- **The fence** is the cards with the least latency load, taken until their
-  power reaches the **NPC floor**, `NPC_FLOOR_PERCENT` = 15% of the cluster's.
-  On a fenced card, latency work may take only the share of its width the floor
-  does not need: the floor's power over the card's, as rows held back from §4.2.
-- **The weights.** A card that is not busy lends characters by its whole power.
-  A busy card lends nothing — unless it is fenced, when it lends its fence share,
-  or unless every card is busy, when every card lends by its whole power and
-  characters run beneath the conversations everywhere. A member syncing or
-  lagging lends nothing (rule 1), and neither does one whose `CAPACITY` says
-  `process_loading`: another tenant of its process is still loading — zend
-  priming, say — and a character's turns there would take the shared engine
-  from the load. It serves, keeps its quorum place and takes its own leases as
-  ready; the cast runs on the members that have loaded.
+A member syncing or lagging lends nothing (rule 1), and neither does one whose
+`CAPACITY` says `process_loading`: another tenant of its process is still
+loading — zend priming, say — and a character's turns there would take the
+shared engine from the load. It serves, keeps its quorum place and takes its own
+leases as ready; the cast runs on the members that have loaded.
 
 The gateway sends the weights to every npcd member as `PLAN { epoch, weights }`
 (protocol 7) whenever they change, and to a member as it is admitted. npcd's
-authority lends by the plan's weight for each member in place of the power the
-member was admitted at (`replicated_substrate.md` §9.5), so rendezvous moves
-only the characters whose holder changed, at their next turn boundary (§9.3).
-A member keeps the last plan it was sent; with none, it lends by the admitted
-power as before.
+authority lends by the plan's weight for each member (`replicated_substrate.md`
+§9.5), so rendezvous moves only the characters whose holder changed, at their
+next turn boundary (§9.3). A member keeps the last plan it was sent; with none,
+it lends by the admitted power.
 
-**Worlds do not follow the plan.** A world's authority stays where rendezvous
-over the admitted powers puts it: moving a world reloads it, and a character's
-act reaches its authority as one request wherever the world is.
+**Worlds do not follow the plan.** A world stays where its lease is
+(`docs/static_placement.md` §6): moving a world reloads it, and a character's act
+reaches its authority as one request wherever the world is.
 
-### 4.5 Changing slowly
+### 4.5 Changing only on what has held
 
-- **Busy quickly, free slowly.** A card is latency-busy from the first plan that
-  sees a zend request in flight on it, and free again once none has been for 10
-  minutes; bulk-busy once its ingest has been outstanding for 60 s, and free
-  again 5 minutes after it empties. A conversation pauses while its person
-  reads and types; ingest ends and restarts unit by unit. Neither pause moves a
-  character.
-- **Coarse steps.** A weight is a quarter of the card's power — 0, ¼, ½, ¾ or
-  all of it — and moves at most one quarter towards its target every 30 s.
+- **Busy at once, free after two minutes.** A card is busy from its first live
+  conversation, and free again once it has had none for 120 s (`RETURN_AFTER`),
+  the pause while a person reads and types.
+- **Fitness settles.** A member's change of fitness to host moves the cast only
+  once it has held for 60 s (`SETTLE`); its first fitness, once it has caught up,
+  counts at once.
 - **A plan is sent only when it changes.** A steady cluster keeps its epoch,
   and nothing moves.
 
@@ -420,16 +353,16 @@ dispatch, so the lines of one request join on `req`:
 
 | Line | When | Says |
 |---|---|---|
-| `placed` | a `Best` or draw pick | how (`finish`, `probe`, `power`, `draw`), the turn size, every candidate's figures and card count |
+| `placed` | a `Best` or draw pick | how (`fill`, `round`, `full`, `draw`), and every candidate's machine, rank, `min`, `max`, units, drawing and reserved |
 | `routed` | a unit placed by something other than the policy: a key's holder, a canary's share | the member and why |
 | `queued` | a unit fits nowhere | its class and the queue's depth |
 | `released` | a queued unit is placed | the member and how long it waited |
 | `refused` | a queued unit times out | how long it waited |
-| `answered` | the answer's body ends, or its client goes away | the member, its status, the time to the first byte and to the end, and its bytes; the same `req`'s `placed` line holds the finish `Best` predicted for it |
+| `answered` | the answer's body ends, or its client goes away | the member, its status, the time to the first byte and to the end, and its bytes |
 
-and every 5 s, under `cluster::gateway::plan`, one `cards` line — each card's
-members, placed count, latency and bulk load, width and fence — and a `plan`
-line when the plan's epoch moves, naming each weight that changed and why.
+and on every plan, under `cluster::gateway::plan`, one `cards` line — each
+card's live conversations and whether it is busy — and a `plan` line when the
+plan's epoch moves, naming the weights.
 
 npcd logs each lease `lend()` changes — the character, its old and new holder,
 the weights it saw — and how long a new holder waited for the old holder's

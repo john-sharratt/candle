@@ -14,18 +14,19 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
 use candle_conversation::projection::Conversation;
 use candle_conversation::substrate::Substrate;
-use cluster::consensus::rendezvous::{owner, Weighted};
+use cluster::consensus::rendezvous::Weighted;
 use cluster::dial::Connect;
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
+use cluster::machines::MachineTable;
 use cluster::member::{AppMember, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use host::cluster::in_flight::InFlight;
@@ -102,12 +103,31 @@ async fn until_showing(
 struct Gw {
     gateway: Arc<Gateway>,
     _router: Router,
+    /// The machines its members run on, each named in the hub's table as it
+    /// joins (`docs/static_placement.md` §2).
+    machines: Mutex<Vec<String>>,
+}
+
+impl Gw {
+    /// Name `host` in the machine table: it takes conversations and an equal
+    /// share of the cast, as every other test machine does.
+    fn name(&self, host: &str) {
+        let mut machines = self.machines.lock().unwrap();
+        machines.push(host.to_string());
+        let yaml: String = machines
+            .iter()
+            .map(|m| format!("{m}:\n  conversations: {{rank: 1, min: 64}}\n  characters: 1\n"))
+            .collect();
+        self.gateway
+            .hub
+            .set_machines(MachineTable::from_yaml(&yaml).unwrap());
+    }
 }
 
 fn gateway() -> Gw {
     logs();
     let yaml = r#"
-cluster: {group_key_file: "unused.key"}
+cluster: {group_key_file: "unused.key", machines_file: "../host/machines.yaml"}
 sites:
   - name: npcd
     default: true
@@ -120,6 +140,7 @@ sites:
     Gw {
         gateway,
         _router: router,
+        machines: Mutex::new(Vec::new()),
     }
 }
 
@@ -222,6 +243,7 @@ async fn member(gw: &Gw, store: Store, world: &str, cast: &[u64]) -> Member {
 async fn member_as(gw: &Gw, store: Store, world: &str, cast: &[u64], leaseholder: bool) -> Member {
     let Store { dir, shared, conv } = store;
     let node = conv.node();
+    gw.name(&format!("m{node:x}"));
     let replication = ConversationStore::new(conv, 0, || {})
         .replication()
         .unwrap();
@@ -326,21 +348,6 @@ fn weighed(m: &Member) -> Vec<Weighted> {
         .collect()
 }
 
-/// The first world name rendezvous over `nodes` gives to `to`.
-fn world_for(nodes: &[u64], to: u64) -> String {
-    let members: Vec<Weighted> = nodes
-        .iter()
-        .map(|&node| Weighted {
-            node,
-            weight: 100.0,
-        })
-        .collect();
-    (0..)
-        .map(|i| format!("w{i}"))
-        .find(|w| owner(w.as_bytes(), &members) == Some(to))
-        .unwrap()
-}
-
 /// The first `n` characters rendezvous over `nodes` lends to each of them.
 fn cast_for(nodes: &[u64], n: usize) -> Vec<u64> {
     let members: Vec<Weighted> = nodes
@@ -399,9 +406,8 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
     let gw = gateway();
     let (sa, sb) = (store(), store());
     let nodes = [sa.node(), sb.node()];
-    // Named for the member that comes up first, which keeps it: what moves a
-    // world is the next test's.
-    let world = &world_for(&nodes, sa.node());
+    // Taken by the member that comes up first, which keeps it.
+    let world = "w-one";
     let cast = cast_for(&nodes, 3);
     let a = member(&gw, sa, world, &cast).await;
     let b = member(&gw, sb, world, &cast).await;
@@ -533,7 +539,7 @@ async fn a_member_that_takes_no_lease_runs_nothing() {
     let gw = gateway();
     let (sa, sb) = (store(), store());
     let nodes = [sa.node(), sb.node()];
-    let world = &world_for(&nodes, sb.node());
+    let world = "w-unleased";
     let cast = cast_for(&nodes, 3);
     let a = member(&gw, sa, world, &cast).await;
     let b = member_as(&gw, sb, world, &cast, false).await;
@@ -564,15 +570,16 @@ async fn a_member_that_takes_no_lease_runs_nothing() {
     );
 }
 
-/// **A world moves to the member rendezvous names, after the one handing it
-/// over has written what it had and the next has applied it**; and the
-/// characters rendezvous moves go over at their turn boundary, handed back.
+/// **A world stays where its lease is, and its characters move where the plan
+/// lends them** (`docs/static_placement.md` §5–§6): a member joining takes no
+/// world from its holder, whatever its rank or power, and the characters the
+/// plan now lends it go over at their turn boundary, handed back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_world_and_its_characters_move_to_the_member_rendezvous_names() {
+async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
     let gw = gateway();
     let (sa, sb) = (store(), store());
     let nodes = [sa.node(), sb.node()];
-    let world = world_for(&nodes, sb.node());
+    let world = "w-stays".to_string();
     let cast = cast_for(&nodes, 2);
 
     // A alone takes the world and every character.
@@ -590,28 +597,28 @@ async fn a_world_and_its_characters_move_to_the_member_rendezvous_names() {
     })
     .await;
 
-    // B joins, and rendezvous names it for the world.
+    // B joins: a keeps the world.
     let b = member(&gw, sb, &world, &cast).await;
     let most = most_authorities(&world, &[&a, &b]);
-    until("b takes the world over", WITHIN, || {
-        b.role(&world).is_authority() && a.role(&world) == Role::Replica
+    until("b follows the world", WITHIN, || {
+        b.rt.standing.written(&world) == a.rt.standing.written(&world)
+            && !b.world.sim(|s| s.table_open)
     })
     .await;
+    sleep(Duration::from_secs(3)).await;
+    assert!(a.role(&world).is_authority(), "a keeps the world");
+    assert_eq!(b.role(&world), Role::Replica);
     assert!(most.load(Ordering::SeqCst) <= 1, "never two authorities");
-    assert!(
-        !b.world.sim(|s| s.table_open),
-        "b runs the world as a left it"
-    );
 
-    // Each character runs where rendezvous now lends it — the ones it moved,
+    // Each character runs where the plan now lends it — the ones it moved,
     // handed back by a.
     let both = [&a, &b];
-    let members = weighed(&b);
+    let members = weighed(&a);
     until_showing(
         "each character runs where it is lent now",
         WITHIN,
         || {
-            let leases = leases_of(&b.rt.standing.written(&world));
+            let leases = leases_of(&a.rt.standing.written(&world));
             cast.iter().all(|&npc| {
                 let at = lent_to(npc, &members).unwrap();
                 leases
@@ -630,8 +637,8 @@ async fn a_world_and_its_characters_move_to_the_member_rendezvous_names() {
                 b.node(),
                 b.role(&world),
                 b.rt.moments(),
-                leases_of(&b.rt.standing.written(&world)),
                 leases_of(&a.rt.standing.written(&world)),
+                leases_of(&b.rt.standing.written(&world)),
                 cast.iter().filter(|&&n| a.awake(n)).collect::<Vec<_>>(),
                 cast.iter().filter(|&&n| b.awake(n)).collect::<Vec<_>>(),
                 cast.iter()
@@ -647,7 +654,7 @@ async fn a_world_and_its_characters_move_to_the_member_rendezvous_names() {
         .filter(|&npc| lent_to(npc, &members) == Some(b.node()))
         .collect();
     assert!(!moved.is_empty());
-    let leases = leases_of(&b.rt.standing.written(&world));
+    let leases = leases_of(&a.rt.standing.written(&world));
     for npc in moved {
         let after = leases[&npc].after.expect("moved by a hand-back");
         assert_eq!(after.origin, a.node(), "b waited for what a wrote");
@@ -742,15 +749,15 @@ async fn a_cut_off_member_runs_its_world_locally_and_scraps_it_on_return() {
 /// **A world keeps one authority across the loss of the member running it.**
 /// Three members; the authority is cut off. It stops writing at once — the
 /// world is its own, locally, while it has characters there — and once its
-/// term has run out at the others, the member rendezvous names among them
-/// takes the world from its records. Back, the old authority scraps what it
-/// lived cut off, and — rendezvous naming it again — is handed the world back.
+/// term has run out at the others, their proposer takes the world from its
+/// records. Back, the old authority scraps what it lived cut off and follows:
+/// the world stays where its lease now is (`docs/static_placement.md` §6).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_world_keeps_one_authority_across_the_loss_of_its_authority() {
     let gw = gateway();
     let (sa, sb, sc) = (store(), store(), store());
     let nodes = [sa.node(), sb.node(), sc.node()];
-    let world = world_for(&nodes, sa.node());
+    let world = "w-kept".to_string();
     let cast = cast_for(&nodes, 1);
     let a = member(&gw, sa, &world, &cast).await;
     let b = member(&gw, sb, &world, &cast).await;
@@ -802,7 +809,7 @@ async fn a_world_keeps_one_authority_across_the_loss_of_its_authority() {
         !a.role(&world).is_authority()
     })
     .await;
-    // Its term runs out at b and c, and the one rendezvous names takes it.
+    // Its term runs out at b and c, and their proposer takes it.
     let rest = [&b, &c];
     until("b or c takes the world", Duration::from_secs(60), || {
         authority_of(&world, &rest).len() == 1
@@ -826,17 +833,25 @@ async fn a_world_keeps_one_authority_across_the_loss_of_its_authority() {
                 .collect::<Vec<_>>()
         )
     };
+    // Back, a follows: the world stays with the member that took it.
     until_showing(
-        "a is handed the world back",
+        "a follows the world it lost",
         Duration::from_secs(60),
-        || a.joined() && a.role(&world).is_authority() && authority_of(&world, &all).len() == 1,
+        || a.joined() && a.role(&world) == Role::Replica,
         log,
     )
     .await;
+    until("a holds the world as its records hold it", WITHIN, || {
+        !a.world.sim(|s| s.table_open)
+    })
+    .await;
+    sleep(Duration::from_secs(3)).await;
     assert!(
-        !a.world.sim(|s| s.table_open),
-        "the world as its records hold it"
+        next.role(&world).is_authority(),
+        "the world stays: {}",
+        log()
     );
+    assert_eq!(authority_of(&world, &all).len(), 1);
     assert!(
         most.load(Ordering::SeqCst) <= 1,
         "never two authorities: {}",

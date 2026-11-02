@@ -39,6 +39,7 @@ use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
 use crate::logs::LogBus;
+use crate::machines::state_expert_pin;
 use crate::model::{ModelView, MODEL};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
 use crate::self_heal::spawn_watchdog;
@@ -363,6 +364,7 @@ async fn serve_tenants(
     let roles = roles();
     let names: Vec<&'static str> = uis.iter().map(|(n, _)| *n).collect();
     let machine = System::host_name().unwrap_or_else(|| listen.bind.to_string());
+    state_expert_pin(&machine);
     let cluster = match cfg.args.cluster(machine.clone())? {
         Some(settings) => {
             tracing::info!(

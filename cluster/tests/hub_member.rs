@@ -17,6 +17,7 @@ use cluster::dispatch::{Dispatch, Route, RouteTable};
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
 use cluster::gateway::{Hub, MemberStream, Pick};
 use cluster::handshake::GroupKey;
+use cluster::machines::MachineTable;
 use cluster::member::{AppMember, Check, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use cluster::session::VirtualConn;
@@ -151,11 +152,19 @@ async fn until(what: &str, mut ok: impl FnMut() -> bool) {
     }
 }
 
-/// Admission, the mode switch, routing by capacity and claims, and streams in
-/// both directions.
+/// Admission, the mode switch, routing by the machine table and claims, and
+/// streams in both directions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn members_join_route_and_carry_streams() {
     let hub = Hub::new(key(), "gw-test");
+    // B's machine ranks first; each is filled to one unit before any round.
+    hub.set_machines(
+        MachineTable::from_yaml(
+            "m1:\n  conversations: {rank: 2, min: 1, max: 4}\n\
+             m2:\n  conversations: {rank: 1, min: 1, max: 4}\n",
+        )
+        .unwrap(),
+    );
     let (up_tx, mut up) = mpsc::unbounded_channel();
     let mut a = member(&hub, 1, build(10), model(1), &up_tx);
     // One build: whichever is admitted first sets the floor, and a lower
@@ -184,13 +193,13 @@ async fn members_join_route_and_carry_streams() {
     );
     b.ready.store(true, Ordering::SeqCst);
     b.app.capacity_changed();
-    // B has the higher power.
+    // B's machine ranks first.
     until("B ready", || {
         hub.pick("zend", &Dispatch::Best, None, None, None).pick == Pick::Member(2)
     })
     .await;
-    // A request B is answering halves its share, 102 / 2 against A's 101:
-    // the next goes to A, and to B again once B's answer is done.
+    // A request B is answering fills it to its `min`: the next goes to A, still
+    // below its own, and to B again once B's answer is done.
     let held = hub.pick("zend", &Dispatch::Best, None, None, None);
     assert_eq!(held.pick, Pick::Member(2));
     assert!(held.load.is_some(), "a Best request is work for its member");

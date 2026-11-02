@@ -1,7 +1,8 @@
-//! Rule 3's queue (`docs/cooperative_admission.md` §4.3): a unit that fits on
-//! no eligible card waits here, most urgent first and then oldest first, until
-//! a card has room — released whenever a card's count falls or a `CAPACITY`
-//! arrives — or until [`HOLD`] has passed.
+//! The forward queue (`docs/static_placement.md` §3.4): a unit that fits on no
+//! eligible card waits here, before it is forwarded to any member, most urgent
+//! first and then oldest first, until a card has room — released whenever a
+//! card's count falls or a `CAPACITY` arrives. A conversation and a draw wait
+//! as long as their client does; any other unit until [`HOLD`] has passed.
 
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,9 @@ use super::load::Picked;
 use super::registry::LATENCY_APP;
 use crate::dispatch::Dispatch;
 
-/// How long a unit waits for room before it is answered `503`: the catch-up
-/// hold of `docs/replicated_substrate.md` §5.4.
+/// How long a unit that is neither a conversation nor a draw waits for room
+/// before it is answered `503`: the catch-up hold of
+/// `docs/replicated_substrate.md` §5.4.
 pub const HOLD: Duration = Duration::from_secs(30);
 
 /// How urgent a waiting unit is, most urgent first.
@@ -107,21 +109,36 @@ impl Queue {
         self.waiters.len() != before
     }
 
-    /// Every waiting unit whose client still waits, most urgent first and then
-    /// oldest first; those whose client went away are dropped. The caller puts
-    /// back, with [`Self::keep`], each one it could not place.
-    pub fn take_in_order(&mut self) -> Vec<Waiter> {
-        let mut waiting: Vec<Waiter> = std::mem::take(&mut self.waiters)
-            .into_iter()
-            .filter(|w| !w.tx.is_closed())
-            .collect();
-        waiting.sort_by_key(|w| (w.urgency, w.seq));
-        waiting
+    /// The sequence numbers of every waiting unit whose client still waits,
+    /// most urgent first and then oldest first; those whose client went away
+    /// are dropped. The caller [`take`](Self::take)s each in turn, so that the
+    /// units still waiting go on holding what they hold while it is placed, and
+    /// puts back with [`Self::keep`] each one it could not place.
+    pub fn order(&mut self) -> Vec<u64> {
+        self.waiters.retain(|w| !w.tx.is_closed());
+        let mut order: Vec<(Urgency, u64)> =
+            self.waiters.iter().map(|w| (w.urgency, w.seq)).collect();
+        order.sort();
+        order.into_iter().map(|(_, seq)| seq).collect()
+    }
+
+    /// Take unit `seq` out of the queue, to place it.
+    pub fn take(&mut self, seq: u64) -> Option<Waiter> {
+        let at = self.waiters.iter().position(|w| w.seq == seq)?;
+        Some(self.waiters.remove(at))
     }
 
     /// Put `waiter` back, still waiting.
     pub fn keep(&mut self, waiter: Waiter) {
         self.waiters.push(waiter);
+    }
+
+    /// What each unit still waiting asks, its client still there.
+    pub fn waiting(&self) -> impl Iterator<Item = &Placing> {
+        self.waiters
+            .iter()
+            .filter(|w| !w.tx.is_closed())
+            .map(|w| &w.ask)
     }
 
     pub fn len(&self) -> usize {
@@ -167,23 +184,16 @@ mod tests {
         drop(rx4);
         assert!(q.forget(late));
         assert!(!q.forget(late), "already gone");
-        let order: Vec<(u64, Urgency)> = q
-            .take_in_order()
-            .into_iter()
-            .map(|w| (w.seq, w.urgency))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                (chat, Urgency::Latency),
-                (check, Urgency::Latency),
-                (npcd, Urgency::Deadline),
-            ]
-        );
-        assert!(
-            !order.iter().any(|(s, _)| *s == gone),
-            "its client went away"
-        );
-        assert_eq!(q.len(), 0, "taken");
+        let order = q.order();
+        assert_eq!(order, vec![chat, check, npcd]);
+        assert!(!order.contains(&gone), "its client went away");
+        assert_eq!(q.len(), 3, "ordered, not taken");
+        assert_eq!(q.waiting().count(), 3);
+        let first = q.take(chat).unwrap();
+        assert_eq!(first.urgency, Urgency::Latency);
+        assert_eq!(q.len(), 2, "taken");
+        assert!(q.take(chat).is_none(), "already taken");
+        q.keep(first);
+        assert_eq!(q.len(), 3, "kept");
     }
 }

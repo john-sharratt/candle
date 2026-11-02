@@ -1,40 +1,34 @@
-//! Rules 4 and 5 (`docs/cooperative_admission.md` §4.4–§4.5): every
-//! [`PLAN_EVERY`] the gateway plans the movable work. A card busy with latency
-//! or bulk work lends no characters — unless it holds part of the NPC floor,
-//! or every card is busy — and each card's weight moves a quarter of its
-//! power at a time, at most every [`STEP_EVERY`]. The result goes to npcd's
-//! members as `PLAN`, and its fences to latency placement.
+//! The plan for the cast (`docs/static_placement.md` §5): every
+//! [`PLAN_EVERY`], and at once when a card becomes busy — and free again
+//! [`busy::RETURN_AFTER`] after its last live conversation — the gateway weighs
+//! each npcd member by its machine's share of the cast. A card busy with a live
+//! conversation lends nothing while a free card can host — unless every
+//! hosting card is busy, when each lends by its share and the characters run
+//! beneath the conversations. The weights go to npcd's members as `PLAN`.
 
 mod busy;
-mod fence;
+mod settle;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use super::registry::{CardKey, Fences};
+use super::registry::CardKey;
 use busy::Busy;
-use fence::{fence, Candidate};
+use settle::Settled;
 
-pub use fence::NPC_FLOOR_PERCENT;
-
-/// How often the gateway plans.
+/// How often the gateway plans when nothing forces it to sooner.
 pub const PLAN_EVERY: Duration = Duration::from_secs(5);
-
-/// How often a card's weight may move one quarter towards its target.
-pub const STEP_EVERY: Duration = Duration::from_secs(30);
-
-/// A weight is this many steps of a card's power, from none to all of it.
-const QUARTERS: u32 = 4;
 
 /// One npcd member, as the plan weighs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Host {
     pub node: u64,
-    /// The power it was admitted at (`MEMBERS`' weight): what it lends by
-    /// while its card is free, and zero for a member that takes no lease.
-    pub weight: u32,
-    /// Ready, in sync, not lagging, not closing: it may be lent a character
-    /// (rule 1).
+    /// Its machine's share of the cast (`host/machines.yaml`): zero for a
+    /// machine the table gives none, and for a member that takes no lease.
+    pub share: u32,
+    /// Ready, in sync, not lagging, not closing, nothing in its process still
+    /// loading: it may be lent a character (rule 1). The plan settles it
+    /// ([`settle::SETTLE`]) before it moves anything.
     pub eligible: bool,
 }
 
@@ -42,23 +36,10 @@ pub struct Host {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardView {
     pub key: CardKey,
-    /// zend units in flight on it.
+    /// Live conversations — zend requests — in flight on it.
     pub latency: u32,
-    /// Bulk units its members report outstanding.
-    pub bulk: u32,
     /// Its npcd members.
     pub hosts: Vec<Host>,
-}
-
-impl CardView {
-    /// The power it hosts characters with: its eligible npcd members'.
-    fn power(&self) -> u32 {
-        self.hosts
-            .iter()
-            .filter(|h| h.eligible)
-            .map(|h| h.weight)
-            .sum()
-    }
 }
 
 /// One card's place in a plan, for the plan log.
@@ -66,13 +47,7 @@ impl CardView {
 pub struct CardPlan {
     pub key: CardKey,
     pub latency: u32,
-    pub bulk: u32,
     pub busy: bool,
-    /// Thousandths of its power the floor holds back, zero when unfenced.
-    pub fence_milli: u32,
-    /// Its weight in quarters of its power, and the quarters it moves towards.
-    pub quarters: u32,
-    pub target: u32,
 }
 
 /// A plan.
@@ -83,33 +58,14 @@ pub struct Planned {
     pub changed: bool,
     /// `(node, weight)` for every npcd member.
     pub weights: Vec<(u64, u32)>,
-    pub fences: Fences,
     pub cards: Vec<CardPlan>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CardState {
-    busy: Busy,
-    quarters: u32,
-    moved: Option<Instant>,
-}
-
-impl Default for CardState {
-    /// A card the plan has just met lends by its whole power, as rendezvous
-    /// over the admitted powers already does.
-    fn default() -> Self {
-        CardState {
-            busy: Busy::default(),
-            quarters: QUARTERS,
-            moved: None,
-        }
-    }
 }
 
 /// The gateway's planner.
 #[derive(Debug, Default)]
 pub struct Planner {
-    cards: BTreeMap<CardKey, CardState>,
+    cards: BTreeMap<CardKey, Busy>,
+    hosts: BTreeMap<u64, Settled>,
     epoch: u64,
     weights: Vec<(u64, u32)>,
     last: Option<Instant>,
@@ -122,85 +78,59 @@ impl Planner {
             .is_none_or(|last| now.duration_since(last) >= PLAN_EVERY)
     }
 
+    /// Whether the plan last saw `key` busy at `now`: a card it has not seen
+    /// busy is one whose first live conversation calls for a plan at once.
+    pub fn busy(&self, key: &CardKey, now: Instant) -> bool {
+        self.cards.get(key).is_some_and(|b| b.busy(now))
+    }
+
     /// The plan last made: its epoch and weights, for a member just admitted.
     /// `None` before the first.
     pub fn current(&self) -> Option<(u64, Vec<(u64, u32)>)> {
         (self.epoch > 0).then(|| (self.epoch, self.weights.clone()))
     }
 
-    /// Plan the movable work over `cards` at `now`.
+    /// Plan the cast over `cards` at `now`.
     pub fn plan(&mut self, now: Instant, cards: &[CardView]) -> Planned {
         self.last = Some(now);
         self.cards
             .retain(|key, _| cards.iter().any(|c| &c.key == key));
+        self.hosts
+            .retain(|node, _| cards.iter().flat_map(|c| &c.hosts).any(|h| h.node == *node));
         for c in cards {
-            self.cards.entry(c.key.clone()).or_default().busy.observe(
-                now,
-                c.latency > 0,
-                c.bulk > 0,
-            );
+            self.cards
+                .entry(c.key.clone())
+                .or_default()
+                .observe(now, c.latency > 0);
+            for h in &c.hosts {
+                self.hosts
+                    .entry(h.node)
+                    .or_insert_with(|| Settled::new(h.eligible, now))
+                    .observe(h.eligible, now);
+            }
         }
-        let hosting: Vec<usize> = (0..cards.len()).filter(|&i| cards[i].power() > 0).collect();
-        let busy: Vec<bool> = cards
+        let busy: Vec<bool> = cards.iter().map(|c| self.cards[&c.key].busy(now)).collect();
+        let lends = |h: &Host| h.share > 0 && self.hosts[&h.node].eligible();
+        // A free card that can host takes the cast off the busy ones; with
+        // none, every card lends by its share and the cast runs beneath the
+        // conversations.
+        let free_hosts = cards
             .iter()
-            .map(|c| self.cards[&c.key].busy.busy(now))
-            .collect();
-        let every_busy = !hosting.is_empty() && hosting.iter().all(|&i| busy[i]);
-        let candidates: Vec<Candidate> = hosting
+            .zip(&busy)
+            .any(|(c, busy)| !busy && c.hosts.iter().any(lends));
+        let mut weights: Vec<(u64, u32)> = cards
             .iter()
-            .map(|&i| Candidate {
-                index: i,
-                latency: cards[i].latency,
-                power: cards[i].power(),
+            .zip(&busy)
+            .flat_map(|(c, busy)| {
+                c.hosts.iter().map(move |h| {
+                    let weight = match lends(h) && !(*busy && free_hosts) {
+                        true => h.share,
+                        false => 0,
+                    };
+                    (h.node, weight)
+                })
             })
             .collect();
-        let fenced: BTreeMap<usize, u32> = fence(&candidates).into_iter().collect();
-
-        let mut plans = Vec::new();
-        let mut weights = Vec::new();
-        let mut fences = Fences::new();
-        for (i, c) in cards.iter().enumerate() {
-            let is_busy = busy[i];
-            let fence_milli = fenced.get(&i).copied().unwrap_or(0);
-            let target = if !is_busy || every_busy {
-                QUARTERS
-            } else if fence_milli > 0 {
-                (fence_milli * QUARTERS).div_ceil(1000).max(1)
-            } else {
-                0
-            };
-            let state = self.cards.get_mut(&c.key).expect("observed above");
-            let may_move = state
-                .moved
-                .is_none_or(|at| now.duration_since(at) >= STEP_EVERY);
-            if state.quarters != target && may_move {
-                state.quarters = if target > state.quarters {
-                    state.quarters + 1
-                } else {
-                    state.quarters - 1
-                };
-                state.moved = Some(now);
-            }
-            for h in &c.hosts {
-                let weight = match (h.eligible, h.weight) {
-                    (false, _) | (_, 0) => 0,
-                    (true, w) => (w * state.quarters / QUARTERS).max(u32::from(state.quarters > 0)),
-                };
-                weights.push((h.node, weight));
-            }
-            if fence_milli > 0 {
-                fences.insert(c.key.clone(), fence_milli);
-            }
-            plans.push(CardPlan {
-                key: c.key.clone(),
-                latency: c.latency,
-                bulk: c.bulk,
-                busy: is_busy,
-                fence_milli,
-                quarters: state.quarters,
-                target,
-            });
-        }
         weights.sort_unstable();
         let changed = weights != self.weights;
         if changed {
@@ -211,8 +141,15 @@ impl Planner {
             epoch: self.epoch,
             changed,
             weights,
-            fences,
-            cards: plans,
+            cards: cards
+                .iter()
+                .zip(busy)
+                .map(|(c, busy)| CardPlan {
+                    key: c.key.clone(),
+                    latency: c.latency,
+                    busy,
+                })
+                .collect(),
         }
     }
 }

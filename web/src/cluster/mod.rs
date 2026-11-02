@@ -159,6 +159,7 @@ impl Gateway {
             canary_pct: cluster.canary_share.min(100),
         });
         hub.set_standby_agents(cluster.standby_agents.iter().cloned().collect());
+        hub.set_machines(cluster.machines.clone());
         let peering = peers::peering(cfg, &key, &hub)?;
         let (voter, peer_n) = match &peering {
             Some(p) => (p.node(), cluster.peers.len()),
