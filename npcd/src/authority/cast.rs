@@ -14,7 +14,7 @@ use std::time::Instant;
 use cluster::consensus::rendezvous::Weighted;
 use cluster::frame::MemberState;
 
-use super::npc_lease::{by_plan, hex, leases_of};
+use super::npc_lease::{by_plan, hex, leases_of, never_ran};
 use super::ops::{OpReply, WorldOp};
 use crate::engine::environment;
 use crate::engine::event::{EventKind, Salience};
@@ -116,6 +116,7 @@ impl Runtime {
                 let mine = lease.is_some_and(|l| l.holder == me);
                 let awake = self.scheduler.pace_of(npc).is_some();
                 let handing = self.standing.handing(npc);
+                let never_ran = lease.is_some_and(|l| never_ran(l, applied));
                 if !self.standing.characters() {
                     // **A member that runs no characters runs none**, whatever
                     // its leases say. One still naming it — lent before it was
@@ -126,7 +127,7 @@ impl Runtime {
                     }
                     let next = lease.is_some_and(|l| l.next.is_some());
                     if mine && next && !handing && self.standing.begin_handing(npc) {
-                        self.hand_back(&world, npc, false);
+                        self.hand_back(&world, npc, never_ran);
                     } else if !mine && handing {
                         self.standing.end_handing(npc);
                     }
@@ -137,13 +138,10 @@ impl Runtime {
                     // **Held here, not running, and asked to move: handed back
                     // now**, with no turn to wait for. Woken first, it waited on
                     // its last holder's writes before it could move on; never
-                    // woken, it was never handed back, and ran nowhere. It never
-                    // ran under this lease — a character lent here runs from the
-                    // moment it is woken until it is put down — so the wait its
-                    // lease names is carried on to the next holder.
+                    // woken, it was never handed back, and ran nowhere.
                     (true, false) if moving && !handing => {
                         if self.standing.begin_handing(npc) {
-                            self.hand_back(&world, npc, true);
+                            self.hand_back(&world, npc, never_ran);
                         }
                     }
                     (true, false) if !handing => {
@@ -168,7 +166,7 @@ impl Runtime {
                     (true, true) => {
                         if moving && !self.standing.turning(npc) && self.standing.begin_handing(npc)
                         {
-                            self.hand_back(&world, npc, false);
+                            self.hand_back(&world, npc, never_ran);
                         }
                     }
                     (false, true) if !handing => self.put_down(npc),

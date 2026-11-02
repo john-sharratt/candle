@@ -46,6 +46,10 @@ pub enum Pick {
     /// Every card the request may go to is full (`docs/cooperative_admission.md`
     /// §4.2): it waits at the gateway until one has room (§4.3).
     Wait,
+    /// No machine the request may go to takes its work at all
+    /// (`docs/static_placement.md` §3.2, §4): there is no room to wait for, and
+    /// the gateway refuses it.
+    Unplaced,
 }
 
 #[derive(Debug, Default)]

@@ -114,13 +114,13 @@ impl Registry {
                 .filter(|m| !out.contains(&Some(m.node)))
                 .collect()
         };
-        let peers = without(&[ask.sender, ask.canary]);
-        if !peers.is_empty() {
-            return place(app, peers, draw, weigh);
-        }
-        let proven = without(&[ask.canary]);
-        if !proven.is_empty() {
-            return place(app, proven, draw, weigh);
+        // Each narrower pool first; one whose machines take nothing of the
+        // unit falls through to the next, as an empty one does.
+        for pool in [without(&[ask.sender, ask.canary]), without(&[ask.canary])] {
+            let placed = place(app, pool, draw, weigh);
+            if !placed.missed() {
+                return placed;
+            }
         }
         place(app, pool, draw, weigh)
     }
@@ -161,10 +161,11 @@ impl Registry {
             let holding: Vec<&MemberView> =
                 ready.iter().copied().filter(|m| h.held_by(m)).collect();
             let everyone_holds = holding.len() == ready.len();
-            let pick = if holding.is_empty() {
-                place(app, ready, draw, weigh)
-            } else {
-                place(app, holding, draw, weigh)
+            // Among the holders; when none holds it, or no holder's machine
+            // takes the unit at all, among them all.
+            let pick = match place(app, holding, draw, weigh) {
+                placed if placed.missed() => place(app, ready, draw, weigh),
+                placed => placed,
             };
             (pick, everyone_holds)
         };
@@ -347,6 +348,7 @@ impl Registry {
         match placed {
             Placed::To(node) => Pick::Member(node),
             Placed::Full => Pick::Wait,
+            Placed::Unplaced => Pick::Unplaced,
             Placed::Nobody => Pick::Configured,
         }
     }
@@ -417,8 +419,18 @@ impl Registry {
         match baseline {
             Placed::To(node) => Pick::Member(node),
             Placed::Full => Pick::Wait,
-            Placed::Nobody if canary_room => Pick::Member(canary),
-            Placed::Nobody => Pick::Wait,
+            missed if missed.missed() && canary_room => Pick::Member(canary),
+            Placed::Unplaced => Pick::Unplaced,
+            // Nobody but the candidate, and its card has no room: it waits when
+            // the candidate's machine can come to have room, and is refused when
+            // it takes nothing of the unit at all.
+            _ => {
+                let alone: Vec<&MemberView> = self.member(app, canary).into_iter().collect();
+                match place(app, alone, draw, &self.weigh(app, &cards)) {
+                    Placed::Full => Pick::Wait,
+                    _ => Pick::Unplaced,
+                }
+            }
         }
     }
 }

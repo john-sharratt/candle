@@ -91,7 +91,8 @@ answering, draws aside (`CardLoad::work`). A chat streams for as long as it
 decodes, so a live conversation is counted for the whole of its turn.
 
 A task delegated to a worker runs inside its zend member, turn after turn,
-without passing the gateway: it is neither placed nor counted.
+without passing the gateway: it is neither placed nor counted towards `min` and
+`max`. It does make its card busy (§5.1).
 
 An app that runs no model — the agents, keep, the MCP aggregator — is not
 placed by the table: a unit of one goes to its member with the fewest requests
@@ -108,8 +109,12 @@ too full for, and after the holders of a released conversation are found, so a
 lagging member that alone holds a conversation still takes it.
 
 When no machine the unit could go to takes conversations at all — none named in
-the table, or none with a `conversations` entry — nobody takes it, and the
-route's configured upstream answers: there is no room to wait for.
+the table, or none with a `conversations` entry — the unit is **unplaced**: the
+gateway refuses it, `502` with no retry, since there is no room to wait for, and
+it goes to no machine the table gives nothing, a member still loading included.
+A narrower pool that comes out unplaced — a member's ask for a peer without the
+sender, a released conversation among its holders — falls through to the wider
+one, as an empty pool does.
 
 Among the eligible machines below their `max`:
 
@@ -147,11 +152,12 @@ gateway forwards it, and forms its waves exactly as before.
   those behind it that fit elsewhere. The cards the waiting draws hold (§4) are
   worked out once per walk, not once per unit.
 - **A client's conversation turn and a client's draw wait as long as their
-  client does** (`Placing::waits_for_its_client`): a zend request routed by its
-  conversation, or a draw, that no member sent. A client that goes away is
-  dropped. Everything else — an MCP tool call, a member's ask for a peer, any
-  other request — has nobody behind it to go away, and is answered `503` after
-  the 30 s hold (`HOLD`).
+  client does** (`Placing::waits_for_its_client`): zend's turn route,
+  `POST /v1/chat/completions` (`TURN_ROUTE`), or a draw, that no member sent. A
+  client that goes away is dropped. Everything else — a read or an upload under
+  a conversation, an MCP tool call, a member's ask for a peer — has no person
+  waiting on a turn behind it, and is answered `503` after the 30 s hold
+  (`HOLD`).
 
 ## 4. Pictures
 
@@ -164,9 +170,11 @@ fixes) and holds that card's admission while it runs.
 - **A card with nothing in flight first.** Among the reaching cards that may
   draw — not drawing, on a machine with a `pictures` preference — one with no
   unit in flight wins, whatever the preferences: a draw on a card mid-turn
-  stalls that turn's stream for as long as it draws. Then the lowest
-  `pictures`, then the lower node. With the table above, a picture goes to
-  WhiteWorld while BlackWorld answers conversations.
+  stalls that turn's stream for as long as it draws. Then one not lagging —
+  weighed after the turn in flight, so an idle card that lags draws before a
+  busy one that does not — then the lowest `pictures`, then the lower node.
+  With the table above, a picture goes to WhiteWorld while BlackWorld answers
+  conversations.
 - **When every card that may draw it has a turn in flight, the draw waits, and
   holds its card.** The card it would take is **reserved** (`draw_target`): it
   takes no new unit but a draw, the turns already there run to their end, and
@@ -178,16 +186,21 @@ fixes) and holds that card's admission while it runs.
   end. A draw that has waited `RESERVE_FOR`, 60 s, takes its card as it stands
   at the next release.
 - **Every card that may draw it is drawing:** the draw waits for one to finish.
-- **No machine draws at all** — none named with a `pictures` preference: nobody
-  takes the draw, and the route's configured upstream answers.
+- **No machine draws at all** — none named with a `pictures` preference: the
+  draw is unplaced, and refused (§3.2).
 
 ## 5. Characters
 
 ### 5.1 Busy and free
 
-A card is **busy** while a live conversation — a zend unit — is in flight on
-it, from the first, and **free** once it has had none for `RETURN_AFTER`,
-120 s: the pause while a person reads a reply and types the next message.
+A card is **busy** while zend works on it — a live conversation's request in
+flight, or a conversation whose claim its zend member holds, a worker's
+delegated task among them — from the first, and **free** once it has had none
+for `RETURN_AFTER`, 120 s: the pause while a person reads a reply and types the
+next message, or between a task's turns. A delegated task runs inside its member
+and never passes the gateway, so its claim is how the plan sees it
+(`Registry::card_views`); the cast leaves a card running a task exactly as it
+leaves one serving a conversation.
 
 ### 5.2 Where they run
 
@@ -225,10 +238,16 @@ When a card becomes busy:
    (`HandBack.through`, the old holder's own records). The character's K/V and
    recurrent state are already there: every sealed turn replicates to every
    member. A member the plan lends to is never one lagging on replication, so
-   that wait is short. A holder that **never ran** the character — handed it
-   back before it had its own last holder's writes — wrote nothing of it, and
-   says so (`HandBack.never_ran`): the lease keeps the wait it already named, so
-   the next holder waits for the last holder that did run it.
+   that wait is short. A holder that **never ran** the character wrote nothing
+   of it, and says so (`HandBack.never_ran`): the lease keeps the wait it
+   already named, so the next holder waits for the last holder that did run it.
+   Never ran is a fact about what the holder has applied, not about whether the
+   character is awake (`npc_lease::never_ran`): a character is woken only once
+   its lease's wait is met, and an applied record stays applied, a restart
+   included, so a wait still unmet means the holder never woke it. One met may
+   have run — asleep after a restart, it ran for hours — and hands back its own
+   writes. Every branch that hands a character back decides it so, a member that
+   runs no characters included.
 
 ### 5.4 A fast return
 
@@ -308,7 +327,7 @@ while a card sits idle. The invariants that prevent it:
    It never holds a card idle: it waits only for turns already running there.
 5. **No room and no machine are different outcomes.** A unit waits only when a
    machine that takes it could come to have room; one that no machine of its
-   pool takes at all goes to the route's configured upstream.
+   pool takes at all is refused, unplaced.
 6. **Characters always have a home.** Busy cards lend again when no free card
    can host (§5.2), and a move whose target cannot host is withdrawn (§5.5).
 7. **The holder of a key is never refused** (rule 1). A conversation mid-turn on

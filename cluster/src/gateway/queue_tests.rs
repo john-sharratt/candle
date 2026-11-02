@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::hub::Hub;
-use super::queue::{Placing, HOLD, RESERVE_FOR};
+use super::queue::{Placing, RouteAt, HOLD, RESERVE_FOR, TURN_ROUTE};
 use super::registry::{MemberView, Pick};
 use crate::dispatch::Dispatch;
 use crate::frame::{BuildId, Capacity, MemberState};
@@ -95,23 +95,40 @@ fn draw(area: u64) -> Placing {
     }
 }
 
-/// A client's conversation turn: a zend request routed by its conversation.
+/// A client's conversation turn: zend's turn route.
 fn turn() -> Placing {
     Placing {
-        dispatch: Dispatch::sticky_path("id"),
+        dispatch: Dispatch::Sticky(Vec::new()),
+        route: Some(RouteAt {
+            method: TURN_ROUTE.0.into(),
+            path: TURN_ROUTE.1.into(),
+        }),
         ..unit("zend")
     }
 }
 
 /// **Only a client's conversation turn and a client's draw wait as long as
-/// their client**: a zend request routed otherwise — an MCP tool call — and a
-/// member's ask for a peer have nobody behind them to go away.
+/// their client**: a zend request routed otherwise — an MCP tool call, a read
+/// under a conversation — and a member's ask for a peer have no person waiting
+/// on a turn behind them.
 #[test]
 fn only_a_clients_turn_or_draw_waits_unbounded() {
     assert!(turn().waits_for_its_client());
     assert!(draw(512 * 512).waits_for_its_client());
     assert!(!unit("zend").waits_for_its_client(), "a Best zend request");
     assert!(!unit("npcd").waits_for_its_client());
+    let journal = Placing {
+        dispatch: Dispatch::sticky_path("id"),
+        route: Some(RouteAt {
+            method: "GET".into(),
+            path: "/v1/conversations/c-1/journal".into(),
+        }),
+        ..unit("zend")
+    };
+    assert!(
+        !journal.waits_for_its_client(),
+        "a read under a conversation is no turn"
+    );
     let asked = Placing {
         sender: Some(9),
         ..turn()

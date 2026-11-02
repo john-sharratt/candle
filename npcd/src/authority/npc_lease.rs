@@ -240,6 +240,19 @@ fn fresh(holder: u64, now_ms: u64) -> NpcLease {
     }
 }
 
+/// Whether the member holding `lease`, which has applied each origin's records
+/// through `applied(origin)`, never ran the character under it.
+///
+/// **A fact about what the member holds, not about whether the character is
+/// awake now.** A character is woken only once the wait its lease names is met,
+/// and an applied record stays applied, a restart included: a wait still unmet
+/// means the member never woke it. One met, or none, may have run — after a
+/// restart the character is asleep and ran for hours — and its holder hands
+/// back its own writes.
+pub fn never_ran(lease: &NpcLease, applied: impl Fn(u64) -> u64) -> bool {
+    lease.after.is_some_and(|a| applied(a.origin) < a.through)
+}
+
 /// The holder `from` handed `nid` back, its own writes reaching `through`: the
 /// lease goes to its `next`, who waits for them. A holder that `never_ran` the
 /// character wrote nothing of it, so the next holder waits for what the lease
@@ -392,6 +405,18 @@ mod tests {
                 through: 900
             })
         );
+        // B has applied A's records only to 400: it never ran N. Once it holds
+        // them through 900 it may have — asleep after a restart, it ran for
+        // hours — and a lease naming no wait may have run too.
+        assert!(never_ran(&lease, |_| 400));
+        assert!(!never_ran(&lease, |_| 900));
+        assert!(!never_ran(
+            &NpcLease {
+                after: None,
+                ..lease.clone()
+            },
+            |_| 0
+        ));
         let ran = hand_back(&lease, 2, 55, false, NOW).unwrap();
         assert_eq!(
             ran.after,

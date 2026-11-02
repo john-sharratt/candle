@@ -149,6 +149,20 @@ fn full(app: &str, want_html: bool) -> Response {
     )
 }
 
+/// The answer when no machine the request could go to takes its work at all
+/// (`docs/static_placement.md` §3.2, §4): named nowhere in the machine table,
+/// or without the key the work needs. Nothing about waiting will help, so it
+/// is no "retrying" page — and the work goes to no machine the table says gets
+/// none, the members still loading included.
+fn unplaced(app: &str, want_html: bool) -> Response {
+    errors::respond(
+        Problem::upstream_down("No machine in this deployment takes that work.", None).because(
+            format!("no {app} member's machine takes the request in host/machines.yaml"),
+        ),
+        want_html,
+    )
+}
+
 /// The gateway's own "reconnecting" page, which the consoles retry: the answer
 /// when `app` is admitted here yet has no member to send a request to — every
 /// one gone between the check and the pick.
@@ -296,6 +310,7 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
     match picked.pick {
         Pick::Configured => none_ready(gateway, app, &ctx, req).await,
         Pick::Wait => Routed::Answered(full(app, ctx.want_html)),
+        Pick::Unplaced => Routed::Answered(unplaced(app, ctx.want_html)),
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
             // Never a member's ask for a peer: an unproven build is not handed

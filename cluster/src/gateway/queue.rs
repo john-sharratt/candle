@@ -156,16 +156,25 @@ impl Queue {
     }
 }
 
+/// The route that starts a conversation's turn: zend's chat completions, which
+/// streams the turn for as long as it decodes. Every other route under a
+/// conversation — its journal, its uploads, a diag run — is not a turn.
+pub const TURN_ROUTE: (&str, &str) = ("POST", "/v1/chat/completions");
+
 impl Placing {
     /// Whether this unit waits as long as its client does
-    /// (`docs/static_placement.md` §3.4): a client's conversation turn — a zend
-    /// request routed by its conversation — or a client's draw. A member's own
-    /// ask for a peer, an MCP tool call or any other request has no person
-    /// behind it to go away, and is held [`HOLD`] at most.
+    /// (`docs/static_placement.md` §3.4): a client's conversation turn — the
+    /// turn route ([`TURN_ROUTE`]) of zend — or a client's draw. A member's own
+    /// ask for a peer, an MCP tool call, a read under a conversation or any
+    /// other request has no person waiting on a turn behind it, and is held
+    /// [`HOLD`] at most.
     pub fn waits_for_its_client(&self) -> bool {
-        self.sender.is_none()
-            && (self.draw.is_some()
-                || (self.app == LATENCY_APP && matches!(self.dispatch, Dispatch::Sticky(_))))
+        let turn = self.app == LATENCY_APP
+            && self
+                .route
+                .as_ref()
+                .is_some_and(|at| (at.method.as_str(), at.path.as_str()) == TURN_ROUTE);
+        self.sender.is_none() && (self.draw.is_some() || turn)
     }
 }
 

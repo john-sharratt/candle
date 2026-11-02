@@ -456,8 +456,8 @@ fn units_fill_to_each_min_in_rank_order_then_go_round_to_each_max() {
 /// **A machine the table does not name is given no work**, whatever else it
 /// is: a unit waits for a named machine's room rather than going to it — and
 /// when no machine the unit could go to takes conversations at all, it does not
-/// wait for room that will never come: nobody takes it, and the route's
-/// configured upstream answers.
+/// wait for room that will never come: it is refused, unplaced. So is a
+/// canary's baseline with nobody but an unnamed candidate.
 #[test]
 fn a_machine_the_table_does_not_name_takes_nothing() {
     let mut r = Registry::new();
@@ -473,11 +473,51 @@ fn a_machine_the_table_does_not_name_takes_nothing() {
     unnamed.set_machines(table(&[("m1", 1, 1, 1)]));
     unnamed.join(member(9, 9));
     unnamed.capacity("zend", 9, capacity(MemberState::Ready, 1, true, 1));
-    assert_eq!(placed(&mut unnamed), Err(Pick::Configured));
+    assert_eq!(placed(&mut unnamed), Err(Pick::Unplaced));
+    assert_eq!(
+        unnamed.pick_canary("zend", &Dispatch::Best, None, None, None, 9, &mut || true),
+        Pick::Unplaced,
+        "a candidate no machine names, with nobody else"
+    );
     let mut empty = Registry::new();
     empty.join(member(1, 1));
     empty.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
-    assert_eq!(placed(&mut empty), Err(Pick::Configured), "no table at all");
+    assert_eq!(placed(&mut empty), Err(Pick::Unplaced), "no table at all");
+
+    // A member's ask for a peer whose peers' machines take nothing falls back
+    // to the sender, as an empty pool of peers does.
+    let mut peers = Registry::new();
+    peers.set_machines(table(&[("m1", 1, 1, 1)]));
+    for node in [1, 9] {
+        peers.join(member(node, node));
+        peers.capacity("zend", node, capacity(MemberState::Ready, 1, true, 1));
+    }
+    let ask = PeerAsk {
+        sender: Some(1),
+        canary: None,
+    };
+    assert_eq!(
+        peers.pick_from("zend", &Dispatch::Best, None, None, None, ask),
+        Pick::Member(1)
+    );
+}
+
+/// **A held key's holders whose machines take nothing of it do not strand it**:
+/// it is placed among every member, as if nobody held it.
+#[test]
+fn a_released_key_held_only_where_nothing_is_taken_goes_among_them_all() {
+    let mut r = Registry::new();
+    r.set_machines(table(&[("m2", 1, 4, 4)]));
+    for n in [1, 2] {
+        r.join(member(n, n));
+        r.capacity("zend", n, capacity(MemberState::Ready, 1, true, 1));
+    }
+    r.released("zend", b"c", 1, 500);
+    assert_eq!(
+        r.pick("zend", &sticky(), None, Some("c"), None),
+        Pick::Member(2),
+        "only m1 holds it, and m1 is named nowhere"
+    );
 }
 
 /// **A lagging member with room takes a unit every other member is too full

@@ -2,28 +2,29 @@
 //! drawing, one with no unit of work in flight before one with, then the
 //! machine's picture preference.
 
-use super::{guest_reach, has_room, prefer_current, Placed, Weigh};
+use super::{guest_reach, has_room, Placed, Weigh};
 use crate::gateway::registry::{CardKey, MemberView};
 
 /// The member of `pool` — the cards that reach the draw — a draw goes to.
 ///
-/// Among the cards that may draw now ([`has_room`]) — those not lagging, while
-/// any of them may — **one with no unit in flight first**, whatever the
-/// preferences: a draw on a card mid-turn stalls that turn's stream for as long
-/// as it draws. Then the lowest `pictures`, then the lower node. When every
+/// Among the cards that may draw now ([`has_room`]) — **one with no unit in
+/// flight first**, whatever the preferences: a draw on a card mid-turn stalls
+/// that turn's stream for as long as it draws. Then one not lagging, then the
+/// lowest `pictures`, then the lower node. When every
 /// card that may draw has a unit in flight, the draw waits ([`Placed::Full`]);
 /// the gateway holds its card ([`draw_target`]) so that it takes no new unit,
 /// and the draw starts once the units there end — or once it has waited
 /// [`Weigh::draw_overdue`], when it takes its card as it stands. **No machine of
-/// the pool draws at all** is [`Placed::Nobody`]: waiting would never end.
+/// the pool draws at all** is [`Placed::Unplaced`]: waiting would never end.
 pub(super) fn draw_of(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Placed {
     let draws = pool
         .iter()
         .any(|m| weigh.machines.pictures(&m.host).is_some());
     let pick = best(&pool, weigh);
+    let idle = pick.is_some_and(|m| weigh.card(m).work() == 0);
     let placed = match pick {
-        _ if !draws => Placed::Nobody,
-        Some(m) if weigh.card(m).work() == 0 || weigh.draw_overdue => Placed::To(m.node),
+        _ if !draws => Placed::Unplaced,
+        Some(m) if idle || weigh.draw_overdue => Placed::To(m.node),
         _ => Placed::Full,
     };
     tracing::info!(
@@ -33,8 +34,8 @@ pub(super) fn draw_of(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Placed {
             _ => "none".to_string(),
         },
         by = match placed {
-            Placed::Nobody => "nobody",
-            _ if weigh.draw_overdue => "draw-overdue",
+            Placed::Unplaced => "unplaced",
+            Placed::To(_) if !idle => "draw-overdue",
             _ => "draw",
         },
         waits_for = %pick
@@ -71,17 +72,21 @@ pub(crate) fn draw_target(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Option<C
     best(&pool, weigh).map(CardKey::of)
 }
 
+/// The card a draw of `pool` would take: among those that may draw now, one
+/// with nothing in flight before one with, then one not lagging before one
+/// that is, then the picture preference, then the lower node. Lag weighs after
+/// a turn in flight: an idle card that lags draws sooner than a busy one that
+/// does not.
 fn best<'a>(pool: &[&'a MemberView], weigh: &Weigh<'_>) -> Option<&'a MemberView> {
-    let may: Vec<&MemberView> = pool
-        .iter()
+    pool.iter()
         .copied()
         .filter(|m| has_room(m, weigh, true))
-        .collect();
-    prefer_current(may).into_iter().min_by_key(|m| {
-        (
-            weigh.card(m).work() > 0,
-            weigh.machines.pictures(&m.host).unwrap_or(u32::MAX),
-            m.node,
-        )
-    })
+        .min_by_key(|m| {
+            (
+                weigh.card(m).work() > 0,
+                m.lagging,
+                weigh.machines.pictures(&m.host).unwrap_or(u32::MAX),
+                m.node,
+            )
+        })
 }

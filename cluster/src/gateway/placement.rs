@@ -73,8 +73,19 @@ pub(crate) enum Placed {
     To(u64),
     /// Every eligible card is full: the unit waits at the gateway (§3.4).
     Full,
+    /// No machine of the pool takes the unit at all — named nowhere in the
+    /// table, or without the key the unit needs: waiting would never end.
+    Unplaced,
     /// Nobody is eligible.
     Nobody,
+}
+
+impl Placed {
+    /// Whether the unit found no member at all — nobody eligible, or nobody
+    /// whose machine takes it — so a caller with a wider pool to try tries it.
+    pub fn missed(self) -> bool {
+        matches!(self, Placed::Nobody | Placed::Unplaced)
+    }
 }
 
 /// The member of `pool`, members of `app`, a request goes to: a draw by

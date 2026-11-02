@@ -235,6 +235,10 @@ pub(super) fn hex(node: u64) -> String {
 /// reservation ends with the draw that made it; the cards' load is read once
 /// for them all.
 fn reserve(s: &mut State) {
+    if !s.queue.waiting().any(|ask| ask.draw.is_some()) {
+        s.registry.set_reserved(BTreeSet::new());
+        return;
+    }
     let cards = s.registry.cards();
     let reserved: BTreeSet<CardKey> = s
         .queue
@@ -1497,9 +1501,9 @@ impl Hub {
                 s.registry.set_reserved(BTreeSet::new());
                 return;
             }
-            // The waiting draws' cards, held once for the whole walk: a draw
-            // placed during it is drawing, which keeps its card from the rest
-            // the same way.
+            // The waiting draws' cards, held for the walk, and held again after
+            // each draw it places: the draws still waiting may now want
+            // another card.
             reserve(&mut s);
             for seq in s.queue.order() {
                 let Some(w) = s.queue.take(seq) else {
@@ -1522,6 +1526,9 @@ impl Hub {
                 if picked.pick == Pick::Wait {
                     s.queue.keep(w);
                 } else {
+                    if w.ask.draw.is_some() {
+                        reserve(&mut s);
+                    }
                     placed.push((w, picked));
                 }
             }

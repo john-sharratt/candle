@@ -64,12 +64,24 @@ pub type Cards = HashMap<CardKey, CardLoad>;
 
 impl Registry {
     /// Every card as the plan reads it (`docs/static_placement.md` §5): its
-    /// latency units in flight, and its npcd members — each with its machine's
-    /// share of the cast, zero for one that takes no lease, and eligible to
-    /// host only while it may be routed to and nothing in its process still
-    /// loads (rule 1, [`MemberView::may_host`]).
+    /// zend work — requests in flight, and conversations its zend member holds
+    /// the claim of, a worker's delegated task among them — and its npcd
+    /// members, each with its machine's share of the cast, zero for one that
+    /// takes no lease, and eligible to host only while it may be routed to and
+    /// nothing in its process still loads (rule 1, [`MemberView::may_host`]).
+    ///
+    /// **A delegated task makes its card busy as a live conversation does.** A
+    /// worker's turns run inside its zend member and never pass the gateway, so
+    /// no request of theirs is in flight here; but each holds its
+    /// conversation's claim while it runs (`docs/cooperative_admission.md`
+    /// §2.2), and the claim is what says the card is at work.
     pub fn card_views(&self) -> Vec<CardView> {
         let loads = self.cards();
+        let claimed = self
+            .apps
+            .get(LATENCY_APP)
+            .map(|a| a.claims.held_by())
+            .unwrap_or_default();
         let mut views: BTreeMap<CardKey, CardView> = BTreeMap::new();
         for m in self.apps.values().flat_map(|a| a.members.values()) {
             let key = CardKey::of(m);
@@ -78,6 +90,9 @@ impl Registry {
                 key,
                 hosts: Vec::new(),
             });
+            if m.app == LATENCY_APP {
+                view.latency += claimed.get(&m.node).copied().unwrap_or(0);
+            }
             if m.app == HOSTING_APP {
                 view.hosts.push(Host {
                     node: m.node,

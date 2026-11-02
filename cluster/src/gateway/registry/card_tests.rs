@@ -3,9 +3,12 @@
 //! but a draw, a card held for a draw takes only that draw, and a key's holder
 //! is never refused.
 
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::dispatch::KeySource;
 use crate::frame::{BuildId, Epoch};
+use crate::gateway::planner::Planner;
 use crate::machines::MachineTable;
 
 /// A ready member of `app` on `host`'s card `card`.
@@ -118,17 +121,44 @@ fn a_drawing_card_takes_only_draws() {
 }
 
 /// **A machine that draws nothing is given no draw**, and a draw no machine
-/// will ever take does not wait for one: nobody takes it, and the route's
-/// configured upstream answers.
+/// will ever take does not wait for one: it is refused, unplaced.
 #[test]
 fn a_machine_that_draws_nothing_is_given_no_draw() {
     let mut r = registry("box:\n  conversations: {rank: 1, min: 4}\n");
     r.join(on_card("npcd", 1, "box", 9));
     assert_eq!(
         r.pick("npcd", &Dispatch::Best, Some(512 * 512), None, None),
-        Pick::Configured
+        Pick::Unplaced
     );
     assert_eq!(best(&mut r, "npcd"), Pick::Member(1));
+}
+
+/// **An idle picture card that lags draws before a busy one that does not**: a
+/// turn in flight weighs first, the lag after it.
+#[test]
+fn an_idle_lagging_card_draws_before_a_busy_current_one() {
+    let mut r = registry(
+        "bw:\n  conversations: {rank: 1, min: 4}\n  pictures: 1\n\
+         ww:\n  conversations: {rank: 2, min: 4}\n  pictures: 2\n",
+    );
+    r.join(on_card("npcd", 1, "bw", 7));
+    r.join(on_card("npcd", 2, "ww", 8));
+    r.begin("npcd", 1, false);
+    r.set_lagging("npcd", 2, true);
+    assert_eq!(
+        r.pick("npcd", &Dispatch::Best, Some(512 * 512), None, None),
+        Pick::Member(2),
+        "bw has a turn in flight"
+    );
+    r.set_lagging("npcd", 2, false);
+    let session = r.member("npcd", 1).unwrap().session;
+    r.end("npcd", 1, session, false);
+    r.set_lagging("npcd", 1, true);
+    assert_eq!(
+        r.pick("npcd", &Dispatch::Best, Some(512 * 512), None, None),
+        Pick::Member(2),
+        "both idle: the one not lagging"
+    );
 }
 
 /// **An errand waits for no card**: a request routed by its subject that
@@ -183,6 +213,56 @@ fn a_held_card_takes_only_its_draw() {
     );
     r.leave("zend", 3, 3);
     assert_eq!(best(&mut r, "zend"), Pick::Wait, "no other machine");
+}
+
+/// **A worker's delegated task makes its machine busy, and the cast leaves and
+/// comes back** (`docs/static_placement.md` §5.1). The task's turns run inside
+/// BlackWorld's zend member, so no request of theirs is in flight at the
+/// gateway — but the member holds the task's conversation claim, and that
+/// makes the card busy: the plan gives BlackWorld nothing while WhiteWorld can
+/// host. The claim let go, the card is free 120 s later and its share returns.
+#[test]
+fn a_delegated_task_makes_its_machine_busy() {
+    let mut r = registry(
+        "bw:\n  conversations: {rank: 1, min: 4}\n  characters: 3\n\
+         ww:\n  conversations: {rank: 2, min: 1}\n  characters: 1\n",
+    );
+    r.join(on_card("zend", 1, "bw", 7));
+    r.join(on_card("npcd", 2, "bw", 7));
+    r.join(on_card("npcd", 3, "ww", 8));
+    let t0 = Instant::now();
+    let mut p = Planner::default();
+    assert_eq!(p.plan(t0, &r.card_views()).weights, vec![(2, 3), (3, 1)]);
+
+    let task = Epoch { ms: 1, node: 1 };
+    r.claims("zend").claim(b"task-conversation", task);
+    assert_eq!(
+        r.cards()[&CardKey::Card(7)].in_flight,
+        0,
+        "nothing at the gateway"
+    );
+    let working = p.plan(t0 + Duration::from_secs(5), &r.card_views());
+    assert_eq!(
+        working.weights,
+        vec![(2, 0), (3, 1)],
+        "the cast leaves BlackWorld"
+    );
+
+    let done = t0 + Duration::from_secs(10);
+    p.plan(done, &r.card_views());
+    r.claims("zend").unclaim(b"task-conversation", task);
+    assert_eq!(
+        p.plan(done + Duration::from_secs(119), &r.card_views())
+            .weights,
+        vec![(2, 0), (3, 1)],
+        "within two minutes of the task's end"
+    );
+    assert_eq!(
+        p.plan(done + Duration::from_secs(121), &r.card_views())
+            .weights,
+        vec![(2, 3), (3, 1)],
+        "and back"
+    );
 }
 
 /// **A key's holder is never held back for room** (rule 1 before rule 3): a

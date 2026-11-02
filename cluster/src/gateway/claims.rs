@@ -42,6 +42,15 @@ impl Claims {
         self.held.get(key).map(|e| e.node)
     }
 
+    /// How many keys each node holds.
+    pub fn held_by(&self) -> HashMap<u64, u32> {
+        let mut held = HashMap::new();
+        for epoch in self.held.values() {
+            *held.entry(epoch.node).or_default() += 1;
+        }
+        held
+    }
+
     /// The whole table, as `ADMIT` sends it.
     pub fn table(&self) -> Vec<ClaimInfo> {
         let mut t: Vec<ClaimInfo> = self

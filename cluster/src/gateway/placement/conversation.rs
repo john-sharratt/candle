@@ -15,14 +15,14 @@ use crate::gateway::registry::MemberView;
 ///    cursor, in `(rank, node)` order, wrapping — and the cursor moves to it.
 /// 3. **None with room**: [`Placed::Full`], the unit waits. **No machine of the
 ///    pool takes conversations at all** — named nowhere in the table, or with no
-///    `conversations` — is [`Placed::Nobody`]: waiting would never end.
+///    `conversations` — is [`Placed::Unplaced`]: waiting would never end.
 pub(super) fn conversation_of(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Placed {
     if pool
         .iter()
         .all(|m| weigh.machines.conversations(&m.host).is_none())
     {
-        log(&pool, weigh, None, "nobody");
-        return Placed::Nobody;
+        log(&pool, weigh, None, "unplaced");
+        return Placed::Unplaced;
     }
     let room: Vec<&MemberView> = pool
         .iter()

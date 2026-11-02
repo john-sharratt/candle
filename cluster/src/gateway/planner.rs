@@ -36,7 +36,8 @@ pub struct Host {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardView {
     pub key: CardKey,
-    /// Live conversations — zend requests — in flight on it.
+    /// Its zend work: requests in flight, and the conversations its zend member
+    /// holds the claim of — a live conversation, or a worker's delegated task.
     pub latency: u32,
     /// Its npcd members.
     pub hosts: Vec<Host>,
