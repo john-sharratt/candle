@@ -25,6 +25,7 @@ use npc_map::world::Where;
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
+use crate::engine::authorize;
 use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
 use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
@@ -289,11 +290,27 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         // as a board is: marked read as it is handed over, which is what ends
         // the unread reminder (`sim::unread`).
         if s.has_phone(body) {
-            if let Some(said) = read_phone(&mut s.threads, &me, &what) {
+            if let Some((said, read)) = read_phone(&mut s.threads, &me, &what) {
                 // Reading its messages is a step of the reader's round, seen
                 // done as it lands.
                 if said.happened() {
                     s.missions.read_messages(body);
+                    // A critical step held open is let through only by an
+                    // authorizer's affirmative, read here off the phone.
+                    let authorizers = s.missions.authorizers().to_vec();
+                    if !authorizers.is_empty() {
+                        if let Some(m) = s.missions.active_mut(body) {
+                            if m.critical_next().is_some() {
+                                for (from, text) in &read {
+                                    if authorize::authorize_on_message(m, from, text, &authorizers)
+                                        .is_some()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 return said;
             }
@@ -320,7 +337,11 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
 /// calls it, or every one with something unread when `what` asks for its
 /// messages or its phone. `None` when `what` names neither, so the reading
 /// goes on to the room.
-fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
+fn read_phone(
+    threads: &mut Threads,
+    me: &str,
+    what: &str,
+) -> Option<(Outcome, Vec<(String, String)>)> {
     let want = what.trim().to_lowercase();
     let all = want == ALL_MESSAGES
         || matches!(
@@ -336,6 +357,7 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
         false => vec![threads.by_name_for(me, what)?.as_named_to(me)],
     };
     let mut said = Vec::new();
+    let mut read: Vec<(String, String)> = Vec::new();
     for name in &names {
         let fresh = threads.read(me, name).ok()?;
         if fresh.is_empty() {
@@ -345,9 +367,10 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
             .iter()
             .map(|m| format!("{}: {}", m.from, m.intent.trim()))
             .collect();
+        read.extend(fresh.iter().map(|m| (m.from.clone(), m.intent.clone())));
         said.push(format!("On {name}: {}", lines.join("; ")));
     }
-    Some(match (said.is_empty(), all) {
+    let outcome = match (said.is_empty(), all) {
         (true, true) => Outcome::Refused("Nothing on your phone is unread.".into()),
         (true, false) => Outcome::Refused(format!(
             "You have read everything on {}. Nothing has been said since.",
@@ -357,7 +380,8 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
             "{}\nTo answer, `reply` on the conversation it was said on, by that name.",
             said.join("\n")
         )),
-    })
+    };
+    Some((outcome, read))
 }
 
 /// Leave words on something here, for whoever comes to it next.

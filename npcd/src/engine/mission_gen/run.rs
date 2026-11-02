@@ -830,12 +830,16 @@ pub fn spawn(rt: Arc<Runtime>) {
                         hosted.with_sim(|s| {
                             s.missions.set_workflows(Vec::new());
                             s.missions.set_routines(own.routines, own.draw);
+                            s.missions.set_authorizers(own.authorizers);
                         });
                         continue;
                     }
                     Ok(None) => {
                         told_world.remove(&id);
-                        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
+                        hosted.with_sim(|s| {
+                            s.missions.set_routines(Vec::new(), Draw::Routines);
+                            s.missions.set_authorizers(Vec::new());
+                        });
                     }
                     Err(e) => {
                         if told_world.get(&id) != Some(&e) {

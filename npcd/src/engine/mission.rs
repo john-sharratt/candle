@@ -718,7 +718,11 @@ impl Mission {
     /// Sign off every open step that opens with `opening`.
     fn tick_opening(&mut self, opening: &str) -> bool {
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if step.text.trim().to_lowercase().starts_with(opening) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);

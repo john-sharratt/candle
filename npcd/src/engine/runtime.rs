@@ -79,6 +79,7 @@ use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
 use crate::engine::authoring;
+use crate::engine::authorize::critical_compass;
 use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
 use crate::engine::channels::{self, ChannelSection};
@@ -1719,6 +1720,11 @@ impl Runtime {
                 }
                 let written = written_up_to_floor(s, &body, mission, &doc);
                 return Some(doc_compass(&doc, &desk, way.as_deref(), written));
+            }
+            // A critical step is not done until an authorizer approves: the
+            // compass tells the carrier to seek the go-ahead, not to do it.
+            if next.critical {
+                return Some(critical_compass(&next.text, s.missions.authorizers()));
             }
             let way = Aim::of(&next.text).and_then(|aim| {
                 let target = reach

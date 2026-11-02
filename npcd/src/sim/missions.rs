@@ -204,6 +204,10 @@ pub struct Missions {
     /// mind's, with the routines.
     #[serde(skip)]
     draw: Draw,
+    /// Who may approve a critical step (`docs/mission_templates.md` §6), by the
+    /// name the world writes — the mind's, read afresh like the routines.
+    #[serde(skip)]
+    authorizers: Vec<String>,
     /// What the world's round has done — see [`super::round`].
     #[serde(default)]
     round: RoundState,
@@ -570,6 +574,12 @@ impl Missions {
         self.active.get(body)
     }
 
+    /// The body's open mission, to change — what the critical gate signs off
+    /// when an authorizer's go-ahead lands.
+    pub fn active_mut(&mut self, body: &str) -> Option<&mut Mission> {
+        self.active.get_mut(body)
+    }
+
     /// The last mission the body finished, if any.
     pub fn done(&self, body: &str) -> Option<&Mission> {
         self.done.get(body)
@@ -911,6 +921,17 @@ impl Missions {
         self.draw = draw;
     }
 
+    /// Set who may approve a critical step — empty for a world that sets none,
+    /// so a critical step can then only be held.
+    pub fn set_authorizers(&mut self, authorizers: Vec<String>) {
+        self.authorizers = authorizers;
+    }
+
+    /// Who may approve a critical step here (`docs/mission_templates.md` §6).
+    pub fn authorizers(&self) -> &[String] {
+        &self.authorizers
+    }
+
     /// Take `from`'s workflows and routines in place of these: they are the
     /// mind's, not the world's, and a world taken in from elsewhere keeps the
     /// ones this machine loaded.
@@ -918,6 +939,7 @@ impl Missions {
         self.operations.adopt_workflows(&mut from.operations);
         self.routines = std::mem::take(&mut from.routines);
         self.draw = from.draw;
+        self.authorizers = std::mem::take(&mut from.authorizers);
     }
 
     /// Call off every operation not yet over, for `why` — what a world that
