@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::engine::body::Outcome;
 use crate::engine::mission::{Origin, Outcome as Verdict};
-use crate::engine::mission_gen::world::{mission_of, Filled};
+use crate::engine::mission_gen::world::{mission_of, Filled, FilledStep};
 use crate::world::Hosted;
 
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
@@ -100,7 +100,13 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             }
             Filled {
                 brief,
-                steps,
+                steps: steps
+                    .into_iter()
+                    .map(|text| FilledStep {
+                        text,
+                        critical: false,
+                    })
+                    .collect(),
                 grants: Vec::new(),
                 work: None,
             }

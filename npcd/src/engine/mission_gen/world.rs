@@ -49,8 +49,10 @@ pub struct Routine {
     /// What the character is asked, in a paragraph. May hold `{name}`
     /// placeholders for the routine's parameters.
     pub brief: String,
-    /// The steps it works through, in order. May hold `{name}` placeholders.
-    pub steps: Vec<String>,
+    /// The steps it works through, in order — each a plain string, or a map
+    /// with `critical: true` for an irreversible one ([`Step`]). May hold
+    /// `{name}` placeholders.
+    pub steps: Vec<Step>,
     /// The parameters the routine takes — names that may appear as `{name}` in
     /// the brief, the steps and the work. Empty for a routine that takes none,
     /// which is issued and drawn exactly as before.
@@ -64,6 +66,48 @@ pub struct Routine {
     /// template.
     #[serde(default)]
     pub work: Option<RoutineWork>,
+}
+
+/// One step of a routine: a plain instruction, or one flagged `critical` — an
+/// irreversible move the carrier may take only with an authorizer's go-ahead
+/// (`docs/mission_templates.md` §6). In YAML a bare string is a plain step; a
+/// map `{ text: "...", critical: true }` flags one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Step {
+    Plain(String),
+    Flagged {
+        text: String,
+        #[serde(default)]
+        critical: bool,
+    },
+}
+
+impl Step {
+    /// The instruction itself, whichever form it took.
+    pub fn text(&self) -> &str {
+        match self {
+            Step::Plain(s) => s,
+            Step::Flagged { text, .. } => text,
+        }
+    }
+
+    /// Whether it is an irreversible step that waits on an authorizer.
+    pub fn is_critical(&self) -> bool {
+        matches!(self, Step::Flagged { critical: true, .. })
+    }
+}
+
+impl From<&str> for Step {
+    fn from(s: &str) -> Self {
+        Step::Plain(s.to_string())
+    }
+}
+
+impl From<String> for Step {
+    fn from(s: String) -> Self {
+        Step::Plain(s)
+    }
 }
 
 /// What a routine's mission is work on: the document to write, the ones to read
@@ -111,12 +155,20 @@ impl RoutineWork {
     }
 }
 
+/// One filled step: its text with placeholders replaced, and whether it is
+/// critical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilledStep {
+    pub text: String,
+    pub critical: bool,
+}
+
 /// A routine filled with its arguments: the mission it produces, bar the report
 /// step the table adds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filled {
     pub brief: String,
-    pub steps: Vec<String>,
+    pub steps: Vec<FilledStep>,
     pub grants: Vec<String>,
     pub work: Option<Work>,
 }
@@ -144,6 +196,11 @@ pub struct WorldMissions {
     /// What a character with nothing set for it is handed — see [`Draw`].
     #[serde(default)]
     pub draw: Draw,
+    /// Who may approve a critical step (`docs/mission_templates.md` §6), by the
+    /// name the world writes for them — the Creator and Yen. Empty where none
+    /// is set, and then a critical step can only be held, never approved.
+    #[serde(default)]
+    pub authorizers: Vec<String>,
 }
 
 /// The world-level config a `missions/<world>/world.yaml` carries.
@@ -152,6 +209,8 @@ pub struct WorldMissions {
 struct WorldConfig {
     #[serde(default)]
     draw: Draw,
+    #[serde(default)]
+    authorizers: Vec<String>,
 }
 
 /// Where world `world`'s combined missions file stands in the mind.
@@ -189,8 +248,13 @@ impl Routine {
             steps: self
                 .steps
                 .iter()
-                .map(|s| substitute(s, args))
-                .collect::<Result<_, _>>()?,
+                .map(|s| {
+                    Ok(FilledStep {
+                        text: substitute(s.text(), args)?,
+                        critical: s.is_critical(),
+                    })
+                })
+                .collect::<Result<_, String>>()?,
             grants: self.grants.clone(),
             work: self.work.as_ref().map(|w| w.fill(args)).transpose()?,
         })
@@ -217,6 +281,7 @@ impl WorldMissions {
     pub fn load(mind: &MindFiles, world: &str) -> Result<Option<WorldMissions>, String> {
         let mut routines: Vec<Routine> = Vec::new();
         let mut draw = Draw::default();
+        let mut authorizers: Vec<String> = Vec::new();
         let mut found = false;
 
         let file = path(world);
@@ -225,6 +290,7 @@ impl WorldMissions {
                 let m = WorldMissions::parse(&file, &text)?;
                 routines.extend(m.routines);
                 draw = m.draw;
+                authorizers.extend(m.authorizers);
                 found = true;
             }
             None if mind.is_file(&file) => return Err(format!("{file} is not UTF-8")),
@@ -246,6 +312,7 @@ impl WorldMissions {
                 let c: WorldConfig =
                     serde_yaml::from_str(&text).map_err(|e| format!("{rel}: {e}"))?;
                 draw = c.draw;
+                authorizers.extend(c.authorizers);
             } else {
                 routines.push(Routine::parse(&rel, &text)?);
             }
@@ -256,7 +323,11 @@ impl WorldMissions {
             return Ok(None);
         }
         check_unique(&routines)?;
-        Ok(Some(WorldMissions { routines, draw }))
+        Ok(Some(WorldMissions {
+            routines,
+            draw,
+            authorizers,
+        }))
     }
 }
 
@@ -273,7 +344,7 @@ fn check_routine(file: &str, r: &Routine) -> Result<(), String> {
     if r.brief.trim().is_empty() {
         return Err(format!("{file}: routine `{}` has no brief", r.id));
     }
-    if r.steps.is_empty() || r.steps.iter().any(|s| s.trim().is_empty()) {
+    if r.steps.is_empty() || r.steps.iter().any(|s| s.text().trim().is_empty()) {
         return Err(format!(
             "{file}: routine `{}` needs at least one step, and no empty ones",
             r.id
@@ -297,7 +368,7 @@ fn check_routine(file: &str, r: &Routine) -> Result<(), String> {
     let declared: BTreeSet<&str> = r.params.iter().map(String::as_str).collect();
     let mut used = placeholders(&r.brief);
     for s in &r.steps {
-        used.extend(placeholders(s));
+        used.extend(placeholders(s.text()));
     }
     if let Some(w) = &r.work {
         used.extend(w.placeholders());
@@ -412,7 +483,14 @@ pub fn draw(routines: &[Routine], table: Option<&str>, seed: u64) -> Option<Miss
 /// The mission a filled routine becomes, with the report step appended and its
 /// grants and work carried onto it.
 pub fn mission_of(filled: Filled, origin: Origin, table: Option<&str>) -> Mission {
-    let mut todo: Vec<Todo> = filled.steps.iter().map(|s| Todo::new(s.as_str())).collect();
+    let mut todo: Vec<Todo> = filled
+        .steps
+        .iter()
+        .map(|s| match s.critical {
+            true => Todo::critical(s.text.as_str()),
+            false => Todo::new(s.text.as_str()),
+        })
+        .collect();
     todo.push(Todo::report(report_step(table)));
     let mut m = Mission::new(filled.brief.as_str(), todo, origin);
     if !filled.grants.is_empty() {
@@ -453,8 +531,9 @@ routines:
         let m = WorldMissions::parse("missions/life.yaml", LIFE).unwrap();
         let ids: Vec<&str> = m.routines.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["check-on-the-sharratts", "ward-shift"]);
+        let steps: Vec<&str> = m.routines[0].steps.iter().map(|s| s.text()).collect();
         assert_eq!(
-            m.routines[0].steps,
+            steps,
             ["go to the Sharratt room", "settle how the family is today"]
         );
     }
@@ -529,10 +608,39 @@ routines:
             ]))
             .unwrap();
         assert_eq!(filled.brief, "Put Dune on the living room TV.");
+        let steps: Vec<&str> = filled.steps.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
-            filled.steps,
+            steps,
             ["go to the front room", "put Dune on the living room TV"]
         );
+        assert!(filled.steps.iter().all(|s| !s.critical));
+    }
+
+    /// **A step flagged `critical` carries that flag through fill and onto the
+    /// mission's Todo** — the irreversible one the gate holds; plain steps stay
+    /// ordinary.
+    #[test]
+    fn a_critical_step_is_carried_through() {
+        let r = Routine::parse(
+            "clear.yaml",
+            "id: clear\nbrief: Clear {what}.\nparams: [what]\nsteps:\n  - check what {what} is safe to remove\n  - text: delete the old {what}\n    critical: true\n",
+        )
+        .unwrap();
+        let filled = r.fill(&args(&[("what", "logs")])).unwrap();
+        assert_eq!(filled.steps[0].text, "check what logs is safe to remove");
+        assert!(!filled.steps[0].critical);
+        assert_eq!(filled.steps[1].text, "delete the old logs");
+        assert!(filled.steps[1].critical);
+        let m = mission_of(
+            filled,
+            Origin::Random {
+                routine: "clear".into(),
+            },
+            None,
+        );
+        assert!(!m.todo[0].critical);
+        assert!(m.todo[1].critical, "the delete step is critical");
+        assert!(!m.todo[2].critical, "the report step is ordinary");
     }
 
     /// **A missing argument is named, not guessed**; an unfilled parameter
@@ -668,7 +776,7 @@ routines:
             .unwrap();
         assert_eq!(a.prompt, r.brief);
         let steps: Vec<&str> = a.todo.iter().map(|t| t.text.as_str()).collect();
-        let mut want: Vec<&str> = r.steps.iter().map(String::as_str).collect();
+        let mut want: Vec<&str> = r.steps.iter().map(|s| s.text()).collect();
         want.push("go back to the table in the watch room and report it");
         assert_eq!(steps, want);
         let drawn: BTreeSet<String> = (0..64)

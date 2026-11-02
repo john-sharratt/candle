@@ -41,6 +41,14 @@ pub struct Todo {
     /// closes it, so no observer ticks it on the character's word.
     #[serde(default)]
     pub reports: bool,
+    /// Whether the step is irreversible and may be taken only with an
+    /// authorizer's go-ahead (`docs/mission_templates.md` §6). The engine never
+    /// signs a critical step off from what it sees, and the carrier may not tick
+    /// it itself: only [`Mission::authorize`], called once an authorizer has
+    /// approved, closes it. An undone critical step keeps [`Self::all_todos_done`]
+    /// false, so the mission holds at it until the go-ahead lands.
+    #[serde(default)]
+    pub critical: bool,
 }
 
 /// How a signed-off step turned out.
@@ -71,6 +79,16 @@ impl Todo {
             done: false,
             outcome: None,
             reports: false,
+            critical: false,
+        }
+    }
+
+    /// A fresh, un-ticked step that is irreversible — taken only with an
+    /// authorizer's go-ahead. See [`Todo::critical`].
+    pub fn critical(text: impl Into<String>) -> Self {
+        Self {
+            critical: true,
+            ..Self::new(text)
         }
     }
 
@@ -339,7 +357,11 @@ impl Mission {
     pub fn read_doc(&mut self, path: &str) -> bool {
         let path = plain_path(path);
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if reading_doc(&step.text).is_some_and(|p| p == path) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
@@ -364,7 +386,7 @@ impl Mission {
         let gone: Vec<String> = self
             .todo
             .iter()
-            .filter(|t| !t.done && !t.reports)
+            .filter(|t| !t.done && !t.reports && !t.critical)
             .filter_map(|t| raw_doc_after(&t.text, "read "))
             .filter(|p| !holds(op, p))
             .collect();
@@ -444,7 +466,11 @@ impl Mission {
     pub fn travelled(&mut self, year: u32) -> bool {
         self.year = Some(year);
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if time_step(&step.text) == Some(year) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
@@ -459,7 +485,11 @@ impl Mission {
     pub fn committed(&mut self, paths: &[String]) -> bool {
         let paths: Vec<String> = paths.iter().map(|p| plain_path(p)).collect();
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if writing_doc(&step.text).is_some_and(|p| paths.contains(&p)) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
@@ -539,13 +569,40 @@ impl Mission {
     pub fn check_off(&mut self, which: &str, outcome: StepOutcome) -> bool {
         let want = which.trim().to_lowercase();
         for step in &mut self.todo {
-            if !step.done && step.text.trim().to_lowercase() == want {
+            if !step.done && !step.critical && step.text.trim().to_lowercase() == want {
                 step.done = true;
                 step.outcome = Some(outcome);
                 return true;
             }
         }
         false
+    }
+
+    /// The current step's text when it is a critical one — what the carrier may
+    /// not do until an authorizer approves. `None` when the next step is
+    /// ordinary or there is none. The critical gate reads this to know when to
+    /// seek a go-ahead instead of letting the step be done.
+    pub fn critical_next(&self) -> Option<&str> {
+        self.todo
+            .iter()
+            .find(|t| !t.done)
+            .filter(|t| t.critical)
+            .map(|t| t.text.as_str())
+    }
+
+    /// Sign off the current step because an authorizer has approved it — the
+    /// only thing that closes a `critical` step (nothing the engine sees and no
+    /// `check_off` on the carrier's word does). Signs off the first open step
+    /// when it is critical, and says whether it did.
+    pub fn authorize(&mut self) -> bool {
+        match self.todo.iter_mut().find(|t| !t.done) {
+            Some(step) if step.critical => {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Add a step. A character adds one when it discovers work the mission did
@@ -585,7 +642,11 @@ impl Mission {
     pub fn arrived_in(&mut self, room: &str, level: &str) -> bool {
         let (room, level) = (plain(room), plain(level));
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if journey_to(&step.text).is_some_and(|to| at_place(&to, &room, &level)) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
@@ -601,7 +662,11 @@ impl Mission {
     pub fn read_off(&mut self, seen: &[String]) -> bool {
         let seen: Vec<String> = seen.iter().map(|n| plain(n)).collect();
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             if reading_of(&step.text).is_some_and(|of| seen.iter().any(|n| names(&of, n))) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
@@ -665,7 +730,11 @@ impl Mission {
 
     fn tick_about(&mut self, who: &str, verbs: &[&str]) -> bool {
         let mut ticked = false;
-        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
             let text = step.text.trim().to_lowercase();
             if verbs.iter().any(|v| text.starts_with(v)) && mentions(&text, who) {
                 step.done = true;
@@ -694,7 +763,7 @@ impl Mission {
         let machines: Vec<String> = machines.iter().map(|n| plain(n)).collect();
         self.todo
             .iter()
-            .filter(|t| !t.done && !t.reports)
+            .filter(|t| !t.done && !t.reports && !t.critical)
             .find(|t| reading_of(&t.text).is_some_and(|of| machines.iter().any(|m| names(&of, m))))
             .map(|t| t.text.as_str())
     }
@@ -2409,7 +2478,7 @@ mod tests {
         assert_eq!(t.outcome, None);
         assert_eq!(
             serde_json::to_string(&Todo::new("x")).unwrap(),
-            r#"{"text":"x","done":false,"outcome":null,"reports":false}"#
+            r#"{"text":"x","done":false,"outcome":null,"reports":false,"critical":false}"#
         );
     }
 

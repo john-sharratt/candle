@@ -1761,7 +1761,7 @@ mod tests {
             vec![Routine {
                 id: "ward-shift".to_string(),
                 brief: "Take a shift on the ward.".to_string(),
-                steps: vec!["go to the ward room".to_string()],
+                steps: vec!["go to the ward room".into()],
                 ..Default::default()
             }]
         };

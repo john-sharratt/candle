@@ -54,6 +54,7 @@ pub mod archive;
 pub mod ask_api;
 pub mod at_work;
 pub mod authoring;
+pub mod authorize;
 pub mod bearings;
 pub mod bench;
 pub mod bodies;
