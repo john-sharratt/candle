@@ -193,7 +193,7 @@ still told who is there.
 | Notifications | Report → the poster, with "the table is empty" when it is. Post → every Drone waiting at the table, or the one named. |
 | Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it — in a world with no round. |
 | Zen's agenda (§17) | Several missions per body that takes no orders, by priority, the highest worked; `mission_add` / `mission_edit` / `mission_cancel`, offered anywhere to such a body; `Choices::Agenda`. |
-| The round (§17.3) | `missions/<world>/round.yaml`; `collect_mission` offered to a body that takes no orders when its agenda is empty and an item is due, given by the table's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
+| The round (§17.3) | `rounds/<world>.yaml`; `collect_mission` offered to a body that takes no orders when its agenda is empty and an item is due, given by the table's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
 
 ## 10. Build order
 
@@ -210,7 +210,8 @@ still told who is there.
 itself, on a schedule, in every room it applies to — and gives out last, when nobody has
 anything better to do. Drones waiting at the table for work (§8.3) take Zen's orders first and a
 standing mission only when nothing else waits, so their idle time becomes the world's upkeep and
-its growth. Each is a file in the mind, `missions/<world>/<id>.yaml`, so how the world grows is
+its growth. Each is a file in the mind, `standing/<world>/<id>.yaml` — apart from the world's
+template library (`missions/<world>/`, `docs/mission_templates.md` §5) — so how the world grows is
 in source control:
 
 ```yaml
@@ -246,7 +247,7 @@ steps:
   the carrier's to report.
 
 The routines of `missions/life.yaml` are standing missions in all but name; they become
-`missions/life/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing
+`standing/life/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing
 missions not yet due.
 
 ## 13. The house link
@@ -423,7 +424,8 @@ due, Zen rests (§17.4).
 
 #### The file
 
-One file, `missions/<world>/round.yaml`, beside the world's standing missions:
+One file, `rounds/<world>.yaml` — apart from the world's template library (`missions/<world>/`)
+and its standing missions (`standing/<world>/`), so each folder holds one kind of file:
 
 ```yaml
 round:

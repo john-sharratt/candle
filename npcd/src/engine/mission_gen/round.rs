@@ -2,8 +2,7 @@
 //! that takes no orders when its agenda is empty, one item at a time, in order,
 //! for ever.
 //!
-//! One file, `missions/<world>/round.yaml`, beside the world's standing
-//! missions. Each item is a mission's brief and steps, with when it is due:
+//! One file, `rounds/<world>.yaml`. Each item is a mission's brief and steps, with when it is due:
 //! only while a condition of the world holds (`when`), and not again until a
 //! period has passed since it was last done (`every`). The item given is the
 //! first due one after the one given last, so an item just done is given again
@@ -19,8 +18,12 @@ use crate::mind::files::MindFiles;
 use crate::sim::round::RoundState;
 use crate::sim::Sim;
 
-/// The round's file, in a world's missions folder.
-pub const ROUND_FILE: &str = "round.yaml";
+/// Where world `world`'s round stands in the mind: a file of its own, apart
+/// from the world's template library (`missions/<world>/`) and its standing
+/// missions (`standing/<world>/`).
+pub fn path(world: &str) -> String {
+    format!("rounds/{world}.yaml")
+}
 
 /// How long a round mission may be carried without every step signed off
 /// before it is called off as failed: an hour, so a step that cannot be done
@@ -149,18 +152,15 @@ pub fn parse(file: &str, yaml: &str) -> Result<Vec<Item>, String> {
     Ok(out)
 }
 
-/// World `world`'s round, from `missions/<world>/round.yaml` — empty when it
-/// has none.
+/// World `world`'s round, from `rounds/<world>.yaml` — empty when it has
+/// none.
 pub fn load(mind: &MindFiles, world: &str) -> Result<Vec<Item>, String> {
-    let dir = format!("missions/{world}");
-    if !mind.list(&dir).iter().any(|n| n == ROUND_FILE) {
-        return Ok(Vec::new());
+    let file = path(world);
+    match mind.read(&file) {
+        Some(text) => parse(&file, &text),
+        None if mind.is_file(&file) => Err(format!("{file} is not UTF-8")),
+        None => Ok(Vec::new()),
     }
-    let file = format!("{dir}/{ROUND_FILE}");
-    let Some(text) = mind.read(&file) else {
-        return Err(format!("{file} is not UTF-8"));
-    };
-    parse(&file, &text)
 }
 
 impl Item {
@@ -313,6 +313,23 @@ mod tests {
             let e = parse("f", &bad).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
+    }
+
+    /// **A round is read from its own file**, `rounds/<world>.yaml`, apart from
+    /// the world's template library and its standing missions: a world with
+    /// none has an empty round, and a bad one is refused naming the file.
+    #[test]
+    fn a_round_is_read_from_its_own_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mind = MindFiles::folder(tmp.path());
+        assert_eq!(load(&mind, "life"), Ok(Vec::new()));
+        std::fs::create_dir_all(tmp.path().join("rounds")).unwrap();
+        std::fs::write(tmp.path().join(path("life")), ROUND).unwrap();
+        assert_eq!(load(&mind, "life").unwrap(), round());
+        std::fs::write(tmp.path().join(path("life")), "round: [x]\n").unwrap();
+        assert!(load(&mind, "life")
+            .unwrap_err()
+            .starts_with("rounds/life.yaml: "));
     }
 
     /// **In order, from where it left off, and never the same twice running

@@ -136,6 +136,11 @@ loader walks `missions/` with `MindFiles::walk` (which exists) and validates eac
 file as `WorldMissions::parse` does now — a template that would produce a broken
 mission is refused at load, naming the file and the fault.
 
+**The library's folder holds templates and nothing else.** The world's other
+mission files keep their own places, so no loader meets a file of another kind:
+its standing missions under `standing/<world>/` (`docs/zen_moon_mind.md` §12)
+and its round in `rounds/<world>.yaml` (§17.3).
+
 The two worlds keep their templates in different repos, along the line the repos
 already divide on:
 

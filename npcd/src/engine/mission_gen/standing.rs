@@ -2,7 +2,7 @@
 //! put up by the table on a schedule in every room it applies to, and given
 //! out last.
 //!
-//! Each is a file in the mind, `missions/<world>/<id>.yaml`. The table puts one
+//! Each is a file in the mind, `standing/<world>/<id>.yaml`. The table puts one
 //! up in a room when it is due there; **never more than one in a room at a
 //! time**, and with `every: never`, once in each room ever.
 
@@ -14,7 +14,6 @@ use npc_map::MapSet;
 
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::mission::{Mission, Origin, Todo};
-use crate::engine::mission_gen::round::ROUND_FILE;
 use crate::mind::files::MindFiles;
 use crate::sim::missions::Missions;
 
@@ -182,13 +181,18 @@ impl Standing {
     }
 }
 
-/// Every standing mission of world `world`, from `missions/<world>/` — every
-/// file there but the round's ([`ROUND_FILE`]).
+/// Where world `world`'s standing missions stand in the mind: a folder of
+/// their own, apart from the world's template library (`missions/<world>/`).
+pub fn dir(world: &str) -> String {
+    format!("standing/{world}")
+}
+
+/// Every standing mission of world `world`, from `standing/<world>/`.
 pub fn load(mind: &MindFiles, world: &str) -> Result<Vec<Standing>, String> {
-    let dir = format!("missions/{world}");
+    let dir = dir(world);
     let mut out = Vec::new();
     for name in mind.list(&dir) {
-        if !name.ends_with(".yaml") || name == ROUND_FILE {
+        if !name.ends_with(".yaml") {
             continue;
         }
         let file = format!("{dir}/{name}");
