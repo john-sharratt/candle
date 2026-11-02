@@ -47,3 +47,4 @@ pub mod standing;
 pub mod step;
 pub mod target;
 pub mod world;
+pub mod write_template;

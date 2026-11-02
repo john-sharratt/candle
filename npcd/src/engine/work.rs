@@ -37,8 +37,11 @@ use crate::engine::archive;
 use crate::engine::body::Outcome;
 use crate::engine::chronology;
 use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict};
-use crate::engine::mission_gen::config::{CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC};
+use crate::engine::mission_gen::config::{
+    CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC, ROUTINE_PARSES,
+};
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
+use crate::engine::mission_gen::world::Routine;
 use crate::engine::mission_gen::{gates, leakage, rejection, round};
 use crate::engine::order_table;
 use crate::engine::passage;
@@ -648,6 +651,13 @@ fn gate_refusal(
         .and_then(|b| copied::copied(&text, b))
     {
         faults.push(fault);
+    }
+    // A mission template that would not parse must never publish, or it breaks
+    // the world's loader for every routine. The write step carries this check.
+    if checks(ROUTINE_PARSES) {
+        if let Err(why) = Routine::parse(path, &text) {
+            faults.push(format!("it is not a valid mission template: {why}"));
+        }
     }
     if faults.is_empty() {
         return None;

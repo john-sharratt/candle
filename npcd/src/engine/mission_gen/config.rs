@@ -33,6 +33,10 @@ pub const READING: &str = "reading";
 /// operation's store landed on the record ([`PUBLISHED`]).
 pub const COMMITTED: &str = "committed";
 pub const CHANGED: &str = "changed";
+/// The committed document parses as a mission template (a `Routine`): the
+/// built-in `write-template` workflow's write step carries it, so a broken
+/// template can never publish and break a world's loader.
+pub const ROUTINE_PARSES: &str = "routine-parses";
 pub const REJECTION_QUOTES: &str = "rejection-quotes-the-draft";
 pub const REJECTION_NAMES_AN_ERA: &str = "rejection-names-an-era";
 
@@ -257,6 +261,7 @@ fn check_workflow(w: &Workflow) -> Result<(), String> {
         .chain([
             COMMITTED,
             CHANGED,
+            ROUTINE_PARSES,
             BRIEF_COPIED,
             REJECTION_QUOTES,
             REJECTION_NAMES_AN_ERA,
