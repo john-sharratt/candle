@@ -1,9 +1,12 @@
 //! Talking on a chat (`docs/zen_chat.md` §1, §2): a send, a read, and Zen's
 //! answer said as a message when its turn settles.
 //!
-//! A send runs under the lock a turn begins under ([`workers::holding`]), as a
-//! task's start does, so two sends at once never begin two turns on one
-//! conversation, and a disposal never ceases a chat under a turn it begins. Zen
+//! A chat is named by its id, which the send that opened it answered with —
+//! never by the MCP session it was opened on, since claude.ai keeps one session
+//! across every conversation a person has through it. A send runs under the
+//! lock a turn begins under ([`workers::holding`]), as a task's start does, so
+//! two sends at once never begin two turns on one conversation, and a disposal
+//! never ceases a chat under a turn it begins. Zen
 //! answers on a worker of kind chat under the chat's thread: the same worker
 //! for every message while it can be continued, and a fresh one — shown the
 //! chat's last messages — after a turn that failed.
@@ -11,7 +14,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mcp_server::{Session, Store};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::mcp::archiving;
@@ -19,7 +21,6 @@ use crate::mcp::caller::Caller;
 use crate::mcp::names;
 use crate::mcp::records::Records;
 use crate::mcp::roles::WorkerKind;
-use crate::mcp::state::CHAT;
 use crate::mcp::threads::{self, Effort, Priority, State, Worker};
 use crate::mcp::workers::{self, now_ms};
 use crate::session::ZendSession;
@@ -43,8 +44,15 @@ pub struct Sent {
     pub worker: Worker,
     /// The sent message's number.
     pub number: usize,
-    /// The chat the session held was disposed of, so this one is new.
-    pub reopened: bool,
+}
+
+/// What a call naming a chat that is not open is answered: it was closed, or
+/// disposed of idle, or it was never this person's.
+pub fn not_open(id: &str) -> String {
+    format!(
+        "No chat `{id}` is open: it was closed, or deleted after twelve hours with nothing said. \
+         Everything said on it is gone; `zen_chat_send` without `chat` opens a new one."
+    )
 }
 
 /// Which worker answers the next message on a chat.
@@ -57,15 +65,34 @@ pub enum Next {
     Fresh(String),
 }
 
-/// What a send is refused with while Zen answers.
-pub const STILL_ANSWERING: &str = "Zen is still answering your last message: read its answer with \
-    `zen_chat_read`, then send this one";
+/// How many chats one person may have kept at once. Each holds a conversation
+/// and a worker until it is closed or idle twelve hours, so a caller that
+/// loses its ids and opens a chat on every send is stopped here, told to close
+/// what it no longer needs.
+pub const MAX_CHATS: usize = 16;
+
+/// What a send is refused with while Zen answers on the chat `id`.
+pub fn still_answering(id: &str) -> String {
+    format!(
+        "Zen is still answering your last message: read its answer with `zen_chat_read {{chat: \
+         \"{id}\"}}`, then send this one"
+    )
+}
+
+/// What a send opening a chat is refused with once `MAX_CHATS` are kept.
+pub fn too_many() -> String {
+    format!(
+        "You have {MAX_CHATS} chats with Zen kept, the most there may be: go on with one by \
+         passing its id as `chat`, or close those you are done with (`zen_chat_close`). One left \
+         alone is deleted twelve hours after its last message."
+    )
+}
 
 /// The worker that answers the next message on the chat whose thread is
 /// `thread` and whose workers, as observed, are `workers`.
 pub fn next(workers: &[Worker], thread: &str) -> Result<Next, String> {
     if workers.iter().any(|w| w.state.working()) {
-        return Err(STILL_ANSWERING.into());
+        return Err(still_answering(id_of(thread).unwrap_or(thread)));
     }
     let newest = workers
         .iter()
@@ -141,14 +168,13 @@ fn continued(
     w
 }
 
-/// Send `text` to Zen on the chat the MCP session `mcp_id` (`mcp`, as the call
-/// found it, kept in `store`) holds, opening one when it holds none, or one
-/// since disposed of; Zen's answer runs at `effort`.
+/// Send `text` to Zen on `caller`'s chat `on`, or on a new chat when `on` is
+/// `None`; Zen's answer runs at `effort`. A chat that is closing or no longer
+/// kept takes no message: [`not_open`].
 pub fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
-    store: &dyn Store,
-    (mcp_id, mcp): (&str, &Session),
+    on: Option<&str>,
     text: &str,
     effort: Effort,
 ) -> Result<Sent, String> {
@@ -159,35 +185,24 @@ pub fn send(
     let owner = caller.key();
     let now = now_ms();
     let _held = workers::holding();
-    // What the session holds is read again under the lock, and the chat it
-    // opens held under it, so two sends at once on a session that holds none
-    // open one chat between them.
-    let held = match store.get(mcp_id, now) {
-        Some(kept) => kept.held(CHAT).map(str::to_string),
-        None => mcp.held(CHAT).map(str::to_string),
-    }
-    .filter(|id| !id.is_empty());
-    let found = held
-        .as_deref()
-        .and_then(|id| record::chat(&records, &owner, id))
-        .filter(|c| !c.closing);
-    let reopened = held.is_some() && found.is_none();
-    let mut chat = found.unwrap_or_else(|| Chat {
-        id: new_id(),
-        session: mcp_id.to_string(),
-        opened_ms: now,
-        last_ms: now,
-        closing: false,
-    });
+    // Read under the lock a disposal marks the chat closing under, so a send
+    // never lands on a chat being disposed of.
+    let mut chat = match on {
+        Some(id) => record::chat(&records, &owner, id)
+            .filter(|c| !c.closing)
+            .ok_or_else(|| not_open(id))?,
+        None if record::kept_count(&records, &owner) >= MAX_CHATS => return Err(too_many()),
+        None => Chat {
+            id: new_id(),
+            opened_ms: now,
+            last_ms: now,
+            closing: false,
+        },
+    };
     chat.last_ms = now;
     // The chat's record first: whatever else is written after it, the sweep
     // finds the chat by its record, so nothing it made is left unfound.
     record::put_chat(&records, &owner, &chat).map_err(|e| e.to_string())?;
-    if held.as_deref() != Some(chat.id.as_str()) {
-        store
-            .hold(mcp_id, mcp, CHAT, &chat.id, now)
-            .map_err(|e| format!("this session could not keep its chat: {e}"))?;
-    }
     let thread = thread_of(&chat.id);
     threads::attach(&records, &owner, &thread, now).map_err(|e| e.to_string())?;
     let all: Vec<Worker> = threads::workers(&records, &owner, &thread)
@@ -225,7 +240,6 @@ pub fn send(
         chat,
         worker,
         number,
-        reopened,
     })
 }
 
@@ -299,11 +313,12 @@ pub async fn read(
     }
 }
 
-/// `v`'s messages after `from`, each under its number, and whether Zen is
-/// still answering, as the chat's tools answer them.
-pub fn render(v: &View, from: usize, now: u64) -> String {
+/// The chat `id`'s messages in `v` after `from`, each under its number, and
+/// whether Zen is still answering, as the chat's tools answer them. Every
+/// answer names the chat, since it is what each later call passes as `chat`.
+pub fn render(v: &View, id: &str, from: usize, now: u64) -> String {
     let mut out = format!(
-        "Chat with Zen: {} message{}.",
+        "Chat `{id}` with Zen: {} message{}.",
         v.said.len(),
         if v.said.len() == 1 { "" } else { "s" }
     );
@@ -327,7 +342,8 @@ pub fn render(v: &View, from: usize, now: u64) -> String {
     }
     if let Some(w) = &v.answering {
         out.push_str(&format!(
-            "\n\nZen is still answering — {}. Read its answer with `zen_chat_read`.",
+            "\n\nZen is still answering — {}. Read its answer with `zen_chat_read {{chat: \
+             \"{id}\"}}`.",
             w.doing(now)
         ));
     }
@@ -410,11 +426,9 @@ mod tests {
     use super::*;
     use crate::config::DaemonConfig;
     use crate::mcp::caller::Person;
-    use mcp_server::Client;
 
     use crate::mcp::chats::dispose::{Disposal, STOPPED};
     use crate::mcp::records::MemRecords;
-    use crate::mcp::state::{held_by, RecordStore};
     use crate::mcp::stops;
     use crate::workspace::single_repo;
 
@@ -464,12 +478,53 @@ mod tests {
     #[test]
     fn a_send_while_zen_answers_is_refused() {
         let now = now_ms();
+        let refused = Err(
+            "Zen is still answering your last message: read its answer with `zen_chat_read \
+             {chat: \"0123456789abcdef\"}`, then send this one"
+                .to_string(),
+        );
         let running = worker("zen", "running", now, false);
-        assert_eq!(next(&[running], THREAD), Err(STILL_ANSWERING.into()));
+        assert_eq!(next(&[running], THREAD), refused);
         let part = worker("zen/look", "running", now, false);
         assert_eq!(
             next(&[worker("zen", "done", 1, true), part], THREAD),
-            Err(STILL_ANSWERING.into())
+            refused
+        );
+    }
+
+    /// **One person keeps at most `MAX_CHATS` chats**: the count is theirs
+    /// alone, and a message is no chat.
+    #[test]
+    fn a_persons_kept_chats_are_counted_apart() {
+        let r = MemRecords::default();
+        for i in 0..3 {
+            let c = Chat {
+                id: format!("000000000000000{i}"),
+                opened_ms: 0,
+                last_ms: 0,
+                closing: i == 2,
+            };
+            record::put_chat(&r, "o", &c).unwrap();
+        }
+        record::say(&r, "o", "0000000000000000", &said(Speaker::Claude, "q")).unwrap();
+        record::put_chat(
+            &r,
+            "p",
+            &Chat {
+                id: "0000000000000000".into(),
+                opened_ms: 0,
+                last_ms: 0,
+                closing: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(record::kept_count(&r, "o"), 3);
+        assert_eq!(record::kept_count(&r, "p"), 1);
+        assert_eq!(
+            too_many(),
+            "You have 16 chats with Zen kept, the most there may be: go on with one by passing its \
+             id as `chat`, or close those you are done with (`zen_chat_close`). One left alone is \
+             deleted twelve hours after its last message."
         );
     }
 
@@ -527,22 +582,23 @@ mod tests {
             ],
             answering: None,
         };
+        let id = "0123456789abcdef";
         assert_eq!(
-            render(&v, 1, 0),
-            "Chat with Zen: 3 messages.\n\n#2 Zen, whose answer failed:\nthe model is still \
-             loading\n\n#3 Zen:\na1"
+            render(&v, id, 1, 0),
+            "Chat `0123456789abcdef` with Zen: 3 messages.\n\n#2 Zen, whose answer failed:\nthe \
+             model is still loading\n\n#3 Zen:\na1"
         );
         assert_eq!(
-            render(&v, 3, 0),
-            "Chat with Zen: 3 messages. Nothing after #3."
+            render(&v, id, 3, 0),
+            "Chat `0123456789abcdef` with Zen: 3 messages. Nothing after #3."
         );
         let one = View {
             said: vec![said(Speaker::Claude, "q1")],
             ..v
         };
         assert_eq!(
-            render(&one, 1, 0),
-            "Chat with Zen: 1 message. Nothing after #1."
+            render(&one, id, 1, 0),
+            "Chat `0123456789abcdef` with Zen: 1 message. Nothing after #1."
         );
     }
 
@@ -570,7 +626,6 @@ mod tests {
             "o",
             &Chat {
                 id: id.into(),
-                session: "s".into(),
                 opened_ms: 0,
                 last_ms: 0,
                 closing: false,
@@ -609,12 +664,14 @@ mod tests {
         }
     }
 
-    /// **A chat runs on a real session**: the first send opens the chat and
+    /// **A chat runs on a real session**: a send naming no chat opens one and
     /// Zen's side of it, running; with no model loaded its turn waits for one,
     /// so a read waits out its `wait` and says Zen is still answering, and a
-    /// second send is refused. The chat's thread keeps no journal line.
+    /// second send on it is refused. Another send naming no chat opens another
+    /// chat, apart from the first. The chat's thread keeps no journal line.
     /// Closing it while Zen answers marks it closing and asks the answer to
-    /// stop, tombstoning nothing yet, and a send after that opens a new chat.
+    /// stop, tombstoning nothing yet, and a send naming it after that is
+    /// refused as not open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_chat_runs_on_a_real_session() {
         let work = TempDir::new().unwrap();
@@ -624,25 +681,23 @@ mod tests {
         session.hold_substrate(Conversation::new());
         let records = session.shared_substrate().unwrap();
         let (caller, owner) = (caller(), caller().key());
-        let store = RecordStore::new(records.clone(), Arc::default());
-        let mcp = Session::new(&owner, Client::Other, "2026-07-28", now_ms());
-        let on = ("s1", &mcp);
 
         let first = send(
             &session,
             &caller,
-            &store,
-            on,
+            None,
             "how big is the arena?",
             Effort::Balanced,
         )
         .unwrap();
-        assert_eq!(held_by(&records, "s1", CHAT), Some(first.chat.id.clone()));
-        assert_eq!((first.number, first.reopened), (1, false));
+        assert_eq!(first.number, 1);
         assert_eq!(first.worker.name, ZEN);
         assert!(first.worker.kind.is_chat());
         assert_eq!(first.worker.effort, Effort::Balanced);
-        assert_eq!(first.chat.session, "s1");
+        assert_eq!(
+            record::chat(&records, &owner, &first.chat.id),
+            Some(first.chat.clone())
+        );
         let thread = thread_of(&first.chat.id);
         assert_eq!(first.worker.conv_id, format!("mcp:{owner}:{thread}/zen"));
 
@@ -666,24 +721,52 @@ mod tests {
         );
         let answering = v.answering.as_ref().expect("Zen is answering");
         assert_eq!(answering.name, ZEN);
-        assert!(render(&v, from, now_ms()).starts_with(
-            "Chat with Zen: 1 message. Nothing after #1.\n\nZen is still answering — "
-        ));
+        assert!(
+            render(&v, &first.chat.id, from, now_ms()).starts_with(&format!(
+                "Chat `{}` with Zen: 1 message. Nothing after #1.\n\nZen is still answering — ",
+                first.chat.id
+            ))
+        );
 
         assert_eq!(
             send(
                 &session,
                 &caller,
-                &store,
-                on,
+                Some(&first.chat.id),
                 "still there?",
                 Effort::Balanced
             )
             .unwrap_err(),
-            STILL_ANSWERING,
-            "the session's chat is read from its record, not the call's snapshot"
+            still_answering(&first.chat.id)
         );
         assert_eq!(record::said(&records, &owner, &first.chat.id).len(), 1);
+
+        let other = send(&session, &caller, None, "a second chat", Effort::Balanced).unwrap();
+        assert_ne!(
+            other.chat.id, first.chat.id,
+            "each send naming no chat opens its own"
+        );
+        assert_eq!((other.number, other.worker.name.as_str()), (1, ZEN));
+        assert_eq!(record::said(&records, &owner, &first.chat.id).len(), 1);
+        assert_eq!(record::said(&records, &owner, &other.chat.id).len(), 1);
+        assert_eq!(
+            send(
+                &session,
+                &Caller {
+                    person: Person {
+                        sub: "someone-else".into(),
+                        ..caller.person.clone()
+                    },
+                    role: caller.role,
+                },
+                Some(&first.chat.id),
+                "may I read it?",
+                Effort::Balanced
+            )
+            .unwrap_err(),
+            not_open(&first.chat.id),
+            "a chat is its owner's alone"
+        );
         assert_eq!(
             threads::note_count(&records, &owner, &thread),
             0,
@@ -712,11 +795,33 @@ mod tests {
             Some(STOPPED)
         );
 
-        let after = send(&session, &caller, &store, on, "and now?", Effort::Deep).unwrap();
-        assert!(after.reopened, "a closing chat takes no more messages");
-        assert_ne!(after.chat.id, first.chat.id);
-        assert_eq!((after.number, after.worker.name.as_str()), (1, ZEN));
-        assert_eq!(after.worker.effort, Effort::Deep);
-        assert_eq!(held_by(&records, "s1", CHAT), Some(after.chat.id.clone()));
+        assert_eq!(
+            send(
+                &session,
+                &caller,
+                Some(&first.chat.id),
+                "and now?",
+                Effort::Deep
+            )
+            .unwrap_err(),
+            not_open(&first.chat.id),
+            "a closing chat takes no more messages"
+        );
+
+        for i in record::kept_count(&records, &owner)..MAX_CHATS {
+            send(
+                &session,
+                &caller,
+                None,
+                &format!("chat {i}"),
+                Effort::Balanced,
+            )
+            .unwrap();
+        }
+        assert_eq!(record::kept_count(&records, &owner), MAX_CHATS);
+        assert_eq!(
+            send(&session, &caller, None, "one too many", Effort::Balanced).unwrap_err(),
+            too_many()
+        );
     }
 }

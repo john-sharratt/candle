@@ -1,6 +1,6 @@
-//! Zen chat (`docs/zen_chat.md`): a private conversation with Zen for the life
-//! of one MCP session, disposed of — its conversation tombstoned, every record
-//! it made ceased — when the session is done.
+//! Zen chat (`docs/zen_chat.md`): a private conversation with Zen, named by the
+//! id the send that opened it answered with, disposed of — its conversation
+//! tombstoned, every record it made ceased — when it is closed or idle.
 //!
 //! | Module | What |
 //! |---|---|
@@ -8,7 +8,7 @@
 //! | [`record`] | The chat and its messages, as records |
 //! | [`talk`] | A send, a read, and Zen's answer said as a message |
 //! | [`dispose`] | Disposing of a chat: tombstone its conversations, cease its records |
-//! | [`sweep`] | The sweep that disposes of the chats whose session is done |
+//! | [`sweep`] | The sweep that disposes of the chats closed or idle |
 
 pub mod dispose;
 pub mod naming;

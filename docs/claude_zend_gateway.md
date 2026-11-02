@@ -157,7 +157,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | `user_episode_note {tool, summary?}` | Records an episode on the conversation's journal — called by the aggregator only; in no listing (`docs/mcp_user_context.md` §2.3) | The episode's line |
 | `thread_list {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
 | `thread_archive {thread}` | Archives a finished feature's thread | The thread's last state |
-| `zen_chat_send {text, effort?, wait_s?}`, `zen_chat_read {after?, wait_s?}`, `zen_chat_close` | A private chat with Zen for the life of the MCP session, disposed of — conversation tombstoned, records ceased — when the session is done (`docs/zen_chat.md`) | Zen's answer; the chat's messages; `disposed` |
+| `zen_chat_send {text, chat?, effort?, wait_s?}`, `zen_chat_read {chat, after?, wait_s?}`, `zen_chat_close {chat}` | A private chat with Zen, named by the id the send that opened it answers with — never by the MCP session, which claude.ai shares across conversations — disposed of, conversation tombstoned and records ceased, when closed or twelve hours idle (`docs/zen_chat.md`) | The chat's id and Zen's answer; the chat's messages; `disposed` |
 
 **How they are served.** The member serving `/mcp` runs the tools in
 process, on the session (`zend/src/mcp/tools/`, one file per tool), not

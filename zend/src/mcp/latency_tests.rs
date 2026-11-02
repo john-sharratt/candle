@@ -29,6 +29,7 @@ use tempfile::TempDir;
 use web::auth::Role;
 
 use super::caller::{Caller, Person};
+use super::chats::record;
 use super::memory::tests::repo;
 use super::state::RecordStore;
 use super::tools::{self, Ctx};
@@ -138,7 +139,7 @@ fn session() -> (Vec<TempDir>, Ctx) {
 /// The calls of one round, the `i`th: each tool that runs no model and needs
 /// no other member, with what it writes new each time — each under the label
 /// it is timed by, a thread's journal and the memory's apart.
-fn round(i: usize) -> Vec<(&'static str, &'static str, Value)> {
+fn round(i: usize, chat: &str) -> Vec<(&'static str, &'static str, Value)> {
     vec![
         ("get_user_context", "get_user_context", json!({})),
         (
@@ -177,7 +178,11 @@ fn round(i: usize) -> Vec<(&'static str, &'static str, Value)> {
             "journal_grep",
             json!({"journal": "*", "pattern": "tea"}),
         ),
-        ("zen_chat_read", "zen_chat_read", json!({"wait_s": 0})),
+        (
+            "zen_chat_read",
+            "zen_chat_read",
+            json!({"chat": chat, "wait_s": 0}),
+        ),
         // A focus that changes nothing is refused: each round moves it.
         (
             "journal_focus",
@@ -185,6 +190,15 @@ fn round(i: usize) -> Vec<(&'static str, &'static str, Value)> {
             json!({"speaker": "john", "about": [if i.is_multiple_of(2) { "people/john" } else { "people" }]}),
         ),
     ]
+}
+
+/// The chat a `zen_chat_send` answer says it opened: the id between the first
+/// pair of backticks, as ``Opened chat `<id>` `` puts it.
+fn opened_chat(answer: &str) -> String {
+    let rest = answer
+        .strip_prefix("Opened chat `")
+        .unwrap_or_else(|| panic!("the answer opens no chat: {answer}"));
+    rest.split('`').next().unwrap().to_string()
 }
 
 /// The 95th percentile of `times`.
@@ -199,9 +213,10 @@ fn p95(times: &mut [Duration]) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a latency gate: run on its own, on a quiet machine"]
 async fn every_tool_without_a_model_answers_within_its_budget() {
-    let (_dirs, mut ctx) = session();
-    // A chat open on the session, so `zen_chat_read` reads one — its answer
-    // waiting on a model that never loads here, as one still being given.
+    let (_dirs, ctx) = session();
+    // A chat opened through the tool, so `zen_chat_read` reads one — its
+    // answer waiting on a model that never loads here, as one still being
+    // given — named by the id the tool's own answer gives.
     let opened = tools::call(
         &ctx,
         "zen_chat_send",
@@ -209,10 +224,20 @@ async fn every_tool_without_a_model_answers_within_its_budget() {
     )
     .await;
     assert!(!opened.is_error, "{}", opened.text);
-    ctx.mcp = ctx.store.get(&ctx.mcp_id, now_ms()).unwrap();
+    let chat = opened_chat(&opened.text);
+    assert!(
+        record::chat(
+            &ctx.session.shared_substrate().unwrap(),
+            &ctx.caller.key(),
+            &chat
+        )
+        .is_some(),
+        "the answer names the chat it opened: {}",
+        opened.text
+    );
     let mut times: Vec<(&'static str, Vec<Duration>)> = Vec::new();
     for i in 0..ROUNDS {
-        for (label, name, args) in round(i) {
+        for (label, name, args) in round(i, &chat) {
             let started = Instant::now();
             let answer = tools::call(&ctx, name, &args).await;
             let took = started.elapsed();
@@ -234,6 +259,17 @@ async fn every_tool_without_a_model_answers_within_its_budget() {
         over.is_empty(),
         "over {P95_BUDGET:?} at p95: {}",
         over.join(", ")
+    );
+}
+
+#[test]
+fn an_opened_chat_is_read_off_the_answer() {
+    assert_eq!(
+        opened_chat(
+            "Opened chat `0123456789abcdef`: pass it as `chat` to go on.\n\nSent as #1. Chat \
+             `0123456789abcdef` with Zen: 1 message."
+        ),
+        "0123456789abcdef"
     );
 }
 

@@ -14,10 +14,32 @@ const MARK: char = '~';
 /// failed turn ended the first.
 pub const ZEN: &str = "zen";
 
-/// A new chat's id: 16 hex digits, from the OS's randomness.
+/// How many hex digits a chat's id is.
+const ID_LEN: usize = 16;
+
+/// A new chat's id: 16 hex digits, from the OS's randomness. It is what names
+/// the chat to its tools, so it is never derived from anything a caller knows.
 pub fn new_id() -> String {
     let digest = Sha256::digest(random_token().as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest[..ID_LEN / 2]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `id`, when it is the shape a chat's id has; what a tool says otherwise.
+pub fn checked_id(id: &str) -> Result<&str, String> {
+    let shaped = id.len() == ID_LEN
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+    if shaped {
+        Ok(id)
+    } else {
+        Err(format!(
+            "`{id}` is no chat's id: a chat's id is the 16 hex digits `zen_chat_send` answered with"
+        ))
+    }
 }
 
 /// The thread the chat `id`'s workers run under.
@@ -62,5 +84,27 @@ mod tests {
             .bytes()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
+        assert_eq!(checked_id(&a), Ok(a.as_str()));
+    }
+
+    #[test]
+    fn only_a_chats_shape_is_taken_for_its_id() {
+        assert_eq!(checked_id("0123456789abcdef"), Ok("0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789abcde",
+            "0123456789ABCDEF",
+            "0123456789abcdeg",
+            "../chat/x/012345",
+        ] {
+            assert_eq!(
+                checked_id(bad),
+                Err(format!(
+                    "`{bad}` is no chat's id: a chat's id is the 16 hex digits `zen_chat_send` \
+                     answered with"
+                )),
+                "{bad}"
+            );
+        }
     }
 }

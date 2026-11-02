@@ -1,7 +1,7 @@
 //! A chat and its messages, as records (`docs/zen_chat.md` §2).
 //!
-//! - **The chat** is `mcp/chat/<owner>/<id>`: the session it belongs to, when
-//!   it opened, when a message was last said on it, and whether it is closing.
+//! - **The chat** is `mcp/chat/<owner>/<id>`: when it opened, when a message
+//!   was last said on it, and whether it is closing.
 //! - **Its messages** are one record each under `mcp/chat-said/<owner>/<id>/`,
 //!   keyed by time and a sequence, so key order is the order they were said and
 //!   two said in one millisecond never race to rewrite one record. A message's
@@ -27,8 +27,6 @@ const CHAT_PREFIX: &str = "mcp/chat/";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chat {
     pub id: String,
-    /// The MCP session it belongs to, by the id the session is kept under.
-    pub session: String,
     pub opened_ms: u64,
     /// When the last message was said on it: what its idle time counts from.
     pub last_ms: u64,
@@ -85,6 +83,12 @@ pub fn chat(records: &dyn Records, owner: &str, id: &str) -> Option<Chat> {
 
 pub fn put_chat(records: &dyn Records, owner: &str, chat: &Chat) -> anyhow::Result<()> {
     records.put(&chat_key(owner, &chat.id), serde_json::to_value(chat)?)
+}
+
+/// How many chats `owner` has kept, closing ones among them: a range of keys,
+/// read without decoding any.
+pub fn kept_count(records: &dyn Records, owner: &str) -> usize {
+    records.count_under(&format!("{CHAT_PREFIX}{owner}/"))
 }
 
 /// Every chat of every owner, each with the owner key it is kept under. A
@@ -145,11 +149,14 @@ mod tests {
         let r = MemRecords::default();
         let c = Chat {
             id: "0123456789abcdef".into(),
-            session: "s1".into(),
             opened_ms: 10,
             last_ms: 10,
             closing: false,
         };
+        assert_eq!(
+            serde_json::to_string(&c).unwrap(),
+            r#"{"id":"0123456789abcdef","opened_ms":10,"last_ms":10,"closing":false}"#
+        );
         put_chat(&r, "o", &c).unwrap();
         assert_eq!(
             r.under("mcp/").first().map(|(k, _)| k.as_str()),

@@ -183,7 +183,6 @@ mod tests {
             OWNER,
             &Chat {
                 id: ID.into(),
-                session: "s1".into(),
                 opened_ms: 0,
                 last_ms: 5,
                 closing: false,
@@ -221,7 +220,6 @@ mod tests {
             "p",
             &Chat {
                 id: ID.into(),
-                session: "s2".into(),
                 opened_ms: 0,
                 last_ms: 0,
                 closing: false,

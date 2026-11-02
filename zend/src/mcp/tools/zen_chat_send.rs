@@ -1,36 +1,35 @@
-//! `zen_chat_send {text, effort?, wait_s?}`: send a message to Zen on this
-//! session's chat, opening it on first use, and wait for the answer
+//! `zen_chat_send {text, chat?, effort?, wait_s?}`: send a message to Zen on a
+//! private chat — a new one, or the one `chat` names — and wait for the answer
 //! (`docs/zen_chat.md` §1).
 
 use serde_json::{json, Value};
 
 use super::{string, wait_secs, Answer, Ctx};
+use crate::mcp::chats::naming::checked_id;
 use crate::mcp::chats::talk::{self, render};
 use crate::mcp::threads::Effort;
 use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "zen_chat_send";
 
-/// What an answer opens with when the chat the session held was disposed of.
-pub const REOPENED: &str = "This session's earlier chat was deleted after it ended, so this \
-    message opened a new one.";
-
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Send a message to Zen on this session's private chat, and wait up to `wait_s` for its \
-            answer. Zen is the user's own model, on hardware the user owns, with the user's repositories, \
-            journals and the web to read; the chat is a conversation with it, not a task — no thread, no \
-            journal entry, nothing kept. The chat opens with the first message and belongs to this session \
-            alone: no other session or conversation can read it. It is deleted, with everything said on it, \
-            when the session is done — by `zen_chat_close`, when the session ends, or after twelve hours with \
-            nothing said. Answers with Zen's reply, or that Zen is still answering: then read the reply with \
-            `zen_chat_read`. One message is answered at a time. For work in a repository that should be kept \
-            and checked, delegate it with `repo_task_start` instead.",
+        "description": "Send a message to Zen on a private chat, and wait up to `wait_s` for its answer. Zen is \
+            the user's own model, on hardware the user owns, with the user's repositories, journals and the web \
+            to read; a chat is a conversation with it, not a task — no thread, no journal entry, nothing kept. \
+            With no `chat`, the message opens a new chat, and the answer names its id: pass that id as `chat` \
+            on every later message, read and close, since nothing else ties the chat to you — a new chat for \
+            each subject or conversation, never another's id. A chat is deleted, with everything said on it, \
+            by `zen_chat_close`, or after twelve hours with nothing said. Answers with Zen's reply, or that Zen \
+            is still answering: then read the reply with `zen_chat_read`. One message is answered at a time. \
+            For work in a repository that should be kept and checked, delegate it with `repo_task_start` \
+            instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "The message."},
+                "chat": {"type": "string", "description": "The chat to send on: the id an earlier `zen_chat_send` answered with. Leave it out to open a new chat."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard Zen thinks about its answer: `balanced` by default, which answers soonest; `deep` or `exhaustive` for a question that must weigh evidence."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait for the answer (45 by default)."}
             },
@@ -49,23 +48,26 @@ fn effort_of(args: &Value) -> Result<Effort, String> {
     }
 }
 
+/// The chat a send names, `None` when it opens a new one. A `chat` given as
+/// anything but a chat's id is refused, never taken for none: the message
+/// would go to a new chat and the conversation on the old one be lost.
+fn chat_of(args: &Value) -> Result<Option<&str>, String> {
+    match args.get("chat") {
+        None => Ok(None),
+        Some(_) => string(args, "chat").and_then(checked_id).map(Some),
+    }
+}
+
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     let text = match string(args, "text") {
         Ok(t) => t,
         Err(e) => return Answer::error(e),
     };
-    let effort = match effort_of(args) {
-        Ok(e) => e,
-        Err(e) => return Answer::error(e),
+    let (effort, on) = match (effort_of(args), chat_of(args)) {
+        (Ok(e), Ok(on)) => (e, on),
+        (Err(e), _) | (_, Err(e)) => return Answer::error(e),
     };
-    let sent = match talk::send(
-        &ctx.session,
-        &ctx.caller,
-        &*ctx.store,
-        (&ctx.mcp_id, &ctx.mcp),
-        text,
-        effort,
-    ) {
+    let sent = match talk::send(&ctx.session, &ctx.caller, on, text, effort) {
         Ok(s) => s,
         Err(e) => return Answer::error(e),
     };
@@ -85,12 +87,14 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     let mut out = String::new();
-    if sent.reopened {
-        out.push_str(REOPENED);
-        out.push_str("\n\n");
+    if on.is_none() {
+        out.push_str(&format!(
+            "Opened chat `{}`: pass it as `chat` to go on.\n\n",
+            sent.chat.id
+        ));
     }
     out.push_str(&format!("Sent as #{}. ", sent.number));
-    out.push_str(&render(&view, from, now_ms()));
+    out.push_str(&render(&view, &sent.chat.id, from, now_ms()));
     if let Some(note) = wait.note() {
         out.push_str("\n\n");
         out.push_str(&note);
@@ -110,5 +114,26 @@ mod tests {
             Ok(Effort::Deep)
         );
         assert!(effort_of(&json!({"effort": "quick"})).is_err());
+    }
+
+    #[test]
+    fn a_send_names_its_chat_or_opens_one() {
+        assert_eq!(chat_of(&json!({"text": "hi"})), Ok(None));
+        assert_eq!(
+            chat_of(&json!({"chat": "0123456789abcdef"})),
+            Ok(Some("0123456789abcdef"))
+        );
+        assert_eq!(
+            chat_of(&json!({"chat": " 0123456789abcdef "})),
+            Ok(Some("0123456789abcdef")),
+            "trimmed as read and close trim it"
+        );
+        assert!(chat_of(&json!({"chat": "../session/x"})).is_err());
+        assert!(
+            chat_of(&json!({"chat": 1234})).is_err(),
+            "never taken for none"
+        );
+        assert!(chat_of(&json!({"chat": null})).is_err());
+        assert!(chat_of(&json!({"chat": ""})).is_err());
     }
 }

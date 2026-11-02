@@ -173,7 +173,6 @@ mod tests {
         assert!(!chat_open(&r, "o", "~0123456789abcdef"), "not kept");
         let mut c = Chat {
             id: "0123456789abcdef".into(),
-            session: "s".into(),
             opened_ms: 0,
             last_ms: 0,
             closing: false,

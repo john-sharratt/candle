@@ -98,8 +98,11 @@ compacted.
 ### A8. `zen-chat`
 **Use when:** asking Zen something directly, for an answer to use now.
 **Tools:** `zen_chat_send`, `zen_chat_read`, `zen_chat_close`
-- A private chat for the life of the session, deleted after (`docs/zen_chat.md`):
-  nothing on it is kept, so what must last is noted elsewhere.
+- A private chat, deleted when closed or idle (`docs/zen_chat.md`): nothing on
+  it is kept, so what must last is noted elsewhere.
+- Its id is the only thing tying it to this conversation, since the connector's
+  session is shared: open one per conversation, pass its id on every call, and
+  never use an id this conversation did not open.
 - A task, not a chat, for work that changes a repository or must be checked and
   kept.
 - Close it when done; one left alone is deleted twelve hours after its last

@@ -1,46 +1,42 @@
-//! `zen_chat_read {after?, wait_s?}`: read this session's chat with Zen, waiting
-//! while Zen answers (`docs/zen_chat.md` §1). It only reads: it keeps no
-//! cursor, so the caller pages on with `after`.
+//! `zen_chat_read {chat, after?, wait_s?}`: read a private chat with Zen,
+//! waiting while Zen answers (`docs/zen_chat.md` §1). It only reads: it keeps
+//! no cursor, so the caller pages on with `after`.
 
 use serde_json::{json, Value};
 
-use super::{wait_secs, Answer, Ctx};
-use crate::mcp::chats::talk::{self, render};
-use crate::mcp::state::CHAT;
+use super::{string, wait_secs, Answer, Ctx};
+use crate::mcp::chats::naming::checked_id;
+use crate::mcp::chats::talk::{self, not_open, render};
 use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "zen_chat_read";
-
-/// What a read answers on a session that holds no chat.
-pub const NO_CHAT: &str = "No chat is open on this session: `zen_chat_send` opens one.";
-
-/// What a read answers when the session's chat was disposed of.
-pub const DELETED: &str = "This session's chat was deleted, with everything said on it: \
-    `zen_chat_send` opens a new one.";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
-        "description": "Read this session's private chat with Zen: the messages after message `after`, each \
-            numbered — or, with no `after`, what Zen has said since your last message. While Zen is still \
-            answering and has said nothing new, waits up to `wait_s` for it. Use it when `zen_chat_send` \
-            answered that Zen was still answering, and pass `after` to page through the chat from the start. \
-            The chat belongs to this session alone and is deleted when the session is done.",
+        "description": "Read a private chat with Zen: the messages after message `after`, each numbered — or, \
+            with no `after`, what Zen has said since your last message. While Zen is still answering and has \
+            said nothing new, waits up to `wait_s` for it. Use it when `zen_chat_send` answered that Zen was \
+            still answering, and pass `after` to page through the chat from the start. `chat` is the id \
+            `zen_chat_send` answered with when it opened the chat.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "chat": {"type": "string", "description": "The chat: the id `zen_chat_send` answered with."},
                 "after": {"type": "integer", "minimum": 0, "description": "The number of the last message you have read; 0 for the whole chat."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait while Zen answers (45 by default)."}
             },
+            "required": ["chat"],
             "additionalProperties": false
         }
     })
 }
 
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
-    let Some(id) = ctx.mcp.held(CHAT).filter(|id| !id.is_empty()) else {
-        return Answer::ok(NO_CHAT);
+    let id = match string(args, "chat").and_then(checked_id) {
+        Ok(id) => id,
+        Err(e) => return Answer::error(e),
     };
     let after = args
         .get("after")
@@ -61,10 +57,11 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(r) => r,
         Err(e) => return Answer::error(e),
     };
-    if view.chat.is_none() {
-        return Answer::ok(DELETED);
+    // A closing chat is answered as a send answers it: no longer open.
+    if view.chat.as_ref().is_none_or(|c| c.closing) {
+        return Answer::ok(not_open(id));
     }
-    let mut out = render(&view, from, now_ms());
+    let mut out = render(&view, id, from, now_ms());
     if let Some(note) = wait.note() {
         out.push_str("\n\n");
         out.push_str(&note);
