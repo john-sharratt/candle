@@ -350,7 +350,18 @@ kept for an hour) in `heap-census/src/history.rs`, separate from the telemetry
 ring, so the log's arithmetic does not depend on the page's. The task that
 takes them, logs them and serves the last one is `host/src/memory_census/`.
 
-## 8. The order of the changes, and what each one settles
+## 8. Built behind a feature
+
+The census is a Cargo feature, `memory-census`, like `profile` and
+`tensor-assert`: compiled in or not, never switched at run time. It gates the
+three things that do work — the counting allocator each binary installs, the
+host's once-a-minute census task, and each store's gauge pass — and leaves the
+types and the readers built, so `/v1/memory` and `/v1/telemetry` report the
+census absent without it. `motherd` turns it on by default while BlackWorld's
+growth is being found; `zend` and `npcd` take it when built with
+`--features memory-census`.
+
+## 8.1 The order of the changes, and what each one settles
 
 | # | Change | Deployed alone, it tells us |
 |---|---|---|

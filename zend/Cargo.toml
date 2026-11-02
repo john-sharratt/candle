@@ -37,7 +37,7 @@ include_dir  = { version = "0.7" }
 # endpoints (`docs/shared_model_host.md`). zend is one of its tenants.
 host         = { path = "../host" }
 # The counting global allocator the `zend` binary installs (`docs/memory_census.md`).
-heap-census  = { path = "../heap-census" }
+heap-census  = { path = "../heap-census", optional = true }
 # How each route is dispatched under a cluster, and the passthrough key the
 # gateway routes a conversation by (`docs/replicated_substrate.md` §5.2).
 cluster      = { path = "../cluster" }
@@ -117,6 +117,9 @@ libc = "0.2"
 default = []
 # Enable to run GPU-backed integration tests (needs CUDA + GGUF model on disk).
 cuda = []
+# The memory census (`docs/memory_census.md`): the `zend` binary installs the
+# counting allocator, and the host reads, judges and logs it once a minute.
+memory-census = ["dep:heap-census", "host/memory-census"]
 # Zero-cost scoped timing of the projection / reproject hot path. Forwards to
 # candle-conversation; emits an aggregated breakdown under
 # `candle_conversation::scheduler::profile`.

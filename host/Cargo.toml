@@ -79,3 +79,8 @@ default = []
 # Zero-cost scoped timing of the hot path; `/v1/profile` reports whether it
 # was built in.
 profile = ["candle-conversation/profile"]
+# The memory census (`docs/memory_census.md`): the once-a-minute census task —
+# reading, judging, logging — and each store's gauge pass. The readers behind
+# `/v1/memory` and `/v1/telemetry` are always built, and report the census
+# absent without it.
+memory-census = ["candle-conversation/memory-census"]

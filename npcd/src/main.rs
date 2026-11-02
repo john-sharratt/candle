@@ -11,13 +11,15 @@
 
 use clap::Parser;
 use cluster::version::info::NPCD;
+#[cfg(feature = "memory-census")]
 use heap_census::Counting;
 use host::build_info::first;
 use host::{run, HostArgs, HostConfig, Tenant};
 use npcd::tenant::NpcdArgs;
 
 /// Every allocation counted by size class, for the memory census
-/// (`docs/memory_census.md`).
+/// (`docs/memory_census.md`). Built with the `memory-census` feature.
+#[cfg(feature = "memory-census")]
 #[global_allocator]
 static HEAP: Counting = Counting;
 

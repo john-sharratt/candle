@@ -115,6 +115,9 @@ large_enum_variant = "allow"
 
 [features]
 default = []
+# The memory census's gauge pass (`docs/memory_census.md` §5): once a minute,
+# each store's in-memory structures counted on the persistence pass.
+memory-census = []
 # Feature-gated, zero-cost scoped timing of the projection / reproject hot path
 # (see `scheduler::profile`). Emits an aggregated, sorted-by-cost breakdown.
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,

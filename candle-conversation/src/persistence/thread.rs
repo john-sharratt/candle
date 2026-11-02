@@ -58,6 +58,7 @@ use crate::scheduler::phase_ring::{
     migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
 };
 use crate::scheduler::relief_trace;
+#[cfg(feature = "memory-census")]
 use crate::store_gauges::gauge_if_due;
 use crate::substrate::{ConvCompression, HotKv, ResidenceIndex, StoredSequence};
 use sysinfo::System;
@@ -1602,7 +1603,9 @@ fn run_pass(
     //
     // Once a minute, what this store's in-memory structures hold
     // (`docs/memory_census.md` §5). Here because this pass already holds the
-    // store off every request path, and the gauge walks its maps.
+    // store off every request path, and the gauge walks its maps. Built with
+    // the `memory-census` feature.
+    #[cfg(feature = "memory-census")]
     gauge_if_due(conversation, &conversation.substrate_dir());
 
     // ── Phase 3: fsync ─────────────────────────────────────────────────

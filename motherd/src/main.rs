@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use cluster::version::info::MOTHERD;
+#[cfg(feature = "memory-census")]
 use heap_census::Counting;
 use host::build_info::first;
 use host::{run_seated, HostArgs, HostConfig, Seat};
@@ -52,7 +53,8 @@ use zend::cli::ZendArgs;
 
 /// Every allocation counted by size class, for the memory census
 /// (`docs/memory_census.md`): what `/v1/memory` and the `memory census` log
-/// line report as live heap bytes.
+/// line report as live heap bytes. Built with the `memory-census` feature.
+#[cfg(feature = "memory-census")]
 #[global_allocator]
 static HEAP: Counting = Counting;
 

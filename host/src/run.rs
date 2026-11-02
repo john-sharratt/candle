@@ -40,6 +40,7 @@ use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
 use crate::logs::LogBus;
 use crate::machines::state_expert_pin;
+#[cfg(feature = "memory-census")]
 use crate::memory_census;
 use crate::model::{ModelView, MODEL};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
@@ -362,6 +363,7 @@ async fn serve_tenants(
     );
     let telemetry = Telemetry::new(model.clone());
     telemetry.spawn_sampler();
+    #[cfg(feature = "memory-census")]
     memory_census::spawn();
     let roles = roles();
     let names: Vec<&'static str> = uis.iter().map(|(n, _)| *n).collect();
