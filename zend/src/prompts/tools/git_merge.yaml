@@ -62,6 +62,26 @@ parameters:
   title: MergeRequest
   type: object
 examples:
+- |-
+  git_status says there are incoming commits<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `incoming` counts what my branch has that I do not, and my commit waits on them. git_merge with no `from` brings them into my files.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_merge", "arguments": {"repo": "app"}}
+  </tool_call><|projection|>
+- |-
+  bring main into this feature branch before you go on<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  This is a different branch merging in, not my own as origin holds it, so `from` names main.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_merge", "arguments": {"repo": "candle", "from": {"kind": "branch", "name": "main"}}}
+  </tool_call><|projection|>
 - my commit was refused, merge in what origin has<|im_end|>
 - pull the latest changes into candle<|im_end|>
 - merge main into my feature branch<|im_end|>

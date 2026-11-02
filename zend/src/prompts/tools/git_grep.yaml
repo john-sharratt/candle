@@ -94,6 +94,36 @@ parameters:
   title: GrepRequest
   type: object
 examples:
+- |-
+  does main already have this helper somewhere<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  My working files may not match main yet. file_grep searches mine, so to search main as committed I use git_grep with `rev` on that branch.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_grep", "arguments": {"repo": "app", "pattern": "fn retry_after", "rev": {"kind": "branch", "name": "main"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  was this constant still there in the previous commit<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The previous commit is the `parent` revision, with no id needed. git_grep searches what that revision tracks, and the name is a literal, so `fixed`.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_grep", "arguments": {"repo": "candle", "pattern": "RESUME_AFTER_MS", "fixed": true, "rev": {"kind": "parent"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  which committed files on origin use the old name<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Origin may be ahead of what I hold, so I search its tracking branch, narrowed to the sources with `paths`.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_grep", "arguments": {"repo": "candle", "pattern": "old_name", "rev": {"kind": "remote_branch", "name": "origin/main"}, "paths": ["src"], "page": 1}}
+  </tool_call><|projection|>
 - search the release branch for that function definition<|im_end|>
 - grep candle at that tag for the timeout constant<|im_end|>
 - was this string still present in the previous revision<|im_end|>

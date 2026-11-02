@@ -107,6 +107,56 @@ parameters:
   title: LogRequest
   type: object
 examples:
+- |-
+  how have these files been changed before<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  How earlier commits made this kind of change tells me how to do it here. git_log with `paths` narrows the history to those files. Paths are relative to the repository, with no leading slash.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_log", "arguments": {"repo": "app", "paths": ["web/content/index.html", "web/content/site.css"], "page": 1}}
+  </tool_call><|projection|>
+- |-
+  when did this file last change<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  One file's history, newest first: the first commit git_log gives for it is the last change. Its path goes in `paths`, relative to the repository.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_log", "arguments": {"repo": "candle", "paths": ["zend/src/session.rs"], "page": 1}}
+  </tool_call><|projection|>
+- |-
+  how far ahead of main is this branch<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `since` set to main leaves only what this branch adds, and the answer's `count` says how many, so I read the number off it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_log", "arguments": {"repo": "candle", "since": {"kind": "branch", "name": "main"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  what style do the commit messages here use<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  My commit should read like the ones already here. The newest commits on the branch show how they are written, and git_log gives their subjects.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_log", "arguments": {"repo": "app", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  who changed lines 40 to 60 of the config loader<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `lines` narrows the history of one file to the commits that last changed those lines, which is better than whoever last touched the file anywhere.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_log", "arguments": {"repo": "app", "paths": ["src/config.rs"], "lines": {"start": 40, "end": 60}, "page": 1}}
+  </tool_call><|projection|>
 - what were the last few commits in candle<|im_end|>
 - show me the history of src/lib.rs<|im_end|>
 - what is on this feature branch that main does not have<|im_end|>

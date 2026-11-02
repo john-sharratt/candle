@@ -42,6 +42,26 @@ parameters:
   title: OutputRequest
   type: object
 examples:
+- |-
+  the build failed, what was the first error<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The first page and the last lines came back with the run, and the first error is somewhere between them. Running the build again would take minutes, and run_output reads the same log by its job.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_output", "arguments": {"repo": "app", "job": "T_EbcNa4U3k", "page": 2}}
+  </tool_call><|projection|>
+- |-
+  read the next page of that log<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I have read page 2 of the run and the failure goes on past it, so page 3 of the same job.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_output", "arguments": {"repo": "candle", "job": "Bf298Ky4Ifk", "page": 3}}
+  </tool_call><|projection|>
 - show me the rest of that test run's output<|im_end|>
 - what failed at the end of the build log?<|im_end|>
 - |-

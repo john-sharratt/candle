@@ -55,6 +55,36 @@ parameters:
   title: RefsRequest
   type: object
 examples:
+- |-
+  is there already a branch for this work<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Before I make a branch I should see what exists. As well as local branches I want those on origin, so `remote_branches`.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_refs", "arguments": {"repo": "app", "kind": "remote_branches", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  what was the last release tagged as<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Releases are tags, and git_refs lists them with the commit each points at.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_refs", "arguments": {"repo": "candle", "kind": "tags", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  where does this repository push to<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The url of a remote comes from `remotes`, never from a README or a guess.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_refs", "arguments": {"repo": "app", "kind": "remotes", "page": 1}}
+  </tool_call><|projection|>
 - what branches are there in candle<|im_end|>
 - list the tags in that repository<|im_end|>
 - am I ahead of origin on this branch<|im_end|>

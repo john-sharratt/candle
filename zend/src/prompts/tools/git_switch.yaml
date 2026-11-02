@@ -71,6 +71,36 @@ parameters:
   title: SwitchRequest
   type: object
 examples:
+- |-
+  this one needs reviewing, keep it off main<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  It should not land on main, so a new branch comes first, before any commit. `create` true makes it from where I am and my changes come with me.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_switch", "arguments": {"repo": "app", "branch": "review/empty-input", "create": true}}
+  </tool_call><|projection|>
+- |-
+  carry on from the branch that is already on origin<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The branch exists, so `create` is false. It is brought up to date with origin as I switch, so it does not need to be local yet.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_switch", "arguments": {"repo": "candle", "branch": "feature/login", "create": false}}
+  </tool_call><|projection|>
+- |-
+  start the hotfix from the release tag, not from here<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A new branch normally starts from where I am. `from` names the tag instead, so the hotfix carries nothing else.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_switch", "arguments": {"repo": "candle", "branch": "hotfix/timeout", "create": true, "from": {"kind": "tag", "name": "v1.4.0"}}}
+  </tool_call><|projection|>
 - switch to main in candle<|im_end|>
 - start a new branch called feature/login for this<|im_end|>
 - put me on the release branch<|im_end|>

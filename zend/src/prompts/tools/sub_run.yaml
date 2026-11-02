@@ -45,6 +45,26 @@ parameters:
   title: Request
   type: object
 examples:
+- |-
+  review all four of these files for the same mistake<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Four files read one after another would fill my context. Several sub_run calls in one round run at once, so each file gets a part of its own, and each part's prompt says in full what to look for.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"name": "review-parser", "prompt": "Read src/parser.rs in the app repository. Report every place an empty input is not handled, each with its line and why. Answer with a list, or say there are none."}}
+  </tool_call><|projection|>
+- |-
+  check your findings before you answer<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I have a draft of findings. A part that starts without my reasoning can check each one against the lines it cites, and tell me which do not hold.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "sub_run", "arguments": {"name": "verify-findings", "prompt": "Each finding below cites a file and line in the candle repository. Read each and say whether the code does what the finding claims. Findings: 1. zend/src/session.rs:120 drops the lease before the write. Answer with each finding and holds or does not hold, with the line that shows it."}}
+  </tool_call><|projection|>
 - spawn a subagent to research the best Rust logging crate and report back<|im_end|>
 - delegate finding every TODO comment under the src directory to a subagent<|im_end|>
 - have a subagent investigate why the build is failing<|im_end|>

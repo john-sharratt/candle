@@ -39,6 +39,26 @@ parameters:
   title: Request
   type: object
 examples:
+- |-
+  the gateway fix is on main, get it running on blackworld<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  It is merged, so it can be built. The gateway is the `web` service, and service_deploy tries it on one machine and waits for the outcome.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_deploy", "arguments": {"host": "blackworld", "service": "web"}}
+  </tool_call><|projection|>
+- |-
+  does the connector build from main actually come up<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Only a live trial answers this. The connector is `mcp`, and keep puts the old build back if the new one does not serve, so it is safe to try on one machine.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_deploy", "arguments": {"host": "whiteworld", "service": "mcp"}}
+  </tool_call><|projection|>
 - deploy main to whiteworld<|im_end|>
 - try the new gateway build on blackworld<|im_end|>
 - |-

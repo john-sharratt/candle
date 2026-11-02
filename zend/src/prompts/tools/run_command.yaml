@@ -51,6 +51,36 @@ parameters:
   title: RunRequest
   type: object
 examples:
+- |-
+  no agent has that program<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The refusal named the programs that do run in this repository. The one I tried is not among them, and neither would a similar one be, so I pick one it listed.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "python", "args": ["scripts/check_sizes.py"]}}
+  </tool_call><|projection|>
+- |-
+  there is a test that pins this, make sure it still holds<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The change is written, so I run the one test that pins it, by name, in the one crate that holds it. That takes a minute, where the whole suite takes much longer and proves nothing more about this change.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "web", "--lib", "the_switcher_icons_are_the_marks_their_sites_serve"]}}
+  </tool_call><|projection|>
+- |-
+  the file is written, does it compile<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I reasoned about this but nothing has run it yet. A compile check of the crate I touched is the quickest evidence.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "run_command", "arguments": {"repo": "app", "program": "cargo", "args": ["check", "-p", "web"]}}
+  </tool_call><|projection|>
 - run the tests in zend-test<|im_end|>
 - does the project still build?<|im_end|>
 - run npm test and tell me which tests fail<|im_end|>

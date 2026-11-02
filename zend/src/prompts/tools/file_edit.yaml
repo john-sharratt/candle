@@ -91,6 +91,56 @@ parameters:
   title: EditRequest
   type: object
 examples:
+- |-
+  now fix the bug you found<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I have read the function and I know the wrong comparison. One part of an existing file changes, so file_edit by its anchor with `old` on those words alone, rather than write, which would rewrite the file.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "at": "b4Qx", "do": "replace", "old": "len > max", "text": "len >= max"}}
+  </tool_call><|projection|>
+- |-
+  add a test for that next to the others<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The new test belongs after the last test in the module. `insert_after` on that part's anchor adds it as a new part, written as it is to stand, indentation included.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "at": "Kd2w", "do": "insert_after", "text": "    #[test]\n    fn empty_input_is_accepted() {\n        assert!(parse(\"\").is_ok());\n    }\n"}}
+  </tool_call><|projection|>
+- |-
+  that helper is dead now, take it out<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Nothing calls it any more, so `delete` on its anchor removes the part and leaves the rest of the file as it is.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/util.rs", "at": "zP9c", "do": "delete"}}
+  </tool_call><|projection|>
+- |-
+  the path in the test needs changing as well<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The test still names the old path, and the result of my last edit showed its neighbours' anchors. This is a small change to one part, so `replace` with `old`, and I do not need another read.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "candle", "path": "web/tests/roles.rs", "at": "HYzy", "do": "replace", "old": "old-icon.png", "text": "new-icon.png"}}
+  </tool_call><|projection|>
+- |-
+  rewrite the body of that function so it pages<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The whole function changes but the file around it does not, so `replace` on its anchor with no `old`, and `text` holds the function as it is to stand.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/list.rs", "at": "m3Ty", "do": "replace", "text": "fn list(page: usize) -> Vec<Item> {\n    items().skip(page * SIZE).take(SIZE).collect()\n}\n"}}
+  </tool_call><|projection|>
 - in Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`<|im_end|>
 - in src/config.rs replace the string `localhost` with `0.0.0.0`<|im_end|>
 - update the port from 8080 to 9090 in config.toml<|im_end|>

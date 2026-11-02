@@ -43,6 +43,26 @@ parameters:
   title: FetchRequest
   type: object
 examples:
+- |-
+  did the fix land on origin's main yet<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  What I know of origin is only as new as my last fetch. Fetching just that branch tells me whether it moved, and it changes none of my files.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_fetch", "arguments": {"repo": "app", "remote": "origin", "branch": "main"}}
+  </tool_call><|projection|>
+- |-
+  compare your branch with what is on the server now<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A comparison against a stale tracking ref would mislead me, so I fetch first and compare after.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_fetch", "arguments": {"repo": "candle", "remote": "origin"}}
+  </tool_call><|projection|>
 - fetch origin in candle and tell me what moved<|im_end|>
 - is there any new work upstream<|im_end|>
 - update my remote-tracking refs before I push<|im_end|>

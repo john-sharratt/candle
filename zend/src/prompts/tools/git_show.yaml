@@ -108,6 +108,56 @@ parameters:
   title: ShowRequest
   type: object
 examples:
+- |-
+  look at how the last commit did it and do the same here<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A commit that did the same job is the best guide. `patch` gives its changed lines and, on the first page, its full message. `rev` left out is the branch I am on.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "app", "what": "patch", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  what was that function like before the regression<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  file_read gives the file as it stands now. I want it as of the commit before, and `parent` says that without an id, so git_show with `what` set to file.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "file", "path": "zend/src/session.rs", "rev": {"kind": "parent"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  list what is in that folder on origin's main<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  file_list reads my own files. For the folder as origin's branch holds it, git_show with `what` set to tree at that remote branch.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "tree", "path": "web/content", "rev": {"kind": "remote_branch", "name": "origin/main"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  which files did my branch change compared with main<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `changes` with `from` set to main compares the two and lists each file that differs, which is what I need before I write this up.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "app", "what": "changes", "from": {"kind": "branch", "name": "main"}, "page": 1}}
+  </tool_call><|projection|>
+- |-
+  who wrote this block and why<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `blame` attributes each line to the commit that last changed it, and that commit's message will say why. It needs the file in `path`.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_show", "arguments": {"repo": "app", "what": "blame", "path": "src/config.rs", "page": 1}}
+  </tool_call><|projection|>
 - show me what the last commit in candle changed<|im_end|>
 - which files differ between main and this branch<|im_end|>
 - show me Cargo.toml as the release tag has it<|im_end|>

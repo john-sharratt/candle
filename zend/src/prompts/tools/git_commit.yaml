@@ -136,6 +136,56 @@ parameters:
   title: CommitRequest
   type: object
 examples:
+- |-
+  the icons are generated and the test passes, commit them<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Generated files are already among my changes, binary ones too, so nothing has to be written out again. `all_changes` commits exactly what git_status lists.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "app", "from": "all_changes", "message": "Regenerate the site's icons from the new source art"}}
+  </tool_call><|projection|>
+- |-
+  commit only the two files for this fix and leave the rest<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Some of my changes belong to another piece, so `all_changes` is wrong here. `files` commits only what `changes` lists, and `take` commits each as I hold it, so I do not reproduce anything.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "files", "changes": [{"action": "take", "path": "src/parser.rs"}, {"action": "take", "path": "tests/parser.rs"}], "message": "The parser accepts empty input"}}
+  </tool_call><|projection|>
+- |-
+  the merge is settled and the tests pass again<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A merge is committed whole, and only with `all_changes`. The conflicts are gone, so this publishes the merge and my work together.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "all_changes", "message": "Merge main, keeping the parser fix"}}
+  </tool_call><|projection|>
+- |-
+  undo that commit, it broke the build<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `revert` applies the commit backwards and keeps the history. It takes the full object id git_log reported, and writes its own message.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "candle", "from": "revert", "commit": "9be31856b7c1d0a24f6e3a5b8c9d1e2f30415263"}}
+  </tool_call><|projection|>
+- |-
+  that is done, what is next<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The change is finished and checked, and the task asked for it committed. Saying it is done is not the same as committing it, so that is the next call.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_commit", "arguments": {"repo": "app", "from": "all_changes", "message": "Serve the new page from the site's routes"}}
+  </tool_call><|projection|>
 - commit all my changes with the message fix the parser<|im_end|>
 - commit the file I just edited, take it as I have it<|im_end|>
 - save this with the message fix the parser crash<|im_end|>

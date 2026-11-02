@@ -41,6 +41,56 @@ parameters:
   title: StatusRequest
   type: object
 examples:
+- |-
+  the tests pass, what is left to do before I can finish<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The work is written and tested, and the next step is committing it. I want the list of what a commit would hold, so nothing stray goes in and nothing I made is left out. git_status gives that list.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "app", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  did the formatter touch anything else<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A program's changes come back into my uncommitted changes, so the whole list of them is in git_status. That answers it without reading each file.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "app", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  the merge left conflicts, which files need settling<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A merge lists what it could not settle under `conflicts`, and git_status reports them, so I read that list rather than searching the files for markers.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "candle", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  did you remove the scratch files<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I made scratch files along the way and they must not go into the commit. git_status lists every file I added or changed, so anything left over shows up there.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "candle", "page": 1}}
+  </tool_call><|projection|>
+- |-
+  has anything landed since you started<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  `incoming` in git_status counts the commits my branch has that I do not, and a commit of mine would wait on them. That is the number to read before I go on.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "git_status", "arguments": {"repo": "app", "page": 1}}
+  </tool_call><|projection|>
 - what have I changed in the candle repo<|im_end|>
 - is my work committed<|im_end|>
 - which branch am I on<|im_end|>
