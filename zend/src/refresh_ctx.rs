@@ -14,6 +14,7 @@ use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 
+use crate::priming_watch;
 use crate::retrieval_scope::RetrievalScope;
 use crate::types::ToolMode;
 
@@ -91,6 +92,14 @@ impl RefreshContext<'_> {
         match self.band {
             Some(band) => base.fork_at(band),
             None => base.fork(),
+        }
+    }
+
+    /// Say a chain link has reached `stage`; a unit read at no band of its own
+    /// is no link.
+    pub fn link_stage(&self, stage: &'static str) {
+        if self.band.is_some() {
+            priming_watch::stage(stage);
         }
     }
 

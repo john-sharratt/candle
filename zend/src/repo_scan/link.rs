@@ -12,6 +12,7 @@ use super::{process_one_dir, IngestPlan, UnitJob};
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
+use crate::priming_watch;
 use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
 /// Ingest `job` with `parent` recorded as its parent before it is read, and
@@ -32,6 +33,7 @@ pub(crate) fn ingest_link(
     parent: Option<TimelineId>,
 ) -> anyhow::Result<Option<TimelineId>> {
     if let Some(held) = holder(ctx.engine, &job.unit.key) {
+        priming_watch::stage("re-pointing the held link");
         if repoint(ctx.engine, held, parent)
             .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?
         {

@@ -24,6 +24,7 @@ use crate::projection::{
     SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
+use crate::reply_wait::replied;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
@@ -59,7 +60,7 @@ fn alloc_scratch_slot_on(
             response_tx: tx,
         })
         .map_err(|_| ConversationError::SchedulerGone)?;
-    rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+    replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
 }
 
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
@@ -715,7 +716,7 @@ pub(crate) fn install_branch_states(
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+        match replied(&rx).map_err(|_| ConversationError::SchedulerGone)? {
             Ok(true) => {
                 for _ in 0..n_slots {
                     note_branch_checkpoint_installed();
@@ -1228,7 +1229,7 @@ impl Sequence {
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
-            rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+            replied(&rx).map_err(|_| ConversationError::SchedulerGone)??;
         }
 
         // The prompt's K/V is on the slot; give the recurrent layers the state
@@ -1735,7 +1736,7 @@ impl Sequence {
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
-            match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+            match replied(&rx).map_err(|_| ConversationError::SchedulerGone)? {
                 Ok(chunks_per_layer) => {
                     // Block count for diagnostics — the section is now a
                     // cold-marker; the actual hot grid lands when the next
@@ -3611,7 +3612,7 @@ impl Sequence {
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+        match replied(&rx).map_err(|_| ConversationError::SchedulerGone)? {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Not fatal to the splice — the K/V is committed and the
@@ -4333,7 +4334,7 @@ impl Sequence {
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+        replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
     }
 
     /// The last projection's score-density selection for this conversation's
@@ -4385,7 +4386,7 @@ impl Sequence {
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+        replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
     }
 
     /// The conversation's sealed block count after its last completed turn —
@@ -4526,7 +4527,7 @@ impl Sequence {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 
-        let new_seq_id = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+        let new_seq_id = replied(&rx).map_err(|_| ConversationError::SchedulerGone)??;
 
         let fork_conv = Sequence {
             submitter: self.submitter.clone(),
@@ -5147,7 +5148,7 @@ impl Sequence {
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        rx.recv().map_err(|_| ConversationError::SchedulerGone)?
+        replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
     }
 
     /// Set this conversation's sidebar label, persisting it to the redo
@@ -5425,7 +5426,7 @@ impl ProbeCtx {
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
-            rx.recv().map_err(|_| ConversationError::SchedulerGone)??
+            replied(&rx).map_err(|_| ConversationError::SchedulerGone)??
         };
         let free = |tx: &Sender<SchedulerRequest>| {
             let _ = tx.send(SchedulerRequest::FreeSequence { sequence_id: slot });

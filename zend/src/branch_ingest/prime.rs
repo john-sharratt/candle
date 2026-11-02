@@ -41,6 +41,7 @@ use super::{record_branches, BranchIngest, LayerPass};
 use crate::code_read::{self, FileJob};
 use crate::ingest::IngestMode;
 use crate::loading::LoadProgress;
+use crate::priming_watch::{self, Watch};
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{self, UnitJob};
 
@@ -156,7 +157,10 @@ impl BranchIngest {
         layers: &[LayerPass<'_>],
         progress: &LoadProgress,
     ) -> anyhow::Result<Option<TimelineId>> {
+        let _watch = Watch::start(ctx.engine.conversation());
+        priming_watch::link("the chain's plan");
         let (repos, _unreadable) = record_branches(workspace);
+        priming_watch::stage("walking the repositories");
         let folders = layers.iter().find(|l| l.mode == IngestMode::Folders);
         let files = layers.iter().find(|l| l.mode == IngestMode::Files);
         let (folder_corpus, file_corpus) = {
@@ -168,6 +172,7 @@ impl BranchIngest {
             };
             (corpus_of(folders), corpus_of(files))
         };
+        priming_watch::stage("finding binary files");
         let binary = self.known_binary(ctx);
         let file_items: Vec<FileItem> = file_corpus
             .ingest
@@ -212,6 +217,7 @@ impl BranchIngest {
                 unit = %link.name(),
                 "reading a chain link",
             );
+            priming_watch::link(link.name());
             let read = match (link, folders, files) {
                 (Link::Folder(u), Some(layer), _) => repo_scan::ingest_link(
                     ctx,

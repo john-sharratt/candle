@@ -264,6 +264,17 @@ impl Conversation {
         self.persistence.dir().to_path_buf()
     }
 
+    /// The `oseq` the next record will carry: how many identities this node
+    /// has minted, written or abandoned.
+    pub fn next_oseq(&self) -> u64 {
+        self.minter.origination().next_oseq()
+    }
+
+    /// Versions of the substrate published since it opened.
+    pub fn versions_published(&self) -> u64 {
+        self.inner.published()
+    }
+
     /// The generation this substrate writes under.
     pub fn generation(&self) -> u64 {
         self.minter.origination().gen()

@@ -218,8 +218,11 @@ impl Replicator {
     /// and send it (§6.7).
     async fn rejoined(self: &Arc<Self>, k: u64) {
         let store = self.store.clone();
+        let began = Instant::now();
+        let node = self.node;
         let fixed = tokio::task::spawn_blocking(move || {
             let fixed = store.detached();
+            tracing::info!(node, k, fixed, "rejoining the group");
             store.rejoin(k);
             if fixed {
                 store.reload();
@@ -228,6 +231,13 @@ impl Replicator {
         })
         .await
         .unwrap_or(false);
+        tracing::info!(
+            node,
+            k,
+            fixed,
+            took_ms = began.elapsed().as_millis() as u64,
+            "rejoined the group"
+        );
         {
             let mut s = self.state();
             s.phase = Phase::Joined;

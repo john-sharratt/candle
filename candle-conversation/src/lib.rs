@@ -103,6 +103,7 @@ pub mod prompts;
 pub mod provenance;
 mod recorded_reply;
 mod recovered_message;
+mod reply_wait;
 mod sampler_args;
 pub(crate) mod scheduler;
 /// A throwaway substrate directory that removes itself on drop and sweeps the

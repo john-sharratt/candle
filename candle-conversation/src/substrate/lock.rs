@@ -24,6 +24,7 @@
 
 use std::ops::Deref;
 use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,9 +40,17 @@ pub const SLOW: Duration = Duration::from_millis(250);
 /// See [`SLOW`].
 pub const RETRIES_NOTED: u32 = 8;
 
+/// An edit still landing nothing is logged every this many tries, while it
+/// tries: [`note_edit`] speaks only once an edit lands, and one that loses every
+/// race never does.
+const RETRIES_STARVED: u32 = 1 << 14;
+
 /// See the module documentation.
 pub struct SubstrateLock {
     root: ArcSwap<Substrate>,
+    /// Versions published since the substrate opened: a writer that publishes
+    /// without pause shows here, and makes every other writer run again.
+    published: AtomicU64,
 }
 
 /// One version of the substrate, held for as long as the reader reads.
@@ -66,7 +75,13 @@ impl SubstrateLock {
     pub fn new(substrate: Substrate) -> Self {
         SubstrateLock {
             root: ArcSwap::from_pointee(substrate),
+            published: AtomicU64::new(0),
         }
+    }
+
+    /// Versions published since the substrate opened.
+    pub fn published(&self) -> u64 {
+        self.published.load(Ordering::Relaxed)
     }
 
     /// The latest version. Never waits.
@@ -109,11 +124,22 @@ impl SubstrateLock {
             if Arc::ptr_eq(&prev, &current) {
                 attempt.committed = true;
                 drop(attempt);
+                self.published.fetch_add(1, Ordering::Relaxed);
                 note_edit(site, started.elapsed(), retries);
                 return out;
             }
             drop(attempt);
-            retries += 1;
+            retries = retries.saturating_add(1);
+            if retries.is_multiple_of(RETRIES_STARVED) {
+                tracing::warn!(
+                    target: "candle_conversation::substrate::lock",
+                    site = %site,
+                    took_ms = started.elapsed().as_millis() as u64,
+                    retries,
+                    published = self.published(),
+                    "a substrate edit has not landed: other writers keep publishing first"
+                );
+            }
             current = arc_swap::Guard::into_inner(prev);
         }
     }

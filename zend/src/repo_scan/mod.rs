@@ -1014,6 +1014,7 @@ fn process_one_dir(
     // running the tools, so a directory the tools can't read is caught here and
     // costs no conversation. Prefilling an error body would be worse than
     // skipping — it teaches the model a tool interaction that failed.
+    ctx.link_stage("listing the folder");
     let (prefilled, decode_user) = render::render_chain(&tools, unit, &plan.envelope);
     if let Some(detail) = render::chain_error(&prefilled, &decode_user) {
         let n = failures.record(&unit.dir, format!("file_list failed: {detail}"));
@@ -1059,9 +1060,11 @@ fn process_one_dir(
         // live dialogue turn forks from, rather than this pool's workers each
         // independently re-running the schema's "eager section ingestion"
         // under concurrent load.
+        ctx.link_stage("forking its conversation");
         let conv = ctx
             .fork_unit(base)
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
+        ctx.link_stage("recording its parent");
         // The priming chain is this conversation's parent, recorded BEFORE its
         // own listing and summary run, so its turns are projected with the
         // chain already in context (`Substrate::inherited_chain`). Metadata
@@ -1118,6 +1121,7 @@ fn process_one_dir(
     // The conversation projects its own turns (`target_is_ingest_self`), so the
     // request is in every decode's context where it belongs, and there is no
     // throwaway intermediate decode to set the wrong style.
+    ctx.link_stage("decoding its summary");
     let emit = converse::run_folder_conversation(
         &mut conv,
         unit,
@@ -1127,6 +1131,7 @@ fn process_one_dir(
         &tools,
     );
 
+    ctx.link_stage("committing it");
     let summary = match emit {
         Ok(summary) => summary,
         Err(e) => {

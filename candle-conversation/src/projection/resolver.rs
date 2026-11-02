@@ -3696,6 +3696,10 @@ impl Conversation {
     /// the member has rejoined, until the rejoin's reload: it is settled under
     /// the generation minted now. Trying again alone never returned, and said
     /// nothing. Past [`EDIT_TRIES`] the edit gives up, loudly, and stores nothing.
+    ///
+    /// **A try that cannot store publishes nothing**, so it is looked at on the
+    /// latest version first: every published version sends every other writer
+    /// round again, and one edit trying without pause starved them all.
     pub fn update_conversation_metadata(
         &self,
         timeline: TimelineId,
@@ -3709,20 +3713,26 @@ impl Conversation {
         }
         for _ in 0..EDIT_TRIES {
             let identity = self.minter.mint(0);
-            let edit = self.update(|s| {
-                if !s.custom_field_takes(timeline, key, identity) {
-                    return Edit::Overtaken(s.custom_field_id(timeline, key));
-                }
-                let current = s.custom_of(timeline).and_then(|m| m.get(key).cloned());
-                match next(s, current.as_deref()) {
-                    Some(value) => {
-                        let kv = BTreeMap::from([(key.to_string(), value.clone())]);
-                        s.merge_custom(timeline, &kv, identity);
-                        Edit::Stored(value)
+            let latest = self.read();
+            let edit = if latest.custom_field_takes(timeline, key, identity) {
+                drop(latest);
+                self.update(|s| {
+                    if !s.custom_field_takes(timeline, key, identity) {
+                        return Edit::Overtaken(s.custom_field_id(timeline, key));
                     }
-                    None => Edit::Unchanged,
-                }
-            });
+                    let current = s.custom_of(timeline).and_then(|m| m.get(key).cloned());
+                    match next(s, current.as_deref()) {
+                        Some(value) => {
+                            let kv = BTreeMap::from([(key.to_string(), value.clone())]);
+                            s.merge_custom(timeline, &kv, identity);
+                            Edit::Stored(value)
+                        }
+                        None => Edit::Unchanged,
+                    }
+                })
+            } else {
+                Edit::Overtaken(latest.custom_field_id(timeline, key))
+            };
             match edit {
                 Edit::Stored(value) => {
                     let kv = BTreeMap::from([(key.to_string(), value.clone())]);

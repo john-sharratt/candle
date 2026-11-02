@@ -48,6 +48,7 @@ pub mod loading;
 pub mod mcp;
 pub mod openai_tools;
 pub mod passthrough;
+pub mod priming_watch;
 pub mod projection_event;
 pub mod raw_read;
 pub mod reasoning_split;

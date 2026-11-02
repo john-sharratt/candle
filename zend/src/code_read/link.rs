@@ -13,6 +13,7 @@ use super::{chain_finished, finished_content_keys, process_one_file, FileJob, Jo
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
+use crate::priming_watch;
 use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
 /// Read `file` with `parent` recorded as its parent before its reading
@@ -35,6 +36,7 @@ pub(crate) fn ingest_link(
 ) -> anyhow::Result<Option<TimelineId>> {
     let key = file.key();
     if let Some(held) = holder(ctx.engine, &key) {
+        priming_watch::stage("re-pointing the held link");
         if repoint(ctx.engine, held, parent)
             .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", file.path))?
         {
@@ -53,6 +55,7 @@ pub(crate) fn ingest_link(
         binary,
     };
     let failures = Failures::new();
+    priming_watch::stage("reading the file");
     // A chain link is calibrated by the pass's catch-up round, not as it
     // commits: it is read ahead of the pass, outside its workers.
     process_one_file(
