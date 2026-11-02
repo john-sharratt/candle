@@ -1,5 +1,6 @@
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
+use crate::recurrent_span::ReplyRows;
 use crate::scheduler::exported_state::ExportedState;
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::TurnText;
@@ -242,6 +243,11 @@ pub enum TurnEvent {
 
     /// Generation complete. Contains the full response.
     Done(TurnResponse),
+
+    /// The recurrent rows of the span this turn armed for capture
+    /// ([`TurnOptions::recurrent_spans`](crate::TurnOptions::recurrent_spans)),
+    /// sent once its prefill has run every recurrent layer, before `Done`.
+    RecurrentCapture(Arc<ReplyRows>),
 
     /// A projection event: emitted once at each mid-decode reprojection, when
     /// the scheduler rebuilds the view against fresh provenance scores. Carries

@@ -146,6 +146,7 @@ use crate::provenance::{
     GalleryArena, WideQSig,
 };
 use crate::recorded_reply::{RecordedReply, Replay};
+use crate::recurrent_span::TokenSpan;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
@@ -416,6 +417,9 @@ pub(crate) enum SchedulerRequest {
         /// per step, then the end of turn or free decoding. `None` = an ordinary
         /// sampled decode.
         recorded_reply: Option<RecordedReply>,
+        /// Spans of `prefill_tokens` whose recurrent state is captured or
+        /// replayed — see [`crate::TurnOptions::recurrent_spans`].
+        recurrent_spans: Vec<TokenSpan>,
     },
 
     /// Free a sequence slot.
@@ -2227,6 +2231,9 @@ pub(super) struct PrefillWork {
     pub(super) free_tool_calls_from_penalties: bool,
     /// The recorded reply this turn replays — see [`DecodeState::recorded_reply`].
     pub(super) recorded_reply: Option<RecordedReply>,
+    /// Spans of `tokens` each prefilled as a chunk of its own, armed on the
+    /// model for a capture or a replay of their recurrent state.
+    pub(super) recurrent_spans: Vec<TokenSpan>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -4553,6 +4560,7 @@ impl Scheduler {
                 turn_grammar,
                 free_tool_calls_from_penalties,
                 recorded_reply,
+                recurrent_spans,
             } => {
                 // **The whole SubmitTurn handler, because it is the one that runs real
                 // work on the loop thread.** Its siblings are bookkeeping; this one
@@ -4962,6 +4970,7 @@ impl Scheduler {
                         turn_grammar,
                         free_tool_calls_from_penalties,
                         recorded_reply,
+                        recurrent_spans,
                     },
                     lift,
                     depth,
@@ -6591,6 +6600,7 @@ impl Scheduler {
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
+            recurrent_spans: Vec::new(),
         });
         Ok(())
     }
@@ -16079,6 +16089,7 @@ mod tests {
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
+            recurrent_spans: Vec::new(),
         }
     }
 
@@ -16862,6 +16873,7 @@ mod tests {
             turn_grammar: None,
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
+            recurrent_spans: Vec::new(),
         }
     }
 

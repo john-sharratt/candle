@@ -77,8 +77,8 @@ use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::{
     commit_stores, compact_stores, end_steps, quantized_delta_net_layer_forward_spans, seq_spans,
-    DeltaNetSeq, ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan,
-    StagedSnapshot, ZGate, TIMELINE_ROWS,
+    ArmKind, DeltaNetSeq, ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore,
+    ReplyRows, SeqSpan, SpanArms, StagedSnapshot, ZGate, TIMELINE_ROWS,
 };
 use crate::models::draft_blend::{blend, DraftTable};
 use crate::models::expert_lre::{
@@ -155,6 +155,9 @@ pub struct Qwen4ExpBatched {
     draft: DraftTable,
     /// Per-sequence GDN state (S + conv tails), wave-atomic.
     pub(super) recurrent: RwLock<HashMap<usize, RecurrentStateStore>>,
+    /// Spans armed for capture or replay, committed and rolled back with the
+    /// stores (`docs/recurrent_reply_calibration.md`).
+    arms: RwLock<SpanArms>,
     /// Per-sequence PLE state (conv history + hash window) — the third
     /// carried class. Advanced in place by the sweep; the failure bracket
     /// snapshots and restores it.
@@ -1843,6 +1846,7 @@ impl Qwen4ExpBatched {
             model,
             draft,
             recurrent: RwLock::new(HashMap::new()),
+            arms: RwLock::new(SpanArms::default()),
             seeds: RwLock::new(SeedStore::new()),
             seed_spares: RwLock::new(SeedStore::new()),
             draft_carry: Mutex::new(None),
@@ -2722,6 +2726,36 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::export_recurrent(self, seq)
     }
 
+    fn arm_recurrent_span(&self, seq: usize, at: usize, len: usize, kind: ArmKind) -> Result<bool> {
+        let cfg = &self.model.cfg;
+        let layers: Vec<u32> = cfg
+            .layer_kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| matches!(k, LayerKind::DeltaNet))
+            .map(|(i, _)| i as u32)
+            .collect();
+        self.arms
+            .write()
+            .map_err(|_| candle::Error::Msg("arms lock poisoned".into()))?
+            .arm(
+                seq,
+                (at, len),
+                kind,
+                &layers,
+                &cfg.delta_net,
+                &self.model.device,
+            )?;
+        Ok(true)
+    }
+
+    fn take_recurrent_capture(&self, seq: usize) -> Result<Option<ReplyRows>> {
+        self.arms
+            .write()
+            .map_err(|_| candle::Error::Msg("arms lock poisoned".into()))?
+            .take_capture(seq)
+    }
+
     fn export_aux_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {
         Qwen4ExpBatched::export_aux_state(self, seq)
     }
@@ -3317,6 +3351,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         }
         if let Ok(mut m) = self.ple.write() {
             m.remove(&seq);
+        }
+        if let Ok(mut m) = self.arms.write() {
+            m.forget(seq);
         }
         if let Ok(mut m) = self.index.write() {
             m.remove(&seq);
@@ -3997,6 +4034,18 @@ impl WaveSweep for Qwen4ExpBatched {
                 Ok(()) => swept,
                 Err(e) => Err(e),
             };
+            {
+                let mut arms = self
+                    .arms
+                    .write()
+                    .map_err(|_| candle::Error::Msg("arms lock poisoned".into()))?;
+                for &s in seq_ids {
+                    match &swept {
+                        Ok(_) => arms.commit(s),
+                        Err(_) => arms.rollback(s),
+                    }
+                }
+            }
             if let Err(e) = &swept {
                 for (s, store) in rec.iter_mut() {
                     if !seq_ids.contains(s) {
@@ -4341,6 +4390,13 @@ impl Qwen4ExpBatched {
             .recurrent
             .write()
             .map_err(|_| candle::Error::Msg("recurrent lock poisoned".into()))?;
+        // Held for the sweep beside the stores, and each span's absolute position
+        // beside its rows — what an armed span is named by.
+        let mut arms = self
+            .arms
+            .write()
+            .map_err(|_| candle::Error::Msg("arms lock poisoned".into()))?;
+        let span_at: Vec<usize> = dec_off.iter().chain(pre_off).copied().collect();
         let mut ple_map = self
             .ple
             .write()
@@ -4592,7 +4648,8 @@ impl Qwen4ExpBatched {
             let y: Option<LiveTensor<'_>> = match &layer.mix {
                 GpuLayerMix::DeltaNet(w) => {
                     let mut seqs: Vec<DeltaNetSeq<'_>> = Vec::with_capacity(spans.len());
-                    for span in &spans {
+                    for (span, &at) in spans.iter().zip(&span_at) {
+                        let hook = arms.hook(span.seq, li as u32, at, span.len);
                         let store =
                             rec.get_mut(&span.seq).expect("ensured") as *mut RecurrentStateStore;
                         // SAFETY: each span names a distinct sequence (the
@@ -4609,6 +4666,7 @@ impl Qwen4ExpBatched {
                             len: span.len,
                             state,
                             write,
+                            hook,
                         });
                     }
                     let acts = match h_q8 {

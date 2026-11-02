@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::iter;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
@@ -674,7 +675,17 @@ pub fn run_tool_calls(
 /// separated by newlines.  This matches the Hermes spec — the model
 /// reads each block and continues its prior reasoning.
 pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
+    format_tool_blocks(results).0
+}
+
+/// [`format_tool_responses`], with each result's block as a byte range of the
+/// text — `<tool_response>` through `</tool_response>`, the span a served
+/// read's recurrent record is applied over
+/// (`docs/recurrent_reply_calibration.md` §7).
+pub fn format_tool_blocks(results: &[ToolResult]) -> (TurnText, Vec<Range<usize>>) {
     let mut out = TurnText::default();
+    let mut at = 0usize;
+    let mut blocks = Vec::with_capacity(results.len());
     // A turn may make several calls, and the results come back as a run of
     // sibling blocks — so each one has to say which call it answers. This is
     // what OpenAI's `tool_call_id` is for; here the pairing rides in the text
@@ -711,13 +722,21 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
         // different piece sequence from the one submitted. Literal costs nothing
         // here: `[n/total name]` holds a registry name and digits, never a
         // special-token string, so the two tokenize identically.
-        out = out.then_markup("<tool_response>");
-        if results.len() > 1 {
-            out = out.then_literal(label(i, r));
-        }
-        out = out.then_literal(body).then_markup("</tool_response>\n");
+        let label = if results.len() > 1 {
+            label(i, r)
+        } else {
+            String::new()
+        };
+        let block = "<tool_response>".len() + label.len() + body.len() + "</tool_response>".len();
+        blocks.push(at..at + block);
+        at += block + 1;
+        out = out
+            .then_markup("<tool_response>")
+            .then_literal(label)
+            .then_literal(body)
+            .then_markup("</tool_response>\n");
     }
-    out
+    (out, blocks)
 }
 
 /// A tool round's user half rebuilt from its stored text — the inverse of
@@ -729,34 +748,58 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
 /// split back. Text that is not a run of `<tool_response>` blocks is ordinary
 /// user text, which the chat submits as markup.
 pub fn tool_round_text(text: &str) -> TurnText {
+    match tool_round_blocks(text) {
+        Some(blocks) => blocks.iter().fold(TurnText::default(), |out, b| {
+            out.then_markup(&text[b.block.start..b.body.start])
+                .then_literal(&text[b.body.clone()])
+                .then_markup(&text[b.body.end..b.next])
+        }),
+        None => TurnText::markup(text),
+    }
+}
+
+/// One `<tool_response>` block of a stored round, by bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundBlock {
+    /// `<tool_response>` through `</tool_response>`.
+    pub block: Range<usize>,
+    /// What the tool returned, between the tags.
+    pub body: Range<usize>,
+    /// Where the next block starts: past this one's closing newline.
+    pub next: usize,
+}
+
+/// The blocks of a stored tool round, or `None` for text that is not a run of
+/// `<tool_response>` blocks.
+pub fn tool_round_blocks(text: &str) -> Option<Vec<RoundBlock>> {
     const OPEN: &str = "<tool_response>";
     const CLOSE: &str = "</tool_response>";
     if !text.starts_with(OPEN) {
-        return TurnText::markup(text);
+        return None;
     }
-    let mut out = TurnText::default();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let Some(after_open) = rest.strip_prefix(OPEN) else {
-            return TurnText::markup(text);
-        };
-        let Some(end) = after_open.find(CLOSE) else {
-            return TurnText::markup(text);
-        };
-        let after_close = &after_open[end + CLOSE.len()..];
+    let mut blocks = Vec::new();
+    let mut at = 0usize;
+    while at < text.len() {
+        let rest = &text[at..];
+        rest.strip_prefix(OPEN)?;
+        let body = at + OPEN.len();
+        let end = body + text[body..].find(CLOSE)?;
+        let close_end = end + CLOSE.len();
         // Each block is closed by `</tool_response>\n`; the last may have lost
         // its newline to a trim.
-        let (close, next) = match after_close.strip_prefix('\n') {
-            Some(next) => ("</tool_response>\n", next),
-            None => (CLOSE, after_close),
+        let next = if text[close_end..].starts_with('\n') {
+            close_end + 1
+        } else {
+            close_end
         };
-        out = out
-            .then_markup(OPEN)
-            .then_literal(&after_open[..end])
-            .then_markup(close);
-        rest = next;
+        blocks.push(RoundBlock {
+            block: at..close_end,
+            body: body..end,
+            next,
+        });
+        at = next;
     }
-    out
+    Some(blocks)
 }
 
 // ── Public helper bundle ─────────────────────────────────────────────────────

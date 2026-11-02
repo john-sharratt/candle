@@ -18,6 +18,7 @@ use super::wave_logits::WaveLogits;
 use super::*;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
+use crate::recurrent_span::{snap_advance, span_at, ArmKind};
 use crate::stats::streams_committed;
 use crate::substrate::residence::{drain_reclaimed, rewrite_reclaimed};
 use crate::substrate::EvictionReport;
@@ -4102,6 +4103,7 @@ impl Scheduler {
             return;
         }
         self.fit_cohort_to_ground(&mut members);
+        self.cut_at_recurrent_spans(&mut members);
         let used: usize = members
             .iter()
             .map(|m| match m {
@@ -4137,6 +4139,39 @@ impl Scheduler {
         let held = self.held_arena_bytes();
         self.sweep_forecast.held_formed(held);
         self.wave_prefill_members = members;
+    }
+
+    /// Cut each prefill's chunk so that every recurrent span of its turn runs as
+    /// a chunk of its own, and arm the model for a chunk that is one — the model
+    /// honours an arm only on exactly that span
+    /// (`docs/recurrent_reply_calibration.md` §7.2). The last step of forming a
+    /// group: the members are fixed for its life, so the cut holds across every
+    /// window of its sweep.
+    fn cut_at_recurrent_spans(&mut self, members: &mut [WaveMember]) {
+        for m in members.iter_mut() {
+            let WaveMember::Prefill { seq_id, advance } = m else {
+                continue;
+            };
+            let Some(i) = self
+                .active_prefills
+                .iter()
+                .position(|p| p.work.sequence_id.0 == *seq_id)
+            else {
+                continue;
+            };
+            let p = &self.active_prefills[i];
+            *advance = snap_advance(&p.work.recurrent_spans, p.offset, *advance);
+            let Some(span) = span_at(&p.work.recurrent_spans, p.offset).cloned() else {
+                continue;
+            };
+            let at = self.session.sequence_offset(*seq_id).unwrap_or(0);
+            if let Err(e) = self
+                .model
+                .arm_recurrent_span(*seq_id, at, span.tokens.len(), span.kind)
+            {
+                self.active_prefills[i].error = Some(ConversationError::Model(e));
+            }
+        }
     }
 
     /// **Fit a cohort to the tier its windows will place**, not to the width
@@ -4549,6 +4584,23 @@ impl Scheduler {
                                 .send(TurnEvent::Projection(ev));
                         }
                         self.active_prefills[i].next_projection = offs.len();
+                    }
+                    // A captured span ran in an earlier chunk of this prefill, so
+                    // by its last every recurrent layer has run it.
+                    let captures = self.active_prefills[i]
+                        .work
+                        .recurrent_spans
+                        .iter()
+                        .any(|s| matches!(s.kind, ArmKind::Capture));
+                    if captures {
+                        let event = match self.model.take_recurrent_capture(sid) {
+                            Ok(Some(rows)) => TurnEvent::RecurrentCapture(Arc::new(rows)),
+                            Ok(None) => TurnEvent::Error(ConversationError::Other(
+                                "the turn's captured span never ran every recurrent layer".into(),
+                            )),
+                            Err(e) => TurnEvent::Error(ConversationError::Model(e)),
+                        };
+                        let _ = self.active_prefills[i].work.event_tx.send(event);
                     }
                     let _ =
                         self.active_prefills[i]
@@ -7088,6 +7140,7 @@ mod wave_chunk_tests {
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
+                recurrent_spans: Vec::new(),
             },
             offset: 0,
             next_projection: 0,

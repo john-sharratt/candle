@@ -71,7 +71,7 @@ const IN_CONTEXT: &str = "in_context";
 /// read, not this conversation. Told it had already read it, the model
 /// searched its own reads, found none, and called the reply false. `in_context`
 /// says what is true: the content is here, at this anchor.
-fn served_response(anchor: String, page: u32, pages: u32) -> Value {
+pub(crate) fn served_response(anchor: String, page: u32, pages: u32) -> Value {
     json!({
         "status": IN_CONTEXT,
         "anchor": format!("{anchor} page={page} pages={pages}"),
@@ -96,6 +96,12 @@ pub struct Served {
     /// Workspace-relative: `candle/src/lib.rs`.
     pub path: String,
     pub timeline: TimelineId,
+    /// The unit's content key and the page served — what the page's recurrent
+    /// record is keyed by (`crate::reply_record::slot_key`).
+    pub content_key: String,
+    pub page: u32,
+    /// The reply the call was answered with.
+    pub response: Value,
 }
 
 /// What one screening consults: the conversation, its view of every
@@ -245,12 +251,23 @@ impl Screen<'_> {
             );
             return None;
         };
+        // Found by this key, so it is there; were it not, the read is served
+        // all the same and simply finds no record.
+        let content_key = self
+            .engine
+            .conversation_metadata(timeline)
+            .and_then(|m| m.get(CONTENT_KEY).cloned())
+            .unwrap_or_default();
+        let response = served_response(file_anchor(repo, rel), page as u32, pages);
         Some(Hit {
-            response: served_response(file_anchor(repo, rel), page as u32, pages),
+            response: response.clone(),
             served: Served {
                 tool: FILE_READ,
                 path: key,
                 timeline,
+                content_key,
+                page: page as u32,
+                response,
             },
         })
     }
@@ -343,7 +360,7 @@ fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
 /// How many pages the file `timeline` read reads as, as its ingest recorded
 /// it. `None` for a conversation that recorded none: an answer that cannot say
 /// how much the model already has is not given.
-fn pages_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<u32> {
+pub(crate) fn pages_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<u32> {
     pages_in(&engine.conversation_metadata(timeline)?)
 }
 

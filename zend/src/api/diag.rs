@@ -43,6 +43,10 @@ pub struct RunBody {
     /// The target turn's user half in place of the recorded one.
     #[serde(default)]
     pub user: Option<String>,
+    /// Each `in_context` block of the target's user half replays its page's
+    /// recurrent record.
+    #[serde(default)]
+    pub inject: bool,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +105,7 @@ pub async fn start(
                 without: r.without.clone(),
                 catch_up: r.catch_up.clone(),
                 user: r.user.clone(),
+                inject: r.inject,
             })
         })
         .collect::<Result<Vec<_>, String>>()

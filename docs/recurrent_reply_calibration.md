@@ -1,6 +1,6 @@
 # Recurrent reply calibration: a served read the recurrence has seen
 
-**Status: design, not built.** Answers the `in_context` gap: a page the fast
+**Status: built, not yet deployed or measured.** Answers the `in_context` gap: a page the fast
 path places is attended and recalled verbatim once cued, yet the model says it
 cannot see it. This document is authoritative for the calibration step, the
 record it writes, and how a live conversation applies it.
@@ -125,22 +125,23 @@ Two halves, treated differently.
 - The unit's content key (`CONTENT_KEY`: path and blob) and the page. A new
   version of the file is a new unit: its old record is never looked up, so no
   hash is needed for content.
-- The model: the record carries the model's binding (`ModelKey`) and its
-  DeltaNet geometry (`n_layers`, `conv_dim`, `n_v_heads`). Rows from another
-  model's recurrence are noise; a mismatch is refused, never applied.
+- The model. A substrate is bound to the model that wrote it and refuses any
+  other, so a record in it is this model's. The rows also carry their DeltaNet
+  geometry — the layer indices, `conv_dim`, `n_v_heads` — and an arm refuses
+  rows whose geometry is not the model's (`SpanArms::arm`).
 
 **Recipe — may be stale; the old record is used until the new one lands.**
 
 ```text
-recipe = SHA-256( token ids prefilled in the fork after the unit
-                  ‖ SHA-256(the frame's formatted system prompt) )[..8]
+recipe = SHA-256( request ‖ 0 ‖ call ‖ 0 ‖ reply ‖ 0 ‖ frame system prompt ‖ 0 )[..8]
 ```
 
-The token ids are the call turn and the reply block exactly as prefilled, in
-the tool-round wrapping a live turn gets (`tool_round_text`). Hashing ids, not
-the reply's JSON, catches every cause of change in one place — the reply's
-format, the anchor's, the call's canonical form, the wrapper, the chat template,
-the tokenizer — with no version constant to forget to bump.
+The texts are exactly what the fork prefills after the unit: the layer's reply
+request, the call, and the reply's tool-round text (`format_tool_blocks`, the
+function a live round's results turn is built with). A change to the reply's
+format, the anchor's, the call's canonical form, the wrapper or the request is a
+new recipe. The chat template and tokenizer belong to the model, which the
+substrate already pins.
 
 ## 5. Where a record lives
 
@@ -152,9 +153,11 @@ replicate.
 
 ```text
 key:    recurrent/<content key>/<page>
-value:  { "recipe": "<16 hex>", "model": "<ModelKey>", "rows": "<blob sha256>",
-          "tokens": <n_tokens> }
+value:  { "recipe": "<16 hex>", "rows": "<blob sha256, hex>" }
 ```
+
+The store is `zend::reply_record`: the object through the `Records` trait every
+`/mcp` record uses, the rows through the substrate's blob store.
 
 Reading a slot is one key lookup (`custom_object`), never a scan of the prefix —
 the request path's no-full-scan rule. A later write of the same key supersedes
@@ -174,7 +177,7 @@ already runs:
   recipe differs from the current one. Units read before this step existed are
   calibrated by the first pass, without being read again.
 
-The layer opts in the way it opts into questions, with a block in its schema:
+The layer opts in with a `reply:` request in its `calibrate:` block:
 
 ```yaml
 - name: code_reading
@@ -182,13 +185,13 @@ The layer opts in the way it opts into questions, with a block in its schema:
     questions: 24
     think: 64
     prompt: …
-  recurrent:
-    request: |
+    reply: |
       Read page <<page>> of `<<path>>` in the `<<repo>>` repository using file_read.
 ```
 
-`request` is the user turn the call answers in the fork (§6.2). Its tokens are
-part of the recipe, so rewording it recalibrates every page.
+`reply` is the user turn the call answers in the fork (§6.2). It is part of the
+recipe, so rewording it recalibrates every page; it is not part of the
+questions' marker, so it recalibrates no questions.
 
 ### 6.1 The plan
 
@@ -216,13 +219,14 @@ written twice.
    `seed_recurrent_from_lineage`. The fork projects the unit's reading and
    carries the state the reading left. Each page gets its own fork, so every
    record starts from the reading's state, not from another page's reply.
-2. Prefill turn A: the user half is the layer's `request` for this page, and the
-   assistant half is the canonical call, prefilled whole —
-   `<tool_call>\n{"name": "file_read", "arguments": {"repo": R, "path": P,
-   "page": N}}\n</tool_call>` — with nothing decoded.
-3. Prefill turn B: the user half is `tool_round_text` of the served reply for
-   this page, exactly as `served_response` builds it, with the block's tokens
-   marked for capture (§6.3). Nothing is decoded.
+2. Prefill turn A with `submit_prefilled_turn`: the user half is the layer's
+   `reply` request for this page, and the assistant half is the canonical call,
+   `<tool_call>\n{"name":"file_read","arguments":{"repo":R,"path":P,"page":N}}\n</tool_call>`,
+   with nothing decoded.
+3. Run turn B: the user half is the served reply for this page, built by
+   `format_tool_blocks` from `served_response` exactly as a live round's is,
+   with the block armed for capture (§6.3). It decodes one argmax token, which
+   is the draft's and goes with it.
 4. Write the rows as a blob, then the slot's object, then tombstone the
    superseded blob. Tombstone the fork.
 
@@ -232,14 +236,24 @@ so a change to it recalibrates.
 
 ### 6.3 Capture
 
-A turn may ask for one span of its user half to be captured, named by
-`TurnText` piece range (the block's `<tool_response>` markup through its closing
-markup), which the scheduler maps to token positions after tokenizing. For each
-DeltaNet layer the scheduler copies that span's `qkv`, `alpha` and `beta` rows
-out of the wave's buffers, asynchronously, into pinned host memory, on the
-stream the scan runs on. The turn's result carries the rows once it has ended.
-No host thread waits per layer; the copy runs only for a turn that asked for
-capture, which only calibration does.
+A turn names a span of its user half by its bytes (`TurnOptions::recurrent_spans`,
+`<tool_response>` through `</tool_response>`). The conversation maps the bytes
+to tokens (`turn_text::token_span`: both ends fall on a tag, so each prefix of
+the text encodes to a prefix of the whole — checked, not assumed), and shifts
+them past the turn's baked head. The scheduler cuts the turn's prefill so the
+span is a chunk of its own (`recurrent_span::snap_advance`, the last step of
+forming a wave group) and arms the model for exactly that chunk, by its absolute
+position and length (`arm_recurrent_span`). The arms live in a model-level map
+beside the recurrent stores (`delta_net::SpanArms`), committed and rolled back
+with each wave, so a creep that sweeps the layers a window at a time keeps its
+arm until every DeltaNet layer has run the span.
+
+A capture arm allocates each layer's rows on the device; the mixer copies the
+span's `conved`, `alpha_lin` and `beta_lin` rows into them, on the scan's
+stream (`capture_spans`). When the turn's last chunk lands the scheduler takes
+the rows (`take_recurrent_capture`) — BF16 on the host — and sends them on the
+turn's stream as `TurnEvent::RecurrentCapture`, before `Done`. Only a turn that
+armed a capture copies anything, and only calibration arms one.
 
 ## 7. Applying a record in a live conversation
 
@@ -275,12 +289,15 @@ turn (`/projections/1/0`) carries the page's reading.
 
 ### 7.1 Serve
 
-When the fast path serves a page (`Screen::read_hit`), it already knows the unit
-(`Served::timeline`), the unit's content key, and the page. It looks up the
-slot's object — one key read — and returns it with the hit. The round's results
-turn is marked with the record it applies, beside the lock mark
-(`round_marks`): `recurrent:<blob sha256>`. The rows are read from disk while
-the round's other calls run, so nothing waits on them at the prefill.
+When the fast path serves a page (`Screen::read_hit`), the hit carries the unit's
+content key, the page and the reply it was answered with (`Served`). Once the
+round has run, the session builds the results turn with `format_tool_blocks` —
+its text and each result's block by bytes — and, on the blocking pool, gives
+every block a served read answered a replay span with its page's record
+(`zend::reply_spans::replay_spans`, one key read and one blob read per served
+read). The served result is found by its reply, not by its position, so a
+notice the round appends moves nothing. A served page with no record replays
+nothing.
 
 ### 7.2 The span's state comes from the record
 
@@ -318,20 +335,22 @@ nothing, and the reply prefills as it does today.
 
 ### 7.4 Batching and the upload
 
-Every injected span of a wave replays in **one** launch per DeltaNet layer,
-through a span table of its own: per entry, the entering state, the span's
-state-out, and the record rows' base. The record rows of the wave are uploaded
-once per wave into one wave-arena buffer, BF16 widened to F32 by one kernel over
-all of them; each layer's entries point into it by offset.
+A replay arm uploads each layer's rows once, when the span is armed — BF16
+widened to the F32 the scan reads, the narrowing being the storage format's.
+In the span's wave each DeltaNet layer runs one extra launch per replayed span
+(`replay_spans` in `delta_net/mix.rs`): the same `delta_net_prefill_scan`, over
+a one-span table built by the same `build_span_tables`, pointed at the record's
+rows. A replay is one per served read, and a wave carries one about as often as
+a turn serves a read, so the launches are not batched across spans.
 
 ### 7.5 Seal, restart, replay
 
 The sealed turn's recurrent snapshot is the state after the injection, so a
-conversation resumed from it carries it and nothing is applied again. A turn
-prefilled again — a recorded-turn replay, a diagnostic decode, a restart before
-the seal — applies the record its `recurrent:` mark names. If that blob has been
-retired, the slot's current record is applied; if the slot has none, nothing is,
-and the replay logs it.
+conversation resumed from it carries it and nothing is applied again. A
+diagnostic decode applies it when asked (`DiagRun::inject`): each `in_context`
+block of the target's user half replays its page's current record, calibrated
+on the spot when the page has none. A recorded-turn replay of history does not
+re-apply records.
 
 ## 8. Generality
 
@@ -424,17 +443,21 @@ Taken 2026-11-03:
 - **The sweep calibrates every page of every unit**, and the storage of §3.3 is
   accepted.
 
-## 13. What the code does not have yet
+## 13. Where it is built
 
-Checked against the code on 2026-11-03:
+| Piece | Where |
+|---|---|
+| Rows and their blob | `candle-transformers/src/models/delta_net/span_rows.rs` |
+| Arms and hooks | `candle-transformers/src/models/delta_net/span_arm.rs`; `DeltaNetSeq::hook` |
+| Capture and replay in the mixer | `capture_spans`, `replay_spans` in `delta_net/mix.rs` (fused path only; the ops path refuses a hook) |
+| Model trait | `arm_recurrent_span`, `take_recurrent_capture`; Flash-Next in `qwen4exp/wave.rs` |
+| Byte span → tokens | `turn_text::token_span`, `TurnText::prefix` |
+| Spans, the cut | `candle-conversation/src/recurrent_span.rs`; `Scheduler::cut_at_recurrent_spans` |
+| The record | `zend/src/reply_record.rs` |
+| Calibration | `zend/src/calibrate/reply.rs`; at commit and in `sweep_replies` |
+| Live apply | `zend/src/reply_spans.rs`; the session's results turn |
+| Diagnostic | `DiagRun::inject` |
 
-- **A prefill-only turn.** No turn today prefills and seals with nothing decoded;
-  the calibration's turns A and B need one.
-- **Capture of a span's scan inputs.** The wave's `qkv`, `alpha` and `beta`
-  buffers exist per layer (`DeltaNetProjections`, the conv output the scan
-  reads), but nothing copies a span of them out.
-- **A span whose state comes from elsewhere.** `DeltaNetSeq` carries one entering
-  state and one write; the replay entry, the second launch and the cut of a turn's
-  prefill at a block's boundaries are new.
-- **Records and the slot lookup.** The custom-object and blob stores exist; the
-  `recurrent/` objects, the plan over them and the fast path's lookup are new.
+Each one rests on code that existed: the draft fork (`on_a_draft`, shared with
+the questions), `submit_prefilled_turn` for turn A, the fused scan and its span
+tables, the calibration lease, and the `Records` and blob stores.

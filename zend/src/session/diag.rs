@@ -27,12 +27,18 @@ use candle_conversation::projection::{recorded_dials, ProjectionScript, Timeline
 use candle_conversation::{SamplingConfig, SelectionState, TurnEvent, TurnOptions};
 use serde::Serialize;
 
+use candle_conversation::recurrent_span::{ArmKind, TextSpan};
+
 use super::replay::{compare_turns, replay_history, turn_selection, Demonstration, ReplaySampling};
 use super::{
     think_mode_from_selection, timeline_for, turn_projection, turn_sampling, turn_triggers,
-    Sequence, ZendSession,
+    InferenceState, Sequence, ZendSession,
 };
-use crate::tools::tool_round_text;
+use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::calibrate::reply::calibrate_replies;
+use crate::code_read::PATH_KEY;
+use crate::reply_record::{self, slot_key};
+use crate::tools::{tool_round_blocks, tool_round_text};
 use crate::types::ToolMode;
 
 /// The most tokens one run may decode free: each records every attention
@@ -57,6 +63,10 @@ pub struct DiagRun {
     /// ids then belong to another prompt, so the reply decodes free from its
     /// first token.
     pub user: Option<String>,
+    /// Each `in_context` block of the target's user half replays its page's
+    /// recurrent record, as a live serve does — calibrated first when the page
+    /// has none (`docs/recurrent_reply_calibration.md`).
+    pub inject: bool,
 }
 
 /// What to decode.
@@ -180,6 +190,72 @@ fn fnv(bytes: &[u8]) -> u64 {
 fn piece_turn(label: &str) -> Option<(u64, u32)> {
     let (timeline, index) = label.strip_prefix("turn:")?.split_once(':')?;
     Some((timeline.parse().ok()?, index.parse().ok()?))
+}
+
+/// The page an `in_context` reply names — its file (`<repo>/<path>`) and page
+/// — or `None` for any other block.
+fn served_page(body: &str) -> Option<(String, u32)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("status")?.as_str()? != "in_context" {
+        return None;
+    }
+    let anchor = v.get("anchor")?.as_str()?;
+    let field = |name: &str| {
+        anchor
+            .split(' ')
+            .find_map(|part| part.strip_prefix(name))
+            .map(str::to_string)
+    };
+    Some((field("file=")?, field("page=")?.parse().ok()?))
+}
+
+/// A replay span per `in_context` block of `user_half`, each with its page's
+/// record — calibrated now, on its unit, when the page has none.
+fn served_replays(state: &InferenceState, user_half: &str) -> anyhow::Result<Vec<TextSpan>> {
+    let Some(blocks) = tool_round_blocks(user_half) else {
+        return Ok(Vec::new());
+    };
+    let Some(layer) = state
+        .branch_layers
+        .iter()
+        .map(|(il, _)| il)
+        .find(|il| il.calibrate.as_ref().is_some_and(|c| c.reply.is_some()))
+    else {
+        bail!("no layer records replies");
+    };
+    let spec = layer.calibrate.as_deref().expect("found by it");
+    let base = state.ingest_base(&layer.name)?;
+    let store = state.engine.conversation().shared();
+    let mut spans = Vec::new();
+    for b in blocks {
+        let Some((file, page)) = served_page(&user_half[b.body.clone()]) else {
+            continue;
+        };
+        let rows = state
+            .engine
+            .find_conversations_by_metadata(PATH_KEY, &file)
+            .into_iter()
+            .find_map(|tl| {
+                let key = state.engine.conversation_metadata(tl)?.get(CONTENT_KEY)?.clone();
+                let slot = slot_key(&key, page);
+                if reply_record::record(&store, &slot).is_none() {
+                    let unit = (tl, file.as_str(), key.as_str());
+                    if let Err(e) = calibrate_replies(&state.engine, spec, base, unit, &state.formatted_prompt) {
+                        tracing::warn!(file = %file, page, "diag: calibrating the page's reply failed: {e:#}");
+                        return None;
+                    }
+                }
+                reply_record::rows(&store, &slot).ok().flatten()
+            });
+        let Some(rows) = rows else {
+            bail!("no record of page {page} of {file} could be had");
+        };
+        spans.push(TextSpan {
+            bytes: b.block,
+            kind: ArmKind::Replay(rows),
+        });
+    }
+    Ok(spans)
 }
 
 /// Disarms on every way out of a run.
@@ -364,6 +440,12 @@ impl ZendSession {
         let dropped_turns = script.dropped_turns;
         conv.set_projection(builder.with_script(script).into());
 
+        let user_half = run.user.as_deref().unwrap_or(&target.user);
+        let recurrent_spans = if run.inject {
+            served_replays(&state, user_half)?
+        } else {
+            Vec::new()
+        };
         let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
         let (explicit, seed) = match run.sampling {
@@ -384,6 +466,7 @@ impl ZendSession {
             recorded_turn: run.user.is_none().then(|| target_sealed.token_ids.clone()),
             forced_tokens: Some(spec.token),
             forced_suffix: suffix,
+            recurrent_spans,
             ..Default::default()
         };
         if run.user.is_some() && from > 0 {
@@ -401,10 +484,7 @@ impl ZendSession {
         let armed = Armed;
         let decode_start = Instant::now();
         let handle = conv
-            .submit_turn_with_options(
-                tool_round_text(run.user.as_deref().unwrap_or(&target.user)),
-                options,
-            )
+            .submit_turn_with_options(tool_round_text(user_half), options)
             .context("submitting the target turn")?;
         let mut points_reached = Vec::new();
         let mut finished = None;
@@ -503,6 +583,20 @@ mod tests {
         let a = [step(5, 1), step(6, 2)];
         assert_eq!(first_divergence(&a, &a[..1]), Some(6));
         assert_eq!(first_divergence(&a[..1], &a), Some(6));
+    }
+
+    /// The anchor the fast path serves names the file and the page; any other
+    /// block names nothing.
+    #[test]
+    fn an_in_context_reply_names_its_page() {
+        assert_eq!(
+            served_page(
+                r#"{"status":"in_context","anchor":"file=candle/zend/src/a.rs page=2 pages=3"}"#
+            ),
+            Some(("candle/zend/src/a.rs".to_string(), 2))
+        );
+        assert_eq!(served_page(r#"{"status":"ok"}"#), None);
+        assert_eq!(served_page("not json"), None);
     }
 
     #[test]

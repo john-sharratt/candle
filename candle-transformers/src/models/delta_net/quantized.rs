@@ -30,6 +30,7 @@ use super::mix::{
     delta_net_mix_spans, delta_net_mix_spans_q8, finish_solo, solo_write, DeltaNetConstants,
     DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq, DeltaNetState, MixOut,
 };
+use super::span_arm::SpanHook;
 use super::types::{DeltaNetDims, ZGate};
 
 /// A DeltaNet layer's production weights.
@@ -112,6 +113,7 @@ pub fn quantized_delta_net_layer_forward<'w>(
         len: t,
         state,
         write,
+        hook: SpanHook::None,
     }];
     // The single-sequence convenience path, used off the sweep, so no phase is
     // open for its projections to root on.

@@ -277,6 +277,7 @@ impl SummarizationTask {
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
+                recurrent_spans: Vec::new(),
             })
             .is_err()
         {
@@ -351,8 +352,8 @@ impl CognitiveTask for SummarizationTask {
                     }
                 }
                 // Projection events are timeline telemetry for the live UI;
-                // the summariser has no use for them.
-                Ok(TurnEvent::Projection(_)) => {}
+                // the summariser has no use for them, and arms no capture.
+                Ok(TurnEvent::Projection(_)) | Ok(TurnEvent::RecurrentCapture(_)) => {}
                 Ok(TurnEvent::Done(response)) => {
                     self.free_sequence();
                     let summary_text = crate::think_strip::strip_think_blocks(&response.text);

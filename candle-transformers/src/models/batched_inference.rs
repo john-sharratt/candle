@@ -30,6 +30,7 @@ use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::delta_net::TIMELINE_ROWS;
+use crate::models::delta_net::{ArmKind, ReplyRows};
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
@@ -5057,6 +5058,30 @@ pub trait ManagedBatchedModel {
     /// wave in flight. The seal runs outside the wave, so this is an assertion
     /// on that ordering rather than a case to handle.
     fn export_recurrent(&self, _seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
+        Ok(None)
+    }
+
+    /// Arm `seq`'s span of `len` tokens at absolute position `at` for a capture
+    /// of its recurrent scan inputs, or for a replay that takes the span's
+    /// advanced recurrent state from a record's rows
+    /// (`docs/recurrent_reply_calibration.md`). The wave that runs exactly that
+    /// span honours it.
+    ///
+    /// `false` for a model with no recurrent layers, where a span has no such
+    /// state to capture or replace.
+    fn arm_recurrent_span(
+        &self,
+        _seq: usize,
+        _at: usize,
+        _len: usize,
+        _kind: ArmKind,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The rows a capture armed on `seq` took, once every recurrent layer has
+    /// run its span — `None` before then, or with nothing armed.
+    fn take_recurrent_capture(&self, _seq: usize) -> Result<Option<ReplyRows>> {
         Ok(None)
     }
 

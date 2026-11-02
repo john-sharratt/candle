@@ -438,6 +438,34 @@ fn format_tool_responses_produces_one_block_per_result() {
     assert!(formatted.contains("\"result\":4"));
 }
 
+/// Each block's bytes run from its `<tool_response>` to the end of its
+/// `</tool_response>`, label included, newline excluded.
+#[test]
+fn each_tool_block_names_its_bytes() {
+    let result = |name: &str, response: Value| ToolResult {
+        call: ToolCall {
+            name: name.to_string(),
+            arguments: Value::Null,
+        },
+        response,
+    };
+    let results = vec![result("a", json!(1)), result("b", json!("two"))];
+    let (text, blocks) = zend::tools::format_tool_blocks(&results);
+    let text = text.text();
+    assert_eq!(
+        blocks.iter().map(|b| &text[b.clone()]).collect::<Vec<_>>(),
+        [
+            "<tool_response>[1/2 a]\n1</tool_response>",
+            "<tool_response>[2/2 b]\ntwo</tool_response>",
+        ]
+    );
+    let (one, blocks) = zend::tools::format_tool_blocks(&results[..1]);
+    assert_eq!(
+        &one.text()[blocks[0].clone()],
+        "<tool_response>1</tool_response>"
+    );
+}
+
 #[test]
 fn format_tool_responses_escapes_nested_json_correctly() {
     let results = vec![ToolResult {

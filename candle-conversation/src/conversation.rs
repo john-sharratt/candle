@@ -213,8 +213,9 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
+use crate::recurrent_span::TokenSpan;
 use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
-use crate::turn_text::{encode_pieces, TurnText};
+use crate::turn_text::{encode_pieces, token_span, TurnText};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -2203,6 +2204,25 @@ impl TurnSubmitter {
         // markers on `user_end`, a registered tag the tokenizer splits at anyway,
         // so the concatenation is the whole grid's encoding.
         let user_tokens = self.encode_text(user_message)?;
+        // The user half opens the grid, so a span's tokens in the half are its
+        // tokens in the grid until the turn's head is baked on.
+        let recurrent_spans = options
+            .recurrent_spans
+            .iter()
+            .map(|s| {
+                token_span(
+                    &self.tokenizer,
+                    &self.literal_tokenizer,
+                    user_message,
+                    s.bytes.clone(),
+                )
+                .map(|tokens| TokenSpan {
+                    tokens,
+                    kind: s.kind.clone(),
+                })
+                .map_err(|e| ConversationError::Tokenizer(e.to_string()))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
         let assistant_head = format!("{user_text}{markers}");
         let lead = assistant_lead(closed_think, assistant_prefill);
@@ -2340,6 +2360,7 @@ impl TurnSubmitter {
             options
                 .recorded_turn
                 .map(|g| (g, options.forced_tokens, options.forced_suffix)),
+            recurrent_spans,
         )?;
         Ok((handle, user_tokens))
     }
@@ -2481,6 +2502,7 @@ impl Sequence {
             false,
             // Nothing is decoded, so there is no reply to replay.
             None,
+            Vec::new(),
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -2644,6 +2666,7 @@ impl Sequence {
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
+                recurrent_spans: Vec::new(),
                 seal_group: Some(turns),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2696,6 +2719,7 @@ impl TurnSubmitter {
         turn_grammar: Option<Arc<StencilTree>>,
         free_tool_calls_from_penalties: bool,
         recorded_turn: Option<(Vec<u32>, Option<usize>, Vec<u32>)>,
+        recurrent_spans: Vec<TokenSpan>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2754,6 +2778,14 @@ impl TurnSubmitter {
                 assistant_content_start + head_len,
             )
         };
+        // The spans move with the user body.
+        let recurrent_spans: Vec<TokenSpan> = recurrent_spans
+            .into_iter()
+            .map(|s| TokenSpan {
+                tokens: s.tokens.start + head_len as usize..s.tokens.end + head_len as usize,
+                kind: s.kind,
+            })
+            .collect();
         // The closing marker rides the post-decode tail, so it lands after the
         // decoded body and inside the sealed grid.
         let mut post_decode_tokens = post_decode_tokens;
@@ -2817,6 +2849,7 @@ impl TurnSubmitter {
                 turn_grammar,
                 free_tool_calls_from_penalties,
                 recorded_reply: reply,
+                recurrent_spans,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -3061,6 +3094,7 @@ impl Sequence {
             None,
             false,
             None,
+            Vec::new(),
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -5493,6 +5527,7 @@ impl ProbeCtx {
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
+                recurrent_spans: Vec::new(),
             })
             .is_err()
         {

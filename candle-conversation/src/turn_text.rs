@@ -17,6 +17,8 @@
 //! on one side and the content on the other — the concatenation is exactly the
 //! whole string's encoding.
 
+use std::ops::Range;
+
 use tokenizers::{AddedToken, Tokenizer};
 
 use crate::token_buffer::TokenBuffer;
@@ -86,6 +88,21 @@ impl TurnText {
     /// The half's text — every piece, in order.
     pub fn text(&self) -> String {
         self.pieces.iter().map(|p| p.text.as_str()).collect()
+    }
+
+    /// The half's first `bytes` bytes of text, each piece keeping its kind.
+    pub fn prefix(&self, bytes: usize) -> Self {
+        let mut out = Self::default();
+        let mut left = bytes;
+        for piece in &self.pieces {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(piece.text.len());
+            out.push(piece.text[..take].to_string(), piece.literal);
+            left -= take;
+        }
+        out
     }
 
     /// Whether the half holds nothing but whitespace.
@@ -159,6 +176,29 @@ pub fn encode_pieces(
         ids.extend_from_slice(tokenizer.encode(piece.text.as_str(), false)?.get_ids());
     }
     Ok(TokenBuffer::from(ids))
+}
+
+/// The tokens of `text`'s byte range `bytes`, as positions in its encoding.
+///
+/// Both ends must fall where a tokenizer splits regardless — at a registered
+/// tag, which is how a span is drawn (`<tool_response>` … `</tool_response>`) —
+/// so each prefix of the text encodes to a prefix of the whole. Checked: an end
+/// that falls inside a token is refused rather than rounded.
+pub fn token_span(
+    markup: &Tokenizer,
+    literal: &Tokenizer,
+    text: &TurnText,
+    bytes: Range<usize>,
+) -> tokenizers::Result<Range<usize>> {
+    let whole = encode_pieces(markup, literal, text)?;
+    let end_of = |at: usize| -> tokenizers::Result<usize> {
+        let head = encode_pieces(markup, literal, &text.prefix(at))?;
+        if whole.get(..head.len()) != Some(&head[..]) {
+            return Err(format!("byte {at} of the turn's text falls inside a token").into());
+        }
+        Ok(head.len())
+    };
+    Ok(end_of(bytes.start)?..end_of(bytes.end)?)
 }
 
 #[cfg(test)]
@@ -305,6 +345,36 @@ mod tests {
         let kinds: Vec<bool> = text.pieces().iter().map(|p| p.literal).collect();
         assert_eq!(kinds, [true, false, true]);
         assert_eq!(TurnText::join([], "\n"), TurnText::default());
+    }
+
+    /// A served block's tokens, found by its bytes — the second block of a
+    /// round, whose opening tag shares a markup piece with the first one's
+    /// closing tag.
+    #[test]
+    fn a_block_s_bytes_name_its_tokens() {
+        let markup = fixture();
+        let literal = literal_tokenizer(&markup);
+        let text = TurnText::markup("<tool_response>")
+            .then_literal("x")
+            .then_markup("</tool_response>\n<tool_response>")
+            .then_literal("x x")
+            .then_markup("</tool_response>\n");
+        let s = text.text();
+        let start = s.rfind("<tool_response>").unwrap();
+        let end = s.rfind("</tool_response>").unwrap() + "</tool_response>".len();
+        let span = token_span(&markup, &literal, &text, start..end).unwrap();
+        let ids = encoded(&text);
+        assert_eq!(ids[span], [23, 19, 20, 19, 24]);
+        // Inside the `<tool_response>` tag is not a token boundary.
+        assert!(token_span(&markup, &literal, &text, start + 1..end).is_err());
+    }
+
+    #[test]
+    fn a_prefix_keeps_each_piece_s_kind() {
+        let text = TurnText::markup("ab").then_literal("cd");
+        assert_eq!(text.prefix(3), TurnText::markup("ab").then_literal("c"));
+        assert_eq!(text.prefix(1), TurnText::markup("a"));
+        assert_eq!(text.prefix(9), text);
     }
 
     #[test]

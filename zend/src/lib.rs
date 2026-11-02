@@ -54,6 +54,8 @@ pub mod raw_read;
 pub mod reasoning_split;
 pub mod refresh_ctx;
 pub mod repeat_guard;
+pub mod reply_record;
+pub mod reply_spans;
 pub mod repo_ads;
 pub mod repo_path;
 pub mod repo_scan;

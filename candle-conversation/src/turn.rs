@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::config::SamplingConfig;
 use crate::projection::SelectionState;
+use crate::recurrent_span::TextSpan;
 use crate::stencil::{StencilTree, TriggerRegistry};
 use crate::token_buffer::TokenBuffer;
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,12 @@ pub struct TurnOptions {
     /// Ids forced after those [`Self::forced_tokens`] kept, before sampling
     /// starts: a question put to the model from inside its own reply.
     pub forced_suffix: Vec<u32>,
+
+    /// Spans of the user half whose recurrent state is captured — the rows
+    /// arrive as [`TurnEvent::RecurrentCapture`](crate::TurnEvent::RecurrentCapture)
+    /// before `Done` — or replayed from a record
+    /// (`docs/recurrent_reply_calibration.md`).
+    pub recurrent_spans: Vec<TextSpan>,
 }
 
 impl TurnOptions {

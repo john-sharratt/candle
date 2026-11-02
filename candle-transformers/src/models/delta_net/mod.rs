@@ -22,6 +22,8 @@ pub mod mix;
 /// scatter is a kernel wrapper, so it shares that module's gate.
 #[cfg(feature = "cuda")]
 pub mod quantized;
+pub mod span_arm;
+pub mod span_rows;
 pub mod state_store;
 pub mod timeline;
 pub mod types;
@@ -38,6 +40,8 @@ pub use quantized::{
     quantized_delta_net_layer_forward, quantized_delta_net_layer_forward_spans,
     QuantDeltaNetWeights,
 };
+pub use span_arm::{ArmKind, SpanArms, SpanHook};
+pub use span_rows::{ReplyRows, SpanRows};
 pub use state_store::{
     commit_stores, compact_stores, end_steps, fold_stores, release_seal_readback,
     ExportedLayerState, RecurrentCompaction, RecurrentStateStore, StagedSnapshot,

@@ -39,6 +39,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::FOLD_GROUPS;
+use candle_conversation::recurrent_span::TextSpan;
 use candle_conversation::stencil::{
     compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
@@ -127,6 +128,7 @@ use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript}
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
+use crate::reply_spans::replay_spans;
 use crate::repo_ads::repo_ads;
 use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
@@ -140,8 +142,8 @@ use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_availability::{announce_returned, unavailable, Unavailable};
 use crate::tool_round;
 use crate::tools::{
-    extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
-    ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
+    extract_tool_calls, format_tool_blocks, format_tool_responses, install_tool_catalog,
+    run_tool_calls, Dispatch, ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
 };
 use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
@@ -4396,6 +4398,9 @@ fn run_inference_stream(
         // round it answers did to the working set, in the order it happened
         // (`docs/zend_working_set.md` §4.8).
         let mut marks: Vec<String> = Vec::new();
+        // The replay spans the next submitted turn carries: its served blocks,
+        // each with its page's recurrent record.
+        let mut reply_spans: Vec<TextSpan> = Vec::new();
         if let Some(Resume {
             call_turn,
             dispatch,
@@ -4577,6 +4582,7 @@ fn run_inference_stream(
                     .into_iter()
                     .chain(std::mem::take(&mut marks))
                     .collect(),
+                recurrent_spans: std::mem::take(&mut reply_spans),
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
@@ -5143,6 +5149,7 @@ fn run_inference_stream(
             // On the blocking pool, like the dispatch below: the lookups are
             // git work, and this task's every wait is an await.
             let mut served: Vec<TimelineId> = Vec::new();
+            let mut served_hits: Vec<fast_path::Served> = Vec::new();
             let round = match state.working_set.clone() {
                 None => round,
                 Some(config) => {
@@ -5176,6 +5183,7 @@ fn run_inference_stream(
                                 );
                                 served.push(hit.timeline);
                             }
+                            served_hits = screened.served;
                             screened.steps
                         }
                         Err(e) => {
@@ -5309,7 +5317,19 @@ fn run_inference_stream(
                     tokens,
                 })))
                 .await;
-            current_message = format_tool_responses(&results);
+            let (message, blocks) = format_tool_blocks(&results);
+            current_message = message;
+            // Each served block replays its page's recurrent record when the
+            // results turn prefills (`docs/recurrent_reply_calibration.md` §7).
+            if !served_hits.is_empty() {
+                let store = state.engine.conversation().shared();
+                let results = results.clone();
+                reply_spans = tokio::task::spawn_blocking(move || {
+                    replay_spans(&store, &served_hits, &results, &blocks)
+                })
+                .await
+                .unwrap_or_default();
+            }
             // A tool round that produces no response text must NOT spawn a
             // follow-up turn. `format_tool_responses` wraps every real result in
             // `<tool_response>…</tool_response>`, so an empty `current_message`

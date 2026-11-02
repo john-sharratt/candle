@@ -26,6 +26,7 @@ use candle::{Device, Result, Tensor};
 use super::mix::{
     delta_net_mix, delta_net_mix_spans, solo_write, DeltaNetProjections, DeltaNetSeq,
 };
+use super::span_arm::SpanHook;
 use super::types::{DeltaNetDims, ZGate};
 use super::{DeltaNetConstants, DeltaNetState};
 
@@ -190,6 +191,7 @@ fn correctness_gate(
             len: gate_tokens,
             state: &mut st,
             write,
+            hook: SpanHook::None,
         }];
         delta_net_mix_spans(
             &p_gpu.view(),
@@ -279,6 +281,7 @@ pub fn run_delta_net_kernels(dev: &Device, cfg: DeltaNetBenchCfg) -> Result<()> 
                 len: per_seq,
                 state,
                 write,
+                hook: SpanHook::None,
             })
             .collect();
         let _ = delta_net_mix_spans(

@@ -227,7 +227,7 @@ fn test_streaming_events() {
             }
             TurnEvent::Error(e) => panic!("unexpected error: {e}"),
             TurnEvent::HealthWarning(_) => {}
-            TurnEvent::Projection(_) => {}
+            TurnEvent::Projection(_) | TurnEvent::RecurrentCapture(_) => {}
         }
     }
 
@@ -1484,7 +1484,7 @@ fn test_tool_call_weather_pos1() {
             }
             TurnEvent::Error(e) => panic!("stream error: {e}"),
             TurnEvent::HealthWarning(w) => eprintln!("HealthWarning: {w}"),
-            TurnEvent::Projection(_) => {}
+            TurnEvent::Projection(_) | TurnEvent::RecurrentCapture(_) => {}
         }
     }
 

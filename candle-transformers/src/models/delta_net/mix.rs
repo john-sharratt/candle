@@ -57,6 +57,7 @@ use candle_kernels::delta_net::DELTA_NET_SHORT_SPAN_CONV;
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::upload_into;
 
+use super::span_arm::SpanHook;
 use super::timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
 use super::types::{DeltaNetDims, ZGate};
 
@@ -995,6 +996,10 @@ pub struct DeltaNetSeq<'a> {
     pub state: &'a mut DeltaNetState,
     /// Where the span's work lands.
     pub write: SpanWrite,
+    /// A capture of the span's scan inputs, or a replay that writes its
+    /// advanced state from a record's rows (`span_arm`). Long spans on the
+    /// fused path only.
+    pub hook: SpanHook,
 }
 
 /// Where a span's work lands — chosen by its length, never by its purpose
@@ -1337,6 +1342,7 @@ pub fn delta_net_mix<'w>(
         len: t,
         state,
         write,
+        hook: SpanHook::None,
     }];
     // The single-sequence reference path, off the sweep: no phase is open.
     let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate, None)?;
@@ -1389,6 +1395,7 @@ pub fn delta_net_mix_spans<'w>(
     // the one place that can see both.
     check_span_tiling(seqs, t)?;
     check_span_writes(seqs)?;
+    check_span_hooks(seqs)?;
     #[cfg(feature = "cuda")]
     let d = dims.head_dim;
 
@@ -1436,6 +1443,7 @@ pub fn delta_net_mix_spans_q8<'w>(
     let (t, _) = p.qkv.dims2()?;
     check_span_tiling(seqs, t)?;
     check_span_writes(seqs)?;
+    check_span_hooks(seqs)?;
     let d = dims.head_dim;
     match fused_mix(p, c, dims, seqs, rms_eps, table, ticket)? {
         Some(o) if d == 128 => Ok(MixOut::Q8(super::cuda::delta_net_norm_gate_q8(
@@ -1593,7 +1601,88 @@ fn fused_mix<'w>(
     if let Some(sp) = long.as_ref() {
         super::cuda::delta_net_prefill_scan(&fused, sp)?;
     }
+    capture_spans(seqs, &conved, p)?;
+    replay_spans(seqs, &fused, dims)?;
     Ok(Some(o))
+}
+
+/// Copy each captured span's scan inputs — its rows of the conv output and of
+/// the two gate projections — into the rows its hook carries.
+#[cfg(feature = "cuda")]
+fn capture_spans(
+    seqs: &[DeltaNetSeq<'_>],
+    conved: &LiveTensor<'_>,
+    p: &DeltaNetProjections<'_>,
+) -> Result<()> {
+    for s in seqs {
+        let SpanHook::Capture(rows) = &s.hook else {
+            continue;
+        };
+        rows.qkv
+            .slice_set(&conved.narrow(0, s.start, s.len)?, 0, 0)?;
+        rows.alpha
+            .slice_set(&p.alpha_lin.narrow(0, s.start, s.len)?, 0, 0)?;
+        rows.beta
+            .slice_set(&p.beta_lin.narrow(0, s.start, s.len)?, 0, 0)?;
+    }
+    Ok(())
+}
+
+/// For each replayed span, run the record's rows through the span's entering
+/// state with the wave's own scan and write the result to the span's advanced
+/// state — over what the live scan wrote there, on the same stream, so the
+/// span's outputs are its own and the state it carries on is the record's.
+#[cfg(feature = "cuda")]
+fn replay_spans(
+    seqs: &mut [DeltaNetSeq<'_>],
+    fused: &super::cuda::DeltaNetFused<'_, '_>,
+    dims: &DeltaNetDims,
+) -> Result<()> {
+    for s in seqs.iter_mut() {
+        let SpanHook::Replay(rows) = &s.hook else {
+            continue;
+        };
+        let rows = rows.clone();
+        let n = rows.tokens()?;
+        let o = rows.qkv.empty_beside((n, dims.value_dim()), DType::F32)?;
+        let replay = super::cuda::DeltaNetFused {
+            conved: &rows.qkv,
+            alpha: &rows.alpha,
+            blin: &rows.beta,
+            dt_bias: fused.dt_bias,
+            a: fused.a,
+            o: &o,
+            q_scale: fused.q_scale,
+        };
+        let one = [DeltaNetSeq {
+            start: 0,
+            len: n,
+            state: &mut *s.state,
+            write: s.write.clone(),
+            hook: SpanHook::None,
+        }];
+        let (_, Some(table)) = super::cuda::build_span_tables(&one, &rows.qkv)? else {
+            candle::bail!("delta_net: a replay of {n} rows is not a long span");
+        };
+        super::cuda::delta_net_prefill_scan(&replay, &table)?;
+    }
+    Ok(())
+}
+
+/// A hook is a long span's: a short span writes a timeline, which neither a
+/// capture nor a replay has a state to stand beside.
+fn check_span_hooks(seqs: &[DeltaNetSeq<'_>]) -> Result<()> {
+    match seqs
+        .iter()
+        .find(|s| !s.hook.is_none() && s.len <= TIMELINE_ROWS)
+    {
+        Some(s) => candle::bail!(
+            "delta_net_mix_spans: a span of {} rows carries a capture or replay, which a span of \
+             at most {TIMELINE_ROWS} rows cannot",
+            s.len
+        ),
+        None => Ok(()),
+    }
 }
 
 /// The mixer as tensor ops — the arithmetic the fused kernels are
@@ -1610,6 +1699,14 @@ fn mix_spans_by_ops<'w>(
     let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
     let (qkv, w) = (&p.qkv, c);
     let key_dim = dims.key_dim();
+    // A record's rows are the fused conv's output, Q|K already normed; the ops
+    // path holds no such buffer to capture from or replay into.
+    if seqs.iter().any(|s| !s.hook.is_none()) {
+        candle::bail!(
+            "delta_net_mix_spans: a span carries a capture or replay, which runs on the fused \
+             path only"
+        );
+    }
 
     // Causal conv, then SiLU.
     //
@@ -2162,12 +2259,14 @@ mod tests {
                     len: len_a,
                     state: &mut st_a,
                     write: write_a,
+                    hook: SpanHook::None,
                 },
                 DeltaNetSeq {
                     start: len_a,
                     len: len_b,
                     state: &mut st_b,
                     write: write_b,
+                    hook: SpanHook::None,
                 },
             ];
             let mixed = delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu, None)
@@ -2251,6 +2350,7 @@ mod tests {
                 len: block,
                 state: &mut read,
                 write: SpanWrite::Timeline(tl.clone()),
+                hook: SpanHook::None,
             }];
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
@@ -2335,6 +2435,7 @@ mod tests {
             len: 3,
             state: &mut st,
             write: SpanWrite::State(out),
+            hook: SpanHook::None,
         }];
         let err = delta_net_mix_spans(&short, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
             .unwrap_err();
@@ -2347,6 +2448,7 @@ mod tests {
             len: TIMELINE_ROWS + 1,
             state: &mut st,
             write: SpanWrite::Timeline(tl),
+            hook: SpanHook::None,
         }];
         let err = delta_net_mix_spans(&long, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
             .unwrap_err();
@@ -2384,12 +2486,14 @@ mod tests {
                     len: spans[0].1,
                     state: sa,
                     write: write_a,
+                    hook: SpanHook::None,
                 },
                 DeltaNetSeq {
                     start: spans[1].0,
                     len: spans[1].1,
                     state: sb,
                     write: write_b,
+                    hook: SpanHook::None,
                 },
             ];
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).map(|_| ())

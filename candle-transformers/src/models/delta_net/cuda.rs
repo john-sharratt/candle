@@ -22,6 +22,8 @@ use candle_kernels::delta_net::{
 pub use candle_kernels::delta_net::{DELTA_NET_SHORT_SPAN_CONV, DELTA_NET_SHORT_SPAN_ROWS};
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, DeltaNetState, SeqSpan};
+#[cfg(test)]
+use super::span_arm::SpanHook;
 use super::state_store::RecurrentStateStore;
 use super::timeline::{TimelineLayout, TIMELINE_ROWS};
 use super::types::DeltaNetDims;
@@ -2533,6 +2535,7 @@ mod tests {
                 len: lens[i],
                 state: &mut st,
                 write,
+                hook: SpanHook::None,
             }];
             let o = delta_net_mix_spans(&ps, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
                 .unwrap();
@@ -2570,6 +2573,7 @@ mod tests {
                     len: lens[i],
                     state,
                     write: write.clone(),
+                    hook: SpanHook::None,
                 })
                 .collect();
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap()
@@ -2608,6 +2612,104 @@ mod tests {
                 "span {i}: conv tail"
             );
         }
+    }
+
+    /// **A replay is the captured span's state, and nothing else of it**
+    /// (`docs/recurrent_reply_calibration.md` §10). Span A runs with its rows
+    /// captured; span B — other rows, another length — runs from the same
+    /// entering state replaying A's rows. B's advanced state is A's, bit for
+    /// bit, while B's outputs and conv tail are B's own, bit for bit what B
+    /// produces with no hook at all.
+    #[test]
+    fn a_replay_takes_the_captured_span_s_state_and_leaves_its_own_outputs() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        use super::super::mix::{
+            delta_net_mix_spans, DeltaNetConstants, DeltaNetOut, DeltaNetProjections, SpanWrite,
+        };
+        use super::super::span_rows::SpanRows;
+        let dims = DeltaNetDims {
+            head_dim: 128,
+            n_k_heads: 1,
+            n_v_heads: 2,
+            conv_kernel: 4,
+        };
+        let proj = |len: usize, seed: u64| DeltaNetProjections {
+            qkv: lcg_tensor(&[len, dims.conv_dim()], seed, &gpu),
+            z: lcg_tensor(&[len, dims.value_dim()], seed + 1, &gpu),
+            beta_lin: lcg_tensor(&[len, dims.n_v_heads], seed + 2, &gpu),
+            alpha_lin: lcg_tensor(&[len, dims.n_v_heads], seed + 3, &gpu),
+        };
+        let dt_bias = lcg_tensor(&[dims.n_v_heads], 15, &gpu);
+        let a = lcg_tensor(&[dims.n_v_heads], 16, &gpu)
+            .abs()
+            .unwrap()
+            .affine(1.0, 0.1)
+            .unwrap()
+            .neg()
+            .unwrap();
+        let conv = lcg_tensor(&[dims.conv_dim(), dims.conv_kernel], 17, &gpu);
+        let norm = lcg_tensor(&[dims.head_dim], 18, &gpu).abs().unwrap();
+        let c = DeltaNetConstants {
+            dt_bias: &dt_bias,
+            a: &a,
+            conv: &conv,
+            norm: &norm,
+        };
+        let entering = || DeltaNetState {
+            s: lcg_tensor(&[2, 128, 128], 40, &gpu),
+            conv_tail: lcg_tensor(&[dims.conv_dim(), 3], 60, &gpu),
+        };
+        let scratch = || DeltaNetOut {
+            s: Tensor::zeros((2, 128, 128), DType::F32, &gpu).unwrap(),
+            conv_tail: Tensor::zeros((dims.conv_dim(), 3), DType::F32, &gpu).unwrap(),
+        };
+        // One long span through the fused mixer, into a scratch apart from
+        // its entering state, as a store hands a prefilling sequence.
+        let run = |p: &DeltaNetProjections<'static>, len: usize, hook: SpanHook| {
+            let mut st = entering();
+            let out = scratch();
+            let mut seqs = [DeltaNetSeq {
+                start: 0,
+                len,
+                state: &mut st,
+                write: SpanWrite::State(out.clone()),
+                hook,
+            }];
+            let o = delta_net_mix_spans(p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Sigmoid, None)
+                .unwrap();
+            (o.to_device(&Device::Cpu).unwrap(), out)
+        };
+
+        let (la, lb) = (TIMELINE_ROWS + 12, TIMELINE_ROWS + 7);
+        let (pa, pb) = (proj(la, 11), proj(lb, 21));
+        let captured = SpanRows::alloc(la, dims.conv_dim(), dims.n_v_heads, &gpu).unwrap();
+        let (_, a_out) = run(&pa, la, SpanHook::Capture(captured.clone()));
+        let (b_alone, b_own) = run(&pb, lb, SpanHook::None);
+        let (b_replayed, b_out) = run(&pb, lb, SpanHook::Replay(captured));
+
+        assert_eq!(
+            f32_bits(&b_out.s),
+            f32_bits(&a_out.s),
+            "the replayed state is A's"
+        );
+        assert_ne!(
+            f32_bits(&b_own.s),
+            f32_bits(&a_out.s),
+            "B's own state differs from A's"
+        );
+        assert_eq!(
+            f32_bits(&b_replayed),
+            f32_bits(&b_alone),
+            "B's outputs are its own"
+        );
+        assert_eq!(
+            f32_bits(&b_out.conv_tail),
+            f32_bits(&b_own.conv_tail),
+            "B's conv tail is its own"
+        );
     }
 
     /// A span past [`DELTA_NET_SHORT_SPAN_ROWS`] is refused by name, before
