@@ -37,6 +37,11 @@
 //! carries a `warning`. Nothing is refused for it: a different argument may be
 //! the one that works.
 //!
+//! **The same refusal word for word is plainer still.** From
+//! [`FAILURES_WARN_FROM`] in a row with one `detail`, the result is cut to that
+//! detail and a warning, schema gone: a worker read past the warning under 3 KB
+//! of schema and sent one wrong path to `git_log` four times (2026-11-01).
+//!
 //! **A change starts the count again.** A call that mutates — writes a file,
 //! changes a repository, runs a program or code ([`mutates`]) — is never a
 //! repeat, and it clears every count: after it, reading the same file again
@@ -171,12 +176,23 @@ struct Seen {
     count: usize,
 }
 
+/// One tool's run of one error.
+#[derive(Debug)]
+struct Failing {
+    error: String,
+    /// How many in a row.
+    run: usize,
+    detail: Option<String>,
+    /// How many of the last of them gave `detail`.
+    same: usize,
+}
+
 /// Every call this turn's tool loop has run since its last mutation, with the
 /// result it got and how often.
 #[derive(Debug, Default)]
 pub struct RepeatGuard {
-    /// Each tool's run of one error: the error and how many in a row.
-    failing: HashMap<String, (String, usize)>,
+    /// Each tool's run of one error.
+    failing: HashMap<String, Failing>,
     seen: Vec<Seen>,
     streak: usize,
 }
@@ -213,7 +229,7 @@ impl RepeatGuard {
             })
             .collect();
         let repeated: Vec<bool> = occurrences.iter().map(|&n| n >= NOTICE_FROM).collect();
-        let failures: Vec<usize> = results.iter().map(|r| self.note_failure(r)).collect();
+        let failures: Vec<(usize, usize)> = results.iter().map(|r| self.note_failure(r)).collect();
         if mutating.iter().any(|&m| m) {
             self.seen.clear();
         } else {
@@ -245,12 +261,14 @@ impl RepeatGuard {
                 if self.streak > 0 {
                     warn_of(&mut result.response, closing_warning(rounds_left));
                 }
+            } else if failures[i].1 >= FAILURES_WARN_FROM {
+                result.response = same_refusal(&result.call, failures[i].1, &result.response);
             } else if occurrences[i] >= WARN_FROM {
                 let left = NOTICE_FROM - occurrences[i];
                 let warning = repeat_warning(&result.call, occurrences[i], left);
                 warn_of(&mut result.response, warning);
-            } else if failures[i] >= FAILURES_WARN_FROM {
-                let warning = failure_warning(&result.call, failures[i], &result.response);
+            } else if failures[i].0 >= FAILURES_WARN_FROM {
+                let warning = failure_warning(&result.call, failures[i].0, &result.response);
                 warn_of(&mut result.response, warning);
             }
         }
@@ -262,21 +280,39 @@ impl RepeatGuard {
     }
 
     /// Count `result` in its tool's run of one error: how many in a row it now
-    /// is, 0 when it did not fail. Any other result of the tool ends the run.
-    fn note_failure(&mut self, result: &ToolResult) -> usize {
+    /// is, and how many of them gave its very detail; 0 when it did not fail.
+    /// Any other result of the tool ends the run.
+    fn note_failure(&mut self, result: &ToolResult) -> (usize, usize) {
         let Some(error) = result.response.get("error").and_then(Value::as_str) else {
             self.failing.remove(&result.call.name);
-            return 0;
+            return (0, 0);
         };
+        let detail = result
+            .response
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let run = self
             .failing
             .entry(result.call.name.clone())
-            .or_insert_with(|| (error.to_string(), 0));
-        if run.0 != error {
-            *run = (error.to_string(), 0);
+            .or_insert_with(|| Failing {
+                error: error.to_string(),
+                run: 0,
+                detail: None,
+                same: 0,
+            });
+        if run.error != error {
+            run.error = error.to_string();
+            run.run = 0;
+            run.same = 0;
         }
-        run.1 += 1;
-        run.1
+        if run.detail != detail {
+            run.detail = detail;
+            run.same = 0;
+        }
+        run.run += 1;
+        run.same += 1;
+        (run.run, run.same)
     }
 
     /// The earlier occurrences of `result`'s call with `result`'s response.
@@ -291,9 +327,16 @@ impl RepeatGuard {
 /// Whether `result` is a program that failed and left no file changed: it
 /// mutated nothing, so it is screened like a read. Counted as a mutation for
 /// starting a program, the same `node -e` failed sixteen times in one turn
-/// with the guard clearing its counts each time.
+/// with the guard clearing its counts each time. `file_image` asked for no
+/// copies only read the picture.
 fn changed_nothing(result: &ToolResult) -> bool {
     let response = &result.response;
+    if result.call.name == "file_image" {
+        return response
+            .get("written")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+    }
     result.call.name == "run_command"
         && response.get("exit_code").and_then(Value::as_i64) != Some(0)
         && response
@@ -394,6 +437,24 @@ fn failure_warning(call: &ToolCall, failures: usize, response: &Value) -> String
          a different way to reach the goal.",
         call.name
     )
+}
+
+/// `response`, the `same`th in a row to say the same thing, cut to its error and
+/// detail with a warning that nothing else will help.
+fn same_refusal(call: &ToolCall, same: usize, response: &Value) -> Value {
+    let error = response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "error": error,
+        "detail": response.get("detail"),
+        "warning": format!(
+            "The last {same} {} calls all failed with `{error}` and this same detail. Sending \
+             it again cannot work: change what `detail` names, or reach the goal another way.",
+            call.name
+        ),
+    })
 }
 
 /// What a refused round says, with `rounds` more like it before the tools close.
@@ -626,6 +687,40 @@ mod tests {
             again[0].response.get("warning").is_none(),
             "it started over"
         );
+    }
+
+    /// **One refusal word for word is cut to its detail**, schema gone, while
+    /// a failure saying something new each time keeps all it carried.
+    #[test]
+    fn the_same_refusal_word_for_word_loses_its_schema() {
+        let refused = |path: &str, detail: &str| {
+            vec![result(
+                "git_log",
+                json!({"paths": [path]}),
+                json!({"error": "invalid_arguments", "detail": detail, "parameters": {}}),
+            )]
+        };
+        let mut guard = RepeatGuard::new();
+        for n in 0..FAILURES_WARN_FROM - 1 {
+            let mut round = refused(&format!("/a/{n}"), "same");
+            guard.screen(&mut round);
+            assert!(round[0].response.get("parameters").is_some(), "failure {n}");
+        }
+        let mut third = refused("/b", "same");
+        guard.screen(&mut third);
+        assert_eq!(third[0].response["detail"], "same");
+        assert!(third[0].response.get("parameters").is_none());
+        assert!(third[0].response["warning"]
+            .as_str()
+            .unwrap()
+            .contains("this same detail"));
+
+        let mut guard = RepeatGuard::new();
+        for n in 0..2 * FAILURES_WARN_FROM {
+            let mut round = refused("/a", &format!("detail {n}"));
+            guard.screen(&mut round);
+            assert!(round[0].response.get("parameters").is_some(), "failure {n}");
+        }
     }
 
     /// **Repeats are warned, then refused, and the loop closes after

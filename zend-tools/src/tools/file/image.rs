@@ -1,9 +1,14 @@
-//! file_image tool: make resized copies of a picture in the repository.
+//! file_image tool: read what a picture is, and make resized copies of it in the
+//! repository.
 //!
 //! `code_run`'s files are text and the sandbox holds no image program, so a
 //! task as ordinary as a site's icon set had no way to be done: a worker spent
 //! twenty calls looking for one (2026-10-31). The bytes go through the file
 //! store, so the copies are the conversation's changes like any other write.
+//!
+//! With no `outputs` it only reads: the picture's size, its bytes, and an
+//! `.ico`'s frames. With no way to ask, a worker spent a third of a favicon task
+//! probing with 0×0 copies, `od`, `magick` and scripts (2026-11-01).
 
 use std::io::Cursor;
 use std::path::Path;
@@ -72,8 +77,9 @@ pub struct ImageRequest {
     /// The part of the picture to use; all of it when left out. Use it when a copy's shape differs from the picture's. Optional.
     #[serde(default)]
     pub crop: Option<Crop>,
-    /// The copies to make. Required.
-    #[validate(length(min = 1, max = 32))]
+    /// The copies to make. Left out, nothing is written and the answer says what the picture is.
+    #[serde(default)]
+    #[validate(length(max = 32))]
     pub outputs: Vec<ImageOutput>,
 }
 
@@ -91,6 +97,11 @@ pub struct ImageResponse {
     /// The picture's own size.
     pub width: u32,
     pub height: u32,
+    /// The picture's file size in bytes.
+    pub bytes: usize,
+    /// The side of each frame an `.ico` holds, in its file's order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ico_sizes: Vec<u32>,
     pub written: Vec<WrittenImage>,
 }
 
@@ -102,10 +113,13 @@ impl Tool for FileImage {
         "Make resized copies of a picture in the repository, keeping its transparency: PNG, \
          JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your \
          uncommitted changes. The picture may be in another repository (`source_repo`), which \
-         is how a picture gets from one repository into another. Use for: an icon set, a \
-         favicon, thumbnails, converting a picture to another format. Triggered by \"resize the image\", \"make a favicon\", \"generate \
-         the icon sizes\", \"convert to webp\". Returns the picture's size and each copy's path, \
-         bytes and size. A copy whose shape differs from the picture's is refused: crop first.";
+         is how a picture gets from one repository into another. With no `outputs` nothing is \
+         written and it reads what a picture is: its size, its file's bytes and an ICO's frame \
+         sizes. Use for: an icon set, a favicon, thumbnails, converting a picture to another \
+         format, checking a picture's dimensions. Triggered by \"resize the image\", \"make a \
+         favicon\", \"generate the icon sizes\", \"convert to webp\", \"how big is this image\". \
+         Returns the picture's size and each copy's path, bytes and size. A copy whose shape \
+         differs from the picture's is refused: crop first.";
 
     type Request = ImageRequest;
     type Response = ImageResponse;
@@ -126,6 +140,7 @@ impl Tool for FileImage {
         refuse_overwriting_source(&req)?;
         let picture = decode(&source, &req.path)?;
         let (width, height) = picture.dimensions();
+        let ico_sizes = ico_frames(&source);
         let cut = cut(picture, req.crop)?;
         // Every copy is made before any is written, so a bad one leaves none.
         let made = req
@@ -147,9 +162,30 @@ impl Tool for FileImage {
             repo: req.repo,
             width,
             height,
+            bytes: source.len(),
+            ico_sizes,
             written,
         })
     }
+}
+
+/// The side of each frame in `bytes`' `.ico` directory, none when it is no
+/// `.ico`: a six-byte header counting sixteen-byte entries, each opening with
+/// its width, where 0 means 256.
+fn ico_frames(bytes: &[u8]) -> Vec<u32> {
+    if !bytes.starts_with(&[0, 0, 1, 0]) || bytes.len() < 6 {
+        return Vec::new();
+    }
+    let count = usize::from(u16::from_le_bytes([bytes[4], bytes[5]]));
+    bytes[6..]
+        .iter()
+        .step_by(16)
+        .take(count.min((bytes.len() - 6) / 16))
+        .map(|&side| match side {
+            0 => MAX_ICO_SIDE,
+            side => u32::from(side),
+        })
+        .collect()
 }
 
 /// The picture `req` names is not there, said with the way out when it may be
@@ -220,7 +256,8 @@ fn cut(picture: DynamicImage, crop: Option<Crop>) -> Result<DynamicImage, FileEr
 fn sized(picture: &DynamicImage, width: u32, height: u32) -> Result<DynamicImage, FileError> {
     if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE {
         return Err(FileError::InvalidArguments(format!(
-            "a copy of {width}x{height} is out of range: each side is 1 to {MAX_SIDE}"
+            "a copy of {width}x{height} is out of range: each side is 1 to {MAX_SIDE}. To read a \
+             picture's size, call with no `outputs`"
         )));
     }
     let (from_width, from_height) = picture.dimensions();
@@ -340,6 +377,21 @@ mod tests {
         assert_eq!(sides, [16, 32, 0]);
         let first = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
         assert_eq!(&bytes[first..first + 8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// **An `.ico` reads back as its frames**, 256 written 0 included, and
+    /// anything else as none. An `.ico` also decodes as a picture, which is what
+    /// reading one with no `outputs` depends on.
+    #[test]
+    fn an_ico_reads_back_as_its_frames() {
+        let mut ico = output("favicon.ico", 0, 0);
+        ico.ico_sizes = Some(vec![16, 32, 256]);
+        let bytes = encode(&half_clear(512), &ico).unwrap();
+        assert_eq!(ico_frames(&bytes), [16, 32, 256]);
+        assert!(decode(&bytes, "favicon.ico").is_ok());
+        let png = encode(&half_clear(64), &output("a.png", 16, 16)).unwrap();
+        assert!(ico_frames(&png).is_empty());
+        assert!(ico_frames(&[0, 0, 1, 0]).is_empty(), "cut off");
     }
 
     /// With no sizes named an `.ico` holds the usual three.

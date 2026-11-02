@@ -271,6 +271,10 @@ impl From<VfsError> for FileError {
     fn from(e: VfsError) -> Self {
         match e {
             VfsError::Full => FileError::VfsFull,
+            VfsError::Unreadable(why) if why.contains("UTF-8") => FileError::Unreadable(format!(
+                "{why}: file_image with no `outputs` reads a picture's size, and \
+                 `vfs.readBytes(path)` in code_run reads any file's bytes"
+            )),
             VfsError::Unreadable(why) => FileError::Unreadable(why),
             // Keep the store's own wording: it names the path and says the
             // directory is off limits, which is exactly what the model needs to

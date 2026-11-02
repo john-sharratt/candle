@@ -54,7 +54,8 @@ impl Tool for CodeRun {
     const DESCRIPTION: &'static str =
         "Execute a JavaScript snippet in an embedded, sandboxed engine (no network or process \
          access; files only through the `vfs` global, over the named repo: vfs.read(path), \
-         vfs.write(path, text), vfs.list(prefix)). Runs in-process on a pure-Rust VM — no Node or external interpreter \
+         vfs.readBytes(path) for a binary file's bytes as a Uint8Array, vfs.write(path, text), \
+         vfs.list(prefix)). Runs in-process on a pure-Rust VM — no Node or external interpreter \
          required. Use for arithmetic/logic the model would get wrong, data transformation, \
          string processing, JSON manipulation, quick algorithms, and testing JavaScript just \
          written to a file (`require('./path.js')` loads a CommonJS module from the files; \

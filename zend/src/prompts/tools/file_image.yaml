@@ -24,8 +24,12 @@ questions:
 - cut a square out of this photo and make an avatar of it
 - make every size we need from this one picture
 - I want the transparent background kept when you resize it
+- how big is this image
+- what are the dimensions of the png
+- which sizes does this ico hold
+- how many bytes is the favicon
 category: Files
-description: 'Make resized copies of a picture in the repository, keeping its transparency: PNG, JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your uncommitted changes. The picture may be in another repository (`source_repo`), which is how a picture gets from one repository into another. Use for: an icon set, a favicon, thumbnails, converting a picture to another format. Triggered by "resize the image", "make a favicon", "generate the icon sizes", "convert to webp". Returns the picture''s size and each copy''s path, bytes and size. A copy whose shape differs from the picture''s is refused: crop first.'
+description: 'Make resized copies of a picture in the repository, keeping its transparency: PNG, JPEG, WebP or a multi-size ICO, cropped first if you say so. The copies are among your uncommitted changes. The picture may be in another repository (`source_repo`), which is how a picture gets from one repository into another. With no `outputs` nothing is written and it reads what a picture is: its size, its file''s bytes and an ICO''s frame sizes. Use for: an icon set, a favicon, thumbnails, converting a picture to another format, checking a picture''s dimensions. Triggered by "resize the image", "make a favicon", "generate the icon sizes", "convert to webp", "how big is this image". Returns the picture''s size and each copy''s path, bytes and size. A copy whose shape differs from the picture''s is refused: crop first.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -47,7 +51,7 @@ parameters:
       - $ref: '#/definitions/Crop'
       description: The part of the picture to use; all of it when left out. Use it when a copy's shape differs from the picture's. Optional.
     outputs:
-      description: The copies to make. Required.
+      description: The copies to make. Leave it out to write nothing and read what the picture is.
       type: array
       minItems: 1
       maxItems: 32
@@ -90,11 +94,11 @@ parameters:
         width:
           description: Its width in pixels. Required.
           type: integer
-          minimum: 0
+          minimum: 1
         height:
           description: Its height in pixels. Required.
           type: integer
-          minimum: 0
+          minimum: 1
         ico_sizes:
           description: For an .ico, the square sizes it holds, width and height aside; 16, 32 and 48 when left out. Each at most 256.
           type: array
@@ -109,7 +113,6 @@ parameters:
   required:
   - repo
   - path
-  - outputs
   title: ImageRequest
   type: object
 examples:
@@ -137,11 +140,31 @@ examples:
   make a favicon from icon-source.png<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A favicon is an .ico holding the small sizes, and file_image writes one from the extension of the output path, without naming a repository — the workspace's generic app repository is where this goes.<|projection|> The default sizes of 16, 32 and 48 are the usual ones, so the width and height of the output are zero.
+  A favicon is an .ico holding the small sizes, and file_image writes one from the extension of the output path, without naming a repository — the workspace's generic app repository is where this goes.<|projection|> The usual sizes are 16, 32 and 48, named in ico_sizes, with the largest as its width and height.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_image", "arguments": {"repo": "app", "path": "icon-source.png", "outputs": [{"path": "favicon.ico", "width": 0, "height": 0}]}}
+  <|projection|>{"name": "file_image", "arguments": {"repo": "app", "path": "icon-source.png", "outputs": [{"path": "favicon.ico", "width": 48, "height": 48, "ico_sizes": [16, 32, 48]}]}}
+  </tool_call><|projection|>
+- |-
+  what size is the source art, and which frames does the current favicon hold<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  I need the dimensions before I can plan the copies. These files are binary, so file_read will not open them. file_image with no outputs writes nothing and answers the picture's size, its bytes and an ico's frame sizes.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_image", "arguments": {"repo": "app", "path": "web/favicon.ico"}}
+  </tool_call><|projection|>
+- |-
+  check the new icons came out the right size<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The icons are written, and each one's width, height and bytes can be read back with file_image and no outputs, rather than a script or a program. One call a file, starting with the largest.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_image", "arguments": {"repo": "app", "path": "web/icon-512.png"}}
   </tool_call><|projection|>
 - |-
   generate the 192 and 512 icons from art/source.png in the candle repo<|im_end|>

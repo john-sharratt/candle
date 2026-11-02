@@ -209,6 +209,34 @@ mod tests {
         assert_eq!(store.read("scratch/out.txt").unwrap().as_deref(), Some("5"));
     }
 
+    /// **A binary file reads as its bytes**, null when absent, and reading one
+    /// as text says where to go.
+    #[test]
+    fn a_script_reads_a_binary_files_bytes() {
+        let store = Arc::new(VfsStore::new());
+        store
+            .write_bytes("icons/favicon.ico", vec![0, 0, 1, 0, 0xFF])
+            .unwrap();
+        let ran = run_js(
+            sandbox(),
+            &store,
+            &[],
+            "const b = vfs.readBytes('icons/favicon.ico'); \
+             [b.length, b[2], b[4], vfs.readBytes('icons/none.ico')].join('|')",
+        )
+        .unwrap();
+        assert_eq!(ran.error, None);
+        assert_eq!(ran.result.as_deref(), Some("5|1|255|"));
+        let text = run_js(sandbox(), &store, &[], "vfs.read('icons/favicon.ico')").unwrap();
+        assert!(
+            text.error
+                .as_deref()
+                .is_some_and(|e| e.contains("vfs.readBytes(path) reads a binary file")),
+            "{:?}",
+            text.error
+        );
+    }
+
     /// **A module the model wrote can be required**, relative to the script
     /// (the workspace root) or to the requiring module, with `.js` optional —
     /// and a Node built-in is refused by name rather than as a bare failure.

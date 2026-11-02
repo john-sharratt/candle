@@ -2,11 +2,12 @@
 //!
 //! A script sees exactly what the `file_*` tools see — the session's overlay in
 //! the overlay tools modes, the workspace on disk in the one mode granted
-//! `disk_write` — through three functions:
+//! `disk_write` — through these functions:
 //!
 //! | Call | Returns |
 //! |---|---|
 //! | `vfs.read(path)` | the file's text, or `null` when there is no such file |
+//! | `vfs.readBytes(path)` | the file's bytes as a `Uint8Array`, or `null` |
 //! | `vfs.write(path, text)` | the byte count written |
 //! | `vfs.list(prefix)` | up to [`LIST_LIMIT`] paths under `prefix` |
 //! | `require('./path')` | a CommonJS module from the store — see [`FILES_PRELUDE`] |
@@ -44,6 +45,10 @@ pub const CALL_LIMIT: u32 = 1_000;
 /// Most `vfs.list` calls one snippet may make — each walks the workspace.
 pub const LIST_CALL_LIMIT: u32 = 20;
 
+/// Largest file `vfs.readBytes` hands a script: it crosses into the interpreter
+/// as text, and a video in the repository would hold the turn.
+pub const READ_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+
 /// The `vfs` object, over the native functions [`Files::register`] installs,
 /// and a CommonJS `require` that loads modules from the file store.
 ///
@@ -56,6 +61,10 @@ pub const LIST_CALL_LIMIT: u32 = 20;
 const FILES_PRELUDE: &str = r#"
 globalThis.vfs = Object.freeze({
     read:  (path) => __zend_vfs_read(String(path)),
+    readBytes: (path) => {
+        const bytes = __zend_vfs_read_bytes(String(path));
+        return bytes === null ? null : new Uint8Array(JSON.parse(bytes));
+    },
     write: (path, text) => __zend_vfs_write(String(path), String(text)),
     list:  (prefix) => JSON.parse(__zend_vfs_list(String(prefix ?? ''))),
 });
@@ -73,7 +82,7 @@ globalThis.require = (() => {
     const load = (base) => function require(spec) {
         spec = String(spec);
         if (!spec.startsWith('.') && !spec.startsWith('/')) {
-            throw new Error(`Cannot find module '${spec}': Node's built-in and npm modules are not available in this sandbox — read files with vfs.read(path), write with vfs.write(path, text)`);
+            throw new Error(`Cannot find module '${spec}': Node's built-in and npm modules are not available in this sandbox — read files with vfs.read(path), or vfs.readBytes(path) for a binary file, write with vfs.write(path, text)`);
         }
         const path = resolve(base, spec);
         for (const candidate of [path, path + '.js']) {
@@ -165,6 +174,31 @@ impl Files {
                 match store.read(&path) {
                     Ok(Some(text)) => Ok(JsValue::from(JsString::from(text.as_str()))),
                     Ok(None) => Ok(JsValue::null()),
+                    Err(e) if e.to_string().contains("UTF-8") => Err(thrown(format!(
+                        "{e}: vfs.readBytes(path) reads a binary file"
+                    ))),
+                    Err(e) => Err(thrown(e.to_string())),
+                }
+            })
+        };
+        let store = Arc::clone(&self.store);
+        let budget = Rc::clone(&self.budget);
+        // SAFETY: captures an `Arc<VfsStore>` and an `Rc<Budget>` only.
+        let read_bytes = unsafe {
+            NativeFunction::from_closure(move |_this, args, ctx| {
+                budget.spend(&budget.calls, "vfs.read/vfs.write", CALL_LIMIT)?;
+                let path = arg(args, 0, ctx)?;
+                match store.read_bytes(&path) {
+                    Ok(Some(bytes)) if bytes.len() > READ_BYTES_LIMIT => Err(thrown(format!(
+                        "{path} is {} bytes, past the {READ_BYTES_LIMIT} vfs.readBytes reads",
+                        bytes.len()
+                    ))),
+                    Ok(Some(bytes)) => {
+                        let json =
+                            serde_json::to_string(&bytes).map_err(|e| thrown(e.to_string()))?;
+                        Ok(JsValue::from(JsString::from(json.as_str())))
+                    }
+                    Ok(None) => Ok(JsValue::null()),
                     Err(e) => Err(thrown(e.to_string())),
                 }
             })
@@ -202,6 +236,7 @@ impl Files {
             })
         };
         context.register_global_callable(js_string!("__zend_vfs_read"), 1, read)?;
+        context.register_global_callable(js_string!("__zend_vfs_read_bytes"), 1, read_bytes)?;
         context.register_global_callable(js_string!("__zend_vfs_write"), 2, write)?;
         context.register_global_callable(js_string!("__zend_vfs_list"), 1, list)?;
         context.eval(Source::from_bytes(FILES_PRELUDE))?;

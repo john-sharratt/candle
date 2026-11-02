@@ -7,6 +7,9 @@
 //!
 //! - `invalid_arguments` gains the tool's `parameters` schema, so the next
 //!   attempt is written against the real signature rather than another guess.
+//!   Not when the tool itself refused a value: the call had the right shape,
+//!   its `detail` names what to change, and 3 KB of schema buried that detail
+//!   on every one of four `git_log` calls in a row (2026-11-01).
 //! - A name no tool answers to is refused with the nearest real names, so a
 //!   misremembered name (`web_get`, `read_file`) lands on its tool one call
 //!   later instead of ending the turn in "that tool does not exist". Only
@@ -34,6 +37,9 @@ pub fn with_guidance(name: &str, mut response: Value) -> Value {
         return response;
     }
     if let (Some(def), Some(obj)) = (tool_def::find(name), response.as_object_mut()) {
+        if obj.remove(registry::VALUE_REFUSED).is_some() {
+            return response;
+        }
         obj.insert("parameters".to_string(), def.parameters.clone());
         obj.insert(
             "hint".to_string(),
@@ -190,6 +196,14 @@ mod tests {
             tool_def::find("weather").unwrap().parameters
         );
         assert!(guided["hint"].is_string());
+
+        let value =
+            json!({"error": "invalid_arguments", "detail": "a 0x0 copy", "value_refused": true});
+        assert_eq!(
+            with_guidance("weather", value),
+            json!({"error": "invalid_arguments", "detail": "a 0x0 copy"}),
+            "a value the tool refused needs no signature"
+        );
 
         let other = json!({"error": "not_found", "detail": "x"});
         assert_eq!(with_guidance("weather", other.clone()), other);

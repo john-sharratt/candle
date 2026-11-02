@@ -17,6 +17,7 @@ none, so it runs no code at all.
 | Call | Returns |
 |------|---------|
 | `vfs.read(path)` | the file's text, or `null` when there is no such file |
+| `vfs.readBytes(path)` | the file's bytes as a `Uint8Array`, or `null`; at most 8 MiB |
 | `vfs.write(path, text)` | the byte count written |
 | `vfs.list(prefix)` | up to 200 paths under `prefix` |
 | `require('./path')` | a CommonJS module from the store (`module.exports` / `exports`), resolved like Node's relative requires with `.js` optional; Node built-ins and npm modules are not available |

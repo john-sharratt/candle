@@ -446,8 +446,12 @@ pub fn rev_or_head(rev: &Option<RevArg>, repo: &ConvRepo) -> Result<Rev, GitTool
 /// for the `file_*` tools.** A key committed once stays in the object store
 /// forever, so reading it out of a past commit would serve precisely what the
 /// live path is guarded against.
+///
+/// **A leading `/` means the repository's root**, the only root a repository
+/// path has. Refused as absolute, `/web/icon.png` cost a worker four `git_log`
+/// calls in a row, each sent the same way (2026-11-01).
 pub fn path_arg(path: &str) -> Result<RepoPath, GitToolError> {
-    let parsed = RepoPath::parse(path)?;
+    let parsed = RepoPath::parse(path.strip_prefix('/').unwrap_or(path))?;
     if parsed.is_protected() {
         return Err(
             GitError::invalid(format!("{path} is under a protected `secrets` folder")).into(),

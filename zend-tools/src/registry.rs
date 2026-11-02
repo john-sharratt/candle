@@ -115,6 +115,12 @@ impl RegisteredTool {
     }
 }
 
+/// Set on an `invalid_arguments` the tool itself gave, past parsing and
+/// validation: the call had the right shape and a value was wrong, which its
+/// `detail` names. The caller takes this off, and knows the tool's schema would
+/// tell the model nothing.
+pub const VALUE_REFUSED: &str = "value_refused";
+
 // ── Type-erasing shims ────────────────────────────────────────────────────────
 
 fn tool_run<T: Tool>(ctx: &ToolContext, args: &Value) -> Value {
@@ -133,6 +139,11 @@ fn tool_run<T: Tool>(ctx: &ToolContext, args: &Value) -> Value {
                 "error": "internal_error",
                 "detail": format!("response serialization failed: {e}"),
             })
+        }),
+        Err(e) if e.code() == "invalid_arguments" => json!({
+            "error": e.code(),
+            "detail": e.detail(),
+            VALUE_REFUSED: true,
         }),
         Err(e) => json!({
             "error": e.code(),
