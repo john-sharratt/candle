@@ -946,10 +946,18 @@ impl Missions {
     /// has come to run on its own missions does with the record's work opened
     /// before it did. Returns the ids called off.
     pub fn call_off_operations(&mut self, why: &str) -> Vec<u64> {
+        self.call_off_operations_but(None, why)
+    }
+
+    /// [`Self::call_off_operations`], all but those on workflow `keep` — the
+    /// one a world with its own missions runs (`docs/mission_templates.md`
+    /// §6).
+    pub fn call_off_operations_but(&mut self, keep: Option<&str>, why: &str) -> Vec<u64> {
         let open: Vec<u64> = self
             .operations
             .all()
             .filter(|o| !o.settled())
+            .filter(|o| keep.is_none_or(|k| o.run.workflow != k))
             .map(|o| o.id)
             .collect();
         open.into_iter()

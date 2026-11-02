@@ -311,6 +311,23 @@ fn every_open_operation_is_called_off_and_a_settled_one_is_left() {
     assert!(m.call_off_operations("again").is_empty());
 }
 
+/// **A world with its own missions keeps the one workflow it runs**: every
+/// other open operation is called off, and one on the kept workflow stands.
+#[test]
+fn calling_off_all_but_one_workflow_keeps_its_operations() {
+    let mut m = table();
+    let story = launch(&mut m, "era:w", 1);
+    let life = launch(&mut m, "life:keeper", 1);
+    assert_eq!(
+        m.call_off_operations_but(Some("life-event"), "this world runs on its own missions"),
+        vec![story]
+    );
+    assert!(!m.operations().get(life).unwrap().settled(), "kept");
+    assert!(m
+        .call_off_operations_but(Some("life-event"), "again")
+        .is_empty());
+}
+
 /// **Stuck where the step says**: a correction stuck at its writing fails, and
 /// its target counts it; stuck twice on the same text, it is left until it
 /// changes. A review stuck goes to somebody else first.

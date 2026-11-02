@@ -28,6 +28,7 @@ use super::standing;
 use super::step;
 use super::target::{self, Kind, Target};
 use super::world::{Draw, WorldMissions};
+use super::write_template::write_template_workflow;
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
@@ -816,22 +817,36 @@ pub fn spawn(rt: Arc<Runtime>) {
                 // routines replace the bank's, and the record's generators and
                 // workflows are not this world's: work they opened before the
                 // file was written is called off, by the world's authority,
-                // whose records every follower takes the table from.
+                // whose records every follower takes the table from. It runs
+                // one workflow of its own, the built-in write-template
+                // (`docs/mission_templates.md` §6), whose steps its authority
+                // puts on the table like any operation's.
                 match WorldMissions::load(&mind, &id) {
                     Ok(Some(own)) => {
                         told_world.remove(&id);
-                        if rt.standing.role(&id).is_authority() {
-                            let called =
-                                hosted.with_sim(|s| s.missions.call_off_operations(OWN_MISSIONS));
+                        let written = write_template_workflow();
+                        let keep = written.name.clone();
+                        let authority = rt.standing.role(&id).is_authority();
+                        if authority {
+                            let called = hosted.with_sim(|s| {
+                                s.missions
+                                    .call_off_operations_but(Some(&keep), OWN_MISSIONS)
+                            });
                             for op in called {
                                 tracing::info!(world = %id, operation = op, "operation: called off, {OWN_MISSIONS}");
                             }
                         }
                         hosted.with_sim(|s| {
-                            s.missions.set_workflows(Vec::new());
+                            s.missions.set_workflows(vec![written]);
                             s.missions.set_routines(own.routines, own.draw);
                             s.missions.set_authorizers(own.authorizers);
                         });
+                        if authority {
+                            settle_failed(&hosted);
+                            if hosted.sim(|s| s.table_open && s.bench.has_root()) {
+                                offer_owed(&hosted, &mind);
+                            }
+                        }
                         continue;
                     }
                     Ok(None) => {

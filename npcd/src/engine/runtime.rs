@@ -720,9 +720,14 @@ pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting
 
 /// The idle wake for a character that takes no orders, with an empty agenda,
 /// while its world's round has something due (`docs/zen_moon_mind.md` §17.3).
-pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you. \
-                             Turn your attention to the order table and take it up with \
-                             `collect_mission`.";
+///
+/// **It names the way there and the verb's address**, not only the verb.
+/// `collect_mission` is the order table's, offered only beside it through
+/// `invoke`; told only "take it up with `collect_mission`" from another room,
+/// Zen found no such act and reasoned that it had none.
+pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you at \
+                             the order table in the watch room. `focus` on the watch room, then \
+                             `invoke` the order table's `collect_mission` to take it up.";
 
 /// What a character is told when its mission is called off: the errand is
 /// withdrawn, nothing of it is still owed, and what it said about it earlier is
