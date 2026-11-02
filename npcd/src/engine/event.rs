@@ -223,23 +223,28 @@ pub enum EventKind {
         #[serde(default)]
         to: Addressed,
     },
-    /// Something said to the character on its handset, from wherever the sender
-    /// is.
+    /// Something arrived on the character's handset, from wherever the sender
+    /// is: who wrote, on which thread, and how much now waits unread.
     ///
     /// **Not [`EventKind::Speech`], and the difference is the whole point of a
     /// phone.** Speech is delivered by place: everybody in the room hears it,
     /// and overhearing is the normal case. A message reaches one thread and
     /// nobody else, from somebody who may be nowhere near — so it carries the
-    /// thread it arrived on rather than a room, and the character answers it by
-    /// naming that thread.
+    /// thread it arrived on rather than a room.
+    ///
+    /// **A notice, never the words.** A phone buzzes; what was said is read
+    /// off it with `read`, which is what marks it read. Handing the words over
+    /// here left a character that had heard and answered them still counting
+    /// them unread, reminded of them every few minutes, for good.
     Message {
         /// The thread, by the name *this* character calls it — which is the
         /// other party for a direct thread and the group's name otherwise. It
-        /// is the argument `message` takes, so what the character is told is
-        /// what it would have to type back.
+        /// is the argument `read` and `reply` take, so what the character is
+        /// told is what it would have to type back.
         thread: String,
         from: String,
-        text: String,
+        /// Everything unread on the character's phone, this included.
+        unread: usize,
     },
     /// Messages wait unread on the character's handset: each thread by the
     /// name the character calls it, and how many.
@@ -329,6 +334,28 @@ pub fn unread_line(threads: &[(String, usize)]) -> String {
          messages, or one conversation by name; to answer, `reply` on it.",
         on.join(", ")
     )
+}
+
+/// How an [`EventKind::Message`] notice reads: who wrote, where, how much
+/// waits in all, and the act that shows it.
+pub fn message_line(thread: &str, from: &str, unread: usize) -> String {
+    let waiting = match unread {
+        1 => "1 unread message".to_string(),
+        n => format!("{n} unread messages"),
+    };
+    // A direct thread is named for the other party, so saying both would read
+    // as "Wren, on Wren".
+    match thread == from {
+        true => format!(
+            "Your phone shows a message from {from} ({waiting} in all). `read` {from} to see \
+             what they said."
+        ),
+        false => format!(
+            "Your phone shows a message from {from} on {thread} ({waiting} in all). `read` \
+             {thread} to see what was said, and answer it there with `reply`, not to {from} \
+             alone."
+        ),
+    }
 }
 
 /// How a [`EventKind::MindControl`] thought reads to the character.
@@ -468,39 +495,21 @@ impl Event {
                 }
             }
             // **Named as a message, and the thread named with it.** A character
-            // that is told only who spoke cannot tell whether it was heard by a
+            // that is told only who wrote cannot tell whether it was heard by a
             // room or read off a handset, and the two are answered by different
-            // acts. Naming the thread here means the argument `message` needs
-            // is already in front of it.
-            //
-            // Reported rather than quoted, for the reason `Speech` gives: what
-            // a phone carries is intent, and quoting it would fabricate wording
-            // nobody chose.
+            // acts. Naming the thread here means the argument `read` needs is
+            // already in front of it.
             //
             // **A group's line says where to answer it.** The sender is on the
             // group and on a direct thread with this character under the same
             // name, so a character told "Johnathan messages you, on ZenWorld
             // #general" answered `message` Johnathan — the direct thread — and
-            // a channel's question was answered in private. The thread leads,
-            // and the line names it as the place the answer goes.
-            EventKind::Message { thread, from, text } => {
-                let t = third_person(text.trim());
-                match thread == from {
-                    // A direct thread is named for the other party, so saying
-                    // both would read as "Wren, on Wren".
-                    true => format!("{from} messages you: {t}"),
-                    false => {
-                        let end = match t.ends_with(['.', '!', '?']) {
-                            true => "",
-                            false => ".",
-                        };
-                        format!(
-                            "On {thread}, {from} messages you: {t}{end} Answer it with `reply` \
-                             on {thread}, where it was said, not to {from} alone."
-                        )
-                    }
-                }
-            }
+            // a channel's question was answered in private.
+            EventKind::Message {
+                thread,
+                from,
+                unread,
+            } => message_line(thread, from, *unread),
             EventKind::Unread { threads } => unread_line(threads),
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
@@ -569,12 +578,13 @@ mod tests {
         assert_eq!(one.tag(), "unread");
     }
 
-    /// **A group's message says where to answer it**: on the group, with
-    /// `reply`, not to the sender alone — who is on a direct thread with the
-    /// character under the same name. A direct one needs no such line.
+    /// **A message is a notice**: who wrote, where, how much waits, and the
+    /// act that shows it — never the words. A group's says where to answer
+    /// it: on the group, with `reply`, not to the sender alone, who is on a
+    /// direct thread with the character under the same name.
     #[test]
-    fn a_group_message_says_to_answer_it_on_the_group() {
-        let prose = |thread: &str, text: &str| {
+    fn a_message_is_noticed_and_not_read_out() {
+        let prose = |thread: &str, unread: usize| {
             Event::new(
                 0,
                 0,
@@ -582,22 +592,22 @@ mod tests {
                 EventKind::Message {
                     thread: thread.into(),
                     from: "John".into(),
-                    text: text.into(),
+                    unread,
                 },
             )
             .prose()
         };
         assert_eq!(
-            prose("zenworld #general", "are you there"),
-            "On zenworld #general, John messages you: are you there. Answer it with `reply` \
-             on zenworld #general, where it was said, not to John alone."
+            prose("zenworld #general", 3),
+            "Your phone shows a message from John on zenworld #general (3 unread messages in \
+             all). `read` zenworld #general to see what was said, and answer it there with \
+             `reply`, not to John alone."
         );
         assert_eq!(
-            prose("zenworld #general", "are you there?"),
-            "On zenworld #general, John messages you: are you there? Answer it with `reply` \
-             on zenworld #general, where it was said, not to John alone."
+            prose("John", 1),
+            "Your phone shows a message from John (1 unread message in all). `read` John to \
+             see what they said."
         );
-        assert_eq!(prose("John", "hello"), "John messages you: hello");
     }
 
     #[test]

@@ -172,15 +172,21 @@ async fn a_message_reaches_the_other_characters_mind() {
     moment(&rt);
     think(&rt, 1);
 
-    let read = reads(&rt, 2);
+    // What reaches it is a notice naming the sender; the words wait on the
+    // phone until it reads them.
+    let told = reads(&rt, 2);
     assert!(
-        read.contains("that the redoubt burned twice"),
-        "the message never reached the other character: {read}"
+        told.contains("a message from Maker-01"),
+        "the message never reached the other character: {told}"
     );
     assert!(
-        read.contains("Maker-01"),
-        "the sender was not named: {read}"
+        !told.contains("the redoubt burned twice"),
+        "the notice read the message out: {told}"
     );
+    let read = rt
+        .record_act(2, &act("read", json!({"what": "Maker-01"})))
+        .feed;
+    assert!(read.contains("the redoubt burned twice"), "{read}");
 }
 
 // =========================================================================
@@ -251,15 +257,21 @@ async fn what_is_said_on_the_channel_reaches_every_other_mind() {
     think(&rt, 1);
 
     for npc_id in [2, 3] {
-        let read = reads(&rt, npc_id);
+        let told = reads(&rt, npc_id);
         assert!(
-            read.contains("cannot make it reconcile"),
-            "character {npc_id} never heard the channel: {read}"
+            told.contains(&format!(
+                "a message from Maker-01 on {}",
+                npcd::sim::phone::CHANNEL
+            )),
+            "character {npc_id} never heard the channel: {told}"
         );
-        assert!(
-            read.contains("Maker-01"),
-            "the speaker was not named: {read}"
-        );
+        let read = rt
+            .record_act(
+                npc_id,
+                &act("read", json!({"what": npcd::sim::phone::CHANNEL})),
+            )
+            .feed;
+        assert!(read.contains("cannot make it reconcile"), "{read}");
         // The room it named is the whole point — it is what the listener can
         // then walk to.
         assert!(read.contains("band one"), "{read}");
@@ -289,15 +301,18 @@ async fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
     think(&rt, 1);
 
     for npc_id in [1, 2] {
-        let read = reads(&rt, npc_id);
+        let told = reads(&rt, npc_id);
         assert!(
-            read.contains("left running"),
-            "character {npc_id} was not told: {read}"
+            told.contains("(The Creator)"),
+            "character {npc_id} was not told, or cannot tell who said it: {told}"
         );
-        assert!(
-            read.contains("(The Creator)"),
-            "the cast cannot tell who said it: {read}"
-        );
+        let read = rt
+            .record_act(
+                npc_id,
+                &act("read", json!({"what": npcd::sim::phone::CHANNEL})),
+            )
+            .feed;
+        assert!(read.contains("left running"), "{read}");
     }
 
     // And a character can answer, because the Creator is on the roster and the
@@ -543,7 +558,7 @@ async fn a_message_is_delivered_once_and_not_again_every_moment() {
     }
     let read = reads(&rt, 2);
     assert_eq!(
-        read.matches("once only").count(),
+        read.matches("a message from Maker-01").count(),
         1,
         "the message was delivered more than once: {read}"
     );
@@ -576,7 +591,7 @@ async fn your_own_message_does_not_come_back_to_you() {
 
     let mine = reads(&rt, 1);
     assert!(
-        !mine.contains("messages you"),
+        !mine.contains("Your phone shows a message"),
         "a character was told about its own message: {mine}"
     );
 }
@@ -608,12 +623,15 @@ async fn a_person_can_message_a_character_and_it_is_told() {
 
     moment(&rt);
     think(&rt, 1);
-    let read = reads(&rt, 1);
+    let told = reads(&rt, 1);
     assert!(
-        read.contains("that the third era will not reconcile"),
-        "the character was never told: {read}"
+        told.contains("a message from Wren S"),
+        "the character was never told: {told}"
     );
-    assert!(read.contains("Wren S"), "the person was not named: {read}");
+    let read = rt
+        .record_act(1, &act("read", json!({"what": "Wren S"})))
+        .feed;
+    assert!(read.contains("the third era will not reconcile"), "{read}");
 }
 
 /// And the character can answer, on the same thread, which the person then

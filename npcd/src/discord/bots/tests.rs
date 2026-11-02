@@ -578,7 +578,7 @@ async fn a_429_is_waited_out_and_the_posts_stay_in_order() {
             .into_iter()
             .map(|(_, content)| content)
             .collect::<Vec<_>>(),
-        ["one", "one", "two"]
+        ["One.", "One.", "Two."]
     );
 }
 
@@ -614,7 +614,7 @@ async fn a_500_is_posted_again_once_its_hold_is_over() {
             .into_iter()
             .map(|(_, content)| content)
             .collect::<Vec<_>>(),
-        ["one", "one"]
+        ["One.", "One."]
     );
 }
 

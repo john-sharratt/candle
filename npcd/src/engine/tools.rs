@@ -2186,6 +2186,10 @@ impl Within {
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
         self.threads = sim.threads_for(&self.me, body);
+        // What waits unread is read by the name the character calls it — the
+        // name its notice gave — and not only off whatever board is here.
+        self.readable
+            .extend(sim.unread_on_phone_for(&self.me, body));
         self.private = sim.threads_of_kind_for(&self.me, body, ThreadKind::Direct);
         self.channels = sim.threads_of_kind_for(&self.me, body, ThreadKind::Group);
         self.awaiting = sim.awaiting_for(&self.me, body);

@@ -57,6 +57,28 @@ fn flush(out: &mut String, word: &mut String, after_i: &mut bool, starts_sentenc
     word.clear();
 }
 
+/// A character's intent as it says it to a person outside the world.
+///
+/// A tool carries what the character *means*, in its own first person and
+/// usually as a clause — "that I am here and ready to work" — for a narrator
+/// to render for a reader inside the world. A person reading it on Discord or
+/// through the MCP has no narrator, and read the clause itself: a post that
+/// began "that I am…". The speaker's own words are the clause less its
+/// conjunction, so that is dropped, the first letter raised, and the line
+/// ended.
+pub fn spoken(intent: &str) -> String {
+    let t = intent.trim();
+    let t = match t.get(..5) {
+        Some(head) if head.eq_ignore_ascii_case("that ") => t[5..].trim_start(),
+        _ => t,
+    };
+    let mut out = cased(t, true);
+    if !out.is_empty() && !out.ends_with(['.', '!', '?', '…', '"', ')']) {
+        out.push('.');
+    }
+    out
+}
+
 fn cased(word: &str, capital: bool) -> String {
     let mut chars = word.chars();
     match (capital, chars.next()) {
@@ -108,6 +130,32 @@ mod tests {
             third_person("it is in the mine, I think, said Pam"),
             "it is in the mine, they think, said Pam"
         );
+    }
+
+    /// **Said, not reported**: the clause's conjunction goes, the line opens
+    /// with a capital and ends with a stop; what is already a sentence is
+    /// left as it is, and a "that" inside a word is not a conjunction.
+    #[test]
+    fn an_intent_is_spoken_as_its_speaker_would_say_it() {
+        assert_eq!(
+            spoken("that I am here and ready to work"),
+            "I am here and ready to work."
+        );
+        assert_eq!(
+            spoken("  That the seam runs further than the map shows  "),
+            "The seam runs further than the map shows."
+        );
+        assert_eq!(
+            spoken("where each of you is working?"),
+            "Where each of you is working?"
+        );
+        assert_eq!(
+            spoken("I am at the watch table."),
+            "I am at the watch table."
+        );
+        assert_eq!(spoken("thatch on the roof"), "Thatch on the roof.");
+        assert_eq!(spoken("that"), "That.");
+        assert_eq!(spoken(""), "");
     }
 
     #[test]

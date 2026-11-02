@@ -401,14 +401,6 @@ fn render_structured(content: &str) -> Option<String> {
         } else {
             format!("You overhear {actor} tell {who} {body}")
         }
-    } else if let Some(rest) = relation.strip_prefix("messages you") {
-        // `messages you` or `messages you (on <thread>)`.
-        let on = rest.trim();
-        if on.is_empty() {
-            format!("{actor} messages you {body}")
-        } else {
-            format!("{actor} messages you {on} {body}")
-        }
     } else {
         // An unknown relation with a meaning — render it plainly rather than drop
         // the content.
@@ -877,18 +869,6 @@ mod tests {
             )
             .unwrap(),
             "You overhear Ulysses ask Pax whether it works."
-        );
-    }
-
-    #[test]
-    fn messages_direct_and_on_a_thread() {
-        assert_eq!(
-            render_event("Pax — messages you — meaning: \"that I am late\"").unwrap(),
-            "Pax messages you that they are late."
-        );
-        assert_eq!(
-            render_event("Pax — messages you (on ops) — meaning: \"that I am late\"").unwrap(),
-            "Pax messages you (on ops) that they are late."
         );
     }
 

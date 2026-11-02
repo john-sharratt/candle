@@ -322,8 +322,12 @@ handset, and the character uses it as it uses any group.
   or names the character as a word ("Zen, are you there?") — is stored with
   `Message::to` set to the character, and is told it as urgently as a DM; the rest of a
   channel's talk stays at a group's ordinary salience, so a busy server does not preempt
-  the character on every line. Each hand-off to a character's mind is logged
-  (`a message is handed to the character's mind`, with thread, seq and urgency), and
+  the character on every line. What reaches the character's mind is a **notice**, never
+  the words: who wrote, on which thread, and how much waits unread in all — one per
+  thread per moment. The words are read off the phone with `read`, whose choices name each
+  conversation with something unread (and `messages` for all of them); reading is what
+  marks them read and ends the unread reminder. Each notice is logged
+  (`a message is noticed on the character's phone`, with thread, seq and urgency), and
   `bot_thread_read` marks a message said to the character `to <name>`. Its author is
   their speaking name (§3.2) when linked, and otherwise
   `<display name> (@<username>)` — the server's nickname, else the global name, else the

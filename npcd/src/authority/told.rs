@@ -63,7 +63,7 @@ mod tests {
             EventKind::Message {
                 thread: "t1".into(),
                 from: "Maker-02".into(),
-                text: "come up".into(),
+                unread: 1,
             },
         )];
         let wire: serde_json::Value = serde_json::from_slice(&encode(&told)).unwrap();

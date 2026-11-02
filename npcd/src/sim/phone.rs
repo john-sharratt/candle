@@ -47,6 +47,9 @@ use super::unread::Reminded;
 /// The item that makes any of this reachable. Carried like anything else.
 pub const PHONE: &str = "handset";
 
+/// What `read` takes for every conversation with something unread at once.
+pub const ALL_MESSAGES: &str = "messages";
+
 /// What every world's standing channel is called.
 ///
 /// # Why there is one at all

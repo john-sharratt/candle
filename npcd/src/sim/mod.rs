@@ -444,6 +444,28 @@ impl Sim {
         }
     }
 
+    /// `read.what`, off the phone — each conversation with something unread
+    /// for this character, as it names them, led by `messages` for all of
+    /// them at once. Empty without a handset, or with nothing unread, which is
+    /// what keeps `read` from being offered a phone it has already read.
+    pub fn unread_on_phone_for(&self, me: &str, body: &str) -> Vec<String> {
+        if !self.has_phone(body) {
+            return Vec::new();
+        }
+        let unread: Vec<String> = self
+            .threads
+            .unread_threads(me)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        match unread.is_empty() {
+            true => unread,
+            false => std::iter::once(phone::ALL_MESSAGES.to_string())
+                .chain(unread)
+                .collect(),
+        }
+    }
+
     /// `reply.to` — the conversations where somebody else spoke last, waiting
     /// on this character. Empty without a handset.
     pub fn awaiting_for(&self, me: &str, body: &str) -> Vec<String> {

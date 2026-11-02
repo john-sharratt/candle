@@ -38,7 +38,9 @@
 //! character as the literal token "you", which is what the renderer keys off.
 
 use crate::clock::{WorldTime, DAY_MS};
-use crate::engine::event::{mind_control_line, unread_line, Addressed, Event, EventKind};
+use crate::engine::event::{
+    message_line, mind_control_line, unread_line, Addressed, Event, EventKind,
+};
 
 /// How many people are named in `STATE` before the rest become "several others".
 /// The event lines name whoever actually acted this turn regardless, so the
@@ -63,19 +65,12 @@ fn event_line(e: &Event) -> Option<String> {
             };
             Some(format!("{speaker} — {rel} — meaning: \"{}\"", text.trim()))
         }
-        EventKind::Message { thread, from, text } => {
-            // A group's line names it as where the answer goes: the sender is
-            // on a direct thread too, under the same name (see `Event::prose`).
-            let on = if thread == from {
-                String::new()
-            } else {
-                format!(" (on {thread}, to be answered on {thread})")
-            };
-            Some(format!(
-                "{from} — messages you{on} — meaning: \"{}\"",
-                text.trim()
-            ))
-        }
+        // A notice, already prose: what was said waits on the phone to be read.
+        EventKind::Message {
+            thread,
+            from,
+            unread,
+        } => Some(message_line(thread, from, *unread)),
         EventKind::Entity {
             entity_id,
             observation,

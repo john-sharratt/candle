@@ -35,6 +35,7 @@ use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::world::hold::{FAILED_FOR, REFUSED_FOR};
+use crate::engine::reported::spoken;
 use crate::engine::speaking_as;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
@@ -180,7 +181,7 @@ async fn deliver(
     }
     for m in waiting.messages {
         let text = match m.from == character {
-            true => m.intent.clone(),
+            true => spoken(&m.intent),
             false => format!("> {} (console): {}", m.from, m.intent),
         };
         let to = Target {

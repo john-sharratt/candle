@@ -13,7 +13,7 @@
 //! in the listener's trace: the server's settings, not the world, decide
 //! whether the listener may write there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use crate::api::Authored;
 use crate::discord::online::Online;
 use crate::discord::post::split::{split, LIMIT};
 use crate::discord::post::{post as send, post_hook, posted, Post, Target};
+use crate::engine::reported::spoken;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
 
@@ -41,6 +42,9 @@ pub async fn post(
 ) -> Option<Duration> {
     let mut hold: Option<Duration> = None;
     let mut held = |wait: Duration| hold = Some(hold.map_or(wait, |h| h.max(wait)));
+    // A character's line is its intent, posted as it would say it; a
+    // person's words are posted as they wrote them.
+    let cast: HashSet<String> = hosted.read(|w| w.actors().map(|a| a.name.clone()).collect());
     'threads: for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
         if mirrored.archived {
             continue;
@@ -69,7 +73,11 @@ pub async fn post(
                 Some(_) => speaker::hooked(a, hosted, &m.from),
                 None => speaker::of(a, hosted, guild.guild_id, &m.from, online),
             };
-            let parts = split(&m.intent, LIMIT);
+            let text = match cast.contains(&m.from) {
+                true => spoken(&m.intent),
+                false => m.intent.clone(),
+            };
+            let parts = split(&text, LIMIT);
             let mut last = 0;
             for part in &parts {
                 let sent = match &who {

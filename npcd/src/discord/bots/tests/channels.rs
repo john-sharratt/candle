@@ -230,30 +230,24 @@ async fn a_guild_message_is_heard_from_who_wrote_it_and_wakes_the_character() {
     );
     assert_eq!(d.record(GENERAL).unwrap().last_seen_discord, first + 1);
 
-    // The world's moment hands them to the character on the group.
+    // The world's moment tells the character the group has something for
+    // it: who wrote last, and how much waits to be read.
     d.rt.beat(&d.hosted);
-    let handed: Vec<(String, String, String)> = d
+    let handed: Vec<(String, String, usize)> = d
         .told()
         .into_iter()
         .filter_map(|k| match k {
-            EventKind::Message { thread, from, text } => Some((thread, from, text)),
+            EventKind::Message {
+                thread,
+                from,
+                unread,
+            } => Some((thread, from, unread)),
             _ => None,
         })
         .collect();
     assert_eq!(
         handed,
-        [
-            (
-                "zenworld #general".to_string(),
-                "Kit (@kit)".to_string(),
-                "@Zen do you know @Wrennie?".to_string()
-            ),
-            (
-                "zenworld #general".to_string(),
-                WREN_S.to_string(),
-                "I'm here too".to_string()
-            ),
-        ]
+        [("zenworld #general".to_string(), WREN_S.to_string(), 2)]
     );
     d.settle().await;
     assert_eq!(

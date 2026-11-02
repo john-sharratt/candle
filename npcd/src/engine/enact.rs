@@ -31,7 +31,7 @@ use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
 use crate::engine::whereabouts;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
-use crate::sim::phone::{Kind as ThreadKind, Threads};
+use crate::sim::phone::{Kind as ThreadKind, Threads, ALL_MESSAGES};
 use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
 use crate::sim::Sim;
 use crate::world::Hosted;
@@ -317,10 +317,11 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
 /// goes on to the room.
 fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
     let want = what.trim().to_lowercase();
-    let all = matches!(
-        want.as_str(),
-        "messages" | "my messages" | "phone" | "my phone" | "handset"
-    );
+    let all = want == ALL_MESSAGES
+        || matches!(
+            want.as_str(),
+            "my messages" | "phone" | "my phone" | "handset"
+        );
     let names: Vec<String> = match all {
         true => threads
             .unread_threads(me)

@@ -2310,7 +2310,7 @@ mod tests {
                 EventKind::Message {
                     thread: "Johnathan Sharratt".into(),
                     from: "Johnathan Sharratt".into(),
-                    text: "where are you".into(),
+                    unread: 1,
                 },
             ),
             (

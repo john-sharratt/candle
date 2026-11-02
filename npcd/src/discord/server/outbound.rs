@@ -22,6 +22,7 @@ use crate::discord::post::{post as send, posted, Post, Target};
 use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
+use crate::engine::reported::spoken;
 use crate::sim::phone::Message;
 
 /// Post what is waiting on `bot`'s channels' threads.
@@ -46,7 +47,7 @@ pub async fn post(a: &Arc<Authored>, bot: &Online) -> Result<(), Rejected> {
         });
         for m in waiting {
             let text = match m.from == character {
-                true => m.intent.clone(),
+                true => spoken(&m.intent),
                 false => format!("> **{}:** {}", m.from, m.intent),
             };
             let to = Target {

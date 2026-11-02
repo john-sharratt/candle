@@ -110,6 +110,7 @@ use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
+use crate::engine::reported::spoken;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
@@ -2666,13 +2667,17 @@ impl Runtime {
     ) -> Option<(String, Vec<(String, String)>)> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
+        // The character's lines as it would say them; the person's as written.
         let said = hosted.sim(|sim| {
             sim.threads
                 .direct_between(from, &them)
                 .map(|t| {
                     t.messages
                         .iter()
-                        .map(|m| (m.from.clone(), m.intent.clone()))
+                        .map(|m| match m.from == them {
+                            true => (m.from.clone(), spoken(&m.intent)),
+                            false => (m.from.clone(), m.intent.clone()),
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
@@ -2725,6 +2730,8 @@ impl Runtime {
     /// it but only shows what was said after each member arrived.
     pub fn channel(&self, world_id: &str, who: &str) -> Option<Vec<(String, String)>> {
         let hosted = self.hosted.get(world_id)?;
+        // The cast's lines as they would say them; a person's as written.
+        let cast: HashSet<String> = hosted.read(|w| w.actors().map(|a| a.name.clone()).collect());
         Some(hosted.sim(|sim| {
             sim.threads
                 .by_name_for(who, crate::sim::phone::CHANNEL)
@@ -2732,7 +2739,10 @@ impl Runtime {
                     t.messages
                         .iter()
                         .skip(t.arrived_at(who))
-                        .map(|m| (m.from.clone(), m.intent.clone()))
+                        .map(|m| match cast.contains(&m.from) {
+                            true => (m.from.clone(), spoken(&m.intent)),
+                            false => (m.from.clone(), m.intent.clone()),
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()

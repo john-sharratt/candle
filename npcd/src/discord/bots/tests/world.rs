@@ -273,7 +273,7 @@ async fn the_world_is_posted_by_its_speakers() {
         d.hooked(),
         [
             ("Wick".to_string(), "the hatchery is warm".to_string()),
-            ("Zen".to_string(), "good".to_string()),
+            ("Zen".to_string(), "Good.".to_string()),
         ]
     );
 
@@ -305,7 +305,7 @@ async fn the_world_is_posted_by_its_speakers() {
         d.posts(),
         [(
             format!("/channels/{MADE}/messages"),
-            "I am watching".to_string()
+            "I am watching.".to_string()
         )]
     );
     assert_eq!(d.hooked().len(), 2, "something was posted twice");
@@ -483,7 +483,7 @@ async fn a_group_is_a_channel_only_its_members_see() {
     });
     d.until("posted", |d| {
         d.hooked()
-            .contains(&("Wick".to_string(), "the east is clear".to_string()))
+            .contains(&("Wick".to_string(), "The east is clear.".to_string()))
     })
     .await;
 
@@ -616,7 +616,7 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
     .await;
     assert_eq!(
         d.hooked(),
-        [("Wick".to_string(), "hello, Wren".to_string())],
+        [("Wick".to_string(), "Hello, Wren.".to_string())],
         "what was said before the server was posted"
     );
 
@@ -829,7 +829,7 @@ async fn a_bot_shows_typing_while_a_dm_waits_on_it() {
 
     d.zen_says("I am here");
     d.until("answered", |d| {
-        d.posts().iter().any(|(_, text)| text == "I am here")
+        d.posts().iter().any(|(_, text)| text == "I am here.")
     })
     .await;
     d.settle().await;
