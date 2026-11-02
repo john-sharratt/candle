@@ -31,8 +31,10 @@ In order of precedence:
 4. **Watches, when nothing else calls for it.** It turns its attention to the places it looks
    after and reads their terminals — and acts on what it finds, most often by posting work.
 
-**Zen takes no orders** (`takes_orders: false`): the table never calls it and never hands it
-work. What sets it going when idle is its own nature (§7), not the world.
+**Zen takes no orders** (`takes_orders: false`): the table never calls it and never hands it a
+Drone's work. What it does is its own agenda of missions (§17) — made by it in answer to what it
+hears, and, when it has none left, the next item of the world's round from the order table — and,
+in a world with no round, its own nature (§7).
 
 ## 3. The mirror
 
@@ -121,11 +123,16 @@ being private (§1) is what keeps it there.
 
 ## 7. Zen when idle
 
-Being given no orders is not being told to do nothing. A character's idle wake comes from its
-**personality** when the personality has one (`idle:`); Zen's says what Zen is — when nothing
-calls for it, it turns its attention to the places it looks after, reads what their terminals
-hold, and acts on what it finds. A personality with no `idle:` that takes no orders is woken with
-`YOUR_OWN_TIME`.
+Being given no orders is not being told to do nothing. **In a world with a round (§17), what
+Zen does when its agenda is empty is the round**: it takes up the next of the things the moon's
+mind is for at the order table, one at a time, for ever, and a Zen with nothing due rests. Only in a world
+with no round does the idle wake come from the **personality** (`idle:`), or, with none, is a
+character that takes no orders woken with `YOUR_OWN_TIME`.
+
+An idle thought alone is not enough for a mind that takes no orders: it names no act, so a
+character woken with it again and again has nothing to land on but talk, and a loop broken out of
+lands on whatever act is left — the phone, the channel — with nothing in front of it that is its
+own.
 
 ## 8. Orders
 
@@ -184,7 +191,9 @@ still told who is there.
 | `Origin::Ordered { by, poster }` | A mission posted by a character; its report notifies its poster. |
 | Waiting at the table | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is sent to the table to wait (`TO_WAIT`) and waits there told nothing, woken by a post. |
 | Notifications | Report → the poster, with "the table is empty" when it is. Post → every Drone waiting at the table, or the one named. |
-| Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it. |
+| Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it — in a world with no round. |
+| Zen's agenda (§17) | Several missions per body that takes no orders, by priority, the highest worked; `mission_add` / `mission_edit` / `mission_cancel`, offered anywhere to such a body; `Choices::Agenda`. |
+| The round (§17.3) | `missions/<world>/round.yaml`; `collect_mission` offered to a body that takes no orders when its agenda is empty and an item is due, given by the table's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
 
 ## 10. Build order
 
@@ -356,6 +365,162 @@ Every body in `life` reaches the internet through its effector, wherever it stan
 `web_request` refuse a loopback, private or link-local address, checked after the name is
 resolved — the members' own control ports are on those addresses. Every request is recorded with
 who made it.
+
+## 17. Zen's missions
+
+**Zen takes no orders, but it carries missions — several at once, in order of priority — and
+they are its own.** It makes them, in answer to what it hears and sees; it changes and drops them
+as things change; and when it has none left, it goes to the order table and takes up the next of
+its **round**: the world's list of what the moon's mind is for. A Drone carries one mission set
+for it; Zen keeps an agenda.
+
+What this replaces: an idle thought (`idle:`) names no act, so a Zen woken with it had nothing to
+land on but talk, and a loop broken out of landed on whatever act was left — the phone, the
+channel. The agenda is what a struck act breaks *into*: the next step of the mission on top.
+
+### 17.1 The agenda
+
+- **Many missions, one worked.** Zen carries up to eight missions (`agenda::KEEP`), each with a
+  **priority**: `now`, `soon` or `later`. The one it works is the highest, the oldest of equals;
+  its brief and compass are in Zen's prompt as any carried mission's are, and the rest are listed
+  beneath it, one line each — title, priority, the step each is on.
+- **A mission pushed down keeps its place.** When a higher one arrives, the one being worked is
+  set aside with every step it had signed off, and taken up again where it was when the higher one
+  is done or dropped.
+- **Each has a title** Zen gives it — a few words — by which it is named in the grammar
+  (`Choices::Agenda`, the agenda's titles: never a free string).
+- **Full is said, not silently trimmed.** Adding a ninth is refused, naming the lowest one to drop
+  or finish first.
+
+### 17.2 Zen makes, changes and drops its own
+
+Acts of Zen's own, offered wherever its attention is (it needs no table to decide what it is
+doing), and only to a character that takes no orders:
+
+| Act | Does |
+|---|---|
+| `mission_add` | `{title, brief, steps, priority}` — a new mission on the agenda, steps one to a line as `order_post` takes them. |
+| `mission_edit` | `{mission, brief?, steps?, priority?}` — changes one; steps already signed off stay signed off. |
+| `mission_cancel` | `{mission, why}` — drops one; what it was and why goes on its record. |
+
+This is how Zen reacts in real time: a message that asks for something becomes a mission at
+`now` on top of whatever it was doing; news that makes a plan pointless cancels it; a change of
+course edits it. A message that needs only an answer is answered — `reply` — and needs no
+mission.
+
+Zen's own missions are written in the same step grammar as the Drones' (§8.1), and the work it
+wants a Drone to do is still posted on the order table with `order_post` — or, once templates land
+(`docs/mission_templates.md`), issued as a template with its arguments. A mission of Zen's own is
+how Zen does a thing; a post is how it has a Drone do one.
+
+### 17.3 The round: what the table gives Zen when its agenda is empty
+
+With nothing on its agenda, **Zen goes to the order table and takes up the next item of its round
+with `collect_mission`** — the act a Drone uses, offered to Zen only when its agenda is empty and
+something on the round is due. The table decides which item; Zen does not choose. With nothing
+due, Zen rests (§17.4).
+
+#### The file
+
+One file, `missions/<world>/round.yaml`, beside the world's standing missions:
+
+```yaml
+round:
+  - id: read-the-reports
+    when: reports            # only while a report waits unread
+    brief: >-
+      Go to the order table and read what the Drones brought back.
+    steps:
+      - read what came back at the order table
+  - id: set-the-work
+    when: table-empty        # only while nothing waits on the table
+    brief: >-
+      Nothing waits on the table. Set the Drones the work the moon needs next.
+    steps:
+      - post work on the order table
+  - id: watch-earth
+    every: 2h                # not again until two hours after it was last done
+    brief: ...
+    steps:
+      - go to the watch room
+      - scan the sensor panel and read what state it is in
+      - post work on the order table
+```
+
+- **`id`** — kebab-case, unique in the round.
+- **`brief` and `steps`** — as any mission's, the steps one to an act the engine sees happen
+  (§17.5).
+- **`when`** — what must be true for the item to be due: `reports`, a report Zen posted waits
+  unread; `table-empty`, nothing waits on the table. Absent, it is always due. (Messages are not a
+  round item: they reach Zen urgently on their own, and are answered before anything on the
+  agenda.)
+- **`every`** — the least time between one doing of it and the next: `30m`, `2h`, `1d`. Absent,
+  none.
+
+A round that names a `when` it does not know, a malformed period, a duplicate id, or an item with
+no step, is refused whole at load, naming the file and the fault.
+
+#### Which item the table gives — the anti-loop rules
+
+- **In order, from where it left off.** The next item is the first due one after the one given
+  last, wrapping round to the start. An item is **due** when its `when` holds, its `every` has
+  passed since it was last done, and it has not failed within the last hour
+  (`standing::RETRY_MS`).
+- **Never the same twice running while another is due.** An item just done is passed over for
+  the next due one; it is given again only when it is the only one due.
+- **An item is due only when doing it can change something** — that is what `when` and `every`
+  are for, and what makes the round a cycle rather than a treadmill.
+
+A round item collected joins the agenda at `later`, so anything Zen adds of its own comes first.
+
+### 17.4 Nothing to do is a rest
+
+With an empty agenda and nothing on the round due, **Zen is not woken** — no idle thought, no
+restated task — until something reaches it: a message, a report, a tannoy, or an item of the round
+coming due, which wakes it with a word that rouses without breaking off what it is doing
+(`Salience` between the bars) and points at the table. A world with no round wakes Zen with its
+`idle:` as before (§7).
+
+### 17.5 Done is seen, not said
+
+A round mission is closed by the engine, **with no report**: when every step is signed off, it is
+done, stamped, and the agenda moves on. Each step is signed off by the act it names landing:
+
+| Step begins | Signed off when |
+|---|---|
+| `go to …` | Zen's attention is in that room (`focus`) |
+| `scan … and read …` | the scan shows that machine |
+| `read what came back` | `order_results` reads the reports |
+| `post work` | `order_post` puts a mission on the table |
+| `read your messages` | `read` takes a conversation off the phone |
+
+A mission of Zen's own is closed the same way when its steps are seen done; one whose steps the
+engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_cancel`, saying
+it is done. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
+is called off as failed, rests as a failure does, and the round moves on — so a step Zen cannot do
+holds the round up for an hour, never for good.
+
+### 17.6 What breaks into it
+
+- **A message, a report, a tannoy** reach Zen as ever and are answered first; the mission being
+  worked stays on top of the agenda, and its compass names the step it was on when the
+  interruption is over. What the interruption asks for, if anything, becomes a mission of its own.
+- **The loop guard** strikes a repeated act as ever (`engine::loopguard`); with a mission on the
+  agenda, what is left in the grammar includes its next step.
+- **A mission of the agenda is a routine, not a chapter**: closing one turns no chapter of Zen's
+  journal, the same as a standing job (`Missions::close`).
+
+### 17.7 To settle in review
+
+- **Priorities.** Three named levels (`now`, `soon`, `later`), or a number? Three keeps the
+  grammar a closed set and the choice legible.
+- **The agenda's size.** Eight is a guess at what a prompt can carry without the list crowding
+  out the mission being worked.
+- **Closing Zen's own missions.** Seen-done where the engine can see the steps, `mission_cancel`
+  where it cannot — or a `mission_done` of its own, so a finished mission is not filed as dropped?
+- **The round's first items for `life`**: read the reports (`when: reports`), set the work
+  (`when: table-empty`), watch Earth (`every: 2h`), look in on the Sharratts (`every: 6h`), tell
+  the story circle (`every: 1d`) — each ending in an act that changes something.
 
 ## 11. Decided by the deployment
 
