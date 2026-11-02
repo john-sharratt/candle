@@ -62,6 +62,10 @@ struct AppMembers {
     /// of its own records. Dropped once every member a request may go to holds
     /// them.
     handovers: HashMap<Vec<u8>, Handover>,
+    /// The machine this app's round robin last gave a unit to
+    /// (`docs/static_placement.md` §3.2), as `(rank, node)` — the app's own, so
+    /// another app's picks never move it.
+    cursor: Cell<Option<(u32, u64)>>,
 }
 
 #[derive(Debug, Default)]
@@ -74,9 +78,11 @@ pub struct Registry {
     /// (`docs/static_placement.md` §4), as the hub last derived them from its
     /// queue.
     reserved: BTreeSet<CardKey>,
-    /// The machine the round robin last gave a unit to (§3.2), as
-    /// `(rank, node)`.
-    cursor: Cell<Option<(u32, u64)>>,
+    /// The cursor of an app with no members yet: nothing is placed by it.
+    no_cursor: Cell<Option<(u32, u64)>>,
+    /// The draw the hub is placing has waited its bound for a card's turns to
+    /// end, and takes its card as it stands (`docs/static_placement.md` §4).
+    draw_overdue: bool,
     /// The hosts whose agents stand by (§11.3): given a job only when no
     /// other agent can run it.
     standby: BTreeSet<String>,
@@ -105,6 +111,12 @@ impl Registry {
     /// draw until the hub says otherwise.
     pub fn set_reserved(&mut self, cards: BTreeSet<CardKey>) {
         self.reserved = cards;
+    }
+
+    /// Whether the draw placed next has waited its bound, and takes its card as
+    /// it stands.
+    pub fn set_draw_overdue(&mut self, overdue: bool) {
+        self.draw_overdue = overdue;
     }
 
     /// Whether the agents on `host` stand by.

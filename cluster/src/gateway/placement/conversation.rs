@@ -2,22 +2,35 @@
 //! §3.2): the deterministic fill to each machine's `min` in rank order, then a
 //! round robin up to each one's `max`, then nobody — the unit waits.
 
-use super::{has_room, Placed, Weigh};
+use super::{has_room, prefer_current, Placed, Weigh};
 use crate::gateway::registry::MemberView;
 
 /// The member of `pool` a unit goes to.
 ///
-/// 1. **The fill.** Among the members whose card has room ([`has_room`]), in
-///    `rank` order, the first whose card holds fewer units than its machine's
-///    `min`.
+/// 1. **The fill.** Among the members whose card has room ([`has_room`]) —
+///    those not lagging on replication, while any of them has room — in
+///    `(rank, node)` order, the first whose card holds fewer units than its
+///    machine's `min`.
 /// 2. **The round robin.** Every one at its `min`: the next after the
 ///    cursor, in `(rank, node)` order, wrapping — and the cursor moves to it.
-/// 3. **None with room**: [`Placed::Full`].
+/// 3. **None with room**: [`Placed::Full`], the unit waits. **No machine of the
+///    pool takes conversations at all** — named nowhere in the table, or with no
+///    `conversations` — is [`Placed::Nobody`]: waiting would never end.
 pub(super) fn conversation_of(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Placed {
-    let mut open: Vec<(u32, u32, u32, &MemberView)> = pool
+    if pool
+        .iter()
+        .all(|m| weigh.machines.conversations(&m.host).is_none())
+    {
+        log(&pool, weigh, None, "nobody");
+        return Placed::Nobody;
+    }
+    let room: Vec<&MemberView> = pool
         .iter()
         .copied()
         .filter(|m| has_room(m, weigh, false))
+        .collect();
+    let mut open: Vec<(u32, u32, u32, &MemberView)> = prefer_current(room)
+        .into_iter()
         .filter_map(|m| {
             let c = weigh.machines.conversations(&m.host)?;
             Some((c.rank, c.min, weigh.card(m).work(), m))
@@ -38,26 +51,21 @@ pub(super) fn conversation_of(pool: Vec<&MemberView>, weigh: &Weigh<'_>) -> Plac
             ("round", next.map(|(_, _, _, m)| m.node))
         }
     };
-    tracing::info!(
-        target: "cluster::gateway::placement",
-        picked = %pick.map_or_else(|| "none".to_string(), |n| format!("{n:016x}")),
-        by = if pick.is_some() { by } else { "full" },
-        candidates = %candidates(&pool, weigh),
-        "placed"
-    );
+    log(&pool, weigh, pick, if pick.is_some() { by } else { "full" });
     pick.map_or(Placed::Full, Placed::To)
 }
 
-/// Every candidate as the pick saw it, for the placement line
-/// (`docs/static_placement.md` §3.2): its machine, what its card holds, and
-/// whether it had room.
-fn candidates(pool: &[&MemberView], weigh: &Weigh<'_>) -> String {
-    pool.iter()
+/// The placement line (`docs/static_placement.md` §3.2): how the unit was
+/// placed, and every candidate as the pick saw it — its machine, what its card
+/// holds, and whether it had room.
+fn log(pool: &[&MemberView], weigh: &Weigh<'_>, pick: Option<u64>, by: &str) {
+    let candidates = pool
+        .iter()
         .map(|m| {
             let card = weigh.card(m);
             let c = weigh.machines.conversations(&m.host);
             format!(
-                "{:016x} host={} rank={} min={} max={} units={} drawing={} reserved={} room={}",
+                "{:016x} host={} rank={} min={} max={} units={} drawing={} reserved={} lagging={} room={}",
                 m.node,
                 m.host,
                 c.map_or_else(|| "-".to_string(), |c| c.rank.to_string()),
@@ -66,9 +74,17 @@ fn candidates(pool: &[&MemberView], weigh: &Weigh<'_>) -> String {
                 card.work(),
                 card.drawing,
                 weigh.reserved(m),
+                m.lagging,
                 has_room(m, weigh, false),
             )
         })
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    tracing::info!(
+        target: "cluster::gateway::placement",
+        picked = %pick.map_or_else(|| "none".to_string(), |n| format!("{n:016x}")),
+        by,
+        candidates = %candidates,
+        "placed"
+    );
 }

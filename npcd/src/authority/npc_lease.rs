@@ -241,18 +241,32 @@ fn fresh(holder: u64, now_ms: u64) -> NpcLease {
 }
 
 /// The holder `from` handed `nid` back, its own writes reaching `through`: the
-/// lease goes to its `next`, who waits for them. `None` when `from` is not its
-/// holder or no move was asked.
-pub fn hand_back(current: &NpcLease, from: u64, through: u64, now_ms: u64) -> Option<NpcLease> {
+/// lease goes to its `next`, who waits for them. A holder that `never_ran` the
+/// character wrote nothing of it, so the next holder waits for what the lease
+/// already named instead — the last holder that did run it. Rewritten to the
+/// holder's own writes, a move asked before the holder had caught up let the
+/// next one wake the character ahead of its previous holder's turns. `None`
+/// when `from` is not its holder or no move was asked.
+pub fn hand_back(
+    current: &NpcLease,
+    from: u64,
+    through: u64,
+    never_ran: bool,
+    now_ms: u64,
+) -> Option<NpcLease> {
     if node_of(&current.holder) != Some(from) {
         return None;
     }
     let next = node_of(current.next.as_deref()?)?;
-    Some(NpcLease {
-        after: Some(After {
+    let after = match never_ran {
+        true => current.after,
+        false => Some(After {
             origin: from,
             through,
         }),
+    };
+    Some(NpcLease {
+        after,
         ..fresh(next, now_ms)
     })
 }
@@ -331,8 +345,12 @@ mod tests {
         let moving = lend(&[nid], &held, &after, &joined(&[1, 2]), NOW + 1_000);
         assert_eq!(moving[&nid].holder, hex(1), "still running where it is");
         assert_eq!(moving[&nid].next.as_deref(), Some(hex(2).as_str()));
-        assert_eq!(hand_back(&moving[&nid], 2, 9, NOW), None, "not its holder");
-        let moved = hand_back(&moving[&nid], 1, 40, NOW + 2_000).unwrap();
+        assert_eq!(
+            hand_back(&moving[&nid], 2, 9, false, NOW),
+            None,
+            "not its holder"
+        );
+        let moved = hand_back(&moving[&nid], 1, 40, false, NOW + 2_000).unwrap();
         assert_eq!(moved.holder, hex(2));
         assert_eq!(moved.next, None);
         assert_eq!(
@@ -348,6 +366,41 @@ mod tests {
         current.insert(nid, moved.clone());
         let renewed = lend(&[nid], &current, &after, &joined(&[1, 2]), NOW + 50_000);
         assert_eq!(renewed[&nid].after, moved.after);
+    }
+
+    /// **A holder that never ran a character carries its last holder's wait
+    /// on.** A hands N to B naming its writes through 900; a move to C is asked
+    /// before B has them, and B hands N back unwoken. C waits for A's 900, not
+    /// for B's writes, which hold nothing of N.
+    #[test]
+    fn a_holder_that_never_ran_it_carries_the_wait_on() {
+        let lease = NpcLease {
+            holder: hex(2),
+            expires_ms: NOW + NPC_TTL_MS,
+            next: Some(hex(3)),
+            after: Some(After {
+                origin: 1,
+                through: 900,
+            }),
+        };
+        let unran = hand_back(&lease, 2, 55, true, NOW).unwrap();
+        assert_eq!(unran.holder, hex(3));
+        assert_eq!(
+            unran.after,
+            Some(After {
+                origin: 1,
+                through: 900
+            })
+        );
+        let ran = hand_back(&lease, 2, 55, false, NOW).unwrap();
+        assert_eq!(
+            ran.after,
+            Some(After {
+                origin: 2,
+                through: 55
+            }),
+            "one that ran it names its own writes"
+        );
     }
 
     /// **A move, once asked, completes** (`docs/static_placement.md` §5.5):

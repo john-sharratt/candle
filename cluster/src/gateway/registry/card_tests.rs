@@ -117,14 +117,16 @@ fn a_drawing_card_takes_only_draws() {
     );
 }
 
-/// **A machine that draws nothing is given no draw.**
+/// **A machine that draws nothing is given no draw**, and a draw no machine
+/// will ever take does not wait for one: nobody takes it, and the route's
+/// configured upstream answers.
 #[test]
 fn a_machine_that_draws_nothing_is_given_no_draw() {
     let mut r = registry("box:\n  conversations: {rank: 1, min: 4}\n");
     r.join(on_card("npcd", 1, "box", 9));
     assert_eq!(
         r.pick("npcd", &Dispatch::Best, Some(512 * 512), None, None),
-        Pick::Wait
+        Pick::Configured
     );
     assert_eq!(best(&mut r, "npcd"), Pick::Member(1));
 }

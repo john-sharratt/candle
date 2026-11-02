@@ -49,6 +49,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+// A queued unit's wait is measured on the runtime's clock, as its hold is.
+use tokio::time::Instant as RuntimeInstant;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use super::admission::{Admission, Admitted};
@@ -60,7 +62,7 @@ use super::log::{CoordLog, Entry};
 use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
 use super::planner::{Planned, Planner};
-use super::queue::{Placing, Queue, RouteAt, Urgency, HOLD};
+use super::queue::{Placing, Queue, RouteAt, Urgency, HOLD, RESERVE_FOR};
 use super::registry::{
     is_errand, CardKey, MemberView, PeerAsk, Pick, Registry, HOSTING_APP, LATENCY_APP,
 };
@@ -225,6 +227,21 @@ pub struct Hub {
 
 pub(super) fn hex(node: u64) -> String {
     format!("{node:016x}")
+}
+
+/// Hold, for each draw waiting at the gateway, the card it waits for: it takes
+/// no new unit but a draw until the draw is placed or gone
+/// (`docs/static_placement.md` §4). Derived from the queue as it stands, so a
+/// reservation ends with the draw that made it; the cards' load is read once
+/// for them all.
+fn reserve(s: &mut State) {
+    let cards = s.registry.cards();
+    let reserved: BTreeSet<CardKey> = s
+        .queue
+        .waiting()
+        .filter_map(|ask| s.registry.draw_target(&ask.app, ask.draw?, &cards))
+        .collect();
+    s.registry.set_reserved(reserved);
 }
 
 /// Plan the cast now, under the state's hold, and send a changed plan to every
@@ -1325,7 +1342,6 @@ impl Hub {
             registry,
             upgrades,
             sockets,
-            queue,
             ..
         } = s;
         // A session that has ended is still listed until its socket's cleanup
@@ -1343,15 +1359,6 @@ impl Hub {
                 return Picked { pick, load: None };
             }
         }
-        // A draw waiting for the units on its card to end holds that card: it
-        // takes no new unit but a draw until the draw is placed or gone
-        // (`docs/static_placement.md` §4). Derived from the queue as it stands,
-        // so a reservation ends with the draw that made it.
-        let reserved: BTreeSet<CardKey> = queue
-            .waiting()
-            .filter_map(|ask| registry.draw_target(&ask.app, ask.draw?))
-            .collect();
-        registry.set_reserved(reserved);
         let canary = upgrades.canary(app);
         let peer_of = sender.filter(|_| matches!(dispatch, Dispatch::Best));
         let pick = match (canary, peer_of) {
@@ -1394,14 +1401,16 @@ impl Hub {
 
     /// [`Self::pick_from`], waiting at the gateway while every card the unit
     /// may go to is full (`docs/static_placement.md` §3.4): answered with the
-    /// pick once a card has room, most urgent and then oldest first. A
-    /// conversation and a draw wait as long as their client does; any other
-    /// unit is answered `None` once it has waited [`HOLD`].
+    /// pick once a card has room, most urgent and then oldest first. A client's
+    /// conversation turn and a client's draw wait as long as their client does
+    /// ([`Placing::waits_for_its_client`]); any other unit is answered `None`
+    /// once it has waited [`HOLD`].
     pub async fn place(self: &Arc<Self>, placing: Placing) -> Option<Picked> {
         let urgency = Urgency::of(&placing.app, placing.sender);
-        let draw = placing.draw.is_some();
+        let unbounded = placing.waits_for_its_client();
         let (seq, mut rx) = {
             let mut s = self.state();
+            reserve(&mut s);
             let picked = self.pick_in(
                 &mut s,
                 &placing.app,
@@ -1417,7 +1426,7 @@ impl Hub {
             }
             let (tx, rx) = oneshot::channel();
             let app = placing.app.clone();
-            let seq = s.queue.push(placing, Instant::now(), tx);
+            let seq = s.queue.push(placing, RuntimeInstant::now(), tx);
             tracing::info!(
                 target: "cluster::gateway::placement",
                 app,
@@ -1427,9 +1436,10 @@ impl Hub {
             );
             (seq, rx)
         };
-        // A conversation, and a draw — a card draws one at a time, so a burst
-        // waits here for the cards to come free — wait as long as their client.
-        if urgency == Urgency::Latency || draw {
+        // A client's conversation turn, and a client's draw — a card draws one
+        // at a time, so a burst waits here for the cards to come free — wait as
+        // long as their client. Nothing else is held past the hold.
+        if unbounded {
             return rx.await.ok();
         }
         let since = Instant::now();
@@ -1483,12 +1493,21 @@ impl Hub {
         {
             let mut s = self.state();
             if s.queue.len() == 0 {
+                // Nothing waits, so nothing holds a card.
+                s.registry.set_reserved(BTreeSet::new());
                 return;
             }
+            // The waiting draws' cards, held once for the whole walk: a draw
+            // placed during it is drawing, which keeps its card from the rest
+            // the same way.
+            reserve(&mut s);
             for seq in s.queue.order() {
                 let Some(w) = s.queue.take(seq) else {
                     continue;
                 };
+                // A draw that has waited its bound takes its card as it stands.
+                let overdue = w.ask.draw.is_some() && w.since.elapsed() >= RESERVE_FOR;
+                s.registry.set_draw_overdue(overdue);
                 let picked = self.pick_in(
                     &mut s,
                     &w.ask.app,
@@ -1499,6 +1518,7 @@ impl Hub {
                     w.ask.sender,
                     w.ask.route.as_ref(),
                 );
+                s.registry.set_draw_overdue(false);
                 if picked.pick == Pick::Wait {
                     s.queue.keep(w);
                 } else {

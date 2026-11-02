@@ -26,16 +26,33 @@ use crate::machines::MachineTable;
 
 /// What a placement weighs beside the members themselves: what the gateway has
 /// placed on each card, what each machine takes, the cards held for a waiting
-/// draw, and where the round robin stands.
+/// draw, and where the app's round robin stands.
 pub(crate) struct Weigh<'a> {
     pub cards: &'a Cards,
     pub machines: &'a MachineTable,
     /// Cards held for a draw that waits for their turns to end
     /// (`docs/static_placement.md` §4): they take no new unit but a draw.
     pub reserved: &'a BTreeSet<CardKey>,
-    /// The machine the round robin last gave a unit to, as `(rank, node)`
-    /// (§3.2).
+    /// The machine this app's round robin last gave a unit to, as
+    /// `(rank, node)` (§3.2).
     pub cursor: &'a Cell<Option<(u32, u64)>>,
+    /// The draw being placed has waited its bound for a card's turns to end
+    /// (`RESERVE_FOR`): it takes its card as it stands.
+    pub draw_overdue: bool,
+}
+
+/// Of `members`, those not lagging on replication — or all of them when every
+/// one is (`docs/static_placement.md` §3.2). Applied to the members that have
+/// room, so a lagging one with room still takes a unit every other is too full
+/// for, and after the holders of a released key are found, so a lagging member
+/// that alone holds a conversation still takes it. On 2026-11-02 a new
+/// conversation placed on a lagging WhiteWorld stayed there, turn after turn,
+/// because no other member ever held it complete.
+fn prefer_current(members: Vec<&MemberView>) -> Vec<&MemberView> {
+    if members.iter().all(|m| m.lagging) {
+        return members;
+    }
+    members.into_iter().filter(|m| !m.lagging).collect()
 }
 
 impl Weigh<'_> {

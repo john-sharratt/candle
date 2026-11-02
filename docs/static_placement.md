@@ -102,9 +102,14 @@ in flight, then the lower node.
 A machine is **eligible** for a unit when it is ready, holds the unit's state
 (rule 1 of `docs/cooperative_admission.md` §4, unchanged), and its card is
 neither drawing nor held for a waiting draw (§4). A member **lagging** on
-replication is passed over while any other can take the unit — weighed after
-the holders of a released conversation are found, so a lagging member that
-alone holds a conversation still takes it.
+replication is passed over while another with room can take the unit — weighed
+among the members with room, so a lagging one still takes what every other is
+too full for, and after the holders of a released conversation are found, so a
+lagging member that alone holds a conversation still takes it.
+
+When no machine the unit could go to takes conversations at all — none named in
+the table, or none with a `conversations` entry — nobody takes it, and the
+route's configured upstream answers: there is no room to wait for.
 
 Among the eligible machines below their `max`:
 
@@ -112,7 +117,8 @@ Among the eligible machines below their `max`:
    `min`. With the table above, the first four go to BlackWorld and the fifth to
    WhiteWorld.
 2. **The round robin.** Once every one is at its `min`: the next after the
-   gateway's cursor, in `(rank, node)` order, wrapping; the cursor moves to it.
+   app's cursor, in `(rank, node)` order, wrapping; the cursor moves to it. Each
+   app has its own cursor.
    With the table above, the sixth goes to BlackWorld, the seventh to WhiteWorld
    — full at 2 — and the eighth to tenth to BlackWorld, full at 8.
 3. **None below `max`:** the unit queues (§3.4).
@@ -138,11 +144,14 @@ gateway forwards it, and forms its waves exactly as before.
 - **Release.** Whenever a card's count falls (an answer ends, a draw ends) or a
   `CAPACITY` arrives, the gateway takes each waiting unit out in order and
   places it; one that still fits nowhere is put back, and does not hold back
-  those behind it that fit elsewhere. Each is taken out alone, so the units
-  still waiting go on holding what they hold (§4) while it is placed.
-- **A conversation and a draw wait as long as their client does**; a client
-  that goes away is dropped. Any other unit is answered `503` after the 30 s
-  hold (`HOLD`).
+  those behind it that fit elsewhere. The cards the waiting draws hold (§4) are
+  worked out once per walk, not once per unit.
+- **A client's conversation turn and a client's draw wait as long as their
+  client does** (`Placing::waits_for_its_client`): a zend request routed by its
+  conversation, or a draw, that no member sent. A client that goes away is
+  dropped. Everything else — an MCP tool call, a member's ask for a peer, any
+  other request — has nobody behind it to go away, and is answered `503` after
+  the 30 s hold (`HOLD`).
 
 ## 4. Pictures
 
@@ -159,13 +168,18 @@ fixes) and holds that card's admission while it runs.
   `pictures`, then the lower node. With the table above, a picture goes to
   WhiteWorld while BlackWorld answers conversations.
 - **When every card that may draw it has a turn in flight, the draw waits, and
-  holds its card.** The card it would take is **reserved** for as long as it
-  waits (`draw_target`): it takes no new unit but a draw, the turns already
-  there run to their end, and the draw starts when they have. Units arriving
-  meanwhile go to the other machines, or queue. The reservation is derived from
-  the queue at every pick, so it ends with the draw that made it — placed, or
-  its client gone.
-- **No card that may draw it:** the draw waits for one to finish.
+  holds its card.** The card it would take is **reserved** (`draw_target`): it
+  takes no new unit but a draw, the turns already there run to their end, and
+  the draw starts when they have. Units arriving meanwhile go to the other
+  machines, or queue. The reservation is derived from the queue, so it ends
+  with the draw that made it — placed, or its client gone.
+- **A reservation is bounded.** A conversation whose claim the card holds still
+  lands there between its tool rounds (rule 1), so the turns there may never all
+  end. A draw that has waited `RESERVE_FOR`, 60 s, takes its card as it stands
+  at the next release.
+- **Every card that may draw it is drawing:** the draw waits for one to finish.
+- **No machine draws at all** — none named with a `pictures` preference: nobody
+  takes the draw, and the route's configured upstream answers.
 
 ## 5. Characters
 
@@ -211,7 +225,10 @@ When a card becomes busy:
    (`HandBack.through`, the old holder's own records). The character's K/V and
    recurrent state are already there: every sealed turn replicates to every
    member. A member the plan lends to is never one lagging on replication, so
-   that wait is short.
+   that wait is short. A holder that **never ran** the character — handed it
+   back before it had its own last holder's writes — wrote nothing of it, and
+   says so (`HandBack.never_ran`): the lease keeps the wait it already named, so
+   the next holder waits for the last holder that did run it.
 
 ### 5.4 A fast return
 
@@ -251,8 +268,10 @@ world is, so a world on one card serves a cast on both.
 ## 7. Host memory
 
 `pinned_experts_gib`, when the table gives it, is the expert cache's page-lock
-budget, exactly (`candle::vram::state_expert_pin`). When it does not, the
-budget is derived from the machine (`host_ram_budget_from`):
+budget (`candle::vram::state_expert_pin`), held to the derived pool: a pin may
+lower the budget below what the machine leaves after its fixed obligations,
+never raise it above. When the table gives none, the budget is the derived pool
+(`host_ram_budget_from`):
 
 ```text
 tier_pool     = total − weights_reserved − PAGEABLE_RESERVE − OS_KEEP − KV_WARM_FLOOR
@@ -284,14 +303,17 @@ while a card sits idle. The invariants that prevent it:
    unit is placed among them as ever.
 3. **A queue is released by every event that could make room** — an answer
    ending, a draw ending, a `CAPACITY` — not by a timer.
-4. **A reservation is for one waiting draw**, derived from the queue at every
-   pick, and ends with it. It never holds a card idle: it waits only for turns
-   already running there.
-5. **Characters always have a home.** Busy cards lend again when no free card
+4. **A reservation is for one waiting draw**, derived from the queue, and ends
+   with it — or after `RESERVE_FOR`, when the draw takes its card as it stands.
+   It never holds a card idle: it waits only for turns already running there.
+5. **No room and no machine are different outcomes.** A unit waits only when a
+   machine that takes it could come to have room; one that no machine of its
+   pool takes at all goes to the route's configured upstream.
+6. **Characters always have a home.** Busy cards lend again when no free card
    can host (§5.2), and a move whose target cannot host is withdrawn (§5.5).
-6. **The holder of a key is never refused** (rule 1). A conversation mid-turn on
+7. **The holder of a key is never refused** (rule 1). A conversation mid-turn on
    a card that is then reserved or drawing finishes its turn there.
-7. **A machine the table does not name gets nothing**, so a mis-named machine
+8. **A machine the table does not name gets nothing**, so a mis-named machine
    shows on the gateway's page as admitted and idle rather than taking work at a
    guessed size.
 
@@ -321,7 +343,7 @@ With the table of §2.
 | The fill, the round robin, an app that runs no model | `cluster/src/gateway/placement/{conversation,least}.rs` |
 | Room: drawing, reserved, `max` | `cluster/src/gateway/placement/room.rs` |
 | Pictures and the reservation | `cluster/src/gateway/placement/draw.rs`, `Registry::draw_target`, `Hub::pick_in` |
-| Lagging passed over | `cluster/src/gateway/registry/pick.rs` (`current`) |
+| Lagging passed over, among those with room | `cluster/src/gateway/placement.rs` (`prefer_current`) |
 | The forward queue | `cluster/src/gateway/queue.rs`, `Hub::place`, `Hub::release_waiting` |
 | The plan: shares, busy, `RETURN_AFTER`, `SETTLE`, the plan on the busy event | `cluster/src/gateway/planner/`, `Hub::pick_in` |
 | A move that completes; a held, unwoken character handed back | `npcd/src/authority/{npc_lease,cast}.rs` |

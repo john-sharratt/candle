@@ -18,6 +18,7 @@ use cluster::dispatch::{Dispatch, Merge};
 use cluster::frame::{BuildId, ModelId};
 use cluster::gateway::{state_name, Hub};
 use cluster::handshake::GroupKey;
+use cluster::machines::MachineTable;
 use cluster::member::{Check, Link};
 use cluster::replicate::{MemoryStore, Replication, Store};
 use cluster::upgrade::artifacts::RunProbe;
@@ -273,7 +274,7 @@ impl Member {
 async fn gateway(upstream: &str) -> (SocketAddr, Arc<Hub>) {
     let yaml = format!(
         r#"
-cluster: {{group_key_file: "unused.key"}}
+cluster: {{group_key_file: "unused.key", machines_file: "machines.yaml"}}
 sites:
   - name: zend
     default: true
@@ -283,6 +284,15 @@ sites:
     );
     let cfg = Config::from_yaml(&yaml, Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
     let hub = Hub::new(key(), "gw-member-test");
+    // The tests' members run on `m1` and `m2`, ranked by their number
+    // (`docs/static_placement.md` §2).
+    hub.set_machines(
+        MachineTable::from_yaml(
+            "m1:\n  conversations: {rank: 1, min: 8}\n\
+             m2:\n  conversations: {rank: 2, min: 8}\n",
+        )
+        .unwrap(),
+    );
     let router = Builder::new(cfg)
         .cluster(Gateway::with_hub(hub.clone()))
         .router();

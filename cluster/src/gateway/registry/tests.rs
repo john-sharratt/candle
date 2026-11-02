@@ -454,7 +454,10 @@ fn units_fill_to_each_min_in_rank_order_then_go_round_to_each_max() {
 }
 
 /// **A machine the table does not name is given no work**, whatever else it
-/// is: it is listed and idle, and a unit only it could take waits.
+/// is: a unit waits for a named machine's room rather than going to it — and
+/// when no machine the unit could go to takes conversations at all, it does not
+/// wait for room that will never come: nobody takes it, and the route's
+/// configured upstream answers.
 #[test]
 fn a_machine_the_table_does_not_name_takes_nothing() {
     let mut r = Registry::new();
@@ -465,6 +468,61 @@ fn a_machine_the_table_does_not_name_takes_nothing() {
     }
     assert_eq!(placed(&mut r), Ok(1));
     assert_eq!(placed(&mut r), Err(Pick::Wait), "m9 is named nowhere");
+
+    let mut unnamed = Registry::new();
+    unnamed.set_machines(table(&[("m1", 1, 1, 1)]));
+    unnamed.join(member(9, 9));
+    unnamed.capacity("zend", 9, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(placed(&mut unnamed), Err(Pick::Configured));
+    let mut empty = Registry::new();
+    empty.join(member(1, 1));
+    empty.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(placed(&mut empty), Err(Pick::Configured), "no table at all");
+}
+
+/// **A lagging member with room takes a unit every other member is too full
+/// for**: the lag is weighed among the members with room, never before.
+#[test]
+fn a_lagging_member_with_room_takes_what_the_others_cannot() {
+    let mut r = Registry::new();
+    r.set_machines(table(&[("m1", 1, 1, 1), ("m2", 2, 1, 2)]));
+    for n in [1, 2] {
+        r.join(member(n, n));
+        r.capacity("zend", n, capacity(MemberState::Ready, 1, true, 1));
+    }
+    r.set_lagging("zend", 2, true);
+    assert_eq!(placed(&mut r), Ok(1), "the current one, while it has room");
+    assert_eq!(placed(&mut r), Ok(2), "m1 full: the lagging one");
+}
+
+/// **Each app has its own round robin**: npcd's picks do not move zend's
+/// cursor.
+#[test]
+fn each_app_has_its_own_round_robin() {
+    let mut r = Registry::new();
+    r.set_machines(table(&[("m1", 1, 0, 4), ("m2", 1, 0, 4)]));
+    for n in [1, 2] {
+        r.join(member(n, n));
+        r.capacity("zend", n, capacity(MemberState::Ready, 1, true, 1));
+        let mut npcd = member(n, n);
+        npcd.app = "npcd".into();
+        r.join(npcd);
+        r.capacity("npcd", n, capacity(MemberState::Ready, 1, true, 1));
+    }
+    let zend = |r: &mut Registry| r.pick("zend", &Dispatch::Best, None, None, None);
+    let npcd = |r: &mut Registry| r.pick("npcd", &Dispatch::Best, None, None, None);
+    assert_eq!(zend(&mut r), Pick::Member(1));
+    assert_eq!(
+        npcd(&mut r),
+        Pick::Member(1),
+        "npcd's own cursor starts afresh"
+    );
+    assert_eq!(npcd(&mut r), Pick::Member(2));
+    assert_eq!(
+        zend(&mut r),
+        Pick::Member(2),
+        "zend's cursor, where zend left it"
+    );
 }
 
 /// **A lagging member is passed over while another can take the unit, a
@@ -1019,7 +1077,7 @@ fn a_draw_prefers_a_card_with_nothing_in_flight() {
         "only the busy card reaches it"
     );
     assert_eq!(
-        r.draw_target("zend", 2048 * 2048),
+        r.draw_target("zend", 2048 * 2048, &r.cards()),
         Some(CardKey::Card(3)),
         "the card it waits for"
     );

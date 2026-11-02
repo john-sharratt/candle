@@ -126,7 +126,7 @@ impl Runtime {
                     }
                     let next = lease.is_some_and(|l| l.next.is_some());
                     if mine && next && !handing && self.standing.begin_handing(npc) {
-                        self.hand_back(&world, npc);
+                        self.hand_back(&world, npc, false);
                     } else if !mine && handing {
                         self.standing.end_handing(npc);
                     }
@@ -137,10 +137,13 @@ impl Runtime {
                     // **Held here, not running, and asked to move: handed back
                     // now**, with no turn to wait for. Woken first, it waited on
                     // its last holder's writes before it could move on; never
-                    // woken, it was never handed back, and ran nowhere.
+                    // woken, it was never handed back, and ran nowhere. It never
+                    // ran under this lease — a character lent here runs from the
+                    // moment it is woken until it is put down — so the wait its
+                    // lease names is carried on to the next holder.
                     (true, false) if moving && !handing => {
                         if self.standing.begin_handing(npc) {
-                            self.hand_back(&world, npc);
+                            self.hand_back(&world, npc, true);
                         }
                     }
                     (true, false) if !handing => {
@@ -165,7 +168,7 @@ impl Runtime {
                     (true, true) => {
                         if moving && !self.standing.turning(npc) && self.standing.begin_handing(npc)
                         {
-                            self.hand_back(&world, npc);
+                            self.hand_back(&world, npc, false);
                         }
                     }
                     (false, true) if !handing => self.put_down(npc),
@@ -218,8 +221,9 @@ impl Runtime {
     }
 
     /// Hand `npc` back to `world`'s authority, with how far this member's
-    /// writes reach, and put it down once the authority has it.
-    fn hand_back(self: &Arc<Self>, world: &str, npc: u64) {
+    /// writes reach — or, when it `never_ran` here, for the wait its lease
+    /// names to be carried on — and put it down once the authority has it.
+    fn hand_back(self: &Arc<Self>, world: &str, npc: u64, never_ran: bool) {
         let Some(handle) = self.spawner() else {
             self.standing.end_handing(npc);
             return;
@@ -233,7 +237,14 @@ impl Runtime {
         let world = world.to_string();
         handle.spawn(async move {
             match rt
-                .world_write(&world, WorldOp::HandBack { npc, through })
+                .world_write(
+                    &world,
+                    WorldOp::HandBack {
+                        npc,
+                        through,
+                        never_ran,
+                    },
+                )
                 .await
             {
                 Ok(OpReply::Done { ok: true }) => rt.put_down(npc),

@@ -1,21 +1,31 @@
 //! The forward queue (`docs/static_placement.md` §3.4): a unit that fits on no
 //! eligible card waits here, before it is forwarded to any member, most urgent
 //! first and then oldest first, until a card has room — released whenever a
-//! card's count falls or a `CAPACITY` arrives. A conversation and a draw wait
-//! as long as their client does; any other unit until [`HOLD`] has passed.
+//! card's count falls or a `CAPACITY` arrives. A client's conversation turn and
+//! a client's draw wait as long as their client does; any other unit until
+//! [`HOLD`] has passed.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
+// The runtime's clock, which the hold's timeout keeps too: a unit's wait is
+// measured on the clock its hold runs out on.
+use tokio::time::Instant;
 
 use super::load::Picked;
 use super::registry::LATENCY_APP;
 use crate::dispatch::Dispatch;
 
-/// How long a unit that is neither a conversation nor a draw waits for room
-/// before it is answered `503`: the catch-up hold of
+/// How long a unit that is neither a client's conversation turn nor a client's
+/// draw waits for room before it is answered `503`: the catch-up hold of
 /// `docs/replicated_substrate.md` §5.4.
 pub const HOLD: Duration = Duration::from_secs(30);
+
+/// How long a draw waiting for its card's turns to end holds that card
+/// (`docs/static_placement.md` §4). A conversation whose claim the card holds
+/// still lands there between its tool rounds (rule 1), so the turns there may
+/// never all end; past this the draw takes its card as it stands.
+pub const RESERVE_FOR: Duration = Duration::from_secs(60);
 
 /// How urgent a waiting unit is, most urgent first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -143,6 +153,19 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.waiters.len()
+    }
+}
+
+impl Placing {
+    /// Whether this unit waits as long as its client does
+    /// (`docs/static_placement.md` §3.4): a client's conversation turn — a zend
+    /// request routed by its conversation — or a client's draw. A member's own
+    /// ask for a peer, an MCP tool call or any other request has no person
+    /// behind it to go away, and is held [`HOLD`] at most.
+    pub fn waits_for_its_client(&self) -> bool {
+        self.sender.is_none()
+            && (self.draw.is_some()
+                || (self.app == LATENCY_APP && matches!(self.dispatch, Dispatch::Sticky(_))))
     }
 }
 

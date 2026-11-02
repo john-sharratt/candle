@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::hub::Hub;
-use super::queue::{Placing, HOLD};
+use super::queue::{Placing, HOLD, RESERVE_FOR};
 use super::registry::{MemberView, Pick};
 use crate::dispatch::Dispatch;
 use crate::frame::{BuildId, Capacity, MemberState};
@@ -95,6 +95,35 @@ fn draw(area: u64) -> Placing {
     }
 }
 
+/// A client's conversation turn: a zend request routed by its conversation.
+fn turn() -> Placing {
+    Placing {
+        dispatch: Dispatch::sticky_path("id"),
+        ..unit("zend")
+    }
+}
+
+/// **Only a client's conversation turn and a client's draw wait as long as
+/// their client**: a zend request routed otherwise — an MCP tool call — and a
+/// member's ask for a peer have nobody behind them to go away.
+#[test]
+fn only_a_clients_turn_or_draw_waits_unbounded() {
+    assert!(turn().waits_for_its_client());
+    assert!(draw(512 * 512).waits_for_its_client());
+    assert!(!unit("zend").waits_for_its_client(), "a Best zend request");
+    assert!(!unit("npcd").waits_for_its_client());
+    let asked = Placing {
+        sender: Some(9),
+        ..turn()
+    };
+    assert!(!asked.waits_for_its_client(), "a member's ask for a peer");
+    let asked_draw = Placing {
+        sender: Some(9),
+        ..draw(512 * 512)
+    };
+    assert!(!asked_draw.waits_for_its_client());
+}
+
 /// **A unit that fits nowhere waits, and is placed the moment an answer ends
 /// on its card.** Two units fill the machine; the third waits until the first
 /// is answered, then takes its place.
@@ -127,16 +156,16 @@ async fn a_waiting_unit_is_placed_when_an_answer_ends() {
     );
 }
 
-/// **A conversation waits as long as its client does**: past the hold it is
-/// still queued, and is placed once there is room.
+/// **A conversation turn waits as long as its client does**: past the hold it
+/// is still queued, and is placed once there is room.
 #[tokio::test(start_paused = true)]
 async fn a_conversation_waits_past_the_hold() {
     let hub = narrow();
-    let first = hub.place(unit("zend")).await.expect("room");
-    let _second = hub.place(unit("zend")).await.expect("room");
+    let first = hub.place(turn()).await.expect("room");
+    let _second = hub.place(turn()).await.expect("room");
     let waiting = tokio::spawn({
         let hub = Arc::clone(&hub);
-        async move { hub.place(unit("zend")).await }
+        async move { hub.place(turn()).await }
     });
     tokio::time::sleep(HOLD * 3).await;
     assert!(!waiting.is_finished(), "still queued past the hold");
@@ -149,19 +178,54 @@ async fn a_conversation_waits_past_the_hold() {
 }
 
 /// **Any other unit that waits the whole hold is refused**, and leaves nothing
-/// queued.
+/// queued: an npcd request, a zend request that is no conversation turn, a
+/// member's ask for a peer.
 #[tokio::test(start_paused = true)]
 async fn a_unit_that_is_no_conversation_is_refused_after_the_hold() {
     let hub = hub(
         "m1:\n  conversations: {rank: 1, min: 1}\n",
-        vec![member("npcd", 1, "m1", 7)],
+        vec![member("npcd", 1, "m1", 7), member("zend", 2, "m1", 7)],
         0,
     );
     let _first = hub.place(unit("npcd")).await.expect("room");
-    let started = tokio::time::Instant::now();
-    assert!(hub.place(unit("npcd")).await.is_none());
-    assert_eq!(started.elapsed(), HOLD);
-    assert_eq!(hub.waiting(), 0);
+    let asked = Placing {
+        sender: Some(1),
+        ..turn()
+    };
+    for unit in [unit("npcd"), unit("zend"), asked] {
+        let started = tokio::time::Instant::now();
+        assert!(hub.place(unit).await.is_none());
+        assert_eq!(started.elapsed(), HOLD);
+        assert_eq!(hub.waiting(), 0);
+    }
+}
+
+/// **A draw holds its card for a bound, then takes it as it stands**: the
+/// turn on the card never ends, and once the draw has waited [`RESERVE_FOR`]
+/// the next release places it there.
+#[tokio::test(start_paused = true)]
+async fn a_draw_waits_its_bound_then_takes_its_card() {
+    let hub = hub(
+        "m1:\n  conversations: {rank: 1, min: 4}\n  pictures: 1\n",
+        vec![member("zend", 1, "m1", 7), member("npcd", 2, "m1", 7)],
+        1024,
+    );
+    let _turn = hub.place(turn()).await.expect("room");
+    let drawing = tokio::spawn({
+        let hub = Arc::clone(&hub);
+        async move { hub.place(draw(512 * 512)).await }
+    });
+    tokio::time::sleep(RESERVE_FOR - Duration::from_secs(1)).await;
+    hub.release_waiting();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!drawing.is_finished(), "within its bound");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    hub.release_waiting();
+    assert_eq!(
+        drawing.await.unwrap().expect("drawn").pick,
+        Pick::Member(2),
+        "past its bound, beside the turn"
+    );
 }
 
 /// **A draw only one card reaches waits for that card's turns to end, and
@@ -176,7 +240,7 @@ async fn a_waiting_draw_holds_its_card() {
         vec![member("zend", 1, "m1", 7), member("npcd", 2, "m1", 7)],
         1024,
     );
-    let turn = hub.place(unit("zend")).await.expect("room");
+    let held = hub.place(unit("zend")).await.expect("room");
     let drawing = tokio::spawn({
         let hub = Arc::clone(&hub);
         async move { hub.place(draw(512 * 512)).await }
@@ -189,7 +253,7 @@ async fn a_waiting_draw_holds_its_card() {
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!chat.is_finished(), "the card is held for the draw");
-    drop(turn);
+    drop(held);
     let drew = drawing.await.unwrap().expect("drawn");
     assert_eq!(drew.pick, Pick::Member(2));
     tokio::time::sleep(Duration::from_secs(1)).await;

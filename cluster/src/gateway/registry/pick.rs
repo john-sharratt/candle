@@ -59,24 +59,25 @@ impl Registry {
         Some(pick)
     }
 
-    /// What a placement weighs now, over `cards`.
-    fn weigh<'a>(&'a self, cards: &'a Cards) -> Weigh<'a> {
+    /// What a placement of `app`'s unit weighs now, over `cards`.
+    fn weigh<'a>(&'a self, app: &str, cards: &'a Cards) -> Weigh<'a> {
         Weigh {
             cards,
             machines: &self.machines,
             reserved: &self.reserved,
-            cursor: &self.cursor,
+            cursor: self.apps.get(app).map_or(&self.no_cursor, |a| &a.cursor),
+            draw_overdue: self.draw_overdue,
         }
     }
 
     /// The card a draw of `area` pixels for `app` waits for, when it would
     /// wait for one (`docs/static_placement.md` §4): what the hub holds back
-    /// from new units while that draw is queued.
-    pub fn draw_target(&self, app: &str, area: u64) -> Option<CardKey> {
-        let cards = self.cards();
+    /// from new units while that draw is queued. `cards` is every card's load,
+    /// read once for every draw the hub asks about.
+    pub fn draw_target(&self, app: &str, area: u64, cards: &Cards) -> Option<CardKey> {
         draw_target(
-            current(self.placeable_but(app, Some(area), None)),
-            &self.weigh(&cards),
+            self.placeable_but(app, Some(area), None),
+            &self.weigh(app, cards),
         )
     }
 
@@ -93,12 +94,7 @@ impl Registry {
         except: Option<u64>,
         weigh: &Weigh<'_>,
     ) -> Placed {
-        place(
-            app,
-            current(self.placeable_but(app, draw, except)),
-            draw,
-            weigh,
-        )
+        place(app, self.placeable_but(app, draw, except), draw, weigh)
     }
 
     /// [`Self::best`] for a member asking for a peer ([`Self::pick_from`]):
@@ -111,7 +107,7 @@ impl Registry {
         ask: PeerAsk,
         weigh: &Weigh<'_>,
     ) -> Placed {
-        let pool = current(self.placeable_but(app, draw, None));
+        let pool = self.placeable_but(app, draw, None);
         let without = |out: &[Option<u64>]| -> Vec<&MemberView> {
             pool.iter()
                 .copied()
@@ -157,18 +153,18 @@ impl Registry {
     ) -> Placed {
         let handover = key.and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).cloned());
         let Some(h) = handover else {
-            return self.best(app, draw, &self.weigh(cards));
+            return self.best(app, draw, &self.weigh(app, cards));
         };
         let (pick, everyone_holds) = {
-            let weigh = &self.weigh(cards);
+            let weigh = &self.weigh(app, cards);
             let ready = self.placeable_but(app, draw, None);
             let holding: Vec<&MemberView> =
                 ready.iter().copied().filter(|m| h.held_by(m)).collect();
             let everyone_holds = holding.len() == ready.len();
             let pick = if holding.is_empty() {
-                place(app, current(ready), draw, weigh)
+                place(app, ready, draw, weigh)
             } else {
-                place(app, current(holding), draw, weigh)
+                place(app, holding, draw, weigh)
             };
             (pick, everyone_holds)
         };
@@ -310,9 +306,9 @@ impl Registry {
                 );
             }
             Dispatch::Best if ask == PeerAsk::default() => {
-                self.best(app, draw, &self.weigh(&cards))
+                self.best(app, draw, &self.weigh(app, &cards))
             }
-            Dispatch::Best => self.best_for_peer(app, draw, ask, &self.weigh(&cards)),
+            Dispatch::Best => self.best_for_peer(app, draw, ask, &self.weigh(app, &cards)),
             Dispatch::Any => self.round_robin(app).map_or(Placed::Nobody, Placed::To),
             // A request routed by its subject that names none and draws
             // nothing — a listing, a read of the caller's own — is no unit of
@@ -407,7 +403,7 @@ impl Registry {
         let canary_room = matches!(dispatch, Dispatch::Any)
             || self
                 .member(app, canary)
-                .is_some_and(|m| has_room(m, &self.weigh(&cards), draw.is_some()));
+                .is_some_and(|m| has_room(m, &self.weigh(app, &cards), draw.is_some()));
         if canary_room && take() {
             routed(app, dispatch, canary, "canary");
             return Pick::Member(canary);
@@ -416,7 +412,7 @@ impl Registry {
             Dispatch::Any => self
                 .round_robin_but(app, Some(canary))
                 .map_or(Placed::Nobody, Placed::To),
-            _ => self.best_but(app, draw, Some(canary), &self.weigh(&cards)),
+            _ => self.best_but(app, draw, Some(canary), &self.weigh(app, &cards)),
         };
         match baseline {
             Placed::To(node) => Pick::Member(node),
@@ -425,19 +421,6 @@ impl Registry {
             Placed::Nobody => Pick::Wait,
         }
     }
-}
-
-/// Of `members`, those not lagging on replication — or all of them when every
-/// one is (`docs/static_placement.md` §3.2). Applied after the holders of a
-/// released key are found, so a lagging member that alone holds a conversation
-/// still takes it. On 2026-11-02 a new conversation placed on a lagging
-/// WhiteWorld stayed there, turn after turn, because no other member ever held
-/// it complete.
-fn current(members: Vec<&MemberView>) -> Vec<&MemberView> {
-    if members.iter().all(|m| m.lagging) {
-        return members;
-    }
-    members.into_iter().filter(|m| !m.lagging).collect()
 }
 
 /// Of `members`, those not silent (§4.4) — or all of them when every one is:

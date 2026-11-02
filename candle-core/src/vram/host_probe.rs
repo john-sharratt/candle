@@ -329,7 +329,8 @@ pub fn pages_in_per_sec() -> Option<f64> {
 /// held next to none. No reserve derived from the machine is right for both, so
 /// a machine whose engine needs more than [`PAGEABLE_RESERVE`] covers states
 /// its pin in `host/machines.yaml` (`docs/static_placement.md` §7), and that is
-/// the budget, exactly ([`state_expert_pin`]).
+/// the budget ([`state_expert_pin`]) — held to the pool, which it may lower and
+/// never raise.
 ///
 /// # One pool, split once — because there are TWO warm tiers
 ///
@@ -532,7 +533,10 @@ pub fn host_ram_budget_from(
         pageable_reserve_bytes: PAGEABLE_RESERVE,
         tier_pool_bytes: tier_pool,
         kv_warm_budget_bytes: KV_WARM_FLOOR,
-        expert_pinned_budget_bytes: stated.unwrap_or(tier_pool),
+        // A stated pin says how much less than the pool the engine's own heap
+        // leaves the experts; it never buys more than the machine has after
+        // its fixed obligations, whatever the table says.
+        expert_pinned_budget_bytes: stated.map_or(tier_pool, |pin| pin.min(tier_pool)),
     }
 }
 
@@ -750,6 +754,11 @@ mod tests {
             64 * GIB - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES - KV_WARM_FLOOR,
         );
         assert_eq!(stated.kv_warm_budget_bytes, KV_WARM_FLOOR);
+
+        // A pin past the pool is held to the pool: the table cannot promise
+        // the experts RAM the machine does not have.
+        let over = host_ram_budget_from(total, 0, weights, 30, OS_KEEP_BYTES, Some(80 * GIB));
+        assert_eq!(over.expert_pinned_budget_bytes, derived.tier_pool_bytes);
     }
 
     /// A model bigger than `total − buffer` is capped — the machine must swap
