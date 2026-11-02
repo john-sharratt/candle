@@ -226,6 +226,7 @@ mod tests {
             high_water: 0,
             lagging: false,
             syncing: false,
+            silent: false,
             queues: Queues::default(),
         }
     }

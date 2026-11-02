@@ -38,6 +38,7 @@ fn member(node: u64, session: u64) -> MemberView {
         applied: Vec::new(),
         lagging: false,
         syncing: false,
+        silent: false,
         in_flight: 0,
         drawing: 0,
         handed: 0,
@@ -200,6 +201,55 @@ fn a_lagging_member_is_routed_nothing() {
         .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
         .collect();
     assert!(picks.contains(&Pick::Member(2)));
+}
+
+/// **A silent member is passed over while another can take the request** —
+/// round robin, `Best`, a declared route, a catch-up's answer, a canary's
+/// share — and is routed again once it reports. When every member is
+/// silent they are all still served: the gateway's judgement never leaves
+/// the app answering nothing (§4.4).
+#[test]
+fn a_silent_member_is_passed_over_while_another_can_answer() {
+    let mut r = three();
+    assert!(r.set_silent("zend", 2, true));
+    assert!(!r.set_silent("zend", 2, true), "no change");
+    for _ in 0..6 {
+        assert_ne!(
+            r.pick("zend", &Dispatch::Any, None, None, None),
+            Pick::Member(2)
+        );
+        assert_ne!(
+            r.pick("zend", &Dispatch::Best, None, None, None),
+            Pick::Member(2)
+        );
+        assert_ne!(r.answerer("zend", 1), Some(2));
+        assert_ne!(
+            r.pick_canary("zend", &Dispatch::Best, None, None, None, 2, &mut || true),
+            Pick::Member(2),
+            "a silent canary takes no share"
+        );
+    }
+    assert!(r.clustered("zend"));
+    r.set_silent("zend", 2, false);
+    let picks: Vec<Pick> = (0..3)
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
+        .collect();
+    assert!(picks.contains(&Pick::Member(2)), "reporting again");
+
+    for node in [1, 2, 3] {
+        r.set_silent("zend", node, true);
+    }
+    let picks: Vec<Pick> = (0..3)
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None, None))
+        .collect();
+    assert!(
+        picks.iter().all(|p| matches!(p, Pick::Member(_))),
+        "every member silent: still served, {picks:?}"
+    );
+    assert!(matches!(
+        r.pick("zend", &Dispatch::Best, None, None, None),
+        Pick::Member(_)
+    ));
 }
 
 /// While a candidate certifies, a `Best`, `Any` or new sticky request is its

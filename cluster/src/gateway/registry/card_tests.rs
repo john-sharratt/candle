@@ -36,6 +36,7 @@ fn on_card(app: &str, node: u64, card: u64, next_us: u32, wide_us: u32) -> Membe
         applied: Vec::new(),
         lagging: false,
         syncing: false,
+        silent: false,
         in_flight: 0,
         drawing: 0,
         handed: 0,

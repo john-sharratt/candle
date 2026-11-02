@@ -26,15 +26,17 @@ impl Registry {
             .filter(|m| m.routable() && Some(m.node) != except)
             .collect();
         if !routable.is_empty() {
-            return routable;
+            return speaking(routable);
         }
         // Nobody in sync is serving — the one that was has left: the members
         // still syncing are the most anyone has, and serve rather than leave
         // the app answering nothing.
-        a.members
-            .values()
-            .filter(|m| m.ready() && !m.lagging && !m.closing && Some(m.node) != except)
-            .collect()
+        speaking(
+            a.members
+                .values()
+                .filter(|m| m.ready() && !m.lagging && !m.closing && Some(m.node) != except)
+                .collect(),
+        )
     }
 
     /// The next routable member other than `except`, round robin: the
@@ -109,7 +111,7 @@ impl Registry {
                 .filter(|m| m.placeable() && Some(m.node) != except)
                 .collect()
         });
-        within_reach(placeable, draw)
+        within_reach(speaking(placeable), draw)
     }
 
     /// Where a request for sticky `key`, which no member here holds, goes
@@ -262,8 +264,10 @@ impl Registry {
             cards: &cards,
             fences: &fences,
         };
-        let ready_here =
-            |r: &Registry, node: u64| r.member(app, node).is_some_and(MemberView::routable);
+        let ready_here = |r: &Registry, node: u64| {
+            r.member(app, node)
+                .is_some_and(|m| m.routable() && !m.silent)
+        };
         let placed = match dispatch {
             // Every member loaded, a syncing one included: each answers from
             // what it holds, and one rejoining holds what it wrote cut off
@@ -368,7 +372,8 @@ impl Registry {
             self.member(app, canary)
                 .is_some_and(|m| reaches(guest_reach(m), area))
         });
-        if !shared || !canary_holds || !canary_reaches || !routable(self, canary) {
+        let speaks = self.member(app, canary).is_some_and(|m| !m.silent);
+        if !shared || !canary_holds || !canary_reaches || !routable(self, canary) || !speaks {
             return self.pick(app, dispatch, draw, key, pinned);
         }
         let cards = self.cards();
@@ -400,6 +405,16 @@ impl Registry {
             Placed::Nobody => Pick::Wait,
         }
     }
+}
+
+/// Of `members`, those not silent (§4.4) — or all of them when every one is:
+/// a member that stopped reporting is passed over while another can take the
+/// request, and never leaves the app answering nothing on its own judgement.
+fn speaking(members: Vec<&MemberView>) -> Vec<&MemberView> {
+    if members.iter().all(|m| m.silent) {
+        return members;
+    }
+    members.into_iter().filter(|m| !m.silent).collect()
 }
 
 /// Whether a request placed by `dispatch` with `key` and `draw` is an errand

@@ -34,6 +34,11 @@ pub struct MemberView {
     /// — the gateway's judgement, not the member's. Unlike lagging, it is sent
     /// live events throughout, so it catches up rather than chasing them.
     pub syncing: bool,
+    /// It has sent no `CAPACITY` for [`crate::gateway::CAPACITY_SILENCE`]
+    /// while its socket stays open: a member sends one every second, so its
+    /// process is not answering. It is routed nothing while another member
+    /// can take the request, until its next `CAPACITY` (§4.4).
+    pub silent: bool,
     /// Requests this gateway has handed it and it has not finished answering
     /// (§5.3): counted at the pick, so a burst sees its own earlier picks
     /// before the member's next `CAPACITY` reports them.

@@ -278,6 +278,16 @@ impl Registry {
         changed
     }
 
+    /// Mark `node` silent or not; whether that changed.
+    pub fn set_silent(&mut self, app: &str, node: u64, silent: bool) -> bool {
+        let Some(m) = self.app(app).members.get_mut(&node) else {
+            return false;
+        };
+        let changed = m.silent != silent;
+        m.silent = silent;
+        changed
+    }
+
     /// A request handed to `node`, a draw when `draw`: one more in flight
     /// there. Returns the member's session, which [`Self::end`] names, or
     /// `None` for a node not admitted.

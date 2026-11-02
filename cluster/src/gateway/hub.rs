@@ -135,6 +135,12 @@ pub const CATCHUP_CAP: usize = 128 << 20;
 /// How often each socket's `RECEIPT` timer and lagging state are looked at.
 const RECEIPT_TICK: Duration = Duration::from_millis(100);
 
+/// How long a member may send no `CAPACITY` before it is silent (§4.4): it
+/// sends one every [`crate::member::CAPACITY_EVERY`], and pauses only while
+/// the records it is applying fill their budget. A deadlocked process keeps
+/// its socket open — the transport still answers — while sending none.
+pub const CAPACITY_SILENCE: Duration = Duration::from_secs(15);
+
 /// A stream a member opened towards the gateway (§5.1): served by the
 /// gateway's own router as a request for `app`, or, when its target is
 /// `group:<other>`, routed to that app's group.
@@ -155,6 +161,8 @@ pub(super) struct Socket {
     /// Its last `COORD` (§12.1).
     pub coord: Option<CoordState>,
     pub pacer: ReceiptPacer,
+    /// When its last `CAPACITY` arrived, or it was admitted.
+    pub capacity_at: Instant,
     /// Live events not queued for it while it lagged, and catch-up frames
     /// dropped at its cap.
     pub skipped: u64,
@@ -486,6 +494,7 @@ impl Hub {
                     clock_offset_ms: hello.now_ms as i64 - connected_ms as i64,
                     coord: None,
                     pacer: ReceiptPacer::new(Instant::now()),
+                    capacity_at: Instant::now(),
                     skipped: 0,
                     dropped: 0,
                     pulses_dropped: 0,
@@ -519,6 +528,7 @@ impl Hub {
                 applied: Vec::new(),
                 lagging: false,
                 syncing,
+                silent: false,
                 in_flight: 0,
                 drawing: 0,
                 handed: 0,
@@ -585,7 +595,10 @@ impl Hub {
                     let _ = handle.control(Frame::Members(Members { epoch, members }));
                     self.plan_tick();
                 }
-                _ = receipts.tick() => self.receipt_tick(app, node),
+                _ = receipts.tick() => {
+                    self.receipt_tick(app, node);
+                    self.silence_tick(app, node);
+                }
             }
         };
 
@@ -657,7 +670,18 @@ impl Hub {
         match frame {
             Frame::Capacity(c) => {
                 let state = c.state;
-                if self.state().registry.capacity(app, node, c) {
+                let (changed, spoke) = {
+                    let mut s = self.state();
+                    if let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) {
+                        x.capacity_at = Instant::now();
+                    }
+                    let spoke = s.registry.set_silent(app, node, false);
+                    (s.registry.capacity(app, node, c), spoke)
+                };
+                if spoke {
+                    self.note(app, hex(node), "reporting again: routed as ever".into());
+                }
+                if changed {
                     self.members_changed(app);
                 }
                 let ready = self.state().upgrades.capacity(app, node, state, now_ms());

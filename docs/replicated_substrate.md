@@ -1308,6 +1308,18 @@ Each member has an outbound queue per lane.
   what crosses it — weighed by its own length, a record over 16 MiB was dropped on
   every try and never arrived (npcd on `.5`, 2026-10-17: 6 of 192 records, 24 of
   21,290 MiB, in ten minutes).
+- **A member that stops reporting is silent.** Every member sends `CAPACITY` each second
+  (`member::CAPACITY_EVERY`), pausing only while the records it applies fill their budget.
+  One that sends none for 15 s (`gateway::CAPACITY_SILENCE`) with its socket still open is
+  **silent**: its process is not answering though its transport is. The gateway passes it
+  over — round robin, `Best`, a declared route, a catch-up's answer, a canary's share,
+  a pinned UI page — while any other member can take the request, and routes it as ever
+  from its next `CAPACITY`. When every candidate is silent they are all still served, so
+  the judgement never leaves an app answering nothing on its own. A key's holder keeps
+  its keys: moving a conversation off a holder that may still be writing it would split
+  it. Without this a deadlocked WhiteWorld (2026-11-02) stayed `ready` here for as long
+  as it hung, and every request dealt to it — the MCP aggregator's tool listing among
+  them — waited out its deadline.
 
 ---
 

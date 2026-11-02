@@ -186,6 +186,10 @@ pub struct MemberRow {
     /// Admitted beside a serving member and not yet in sync with it: routed
     /// no request.
     pub syncing: bool,
+    /// It has sent no `CAPACITY` for a while though its socket is open: its
+    /// process is not answering, and it is routed nothing another member can
+    /// take.
+    pub silent: bool,
     #[serde(flatten)]
     pub queues: Queues,
 }
@@ -246,6 +250,7 @@ impl MemberRow {
             high_water: m.high_water,
             lagging: m.lagging,
             syncing: m.syncing,
+            silent: m.silent,
             queues: socket.queues,
         }
     }
@@ -361,6 +366,7 @@ mod tests {
             high_water: 0,
             lagging: false,
             syncing: false,
+            silent: false,
             queues: Queues::default(),
         }
     }

@@ -21,6 +21,7 @@ mod queue;
 mod queue_tests;
 mod registry;
 mod relay;
+mod silence;
 mod status;
 mod tiebreak;
 mod traffic;
@@ -38,8 +39,8 @@ pub use claims::Claims;
 pub use coord_log::changes;
 pub use drain::DRAIN_WAIT;
 pub use hub::{
-    is_service, rolls_out, Hub, MemberStream, APPS, CATCHUP_CAP, KEEP, LAG_CAP, MCP, MEMBERS_EVERY,
-    REFUSALS_KEPT, SERVICES,
+    is_service, rolls_out, Hub, MemberStream, APPS, CAPACITY_SILENCE, CATCHUP_CAP, KEEP, LAG_CAP,
+    MCP, MEMBERS_EVERY, REFUSALS_KEPT, SERVICES,
 };
 pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};

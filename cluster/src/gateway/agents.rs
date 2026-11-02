@@ -221,6 +221,7 @@ mod tests {
             applied: Vec::new(),
             lagging: false,
             syncing: false,
+            silent: false,
             in_flight: 0,
             drawing: 0,
             handed: 0,
