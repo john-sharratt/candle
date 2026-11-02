@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::event::{ProjectionEvent, SelectedTurn, SystemItem};
-use super::ids::{TimelineId, TurnId, TurnIndex};
+use super::ids::{TimelineId, TurnId, TurnIndex, TurnKey};
 use super::project::{Projection, ProjectionSegment, ResolvedTurn, SealedKind};
 use super::schema::Schema;
 
@@ -197,14 +197,26 @@ impl ProjectionScript {
 
 impl ScriptedChoice {
     /// Put the recorded turns in `projection` in place of the ones chosen. A
-    /// projection's turns close it, after the system prompt.
-    pub fn place_turns(&self, projection: &mut Projection) {
+    /// projection's turns close it, after the system prompt. A recorded turn
+    /// `holds` says is gone, its thread retired since, is left out: nothing
+    /// could be placed for it.
+    pub fn place_turns(&self, projection: &mut Projection, holds: &dyn Fn(TurnKey) -> bool) {
         projection
             .segments
             .retain(|s| !matches!(s, ProjectionSegment::Sealed(SealedKind::Turn(..))));
+        let kept: Vec<&ResolvedTurn> = self
+            .turns
+            .iter()
+            .filter(|t| t.key().is_some_and(holds))
+            .collect();
+        if kept.len() < self.turns.len() {
+            tracing::warn!(
+                gone = self.turns.len() - kept.len(),
+                "a played-back projection names turns the substrate no longer holds"
+            );
+        }
         projection.segments.extend(
-            self.turns
-                .iter()
+            kept.into_iter()
                 .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(*t, crate::Role::Assistant))),
         );
     }
@@ -409,10 +421,19 @@ mod tests {
         };
         ScriptedChoice {
             members: Arc::new(HashSet::new()),
-            turns: vec![recorded],
+            turns: vec![
+                recorded,
+                ResolvedTurn {
+                    id: TurnId {
+                        index: TurnIndex(3),
+                        ..chosen.id
+                    },
+                    ..chosen
+                },
+            ],
             dials: Vec::new(),
         }
-        .place_turns(&mut projection);
+        .place_turns(&mut projection, &|key| key.index == TurnIndex(2));
         assert_eq!(projection.segments.len(), 2);
         assert!(matches!(
             projection.segments[0],

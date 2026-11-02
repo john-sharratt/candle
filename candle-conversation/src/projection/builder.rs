@@ -1236,7 +1236,7 @@ impl Builder {
             decode_pos,
             sink,
         );
-        choice.place_turns(&mut projection);
+        choice.place_turns(&mut projection, &|key| resolver.turn_token_count(key) > 0);
         projection
     }
 
