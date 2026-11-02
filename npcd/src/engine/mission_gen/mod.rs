@@ -41,6 +41,7 @@ pub mod rejection;
 #[cfg(test)]
 mod replay;
 pub mod research;
+pub mod round;
 pub mod run;
 pub mod standing;
 pub mod step;

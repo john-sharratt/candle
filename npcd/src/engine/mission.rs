@@ -24,6 +24,8 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sim::agenda::Agendum;
+
 /// One step of a mission. `done` flips when the character ticks it off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Todo {
@@ -134,6 +136,14 @@ pub enum Origin {
     /// for the room `room` (`area/node`) — see `engine::mission_gen::standing`
     /// and `docs/zen_moon_mind.md` §12.
     Standing { id: String, room: String },
+    /// Set by the table to a body that takes no orders: item `id` of its
+    /// world's round — see `engine::mission_gen::round` and
+    /// `docs/zen_moon_mind.md` §17. Closed by the engine when its steps are
+    /// signed off, with no report.
+    Round { id: String },
+    /// Made by its carrier for its own agenda (`mission_add`,
+    /// `docs/zen_moon_mind.md` §17.2).
+    Own,
     /// Written by the command table for one step of an operation's workflow
     /// (`generator` names which of the configured generators found the work,
     /// `target` the piece of the corpus it is about, `operation` the operation
@@ -247,6 +257,11 @@ pub struct Mission {
     /// §14), in the room it is for — a standing mission's own.
     #[serde(default)]
     pub grants: Vec<String>,
+    /// Its place on the carrier's agenda — its title and priority — when the
+    /// carrier keeps one (`docs/zen_moon_mind.md` §17.1). `None` for a mission
+    /// carried alone.
+    #[serde(default)]
+    pub agendum: Option<Agendum>,
 }
 
 impl Mission {
@@ -266,7 +281,14 @@ impl Mission {
             work: None,
             year: None,
             grants: Vec::new(),
+            agendum: None,
         }
+    }
+
+    /// The same mission, on an agenda as `agendum`.
+    pub fn on_agenda(mut self, agendum: Agendum) -> Self {
+        self.agendum = Some(agendum);
+        self
     }
 
     /// The same mission, about `work`.
@@ -607,6 +629,40 @@ impl Mission {
         self.tick_about(who, SPEAKING) || met
     }
 
+    /// Sign off every open step that posts work, because the carrier's
+    /// `order_post` put a mission on the table. Returns whether anything was
+    /// signed off.
+    pub fn posted_work(&mut self) -> bool {
+        self.tick_opening(POSTING)
+    }
+
+    /// Sign off every open step that reads what came back, because the
+    /// carrier's `order_results` read the reports. Returns whether anything was
+    /// signed off.
+    pub fn read_results(&mut self) -> bool {
+        self.tick_opening(READING_RESULTS)
+    }
+
+    /// Sign off every open step that reads the carrier's messages, because a
+    /// `read` took a conversation off its phone. Returns whether anything was
+    /// signed off.
+    pub fn read_messages(&mut self) -> bool {
+        self.tick_opening(READING_MESSAGES)
+    }
+
+    /// Sign off every open step that opens with `opening`.
+    fn tick_opening(&mut self, opening: &str) -> bool {
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if step.text.trim().to_lowercase().starts_with(opening) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
     fn tick_about(&mut self, who: &str, verbs: &[&str]) -> bool {
         let mut ticked = false;
         for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
@@ -702,12 +758,21 @@ impl Mission {
             out.push_str("\nThe steps that see it through:\n");
             out.push_str(&tasks);
         }
-        out.push_str(
-            "\nCarry it out. When it is done, go back to the table where work is handed out, \
-             `scan` it, and report on your effector device — `invoke` its `report_done` with \
-             what you found, or its `report_stuck` with what stopped you if it cannot be \
-             finished — and take up the next.",
-        );
+        // **A mission of an agenda is closed by what is seen done**, not by a
+        // report at the table (`docs/zen_moon_mind.md` §17.5).
+        out.push_str(match self.agendum {
+            Some(_) => {
+                "\nCarry it out. It is done when every step is seen done. If it is finished in \
+                 a way no step shows, close it with `mission_done`; if it has stopped being \
+                 worth doing, drop it with `mission_cancel`."
+            }
+            None => {
+                "\nCarry it out. When it is done, go back to the table where work is handed out, \
+                 `scan` it, and report on your effector device — `invoke` its `report_done` with \
+                 what you found, or its `report_stuck` with what stopped you if it cannot be \
+                 finished — and take up the next."
+            }
+        });
         out
     }
 
@@ -1265,6 +1330,16 @@ const MEETING: &[&str] = &[
     "look in on ",
     "meet ",
 ];
+
+/// How a step that puts work on the order table begins (`order_post`).
+const POSTING: &str = "post work";
+
+/// How a step that reads what came back to the order table begins
+/// (`order_results`).
+const READING_RESULTS: &str = "read what came back";
+
+/// How a step that reads the carrier's phone begins (`read`).
+const READING_MESSAGES: &str = "read your messages";
 
 /// How a step that is about saying something to somebody begins.
 const SPEAKING: &[&str] = &[
@@ -1975,6 +2050,43 @@ mod tests {
         );
         assert!(m.spoke_with("Ione Valtiere"));
         assert!(m.next_step().unwrap().reports);
+    }
+
+    /// **An order-giver's steps are signed off by its acts landing**: a post
+    /// signs off the step that posts work, a reading of the reports the step
+    /// that reads what came back, and a read of the phone the step that reads
+    /// the messages — each only its own.
+    #[test]
+    fn an_order_givers_steps_are_signed_off_by_its_acts() {
+        let mut m = Mission::new(
+            "Keep the table.",
+            vec![
+                Todo::new("read what came back at the order table"),
+                Todo::new("Post work on the order table"),
+                Todo::new("read your messages"),
+            ],
+            Origin::Round {
+                id: "keep-the-table".into(),
+            },
+        );
+        assert!(m.posted_work());
+        assert!(!m.posted_work(), "signed off already");
+        let open: Vec<&str> = m
+            .todo
+            .iter()
+            .filter(|t| !t.done)
+            .map(|t| t.text.as_str())
+            .collect();
+        assert_eq!(
+            open,
+            [
+                "read what came back at the order table",
+                "read your messages"
+            ]
+        );
+        assert!(m.read_results());
+        assert!(m.read_messages());
+        assert!(m.all_todos_done());
     }
 
     /// **The compass names the next step and where the person it names is.**

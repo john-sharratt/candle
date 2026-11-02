@@ -23,6 +23,7 @@ use super::corpus::Corpus;
 use super::gates;
 use super::material;
 use super::reading;
+use super::round;
 use super::standing;
 use super::step;
 use super::target::{self, Kind, Target};
@@ -724,6 +725,7 @@ pub fn spawn(rt: Arc<Runtime>) {
         let mut told: Option<String> = None;
         let mut told_world: BTreeMap<String, String> = BTreeMap::new();
         let mut told_standing: BTreeMap<String, String> = BTreeMap::new();
+        let mut told_round: BTreeMap<String, String> = BTreeMap::new();
         loop {
             tokio::time::sleep(TICK).await;
             if rt.stopping() {
@@ -777,6 +779,36 @@ pub fn spawn(rt: Arc<Runtime>) {
                                 tracing::warn!(world = %id, "a world's standing missions: {e}");
                                 told_standing.insert(id.clone(), e);
                             }
+                        }
+                    }
+                }
+                // **The round** (`docs/zen_moon_mind.md` §17.3): read on every
+                // member, since whether a world has one decides how a body that
+                // takes no orders is woken and what the table gives it; what
+                // the agendas have seen done is closed and stamped by the
+                // world's authority.
+                match round::load(&mind, &id) {
+                    Ok(items) => {
+                        told_round.remove(&id);
+                        let settles = rt.standing.role(&id).is_authority();
+                        let closed = hosted.with_sim(|s| {
+                            s.missions.set_round(items);
+                            if !settles {
+                                return Vec::new();
+                            }
+                            let now = now_ms();
+                            let closed = s.missions.settle_agendas(now);
+                            s.missions.stamp_round(now);
+                            closed
+                        });
+                        for (body, item, outcome) in closed {
+                            tracing::info!(world = %id, %body, %item, ?outcome, "agenda: closed");
+                        }
+                    }
+                    Err(e) => {
+                        if told_round.get(&id) != Some(&e) {
+                            tracing::warn!(world = %id, "a world's round: {e}");
+                            told_round.insert(id.clone(), e);
                         }
                     }
                 }

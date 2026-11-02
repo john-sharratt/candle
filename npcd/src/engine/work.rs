@@ -31,6 +31,7 @@ use std::sync::Arc;
 use doc_units::{Doc, Edit, Op, Place};
 use serde_json::{Map, Value};
 
+use crate::api::now_ms;
 use crate::engine::act::Act;
 use crate::engine::archive;
 use crate::engine::body::Outcome;
@@ -38,7 +39,7 @@ use crate::engine::chronology;
 use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict};
 use crate::engine::mission_gen::config::{CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC};
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
-use crate::engine::mission_gen::{gates, leakage, rejection};
+use crate::engine::mission_gen::{gates, leakage, rejection, round};
 use crate::engine::order_table;
 use crate::engine::passage;
 use crate::engine::workflow::OnFailed;
@@ -113,13 +114,27 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
         // **The world gives an unordered character no orders** — see
-        // [`crate::sim::missions::Missions::set_unordered`]. The table does not
-        // offer it the act; this is the act refused if it is asked for anyway.
-        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => Outcome::Refused(
-            "Nothing at this table is yours to take up: the work here is for others, and \
-             nobody gives you orders."
-                .into(),
-        ),
+        // [`crate::sim::missions::Missions::set_unordered`] — but with its
+        // agenda empty the table gives it the next item of its world's round
+        // (`docs/zen_moon_mind.md` §17.3), and nothing else.
+        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => {
+            hosted.with_sim(|s| {
+                if s.missions.is_on_mission(body) {
+                    return Outcome::Refused(
+                        "You have work on your agenda: the table gives you your round only when \
+                         it is empty."
+                            .into(),
+                    );
+                }
+                match round::collect(s, body, now_ms()) {
+                    Some(m) => Outcome::Did(format!("You take it up.\n{}", m.standing_text())),
+                    None => Outcome::Refused(
+                        "Nothing on your round is due now. Rest until something reaches you."
+                            .into(),
+                    ),
+                }
+            })
+        }
         // The table's orders are given by a character that takes none; the
         // table does not offer them to anybody else, and refuses them if asked.
         "order_post" | "order_results" if !hosted.sim(|s| s.missions.is_unordered(body)) => {

@@ -25,14 +25,20 @@
 //! A target is settled when its operation is, not when one of its steps is
 //! reported.
 
+use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use super::agenda::{Agendum, Priority, KEEP};
 use super::operations::{Operation, Operations};
 use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
+use super::round::RoundState;
 use crate::engine::mission::bank::{self, Duty, Facts};
-use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome};
+use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome, Todo};
+use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
 
@@ -198,6 +204,22 @@ pub struct Missions {
     /// mind's, with the routines.
     #[serde(skip)]
     draw: Draw,
+    /// What the world's round has done — see [`super::round`].
+    #[serde(default)]
+    round: RoundState,
+    /// The world's round, from `<mind>/missions/<world>/round.yaml` — the
+    /// mind's, read afresh like the routines.
+    #[serde(skip)]
+    round_items: Vec<RoundItem>,
+    /// The missions on each agenda set aside behind the one worked, by body
+    /// (`docs/zen_moon_mind.md` §17.1): the worked one is the body's
+    /// [`Self::active`].
+    #[serde(default)]
+    held: BTreeMap<String, Vec<Mission>>,
+    /// How many missions have come onto any agenda — what orders missions of
+    /// one priority, oldest first.
+    #[serde(default)]
+    agenda_count: u64,
 }
 
 impl Missions {
@@ -236,6 +258,311 @@ impl Missions {
     /// [`Self::set_unordered`].
     pub fn is_unordered(&self, body: &str) -> bool {
         self.unordered.contains(body)
+    }
+
+    /// Set the world's round (`docs/zen_moon_mind.md` §17) — empty for a
+    /// world with none.
+    pub fn set_round(&mut self, items: Vec<RoundItem>) {
+        self.round_items = items;
+    }
+
+    /// The world's round.
+    pub fn round_items(&self) -> &[RoundItem] {
+        &self.round_items
+    }
+
+    /// Whether the world has a round, which is what a body that takes no
+    /// orders does when nothing calls for it.
+    pub fn has_round(&self) -> bool {
+        !self.round_items.is_empty()
+    }
+
+    /// What the round has done.
+    pub fn round(&self) -> &RoundState {
+        &self.round
+    }
+
+    /// Give `body` a round item's `mission` at `now_ms`, at `later` on its
+    /// agenda, named `title`.
+    pub fn take_round(&mut self, body: &str, mission: Mission, title: &str, now_ms: u64) {
+        if let Origin::Round { id } = &mission.origin {
+            self.round.set(body, id, now_ms);
+        }
+        let agendum = self.agendum(title, Priority::Later);
+        self.active
+            .insert(body.to_string(), mission.on_agenda(agendum));
+    }
+
+    /// A place on an agenda for a mission coming onto it now.
+    fn agendum(&mut self, title: &str, priority: Priority) -> Agendum {
+        self.agenda_count += 1;
+        Agendum {
+            title: title.trim().to_string(),
+            priority,
+            since: self.agenda_count,
+        }
+    }
+
+    /// Every mission on `body`'s agenda: the one worked first, then the rest
+    /// by rank.
+    pub fn agenda(&self, body: &str) -> Vec<&Mission> {
+        self.active
+            .get(body)
+            .into_iter()
+            .chain(self.held.get(body).into_iter().flatten())
+            .collect()
+    }
+
+    /// The titles of `body`'s agenda — what its agenda acts name a mission
+    /// by.
+    pub fn agenda_titles(&self, body: &str) -> Vec<String> {
+        self.agenda(body)
+            .into_iter()
+            .filter_map(|m| m.agendum.as_ref().map(|a| a.title.clone()))
+            .collect()
+    }
+
+    /// Put `mission` on `body`'s agenda as `title` at `priority`: worked at
+    /// once when it outranks the one being worked, which is set aside with
+    /// its steps as they stand.
+    ///
+    /// Refused when the agenda is full ([`KEEP`]), naming the lowest to finish
+    /// or drop first, or when a mission there is already called `title`.
+    pub fn agenda_add(
+        &mut self,
+        body: &str,
+        mission: Mission,
+        title: &str,
+        priority: Priority,
+    ) -> Result<(), String> {
+        let titles = self.agenda_titles(body);
+        if titles.iter().any(|t| t.eq_ignore_ascii_case(title.trim())) {
+            return Err(format!(
+                "Your agenda already has a mission called \"{}\": change it with \
+                 `mission_edit`, or name this one differently.",
+                title.trim()
+            ));
+        }
+        if self.agenda(body).len() >= KEEP {
+            let lowest = self
+                .agenda(body)
+                .into_iter()
+                .filter_map(|m| m.agendum.as_ref())
+                .min_by_key(|a| (a.priority, Reverse(a.since)))
+                .map(|a| a.title.clone())
+                .unwrap_or_default();
+            return Err(format!(
+                "Your agenda is full — {KEEP} missions. Finish or drop one first: the lowest is \
+                 \"{lowest}\"."
+            ));
+        }
+        let agendum = self.agendum(title, priority);
+        self.held
+            .entry(body.to_string())
+            .or_default()
+            .push(mission.on_agenda(agendum));
+        self.agenda_rank(body);
+        Ok(())
+    }
+
+    /// Change the mission on `body`'s agenda called `title`: its brief, its
+    /// steps — those it had signed off that it keeps stay signed off — or its
+    /// priority, worked at once if it now outranks the one being worked.
+    pub fn agenda_edit(
+        &mut self,
+        body: &str,
+        title: &str,
+        brief: Option<String>,
+        steps: Option<Vec<String>>,
+        priority: Option<Priority>,
+    ) -> Result<(), String> {
+        let m = self.agenda_mut(body, title)?;
+        if let Some(brief) = brief {
+            m.prompt = brief;
+        }
+        if let Some(steps) = steps {
+            let was = std::mem::take(&mut m.todo);
+            m.todo = steps
+                .into_iter()
+                .map(|text| {
+                    was.iter()
+                        .find(|t| t.text.trim().eq_ignore_ascii_case(text.trim()))
+                        .cloned()
+                        .unwrap_or_else(|| Todo::new(text))
+                })
+                .collect();
+        }
+        if let (Some(p), Some(a)) = (priority, m.agendum.as_mut()) {
+            a.priority = p;
+        }
+        self.agenda_rank(body);
+        Ok(())
+    }
+
+    /// Close the mission on `body`'s agenda called `title` as done, on
+    /// `found` — the agenda's own close, for a mission no step shows done.
+    pub fn agenda_done(&mut self, body: &str, title: &str, found: &str) -> Result<Mission, String> {
+        self.agenda_work(body, title)?;
+        self.report(body, Outcome::Pass, found, None)
+            .ok_or_else(|| format!("You have no mission called \"{title}\"."))
+    }
+
+    /// Drop the mission on `body`'s agenda called `title`, for `why`.
+    pub fn agenda_cancel(&mut self, body: &str, title: &str, why: &str) -> Result<Mission, String> {
+        self.agenda_work(body, title)?;
+        let m = self
+            .active
+            .get(body)
+            .cloned()
+            .ok_or_else(|| format!("You have no mission called \"{title}\"."))?;
+        self.cancel_for(body, why);
+        let mut m = m;
+        m.complete(Outcome::Fail, why, None);
+        Ok(m)
+    }
+
+    /// The mission on `body`'s agenda called `title`, wherever it stands.
+    fn agenda_mut(&mut self, body: &str, title: &str) -> Result<&mut Mission, String> {
+        let named = |m: &Mission| {
+            m.agendum
+                .as_ref()
+                .is_some_and(|a| a.title.eq_ignore_ascii_case(title.trim()))
+        };
+        if self.active.get(body).is_some_and(named) {
+            return Ok(self.active.get_mut(body).expect("just found"));
+        }
+        self.held
+            .get_mut(body)
+            .and_then(|h| h.iter_mut().find(|m| named(m)))
+            .ok_or_else(|| format!("You have no mission called \"{}\".", title.trim()))
+    }
+
+    /// Make the mission on `body`'s agenda called `title` the one worked, the
+    /// one it replaces set aside.
+    fn agenda_work(&mut self, body: &str, title: &str) -> Result<(), String> {
+        self.agenda_mut(body, title)?;
+        let held = self.held.entry(body.to_string()).or_default();
+        if let Some(at) = held.iter().position(|m| {
+            m.agendum
+                .as_ref()
+                .is_some_and(|a| a.title.eq_ignore_ascii_case(title.trim()))
+        }) {
+            let m = held.remove(at);
+            if let Some(was) = self.active.insert(body.to_string(), m) {
+                self.held.entry(body.to_string()).or_default().push(was);
+            }
+        }
+        Ok(())
+    }
+
+    /// Put `body`'s agenda in order: the highest-ranked mission worked, the
+    /// rest held behind it by rank — priority, then oldest first.
+    fn agenda_rank(&mut self, body: &str) {
+        let mut all: Vec<Mission> = self.active.remove(body).into_iter().collect();
+        all.extend(self.held.remove(body).unwrap_or_default());
+        if all.is_empty() {
+            return;
+        }
+        all.sort_by_key(|m| m.agendum.as_ref().map(|a| (Reverse(a.priority), a.since)));
+        let mut all = all.into_iter();
+        if let Some(top) = all.next() {
+            self.active.insert(body.to_string(), top);
+        }
+        let rest: Vec<Mission> = all.collect();
+        if !rest.is_empty() {
+            self.held.insert(body.to_string(), rest);
+        }
+    }
+
+    /// The agenda's prompt section for `body`: the mission worked, as any
+    /// carried mission reads, and the rest listed beneath it — `None` with
+    /// nothing carried.
+    pub fn agenda_prompt(&self, body: &str) -> Option<MissionPrompt> {
+        let worked = self.active.get(body)?.prompt();
+        let held = self.held.get(body).filter(|h| !h.is_empty());
+        let Some(held) = held else {
+            return Some(worked);
+        };
+        let lines: Vec<String> = held
+            .iter()
+            .filter_map(|m| {
+                let a = m.agendum.as_ref()?;
+                let next = m.next_step().map_or("every step done".to_string(), |t| {
+                    format!("next: {}", t.text.trim())
+                });
+                Some(format!("- {} ({}) — {next}", a.title, a.priority.as_str()))
+            })
+            .collect();
+        let text = format!(
+            "{}\nAlso on your agenda, set aside until this is done:\n{}",
+            worked.text,
+            lines.join("\n")
+        );
+        let mut h = DefaultHasher::new();
+        text.hash(&mut h);
+        Some(MissionPrompt {
+            text,
+            fingerprint: h.finish(),
+        })
+    }
+
+    /// Stamp every round item done or failed since the last stamp at
+    /// `now_ms`.
+    pub fn stamp_round(&mut self, now_ms: u64) {
+        self.round.stamp(now_ms);
+    }
+
+    /// Close every mission worked on an agenda whose steps are all signed off,
+    /// as done, and call off as failed every round mission carried
+    /// [`STALE_MS`] without — an agenda is closed by what the engine saw, with
+    /// no report (`docs/zen_moon_mind.md` §17.5). Returns each body closed, the
+    /// mission's title, and how.
+    pub fn settle_agendas(&mut self, now_ms: u64) -> Vec<(String, String, Outcome)> {
+        let closing: Vec<(String, String, Outcome)> = self
+            .active
+            .iter()
+            .filter_map(|(body, m)| {
+                let title = m.agendum.as_ref()?.title.clone();
+                let stale = matches!(m.origin, Origin::Round { .. })
+                    && self
+                        .round
+                        .set_at(body)
+                        .is_some_and(|at| now_ms >= at.saturating_add(STALE_MS));
+                match (m.all_todos_done(), stale) {
+                    (true, _) => Some((body.clone(), title, Outcome::Pass)),
+                    (false, true) => Some((body.clone(), title, Outcome::Fail)),
+                    (false, false) => None,
+                }
+            })
+            .collect();
+        for (body, _, outcome) in &closing {
+            let notes = match outcome {
+                Outcome::Pass => "every step was seen done",
+                Outcome::Fail => "carried an hour without every step done",
+            };
+            self.report(body, *outcome, notes, None);
+        }
+        closing
+    }
+
+    /// Sign off the body's open steps that post work — its `order_post`
+    /// landed. Returns whether anything was signed off.
+    pub fn posted_work(&mut self, body: &str) -> bool {
+        self.active.get_mut(body).is_some_and(Mission::posted_work)
+    }
+
+    /// Sign off the body's open steps that read what came back — its
+    /// `order_results` landed. Returns whether anything was signed off.
+    pub fn read_results(&mut self, body: &str) -> bool {
+        self.active.get_mut(body).is_some_and(Mission::read_results)
+    }
+
+    /// Sign off the body's open steps that read its messages — a `read` of
+    /// its phone landed. Returns whether anything was signed off.
+    pub fn read_messages(&mut self, body: &str) -> bool {
+        self.active
+            .get_mut(body)
+            .is_some_and(Mission::read_messages)
     }
 
     /// The body's open mission, if it is on one.
@@ -277,10 +604,13 @@ impl Missions {
     /// journal entry in the mission's place.
     fn close(&mut self, body: &str, mission: &Mission) {
         // A standing job posted at the table is a routine still, whoever set
-        // it.
+        // it, and so is an item of the round.
         if matches!(
             mission.origin,
-            Origin::Random { .. } | Origin::Ordered { job: Some(_), .. }
+            Origin::Random { .. }
+                | Origin::Ordered { job: Some(_), .. }
+                | Origin::Round { .. }
+                | Origin::Own
         ) {
             return;
         }
@@ -1165,8 +1495,12 @@ impl Missions {
                 if let Some((id, _)) = m.operation() {
                     self.operations.cancel(id, "its mission was called off");
                 }
+                if matches!(m.origin, Origin::Round { .. }) {
+                    self.round.dropped(body);
+                }
                 self.called_off(body, &m, why);
                 self.close(body, &m);
+                self.agenda_rank(body);
                 true
             }
             None => false,
@@ -1294,10 +1628,13 @@ impl Missions {
                     notes: notes.to_string(),
                 });
             }
+            Origin::Round { id } => self.round.closed(body, id, outcome),
             _ => {}
         }
         self.done.insert(body.to_string(), mission.clone());
         self.close(body, &mission);
+        // The next on the agenda is worked, where it was left.
+        self.agenda_rank(body);
         Some(mission)
     }
 

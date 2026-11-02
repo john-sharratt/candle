@@ -41,6 +41,7 @@ use npc_map::NodeKind;
 
 use crate::bridge;
 use crate::engine::act::Act;
+use crate::engine::agenda;
 use crate::engine::build;
 use crate::engine::tools::CATALOG;
 use crate::world::Hosted;
@@ -193,6 +194,7 @@ pub fn is_of_the_body(tool: &str) -> bool {
             | "reflect"
     ) || crate::engine::enact::is_mine(tool)
         || crate::engine::work::is_mine(tool)
+        || agenda::is_mine(tool)
 }
 
 /// Whether this act is an effector-device call — `invoke`.
@@ -264,6 +266,7 @@ fn dispatch(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         // working loop over them. Checked first because the station surface is
         // the larger of the two and its names are unambiguous.
         t if crate::engine::work::is_mine(t) => crate::engine::work::perform(hosted, body, act),
+        t if agenda::is_mine(t) => agenda::perform(hosted, body, act),
         _ => crate::engine::enact::perform(hosted, body, act),
     }
 }

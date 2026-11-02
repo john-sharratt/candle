@@ -14,6 +14,7 @@ use npc_map::MapSet;
 
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::mission::{Mission, Origin, Todo};
+use crate::engine::mission_gen::round::ROUND_FILE;
 use crate::mind::files::MindFiles;
 use crate::sim::missions::Missions;
 
@@ -181,12 +182,13 @@ impl Standing {
     }
 }
 
-/// Every standing mission of world `world`, from `missions/<world>/`.
+/// Every standing mission of world `world`, from `missions/<world>/` — every
+/// file there but the round's ([`ROUND_FILE`]).
 pub fn load(mind: &MindFiles, world: &str) -> Result<Vec<Standing>, String> {
     let dir = format!("missions/{world}");
     let mut out = Vec::new();
     for name in mind.list(&dir) {
-        if !name.ends_with(".yaml") {
+        if !name.ends_with(".yaml") || name == ROUND_FILE {
             continue;
         }
         let file = format!("{dir}/{name}");

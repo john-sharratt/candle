@@ -49,6 +49,7 @@
 
 pub mod act;
 pub mod acts;
+pub mod agenda;
 pub mod archive;
 pub mod ask_api;
 pub mod at_work;

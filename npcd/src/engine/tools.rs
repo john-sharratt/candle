@@ -51,9 +51,11 @@ use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
 use crate::bridge::BRIDGE_ACTS;
+use crate::engine::agenda::AGENDA_ACTS;
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::{acts, bench, mission, mission_acts, station};
+use crate::sim::agenda::Priority;
 use crate::sim::phone::Kind as ThreadKind;
 
 /// What a tool changes, which decides where it can be used and what it must be
@@ -968,6 +970,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(station::STATION_ACTS)
         .chain(bench::BENCH_ACTS)
         .chain(mission_acts::MISSION_ACTS)
+        .chain(AGENDA_ACTS)
         .chain(BRIDGE_ACTS)
         .chain(BUILD_ACTS)
         .copied()
@@ -1594,6 +1597,15 @@ pub enum Choices {
     ///
     /// Empty when nothing waits, which takes `reply` out of the grammar.
     Awaiting,
+    /// A mission on this character's agenda, by its title — what
+    /// `mission_edit`, `mission_cancel` and `mission_done` name
+    /// (`docs/zen_moon_mind.md` §17.1). Empty with nothing on it, which takes
+    /// them out of the grammar.
+    Agenda,
+    /// How soon a mission on the agenda is to be done: `now`, `soon`,
+    /// `later`. Offered only to a character that takes no orders — the one
+    /// that keeps an agenda — which is what gates `mission_add` to it.
+    Priorities,
     /// The conversations this character can actually **leave**.
     ///
     /// [`Choices::Threads`] less the world's standing channels, and the
@@ -1820,6 +1832,13 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("move_to", "destination", Choices::Reachable),
     ("focus", "on", Choices::Rooms),
     ("order_post", "job", Choices::Jobs),
+    // An agenda's own acts (`engine::agenda`): added at a priority, and
+    // changed, dropped or closed by title.
+    ("mission_add", "priority", Choices::Priorities),
+    ("mission_edit", "mission", Choices::Agenda),
+    ("mission_edit", "priority", Choices::Priorities),
+    ("mission_cancel", "mission", Choices::Agenda),
+    ("mission_done", "mission", Choices::Agenda),
     // The house's bridges (`bridge::acts`) and the world building itself
     // (`engine::build`): each bound to what stands in this room, so an act is
     // offered only where the thing it works is.
@@ -2024,6 +2043,11 @@ pub struct Within {
     /// The subset of [`Self::threads`] where somebody else spoke last — see
     /// [`Choices::Awaiting`].
     pub awaiting: Vec<String>,
+    /// The titles of this character's agenda — [`Choices::Agenda`].
+    pub agenda: Vec<String>,
+    /// The priorities an agenda takes, for a character that keeps one —
+    /// [`Choices::Priorities`].
+    pub priorities: Vec<String>,
     /// The subset of [`Self::threads`] it is able to leave — see
     /// [`Choices::Leavable`].
     pub leavable: Vec<String>,
@@ -2193,6 +2217,14 @@ impl Within {
         self.private = sim.threads_of_kind_for(&self.me, body, ThreadKind::Direct);
         self.channels = sim.threads_of_kind_for(&self.me, body, ThreadKind::Group);
         self.awaiting = sim.awaiting_for(&self.me, body);
+        // An agenda is kept by a character that takes no orders.
+        if sim.missions.is_unordered(body) {
+            self.agenda = sim.missions.agenda_titles(body);
+            self.priorities = Priority::ALL
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect();
+        }
         self.leavable = sim.leavable_for(&self.me, body);
         self.invitable = sim.invitable_for(&self.me, body);
         self.invitees = sim.invitees_for(&self.me, body);
@@ -2560,6 +2592,8 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Private => within.private.clone(),
         Choices::Channels => within.channels.clone(),
         Choices::Awaiting => within.awaiting.clone(),
+        Choices::Agenda => within.agenda.clone(),
+        Choices::Priorities => within.priorities.clone(),
         Choices::Leavable => within.leavable.clone(),
         Choices::Invitable => within.invitable.clone(),
         Choices::Invitees => within.invitees.clone(),
@@ -4140,6 +4174,7 @@ mod tests {
             .chain(station::STATION_ACTS)
             .chain(bench::BENCH_ACTS)
             .chain(mission_acts::MISSION_ACTS)
+            .chain(AGENDA_ACTS)
             .chain(BRIDGE_ACTS)
             .chain(BUILD_ACTS)
             .map(|t| t.name)

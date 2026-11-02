@@ -32,6 +32,7 @@
 //! state, which is what makes the tool tests able to assert a live set rather
 //! than assert that one is plausible.
 
+pub mod agenda;
 pub mod bench;
 pub mod built;
 pub mod decisions;
@@ -49,6 +50,7 @@ pub mod phone;
 pub mod posting;
 pub mod reading;
 pub mod record;
+pub mod round;
 pub mod seed;
 pub mod shelf;
 pub mod tower;

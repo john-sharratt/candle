@@ -151,7 +151,11 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         None => "for whoever comes for work first".to_string(),
     };
     let id = to.as_ref().map(|(id, _)| id.as_str());
-    hosted.with_sim(|s| s.missions.post(mission, id));
+    // Posting work is a step of the poster's round, seen done as it lands.
+    hosted.with_sim(|s| {
+        s.missions.post(mission, id);
+        s.missions.posted_work(body);
+    });
     Outcome::Did(format!(
         "Posted on the table, {for_whom}: {brief} You will be told when it is reported."
     ))
@@ -180,7 +184,12 @@ fn who_takes_orders(hosted: &Hosted) -> String {
 /// newest first — read now — what is still out, and, with the table empty, the
 /// standing jobs it may post.
 pub fn results(hosted: &Hosted, body: &str) -> Outcome {
-    let filed = hosted.with_sim(|s| s.missions.read_by(body));
+    // Reading what came back is a step of the reader's round, seen done as it
+    // lands.
+    let filed = hosted.with_sim(|s| {
+        s.missions.read_results(body);
+        s.missions.read_by(body)
+    });
     let (out, empty, jobs) = hosted.sim(|s| {
         (
             s.missions.out_for(body),

@@ -107,6 +107,7 @@ use crate::engine::mission_gen;
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
+use crate::engine::mission_gen::round;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
@@ -716,6 +717,12 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting on you. Your \
                                  time is your own, to spend however you choose.";
 
+/// The idle wake for a character that takes no orders, with an empty agenda,
+/// while its world's round has something due (`docs/zen_moon_mind.md` §17.3).
+pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you. \
+                             Turn your attention to the order table and take it up with \
+                             `collect_mission`.";
+
 /// What a character is told when its mission is called off: the errand is
 /// withdrawn, nothing of it is still owed, and what it said about it earlier is
 /// no longer a commitment.
@@ -1271,16 +1278,25 @@ impl Runtime {
         // what rouses a character gone quiet. It is told its own idle thought
         // when its personality has one, and otherwise only that its time is its
         // own. See [`YOUR_OWN_TIME`].
-        let (on_mission, table_open, unordered, waits) = hosted.sim(|s| {
+        let (on_mission, table_open, unordered, waits, round, round_due) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
                 !s.missions.draws() && !s.missions.has_work_for(&body),
+                s.missions.has_round(),
+                round::due_for(s, &body, crate::api::now_ms()),
             )
         });
         if on_mission {
             return None;
+        }
+        // **In a world with a round, an empty agenda is the table's to fill**
+        // for a character that takes no orders (`docs/zen_moon_mind.md`
+        // §17.3–§17.4): sent there while something on the round is due, and
+        // with nothing due not woken to find something to say.
+        if unordered && round {
+            return round_due.then(|| ROUND_DUE.to_string());
         }
         let idle = self.idles.read().unwrap().get(&npc_id).cloned();
         if unordered {
@@ -4161,7 +4177,8 @@ impl Runtime {
                 who.building = key;
                 who.place = text;
             }
-            who.mission = hosted.sim(|s| s.missions.active(&body).map(|m| m.prompt()));
+            // The mission worked, with the rest of an agenda listed beneath it.
+            who.mission = hosted.sim(|s| s.missions.agenda_prompt(&body));
             let me = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()));
             if let Some(me) = me {
                 who.channels =

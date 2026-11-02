@@ -402,6 +402,7 @@ doing), and only to a character that takes no orders:
 | `mission_add` | `{title, brief, steps, priority}` — a new mission on the agenda, steps one to a line as `order_post` takes them. |
 | `mission_edit` | `{mission, brief?, steps?, priority?}` — changes one; steps already signed off stay signed off. |
 | `mission_cancel` | `{mission, why}` — drops one; what it was and why goes on its record. |
+| `mission_done` | `{mission, found}` — closes one as done that no step shows done: a step that is Zen's to judge. |
 
 This is how Zen reacts in real time: a message that asks for something becomes a mission at
 `now` on top of whatever it was doing; news that makes a plan pointless cancels it; a change of
@@ -477,9 +478,8 @@ A round item collected joins the agenda at `later`, so anything Zen adds of its 
 
 With an empty agenda and nothing on the round due, **Zen is not woken** — no idle thought, no
 restated task — until something reaches it: a message, a report, a tannoy, or an item of the round
-coming due, which wakes it with a word that rouses without breaking off what it is doing
-(`Salience` between the bars) and points at the table. A world with no round wakes Zen with its
-`idle:` as before (§7).
+coming due, when its idle wake is `ROUND_DUE`, which points it at the table. A world with no round
+wakes Zen with its `idle:` as before (§7).
 
 ### 17.5 Done is seen, not said
 
@@ -495,8 +495,8 @@ done, stamped, and the agenda moves on. Each step is signed off by the act it na
 | `read your messages` | `read` takes a conversation off the phone |
 
 A mission of Zen's own is closed the same way when its steps are seen done; one whose steps the
-engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_cancel`, saying
-it is done. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
+engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_done`, saying what
+it found — never filed as dropped. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
 is called off as failed, rests as a failure does, and the round moves on — so a step Zen cannot do
 holds the round up for an hour, never for good.
 
@@ -516,8 +516,6 @@ holds the round up for an hour, never for good.
   grammar a closed set and the choice legible.
 - **The agenda's size.** Eight is a guess at what a prompt can carry without the list crowding
   out the mission being worked.
-- **Closing Zen's own missions.** Seen-done where the engine can see the steps, `mission_cancel`
-  where it cannot — or a `mission_done` of its own, so a finished mission is not filed as dropped?
 - **The round's first items for `life`**: read the reports (`when: reports`), set the work
   (`when: table-empty`), watch Earth (`every: 2h`), look in on the Sharratts (`every: 6h`), tell
   the story circle (`every: 1d`) — each ending in an act that changes something.

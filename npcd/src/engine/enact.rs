@@ -290,6 +290,11 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         // the unread reminder (`sim::unread`).
         if s.has_phone(body) {
             if let Some(said) = read_phone(&mut s.threads, &me, &what) {
+                // Reading its messages is a step of the reader's round, seen
+                // done as it lands.
+                if said.happened() {
+                    s.missions.read_messages(body);
+                }
                 return said;
             }
         }
