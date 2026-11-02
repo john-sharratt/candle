@@ -1469,6 +1469,11 @@ impl Hub {
         self.state().registry.pick_agent(app, lineage, need, waited)
     }
 
+    /// The programs the ready agents of `app` holding `repo` start.
+    pub fn agent_programs(&self, app: &str, repo: &str) -> Vec<String> {
+        self.state().registry.agent_programs(app, repo)
+    }
+
     /// Open a stream to `node`'s socket for `app`, towards `target`.
     pub fn open(&self, app: &str, node: u64, target: &str) -> Option<VirtualConn> {
         let handle = self

@@ -120,9 +120,7 @@ impl CommandPolicy {
         if program.contains('\0') || command.args.iter().any(|a| a.contains('\0')) {
             return Err(Refused::Nul);
         }
-        if let Some(command) = direct_git(command) {
-            return Err(Refused::Git { command });
-        }
+        refuse_git(command)?;
         if !self.programs.contains(program) {
             return Err(Refused::NotAllowed {
                 program: program.clone(),
@@ -165,6 +163,14 @@ impl CommandPolicy {
             return Err(refuse("there is no such file in the repository".into()));
         }
         Ok(())
+    }
+}
+
+/// `command` refused when it runs git directly, the rule no policy lifts.
+pub fn refuse_git(command: &SandboxCommand) -> Result<(), Refused> {
+    match direct_git(command) {
+        Some(command) => Err(Refused::Git { command }),
+        None => Ok(()),
     }
 }
 

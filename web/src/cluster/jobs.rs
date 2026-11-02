@@ -60,6 +60,24 @@ pub fn no_agent(why: String) -> Response {
         .into_response()
 }
 
+/// Why no agent fits a job needing `need`, with what the agents holding its
+/// repository do start: told only that `python3` had no agent, a worker went on
+/// to try `od`, `magick` and `git`, a round each.
+fn unfit(need: &Need, programs: &[String]) -> String {
+    let wanted = need
+        .toolchain
+        .as_ref()
+        .map_or(String::new(), |t| format!(" with `{t}`"));
+    let why = format!("no ready agent holds repository `{}`{wanted}", need.repo);
+    if programs.is_empty() || need.toolchain.is_none() {
+        return why;
+    }
+    format!(
+        "{why}; the programs that run in it: {}",
+        programs.join(", ")
+    )
+}
+
 /// Send one request from member `from` (at `peer`) to an agent.
 pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Request) -> Response {
     let hub = &gateway.hub;
@@ -83,13 +101,7 @@ pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Reques
                 Choice::Run(node) => break node,
                 Choice::Wait => sleep(LOOK_EVERY).await,
                 Choice::NoAgent => {
-                    return no_agent(format!(
-                        "no ready agent holds repository `{}`{}",
-                        need.repo,
-                        need.toolchain
-                            .as_ref()
-                            .map_or(String::new(), |t| format!(" with `{t}`"))
-                    ))
+                    return no_agent(unfit(&need, &hub.agent_programs(AGENT_APP, &need.repo)))
                 }
             }
         }
@@ -118,4 +130,37 @@ pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Reques
         res.headers_mut().insert(NODE_HEADER, v);
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn need(repo: &str, toolchain: Option<&str>) -> Need {
+        Need {
+            repo: repo.into(),
+            toolchain: toolchain.map(str::to_string),
+            push: false,
+        }
+    }
+
+    /// **A program no agent has is refused with those that run**; a git job,
+    /// which names none, or a repository nobody holds has nothing to offer.
+    #[test]
+    fn a_job_with_no_agent_is_told_what_runs() {
+        let running = ["cargo".to_string(), "python".to_string()];
+        assert_eq!(
+            unfit(&need("candle", Some("python3")), &running),
+            "no ready agent holds repository `candle` with `python3`; the programs that run in \
+             it: cargo, python"
+        );
+        assert_eq!(
+            unfit(&need("candle", None), &running),
+            "no ready agent holds repository `candle`"
+        );
+        assert_eq!(
+            unfit(&need("gone", Some("cargo")), &[]),
+            "no ready agent holds repository `gone` with `cargo`"
+        );
+    }
 }

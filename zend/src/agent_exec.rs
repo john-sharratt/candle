@@ -25,6 +25,7 @@ use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
 use zend_tools::run_watch;
 use zend_tools::sandboxes::{page, LogPage, Ran, SandboxesError};
+use zend_vfs::sandbox::refuse_git;
 use zend_vfs::{
     ChangedFile, DiskWriteGrant, JobId, JobInfo, JobNotFound, JobRequest, JobStatus, Push,
     RunOutcome, Unrecorded, VfsStore,
@@ -112,6 +113,9 @@ impl Executor for AgentExecutor {
         lineage: &str,
         request: JobRequest,
     ) -> Result<Ran, SandboxesError> {
+        // No agent advertises git, so the gateway would answer `no_agent` and
+        // the refusal that names the git tools would never be read.
+        refuse_git(&request.command).map_err(|e| SandboxesError::AgentRefused(e.to_string()))?;
         let job = RunJob {
             repo: repo.to_string(),
             branch: request.branch.to_string(),
@@ -249,6 +253,47 @@ mod tests {
             None,
             Instant::now(),
         )
+    }
+
+    /// **git is refused towards the git tools before it reaches an agent**,
+    /// which would only say no agent has it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_is_refused_before_any_agent() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("in.txt"), "x\n").unwrap();
+        git(root.path(), &["add", "in.txt"]);
+        git(root.path(), &["commit", "-q", "-m", "first"]);
+        let main = BranchName::parse("main").unwrap();
+        let files = Arc::new(VfsStore::on_branch(
+            GitSource::open(root.path()).unwrap(),
+            Rev::Branch(main.clone()),
+        ));
+        let executor = AgentExecutor::new(
+            Agents::new(cut_off(), None),
+            Handle::current(),
+            root.path().join("jobs"),
+        );
+        let refused = spawn_blocking(move || {
+            executor.run(
+                DiskWriteGrant::issue(),
+                "app",
+                "conv-1",
+                JobRequest {
+                    branch: main,
+                    files,
+                    command: SandboxCommand::new("git").args(["status".to_string()]),
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&refused, Err(SandboxesError::AgentRefused(why))
+                if why.contains("use the git tools")),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// **`run_command` on an agent records what the command changed in the

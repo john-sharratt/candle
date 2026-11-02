@@ -6,7 +6,7 @@
 
 use super::{MemberView, PeerAsk, Pick, Registry};
 use crate::dispatch::{reaches, Dispatch};
-use crate::gateway::agents::{choose_with_standby, Choice, Need};
+use crate::gateway::agents::{choose_with_standby, programs, Choice, Need};
 use crate::gateway::placement::{guest_reach, has_room, place, within_reach, Placed, Weigh};
 
 impl Registry {
@@ -212,6 +212,11 @@ impl Registry {
             }
         }
         choice
+    }
+
+    /// The programs the ready agents of `app` holding `repo` start.
+    pub fn agent_programs(&self, app: &str, repo: &str) -> Vec<String> {
+        programs(&self.ready(app), repo)
     }
 
     /// Where a request with `dispatch` goes. `draw` is the pixel area it draws,

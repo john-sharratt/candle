@@ -142,6 +142,17 @@ pub fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: b
     best(&mut fit.iter()).map_or(Choice::NoAgent, Choice::Run)
 }
 
+/// The programs the `ready` agents holding `repo` start, in order: what a job
+/// refused for its program can run instead.
+pub fn programs(ready: &[&MemberView], repo: &str) -> Vec<String> {
+    let held = ready
+        .iter()
+        .filter(|a| a.repos.iter().any(|r| r.name == repo))
+        .filter_map(|a| a.capacity.as_ref());
+    let every: BTreeSet<&String> = held.flat_map(|c| c.toolchains.iter()).collect();
+    every.into_iter().cloned().collect()
+}
+
 /// Whether `host` is one `standby` names, in any case: `AlienWorld` and
 /// `alienworld` are one machine.
 pub fn named_standby(standby: &BTreeSet<String>, host: &str) -> bool {
@@ -228,6 +239,19 @@ mod tests {
 
     fn cargo() -> Need {
         need("candle", Some("cargo"), false)
+    }
+
+    /// **What can run instead is what the agents holding the repository
+    /// start**, each program once, and nothing of an agent that does not hold
+    /// it.
+    #[test]
+    fn the_programs_are_those_of_agents_holding_the_repository() {
+        let (a, mut b, mut c) = (agent(1, 4, 0, 1), agent(2, 4, 0, 1), agent(3, 4, 0, 1));
+        b.capacity.as_mut().unwrap().toolchains = vec!["python".into(), "cargo".into()];
+        c.repos.clear();
+        c.capacity.as_mut().unwrap().toolchains = vec!["go".into()];
+        assert_eq!(programs(&[&a, &b, &c], "candle"), ["cargo", "python"]);
+        assert!(programs(&[&a, &b, &c], "not-held").is_empty());
     }
 
     /// **A repo-less job runs on any ready agent** — a device-bridge job holds

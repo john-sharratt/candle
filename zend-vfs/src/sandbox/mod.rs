@@ -89,7 +89,7 @@ use crate::{BranchName, DiskWriteGrant, FileChanges, Oid, Repo, Rev, VfsStore};
 pub use command::{Priority, SandboxCommand, DEFAULT_TIMEOUT};
 pub use error::SandboxError;
 pub use outcome::{ChangedFile, Output, RunOutcome, Unrecorded};
-pub use policy::{CommandPolicy, Refused};
+pub use policy::{refuse_git, CommandPolicy, Refused};
 pub use server::{
     JobHandle, JobId, JobInfo, JobNotFound, JobRequest, JobStatus, OutputStream, SandboxServer,
     StartedJob, JOBS_DIR,
