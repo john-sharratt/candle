@@ -1223,6 +1223,9 @@ impl Builder {
         };
         let mut selection = selection.clone();
         selection.script_members(Arc::clone(&choice.members));
+        for (selector, option) in &choice.dials {
+            selection.select(selector.as_str(), option.as_str());
+        }
         let mut projection = run_with_sink(
             &self.schema,
             target,

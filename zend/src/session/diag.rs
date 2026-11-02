@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context};
 use candle_conversation::decode_diag::{self, Arm, Capture, Control, StepRecord};
-use candle_conversation::projection::{ProjectionScript, TimelineId, TurnIndex};
+use candle_conversation::projection::{recorded_dials, ProjectionScript, TimelineId, TurnIndex};
 use candle_conversation::{SamplingConfig, SelectionState, TurnEvent, TurnOptions};
 use serde::Serialize;
 
@@ -273,6 +273,12 @@ impl ZendSession {
             timeline,
         };
         let builder = turn_projection(&state, &diag_id, spec.identity.as_deref(), spec.tools_mode);
+        // The turn's dials are what its recording ran under, whatever the caller
+        // set: they steer the think block as well as the projection.
+        let mut reply = spec.selection.clone();
+        for (selector, option) in recorded_dials(&events[spec.turn][0]) {
+            reply.select(selector, option);
+        }
 
         // Where each recorded turn of this conversation stands on the run's
         // timeline: a turn's index is minted as it seals.
@@ -298,7 +304,7 @@ impl ZendSession {
             &mut conv,
             &turns[..spec.turn],
             &recorded,
-            &spec.selection,
+            &reply,
             spec.tools_mode,
             Demonstration::FirstStepOnly,
             &mut |index, conv| {
@@ -328,7 +334,7 @@ impl ZendSession {
         let dropped_turns = script.dropped_turns;
         conv.set_projection(builder.with_script(script).into());
 
-        let selection = turn_selection(&spec.selection, &target.user, Demonstration::FirstStepOnly);
+        let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
         let (explicit, seed) = match run.sampling {
             ReplaySampling::Argmax => (Some(SamplingConfig::argmax()), None),

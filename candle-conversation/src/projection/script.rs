@@ -27,6 +27,24 @@ pub struct ScriptedChoice {
     pub members: Arc<HashSet<String>>,
     /// Its turns, in slot order.
     pub turns: Vec<ResolvedTurn>,
+    /// The selector options it projected under ([`recorded_dials`]).
+    pub dials: Vec<(String, String)>,
+}
+
+/// The selector options a recorded projection ran under, as `(selector,
+/// option)`: a selector's section is recorded as `selector:option`. An option
+/// that emits nothing, such as `absent`, leaves no record.
+pub fn recorded_dials(event: &ProjectionEvent) -> Vec<(String, String)> {
+    event
+        .selection
+        .system
+        .iter()
+        .filter_map(|item| match item {
+            SystemItem::Section { name, .. } => name.split_once(':'),
+            _ => None,
+        })
+        .map(|(selector, option)| (selector.to_string(), option.to_string()))
+        .collect()
 }
 
 /// One projection point of a turn.
@@ -121,6 +139,7 @@ impl ProjectionScript {
                     choice: Some(ScriptedChoice {
                         members: Arc::new(members_of(&event.selection.system)),
                         turns,
+                        dials: recorded_dials(event),
                     }),
                 }
             })
@@ -297,6 +316,21 @@ mod tests {
         assert_eq!(choice.turns[0].id.group_id, GroupId::new(1));
     }
 
+    /// A selector's section gives back the option it ran under; a bare section
+    /// names no selector.
+    #[test]
+    fn a_recording_keeps_its_dials() {
+        let mut e = event(0, Vec::new());
+        e.selection.system.push(SystemItem::Section {
+            name: "role:coder".into(),
+            tokens: 1,
+        });
+        assert_eq!(
+            recorded_dials(&e),
+            vec![("role".to_string(), "coder".to_string())]
+        );
+    }
+
     /// A bare section and a selected member are pinned; a skipped member and
     /// structural glue are not.
     #[test]
@@ -376,6 +410,7 @@ mod tests {
         ScriptedChoice {
             members: Arc::new(HashSet::new()),
             turns: vec![recorded],
+            dials: Vec::new(),
         }
         .place_turns(&mut projection);
         assert_eq!(projection.segments.len(), 2);

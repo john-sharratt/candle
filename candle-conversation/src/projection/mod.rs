@@ -289,5 +289,5 @@ pub use schema::{
     SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
-pub use script::ProjectionScript;
+pub use script::{recorded_dials, ProjectionScript};
 pub use working_set_pick::{Standing, WorkingSetMembers};
