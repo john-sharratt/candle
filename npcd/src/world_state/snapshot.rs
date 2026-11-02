@@ -4,7 +4,7 @@
 //! | Entity | Record |
 //! |---|---|
 //! | each body standing still | `body/<body>`: its place and the station it holds |
-//! | the lift car | `lift`: its floor, doors and stops |
+//! | the lift car | `lift`: its floor, doors and stops, who is aboard and who is waiting for it, each with the floor it is bound for |
 //! | each entry of the world's entity maps — a mission, an operation, a body's working set, a pack, a device, a thread, a posting… | `sim/<map path>/<key>` ([`SIM_MAPS`]) |
 //! | everything else the world holds — the command table, the tower, the roster, the ledger's lists | `sim/meta` |
 //!
@@ -83,6 +83,8 @@ pub fn world_records(w: &World) -> Records {
                 "floor": lift.floor(),
                 "doors": doors_name(lift.doors()),
                 "stops": lift.stops(),
+                "riders": w.lift_riders(),
+                "waiting": w.lift_waiting(),
             }),
         );
     }

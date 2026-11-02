@@ -9,6 +9,8 @@
 //! body record places a body that is in the world; one that is not yet is kept
 //! for when it is embodied ([`place_of`]).
 
+use std::collections::BTreeMap;
+
 use npc_map::lift::Doors;
 use npc_map::world::{Where, World};
 use serde_json::Value;
@@ -98,8 +100,27 @@ fn apply_world(w: &mut World, records: &Records) {
                     .collect()
             })
             .unwrap_or_default();
-        w.restore_lift(floor, doors, &stops);
+        w.restore_lift(
+            floor,
+            doors,
+            &stops,
+            bound_for(lift, "riders"),
+            bound_for(lift, "waiting"),
+        );
     }
+}
+
+/// The bodies a lift record lists under `field`, each with the floor it is
+/// bound for.
+fn bound_for(lift: &Value, field: &str) -> BTreeMap<String, usize> {
+    lift.get(field)
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(body, f)| Some((body.clone(), f.as_u64()? as usize)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Put `records` into `hosted`, under one hold of its lock — and its bots'
@@ -164,6 +185,42 @@ mod tests {
             source.sim(sim_records),
             "the same state"
         );
+    }
+
+    /// **Who is riding the lift travels with it.** A body the source has
+    /// waiting on its landing is riding on a replica that takes the records
+    /// in — so the replica offers it nowhere to walk — and one the replica
+    /// thought was riding, the source's record says is not.
+    #[test]
+    fn who_rides_the_lift_travels_with_its_record() {
+        let source = vault();
+        let (from, dest) = source.read(|w| (w.shaft()[0].clone(), w.shaft().len() - 1));
+        source.with(|w| {
+            w.call_lift(dest);
+            while !w.lift().unwrap().boardable_at(dest) {
+                w.tick();
+            }
+            w.enter("a", "A", from.clone()).unwrap();
+            w.enter("b", "B", from.clone()).unwrap();
+            assert!(w.ride_lift("a", dest));
+        });
+        let records = source.read(world_records);
+        assert_eq!(records["lift"]["waiting"], json!({"a": dest}));
+        assert_eq!(records["lift"]["riders"], json!({}));
+
+        let replica = vault();
+        replica.with(|w| {
+            w.enter("a", "A", from.clone()).unwrap();
+            w.enter("b", "B", from.clone()).unwrap();
+            assert!(w.ride_lift("b", dest));
+        });
+        apply(&replica, &records);
+        replica.read(|w| {
+            assert_eq!(w.riding("a"), Some(dest), "aboard at the source");
+            assert_eq!(w.riding("b"), None, "not riding at the source");
+            assert_eq!(w.lift_within("a"), (false, false, Vec::new()));
+        });
+        assert_eq!(replica.read(world_records), records, "the same lift");
     }
 
     /// **A bot's DM is one of the world's records**: written with them,

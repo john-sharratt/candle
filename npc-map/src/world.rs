@@ -1588,17 +1588,44 @@ impl World {
         Ok(())
     }
 
-    /// Set the lift where a record of it says it was ([`Lift::restore`]).
-    /// Nothing is logged: nobody in the building did anything. Whether the
-    /// world has a lift.
-    pub fn restore_lift(&mut self, at: usize, doors: Doors, stops: &[usize]) -> bool {
-        match self.lift.as_mut() {
-            Some(lift) => {
-                lift.restore(at, doors, stops);
-                true
-            }
-            None => false,
-        }
+    /// Who is aboard the car, and the floor each is bound for.
+    pub fn lift_riders(&self) -> &BTreeMap<String, usize> {
+        &self.riders
+    }
+
+    /// Who is waiting on a landing for the car, and the floor each will ride to.
+    pub fn lift_waiting(&self) -> &BTreeMap<String, usize> {
+        &self.waiting
+    }
+
+    /// Set the lift where a record of it says it was ([`Lift::restore`]), and
+    /// who was aboard it and waiting for it. Nothing is logged: nobody in the
+    /// building did anything. Whether the world has a lift.
+    ///
+    /// **Who is riding is part of the lift's record, not of one machine's
+    /// memory.** A world's characters can run on a member that follows it, and
+    /// that member offers each its turn from its own copy of the world: with
+    /// the riders left out, a body its authority had aboard was offered the
+    /// rooms of its landing as if it had never asked, walked off, and so gave
+    /// up the ride — four drones went back and forth between the lift and the
+    /// nest hall, each telling the others the car had passed it by. A rider
+    /// bound for a floor off the shaft is dropped, as the car's own stops are.
+    pub fn restore_lift(
+        &mut self,
+        at: usize,
+        doors: Doors,
+        stops: &[usize],
+        riders: BTreeMap<String, usize>,
+        waiting: BTreeMap<String, usize>,
+    ) -> bool {
+        let Some(lift) = self.lift.as_mut() else {
+            return false;
+        };
+        lift.restore(at, doors, stops);
+        let floors = self.shaft.len();
+        self.riders = riders.into_iter().filter(|(_, f)| *f < floors).collect();
+        self.waiting = waiting.into_iter().filter(|(_, f)| *f < floors).collect();
+        true
     }
 
     /// Set what `id` is holding where a record of it says — the station

@@ -3201,14 +3201,18 @@ persisted:
 
 | Kind | Examples | Persisted | Travels as |
 |---|---|---|---|
-| **State**: what the world *is* | each body's place (area and node) and the station it holds; the lift car's floor, doors and stops; everything the world's `Sim` holds — each bench's working set, each mission and operation, each body's pack, each device, each phone thread, each posting, the command table; who holds each NPC lease (§9.3) | **yes**, one keyed record per entity: `world/<wid>/<entity>` | `EVENT`, replicated, caught up and compacted like any record (§6) |
+| **State**: what the world *is* | each body's place (area and node) and the station it holds; the lift car's floor, doors and stops, and who is aboard it and waiting for it; everything the world's `Sim` holds — each bench's working set, each mission and operation, each body's pack, each device, each phone thread, each posting, the command table; who holds each NPC lease (§9.3) | **yes**, one keyed record per entity: `world/<wid>/<entity>` | `EVENT`, replicated, caught up and compacted like any record (§6) |
 | **Transient**: what the world is *doing* | the steps of a walk between nodes; the lift moving between floors; a line spoken in a room; a passer-by perceived; the metronome's beat; what the world tells a character that runs elsewhere | **never** | `PULSE`, broadcast to the app's other members with no `oseq`, no retransmit and no catch-up |
 
 **The records** (`npcd/src/world_state/`), named under `world/<wid>/`:
 
 - `body/<body>` for each body standing still: its place and the station it holds. A body
   walking has none; its record is written where it stops.
-- `lift`: the car's floor, doors and stops.
+- `lift`: the car's floor, doors and stops, and who is aboard it and who is waiting on a
+  landing for it, each with the floor it is bound for. The riders are the world's state,
+  not the authority's: a member that runs a world's characters without running the world
+  offers each its turn from its own copy, and a rider that copy does not know is aboard is
+  offered the rooms of its landing, walks off, and gives up the ride.
 - `sim/<map>/<key>` for each entry of the `Sim`'s entity maps (`SIM_MAPS`: packs, the
   benches' working sets, devices, the field, the ledger's per-body cursors, missions,
   operations, the record's items, phone threads, postings), and `sim/meta` for the rest
