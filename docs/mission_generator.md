@@ -454,10 +454,13 @@ routines:
   table to report. Steps are written in the grammar the engine signs off (`go to …`, `scan … and
   read what state it is in`, `find …`, `ask …`); a step outside it is ticked by the character's
   report, as the bank's free-form steps are.
-- **The record's work does not run there.** No generator draws for the world and no workflow is
-  loaded for it. Operations opened before the file was written are called off by the world's
-  authority on the next tick, so a carrier is stood down rather than left on work nobody will
-  read.
+- **The record's work does not run there, bar one built-in.** No generator draws for the world,
+  and none of `missions.yaml`'s authored workflows is loaded for it. The one exception is the
+  built-in **`write-template`** workflow (`engine::mission_gen::write_template`), which the
+  world's authority sets so `mission_write` can carry an authored mission template onto the
+  record (`docs/mission_templates.md` §6). Operations on any other workflow, opened before the
+  file was written, are called off by the authority on the next tick, so a carrier is stood down
+  rather than left on work nobody will read.
 - **Or nothing by draw.** `draw: none` hands out no routine: a character with nothing set for it
   waits at the table until work is posted there (`docs/zen_moon_mind.md` §8.3), and the routines
   are the catalogue a poster reads at the table — the standing jobs it may set when the table is

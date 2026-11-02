@@ -162,10 +162,18 @@ versioning, replication and edit-via-thread for free.
 ## 6. Authoring, and the `critical` gate
 
 **Authoring.** Zen writes a template with a new order-giver act, `mission_write`,
-offered where `order_post` is. Writing one *is* a mission — a doc mission whose
-`work.writes` is a template file in the world's repo — so it composes and commits
-through the path that already exists. The Creator or Yen can also author and edit
-templates by editing the repo directly; the same files, the same history.
+offered where `order_post` is. It renders what Zen gives — `id`, `group`, `brief`,
+`steps`, `params` — to a `Routine` YAML and opens an operation on the built-in
+**`write-template`** workflow: a Drone writes the file at a bench (the reused
+`map-table` kind — a world shapes its own capabilities as it shapes its map) and
+publishes it at the `merge-table` into the world's repo
+(`missions/<world>/<group>/<id>.yaml`), a `routine-parses` check refusing a
+template that would not load. The loader reads it next cycle, and it is then
+`order_post`-able by name. **A world with its own missions runs no authored
+workflows — only this one built-in**: an own-missions world otherwise clears the
+record's workflows, so without it `mission_write` would have no pipeline to carry
+a template onto the record. The Creator or Yen can also author and edit templates
+by editing the repo directly; the same files, the same history.
 
 **Autonomy is the default.** A drone carries a mission to completion on its own
 and asks no one — plays the film, patches the machines, deploys the release. The
@@ -225,7 +233,9 @@ with no GPU and no live devices, fully unit-testable.
    parameter, and refusal of a malformed file.
 2. **Issue.** `order_post { job, args }` — substitute and post; refuse a bad
    argument at the table.
-3. **Authoring.** `mission_write` — the doc mission that writes a template file.
+3. **Authoring.** The built-in `write-template` workflow + a `routine-parses`
+   check, and the `mission_write` act that renders the template and opens an
+   operation on it (a world's own-missions path runs this one workflow).
 4. **The `critical` gate.** Step flag, the authorizer list, the Discord reach-out,
    the fail-safe hold.
 5. **Coding/deploy (separate phase).** The world-thread ↔ zend-repo-task bridge

@@ -42,7 +42,7 @@ use crate::engine::mission_gen::config::{
 };
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
 use crate::engine::mission_gen::world::Routine;
-use crate::engine::mission_gen::{gates, leakage, rejection, round};
+use crate::engine::mission_gen::{gates, leakage, rejection, round, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
 use crate::engine::workflow::OnFailed;
@@ -140,13 +140,16 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }
         // The table's orders are given by a character that takes none; the
         // table does not offer them to anybody else, and refuses them if asked.
-        "order_post" | "order_results" if !hosted.sim(|s| s.missions.is_unordered(body)) => {
+        "order_post" | "order_results" | "mission_write"
+            if !hosted.sim(|s| s.missions.is_unordered(body)) =>
+        {
             Outcome::Refused(
                 "The table's orders are not yours to give: you take your work from it.".into(),
             )
         }
         "order_post" => order_table::post(hosted, body, a),
         "order_results" => order_table::results(hosted, body),
+        "mission_write" => write_template::write(hosted, body, a),
         "collect_mission" => {
             // **One mission at a time.** `collect_mission` is offered whenever a
             // body stands at the desk, including when it has come back to report

@@ -30,7 +30,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::{Mission, Origin, Todo, Work};
 use crate::mind::files::MindFiles;
@@ -40,7 +40,7 @@ pub const FOLDER: &str = "missions";
 
 /// One authored routine: a mission a character may be handed whole, or a
 /// template Zen fills with arguments and issues.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Routine {
     /// Its name — what the mission's [`Origin::Random`] carries, and what
@@ -56,15 +56,15 @@ pub struct Routine {
     /// The parameters the routine takes — names that may appear as `{name}` in
     /// the brief, the steps and the work. Empty for a routine that takes none,
     /// which is issued and drawn exactly as before.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<String>,
     /// The world-building acts the carrier is lent while it carries this — a
     /// standing mission's own ([`Mission::grants`]).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<String>,
     /// The document the routine is work on, when it is a doc/coding/deploy
     /// template.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<RoutineWork>,
 }
 
@@ -72,7 +72,7 @@ pub struct Routine {
 /// irreversible move the carrier may take only with an authorizer's go-ahead
 /// (`docs/mission_templates.md` §6). In YAML a bare string is a plain step; a
 /// map `{ text: "...", critical: true }` flags one.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Step {
     Plain(String),
@@ -113,17 +113,17 @@ impl From<String> for Step {
 /// What a routine's mission is work on: the document to write, the ones to read
 /// first, and the checks it is held to. Any field may hold `{name}`
 /// placeholders.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineWork {
     /// The mind path of the document to write or change.
     pub writes: String,
     /// The mind paths to read before writing, in order.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<String>,
     /// The checks the document is held to before the mission may be reported
     /// done — the names in `mission_gen::gates::CHECKS`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<String>,
 }
 

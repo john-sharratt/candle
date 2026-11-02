@@ -14,7 +14,16 @@
 //! because every step, check and desk it names is already the engine's, so a
 //! file would add a parser and a second source of truth for nothing.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+
+use serde_json::{Map, Value};
+
+use crate::engine::body::Outcome;
+use crate::engine::mission_gen::world::{dir, Routine, Step};
 use crate::engine::workflow::{parse_workflows, Workflow};
+use crate::world::Hosted;
 
 /// The workflow, as YAML parsed through the ordinary workflow parser. It
 /// declares no `prompts:`, so every `{token}` is an operation placeholder the
@@ -54,10 +63,127 @@ pub fn write_template_workflow() -> Workflow {
         .remove(0)
 }
 
+fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
+    let s = args.get(key)?.as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// A non-empty kebab-case name — a template id or a group folder.
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A stable digest of the template, so re-authoring the same one does not reset
+/// its stuck count (`sim::missions::launch`).
+fn fingerprint(yaml: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    yaml.hash(&mut h);
+    h.finish()
+}
+
+/// `mission_write`: author a new mission template the world can hand out
+/// (`docs/mission_templates.md` §6). Zen gives the template's `id`, its `group`
+/// (the folder), its `brief`, its `steps` and any `params`; this renders them
+/// to a `Routine` YAML and opens a `write-template` operation to write and
+/// publish it. The loader reads the file next cycle, and it is then
+/// `order_post`-able by name.
+pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome {
+    let (Some(id), Some(group), Some(brief)) =
+        (text(args, "id"), text(args, "group"), text(args, "brief"))
+    else {
+        return Outcome::Refused(
+            "To write a template, say its `id`, the `group` it goes in, and its `brief`.".into(),
+        );
+    };
+    if !is_name(&id) {
+        return Outcome::Refused(format!(
+            "The template id `{id}` must be kebab-case: lower-case letters, digits and hyphens."
+        ));
+    }
+    if !is_name(&group) {
+        return Outcome::Refused(format!(
+            "The group `{group}` must be kebab-case: it is the folder the template goes in."
+        ));
+    }
+    let steps: Vec<Step> = text(args, "steps")
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().trim_start_matches(['-', '*']).trim())
+                .filter(|l| !l.is_empty())
+                .map(Step::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if steps.is_empty() {
+        return Outcome::Refused(
+            "Give it at least one step, one to a line — each something the carrier can be seen \
+             to do."
+                .into(),
+        );
+    }
+    let params: Vec<String> = text(args, "params")
+        .map(|s| {
+            s.split([',', '\n'])
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let routine = Routine {
+        id: id.clone(),
+        brief,
+        steps,
+        params,
+        grants: Vec::new(),
+        work: None,
+    };
+    let yaml = match serde_yaml::to_string(&routine) {
+        Ok(y) => y,
+        Err(e) => return Outcome::Refused(format!("The template could not be written out: {e}")),
+    };
+    let path = format!("{}/{group}/{id}.yaml", dir(hosted.id()));
+    // Caught here as well as by the write step's `routine-parses` check, so Zen
+    // hears a malformed template at once rather than the Drone's publish holding.
+    if let Err(why) = Routine::parse(&path, &yaml) {
+        return Outcome::Refused(format!("That is not a valid mission template: {why}"));
+    }
+    let objective = format!("the mission template `{id}`");
+    let brief = format!("Write the mission template `{id}` into its file, exactly as given.");
+    let fields = BTreeMap::from([
+        ("id".to_string(), id.clone()),
+        ("yaml".to_string(), yaml.clone()),
+    ]);
+    let launched = hosted.with_sim(|s| {
+        s.missions.launch(
+            "write-template",
+            "mission_write",
+            &format!("template:{path}"),
+            fingerprint(&yaml),
+            &objective,
+            &path,
+            &brief,
+            fields,
+            Vec::new(),
+        )
+    });
+    match launched {
+        Ok(_) => Outcome::Did(format!(
+            "Set to be written: a Drone will draft and publish the template `{id}` into {path}. \
+             Once it has landed, `order_post` it by name."
+        )),
+        Err(e) => Outcome::Refused(format!("The template could not be set to write: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::workflow::By;
+    use crate::world::Hosted;
+    use npc_map::world::Where;
+    use serde_json::json;
 
     /// **The built-in workflow is write-then-publish**, with the write step at
     /// a `template-desk` holding the template to `committed` + `routine-parses`,
@@ -80,5 +206,65 @@ mod tests {
         assert_eq!(publish.desk.as_deref(), Some("merge-table"));
         assert_eq!(publish.checks, ["published"]);
         assert!(publish.publishes());
+    }
+
+    fn world_with_write_template() -> Hosted {
+        let h = Hosted::load(
+            "creators-vault",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
+        )
+        .expect("the shipped vault must load");
+        h.with(|w| {
+            w.enter("zen", "Zen", Where::new("vault-command", "command-room"))
+                .unwrap();
+        });
+        h.with_sim(|s| {
+            s.missions.set_unordered("zen", true);
+            s.missions.set_workflows(vec![write_template_workflow()]);
+        });
+        h
+    }
+
+    fn args(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// **mission_write renders the template to YAML and opens a write-template
+    /// operation for it**, keyed to its path, with the YAML in the step's
+    /// fields; a bad id is refused.
+    #[test]
+    fn write_opens_an_operation_for_the_template() {
+        let h = world_with_write_template();
+        let out = write(
+            &h,
+            "zen",
+            &args(json!({
+                "id": "play-a-film",
+                "group": "devices",
+                "brief": "Put {title} on {device}.",
+                "steps": "go to the front room\nput {title} on {device}",
+                "params": "title, device",
+            })),
+        );
+        assert!(out.happened(), "{out:?}");
+        let found = h.sim(|s| {
+            s.missions.operations().all().any(|o| {
+                o.run.workflow == "write-template"
+                    && o.document == "missions/creators-vault/devices/play-a-film.yaml"
+                    && o.fields
+                        .get("yaml")
+                        .is_some_and(|y| y.contains("id: play-a-film"))
+                    && o.fields.get("id").map(String::as_str) == Some("play-a-film")
+            })
+        });
+        assert!(found, "an operation to write the template should be open");
+
+        // A non-kebab id is refused, and nothing is opened for it.
+        let bad = write(
+            &h,
+            "zen",
+            &args(json!({"id": "Bad Id", "group": "devices", "brief": "b", "steps": "go"})),
+        );
+        assert!(!bad.happened(), "{bad:?}");
     }
 }

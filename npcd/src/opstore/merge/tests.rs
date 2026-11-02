@@ -180,6 +180,26 @@ fn a_store_lands_on_the_record_and_the_mind_follows() {
     assert_eq!(r.publish(1), Publish::Nothing);
 }
 
+/// **A mission template publishes like any other document.** A `missions/…yaml`
+/// path lands on the record unchanged — nothing in the store scopes a commit to
+/// `layers/` — so the built-in `write-template` workflow's publish step can
+/// carry an authored template into the world's repo (`docs/mission_templates.md`
+/// §6, `engine::mission_gen::write_template`).
+#[test]
+fn a_mission_template_path_lands_on_the_record() {
+    let r = record();
+    let shelf = r.open(1);
+    let path = "missions/life/devices/play-a-film.yaml";
+    let yaml = "id: play-a-film\nbrief: Put {title} on {device}.\nsteps:\n- put {title} on {device}\nparams:\n- title\n- device\n";
+    shelf.commit(&[(path.into(), Some(yaml.into()))]).unwrap();
+    let Publish::Landed { paths, .. } = r.publish(1) else {
+        panic!("a template path did not land on the record");
+    };
+    assert_eq!(paths, [path]);
+    assert_eq!(r.on_record(path).as_deref(), Some(yaml));
+    assert_eq!(r.publish(1), Publish::Nothing);
+}
+
 /// **A record that moved only at other lines is taken in as the work lands**:
 /// the work, uncommitted on its base, is carried onto the record's commit and
 /// lands on top of it, and the record keeps both changes.

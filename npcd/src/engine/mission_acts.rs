@@ -208,6 +208,60 @@ pub const ORDER_RESULTS: Tool = desk!(
      what you do next."
 );
 
+/// Write a new mission template the world can hand out, as the order-giver
+/// authors one (`docs/mission_templates.md` §6).
+pub const MISSION_WRITE: Tool = Tool {
+    name: "mission_write",
+    at: COMMAND_DESK,
+    category: "Command",
+    plane: Plane::World,
+    availability: Availability::AtPart,
+    description: "Write a new kind of mission the world can hand out — a template a Drone \
+                  carries, filled with arguments each time it is issued. A Drone drafts and \
+                  publishes it; then you `order_post` it by name. Put `{name}` where the brief \
+                  or a step takes one of its parameters.",
+    params: &[
+        Param {
+            name: "id",
+            ty: "string",
+            required: true,
+            description: "The template's name, kebab-case — `play-a-film`.",
+        },
+        Param {
+            name: "group",
+            ty: "string",
+            required: true,
+            description: "The folder it belongs in, kebab-case — `devices`, `family`, `ops`.",
+        },
+        Param {
+            name: "brief",
+            ty: "string",
+            required: true,
+            description: "What the carrier is asked, a paragraph. Use `{name}` for a parameter.",
+        },
+        Param {
+            name: "steps",
+            ty: "string",
+            required: true,
+            description: "The steps, one to a line, each something the carrier can be seen to \
+                          do; `{name}` for a parameter.",
+        },
+        Param {
+            name: "params",
+            ty: "string",
+            required: false,
+            description: "The parameter names it takes, comma-separated or one to a line.",
+        },
+    ],
+    examples: &[Example {
+        situation: "The family keeps asking for a film on the television, and there is no \
+                    standing job for it.",
+        call: r#"{"id":"play-a-film","group":"devices","brief":"Put {title} on {device} for the family.","steps":"go to the front room\nput {title} on {device}","params":"title, device"}"#,
+        because: "A kind of work written down once is work the world can do again on a word; \
+                  left unwritten it is done from scratch each time, or not at all.",
+    }],
+};
+
 /// Every mission act, for the catalog. All at the command table: a mission is
 /// taken up and answered for there, and carried out in the world between.
 pub const MISSION_ACTS: &[Tool] = &[
@@ -217,6 +271,7 @@ pub const MISSION_ACTS: &[Tool] = &[
     REPORT_REJECTED,
     ORDER_POST,
     ORDER_RESULTS,
+    MISSION_WRITE,
 ];
 
 /// What a body at the table is carrying, as far as the table's acts care.
@@ -304,6 +359,8 @@ pub fn offered(tool: &str, c: Carrying) -> bool {
         // once: the reading is offered only while something new waits in it.
         t if t == ORDER_POST.name => c.unordered,
         t if t == ORDER_RESULTS.name => c.unordered && c.unread,
+        // Authoring a template is the order-giver's, like posting work.
+        t if t == MISSION_WRITE.name => c.unordered,
         t if t == REPORT_DONE.name || t == REPORT_STUCK.name => c.mission,
         t if t == REPORT_REJECTED.name => c.mission && c.review,
         "orders_report_done" => c.order,
