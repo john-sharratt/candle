@@ -138,7 +138,10 @@ own.
 
 ### 8.1 The order table is Zen's
 
-The order table in the watch room holds the work, and Zen uses it through its effector:
+The order table in the watch room holds the work, and Zen uses it through its effector — **from
+wherever its attention is**: a character that takes no orders is offered every order table in its
+world and reaches it from any room, while a Drone must be standing at the table to collect or
+report. A mission posted from elsewhere is still reported back at the table's own room.
 
 | Act | Who | Does |
 |---|---|---|
@@ -417,9 +420,9 @@ how Zen does a thing; a post is how it has a Drone do one.
 
 ### 17.3 The round: what the table gives Zen when its agenda is empty
 
-With nothing on its agenda, **Zen goes to the order table and takes up the next item of its round
-with `collect_mission`** — the act a Drone uses, offered to Zen only when its agenda is empty and
-something on the round is due. The table decides which item; Zen does not choose. With nothing
+With nothing on its agenda, **Zen takes up the next item of its round with the order table's
+`collect_mission`** — the act a Drone uses, reached by Zen from wherever its attention is (§8.1),
+and offered to it only when its agenda is empty and something on the round is due. The table decides which item; Zen does not choose. With nothing
 due, Zen rests (§17.4).
 
 #### The file
@@ -480,7 +483,7 @@ A round item collected joins the agenda at `later`, so anything Zen adds of its 
 
 With an empty agenda and nothing on the round due, **Zen is not woken** — no idle thought, no
 restated task — until something reaches it: a message, a report, a tannoy, or an item of the round
-coming due, when its idle wake is `ROUND_DUE`, which points it at the table. A world with no round
+coming due, when its idle wake is `ROUND_DUE`, which names the table's `collect_mission`. A world with no round
 wakes Zen with its `idle:` as before (§7).
 
 ### 17.5 Done is seen, not said

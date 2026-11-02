@@ -103,7 +103,7 @@ use crate::engine::mission::{
     refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
     Outcome as Verdict,
 };
-use crate::engine::mission_acts;
+use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
@@ -721,13 +721,14 @@ pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting
 /// The idle wake for a character that takes no orders, with an empty agenda,
 /// while its world's round has something due (`docs/zen_moon_mind.md` §17.3).
 ///
-/// **It names the way there and the verb's address**, not only the verb.
-/// `collect_mission` is the order table's, offered only beside it through
-/// `invoke`; told only "take it up with `collect_mission`" from another room,
-/// Zen found no such act and reasoned that it had none.
-pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you at \
-                             the order table in the watch room. `focus` on the watch room, then \
-                             `invoke` the order table's `collect_mission` to take it up.";
+/// **It names the verb's address, not only the verb.** `collect_mission` is the
+/// order table's, reached through `invoke` — from anywhere, for a character
+/// that takes no orders (`docs/zen_moon_mind.md` §8.1). Told only "take it up
+/// with `collect_mission`", Zen looked for an act of its own by that name,
+/// found none, and reasoned that it had none.
+pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you. The \
+                             order table answers you from wherever your attention is: `invoke` \
+                             its `collect_mission` to take it up.";
 
 /// What a character is told when its mission is called off: the errand is
 /// withdrawn, nothing of it is still owed, and what it said about it earlier is
@@ -2251,15 +2252,36 @@ impl Runtime {
         // Only what this body can do here — see [`mission_acts::offered`].
         let carrying = hosted.sim(|s| mission_acts::carrying(s, body));
         hosted.read(|w| {
-            if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
-                for inst in w.map().instances_at(&at) {
-                    let Some(url) = address_of(&inst) else {
-                        continue;
-                    };
-                    for (verb, tool) in station::verbs_at(inst.part_id()) {
-                        if mission_acts::offered(tool.name, carrying) {
-                            invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
+            let Some(at) = w.actor(body).map(|a| a.at.clone()) else {
+                return;
+            };
+            let mut here = w.map().instances_at(&at);
+            // **A character that takes no orders works the order table from
+            // wherever its attention is** (`docs/zen_moon_mind.md` §8.1): every
+            // table in its world is in reach, not only one in its room.
+            if carrying.unordered {
+                for area in w.map().areas() {
+                    for node in &area.nodes {
+                        let there = Where::new(area.id.as_str(), node.id.as_str());
+                        if there == at {
+                            continue;
                         }
+                        here.extend(
+                            w.map()
+                                .instances_at(&there)
+                                .into_iter()
+                                .filter(|i| COMMAND_DESK.contains(&i.part_id())),
+                        );
+                    }
+                }
+            }
+            for inst in here {
+                let Some(url) = address_of(&inst) else {
+                    continue;
+                };
+                for (verb, tool) in station::verbs_at(inst.part_id()) {
+                    if mission_acts::offered(tool.name, carrying) {
+                        invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
                     }
                 }
             }

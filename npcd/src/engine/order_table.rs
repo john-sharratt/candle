@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::engine::body::Outcome;
 use crate::engine::mission::{Origin, Outcome as Verdict};
+use crate::engine::mission_gen::standing::table_room;
 use crate::engine::mission_gen::world::{mission_of, Filled, FilledStep};
 use crate::world::Hosted;
 
@@ -113,10 +114,15 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         }
     };
     let brief = filled.brief.clone();
+    // Reported at the table's own room, not the poster's: a poster that takes no
+    // orders posts from wherever its attention is (`docs/zen_moon_mind.md`
+    // §8.1).
     let (me, room) = hosted
         .read(|w| {
             let actor = w.actor(body)?;
-            Some((actor.name.clone(), w.node(&actor.at)?.name.clone()))
+            let room =
+                table_room(w.map(), &actor.at).or_else(|| Some(w.node(&actor.at)?.name.clone()))?;
+            Some((actor.name.clone(), room))
         })
         .unwrap_or_default();
     let to = match text(args, "for") {

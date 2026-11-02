@@ -56,6 +56,7 @@ use crate::effector::router::Local;
 use crate::effector::token::Scope;
 use crate::engine::act::Act;
 use crate::engine::body;
+use crate::engine::mission_acts::COMMAND_DESK;
 use crate::engine::tools::{self, Tool};
 use crate::world::Hosted;
 
@@ -278,8 +279,12 @@ fn resolve(
     // ([`PinnedStandpoint`]).
     let standpoint = pinned.or(live_standpoint);
     // As-npc is proximity-gated (§8.3): the thing must be where the body stands.
-    // A direct-scope caller addresses any id regardless of standpoint.
-    if caller.scope != Scope::Direct && standpoint.as_ref() != Some(&place) {
+    // A direct-scope caller addresses any id regardless of standpoint, and so
+    // does a character that takes no orders at the order table, which it works
+    // from wherever its attention is (`docs/zen_moon_mind.md` §8.1).
+    let anywhere = COMMAND_DESK.contains(&station.part_id.as_str())
+        && hosted.sim(|s| s.missions.is_unordered(&body));
+    if caller.scope != Scope::Direct && !anywhere && standpoint.as_ref() != Some(&place) {
         return None;
     }
     Some((hosted, body, station))
@@ -525,6 +530,43 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// **A character that takes no orders reaches the order table from any
+    /// room; one that takes orders reaches it only beside it.** The body stands
+    /// in the early range, nowhere near the command room's table: as an
+    /// order-taker its post is `404`; marked unordered, the same post lands.
+    #[tokio::test]
+    async fn one_who_takes_no_orders_reaches_the_order_table_from_anywhere() {
+        use npc_map::load::MapSet;
+        let table = MapSet::load_dir(ROOMS)
+            .expect("the vault loads")
+            .instances_at(&Where::new("vault-command", "command-room"))
+            .into_iter()
+            .find(|i| i.part_id() == "order-table")
+            .expect("the command room holds the order table")
+            .id();
+        let (rt, tokens) = daemon(53);
+        let post = json!({"brief": "Read the board.", "steps": "go to the dispatch room"});
+        let path = format!("/command/{table}/order_post");
+
+        let (status, body) = send(&rt, &tokens, 53, "POST", &path, Some(post.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let world = rt.hosted.get(WORLD).expect("hosted");
+        world.with_sim(|s| s.missions.set_unordered(&Runtime::body_id(53), true));
+        let (status, body) = send(&rt, &tokens, 53, "POST", &path, Some(post)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pooled = world.sim(|s| s.missions.pooled().to_vec());
+        let steps: Vec<&str> = pooled[0].todo.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                "go to the dispatch room",
+                "go back to the table in the command room and report it"
+            ],
+            "reported at the table's room, not the poster's"
+        );
     }
 
     /// **A station answers only under its own namespace prefix.** A chronicle
