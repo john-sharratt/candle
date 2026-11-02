@@ -319,6 +319,7 @@ mod tests {
             id: "ward-shift".into(),
             brief: "Take a shift on the ward.".into(),
             steps: vec!["go to the ward room".into()],
+            ..Default::default()
         }
     }
 
