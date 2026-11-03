@@ -257,7 +257,7 @@ mod tests {
         let r = response(&failed);
         assert_eq!(
             (r.state.as_str(), r.result.as_str()),
-            ("error", "T:review/verify/read — error: boom")
+            ("error", "task:review/verify/read — error: boom")
         );
     }
 
