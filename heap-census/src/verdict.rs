@@ -42,6 +42,10 @@ pub enum Verdict {
     /// The process grew, but neither its heap nor our code did: a native
     /// library's own heap, a mapping, or direct virtual allocation.
     OutsideHeap,
+    /// The process grew and our code holds no more, on a platform whose heap
+    /// cannot say what it committed: either freed memory the heap keeps, or
+    /// memory outside it — the store gauges tell which.
+    NotHeld,
 }
 
 /// The window's figures and what they mean.
@@ -80,6 +84,8 @@ pub fn judge(old: &Reading, new: &Reading, threshold: u64) -> Growth {
         Verdict::Owner {
             classes: grown_classes(old, new),
         }
+    } else if committed_grew.is_none() {
+        Verdict::NotHeld
     } else if explains(committed_grew) {
         Verdict::Retention
     } else {
@@ -192,6 +198,22 @@ mod tests {
             2 * GIB,
         );
         assert_eq!(g.verdict, Verdict::OutsideHeap);
+    }
+
+    /// **Without the heap's committed figure, growth our code does not hold is
+    /// named not held** — retention and outside the heap cannot be told apart.
+    #[test]
+    fn growth_without_the_heaps_figure_is_not_held() {
+        let mut old = reading(0, 225 * GIB, 0, 30 * GIB);
+        let mut new = reading(1, 229 * GIB, 0, 30 * GIB);
+        old.heap = None;
+        new.heap = None;
+        assert_eq!(judge(&old, &new, 2 * GIB).verdict, Verdict::NotHeld);
+        new.classes.as_mut().unwrap()[15] = 34 * GIB;
+        assert!(matches!(
+            judge(&old, &new, 2 * GIB).verdict,
+            Verdict::Owner { .. }
+        ));
     }
 
     /// **Neither heap nor live up: outside the heap.**

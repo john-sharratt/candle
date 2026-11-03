@@ -66,6 +66,7 @@ enum GrowthKind {
     Retention,
     Owner,
     OutsideHeap,
+    NotHeld,
 }
 
 impl GrowthKind {
@@ -75,6 +76,7 @@ impl GrowthKind {
             Verdict::Retention => Some(GrowthKind::Retention),
             Verdict::Owner { .. } => Some(GrowthKind::Owner),
             Verdict::OutsideHeap => Some(GrowthKind::OutsideHeap),
+            Verdict::NotHeld => Some(GrowthKind::NotHeld),
         }
     }
 }
@@ -311,6 +313,7 @@ fn log_growing(g: &Growth, untracked: Option<u64>, previous_untracked: Option<u6
     let (verdict, classes) = match &g.verdict {
         Verdict::Retention => ("retention", String::new()),
         Verdict::OutsideHeap => ("outside the heap", String::new()),
+        Verdict::NotHeld => ("not held by our code", String::new()),
         Verdict::Owner { classes } => (
             "owner",
             classes

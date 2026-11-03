@@ -3,10 +3,12 @@
 //!
 //! The process heap's summary is the figure the census cannot give from
 //! inside: `committed − allocated` is memory the heap holds committed while
-//! nothing uses it — retention, measured by the heap itself. Reading it takes
-//! the heap's lock while it runs, so it is read off every hot path and its own
-//! duration is reported with it.
+//! nothing uses it — retention, measured by the heap itself. Only a platform
+//! that reads it without walking the heap gives one: glibc's `mallinfo2`
+//! does; Windows' `HeapSummary` walks every block under the heap's lock, so
+//! on Windows there is none.
 
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 /// The process heap's own figures.
@@ -50,9 +52,8 @@ pub fn private_bytes() -> Option<u64> {
     platform::private_bytes()
 }
 
-/// The process heap's summary alone. Holds the heap's lock while it runs —
-/// every allocation in the process waits for it — so it is read on a timer,
-/// not per request.
+/// The process heap's summary alone, where the platform reads one without
+/// walking the heap.
 pub fn heap_summary() -> Option<OsHeap> {
     platform::heap()
 }
@@ -63,6 +64,7 @@ pub fn machine_commit() -> Option<MachineCommit> {
 }
 
 /// `read` timed: its answer and the microseconds it took.
+#[cfg(target_os = "linux")]
 fn timed<T>(read: impl FnOnce() -> Option<T>) -> Option<(T, u64)> {
     let t = Instant::now();
     let v = read()?;
@@ -73,14 +75,13 @@ fn timed<T>(read: impl FnOnce() -> Option<T>) -> Option<(T, u64)> {
 mod platform {
     use std::mem::{size_of, zeroed};
 
-    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapSummary, HEAP_SUMMARY};
     use windows_sys::Win32::System::ProcessStatus::{
         GetPerformanceInfo, GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
         PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use super::{timed, MachineCommit, OsHeap};
+    use super::{MachineCommit, OsHeap};
 
     pub fn private_bytes() -> Option<u64> {
         // SAFETY: a zeroed counters struct with its size set is what the call
@@ -97,22 +98,13 @@ mod platform {
         }
     }
 
+    /// No summary on Windows. `HeapSummary` walks every block of the process
+    /// heap under the heap's lock: on BlackWorld's 37 GB heap of 14.5 M blocks
+    /// it took 31.8–35.4 s, freezing every allocating thread in motherd for
+    /// that long once a minute (2026-11-03). Nothing on Windows reads the heap's
+    /// committed bytes cheaply, so the census goes without them there.
     pub fn heap() -> Option<OsHeap> {
-        let (s, read_us) = timed(|| {
-            // SAFETY: the summary struct carries its own size; the process heap
-            // handle is the process's for its whole life.
-            unsafe {
-                let mut s: HEAP_SUMMARY = zeroed();
-                s.cb = size_of::<HEAP_SUMMARY>() as u32;
-                let ok = HeapSummary(GetProcessHeap(), 0, &mut s);
-                (ok != 0).then_some(s)
-            }
-        })?;
-        Some(OsHeap {
-            allocated_bytes: s.cbAllocated as u64,
-            committed_bytes: s.cbCommitted as u64,
-            read_us,
-        })
+        None
     }
 
     pub fn machine_commit() -> Option<MachineCommit> {
@@ -204,9 +196,13 @@ mod tests {
     fn the_readings_are_present_and_ordered() {
         let p = process_memory().expect("this platform reads its process");
         assert!(p.private_bytes > 0);
-        let h = p.heap.expect("this platform summarises its heap");
-        assert!(h.allocated_bytes <= h.committed_bytes, "{h:?}");
-        assert!(h.committed_bytes <= p.private_bytes, "{h:?} against {p:?}");
+        if cfg!(windows) {
+            assert_eq!(p.heap, None, "Windows walks its heap to summarise it");
+        } else {
+            let h = p.heap.expect("this platform summarises its heap");
+            assert!(h.allocated_bytes <= h.committed_bytes, "{h:?}");
+            assert!(h.committed_bytes <= p.private_bytes, "{h:?} against {p:?}");
+        }
         let m = machine_commit().expect("this platform states a commit limit");
         assert!(
             m.committed_bytes > 0 && m.committed_bytes <= m.limit_bytes,
