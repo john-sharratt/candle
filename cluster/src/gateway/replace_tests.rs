@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::hub::{take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
+use super::hub::{
+    age_pending, take_pending, undo_pending, Hub, PendingGuard, Socket, Taken, PENDING_CAP,
+    PENDING_STALE,
+};
 use super::registry::MemberView;
 use crate::close::{AfterClose, CloseCode};
 use crate::delivery::ReceiptPacer;
@@ -281,6 +284,55 @@ async fn overlapping_dials_converge() {
         let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
         assert!(s2.session > s1.session, "S2's next dial is admitted");
     }
+}
+
+/// **A serve task that ends before `run` takes its pending undoes it** — a
+/// panic, a dropped task — through the guard armed when the admission was
+/// decided: the standing session reports again, and the node's next `HELLO`
+/// is admitted rather than refused for good.
+#[tokio::test]
+async fn a_dropped_serve_undoes_its_admission() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (_, old) = admitted_once(&hub);
+    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
+    assert!(old.load(Ordering::SeqCst));
+    drop(PendingGuard {
+        hub: Arc::clone(&hub),
+        app: "zend".into(),
+        node: 1,
+        session: s1.session,
+        armed: true,
+    });
+    assert!(!old.load(Ordering::SeqCst), "undone");
+    assert!(
+        hub.decide("zend", &hello(1)).is_ok(),
+        "the next HELLO is admitted"
+    );
+}
+
+/// **A pending that stands past `PENDING_STALE` gives way to a newer
+/// `HELLO`**, which takes its place; the stale session's `run`, should it
+/// come, finds itself gone.
+#[tokio::test]
+async fn a_stale_pending_gives_way() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    admitted_once(&hub);
+    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
+    assert!(
+        hub.decide("zend", &hello(1)).is_err(),
+        "fresh, it completes first"
+    );
+    age_pending(&mut hub.state(), "zend", 1, PENDING_STALE);
+    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
+    let mut s = hub.state();
+    assert!(matches!(
+        take_pending(&mut s, "zend", 1, s1.session),
+        Taken::Gone
+    ));
+    assert!(matches!(
+        take_pending(&mut s, "zend", 1, s2.session),
+        Taken::Ready(_)
+    ));
 }
 
 /// **A handshake during which more claim relays pile up than it can be

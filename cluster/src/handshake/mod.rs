@@ -8,7 +8,7 @@ mod limiter;
 mod member;
 mod proof;
 
-pub use gateway::admit;
+pub use gateway::{admit, ADMIT_SEND};
 pub use key::{GroupKey, KeyError};
 pub use limiter::ProofLimiter;
 pub use member::join;

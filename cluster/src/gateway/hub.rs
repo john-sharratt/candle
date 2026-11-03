@@ -46,7 +46,7 @@ mod reports;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::machines::MachineTable;
-use reports::{apply_report, check_report, is_state_report, Applied, Held};
+use reports::{apply_report, check_report, is_state_report, Applied, Held, Report};
 use std::net::IpAddr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +90,7 @@ use crate::frame::{
     name, Admit, BuildFetch, BuildId, Capacity, Frame, Hello, Lost, MemberState, Members,
     Plan as PlanFrame,
 };
-use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, PROTO};
+use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, ADMIT_SEND, PROTO};
 use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, start_behind, Ended, Incoming, Role, SessionHandle, VirtualConn};
 
@@ -191,12 +191,20 @@ pub(super) struct Socket {
 /// are kept to what each kind last said ([`Held`]).
 pub(super) const PENDING_CAP: usize = 4096;
 
+/// How long a [`Pending`] may stand before a newer `HELLO` of its node may
+/// take its place: past `ADMIT_SEND`, its handshake has failed or its task is
+/// gone without undoing it, and the node must not be refused for good.
+pub(super) const PENDING_STALE: Duration = Duration::from_secs(ADMIT_SEND.as_secs() + 5);
+
 /// A session admitted whose socket is not yet in place: its `ADMIT` was
 /// built, and what has to bring that snapshot up to date waits here for it.
-/// One per node: a newer admission of the node supersedes it, and the
-/// superseded session's own `run` then fails (`take_pending`).
+/// One per node: a newer `HELLO` of the node is refused while it stands
+/// ([`Hub::decide`]), unless it has stood past [`PENDING_STALE`] — then the
+/// newer takes its place, and the stale session's `run`, should it ever come,
+/// finds itself [`Taken::Gone`].
 pub(super) struct Pending {
     session: u64,
+    since: Instant,
     /// The claim relays and plans for the node since its `ADMIT`'s table was
     /// built, handed to the new socket under the guard that puts it in place.
     queue: Vec<Frame>,
@@ -230,9 +238,9 @@ impl Pending {
 pub(super) enum Taken {
     /// Its own: the frames to hand the new socket.
     Ready(Vec<Frame>),
-    /// The node's pending admission is not this session's — none supersedes
-    /// another ([`Hub::decide`]), so this is no session `decide` admitted: it
-    /// goes, and changes nothing.
+    /// The node's pending admission is not this session's: it stood past
+    /// [`PENDING_STALE`] and a newer one took its place. The session goes, and
+    /// changes nothing.
     Gone,
     /// Too much arrived during the handshake: the session goes, and the
     /// state reports held back have been applied to the node's standing
@@ -240,17 +248,17 @@ pub(super) enum Taken {
     Overflowed(Vec<Applied>),
 }
 
-/// `frame`, a state report from the session `replaced` marks, under the state's
-/// guard: held back in the node's [`Pending`] while the replacement can still
-/// be undone and this is the node's standing session, and otherwise dropped.
-fn hold_back(s: &mut State, app: &str, node: u64, replaced: &AtomicBool, frame: Frame) {
+/// `report`, from the session `replaced` marks, under the state's guard: held
+/// back in the node's [`Pending`] while the replacement can still be undone and
+/// this is the node's standing session, and otherwise dropped.
+fn hold_back(s: &mut State, app: &str, node: u64, replaced: &AtomicBool, report: Report) {
     let key = (app.to_string(), node);
     let standing = s
         .sockets
         .get(&key)
         .is_some_and(|x| ptr::eq(Arc::as_ptr(&x.replaced), replaced));
     if let Some(p) = s.pending.get_mut(&key).filter(|_| standing) {
-        p.held.keep(frame);
+        p.held.keep(report);
     }
 }
 
@@ -259,21 +267,15 @@ fn hold_back(s: &mut State, app: &str, node: u64, replaced: &AtomicBool, frame: 
 /// report it sends after, so nothing it said lands out of order. A standing
 /// session that has since left takes what it reported with it: its node is no
 /// member here, and naming it a key's holder or a build's would send work to
-/// a socket that is gone. A report the protocol refuses was refused on
-/// arrival ([`Hub::on_frame`]), so none is held.
+/// a socket that is gone. What is held was checked and decoded on arrival
+/// ([`check_report`]), so it applies.
 fn apply_held(s: &mut State, app: &str, node: u64, held: Held) -> Vec<Applied> {
     if !s.sockets.contains_key(&(app.to_string(), node)) {
         return Vec::new();
     }
-    held.into_frames()
+    held.into_reports()
         .into_iter()
-        .filter_map(|frame| match apply_report(s, app, node, frame) {
-            Ok(done) => Some(done),
-            Err(close) => {
-                tracing::warn!(app, node = %hex(node), "a held report was refused: {close}");
-                None
-            }
-        })
+        .map(|report| apply_report(s, app, node, report))
         .collect()
 }
 
@@ -350,11 +352,38 @@ fn reserve(s: &mut State) {
     s.registry.set_reserved(reserved);
 }
 
+/// The undoing of an admission decided and not yet taken by its `run`: dropped
+/// armed — its handshake failed, or the serve task was dropped or panicked
+/// first — it undoes the replacement the admission began ([`undo_pending`]),
+/// so the node is not refused for as long as a stale pending would stand.
+pub(super) struct PendingGuard {
+    pub hub: Arc<Hub>,
+    pub app: String,
+    pub node: u64,
+    pub session: u64,
+    pub armed: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let applied = {
+            let mut s = self.hub.state();
+            s.admission.left(&self.app, self.node, self.session);
+            undo_pending(&mut s, &self.app, self.node, self.session)
+        };
+        self.hub.follow(&self.app, self.node, applied);
+    }
+}
+
 /// Undo the replacement [`Hub::decide`] began for `node`'s `session`, whose
-/// handshake failed before its socket was in place — only while it is still
-/// the node's pending admission; a newer one owns the replacement. The
-/// relays kept for it are dropped, the node's standing session reports again,
-/// and what it reported meanwhile is applied under this same guard
+/// handshake failed before its socket was in place — while it is still the
+/// node's pending admission: one that stood past [`PENDING_STALE`] may have
+/// been taken over by a newer, which owns the replacement now. The relays
+/// kept for it are dropped, the node's standing session reports again, and
+/// what it reported meanwhile is applied under this same guard
 /// ([`apply_held`]); what follows from it is returned, to do.
 pub(super) fn undo_pending(s: &mut State, app: &str, node: u64, session: u64) -> Vec<Applied> {
     let key = (app.to_string(), node);
@@ -366,6 +395,14 @@ pub(super) fn undo_pending(s: &mut State, app: &str, node: u64, session: u64) ->
         current.replaced.store(false, Ordering::SeqCst);
     }
     apply_held(s, app, node, p.held)
+}
+
+/// Age `node`'s pending admission by `by`, as though it had stood that long.
+#[cfg(test)]
+pub(super) fn age_pending(s: &mut State, app: &str, node: u64, by: Duration) {
+    if let Some(p) = s.pending.get_mut(&(app.to_string(), node)) {
+        p.since -= by;
+    }
 }
 
 /// The [`Pending`] `run` puts its session's socket in place with. Overflowed,
@@ -537,18 +574,25 @@ impl Hub {
         // **An admission of the node already decided completes first.** Its
         // handshake is past its proof and bounded by `ADMIT_SEND`, so it is
         // either taken or undone in moments; a newer `HELLO` meanwhile is
-        // refused to dial again rather than superseding it, so two overlapping
-        // dials of one node cannot unseat each other in turn and neither ever
-        // land.
-        if s.pending.contains_key(&key) {
-            return Err(Close::new(
-                CloseCode::Retry,
-                format!(
-                    "an admission of node {} is completing: dial again",
-                    hex(hello.node)
-                ),
-            ));
-        }
+        // refused to dial again rather than taking its place, so two
+        // overlapping dials of one node cannot unseat each other in turn and
+        // neither ever land. One that has stood past `PENDING_STALE` belongs
+        // to a handshake that came to nothing without undoing it — a task
+        // dropped mid-way — and the newer takes its place, with what the
+        // standing session reported meanwhile.
+        let stale = match s.pending.get(&key) {
+            Some(p) if p.since.elapsed() < PENDING_STALE => {
+                return Err(Close::new(
+                    CloseCode::Retry,
+                    format!(
+                        "an admission of node {} is completing: dial again",
+                        hex(hello.node)
+                    ),
+                ));
+            }
+            Some(_) => s.pending.remove(&key).map(|p| p.held),
+            None => None,
+        };
         let locked_before = s.admission.lock(app).is_some();
         let State {
             admission, held, ..
@@ -573,8 +617,9 @@ impl Hub {
             key,
             Pending {
                 session: admitted.session,
+                since: Instant::now(),
                 queue: Vec::new(),
-                held: Held::default(),
+                held: stale.unwrap_or_default(),
                 overflowed: false,
             },
         );
@@ -635,6 +680,11 @@ impl Hub {
         }
         let mut seen = None;
         let mut decided = None;
+        // Armed from the moment the admission is decided: should the handshake
+        // fail, or this task be dropped or panic before `run` takes the
+        // admission's pending, the replacement it began is undone, and the
+        // node's session stays as it was.
+        let mut guard = None;
         let handshake = admit(
             &mut tx,
             &mut rx,
@@ -642,6 +692,13 @@ impl Hub {
             |h| seen = Some((h.node, h.host.clone())),
             |h| {
                 let (admit, admitted) = self.decide(app, h)?;
+                guard = Some(PendingGuard {
+                    hub: Arc::clone(self),
+                    app: app.to_string(),
+                    node: h.node,
+                    session: admitted.session,
+                    armed: true,
+                });
                 decided = Some(admitted);
                 Ok(admit)
             },
@@ -650,16 +707,7 @@ impl Hub {
         let hello = match handshake {
             Ok((hello, _)) => hello,
             Err(e) => {
-                // Admitted, and the ADMIT never reached it: the replacement it
-                // began is undone, and the node's session stays as it was.
-                if let (Some(a), Some((node, _))) = (&decided, &seen) {
-                    let applied = {
-                        let mut s = self.state();
-                        s.admission.left(app, *node, a.session);
-                        undo_pending(&mut s, app, *node, a.session)
-                    };
-                    self.follow(app, *node, applied);
-                }
+                drop(guard);
                 match e {
                     HandshakeError::Refused(close) => {
                         if close.code == CloseCode::Proof.code() {
@@ -674,14 +722,17 @@ impl Hub {
             }
         };
         let admitted = decided.expect("an ADMIT was decided");
-        self.run(app, hello, admitted, tx, rx, streams).await;
+        let guard = guard.expect("an ADMIT decided arms its guard");
+        self.run(app, hello, admitted, guard, tx, rx, streams).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run<T, R, F>(
         self: &Arc<Self>,
         app: &str,
         hello: Hello,
         admitted: Admitted,
+        mut guard: PendingGuard,
         tx: T,
         rx: R,
         streams: F,
@@ -708,10 +759,13 @@ impl Hub {
             let mut s = self.state();
             let connected_ms = now_ms();
             // What was meant for the node since its ADMIT's table was built —
-            // unless a newer admission of the node superseded this one, or too
-            // much arrived meanwhile: then this session goes, having changed
-            // nothing.
-            let waiting = match take_pending(&mut s, app, node, admitted.session) {
+            // unless too much arrived meanwhile, or the pending stood so long
+            // a newer admission took its place: then this session goes,
+            // having changed nothing. Taken either way, it is no longer the
+            // guard's to undo.
+            let taken = take_pending(&mut s, app, node, admitted.session);
+            guard.armed = false;
+            let waiting = match taken {
                 Taken::Ready(waiting) => waiting,
                 gone => {
                     s.admission.left(app, node, admitted.session);
@@ -721,7 +775,10 @@ impl Hub {
                             "more changed during the handshake than it could be brought up to date with: dial again",
                             applied,
                         ),
-                        _ => ("this admission is no longer pending: dial again", Vec::new()),
+                        _ => (
+                            "this admission stood so long a newer one took its place: dial again",
+                            Vec::new(),
+                        ),
                     };
                     // Not 4409: no session of the node displaced this socket
                     // for good, and the member dials again.
@@ -928,16 +985,16 @@ impl Hub {
         // table was built or not at all; while the replacement can still be
         // undone it is held back rather than dropped ([`hold_back`]).
         if is_state_report(&frame) {
-            // Refused on arrival, held back or not: a report held is one that
-            // will apply.
-            check_report(&frame, node)?;
+            // Checked and decoded on arrival, held back or not: a report held
+            // is one that will apply.
+            let report = check_report(frame, node)?;
             let done = {
                 let mut s = self.state();
                 if replaced.load(Ordering::SeqCst) {
-                    hold_back(&mut s, app, node, replaced, frame);
+                    hold_back(&mut s, app, node, replaced, report);
                     return Ok(());
                 }
-                apply_report(&mut s, app, node, frame)?
+                apply_report(&mut s, app, node, report)
             };
             self.follow(app, node, [done]);
             return Ok(());

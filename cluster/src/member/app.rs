@@ -585,6 +585,15 @@ impl AppMember {
         };
         let upgrading = self.below(&floor);
         lock(&self.floors)[c] = Some(floor);
+        // A key claimed again above an epoch this gateway named is announced
+        // at once on every other gateway joined, upgrading or not — each still
+        // names the epoch before, and a later release at the new one would
+        // match nothing there. Sent before this socket joins the announced
+        // ones, so this gateway, which hears it with the re-announce below,
+        // does not hear it twice.
+        for (key, epoch) in again {
+            self.announce(Frame::Claim(Claim { key, epoch }));
+        }
         if !upgrading {
             for (key, epoch) in lock(&self.claims).own() {
                 let _ = handle.control(Frame::Claim(Claim { key, epoch }));
@@ -617,25 +626,10 @@ impl AppMember {
         let mut tick = interval(CAPACITY_EVERY);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut ticks: u64 = 0;
-        // A key claimed again above an epoch this gateway named is announced
-        // on every gateway joined — each still names the epoch before, and a
-        // later release at the new one would match nothing there — once this
-        // admission is taken: the gateway's first frame after `ADMIT`, which
-        // a superseded or overflowed one closes before. Never while
-        // upgrading, which holds no claim. This gateway hears it with the
-        // re-announce above. Should the session end first, it is announced
-        // then all the same: this member holds the key at the new epoch
-        // whatever became of the admission.
-        let mut again = if upgrading { Vec::new() } else { again };
         let how = loop {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
-                    Some(Incoming::Frame(frame)) => {
-                        for (key, epoch) in again.drain(..) {
-                            self.announce(Frame::Claim(Claim { key, epoch }));
-                        }
-                        self.on_frame(c, frame, upgrading)
-                    }
+                    Some(Incoming::Frame(frame)) => self.on_frame(c, frame, upgrading),
                     // Nothing is routed to an upgrading member; a stream that
                     // raced the admission is refused.
                     Some(Incoming::Stream(conn)) if upgrading => conn.reset(),
@@ -690,9 +684,6 @@ impl AppMember {
             }
         };
         lock(&self.sockets)[c] = None;
-        for (key, epoch) in again {
-            self.announce(Frame::Claim(Claim { key, epoch }));
-        }
         lock(&self.members)[c] = None;
         lock(&self.floors)[c] = None;
         if let Some(r) = &self.replicator {

@@ -402,7 +402,7 @@ member                                               gateway
 | 4400 | Malformed frame or protocol violation | reconnects (backoff) |
 | 4401 | Proof failed (either direction) | reconnects (backoff); the loading page names it |
 | 4409 | Replaced: a newer session of the same node was admitted (§3.3) | nothing: this socket is the stale one, and the member is already connected through the new one |
-| 4429 | Retry: this admission was not taken — a newer one of the node superseded it while it was still in its handshake, or more changed meanwhile than it could be brought up to date with (§5.4) | backs off and dials again: no session of the node displaced this socket for good. A member that knows no 4429 backs off from it as from any code it does not know |
+| 4429 | Retry: this admission was not taken — another admission of the node was completing when its `HELLO` came, more changed during its handshake than it could be brought up to date with, or it stood past `PENDING_STALE` and a newer one took its place (§5.4) | backs off and dials again: no session of the node displaced this socket for good. A member that knows no 4429 backs off from it as from any code it does not know |
 | **4410** | **Build superseded, and no way to upgrade:** `build.count` below the app's floor, and no build at the floor fits it (no artifact for its kind and platform, or the checks of §3.9 fail); or a member left behind when a rollout ends: stranded, or its install failed (§3.5, §3.9). A member below the floor that *can* take the floor's build is admitted to upgrade instead (§3.5) | **closes that app's sockets to every cluster and stops reconnecting** until the process is replaced by a rebuilt binary — a build any cluster has superseded serves on none |
 | 4412 | Model mismatch: the app's group is locked to another model. A new model is moved to by hand, not by an upgrade (§3.6) | reconnects at the 8 s cap; admitted once the group empties and the lock clears |
 | 4417 | Clock skew: `HELLO.now_ms` is more than 60 s from the gateway's clock. A clock far ahead would drag every member's `hlc` with it (§6.2), and Paxos lease terms and tombstone ages read the clock (§5.9, §6.8) | reconnects at the 8 s cap; the loading page names the skew |
@@ -1576,12 +1576,17 @@ instead:
   `PENDING_CAP`; past it the admission fails, and the member dials again.
 - **One admission of a node is pending at a time, and it completes first.** A `HELLO` of
   the node while one is pending — past its proof, and bounded by `ADMIT_SEND` — is refused
-  `4429` rather than superseding it, so two overlapping dials cannot unseat each other in
+  `4429` rather than taking its place, so two overlapping dials cannot unseat each other in
   turn and neither ever land: the pending one is taken or undone in moments, and the other
   dials again into a node with none pending. Only the pending session's own `run` or
-  failure touches the replacement. An admission not taken — refused so, or overflowed — is
-  closed `4429`, and its member dials again: never `4409`, which would stop that dial loop
-  for good though nothing displaced it. A member's one dial loop per cluster tries that
+  failure touches the replacement — its failure through a guard armed from the moment the
+  admission is decided, which undoes it however the serve task ends before `run` takes it,
+  a panic or a dropped task included. A pending that still stands past `PENDING_STALE`
+  (`ADMIT_SEND` and 5 s) belongs to a handshake that came to nothing, and a newer `HELLO`
+  takes its place, with what the standing session reported meanwhile; the stale session's
+  `run`, should it ever come, finds itself gone. An admission not taken — refused so,
+  overflowed, or gone — is closed `4429`, and its member dials again: never `4409`, which
+  would stop that dial loop for good though nothing displaced it. A member's one dial loop per cluster tries that
   cluster's URLs in turn (`gateway.tokera.local`, then `gateway.tokera.com`), so it never
   dials one gateway twice at once.
 - **A replaced session reports nothing of its node's state.** What it sends that is
@@ -1594,10 +1599,11 @@ instead:
   holding with every artifact they named, every key reported complete, each key's net
   claim — so however long the handshake none of what it ended at is lost. If the handshake
   fails it is applied after all, in the order each kept report arrived (a key's `UNCLAIM`
-  before the `COMPLETE` that followed it, a `CAPACITY` before a later `ACK`), under the very
+  before the `COMPLETE` that followed it, still when the same release is sent again after;
+  a `CAPACITY` before a later `ACK`), under the very
   guard that undoes the replacement, before anything the session sends after — unless the
   standing session has left meanwhile, which takes what it reported with it. A report is
-  checked as it arrives, held back or not: a claim naming another node, or a `ROUTES` or
+  checked and decoded as it arrives, held back or not, and kept decoded: a claim naming another node, or a `ROUTES` or
   `COORD` that does not decode, closes the socket `4400` then. Requests routed on and
   one-time replies and offers — catch-ups and their answers, a resync's `HAVE`, votes,
   build chunks — still pass: a process still running sends each once, and a peer awaits
@@ -1612,8 +1618,8 @@ instead:
   serves would let a peer take it — and its re-announce corrects the table: an epoch below
   the held one is superseded by it, and above it the key is claimed again here, above that
   epoch, and that claim is announced on every gateway the member has joined, each of which
-  still names the epoch before — once the admission is taken, at the gateway's first frame
-  after `ADMIT`, and never while upgrading. The gateway relays an `UNCLAIM` only when it let a
+  still names the epoch before — at once, upgrading or not; the gateway that sent the
+  `ADMIT` hears it with the member's re-announce. The gateway relays an `UNCLAIM` only when it let a
   claim go, so a release that matched nothing reaches no peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
   another node is a protocol violation, closed `4400`. No gateway relays a node its own
