@@ -9,11 +9,12 @@
 //! same scope. A scope names the code that *made* a block, not whatever holds
 //! it after.
 //!
-//! The scope is one `u8` in a `const`-initialised thread-local with no
-//! destructor, so reading it allocates nothing and costs a TLS load.
+//! The scope is one byte of the thread's census word (`thread_state`), read
+//! with the shard in one TLS load.
 
-use std::cell::Cell;
 use std::marker::PhantomData;
+
+use super::thread_state::{replace_scope, shard_and_scope};
 
 /// How many scopes there are. A power of two: a header byte is masked by it,
 /// so no byte read back indexes past the counters.
@@ -98,22 +99,17 @@ impl Scope {
     }
 }
 
-thread_local! {
-    /// The calling thread's scope.
-    static CURRENT: Cell<u8> = const { Cell::new(Scope::Unscoped as u8) };
-}
-
 /// The calling thread's scope, as its index. A thread past its thread-locals'
 /// lifetime is unscoped.
-#[inline(always)]
+#[cfg(test)]
 pub(crate) fn current() -> u8 {
-    CURRENT.try_with(Cell::get).unwrap_or(Scope::Unscoped as u8)
+    shard_and_scope().1
 }
 
 /// Name the calling thread's scope for the rest of its life, or until a guard
 /// narrows it. What a thread calls as it starts.
 pub fn set_thread(scope: Scope) {
-    let _ = CURRENT.try_with(|c| c.set(scope as u8));
+    replace_scope(scope as u8);
 }
 
 /// The calling thread's scope as it was before an [`enter`], put back when
@@ -127,18 +123,15 @@ pub struct Scoped {
 
 /// Narrow the calling thread's scope to `scope` until the guard is dropped.
 pub fn enter(scope: Scope) -> Scoped {
-    let previous = CURRENT
-        .try_with(|c| c.replace(scope as u8))
-        .unwrap_or(Scope::Unscoped as u8);
     Scoped {
-        previous,
+        previous: replace_scope(scope as u8),
         _thread: PhantomData,
     }
 }
 
 impl Drop for Scoped {
     fn drop(&mut self) {
-        let _ = CURRENT.try_with(|c| c.set(self.previous));
+        replace_scope(self.previous);
     }
 }
 

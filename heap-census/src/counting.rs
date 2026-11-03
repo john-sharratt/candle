@@ -14,17 +14,17 @@
 //! allocates recurses into itself; one that locks can deadlock against a thread
 //! holding that lock while it allocates; one that panics aborts the process.
 //! So the counting is atomic adds on static memory, the arithmetic wraps, and
-//! the thread's shard and scope live in `const`-initialised thread-locals with
-//! no destructor — the kind the platform keeps in static TLS, which needs no
-//! allocation to create and is never torn down while its thread runs.
+//! the thread's shard and scope live in one `const`-initialised thread-local
+//! word with no destructor (`thread_state`) — the kind the platform keeps in
+//! static TLS, which needs no allocation to create and is never torn down while
+//! its thread runs.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::ptr::{copy_nonoverlapping, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use super::scope::current;
-use super::shards::{Census, SHARDS};
+use super::shards::Census;
+use super::thread_state::shard_and_scope;
 
 /// The process's census: what [`Counting`] counts into.
 pub static CENSUS: Census = Census::new();
@@ -43,32 +43,10 @@ const MIN_HEADER: usize = 16;
 /// installed census reading zero from no census at all.
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// The next shard a thread is given.
-static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
-
-/// No shard chosen yet.
-const UNSET: usize = usize::MAX;
-
-thread_local! {
-    /// This thread's shard, chosen on its first allocation.
-    static SHARD: Cell<usize> = const { Cell::new(UNSET) };
-}
-
-/// The calling thread's shard: the one it was given, or the next in turn on its
-/// first call. A thread past its thread-locals' lifetime counts on shard 0.
+/// The calling thread's shard.
 #[inline(always)]
 fn shard() -> usize {
-    SHARD
-        .try_with(|s| {
-            let held = s.get();
-            if held != UNSET {
-                return held;
-            }
-            let given = NEXT_SHARD.fetch_add(1, Relaxed) % SHARDS;
-            s.set(given);
-            given
-        })
-        .unwrap_or(0)
+    shard_and_scope().0
 }
 
 /// The header in front of a block of `layout`, in bytes, when it carries its
@@ -88,10 +66,23 @@ pub const fn header_of(layout: Layout) -> Option<usize> {
 }
 
 /// The layout `System` is asked for: `layout` with `header` bytes in front.
+/// `None` only when the sum passes the largest size a layout may have.
 #[inline(always)]
 fn outer(layout: Layout, header: usize) -> Option<Layout> {
     let size = layout.size().checked_add(header)?;
-    Layout::from_size_align(size, layout.align()).ok()
+    // The bound `Layout` itself keeps: rounded up to its alignment, a size
+    // may not pass `isize::MAX`.
+    if size > isize::MAX as usize - (layout.align() - 1) {
+        return None;
+    }
+    // SAFETY: the alignment is `layout`'s own, and the size was bounded above.
+    Some(unsafe { Layout::from_size_align_unchecked(size, layout.align()) })
+}
+
+/// [`outer`] for a block already allocated with it, which therefore fits.
+#[inline(always)]
+unsafe fn outer_of_held(layout: Layout, header: usize) -> Layout {
+    Layout::from_size_align_unchecked(layout.size() + header, layout.align())
 }
 
 /// Whether [`Counting`] is this process's global allocator — whether it has
@@ -135,11 +126,11 @@ impl Counting {
         if base.is_null() {
             return base;
         }
-        let scope = current();
+        let (shard, scope) = shard_and_scope();
         // SAFETY: `base` holds `header` bytes before the block; the scope is
         // their last.
         base.add(header - 1).write(scope);
-        CENSUS.on_alloc_scoped(shard(), layout.size(), scope);
+        CENSUS.on_alloc_scoped(shard, layout.size(), scope);
         Counting::mark_installed();
         base.add(header)
     }
@@ -171,9 +162,7 @@ unsafe impl GlobalAlloc for Counting {
             Some(header) => {
                 let base = ptr.sub(header);
                 let scope = base.add(header - 1).read();
-                // SAFETY: the allocation succeeded with this outer layout, so
-                // it is valid.
-                System.dealloc(base, outer(layout, header).unwrap_unchecked());
+                System.dealloc(base, outer_of_held(layout, header));
                 CENSUS.on_free_scoped(shard(), layout.size(), scope);
             }
         }
@@ -199,10 +188,10 @@ unsafe impl GlobalAlloc for Counting {
             (Some(header), Some(_)) => {
                 let base = ptr.sub(header);
                 let scope = base.add(header - 1).read();
-                let Some(whole) = new_size.checked_add(header) else {
+                let Some(whole) = outer(new_layout, header) else {
                     return null_mut();
                 };
-                let p = System.realloc(base, outer(layout, header).unwrap_unchecked(), whole);
+                let p = System.realloc(base, outer_of_held(layout, header), whole.size());
                 if p.is_null() {
                     return p;
                 }
@@ -228,6 +217,7 @@ unsafe impl GlobalAlloc for Counting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::current;
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).unwrap()
