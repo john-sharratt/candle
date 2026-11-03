@@ -43,8 +43,6 @@ use crate::machines::state_expert_pin;
 #[cfg(feature = "memory-census")]
 use crate::memory_census;
 use crate::model::{ModelView, MODEL};
-#[cfg(feature = "memory-census")]
-use heap_census::{set_thread, Scope};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
 use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
@@ -55,6 +53,8 @@ use crate::telemetry::Telemetry;
 use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
 use agent::config::AgentConfig;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 
 /// One forward in this many records its GPU spans in a profiling build (see
 /// `set_gpu_span_period`). At a decode step of ~35 ms that is a sampled forward

@@ -233,7 +233,11 @@ mod tests {
     /// **An owner serialises with its classes and its scopes.**
     #[test]
     fn an_owner_reads_as_json() {
-        let g = judge(&reading(0, 0, 0, 0), &reading(60_000, 4 * GIB, 4 * GIB, 4 * GIB), 2 * GIB);
+        let g = judge(
+            &reading(0, 0, 0, 0),
+            &reading(60_000, 4 * GIB, 4 * GIB, 4 * GIB),
+            2 * GIB,
+        );
         assert_eq!(
             serde_json::to_string(&g).unwrap(),
             r#"{"over_ms":60000,"private_grew":4294967296,"committed_grew":4294967296,"live_grew":4294967296,"verdict":"owner","classes":[{"class":15,"upto_bytes":32768,"grew_bytes":4294967296}],"scopes":[{"scope":"remote_apply","grew_bytes":4294967296}]}"#

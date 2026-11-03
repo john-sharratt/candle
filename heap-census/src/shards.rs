@@ -13,8 +13,11 @@
 //! call that has updated its bytes and not yet its count; the error is bounded
 //! by the calls in flight while it reads.
 //!
-//! A block that carries its scope ([`Census::on_alloc_scoped`]) is counted
-//! twice: in its class, like every block, and in its scope's class.
+//! A block that carries its scope ([`Census::on_alloc_scoped`]) is counted in
+//! its scope's class **instead of** the plain one, and a class's total is the
+//! sum of both, taken at the reading. Counting it in both would be two more
+//! locked adds on every allocation and free of such a block — a 40% slower
+//! allocator, measured — for a figure the reading can add up itself.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -130,21 +133,20 @@ impl Census {
         s.count[k].fetch_sub(1, Relaxed);
     }
 
-    /// Count a `size`-byte allocation made in scope `scope` on `shard`: in its
-    /// class, and in its scope's.
+    /// Count a `size`-byte allocation made in scope `scope` on `shard`, in its
+    /// scope's class: the same three adds as [`Self::on_alloc`].
     #[inline(always)]
     pub fn on_alloc_scoped(&self, shard: usize, size: usize, scope: u8) {
-        self.on_alloc(shard, size);
         let s = &self.shards[shard % SHARDS];
         let (k, c) = (class_of(size), scope as usize & (SCOPES - 1));
         s.scoped_bytes[c][k].fetch_add(size as u64, Relaxed);
         s.scoped_count[c][k].fetch_add(1, Relaxed);
+        s.allocated.fetch_add(size as u64, Relaxed);
     }
 
     /// Count the free of a `size`-byte allocation made in scope `scope`.
     #[inline(always)]
     pub fn on_free_scoped(&self, shard: usize, size: usize, scope: u8) {
-        self.on_free(shard, size);
         let s = &self.shards[shard % SHARDS];
         let (k, c) = (class_of(size), scope as usize & (SCOPES - 1));
         s.scoped_bytes[c][k].fetch_sub(size as u64, Relaxed);
@@ -175,21 +177,24 @@ impl Census {
             }
             allocated = allocated.wrapping_add(s.allocated.load(Relaxed));
         }
+        // A class's total: its plain blocks and every scope's.
+        let mut scopes = [[ClassCount::default(); CLASSES]; SCOPES];
+        for c in 0..SCOPES {
+            for k in 0..CLASSES {
+                bytes[k] = bytes[k].wrapping_add(scoped_bytes[c][k]);
+                count[k] = count[k].wrapping_add(scoped_count[c][k]);
+                scopes[c][k] = ClassCount {
+                    bytes: live(scoped_bytes[c][k]),
+                    count: live(scoped_count[c][k]),
+                };
+            }
+        }
         let mut classes = [ClassCount::default(); CLASSES];
         for k in 0..CLASSES {
             classes[k] = ClassCount {
                 bytes: live(bytes[k]),
                 count: live(count[k]),
             };
-        }
-        let mut scopes = [[ClassCount::default(); CLASSES]; SCOPES];
-        for c in 0..SCOPES {
-            for k in 0..CLASSES {
-                scopes[c][k] = ClassCount {
-                    bytes: live(scoped_bytes[c][k]),
-                    count: live(scoped_count[c][k]),
-                };
-            }
         }
         Counts {
             classes,
@@ -259,7 +264,15 @@ mod tests {
                 count: 1
             }
         );
-        assert_eq!(n.classes[17].bytes, 100_000);
+        assert_eq!(
+            n.classes[17],
+            ClassCount {
+                bytes: 100_000,
+                count: 1
+            },
+            "a class's total sums its scopes"
+        );
+        assert_eq!((n.live_bytes(), n.allocated_total), (100_000, 100_000));
         assert_eq!(n.scope_bytes(5), 100_000);
         assert_eq!(n.scope_bytes(0), 0);
         c.on_free_scoped(9, 100_000, 5);

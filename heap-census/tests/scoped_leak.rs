@@ -30,7 +30,10 @@ fn scope_bytes(s: Scope) -> u64 {
 /// zero.**
 #[test]
 fn a_kept_leak_is_named_by_its_scope_and_churn_is_not() {
-    let (kept_before, churn_before) = (scope_bytes(Scope::RemoteApply), scope_bytes(Scope::Adoption));
+    let (kept_before, churn_before) = (
+        scope_bytes(Scope::RemoteApply),
+        scope_bytes(Scope::Adoption),
+    );
     let kept: Vec<Vec<u8>> = {
         let _s = enter(Scope::RemoteApply);
         (0..KEPT).map(|i| vec![(i % 251) as u8; SIZE]).collect()
@@ -38,7 +41,9 @@ fn a_kept_leak_is_named_by_its_scope_and_churn_is_not() {
     {
         let _s = enter(Scope::Adoption);
         for round in 0..20 {
-            let churned: Vec<Vec<u8>> = (0..KEPT).map(|i| vec![((i + round) % 251) as u8; SIZE]).collect();
+            let churned: Vec<Vec<u8>> = (0..KEPT)
+                .map(|i| vec![((i + round) % 251) as u8; SIZE])
+                .collect();
             black_box(&churned);
         }
     }
@@ -80,7 +85,11 @@ fn a_block_grown_and_shrunk_across_the_labelled_size_balances() {
         assert!(scope_bytes(Scope::Journals) >= before + v.capacity() as u64);
         v.truncate(100);
         v.shrink_to_fit();
-        assert_eq!(scope_bytes(Scope::Journals), before, "100 bytes carry no scope");
+        assert_eq!(
+            scope_bytes(Scope::Journals),
+            before,
+            "100 bytes carry no scope"
+        );
         black_box(&v);
     }
     assert_eq!(scope_bytes(Scope::Journals), before);

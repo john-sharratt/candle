@@ -2,8 +2,6 @@
 
 use crate::cancel::CancelToken;
 use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
-#[cfg(feature = "memory-census")]
-use heap_census::{set_thread, Scope};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
@@ -34,6 +32,8 @@ use crate::stencil::{
     TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner.
 use crate::substrate::{ConvCompression, Substrate};

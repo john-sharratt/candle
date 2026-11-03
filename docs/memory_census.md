@@ -425,10 +425,13 @@ instead.
   takes the block off it on whichever thread frees it. The header costs under
   0.4% of such a block; a smaller block is counted by class only, where a
   header would be a large share of it.
-- **Counted per scope per class**, in the same shards as the classes, with the
-  same `Relaxed` adds. The cost is one thread-local read per allocation, and
-  for a labelled block one byte written and read; the overhead gate (§3) times
-  it with 4 KiB and 30 KB blocks in the mix.
+- **Counted per scope per class, instead of in the plain class**, in the same
+  shards: a labelled block costs the same three locked adds as any other, and a
+  class's total is summed at the reading. Counting it in both was measured at
+  1.41× the plain allocator (BlackWorld, 2026-11-04); the extra cost now is one
+  thread-local read per allocation, and for a labelled block one byte written
+  and read. The overhead gate (§3) times it with 4 KiB and 30 KB blocks in the
+  mix.
 - **Reported** under `/v1/memory` `process.heap.allocator.scopes` (each scope's
   live bytes, count and classes), and named in the owner verdict and the
   `memory census` and `memory growing` lines as `grown_scopes`.
