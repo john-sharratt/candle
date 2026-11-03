@@ -45,16 +45,18 @@ pub fn record_of(t: &TimelineDetail, index: u32) -> Option<usize> {
         .position(|turn| turn.index == index)
 }
 
-/// One point, as its lines.
-pub fn point(n: usize, p: &Value) -> String {
+/// One point of `of`, as its lines. The first is the opening the prompt was
+/// built from; the last of several is recomputed after the turn sealed, and
+/// governs nothing the reply read.
+pub fn point(n: usize, of: usize, p: &Value) -> String {
     let start = p.get("start_token").and_then(Value::as_u64).unwrap_or(0);
     let bar = bar_at(start);
     let mut out = format!(
-        "point {n} at reply token {start} ({}): {} tokens materialized of {} in the substrate",
-        match (n, start) {
-            (0, _) => "opening",
-            (_, 0) => "before decode",
-            _ => "while decoding",
+        "point {n} at reply token {start} ({}): {} tokens materialized; the substrate holds {}",
+        match n {
+            0 => "opening — the prompt the reply began on",
+            n if n + 1 == of => "after the turn sealed",
+            _ => "reprojected while decoding",
         },
         p.get("materialized_tokens").and_then(Value::as_u64).unwrap_or(0),
         p.get("substrate_tokens").and_then(Value::as_u64).unwrap_or(0),
@@ -82,15 +84,29 @@ pub fn point(n: usize, p: &Value) -> String {
                 })
                 .collect();
             members.sort_by(|a, b| b.1.total_cmp(&a.1));
+            // A member shown with no score is a mandatory one: it is in every
+            // prompt, whatever the belief.
             let shown: Vec<String> = members
                 .iter()
-                .filter(|m| m.2)
+                .filter(|m| m.2 && m.1 > 0.0)
                 .map(|(name, score, _, _)| format!("{name} {score:.0}"))
                 .collect();
+            let always: Vec<&str> = members
+                .iter()
+                .filter(|m| m.2 && m.1 <= 0.0)
+                .map(|m| m.0)
+                .collect();
             out.push_str(&format!(
-                "\n  signatures shown (bar {bar:.0}): {}",
-                shown.join(", ")
+                "\n  signatures shown by score (bar {bar:.0}): {}",
+                if shown.is_empty() {
+                    "none — no tool scored".to_string()
+                } else {
+                    shown.join(", ")
+                }
             ));
+            if !always.is_empty() {
+                out.push_str(&format!("\n  always shown: {}", always.join(", ")));
+            }
             let left: Vec<String> = members
                 .iter()
                 .filter(|m| !m.2 && m.1 > 0.0)
@@ -112,8 +128,8 @@ pub fn point(n: usize, p: &Value) -> String {
             ));
         }
         None => out.push_str(&format!(
-            "\n  signatures shown (bar {bar:.0}): none — no tool reached the bar, so the prompt \
-             carried the tool names alone and the point recorded no candidates"
+            "\n  signatures shown by score (bar {bar:.0}): none — no tool reached the bar, so \
+             the prompt carried the tool names alone and the point recorded no candidates"
         )),
     }
     let buckets: Vec<String> = p
@@ -174,7 +190,7 @@ pub fn render(
     for (n, p) in record.iter().enumerate() {
         let v = serde_json::to_value(p).unwrap_or(Value::Null);
         out.push('\n');
-        out.push_str(&point(n, &v));
+        out.push_str(&point(n, record.len(), &v));
     }
     Ok(out)
 }
@@ -224,20 +240,20 @@ mod tests {
                 {"name": "file_list", "tokens": 300, "selected": true, "score": 990.0, "qualified": true},
                 {"name": "job_status", "tokens": 300, "selected": false, "score": 640.0, "qualified": false},
                 {"name": "run_command", "tokens": 300, "selected": true, "score": 1000.0, "qualified": true},
-                {"name": "datetime", "tokens": 90, "selected": false, "score": 0.0, "qualified": false}
+                {"name": "datetime", "tokens": 90, "selected": false, "score": 0.0, "qualified": false},
+                {"name": "file_read", "tokens": 300, "selected": true, "score": 0.0, "qualified": false}
             ]}], "turns": [{"selected": true}, {"selected": false}]}
         });
         assert_eq!(
-            point(0, &p),
-            "point 0 at reply token 0 (opening): 9000 tokens materialized of 40000 in the \
-             substrate\n  signatures shown (bar 800): run_command 1000, file_list 990\n  \
-             strongest left out: job_status 640\n  tokens by bucket: tools 1200\n  dialogue \
-             turns in context: 1"
+            point(0, 3, &p),
+            "point 0 at reply token 0 (opening — the prompt the reply began on): 9000 tokens \
+             materialized; the substrate holds 40000\n  signatures shown by score (bar 800): \
+             run_command 1000, file_list 990\n  always shown: file_read\n  strongest left out: \
+             job_status 640\n  tokens by bucket: tools 1200\n  dialogue turns in context: 1"
         );
         let none = json!({"start_token": 40, "selection": {"system": [], "turns": []}});
-        assert!(point(1, &none).contains(
-            "point 1 at reply token 40 (while decoding)"
-        ));
-        assert!(point(1, &none).contains("signatures shown (bar 250): none — no tool reached the bar"));
+        assert!(point(1, 3, &none).contains("point 1 at reply token 40 (reprojected while decoding)"));
+        assert!(point(1, 3, &none).contains("signatures shown by score (bar 250): none — no tool reached the bar"));
+        assert!(point(2, 3, &none).contains("(after the turn sealed)"));
     }
 }
