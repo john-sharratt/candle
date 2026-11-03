@@ -281,7 +281,9 @@ mod tests {
     /// **The machine the table prefers to build on takes the job** while it has
     /// a slot — at low priority beside a model member, and with fewer idle
     /// cores than another; full, the next does; a machine the table ranks
-    /// nowhere comes last. A lineage still goes back to its holder.
+    /// nowhere comes last. A lineage stays on BlackWorld beside a free
+    /// dedicated agent, goes back to a holder no free agent outranks, and moves
+    /// off one a free agent does.
     #[test]
     fn the_preferred_build_machine_builds_first() {
         let machines = MachineTable::from_yaml(
@@ -313,9 +315,14 @@ mod tests {
             "BlackWorld full: AlienWorld before an unranked WhiteWorld"
         );
         assert_eq!(
+            super::choose(&ready, &machines, Some(2), &cargo(), false),
+            Choice::Run(2),
+            "a lineage's holder keeps it while none it ranks below is free"
+        );
+        assert_eq!(
             super::choose(&ready, &machines, Some(3), &cargo(), false),
-            Choice::Run(3),
-            "a lineage's holder keeps it"
+            Choice::Run(2),
+            "a lineage on an unranked machine moves to a free ranked one"
         );
         assert_eq!(machines.builds("blackworld"), Some(1));
     }
