@@ -4,7 +4,7 @@
 use mcp_server::protocol::text_result;
 use serde_json::{json, Value};
 
-use super::library::Library;
+use super::Library;
 
 pub const LIST: &str = "guide_list";
 pub const READ: &str = "guide_read";
