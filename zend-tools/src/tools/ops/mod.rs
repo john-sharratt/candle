@@ -1,8 +1,9 @@
 //! The operations tools a worker reaches (`docs/jobs.md` §8): the five job
 //! tools — `job_list`, `job_status`, `job_read`, `job_grep`, `job_cancel` —
 //! over its tasks, builds, deploys and maintenance jobs; `service_deploy` and
-//! `service_status`; and `cluster_status`, `cluster_logs`, `cluster_audit` for
-//! reading the cluster. Each is a typed request handed whole to the daemon's
+//! `service_status`; `cluster_status`, `cluster_logs`, `cluster_audit` for
+//! reading the cluster; and `timeline_read` for reading a stored conversation
+//! — another run's turns, calls, projections and prompt. Each is a typed request handed whole to the daemon's
 //! [`OpsRunner`], which runs the implementation its MCP tools run, so a worker
 //! and Claude get one answer from one code path. The answer is the text Claude
 //! reads too.
@@ -18,6 +19,7 @@ use crate::{ToolContext, ToolError};
 pub mod cluster;
 pub mod job;
 pub mod service;
+pub mod timeline;
 
 #[derive(Debug, Error)]
 pub enum OpsError {

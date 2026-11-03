@@ -20,7 +20,8 @@ use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
 use super::tools::{
-    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, Answer, Ctx,
+    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, timeline_read, Answer,
+    Ctx,
 };
 use crate::session::ZendSession;
 
@@ -148,6 +149,7 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (cluster_status::NAME, Needs::ReadsAsPerson),
     (cluster_logs::NAME, Needs::ReadsAsPerson),
     (cluster_audit::NAME, Needs::ReadsAsPerson),
+    (timeline_read::NAME, Needs::ReadsAsPerson),
 ];
 
 /// Why a worker of `role` doing `kind`'s work, working for a person or not
@@ -179,6 +181,7 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         cluster_status::NAME => cluster_status::run(call, args).await,
         cluster_logs::NAME => cluster_logs::run(call, args).await,
         cluster_audit::NAME => cluster_audit::run(call, args).await,
+        timeline_read::NAME => timeline_read::run(call, args).await,
         job::list::NAME => job::list::run(call, args).await,
         job::status::NAME => job::status::run(call, args).await,
         job::read::NAME => job::read::run(call, args).await,

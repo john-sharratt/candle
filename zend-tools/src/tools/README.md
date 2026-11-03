@@ -76,6 +76,7 @@ handle: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or
 | `job_cancel` | `ops/job.rs` | Stops a job of any kind. `Network` + `Exec` + `DiskWrite` |
 | `service_deploy` | `ops/service.rs` | Builds origin/main on the machine's agent and has keep try it; answers the deploy's handle at once. `Network` + `Exec` + `DiskWrite` |
 | `service_status` | `ops/service.rs` | What each machine's keep runs, and the deploys building there. `Network` |
+| `timeline_read` | `ops/timeline.rs` | A stored conversation as `view` asks: turns, one turn, calls with repeats flagged, projections (signatures shown, scores, left out), prompt, selection, a probe of a text. `Network` |
 
 ### Git (12 tools)
 

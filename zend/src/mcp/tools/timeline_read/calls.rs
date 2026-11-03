@@ -1,0 +1,117 @@
+//! `view: calls`: each turn's tool calls, one line each — the name and its
+//! arguments as written — with a call identical to one the conversation already
+//! made flagged as a repeat, and where it was first made. A run that went round
+//! in circles reads as a column of repeats; a call that dropped the argument
+//! its reasoning named reads as the same call over and over.
+
+use std::collections::HashMap;
+
+use host::substrate_views::TimelineDetail;
+
+use super::head;
+use crate::tools::extract_tool_calls;
+
+/// How much of a call's arguments a line shows.
+const ARGS: usize = 200;
+
+/// A call's arguments as one line, cut at [`ARGS`] characters.
+fn args_line(args: &serde_json::Value) -> String {
+    let text = args.to_string();
+    match text.char_indices().nth(ARGS) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
+/// The calls of turns `offset..offset + limit`, a line each, repeats of any
+/// earlier call of the conversation flagged with where it was first made.
+pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
+    let mut first: HashMap<String, u32> = HashMap::new();
+    let (mut calls, mut repeats) = (0, 0);
+    let mut lines = Vec::new();
+    for (at, turn) in t.turns.iter().enumerate() {
+        let shown = (offset..offset + limit).contains(&at);
+        let made = extract_tool_calls(&turn.assistant);
+        if shown && made.is_empty() {
+            lines.push(format!("#{} no calls", turn.index));
+        }
+        for c in made {
+            let key = format!("{} {}", c.name, c.arguments);
+            let line = format!("{} {}", c.name, args_line(&c.arguments));
+            let seen = first.get(&key).copied();
+            if seen.is_none() {
+                first.insert(key, turn.index);
+            }
+            if !shown {
+                continue;
+            }
+            calls += 1;
+            match seen {
+                Some(was) => {
+                    repeats += 1;
+                    lines.push(format!("#{} {line} — repeat of #{was}'s", turn.index));
+                }
+                None => lines.push(format!("#{} {line}", turn.index)),
+            }
+        }
+    }
+    let mut out = head(t);
+    out.push_str(&format!(
+        "\ncalls of turns {}–{}: {calls}, of which {repeats} repeat a call already made",
+        offset.min(t.turns.len()),
+        (offset + limit).min(t.turns.len())
+    ));
+    for l in lines {
+        out.push('\n');
+        out.push_str(&l);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{timeline, turn_view};
+    use super::*;
+
+    /// **A repeated call is flagged with where it was first made**, whether
+    /// the repeat is in the same turn or a later one; a turn with no calls
+    /// says so.
+    #[test]
+    fn a_repeated_call_is_flagged_with_where_it_was_first_made() {
+        let call = |args: &str| {
+            format!("<tool_call>\n{{\"name\": \"file_list\", \"arguments\": {args}}}\n</tool_call>")
+        };
+        let root = call(r#"{"repo": "candle", "page": 1}"#);
+        let docs = call(r#"{"repo": "candle", "path": "docs", "page": 1}"#);
+        let mut t = timeline();
+        t.turns = vec![
+            turn_view(0, "tour", &format!("<think>x</think>\n{root}\n{root}")),
+            turn_view(1, "r", &format!("{docs}\n{root}")),
+            turn_view(2, "r", "Here it is."),
+        ];
+        let text = render(&t, 0, 10);
+        assert!(
+            text.contains("calls of turns 0–3: 4, of which 2 repeat a call already made"),
+            "{text}"
+        );
+        let lines: Vec<&str> = text.lines().skip_while(|l| !l.starts_with("calls of")).skip(1).collect();
+        assert_eq!(lines.len(), 5, "{text}");
+        assert!(lines[0].starts_with("#0 file_list {") && !lines[0].contains("repeat"), "{text}");
+        assert!(lines[1].starts_with("#0 file_list {") && lines[1].ends_with("— repeat of #0's"), "{text}");
+        assert!(lines[2].starts_with("#1 file_list {") && lines[2].contains("\"path\":\"docs\""), "{text}");
+        assert!(!lines[2].contains("repeat"), "{text}");
+        assert!(lines[3].starts_with("#1 file_list {") && lines[3].ends_with("— repeat of #0's"), "{text}");
+        assert_eq!(lines[4], "#2 no calls");
+    }
+
+    /// **A repeat of a call made before the page is still a repeat.**
+    #[test]
+    fn a_repeat_of_a_call_before_the_page_is_still_flagged() {
+        let root = "<tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
+        let mut t = timeline();
+        t.turns = vec![turn_view(0, "a", root), turn_view(1, "b", root)];
+        let text = render(&t, 1, 1);
+        assert!(text.contains("#1 datetime {} — repeat of #0's"), "{text}");
+        assert!(!text.contains("\n#0 "), "{text}");
+    }
+}

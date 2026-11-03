@@ -1053,6 +1053,7 @@ use crate::tools::{
     ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS},
     ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
     ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
+    ops::timeline::TIMELINE_READ,
     random::REGISTRATION as RANDOM,
     remote_fs::{
         REMOTE_FS_SESSION_CLOSE, REMOTE_FS_SESSION_DELETE, REMOTE_FS_SESSION_GET,
@@ -1290,6 +1291,9 @@ fn register_all() -> &'static [RegisteredTool] {
         CLUSTER_STATUS.requires(NET),
         CLUSTER_LOGS.requires(NET),
         CLUSTER_AUDIT.requires(NET),
+        // A stored conversation (1) — read through the daemon; nothing
+        // changes. `probe` runs a prefill, and changes nothing either.
+        TIMELINE_READ.requires(NET),
         // Guides (2) — read from the library embedded in this binary.
         GUIDE_LIST,
         GUIDE_READ,

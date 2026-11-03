@@ -1,0 +1,116 @@
+name: timeline_read
+questions:
+- why did that worker repeat the same call over and over
+- which tool signatures were shown on turn 3 of that conversation
+- read the conversation behind this conv link
+- why did the task guess the tool's arguments
+- did the job_status signature make it into the worker's prompt
+- what scores did the tools get on that turn's projection
+- list every tool call the worker made, with the repeats
+- show me what the model saw on its first turn
+- would this prompt bring up the job tools' signatures
+- read turn 0 of the codebase tour in full
+- what did the reviewer's run spend its rounds on
+- which dialogue turns did the last projection keep
+- what is in that conversation's prompt right now
+- rank the tools for this delegated task's wording
+- which tool was strongest but left out of the prompt
+- page through that timeline's turns
+- check the thinking of the worker that skipped wait_s
+- diagnose why the file_list calls dropped their path
+category: Commands
+description: 'Read one stored conversation — any run of Zen''s, a worker''s or a chat — to diagnose how it went, as `view` asks. `id` is the timeline id `layer_read` lists, a worker''s path `T:<thread>/<name>`, or the conversation id a web UI link carries after `#conv=` (a uuid, or `mcp:<owner>:<thread>/<name>`, escaped or not). `view`: `turns` lists its turns a page at a time (`offset`, `limit`), each with the first line of each half; `turn` reads turn `turn` in full — its prompt or tool results, then its thinking and the calls it made, from character `from`; `calls` lists every tool call, one line each, flagging a call identical to one already made; `projections` shows turn `turn`''s projection points — the tools whose signatures were shown with their scores against the 800 bar (250 over a reply''s first 64 tokens) and the strongest left out; `prompt` shows the prompt as it would be decoded now, piece by piece; `selection` the dialogue turns its latest projection kept; `probe` ranks the tools for the text `probe` on a fresh probe. Use for: why a run repeated itself, guessed arguments, or missed a tool. Triggered by "why did it repeat", "was the signature shown". Admins only. Returns the view asked for.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    id:
+      description: 'The conversation: a timeline id, a worker''s path `T:<thread>/<name>`, or a conversation id as a web UI link''s `#conv=` names it. Required.'
+      maxLength: 200
+      minLength: 1
+      type: string
+    view:
+      description: 'What to read: `turns`, `turn`, `calls`, `projections`, `prompt`, `selection` or `probe`. Required.'
+      enum:
+      - turns
+      - turn
+      - calls
+      - projections
+      - prompt
+      - selection
+      - probe
+      type: string
+    turn:
+      description: '`turn` and `projections`: the turn''s index, as `turns` lists it.'
+      minimum: 0.0
+      type: integer
+    probe:
+      description: '`probe`: the text to rank the tools by — a task''s prompt, a question.'
+      maxLength: 4000
+      minLength: 1
+      type: string
+    offset:
+      description: '`turns` and `calls`: the first turn; 0 by default.'
+      minimum: 0.0
+      type: integer
+    limit:
+      description: '`turns` and `calls`: how many turns; 40 by default.'
+      maximum: 400.0
+      minimum: 1.0
+      type: integer
+    from:
+      description: '`turn`: the character to read from; 0 by default.'
+      minimum: 0.0
+      type: integer
+  required:
+  - id
+  - view
+  allOf:
+  - if: {properties: {view: {enum: [turn, projections]}}}
+    then: {required: [turn]}
+  - if: {properties: {view: {const: probe}}}
+    then: {required: [probe]}
+  title: TimelineReadRequest
+  type: object
+examples:
+- |-
+  why did the worker list the same folder six times<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The calls view lists every call it made and flags the ones identical to a call already made.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "timeline_read", "arguments": {"id": "T:zen-ops/codebase-tour", "view": "calls"}}
+  </tool_call><|projection|>
+- |-
+  was job_status's signature in the prompt when it called it on turn 0<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Turn 0's projection points say which tools' signatures were shown, their scores against the bar, and the strongest left out.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "timeline_read", "arguments": {"id": "mcp:154797f34c5a6ca6:zen-ops/read-stencil-checks", "view": "projections", "turn": 0}}
+  </tool_call><|projection|>
+- |-
+  read what the model thought on turn 2 of 1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  One turn in full shows its tool results and its thinking and calls.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "timeline_read", "arguments": {"id": "1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015", "view": "turn", "turn": 2}}
+  </tool_call><|projection|>
+- |-
+  would "call job_status on these builds with wait_s 240" bring up the job tools<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A probe ranks the tools for that text against the 800 a signature needs.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "timeline_read", "arguments": {"id": "T:zen-ops/read-stencil-checks", "view": "probe", "probe": "call job_status on these builds with wait_s 240"}}
+  </tool_call><|projection|>
+- show me the turns of that timeline<|im_end|>

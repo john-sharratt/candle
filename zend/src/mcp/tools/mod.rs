@@ -71,7 +71,7 @@ mod service_control;
 mod task;
 mod threads;
 mod timeline_delete;
-mod timeline_read;
+pub mod timeline_read;
 pub mod turn_report;
 mod user_context;
 mod user_episode;
@@ -254,7 +254,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         service_control::NAME => service_control::call(ctx, args).await,
         layer_read::NAME => blocking(ctx, args, layer_read::call).await,
         layer_toggle::NAME => layer_toggle::call(ctx, args).await,
-        timeline_read::NAME => blocking(ctx, args, timeline_read::call).await,
+        timeline_read::NAME => timeline_read::call(ctx, args).await,
         timeline_delete::NAME => timeline_delete::call(ctx, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }
