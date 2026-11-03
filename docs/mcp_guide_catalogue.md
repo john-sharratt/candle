@@ -41,7 +41,7 @@ compacted.
 
 ### A2. `delegate`
 **Use when:** writing any `repo_task_start` prompt.
-**Tools:** `repo_task_start`, `repo_task_wait`
+**Tools:** `repo_task_start`, `job_status`
 - State the task in full: what to do, what to verify before answering, the
   shape of the final response (verdict, findings, file:line pointers).
 - Name the worker for what it does; never a number.
@@ -52,9 +52,9 @@ compacted.
 
 ### A3. `wait`
 **Use when:** tasks are running.
-**Tools:** `repo_task_wait`, `thread_list`, `repo_task_nudge`, `repo_task_stop`
-- Wait on every running worker in one call; handle whichever settles first,
-  then wait again on the rest.
+**Tools:** `job_status`, `job_list`, `thread_list`, `repo_task_nudge`, `job_cancel`
+- Wait on every running worker in one `job_status` call; handle whichever
+  settles first, then wait again on the rest.
 - Read the progress lines and the new journal entries each answer brings; stop
   waiting when the entries already answer the question.
 - Nudge a worker heading the wrong way; stop one repeating itself.
@@ -62,7 +62,7 @@ compacted.
 
 ### A4. `verify`
 **Use when:** a worker has finished and its answer will be relied on.
-**Tools:** `repo_task_wait`, `repo_task_reply`, `journal_read`, `journal_grep`,
+**Tools:** `job_status`, `repo_task_reply`, `journal_read`, `journal_grep`,
 `timeline_read`
 - Read the citation audit (planned): anything cited but not opened is suspect.
 - Follow up with the same worker (planned `repo_task_reply` on a done worker): open
@@ -73,9 +73,9 @@ compacted.
 
 ### A5. `steer`
 **Use when:** a running worker needs redirecting.
-**Tools:** `repo_task_nudge`, `repo_task_stop`, `repo_task_reply`
+**Tools:** `repo_task_nudge`, `job_cancel`, `repo_task_reply`
 - Nudge for course corrections that should not end its work.
-- Stop for a worker looping or on a path you no longer want; then `repo_task_reply`
+- `job_cancel` for a worker looping or on a path you no longer want; then `repo_task_reply`
   with the new direction.
 - Reply to a question with the decision itself, never "it depends".
 
@@ -89,7 +89,7 @@ compacted.
 
 ### A7. `handoff`
 **Use when:** resuming work another session started, or after a long break.
-**Tools:** `thread_list`, `thread_attach`, `journal_read`, `repo_task_wait`,
+**Tools:** `thread_list`, `thread_attach`, `journal_read`, `job_status`,
 `cluster_status`
 - List threads; attach to the one in question; read its journal and any
   waiting questions; check running workers; summarise where things stand
@@ -115,14 +115,14 @@ compacted.
 ### B1. `ask`
 **Use when:** a question about a codebase whose answer needs reading many
 files.
-**Tools:** `repo_task_start`, `repo_task_wait`, `journal_grep`
+**Tools:** `repo_task_start`, `job_status`, `journal_grep`
 - One worker per independent question; answer cites file:line for every claim.
 - Spot-check the pointers before relying on them.
 
 ### B2. `implement`
 **Use when:** building something against a written spec.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_task_reply`, `journal_read`,
-`repo_job_start`, `repo_job_log`
+**Tools:** `repo_task_start`, `job_status`, `repo_task_reply`, `journal_read`,
+`repo_job_start`, `job_read`
 - The spec is written first (by Claude, approved by the user) and passed whole.
 - The worker implements on a branch, tests as it goes, reports what changed
   and what it could not do.
@@ -131,7 +131,7 @@ files.
 
 ### B3. `review`
 **Use when:** reviewing a change, a branch or a PR.
-**Tools:** `repo_task_start`, `repo_task_wait`, `journal_grep`, `timeline_read`
+**Tools:** `repo_task_start`, `job_status`, `journal_grep`, `timeline_read`
 - One worker per area for a large change, `effort: exhaustive`.
 - Findings with file:line, a concrete failure scenario each, ranked.
 - Verify each finding against the code before reporting it.
@@ -139,58 +139,59 @@ files.
 ### B4. `security-review`
 **Use when:** a change touches auth, input handling, secrets, network or
 sandboxing.
-**Tools:** `repo_task_start`, `repo_task_wait`, `journal_grep`
+**Tools:** `repo_task_start`, `job_status`, `journal_grep`
 - Threat-model first (what an attacker controls), then trace each input to its
   sinks; findings need an exploit path, not a pattern match.
 
 ### B5. `debug`
 **Use when:** a bug, a failing test, or a wrong answer needs its root cause.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_task_reply`, `cluster_logs`,
-`repo_job_start`, `repo_job_log`
+**Tools:** `repo_task_start`, `job_status`, `repo_task_reply`, `cluster_logs`,
+`repo_job_start`, `job_read`
 - Reproduce first; then narrow — test, narrow, test — never patch a symptom.
 - Each hypothesis is checked against evidence before the next.
 - The fix comes with a test that failed before it.
 
 ### B6. `test`
 **Use when:** a branch needs building and testing.
-**Tools:** `repo_job_start`, `repo_job_log`
+**Tools:** `repo_job_start`, `job_status`, `job_read`, `job_grep`
 - Build and test on a build agent, never on a member serving traffic.
-- Read the last page for the summary; `grep: "FAILED"` for failures.
+- Read the ended job's summary in `job_status`; `job_grep` for `FAILED` finds
+  the failures.
 - Report pass or fail, the failing tests and their output.
 
 ### B7. `test-write`
 **Use when:** code needs tests, or a bug needs a regression test.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_job_start`, `repo_job_log`
+**Tools:** `repo_task_start`, `repo_job_start`, `job_status`, `job_read`
 - Tests assert exact expected values; one behaviour each; named for what they
   prove. Run them before calling them done.
 
 ### B8. `refactor`
 **Use when:** restructuring code without changing behaviour.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_job_start`, `repo_job_log`
+**Tools:** `repo_task_start`, `repo_job_start`, `job_status`, `job_read`
 - Tests green before and after; the plan names every call site; no behaviour
   change hidden in the move.
 
 ### B9. `upgrade`
 **Use when:** bumping a dependency or toolchain.
-**Tools:** `repo_task_start` (with research), `repo_job_start`, `repo_job_log`
+**Tools:** `repo_task_start` (with research), `repo_job_start`, `job_status`, `job_read`
 - Research the changelog first (C1); list breaking changes and where they bite;
   upgrade on a branch; build and test on an agent.
 
 ### B10. `perf`
 **Use when:** something is slower than it should be.
-**Tools:** `repo_task_start`, `repo_job_start`, `repo_job_log`, `cluster_status`
+**Tools:** `repo_task_start`, `repo_job_start`, `job_status`, `job_read`, `cluster_status`
 - Measure before changing; compare like with like; one change per measurement;
   report numbers with the machine they came from.
 
 ### B11. `docs-write`
 **Use when:** a design document or a README needs writing from the code.
-**Tools:** `repo_task_start`, `repo_task_wait`, `journal_grep`
+**Tools:** `repo_task_start`, `job_status`, `journal_grep`
 - Every statement about the code cites where it is; the document describes
   what is, marking anything planned as planned.
 
 ### B12. `branch`
 **Use when:** a worker's change needs to land as a branch for review.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_job_start`
+**Tools:** `repo_task_start`, `repo_job_start`, `job_status`
 - Workers push branches only, never a default branch; Claude reviews; the user
   approves the merge.
 
@@ -200,7 +201,7 @@ sandboxing.
 
 ### C1. `research`
 **Use when:** a question answered from the web, every claim checked.
-**Tools:** `repo_task_start`, `repo_task_wait`, `repo_task_reply`, `journal_grep`,
+**Tools:** `repo_task_start`, `job_status`, `repo_task_reply`, `journal_grep`,
 `timeline_read`
 - Gather → verify (fetch primary sources; independent evidence both ways;
   conflicts settled by source quality; aggregator-only figures marked; images
@@ -253,7 +254,7 @@ something stalls.
 
 ### D2b. `watch`
 **Use when:** keeping an eye on a rollout, a member or the logs for a while.
-**Tools:** `repo_task_start`, `repo_task_wait`, `cluster_status`, `cluster_logs`
+**Tools:** `repo_task_start`, `job_status`, `cluster_status`, `cluster_logs`
 - Delegated to a worker that polls and reports only exceptions and the end
   state, so the watch costs one answer, not a poll loop.
 
@@ -267,24 +268,24 @@ something stalls.
 
 ### D4. `cluster-care`
 **Use when:** a member needs maintenance.
-**Tools:** `cluster_command`, `cluster_job_status`, `cluster_status`
+**Tools:** `cluster_command`, `job_status`, `cluster_status`
 - Look and Care commands as asked; Decide commands only with approval; follow
   each job to its end; confirm the member came back healthy.
 
 ### D5. `deploy`
 **Use when:** putting a commit on origin/main onto one machine.
-**Tools:** `service_deploy`, `service_status`, `service_log`, `service_cancel`,
-`repo_job_log`, `cluster_status`
+**Tools:** `service_deploy`, `service_status`, `job_status`, `job_read`,
+`job_grep`, `job_list`, `job_cancel`, `cluster_status`
 - One `service_deploy` builds on that machine's agent and has keep try it;
-  `service_status {deploy, wait_s}` waits to proven or rolled back; read a
-  failure with `repo_job_log` (the build) or `service_log` (the trial);
-  confirm the member serves the new build.
+  `job_status {jobs: ["deploy:<node>:<id>"], wait_s}` waits to proven or rolled
+  back; read a failure with `job_read` / `job_grep` on the deploy's handle (the
+  build log, then the trial's); confirm the member serves the new build.
 
 ### D6. `release`
 **Use when:** taking a commit through tests, a trial, certification and
 rollout.
-**Tools:** `repo_job_start`, `repo_job_status`, `repo_job_log`, `service_deploy`,
-`service_status`, `cluster_command`, `cluster_job_status`, `gateway_command`,
+**Tools:** `repo_job_start`, `job_status`, `job_read`, `job_grep`, `service_deploy`,
+`service_status`, `cluster_command`, `gateway_command`,
 `cluster_status`
 - Tests on an agent → a trial on one machine → certification watched → the
   rollout's plan shown, approved, started, watched member by member.
@@ -292,13 +293,13 @@ rollout.
 
 ### D7. `rollback`
 **Use when:** a released build misbehaves.
-**Tools:** `cluster_command`, `cluster_job_status`, `cluster_status`
+**Tools:** `cluster_command`, `job_status`, `cluster_status`
 - Name the build to return to; show the plan; approval; watch every member
   onto it.
 
 ### D8. `ab-trial`
 **Use when:** comparing a new build against the running one on one machine.
-**Tools:** `service_deploy`, `service_status`, `service_log`, `cluster_status`,
+**Tools:** `service_deploy`, `job_status`, `job_cancel`, `cluster_status`,
 `cluster_logs`
 - Trial on one machine while the others serve the old build; compare what
   matters (errors, latency, answers) before rolling out.

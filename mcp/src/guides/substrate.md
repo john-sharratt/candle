@@ -1,7 +1,7 @@
 ---
 name: substrate
 description: How to read what the stored analysis holds, find out whether a bad answer comes from it by switching a layer off and asking again, and delete a corrupt conversation only with approval.
-tools: [layer_read, layer_toggle, timeline_read, timeline_delete, repo_task_start, repo_task_wait]
+tools: [layer_read, layer_toggle, timeline_read, timeline_delete, repo_task_start, job_status]
 ---
 # Stored analysis
 

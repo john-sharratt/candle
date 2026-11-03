@@ -1,7 +1,7 @@
 ---
 name: delegate
 description: How to write a task for a worker so it does the work properly — the prompt template every other guide builds on, and how to choose effort and priority.
-tools: [repo_task_start, repo_task_wait]
+tools: [repo_task_start, job_status]
 ---
 # Delegating a task
 
@@ -93,8 +93,8 @@ For work on the web:
 Split broad work into independent tasks, each with its own prompt, name and
 final response. Start them all — each `repo_task_start` with `wait_s: 5`, as a
 start holds for its whole `wait_s` and several in a row add up — then
-`repo_task_wait` on all of them together.
+`job_status` on all of their handles together.
 Name each worker for what it does (`verify-expiry`), never a number. A name
 already used on the thread gets the next free one (`verify-expiry.2`), so
-always wait on the path `repo_task_start` answers, not the name you asked
-for.
+always wait on the handle `repo_task_start` answers (`task:<thread>/<name>`),
+not the name you asked for.

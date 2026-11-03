@@ -1,7 +1,7 @@
 ---
 name: ask
 description: How to get a codebase question answered by a worker — every claim pinned to the file and line it was read at.
-tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, job_status, journal_grep, timeline_read]
 ---
 # Asking about a codebase
 

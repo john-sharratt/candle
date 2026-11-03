@@ -1,7 +1,7 @@
 ---
 name: incident
 description: How to handle something broken now — contain, establish what changed, diagnose from evidence, act only with approval, then write it up.
-tools: [cluster_status, cluster_logs, cluster_audit, service_status, service_control, cluster_command, cluster_job_status, journal_note]
+tools: [cluster_status, cluster_logs, cluster_audit, service_status, service_control, cluster_command, job_status, journal_note]
 ---
 # Incidents
 

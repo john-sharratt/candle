@@ -1,7 +1,7 @@
 ---
 name: journal-restructure
 description: How to restructure Zen's memory — move, merge, rename or split journals, or clean up duplicate lines — as a coding task for Zen on the `journals` checkout, previewed for the user and pushed straight to main.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_read, journal_grep]
+tools: [repo_task_start, job_status, repo_task_reply, journal_read, journal_grep]
 ---
 # Restructuring the memory
 

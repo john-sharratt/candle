@@ -45,7 +45,7 @@ answer it and stop.
 Re-attach (`thread_attach` with the same name), then
 `journal_read {journal: "T:<thread>"}`, and carry on from the notes — not from
 what you think you remember. Running workers are still running:
-`repo_task_wait` on them. Do the same after a call answered that the model is
+`job_status` on their `task:` handles (`job_list {kind: "task"}` names them). Do the same after a call answered that the model is
 still loading or the service was unavailable (see `wait`).
 
 ## When the work is done

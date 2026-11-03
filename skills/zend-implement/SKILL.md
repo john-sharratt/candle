@@ -52,7 +52,7 @@ Use `priority: high` only if the user is waiting on it now.
 
 ## Wait and answer
 
-`repo_task_wait` until it settles. Answer questions with the spec in hand; if a
+`job_status` on its `task:` handle until it settles. Answer questions with the spec in hand; if a
 question exposes a gap in the spec, decide it, note the decision on the thread,
 and answer.
 

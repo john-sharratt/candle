@@ -1,21 +1,22 @@
 ---
 name: test
 description: How to build a branch, run its tests or clippy on a build agent — never on a member serving traffic — wait for them, read their logs without pulling them whole, and report pass or fail with the evidence.
-tools: [repo_job_start, repo_job_status, repo_job_log, repo_job_list, repo_job_cancel]
+tools: [repo_job_start, job_status, job_read, job_grep, job_list, job_cancel]
 ---
 # Building and testing on the agents
 
 A **build agent** is a cluster machine that checks out a repository and runs
 programs on it, at low priority beside a model. Builds, tests and clippy run
 there, never on a member serving traffic. A **job** is one program run on one
-agent, named by one **handle**, `<node>:<id>` — `76c3a0f4d39bd9db:XeV_I_QPzpg`
-— which every `repo_job_*` tool takes as `job`. Admins only.
+agent, named by one **handle**, `build:<node>:<id>` —
+`build:76c3a0f4d39bd9db:XeV_I_QPzpg` — which every `job_*` tool takes as `job`.
+Admins only.
 
 ## Before
 
 - **Push what you changed.** A job runs on the branch as origin holds it;
   nothing unpushed is in it. Testing `main` as it stands needs no push.
-- `repo_job_list {running: true}` says what each agent is already running. Jobs
+- `job_list {kind: "build"}` says what each agent is already running. Jobs
   on one checkout run one at a time, so a job started behind a long one waits
   for it — its phase says `waiting for its checkout behind <handle>`.
 
@@ -46,9 +47,10 @@ second.
 
 ## Wait
 
-`repo_job_status {job, wait_s: 240}` holds until the job ends or the wait runs
-out — one call, not a loop. While it waits it says each step; when it answers
-still running, call it once more the same way. Its phases:
+`job_status {jobs: [<handle>, ...], wait_s: 240}` holds until any of the jobs
+ends or the wait runs out — one call, not a loop. While it waits it says each
+step; when it answers still running, call it once more the same way. A build's
+phases:
 
 | Phase | |
 |---|---|
@@ -64,25 +66,25 @@ their line numbers**.
 
 ## Read
 
-`repo_job_log` reads the log on the agent; only the answer comes back, every
-line numbered as it stands in the log.
+`job_read` and `job_grep` read the log on the agent; only the answer comes
+back, every line numbered as it stands in the log, 200 lines to a page.
 
-1. `{job, mode: "summary"}` first: results, failures, errors, warnings, the
-   last lines, and the call that reads around the first failure.
-2. `{job, mode: "lines", from: <a line it named, less ten>, count: 60}` reads
-   the failure in full — the panic, the assertion's values, the compiler's
-   note.
-3. `{job, mode: "grep", pattern: "panicked at", context: 2}` finds every
-   panic; plain text, any case. Past 200 hits it says the `from` to go on
-   with.
-4. `{job, mode: "tail", lines: 40}` follows a running job's last lines.
+1. The ended job's `job_status` answer first: results, failures and errors by
+   line number, and `pages: N`.
+2. `job_read {job, page}` on the page holding a line it named (page
+   `(line - 1) / 200 + 1`) reads the failure in full — the panic, the
+   assertion's values, the compiler's note.
+3. `job_grep {job, pattern: "panicked at", context: 2}` finds every panic;
+   plain text, each hit with its line and its page.
+4. `job_read {job, page: <the last>, wait_s: 60}` follows a running job: a page
+   not yet full waits until it fills.
 
 Never read a log from the top a page at a time: a test log is megabytes, and
 the summary and a search find what matters in a few hundred bytes.
 
 ## Stop
 
-`repo_job_cancel {job}` stops it at any phase: one still fetching or waiting
+`job_cancel {job}` stops it at any phase: one still fetching or waiting
 never runs, a running one is killed with what it started, and nothing is
 staged.
 

@@ -3939,7 +3939,7 @@ them by the same order. **The gateway never holds a job back**: an agent accepts
 soon as it has checked it and answers with its id, then fetches origin, waits for its
 checkout and runs it as phases of the job (`agent/src/jobs.rs`), so a job routed to a busy
 agent is queued there and its caller has its id at once
-(`docs/build_deploy_tools.md` §2).
+(`docs/jobs.md` §2).
 
 **An agent at low priority** — one sharing its host with a model member (§11.5), which
 says so in its `CAPACITY` — is chosen only when no dedicated agent fit for the job, on a

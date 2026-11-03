@@ -144,10 +144,11 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 |---|---|---|
 | `thread_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
 | `repo_task_start {thread, name, prompt, priority?, effort?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
-| `repo_task_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
-| `repo_task_reply {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `repo_task_start` |
-| `repo_task_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
-| `repo_task_stop {worker, reason?, wait_s?}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `repo_task_reply` to redirect (§6.2) | As `repo_task_wait`: `stopped` once it has |
+| `job_status {jobs, wait_s?}` (`docs/jobs.md` §4) | Waits on one or more running jobs, tasks among them (`task:<thread>/<name>`), answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
+| `job_read {job, page, wait_s?}` (`docs/jobs.md` §3) | One 200-line page of a task's output: its prompt, its journal entries as drafted, its question or answer, then its turn's report (rounds, time, calls by tool, what failed) at the end | The page, and where it is |
+| `repo_task_reply {task, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `repo_task_start` |
+| `repo_task_nudge {task, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
+| `job_cancel {job}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `repo_task_reply` to redirect (§6.2) | As `job_status`: `stopped` once it has |
 | `journal_read {journal, entry?, offset?, limit?}` | Without `entry`: the journal's entries, one line each, with open items. With an `entry` (or an entry address, `…#12`): pages the turns behind it | The journal as the prompt reads it, or `limit` lines from `offset` (200 by default, 400 at most) |
 | `journal_grep {journal, pattern, entry?, max_results?}` | Case-insensitive substring search of a journal's entries' turns; `journal` may be a subtree (`T:review-layers/*`) | Each hit's path, entry, turn and line; 20 hits by default, 50 at most |
 | `journal_note {journal, text}` | Records a note — a decision and its reason, what the user said — on a thread or project journal as one entry (§4); on a memory journal, `~/…` or `@group/…`, something to be remembered (`docs/memory_backbone.md` §6.6) | The entry's address; on the memory, the line's address and who reads it |
@@ -199,7 +200,8 @@ the access they have.
 
 ### 3.3 Long work
 
-**A run is judged by `repo_task_report`.** The counts a worker's activity
+**A run is judged by its turn report**, the end of the task's output
+(`job_read {job: "task:...", page: N}`, `docs/jobs.md` §3). The counts a worker's activity
 sentence is made from also keep the time spent in tools, every failed call by
 how it failed, and when it first changed a file and first committed. They live
 on the worker's record and cover its latest turn.
@@ -213,15 +215,15 @@ held longer than `wait_s`:
 
 - **Start everything, then wait on all of it.** `repo_task_start` answers `running`
   within `wait_s` and the worker carries on, so Claude starts as many tasks as
-  it wants in one turn. `repo_task_wait {workers: [...]}` then waits on the whole
+  it wants in one turn. `job_status {jobs: ["task:review/verify", ...]}` then waits on the whole
   set and answers as soon as **any** of them leaves `running` — `done`,
   `question`, `stuck` or `error` — with that worker's result and, for each
   worker still running, what it has done. Claude handles that one (reads the
   answer, answers the question) and waits again on the rest. A question from
   any worker surfaces on the next return, so no worker sits blocked behind
   another's long build.
-- **A short wait is the progress report.** `wait_s` defaults to 45 s, so a
-  wait that finds every worker still running answers every 45 s with, for
+- **A short wait is the progress report.** `wait_s` defaults to 60 s, so a
+  wait that finds every worker still running answers every 60 s with, for
   each, one sentence counted from its turn's stream — never summarised by a
   model (`zend/src/mcp/activity.rs`): `running 4m10s, 6 rounds: 1,934
   thinking tokens, 12 tool calls (web_fetch 5, web_search 4, file_grep 3); now
@@ -247,10 +249,10 @@ held longer than `wait_s`:
 
 | Client | `wait_s` default | `wait_s` at most | How long waits are carried |
 |---|---|---|---|
-| claude.ai, Claude Desktop | 45 s | 200 s, inside the 240 s cap | Polling: each `repo_task_wait` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
-| Claude Code | 45 s | 240 s, inside the claude.ai connector's ~300 s | Polling as above: a longer wait is another call |
+| claude.ai, Claude Desktop | 60 s | 200 s, inside the 240 s cap | Polling: each `job_status` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
+| Claude Code | 60 s | 240 s, inside the claude.ai connector's ~300 s | Polling as above: a longer wait is another call |
 
-`repo_task_start`, `repo_task_wait` and `repo_task_reply` answer one of:
+`repo_task_start`, `job_status` (for a task) and `repo_task_reply` answer one of:
 
 | State | Meaning |
 |---|---|
@@ -739,14 +741,14 @@ its working set and locks stand; its K/V is in the substrate, so a question
 waiting an hour costs nothing. The thread's journal gains a `Task asks:` entry.
 
 **The question reaches Claude as a tool result.** The `repo_task_start` call on the
-worker, or the `repo_task_wait` call whose set includes it, answers `question` with
-it — a `repo_task_wait` over many workers returns on the first question, however
+worker, or the `job_status` call whose set includes it, answers `question` with
+it — a `job_status` over many workers returns on the first question, however
 long the others still run. When no call is
 waiting, `thread_list` lists the thread as having a worker waiting, so the
 next look finds it. Claude checks what it needs through the pointers and
 answers with `repo_task_reply`.
 
-**The answer is the worker's next turn.** `repo_task_reply {worker, answer}`
+**The answer is the worker's next turn.** `repo_task_reply {task, answer}`
 submits it as the worker's next message through the same session path a chat
 turn takes, and the worker carries on with the answer in its history, so a
 later round, its journal and its verifier all see what was decided. The answer
@@ -773,16 +775,16 @@ A nudge never interrupts a decoding round. Today a second message on a busy
 conversation waits on its lock until the whole turn ends
 (`zend/src/session.rs:3848-3862`), which is too late to steer it.
 
-**Claude can stop a worker going the wrong way.** `repo_task_stop {worker,
-reason?}` queues a stop as a record under the worker's conversation
+**Claude can stop a worker going the wrong way.** `job_cancel {job:
+"task:..."}` queues a stop as a record under the worker's conversation
 (`zend/src/mcp/stops.rs`), read where a nudge is: at the worker's next tool
 round, never mid-decode. That round then closes the loop as the round cap does
-— its results carry the stop and Claude's reason, the next turn may not call
+— its results carry the stop, the next turn may not call
 tools, and the loop sends `StreamItem::Closing(CLOSED_BY_CLAUDE)` — so the
 worker answers with what it has found and what remains. It settles **stuck**
 with `stopped` set, unarchived: `repo_task_reply` redirects it ("use v2 and
 answer"), or `thread_archive` ends it. The call waits for the stop as
-`repo_task_wait` does. A stop the turn never reaches, because it ended without
+`job_status` does. A stop the turn never reaches, because it ended without
 another round, is cleared at settling and entered on the thread as
 `Stop dropped:`.
 
@@ -964,11 +966,12 @@ what it holds against what maintenance counts as live
 maintenance commands on one member — `member` is its app and 16-hex-digit node
 id, as `cluster_status` lists them, sent as `x-tokera-node`
 (`web/src/cluster/route.rs:91-159`) — and answers `202 {job, command, stream}`
-(`host/src/commands/mod.rs:174-182`). `cluster_job_status {member, job, wait_s?}`
-reads `GET /v1/cluster/command/job/:id`: NDJSON, a `started` line, `step`
+(`host/src/commands/mod.rs:174-182`) as the handle `cluster:<node>:<n>`.
+`job_status {jobs: ["cluster:<node>:<n>"], wait_s?}` and `job_read` read
+`GET /v1/cluster/command/job/:id`: NDJSON, a `started` line, `step`
 lines, and one terminal `done` or `error` (`host/src/commands/jobs.rs:76-108`),
 summarised to its last state and its errors. A job is readable only on the
-member that ran it (`mod.rs:226-235`), so `cluster_job_status` names the same member;
+member that ran it (`mod.rs:226-235`), so the handle names the same member;
 one command runs per member at a time, and a second answers 409
 (`jobs.rs:134-141`), which the tool reports as busy rather than an error.
 
@@ -1013,11 +1016,12 @@ name before it is parsed):
 
 ### 8.3 Building and testing
 
-The `repo_job_*` tools (`docs/build_deploy_tools.md`, which is authoritative for
-them) run a program on an agent and follow it: `repo_job_start {repo, branch,
-program, args, timeout_s?, stage?, node?}`, `repo_job_status {job, wait_s?}`,
-`repo_job_log {job, mode, …}`, `repo_job_list {node?, running?, limit?}`,
-`repo_job_cancel {job}`. A job is one handle, `<node>:<id>`. Agents run inside
+`repo_job_start` (`docs/jobs.md`, which is authoritative for the job tools) runs
+a program on an agent and the `job_*` tools follow it: `repo_job_start {repo,
+branch, program, args, timeout_s?, stage?, node?}`, `job_status {jobs, wait_s?}`,
+`job_read {job, page, wait_s?}`, `job_grep {job, pattern, context?}`,
+`job_list {kind?, running?, limit?}`, `job_cancel {job}`. A job is one handle,
+`build:<node>:<id>`. Agents run inside
 each motherd at low priority (`motherd/motherd.yaml`, `motherd/agent.yaml`).
 
 - **A run job** is `{repo, branch, overlay, program, args, timeout_secs,
@@ -1030,8 +1034,8 @@ each motherd at low priority (`motherd/motherd.yaml`, `motherd/agent.yaml`).
   answers before it fetches origin; the fetch, the wait for the checkout and
   the staging are the job's phases (`agent::wire::Phase`).
 - **Logs are read on the agent** (`POST /v1/jobs/:id/read`,
-  `cluster/src/log_read.rs`): a summary, a tail, a range of lines or a search,
-  every line numbered as in the log, at most 200 lines an answer.
+  `cluster/src/log_read.rs`): a page, a search, and the summary an ended job's
+  `job_status` carries, every line numbered as in the log, 200 lines a page.
 - **Choosing an agent** follows §11.3: sticky on `x-tokera-lineage`, spilling at
   once off a busy holder to the best idle agent — the machine table's `builds`
   preference first, then dedicated over low-priority agents, then idle cores
@@ -1069,10 +1073,10 @@ are Admin-only at the endpoint:
 
 | Tool | keep route | Class |
 |---|---|---|
-| `service_deploy {host, service}` | the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
-| `service_status {deploy?, host?, wait_s?}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended, each with its deploy; or one deploy's stage, waited on | Look |
-| `service_log {host, service, mode, …}` | `POST /v1/keep/trial/log` — the trial log, read on keep's machine | Look |
-| `service_cancel {deploy}` | the build cancelled, or `POST /v1/keep/trial/cancel` — the trial rolled back and recorded cancelled | Care |
+| `service_deploy {host, service}` | the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle, `deploy:<node>:<id>`, which it answers. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
+| `service_status {host?}` | `GET /v1/keep/state` — each service: its stable file's build and whether it runs | Look |
+| `job_read` / `job_grep` on a deploy | the build's log, a marker line, then `POST /v1/keep/trial/log` — the trial log, read on keep's machine | Look |
+| `job_status` / `job_cancel` on a deploy | the deploy's stage, waited on; or the build cancelled, or `POST /v1/keep/trial/cancel` — the trial rolled back and recorded cancelled | Look / Care |
 | `service_control {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |
 
 Every trial keep runs — through the cluster or its loopback switch — is on its
@@ -1108,7 +1112,7 @@ names a `stage` — `target/release/motherd.exe` — has the agent copy that fil
 to its `stage_dir`, the machine's `keep/stage/` (`agent/src/config.rs`), once
 the run exits 0: written beside its name and renamed into place, from the
 checkout's build outputs, which the sandbox never sets aside or removes. The
-job's view answers the staged path (`Staged`), which `repo_job_log` reports.
+job's view answers the staged path (`Staged`), which `job_status` reports.
 
 ### 8.5 The substrate
 
@@ -1337,7 +1341,7 @@ page far inside both clients' bounds.
 MCP's tasks extension (`io.modelcontextprotocol/tasks`, 2026-07-28) would
 carry long work natively, but only Claude Code's terminal CLI supports it in
 beta — not the VS Code extension — and claude.ai does not document it;
-`running` and a `repo_task_wait` over a set of workers work on every client, so they
+`running` and a `job_status` over a set of workers work on every client, so they
 are the design.
 
 ### 13.3 Server instructions
@@ -1370,9 +1374,9 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 ## 14. Tests
 
 - Every tool against a mock gateway and member: each tool's request and its
-  exact response bytes, every state of §3.3, the `running` → `repo_task_wait` path,
+  exact response bytes, every state of §3.3, the `running` → `job_status` path,
   every row of §15.
-- `repo_task_wait` over a set: answering on the first worker to leave `running`
+- `job_status` over a set: answering on the first worker to leave `running`
   with the others' lines; a question from one worker returned while another
   still builds; the stream opened at once with progress notifications;
   `wait_s` clamped to 200 s for a claude.ai `clientInfo` and 240 s for
@@ -1415,7 +1419,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   entry overlapping its turns.
 - The question block read only from its own line at a reply's end; a reply
   ending in one settling `question`, unarchived, with a `Task asks:` entry;
-  `repo_task_wait` answering it; `repo_task_reply` refused for a worker not waiting,
+  `job_status` answering it; `repo_task_reply` refused for a worker not waiting,
   landing as the next turn otherwise, entered as `Claude answered:`; a restart
   finding a finished turn. `StreamItem::Closing` settling the worker `stuck`.
 - `repo_task_nudge` queued, surviving a restart, and taken at the next round head,
@@ -1432,8 +1436,8 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - keep: its routes on its own socket — state, a trial as a job, start, stop,
   restart — against a keep on loopback; a trial refused for an artifact not
   built from `origin/main`.
-- The agent: a run job submitted through the member route; `repo_job_log` paging
-  by byte offset and grepping; a job lost to a motherd restart reported lost.
+- The agent: a run job submitted through the member route; `job_read` paging
+  by line and `job_grep` searching; a job lost to a motherd restart reported lost.
 - One live end-to-end run per skill, graded as the replays were, before the
   routing rules make it the default.
 
@@ -1471,11 +1475,11 @@ and reached the way a real client reaches it:
 | A turn errors | `repo_task_start` answers `error`; the skill retries once with a fresh worker on the same thread, then falls back. The failed worker is archived like any finished one, so its evidence stays readable |
 | The forced draft is refused or skips | `repo_task_start` answers the task's earlier entries and says the final stretch added nothing; with none at all, the final response's text and that no entry was kept |
 | Archiving a worker fails | The outcome is already on the thread; the worker is left live and archived by the next task on its thread |
-| A task stalls | `repo_task_wait` keeps answering with it still `running` past the skill's timeout; Claude does the job, and the stalled turn finishes or fails on its own |
-| A client cuts a call off before `wait_s` | Nothing is lost: the work runs on zend regardless, and the next `repo_task_wait` answers its state |
+| A task stalls | `job_status` keeps answering with it still `running` past the skill's timeout; Claude does the job, and the stalled turn finishes or fails on its own |
+| A client cuts a call off before `wait_s` | Nothing is lost: the work runs on zend regardless, and the next `job_status` answers its state |
 | A command's member is busy | `cluster_command` answers busy (409); the skill waits for the running job and retries |
-| A command's or an agent job fails | `cluster_job_status` / `repo_job_log` answer its errors; the skill reports them and stops |
-| A trial fails | keep restores the previous binary; `service_status` reports the rollback |
+| A command's or an agent job fails | `job_status` / `job_read` answer its errors; the skill reports them and stops |
+| A trial fails | keep restores the previous binary; `job_status` on the deploy reports the rollback |
 | The motherd running a worker restarts mid-task | That member's boot scan carries the worker on from the round it was in (`workers::carry_on`). A member that does not come back loses it: it reads as lost once its beat stops (`BEAT_LOST_MS`), and after `RESUME_AFTER_MS` another member starts it again (`super::resuming`), told its task in full. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
 | An OAuth token expires | The client refreshes it; a refused refresh signs the user in again |
 

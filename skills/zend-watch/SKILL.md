@@ -28,7 +28,8 @@ STATE: the last cluster_status, one line per member
 EXCEPTIONS: each, with its time and the evidence (status line or quoted log line)
 ```
 
-3. `repo_task_wait` on it — it answers when the watch ends, either way.
+3. `job_status {jobs: ["task:watch-<what>/watch"]}` on it — it answers when the
+   watch ends, either way.
 4. Report the end state; for an exception, what it was and the evidence, and
    suggest the next step (cluster-logs, cluster-care, zend-rollback).
 

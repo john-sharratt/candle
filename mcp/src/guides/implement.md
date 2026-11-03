@@ -1,7 +1,7 @@
 ---
 name: implement
 description: How to have a worker implement a written spec — on its own branch, tests alongside, built and run, pushed, verified by a part — then review it before anything merges.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_read, repo_job_start, repo_job_log]
+tools: [repo_task_start, job_status, repo_task_reply, journal_read, repo_job_start, job_read]
 ---
 # Implementing a spec
 

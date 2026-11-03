@@ -1,16 +1,16 @@
 ---
 name: wait
 description: How to wait on running workers — all at once, handling whichever settles first, reading progress, and knowing when to stop waiting.
-tools: [repo_task_wait, thread_list, repo_task_nudge, repo_task_stop]
+tools: [job_status, job_list, thread_list, repo_task_nudge, job_cancel]
 ---
 # Waiting on workers
 
 ## Wait on all of them
 
-`repo_task_wait {workers: [<every running path>]}` answers as soon as any one stops
-running — done, failed, asking you a question, or stuck — with a line for each
-still running. Handle the one that settled, then call `repo_task_wait` again on the
-rest. Never wait on one worker while others run unwatched.
+`job_status {jobs: [<every running task's handle>], wait_s}` answers as soon as
+any one stops running — done, failed, asking you a question, or stuck — with a
+line for each still running. Handle the one that settled, then call
+`job_status` again on the rest. Never wait on one worker while others run unwatched.
 
 ## Read what each answer brings
 
@@ -41,8 +41,8 @@ rest. Never wait on one worker while others run unwatched.
 ## When a worker goes wrong
 
 - Heading the wrong way, but still useful: `repo_task_nudge` (see `steer`).
-- Repeating a step, the same fetch failing: `repo_task_stop`, then `repo_task_reply`
-  with a new direction.
+- Repeating a step, the same fetch failing: `job_cancel {job: "task:..."}`,
+  then `repo_task_reply` with a new direction.
 
 ## When Zen restarts
 
@@ -54,12 +54,12 @@ which then reports as lost (above).
 
 A `repo_task_start` whose answer was cut off may still have started its
 worker. Before starting it again, `thread_list` (or `thread_attach` the
-thread): a worker it shows under the name is yours — wait on that path.
+thread): a worker it shows under the name is yours — wait on its handle.
 
 ## Waits are cut off
 
 A call holds at most about four minutes — less on claude.ai — whatever
-`wait_s` asks; a wait cut short says so: call `repo_task_wait` again. Keep
+`wait_s` asks; a wait cut short says so: call `job_status` again. Keep
 `wait_s` under 200 when starting or replying, so the answer arrives before
 any client gives up on the call. When no call is open — a new
 conversation, after compaction — `thread_list` shows what is running and what
@@ -69,4 +69,4 @@ waits on you.
 Zen) is the connection between your client and Zen dropping, not Zen
 restarting, and it can happen at any `wait_s`. Make the same call again at
 once; nothing was lost, and a reply sent on a call that dropped has usually
-landed — `repo_task_wait` shows whether the worker is running it.
+landed — `job_status` shows whether the worker is running it.

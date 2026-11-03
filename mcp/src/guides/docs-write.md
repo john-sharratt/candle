@@ -1,7 +1,7 @@
 ---
 name: docs-write
 description: How to have a worker write a design document or README from the code — every statement about the code cited, what is planned marked as planned.
-tools: [repo_task_start, repo_task_wait, journal_grep]
+tools: [repo_task_start, job_status, journal_grep]
 ---
 # Writing documentation from code
 

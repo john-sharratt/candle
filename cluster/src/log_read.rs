@@ -1,7 +1,7 @@
 //! A log read where it is written, so only the answer crosses the cluster: an
 //! agent reads a job's log, keep a trial's. A test run's log is megabytes, and
 //! a caller reading it to find one failure would otherwise carry all of it
-//! into its context (`docs/build_deploy_tools.md` §3).
+//! into its context (`docs/jobs.md` §3).
 //!
 //! Every line is numbered from 1 across the whole log, so a line a search
 //! found is the line a later read of [`LogAsk::Lines`] returns. Each answer

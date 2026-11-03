@@ -1,7 +1,7 @@
 ---
 name: handoff
 description: How to hand work on and pick it up — what to write on the thread before your context ends, and how to find a thread, read where it stands and act after a long break or in another session.
-tools: [thread_list, thread_attach, journal_note, journal_read, repo_task_wait, cluster_status]
+tools: [thread_list, thread_attach, journal_note, journal_read, job_status, cluster_status]
 ---
 # Handing off and picking up work
 
@@ -27,7 +27,8 @@ which to wait on.
 2. `thread_attach` to the one in question: its answer is the journal — what
    was decided, what was started, how each task ended, and any `HANDOFF:`
    note, which is where to start.
-3. For each worker still running: `repo_task_wait` on all of them.
+3. For each worker still running: one `job_status` on all of their `task:`
+   handles (`job_list {kind: "task"}` names them).
 4. For each worker waiting on you (a question, a stuck loop): read its
    question before deciding anything.
 5. `cluster_status` if the work touches the cluster or depends on the

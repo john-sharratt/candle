@@ -1,7 +1,7 @@
 ---
 name: feature
 description: How to take a feature from idea to release on one thread — spec, implement, test, review, merge, deploy, release — with the user's approval at each decision.
-tools: [thread_attach, journal_note, repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_status, repo_job_log, service_deploy, cluster_command, cluster_status]
+tools: [thread_attach, journal_note, repo_task_start, job_status, repo_task_reply, repo_job_start, job_read, job_grep, service_deploy, cluster_command, cluster_status]
 ---
 # A feature, end to end
 

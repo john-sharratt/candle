@@ -1,7 +1,7 @@
 ---
 name: review
 description: How to have workers review a change — correctness, regressions, missing tests, convention breaks — with every finding verified against the code before it is reported.
-tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, job_status, journal_grep, timeline_read]
 ---
 # Reviewing code
 

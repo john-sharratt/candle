@@ -40,7 +40,7 @@ certifies it by mirroring traffic.
 3. With approval: `cluster_command {name: "rollout", args: {app: "zend",
    build, confirm: "<build>"}, confirm: "approved by the user"}`.
 4. Watch member by member with `cluster_status` until every member runs the
-   build and is ready. `cluster_job_status` reads the rollout's job.
+   build and is ready. `job_status` reads the rollout's job (`cluster:<node>:<n>`).
 5. Report: every member, its build, `started` time and state.
 
 ## If anything goes wrong

@@ -1,7 +1,7 @@
 ---
 name: test-write
 description: How to have a worker write tests — one behaviour each, exact expected values, run before they are called done.
-tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
+tools: [repo_task_start, repo_job_start, job_status, job_read]
 ---
 # Writing tests
 

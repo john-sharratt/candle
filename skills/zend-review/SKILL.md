@@ -18,7 +18,7 @@ The feature's thread, or `review-<branch>` for a standalone review.
 ## Delegate
 
 For a large change, split it: one `repo_task_start` per area, started together,
-then one `repo_task_wait` over all of them. Each with this prompt:
+then one `job_status` over all of their handles. Each with this prompt:
 
 ```
 Review <branch | these files | this diff> of <repository> for:

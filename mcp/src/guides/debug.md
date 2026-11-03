@@ -1,7 +1,7 @@
 ---
 name: debug
 description: How to find a bug's root cause with a worker — reproduce, narrow by evidence, fix the cause with a test that failed before it.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, cluster_logs, repo_job_start, repo_job_log]
+tools: [repo_task_start, job_status, repo_task_reply, cluster_logs, repo_job_start, job_read]
 ---
 # Debugging to the root cause
 

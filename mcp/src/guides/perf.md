@@ -1,7 +1,7 @@
 ---
 name: perf
 description: How to investigate a performance problem — measure before changing, compare like with like, one change per measurement, numbers with the machine they came from.
-tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log, cluster_status]
+tools: [repo_task_start, repo_job_start, job_status, job_read, cluster_status]
 ---
 # Performance work
 

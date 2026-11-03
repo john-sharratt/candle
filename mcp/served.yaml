@@ -26,7 +26,7 @@ server:
     your own tools. Call guide_list first. Attach to the feature's thread with
     thread_attach before working on it, and again after your context is
     compacted. Start tasks with repo_task_start — state each in full and name
-    it for what it does — and wait on them together with repo_task_wait. A
+    it for what it does — and wait on them together with job_status. A
     task's result is its worker's journal entry: an entry is evidence, not
     truth, so check a claim against the turns it cites (journal_read with the
     entry) before acting on it. The bot_* tools manage the user's bots —

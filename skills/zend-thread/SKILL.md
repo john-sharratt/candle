@@ -26,21 +26,22 @@ what every later task knows.
    project journal instead: `journal_note {journal: "P:<repository>"}`. Every
    task in every thread starts with that.
 4. **Delegate with `repo_task_start`**, passing the thread and a name saying what the
-   worker does. State the task in full: the worker shares the thread's
+   worker does; it answers the task's handle, `task:<thread>/<name>`. State the task in full: the worker shares the thread's
    journal, not your conversation.
 5. **Wait on everything at once.** Start every independent task first, then
-   `repo_task_wait {workers: [...]}` on all of them; it answers as soon as one
-   settles, and otherwise every 45 s with what each worker has done — its
-   rounds, thinking, tool calls by name — and any journal entries it wrote
-   since you last heard. Tell the user one line of where things stand, then
-   wait again. Stop waiting early if the entries already answer you.
+   `job_status {jobs: ["task:review/verify", ...], wait_s}` on all of them; it
+   answers as soon as one settles, and otherwise when `wait_s` runs out with
+   what each worker has done — its rounds, thinking, tool calls by name — and
+   any journal entries it wrote since you last heard. Tell the user one line
+   of where things stand, then wait again. Stop waiting early if the entries
+   already answer you.
 6. **Answer what asks.** A worker that is blocked ends its turn with a
    `QUESTION:` block — options, what it tried, pointers. Check the pointers,
    decide, and `repo_task_reply`. A **stuck** worker (its loop was closed) is
    answered the same way: say how to go on.
 7. **Steer without waiting** with `repo_task_nudge` while a worker runs. When its
    progress shows it off course — the same fetch failing, a step repeated, a
-   path you no longer want — `repo_task_stop` it with a reason: it stops at its next
+   path you no longer want — `job_cancel {job: "task:..."}` it: it stops at its next
    tool round and answers with what it has, then `repo_task_reply` redirects it.
 8. **Archive** the thread with `thread_archive` once the feature is done.
 
@@ -66,5 +67,5 @@ given. An entry is a line, then claims, each labelled with how it was known —
   committing under the repository's rules, any Decide operation. Those stay
   with you and the user.
 - Never paste a worker's claims to the user as fact without the check above.
-- Never let zend stall you: if `repo_task_wait` keeps answering `running` past
+- Never let zend stall you: if `job_status` keeps answering `running` past
   the skill's timeout, or zend is down, do the work yourself.

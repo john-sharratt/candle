@@ -45,7 +45,7 @@ can also be zipped as a claude.ai skill if ever wanted.
 ---
 name: research
 description: A question answered from the web, every claim checked against the page it came from.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, job_status, repo_task_reply, journal_grep, timeline_read]
 ---
 # Research
 ...the method...
@@ -172,7 +172,7 @@ A turn's tool results are its user half's `<tool_response>` blocks
 (`fast_path::coverage::response_bodies`), so the audit is deterministic and
 cheap. It reads every normal turn of the worker's conversation and of each
 part it started (`ZendSession::conversation_detail`), and goes at the end of
-what `repo_task_wait` / `repo_task_start` answer for a `done` worker. An answer citing no
+what `job_status` / `repo_task_start` answer for a `done` worker. An answer citing no
 URL carries no audit.
 
 **One automatic correction round.** When anything cited is `seen` or
@@ -245,9 +245,9 @@ rolling to the cluster).
   tools by name alone until one is loaded, and drops the server's
   instructions, so a name is the only thing Claude sees when it decides
   whether a request is Zen's. Work in the user's repositories is named
-  `repo_`: `repo_task_start` / `_wait` / `_reply` / `_nudge` / `_stop` (a
-  worker with a shell in the repository) and `repo_job_start` / `repo_job_log`
-  (a program run on a branch on one machine). Claude has no other way to reach
+  `repo_`: `repo_task_start` / `_reply` / `_nudge` (a worker with a shell in the
+  repository) and `repo_job_start` (a program run on a branch on one machine);
+  both are then watched with the `job_*` tools. Claude has no other way to reach
   those, so the name is enough to send it here. Web research is Claude's own,
   with its own tools; Zen's server instructions no longer ask for it.
 - **What Claude reads never says "zend".** The server is Zen; tool

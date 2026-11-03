@@ -4,7 +4,7 @@
 //! started from the cluster runs on its own thread and is read back here.
 //!
 //! A trial started by a deploy carries the deploy's id
-//! (`docs/build_deploy_tools.md` §4), so whoever reads the board — any member,
+//! (`docs/jobs.md` §1), so whoever reads the board — any member,
 //! any session — can tell which deploy a trial belongs to and how it ended. A
 //! trial asked to stop is marked cancelled here; the supervisor watching it
 //! reads the mark and rolls it back.

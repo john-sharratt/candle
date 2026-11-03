@@ -1,7 +1,7 @@
 ---
 name: refactor
 description: How to have a worker restructure code without changing what it does — tests green before and after, every call site moved, no behaviour hidden in the move.
-tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
+tools: [repo_task_start, repo_job_start, job_status, job_read]
 ---
 # Refactoring
 

@@ -1,7 +1,7 @@
 ---
 name: rollback
 description: How to roll the cluster back to an earlier build — a rollout of that build, planned by the gateway, started only with the user's approval, watched until every member runs it.
-tools: [cluster_command, cluster_job_status, cluster_status, cluster_audit, journal_note]
+tools: [cluster_command, job_status, cluster_status, cluster_audit, journal_note]
 ---
 # Rolling back
 

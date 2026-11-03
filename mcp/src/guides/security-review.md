@@ -1,7 +1,7 @@
 ---
 name: security-review
 description: How to have a worker review a change for security — threat-model first, every finding an exploit path from attacker-controlled input to a sink.
-tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, job_status, journal_grep, timeline_read]
 ---
 # Security review
 

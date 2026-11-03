@@ -407,9 +407,9 @@ last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.m
 
 **Deploy through the zend MCP first.** Once the commit is on `origin/main`, follow the
 `zend-deploy` skill: `service_deploy {host, service}` builds it on that machine's agent and has
-keep try it, answering at once with the deploy's handle; `service_status {deploy, wait_s}`
-waits it out, `service_log` reads the trial, `service_cancel` stops it
-(`docs/build_deploy_tools.md`). A coder worker of Zen's has the same tools. A refusal from a
+keep try it, answering at once with the deploy's handle; `job_status {jobs, wait_s}`
+waits it out, `job_read` / `job_grep` read the trial, `job_cancel` stops it
+(`docs/jobs.md`). A coder worker of Zen's has the same tools. A refusal from a
 worker's `service_deploy` because the machine runs the worker or holds an app's only ready
 member is a reason to ask the user, not to work around it by hand. Fall back to the manual steps below,
 through keep's HTTP API and the command line, when the connector is not attached,

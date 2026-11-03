@@ -74,7 +74,7 @@ mod tests {
     fn a_guide_reads_as_its_frontmatter_and_its_method() {
         let g = Guide::parse(
             "---\r\nname: research\r\ndescription: A question answered from the web.\r\n\
-             tools: [repo_task_start, repo_task_wait]\r\n---\r\n# Research\r\n\r\nGather.\r\n",
+             tools: [repo_task_start, job_status]\r\n---\r\n# Research\r\n\r\nGather.\r\n",
         )
         .unwrap();
         assert_eq!(
@@ -82,7 +82,7 @@ mod tests {
             Guide {
                 name: "research".into(),
                 description: "A question answered from the web.".into(),
-                tools: vec!["repo_task_start".into(), "repo_task_wait".into()],
+                tools: vec!["repo_task_start".into(), "job_status".into()],
                 clients: Vec::new(),
                 body: "# Research\n\nGather.".into(),
             }

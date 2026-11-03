@@ -1,7 +1,7 @@
 ---
 name: guide-change
 description: How to change a guide, or any of this connector's own words, from a conversation — a worker edits it on a branch, a build agent tests it, the user approves the merge, and mcp is rebuilt and trialled on each machine that runs it.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_status, repo_job_log, service_deploy, service_status]
+tools: [repo_task_start, job_status, repo_task_reply, repo_job_start, job_read, job_grep, service_deploy]
 ---
 # Changing a guide
 
@@ -32,10 +32,11 @@ A new guide is a new file there: its `name` its file's, a one-line
 Read the new text in the worker's answer against the change asked for. Then
 `repo_job_start {repo: "candle", branch: "zen/guide-<what>", program:
 "cargo", args: ["test", "-p", "mcp", "--bin", "mcp", "guides"], timeout_s:
-1800}`, and `repo_job_status {job: <its handle>, wait_s: 240}` until it ends:
-its `test result: ok` line is the proof every guide still reads. A failure
-names the guide and what is wrong with it — `repo_job_log {job, mode:
-"summary"}` reads it — send it back to the worker.
+1800}`, and `job_status {jobs: ["build:76c3a0f4d39bd9db:XeV_I_QPzpg"],
+wait_s: 240}` on its handle until it ends: its `test result: ok` line is the
+proof every guide still reads. A failure names the guide and what is wrong
+with it — the ended job's `job_status` answer quotes it, `job_read {job,
+page}` reads on — send it back to the worker.
 
 ## 3. Merge — the user's decision
 
@@ -52,8 +53,8 @@ commit on main."}`.
 
 For blackworld, then whiteworld: `service_deploy {host, service: "mcp"}`
 builds main on that machine's agent and has keep try it; it answers with the
-deploy's handle. `service_status {deploy: <handle>, wait_s: 240}` waits until
-it is proven or rolled back (the `deploy` guide). While one machine's mcp
+deploy's handle. `job_status {jobs: ["deploy:76c3a0f4d39bd9db:XeV_I_QPzpg"], wait_s: 240}`
+waits until it is proven or rolled back (the `deploy` guide). While one machine's mcp
 switches, the other serves the connector. Then the second machine.
 
 ## Report

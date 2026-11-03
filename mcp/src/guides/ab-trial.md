@@ -1,7 +1,7 @@
 ---
 name: ab-trial
 description: How to compare a new build against the running one — trial it on one machine while the others serve the old build, compare what matters, then decide whether to roll out.
-tools: [service_deploy, service_status, service_log, cluster_status, cluster_logs]
+tools: [service_deploy, job_status, job_cancel, cluster_status, cluster_logs]
 ---
 # A/B trial
 
@@ -19,12 +19,13 @@ ready.
    down on the thread.
 2. **Baseline**: measure it on the machines still on the old build.
 3. **Trial the new build on one machine** (`deploy`): `service_deploy`, then
-   `service_status {deploy, wait_s}` until it is proven.
+   `job_status {jobs: ["deploy:76c3a0f4d39bd9db:XeV_I_QPzpg"], wait_s}` until
+   it is proven.
 4. **Compare** under the same load: `cluster_logs` for errors on each member
    (`node` narrows to one), `cluster_status` for state, the operation timed on
    each. Same inputs, same window.
 5. **Decide with the user**: roll out (`release`), keep testing, or roll back
-   the trial machine (`rollback`, or `service_cancel {deploy}` while its trial
+   the trial machine (`rollback`, or `job_cancel {job: "deploy:..."}` while its trial
    still runs).
 
 ## Notes

@@ -1,7 +1,7 @@
 ---
 name: upgrade
 description: How to upgrade a dependency or toolchain — research what changed first, then upgrade on a branch, build and test on an agent.
-tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
+tools: [repo_task_start, repo_job_start, job_status, job_read]
 ---
 # Upgrading a dependency
 

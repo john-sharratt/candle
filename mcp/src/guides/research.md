@@ -1,7 +1,7 @@
 ---
 name: research
 description: When the user asks for web research to run on Zen's workers — how to have them answer with every claim checked against the page it came from; gather, verify, check themselves, then you verify them. Otherwise research with your own tools.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, job_status, repo_task_reply, journal_grep, timeline_read]
 ---
 # Research
 

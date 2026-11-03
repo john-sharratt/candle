@@ -1,7 +1,7 @@
 ---
 name: branch
 description: How a worker's change lands — always on a branch, pushed for review, merged only with the user's approval.
-tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
+tools: [repo_task_start, repo_job_start, job_status, job_read]
 ---
 # Branches and merges
 
