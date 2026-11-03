@@ -899,7 +899,7 @@ impl Hub {
     /// replaced: kept, relayed, or a protocol violation. A vote is also
     /// answered on `reply_on`, the socket it arrived on.
     pub(super) fn on_frame(
-        &self,
+        self: &Arc<Self>,
         app: &str,
         node: u64,
         replaced: &AtomicBool,
@@ -1367,7 +1367,7 @@ impl Hub {
     /// guard ([`apply_report`]): its log lines, its relays, a changed listing,
     /// the upgrade actions it set off, and — after a `CAPACITY`, which says what
     /// a card can take — placing the units waiting for room (§4.3).
-    pub(super) fn follow(&self, app: &str, node: u64, done: Applied) {
+    pub(super) fn follow(self: &Arc<Self>, app: &str, node: u64, done: Applied) {
         for (subject, text) in done.notes {
             self.note(app, subject, text);
         }

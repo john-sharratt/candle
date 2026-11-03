@@ -192,7 +192,8 @@ impl Held {
             }
             Frame::Complete(c) => self.complete.extend(c.keys),
             Frame::Claim(c) => {
-                self.keys.entry(c.key.clone()).or_default().claim = Some(c);
+                let key = c.key.clone();
+                self.keys.entry(key).or_default().claim = Some(c);
             }
             Frame::Unclaim(u) => {
                 let held = self.keys.entry(u.key.clone()).or_default();
