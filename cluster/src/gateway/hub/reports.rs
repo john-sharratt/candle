@@ -17,32 +17,14 @@ use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
 use crate::coord::CoordState;
 use crate::dispatch::RouteTable;
-use crate::frame::{name, Ack, BuildArtifacts, Capacity, Claim, Complete, Frame, Unclaim};
+use crate::frame::{Ack, BuildArtifacts, Capacity, Claim, Complete, Frame, Unclaim};
 use crate::gateway::coord_log::changes;
 use crate::gateway::upgrades::Action;
 
-/// What a session reports of its node's state: dropped once the session is
-/// replaced, for the node's newer session says it of the process that is
-/// there now. A request routed on, or a one-time reply or offer — a vote, a
-/// catch-up answer, a build chunk, a resync's `HAVE` — still passes: a
-/// process still running sends it once, and a peer awaits it.
-pub(in crate::gateway) fn is_state_report(frame: &Frame) -> bool {
-    matches!(
-        frame,
-        Frame::Claim(_)
-            | Frame::Unclaim(_)
-            | Frame::Capacity(_)
-            | Frame::Routes(_)
-            | Frame::Complete(_)
-            | Frame::Coord(_)
-            | Frame::Ack(_)
-            | Frame::BuildOffer(_)
-            | Frame::BuildHave(_)
-    )
-}
-
 /// A state report, checked and decoded ([`check_report`]): what is applied or
-/// held back, so nothing held can fail to apply.
+/// held back, so nothing held can fail to apply. What a session reports of
+/// its node's state is dropped once the session is replaced, for the node's
+/// newer session says it of the process that is there now.
 pub(in crate::gateway) enum Report {
     Claim(Claim),
     Unclaim(Unclaim),
@@ -56,6 +38,7 @@ pub(in crate::gateway) enum Report {
     BuildHave(BuildArtifacts),
 }
 
+#[cfg(test)]
 impl PartialEq for Report {
     fn eq(&self, other: &Report) -> bool {
         match (self, other) {
@@ -73,6 +56,7 @@ impl PartialEq for Report {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -89,11 +73,22 @@ impl fmt::Debug for Report {
     }
 }
 
-/// `frame`, a state report from `node`, checked as it arrives — a claim or
-/// release of its own node's, a `ROUTES` table and a `COORD` that decode —
-/// before it is applied or held back, and decoded once for both. `Err` closes
-/// the socket `4400`.
-pub(in crate::gateway) fn check_report(frame: Frame, node: u64) -> Result<Report, Close> {
+/// A frame from a member, as [`check_report`] sorts it.
+pub(in crate::gateway) enum Arrived {
+    /// A state report, checked and decoded.
+    Report(Report),
+    /// Anything else — a request routed on, or a one-time reply or offer: a
+    /// vote, a catch-up answer, a build chunk, a resync's `HAVE`. It passes
+    /// whatever session it came on: a process still running sends it once,
+    /// and a peer awaits it.
+    Other(Frame),
+}
+
+/// Sort `frame`, from `node`, as it arrives: a state report is checked — a
+/// claim or release of its own node's, a `ROUTES` table and a `COORD` that
+/// decode — before it is applied or held back, and decoded once for both.
+/// `Err` closes the socket `4400`.
+pub(in crate::gateway) fn check_report(frame: Frame, node: u64) -> Result<Arrived, Close> {
     let names = |kind: &str, other: u64| -> Result<(), Close> {
         match other == node {
             true => Ok(()),
@@ -103,7 +98,7 @@ pub(in crate::gateway) fn check_report(frame: Frame, node: u64) -> Result<Report
             )),
         }
     };
-    Ok(match frame {
+    Ok(Arrived::Report(match frame {
         Frame::Claim(c) => {
             names("CLAIM", c.epoch.node)?;
             Report::Claim(c)
@@ -129,8 +124,8 @@ pub(in crate::gateway) fn check_report(frame: Frame, node: u64) -> Result<Report
         Frame::Ack(a) => Report::Ack(a),
         Frame::BuildOffer(b) => Report::BuildOffer(b),
         Frame::BuildHave(b) => Report::BuildHave(b),
-        other => unreachable!("{} is not a state report", name(other.kind())),
-    })
+        other => return Ok(Arrived::Other(other)),
+    }))
 }
 
 /// What follows from a report applied: done by the hub once the guard it was
@@ -481,23 +476,26 @@ mod tests {
         assert_eq!(held.into_reports(), vec![have(&["motherd", "web"])]);
     }
 
-    /// **A report is checked, and decoded, as it arrives**: one naming another
-    /// node's claim and a `ROUTES` that does not decode are refused `4400`;
-    /// a resync's `HAVE`, a catch-up and a vote are not state reports.
+    /// **A frame is sorted, and a report checked and decoded, as it arrives**:
+    /// one naming another node's claim and a `ROUTES` that does not decode are
+    /// refused `4400`; a claim of its own is a report; a ping is not, and
+    /// passes as it came.
     #[test]
     fn a_report_is_checked_as_it_arrives() {
         let other = Frame::Claim(Claim {
             key: b"k".to_vec(),
             epoch: Epoch { ms: 1, node: 2 },
         });
-        assert_eq!(check_report(other, 1).unwrap_err().code, 4400);
+        assert_eq!(check_report(other, 1).err().unwrap().code, 4400);
         let garbled = Frame::Routes(Routes { table: vec![0xff] });
-        assert_eq!(check_report(garbled, 1).unwrap_err().code, 4400);
-        assert_eq!(
-            check_report(Frame::Claim(claim(b"k", 1)), 1).unwrap(),
-            Report::Claim(claim(b"k", 1))
-        );
-        assert!(is_state_report(&Frame::Claim(claim(b"k", 1))));
-        assert!(!is_state_report(&Frame::Ping([0; 8])));
+        assert_eq!(check_report(garbled, 1).err().unwrap().code, 4400);
+        let Ok(Arrived::Report(own)) = check_report(Frame::Claim(claim(b"k", 1)), 1) else {
+            panic!("a report");
+        };
+        assert_eq!(own, Report::Claim(claim(b"k", 1)));
+        assert!(matches!(
+            check_report(Frame::Ping([0; 8]), 1),
+            Ok(Arrived::Other(Frame::Ping(_)))
+        ));
     }
 }

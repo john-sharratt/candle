@@ -534,10 +534,20 @@ impl AppMember {
         F: Fn(VirtualConn) + Send + Sync + 'static,
     {
         let handle = session.handle.clone();
+        // Admitted below the floor, the member upgrades: it takes no traffic,
+        // applies and sends no events, holds no claim and does not vote
+        // (§3.5). Its replication waits for the build that replaces it.
+        let floor = BuildId {
+            count: admit.floor_count,
+            hash: admit.floor_hash.clone(),
+            local: String::new(),
+        };
+        let upgrading = self.below(&floor);
         // The table names this node the holder of claims it does not hold —
         // its previous process's, or one let go on a socket that died before
         // the gateway heard — and they are released here, as their holder,
-        // through each key's own last record (§5.4).
+        // through each key's own last record (§5.4). Upgrading, it claims
+        // nothing again: a key it holds stays at the epoch it holds it at.
         let (lost, stale, again) = {
             let mut claims = lock(&self.claims);
             let mut lost: Vec<Vec<u8>> = Vec::new();
@@ -545,7 +555,7 @@ impl AppMember {
             let mut again: Vec<(Vec<u8>, Epoch)> = Vec::new();
             let now = now_ms();
             for claim in &admit.claims {
-                match claims.of_own_node(&claim.key, claim.epoch, now) {
+                match claims.of_own_node(&claim.key, claim.epoch, now, !upgrading) {
                     OwnClaim::Release(epoch) => stale.push((claim.key.clone(), epoch)),
                     OwnClaim::Reclaimed(epoch) => again.push((claim.key.clone(), epoch)),
                     OwnClaim::Kept => {}
@@ -575,22 +585,13 @@ impl AppMember {
                 table: self.routes.encode(),
             }));
         }
-        // Admitted below the floor, the member upgrades: it takes no traffic,
-        // applies and sends no events, holds no claim and does not vote
-        // (§3.5). Its replication waits for the build that replaces it.
-        let floor = BuildId {
-            count: admit.floor_count,
-            hash: admit.floor_hash.clone(),
-            local: String::new(),
-        };
-        let upgrading = self.below(&floor);
         lock(&self.floors)[c] = Some(floor);
         // A key claimed again above an epoch this gateway named is announced
-        // at once on every other gateway joined, upgrading or not — each still
-        // names the epoch before, and a later release at the new one would
-        // match nothing there. Sent before this socket joins the announced
-        // ones, so this gateway, which hears it with the re-announce below,
-        // does not hear it twice.
+        // at once on every other gateway joined — each still names the epoch
+        // before, and a later release at the new one would match nothing
+        // there. Sent before this socket joins the announced ones, so this
+        // gateway, which hears it with the re-announce below, does not hear it
+        // twice. An upgrading member claims nothing again, so has none.
         for (key, epoch) in again {
             self.announce(Frame::Claim(Claim { key, epoch }));
         }

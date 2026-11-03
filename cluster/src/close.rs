@@ -15,10 +15,10 @@ pub enum CloseCode {
     Replaced,
     /// This admission was not taken, and the member dials again
     /// (`docs/replicated_substrate.md` §5.4): another admission of the node was
-    /// completing when its `HELLO` came, more changed during its handshake than
-    /// it could be brought up to date with, or it stood so long a newer one
-    /// took its place. Unlike [`CloseCode::Replaced`], no session of the node
-    /// displaced this socket for good.
+    /// completing when its `HELLO` came, or more changed during its handshake
+    /// than it could be brought up to date with. Unlike
+    /// [`CloseCode::Replaced`], no session of the node displaced this socket
+    /// for good.
     Retry,
     /// Below the app's floor with no way to upgrade, or left behind by a
     /// rollout.

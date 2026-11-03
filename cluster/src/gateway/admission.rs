@@ -202,6 +202,27 @@ impl Admission {
             Some((build.clone(), node, by.to_string()));
     }
 
+    /// `admitted`, a session of `node`'s whose handshake failed, is undone:
+    /// the session it replaced is the node's again while `standing` — still
+    /// connected — as though it had never been decided, so a group of one, its
+    /// member redialling, keeps its model lock. With none replaced, or the one
+    /// replaced gone since, the node has none, and when it was the app's last
+    /// the lock clears, as on [`Self::left`].
+    pub fn undo(&mut self, app: &str, node: u64, admitted: &Admitted, standing: bool) {
+        let Some(policy) = self.apps.get_mut(app) else {
+            return;
+        };
+        if policy.sessions.get(&node) == Some(&admitted.session) {
+            match admitted.replaces.filter(|_| standing) {
+                Some(replaced) => policy.sessions.insert(node, replaced),
+                None => policy.sessions.remove(&node),
+            };
+        }
+        if policy.sessions.is_empty() {
+            policy.lock = None;
+        }
+    }
+
     /// `node`'s `session` ended. When it was the app's last, the model lock
     /// clears (§3.6).
     pub fn left(&mut self, app: &str, node: u64, session: u64) {

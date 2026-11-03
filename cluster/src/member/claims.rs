@@ -35,9 +35,10 @@ pub enum OwnClaim {
     /// process's, or one it let go on a socket that died before the gateway
     /// heard: released at that epoch, as its holder.
     Release(Epoch),
-    /// This node's, below the epoch this member holds the key at: nothing is
-    /// released, and its announcing that claim again on admission supersedes
-    /// it.
+    /// This node's, below the epoch this member holds the key at — or above
+    /// it, for a member upgrading, which claims nothing again: nothing is
+    /// released, and the key stays at the epoch held. Below, its announcing
+    /// that claim again on admission supersedes it.
     Kept,
     /// This node's, above the epoch this member held the key at: nothing is
     /// released, and the key is claimed again above it, at this epoch — to
@@ -172,8 +173,15 @@ impl MemberClaims {
     /// serves would let a peer take it, and both serve it. Named at an epoch
     /// above the one it holds, the key is claimed again here above that one,
     /// at `now_ms` or past every epoch seen, so the re-announce on admission
-    /// replaces the table's.
-    pub fn of_own_node(&mut self, key: &[u8], epoch: Epoch, now_ms: u64) -> OwnClaim {
+    /// replaces the table's — unless `reclaim` is false, for a member upgrading,
+    /// which claims nothing and keeps the key at the epoch it holds it at.
+    pub fn of_own_node(
+        &mut self,
+        key: &[u8],
+        epoch: Epoch,
+        now_ms: u64,
+        reclaim: bool,
+    ) -> OwnClaim {
         if epoch.node != self.node {
             return OwnClaim::Hear;
         }
@@ -185,7 +193,7 @@ impl MemberClaims {
         let Some((held, served)) = held else {
             return OwnClaim::Release(epoch);
         };
-        if epoch < held {
+        if epoch < held || !reclaim {
             return OwnClaim::Kept;
         }
         let floor = self.seen.get(key).map_or(0, |ms| ms + 1);
@@ -328,25 +336,31 @@ mod tests {
         let t = Instant::now();
         let mut c = MemberClaims::new(ME);
         assert_eq!(
-            c.of_own_node(b"other", e(700, 2), 600),
+            c.of_own_node(b"other", e(700, 2), 600, true),
             OwnClaim::Hear,
             "another node's"
         );
 
         assert_eq!(c.serve(b"held", 500, t, |_| true), Check::Took(e(500, ME)));
         assert_eq!(
-            c.of_own_node(b"held", e(500, ME), 600),
+            c.of_own_node(b"held", e(500, ME), 600, true),
             OwnClaim::Hear,
             "held at that epoch"
         );
         assert_eq!(
-            c.of_own_node(b"held", e(400, ME), 600),
+            c.of_own_node(b"held", e(400, ME), 600, true),
             OwnClaim::Kept,
             "below the held epoch: the re-announce supersedes it"
         );
         assert_eq!(c.own(), vec![(b"held".to_vec(), e(500, ME))]);
         assert_eq!(
-            c.of_own_node(b"held", e(900, ME), 600),
+            c.of_own_node(b"held", e(900, ME), 600, false),
+            OwnClaim::Kept,
+            "upgrading, above the held epoch: claimed nothing again"
+        );
+        assert_eq!(c.own(), vec![(b"held".to_vec(), e(500, ME))]);
+        assert_eq!(
+            c.of_own_node(b"held", e(900, ME), 600, true),
             OwnClaim::Reclaimed(e(901, ME)),
             "above the held epoch: never released, never adopted — claimed again"
         );
@@ -358,7 +372,7 @@ mod tests {
         assert_eq!(c.holder(b"held"), Some(ME));
 
         assert_eq!(
-            c.of_own_node(b"stale", e(800, ME), 600),
+            c.of_own_node(b"stale", e(800, ME), 600, true),
             OwnClaim::Release(e(800, ME)),
             "a previous process's"
         );
@@ -374,7 +388,7 @@ mod tests {
         c.follow_use();
         assert_eq!(c.end_use(b"gone"), Some(e(600, ME)), "let go");
         assert_eq!(
-            c.of_own_node(b"gone", e(600, ME), 700),
+            c.of_own_node(b"gone", e(600, ME), 700, true),
             OwnClaim::Release(e(600, ME)),
             "a release the gateway never heard"
         );

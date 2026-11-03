@@ -3,22 +3,23 @@
 //! replaces under the same guard, what that session still reports of the
 //! node's state lands nowhere, and a handshake that fails undoes it all.
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::hub::{
-    age_pending, take_pending, undo_pending, Hub, PendingGuard, Socket, Taken, PENDING_CAP,
-    PENDING_STALE,
-};
+use tokio::time::timeout;
+
+use super::hub::{take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
 use super::registry::MemberView;
 use crate::close::{AfterClose, CloseCode};
 use crate::delivery::ReceiptPacer;
 use crate::frame::{
-    BuildId, Capacity, Claim, Complete, Epoch, Frame, Hello, MemberState, ModelId, Unclaim,
+    BuildId, Capacity, Claim, Complete, Epoch, Frame, Hello, MemberState, ModelId, Prove, Unclaim,
 };
-use crate::handshake::{GroupKey, PROTO};
+use crate::handshake::{member_proof, nonce, GroupKey, PROTO};
 use crate::pipe::memory::pair;
+use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, Role, SessionHandle};
 
 fn hello(node: u64) -> Hello {
@@ -87,7 +88,10 @@ fn admitted_once(hub: &Hub) -> (u64, Arc<AtomicBool>) {
     let (_, first) = hub.decide("zend", &hello(1)).unwrap();
     let flag = Arc::new(AtomicBool::new(false));
     let mut s = hub.state();
-    undo_pending(&mut s, "zend", 1, first.session);
+    assert!(matches!(
+        take_pending(&mut s, "zend", 1, &first),
+        Taken::Ready(_)
+    ));
     s.sockets.insert(
         ("zend".into(), 1),
         Socket {
@@ -170,7 +174,7 @@ async fn a_failed_handshake_undoes_the_replacement() {
 
     let applied = {
         let mut s = hub.state();
-        let applied = undo_pending(&mut s, "zend", 1, second.session);
+        let applied = undo_pending(&mut s, "zend", 1, &second);
         assert_eq!(s.sockets[&("zend".to_string(), 1)].session, first);
         assert_eq!(
             s.registry.member("zend", 1).unwrap().state(),
@@ -224,7 +228,7 @@ async fn held_reports_land_in_the_order_they_arrived() {
     )
     .unwrap();
     let mut s = hub.state();
-    undo_pending(&mut s, "zend", 1, second.session);
+    undo_pending(&mut s, "zend", 1, &second);
     assert_eq!(s.registry.claims("zend").holder(b"k"), None, "released");
     assert!(
         s.registry.holds_release("zend", b"k", 1),
@@ -245,7 +249,7 @@ async fn a_departed_sessions_held_reports_go_with_it() {
     let mut s = hub.state();
     s.sockets.remove(&("zend".to_string(), 1));
     assert!(s.registry.leave("zend", 1, first));
-    assert!(undo_pending(&mut s, "zend", 1, second.session).is_empty());
+    assert!(undo_pending(&mut s, "zend", 1, &second).is_empty());
     assert_eq!(s.registry.claims("zend").holder(b"k"), None);
 }
 
@@ -272,11 +276,11 @@ async fn overlapping_dials_converge() {
         {
             let mut s = hub.state();
             if s1_fails {
-                undo_pending(&mut s, "zend", 1, s1.session);
+                undo_pending(&mut s, "zend", 1, &s1);
                 assert!(!old.load(Ordering::SeqCst));
             } else {
                 assert!(matches!(
-                    take_pending(&mut s, "zend", 1, s1.session),
+                    take_pending(&mut s, "zend", 1, &s1),
                     Taken::Ready(_)
                 ));
             }
@@ -286,53 +290,84 @@ async fn overlapping_dials_converge() {
     }
 }
 
-/// **A serve task that ends before `run` takes its pending undoes it** — a
-/// panic, a dropped task — through the guard armed when the admission was
-/// decided: the standing session reports again, and the node's next `HELLO`
-/// is admitted rather than refused for good.
+/// Drive `hub`'s serve through a handshake for `hello` that its admission
+/// decides — and then fails, the member gone before its `ADMIT`: the serve
+/// task ends before `run` takes the admission's pending.
+async fn decided_then_gone(hub: &Arc<Hub>, hello: Hello) {
+    let (m, g) = pair(1 << 16);
+    let served = {
+        let hub = Arc::clone(hub);
+        tokio::spawn(async move {
+            hub.serve("zend", IpAddr::from([10, 0, 0, 7]), g.tx, g.rx, |_| {})
+                .await;
+        })
+    };
+    let (mut tx, mut rx) = (m.tx, m.rx);
+    let hello = Hello {
+        nonce: nonce(),
+        ..hello
+    };
+    tx.send(Message::Frame(
+        Frame::Hello(Box::new(hello.clone())).encode(),
+    ))
+    .await
+    .unwrap();
+    let Some(Message::Frame(bytes)) = rx.recv().await else {
+        panic!("a CHALLENGE");
+    };
+    let Ok(Frame::Challenge(challenge)) = Frame::decode(&bytes) else {
+        panic!("a CHALLENGE");
+    };
+    let proof = member_proof(
+        &GroupKey::from_bytes([1; 32]),
+        "zend",
+        hello.node,
+        &challenge.nonce,
+        &hello.nonce,
+    );
+    drop(rx);
+    tx.send(Message::Frame(Frame::Prove(Prove { proof }).encode()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), served)
+        .await
+        .expect("the serve task ends")
+        .unwrap();
+}
+
+/// **A serve task that ends before `run` takes its pending undoes it**,
+/// through the guard armed when the admission was decided: the standing
+/// session reports again, and the node's next `HELLO` is admitted rather than
+/// refused for good.
 #[tokio::test]
-async fn a_dropped_serve_undoes_its_admission() {
+async fn a_serve_ending_before_run_undoes_its_admission() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
-    let (_, old) = admitted_once(&hub);
-    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
-    assert!(old.load(Ordering::SeqCst));
-    drop(PendingGuard {
-        hub: Arc::clone(&hub),
-        app: "zend".into(),
-        node: 1,
-        session: s1.session,
-        armed: true,
-    });
+    let (first, old) = admitted_once(&hub);
+    decided_then_gone(&hub, hello(1)).await;
     assert!(!old.load(Ordering::SeqCst), "undone");
+    assert_eq!(hub.state().sockets[&("zend".to_string(), 1)].session, first);
     assert!(
         hub.decide("zend", &hello(1)).is_ok(),
         "the next HELLO is admitted"
     );
 }
 
-/// **A pending that stands past `PENDING_STALE` gives way to a newer
-/// `HELLO`**, which takes its place; the stale session's `run`, should it
-/// come, finds itself gone.
+/// **A redial that fails leaves a group of one its model lock**: the session
+/// it would have replaced is the node's again, so a member of another model
+/// is still refused `4412`.
 #[tokio::test]
-async fn a_stale_pending_gives_way() {
+async fn a_failed_redial_keeps_the_model_lock() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
     admitted_once(&hub);
-    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
-    assert!(
-        hub.decide("zend", &hello(1)).is_err(),
-        "fresh, it completes first"
-    );
-    age_pending(&mut hub.state(), "zend", 1, PENDING_STALE);
-    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
-    let mut s = hub.state();
-    assert!(matches!(
-        take_pending(&mut s, "zend", 1, s1.session),
-        Taken::Gone
-    ));
-    assert!(matches!(
-        take_pending(&mut s, "zend", 1, s2.session),
-        Taken::Ready(_)
-    ));
+    decided_then_gone(&hub, hello(1)).await;
+    let mut other = hello(2);
+    other.model = Some(ModelId {
+        weights: [2; 32],
+        describe: "model 2".into(),
+        ..other.model.clone().unwrap()
+    });
+    let refused = hub.decide("zend", &other).unwrap_err();
+    assert_eq!(refused.code, CloseCode::Model.code());
 }
 
 /// **A handshake during which more claim relays pile up than it can be
@@ -359,7 +394,7 @@ async fn an_overflowing_handshake_fails_its_admission() {
         );
     }
     let mut s = hub.state();
-    let Taken::Overflowed(applied) = take_pending(&mut s, "zend", 1, second.session) else {
+    let Taken::Overflowed(applied) = take_pending(&mut s, "zend", 1, &second) else {
         panic!("overflowed");
     };
     assert_eq!(applied.len(), 1, "the thousands of CAPACITYs, as the last");
