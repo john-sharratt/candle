@@ -2390,6 +2390,7 @@ fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilParam {
         properties: None,
         nullable: false,
         minimum: minimum_of(t.name, p.name),
+        maximum: None,
         max_tokens: (p.ty == "string").then_some(ACT_VALUE_TOKENS),
         requires: value_requirements(t.name, p.name),
         // **What each value carries is decided by which value it is.**
