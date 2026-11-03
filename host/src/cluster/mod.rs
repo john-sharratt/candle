@@ -33,7 +33,6 @@
 //! the gateway opens is handed back to the HTTP runtime to be served.
 
 pub mod capacity;
-pub mod disk;
 pub mod flush;
 pub mod held_body;
 pub mod in_flight;

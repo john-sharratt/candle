@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use agent::checkouts::Checkouts;
 use agent::client::{AgentError, Agents, At};
-use agent::config::{AgentConfig, CheckoutConfig};
+use agent::config::{AgentConfig, CheckoutConfig, SweepConfig};
 use agent::fetcher::AgentFetch;
 use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
@@ -141,6 +141,7 @@ fn jobs_over(r: &Repos, push: bool) -> Arc<Jobs> {
             push,
             journal: false,
         }],
+        sweep: SweepConfig::default(),
     };
     let shell = copy("a", "b").0;
     let checkouts = Checkouts::open(&cfg, &CommandPolicy::allowing([shell.as_str()])).unwrap();

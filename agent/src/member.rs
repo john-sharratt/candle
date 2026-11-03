@@ -246,7 +246,7 @@ mod tests {
 
     use super::*;
     use crate::checkouts::Checkouts;
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, SweepConfig};
 
     /// **An agent whose jobs run below normal priority says so**, and a
     /// dedicated one does not.
@@ -258,6 +258,7 @@ mod tests {
             slots: Some(2),
             stage_dir: None,
             checkouts: Vec::new(),
+            sweep: SweepConfig::default(),
         };
         let open = || Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap();
         let beside = Jobs::new(open(), 2, Priority::Below);
@@ -277,6 +278,7 @@ mod tests {
             slots: Some(1),
             stage_dir: None,
             checkouts: Vec::new(),
+            sweep: SweepConfig::default(),
         };
         let jobs = Jobs::new(
             Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),

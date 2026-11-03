@@ -11,7 +11,14 @@
 //!   - name: candle
 //!     dir: D:/agent/candle
 //!     push: true
+//! sweep:                    # optional; these are the defaults
+//!   low_free_gb: 150        # a volume is low under the larger of these two
+//!   low_free_percent: 10
+//!   worth_gb: 10            # a prune or a clean must bring back at least this
 //! ```
+//!
+//! `sweep` is when a run, as it takes its checkout, first takes back what the
+//! checkouts' build outputs hold ([`crate::sweep`]): prune, then clean.
 //!
 //! `stage_dir` is where a run that asks for it stages the file it built —
 //! this machine's `keep/stage/`, which `keep` tries a build from
@@ -39,6 +46,28 @@ pub struct CheckoutConfig {
     pub journal: bool,
 }
 
+/// When the agent sweeps its checkouts' build outputs ([`crate::sweep`]): when
+/// the free space on a checkout's volume is below the larger of `low_free_gb`
+/// and `low_free_percent` of the volume, and only where at least `worth_gb`
+/// would come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SweepConfig {
+    pub low_free_gb: u64,
+    pub low_free_percent: u8,
+    pub worth_gb: u64,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        SweepConfig {
+            low_free_gb: 150,
+            low_free_percent: 10,
+            worth_gb: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -51,6 +80,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub stage_dir: Option<PathBuf>,
     pub checkouts: Vec<CheckoutConfig>,
+    /// When its checkouts' build outputs are swept.
+    #[serde(default)]
+    pub sweep: SweepConfig,
 }
 
 impl AgentConfig {
@@ -123,9 +155,27 @@ mod tests {
                         journal: false,
                     },
                 ],
+                sweep: SweepConfig::default(),
             }
         );
         assert_eq!(cfg.slots(16), 3);
+    }
+
+    /// **The sweep's bars default, and each can be set alone.**
+    #[test]
+    fn the_sweep_defaults_and_each_bar_can_be_set() {
+        let cfg = AgentConfig::parse("jobs_dir: j\ncheckouts: []\n").unwrap();
+        assert_eq!(cfg.sweep, SweepConfig::default());
+        let cfg =
+            AgentConfig::parse("jobs_dir: j\ncheckouts: []\nsweep: {worth_gb: 25}\n").unwrap();
+        assert_eq!(
+            cfg.sweep,
+            SweepConfig {
+                worth_gb: 25,
+                ..SweepConfig::default()
+            }
+        );
+        assert!(AgentConfig::parse("jobs_dir: j\ncheckouts: []\nsweep: {often: 1}\n").is_err());
     }
 
     #[test]

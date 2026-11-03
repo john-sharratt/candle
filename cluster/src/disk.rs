@@ -1,6 +1,7 @@
-//! The volume a substrate is on, measured for fault mode
-//! (`docs/replicated_substrate.md` §7.7): its free and total bytes, from the
-//! mount whose point is the longest prefix of the substrate's directory.
+//! The volume a directory is on — a member's substrate, measured for fault
+//! mode (`docs/replicated_substrate.md` §7.7), or an agent's checkout,
+//! measured for its disk sweep: its free and total bytes, from the mount whose
+//! point is the longest prefix of the directory.
 
 use std::path::{absolute, Component, Path, PathBuf, Prefix};
 

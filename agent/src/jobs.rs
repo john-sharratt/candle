@@ -34,9 +34,11 @@ use zend_vfs::{
     Priority, RemoteName, Rev, RunOutcome, SandboxCommand, StartedJob, VfsStore, ORIGIN,
 };
 
+use cluster::disk::volume_of;
 use cluster::log_read::{self, LogAsk, LogRead};
 
 use crate::checkouts::{Checkout, Checkouts};
+use crate::sweep::{sweep, Bars, Target};
 use crate::switch::Switch;
 use crate::wire::{
     decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
@@ -542,6 +544,7 @@ impl Jobs {
         branch: BranchName,
     ) -> Result<StartedJob, JobError> {
         self.fetch(&run.repo).await?;
+        self.sweep(&run.repo).await;
         let c = self.checkout(&run.repo)?;
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
         store
@@ -804,6 +807,30 @@ impl Jobs {
                 }
             }
         })
+    }
+
+    /// Sweep the checkouts' build outputs if their disk is low ([`sweep`]), as a
+    /// run of `repo` is about to add to it: on the blocking pool, since it
+    /// walks and removes files, each step said in the agent's log.
+    async fn sweep(&self, repo: &str) {
+        let targets: Vec<Target> = {
+            let t = self.table();
+            self.checkouts
+                .all()
+                .map(|c| Target {
+                    name: c.name.clone(),
+                    dir: c.dir.join("target"),
+                    held: !self.holding(&t, &c.name).is_empty(),
+                })
+                .collect()
+        };
+        let bars = Bars::of(self.checkouts.sweep());
+        let lines = spawn_blocking(move || sweep(&targets, &bars, &volume_of))
+            .await
+            .unwrap_or_default();
+        for line in lines {
+            tracing::warn!(repo, "disk sweep: {line}");
+        }
     }
 
     /// The runs holding `repo`'s checkout: those whose sandbox job is

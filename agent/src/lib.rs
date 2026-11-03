@@ -28,5 +28,6 @@ pub mod jobs;
 pub mod member;
 pub mod pusher;
 pub mod routes;
+pub mod sweep;
 pub mod switch;
 pub mod wire;

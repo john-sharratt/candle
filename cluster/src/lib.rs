@@ -37,6 +37,7 @@ pub mod consensus;
 pub mod coord;
 pub mod delivery;
 pub mod dial;
+pub mod disk;
 pub mod dispatch;
 pub mod fragment;
 pub mod frame;

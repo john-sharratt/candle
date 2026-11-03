@@ -22,7 +22,7 @@ use cluster::frame::RecordHeader;
 use cluster::replicate::{Applied, Disk, Listing, Replication, Store, Tap, Tombstones};
 use serde_json::{json, Value};
 
-use super::disk::volume_of;
+use ::cluster::disk::volume_of;
 
 /// The file a member's acceptor keeps its votes in, beside its log (§5.9).
 pub const VOTES: &str = "VOTES";

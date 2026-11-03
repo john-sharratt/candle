@@ -187,7 +187,7 @@ mod tests {
     use std::time::Instant;
 
     use agent::checkouts::Checkouts;
-    use agent::config::{AgentConfig, CheckoutConfig};
+    use agent::config::{AgentConfig, CheckoutConfig, SweepConfig};
     use agent::jobs::Jobs;
     use cluster::dispatch::RouteTable;
     use cluster::frame::{BuildId, Capacity};
@@ -334,6 +334,7 @@ mod tests {
                 push: true,
                 journal: false,
             }],
+            sweep: SweepConfig::default(),
         };
         let jobs = Jobs::new(
             Checkouts::open(&cfg, &CommandPolicy::allowing([shell()])).unwrap(),

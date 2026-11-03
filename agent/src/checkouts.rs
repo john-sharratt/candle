@@ -10,7 +10,7 @@ use cluster::frame::RepoAd;
 use cluster::machine::toolchains;
 use zend_vfs::{CommandPolicy, GitSource, Repo, Sandbox, SandboxServer, ORIGIN};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, SweepConfig};
 
 /// One repository's checkout.
 pub struct Checkout {
@@ -44,6 +44,8 @@ pub struct Checkouts {
     jobs_dir: PathBuf,
     /// Where a run stages what it built, for this machine's keep.
     stage_dir: Option<PathBuf>,
+    /// When their build outputs are swept.
+    sweep: SweepConfig,
 }
 
 impl Checkouts {
@@ -88,7 +90,13 @@ impl Checkouts {
             toolchains,
             jobs_dir: cfg.jobs_dir.clone(),
             stage_dir: cfg.stage_dir.clone(),
+            sweep: cfg.sweep,
         })
+    }
+
+    /// When their build outputs are swept.
+    pub fn sweep(&self) -> SweepConfig {
+        self.sweep
     }
 
     /// The folder the job logs are written to.

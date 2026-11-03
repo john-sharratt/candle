@@ -14,7 +14,7 @@ use tokio::task::spawn_blocking;
 use super::jobs::Job;
 use super::parse::Command;
 use super::Commands;
-use crate::cluster::disk::volume_of;
+use ::cluster::disk::volume_of;
 use crate::stopping::Ending;
 use crate::tenant::CheckProgress;
 

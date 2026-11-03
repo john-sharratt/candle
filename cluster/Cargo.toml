@@ -30,7 +30,7 @@ serde       = { workspace = true }
 # daemon read the same way.
 serde_yaml  = { workspace = true }
 # A member's `CAPACITY`: cores, load and free memory (§5.3, §11.2).
-sysinfo     = { version = "0.31", default-features = false, features = ["system"] }
+sysinfo     = { version = "0.31", default-features = false, features = ["system", "disk"] }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["sync", "rt", "time", "macros", "io-util"] }
 # A member's socket. No TLS and no connector here: the host that dials picks
