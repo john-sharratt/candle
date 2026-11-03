@@ -15,21 +15,36 @@
 //! controls ask the question a repeat cannot: the same decode with every cell
 //! attended, with every piece placed afresh, or without given turns.
 //!
-//! A run writes turns to its own timeline and tombstones that timeline when it
-//! ends, on every path out.
+//! A run writes turns to a timeline of its own — named by the call and the
+//! run, so no two runs ever share one — and tombstones it when it ends, on
+//! every path out. A timeline that already held turns would resume them and
+//! their recurrent snapshot in place of the run's own replay.
+//!
+//! A run may change the target before it decodes: text spliced into its user
+//! half ([`splice`]), and the recurrent rows of one of its blocks captured for
+//! a later run of the call, or merged in from an earlier run's capture
+//! (`docs/recurrent_reply_calibration.md` §3: rows run through any state).
+
+mod splice;
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context};
 use candle_conversation::decode_diag::{self, Arm, Capture, Control, StepRecord};
 use candle_conversation::projection::{recorded_dials, ProjectionScript, TimelineId, TurnIndex};
+use candle_conversation::recurrent_span::{ArmKind, ReplyRows, TextSpan};
 use candle_conversation::{SamplingConfig, SelectionState, TurnEvent, TurnOptions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use candle_conversation::recurrent_span::{ArmKind, TextSpan};
+pub use splice::Splice;
+use splice::{splice_grid, splice_text};
 
-use super::replay::{compare_turns, replay_history, turn_selection, Demonstration, ReplaySampling};
+use super::replay::{
+    compare_turns, replay_history, turn_selection, Demonstration, ReplaySampling, TurnComparison,
+};
 use super::{
     think_mode_from_selection, timeline_for, turn_projection, turn_sampling, turn_triggers,
     InferenceState, Sequence, ZendSession,
@@ -67,11 +82,64 @@ pub struct DiagRun {
     /// recurrent record, as a live serve does — calibrated first when the page
     /// has none (`docs/recurrent_reply_calibration.md`).
     pub inject: bool,
+    /// Text put into the target's user half before it is submitted, the
+    /// recorded reply kept.
+    pub splices: Vec<Splice>,
+    /// A block of the submitted half whose recurrent rows are kept, under a
+    /// name, for the call's later runs. It is the half's last armed span.
+    pub capture: Option<NamedBlock>,
+    /// Blocks of the submitted half that take an earlier run's capture: its
+    /// rows run through the block's entering state in place of the block's.
+    pub merge: Vec<NamedBlock>,
+}
+
+/// A `<tool_response>` block of the submitted user half, by its position in
+/// the round (from 0), and the capture it names.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NamedBlock {
+    pub name: String,
+    pub block: usize,
+}
+
+/// An earlier turn the replay did not seal as recorded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryDiffers {
+    pub turn: usize,
+    /// Where its ids first part from the recording, with the text either side
+    /// — `None` when only its page cuts differ, which leaves its recurrent
+    /// state as recorded.
+    pub ids_at: Option<usize>,
+    pub recorded: Option<String>,
+    pub replayed: Option<String>,
+    /// The replay sealed no such turn.
+    pub missing: bool,
+}
+
+impl HistoryDiffers {
+    fn of(c: &TurnComparison) -> Self {
+        Self {
+            turn: c.turn,
+            ids_at: c.difference.as_ref().map(|d| d.at),
+            recorded: c.difference.as_ref().map(|d| d.recorded.clone()),
+            replayed: c.difference.as_ref().map(|d| d.replayed.clone()),
+            missing: c.replayed.is_none(),
+        }
+    }
+}
+
+/// A span the run armed, as the report names it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SpanArmed {
+    pub bytes: Range<usize>,
+    /// `inject`, `capture:<name>` or `merge:<name>`.
+    pub kind: String,
 }
 
 /// What to decode.
 #[derive(Debug, Clone)]
 pub struct DiagSpec {
+    /// The call's name, which its runs' timelines are named by.
+    pub run: String,
     pub conv_id: String,
     /// The target turn, counted from 0 over the conversation's turns.
     pub turn: usize,
@@ -136,7 +204,9 @@ pub struct DiagOutcome {
     pub dropped_turns: usize,
     pub points_reached: Vec<PointReached>,
     /// Earlier turns whose replayed ids or pages differ from the recording.
-    pub history_differs: Vec<usize>,
+    pub history_differs: Vec<HistoryDiffers>,
+    /// The spans of the submitted half the run armed.
+    pub spans: Vec<SpanArmed>,
     /// The text sampled from `token` on.
     pub text: String,
     pub context: Vec<ContextPiece>,
@@ -258,6 +328,75 @@ fn served_replays(state: &InferenceState, user_half: &str) -> anyhow::Result<Vec
     Ok(spans)
 }
 
+/// The spans `run` arms on `half`, the user half it submits, in the half's
+/// order: its pages' replays (`injected`) and its merges, then its capture.
+/// The capture is the half's last span, since an arm replaces the one before
+/// it and a capture is handed back as the turn ends.
+fn armed_spans(
+    run: &DiagRun,
+    half: &str,
+    injected: Vec<TextSpan>,
+    captures: &HashMap<String, Arc<ReplyRows>>,
+) -> anyhow::Result<(Vec<TextSpan>, Vec<SpanArmed>)> {
+    let block = |b: usize| -> anyhow::Result<Range<usize>> {
+        let blocks =
+            tool_round_blocks(half).context("the submitted user half is not a tool round")?;
+        blocks
+            .get(b)
+            .map(|x| x.block.clone())
+            .with_context(|| format!("the round holds {} blocks, so no block {b}", blocks.len()))
+    };
+    let mut armed: Vec<(TextSpan, String)> = injected
+        .into_iter()
+        .map(|s| (s, "inject".to_string()))
+        .collect();
+    for m in &run.merge {
+        let rows = captures
+            .get(&m.name)
+            .with_context(|| format!("no earlier run of the call captured {}", m.name))?;
+        armed.push((
+            TextSpan {
+                bytes: block(m.block)?,
+                kind: ArmKind::Replay(Arc::clone(rows)),
+            },
+            format!("merge:{}", m.name),
+        ));
+    }
+    armed.sort_by_key(|(s, _)| s.bytes.start);
+    if let Some(c) = &run.capture {
+        let bytes = block(c.block)?;
+        if armed.iter().any(|(s, _)| s.bytes.end > bytes.start) {
+            bail!(
+                "the capture of block {} is not the half's last armed span",
+                c.block
+            );
+        }
+        armed.push((
+            TextSpan {
+                bytes,
+                kind: ArmKind::Capture,
+            },
+            format!("capture:{}", c.name),
+        ));
+    }
+    if armed
+        .windows(2)
+        .any(|w| w[0].0.bytes.end > w[1].0.bytes.start)
+    {
+        bail!("two of the run's armed spans overlap");
+    }
+    Ok(armed
+        .into_iter()
+        .map(|(s, kind)| {
+            let report = SpanArmed {
+                bytes: s.bytes.clone(),
+                kind,
+            };
+            (s, report)
+        })
+        .unzip())
+}
+
 /// Disarms on every way out of a run.
 struct Armed;
 
@@ -292,9 +431,10 @@ impl ZendSession {
             bail!("runs must be 1..={MAX_RUNS}, not {}", spec.runs.len());
         }
         let mut runs = Vec::with_capacity(spec.runs.len());
+        let mut captures = HashMap::new();
         for (i, run) in spec.runs.iter().enumerate() {
             runs.push(
-                self.diag_run(spec, i, run)
+                self.diag_run(spec, i, run, &mut captures)
                     .with_context(|| format!("run {i}"))?,
             );
         }
@@ -325,6 +465,7 @@ impl ZendSession {
         spec: &DiagSpec,
         run_index: usize,
         run: &DiagRun,
+        captures: &mut HashMap<String, Arc<ReplyRows>>,
     ) -> anyhow::Result<DiagOutcome> {
         let state = self
             .inference
@@ -351,7 +492,10 @@ impl ZendSession {
             bail!("turn {} has no sealed record", spec.turn);
         };
 
-        let diag_id = format!("diag/{}/{}/{run_index}", spec.conv_id, spec.turn);
+        let diag_id = format!(
+            "diag/{}/{}/{}/{run_index}",
+            spec.conv_id, spec.turn, spec.run
+        );
         let timeline = timeline_for(&diag_id);
         let mut conv = state
             .base_conv
@@ -402,16 +546,20 @@ impl ZendSession {
             },
         )?;
         let replay_secs = replay_start.elapsed().as_secs_f64();
-        let history_differs = compare_turns(
-            &recorded,
-            &conv.sealed_turns(timeline),
-            spec.turn,
-            &|ids: &[u32]| format!("{ids:?}"),
-        )
-        .iter()
-        .filter(|t| !t.matches())
-        .map(|t| t.turn)
-        .collect();
+        let replayed = conv.sealed_turns(timeline);
+        if replayed.len() != spec.turn {
+            bail!(
+                "the run's timeline holds {} turns after replaying the {} before the target",
+                replayed.len(),
+                spec.turn
+            );
+        }
+        let decode = |ids: &[u32]| state.tokenizer.decode(ids, false).unwrap_or_default();
+        let history_differs = compare_turns(&recorded, &replayed, spec.turn, &decode)
+            .iter()
+            .filter(|t| !t.matches())
+            .map(HistoryDiffers::of)
+            .collect();
 
         for &(raw, index) in &run.catch_up {
             let tl = TimelineId::from_raw(raw).context("a catch-up turn's timeline")?;
@@ -440,17 +588,31 @@ impl ZendSession {
         let dropped_turns = script.dropped_turns;
         conv.set_projection(builder.with_script(script).into());
 
-        let user_half = run.user.as_deref().unwrap_or(&target.user);
-        let recurrent_spans = if run.inject {
-            served_replays(&state, user_half)?
+        let recorded_half = tool_round_text(run.user.as_deref().unwrap_or(&target.user));
+        let half = splice_text(&recorded_half, &run.splices)?;
+        // The recording replays onto the spliced prefill once it is spliced
+        // alike; a run with its own user half has no recording to keep.
+        let recorded_turn = match &run.user {
+            Some(_) => None,
+            None if run.splices.is_empty() => Some(target_sealed.token_ids.clone()),
+            None => Some(
+                splice_grid(
+                    &target_sealed.token_ids,
+                    &recorded_half,
+                    &run.splices,
+                    |t| Ok(Vec::from(conv.encode_text(t)?)),
+                )
+                .context("splicing the recorded turn")?,
+            ),
+        };
+        let half_text = half.text();
+        let injected = if run.inject {
+            served_replays(&state, &half_text)?
         } else {
             Vec::new()
         };
-        tracing::info!(
-            run = run_index,
-            spans = ?recurrent_spans.iter().map(|s| s.bytes.clone()).collect::<Vec<_>>(),
-            "diag: the target's replay spans"
-        );
+        let (recurrent_spans, spans) = armed_spans(run, &half_text, injected, captures)?;
+        tracing::info!(run = run_index, spans = ?spans, "diag: the target's armed spans");
         let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
         let (explicit, seed) = match run.sampling {
@@ -468,7 +630,7 @@ impl ZendSession {
             )),
             triggers: turn_triggers(&state, think_mode, spec.tools_mode),
             selection,
-            recorded_turn: run.user.is_none().then(|| target_sealed.token_ids.clone()),
+            recorded_turn,
             forced_tokens: Some(spec.token),
             forced_suffix: suffix,
             recurrent_spans,
@@ -489,10 +651,11 @@ impl ZendSession {
         let armed = Armed;
         let decode_start = Instant::now();
         let handle = conv
-            .submit_turn_with_options(tool_round_text(user_half), options)
+            .submit_turn_with_options(half, options)
             .context("submitting the target turn")?;
         let mut points_reached = Vec::new();
         let mut finished = None;
+        let mut taken = None;
         for event in handle.stream() {
             match event {
                 TurnEvent::Projection(p) => points_reached.push(PointReached {
@@ -501,12 +664,18 @@ impl ZendSession {
                     turns: p.selection.turns.len(),
                     seconds: p.seconds,
                 }),
+                TurnEvent::RecurrentCapture(rows) => taken = Some(rows),
                 TurnEvent::Done(response) => finished = Some(response),
                 TurnEvent::Error(e) => bail!("decoding the target: {e}"),
                 _ => {}
             }
         }
         let response = finished.context("the scheduler closed the target without finishing it")?;
+        if let Some(c) = &run.capture {
+            let rows =
+                taken.with_context(|| format!("the capture of {} came back empty", c.name))?;
+            captures.insert(c.name.clone(), rows);
+        }
         let decode_secs = decode_start.elapsed().as_secs_f64();
         let capture = decode_diag::disarm();
         drop(armed);
@@ -551,6 +720,7 @@ impl ZendSession {
             dropped_turns,
             points_reached,
             history_differs,
+            spans,
             text: response.text.clone(),
             context,
             recurrent,
@@ -602,6 +772,89 @@ mod tests {
         );
         assert_eq!(served_page(r#"{"status":"ok"}"#), None);
         assert_eq!(served_page("not json"), None);
+    }
+
+    const ROUND: &str = "<tool_response>a</tool_response>\n<tool_response>bb</tool_response>";
+
+    fn run_of(capture: Option<NamedBlock>, merge: Vec<NamedBlock>) -> DiagRun {
+        DiagRun {
+            control: Control::Sparse,
+            sampling: ReplaySampling::Argmax,
+            without: Vec::new(),
+            catch_up: Vec::new(),
+            user: None,
+            inject: false,
+            splices: Vec::new(),
+            capture,
+            merge,
+        }
+    }
+
+    fn named(name: &str, block: usize) -> NamedBlock {
+        NamedBlock {
+            name: name.to_string(),
+            block,
+        }
+    }
+
+    fn captured(name: &str) -> HashMap<String, Arc<ReplyRows>> {
+        let rows = ReplyRows {
+            layers: vec![0],
+            tokens: 1,
+            conv_dim: 1,
+            n_v_heads: 1,
+            data: vec![Vec::new()],
+        };
+        HashMap::from([(name.to_string(), Arc::new(rows))])
+    }
+
+    fn reported(spans: &[SpanArmed]) -> Vec<(Range<usize>, &str)> {
+        spans
+            .iter()
+            .map(|s| (s.bytes.clone(), s.kind.as_str()))
+            .collect()
+    }
+
+    /// A merge takes its block's bytes and the named rows; the capture comes
+    /// last.
+    #[test]
+    fn a_run_arms_its_merges_then_its_capture_by_block() {
+        let run = run_of(Some(named("page", 1)), vec![named("read", 0)]);
+        let (spans, report) = armed_spans(&run, ROUND, Vec::new(), &captured("read")).unwrap();
+        assert_eq!(
+            reported(&report),
+            [(0..32, "merge:read"), (33..66, "capture:page")]
+        );
+        assert!(matches!(spans[0].kind, ArmKind::Replay(_)));
+        assert!(matches!(spans[1].kind, ArmKind::Capture));
+    }
+
+    #[test]
+    fn a_capture_before_another_span_is_refused() {
+        let run = run_of(Some(named("page", 0)), vec![named("read", 1)]);
+        let err = armed_spans(&run, ROUND, Vec::new(), &captured("read")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the capture of block 0 is not the half's last armed span"
+        );
+    }
+
+    #[test]
+    fn a_merge_of_nothing_captured_or_of_no_block_is_refused() {
+        let unknown = run_of(None, vec![named("read", 0)]);
+        assert_eq!(
+            armed_spans(&unknown, ROUND, Vec::new(), &HashMap::new())
+                .unwrap_err()
+                .to_string(),
+            "no earlier run of the call captured read"
+        );
+        let far = run_of(None, vec![named("read", 5)]);
+        assert_eq!(
+            armed_spans(&far, ROUND, Vec::new(), &captured("read"))
+                .unwrap_err()
+                .to_string(),
+            "the round holds 2 blocks, so no block 5"
+        );
     }
 
     #[test]

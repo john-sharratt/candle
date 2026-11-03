@@ -67,6 +67,15 @@ impl TurnText {
         self
     }
 
+    /// This half followed by `other`, each piece keeping its kind.
+    #[must_use]
+    pub fn then(mut self, other: TurnText) -> Self {
+        for piece in other.pieces {
+            self.push(piece.text, piece.literal);
+        }
+        self
+    }
+
     /// `parts` in order, with `separator` between each as markup.
     pub fn join(parts: impl IntoIterator<Item = TurnText>, separator: &str) -> Self {
         let mut out = Self::default();
@@ -74,9 +83,7 @@ impl TurnText {
             if i > 0 {
                 out.push(separator.to_string(), false);
             }
-            for piece in part.pieces {
-                out.push(piece.text, piece.literal);
-            }
+            out = out.then(part);
         }
         out
     }
@@ -92,15 +99,20 @@ impl TurnText {
 
     /// The half's first `bytes` bytes of text, each piece keeping its kind.
     pub fn prefix(&self, bytes: usize) -> Self {
+        self.slice(0..bytes)
+    }
+
+    /// The half's text over byte range `bytes`, each piece keeping its kind.
+    pub fn slice(&self, bytes: Range<usize>) -> Self {
         let mut out = Self::default();
-        let mut left = bytes;
+        let mut at = 0;
         for piece in &self.pieces {
-            if left == 0 {
-                break;
+            let end = at + piece.text.len();
+            let (from, to) = (bytes.start.max(at), bytes.end.min(end));
+            if from < to {
+                out.push(piece.text[from - at..to - at].to_string(), piece.literal);
             }
-            let take = left.min(piece.text.len());
-            out.push(piece.text[..take].to_string(), piece.literal);
-            left -= take;
+            at = end;
         }
         out
     }
@@ -375,6 +387,24 @@ mod tests {
         assert_eq!(text.prefix(3), TurnText::markup("ab").then_literal("c"));
         assert_eq!(text.prefix(1), TurnText::markup("a"));
         assert_eq!(text.prefix(9), text);
+    }
+
+    #[test]
+    fn a_slice_keeps_each_piece_s_kind() {
+        let text = TurnText::markup("ab").then_literal("cd").then_markup("ef");
+        assert_eq!(
+            text.slice(1..5),
+            TurnText::markup("b").then_literal("cd").then_markup("e")
+        );
+        assert_eq!(text.slice(2..4), TurnText::literal("cd"));
+        assert_eq!(text.slice(4..9), TurnText::markup("ef"));
+        assert_eq!(text.slice(3..3), TurnText::default());
+    }
+
+    #[test]
+    fn then_appends_each_piece_and_merges_at_the_seam() {
+        let text = TurnText::markup("a").then(TurnText::markup("b").then_literal("c"));
+        assert_eq!(text, TurnText::markup("ab").then_literal("c"));
     }
 
     #[test]

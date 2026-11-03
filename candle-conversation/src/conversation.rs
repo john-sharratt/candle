@@ -2893,8 +2893,8 @@ impl TurnSubmitter {
     }
 
     /// Encode a user half piece by piece, its literal pieces spelled out — see
-    /// [`crate::turn_text`].
-    fn encode_text(&self, text: &TurnText) -> crate::Result<TokenBuffer> {
+    /// [`crate::turn_text`]. The ids a submitted turn's half becomes.
+    pub fn encode_text(&self, text: &TurnText) -> crate::Result<TokenBuffer> {
         encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
             .map_err(|e| ConversationError::Tokenizer(e.to_string()))
     }
@@ -5034,9 +5034,7 @@ impl Sequence {
     /// the length its block shows once the turn is sealed
     /// ([`RecoveredMessage::tool_tokens`]).
     pub fn encoded_len(&self, text: &TurnText) -> usize {
-        encode_pieces(&self.tokenizer, &self.literal_tokenizer, text)
-            .map(|ids| ids.len())
-            .unwrap_or(0)
+        self.encode_text(text).map_or(0, |ids| ids.len())
     }
 
     /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`

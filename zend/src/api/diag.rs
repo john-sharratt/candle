@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::chat::{apply_tools_dial, dial_selection};
-use crate::session::diag::{DiagRun, DiagSpec};
+use crate::session::diag::{DiagRun, DiagSpec, NamedBlock, Splice};
 use crate::session::{ReplaySampling, ZendSession};
 use crate::types::ToolMode;
 
@@ -47,6 +47,16 @@ pub struct RunBody {
     /// recurrent record.
     #[serde(default)]
     pub inject: bool,
+    /// `{at, text, literal}`: text put into the target's user half at byte
+    /// `at`, the recorded reply kept.
+    #[serde(default)]
+    pub splices: Vec<Splice>,
+    /// `{name, block}`: that block's recurrent rows, kept for later runs.
+    #[serde(default)]
+    pub capture: Option<NamedBlock>,
+    /// `{name, block}`: that block takes an earlier run's capture.
+    #[serde(default)]
+    pub merge: Vec<NamedBlock>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +116,9 @@ pub async fn start(
                 catch_up: r.catch_up.clone(),
                 user: r.user.clone(),
                 inject: r.inject,
+                splices: r.splices.clone(),
+                capture: r.capture.clone(),
+                merge: r.merge.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()
@@ -113,7 +126,13 @@ pub async fn start(
     let tools_mode = ToolMode::Comprehensive;
     let mut selection = dial_selection(body.effort, body.verbosity, body.think);
     apply_tools_dial(&mut selection, tools_mode);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let run = millis.to_string();
+    let path = dump_path(&run).ok_or_else(|| refused("no run name".to_string()))?;
     let spec = DiagSpec {
+        run: run.clone(),
         conv_id: id,
         turn: body.turn,
         token: body.token,
@@ -124,11 +143,6 @@ pub async fn start(
         identity: body.identity,
         runs,
     };
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let run = millis.to_string();
-    let path = dump_path(&run).ok_or_else(|| refused("no run name".to_string()))?;
     tokio::task::spawn_blocking(move || {
         let dump = match session.diag_decode(&spec) {
             Ok(report) => serde_json::to_vec(&report),
