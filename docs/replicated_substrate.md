@@ -1559,28 +1559,36 @@ the holder's sessions ending, reconnecting, or being replaced. A gateway never m
 an `UNCLAIM` on a member's behalf: it does not know the key's last record, it cannot tell
 a member that reconnected still holding its claims from one that restarted, and a release
 it sent between a reconnect and the member's re-announced `CLAIM` would let a peer take
-the key at a higher epoch from a holder still serving it. Two rules keep the table true
+the key at a higher epoch from a holder still serving it. These rules keep the table true
 instead:
 
-- **A member takes in no claim of its own node for a key it does not hold**
-  (`MemberClaims::unheld_own`). `ADMIT`'s table may name this node for a key its process
-  holds nothing of: its previous process's claim, after a restart, or one it let go on a
-  socket that died before the gateway heard. The member is that claim's holder, so it
-  releases it with `UNCLAIM { key, epoch, through }` on the new socket, through the key's
-  own last record as any release is; the gateway relays it, and the gateway and every peer
-  stop naming it. A key it does hold — at that epoch, a member that reconnected in the same
-  process, or at a newer one — is released by nobody: the member announces its own claim
-  again, which supersedes an older one.
-- **A replaced session changes nothing.** Every frame still queued on a socket the node
-  has reconnected past is dropped at the gateway — a `CLAIM`, an `UNCLAIM`, a `CAPACITY`,
-  a `ROUTES` alike: a process still running says it again on its new session, and one that
-  restarted holds nothing it said. The claim frames check it under the guard they change
-  the table with. A `CLAIM` the old session's frames recorded after the new session's
-  `ADMIT` table was built — while the old session was still the current one — is sent on
-  to the new session under the guard that makes it current, as a relayed `CLAIM`, and the
-  member releases it by the first rule.
+- **A session is replaced in one step** (`Hub::decide`). Under the guard its `ADMIT`'s
+  claim table is read under, the node's current session is marked replaced, and from then
+  every control frame for the node — a relayed `CLAIM` or `UNCLAIM`, a `PLAN` — is kept for
+  the new session as well as sent to the old (`Pending`), and handed to the new socket
+  under the guard that puts it in place, before anything relayed after. So nothing falls
+  between the table the new session was sent and the socket it is reached on, and no claim
+  of the node's own lands after the table was built. A handshake that fails from there
+  undoes it: the mark is cleared, and what was kept is dropped.
+- **A replaced session reports nothing of its node's state.** What it still sends of it —
+  `CLAIM`, `UNCLAIM`, `CAPACITY`, `ROUTES`, `COMPLETE`, `COORD` — is dropped at the
+  gateway, checked against a flag on the session itself, under the guard each changes
+  state with: a process still running says it again on its new session, and one that
+  restarted holds nothing it said. One-time replies — votes, catch-up answers, build
+  chunks — are still taken: a process still running sends each once, and a peer awaits
+  it.
+- **A member takes in no claim of its own node at an epoch it does not hold**
+  (`MemberClaims::of_own_node`). `ADMIT`'s table may name this node for a key its process
+  holds nothing of — its previous process's claim, after a restart, or one it let go on a
+  socket that died before the gateway heard — or at an epoch above the one it holds the key
+  at. The member is that claim's holder, so it releases it, at that epoch, with `UNCLAIM
+  { key, epoch, through }` on the new socket, through the key's own last record as any
+  release is; then it announces what it does hold. One below the epoch it holds is
+  released by nobody: its re-announce supersedes it. The gateway relays an `UNCLAIM` only
+  when it let a claim go, so a release that matched nothing reaches no peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
-  another node is a protocol violation, closed `4400`.
+  another node is a protocol violation, closed `4400`. No gateway relays a node its own
+  claims.
 
 A gateway's table names a holder that has left — every one of its sessions over — until
 that holder returns and releases or re-announces it, and the Claims block marks it
@@ -1590,7 +1598,8 @@ released by it meanwhile** (`Registry::leave`): its next request goes among the 
 holding the holder's records through the highest of its own the gateway heard
 (`docs/cooperative_admission.md` §2.4), as after a release, not to whichever member places
 first. That is a hint for this gateway's placement alone: nothing is relayed, no claim
-changes, and the holder's own release, when it comes, replaces it.
+changes, a key with a release already standing keeps that one, and the holder's own
+release, when it comes, replaces it.
 
 A holder that left every cluster loses it without an `UNCLAIM`:
 

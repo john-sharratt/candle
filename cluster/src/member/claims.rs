@@ -24,6 +24,24 @@ pub enum Check {
     Held(u64),
 }
 
+/// What a claim in an `ADMIT`'s table is to the member it is sent to
+/// ([`MemberClaims::of_own_node`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnClaim {
+    /// Another node's, or this member's own at the epoch it holds: heard as
+    /// any claim is ([`MemberClaims::heard`]).
+    Hear,
+    /// This node's, at an epoch this member does not hold — its previous
+    /// process's, one it let go on a socket that died before the gateway heard,
+    /// or one above the epoch it holds the key at: released at that epoch, as
+    /// its holder. A key it holds is then announced again at its own.
+    Release(Epoch),
+    /// This node's, at an epoch below the one this member holds the key at:
+    /// its announcing that claim again on admission supersedes it, and nothing
+    /// is released.
+    Kept,
+}
+
 #[derive(Debug)]
 pub struct MemberClaims {
     node: u64,
@@ -137,27 +155,28 @@ impl MemberClaims {
         *ms = (*ms).max(epoch.ms);
     }
 
-    /// Whether a claim this member is told of — in an `ADMIT`'s table or
-    /// relayed — names this member's node for a key it does not hold at all:
-    /// its previous process's, after a restart, or one it let go on a socket
-    /// that died before the gateway heard. **Such a claim is not taken in, and
-    /// its epoch is returned for this member to `UNCLAIM`**: only the holder
-    /// releases a claim, and only the holder knows which it holds. Taken in, it
-    /// would name this member the holder of a key it is not serving: the member
-    /// would answer for the key as its own without ever announcing it, while
-    /// every peer refused it naming this node. The epoch is still seen, so a
-    /// claim this member takes on the key later sorts above it.
-    ///
-    /// `None` for another node's claim, and for a key this member holds at any
-    /// epoch: a claim of its own it holds at a newer one is superseded by the
-    /// `CLAIM` it announces again on admission, and nothing is released. Hear
-    /// those with [`Self::heard`].
-    pub fn unheld_own(&mut self, key: &[u8], epoch: Epoch) -> Option<Epoch> {
-        if epoch.node != self.node || self.own.contains_key(key) {
-            return None;
+    /// What a claim in an `ADMIT`'s table is to this member. Only the holder
+    /// releases a claim, and only the holder knows which it holds, so one that
+    /// names this member's node at an epoch other than the one it holds is
+    /// **never taken in**: taken in, it would name this member the holder of a
+    /// key it is not serving — answering for it as its own without announcing
+    /// it, while every peer refused it naming this node — or, at an epoch above
+    /// the one it holds, leave a claim its re-announce cannot replace and its
+    /// own release cannot match. The epoch is seen either way, so a claim this
+    /// member takes on the key later sorts above it.
+    pub fn of_own_node(&mut self, key: &[u8], epoch: Epoch) -> OwnClaim {
+        if epoch.node != self.node {
+            return OwnClaim::Hear;
+        }
+        let held = self.own.get(key).map(|(e, _)| *e);
+        if held == Some(epoch) {
+            return OwnClaim::Hear;
         }
         self.saw(key, epoch);
-        Some(epoch)
+        match held {
+            Some(held) if held > epoch => OwnClaim::Kept,
+            _ => OwnClaim::Release(epoch),
+        }
     }
 
     /// A claim announced by any member — from `ADMIT`'s table or relayed.
@@ -276,32 +295,49 @@ mod tests {
         );
     }
 
-    /// **A claim of this node's for a key it does not hold is for it to
-    /// release**; every other is heard. Another node's claim, and one of its own
-    /// it holds — at that epoch or a newer — are not; one it does not hold, a
-    /// previous process's or one let go, is, and is never taken in, while its
-    /// epoch is seen: the member's next claim on the key sorts above it.
+    /// **A claim of this node's at an epoch it does not hold is never taken in.**
+    /// Another node's claim, and its own at the epoch it holds, are heard. Its
+    /// own below the epoch it holds is kept to the re-announce. Its own above
+    /// it, or for a key it does not hold — a previous process's, or one let go
+    /// — is released at that epoch. Either way the epoch is seen: the member's
+    /// next claim on the key sorts above it, and the key it holds stays at its
+    /// own epoch.
     #[test]
-    fn a_claim_of_its_own_it_does_not_hold_is_released() {
+    fn a_claim_of_its_own_node_it_does_not_hold_is_never_taken_in() {
         let t = Instant::now();
         let mut c = MemberClaims::new(ME);
-        assert_eq!(c.unheld_own(b"other", e(700, 2)), None, "another node's");
+        assert_eq!(
+            c.of_own_node(b"other", e(700, 2)),
+            OwnClaim::Hear,
+            "another node's"
+        );
 
         assert_eq!(c.serve(b"held", 500, t, |_| true), Check::Took(e(500, ME)));
         assert_eq!(
-            c.unheld_own(b"held", e(500, ME)),
-            None,
+            c.of_own_node(b"held", e(500, ME)),
+            OwnClaim::Hear,
             "held at that epoch"
         );
         assert_eq!(
-            c.unheld_own(b"held", e(400, ME)),
-            None,
-            "held at a newer epoch: its re-announce supersedes the old"
+            c.of_own_node(b"held", e(400, ME)),
+            OwnClaim::Kept,
+            "below the held epoch: the re-announce supersedes it"
         );
+        assert_eq!(
+            c.of_own_node(b"held", e(900, ME)),
+            OwnClaim::Release(e(900, ME)),
+            "above the held epoch: released, never adopted"
+        );
+        assert_eq!(
+            c.own(),
+            vec![(b"held".to_vec(), e(500, ME))],
+            "still held at 500"
+        );
+        assert_eq!(c.holder(b"held"), Some(ME));
 
         assert_eq!(
-            c.unheld_own(b"stale", e(800, ME)),
-            Some(e(800, ME)),
+            c.of_own_node(b"stale", e(800, ME)),
+            OwnClaim::Release(e(800, ME)),
             "a previous process's"
         );
         assert_eq!(c.holder(b"stale"), None, "never taken in");
@@ -316,8 +352,8 @@ mod tests {
         c.follow_use();
         assert_eq!(c.end_use(b"gone"), Some(e(600, ME)), "let go");
         assert_eq!(
-            c.unheld_own(b"gone", e(600, ME)),
-            Some(e(600, ME)),
+            c.of_own_node(b"gone", e(600, ME)),
+            OwnClaim::Release(e(600, ME)),
             "a release the gateway never heard"
         );
     }

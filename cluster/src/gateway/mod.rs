@@ -21,6 +21,8 @@ mod queue;
 mod queue_tests;
 mod registry;
 mod relay;
+#[cfg(test)]
+mod replace_tests;
 mod silence;
 mod status;
 mod tiebreak;

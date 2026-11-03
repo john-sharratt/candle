@@ -13,7 +13,7 @@ pub use app::{
     AppMember, CapacitySource, ClaimUse, ClusterView, Identity, KeyThroughHook, ReleaseHook,
     UnclaimHook, APPLY_WAIT, CAPACITY_EVERY, GROUP,
 };
-pub use claims::{Check, MemberClaims};
+pub use claims::{Check, MemberClaims, OwnClaim};
 pub use link::{Link, Links, START_WAIT};
 pub use listener::{
     decide, Arrival, Serve, DUMB_HOP, DUMB_HOP_VALUE, FROM_MEMBER, PREFER_PEER, STATUS_PATH,

@@ -45,6 +45,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::machines::MachineTable;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -83,8 +84,8 @@ use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
 use crate::frame::{
-    name, Admit, BuildFetch, BuildId, Capacity, Claim, ClaimInfo, Frame, Hello, Lost, MemberState,
-    Members, Plan as PlanFrame,
+    name, Admit, BuildFetch, BuildId, Capacity, Frame, Hello, Lost, MemberState, Members,
+    Plan as PlanFrame,
 };
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, PROTO};
 use crate::pipe::{Message, PipeRx, PipeTx};
@@ -161,6 +162,10 @@ pub struct MemberStream {
 pub(super) struct Socket {
     pub session: u64,
     pub handle: SessionHandle,
+    /// Set, under the state's guard, once a newer session of the node is
+    /// admitted: its session's loop reads it to drop what it still reports
+    /// ([`is_state_report`]).
+    pub replaced: Arc<AtomicBool>,
     pub connected_ms: u64,
     /// Its clock against this gateway's at admission, from its `HELLO`.
     pub clock_offset_ms: i64,
@@ -177,6 +182,31 @@ pub(super) struct Socket {
     pub pulses_dropped: u64,
 }
 
+/// A session admitted whose socket is not yet in place: its `ADMIT` was built,
+/// and the control frames meant for its node since — relayed claims and
+/// releases, plans — wait here for it, so none falls between the table it was
+/// sent and the socket it is reached on.
+pub(super) struct Pending {
+    session: u64,
+    queue: Vec<Frame>,
+}
+
+/// What a session reports of its node's state: dropped once the session is
+/// replaced, for its node's newer session says it of the process that is
+/// there now. A one-time reply — a vote, a catch-up, a build chunk — is still
+/// taken: a process still running sends it once, and a peer awaits it.
+pub(super) fn is_state_report(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::Claim(_)
+            | Frame::Unclaim(_)
+            | Frame::Capacity(_)
+            | Frame::Routes(_)
+            | Frame::Complete(_)
+            | Frame::Coord(_)
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Mode {
     clustered: bool,
@@ -188,6 +218,8 @@ pub(super) struct State {
     admission: Admission,
     pub registry: Registry,
     pub sockets: HashMap<(String, u64), Socket>,
+    /// Sessions admitted whose socket is not in place yet, by app and node.
+    pending: HashMap<(String, u64), Pending>,
     limiter: ProofLimiter,
     refusals: VecDeque<Refusal>,
     modes: HashMap<String, Mode>,
@@ -248,18 +280,37 @@ fn reserve(s: &mut State) {
     s.registry.set_reserved(reserved);
 }
 
+/// Undo the replacement [`Hub::decide`] began for `node`'s `session`, whose
+/// handshake failed before its socket was in place: what was kept for it is
+/// dropped, and the node's current session reports again.
+pub(super) fn undo_pending(s: &mut State, app: &str, node: u64, session: u64) {
+    let key = (app.to_string(), node);
+    if s.pending.get(&key).is_some_and(|p| p.session == session) {
+        s.pending.remove(&key);
+        if let Some(current) = s.sockets.get(&key) {
+            current.replaced.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Plan the cast now, under the state's hold, and send a changed plan to every
 /// npcd member (`docs/static_placement.md` §5).
 fn plan_in(s: &mut State, now: Instant) {
     let views = s.registry.card_views();
     let planned = s.planner.plan(now, &views);
     if planned.changed {
+        let frame = Frame::Plan(PlanFrame {
+            epoch: planned.epoch,
+            weights: planned.weights.clone(),
+        });
         for ((a, _), socket) in &s.sockets {
             if a == HOSTING_APP {
-                let _ = socket.handle.control(Frame::Plan(PlanFrame {
-                    epoch: planned.epoch,
-                    weights: planned.weights.clone(),
-                }));
+                let _ = socket.handle.control(frame.clone());
+            }
+        }
+        for ((a, _), p) in s.pending.iter_mut() {
+            if a == HOSTING_APP {
+                p.queue.push(frame.clone());
             }
         }
     }
@@ -382,7 +433,7 @@ impl Hub {
     }
 
     /// The admission of `hello` on the socket for `app` (§3.3–§3.6).
-    fn decide(&self, app: &str, hello: &Hello) -> Result<(Admit, Admitted), Close> {
+    pub(super) fn decide(&self, app: &str, hello: &Hello) -> Result<(Admit, Admitted), Close> {
         if hello.app != app {
             return Err(Close::new(
                 CloseCode::Malformed,
@@ -399,7 +450,24 @@ impl Hub {
             .then(|| s.admission.lock(app).map(|m| m.describe.clone()))
             .flatten();
         let (_, members) = s.registry.listing(app);
+        // **The replacement starts here, under the guard the table is read
+        // under** (`docs/replicated_substrate.md` §5.4): the node's current
+        // session, if any, is marked replaced, so nothing it still reports
+        // lands after this table was built, and every control frame for the
+        // node from now on waits for the new socket in `pending`. A handshake
+        // that fails from here undoes both (`Hub::undo_pending`).
         let claims = s.registry.claims(app).table();
+        let key = (app.to_string(), hello.node);
+        if let Some(old) = s.sockets.get(&key) {
+            old.replaced.store(true, Ordering::SeqCst);
+        }
+        s.pending.insert(
+            key,
+            Pending {
+                session: admitted.session,
+                queue: Vec::new(),
+            },
+        );
         drop(s);
         if let Some(model) = lock {
             self.note(app, hex(hello.node), format!("model lock set: {model}"));
@@ -469,12 +537,15 @@ impl Hub {
             },
         )
         .await;
-        let (hello, sent) = match handshake {
-            Ok((hello, admit)) => (hello, admit.claims),
+        let hello = match handshake {
+            Ok((hello, _)) => hello,
             Err(e) => {
-                // Admitted, and the ADMIT never reached it.
+                // Admitted, and the ADMIT never reached it: the replacement it
+                // began is undone, and the node's session stays as it was.
                 if let (Some(a), Some((node, _))) = (&decided, &seen) {
-                    self.state().admission.left(app, *node, a.session);
+                    let mut s = self.state();
+                    s.admission.left(app, *node, a.session);
+                    undo_pending(&mut s, app, *node, a.session);
                 }
                 match e {
                     HandshakeError::Refused(close) => {
@@ -490,18 +561,14 @@ impl Hub {
             }
         };
         let admitted = decided.expect("an ADMIT was decided");
-        self.run(app, hello, admitted, sent, tx, rx, streams).await;
+        self.run(app, hello, admitted, tx, rx, streams).await;
     }
 
-    /// The admitted session's life. `sent` is the claim table its `ADMIT`
-    /// carried.
-    #[allow(clippy::too_many_arguments)]
     async fn run<T, R, F>(
         self: &Arc<Self>,
         app: &str,
         hello: Hello,
         admitted: Admitted,
-        sent: Vec<ClaimInfo>,
         tx: T,
         rx: R,
         streams: F,
@@ -523,14 +590,23 @@ impl Hub {
             state: MemberState::Upgrading,
             ..Capacity::default()
         });
+        let replaced_flag = Arc::new(AtomicBool::new(false));
         {
             let mut s = self.state();
             let connected_ms = now_ms();
+            // What was meant for the node since its ADMIT's table was built.
+            let waiting = s
+                .pending
+                .remove(&(app.to_string(), node))
+                .filter(|p| p.session == admitted.session)
+                .map(|p| p.queue)
+                .unwrap_or_default();
             let replaced = s.sockets.insert(
                 (app.to_string(), node),
                 Socket {
                     session: admitted.session,
                     handle: handle.clone(),
+                    replaced: Arc::clone(&replaced_flag),
                     connected_ms,
                     clock_offset_ms: hello.now_ms as i64 - connected_ms as i64,
                     coord: None,
@@ -575,23 +651,10 @@ impl Hub {
                 handed: 0,
                 closing: false,
             });
-            // The node's claims taken since its ADMIT's table was built — on
-            // the session this one replaces, until now the current one — are
-            // sent on, under the same guard that made this session current, so
-            // a claim its new process does not hold reaches it to release
-            // (`MemberClaims::unheld_own`) rather than standing unseen.
-            let late: Vec<ClaimInfo> = s
-                .registry
-                .claims(app)
-                .table()
-                .into_iter()
-                .filter(|c| c.epoch.node == node && !sent.contains(c))
-                .collect();
-            for c in late {
-                let _ = handle.control(Frame::Claim(Claim {
-                    key: c.key,
-                    epoch: c.epoch,
-                }));
+            // Sent under the guard that put the socket in place, before any
+            // frame relayed after it.
+            for frame in waiting {
+                let _ = handle.control(frame);
             }
         }
         let local = if hello.build.is_local() {
@@ -628,7 +691,7 @@ impl Hub {
                     Some(Incoming::Frame(frame)) => {
                         let capacity = matches!(frame, Frame::Capacity(_));
                         if let Err(close) =
-                            self.on_frame(app, node, admitted.session, frame, &handle)
+                            self.on_frame(app, node, &replaced_flag, frame, &handle)
                         {
                             handle.close(close.clone());
                             break Ended::Refused(close);
@@ -715,25 +778,26 @@ impl Hub {
         }
     }
 
-    /// A frame from `node` on its session `session`: kept, relayed, or a
-    /// protocol violation. A vote is also answered on `reply_on`, the socket it
-    /// arrived on.
-    fn on_frame(
+    /// A frame from `node` on a session `replaced` says whether a newer one has
+    /// replaced: kept, relayed, or a protocol violation. A vote is also
+    /// answered on `reply_on`, the socket it arrived on.
+    pub(super) fn on_frame(
         &self,
         app: &str,
         node: u64,
-        session: u64,
+        replaced: &AtomicBool,
         frame: Frame,
         reply_on: &SessionHandle,
     ) -> Result<(), Close> {
-        // **A replaced session changes nothing.** Its frames still queued here
-        // are from a socket the node has reconnected past: a process that
-        // still runs says it all again on its new session, and one that
-        // restarted holds nothing it said. Kept, a late `CLAIM` would name the
-        // node holder of a key its new process never took, and a late
-        // `CAPACITY` or `ROUTES` would describe a process that is gone. The
-        // claim frames re-check under the guard they change the table with.
-        if !Self::current(&self.state(), app, node, session) {
+        // **A replaced session reports nothing of its node's state.** Its
+        // frames still queued here are from a socket the node has reconnected
+        // past: a process that still runs says its state again on its new
+        // session, and one that restarted holds nothing it said. Kept, a late
+        // `CLAIM` would name the node holder of a key its new process never
+        // took, and a late `CAPACITY` would describe a process that is gone.
+        // Each report re-checks under the guard it changes state with, the
+        // guard the flag is set under ([`Self::decide`]).
+        if is_state_report(&frame) && replaced.load(Ordering::SeqCst) {
             return Ok(());
         }
         if let Some((key, text)) = paxos_step(node, &frame) {
@@ -744,6 +808,9 @@ impl Hub {
                 let state = c.state;
                 let (changed, spoke) = {
                     let mut s = self.state();
+                    if replaced.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     if let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) {
                         x.capacity_at = Instant::now();
                     }
@@ -762,7 +829,10 @@ impl Hub {
             Frame::Routes(r) => {
                 let table = RouteTable::decode(&r.table)
                     .map_err(|e| Close::new(CloseCode::Malformed, format!("ROUTES: {e}")))?;
-                self.state().registry.routes(app, node, table);
+                let mut s = self.state();
+                if !replaced.load(Ordering::SeqCst) {
+                    s.registry.routes(app, node, table);
+                }
             }
             Frame::Claim(c) => {
                 if c.epoch.node != node {
@@ -777,7 +847,7 @@ impl Hub {
                 }
                 let took = {
                     let mut s = self.state();
-                    if !Self::current(&s, app, node, session) {
+                    if replaced.load(Ordering::SeqCst) {
                         return Ok(());
                     }
                     s.registry.claims(app).claim(&c.key, c.epoch)
@@ -804,7 +874,7 @@ impl Hub {
                 }
                 let released = {
                     let mut s = self.state();
-                    if !Self::current(&s, app, node, session) {
+                    if replaced.load(Ordering::SeqCst) {
                         return Ok(());
                     }
                     let released = s.registry.claims(app).unclaim(&u.key, u.epoch);
@@ -813,20 +883,26 @@ impl Hub {
                     }
                     released
                 };
+                // Relayed only when it let a claim go: a release that matched
+                // nothing — a duplicate, or one superseded — would fire every
+                // peer's release hook for a key it holds no word of.
                 if released {
                     self.note(
                         app,
                         String::from_utf8_lossy(&u.key).into_owned(),
                         format!("released by {} through oseq {}", hex(node), u.through),
                     );
+                    self.to_others(app, node, Frame::Unclaim(u));
                 }
-                self.to_others(app, node, Frame::Unclaim(u));
             }
             // The member holds these keys complete: each one's next turn may
             // go to it (`docs/cooperative_admission.md` §2.2). The gateway's
             // own — no other member reads it.
             Frame::Complete(c) => {
-                self.state().registry.completed(app, node, &c.keys);
+                let mut s = self.state();
+                if !replaced.load(Ordering::SeqCst) {
+                    s.registry.completed(app, node, &c.keys);
+                }
             }
             Frame::Coord(c) => {
                 let state = CoordState::decode(&c.state).ok_or_else(|| {
@@ -837,6 +913,9 @@ impl Hub {
                 })?;
                 let (lines, actions) = {
                     let mut s = self.state();
+                    if replaced.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     let key = (app.to_string(), node);
                     let Some(socket) = s.sockets.get_mut(&key) else {
                         return Ok(());
@@ -1287,25 +1366,34 @@ impl Hub {
             .mirrored(app, route, mode, compared, baseline, candidate);
     }
 
-    /// Whether `session` is `node`'s current session for `app`: the one its
-    /// socket here was last admitted on.
-    fn current(s: &State, app: &str, node: u64, session: u64) -> bool {
-        s.sockets
-            .get(&(app.to_string(), node))
-            .is_some_and(|x| x.session == session)
-    }
-
+    /// `frame` to every member of `app` but `from` — and kept for each
+    /// session admitted whose socket is not yet in place ([`Pending`]).
     pub(super) fn to_others(&self, app: &str, from: u64, frame: Frame) {
-        let s = self.state();
-        for ((a, n), socket) in &s.sockets {
+        let mut s = self.state();
+        let State {
+            sockets, pending, ..
+        } = &mut *s;
+        for ((a, n), socket) in sockets.iter() {
             if a == app && *n != from {
                 let _ = socket.handle.control(frame.clone());
             }
         }
+        for ((a, n), p) in pending.iter_mut() {
+            if a == app && *n != from {
+                p.queue.push(frame.clone());
+            }
+        }
     }
 
+    /// `frame` to `node` of `app` — and kept for its session admitted whose
+    /// socket is not yet in place.
     pub(super) fn to_member(&self, app: &str, node: u64, frame: Frame) {
-        if let Some(socket) = self.state().sockets.get(&(app.to_string(), node)) {
+        let mut s = self.state();
+        let key = (app.to_string(), node);
+        if let Some(p) = s.pending.get_mut(&key) {
+            p.queue.push(frame.clone());
+        }
+        if let Some(socket) = s.sockets.get(&key) {
             let _ = socket.handle.control(frame);
         }
     }

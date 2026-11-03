@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
-use super::claims::{Check, MemberClaims};
+use super::claims::{Check, MemberClaims, OwnClaim};
 use super::link::{Link, Links};
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
@@ -543,10 +543,14 @@ impl AppMember {
             let mut lost: Vec<Vec<u8>> = Vec::new();
             let mut stale: Vec<(Vec<u8>, Epoch)> = Vec::new();
             for claim in &admit.claims {
-                if let Some(epoch) = claims.unheld_own(&claim.key, claim.epoch) {
-                    stale.push((claim.key.clone(), epoch));
-                } else if claims.heard(&claim.key, claim.epoch) {
-                    lost.push(claim.key.clone());
+                match claims.of_own_node(&claim.key, claim.epoch) {
+                    OwnClaim::Release(epoch) => stale.push((claim.key.clone(), epoch)),
+                    OwnClaim::Kept => {}
+                    OwnClaim::Hear => {
+                        if claims.heard(&claim.key, claim.epoch) {
+                            lost.push(claim.key.clone());
+                        }
+                    }
                 }
             }
             (lost, stale)
@@ -694,19 +698,6 @@ impl AppMember {
                 // Claimed again: whatever this member reported of it is for a
                 // release that is over.
                 lock(&self.reported).remove(&claim.key);
-                // One of this node's this process does not hold — taken on the
-                // session this one replaced, after the ADMIT's table was built
-                // — is released as its holder, as one in ADMIT is.
-                let unheld = lock(&self.claims).unheld_own(&claim.key, claim.epoch);
-                if let Some(epoch) = unheld {
-                    let through = self.through_for(&claim.key, self.own_through());
-                    self.announce(Frame::Unclaim(Unclaim {
-                        key: claim.key,
-                        epoch,
-                        through,
-                    }));
-                    return;
-                }
                 let lost = lock(&self.claims).heard(&claim.key, claim.epoch);
                 if lost {
                     self.lost(&claim.key);
