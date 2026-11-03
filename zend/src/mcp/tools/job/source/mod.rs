@@ -8,6 +8,8 @@
 //! | [`deploy`] | a deploy: its build, then keep's trial |
 //! | [`cluster`] | a maintenance command's job on a member |
 
+use std::cmp::Reverse;
+
 use ::cluster::log_read::{LogAsk, LogRead};
 
 use super::{JobHandle, Standing};
@@ -87,7 +89,7 @@ pub async fn list(
             Err(e) => unread.push(format!("maintenance jobs: {e}")),
         }
     }
-    rows.sort_by(|a, b| b.started_ms.cmp(&a.started_ms));
+    rows.sort_by_key(|r| Reverse(r.started_ms));
     rows.truncate(limit);
     (rows, unread)
 }
