@@ -202,8 +202,11 @@ pub fn encode(handing: &[u8], records: &[(u64, Vec<u8>)]) -> Vec<u8> {
     body
 }
 
+/// The records a handing's body carries, each as its `oseq` and its bytes.
+pub type Carried<'a> = Vec<(u64, &'a [u8])>;
+
 /// A handing body's JSON and the records after it.
-pub fn decode(body: &[u8]) -> Result<(&[u8], Vec<(u64, &[u8])>), String> {
+pub fn decode(body: &[u8]) -> Result<(&[u8], Carried<'_>), String> {
     let Some(at) = body.iter().position(|b| *b == SEPARATOR) else {
         return Ok((body, Vec::new()));
     };
@@ -335,7 +338,7 @@ mod tests {
             listed(4, 72, 1),
         ];
         assert_eq!(turns_of(&records, &turns), vec![3, 5]);
-        assert_eq!(turns_of(&[], &turns), vec![]);
+        assert_eq!(turns_of(&[], &turns), Vec::<u32>::new());
     }
 
     /// **A handing's body is its JSON, then its records, byte for byte**, and
