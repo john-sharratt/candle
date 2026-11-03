@@ -95,7 +95,10 @@ mod tests {
             text.contains("5000 tokens in 3 pieces\nsignatures in it: job_status\n"),
             "{text}"
         );
-        assert!(text.contains("\nsection tools/job_status — 300 tokens, scored 912, cleared the bar"), "{text}");
+        assert!(
+            text.contains("\nsection tools/job_status — 300 tokens, scored 912, cleared the bar"),
+            "{text}"
+        );
         assert!(text.ends_with("\nturn  — 80 tokens, scored 120"), "{text}");
     }
 }

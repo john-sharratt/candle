@@ -58,8 +58,12 @@ pub fn point(n: usize, of: usize, p: &Value) -> String {
             n if n + 1 == of => "after the turn sealed",
             _ => "reprojected while decoding",
         },
-        p.get("materialized_tokens").and_then(Value::as_u64).unwrap_or(0),
-        p.get("substrate_tokens").and_then(Value::as_u64).unwrap_or(0),
+        p.get("materialized_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        p.get("substrate_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     );
     let tools = p
         .pointer("/selection/system")
@@ -70,7 +74,10 @@ pub fn point(n: usize, of: usize, p: &Value) -> String {
             i.get("kind").and_then(Value::as_str) == Some("collection")
                 && i.get("name").and_then(Value::as_str) == Some("tools")
         });
-    match tools.and_then(|t| t.get("sections")).and_then(Value::as_array) {
+    match tools
+        .and_then(|t| t.get("sections"))
+        .and_then(Value::as_array)
+    {
         Some(sections) => {
             let mut members: Vec<(&str, f64, bool, bool)> = sections
                 .iter()
@@ -252,8 +259,11 @@ mod tests {
              job_status 640\n  tokens by bucket: tools 1200\n  dialogue turns in context: 1"
         );
         let none = json!({"start_token": 40, "selection": {"system": [], "turns": []}});
-        assert!(point(1, 3, &none).contains("point 1 at reply token 40 (reprojected while decoding)"));
-        assert!(point(1, 3, &none).contains("signatures shown by score (bar 250): none — no tool reached the bar"));
+        assert!(
+            point(1, 3, &none).contains("point 1 at reply token 40 (reprojected while decoding)")
+        );
+        assert!(point(1, 3, &none)
+            .contains("signatures shown by score (bar 250): none — no tool reached the bar"));
         assert!(point(2, 3, &none).contains("(after the turn sealed)"));
     }
 }

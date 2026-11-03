@@ -20,8 +20,7 @@ use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
 use super::tools::{
-    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, timeline_read, Answer,
-    Ctx,
+    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, timeline_read, Answer, Ctx,
 };
 use crate::session::ZendSession;
 

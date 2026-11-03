@@ -241,11 +241,9 @@ fn found(call: &OpsCall, which: &Which) -> Result<TimelineDetail, String> {
     let t = match which {
         Which::Timeline(raw) => call.session.substrate_timeline(*raw),
         Which::Worker { thread, name } => {
-            let owner = call
-                .caller
-                .as_ref()
-                .map(|c| c.key())
-                .ok_or("a worker's path is read as the person it works for, and this call names none")?;
+            let owner = call.caller.as_ref().map(|c| c.key()).ok_or(
+                "a worker's path is read as the person it works for, and this call names none",
+            )?;
             call.session
                 .conversation_detail(&threads::conv_id(&owner, thread, name))
         }
@@ -269,7 +267,9 @@ fn uint(args: &Value, key: &str) -> Option<u64> {
 fn turn_of(args: &Value, view: &str) -> Result<u32, String> {
     uint(args, "turn")
         .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| format!("`view: {view}` reads one turn: give `turn`, its index as `turns` lists it"))
+        .ok_or_else(|| {
+            format!("`view: {view}` reads one turn: give `turn`, its index as `turns` lists it")
+        })
 }
 
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
@@ -285,10 +285,7 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     };
     let view = args.get("view").and_then(Value::as_str).unwrap_or("turns");
     if !VIEWS.contains(&view) {
-        return Answer::error(format!(
-            "`{view}` is not a view: {}",
-            VIEWS.join(", ")
-        ));
+        return Answer::error(format!("`{view}` is not a view: {}", VIEWS.join(", ")));
     }
     let which = match Which::of(&id) {
         Ok(w) => w,
@@ -304,9 +301,8 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let offset = uint(args, "offset").unwrap_or(0) as usize;
     let limit = (uint(args, "limit").unwrap_or(DEFAULT_LIMIT as u64) as usize).clamp(1, MAX_LIMIT);
     let answer = match view {
-        "turn" => turn_of(args, view).and_then(|index| {
-            render_turn(&t, index, uint(args, "from").unwrap_or(0) as usize)
-        }),
+        "turn" => turn_of(args, view)
+            .and_then(|index| render_turn(&t, index, uint(args, "from").unwrap_or(0) as usize)),
         "calls" => Ok(calls::render(&t, offset, limit)),
         "projections" => match turn_of(args, view) {
             Ok(index) => {

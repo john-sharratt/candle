@@ -437,13 +437,24 @@ mod tests {
             a(MCP, "windows-x86_64", 2),
             a(MCP, "linux-x86_64", 3),
         ]);
-        assert_eq!(connector_of(&o, &exe, "windows-x86_64"), None, "no connector here");
+        assert_eq!(
+            connector_of(&o, &exe, "windows-x86_64"),
+            None,
+            "no connector here"
+        );
         std::fs::write(binary(t.path(), MCP), b"old").unwrap();
         assert_eq!(
             connector_of(&o, &exe, "windows-x86_64"),
             Some(a(MCP, "windows-x86_64", 2))
         );
-        assert_eq!(connector_of(&offer(vec![a("motherd", "windows-x86_64", 1)]), &exe, "windows-x86_64"), None);
+        assert_eq!(
+            connector_of(
+                &offer(vec![a("motherd", "windows-x86_64", 1)]),
+                &exe,
+                "windows-x86_64"
+            ),
+            None
+        );
     }
 
     #[test]

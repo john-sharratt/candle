@@ -110,8 +110,14 @@ mod tests {
         let exe = Path::new("D:/prog/candle/keep/stable").join(binary(Path::new(""), "motherd"));
         let (staged, running) = paths(&exe).unwrap();
         assert_eq!(staged, binary(Path::new("D:/prog/candle/keep/stage"), MCP));
-        assert_eq!(running, binary(Path::new("D:/prog/candle/keep/stable"), MCP));
-        assert_eq!(paths(Path::new("D:/prog/candle/target/release/motherd.exe")), None);
+        assert_eq!(
+            running,
+            binary(Path::new("D:/prog/candle/keep/stable"), MCP)
+        );
+        assert_eq!(
+            paths(Path::new("D:/prog/candle/target/release/motherd.exe")),
+            None
+        );
     }
 
     /// **The staged connector replaces the running one only when it is the
@@ -120,9 +126,15 @@ mod tests {
     fn a_staged_connector_of_this_build_replaces_another() {
         let own = build(12);
         assert!(due(Some(&own), Some(&build(11)), &own));
-        assert!(due(Some(&own), None, &own), "a running one that answers nothing is replaced");
+        assert!(
+            due(Some(&own), None, &own),
+            "a running one that answers nothing is replaced"
+        );
         assert!(!due(Some(&own), Some(&own), &own), "already this build");
-        assert!(!due(Some(&build(13)), Some(&build(11)), &own), "staged for another build");
+        assert!(
+            !due(Some(&build(13)), Some(&build(11)), &own),
+            "staged for another build"
+        );
         assert!(!due(None, Some(&build(11)), &own));
     }
 }

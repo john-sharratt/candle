@@ -143,7 +143,12 @@ mod tests {
             let path = deps.join(format!("libthing-{:016x}.rlib", g + 1));
             fs::write(&path, vec![0u8; bytes]).unwrap();
             let when = old + Duration::from_secs(g as u64);
-            File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
         }
         Target {
             name: name.into(),
@@ -183,8 +188,14 @@ mod tests {
             Some((f, 10_000))
         };
         let lines = sweep(slice::from_ref(&t), &bars(200), &volume);
-        assert_eq!(lines[0], "the disk is low: 0.0 GB free of 0.0 GB, under the 0.0 GB bar");
-        assert!(lines[1].starts_with("pruned candle:") && lines[1].ends_with("3 stale files removed"), "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "the disk is low: 0.0 GB free of 0.0 GB, under the 0.0 GB bar"
+        );
+        assert!(
+            lines[1].starts_with("pruned candle:") && lines[1].ends_with("3 stale files removed"),
+            "{lines:?}"
+        );
         assert_eq!(dir_bytes(&t.dir), 200, "the two newest generations stay");
         assert!(lines.iter().all(|l| !l.starts_with("cleaned")), "{lines:?}");
     }
@@ -203,10 +214,28 @@ mod tests {
             &bars(100),
             &|_| Some((500, 10_000)),
         );
-        assert!(lines.contains(&"site: a prune would bring back 0.0 GB, under the 0.0 GB worth it".to_string()), "{lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("candle: still low, but a run is using it")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("cleaned site:")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("notes: still low, but its build outputs are")), "{lines:?}");
+        assert!(
+            lines.contains(
+                &"site: a prune would bring back 0.0 GB, under the 0.0 GB worth it".to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("candle: still low, but a run is using it")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("cleaned site:")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("notes: still low, but its build outputs are")),
+            "{lines:?}"
+        );
         assert!(!idle.dir.exists());
         assert_eq!(dir_bytes(&busy.dir), 800);
         assert_eq!(dir_bytes(&small.dir), 10);
@@ -228,7 +257,10 @@ mod tests {
             }
             volume(p)
         });
-        assert!(lines.iter().any(|l| l.starts_with("cleaned big:")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("cleaned big:")),
+            "{lines:?}"
+        );
         assert!(other.dir.exists(), "{lines:?}");
     }
 }

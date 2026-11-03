@@ -94,13 +94,29 @@ mod tests {
             text.contains("calls of turns 0–3: 4, of which 2 repeat a call already made"),
             "{text}"
         );
-        let lines: Vec<&str> = text.lines().skip_while(|l| !l.starts_with("calls of")).skip(1).collect();
+        let lines: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("calls of"))
+            .skip(1)
+            .collect();
         assert_eq!(lines.len(), 5, "{text}");
-        assert!(lines[0].starts_with("#0 file_list {") && !lines[0].contains("repeat"), "{text}");
-        assert!(lines[1].starts_with("#0 file_list {") && lines[1].ends_with("— repeat of #0's"), "{text}");
-        assert!(lines[2].starts_with("#1 file_list {") && lines[2].contains("\"path\":\"docs\""), "{text}");
+        assert!(
+            lines[0].starts_with("#0 file_list {") && !lines[0].contains("repeat"),
+            "{text}"
+        );
+        assert!(
+            lines[1].starts_with("#0 file_list {") && lines[1].ends_with("— repeat of #0's"),
+            "{text}"
+        );
+        assert!(
+            lines[2].starts_with("#1 file_list {") && lines[2].contains("\"path\":\"docs\""),
+            "{text}"
+        );
         assert!(!lines[2].contains("repeat"), "{text}");
-        assert!(lines[3].starts_with("#1 file_list {") && lines[3].ends_with("— repeat of #0's"), "{text}");
+        assert!(
+            lines[3].starts_with("#1 file_list {") && lines[3].ends_with("— repeat of #0's"),
+            "{text}"
+        );
         assert_eq!(lines[4], "#2 no calls");
     }
 

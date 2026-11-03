@@ -440,7 +440,10 @@ mod tests {
     /// A command's arguments are what it parsed to, not the body's spelling.
     #[test]
     fn the_arguments_are_the_commands_own() {
-        assert_eq!(Command::Audit { newest: None }.args(None), json!({"app": null}));
+        assert_eq!(
+            Command::Audit { newest: None }.args(None),
+            json!({"app": null})
+        );
         assert_eq!(
             Command::Audit { newest: Some(4) }.args(None),
             json!({"app": null, "newest": 4})

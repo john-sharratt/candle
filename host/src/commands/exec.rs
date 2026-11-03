@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use candle_conversation::projection::Conversation;
+use cluster::disk::volume_of;
 use cluster::replicate::Replicator;
 use cluster::upgrade::decisions::Settled;
 use cluster::upgrade::runtime::Upgrader;
@@ -14,7 +15,6 @@ use tokio::task::spawn_blocking;
 use super::jobs::Job;
 use super::parse::Command;
 use super::Commands;
-use ::cluster::disk::volume_of;
 use crate::stopping::Ending;
 use crate::tenant::CheckProgress;
 

@@ -36,7 +36,9 @@ pub fn render(t: &TimelineDetail, s: &Value) -> String {
     out.push_str(&format!(
         "\nlatest selection: {} nodes, {} tokens of a {} budget, {} pending",
         selected.len(),
-        s.get("selected_tokens").and_then(Value::as_u64).unwrap_or(0),
+        s.get("selected_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         s.get("budget").and_then(Value::as_u64).unwrap_or(0),
         s.get("pending_count").and_then(Value::as_u64).unwrap_or(0)
     ));
@@ -48,10 +50,12 @@ pub fn render(t: &TimelineDetail, s: &Value) -> String {
 }
 
 pub fn read(call: &OpsCall, t: &TimelineDetail) -> Result<String, String> {
-    let raw: u64 = t
-        .timeline
-        .parse()
-        .map_err(|_| format!("timeline {} has no number to look its selection up by", t.timeline))?;
+    let raw: u64 = t.timeline.parse().map_err(|_| {
+        format!(
+            "timeline {} has no number to look its selection up by",
+            t.timeline
+        )
+    })?;
     let s = call.session.substrate_selection(raw).ok_or_else(|| {
         format!(
             "the member that answered holds no selection for timeline {raw}: none has been \

@@ -188,7 +188,10 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
         .find(|a| u64::from_str_radix(&a.node, 16) == Ok(node))
         .map_or(host, |a| a.host.clone());
     if service == DAEMON {
-        if let Err(e) = agents.submit(&call.lineage, connector_job(), Some(node)).await {
+        if let Err(e) = agents
+            .submit(&call.lineage, connector_job(), Some(node))
+            .await
+        {
             return Answer::error(format!(
                 "the connector's build could not start on {host}, so the daemon is not deployed \
                  without it: {e}"
@@ -248,22 +251,39 @@ mod tests {
     #[test]
     fn the_daemon_is_built_with_the_connector_it_releases() {
         let daemon = build_job("motherd");
-        assert_eq!(daemon.args, ["build", "--release", "-p", "motherd", "-p", "mcp"]);
+        assert_eq!(
+            daemon.args,
+            ["build", "--release", "-p", "motherd", "-p", "mcp"]
+        );
         assert_eq!(daemon.stage.as_deref(), Some("target/release/motherd.exe"));
         let connector = connector_job();
         assert_eq!(
             connector.args,
-            ["build", "--release", "--package", "motherd", "--package", "mcp"]
+            [
+                "build",
+                "--release",
+                "--package",
+                "motherd",
+                "--package",
+                "mcp"
+            ]
         );
         assert_eq!(connector.stage.as_deref(), Some("target/release/mcp.exe"));
-        assert_eq!((connector.repo.as_str(), connector.branch.as_str()), ("candle", "main"));
+        assert_eq!(
+            (connector.repo.as_str(), connector.branch.as_str()),
+            ("candle", "main")
+        );
         let words = |j: &RunJob| {
             let mut w = vec![j.program.clone()];
             w.extend(j.args.iter().cloned());
             w
         };
         assert_eq!(built_service(&words(&daemon)), Some("motherd"));
-        assert_eq!(built_service(&words(&connector)), None, "a build, not a deploy");
+        assert_eq!(
+            built_service(&words(&connector)),
+            None,
+            "a build, not a deploy"
+        );
     }
 
     #[test]
