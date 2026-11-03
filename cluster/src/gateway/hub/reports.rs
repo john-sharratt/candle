@@ -243,8 +243,8 @@ type BuildHeld = (u64, BuildArtifacts);
 /// stay as few as the kinds and keys they name, and none of what they ended
 /// at is lost: the latest `CAPACITY`, `ROUTES`, `COORD` and `ACK`, each
 /// build's offer and holding with every artifact named, every key reported
-/// complete, and each key's net claim — a claim and the release of that same
-/// claim, both held, come to nothing. Each is applied in the order it
+/// complete, and each key's net claim — a release ends the claims held back
+/// before it, and is kept itself. Each is applied in the order it
 /// arrived — the latest of its kind, but a release repeated keeps its first
 /// place — so what depends on an earlier report, a key's `COMPLETE` on its
 /// `UNCLAIM`, an `ACK`'s placeability on a `CAPACITY`, sees it.
@@ -304,13 +304,12 @@ impl Held {
                 self.keys.entry(key).or_default().claim = Some((seq, c));
             }
             Report::Unclaim(u) => {
+                // A release ends the node's claim on the key whatever epoch
+                // either names (`Claims::unclaim`): a claim held back before
+                // it comes to nothing, and the release itself is kept, for
+                // the gateway may hold an earlier claim of the node's it ends.
                 let held = self.keys.entry(u.key.clone()).or_default();
-                if held.claim.as_ref().is_some_and(|(_, c)| c.epoch == u.epoch) {
-                    // The release of a claim itself held back: neither
-                    // reached the gateway, and neither is to.
-                    held.claim = None;
-                    return;
-                }
+                held.claim = None;
                 // The same release again keeps its first place, so what
                 // followed the first — the key's `COMPLETE` — still follows.
                 let at = match &held.unclaim {
@@ -393,9 +392,9 @@ mod tests {
 
     /// **Held reports keep what each kind ended at, however many arrive**: the
     /// latest `CAPACITY`, every key reported complete — together, as they
-    /// were reported — and each key's net claim: a claim and its own release
-    /// both held come to nothing, a release of a claim the gateway holds
-    /// stays, and a later claim follows it.
+    /// were reported — and each key's net claim: a release ends a claim held
+    /// back before it and is kept itself, for the gateway may hold an earlier
+    /// claim of the node's it ends; a later claim follows it.
     #[test]
     fn held_reports_keep_what_each_kind_ended_at() {
         let mut held = Held::default();
@@ -414,6 +413,7 @@ mod tests {
             vec![
                 capacity(MemberState::Ready),
                 complete(&[b"a", b"b"]),
+                Report::Unclaim(unclaim(b"gone", 5)),
                 Report::Unclaim(unclaim(b"moved", 3)),
                 Report::Claim(claim(b"moved", 7)),
             ]

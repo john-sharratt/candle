@@ -37,8 +37,10 @@ pub enum OwnClaim {
     Release(Epoch),
     /// This node's, below the epoch this member holds the key at — or above
     /// it, for a member upgrading, which claims nothing again: nothing is
-    /// released, and the key stays at the epoch held. Below, its announcing
-    /// that claim again on admission supersedes it.
+    /// released, and the key stays at the epoch held. Whatever epoch the
+    /// gateway names it at, the member's own release at the held one ends it
+    /// there (`Claims::unclaim` matches on the node); a member not upgrading
+    /// also announces its held claim again, which supersedes one below it.
     Kept,
     /// This node's, above the epoch this member held the key at: nothing is
     /// released, and the key is claimed again above it, at this epoch — to

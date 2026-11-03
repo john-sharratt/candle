@@ -28,13 +28,29 @@ impl Claims {
         }
     }
 
-    /// `UNCLAIM { key, epoch }`: let go only if that claim still holds it.
+    /// `UNCLAIM { key, epoch }`: a node's release ends **that node's** claim on
+    /// the key, at whatever epoch the table names it — the node is the one
+    /// that knows it no longer holds the key, and its claims' epochs only rise,
+    /// each socket carrying its releases ahead of any later claim. A table that
+    /// names an epoch of the node's other than the one it releases at — one it
+    /// claimed again above, or an older one it never superseded here, as a
+    /// member upgrading claims nothing again — would otherwise keep the claim
+    /// for good. Another node's claim, a higher epoch's, is left as it is.
     pub fn unclaim(&mut self, key: &[u8], epoch: Epoch) -> bool {
-        if self.held.get(key) == Some(&epoch) {
+        if self
+            .held
+            .get(key)
+            .is_some_and(|held| held.node == epoch.node)
+        {
             self.held.remove(key);
             return true;
         }
         false
+    }
+
+    /// The epoch `key` is held at.
+    pub fn epoch(&self, key: &[u8]) -> Option<Epoch> {
+        self.held.get(key).copied()
     }
 
     /// The node holding `key`.
@@ -115,6 +131,26 @@ mod tests {
         assert_eq!(c.holder(b"k"), Some(2));
         assert!(c.unclaim(b"k", e(2, 2)));
         assert_eq!(c.holder(b"k"), None);
+    }
+
+    /// **A node's release ends its claim at whatever epoch the table names
+    /// it** — above the one it releases at (a table that kept a newer epoch of
+    /// the node's while the node, upgrading, claimed nothing again) and below
+    /// it (one the node's re-announce never superseded here) — and leaves
+    /// another node's alone.
+    #[test]
+    fn a_nodes_release_ends_its_claim_at_any_epoch() {
+        for held in [e(900, 1), e(400, 1)] {
+            let mut c = Claims::new();
+            c.claim(b"k", held);
+            assert_eq!(c.epoch(b"k"), Some(held));
+            assert!(c.unclaim(b"k", e(500, 1)), "held at {held:?}");
+            assert_eq!(c.holder(b"k"), None);
+        }
+        let mut c = Claims::new();
+        c.claim(b"k", e(400, 2));
+        assert!(!c.unclaim(b"k", e(500, 1)), "another node's claim");
+        assert_eq!(c.holder(b"k"), Some(2));
     }
 
     #[test]

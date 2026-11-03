@@ -375,18 +375,26 @@ impl Drop for PendingGuard {
 }
 
 /// The node's pending admission, which must be `session`'s: only the session
-/// that `decide` admitted removes it, through its `run` or its guard.
-fn own_pending(s: &mut State, app: &str, node: u64, session: u64) -> Pending {
+/// that `decide` admitted removes it, through its `run` or its guard. `None`,
+/// with the invariant's breach logged and the pending left as it was, when it
+/// is not — the caller decides how loudly to fail: a guard dropping may be
+/// unwinding a panic already, and a second would abort the whole gateway.
+fn own_pending(s: &mut State, app: &str, node: u64, session: u64) -> Option<Pending> {
     let key = (app.to_string(), node);
-    let p = s
-        .pending
-        .remove(&key)
-        .expect("an admission's pending stands until its own run or guard removes it");
-    assert_eq!(
-        p.session, session,
-        "a node's pending admission is removed only by its own session"
-    );
-    p
+    match s.pending.get(&key).map(|p| p.session) {
+        Some(owner) if owner == session => s.pending.remove(&key),
+        owner => {
+            tracing::error!(
+                app,
+                node = %hex(node),
+                session,
+                ?owner,
+                "a node's pending admission is not this session's: an admission's pending \
+                 stands until its own run or guard removes it"
+            );
+            None
+        }
+    }
 }
 
 /// Undo the replacement [`Hub::decide`] began for `admitted`, whose handshake
@@ -395,37 +403,53 @@ fn own_pending(s: &mut State, app: &str, node: u64, session: u64) -> Pending {
 /// model lock; the relays kept for it are dropped; the node's standing
 /// session reports again; and what it reported meanwhile is applied under
 /// this same guard ([`apply_held`]). What follows from that is returned, to
-/// do.
+/// do. A pending not `admitted`'s is left alone ([`own_pending`]).
 pub(super) fn undo_pending(
     s: &mut State,
     app: &str,
     node: u64,
     admitted: &Admitted,
 ) -> Vec<Applied> {
-    let p = own_pending(s, app, node, admitted.session);
-    restore_standing(s, app, node, admitted);
-    apply_held(s, app, node, p.held)
+    let Some(p) = own_pending(s, app, node, admitted.session) else {
+        return Vec::new();
+    };
+    let mut applied = restore_standing(s, app, node, admitted);
+    applied.extend(apply_held(s, app, node, p.held));
+    applied
 }
 
 /// `node`'s standing session, the one `admitted` was to replace, stands again:
-/// admission names it the node's session while its socket is still here, and
-/// it reports again.
-fn restore_standing(s: &mut State, app: &str, node: u64, admitted: &Admitted) {
-    let standing = s.sockets.get(&(app.to_string(), node));
-    let here = standing.is_some_and(|x| Some(x.session) == admitted.replaces);
-    if let Some(x) = standing {
+/// admission names it the node's session again, and it reports again — only
+/// when the node's socket here is that session's; one that left meanwhile has
+/// nothing to restore. When that leaves the app with no session, its model
+/// lock clears, and what follows says so.
+fn restore_standing(s: &mut State, app: &str, node: u64, admitted: &Admitted) -> Vec<Applied> {
+    let socket = s.sockets.get(&(app.to_string(), node));
+    let standing = socket
+        .map(|x| x.session)
+        .filter(|session| Some(*session) == admitted.replaces);
+    if let Some(x) = socket.filter(|_| standing.is_some()) {
         x.replaced.store(false, Ordering::SeqCst);
     }
-    s.admission.undo(app, node, admitted, here);
+    if !s.admission.undo(app, node, admitted, standing) {
+        return Vec::new();
+    }
+    vec![Applied {
+        notes: vec![(hex(node), "model lock cleared: the group is empty".into())],
+        ..Applied::default()
+    }]
 }
 
 /// The [`Pending`] `run` puts its session's socket in place with. Overflowed,
-/// its replacement is undone as a failed handshake's is.
+/// its replacement is undone as a failed handshake's is. The caller has
+/// disarmed its guard: a pending not its own fails it loudly, and only it.
 pub(super) fn take_pending(s: &mut State, app: &str, node: u64, admitted: &Admitted) -> Taken {
-    let p = own_pending(s, app, node, admitted.session);
+    let p = own_pending(s, app, node, admitted.session)
+        .expect("an admission's pending stands until its own run or guard removes it");
     if p.overflowed {
-        restore_standing(s, app, node, admitted);
-        return Taken::Overflowed(apply_held(s, app, node, p.held));
+        let mut applied = restore_standing(s, app, node, admitted);
+        applied.extend(apply_held(s, app, node, p.held));
+        return Taken::Overflowed(applied);
     }
     Taken::Ready(p.queue)
 }
@@ -769,10 +793,12 @@ impl Hub {
             let connected_ms = now_ms();
             // What was meant for the node since its ADMIT's table was built —
             // unless too much arrived meanwhile: then this session goes,
-            // having changed nothing, and its admission is undone. Taken
-            // either way, it is no longer the guard's to undo.
-            let taken = take_pending(&mut s, app, node, &admitted);
+            // having changed nothing, and its admission is undone. Disarmed
+            // first: taken either way it is no longer the guard's to undo, and
+            // a pending not its own fails this session alone, not — through a
+            // guard dropping mid-panic — the whole gateway.
             guard.armed = false;
+            let taken = take_pending(&mut s, app, node, &admitted);
             let waiting = match taken {
                 Taken::Ready(waiting) => waiting,
                 Taken::Overflowed(applied) => {

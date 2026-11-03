@@ -55,6 +55,9 @@ pub struct Admitted {
     pub upgrading: bool,
     /// On an older protocol: its session carries only what crosses protocols.
     pub behind: bool,
+    /// This admission set the app's floor, the first to: undone, it leaves
+    /// none ([`Admission::undo`]).
+    pub set_floor: bool,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +119,7 @@ impl Admission {
                 floor: Some(floor),
                 upgrading: true,
                 behind: true,
+                set_floor: false,
             });
         }
 
@@ -176,7 +180,9 @@ impl Admission {
         // Admitted: the first member that is neither a local build nor on a
         // build the group rejected sets the floor, the first member the lock,
         // and a node's newer session replaces its older one.
-        if floored(app) && policy.floor.is_none() && !hello.build.is_local() && !hello.rejected {
+        let set_floor =
+            floored(app) && policy.floor.is_none() && !hello.build.is_local() && !hello.rejected;
+        if set_floor {
             policy.floor = Some((hello.build.clone(), hello.node, hello.host.clone()));
         }
         if locked(app) && policy.lock.is_none() {
@@ -192,6 +198,7 @@ impl Admission {
             floor,
             upgrading,
             behind: false,
+            set_floor,
         })
     }
 
@@ -202,25 +209,38 @@ impl Admission {
             Some((build.clone(), node, by.to_string()));
     }
 
-    /// `admitted`, a session of `node`'s whose handshake failed, is undone:
-    /// the session it replaced is the node's again while `standing` — still
-    /// connected — as though it had never been decided, so a group of one, its
-    /// member redialling, keeps its model lock. With none replaced, or the one
-    /// replaced gone since, the node has none, and when it was the app's last
-    /// the lock clears, as on [`Self::left`].
-    pub fn undo(&mut self, app: &str, node: u64, admitted: &Admitted, standing: bool) {
+    /// `admitted`, a session of `node`'s whose handshake failed, is undone, as
+    /// though it had never been decided: the session it replaced is the node's
+    /// again when `standing`, the session of the node's socket still here, is
+    /// that one — so a group of one, its member redialling, keeps its model
+    /// lock. With none replaced, or the one replaced gone since, the node has
+    /// none. A floor it set is lifted, so a member never admitted holds no
+    /// one below it out. Returns whether the model lock cleared, the app's
+    /// last session gone, as on [`Self::left`].
+    pub fn undo(
+        &mut self,
+        app: &str,
+        node: u64,
+        admitted: &Admitted,
+        standing: Option<u64>,
+    ) -> bool {
         let Some(policy) = self.apps.get_mut(app) else {
-            return;
+            return false;
         };
         if policy.sessions.get(&node) == Some(&admitted.session) {
-            match admitted.replaces.filter(|_| standing) {
+            match standing.filter(|s| Some(*s) == admitted.replaces) {
                 Some(replaced) => policy.sessions.insert(node, replaced),
                 None => policy.sessions.remove(&node),
             };
         }
+        if admitted.set_floor {
+            policy.floor = None;
+        }
+        let cleared = policy.sessions.is_empty() && policy.lock.is_some();
         if policy.sessions.is_empty() {
             policy.lock = None;
         }
+        cleared
     }
 
     /// `node`'s `session` ended. When it was the app's last, the model lock
@@ -333,6 +353,40 @@ mod tests {
             hello("npcd", 6, build(4000, ""), Some(model(2)), NOW)
         )
         .is_ok());
+    }
+
+    /// **An admission undone is as though never decided**: the first member's,
+    /// failed, sets no floor and no lock — a lower build is admitted after it,
+    /// a member of another model too — and a redial undone while the session it
+    /// would replace still stands leaves that one the node's, its lock held.
+    #[test]
+    fn an_admission_undone_leaves_no_floor_and_keeps_the_standing_lock() {
+        let mut a = Admission::new();
+        let failed = admit(&mut a, zend(1, build(4815, ""))).unwrap();
+        assert!(failed.set_floor);
+        assert!(a.undo("zend", 1, &failed, None), "the lock it set clears");
+        assert!(admit(&mut a, zend(2, build(4812, ""))).is_ok(), "no floor");
+
+        let mut a = Admission::new();
+        let standing = admit(&mut a, zend(1, build(4815, ""))).unwrap();
+        let redial = admit(&mut a, zend(1, build(4815, ""))).unwrap();
+        assert_eq!(redial.replaces, Some(standing.session));
+        assert!(!redial.set_floor);
+        assert!(!a.undo("zend", 1, &redial, Some(standing.session)));
+        let other = admit(
+            &mut a,
+            hello("zend", 2, build(4815, ""), Some(model(2)), NOW),
+        );
+        assert_eq!(other.unwrap_err().code, 4412, "the lock stands");
+        a.left("zend", 1, standing.session);
+        assert!(
+            admit(
+                &mut a,
+                hello("zend", 3, build(4815, ""), Some(model(2)), NOW)
+            )
+            .is_ok(),
+            "the standing session was the node's: its leaving clears the lock"
+        );
     }
 
     /// **A service has no floor** (D1): keep releases each machine's on its

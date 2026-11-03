@@ -1583,7 +1583,11 @@ instead:
   admission is decided, which undoes it however the serve task ends before `run` takes it,
   a panic or a dropped task included. Undone, the node's admitted session is the one it
   would have replaced again, while that one's socket still stands, so a group of one keeps
-  its model lock through a redial that failed. A pending still standing past
+  its model lock through a redial that failed; a floor the admission set is lifted, so a
+  member never admitted holds no one below it out; and a lock that clears because the app
+  is left with no session is logged as one cleared at a session's end is. A breach of the
+  invariant met while undoing is logged, never a second panic in a guard already
+  unwinding one. A pending still standing past
   `PENDING_OVERDUE` (`ADMIT_SEND` and 5 s) breaks that invariant — only a task never polled
   again leaves one — and each `HELLO` refused for it says so in the log; it is never taken
   over. An admission not taken — refused so, or overflowed — is closed `4429`, and its
@@ -1622,9 +1626,17 @@ instead:
   epoch, and that claim is announced on every gateway the member has joined, each of which
   still names the epoch before — at once; the gateway that sent the `ADMIT` hears it with
   the member's re-announce. A member upgrading claims nothing again: it keeps the key at the
-  epoch it holds, and every gateway keeps the one it names until the replacing build's
-  process releases it. The gateway relays an `UNCLAIM` only when it let a
-  claim go, so a release that matched nothing reaches no peer's hooks.
+  epoch it holds, and sends no re-announce, so a gateway may go on naming it at another.
+- **A node's release ends that node's claim at whatever epoch the table names it**
+  (`Claims::unclaim`, at the gateway and at every member alike). The node is the one that
+  knows it no longer holds the key; its claims' epochs only rise, and each socket carries
+  its releases ahead of any later claim, so no release can end a claim it made after. A
+  table naming an epoch of the node's other than the one it releases at — one it claimed
+  again above, or one below that its re-announce never superseded there, as when it was
+  upgrading — would otherwise keep the claim for good, routing the key to a member that
+  serves nothing of it. Another node's claim is left as it is. The gateway relays an
+  `UNCLAIM` only when it let a claim go, so a release that matched nothing reaches no
+  peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
   another node is a protocol violation, closed `4400`. No gateway relays a node its own
   claims.

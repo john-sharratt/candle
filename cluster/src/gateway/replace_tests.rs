@@ -346,9 +346,14 @@ async fn a_serve_ending_before_run_undoes_its_admission() {
     decided_then_gone(&hub, hello(1)).await;
     assert!(!old.load(Ordering::SeqCst), "undone");
     assert_eq!(hub.state().sockets[&("zend".to_string(), 1)].session, first);
-    assert!(
-        hub.decide("zend", &hello(1)).is_ok(),
-        "the next HELLO is admitted"
+    let (_, next) = hub
+        .decide("zend", &hello(1))
+        .expect("the next HELLO is admitted");
+    assert_eq!(
+        next.session,
+        first + 2,
+        "the failed handshake reached decide: it was admitted as session {}",
+        first + 1
     );
 }
 
@@ -358,7 +363,7 @@ async fn a_serve_ending_before_run_undoes_its_admission() {
 #[tokio::test]
 async fn a_failed_redial_keeps_the_model_lock() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
-    admitted_once(&hub);
+    let (first, _) = admitted_once(&hub);
     decided_then_gone(&hub, hello(1)).await;
     let mut other = hello(2);
     other.model = Some(ModelId {
@@ -368,6 +373,13 @@ async fn a_failed_redial_keeps_the_model_lock() {
     });
     let refused = hub.decide("zend", &other).unwrap_err();
     assert_eq!(refused.code, CloseCode::Model.code());
+    let (_, next) = hub.decide("zend", &hello(1)).unwrap();
+    assert_eq!(
+        next.session,
+        first + 2,
+        "the failed redial reached decide: it was admitted as session {}",
+        first + 1
+    );
 }
 
 /// **A handshake during which more claim relays pile up than it can be
