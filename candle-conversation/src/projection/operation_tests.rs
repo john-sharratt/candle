@@ -27,7 +27,8 @@ fn a_fresh_substrate_reads_clean() {
     assert!(!conv.out_of_space());
     assert!(conv.deferred_records().is_empty());
     assert_eq!(conv.tombstone_counts(), TombstoneCounts::default());
-    assert!(conv.liveness_audit().is_ok());
+    assert!(conv.liveness_audit(None).is_ok());
+    assert!(conv.liveness_audit(Some(1)).is_ok(), "a sample of the newest segment");
 }
 
 /// A tombstoned timeline is held until a complete compaction has run past it,

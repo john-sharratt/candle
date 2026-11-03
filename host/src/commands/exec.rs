@@ -331,12 +331,22 @@ impl Commands {
                 }
                 Ok(Value::Object(out))
             }
-            Command::Audit => {
+            Command::Audit { newest } => {
+                let newest = *newest;
                 let mut out = Map::new();
                 for t in self.targets(app)? {
-                    job.step(t.app, "walking every segment, changing nothing");
+                    job.step(
+                        t.app,
+                        match newest {
+                            Some(n) => format!(
+                                "walking the newest {n} sealed segments and the active one, \
+                                 changing nothing"
+                            ),
+                            None => "walking every segment, changing nothing".to_string(),
+                        },
+                    );
                     let conv = t.conversation.clone();
-                    let audit = spawn_blocking(move || conv.liveness_audit())
+                    let audit = spawn_blocking(move || conv.liveness_audit(newest))
                         .await
                         .map_err(|e| format!("{}: the audit panicked: {e}", t.app))?
                         .map_err(|e| format!("{}: {e}", t.app))?;
@@ -358,9 +368,21 @@ impl Commands {
                         })
                         .collect();
                     let gone: Vec<u64> = audit.gone.iter().map(|s| s.raw()).collect();
+                    // Each segment walked: how much it holds, and how much of
+                    // it maintenance counts live and carries.
+                    let by_segment: Map<String, Value> = audit
+                        .by_segment()
+                        .into_iter()
+                        .map(|(seg, c)| {
+                            (
+                                seg.raw().to_string(),
+                                json!({"bytes": c.bytes, "counted": c.counted, "carried": c.carried}),
+                            )
+                        })
+                        .collect();
                     out.insert(
                         t.app.into(),
-                        json!({ "by_type": by_type, "segments_gone": gone }),
+                        json!({ "by_type": by_type, "by_segment": by_segment, "segments_gone": gone }),
                     );
                 }
                 Ok(Value::Object(out))

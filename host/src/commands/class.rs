@@ -115,7 +115,7 @@ mod tests {
             Command::Compact,
             Command::Maintain,
             Command::ExpireTombstones,
-            Command::Audit,
+            Command::Audit { newest: None },
             Command::SelfCheck,
             Command::CatchUp { from: None },
             Command::Resync,

@@ -236,6 +236,43 @@ pub struct AuditSegments {
     pub active_end: u64,
 }
 
+impl AuditSegments {
+    /// Only the newest `n` sealed segments, and the active one: a sample of
+    /// what the log is writing now, walked in seconds where every segment
+    /// takes as long as the disk takes to read.
+    pub fn newest(mut self, n: usize) -> AuditSegments {
+        self.sealed.sort();
+        let skip = self.sealed.len().saturating_sub(n);
+        self.sealed.drain(..skip);
+        self
+    }
+}
+
+#[cfg(test)]
+mod newest_tests {
+    use super::*;
+
+    /// **A sample keeps the newest sealed segments and the active one.**
+    #[test]
+    fn a_sample_keeps_the_newest_sealed_segments() {
+        let at = AuditSegments {
+            sealed: vec![SegmentId(7), SegmentId(3), SegmentId(9), SegmentId(5)],
+            active: SegmentId(10),
+            active_end: 42,
+        };
+        assert_eq!(
+            at.clone().newest(2),
+            AuditSegments {
+                sealed: vec![SegmentId(7), SegmentId(9)],
+                active: SegmentId(10),
+                active_end: 42,
+            }
+        );
+        assert_eq!(at.clone().newest(9).sealed.len(), 4);
+        assert!(at.newest(0).sealed.is_empty());
+    }
+}
+
 impl SubstratePersistence {
     /// Audit the liveness count against the carry over every segment. Read-only.
     pub fn liveness_audit(&self, substrate: &Substrate) -> Result<LivenessAudit> {

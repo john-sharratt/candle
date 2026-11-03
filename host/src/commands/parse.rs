@@ -27,7 +27,11 @@ pub enum Command {
     Compact,
     Maintain,
     ExpireTombstones,
-    Audit,
+    /// Every segment, or a sample: the newest this many sealed ones and the
+    /// active one.
+    Audit {
+        newest: Option<usize>,
+    },
     SelfCheck,
     /// From the member named, or the one each gateway picks.
     CatchUp {
@@ -83,7 +87,7 @@ impl Command {
             Command::Compact => "compact",
             Command::Maintain => "maintain",
             Command::ExpireTombstones => "expire-tombstones",
-            Command::Audit => "audit",
+            Command::Audit { .. } => "audit",
             Command::SelfCheck => "self-check",
             Command::CatchUp { .. } => "catch-up",
             Command::Resync => "resync",
@@ -121,6 +125,7 @@ impl Command {
                 args["parallel"] = json!(plan.parallel);
             }
             Command::Rollback { build } => args["build"] = json!(build),
+            Command::Audit { newest: Some(n) } => args["newest"] = json!(n),
             Command::PruneBuilds { builds, keep } => {
                 args["builds"] = json!(builds);
                 args["keep"] = json!(keep);
@@ -138,7 +143,7 @@ impl Command {
             Command::Compact
             | Command::Maintain
             | Command::ExpireTombstones
-            | Command::Audit
+            | Command::Audit { .. }
             | Command::SelfCheck => Reach::Substrate,
             _ => Reach::Cluster,
         }
@@ -161,6 +166,9 @@ pub struct Body {
     pub builds: Option<Vec<String>>,
     /// `prune-builds`: keep only the newest this many.
     pub keep: Option<usize>,
+    /// `audit`: walk only the newest this many sealed segments, and the
+    /// active one — a sample of what the log writes now.
+    pub newest: Option<usize>,
     /// `rollout`: the plan the gateway worked out.
     pub plan: Option<Rollout>,
     /// A destructive command's target, typed out: this machine's name, or for
@@ -178,7 +186,9 @@ pub fn parse(name: &str, body: &Body, host: &str) -> Result<Command, String> {
         "compact" => Command::Compact,
         "maintain" => Command::Maintain,
         "expire-tombstones" => Command::ExpireTombstones,
-        "audit" => Command::Audit,
+        "audit" => Command::Audit {
+            newest: body.newest,
+        },
         "self-check" => Command::SelfCheck,
         "catch-up" => Command::CatchUp {
             from: match &body.from {
@@ -430,7 +440,15 @@ mod tests {
     /// A command's arguments are what it parsed to, not the body's spelling.
     #[test]
     fn the_arguments_are_the_commands_own() {
-        assert_eq!(Command::Audit.args(None), json!({"app": null}));
+        assert_eq!(Command::Audit { newest: None }.args(None), json!({"app": null}));
+        assert_eq!(
+            Command::Audit { newest: Some(4) }.args(None),
+            json!({"app": null, "newest": 4})
+        );
+        assert_eq!(
+            parse("audit", &body(r#"{"newest":4}"#), "m1"),
+            Ok(Command::Audit { newest: Some(4) })
+        );
         assert_eq!(
             Command::SetQuorum { max_members: 2 }.args(Some("zend")),
             json!({"app": "zend", "max_members": 2})
@@ -444,7 +462,7 @@ mod tests {
     #[test]
     fn each_command_reaches_what_it_acts_on() {
         assert_eq!(Command::Shutdown.reach(), Reach::Process);
-        assert_eq!(Command::Audit.reach(), Reach::Substrate);
+        assert_eq!(Command::Audit { newest: None }.reach(), Reach::Substrate);
         assert_eq!(Command::Drain.reach(), Reach::Cluster);
     }
 }

@@ -93,12 +93,18 @@ impl Conversation {
     /// everything else it has to do; the plan's scan and the walk run here.
     /// The walk reads every segment and takes as long as the disk does
     /// (fifteen minutes over BlackWorld's 346 GiB): on the owner it stopped
-    /// every write, read and replicated record for as long.
-    pub fn liveness_audit(&self) -> PersistenceResult<LivenessAudit> {
+    /// every write, read and replicated record for as long. `newest` samples
+    /// only the newest that many sealed segments and the active one: what the
+    /// log is writing now, read in seconds.
+    pub fn liveness_audit(&self, newest: Option<usize>) -> PersistenceResult<LivenessAudit> {
         let view = self.read();
         let (indexes, at): (LiveIndexes, _) = self
             .persistence
             .call_behind(|p| (p.live_indexes(), p.audit_segments()));
+        let at = match newest {
+            Some(n) => at.newest(n),
+            None => at,
+        };
         indexes.liveness_audit_plan(&view, at).walk()
     }
 }

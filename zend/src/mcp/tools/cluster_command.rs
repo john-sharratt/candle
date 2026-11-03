@@ -49,7 +49,8 @@ pub fn definition() -> Value {
             commands are routine upkeep ({}): both run as asked. Decide commands change what the cluster \
             runs ({}): ask the user first, and pass `confirm: \"approved by the user\"` only with their \
             approval for that command on that member. A command's own arguments go in `args` — `app`, \
-            `build`, `from`, `max_members`, `builds`, `keep` — and a destructive one's typed target (the \
+            `build`, `from`, `max_members`, `builds`, `keep`, and `newest` for an `audit` that samples \
+            only the newest that many segments rather than walking them all — and a destructive one's typed target (the \
             machine's name; for `rollout`, the build) as `args.confirm`. `rollout` without `args.confirm` \
             answers the plan and changes nothing. Admins only.",
             look.join(", "),
