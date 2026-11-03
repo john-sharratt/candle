@@ -18,16 +18,21 @@
 #   pinned_experts_gib  how much host RAM its expert cache may page-lock.
 #                       Absent: derived from the machine
 #                       (candle-core/src/vram/host_probe.rs).
+#   builds              its build preference, lower first: a build or test job
+#                       goes to the agent on the preferred machine with a free
+#                       slot, a model member beside it or not. Absent: after
+#                       every machine that has one.
 #
 # Changing a number is changing the deployment: it takes a restart of the
 # gateway and a build of the daemons.
 
 # The RTX PRO 5000 (72 GB), 194 GB of host RAM, PCIe 5.0: conversations first,
-# and most of the cast while nothing is live.
+# most of the cast while nothing is live, and every build it has a slot for.
 BlackWorld:
   conversations: {rank: 1, min: 4, max: 8}
   pictures: 2
   characters: 3
+  builds: 1
 
 # The RTX 3090 (24 GB), 64 GB of host RAM, PCIe 3.0: one conversation once
 # BlackWorld holds four, pictures first, and the cast while BlackWorld is busy.
@@ -38,6 +43,10 @@ WhiteWorld:
   pictures: 1
   characters: 1
   pinned_experts_gib: 28
+  # Builds only while BlackWorld has no free slot: its memory is the engine's,
+  # and a build beside it pages.
+  builds: 2
 
-# The laptop: an agent, no model member.
+# The laptop: an agent, no model member, and a standby one (web/web.yaml's
+# `cluster.standby_agents`): it builds only when no other agent can.
 AlienWorld: {}

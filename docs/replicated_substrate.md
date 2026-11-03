@@ -3887,14 +3887,18 @@ conversation's jobs go to the agent that last ran them, which keeps incremental 
 warm (`docs/zend_workspace_execution.md` §8.2).
 
 If that agent is busy, the job waits up to 5 s and then spills to the **best idle
-agent**: the one with the most idle cores, `cores × (1 − load/cores)`, among agents that
-hold the job's repositories and toolchain.
+agent**: the one on the machine the machine table prefers to build on (`builds`, lower
+first; `docs/static_placement.md` §2), then with the most idle cores,
+`cores × (1 − load/cores)`, among agents that hold the job's repositories and toolchain.
 
 **An agent at low priority** — one sharing its host with a model member (§11.5), which
-says so in its `CAPACITY` — is chosen only when no dedicated agent fit for the job has a
-free slot (`cluster/src/gateway/agents.rs`). It is never the best idle agent beside a free
+says so in its `CAPACITY` — is chosen only when no dedicated agent fit for the job, on a
+machine the table prefers as much, has a free slot (`cluster/src/gateway/agents.rs`).
+Among machines of one `builds` preference it is never the best idle agent beside a free
 dedicated one, a lineage it holds moves to a free dedicated agent, and a job that must
-queue queues on a dedicated agent.
+queue queues on a dedicated agent. A machine the table prefers to build on comes first,
+low priority or not: BlackWorld builds beside its model member rather than leave a build
+to a weaker machine.
 
 **A standby agent** is a spare. It runs on a machine the gateway's `cluster.standby_agents`
 names (`web/web.yaml`), the laptop AlienWorld among them. It is given a job only when no

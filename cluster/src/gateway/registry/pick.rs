@@ -232,7 +232,14 @@ impl Registry {
                 .get(app)
                 .and_then(|a| a.claims.holder(k.as_bytes()))
         });
-        let choice = choose_with_standby(&self.ready(app), &self.standby, holder, need, waited);
+        let choice = choose_with_standby(
+            &self.ready(app),
+            &self.standby,
+            &self.machines,
+            holder,
+            need,
+            waited,
+        );
         if let Choice::Run(node) = choice {
             if let Some(m) = self.app(app).members.get_mut(&node) {
                 m.handed += 1;

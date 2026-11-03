@@ -57,12 +57,14 @@ BlackWorld:
   conversations: {rank: 1, min: 4, max: 8}
   pictures: 2
   characters: 3
+  builds: 1
 WhiteWorld:
   conversations: {rank: 2, min: 1, max: 2}
   pictures: 1
   characters: 1
   pinned_experts_gib: 28
-AlienWorld: {}                 # an agent only
+  builds: 2
+AlienWorld: {}                 # an agent only, and a standby one
 ```
 
 | Key | Means | Absent |
@@ -73,8 +75,9 @@ AlienWorld: {}                 # an agent only
 | `pictures` | its picture preference (§4); lower first | draws nothing |
 | `characters` | its share of the cast while it is free of conversations (§5) | hosts no characters |
 | `pinned_experts_gib` | how much host RAM its expert cache may page-lock (§7) | derived (§7) |
+| `builds` | its build preference; lower first. A build or test job (`repo_job_start` with no `node`) goes to the agent on the most preferred machine with a free slot, before a dedicated agent elsewhere and before idle cores, and a lineage it holds stays there (`gateway::agents::choose`). A standby agent (`cluster.standby_agents`) still runs only what no other can | after every machine that has one |
 
-The gateway reads `conversations`, `pictures` and `characters`; motherd reads
+The gateway reads `conversations`, `pictures`, `characters` and `builds`; motherd reads
 its own machine's `pinned_experts_gib` at startup, before any tenant loads the
 model. Changing a number is changing the deployment: the gateway takes it at
 its next start, the daemons at their next build.
@@ -399,6 +402,10 @@ answering `409` for it — for as long as that gateway runs: nothing else releas
 and only a gateway restart forgets it. No gateway relays a node its own claims, so
 `ADMIT` is the only way one reaches it. With motherd rolled out first, every member
 that restarts behind the new gateway releases its own.
+
+The table's entries are checked strictly: an earlier gateway refuses a table
+naming a key it does not know (`builds`, at the build that introduced it), so a
+gateway is restarted on the new table only with the new `web.exe`.
 
 The new `web.exe` reads `cluster.machines_file` from `web/web.yaml`, which the
 earlier one refuses as an unknown field. A machine that restarted its earlier

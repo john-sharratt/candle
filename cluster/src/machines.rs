@@ -38,6 +38,11 @@ pub struct Machine {
     /// derived from the machine.
     #[serde(default)]
     pub pinned_experts_gib: Option<u32>,
+    /// Its build preference, lower first: a build or test job goes to the
+    /// agent on the preferred machine with a free slot, whatever else shares it
+    /// (§2). Absent: after every machine that has one.
+    #[serde(default)]
+    pub builds: Option<u32>,
 }
 
 /// A machine's conversations (§3.2): its place in the deterministic fill and
@@ -134,6 +139,11 @@ impl MachineTable {
         })
     }
 
+    /// `host`'s build preference, when the table gives one.
+    pub fn builds(&self, host: &str) -> Option<u32> {
+        self.get(host).and_then(|m| m.builds)
+    }
+
     /// `host`'s share of the cast; zero for a machine the table does not name.
     pub fn characters(&self, host: &str) -> u32 {
         self.get(host).map_or(0, |m| m.characters)
@@ -157,6 +167,7 @@ BlackWorld:
   pictures: 2
   characters: 3
   pinned_experts_gib: 120
+  builds: 1
 WhiteWorld:
   conversations: {rank: 2, min: 1}
   pictures: 1
@@ -186,6 +197,14 @@ AlienWorld: {}
         assert_eq!(t.get("AlienWorld"), Some(&Machine::default()));
         assert_eq!(t.conversations("AlienWorld"), None);
         assert_eq!(t.characters("AlienWorld"), 0);
+        assert_eq!(
+            (
+                t.builds("BlackWorld"),
+                t.builds("WhiteWorld"),
+                t.builds("nowhere")
+            ),
+            (Some(1), None, None)
+        );
     }
 
     /// Whether the table takes a unit at all: a conversation or a draw.

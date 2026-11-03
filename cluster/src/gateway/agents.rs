@@ -3,16 +3,20 @@
 //! A conversation's jobs go to the agent that last ran them — the holder of
 //! its lineage key — which keeps incremental builds warm. While that agent has
 //! no free job slot the job waits, up to [`SPILL_AFTER`], and then spills to
-//! the **best idle agent**: the one with the most idle cores,
+//! the **best idle agent**: the one on the machine the table prefers to build
+//! on (`builds`, lower first), then with the most idle cores,
 //! `cores × (1 − load / cores)`, among the agents that hold the job's
 //! repository (with push rights, for a job that pushes) and its toolchain.
 //! A job with no holder goes to the best idle agent at once, and waits like
 //! the rest when every agent is busy.
 //!
 //! **An agent at low priority** — one sharing its host with a model member
-//! (§11.5) — is chosen only when no dedicated agent fit for the job has a
-//! free slot: it is never the best idle agent beside one, and a lineage it
-//! holds moves to a free dedicated agent rather than staying on it.
+//! (§11.5) — is chosen only when no dedicated agent fit for the job, on a
+//! machine the table prefers as much, has a free slot: among machines of one
+//! `builds` preference it is never the best idle agent beside a dedicated one,
+//! and a lineage it holds moves to a free dedicated agent rather than staying
+//! on it. A machine the table prefers to build on is chosen first, low
+//! priority or not: the strongest machine is worth sharing.
 //!
 //! **A standby agent** — one on a host the gateway's `standby_agents` names —
 //! is a spare: a job goes to it only when no other ready agent can run the
@@ -26,6 +30,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::registry::MemberView;
+use crate::machines::MachineTable;
 
 /// How long a job waits for its busy holder before it spills.
 pub const SPILL_AFTER: Duration = Duration::from_secs(5);
@@ -110,16 +115,35 @@ fn dedicated(agent: &MemberView) -> bool {
     agent.capacity.as_ref().is_some_and(|c| !c.low_priority)
 }
 
+/// Its machine's place among the machines that build, lower first; a machine
+/// the table gives no `builds` comes after every one it does.
+fn build_rank(agent: &MemberView, machines: &MachineTable) -> Reverse<u32> {
+    Reverse(machines.builds(&agent.host).unwrap_or(u32::MAX))
+}
+
 /// Choose among `ready` agents for a job needing `need`, whose lineage
-/// `holder` holds; `waited` once it has waited [`SPILL_AFTER`].
-pub fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: bool) -> Choice {
+/// `holder` holds; `waited` once it has waited [`SPILL_AFTER`]. Among the
+/// agents it may go to, the machine table's `builds` preference
+/// (`docs/static_placement.md` §2) comes first — before a dedicated agent
+/// over one at low priority, and before idle cores: the strongest machine
+/// builds whenever it has a slot, though a model member shares it, and a
+/// weaker one only while it has none.
+pub fn choose(
+    ready: &[&MemberView],
+    machines: &MachineTable,
+    holder: Option<u64>,
+    need: &Need,
+    waited: bool,
+) -> Choice {
     let fit: Vec<&MemberView> = ready.iter().copied().filter(|a| fits(a, need)).collect();
     if fit.is_empty() {
         return Choice::NoAgent;
     }
-    let dedicated_free = fit.iter().any(|a| dedicated(a) && free(a));
+    // What one agent is preferred over another for, before idle cores.
+    let standing = |a: &MemberView| (build_rank(a, machines), dedicated(a));
     if let Some(h) = holder.and_then(|h| fit.iter().find(|a| a.node == h)) {
-        if free(h) && (dedicated(h) || !dedicated_free) {
+        let outranked = fit.iter().any(|a| free(a) && standing(a) > standing(h));
+        if free(h) && !outranked {
             return Choice::Run(h.node);
         }
         if !waited && dedicated(h) {
@@ -128,7 +152,14 @@ pub fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: b
     }
     let best = |among: &mut dyn Iterator<Item = &&MemberView>| {
         among
-            .max_by_key(|a| (dedicated(a), idle_cores(a), Reverse(a.node)))
+            .max_by_key(|a| {
+                (
+                    build_rank(a, machines),
+                    dedicated(a),
+                    idle_cores(a),
+                    Reverse(a.node),
+                )
+            })
             .map(|a| a.node)
     };
     if let Some(node) = best(&mut fit.iter().filter(|a| free(a))) {
@@ -164,6 +195,7 @@ pub fn named_standby(standby: &BTreeSet<String>, host: &str) -> bool {
 pub fn choose_with_standby(
     ready: &[&MemberView],
     standby: &BTreeSet<String>,
+    machines: &MachineTable,
     holder: Option<u64>,
     need: &Need,
     waited: bool,
@@ -172,8 +204,8 @@ pub fn choose_with_standby(
         .iter()
         .copied()
         .partition(|a| named_standby(standby, &a.host));
-    match choose(&regular, holder, need, waited) {
-        Choice::NoAgent => choose(&spares, holder, need, waited),
+    match choose(&regular, machines, holder, need, waited) {
+        Choice::NoAgent => choose(&spares, machines, holder, need, waited),
         chosen => chosen,
     }
 }
@@ -239,6 +271,53 @@ mod tests {
 
     fn cargo() -> Need {
         need("candle", Some("cargo"), false)
+    }
+
+    /// [`super::choose`] with a table that ranks no machine for builds.
+    fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: bool) -> Choice {
+        super::choose(ready, &MachineTable::default(), holder, need, waited)
+    }
+
+    /// **The machine the table prefers to build on takes the job** while it has
+    /// a slot — at low priority beside a model member, and with fewer idle
+    /// cores than another; full, the next does; a machine the table ranks
+    /// nowhere comes last. A lineage still goes back to its holder.
+    #[test]
+    fn the_preferred_build_machine_builds_first() {
+        let machines = MachineTable::from_yaml(
+            "BlackWorld:\n  builds: 1\nAlienWorld:\n  builds: 2\nWhiteWorld: {}\n",
+        )
+        .unwrap();
+        let mut bw = beside(1, 8, 4_000, 1);
+        bw.host = "BlackWorld".into();
+        let mut aw = agent(2, 16, 0, 1);
+        aw.host = "AlienWorld".into();
+        let mut ww = agent(3, 32, 0, 1);
+        ww.host = "WhiteWorld".into();
+        let ready = [&ww, &aw, &bw];
+        assert_eq!(
+            super::choose(&ready, &machines, None, &cargo(), false),
+            Choice::Run(1),
+            "BlackWorld, with the fewest idle cores"
+        );
+        assert_eq!(
+            super::choose(&ready, &machines, Some(1), &cargo(), false),
+            Choice::Run(1),
+            "a lineage on BlackWorld stays there, though AlienWorld is dedicated"
+        );
+        bw.handed = 1;
+        let ready = [&ww, &aw, &bw];
+        assert_eq!(
+            super::choose(&ready, &machines, None, &cargo(), false),
+            Choice::Run(2),
+            "BlackWorld full: AlienWorld before an unranked WhiteWorld"
+        );
+        assert_eq!(
+            super::choose(&ready, &machines, Some(3), &cargo(), false),
+            Choice::Run(3),
+            "a lineage's holder keeps it"
+        );
+        assert_eq!(machines.builds("blackworld"), Some(1));
     }
 
     /// **What can run instead is what the agents holding the repository
@@ -431,7 +510,14 @@ mod tests {
         let free = on("blackworld", 1, 2);
         let busy = on("blackworld", 1, 0);
         let pick = |ready: &[&MemberView], holder, need: &Need, waited| {
-            choose_with_standby(ready, &standby, holder, need, waited)
+            choose_with_standby(
+                ready,
+                &standby,
+                &MachineTable::default(),
+                holder,
+                need,
+                waited,
+            )
         };
         assert_eq!(
             pick(&[&spare, &free], None, &cargo(), false),
@@ -461,7 +547,14 @@ mod tests {
         assert_eq!(pick(&[&gone], None, &cargo(), false), Choice::NoAgent);
         // With no standby hosts named, every agent is a regular one.
         assert_eq!(
-            choose_with_standby(&[&spare, &busy], &BTreeSet::new(), None, &cargo(), false),
+            choose_with_standby(
+                &[&spare, &busy],
+                &BTreeSet::new(),
+                &MachineTable::default(),
+                None,
+                &cargo(),
+                false
+            ),
             Choice::Run(9)
         );
     }

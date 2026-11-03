@@ -1031,7 +1031,8 @@ run inside each motherd at low priority (`motherd/motherd.yaml`,
   here; it leads with how the job stands — running or ended, its exit code,
   and what it staged.
 - **Choosing an agent** follows §11.3: sticky on `x-tokera-lineage`, a
-  5-second spill to the best idle agent, low-priority agents last
+  5-second spill to the best idle agent — the machine table's `builds`
+  preference first, then dedicated over low-priority agents, then idle cores
   (`docs/replicated_substrate.md:3605-3621`); `node` pins one with
   `x-tokera-node` (`web/src/cluster/jobs.rs:69-76`).
 - **A job lives in its motherd.** The agent's job table is in memory
