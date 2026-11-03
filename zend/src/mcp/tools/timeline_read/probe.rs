@@ -24,7 +24,7 @@ pub fn render(text: &str, v: &Value) -> String {
         .and_then(Value::as_array)
         .map(|t| t.iter().collect())
         .unwrap_or_default();
-    let is_tool = |t: &&Value| t.get("group").and_then(Value::as_str) == Some("tools");
+    let is_tool = |t: &Value| t.get("group").and_then(Value::as_str) == Some("tools");
     let line = |t: &Value| {
         let score = t.get("score").and_then(Value::as_f64).unwrap_or(0.0);
         format!(
@@ -37,7 +37,12 @@ pub fn render(text: &str, v: &Value) -> String {
             }
         )
     };
-    let tools: Vec<String> = tiles.iter().filter(is_tool).take(TOOLS).map(|t| line(t)).collect();
+    let tools: Vec<String> = tiles
+        .iter()
+        .filter(|t| is_tool(t))
+        .take(TOOLS)
+        .map(|t| line(t))
+        .collect();
     let others: Vec<String> = tiles
         .iter()
         .filter(|t| !is_tool(t))
