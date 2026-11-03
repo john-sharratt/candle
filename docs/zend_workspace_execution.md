@@ -157,7 +157,7 @@ The `repo_map` and `code_reading` layers are ingested from every branch origin h
 
 ### 5.2 `repo_map` units
 
-One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …) — every one inside a repository, since `file_list` lists inside one repository and there is no listing of the workspace itself. Each unit's prefilled call splits its directory into `repo` and `path` (`file_list {repo: candle, path: zend/src}`; a repository's root is `{repo: candle}`), and the request names the folder with its repository.
+One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …) — every one inside a repository, since `file_list` lists inside one repository and there is no listing of the workspace itself. Each unit's prefilled call splits its directory into `repo` and `path` (`file_list {repo: candle, path: zend/src}`; a repository's root is `{repo: candle, path: ""}` — `path` is required, `""` naming the root), and the request names the folder with its repository.
 
 ### 5.3 `code_reading`
 

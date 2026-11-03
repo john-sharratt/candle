@@ -527,7 +527,7 @@ fn list_caps_a_large_directory_to_one_page() {
 fn list_page_zero_is_refused() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx("file_list", json!({"repo": REPO, "page": 0}), &ctx);
+    let resp = harness::invoke_with_ctx("file_list", json!({"repo": REPO, "path": "", "page": 0}), &ctx);
     harness::expect_error(&resp, "invalid_arguments");
 }
 

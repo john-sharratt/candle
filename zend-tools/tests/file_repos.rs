@@ -171,7 +171,7 @@ fn file_list_lists_inside_one_repository() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": "b", "page": 1}),
+        json!({"repo": "b", "path": "", "page": 1}),
         &c,
     ));
     assert_eq!(resp["repo"], "b");
@@ -191,7 +191,7 @@ fn every_file_tool_refuses_a_call_without_a_repo() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     for (tool, args) in [
-        ("file_list", json!({"page": 1})),
+        ("file_list", json!({"path": "", "page": 1})),
         ("file_search", json!({"query": "shared.txt", "page": 1})),
         ("file_grep", json!({"pattern": "marker", "page": 1})),
         ("file_read", json!({"path": "shared.txt", "page": 1})),
@@ -209,7 +209,7 @@ fn every_paged_file_tool_refuses_a_call_without_a_page() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     for (tool, args) in [
-        ("file_list", json!({"repo": "a"})),
+        ("file_list", json!({"repo": "a", "path": ""})),
         ("file_search", json!({"repo": "a", "query": "shared.txt"})),
         ("file_grep", json!({"repo": "a", "pattern": "marker"})),
     ] {
@@ -217,6 +217,18 @@ fn every_paged_file_tool_refuses_a_call_without_a_page() {
         let detail = harness::expect_error(&resp, "invalid_arguments");
         assert!(detail.contains("page"), "{tool}: {detail}");
     }
+}
+
+/// **The path is always stated.** `file_list` requires `path`, `""` naming the
+/// repository's root: left optional, the cheapest way to close a call was to
+/// leave it out, and a model planning six directories listed the root six times.
+#[test]
+fn file_list_refuses_a_call_without_a_path() {
+    let dir = two_repo_workspace();
+    let c = ctx(&dir);
+    let resp = harness::invoke_with_ctx("file_list", json!({"repo": "a", "page": 1}), &c);
+    let detail = harness::expect_error(&resp, "invalid_arguments");
+    assert!(detail.contains("path"), "{detail}");
 }
 
 /// `*` covers every repository, and only the searches take it: listing and
@@ -231,7 +243,7 @@ fn only_the_search_tools_take_all_repos() {
             "file_read",
             json!({"repo": "*", "path": "shared.txt", "page": 1}),
         ),
-        ("file_list", json!({"repo": "*", "page": 1})),
+        ("file_list", json!({"repo": "*", "path": "", "page": 1})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         let detail = harness::expect_error(&resp, "unknown_repo");

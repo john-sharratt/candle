@@ -1200,10 +1200,9 @@ fn escaped_token_bails_and_terminates() {
 #[test]
 fn an_empty_string_argument_drives() {
     let (tree, vocab) = build_tree();
-    // Required properties first, as the catalog compiles them: `page`, then
-    // the optional `path`.
+    // Required properties in schema order: `repo`, `path`, `page`.
     let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"candle\", \
-                  \"page\": 1, \"path\": \"\"}}\n</tool_call><|im_end|>";
+                  \"path\": \"\", \"page\": 1}}\n</tool_call><|im_end|>";
     let out = drive(Arc::clone(&tree), target, &vocab)
         .unwrap_or_else(|e| panic!("an empty path must drive, got {e:?}"));
     let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
@@ -1604,11 +1603,11 @@ fn a_repo_enum_then_a_path_drives_the_live_grammar() {
     let tree = Arc::new(compile(&spec, &vocab).unwrap());
     let mut failures = Vec::new();
     for call in [
-        // Required properties first, as the catalog compiles them: `page`,
-        // then the optional `path` or `prefix`.
-        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "page": 1, "path": "crates"}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "page": 1}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "mind", "page": 1, "path": "personalities"}}"#,
+        // Required properties first, as the catalog compiles them: `file_list`'s
+        // `repo`, `path`, `page`; then an optional `prefix`.
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "path": "crates", "page": 1}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "path": "", "page": 1}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "mind", "path": "personalities", "page": 1}}"#,
         // `*` before the required page: `file_list` names one repository, so
         // the all-repositories value is a search's.
         r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 1}}"#,
@@ -1648,12 +1647,12 @@ fn live_tree() -> (Arc<StencilTree>, tokenizers::Tokenizer) {
 fn natural_calls_drive_the_live_grammar() {
     let (tree, tok) = live_tree();
     let calls = [
-        // Required properties first, as the catalog compiles them: `page`,
-        // then the optional `path` or `prefix`. `file_read`'s `path` is
-        // required, so it keeps its place before `page`.
-        r#"{"name": "file_list", "arguments": {"repo": "candle", "page": 1, "path": ""}}"#,
+        // Required properties first, as the catalog compiles them: `path` is
+        // required on `file_list` and `file_read` alike, so it keeps its place
+        // before `page`; only `prefix` is optional.
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "", "page": 1}}"#,
         r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 1}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "candle", "page": 1, "path": "zend/src"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "zend/src", "page": 1}}"#,
         r#"{"name": "file_read", "arguments": {"repo": "candle", "path": "src/main.rs", "page": 1}}"#,
         r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "page": 1, "prefix": "zend/"}}"#,
         r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "page": 1, "prefix": "zend/"}}"#,

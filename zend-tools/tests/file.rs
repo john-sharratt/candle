@@ -463,7 +463,7 @@ fn a_stale_edit_does_not_copy_the_file_up() {
 
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "page": 1}),
+        json!({"repo": REPO, "path": "", "page": 1}),
         &ctx,
     ));
     let entry = listed["entries"]

@@ -532,9 +532,9 @@ mod tests {
     #[test]
     fn a_listing_is_never_a_candidate() {
         for args in [
-            json!({"repo": "candle"}),
-            json!({"repo": "candle", "path": "zend/src"}),
-            json!({"repo": "candle", "path": "zend/src/main.rs"}),
+            json!({"repo": "candle", "path": "", "page": 1}),
+            json!({"repo": "candle", "path": "zend/src", "page": 1}),
+            json!({"repo": "candle", "path": "zend/src/main.rs", "page": 1}),
         ] {
             assert_eq!(
                 read_key(&call("file_list", args.clone()), &workspace()),

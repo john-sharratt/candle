@@ -693,15 +693,25 @@ Enumerate **one** directory you already know the name of — the project's worki
 {
   "type": "object",
   "properties": {
-    "prefix": {
+    "repo": {
       "type": "string",
-      "description": "The directory to list (e.g. 'src/'), or a partial name within one ('src/ma') to filter it. Only this directory is listed.",
-      "default": ""
+      "description": "The repository to list inside. Required."
+    },
+    "path": {
+      "type": "string",
+      "description": "Directory to list, relative to the repository, e.g. `src/util`. Required; \"\" lists the repository's root."
+    },
+    "page": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Page of results to return, from 1. Required."
     }
   },
-  "required": []
+  "required": ["repo", "path", "page"]
 }
 ```
+
+`path` is required rather than defaulted: a grammar-constrained call writes the required fields and then closes, so an optional `path` was the cheapest field to leave out, and a model that planned six directories listed the root six times.
 
 **Returns** — one directory: its own files, and its immediate subdirectories as
 entries carrying `dir: true`, a trailing `/`, and no `bytes`.

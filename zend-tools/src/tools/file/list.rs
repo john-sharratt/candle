@@ -19,9 +19,9 @@ pub struct ListRequest {
     #[validate(length(min = 1))]
     pub repo: String,
     /// Directory to list, relative to the repository, e.g. `src/util`.
-    /// Defaults to "" — the repository's root. Must name a real directory (or
-    /// the root); a file path does not resolve.
-    pub path: Option<String>,
+    /// Required; `""` lists the repository's root. Must name a real directory
+    /// (or the root); a file path does not resolve.
+    pub path: String,
     /// Page of results to return, from 1 — 1 to start. When the response's
     /// `paging.next_page` is set, pass it here to read the following page.
     ///
@@ -75,8 +75,8 @@ impl Tool for FileList {
         "List one directory's immediate contents, as visible to this session: \
          the repository on disk plus anything written or edited during the \
          session, which shadows the file of the same path on disk. `repo` is \
-         required and names one repository: alone it lists that repository's \
-         root; add a directory `path` to list inside it. \
+         required and names one repository; `path` is required too: `\"\"` lists \
+         that repository's root, a directory path lists inside it. \
          A listing is one level deep — a subdirectory appears as its own \
          entry (`dir: true`), never expanded — so list it in turn to go \
          further. `path` must name a real directory; a file path does not \
@@ -100,7 +100,7 @@ impl Tool for FileList {
     }
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, FileError> {
-        let path = req.path.as_deref().unwrap_or("");
+        let path = req.path.as_str();
         let total_bytes = ctx.files.total_bytes();
         let repo = req.repo;
         let all = ctx
