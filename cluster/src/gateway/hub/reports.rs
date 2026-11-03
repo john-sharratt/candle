@@ -49,7 +49,8 @@ pub(in crate::gateway) enum Report {
     Capacity(Capacity),
     Routes(RouteTable),
     Complete(Complete),
-    Coord(CoordState),
+    /// Boxed: a coordination state is many times the size of any other report.
+    Coord(Box<CoordState>),
     Ack(Ack),
     BuildOffer(BuildArtifacts),
     BuildHave(BuildArtifacts),
@@ -115,12 +116,14 @@ pub(in crate::gateway) fn check_report(frame: Frame, node: u64) -> Result<Report
             RouteTable::decode(&r.table)
                 .map_err(|e| Close::new(CloseCode::Malformed, format!("ROUTES: {e}")))?,
         ),
-        Frame::Coord(c) => Report::Coord(CoordState::decode(&c.state).ok_or_else(|| {
-            Close::new(
-                CloseCode::Malformed,
-                "a COORD that is not a coordination state",
-            )
-        })?),
+        Frame::Coord(c) => {
+            Report::Coord(Box::new(CoordState::decode(&c.state).ok_or_else(|| {
+                Close::new(
+                    CloseCode::Malformed,
+                    "a COORD that is not a coordination state",
+                )
+            })?))
+        }
         Frame::Capacity(c) => Report::Capacity(c),
         Frame::Complete(c) => Report::Complete(c),
         Frame::Ack(a) => Report::Ack(a),
@@ -197,6 +200,7 @@ pub(in crate::gateway) fn apply_report(
         // other member reads it.
         Report::Complete(c) => s.registry.completed(app, node, &c.keys),
         Report::Coord(state) => {
+            let state = *state;
             let key = (app.to_string(), node);
             let Some(socket) = s.sockets.get_mut(&key) else {
                 return done;
