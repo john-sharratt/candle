@@ -19,7 +19,9 @@ use super::caller::Caller;
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
-use super::tools::{cluster_audit, cluster_logs, cluster_status, job, repo_job, service, Answer, Ctx};
+use super::tools::{
+    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, Answer, Ctx,
+};
 use crate::session::ZendSession;
 
 /// The longest a worker's call waits: it has no client to cut it off, and a
@@ -49,7 +51,10 @@ pub struct OpsCall {
 impl OpsCall {
     /// The identity a request it sends states.
     pub fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
-        self.caller.as_ref().map(Caller::headers).unwrap_or_default()
+        self.caller
+            .as_ref()
+            .map(Caller::headers)
+            .unwrap_or_default()
     }
 
     /// Whether it acts as an Admin.
@@ -255,23 +260,36 @@ mod tests {
     #[test]
     fn a_worker_reads_as_an_admin_and_changes_as_a_coder() {
         assert_eq!(
-            unfit(service::status::NAME, Role::Admin, WorkerKind::Reviewer, false),
+            unfit(
+                service::status::NAME,
+                Role::Admin,
+                WorkerKind::Reviewer,
+                false
+            ),
             None
         );
         assert_eq!(
             unfit(service::deploy::NAME, Role::Admin, WorkerKind::Coder, false),
             None
         );
-        assert!(
-            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Researcher, true)
-                .unwrap()
-                .contains("coder")
-        );
+        assert!(unfit(
+            service::deploy::NAME,
+            Role::Admin,
+            WorkerKind::Researcher,
+            true
+        )
+        .unwrap()
+        .contains("coder"));
         assert!(unfit(job::read::NAME, Role::User, WorkerKind::Coder, true)
             .unwrap()
             .contains("Admin"));
         assert_eq!(
-            unfit(cluster_status::NAME, Role::Admin, WorkerKind::Reviewer, true),
+            unfit(
+                cluster_status::NAME,
+                Role::Admin,
+                WorkerKind::Reviewer,
+                true
+            ),
             None
         );
         assert!(
@@ -284,8 +302,10 @@ mod tests {
                 .unwrap()
                 .contains("coder")
         );
-        assert!(unfit("repo_job_start", Role::Admin, WorkerKind::Coder, true)
-            .unwrap()
-            .contains("not an operations tool"));
+        assert!(
+            unfit("repo_job_start", Role::Admin, WorkerKind::Coder, true)
+                .unwrap()
+                .contains("not an operations tool")
+        );
     }
 }

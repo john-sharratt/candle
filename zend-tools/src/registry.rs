@@ -995,15 +995,21 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
             "run_terminal_cmd",
         ],
     ),
-    (
-        "run_output",
-        &["command_output", "read_output", "run_log"],
-    ),
+    ("run_output", &["command_output", "read_output", "run_log"]),
     ("job_list", &["jobs", "list_jobs", "jobs_list"]),
-    ("job_status", &["job_wait", "wait_job", "jobs_status", "wait_jobs"]),
-    ("job_read", &["job_log", "read_job", "job_page", "job_output"]),
+    (
+        "job_status",
+        &["job_wait", "wait_job", "jobs_status", "wait_jobs"],
+    ),
+    (
+        "job_read",
+        &["job_log", "read_job", "job_page", "job_output"],
+    ),
     ("job_grep", &["job_search", "grep_job", "search_job"]),
-    ("job_cancel", &["job_stop", "cancel_job", "stop_job", "job_kill"]),
+    (
+        "job_cancel",
+        &["job_stop", "cancel_job", "stop_job", "job_kill"],
+    ),
     (
         "sub_run",
         &[

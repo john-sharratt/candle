@@ -129,6 +129,9 @@ mod tests {
             ..LogRead::default()
         };
         let moved = shifted(read, 100);
-        assert_eq!((moved.lines[0].n, moved.next, moved.total), (102, Some(103), 103));
+        assert_eq!(
+            (moved.lines[0].n, moved.next, moved.total),
+            (102, Some(103), 103)
+        );
     }
 }

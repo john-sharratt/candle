@@ -34,7 +34,9 @@ impl JobHandle {
                  answer that started it wrote it — `job_list` lists them"
             )
         };
-        let (kind, rest) = text.split_once(':').ok_or_else(|| bad("it names no kind"))?;
+        let (kind, rest) = text
+            .split_once(':')
+            .ok_or_else(|| bad("it names no kind"))?;
         match kind {
             "task" => match Path::parse(&format!("T:{rest}")) {
                 Ok(Path::Worker { thread, worker }) => Ok(JobHandle::Task {
@@ -121,7 +123,9 @@ mod tests {
             .unwrap_err()
             .contains("`BUILD` is not a kind of job"));
         assert_eq!(
-            JobHandle::parse("deploy:76c3a0f4d39bd9db:Xe").unwrap().kind(),
+            JobHandle::parse("deploy:76c3a0f4d39bd9db:Xe")
+                .unwrap()
+                .kind(),
             "deploy"
         );
     }

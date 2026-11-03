@@ -12,7 +12,9 @@ use super::build::{self, agents, summary_text};
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::cluster_status::ago;
 use crate::mcp::tools::repo_job::{lost, phase, span, Handle};
-use crate::mcp::tools::service::{keep, resolve, Deploy, Stage, KEEP_CANCEL, KEEP_LOG, PROOF_WINDOW_MS};
+use crate::mcp::tools::service::{
+    keep, resolve, Deploy, Stage, KEEP_CANCEL, KEEP_LOG, PROOF_WINDOW_MS,
+};
 use crate::mcp::tools::Answer;
 use crate::mcp::workers::now_ms;
 
@@ -48,7 +50,9 @@ fn line(job: &JobHandle, d: &Deploy, now: u64) -> String {
             d.build.lines
         ),
         Stage::BuildFailed(why) => format!("{head} — the build failed ({why}); nothing was tried"),
-        Stage::Built { stale: false, .. } => format!("{head} — built; keep's trial is being asked for"),
+        Stage::Built { stale: false, .. } => {
+            format!("{head} — built; keep's trial is being asked for")
+        }
         Stage::Built { stale: true, .. } => format!(
             "{head} — built, but no trial was started: the member that was to ask keep for it is \
              gone; deploy again"
@@ -111,7 +115,10 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
             }
         }
         Stage::Trying(_) => {
-            let trial_read = shifted(trial(call, &d, &LogAsk::Tail { lines: 1 }).await?, total + 1);
+            let trial_read = shifted(
+                trial(call, &d, &LogAsk::Tail { lines: 1 }).await?,
+                total + 1,
+            );
             total = trial_read.total;
             if let Some(l) = trial_read.lines.last() {
                 detail = format!("\nthe trial's last line {}: {}", l.n, l.text);
@@ -187,7 +194,9 @@ pub async fn read(call: &OpsCall, h: &Handle, ask: &LogAsk) -> Result<LogRead, S
     match ask {
         LogAsk::Lines { from, count } => range(call, &d, h, *from, *count).await,
         LogAsk::Summary | LogAsk::Tail { .. } if tried(&d) => {
-            let b = build::read(call, h, &LogAsk::Tail { lines: 1 }).await?.total;
+            let b = build::read(call, h, &LogAsk::Tail { lines: 1 })
+                .await?
+                .total;
             Ok(shifted(trial(call, &d, ask).await?, b + 1))
         }
         LogAsk::Summary | LogAsk::Tail { .. } => build::read(call, h, ask).await,

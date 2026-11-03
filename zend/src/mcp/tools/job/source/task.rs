@@ -35,7 +35,12 @@ fn worker(call: &OpsCall, thread: &str, name: &str) -> Result<(String, Worker), 
 pub fn output(w: &Worker, now: u64) -> String {
     let mut out = format!("{}: {}\n", handle(w), w.prompt.trim());
     for e in &w.entries {
-        out.push_str(&format!("── journal entry {}#{} ──\n{}\n", w.path(), e.id, e.text.trim()));
+        out.push_str(&format!(
+            "── journal entry {}#{} ──\n{}\n",
+            w.path(),
+            e.id,
+            e.text.trim()
+        ));
     }
     match w.state {
         State::Question => out.push_str(&format!(
@@ -51,11 +56,19 @@ pub fn output(w: &Worker, now: u64) -> String {
         )),
         State::Running => {}
     }
-    out.push_str(&format!("── its turn ──\n{}\n", turn_report::render(w, now)));
+    out.push_str(&format!(
+        "── its turn ──\n{}\n",
+        turn_report::render(w, now)
+    ));
     out
 }
 
-pub fn standing(call: &OpsCall, job: &JobHandle, thread: &str, name: &str) -> Result<Standing, String> {
+pub fn standing(
+    call: &OpsCall,
+    job: &JobHandle,
+    thread: &str,
+    name: &str,
+) -> Result<Standing, String> {
     let (owner, w) = worker(call, thread, name)?;
     let records = call.session.shared_substrate().ok_or(LOADING)?;
     let seen = reported::last(&records, &owner, thread, name);
@@ -99,9 +112,17 @@ pub fn read(call: &OpsCall, thread: &str, name: &str, ask: &LogAsk) -> Result<Lo
 
 pub fn cancel(call: &OpsCall, job: &JobHandle, thread: &str, name: &str) -> Answer {
     let Some(caller) = &call.caller else {
-        return Answer::error("a task is stopped as the person it works for, and this call names none");
+        return Answer::error(
+            "a task is stopped as the person it works for, and this call names none",
+        );
     };
-    match workers::stop(&call.session, caller, thread, name, "stopped with job_cancel") {
+    match workers::stop(
+        &call.session,
+        caller,
+        thread,
+        name,
+        "stopped with job_cancel",
+    ) {
         Ok(_) => Answer::ok(format!(
             "Stopping {job}: it stops at its next tool round and answers with what it has; it is \
              then stopped but live, and `repo_task_reply` redirects it. `job_status {{jobs: \

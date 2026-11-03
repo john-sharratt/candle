@@ -56,7 +56,10 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
             kind.map_or(String::new(), |k| format!("{k} "))
         )
     } else {
-        rows.iter().map(|r| r.line.as_str()).collect::<Vec<_>>().join("\n")
+        rows.iter()
+            .map(|r| r.line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     for e in unread {
         out.push_str(&format!("\n({e})"));

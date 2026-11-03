@@ -205,7 +205,9 @@ mod tests {
     #[test]
     fn the_next_steps_name_the_deploy_and_its_machine() {
         let next = next_steps(&JobHandle::Deploy(Handle::new(0xab, "Xe")));
-        assert!(next.contains(r#"`job_status {jobs: ["deploy:00000000000000ab:Xe"], wait_s: 240}`"#));
+        assert!(
+            next.contains(r#"`job_status {jobs: ["deploy:00000000000000ab:Xe"], wait_s: 240}`"#)
+        );
         assert!(next.contains(r#"`job_cancel {job: "deploy:00000000000000ab:Xe"}`"#));
     }
 

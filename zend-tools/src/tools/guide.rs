@@ -129,7 +129,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(unknown.to_string().contains("the guides are: "), "{unknown}");
+        assert!(
+            unknown.to_string().contains("the guides are: "),
+            "{unknown}"
+        );
         let list = GuideList::run(&ctx, ListRequest {}).unwrap();
         assert!(list.text.contains("\n- deploy — "), "{}", list.text);
         assert!(list.text.contains("\n- test — "), "{}", list.text);

@@ -8,7 +8,7 @@ use cluster::log_read::{Line, LogAsk, LogRead, Summary};
 use super::super::{pages, JobHandle, Standing, PAGE_LINES};
 use super::Row;
 use crate::mcp::ops_tools::OpsCall;
-use crate::mcp::tools::repo_job::{describe, host_of, host_in, lost, Handle, NO_AGENTS};
+use crate::mcp::tools::repo_job::{describe, host_in, host_of, lost, Handle, NO_AGENTS};
 use crate::mcp::tools::service::built_service;
 use crate::mcp::tools::Answer;
 use crate::mcp::workers::now_ms;
@@ -83,10 +83,9 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
         .map_err(|e| lost(h, &e))?;
     let detail = match (&read.summary, ended) {
         (Some(s), true) => summary_text(job, s),
-        (Some(s), false) => s
-            .last
-            .last()
-            .map_or(String::new(), |l| format!("\nlast line {}: {}", l.n, l.text)),
+        (Some(s), false) => s.last.last().map_or(String::new(), |l| {
+            format!("\nlast line {}: {}", l.n, l.text)
+        }),
         (None, _) => String::new(),
     };
     Ok(Standing {

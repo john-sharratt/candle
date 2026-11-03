@@ -73,11 +73,7 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
                 } else {
                     String::new()
                 },
-                if s.ended {
-                    ""
-                } else {
-                    ", still being written"
-                }
+                if s.ended { "" } else { ", still being written" }
             );
             for l in &r.lines {
                 out.push_str(&format!("\n{}: {}", l.n, l.text));

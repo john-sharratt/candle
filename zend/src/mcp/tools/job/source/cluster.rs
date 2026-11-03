@@ -50,7 +50,10 @@ async fn stream(call: &OpsCall, node: &str, n: u64) -> Result<(String, bool), St
         )
         .await?;
     match reply.status {
-        200 => Ok((String::from_utf8_lossy(&reply.body).into_owned(), reply.complete)),
+        200 => Ok((
+            String::from_utf8_lossy(&reply.body).into_owned(),
+            reply.complete,
+        )),
         404 => Err(format!(
             "cluster:{node}:{n} is not on its member: a job is kept where it ran, and one lost to \
              a restart is gone"
@@ -136,7 +139,12 @@ fn output(ndjson: &str) -> String {
         .collect()
 }
 
-pub async fn standing(call: &OpsCall, job: &JobHandle, node: &str, n: u64) -> Result<Standing, String> {
+pub async fn standing(
+    call: &OpsCall,
+    job: &JobHandle,
+    node: &str,
+    n: u64,
+) -> Result<Standing, String> {
     let (ndjson, ended) = stream(call, node, n).await?;
     let summary = summarise(&ndjson, ended);
     let (line, detail) = summary
