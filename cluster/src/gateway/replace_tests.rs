@@ -238,7 +238,9 @@ async fn held_reports_land_in_the_order_they_arrived() {
 
 /// **A standing session that has left takes its held reports with it**: a
 /// `CLAIM` it sent while a replacement was pending is not applied once the
-/// handshake fails, for its node is no member here.
+/// handshake fails, for its node is no member here — nothing is relayed of
+/// it, and the only thing that follows is the group, now empty, losing its
+/// model lock.
 #[tokio::test]
 async fn a_departed_sessions_held_reports_go_with_it() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
@@ -249,8 +251,17 @@ async fn a_departed_sessions_held_reports_go_with_it() {
     let mut s = hub.state();
     s.sockets.remove(&("zend".to_string(), 1));
     assert!(s.registry.leave("zend", 1, first));
-    assert!(undo_pending(&mut s, "zend", 1, &second).is_empty());
+    let applied = undo_pending(&mut s, "zend", 1, &second);
     assert_eq!(s.registry.claims("zend").holder(b"k"), None);
+    assert!(
+        applied.iter().all(|a| a.to_others.is_empty()),
+        "nothing relayed"
+    );
+    let notes: Vec<&str> = applied
+        .iter()
+        .flat_map(|a| a.notes.iter().map(|(_, text)| text.as_str()))
+        .collect();
+    assert_eq!(notes, ["model lock cleared: the group is empty"]);
 }
 
 fn claim(key: &[u8], ms: u64) -> Frame {
