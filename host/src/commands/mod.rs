@@ -11,7 +11,8 @@
 //! | [`exec`] | what each command does |
 //!
 //! A command answers at once with its job; its progress streams on
-//! `GET /v1/cluster/command/job/:id`. Each one is reported in the member's
+//! `GET /v1/cluster/command/job/:id`, and `GET /v1/cluster/command/jobs` lists
+//! the jobs each member keeps (`docs/jobs.md` §5). Each one is reported in the member's
 //! `COORD`, so every gateway's coordination log shows who ran it, with what,
 //! and how it ended.
 
@@ -28,7 +29,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cluster::coord::CommandLine;
-use cluster::dispatch::Dispatch;
+use cluster::dispatch::{Dispatch, Merge};
 use cluster::replicate::Replicator;
 use serde_json::json;
 use web::auth::forwarded::identify;
@@ -145,6 +146,13 @@ pub fn table(roles: Roles) -> Api<Arc<Commands>> {
             Dispatch::Any,
             get(job),
         )
+        // Every member's own, gathered: a job lives in the member that ran it.
+        .route(
+            "/v1/cluster/command/jobs",
+            Role::Admin,
+            Dispatch::Aggregate(Merge::Envelope),
+            get(jobs_list),
+        )
         .route(
             "/v1/cluster/quorum",
             Role::Admin,
@@ -223,6 +231,11 @@ async fn quorum(
         Ok(body) => started(&commands, "set-quorum", body, &headers),
         Err(refused) => *refused,
     }
+}
+
+/// `GET /v1/cluster/command/jobs`: this member's kept jobs, newest first.
+async fn jobs_list(State(commands): State<Arc<Commands>>) -> Response {
+    Json(json!({"jobs": commands.jobs.list()})).into_response()
 }
 
 async fn job(State(commands): State<Arc<Commands>>, Path(id): Path<u64>) -> Response {

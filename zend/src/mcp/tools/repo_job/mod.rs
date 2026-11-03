@@ -159,7 +159,7 @@ pub fn phase(phase: &Phase, node: u64) -> String {
             "waiting for its checkout behind {}",
             behind
                 .iter()
-                .map(|id| Handle::new(node, id).to_string())
+                .map(|id| format!("build:{}", Handle::new(node, id)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -188,18 +188,23 @@ pub fn command_line(words: &[String], max: usize) -> String {
     }
 }
 
-/// One job in a line: its handle, machine, command, where it is, how long it
-/// has run, its log's length, and what it came to.
-pub fn describe(handle: &Handle, host: &str, view: &JobView, now: u64) -> String {
+/// One agent job in a line, under `label` — its job handle: machine, command,
+/// where it is, how long it has run, its log's length, and what it came to.
+pub fn describe(label: &str, host: &str, view: &JobView, now: u64) -> String {
     let ended = view.status.is_finished();
     let ran = view.ended_ms.unwrap_or(now).saturating_sub(view.started_ms);
+    let node = label
+        .rsplit(':')
+        .nth(1)
+        .and_then(|n| u64::from_str_radix(n, 16).ok())
+        .unwrap_or(0);
     let at = if ended {
         state(&view.status)
     } else {
-        phase(&view.phase, handle.node)
+        phase(&view.phase, node)
     };
     let mut out = format!(
-        "job {handle} on {host}: `{}` on {} — {at}, {} {}, {} lines",
+        "{label} on {host}: `{}` on {} — {at}, {} {}, {} lines",
         command_line(&view.command, 160),
         view.repo,
         if ended { "took" } else { "for" },
@@ -301,7 +306,7 @@ mod tests {
     /// waiting names the jobs ahead of it by handle, and one ended says how.
     #[test]
     fn a_job_reads_as_where_it_is() {
-        let h = Handle::new(0xab, "Xe");
+        let h = "build:00000000000000ab:Xe";
         let waiting = view(
             JobStatus::Queued,
             Phase::Waiting {
@@ -310,9 +315,9 @@ mod tests {
             None,
         );
         assert_eq!(
-            describe(&h, "BlackWorld", &waiting, 126_000),
-            "job 00000000000000ab:Xe on BlackWorld: `cargo test -p web` on candle — waiting for \
-             its checkout behind 00000000000000ab:Yz, for 2 min 5 s, 120 lines"
+            describe(h, "BlackWorld", &waiting, 126_000),
+            "build:00000000000000ab:Xe on BlackWorld: `cargo test -p web` on candle — waiting for \
+             its checkout behind build:00000000000000ab:Yz, for 2 min 5 s, 120 lines"
         );
         let done = JobView {
             staged: Some(Staged::At("D:/keep/stage/web.exe".into())),
@@ -323,9 +328,9 @@ mod tests {
             )
         };
         assert_eq!(
-            describe(&h, "BlackWorld", &done, 999_999),
-            "job 00000000000000ab:Xe on BlackWorld: `cargo test -p web` on candle — exited 0, took \
-             42 s, 120 lines; staged at D:/keep/stage/web.exe"
+            describe(h, "BlackWorld", &done, 999_999),
+            "build:00000000000000ab:Xe on BlackWorld: `cargo test -p web` on candle — exited 0, \
+             took 42 s, 120 lines; staged at D:/keep/stage/web.exe"
         );
         assert_eq!(span(3_700_000), "1 h 1 min");
     }

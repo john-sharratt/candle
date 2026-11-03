@@ -49,6 +49,7 @@ pub mod group_create;
 pub mod group_default;
 pub mod group_describe;
 mod group_remove;
+pub mod job;
 mod journal_accept;
 mod journal_create;
 mod journal_edit;
@@ -180,6 +181,11 @@ pub fn definitions() -> Value {
         zen_chat_send::definition(),
         zen_chat_read::definition(),
         zen_chat_close::definition(),
+        job::list::definition(),
+        job::status::definition(),
+        job::read::definition(),
+        job::grep::definition(),
+        job::cancel::definition(),
         cluster_status::definition(),
         cluster_logs::definition(),
         cluster_audit::definition(),
@@ -245,6 +251,11 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         zen_chat_send::NAME => zen_chat_send::call(ctx, args).await,
         zen_chat_read::NAME => zen_chat_read::call(ctx, args).await,
         zen_chat_close::NAME => blocking(ctx, args, zen_chat_close::call).await,
+        job::list::NAME => job::list::call(ctx, args).await,
+        job::status::NAME => job::status::call(ctx, args).await,
+        job::read::NAME => job::read::call(ctx, args).await,
+        job::grep::NAME => job::grep::call(ctx, args).await,
+        job::cancel::NAME => job::cancel::call(ctx, args).await,
         cluster_status::NAME => cluster_status::call(ctx, args).await,
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
@@ -365,6 +376,11 @@ mod tests {
                 "zen_chat_send",
                 "zen_chat_read",
                 "zen_chat_close",
+                "job_list",
+                "job_status",
+                "job_read",
+                "job_grep",
+                "job_cancel",
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
@@ -412,6 +428,10 @@ mod tests {
                 "journal_grep",
                 "thread_list",
                 "zen_chat_read",
+                "job_list",
+                "job_status",
+                "job_read",
+                "job_grep",
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",

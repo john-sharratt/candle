@@ -437,6 +437,7 @@ mod tests {
                 ("/v1/logs", "user"),
                 ("/v1/cluster/command/:name", "admin"),
                 ("/v1/cluster/command/job/:id", "admin"),
+                ("/v1/cluster/command/jobs", "admin"),
                 ("/v1/cluster/quorum", "admin"),
                 ("/common/*path", "unauthenticated"),
                 ("/brand/*path", "unauthenticated"),

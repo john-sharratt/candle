@@ -180,6 +180,28 @@ impl Jobs {
     pub fn running(&self) -> Option<Arc<Job>> {
         self.inner().running.clone()
     }
+
+    /// Every job kept, newest first, as `GET /v1/cluster/command/jobs` lists
+    /// them: its id, command, when it started, whether it has ended, how many
+    /// lines it has written, and its last line.
+    pub fn list(&self) -> Vec<Value> {
+        self.inner()
+            .kept
+            .iter()
+            .rev()
+            .map(|j| {
+                let lines = j.snapshot();
+                json!({
+                    "id": j.id,
+                    "command": j.command,
+                    "started_ms": j.started_ms,
+                    "ended": j.ended(),
+                    "lines": lines.len(),
+                    "last": lines.last().cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +258,34 @@ mod tests {
         );
         // Read again once it has ended: the same lines, then the end.
         assert_eq!(job.stream().count().await, 3);
+    }
+
+    /// **The jobs are listed newest first**, each with whether it ended, its
+    /// line count and its last line.
+    #[test]
+    fn the_jobs_are_listed_newest_first() {
+        let jobs = Jobs::new();
+        let a = jobs.start("compact", json!({})).unwrap();
+        jobs.finish(&a, Ok(json!({"ran": true})));
+        let b = jobs.start("drain", json!({"app": "zend"})).unwrap();
+        b.step("drain", "3 of 9 handed off");
+        let listed = jobs.list();
+        let row = |j: &Value| {
+            (
+                j["id"].as_u64().unwrap(),
+                j["ended"].as_bool().unwrap(),
+                j["lines"].as_u64().unwrap(),
+            )
+        };
+        assert_eq!(
+            listed.iter().map(row).collect::<Vec<_>>(),
+            [(2, false, 2), (1, true, 2)]
+        );
+        assert_eq!(
+            without_time(listed[0]["last"].clone())["detail"],
+            "3 of 9 handed off"
+        );
+        assert_eq!(listed[1]["command"], "compact");
     }
 
     #[test]
