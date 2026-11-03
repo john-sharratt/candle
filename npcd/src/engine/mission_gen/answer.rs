@@ -231,6 +231,7 @@ pub(super) fn text(name: &str) -> CallParam {
         properties: None,
         nullable: false,
         minimum: None,
+        maximum: None,
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),

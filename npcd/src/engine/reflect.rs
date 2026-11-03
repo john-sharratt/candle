@@ -384,6 +384,7 @@ fn call_tree(
                 properties: None,
                 nullable: false,
                 minimum: None,
+                maximum: None,
                 max_tokens: None,
                 requires: Vec::new(),
                 shapes: Vec::new(),

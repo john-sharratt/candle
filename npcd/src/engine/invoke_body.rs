@@ -121,6 +121,7 @@ fn body_of(tool: &Tool, within: &Within) -> StencilParam {
         properties: Some(stencil_params(tool, within)),
         nullable: false,
         minimum: None,
+        maximum: None,
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),

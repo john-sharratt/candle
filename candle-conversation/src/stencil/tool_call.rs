@@ -122,6 +122,12 @@ pub struct Param {
     /// no `-`; absent or negative, the value may be signed.
     #[serde(default)]
     pub minimum: Option<f64>,
+    /// `integer`: the schema's `maximum`. Below 10 the value is one digit, and
+    /// the grammar offers only the digits up to it — `context` 0–5 cannot be
+    /// written 6. Above, it bounds the digit count ([`Self::max_tokens`]), and
+    /// a value of the right length past it is the tool's to refuse.
+    #[serde(default)]
+    pub maximum: Option<f64>,
     /// `string`: the most tokens the value may run to before the grammar closes
     /// it — the schema's `maxLength`, counted in tokens. Bounds the value below
     /// the envelope's [`ToolCallEnvelope::max_string_tokens`], never above it.
@@ -327,6 +333,7 @@ fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> 
         properties: Some(merged),
         nullable: false,
         minimum: None,
+        maximum: None,
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
@@ -575,6 +582,10 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         properties,
         nullable,
         minimum: schema.get("minimum").and_then(Value::as_f64),
+        maximum: match ty {
+            ParamType::Integer => schema.get("maximum").and_then(Value::as_f64),
+            _ => None,
+        },
         // Characters bound tokens from above: no token is shorter than one. An
         // integer's bound is its `maximum`'s digits: each is one token.
         max_tokens: match ty {
@@ -1864,8 +1875,15 @@ impl<'a> ToolTreeBuilder<'a> {
             arms.extend(ends.iter().cloned());
             more = self.spec.push(NodeSpec::Branch { arms });
         }
-        let leading: Vec<(String, SpecId)> =
-            DIGITS[1..].iter().map(|d| (d.to_string(), more)).collect();
+        // A one-digit value's own maximum is its last digit.
+        let top = match p.maximum {
+            Some(m) if digits == 1 && (1.0..10.0).contains(&m) => m as usize,
+            _ => 9,
+        };
+        let leading: Vec<(String, SpecId)> = DIGITS[1..=top]
+            .iter()
+            .map(|d| (d.to_string(), more))
+            .collect();
         // `0` is a whole value of its own, offered only where the schema's
         // `minimum` admits it: a one-based page has no page 0 to write.
         let mut first = Vec::with_capacity(DIGITS.len() + 1);

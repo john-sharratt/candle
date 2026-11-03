@@ -676,6 +676,24 @@ mod tests {
         assert!(next.contains(b'0' as TokenId), "{next:?}");
     }
 
+    /// **A one-digit maximum offers no digit past it**: `context` 0–5 cannot
+    /// be written 6. Live, a worker asked for six lines of context wrote
+    /// `"context": 6` and spent a round on the refusal.
+    #[test]
+    fn a_one_digit_maximum_offers_no_digit_past_it() {
+        let (_, set) = at_integer(
+            r#"[{"name":"grep","params":[
+                 {"name":"context","type":"integer","minimum":0.0,"maximum":5.0,
+                  "max_tokens":1,"required":true}]}]"#,
+        );
+        for d in b'0'..=b'5' {
+            assert!(set.contains(d as TokenId), "digit {}", d as char);
+        }
+        for d in b'6'..=b'9' {
+            assert!(!set.contains(d as TokenId), "digit {}", d as char);
+        }
+    }
+
     /// **A leading zero ends the number**, as JSON requires — `07` is not a
     /// number — so after it only what follows the value can be written.
     #[test]

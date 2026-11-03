@@ -34,6 +34,7 @@ fn param(name: &str, ty: ParamType, required: bool) -> Param {
         properties: None,
         nullable: false,
         minimum: None,
+        maximum: None,
         max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
