@@ -85,12 +85,44 @@ fn the_proof_line_in_the_log_counts_when_the_process_then_exits() {
     let log = dir.join(LOG);
     let mut child = spawn_trial(&exe, &[], &dir, &log).unwrap();
     let started = Instant::now();
-    let verdict = watch_proof(&mut child, &log, Duration::from_secs(10));
+    let verdict = watch_proof(&mut child, &log, Duration::from_secs(10), &|| false);
     let elapsed = started.elapsed();
     reap(&mut child);
     let _ = fs::remove_dir_all(&dir);
     assert_eq!(verdict, Verdict::Proven);
     assert!(elapsed < Duration::from_secs(8));
+}
+
+/// **A cancelled trial stops being watched at once**, however long its limit.
+#[cfg(windows)]
+#[test]
+fn a_cancelled_trial_is_not_waited_out() {
+    let Some(ping) = ping() else {
+        return;
+    };
+    let dir = scratch();
+    let log = dir.join(LOG);
+    let mut child = spawn_trial(
+        &ping,
+        &[
+            OsString::from("-n"),
+            OsString::from("30"),
+            OsString::from("127.0.0.1"),
+        ],
+        &dir,
+        &log,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let asked = Instant::now() + Duration::from_millis(300);
+    let verdict = watch_proof(&mut child, &log, Duration::from_secs(10 * 60), &|| {
+        Instant::now() >= asked
+    });
+    let elapsed = started.elapsed();
+    reap(&mut child);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(verdict, Verdict::Cancelled);
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
 
 #[cfg(windows)]
@@ -106,7 +138,7 @@ fn a_process_that_exits_without_the_line_is_not_waited_out() {
     )
     .unwrap();
     let started = Instant::now();
-    let verdict = watch_proof(&mut child, &log, Duration::from_secs(10 * 60));
+    let verdict = watch_proof(&mut child, &log, Duration::from_secs(10 * 60), &|| false);
     let elapsed = started.elapsed();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
@@ -143,7 +175,7 @@ fn no_proof_line_within_the_limit_is_a_timeout() {
     )
     .unwrap();
     let started = Instant::now();
-    let verdict = watch_proof(&mut child, &log, Duration::from_millis(300));
+    let verdict = watch_proof(&mut child, &log, Duration::from_millis(300), &|| false);
     let elapsed = started.elapsed();
     reap(&mut child);
     let _ = fs::remove_dir_all(&dir);
@@ -179,7 +211,7 @@ fn a_trial_that_keeps_syncing_is_waited_out() {
     let log = dir.join(LOG);
     let mut child = spawn_trial(&exe, &[], &dir, &log).unwrap();
     let started = Instant::now();
-    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600));
+    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600), &|| false);
     let elapsed = started.elapsed();
     reap(&mut child);
     let _ = fs::remove_dir_all(&dir);
@@ -197,7 +229,7 @@ fn a_stalled_sync_times_out_a_limit_after_its_last_line() {
     let log = dir.join(LOG);
     let mut child = spawn_trial(&exe, &[], &dir, &log).unwrap();
     let started = Instant::now();
-    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600));
+    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600), &|| false);
     let elapsed = started.elapsed();
     reap(&mut child);
     let _ = fs::remove_dir_all(&dir);
@@ -228,7 +260,7 @@ fn a_proven_trial_keeps_running_from_the_stable_path() {
     let log = dir.join(LOG);
 
     let mut running =
-        switch_to(&staged, &stable, &log, &[], &dir, Duration::from_secs(15)).unwrap();
+        switch_to(&staged, &stable, &log, &[], &dir, Duration::from_secs(15), &|| false).unwrap();
     let ended = running.ended.clone();
     let alive = running.child.try_wait().unwrap().is_none();
     let detached = running.child.stdout.is_none() && running.child.stderr.is_none();
@@ -284,6 +316,7 @@ fn a_timed_out_trial_is_stopped_and_the_previous_stable_file_is_started() {
         &args,
         &dir,
         Duration::from_millis(300),
+        &|| false,
     )
     .unwrap();
     let ended = running.ended.clone();

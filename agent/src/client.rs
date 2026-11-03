@@ -16,8 +16,9 @@
 //!
 //! An admin watches the agents through the same streams (§11.7):
 //! [`Agents::listing`] names every agent the gateway admitted, and
-//! [`Agents::jobs_of`], [`Agents::tail`], [`Agents::cancel`] and
-//! [`Agents::switch`] address one of them by its node.
+//! [`Agents::jobs_of`], [`Agents::wait`], [`Agents::tail`],
+//! [`Agents::read_log`], [`Agents::cancel`] and [`Agents::switch`] address one
+//! of them by its node.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use cluster::gateway::{
     state_name, AgentRepo, AgentRow, AGENTS_PATH, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER,
     REPO_HEADER, TOOLCHAIN_HEADER,
 };
+use cluster::log_read::{LogAsk, LogRead};
 use cluster::member::AppMember;
 use cluster::version::this_build;
 use http_body_util::BodyExt;
@@ -36,7 +38,7 @@ use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use zend_vfs::{FetchBundle, JobStatus, PushResult, RemoteRefs, RunOutcome};
 
-use crate::jobs::{JobError, Jobs};
+use crate::jobs::{JobError, Jobs, MAX_WAIT};
 use crate::member::{capacity, node_in, APP};
 use crate::wire::{
     AgentJobs, BridgeCall, Bridged, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit,
@@ -532,6 +534,40 @@ impl Agents {
                     Vec::new(),
                 )
                 .await
+            }
+        }
+    }
+
+    /// Job `id` on agent `at` once it has ended, or as it stands after
+    /// `wait` — at most [`MAX_WAIT`] — whichever comes first.
+    pub async fn wait(&self, at: At, id: &str, wait: Duration) -> Result<JobView, AgentError> {
+        match at {
+            At::InProcess => self.own()?.wait(id, wait).await.map_err(refused),
+            At::Agent(node) => {
+                let secs = wait.min(MAX_WAIT).as_secs();
+                self.ask(
+                    Method::GET,
+                    node,
+                    format!("/v1/jobs/{id}?wait={secs}"),
+                    Vec::new(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer `ask` of job `id`'s log, read on agent `at`.
+    pub async fn read_log(&self, at: At, id: &str, ask: &LogAsk) -> Result<LogRead, AgentError> {
+        match at {
+            At::InProcess => self
+                .own()?
+                .read_log(id, ask.clone())
+                .await
+                .map_err(refused),
+            At::Agent(node) => {
+                let body = serde_json::to_vec(ask).expect("an ask serialises");
+                self.ask(Method::POST, node, format!("/v1/jobs/{id}/read"), body)
+                    .await
             }
         }
     }

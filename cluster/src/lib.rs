@@ -43,6 +43,7 @@ pub mod frame;
 pub mod gateway;
 pub mod handshake;
 pub mod launch;
+pub mod log_read;
 pub mod machine;
 pub mod machines;
 pub mod member;

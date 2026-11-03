@@ -108,6 +108,8 @@ struct Slot {
     tx: Sender<Req>,
     /// See [`ServiceCfg::status`].
     status: Option<String>,
+    /// See [`Service::trial_log`]: read back for the cluster.
+    trial_log: PathBuf,
 }
 
 /// What a service's supervisor is asked to do.
@@ -168,6 +170,7 @@ fn main() -> anyhow::Result<()> {
             stable: svc.stable.clone(),
             tx,
             status,
+            trial_log: svc.trial_log.clone(),
         });
         let name = svc.name.clone();
         thread::Builder::new()
@@ -197,6 +200,7 @@ impl Clone for Slot {
             stable: self.stable.clone(),
             tx: self.tx.clone(),
             status: self.status.clone(),
+            trial_log: self.trial_log.clone(),
         }
     }
 }
@@ -422,6 +426,7 @@ fn apply(svc: &Service, live: Option<Live>, path: &Path, reply: Sender<Answer>) 
         &svc.args,
         &svc.cwd,
         TRIAL,
+        &|| BOARD.cancelled(&svc.name),
     );
     let answer = match &result {
         Ok(Running {
@@ -709,7 +714,7 @@ fn dispatch(body: &str, slots: &[Slot], hand: Hand, forced: bool) -> Answer {
         return refused;
     }
     if hand == Hand::Trial {
-        if let Err(refused) = begin(slot, body) {
+        if let Err(refused) = begin(slot, body, None) {
             return refused;
         }
     }
@@ -758,10 +763,13 @@ fn target<'a>(body: &str, slots: &'a [Slot]) -> Result<(PathBuf, &'a Slot), Answ
     Ok((path, slot))
 }
 
-/// Put a trial of `artifact` on `slot`'s board: on it while it runs, however
-/// it was asked for, so the cluster reads it and a second one is refused.
-fn begin(slot: &Slot, artifact: &str) -> Result<(), Answer> {
-    BOARD.begin(&slot.name, artifact).map_err(trial_running)
+/// Put a trial of `artifact`, for `deploy` when a deploy asked for it, on
+/// `slot`'s board: on it while it runs, however it was asked for, so the
+/// cluster reads it and a second one is refused.
+fn begin(slot: &Slot, artifact: &str, deploy: Option<&str>) -> Result<(), Answer> {
+    BOARD
+        .begin(&slot.name, artifact, deploy)
+        .map_err(trial_running)
 }
 
 /// The answer to a trial asked for while one runs: 423, which is not the 409 of

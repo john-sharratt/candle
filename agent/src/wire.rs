@@ -247,6 +247,14 @@ pub struct JobView {
     /// Where it has got to (see [`Phase`]).
     #[serde(default)]
     pub phase: Phase,
+    /// Its command line and its times, as [`JobLine`] has them: what a reader
+    /// of one job needs to say what it is and how long it has run.
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub started_ms: u64,
+    #[serde(default)]
+    pub ended_ms: Option<u64>,
 }
 
 /// Where a job has got to, finer than its status: a run is accepted before
@@ -588,6 +596,9 @@ mod tests {
             listed: None,
             staged: None,
             phase: Phase::Ended,
+            command: vec!["cargo".into(), "check".into()],
+            started_ms: 5,
+            ended_ms: Some(9),
         };
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(
@@ -595,7 +606,8 @@ mod tests {
             json!({
                 "id": "AAAAAAAAAAA", "repo": "candle", "status": "exited", "code": 0,
                 "lines": 3, "bytes": 40, "outcome": null, "pushed": [], "fetched": null,
-                "phase": {"at": "ended"}
+                "phase": {"at": "ended"}, "command": ["cargo", "check"],
+                "started_ms": 5, "ended_ms": 9
             })
         );
         assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), view);

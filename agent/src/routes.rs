@@ -9,6 +9,7 @@
 //! | `GET /v1/jobs/:id` | where it stands; `?wait=<s>` holds the answer until it ends, up to 30 s |
 //! | `GET /v1/jobs/:id/log` | its log from the first byte |
 //! | `GET /v1/jobs/:id/tail?from=<byte>` | its log from a byte, as a [`LogChunk`] |
+//! | `POST /v1/jobs/:id/read` | a [`LogAsk`] of its log — a summary, a tail, a range of lines, a search — answered here ([`LogRead`]) |
 //! | `DELETE /v1/jobs/:id` | cancel it, killing its process tree |
 //! | `PUT /v1/agent` | switch the agent on or off ([`Switching`], §11.7) |
 //!
@@ -19,6 +20,7 @@
 //!
 //! [`AgentJobs`]: crate::wire::AgentJobs
 //! [`LogChunk`]: crate::wire::LogChunk
+//! [`LogRead`]: cluster::log_read::LogRead
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -40,6 +42,8 @@ use effector_bridge::LocalNet;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+
+use cluster::log_read::LogAsk;
 
 use crate::jobs::{JobError, Jobs};
 use crate::wire::{BridgeCall, Bridged, Submit, Switching};
@@ -77,6 +81,7 @@ pub fn table() -> RouteTable {
         Route::new(&["GET", "DELETE"], "/v1/jobs/:id", Dispatch::Any),
         Route::new(&["GET"], "/v1/jobs/:id/log", Dispatch::Any),
         Route::new(&["GET"], "/v1/jobs/:id/tail", Dispatch::Any),
+        Route::new(&["POST"], "/v1/jobs/:id/read", Dispatch::Any),
         Route::new(&["PUT"], "/v1/agent", Dispatch::Any),
         // A device-bridge job runs on any in-network agent — it holds no repo
         // and needs no toolchain, only the house network the agent stands on.
@@ -91,6 +96,7 @@ pub fn router(jobs: Arc<Jobs>, claim: Claim, switched: Switched) -> Router {
         .route("/v1/jobs/:id", get(view).delete(cancel))
         .route("/v1/jobs/:id/log", get(log))
         .route("/v1/jobs/:id/tail", get(tail))
+        .route("/v1/jobs/:id/read", post(read_log))
         .route("/v1/agent", put(switch))
         .route("/v1/bridge", post(bridge))
         .layer(middleware::from_fn(members_only))
@@ -197,6 +203,17 @@ struct Offset {
 async fn tail(State(api): State<Api>, Path(id): Path<String>, Query(q): Query<Offset>) -> Response {
     match api.jobs.tail(&id, q.from.unwrap_or(0)).await {
         Ok(chunk) => Json(chunk).into_response(),
+        Err(e) => failed(e),
+    }
+}
+
+async fn read_log(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(ask): Json<LogAsk>,
+) -> Response {
+    match api.jobs.read_log(&id, ask).await {
+        Ok(read) => Json(read).into_response(),
         Err(e) => failed(e),
     }
 }

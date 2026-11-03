@@ -4,7 +4,9 @@
 //! | Route | |
 //! |---|---|
 //! | `GET /v1/keep/state` | each service: its stable file and build, whether it runs, its trials |
-//! | `POST /v1/keep/trial {service, artifact}` | a trial, run as a job: accepted at once, its end read from the state |
+//! | `POST /v1/keep/trial {service, artifact, deploy?}` | a trial, run as a job: accepted at once, its end read from the state |
+//! | `POST /v1/keep/trial/cancel {service}` | stop the running trial: it is rolled back, and its end says it was cancelled |
+//! | `POST /v1/keep/trial/log {service, ask}` | a [`LogAsk`] of the service's trial log — its stderr since its last trial — answered here |
 //! | `POST /v1/keep/service/:name/:action` | `restart`, `stop` or `start` |
 //!
 //! Only a cluster member's request is served — one the gateway stamped with
@@ -16,11 +18,14 @@
 //! on the machine.
 
 use std::convert::Infallible;
+use std::fs::File;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
 use cluster::dispatch::{Dispatch, Route as Declared, RouteTable};
+use cluster::log_read::{self, LogAsk, LogRead};
 use cluster::member::FROM_MEMBER;
 use cluster::session::VirtualConn;
 use cluster::upgrade::artifacts::{Probe, RunProbe};
@@ -38,6 +43,8 @@ use crate::{begin, find, service_request, switch, target, Action, Answer, Hand, 
 
 pub const STATE: &str = "/v1/keep/state";
 pub const TRIAL: &str = "/v1/keep/trial";
+pub const TRIAL_CANCEL: &str = "/v1/keep/trial/cancel";
+pub const TRIAL_LOG: &str = "/v1/keep/trial/log";
 const SERVICE: &str = "/v1/keep/service/";
 
 /// The routes keep declares, so the gateway knows what its socket takes.
@@ -45,6 +52,8 @@ pub fn table() -> RouteTable {
     RouteTable::new(vec![
         Declared::new(&["GET"], STATE, Dispatch::Any),
         Declared::new(&["POST"], TRIAL, Dispatch::Any),
+        Declared::new(&["POST"], TRIAL_CANCEL, Dispatch::Any),
+        Declared::new(&["POST"], TRIAL_LOG, Dispatch::Any),
         Declared::new(&["POST"], "/v1/keep/service/:name/:action", Dispatch::Any),
     ])
     .expect("keep's routes are distinct")
@@ -110,6 +119,8 @@ fn route(method: &Method, path: &str, body: &[u8], slots: &[Slot]) -> Response<F
     match (method, path) {
         (&Method::GET, STATE) => reply(StatusCode::OK, state(slots, &RunProbe)),
         (&Method::POST, TRIAL) => trial(body, slots, &RunProbe),
+        (&Method::POST, TRIAL_CANCEL) => cancel(body, slots),
+        (&Method::POST, TRIAL_LOG) => trial_log(body, slots),
         (&Method::POST, p) if p.starts_with(SERVICE) => {
             let rest = &p[SERVICE.len()..];
             let Some((name, action)) = rest.split_once('/') else {
@@ -166,6 +177,90 @@ pub fn state(slots: &[Slot], probe: &dyn Probe) -> Value {
 struct TrialAsk {
     service: String,
     artifact: PathBuf,
+    /// The deploy asking for it, kept on the board with the trial.
+    #[serde(default)]
+    deploy: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CancelAsk {
+    service: String,
+}
+
+#[derive(Deserialize)]
+struct LogOf {
+    service: String,
+    ask: LogAsk,
+}
+
+/// The slot of `service`, in any case.
+fn slot_of<'a>(slots: &'a [Slot], service: &str) -> Option<&'a Slot> {
+    slots.iter().find(|s| s.name.eq_ignore_ascii_case(service))
+}
+
+/// Ask the trial on a service to stop: its supervisor rolls it back.
+fn cancel(body: &[u8], slots: &[Slot]) -> Response<Full<Bytes>> {
+    let ask: CancelAsk = match serde_json::from_slice(body) {
+        Ok(a) => a,
+        Err(e) => {
+            return refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("a cancel is {{service}}: {e}"),
+            )
+        }
+    };
+    let Some(slot) = slot_of(slots, &ask.service) else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            format!("no service `{}`", ask.service),
+        );
+    };
+    match BOARD.cancel(&slot.name) {
+        Ok(trial) => reply(
+            StatusCode::ACCEPTED,
+            json!({"service": slot.name, "cancelled": trial, "read": STATE}),
+        ),
+        Err(e) => refuse(StatusCode::CONFLICT, e),
+    }
+}
+
+/// Answer a [`LogAsk`] of a service's trial log, read here.
+fn trial_log(body: &[u8], slots: &[Slot]) -> Response<Full<Bytes>> {
+    let ask: LogOf = match serde_json::from_slice(body) {
+        Ok(a) => a,
+        Err(e) => {
+            return refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("a log read is {{service, ask}}: {e}"),
+            )
+        }
+    };
+    let Some(slot) = slot_of(slots, &ask.service) else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            format!("no service `{}`", ask.service),
+        );
+    };
+    match read_trial_log(&slot.trial_log, &ask.ask, BOARD.trials(&slot.name).running.is_none()) {
+        Ok(read) => reply(StatusCode::OK, json!(read)),
+        Err(e) => refuse(
+            StatusCode::NOT_FOUND,
+            format!("{}'s trial log: {e}", slot.name),
+        ),
+    }
+}
+
+/// `ask` of the log at `path`, as long as it was when measured; `ended` when
+/// no trial is running to write more of it as a trial.
+pub fn read_trial_log(path: &Path, ask: &LogAsk, ended: bool) -> io::Result<LogRead> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let read = log_read::read(BufReader::new(file.take(size)), ask)?;
+    Ok(LogRead {
+        size,
+        ended,
+        ..read
+    })
 }
 
 /// Refuse `artifact` unless it is a build of a commit on `origin/main`.
@@ -228,8 +323,9 @@ fn trial(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> Response<Full<Bytes>
     // Checked and on the board before the answer, so a trial accepted is a
     // trial the state shows — running, then ended.
     let artifact = ask.artifact.display().to_string();
+    let deploy = ask.deploy.as_deref();
     let (path, tried) = match target(&artifact, slots).and_then(|(path, tried)| {
-        begin(tried, &artifact)?;
+        begin(tried, &artifact, deploy)?;
         Ok((path, tried.clone()))
     }) {
         Ok(t) => t,
@@ -282,14 +378,38 @@ mod tests {
     }
 
     #[test]
-    fn keep_declares_its_three_routes() {
+    fn keep_declares_its_routes() {
         let t = table();
         assert!(t.lookup("GET", STATE).is_some());
         assert!(t.lookup("POST", TRIAL).is_some());
+        assert!(t.lookup("POST", TRIAL_CANCEL).is_some());
+        assert!(t.lookup("POST", TRIAL_LOG).is_some());
         assert!(t
             .lookup("POST", "/v1/keep/service/motherd/restart")
             .is_some());
         assert!(t.lookup("POST", "/accept").is_none());
         assert!(t.lookup("POST", STATE).is_none());
+    }
+
+    /// **A trial's log is read where it is written**: numbered lines, the
+    /// file's length, and whether a trial is still writing it.
+    #[test]
+    fn a_trial_log_is_read_here() {
+        let dir = std::env::temp_dir().join(format!("keep-trial-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("motherd.trial.log");
+        std::fs::write(&path, b"loading\nsyncing 3\nINFO serving\n").unwrap();
+        let read = read_trial_log(&path, &LogAsk::Tail { lines: 2 }, false).unwrap();
+        let missing = read_trial_log(&dir.join("none.log"), &LogAsk::Summary, true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            read.lines
+                .iter()
+                .map(|l| (l.n, l.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "syncing 3"), (3, "INFO serving")]
+        );
+        assert_eq!((read.total, read.size, read.ended), (3, 31, false));
+        assert!(missing.is_err());
     }
 }

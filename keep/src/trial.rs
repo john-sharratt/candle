@@ -55,6 +55,8 @@ pub enum Verdict {
     /// one, and how long it ran. A trial that writes nothing leaves these as
     /// the only word on why (WhiteWorld, 2026-10-31).
     Died { code: Option<i32>, ran: Duration },
+    /// It was cancelled before it proved itself.
+    Cancelled,
 }
 
 /// How a switch ended, and the child left running.
@@ -102,10 +104,15 @@ fn launch(exe: &Path, args: &[OsString], cwd: &Path, stderr: Stdio) -> io::Resul
     cmd.spawn()
 }
 
-/// Read `log` — `child`'s stderr — until [`PROOF`], the limit, or the
-/// process exiting. Lines read before that are logged. The limit restarts at
-/// every syncing line ([`is_syncing`]).
-pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
+/// Read `log` — `child`'s stderr — until [`PROOF`], the limit, the process
+/// exiting, or `cancelled` holding. Lines read before that are logged. The
+/// limit restarts at every syncing line ([`is_syncing`]).
+pub fn watch_proof(
+    child: &mut Child,
+    log: &Path,
+    limit: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Verdict {
     let started = Instant::now();
     let mut deadline = started + limit;
     let mut at = 0u64;
@@ -130,6 +137,9 @@ pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
         }
         if Instant::now() >= deadline {
             return Verdict::TimedOut;
+        }
+        if cancelled() {
+            return Verdict::Cancelled;
         }
         thread::sleep(POLL);
     }
@@ -185,9 +195,10 @@ pub fn reap(child: &mut Child) {
 }
 
 /// Install `trial` on the stable path and start it there, its stderr in `log`.
-/// Proven: the process is left running as the service. Otherwise: it is
-/// stopped, the previous stable file put back and started. The process the
-/// stable file was started from has already been stopped.
+/// Proven: the process is left running as the service. Otherwise — no proof
+/// within `limit`, an exit, or `cancelled` — it is stopped, the previous
+/// stable file put back and started. The process the stable file was started
+/// from has already been stopped.
 pub fn switch_to(
     trial: &Path,
     stable: &Path,
@@ -195,6 +206,7 @@ pub fn switch_to(
     args: &[OsString],
     cwd: &Path,
     limit: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> io::Result<Running> {
     if let Err(e) = set_aside(stable) {
         return rolled_back(
@@ -220,7 +232,7 @@ pub fn switch_to(
             return rolled_back(stable, args, cwd, format!("the trial did not start: {e}"));
         }
     };
-    let why = match watch_proof(&mut child, log, limit) {
+    let why = match watch_proof(&mut child, log, limit, cancelled) {
         Verdict::Proven => {
             // The trial is the service: what it replaced is not needed, and a
             // file left set aside would read as an unproven trial to the next
@@ -235,6 +247,7 @@ pub fn switch_to(
         }
         Verdict::TimedOut => "no proof line within the limit".to_string(),
         Verdict::Died { code, ran } => died(code, ran),
+        Verdict::Cancelled => "the trial was cancelled".to_string(),
     };
     reap(&mut child);
     restore(stable)?;

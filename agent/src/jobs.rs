@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -33,6 +33,8 @@ use zend_vfs::{
     BranchName, DiskWriteGrant, FetchBundle, FetchSpec, JobId, JobRequest, JobStatus, Oid,
     Priority, RemoteName, Rev, RunOutcome, SandboxCommand, StartedJob, VfsStore, ORIGIN,
 };
+
+use cluster::log_read::{self, LogAsk, LogRead};
 
 use crate::checkouts::{Checkout, Checkouts};
 use crate::switch::Switch;
@@ -323,6 +325,9 @@ impl Jobs {
             listed: Some(Listed::of(&listed)),
             staged: None,
             phase: Phase::Ended,
+            command: Vec::new(),
+            started_ms: 0,
+            ended_ms: None,
         })
     }
 
@@ -385,6 +390,9 @@ impl Jobs {
                     listed: None,
                     staged: None,
                     phase: Phase::Ended,
+                    command,
+                    started_ms,
+                    ended_ms: Some(now_ms()),
                 })
             }
             Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
@@ -705,6 +713,8 @@ impl Jobs {
         let e =
             t.0.get(id)
                 .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+        let (command, started_ms, ended_ms) =
+            (e.line.command.clone(), e.line.started_ms, e.line.ended_ms);
         Ok(match &e.kind {
             Kind::Push { status, pushed } => JobView {
                 id: id.to_string(),
@@ -718,6 +728,9 @@ impl Jobs {
                 listed: None,
                 staged: None,
                 phase: Phase::Ended,
+                command,
+                started_ms,
+                ended_ms,
             },
             Kind::Fetch { status } => JobView {
                 id: id.to_string(),
@@ -731,6 +744,9 @@ impl Jobs {
                 listed: None,
                 staged: None,
                 phase: Phase::Ended,
+                command,
+                started_ms,
+                ended_ms,
             },
             Kind::Run {
                 prep,
@@ -779,6 +795,9 @@ impl Jobs {
                     listed: None,
                     staged: staged.clone(),
                     phase,
+                    command,
+                    started_ms,
+                    ended_ms,
                 }
             }
         })
@@ -977,6 +996,35 @@ impl Jobs {
             .map_err(|e| JobError::Bad(e.to_string()))?
             .map_err(|e| JobError::Bad(format!("job {id}'s log: {e}")))?;
         Ok(LogChunk::of(from, &bytes, size, ended))
+    }
+
+    /// Answer `ask` of job `id`'s log, read here so only the answer goes back
+    /// ([`log_read`]). A run that has not started its command, a push and a
+    /// fetch have an empty log.
+    pub async fn read_log(&self, id: &str, ask: LogAsk) -> Result<LogRead, JobError> {
+        let ended = self.view(id)?.status.is_finished();
+        let path = match self.log(id)? {
+            Some(path) => path,
+            None => {
+                return Ok(LogRead {
+                    ended,
+                    ..log_read::read(io::empty(), &ask)
+                        .map_err(|e| JobError::Bad(e.to_string()))?
+                })
+            }
+        };
+        let read = spawn_blocking(move || {
+            let file = File::open(&path)?;
+            let size = file.metadata()?.len();
+            // Only the bytes there when it was measured: a running job's
+            // lines past them are the next read's.
+            let read = log_read::read(BufReader::new(file.take(size)), &ask)?;
+            Ok::<_, io::Error>(LogRead { size, ..read })
+        })
+        .await
+        .map_err(|e| JobError::Bad(e.to_string()))?
+        .map_err(|e| JobError::Bad(format!("job {id}'s log: {e}")))?;
+        Ok(LogRead { ended, ..read })
     }
 }
 
