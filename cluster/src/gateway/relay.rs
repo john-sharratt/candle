@@ -238,12 +238,10 @@ impl Hub {
         }
     }
 
-    /// `ACK`, `CATCHUP`, `HEADERS`, `FETCH`, `DONE` and `HAVE` from `from`.
+    /// `CATCHUP`, `HEADERS`, `FETCH`, `DONE` and `HAVE` from `from`. Its `ACK`
+    /// is a state report (`reports::apply_report`).
     pub(super) fn relay_substrate(&self, app: &str, from: u64, frame: Frame) {
         match frame {
-            Frame::Ack(ack) => {
-                self.state().registry.applied(app, from, ack.applied);
-            }
             Frame::Catchup(c) => {
                 let requester = c.reply_to;
                 let answerer = match c.to {

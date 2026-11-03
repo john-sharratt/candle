@@ -402,6 +402,7 @@ member                                               gateway
 | 4400 | Malformed frame or protocol violation | reconnects (backoff) |
 | 4401 | Proof failed (either direction) | reconnects (backoff); the loading page names it |
 | 4409 | Replaced: a newer session of the same node was admitted (§3.3) | nothing: this socket is the stale one, and the member is already connected through the new one |
+| 4429 | Retry: this admission was not taken — a newer one of the node superseded it while it was still in its handshake, or more changed meanwhile than it could be brought up to date with (§5.4) | backs off and dials again: no session of the node displaced this socket for good. A member that knows no 4429 backs off from it as from any code it does not know |
 | **4410** | **Build superseded, and no way to upgrade:** `build.count` below the app's floor, and no build at the floor fits it (no artifact for its kind and platform, or the checks of §3.9 fail); or a member left behind when a rollout ends: stranded, or its install failed (§3.5, §3.9). A member below the floor that *can* take the floor's build is admitted to upgrade instead (§3.5) | **closes that app's sockets to every cluster and stops reconnecting** until the process is replaced by a rebuilt binary — a build any cluster has superseded serves on none |
 | 4412 | Model mismatch: the app's group is locked to another model. A new model is moved to by hand, not by an upgrade (§3.6) | reconnects at the 8 s cap; admitted once the group empties and the lock clears |
 | 4417 | Clock skew: `HELLO.now_ms` is more than 60 s from the gateway's clock. A clock far ahead would drag every member's `hlc` with it (§6.2), and Paxos lease terms and tombstone ages read the clock (§5.9, §6.8) | reconnects at the 8 s cap; the loading page names the skew |
@@ -1571,20 +1572,25 @@ instead:
   on, and no claim of the node's own lands after the table was built. A request or a
   one-time reply is not kept: it goes to whichever socket is the node's current one when
   it is sent, and a request to a replaced process fails over by its requester's own retry.
-  The `ADMIT` must be sent within `ADMIT_SEND`, 10 s, and what is kept is bounded at
-  `PENDING_CAP` frames; past it the admission fails, and the member dials again.
+  The `ADMIT` must be sent within `ADMIT_SEND`, 10 s, and the relays kept are bounded at
+  `PENDING_CAP`; past it the admission fails, and the member dials again.
 - **One admission of a node is pending at a time.** A newer one supersedes an older still
-  in its handshake — the older's `run` then finds itself superseded and goes, changing
-  nothing — and only the pending session's own `run` or failure touches the replacement.
+  in its handshake, and only the pending session's own `run` or failure touches the
+  replacement. A session whose admission is not taken — superseded, or overflowed — is
+  closed `4429`, and its member dials again: never `4409`, which would stop that dial loop
+  for good though nothing displaced it.
 - **A replaced session reports nothing of its node's state.** What it sends that is
   written into the node's own entries — `CLAIM`, `UNCLAIM`, `CAPACITY`, `ROUTES`,
-  `COMPLETE`, `COORD`, `ACK`, `HAVE`, `BUILD_OFFER`, `BUILD_HAVE` — is not applied, checked
-  against a flag on the session itself, under the guard each changes state with: a process
-  still running says it again on its new session, and one that restarted holds nothing it
-  said. While the replacement is pending such a report is held back, and if the handshake
-  fails it is applied after all, the standing session's still: nothing a live process said
-  is lost to a handshake that came to nothing. Requests routed on and one-time replies —
-  catch-ups and their answers, votes, build chunks — still pass: a process still running
+  `COMPLETE`, `COORD`, `ACK`, `BUILD_OFFER`, `BUILD_HAVE` — is not applied, checked against
+  a flag on the session itself, under the guard each is applied under: a process still
+  running says it again on its new session, and one that restarted holds nothing it said.
+  While the replacement is pending such a report is held back, each kind kept to what it
+  last said — the latest `CAPACITY`, `ROUTES`, `COORD` and `ACK`, each build's latest
+  offer, every key reported complete, each key's net claim — so however long the
+  handshake none of what it ended at is lost, and if the handshake fails it is applied
+  after all, under the very guard that undoes the replacement, before anything the session
+  sends after. Requests routed on and one-time replies and offers — catch-ups and their
+  answers, a resync's `HAVE`, votes, build chunks — still pass: a process still running
   sends each once, and a peer awaits it.
 - **A member takes in no claim of its own node at an epoch it does not hold**
   (`MemberClaims::of_own_node`), **and releases none for a key it holds.** `ADMIT`'s table
@@ -1595,7 +1601,8 @@ instead:
   For a key it holds at another epoch, nothing is released — a release of a key it still
   serves would let a peer take it — and its re-announce corrects the table: an epoch below
   the held one is superseded by it, and above it the key is claimed again here, above that
-  epoch, and that claim is announced. The gateway relays an `UNCLAIM` only when it let a
+  epoch, and that claim is announced on every gateway the member has joined, each of which
+  still names the epoch before. The gateway relays an `UNCLAIM` only when it let a
   claim go, so a release that matched nothing reaches no peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
   another node is a protocol violation, closed `4400`. No gateway relays a node its own

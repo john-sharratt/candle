@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::hub::{is_state_report, take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
+use super::hub::{take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
 use super::registry::MemberView;
 use crate::delivery::ReceiptPacer;
 use crate::frame::{BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberState, ModelId};
@@ -147,8 +147,9 @@ async fn a_replaced_session_reports_nothing_of_its_node() {
 
 /// **A handshake that fails after its admission undoes the replacement, and
 /// loses nothing the standing session said meanwhile**: its `CAPACITY` and
-/// `CLAIM`, held back while the replacement was pending, are applied once it
-/// is undone, and it reports again.
+/// `CLAIM`, held back while the replacement was pending, are applied under the
+/// very guard that undoes it — before anything the session sends after — and
+/// it reports again.
 #[tokio::test]
 async fn a_failed_handshake_undoes_the_replacement() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
@@ -161,27 +162,30 @@ async fn a_failed_handshake_undoes_the_replacement() {
         .unwrap();
     assert_eq!(hub.state().registry.claims("zend").holder(b"k"), None);
 
-    let held = {
+    let applied = {
         let mut s = hub.state();
-        let held = undo_pending(&mut s, "zend", 1, second.session);
+        let applied = undo_pending(&mut s, "zend", 1, second.session);
         assert_eq!(s.sockets[&("zend".to_string(), 1)].session, first);
-        held
+        assert_eq!(
+            s.registry.member("zend", 1).unwrap().state(),
+            MemberState::Ready,
+            "applied under the guard that undid it"
+        );
+        assert_eq!(
+            s.registry.claims("zend").holder(b"k"),
+            Some(1),
+            "its claim from the window stands"
+        );
+        applied
     };
-    assert_eq!(held.len(), 2, "what it said while pending");
+    assert_eq!(applied.len(), 2, "what it said while pending");
     assert!(
         !old.load(Ordering::SeqCst),
         "the standing session reports again"
     );
-    hub.apply_held("zend", 1, held);
-    assert_eq!(
-        hub.state().registry.member("zend", 1).unwrap().state(),
-        MemberState::Ready
-    );
-    assert_eq!(
-        hub.state().registry.claims("zend").holder(b"k"),
-        Some(1),
-        "its claim from the window stands"
-    );
+    for done in applied {
+        hub.follow("zend", 1, done);
+    }
 }
 
 fn claim(key: &[u8], ms: u64) -> Frame {
@@ -228,8 +232,12 @@ async fn overlapping_handshakes_leave_the_newer_in_charge() {
         "S1 no longer owns it"
     );
     assert!(old.load(Ordering::SeqCst));
-    let held = undo_pending(&mut s, "zend", 1, s2.session);
-    assert_eq!(held.len(), 1, "carried over from S1's pending");
+    undo_pending(&mut s, "zend", 1, s2.session);
+    assert_eq!(
+        s.registry.member("zend", 1).unwrap().state(),
+        MemberState::Ready,
+        "its CAPACITY, carried over from S1's pending, applied"
+    );
     assert!(!old.load(Ordering::SeqCst));
     assert!(matches!(
         take_pending(&mut s, "zend", 1, s1.session),
@@ -237,8 +245,10 @@ async fn overlapping_handshakes_leave_the_newer_in_charge() {
     ));
 }
 
-/// **A handshake during which more piles up than it can be brought up to date
-/// with fails its admission**, and the standing session keeps what it said.
+/// **A handshake during which more claim relays pile up than it can be
+/// brought up to date with fails its admission**; what the standing session
+/// reported meanwhile — however much, kept to what each kind last said — is
+/// applied, and it reports again.
 #[tokio::test]
 async fn an_overflowing_handshake_fails_its_admission() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
@@ -248,23 +258,27 @@ async fn an_overflowing_handshake_fails_its_admission() {
     for _ in 0..=PENDING_CAP {
         hub.on_frame("zend", 1, &old, ready(), &reply_on).unwrap();
     }
+    for ms in 0..=PENDING_CAP as u64 {
+        hub.to_others(
+            "zend",
+            2,
+            Frame::Claim(Claim {
+                key: b"k2".to_vec(),
+                epoch: Epoch { ms, node: 2 },
+            }),
+        );
+    }
     let mut s = hub.state();
-    let Taken::Overflowed(held) = take_pending(&mut s, "zend", 1, second.session) else {
+    let Taken::Overflowed(applied) = take_pending(&mut s, "zend", 1, second.session) else {
         panic!("overflowed");
     };
-    assert_eq!(held.len(), PENDING_CAP);
+    assert_eq!(applied.len(), 1, "the thousands of CAPACITYs, as the last");
+    assert_eq!(
+        s.registry.member("zend", 1).unwrap().state(),
+        MemberState::Ready
+    );
     assert!(
         !old.load(Ordering::SeqCst),
         "the standing session reports again"
     );
-}
-
-/// What a replaced session may no longer report — everything written into
-/// the node's own entries — and what it still may: a request routed on, a
-/// one-time reply.
-#[test]
-fn state_reports_are_what_a_node_writes_of_itself() {
-    assert!(is_state_report(&ready()));
-    assert!(is_state_report(&claim(b"k", 1)));
-    assert!(!is_state_report(&Frame::Ping([0; 8])));
 }

@@ -146,8 +146,9 @@ pub fn choose(
         if free(h) && !outranked {
             return Choice::Run(h.node);
         }
-        // A busy dedicated holder is waited for; a free one outranked is not.
-        if !free(h) && !waited && dedicated(h) {
+        // A busy holder is waited for while no free agent outranks it — its
+        // build is warm — and a free one outranked is not kept.
+        if !free(h) && !waited && !outranked {
             return Choice::Wait;
         }
     }
@@ -169,8 +170,9 @@ pub fn choose(
     if !waited {
         return Choice::Wait;
     }
-    // Every agent is still busy: it queues on the one with the most idle
-    // cores.
+    // Every agent is still busy: it queues on the best of them, by the same
+    // order — the machine the table prefers to build on, then a dedicated
+    // agent, then the most idle cores.
     best(&mut fit.iter()).map_or(Choice::NoAgent, Choice::Run)
 }
 
@@ -311,6 +313,16 @@ mod tests {
         bw.handed = 1;
         let ready = [&ww, &aw, &bw];
         assert_eq!(
+            super::choose(&ready, &machines, Some(1), &cargo(), false),
+            Choice::Wait,
+            "a busy BlackWorld holder is waited for: no free agent outranks it"
+        );
+        assert_eq!(
+            super::choose(&ready, &machines, Some(1), &cargo(), true),
+            Choice::Run(2),
+            "and spilled from once the wait is over"
+        );
+        assert_eq!(
             super::choose(&ready, &machines, None, &cargo(), false),
             Choice::Run(2),
             "BlackWorld full: AlienWorld before an unranked WhiteWorld"
@@ -324,6 +336,20 @@ mod tests {
             super::choose(&ready, &machines, Some(3), &cargo(), false),
             Choice::Run(2),
             "a lineage on an unranked machine moves to a free ranked one"
+        );
+        let (mut free_bw, mut busy_ww) = (beside(1, 8, 4_000, 1), agent(3, 32, 0, 0));
+        free_bw.host = "BlackWorld".into();
+        busy_ww.host = "WhiteWorld".into();
+        assert_eq!(
+            super::choose(
+                &[&busy_ww, &aw, &free_bw],
+                &machines,
+                Some(3),
+                &cargo(),
+                false
+            ),
+            Choice::Run(1),
+            "a busy WhiteWorld holder is not waited for while BlackWorld is free"
         );
         assert_eq!(machines.builds("blackworld"), Some(1));
     }

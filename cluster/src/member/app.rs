@@ -538,14 +538,16 @@ impl AppMember {
         // its previous process's, or one let go on a socket that died before
         // the gateway heard — and they are released here, as their holder,
         // through each key's own last record (§5.4).
-        let (lost, stale) = {
+        let (lost, stale, again) = {
             let mut claims = lock(&self.claims);
             let mut lost: Vec<Vec<u8>> = Vec::new();
             let mut stale: Vec<(Vec<u8>, Epoch)> = Vec::new();
+            let mut again: Vec<(Vec<u8>, Epoch)> = Vec::new();
             let now = now_ms();
             for claim in &admit.claims {
                 match claims.of_own_node(&claim.key, claim.epoch, now) {
                     OwnClaim::Release(epoch) => stale.push((claim.key.clone(), epoch)),
+                    OwnClaim::Reclaimed(epoch) => again.push((claim.key.clone(), epoch)),
                     OwnClaim::Kept => {}
                     OwnClaim::Hear => {
                         if claims.heard(&claim.key, claim.epoch) {
@@ -554,10 +556,17 @@ impl AppMember {
                     }
                 }
             }
-            (lost, stale)
+            (lost, stale, again)
         };
         for key in &lost {
             self.lost(key);
+        }
+        // A key claimed again above an epoch this gateway named is announced
+        // on every gateway already joined — each still names the old epoch,
+        // and a later release at the new one would match nothing there. This
+        // gateway hears it with the re-announce below, once it is admitted.
+        for (key, epoch) in again {
+            self.announce(Frame::Claim(Claim { key, epoch }));
         }
         let own_through = self.own_through();
         for (key, epoch) in stale {

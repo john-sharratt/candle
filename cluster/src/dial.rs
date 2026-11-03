@@ -245,6 +245,22 @@ mod tests {
         assert!(matches!(attempts[7], Attempt::Session(Ended::Dropped)));
     }
 
+    /// **A 4429 — an admission not taken — is dialled past**: the member backs
+    /// off and dials that gateway again, unlike a 4409, which stops the socket.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_not_taken_is_dialled_again() {
+        let (stopped, gaps, attempts) = run(vec![
+            Gate::Close(CloseCode::Retry),
+            Gate::Close(CloseCode::Retry),
+            Gate::Close(CloseCode::Superseded),
+        ])
+        .await;
+        assert_eq!(gaps.len(), 2, "dialled again after each 4429");
+        assert!(gaps[0] <= Duration::from_millis(250), "{gaps:?}");
+        assert_eq!(attempts.len(), 3);
+        assert!(matches!(stopped, Stopped::App(c) if c.code == 4410));
+    }
+
     /// A refusal one end's replacement clears is waited out at the cap: a
     /// member a gateway refused for its protocol is admitted the moment the
     /// other end moves, with no restart.

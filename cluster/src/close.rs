@@ -13,6 +13,12 @@ pub enum CloseCode {
     Proof,
     /// A newer session of the same node was admitted.
     Replaced,
+    /// This admission was not taken — a newer one of the node superseded it,
+    /// or more changed during its handshake than it could be brought up to
+    /// date with — and the member dials again (`docs/replicated_substrate.md`
+    /// §5.4). Unlike [`CloseCode::Replaced`], no session of the node displaced
+    /// this socket for good.
+    Retry,
     /// Below the app's floor with no way to upgrade, or left behind by a
     /// rollout.
     Superseded,
@@ -32,6 +38,7 @@ impl CloseCode {
             CloseCode::Malformed => 4400,
             CloseCode::Proof => 4401,
             CloseCode::Replaced => 4409,
+            CloseCode::Retry => 4429,
             CloseCode::Superseded => 4410,
             CloseCode::Model => 4412,
             CloseCode::Skew => 4417,
@@ -47,6 +54,7 @@ impl CloseCode {
             4400 => CloseCode::Malformed,
             4401 => CloseCode::Proof,
             4409 => CloseCode::Replaced,
+            4429 => CloseCode::Retry,
             4410 => CloseCode::Superseded,
             4412 => CloseCode::Model,
             4417 => CloseCode::Skew,
@@ -58,7 +66,9 @@ impl CloseCode {
     /// What the member's dial loop does next.
     pub fn after(self) -> AfterClose {
         match self {
-            CloseCode::GoingAway | CloseCode::Malformed | CloseCode::Proof => AfterClose::Backoff,
+            CloseCode::GoingAway | CloseCode::Malformed | CloseCode::Proof | CloseCode::Retry => {
+                AfterClose::Backoff
+            }
             CloseCode::Model | CloseCode::Skew | CloseCode::Protocol => AfterClose::AtCap,
             CloseCode::Replaced => AfterClose::StopSocket,
             CloseCode::Superseded => AfterClose::StopApp,
@@ -119,6 +129,7 @@ mod tests {
             (CloseCode::Malformed, 4400, AfterClose::Backoff),
             (CloseCode::Proof, 4401, AfterClose::Backoff),
             (CloseCode::Replaced, 4409, AfterClose::StopSocket),
+            (CloseCode::Retry, 4429, AfterClose::Backoff),
             (CloseCode::Superseded, 4410, AfterClose::StopApp),
             (CloseCode::Model, 4412, AfterClose::AtCap),
             (CloseCode::Skew, 4417, AfterClose::AtCap),

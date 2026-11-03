@@ -35,11 +35,14 @@ pub enum OwnClaim {
     /// process's, or one it let go on a socket that died before the gateway
     /// heard: released at that epoch, as its holder.
     Release(Epoch),
-    /// This node's, for a key this member holds at another epoch: nothing is
-    /// released. Below the held epoch, its announcing that claim again on
-    /// admission supersedes it; above, the key has been claimed again above
-    /// it, and that claim is what is announced.
+    /// This node's, below the epoch this member holds the key at: nothing is
+    /// released, and its announcing that claim again on admission supersedes
+    /// it.
     Kept,
+    /// This node's, above the epoch this member held the key at: nothing is
+    /// released, and the key is claimed again above it, at this epoch — to
+    /// announce on every gateway, each of which still names the one before.
+    Reclaimed(Epoch),
 }
 
 #[derive(Debug)]
@@ -182,17 +185,18 @@ impl MemberClaims {
         let Some((held, served)) = held else {
             return OwnClaim::Release(epoch);
         };
-        if epoch > held {
-            let floor = self.seen.get(key).map_or(0, |ms| ms + 1);
-            let again = Epoch {
-                ms: now_ms.max(floor),
-                node: self.node,
-            };
-            self.saw(key, again);
-            self.table.claim(key, again);
-            self.own.insert(key.to_vec(), (again, served));
+        if epoch < held {
+            return OwnClaim::Kept;
         }
-        OwnClaim::Kept
+        let floor = self.seen.get(key).map_or(0, |ms| ms + 1);
+        let again = Epoch {
+            ms: now_ms.max(floor),
+            node: self.node,
+        };
+        self.saw(key, again);
+        self.table.claim(key, again);
+        self.own.insert(key.to_vec(), (again, served));
+        OwnClaim::Reclaimed(again)
     }
 
     /// A claim announced by any member — from `ADMIT`'s table or relayed.
@@ -343,8 +347,8 @@ mod tests {
         assert_eq!(c.own(), vec![(b"held".to_vec(), e(500, ME))]);
         assert_eq!(
             c.of_own_node(b"held", e(900, ME), 600),
-            OwnClaim::Kept,
-            "above the held epoch: never released, never adopted"
+            OwnClaim::Reclaimed(e(901, ME)),
+            "above the held epoch: never released, never adopted — claimed again"
         );
         assert_eq!(
             c.own(),
