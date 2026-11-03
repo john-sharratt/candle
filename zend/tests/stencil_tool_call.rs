@@ -612,6 +612,7 @@ fn held_value(pattern: &str) -> &'static str {
         "[A-Za-z0-9+/]+={0,2}" | "[A-Za-z0-9_-]+" => "AA",
         "[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*" => "",
         r#"[^"]*\.yaml"# => "a.yaml",
+        "(task:[a-z0-9-]+(/[a-z0-9-]+([.][0-9]+)?)+|(build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})" => "task:a/a",
         other => panic!("no minimal value for pattern {other:?}"),
     }
 }
