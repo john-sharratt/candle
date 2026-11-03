@@ -183,12 +183,15 @@ fn h6_routing_decisions_match_the_reference() {
                     session += 1;
                     registry.join(view(node, session));
                     model.members.insert(node, None);
+                    // A node admitted again holds none of its old claims.
+                    model.claims.retain(|_, e| e.node != node);
                 }
                 1 => {
                     let held = registry.member(APP, node).map(|m| m.session);
                     if let Some(s) = held {
                         assert!(registry.leave(APP, node, s));
                         model.members.remove(&node);
+                        model.claims.retain(|_, e| e.node != node);
                     }
                 }
                 2..=6 => {
