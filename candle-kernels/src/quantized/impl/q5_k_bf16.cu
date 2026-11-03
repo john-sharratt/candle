@@ -17,7 +17,7 @@
 
 #include "kernel_instantiate.cuh"
 #include "common.cuh"
-#include "../loader/q5_k.cuh"
+#include "../loader/q5_K.cuh"
 
 constexpr int QK5_K_K128 = 128;
 constexpr int QI5_K_K128 = 32;

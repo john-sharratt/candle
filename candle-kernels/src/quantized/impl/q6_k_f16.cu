@@ -19,7 +19,7 @@
 
 #include "kernel_instantiate.cuh"
 #include "common.cuh"
-#include "../loader/q6_k.cuh"
+#include "../loader/q6_K.cuh"
 
 // K/128 format: 128 elements per block, 32 ints of data
 constexpr int QK6_K_K128 = 128;

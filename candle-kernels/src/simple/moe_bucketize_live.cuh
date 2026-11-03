@@ -8,6 +8,7 @@
 // =============================================================================
 #pragma once
 
+#include <cstdio>
 #include "moe_bucketize_common.cuh"
 #include "../moe_read_ahead.cuh"
 

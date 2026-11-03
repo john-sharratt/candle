@@ -14,6 +14,7 @@
 
 #include "repack_gemx.cuh"
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <stdint.h>
 
 // =============================================================================
