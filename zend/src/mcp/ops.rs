@@ -90,8 +90,29 @@ pub async fn up(
     body: Option<&Value>,
     read_for: Duration,
 ) -> Result<Reply, String> {
+    up_as(
+        session,
+        caller.headers(),
+        method,
+        path,
+        node,
+        body,
+        read_for,
+    )
+    .await
+}
+
+/// [`up`], stating `headers` as who it is for.
+pub async fn up_as(
+    session: &ZendSession,
+    mut headers: Vec<(HeaderName, HeaderValue)>,
+    method: Method,
+    path: &str,
+    node: Option<&str>,
+    body: Option<&Value>,
+    read_for: Duration,
+) -> Result<Reply, String> {
     let member = member(session)?;
-    let mut headers = caller.headers();
     if let Some(n) = node {
         headers.push((
             HeaderName::from_static(NODE_HEADER),

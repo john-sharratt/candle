@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use super::cluster_status::ago;
 use super::{Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "cluster_audit";
@@ -100,25 +101,20 @@ pub fn render(status: &Value, n: usize, now: u64) -> String {
         .join("\n")
 }
 
-pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
-    if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
-        return Answer::error(e);
-    }
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let n = args
         .get("entries")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_ENTRIES)
         .clamp(1, MAX_ENTRIES);
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        &format!("/gateway/status.json?log={SCAN}"),
-        None,
-        None,
-        Duration::from_secs(15),
-    )
-    .await
+    let reply = match call
+        .up(
+            Method::GET,
+            &format!("/gateway/status.json?log={SCAN}"),
+            None,
+            Duration::from_secs(15),
+        )
+        .await
     {
         Ok(r) => r,
         Err(e) => return Answer::error(e),
@@ -127,6 +123,13 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(v) => Answer::ok(render(&v, n as usize, now_ms())),
         Err(e) => Answer::error(format!("the coordination log: {e}")),
     }
+}
+
+pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
+    if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
+        return Answer::error(e);
+    }
+    run(&OpsCall::of(ctx), args).await
 }
 
 #[cfg(test)]

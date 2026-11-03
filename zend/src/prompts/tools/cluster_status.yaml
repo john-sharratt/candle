@@ -1,0 +1,48 @@
+name: cluster_status
+questions:
+- how does the cluster stand
+- which build is each member on
+- is whiteworld ready
+- did the new build reach the other machine
+- is any member in fault
+- what is the floor now
+- is the rollout finished
+- why has whiteworld not upgraded
+- are both machines serving
+- which members are below the floor
+- is a candidate being certified
+- is a member stuck in an upgrade
+- how much disk is left on the members
+- which machine is fetching the new build
+- is the cluster healthy before I deploy
+- did the deploy join the cluster as a candidate
+category: Commands
+description: 'How the cluster stands, read through the gateway as the person this task works for: each member (a machine running the motherd daemon) with its machine, node, build, state and when it started, and how each app it hosts stands; each app''s floor, the oldest build it still routes to; each member''s place in an upgrade from its own report — fetching a build and how much of it, waiting for its turn, installing, stranded and why, an install that failed and was restored — and a member left below the floor with nothing under way; candidates, when a raised floor began its rollout and when the grace period ends; and each member in or near fault, with why, its free disk and unsent events. Read it before deploying, after a deploy to see the new build join, and whenever something stalls. Use for: whether a build reached every machine, why a machine has not upgraded, whether a member is in fault. Triggered by "how does the cluster stand", "did whiteworld take the build". Returns the members, the floors, the upgrades and the faults.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties: {}
+  title: StatusRequest
+  type: object
+examples:
+- |-
+  did the new build reach whiteworld<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Whether a member took a build is in the cluster's status: each member's build, the floor, and where a member below it is in its upgrade.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_status", "arguments": {}}
+  </tool_call><|projection|>
+- is any member in fault right now<|im_end|>
+- |-
+  the deploy was proven, is it serving across the cluster<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A proven motherd joins as a candidate and the others take it once it is certified. The status shows the candidate, the floor and each member's build.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_status", "arguments": {}}
+  </tool_call><|projection|>

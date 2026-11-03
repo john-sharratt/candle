@@ -21,6 +21,7 @@ use serde_json::Value;
 use web::auth::Role;
 
 use super::activity::Activity;
+use super::caller::Person;
 use super::names::{parent_of, Path};
 use super::records::Records;
 use super::roles::WorkerKind;
@@ -148,6 +149,13 @@ pub struct Worker {
     /// began, read afresh for every task and answer, so a part runs with
     /// exactly the tools its worker has.
     pub role: Role,
+    /// The person it works for, as the call that started or last answered it
+    /// named them: whom its cluster, guide and memory tools act as, their role
+    /// checked again by each member and gateway a call reaches. A part works
+    /// for whom its worker does. `None` on a record kept before workers carried
+    /// it: such a task's tools that act as a person are refused.
+    #[serde(default)]
+    pub person: Option<Person>,
     /// How urgently its turns decode; a part decodes as its worker does.
     pub priority: Priority,
     /// How hard its turns think; a part thinks as its worker does.
@@ -575,6 +583,7 @@ mod tests {
             prompt: "p".into(),
             state: State::Running,
             role: Role::User,
+            person: None,
             priority: Priority::Normal,
             effort: Effort::Deep,
             kind: WorkerKind::Coder,

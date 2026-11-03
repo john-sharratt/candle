@@ -88,7 +88,7 @@ pub async fn keep(
 ) -> Result<Value, String> {
     let reply = ops::keep_with(
         &call.session,
-        call.headers.clone(),
+        call.headers(),
         method,
         path,
         host,

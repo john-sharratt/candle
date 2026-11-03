@@ -1,0 +1,52 @@
+name: cluster_audit
+questions:
+- what was done to the cluster today
+- who ran a command on the cluster
+- when was the floor raised
+- did a member enter fault mode
+- what happened in the last hour on the cluster
+- was the new build certified
+- when did whiteworld leave fault mode
+- has anyone drained a member
+- what commands were run recently
+- show the cluster's coordination log
+- when did the candidate get admitted
+- did a member get refused
+- what changed on the cluster before it broke
+- has the rollout started
+- when did the members last rejoin
+- who certified the build
+category: Commands
+description: 'Read what was done to the cluster, newest first, from the gateway''s log of it, read as the person this task works for: each maintenance command a member ran, its arguments, who sent it and how it ended, beside members joining, leaving, being admitted or refused, floors raised by a certification or a rollout, and members entering and leaving fault mode. Replication''s own steps, which the log also keeps, are left out. Kept for a day. Use for: what has already been done and by whom before doing more, and when a floor rose or a fault began. Triggered by "what was done to the cluster", "when was the floor raised". Returns the entries, one line each, with their UTC time.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    entries:
+      description: How many entries; 50 by default. Optional.
+      maximum: 500.0
+      minimum: 1.0
+      type: integer
+  title: AuditRequest
+  type: object
+examples:
+- |-
+  when was the floor raised to the new build<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Floors raised by certification are entries in the gateway's coordination log, beside the commands run.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_audit", "arguments": {}}
+  </tool_call><|projection|>
+- |-
+  show me the last hundred things done to the cluster<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A longer read of the same log: a hundred entries rather than the default fifty.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_audit", "arguments": {"entries": 100}}
+  </tool_call><|projection|>

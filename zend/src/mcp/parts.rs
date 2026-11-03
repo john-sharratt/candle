@@ -187,6 +187,7 @@ mod tests {
             prompt: "p".into(),
             state,
             role: Role::Admin,
+            person: None,
             priority: Default::default(),
             effort: Default::default(),
             kind: Default::default(),

@@ -1,7 +1,8 @@
-//! The build and deploy tools a worker reaches (`docs/build_deploy_tools.md`
-//! §6): `service_deploy`, `service_status`, `service_log`, `service_cancel`,
-//! and `repo_job_status`, `repo_job_log`, `repo_job_list`, `repo_job_cancel`
-//! for watching what a deploy builds. Each is a typed request handed whole to
+//! The operations tools a worker reaches (`docs/build_deploy_tools.md` §6):
+//! `service_deploy`, `service_status`, `service_log`, `service_cancel`;
+//! `repo_job_status`, `repo_job_log`, `repo_job_list`, `repo_job_cancel` for
+//! watching what a deploy builds; and `cluster_status`, `cluster_logs`,
+//! `cluster_audit`, `cluster_job_status` for reading the cluster. Each is a typed request handed whole to
 //! the daemon's [`OpsRunner`], which runs the implementation its MCP tools
 //! run, so a worker and Claude get one answer from one code path. The answer
 //! is the text Claude reads too.
@@ -14,6 +15,7 @@ use thiserror::Error;
 
 use crate::{ToolContext, ToolError};
 
+pub mod cluster;
 pub mod job;
 pub mod service;
 

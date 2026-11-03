@@ -159,7 +159,7 @@ fn continued(
     effort: Effort,
     now: u64,
 ) -> Worker {
-    workers::ready_for_turn(session, &mut w, caller.role, now);
+    workers::ready_for_turn(session, &mut w, caller, now);
     w.effort = effort;
     w.prompt = text.to_string();
     w.stopped = false;
@@ -222,7 +222,8 @@ pub fn send(
                 &thread,
                 name,
                 text,
-                (caller.role, Priority::Normal, effort, WorkerKind::Chat),
+                (Some(caller.person.clone()), caller.role),
+                (Priority::Normal, effort, WorkerKind::Chat),
                 now,
             ),
             recap(&record::said(&records, &owner, &chat.id), text),

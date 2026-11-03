@@ -1,36 +1,45 @@
-//! The build and deploy tools, as one implementation two surfaces call
-//! (`docs/build_deploy_tools.md` §6): Claude through the MCP connector, and a
-//! worker of Zen's through its own tool round ([`OpsTools`], the daemon's
-//! [`OpsRunner`]). Each tool runs against an [`OpsCall`] — who it is for and how
-//! it may wait — so neither surface has a copy of its own to drift.
+//! The operations tools — building, deploying, and reading the cluster — as one
+//! implementation two surfaces call (`docs/build_deploy_tools.md` §6): Claude
+//! through the MCP connector, and a worker of Zen's through its own tool round
+//! ([`OpsTools`], the daemon's [`OpsRunner`]). Each tool runs against an
+//! [`OpsCall`] — whom it is for and how it may wait — so neither surface has a
+//! copy of its own to drift.
 
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue, Method};
+use host::cluster::up::Reply;
 use serde_json::Value;
 use tokio::runtime::Handle;
 use web::auth::Role;
 use zend_tools::{run_watch, OpsRunner};
 
+use super::caller::Caller;
+use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
-use super::tools::{repo_job, service, Answer, Ctx};
+use super::tools::{
+    cluster_audit, cluster_job_status, cluster_logs, cluster_status, repo_job, service, Answer, Ctx,
+};
 use crate::session::ZendSession;
 
 /// The longest a worker's call waits: it has no client to cut it off, and a
 /// round that waited longer would hold the conversation for nothing.
 const WORKER_WAIT_S: u64 = 300;
 
-/// Who a build or deploy tool runs for, and how it may wait.
+/// Who an operations tool runs for, and how it may wait.
 #[derive(Clone)]
 pub struct OpsCall {
     pub session: Arc<ZendSession>,
     /// The lineage its jobs go under: an MCP caller's key, or a worker's
     /// conversation — what keeps its builds on the agent they warmed.
     pub lineage: String,
-    /// Who keep is told the request is for: a person's identity, or nothing
-    /// for a worker, which holds no person.
-    pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// The person it acts as, their role read when the call began: an MCP
+    /// caller, or the person a worker works for. Every request it sends up
+    /// states them, so each member and gateway checks their role itself.
+    /// `None` for a worker whose record names no person.
+    pub caller: Option<Caller>,
     /// Where each step of a wait is said.
     pub progress: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// The most seconds a call may wait.
@@ -40,6 +49,36 @@ pub struct OpsCall {
 }
 
 impl OpsCall {
+    /// The identity a request it sends states.
+    pub fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        self.caller.as_ref().map(Caller::headers).unwrap_or_default()
+    }
+
+    /// Whether it acts as an Admin.
+    pub fn admin(&self) -> bool {
+        self.caller.as_ref().is_some_and(Caller::is_admin)
+    }
+
+    /// Send `method path` up to the cluster as the caller, to member `node`
+    /// when named, reading the answer no longer than `read_for`.
+    pub async fn up(
+        &self,
+        method: Method,
+        path: &str,
+        node: Option<&str>,
+        read_for: Duration,
+    ) -> Result<Reply, String> {
+        ops::up_as(
+            &self.session,
+            self.headers(),
+            method,
+            path,
+            node,
+            None,
+            read_for,
+        )
+        .await
+    }
     /// The call an MCP tool call makes.
     pub fn of(ctx: &Ctx) -> OpsCall {
         let progress = ctx
@@ -53,7 +92,7 @@ impl OpsCall {
         OpsCall {
             session: Arc::clone(&ctx.session),
             lineage: ctx.caller.key(),
-            headers: ctx.caller.headers(),
+            caller: Some(ctx.caller.clone()),
             progress,
             ceiling: ctx.mcp.client.wait_ceiling(),
             worker: false,
@@ -81,36 +120,65 @@ impl OpsCall {
     }
 }
 
-/// The tools a worker of Zen's reaches through [`OpsRunner`], and whether
-/// each changes something — a coder's — or only reads.
-const WORKER_TOOLS: &[(&str, bool)] = &[
-    (service::deploy::NAME, true),
-    (service::cancel::NAME, true),
-    (service::status::NAME, false),
-    (service::log::NAME, false),
-    (repo_job::status::NAME, false),
-    (repo_job::log::NAME, false),
-    (repo_job::list::NAME, false),
-    (repo_job::cancel::NAME, true),
+/// What a worker's tool needs of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Needs {
+    /// It only reads.
+    Reads,
+    /// It changes something: a coder's.
+    Changes,
+    /// It reads as the person the worker works for: the gateway answers only
+    /// an Admin's identity.
+    ReadsAsPerson,
+}
+
+/// The tools a worker of Zen's reaches through [`OpsRunner`], and what each
+/// needs.
+const WORKER_TOOLS: &[(&str, Needs)] = &[
+    (service::deploy::NAME, Needs::Changes),
+    (service::cancel::NAME, Needs::Changes),
+    (service::status::NAME, Needs::Reads),
+    (service::log::NAME, Needs::Reads),
+    (repo_job::status::NAME, Needs::Reads),
+    (repo_job::log::NAME, Needs::Reads),
+    (repo_job::list::NAME, Needs::Reads),
+    (repo_job::cancel::NAME, Needs::Changes),
+    (cluster_status::NAME, Needs::ReadsAsPerson),
+    (cluster_logs::NAME, Needs::ReadsAsPerson),
+    (cluster_audit::NAME, Needs::ReadsAsPerson),
+    (cluster_job_status::NAME, Needs::ReadsAsPerson),
 ];
 
-/// Why a worker of `role` doing `kind`'s work may not run `tool`.
-fn unfit(tool: &str, role: Role, kind: WorkerKind) -> Option<String> {
-    let Some((_, changes)) = WORKER_TOOLS.iter().find(|(name, _)| *name == tool) else {
-        return Some(format!("`{tool}` is not a build or deploy tool"));
+/// Why a worker of `role` doing `kind`'s work, working for a person or not
+/// (`person`), may not run `tool`.
+fn unfit(tool: &str, role: Role, kind: WorkerKind, person: bool) -> Option<String> {
+    let Some((_, needs)) = WORKER_TOOLS.iter().find(|(name, _)| *name == tool) else {
+        return Some(format!("`{tool}` is not an operations tool"));
     };
     if !role.at_least(Role::Admin) {
         return Some(format!(
             "`{tool}` is an Admin's, and this task runs as `{role}`"
         ));
     }
-    (*changes && kind != WorkerKind::Coder)
-        .then(|| format!("`{tool}` is a coder's: this task changes nothing"))
+    match needs {
+        Needs::Changes if kind != WorkerKind::Coder => {
+            Some(format!("`{tool}` is a coder's: this task changes nothing"))
+        }
+        Needs::ReadsAsPerson if !person => Some(format!(
+            "`{tool}` reads the cluster as the person this task works for, and its record names \
+             none: it was started before tasks carried one. Ask Claude to start it again"
+        )),
+        _ => None,
+    }
 }
 
-/// Run build or deploy tool `name` for `call`.
+/// Run operations tool `name` for `call`.
 pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
     match name {
+        cluster_status::NAME => cluster_status::run(call, args).await,
+        cluster_logs::NAME => cluster_logs::run(call, args).await,
+        cluster_audit::NAME => cluster_audit::run(call, args).await,
+        cluster_job_status::NAME => cluster_job_status::run(call, args).await,
         repo_job::start::NAME => repo_job::start::run(call, args).await,
         repo_job::status::NAME => repo_job::status::run(call, args).await,
         repo_job::log::NAME => repo_job::log::run(call, args).await,
@@ -120,7 +188,7 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         service::status::NAME => service::status::run(call, args).await,
         service::log::NAME => service::log::run(call, args).await,
         service::cancel::NAME => service::cancel::run(call, args).await,
-        other => Answer::error(format!("`{other}` is not a build or deploy tool")),
+        other => Answer::error(format!("`{other}` is not an operations tool")),
     }
 }
 
@@ -157,7 +225,7 @@ impl OpsRunner for OpsTools {
             .ok_or("the model is still loading")?;
         let worker = threads::worker(&records, owner, thread, name)
             .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
-        if let Some(why) = unfit(tool, worker.role, worker.kind) {
+        if let Some(why) = unfit(tool, worker.role, worker.kind, worker.person.is_some()) {
             return Err(why);
         }
         let progress = run_watch::current().map(|watch| -> Arc<dyn Fn(String) + Send + Sync> {
@@ -166,7 +234,10 @@ impl OpsRunner for OpsTools {
         let call = OpsCall {
             session,
             lineage: caller.to_string(),
-            headers: Vec::new(),
+            caller: worker.person.map(|person| Caller {
+                person,
+                role: worker.role,
+            }),
             progress,
             ceiling: WORKER_WAIT_S,
             worker: true,
@@ -184,28 +255,38 @@ impl OpsRunner for OpsTools {
 mod tests {
     use super::*;
 
-    /// **A worker reads as an Admin and changes as an Admin's coder**; a tool
-    /// outside the set is refused by name.
+    /// **A worker reads as an Admin, changes as an Admin's coder, and reads
+    /// the cluster as the person it works for**; a tool outside the set is
+    /// refused by name.
     #[test]
     fn a_worker_reads_as_an_admin_and_changes_as_a_coder() {
         assert_eq!(
-            unfit(service::status::NAME, Role::Admin, WorkerKind::Reviewer),
+            unfit(service::status::NAME, Role::Admin, WorkerKind::Reviewer, false),
             None
         );
         assert_eq!(
-            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Coder),
+            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Coder, false),
             None
         );
         assert!(
-            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Researcher)
+            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Researcher, true)
                 .unwrap()
                 .contains("coder")
         );
-        assert!(unfit(repo_job::log::NAME, Role::User, WorkerKind::Coder)
+        assert!(unfit(repo_job::log::NAME, Role::User, WorkerKind::Coder, true)
             .unwrap()
             .contains("Admin"));
-        assert!(unfit("repo_job_start", Role::Admin, WorkerKind::Coder)
+        assert_eq!(
+            unfit(cluster_status::NAME, Role::Admin, WorkerKind::Reviewer, true),
+            None
+        );
+        assert!(
+            unfit(cluster_logs::NAME, Role::Admin, WorkerKind::Coder, false)
+                .unwrap()
+                .contains("names none")
+        );
+        assert!(unfit("repo_job_start", Role::Admin, WorkerKind::Coder, true)
             .unwrap()
-            .contains("not a build or deploy tool"));
+            .contains("not an operations tool"));
     }
 }

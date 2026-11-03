@@ -1038,6 +1038,7 @@ use crate::tools::{
     journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
+    ops::cluster::{CLUSTER_AUDIT, CLUSTER_JOB_STATUS, CLUSTER_LOGS, CLUSTER_STATUS},
     ops::job::{REPO_JOB_CANCEL, REPO_JOB_LIST, REPO_JOB_LOG, REPO_JOB_STATUS},
     ops::service::{SERVICE_CANCEL, SERVICE_DEPLOY, SERVICE_LOG, SERVICE_STATUS},
     random::REGISTRATION as RANDOM,
@@ -1273,6 +1274,12 @@ fn register_all() -> &'static [RegisteredTool] {
         REPO_JOB_STATUS.requires(NET),
         REPO_JOB_LOG.requires(NET),
         REPO_JOB_LIST.requires(NET),
+        // The cluster (4) — read through the gateway as the person the task
+        // works for; nothing changes.
+        CLUSTER_STATUS.requires(NET),
+        CLUSTER_LOGS.requires(NET),
+        CLUSTER_AUDIT.requires(NET),
+        CLUSTER_JOB_STATUS.requires(NET),
     ];
     TOOLS
 }

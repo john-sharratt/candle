@@ -8,8 +8,10 @@ use std::time::Duration;
 use axum::http::Method;
 use serde_json::{json, Value};
 
-use super::{string, wait_secs, Answer, Ctx};
+use super::{string, Answer, Ctx, Wait};
 use crate::mcp::ops::{self, why};
+use crate::mcp::ops_tools::OpsCall;
+use crate::mcp::state::DEFAULT_WAIT_S;
 
 pub const NAME: &str = "cluster_job_status";
 
@@ -103,10 +105,7 @@ pub fn summarise(ndjson: &str, complete: bool) -> String {
     out
 }
 
-pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
-    if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
-        return Answer::error(e);
-    }
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let member = match string(args, "member").and_then(ops::node) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
@@ -114,17 +113,16 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     let Some(job) = args.get("job").and_then(Value::as_u64) else {
         return Answer::error("`job` is the job's id, as `cluster_command` answered it");
     };
-    let wait = wait_secs(ctx, args);
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        &format!("/v1/cluster/command/job/{job}"),
-        Some(&member),
-        None,
-        Duration::from_secs(wait.secs.max(1)),
-    )
-    .await
+    let (secs, asked) = call.wait_of(args, DEFAULT_WAIT_S);
+    let wait = Wait { secs, asked };
+    let reply = match call
+        .up(
+            Method::GET,
+            &format!("/v1/cluster/command/job/{job}"),
+            Some(&member),
+            Duration::from_secs(wait.secs.max(1)),
+        )
+        .await
     {
         Ok(r) => r,
         Err(e) => return Answer::error(e),
@@ -132,7 +130,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     match reply.status {
         200 => {
             let mut text = summarise(&String::from_utf8_lossy(&reply.body), reply.complete);
-            // A job still running after a wait its client cut short says so.
+            // A job still running after a wait its caller's limit cut short
+            // says so.
             if let Some(note) = wait.note().filter(|_| !reply.complete) {
                 text.push_str("\n\n");
                 text.push_str(&note);
@@ -145,6 +144,13 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         )),
         status => Answer::error(format!("job {job} on {member}: {status} — {}", why(&reply))),
     }
+}
+
+pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
+    if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
+        return Answer::error(e);
+    }
+    run(&OpsCall::of(ctx), args).await
 }
 
 #[cfg(test)]

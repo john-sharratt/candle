@@ -112,6 +112,7 @@ mod tests {
             prompt: "p".into(),
             state,
             role: Role::User,
+            person: None,
             priority: Default::default(),
             effort: Default::default(),
             kind: Default::default(),

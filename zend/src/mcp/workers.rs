@@ -47,7 +47,7 @@ use web::auth::Role as AccessRole;
 use super::activity::{Activity, Doing};
 use super::archiving;
 use super::audit::{Audit, Turn};
-use super::caller::Caller;
+use super::caller::{Caller, Person};
 use super::chats::naming::is_chat_thread;
 use super::chats::talk;
 use super::names;
@@ -245,7 +245,8 @@ pub fn start(
         thread,
         name,
         prompt,
-        (caller.role, priority, effort, kind),
+        (Some(caller.person.clone()), caller.role),
+        (priority, effort, kind),
         now,
     );
     note(
@@ -284,15 +285,17 @@ fn taken(records: &dyn Records, owner: &str, thread: &str, now: u64) -> Vec<(Str
         .collect()
 }
 
-/// A new worker's record, `running`, its turn beginning `now`, running as
-/// `role` at `priority`, thinking at `effort`, doing `kind`'s work.
+/// A new worker's record, `running`, its turn beginning `now`, working for
+/// `person` as `role` at `priority`, thinking at `effort`, doing `kind`'s
+/// work.
 pub(super) fn fresh(
     session: &ZendSession,
     owner: &str,
     thread: &str,
     name: String,
     prompt: &str,
-    (role, priority, effort, kind): (AccessRole, Priority, Effort, WorkerKind),
+    (person, role): (Option<Person>, AccessRole),
+    (priority, effort, kind): (Priority, Effort, WorkerKind),
     now: u64,
 ) -> Worker {
     let conv_id = threads::conv_id(owner, thread, &name);
@@ -304,6 +307,7 @@ pub(super) fn fresh(
         prompt: prompt.to_string(),
         state: State::Running,
         role,
+        person,
         priority,
         effort,
         kind,
@@ -350,7 +354,8 @@ pub fn start_part(
         &parent.thread,
         name,
         prompt,
-        (parent.role, parent.priority, parent.effort, parent.kind),
+        (parent.person.clone(), parent.role),
+        (parent.priority, parent.effort, parent.kind),
         now,
     );
     let message = format!("{prompt}{}", part_close(&parent.path()));
@@ -411,7 +416,7 @@ pub fn answer(
     // Continuing a worker is work on its thread: it reopens a thread archived
     // while the worker was left whole.
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
-    ready_for_turn(session, &mut worker, caller.role, now);
+    ready_for_turn(session, &mut worker, caller, now);
     note(
         &records,
         &owner,
@@ -422,17 +427,18 @@ pub fn answer(
     begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
 }
 
-/// `worker`, which settled, made ready for its next turn, run as `role` from
-/// `now`: running again, its last ending's marks cleared, and its entries
-/// counted from its journal's newest.
+/// `worker`, which settled, made ready for its next turn, run for `caller` —
+/// as their role now — from `now`: running again, its last ending's marks
+/// cleared, and its entries counted from its journal's newest.
 pub(super) fn ready_for_turn(
     session: &ZendSession,
     worker: &mut Worker,
-    role: AccessRole,
+    caller: &Caller,
     now: u64,
 ) {
     worker.state = State::Running;
-    worker.role = role;
+    worker.role = caller.role;
+    worker.person = Some(caller.person.clone());
     worker.beat_ms = now;
     worker.turn_ms = now;
     worker.ended_ms = None;
@@ -1910,6 +1916,7 @@ mod tests {
             prompt: "p".into(),
             state: State::Running,
             role: AccessRole::Admin,
+            person: None,
             priority: Priority::Normal,
             effort: Effort::Deep,
             kind: WorkerKind::Coder,

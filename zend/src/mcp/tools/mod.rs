@@ -37,11 +37,11 @@ pub use fit::fit;
 
 mod archive;
 mod attach;
-mod cluster_audit;
+pub mod cluster_audit;
 mod cluster_command;
-mod cluster_job_status;
-mod cluster_logs;
-mod cluster_status;
+pub mod cluster_job_status;
+pub mod cluster_logs;
+pub mod cluster_status;
 mod fit;
 mod gateway_command;
 pub mod group_add;

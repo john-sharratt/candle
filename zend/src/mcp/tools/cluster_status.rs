@@ -8,7 +8,8 @@ use axum::http::Method;
 use serde_json::{json, Value};
 
 use super::{Answer, Ctx};
-use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops::json_of;
+use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "cluster_status";
@@ -352,34 +353,18 @@ pub fn render_gateway(status: &Value) -> String {
     out
 }
 
-pub async fn call(ctx: &Ctx, _args: &Value) -> Answer {
+pub async fn run(call: &OpsCall, _args: &Value) -> Answer {
     let within = Duration::from_secs(15);
-    let members = ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        "/v1/status",
-        None,
-        None,
-        within,
-    );
+    let members = call.up(Method::GET, "/v1/status", None, within);
     // The gateway's own view is asked for beside the members', not after it.
     let gateway = async {
-        if !ctx.caller.is_admin() {
+        if !call.admin() {
             return None;
         }
         Some(
-            ops::up(
-                &ctx.session,
-                &ctx.caller,
-                Method::GET,
-                "/gateway/status.json?log=0",
-                None,
-                None,
-                within,
-            )
-            .await
-            .and_then(|r| json_of(&r)),
+            call.up(Method::GET, "/gateway/status.json?log=0", None, within)
+                .await
+                .and_then(|r| json_of(&r)),
         )
     };
     let (reply, gateway) = tokio::join!(members, gateway);
@@ -399,6 +384,10 @@ pub async fn call(ctx: &Ctx, _args: &Value) -> Answer {
         }
     }
     Answer::ok(out)
+}
+
+pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
+    run(&OpsCall::of(ctx), args).await
 }
 
 #[cfg(test)]

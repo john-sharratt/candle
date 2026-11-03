@@ -1,0 +1,92 @@
+name: cluster_logs
+questions:
+- what do the logs say about the upgrade
+- search the members' logs for errors
+- why did whiteworld stop serving
+- find the panic in the daemon's log
+- what did the trial log on blackworld
+- show the warnings from the last hour
+- grep the cluster logs for fault mode
+- what did npcd log since the restart
+- read zend's errors on whiteworld
+- did a member log a failed install
+- find where the member left fault mode
+- what did the upgrader say about the new build
+- search the logs for catch-up
+- show the errors since ten o'clock
+- read one member's log lines about the floor
+- what went wrong on the other machine
+category: Commands
+description: 'Search the logs of the cluster''s members — the machines running the motherd daemon — for what they say about a symptom, read through the gateway as the person this task works for: every member''s matching lines, oldest first, each under its member, each cut at 400 characters. `grep` is a regular expression found anywhere in a line; narrow with `level` (the least kept: TRACE, DEBUG, INFO, WARN, ERROR), `tenant` (zend, the coding service, or npcd, the bots'') and `since` (an RFC 3339 prefix in UTC, as `2026-11-03T12:00`); `node` reads one member only. When more lines match than `limit` (100 by default), the newest are kept and the answer says earlier ones were left out: narrow the search, or name `since`, to see them. Use for: why a member did something — a fault, a failed upgrade, a panic. Triggered by "what do the logs say", "search the logs for". Returns each member''s matching lines. Cite the lines you rely on.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    grep:
+      description: A regular expression; a line is kept when it is found anywhere in it. Optional.
+      maxLength: 200
+      minLength: 1
+      type: string
+    level:
+      description: 'The least level kept: TRACE, DEBUG, INFO, WARN or ERROR. Optional.'
+      enum:
+      - TRACE
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+      type: string
+    tenant:
+      description: 'Only one app''s lines: `zend` (the coding service) or `npcd` (the bots''). Optional.'
+      enum:
+      - zend
+      - npcd
+      type: string
+    since:
+      description: Only lines stamped at or after this RFC 3339 prefix, in UTC, as `2026-11-03T12:00`. Optional.
+      maxLength: 32
+      minLength: 4
+      type: string
+    limit:
+      description: The most lines per member, the newest kept; 100 by default. Optional.
+      maximum: 5000.0
+      minimum: 1.0
+      type: integer
+    node:
+      description: One member only, by its 16-hex-digit node as cluster_status lists it. Optional.
+      maxLength: 16
+      minLength: 16
+      type: string
+  title: LogsRequest
+  type: object
+examples:
+- |-
+  why has whiteworld not upgraded<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The upgrader logs why it holds or what its fetch is doing. A search for those words since the floor rose shows each member's lines.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_logs", "arguments": {"grep": "upgrad|holding|fetch", "since": "2026-11-03T11:55"}}
+  </tool_call><|projection|>
+- |-
+  did any member log errors in the last hour<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Errors alone, from the hour's start: the level keeps ERROR lines and the time narrows the search.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_logs", "arguments": {"level": "ERROR", "since": "2026-11-03T11:00"}}
+  </tool_call><|projection|>
+- |-
+  what did npcd on that member say about fault mode<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  One app's lines on one member: the tenant and the node narrow it, and the grep finds the fault lines.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_logs", "arguments": {"grep": "fault", "tenant": "npcd", "node": "b2e6c81e74725e18"}}
+  </tool_call><|projection|>

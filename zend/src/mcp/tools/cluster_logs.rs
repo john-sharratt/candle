@@ -20,6 +20,7 @@ use url::form_urlencoded::Serializer;
 
 use super::{Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "cluster_logs";
 
@@ -168,17 +169,10 @@ fn member_path(member: &Listed, search: &str) -> String {
 }
 
 /// `member`'s search, as an envelope entry.
-async fn read_through(ctx: &Ctx, member: &Listed, search: &str) -> Value {
-    let reply = ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        &member_path(member, search),
-        None,
-        None,
-        WITHIN,
-    )
-    .await;
+async fn read_through(call: &OpsCall, member: &Listed, search: &str) -> Value {
+    let reply = call
+        .up(Method::GET, &member_path(member, search), None, WITHIN)
+        .await;
     let (status, body) = match reply {
         Ok(r) => (
             r.status,
@@ -197,21 +191,14 @@ async fn read_through(ctx: &Ctx, member: &Listed, search: &str) -> Value {
 
 /// The gateway's status, for an Admin; `None` for anyone else or when it
 /// cannot be read.
-async fn gateway_members(ctx: &Ctx) -> Option<Vec<Listed>> {
-    if !ctx.caller.is_admin() {
+async fn gateway_members(call: &OpsCall) -> Option<Vec<Listed>> {
+    if !call.admin() {
         return None;
     }
-    let reply = ops::up(
-        &ctx.session,
-        &ctx.caller,
-        Method::GET,
-        "/gateway/status.json?log=0",
-        None,
-        None,
-        WITHIN,
-    )
-    .await
-    .ok()?;
+    let reply = call
+        .up(Method::GET, "/gateway/status.json?log=0", None, WITHIN)
+        .await
+        .ok()?;
     json_of(&reply).ok().map(|s| listed(&s))
 }
 
@@ -296,28 +283,21 @@ pub fn render(envelope: &Value) -> String {
     }
 }
 
-pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let search = path_of(args);
     if let Some(n) = args.get("node").and_then(Value::as_str) {
-        let node = match ops::admin_only(&ctx.caller, "cluster_logs` with `node")
-            .and_then(|()| ops::node(n))
-        {
+        if !call.admin() {
+            return Answer::error("`cluster_logs` with `node` is an Admin's");
+        }
+        let node = match ops::node(n) {
             Ok(n) => n,
             Err(e) => return Answer::error(e),
         };
-        return one(ctx, &node, &search).await;
+        return one(call, &node, &search).await;
     }
     let (reply, members) = tokio::join!(
-        ops::up(
-            &ctx.session,
-            &ctx.caller,
-            Method::GET,
-            &search,
-            None,
-            None,
-            WITHIN
-        ),
-        gateway_members(ctx)
+        call.up(Method::GET, &search, None, WITHIN),
+        gateway_members(call)
     );
     let envelope = match reply.and_then(|r| json_of(&r)) {
         Ok(v) => v,
@@ -327,29 +307,23 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::ok(render(&envelope));
     };
     let missed = missed(&envelope, &members);
-    let through = join_all(missed.iter().map(|m| read_through(ctx, m, &search))).await;
+    let through = join_all(missed.iter().map(|m| read_through(call, m, &search))).await;
     Answer::ok(render(&with_answers(envelope, through)))
+}
+
+pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
+    run(&OpsCall::of(ctx), args).await
 }
 
 /// Member `node`'s search: a zend member's as the gateway routes it, any
 /// other logging app's through the gateway's member route.
-async fn one(ctx: &Ctx, node: &str, search: &str) -> Answer {
-    let listed = gateway_members(ctx).await.unwrap_or_default();
+async fn one(call: &OpsCall, node: &str, search: &str) -> Answer {
+    let listed = gateway_members(call).await.unwrap_or_default();
     let member = listed.iter().find(|m| m.node == node);
     let entry = match member {
-        Some(m) if m.app != GATHERED_APP => read_through(ctx, m, search).await,
+        Some(m) if m.app != GATHERED_APP => read_through(call, m, search).await,
         _ => {
-            let reply = match ops::up(
-                &ctx.session,
-                &ctx.caller,
-                Method::GET,
-                search,
-                Some(node),
-                None,
-                WITHIN,
-            )
-            .await
-            {
+            let reply = match call.up(Method::GET, search, Some(node), WITHIN).await {
                 Ok(r) => r,
                 Err(e) => return Answer::error(e),
             };
