@@ -30,8 +30,9 @@ pub fn definition() -> Value {
         "name": NAME,
         "annotations": {"readOnlyHint": true},
         "description": "Read one stored conversation — a timeline in the substrate, the store everything \
-            is kept in — by the id `layer_read` lists, or a worker's own by its path \
-            (`T:<thread>/<name>`): its label, layer, tokens, \
+            is kept in — by the id `layer_read` lists, a worker's own by its path \
+            (`T:<thread>/<name>`), or any conversation by its id as the web UI's `#conv=` link names it \
+            (a uuid, or `mcp:<owner>:<thread>/<name>`, escaped or not): its label, layer, tokens, \
             metadata (the dials a worker ran with among it) and lineage, then its turns a page at a time — \
             each with its index, kind (normal, or a summary of turns or of summaries), tokens, and the first \
             line of each half. With `turn`, that one turn in full instead: the user half (a tool call's \
@@ -40,7 +41,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "The timeline id, a decimal number as `layer_read` lists it — or a worker's path, `T:<thread>/<name>`, for its own conversation."},
+                "id": {"type": "string", "description": "The timeline id, a decimal number as `layer_read` lists it; a worker's path, `T:<thread>/<name>`; or a conversation id, as the web UI's `#conv=` names it."},
                 "offset": {"type": "integer", "minimum": 0, "description": "The first turn (0 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "How many turns (40 by default)."},
                 "turn": {"type": "integer", "minimum": 0, "description": "One turn's index, to read it in full."},
@@ -135,24 +136,48 @@ pub fn render_turn(t: &TimelineDetail, index: u32, from: usize) -> Result<String
 }
 
 const ID_IS: &str =
-    "`id` is a timeline id, a decimal number as `layer_read` lists it, or a worker's path, \
-     `T:<thread>/<name>`";
+    "`id` is a timeline id, a decimal number as `layer_read` lists it; a worker's path, \
+     `T:<thread>/<name>`; or a conversation id, as the web UI's `#conv=` names it — a uuid, \
+     or `mcp:<owner>:<thread>/<name>`";
 
-/// The conversation an `id` names: a timeline by number, or a worker of the
-/// caller's by its path.
+/// The conversation an `id` names: a timeline by number, a worker of the
+/// caller's by its path, or any conversation by its id — what the web UI's
+/// `#conv=` carries, so a conversation someone is looking at can be read.
 #[derive(Debug, PartialEq, Eq)]
 enum Which {
     Timeline(u64),
     Worker { thread: String, name: String },
+    Conversation(String),
+}
+
+/// `id` as the web UI's link spells it, with its `%3A` and `%2F` undone.
+fn unescaped(id: &str) -> String {
+    id.replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%2F", "/")
+        .replace("%2f", "/")
+}
+
+/// Whether `id` is a conversation id: a uuid, or an MCP conversation's.
+fn is_conversation(id: &str) -> bool {
+    let uuid = id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    uuid || (id.starts_with("mcp:") && id.len() > 4)
 }
 
 impl Which {
     fn of(id: &str) -> Result<Self, String> {
-        let id = id.trim();
+        let id = unescaped(id.trim());
         if let Ok(raw) = id.parse::<u64>() {
             return Ok(Self::Timeline(raw));
         }
-        match Path::parse(id) {
+        if is_conversation(&id) {
+            return Ok(Self::Conversation(id));
+        }
+        match Path::parse(&id) {
             Ok(Path::Worker { thread, worker }) => Ok(Self::Worker {
                 thread,
                 name: worker,
@@ -192,6 +217,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             ctx.session
                 .conversation_detail(&threads::conv_id(&ctx.caller.key(), thread, name))
         }
+        Which::Conversation(conv) => ctx.session.conversation_detail(conv),
     };
     let Some(t) = found else {
         return Answer::error(match which {
@@ -199,6 +225,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             Which::Worker { thread, name } => {
                 format!("`T:{thread}/{name}` has no conversation of yours")
             }
+            Which::Conversation(conv) => format!("there is no conversation {conv}"),
         });
     };
     match args.get("turn").and_then(Value::as_u64) {
@@ -240,6 +267,25 @@ mod tests {
         );
         assert_eq!(Which::of("T:night-test"), Err(ID_IS.to_string()));
         assert_eq!(Which::of("seven"), Err(ID_IS.to_string()));
+    }
+
+    /// **A conversation reads by the id the web UI's link carries**: a uuid,
+    /// or an MCP conversation's id, escaped as the link escapes it or not.
+    #[test]
+    fn a_conversation_reads_by_the_id_its_link_carries() {
+        assert_eq!(
+            Which::of("1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015"),
+            Ok(Which::Conversation(
+                "1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015".into()
+            ))
+        );
+        assert_eq!(
+            Which::of("mcp%3A154797f34c5a6ca6%3Azen-ops%2Fread-stencil-checks"),
+            Ok(Which::Conversation(
+                "mcp:154797f34c5a6ca6:zen-ops/read-stencil-checks".into()
+            ))
+        );
+        assert_eq!(Which::of("1a7f30b0-2e8d"), Err(ID_IS.to_string()));
     }
 
     #[test]
