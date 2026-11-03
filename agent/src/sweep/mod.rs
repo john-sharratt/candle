@@ -128,6 +128,7 @@ pub fn sweep(targets: &[Target], bars: &Bars, volume: Volume) -> Vec<String> {
 mod tests {
     use std::cell::Cell;
     use std::fs::File;
+    use std::slice;
     use std::time::{Duration, SystemTime};
 
     use super::*;
@@ -164,7 +165,7 @@ mod tests {
     fn a_volume_with_room_is_left_alone() {
         let root = tempfile::tempdir().unwrap();
         let t = target(root.path(), "candle", 4, 100);
-        let lines = sweep(&[t.clone()], &bars(1), &|_| Some((5_000, 10_000)));
+        let lines = sweep(slice::from_ref(&t), &bars(1), &|_| Some((5_000, 10_000)));
         assert!(lines.is_empty(), "{lines:?}");
         assert_eq!(dir_bytes(&t.dir), 400);
     }
@@ -181,7 +182,7 @@ mod tests {
             free.set(5_000);
             Some((f, 10_000))
         };
-        let lines = sweep(&[t.clone()], &bars(200), &volume);
+        let lines = sweep(slice::from_ref(&t), &bars(200), &volume);
         assert_eq!(lines[0], "the disk is low: 0.0 GB free of 0.0 GB, under the 0.0 GB bar");
         assert!(lines[1].starts_with("pruned candle:") && lines[1].ends_with("3 stale files removed"), "{lines:?}");
         assert_eq!(dir_bytes(&t.dir), 200, "the two newest generations stay");
