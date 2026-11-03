@@ -1,4 +1,4 @@
-//! All 98 tool implementations, organised into one module per logical group.
+//! Every tool implementation, organised into one module per logical group.
 //!
 //! Each tool module follows the same pattern:
 //! - a `Request` struct (`Deserialize + JsonSchema + Validate`)
@@ -22,11 +22,11 @@
 //! | `file` | `file_{write,read,edit,list,search,grep,delete,image,present}` | VFS tools; `search`/`grep` find by name and by content, `image` makes resized copies |
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
-//! | `deploy` | `service_deploy` | Calls `TrialRunner` trait impl injected by daemon |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |
 //! | `journal` | `journal_read`, `journal_grep` | The conversation's own journal text, through `ToolContext::journal` |
 //! | `network_diag` | `dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info` | subprocess |
 //! | `notes` | `notes_{write,read,search,list}` | In-memory KV with FTS |
+//! | `ops` | `service_{deploy,status,log,cancel}`, `repo_job_{status,log,list,cancel}` | Handed whole to the `OpsRunner` the daemon injects, which runs its MCP tools' implementation |
 //! | `random` | `random` | rand crate; real OS entropy |
 //! | `remote_fs` | `remote_fs_session_*` (10 tools) | SFTP via ssh2 |
 //! | `run` | `run_command`, `run_output` | A program in the repository's sandbox, on the conversation's branch |
@@ -49,7 +49,6 @@ pub mod code;
 pub mod credentials;
 pub mod crypto;
 pub mod datetime;
-pub mod deploy;
 pub mod file;
 pub mod git;
 pub mod hash;
@@ -58,6 +57,7 @@ pub mod http_session;
 pub mod journal;
 pub mod network_diag;
 pub mod notes;
+pub mod ops;
 pub mod random;
 pub mod remote_fs;
 pub mod run;

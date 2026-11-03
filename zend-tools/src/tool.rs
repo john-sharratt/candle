@@ -110,29 +110,14 @@ pub trait SubagentRunner: Send + Sync + 'static {
     fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String>;
 }
 
-/// A service to build from `origin/main` and try on one machine.
-pub struct TrialRequest {
-    /// The machine, by name.
-    pub host: String,
-    /// `motherd`, `web` or `mcp`: the package built and the service tried.
-    pub service: &'static str,
-}
-
-/// How a trial ended. A rollback is an outcome, not a failure of the call.
-pub struct TrialResponse {
-    /// The build's path on that machine.
-    pub artifact: String,
-    /// It served, and is now the machine's installed build.
-    pub proven: bool,
-    /// keep's account of the trial.
-    pub detail: String,
-}
-
-/// Injected by the daemon to deploy: a build on the machine's agent, staged,
-/// then keep's trial there, run to its end before the call returns.
-pub trait TrialRunner: Send + Sync + 'static {
-    /// Build and try `req` for the conversation `caller`, or refuse it.
-    fn run(&self, caller: &str, req: TrialRequest) -> Result<TrialResponse, String>;
+/// Injected by the daemon to run the build and deploy tools — `service_*`
+/// and the `repo_job_*` readers (`docs/build_deploy_tools.md` §6) — with the
+/// same implementation the daemon's MCP tools run, so the two surfaces answer
+/// alike.
+pub trait OpsRunner: Send + Sync + 'static {
+    /// Run `tool` with `args` for the conversation `caller`: its answer, or
+    /// why it was refused or failed.
+    fn run(&self, caller: &str, tool: &str, args: serde_json::Value) -> Result<String, String>;
 }
 
 /// A tool implementation.

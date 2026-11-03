@@ -48,7 +48,7 @@ use zend_tools::executor::Executor;
 use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::JournalShelf;
-use zend_tools::{alias_pins, registry, replay, Replay, SubagentRunner, ToolContext, TrialRunner};
+use zend_tools::{alias_pins, registry, replay, OpsRunner, Replay, SubagentRunner, ToolContext};
 use zend_vfs::sandbox::programs;
 use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
 
@@ -920,11 +920,12 @@ impl ToolHost {
         }
     }
 
-    /// This host with `runner` deploying for every context's `service_deploy`.
-    pub fn running_trials(self, runner: Arc<dyn TrialRunner>) -> Self {
+    /// This host with `runner` running every context's build and deploy tools
+    /// (`docs/build_deploy_tools.md` §6).
+    pub fn running_ops(self, runner: Arc<dyn OpsRunner>) -> Self {
         Self {
             contexts: self.contexts.map(|ctx| {
-                Arc::new(Arc::unwrap_or_clone(ctx).with_trial_runner(Arc::clone(&runner)))
+                Arc::new(Arc::unwrap_or_clone(ctx).with_ops_runner(Arc::clone(&runner)))
             }),
             ..self
         }

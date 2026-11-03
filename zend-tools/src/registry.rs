@@ -1022,7 +1022,6 @@ use crate::tools::{
         SIGNATURE_SIGN, SIGNATURE_VERIFY,
     },
     datetime::REGISTRATION as DATETIME,
-    deploy::REGISTRATION as SERVICE_DEPLOY,
     file::{
         FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_IMAGE, FILE_LIST, FILE_MOVE, FILE_PRESENT,
         FILE_READ, FILE_SEARCH, FILE_WRITE,
@@ -1046,6 +1045,8 @@ use crate::tools::{
         REMOTE_FS_SESSION_OPEN, REMOTE_FS_SESSION_PUT, REMOTE_FS_SESSION_RENAME,
         REMOTE_FS_SESSION_STAT,
     },
+    ops::job::{REPO_JOB_CANCEL, REPO_JOB_LIST, REPO_JOB_LOG, REPO_JOB_STATUS},
+    ops::service::{SERVICE_CANCEL, SERVICE_DEPLOY, SERVICE_LOG, SERVICE_STATUS},
     run::{RUN_COMMAND, RUN_OUTPUT},
     sql_session::{SQL_SESSION_CLOSE, SQL_SESSION_LIST, SQL_SESSION_OPEN, SQL_SESSION_QUERY},
     ssh::{
@@ -1260,8 +1261,18 @@ fn register_all() -> &'static [RegisteredTool] {
         // runs to read.
         RUN_COMMAND.requires(NET_EXEC_DISK),
         RUN_OUTPUT.requires(EXEC),
-        // Deploy (1) — replaces a running service on a machine.
+        // Builds and deploys (8) — through the daemon to the cluster's agents
+        // and keeps. A deploy replaces a running service on a machine, and a
+        // cancel stops a build or rolls a trial back: both act as a command
+        // does. The readers reach the cluster and change nothing.
         SERVICE_DEPLOY.requires(NET_EXEC_DISK),
+        SERVICE_CANCEL.requires(NET_EXEC_DISK),
+        REPO_JOB_CANCEL.requires(NET_EXEC_DISK),
+        SERVICE_STATUS.requires(NET),
+        SERVICE_LOG.requires(NET),
+        REPO_JOB_STATUS.requires(NET),
+        REPO_JOB_LOG.requires(NET),
+        REPO_JOB_LIST.requires(NET),
     ];
     TOOLS
 }

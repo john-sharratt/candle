@@ -1,0 +1,70 @@
+name: service_status
+questions:
+- how is the deploy going
+- did the trial pass
+- is the new build serving yet
+- wait for the deploy to finish
+- what build does whiteworld run
+- was the deploy rolled back
+- which services are running on blackworld
+- has keep proven the gateway build
+- is anything deploying right now
+- what happened to the trial
+- what version is each machine on
+- tell me when the deploy is done
+category: Commands
+description: 'Say where deploys are. With `deploy` — the handle service_deploy answered — that deploy''s stage: building (its phase, time and lines), build failed, built and staged, being tried by keep (how far into its ten-minute proof window, and the trial log''s last line), or ended: proven and now installed, rolled back with keep''s reason, or cancelled. It waits up to `wait_s` seconds (60 by default; 0 answers at once) for the deploy to end, so one call with a long `wait_s` waits it out; do not call it again and again. Without `deploy`, every machine''s services, or `host`''s alone, as its keep reports them: each service''s installed build, whether it runs, the trial running and how the last one ended, with the deploy each belongs to, and the deploys still building there. Use for: following a deploy to its end, and seeing what each machine runs before deploying. Triggered by "how is the deploy going", "did the trial pass", "what does whiteworld run". Returns the stage, and the next call to make.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    deploy:
+      description: A deploy's handle, `<node>:<id>`, as service_deploy answered it. Optional; without it, every machine's services.
+      maxLength: 64
+      minLength: 18
+      type: string
+    host:
+      description: Without `deploy`, one machine only, by name. Optional.
+      maxLength: 32
+      minLength: 1
+      type: string
+    wait_s:
+      description: With `deploy`, seconds to wait for it to end; 60 by default, 0 to answer at once. Optional.
+      maximum: 3600.0
+      minimum: 0.0
+      type: integer
+  title: StatusRequest
+  type: object
+examples:
+- |-
+  the deploy started, wait for it to finish<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  service_deploy answered with the deploy's handle and returned at once. A build and a trial take minutes, so one service_status call with a long wait holds until it is proven or rolled back.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_status", "arguments": {"deploy": "76c3a0f4d39bd9db:XeV_I_QPzpg", "wait_s": 300}}
+  </tool_call><|projection|>
+- |-
+  what is each machine running before I deploy<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Without a deploy, service_status reads every machine's keep: the installed builds and any trial or deploy already under way, which I should not start a second one over.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_status", "arguments": {}}
+  </tool_call><|projection|>
+- did the trial on whiteworld pass<|im_end|>
+- is the new gateway build serving yet<|im_end|>
+- |-
+  it is still building, keep waiting<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The last answer said it was still going and named the call that keeps waiting: the same deploy with a long wait.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_status", "arguments": {"deploy": "76c3a0f4d39bd9db:XeV_I_QPzpg", "wait_s": 300}}
+  </tool_call><|projection|>

@@ -1013,35 +1013,37 @@ name before it is parsed):
 
 ### 8.3 Building and testing
 
-`repo_job_start {node?, repo, branch, program, args, timeout_s?, stage?}` runs a
-program on an agent, and `repo_job_log {node, job, from?, grep?}` reads it. Agents
-run inside each motherd at low priority (`motherd/motherd.yaml`,
-`motherd/agent.yaml`).
+The `repo_job_*` tools (`docs/build_deploy_tools.md`, which is authoritative for
+them) run a program on an agent and follow it: `repo_job_start {repo, branch,
+program, args, timeout_s?, stage?, node?}`, `repo_job_status {job, wait_s?}`,
+`repo_job_log {job, mode, …}`, `repo_job_list {node?, running?, limit?}`,
+`repo_job_cancel {job}`. A job is one handle, `<node>:<id>`. Agents run inside
+each motherd at low priority (`motherd/motherd.yaml`, `motherd/agent.yaml`).
 
 - **A run job** is `{repo, branch, overlay, program, args, timeout_secs,
   stage}`: a program with arguments, not a shell line, limited by the sandbox
   allow-list (`agent/src/wire.rs`). `repo_job_start` sends an empty overlay, so the
-  job runs on the branch as the agent fetches it from origin.
+  job runs on the branch as the agent fetches it from origin, and refuses a
+  shell word (`&&`, `|`, `;`, a redirect) before anything is sent.
 - **Started over the member's own agent stream**, in process: the tool calls
-  `Agents::submit` (`agent/src/client.rs`), which starts the job and answers
-  where it runs without waiting for it to end — the agent's `POST /v1/jobs`
-  takes members only (`agent/src/routes.rs`), and this member is one.
-- **Logs** come as `tail?from=<byte>` in chunks of up to 256 KiB
-  (`agent/src/jobs.rs`). `repo_job_log` pages by byte offset and greps the page
-  here; it leads with how the job stands — running or ended, its exit code,
-  and what it staged.
-- **Choosing an agent** follows §11.3: sticky on `x-tokera-lineage`, a
-  5-second spill to the best idle agent — the machine table's `builds`
+  `Agents::submit` (`agent/src/client.rs`). The agent registers the job and
+  answers before it fetches origin; the fetch, the wait for the checkout and
+  the staging are the job's phases (`agent::wire::Phase`).
+- **Logs are read on the agent** (`POST /v1/jobs/:id/read`,
+  `cluster/src/log_read.rs`): a summary, a tail, a range of lines or a search,
+  every line numbered as in the log, at most 200 lines an answer.
+- **Choosing an agent** follows §11.3: sticky on `x-tokera-lineage`, spilling at
+  once off a busy holder to the best idle agent — the machine table's `builds`
   preference first, then dedicated over low-priority agents, then idle cores
   (`docs/replicated_substrate.md` §11.3); `node` pins one with
-  `x-tokera-node` (`web/src/cluster/jobs.rs:69-76`).
+  `x-tokera-node` (`web/src/cluster/jobs.rs`).
 - **A job lives in its motherd.** The agent's job table is in memory
-  (`agent/src/jobs.rs:44-45, 119, 184`), so a job dies if that motherd
-  restarts; the tool reports it lost, and the skill runs it again.
+  (`agent/src/jobs.rs`), so a job dies if that motherd restarts; the tool
+  reports it lost, and the skill runs it again.
 
-A worker builds and tests with zend's own agent tools, as a Comprehensive
-dialogue does today; `repo_job_start` is for Claude, and for a flow that needs to
-name a node.
+A worker builds and tests its own changes with `run_command`, which lays its
+uncommitted work down; `repo_job_start` runs a branch as origin holds it, and is
+Claude's. A worker reads a deploy's build with the `repo_job_*` readers.
 
 ### 8.4 Deploying
 
@@ -1067,8 +1069,10 @@ are Admin-only at the endpoint:
 
 | Tool | keep route | Class |
 |---|---|---|
-| `service_status {host}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended | Look |
-| `service_trial {host, service, artifact}` | `POST /v1/keep/trial` — the trial, run as a job: accepted at once, its outcome read with `service_status`. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
+| `service_deploy {host, service}` | the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
+| `service_status {deploy?, host?, wait_s?}` | `GET /v1/keep/state` — each service: its stable file's build, whether it runs, the trial running and how the last ended, each with its deploy; or one deploy's stage, waited on | Look |
+| `service_log {host, service, mode, …}` | `POST /v1/keep/trial/log` — the trial log, read on keep's machine | Look |
+| `service_cancel {deploy}` | the build cancelled, or `POST /v1/keep/trial/cancel` — the trial rolled back and recorded cancelled | Care |
 | `service_control {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |
 
 Every trial keep runs — through the cluster or its loopback switch — is on its
@@ -1090,14 +1094,14 @@ by `zend-test` on an agent, and by hand on a machine kept out of the cluster
 (§14.1). **Promotion is not delegated either:** certifying a build, rolling it
 out, or rolling it back is a Decide command.
 
-**A worker deploys with `service_deploy {host, service}`** (`zend/src/mcp/trials.rs`):
-the build on the machine's agent, the stage and the trial as one call, which
-waits for keep's outcome. It builds `origin/main` alone. Only a coder running as
-an Admin may call it. A trial of `motherd` is refused on the machine running the
-worker, whose own call it would end, and where an app has no ready member
-elsewhere, which stays a person's decision through `service_trial`; a status
-that cannot be read refuses too. keep answers the member a request came from,
-so the call states no person.
+**A worker deploys with the same `service_deploy`** (`zend/src/mcp/ops_tools.rs`),
+run through the daemon's `OpsRunner`, and watches it with the same readers. It
+builds `origin/main` alone. Only a coder running as an Admin may deploy or
+cancel. A worker's trial of `motherd` is refused on the machine running the
+worker, which the trial would stop, and where an app has no ready member
+elsewhere, which stays a person's decision (`zend/src/mcp/tools/service/guard.rs`);
+a status that cannot be read refuses too. keep answers the member a request came
+from, so a worker's call states no person.
 
 **The artifact keep runs** is a path on keep's own machine. A build job that
 names a `stage` — `target/release/motherd.exe` — has the agent copy that file

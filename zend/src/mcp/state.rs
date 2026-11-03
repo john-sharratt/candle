@@ -25,9 +25,9 @@ use tokio::sync::watch;
 use web::auth::oidc::random_token;
 
 use super::memory::Memory;
+use super::ops_tools::OpsTools;
 use super::parts::Parts;
 use super::records::Records;
-use super::trials::Trials;
 
 /// The longest any call waits when it names no `wait_s`: short enough that a
 /// running worker reports what it has done every 45 seconds, and Claude can
@@ -186,7 +186,7 @@ impl<R: Records> Store for RecordStore<R> {
 pub struct McpState {
     changed: watch::Sender<u64>,
     parts: Arc<Parts>,
-    trials: Arc<Trials>,
+    ops: Arc<OpsTools>,
     memory: Arc<Memory>,
     used: Arc<Used>,
 }
@@ -196,7 +196,7 @@ impl Default for McpState {
         Self {
             changed: watch::channel(0).0,
             parts: Arc::default(),
-            trials: Arc::default(),
+            ops: Arc::default(),
             memory: Arc::default(),
             used: Arc::default(),
         }
@@ -219,9 +219,9 @@ impl McpState {
         &self.parts
     }
 
-    /// The `service_deploy` runner every tool context carries.
-    pub fn trials(&self) -> &Arc<Trials> {
-        &self.trials
+    /// The runner of the build and deploy tools every tool context carries.
+    pub fn ops(&self) -> &Arc<OpsTools> {
+        &self.ops
     }
 
     /// Tell every waiter a worker's state moved.

@@ -1,58 +1,84 @@
 ---
 name: deploy
-description: How to put a commit on origin/main onto one machine — build and stage it on that machine's agent, trial it through keep, watch it to proven or rolled back, confirm it serves.
-tools: [repo_job_start, repo_job_log, service_trial, service_status, cluster_status, cluster_logs]
+description: How to put origin/main onto one machine — one service_deploy call builds it on that machine's agent and has keep try it — then watch it to proven or rolled back, read why when it fails, stop it, and confirm it serves.
+tools: [service_deploy, service_status, service_log, service_cancel, repo_job_status, repo_job_log, repo_job_list, cluster_status, cluster_logs]
 ---
 # Deploying to one machine
 
-**keep** is the supervisor on each machine that runs its services — motherd
-(the daemon that runs the models), web (the gateway) and mcp (this connector's
-own server, on blackworld and whiteworld). A **trial** starts a new build in place
-of the installed one and keeps it only if it reports serving within ten
-minutes; otherwise it puts the previous binary back. Admins only.
+**keep** is the supervisor on each machine that runs its services — `motherd`
+(the daemon: the models, Zen, npcd), `web` (the gateway) and `mcp` (this
+connector's own server). A **trial** starts a new build in place of the
+installed one and keeps it once it prints that it is serving — within ten
+minutes, the window restarting while it catches up on replication — and
+otherwise puts the previous binary back. A **deploy** is the build and the
+trial together, named by one **handle**, `<node>:<id>`, which is also its build
+job's handle. Admins only.
 
 ## Before
 
-- The commit is on origin/main. keep refuses anything else: a local or branch
-  build would serve real cluster traffic, and everything it writes replicates
-  permanently. A branch is tested (`test`), never deployed.
-- `cluster_status`: note the machine's member, build and `started` time, and
-  its agent's node id. No agent listed for the machine: say so and stop.
-- **If the machine runs an app's only member**, the trial takes that app out
-  of service while it runs, and every worker running on it is lost. Say so to
-  the user and wait for their go before starting.
-- **If the change alters something the gateway must understand** (the
-  cluster's wire format, its route table), the gateway goes first: trial `web`
-  on the gateway's machine before any `motherd`. An older gateway that cannot
-  read a member's new route table drops that member's routes.
+- **The commit is on origin/main, pushed.** keep refuses anything else: a
+  branch or local build would serve real cluster traffic, and what it writes
+  replicates permanently. A branch is tested (`test`), never deployed.
+- `service_status {}` — every machine's services: what each runs, any trial
+  under way, the deploys building. **One deploy per service per machine**: a
+  second trial is refused while one runs.
+- `cluster_status` — the machine's member, its build and `started` time.
+- **A machine that runs an app's only member**: a `motherd` trial takes that
+  app out of service while it runs, and every worker on it is lost. Say so to
+  the user and wait for their go.
+- **Tell whoever is watching** — the user, the other sessions — that a deploy
+  is starting, where, and on which commit, so nothing is started twice.
+- **A change the gateway must understand** (the wire format, the route table)
+  goes to `web` first, on the gateway's machine, before any `motherd`: an
+  older gateway that cannot read a member's new routes drops them.
 
 ## Do
 
-1. **Build and stage** on that machine's agent:
-   `repo_job_start {node: <that machine's agent>, repo, branch: "main",
-   program: "cargo", args: ["build", "--release", "-p", "motherd"],
-   stage: "target/release/motherd.exe", timeout_s: 3600}`
-   (`web` and `mcp` the same way: `-p web`, `target/release/web.exe`;
-   `-p mcp`, `target/release/mcp.exe`).
-2. **Wait for it**: `repo_job_log {node, job}` until it has ended; its
-   answer says where it was staged — use that path, never a guessed one: it
-   differs from machine to machine. A failure: report the build error
-   (`grep: "error"`) and stop.
-3. **Trial**: `service_trial {host, service: "motherd", artifact: <staged
-   path>}`.
-4. **Watch**: `service_status {host}` every few minutes until the trial has
-   ended: proven or rolled back.
-5. **Confirm**: `cluster_status` — the member started after the trial, ready,
-   on the new build. A gateway (`web`) and the connector (`mcp`) have no
-   member line: confirm them with `service_status`, whose trial line says
-   proven.
+1. **Start it**: `service_deploy {host: "BlackWorld", service: "motherd"}`.
+   It answers at once with the deploy's handle and the build's phase. Post the
+   machine and the handle.
+2. **Wait for it**: `service_status {deploy: <handle>, wait_s: 240}` — one call
+   that holds until the deploy ends or the wait runs out; call it again the
+   same way while it answers *still going*. Its stages:
+
+   | Stage | |
+   |---|---|
+   | building | `cargo build --release -p <service>` on that machine's agent: phase, time, lines |
+   | the build failed | nothing was tried; the machine runs what it ran |
+   | built and staged | keep's trial is being asked for |
+   | keep is trying it | how far into the ten-minute window, and the trial log's last line |
+   | proven | installed: the machine runs it from now on |
+   | rolled back / cancelled | the previous binary runs again, with keep's reason |
+
+   Post each stage as it changes.
+3. **Confirm**: `cluster_status` — the member started after the trial, ready,
+   on the new build. `web` and `mcp` have no member line: their `service_status`
+   says proven.
+
+## When it fails
+
+- **The build failed**: `repo_job_log {job: <handle>, mode: "summary"}` gives
+  the compiler errors with their line numbers; `mode: "lines"` reads around
+  one. Fix it on a branch, test, merge, deploy again.
+- **Rolled back**: `service_log {host, service, mode: "summary"}` reads the
+  trial's own stderr — the panic or exit, with line numbers; `mode: "grep",
+  pattern: "error"` finds the rest. A rollback leaves the previous binary
+  running: nothing is down.
+- **Built, but no trial started** past a minute: the member that was to ask
+  keep for it restarted. Deploy again; the build is warm.
+
+## Stop
+
+`service_cancel {deploy: <handle>}` — while it builds, the build is killed and
+nothing is tried; while keep tries it, the trial is stopped and the previous
+binary put back.
 
 ## Report
 
-Proven or rolled back, `service_status`'s line, the member's build and
-`started` time. A rollback leaves the previous binary running — nothing is
-down; read why with `logs` from the trial's start.
+The machine, the handle, the commit, and how it ended — `service_status`'s
+line — with the member's build and `started` time.
 
-Where other members serve the app meanwhile, a trial of a commit on main is
-safe to run. Rolling the build out to other members is `release`, and the
-user's decision.
+A proven `motherd` joins the cluster as a candidate at the higher build count;
+the other members take it once it is certified, which is `release`, and the
+user's decision. `web` and `mcp` are deployed machine by machine, each with
+its own `service_deploy`.

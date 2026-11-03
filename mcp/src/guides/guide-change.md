@@ -1,7 +1,7 @@
 ---
 name: guide-change
 description: How to change a guide, or any of this connector's own words, from a conversation — a worker edits it on a branch, a build agent tests it, the user approves the merge, and mcp is rebuilt and trialled on each machine that runs it.
-tools: [repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_log, service_trial, service_status]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_status, repo_job_log, service_deploy, service_status]
 ---
 # Changing a guide
 
@@ -30,11 +30,12 @@ A new guide is a new file there: its `name` its file's, a one-line
 ## 2. Test the branch, on an agent
 
 Read the new text in the worker's answer against the change asked for. Then
-`repo_job_start {node: <blackworld's agent>, repo: "candle", branch:
-"zen/guide-<what>", program: "cargo", args: ["test", "-p", "mcp", "--bin",
-"mcp", "guides"], timeout_s: 1800}`, and `repo_job_log` until it ends: its
-`test result: ok` line is the proof every guide still reads. A failure names
-the guide and what is wrong with it — send it back to the worker.
+`repo_job_start {repo: "candle", branch: "zen/guide-<what>", program:
+"cargo", args: ["test", "-p", "mcp", "--bin", "mcp", "guides"], timeout_s:
+1800}`, and `repo_job_status {job: <its handle>, wait_s: 240}` until it ends:
+its `test result: ok` line is the proof every guide still reads. A failure
+names the guide and what is wrong with it — `repo_job_log {job, mode:
+"summary"}` reads it — send it back to the worker.
 
 ## 3. Merge — the user's decision
 
@@ -47,24 +48,13 @@ If it cannot (it ended, or its member restarted), start one task for it:
 into main and push main; change nothing else. FINAL RESPONSE: the merged
 commit on main."}`.
 
-## 4. Build, on each machine
+## 4. Deploy, on each machine
 
-For blackworld, then whiteworld — find each machine's agent with
-`cluster_status`:
-
-`repo_job_start {node: <its agent>, repo: "candle", branch: "main",
-program: "cargo", args: ["build", "--release", "-p", "mcp"],
-stage: "target/release/mcp.exe", timeout_s: 1800}`
-
-Follow it with `repo_job_log` until it has ended; its answer says where the
-build was staged. Use that path.
-
-## 5. Trial
-
-`service_trial {host, service: "mcp", artifact: <the staged path>}`, then
-`service_status {host}` until the trial is proven or rolled back. While one
-machine's mcp switches, the other serves the connector. Then the second
-machine.
+For blackworld, then whiteworld: `service_deploy {host, service: "mcp"}`
+builds main on that machine's agent and has keep try it; it answers with the
+deploy's handle. `service_status {deploy: <handle>, wait_s: 240}` waits until
+it is proven or rolled back (the `deploy` guide). While one machine's mcp
+switches, the other serves the connector. Then the second machine.
 
 ## Report
 

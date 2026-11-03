@@ -43,6 +43,7 @@ pub mod memory;
 pub mod names;
 pub mod nudges;
 pub mod ops;
+pub mod ops_tools;
 pub mod ownership;
 pub mod parts;
 pub mod records;
@@ -54,7 +55,6 @@ pub mod state;
 pub mod stops;
 pub mod tending;
 pub mod threads;
-pub mod trials;
 
 #[cfg(test)]
 mod latency_tests;

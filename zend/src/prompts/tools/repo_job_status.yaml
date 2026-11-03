@@ -1,0 +1,42 @@
+name: repo_job_status
+questions:
+- is the deploy's build done
+- wait for the build on the agent
+- how far is the release build on blackworld
+- did the agent job finish
+- what is the build job doing now
+- is that agent job still waiting for the checkout
+- how long has the deploy been building
+- did the build for the deploy pass
+category: Commands
+description: 'Say where a build-agent job is — the machine it runs on, its command, its phase (fetching origin, waiting for the checkout behind named jobs, running, staging what it built, ended), how long it has run, how many lines it has printed and the last of them — and wait up to `wait_s` seconds (60 by default; 0 answers at once) for it to end. One call with a long `wait_s` waits a job out; do not call it again and again. Once ended, the answer says how — exit code, timed out, cancelled, failed before it ran — what it staged, and its summary: cargo''s test results and the first errors and failures with their line numbers, which repo_job_log reads around. `job` is a handle, `<node>:<id>`: a deploy''s handle is its build job''s. Your own run_command runs are read with run_output, not here. Use for: following a deploy''s build. Triggered by "is the build done", "wait for the agent job". Returns where the job is and the next call to make.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    job:
+      description: The job's handle, `<node>:<id>`, as service_deploy or repo_job_list answered it. Required.
+      maxLength: 64
+      minLength: 18
+      type: string
+    wait_s:
+      description: Seconds to wait for it to end; 60 by default, 0 to answer at once. Optional.
+      maximum: 3600.0
+      minimum: 0.0
+      type: integer
+  required:
+  - job
+  title: StatusRequest
+  type: object
+examples:
+- |-
+  wait for the deploy's build to finish<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A deploy's handle is its build job's, so repo_job_status follows the build itself; one call with a long wait holds until it ends.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_job_status", "arguments": {"job": "76c3a0f4d39bd9db:XeV_I_QPzpg", "wait_s": 300}}
+  </tool_call><|projection|>
+- is the agent's build still going<|im_end|>

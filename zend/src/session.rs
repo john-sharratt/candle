@@ -79,7 +79,7 @@ use web::auth::Roles;
 use zend_tools::run_watch::{self, RunWatch};
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::{JournalBook, JournalShelf};
-use zend_tools::{SubagentRunner, TrialRunner};
+use zend_tools::{OpsRunner, SubagentRunner};
 use zend_vfs::{RepoFiles, Workspace};
 
 use crate::api::chat::{
@@ -1349,7 +1349,7 @@ impl InferenceState {
         status_tx: watch::Sender<String>,
         progress: Arc<LoadProgress>,
         loading_substrate: Arc<OnceLock<Conversation>>,
-        (parts, trials): (Arc<dyn SubagentRunner>, Arc<dyn TrialRunner>),
+        (parts, ops): (Arc<dyn SubagentRunner>, Arc<dyn OpsRunner>),
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -3110,7 +3110,7 @@ impl InferenceState {
             tokenizer,
             tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref(), agent.as_ref())?
                 .running_parts(parts)
-                .running_trials(trials)
+                .running_ops(ops)
                 .guarding_defaults(&base_branches),
             repositories,
             workspace,
@@ -8152,7 +8152,7 @@ impl ZendSession {
         let tombstone_retention = self.config.tombstone_retention;
         let cluster = self.config.cluster.clone();
         let parts: Arc<dyn SubagentRunner> = Arc::clone(self.mcp.parts()) as _;
-        let trials: Arc<dyn TrialRunner> = Arc::clone(self.mcp.trials()) as _;
+        let ops: Arc<dyn OpsRunner> = Arc::clone(self.mcp.ops()) as _;
         // The memory its writer keeps current once the engine is up.
         let memory = Arc::clone(self.mcp.memory());
         // Handed to both the downloader and the engine builder, so the artifact
@@ -8178,7 +8178,7 @@ impl ZendSession {
         // threads left idle a day.
         if let Some(rt) = &rt_handle {
             self.mcp.parts().bind(Arc::downgrade(self), rt.clone());
-            self.mcp.trials().bind(Arc::downgrade(self), rt.clone());
+            self.mcp.ops().bind(Arc::downgrade(self), rt.clone());
             archiving::start_sweeping(self, rt);
             resuming::start_resuming(self, rt);
             tending::start_tending(self, rt);
@@ -8281,7 +8281,7 @@ impl ZendSession {
                     status_tx.clone(),
                     load_progress_for_blocking,
                     loading_substrate,
-                    (parts, trials),
+                    (parts, ops),
                 ) {
                     Ok(Some(state)) => {
                         slot.store(Some(Arc::clone(&state)));

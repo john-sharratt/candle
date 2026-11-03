@@ -154,11 +154,11 @@ changed guide is a change to the repository and a redeploy of `mcp`:
 2. With the user's approval — spoken, in the car — the branch is merged to
    `main` (`branch`).
 3. `mcp` is built on each machine that runs it and trialled through keep
-   (`deploy`): `repo_job_start` building `-p mcp` and staging
-   `target/release/mcp.exe`, then `service_trial {service: "mcp"}`. BlackWorld
-   and WhiteWorld each run one, and each is trialled.
+   (`deploy`): `service_deploy {host, service: "mcp"}` builds `-p mcp` on that
+   machine's agent and has keep try it. BlackWorld and WhiteWorld each run one,
+   and each is deployed.
 
-For that, `service_trial` and `service_control` accept `mcp`, and `mcp` (like
+For that, `service_deploy` and `service_control` accept `mcp`, and `mcp` (like
 `web`) answers `--build-info`, which keep checks an artifact against before it
 tries it. A trial of `mcp` takes the connector down for the seconds a switch
 takes on that machine; the other machine's aggregator serves meanwhile.

@@ -16,7 +16,7 @@
 //! | `http_client` | `reqwest::blocking::Client` | Shared HTTP client for `web_fetch`, `weather`, etc. — reached only through [`ToolContext::http`] |
 //! | `secrets` | [`state::Secrets`] | The daemon's API keys and tokens (Tavily, GitHub), read once from a per-user file |
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
-//! | `trial_runner` | `Option<Arc<dyn TrialRunner>>` | Injected by daemon to build a service and try it through keep |
+//! | `ops_runner` | `Option<Arc<dyn OpsRunner>>` | Injected by daemon to run the build and deploy tools (`docs/build_deploy_tools.md` §6) |
 //! | `executor` | [`Executor`] | Where `run_command` runs and the repositories' pushes are made: this daemon's sandboxes, or agents — commands reached only through [`ToolContext::executor`] |
 //! | `lineage` | `String` | The conversation the context's jobs belong to, which keeps them on one agent |
 //! | `journals` | `Option<Arc<dyn JournalShelf>>` | The journals the conversation reads — its own and its ancestors' — for `journal_read` and `journal_grep`, reached only through [`ToolContext::journals`] |
@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
+use crate::tool::OpsRunner;
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
 use crate::tools::journal::JournalShelf;
 use zend_vfs::{here, GitError, Push, RepoFiles, Workspace};
@@ -60,7 +61,7 @@ pub struct ToolContext {
     http_client: reqwest::blocking::Client,
     pub secrets: Arc<Secrets>,
     pub subagent_runner: Option<Arc<dyn crate::SubagentRunner>>,
-    pub trial_runner: Option<Arc<dyn crate::TrialRunner>>,
+    pub ops_runner: Option<Arc<dyn OpsRunner>>,
     /// `None` for a context the daemon gave no executor — a test, a detached
     /// context — which has nowhere to run a command, and pushes from the
     /// repository's own folder.
@@ -107,7 +108,7 @@ impl ToolContext {
             // themselves unconfigured rather than reaching the network.
             secrets: Arc::new(Secrets::empty()),
             subagent_runner: None,
-            trial_runner: None,
+            ops_runner: None,
             executor: None,
             lineage: String::new(),
             journals: None,
@@ -228,9 +229,9 @@ impl ToolContext {
         self
     }
 
-    /// Attach the runner `service_deploy` builds and tries services with.
-    pub fn with_trial_runner(mut self, runner: Arc<dyn crate::TrialRunner>) -> Self {
-        self.trial_runner = Some(runner);
+    /// Attach the runner the build and deploy tools run through.
+    pub fn with_ops_runner(mut self, runner: Arc<dyn OpsRunner>) -> Self {
+        self.ops_runner = Some(runner);
         self
     }
 }

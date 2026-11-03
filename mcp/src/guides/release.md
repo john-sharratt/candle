@@ -1,7 +1,7 @@
 ---
 name: release
 description: How to take a commit on origin/main through a full release — tests, a trial on one machine, certification, then a rollout member by member — stopping at each decision for the user's approval.
-tools: [repo_job_start, repo_job_log, service_trial, service_status, cluster_command, cluster_job_status, gateway_command, cluster_status, cluster_logs, journal_note]
+tools: [repo_job_start, repo_job_status, repo_job_log, service_deploy, service_status, service_log, cluster_command, cluster_job_status, gateway_command, cluster_status, cluster_logs, journal_note]
 ---
 # Releasing a build
 
@@ -12,13 +12,15 @@ is the user's, asked at the step that needs it. Admins only.
 ## 1. Test
 
 Follow the `test` guide on `main` at the commit, for the crates the release
-changes (the crates its changed paths are in). A failure stops the release.
+changes (the crates its changed paths are in). This is the one place the full
+set of tests runs. A failure stops the release.
 
 ## 2. Trial on one machine
 
-Follow the `deploy` guide on one machine — the candidate. It proves the build serves. A
-rollback stops the release. If the release changes what the gateway reads,
-the gateway (`web`) is trialled first.
+Follow the `deploy` guide on one machine — the candidate: `service_deploy`,
+then `service_status {deploy, wait_s}` to its end. It proves the build serves.
+A rollback stops the release. If the release changes what the gateway reads,
+the gateway (`web`) is deployed first.
 
 When the app has only one member (`cluster_status`), the trial takes it out
 of service while it runs: say so to the user before starting it.

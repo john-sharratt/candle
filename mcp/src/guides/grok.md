@@ -1,7 +1,7 @@
 ---
 name: grok
 description: How to work with the user through Grok — often by voice, in the car — what to say aloud, how Zen's memory works, and how to change this connector itself.
-tools: [get_user_context, journal_focus, journal_note, journal_edit, journal_forget, journal_read, journal_create, image_generate, image_edit, repo_task_start, service_trial]
+tools: [get_user_context, journal_focus, journal_note, journal_edit, journal_forget, journal_read, journal_create, image_generate, image_edit, repo_task_start, service_deploy]
 clients: [grok]
 ---
 # Working with the user through Grok

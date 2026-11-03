@@ -1,0 +1,125 @@
+name: service_log
+questions:
+- why was the trial rolled back
+- show the trial's log
+- what did the new motherd print when it started
+- did the trial panic
+- read the gateway's stderr on blackworld
+- what is the trial doing right now
+- find the error in the trial log
+- show the last lines the service printed
+- is the trial catching up on sync
+- search the service log for the panic
+category: Commands
+description: 'Read a service''s trial log on one machine, where keep writes it: the service''s stderr from the moment its last trial started — loading, catching up on replication, `INFO serving` when it proved itself, or the panic or exit that rolled it back — and, after a proven trial, everything the service has printed since. Read on keep''s machine, so only the answer comes back, every line numbered as it stands in the log. `mode: summary` gives the errors, panics and last lines — read it first; `mode: lines` reads `count` lines from line `from`, what a summary pointed at; `mode: grep` finds `pattern` (plain text, any case) with `context` lines around each hit; `mode: tail` reads the last `lines`. A deploy''s build log is not here: read it with repo_job_log. Use for: why a trial was rolled back, what a running trial is doing. Triggered by "why was it rolled back", "show the trial log". Returns the lines asked for and how to read on.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: The machine, by name, as `blackworld`. Required.
+      maxLength: 32
+      minLength: 1
+      type: string
+    service:
+      description: 'The service whose trial log to read: `motherd`, `web` or `mcp`. Required.'
+      enum:
+      - motherd
+      - web
+      - mcp
+      type: string
+    mode:
+      description: 'How to read it: `summary` (errors, panics, last lines; read it first), `tail` (the last `lines`), `lines` (`count` lines from `from`), `grep` (lines holding `pattern`). Required.'
+      enum:
+      - summary
+      - tail
+      - lines
+      - grep
+      type: string
+    pattern:
+      description: With `grep`, the text to find, ignoring case; plain text. Required with `grep`.
+      maxLength: 200
+      minLength: 1
+      type: string
+    context:
+      description: With `grep`, lines either side of each hit, 0 to 5; 0 by default. Optional.
+      maximum: 5.0
+      minimum: 0.0
+      type: integer
+    from:
+      description: With `lines`, the first line, from 1 (required with `lines`); with `grep`, search from this line on. Optional otherwise.
+      minimum: 1.0
+      type: integer
+    count:
+      description: With `lines`, how many lines, at most 200. Required with `lines`.
+      maximum: 200.0
+      minimum: 1.0
+      type: integer
+    lines:
+      description: With `tail`, how many of the last lines, at most 200; 40 by default. Optional.
+      maximum: 200.0
+      minimum: 1.0
+      type: integer
+  required:
+  - host
+  - service
+  - mode
+  allOf:
+  - if:
+      properties:
+        mode:
+          const: grep
+    then:
+      required:
+      - pattern
+  - if:
+      properties:
+        mode:
+          const: lines
+    then:
+      required:
+      - from
+      - count
+  title: ServiceLogRequest
+  type: object
+examples:
+- |-
+  the trial was rolled back, why<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  keep's account says only that it was rolled back. The trial's own stderr says what it did; the summary gives its errors and panics with line numbers, which is where to start.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_log", "arguments": {"host": "whiteworld", "service": "motherd", "mode": "summary"}}
+  </tool_call><|projection|>
+- |-
+  read around that panic<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The summary named the panic at line 4120. Sixty lines from a little before it show what led up to it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_log", "arguments": {"host": "whiteworld", "service": "motherd", "mode": "lines", "from": 4100, "count": 60}}
+  </tool_call><|projection|>
+- |-
+  is the trial still syncing<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A running trial writes its catch-up as it goes, so the last lines of its log say where it is.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_log", "arguments": {"host": "blackworld", "service": "motherd", "mode": "tail", "lines": 20}}
+  </tool_call><|projection|>
+- |-
+  find where the gateway trial said it was serving<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A search finds the line wherever it is; the text is plain, not a pattern.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_log", "arguments": {"host": "blackworld", "service": "web", "mode": "grep", "pattern": "INFO serving"}}
+  </tool_call><|projection|>

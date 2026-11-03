@@ -1,0 +1,105 @@
+name: repo_job_log
+questions:
+- why did the deploy's build fail
+- read the build log on the agent
+- show the compiler errors from the release build
+- what did the agent job print at the end
+- find the error in the deploy build
+- read around the failure in that agent job
+- search the agent build log for the warning
+- summarise the build job's output
+category: Commands
+description: 'Read what a build-agent job printed — a deploy''s build among them — read on the agent so only the answer comes back, every line numbered as it stands in the log. `mode: summary` gives cargo''s test results, the failures and compiler errors with their line numbers, the warning count and the last lines — read it first; `mode: lines` reads `count` lines from line `from`, what a summary pointed at; `mode: grep` finds `pattern` (plain text, any case) with `context` lines around each hit, and past 200 hits says the `from` to go on with; `mode: tail` reads the last `lines`. Works while the job runs and after. `job` is a handle, `<node>:<id>`: a deploy''s handle is its build job''s. Your own run_command runs are read with run_output, not here. Use for: why a deploy''s build failed. Triggered by "why did the build fail", "read the agent build log". Returns the lines asked for and how to read on.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    job:
+      description: The job's handle, `<node>:<id>`. Required.
+      maxLength: 64
+      minLength: 18
+      type: string
+    mode:
+      description: 'How to read it: `summary` (results, errors, failures, last lines; read it first), `tail` (the last `lines`), `lines` (`count` lines from `from`), `grep` (lines holding `pattern`). Required.'
+      enum:
+      - summary
+      - tail
+      - lines
+      - grep
+      type: string
+    pattern:
+      description: With `grep`, the text to find, ignoring case; plain text. Required with `grep`.
+      maxLength: 200
+      minLength: 1
+      type: string
+    context:
+      description: With `grep`, lines either side of each hit, 0 to 5; 0 by default. Optional.
+      maximum: 5.0
+      minimum: 0.0
+      type: integer
+    from:
+      description: With `lines`, the first line, from 1 (required with `lines`); with `grep`, search from this line on. Optional otherwise.
+      minimum: 1.0
+      type: integer
+    count:
+      description: With `lines`, how many lines, at most 200. Required with `lines`.
+      maximum: 200.0
+      minimum: 1.0
+      type: integer
+    lines:
+      description: With `tail`, how many of the last lines, at most 200; 40 by default. Optional.
+      maximum: 200.0
+      minimum: 1.0
+      type: integer
+  required:
+  - job
+  - mode
+  allOf:
+  - if:
+      properties:
+        mode:
+          const: grep
+    then:
+      required:
+      - pattern
+  - if:
+      properties:
+        mode:
+          const: lines
+    then:
+      required:
+      - from
+      - count
+  title: LogRequest
+  type: object
+examples:
+- |-
+  the deploy's build failed, why<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The deploy's handle is its build job's. The summary gives the compiler errors with their line numbers, and it is a few hundred bytes where the whole log is megabytes.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_job_log", "arguments": {"job": "76c3a0f4d39bd9db:XeV_I_QPzpg", "mode": "summary"}}
+  </tool_call><|projection|>
+- |-
+  read around the first error<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The summary named the first error at line 2210. Reading from a little before it gives the error and what the compiler said about it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_job_log", "arguments": {"job": "76c3a0f4d39bd9db:XeV_I_QPzpg", "mode": "lines", "from": 2200, "count": 60}}
+  </tool_call><|projection|>
+- |-
+  find every place the build mentions the zend crate<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A search over the whole log finds them wherever they are, with a line of context around each.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_job_log", "arguments": {"job": "76c3a0f4d39bd9db:XeV_I_QPzpg", "mode": "grep", "pattern": "zend v0", "context": 1}}
+  </tool_call><|projection|>

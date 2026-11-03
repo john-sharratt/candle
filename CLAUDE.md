@@ -406,11 +406,12 @@ On each machine both are supervised by **keep** (`keep/keep.yaml`), which holds 
 last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.md` §3.5–§3.11.
 
 **Deploy through the zend MCP first.** Once the commit is on `origin/main`, follow the
-`zend-deploy` skill: build and stage on the machine's agent with `repo_job_start`, try it with
-`service_trial`, and read the outcome with `service_status`. To delegate it, a coder worker
-does all of that with `service_deploy`, from a member on another machine. A refusal from
-`service_deploy` because the machine runs the worker or holds an app's only ready member is a
-reason to ask the user, not to work around it by hand. Fall back to the manual steps below,
+`zend-deploy` skill: `service_deploy {host, service}` builds it on that machine's agent and has
+keep try it, answering at once with the deploy's handle; `service_status {deploy, wait_s}`
+waits it out, `service_log` reads the trial, `service_cancel` stops it
+(`docs/build_deploy_tools.md`). A coder worker of Zen's has the same tools. A refusal from a
+worker's `service_deploy` because the machine runs the worker or holds an app's only ready
+member is a reason to ask the user, not to work around it by hand. Fall back to the manual steps below,
 through keep's HTTP API and the command line, when the connector is not attached,
 `cluster_status` says zend cannot take work, or a deploy call fails or stalls. Say in the
 report that the fallback was used and why.

@@ -273,16 +273,19 @@ something stalls.
 
 ### D5. `deploy`
 **Use when:** putting a commit on origin/main onto one machine.
-**Tools:** `repo_job_start`, `repo_job_log`, `service_trial`, `service_status`,
-`cluster_status`
-- Build and stage on that machine's agent; trial it through keep; watch to
-  proven or rolled back; confirm the member serves the new build.
+**Tools:** `service_deploy`, `service_status`, `service_log`, `service_cancel`,
+`repo_job_log`, `cluster_status`
+- One `service_deploy` builds on that machine's agent and has keep try it;
+  `service_status {deploy, wait_s}` waits to proven or rolled back; read a
+  failure with `repo_job_log` (the build) or `service_log` (the trial);
+  confirm the member serves the new build.
 
 ### D6. `release`
 **Use when:** taking a commit through tests, a trial, certification and
 rollout.
-**Tools:** `repo_job_start`, `repo_job_log`, `service_trial`, `service_status`,
-`cluster_command`, `cluster_job_status`, `gateway_command`, `cluster_status`
+**Tools:** `repo_job_start`, `repo_job_status`, `repo_job_log`, `service_deploy`,
+`service_status`, `cluster_command`, `cluster_job_status`, `gateway_command`,
+`cluster_status`
 - Tests on an agent → a trial on one machine → certification watched → the
   rollout's plan shown, approved, started, watched member by member.
 - Raise or cancel an app's floor (`gateway_command`) only with approval.
@@ -295,7 +298,8 @@ rollout.
 
 ### D8. `ab-trial`
 **Use when:** comparing a new build against the running one on one machine.
-**Tools:** `service_trial`, `service_status`, `cluster_status`, `cluster_logs`
+**Tools:** `service_deploy`, `service_status`, `service_log`, `cluster_status`,
+`cluster_logs`
 - Trial on one machine while the others serve the old build; compare what
   matters (errors, latency, answers) before rolling out.
 

@@ -1,42 +1,49 @@
 ---
 name: zend-deploy
-description: Deploy a commit on origin/main to one machine — build it on that machine's agent, stage the binary, and run it as a keep trial there, which promotes it only if it serves and restores the previous binary otherwise — then confirm it is serving. Uses the zend MCP's repo_job_start, repo_job_log, service_trial and service_status tools. Use to put a merged build on one member. Admins only.
+description: Deploy a commit on origin/main to one machine with one call — service_deploy builds it on that machine's agent and has keep try it, promoting it only if it serves and restoring the previous binary otherwise — then wait it out with service_status, read why when it fails, and confirm it is serving. Uses the zend MCP's service_deploy, service_status, service_log, service_cancel and repo_job_log tools. Use to put a merged build on one member. Admins only.
 ---
 
 # Deploying a build to one machine
 
+The `deploy` guide (`guide_read`) carries the whole procedure; this is its
+short form.
+
 ## Before
 
-- The commit is on `origin/main`. keep refuses anything else: a local build
-  serves real cluster traffic while it runs, and what it writes replicates
-  and is permanent. A branch is tested with zend-test, never deployed.
-- `cluster_status`: note the machine's member, its build and `started` time.
+- The commit is on `origin/main`, pushed. keep refuses anything else: a local
+  build serves real cluster traffic while it runs, and what it writes
+  replicates and is permanent. A branch is tested with zend-test, never
+  deployed.
+- `service_status {}`: what every machine runs, and that no deploy or trial is
+  already under way on the one you want.
+- `cluster_status`: the machine's member, its build and `started` time.
+- Say — to the user and the other sessions — that a deploy is starting, on
+  which machine and commit.
 
 ## Do
 
-1. **Build and stage** on that machine's agent:
-   `repo_job_start {node: <that machine's agent>, repo: "candle", branch: "main",
-   program: "cargo", args: ["build", "--release", "-p", "motherd"],
-   stage: "target/release/motherd.exe", timeout_s: 3600}`. (`web` the same
-   way, `-p web`, `target/release/web.exe`.)
-2. **Wait for it**: `repo_job_log {node, job}` until it has ended. Its first line
-   says `staged at <path>` — the artifact on that machine. If it failed or
-   staged nothing, report the build error (`grep: "error"`) and stop.
-3. **Trial**: `service_trial {host, service: "motherd", artifact: <staged path>}`.
-   keep stops the service, runs the new binary from the stable path, and
-   promotes it once it prints its serving line within ten minutes — or puts
-   the previous binary back.
-4. **Watch**: `service_status {host}` every few minutes until the trial has ended:
-   `last trial … proven` or `rolled back`.
-5. **Confirm**: `cluster_status` — the member's `started` time is after the
-   trial, its state `ready`, and its build the new one.
-6. Report: proven or rolled back, with `service_status`'s line, the member's build
-   and `started` time.
+1. **Start it**: `service_deploy {host: "BlackWorld", service: "motherd"}`
+   (`web`, `mcp` the same way). It answers at once with the deploy's handle,
+   `<node>:<id>`. Post the machine and the handle.
+2. **Wait for it**: `service_status {deploy: <handle>, wait_s: 240}`, again
+   while it answers *still going*. It says each stage — building, built,
+   keep trying it (how far into its ten-minute window), proven, rolled back.
+   Post each stage.
+3. **Confirm**: `cluster_status` — the member's `started` time is after the
+   trial, its state `ready`, its build the new one.
+4. Report: the machine, the handle, how it ended, the member's build and
+   `started` time.
 
-## If it rolled back
+## If it failed
 
-The previous binary is running again: nothing is down. Read why with
-cluster-logs (`since` the trial's start, `level: ERROR`) and report it.
+- The build: `repo_job_log {job: <handle>, mode: "summary"}`.
+- The trial, rolled back: `service_log {host, service, mode: "summary"}` —
+  the panic or exit, with line numbers. The previous binary runs again:
+  nothing is down.
+
+## Stop
+
+`service_cancel {deploy: <handle>}` stops the build, or rolls the trial back.
 
 ## Approval
 
