@@ -252,6 +252,15 @@ impl Registry {
         );
     }
 
+    /// Whether a release of `key` stands that `node` is known to hold
+    /// complete (`COMPLETE`).
+    pub fn holds_release(&self, app: &str, key: &[u8], node: u64) -> bool {
+        self.apps
+            .get(app)
+            .and_then(|a| a.handovers.get(key))
+            .is_some_and(|h| h.complete.contains(&node))
+    }
+
     /// `node` holds each of `keys` complete (`COMPLETE`): every record of the
     /// conversation it names through its release, and every turn of it whole.
     /// A key with no release standing is ignored — it is held, or every member

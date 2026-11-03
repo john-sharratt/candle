@@ -9,8 +9,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::hub::{take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
 use super::registry::MemberView;
+use crate::close::{AfterClose, CloseCode};
 use crate::delivery::ReceiptPacer;
-use crate::frame::{BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberState, ModelId};
+use crate::frame::{
+    BuildId, Capacity, Claim, Complete, Epoch, Frame, Hello, MemberState, ModelId, Unclaim,
+};
 use crate::handshake::{GroupKey, PROTO};
 use crate::pipe::memory::pair;
 use crate::session::{start, Role, SessionHandle};
@@ -183,9 +186,64 @@ async fn a_failed_handshake_undoes_the_replacement() {
         !old.load(Ordering::SeqCst),
         "the standing session reports again"
     );
-    for done in applied {
-        hub.follow("zend", 1, done);
-    }
+    hub.follow("zend", 1, applied);
+}
+
+/// **Held reports land in the order they arrived**: a key's `UNCLAIM`, then
+/// its `COMPLETE`, both sent while a replacement was pending, are applied in
+/// that order when the handshake fails — so the release's handover stands,
+/// holding the standing member complete, rather than the release landing
+/// after and starting it over with no member complete.
+#[tokio::test]
+async fn held_reports_land_in_the_order_they_arrived() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (_, old) = admitted_once(&hub);
+    hub.state()
+        .registry
+        .claims("zend")
+        .claim(b"k", Epoch { ms: 5, node: 1 });
+    let (_, second) = hub.decide("zend", &hello(1)).unwrap();
+    let reply_on = handle();
+    let release = Frame::Unclaim(Unclaim {
+        key: b"k".to_vec(),
+        epoch: Epoch { ms: 5, node: 1 },
+        through: 30,
+    });
+    hub.on_frame("zend", 1, &old, release, &reply_on).unwrap();
+    hub.on_frame(
+        "zend",
+        1,
+        &old,
+        Frame::Complete(Complete {
+            keys: vec![b"k".to_vec()],
+        }),
+        &reply_on,
+    )
+    .unwrap();
+    let mut s = hub.state();
+    undo_pending(&mut s, "zend", 1, second.session);
+    assert_eq!(s.registry.claims("zend").holder(b"k"), None, "released");
+    assert!(
+        s.registry.holds_release("zend", b"k", 1),
+        "the COMPLETE after it stands on the release"
+    );
+}
+
+/// **A standing session that has left takes its held reports with it**: a
+/// `CLAIM` it sent while a replacement was pending is not applied once the
+/// handshake fails, for its node is no member here.
+#[tokio::test]
+async fn a_departed_sessions_held_reports_go_with_it() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (first, old) = admitted_once(&hub);
+    let (_, second) = hub.decide("zend", &hello(1)).unwrap();
+    hub.on_frame("zend", 1, &old, claim(b"k", 5), &handle())
+        .unwrap();
+    let mut s = hub.state();
+    s.sockets.remove(&("zend".to_string(), 1));
+    assert!(s.registry.leave("zend", 1, first));
+    assert!(undo_pending(&mut s, "zend", 1, second.session).is_empty());
+    assert_eq!(s.registry.claims("zend").holder(b"k"), None);
 }
 
 fn claim(key: &[u8], ms: u64) -> Frame {
@@ -195,54 +253,34 @@ fn claim(key: &[u8], ms: u64) -> Frame {
     })
 }
 
-/// **Overlapping handshakes from one node: the newer admission owns the
-/// replacement**, in either order. S1 and S2 are both decided; S1's `run`
-/// finds itself superseded and changes nothing, S2's takes its place. And
-/// when S2 fails first, S1's undo touches nothing, S2's undo restores the
-/// standing session with what it said meanwhile — carried over from S1's
-/// pending — and S1's `run` is still superseded.
+/// **Overlapping dials from one node converge**: while S1's admission is
+/// pending, S2's `HELLO` is refused `4429` to dial again — it does not unseat
+/// S1, so the two cannot unseat each other in turn. S1 is taken, or fails and
+/// is undone; either way S2's next dial is admitted.
 #[tokio::test]
-async fn overlapping_handshakes_leave_the_newer_in_charge() {
-    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
-    let (_, old) = admitted_once(&hub);
-    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
-    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
-    {
-        let mut s = hub.state();
-        assert!(matches!(
-            take_pending(&mut s, "zend", 1, s1.session),
-            Taken::Superseded
-        ));
-        assert!(old.load(Ordering::SeqCst), "still marked, for S2");
-        assert!(matches!(
-            take_pending(&mut s, "zend", 1, s2.session),
-            Taken::Ready(_)
-        ));
+async fn overlapping_dials_converge() {
+    for s1_fails in [false, true] {
+        let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+        let (_, old) = admitted_once(&hub);
+        let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
+        let refused = hub.decide("zend", &hello(1)).unwrap_err();
+        assert_eq!(refused.code, CloseCode::Retry.code());
+        assert_eq!(refused.after(), AfterClose::Backoff, "it dials again");
+        {
+            let mut s = hub.state();
+            if s1_fails {
+                undo_pending(&mut s, "zend", 1, s1.session);
+                assert!(!old.load(Ordering::SeqCst));
+            } else {
+                assert!(matches!(
+                    take_pending(&mut s, "zend", 1, s1.session),
+                    Taken::Ready(_)
+                ));
+            }
+        }
+        let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
+        assert!(s2.session > s1.session, "S2's next dial is admitted");
     }
-
-    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
-    let (_, old) = admitted_once(&hub);
-    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
-    let reply_on = handle();
-    hub.on_frame("zend", 1, &old, ready(), &reply_on).unwrap();
-    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
-    let mut s = hub.state();
-    assert!(
-        undo_pending(&mut s, "zend", 1, s1.session).is_empty(),
-        "S1 no longer owns it"
-    );
-    assert!(old.load(Ordering::SeqCst));
-    undo_pending(&mut s, "zend", 1, s2.session);
-    assert_eq!(
-        s.registry.member("zend", 1).unwrap().state(),
-        MemberState::Ready,
-        "its CAPACITY, carried over from S1's pending, applied"
-    );
-    assert!(!old.load(Ordering::SeqCst));
-    assert!(matches!(
-        take_pending(&mut s, "zend", 1, s1.session),
-        Taken::Superseded
-    ));
 }
 
 /// **A handshake during which more claim relays pile up than it can be

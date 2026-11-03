@@ -1574,24 +1574,34 @@ instead:
   it is sent, and a request to a replaced process fails over by its requester's own retry.
   The `ADMIT` must be sent within `ADMIT_SEND`, 10 s, and the relays kept are bounded at
   `PENDING_CAP`; past it the admission fails, and the member dials again.
-- **One admission of a node is pending at a time.** A newer one supersedes an older still
-  in its handshake, and only the pending session's own `run` or failure touches the
-  replacement. A session whose admission is not taken — superseded, or overflowed — is
+- **One admission of a node is pending at a time, and it completes first.** A `HELLO` of
+  the node while one is pending — past its proof, and bounded by `ADMIT_SEND` — is refused
+  `4429` rather than superseding it, so two overlapping dials cannot unseat each other in
+  turn and neither ever land: the pending one is taken or undone in moments, and the other
+  dials again into a node with none pending. Only the pending session's own `run` or
+  failure touches the replacement. An admission not taken — refused so, or overflowed — is
   closed `4429`, and its member dials again: never `4409`, which would stop that dial loop
-  for good though nothing displaced it.
+  for good though nothing displaced it. A member's one dial loop per cluster tries that
+  cluster's URLs in turn (`gateway.tokera.local`, then `gateway.tokera.com`), so it never
+  dials one gateway twice at once.
 - **A replaced session reports nothing of its node's state.** What it sends that is
   written into the node's own entries — `CLAIM`, `UNCLAIM`, `CAPACITY`, `ROUTES`,
   `COMPLETE`, `COORD`, `ACK`, `BUILD_OFFER`, `BUILD_HAVE` — is not applied, checked against
   a flag on the session itself, under the guard each is applied under: a process still
   running says it again on its new session, and one that restarted holds nothing it said.
   While the replacement is pending such a report is held back, each kind kept to what it
-  last said — the latest `CAPACITY`, `ROUTES`, `COORD` and `ACK`, each build's latest
-  offer, every key reported complete, each key's net claim — so however long the
-  handshake none of what it ended at is lost, and if the handshake fails it is applied
-  after all, under the very guard that undoes the replacement, before anything the session
-  sends after. Requests routed on and one-time replies and offers — catch-ups and their
-  answers, a resync's `HAVE`, votes, build chunks — still pass: a process still running
-  sends each once, and a peer awaits it.
+  last said — the latest `CAPACITY`, `ROUTES`, `COORD` and `ACK`, each build's offer and
+  holding with every artifact they named, every key reported complete, each key's net
+  claim — so however long the handshake none of what it ended at is lost. If the handshake
+  fails it is applied after all, in the order each kept report arrived (a key's `UNCLAIM`
+  before the `COMPLETE` that followed it, a `CAPACITY` before a later `ACK`), under the very
+  guard that undoes the replacement, before anything the session sends after — unless the
+  standing session has left meanwhile, which takes what it reported with it. A report is
+  checked as it arrives, held back or not: a claim naming another node, or a `ROUTES` or
+  `COORD` that does not decode, closes the socket `4400` then. Requests routed on and
+  one-time replies and offers — catch-ups and their answers, a resync's `HAVE`, votes,
+  build chunks — still pass: a process still running sends each once, and a peer awaits
+  it.
 - **A member takes in no claim of its own node at an epoch it does not hold**
   (`MemberClaims::of_own_node`), **and releases none for a key it holds.** `ADMIT`'s table
   may name this node for a key its process holds nothing of — its previous process's
@@ -1602,7 +1612,8 @@ instead:
   serves would let a peer take it — and its re-announce corrects the table: an epoch below
   the held one is superseded by it, and above it the key is claimed again here, above that
   epoch, and that claim is announced on every gateway the member has joined, each of which
-  still names the epoch before. The gateway relays an `UNCLAIM` only when it let a
+  still names the epoch before — once the admission is taken, at the gateway's first frame
+  after `ADMIT`, and never while upgrading. The gateway relays an `UNCLAIM` only when it let a
   claim go, so a release that matched nothing reaches no peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
   another node is a protocol violation, closed `4400`. No gateway relays a node its own
@@ -3891,11 +3902,16 @@ A new binary, `tokera-agent` (crate `agent/`). It is CPU-only and links `cluster
 
 Job routes are dispatched `Sticky(Header("x-tokera-lineage"))` with a spill rule. A
 conversation's jobs go to the agent that last ran them, which keeps incremental builds
-warm (`docs/zend_workspace_execution.md` §8.2).
+warm (`docs/zend_workspace_execution.md` §8.2) — while no free agent **outranks** it:
+one on a machine the table prefers to build on (`builds`, lower first;
+`docs/static_placement.md` §2), or, on a machine preferred as much, a dedicated agent
+beside one at low priority. A free holder no free agent outranks takes the job; one
+outranked does not, and the job goes elsewhere at once.
 
-If that agent is busy, the job waits up to 5 s and then spills to the **best idle
-agent**: the one on the machine the machine table prefers to build on (`builds`, lower
-first; `docs/static_placement.md` §2), then with the most idle cores,
+If the holder is busy and no free agent outranks it, the job waits up to 5 s for it and
+then spills; if a free agent outranks it, the job spills at once. It spills to the
+**best idle agent**: the one on the machine the table prefers to build on, then a
+dedicated agent before one at low priority, then the one with the most idle cores,
 `cores × (1 − load/cores)`, among agents that hold the job's repositories and toolchain.
 
 **An agent at low priority** — one sharing its host with a model member (§11.5), which

@@ -7,7 +7,7 @@
 //! back ([`Held`]), each kind kept to what it last said, and applied under the
 //! guard that undoes the replacement when its handshake fails.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::{hex, State};
@@ -15,7 +15,7 @@ use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
 use crate::coord::CoordState;
 use crate::dispatch::RouteTable;
-use crate::frame::{Claim, Complete, Frame, Unclaim};
+use crate::frame::{name, BuildArtifacts, Claim, Complete, Frame, Unclaim};
 use crate::gateway::coord_log::changes;
 use crate::gateway::upgrades::Action;
 
@@ -37,6 +37,39 @@ pub(in crate::gateway) fn is_state_report(frame: &Frame) -> bool {
             | Frame::BuildOffer(_)
             | Frame::BuildHave(_)
     )
+}
+
+/// Whether `frame`, a state report from `node`, keeps to the protocol — a
+/// claim or release of its own node's, a `ROUTES` table and a `COORD` that
+/// decode — checked as it arrives, before it is applied or held back. `Err`
+/// closes the socket `4400`.
+pub(in crate::gateway) fn check_report(frame: &Frame, node: u64) -> Result<(), Close> {
+    let named = match frame {
+        Frame::Claim(c) => Some(("CLAIM", c.epoch.node)),
+        Frame::Unclaim(u) => Some(("UNCLAIM", u.epoch.node)),
+        Frame::Routes(r) => {
+            RouteTable::decode(&r.table)
+                .map_err(|e| Close::new(CloseCode::Malformed, format!("ROUTES: {e}")))?;
+            None
+        }
+        Frame::Coord(c) => {
+            CoordState::decode(&c.state).ok_or_else(|| {
+                Close::new(
+                    CloseCode::Malformed,
+                    "a COORD that is not a coordination state",
+                )
+            })?;
+            None
+        }
+        _ => None,
+    };
+    match named {
+        Some((kind, other)) if other != node => Err(Close::new(
+            CloseCode::Malformed,
+            format!("a {kind} from {} names node {}", hex(node), hex(other)),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What follows from a report applied: done by the hub once the guard it was
@@ -141,98 +174,136 @@ pub(in crate::gateway) fn apply_report(
             s.held.announce(node, &b, false);
             done.to_every_other.push(Frame::BuildHave(b));
         }
-        _ => {}
+        other => unreachable!("{} is not a state report", name(other.kind())),
     }
     Ok(done)
 }
 
-/// A key's claim reports held back: the release of a claim the gateway
-/// holds, and the latest claim.
+/// A key's claim reports held back, each with when it arrived: the release
+/// of a claim the gateway holds, and the latest claim.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct KeyHeld {
-    unclaim: Option<Unclaim>,
-    claim: Option<Claim>,
+    unclaim: Option<(u64, Unclaim)>,
+    claim: Option<(u64, Claim)>,
 }
+
+/// A build's offer or holding, each with when its last frame arrived: the
+/// artifacts of every frame for it, merged, as `HeldBuilds::announce` adds
+/// them frame by frame.
+type BuildHeld = (u64, BuildArtifacts);
 
 /// The state reports a session sent while a replacement of it was pending,
 /// each kind kept to what it last said — so however long the handshake, they
 /// stay as few as the kinds and keys they name, and none of what they ended
 /// at is lost: the latest `CAPACITY`, `ROUTES`, `COORD` and `ACK`, each
-/// build's latest offer and holding, every key reported complete, and each
-/// key's net claim — a claim and the release of that same claim, both held,
-/// come to nothing.
+/// build's offer and holding with every artifact named, every key reported
+/// complete, and each key's net claim — a claim and the release of that same
+/// claim, both held, come to nothing. Each is applied in the order its latest
+/// arrived, so what depends on an earlier report — a key's `COMPLETE` on its
+/// `UNCLAIM`, an `ACK`'s placeability on a `CAPACITY` — sees it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(in crate::gateway) struct Held {
-    ack: Option<Frame>,
-    capacity: Option<Frame>,
-    routes: Option<Frame>,
-    coord: Option<Frame>,
-    builds: BTreeMap<(bool, u32, String, String), Frame>,
-    complete: BTreeSet<Vec<u8>>,
+    next: u64,
+    ack: Option<(u64, Frame)>,
+    capacity: Option<(u64, Frame)>,
+    routes: Option<(u64, Frame)>,
+    coord: Option<(u64, Frame)>,
+    offers: BTreeMap<(u32, String, String), BuildHeld>,
+    haves: BTreeMap<(u32, String, String), BuildHeld>,
+    complete: BTreeMap<Vec<u8>, u64>,
     keys: BTreeMap<Vec<u8>, KeyHeld>,
+}
+
+/// `held`'s artifacts and those of `b`, the newer, merged; arrived at `seq`.
+fn merge(held: Option<BuildHeld>, b: BuildArtifacts, seq: u64) -> BuildHeld {
+    let Some((_, mut into)) = held else {
+        return (seq, b);
+    };
+    for a in b.artifacts {
+        if !into.artifacts.contains(&a) {
+            into.artifacts.push(a);
+        }
+    }
+    (seq, into)
 }
 
 impl Held {
     /// Hold `frame`, a state report, back.
     pub fn keep(&mut self, frame: Frame) {
+        let seq = self.next;
+        self.next += 1;
         match frame {
-            Frame::Ack(_) => self.ack = Some(frame),
-            Frame::Capacity(_) => self.capacity = Some(frame),
-            Frame::Routes(_) => self.routes = Some(frame),
-            Frame::Coord(_) => self.coord = Some(frame),
-            Frame::BuildOffer(ref b) | Frame::BuildHave(ref b) => {
-                let offer = matches!(frame, Frame::BuildOffer(_));
-                let id = (
-                    offer,
-                    b.build.count,
-                    b.build.hash.clone(),
-                    b.build.local.clone(),
-                );
-                self.builds.insert(id, frame);
+            Frame::Ack(_) => self.ack = Some((seq, frame)),
+            Frame::Capacity(_) => self.capacity = Some((seq, frame)),
+            Frame::Routes(_) => self.routes = Some((seq, frame)),
+            Frame::Coord(_) => self.coord = Some((seq, frame)),
+            Frame::BuildOffer(b) => {
+                let id = (b.build.count, b.build.hash.clone(), b.build.local.clone());
+                let held = self.offers.remove(&id);
+                self.offers.insert(id, merge(held, b, seq));
             }
-            Frame::Complete(c) => self.complete.extend(c.keys),
+            Frame::BuildHave(b) => {
+                let id = (b.build.count, b.build.hash.clone(), b.build.local.clone());
+                let held = self.haves.remove(&id);
+                self.haves.insert(id, merge(held, b, seq));
+            }
+            Frame::Complete(c) => {
+                for key in c.keys {
+                    self.complete.insert(key, seq);
+                }
+            }
             Frame::Claim(c) => {
                 let key = c.key.clone();
-                self.keys.entry(key).or_default().claim = Some(c);
+                self.keys.entry(key).or_default().claim = Some((seq, c));
             }
             Frame::Unclaim(u) => {
                 let held = self.keys.entry(u.key.clone()).or_default();
-                match held.claim.as_ref().is_some_and(|c| c.epoch == u.epoch) {
+                match held.claim.as_ref().is_some_and(|(_, c)| c.epoch == u.epoch) {
                     // The release of a claim itself held back: neither
                     // reached the gateway, and neither is to.
                     true => held.claim = None,
-                    false => held.unclaim = Some(u),
+                    false => held.unclaim = Some((seq, u)),
                 }
             }
-            _ => {}
+            other => unreachable!("{} is not a state report", name(other.kind())),
         }
     }
 
-    /// What is held, in the order to apply it: each key's release before its
-    /// claim.
+    /// What is held, in the order to apply it: the order each kept frame
+    /// arrived in.
     pub fn into_frames(self) -> Vec<Frame> {
-        let mut frames: Vec<Frame> = [self.ack, self.capacity, self.routes, self.coord]
+        let mut frames: Vec<(u64, Frame)> = [self.ack, self.capacity, self.routes, self.coord]
             .into_iter()
             .flatten()
             .collect();
-        frames.extend(self.builds.into_values());
-        if !self.complete.is_empty() {
-            frames.push(Frame::Complete(Complete {
-                keys: self.complete.into_iter().collect(),
-            }));
-        }
+        frames.extend(
+            self.offers
+                .into_values()
+                .map(|(seq, b)| (seq, Frame::BuildOffer(b))),
+        );
+        frames.extend(
+            self.haves
+                .into_values()
+                .map(|(seq, b)| (seq, Frame::BuildHave(b))),
+        );
+        frames.extend(
+            self.complete
+                .into_iter()
+                .map(|(key, seq)| (seq, Frame::Complete(Complete { keys: vec![key] }))),
+        );
         for held in self.keys.into_values() {
-            frames.extend(held.unclaim.map(Frame::Unclaim));
-            frames.extend(held.claim.map(Frame::Claim));
+            frames.extend(held.unclaim.map(|(seq, u)| (seq, Frame::Unclaim(u))));
+            frames.extend(held.claim.map(|(seq, c)| (seq, Frame::Claim(c))));
         }
-        frames
+        frames.sort_by_key(|(seq, _)| *seq);
+        frames.into_iter().map(|(_, frame)| frame).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{Capacity, Epoch, MemberState};
+    use crate::frame::{Ack, Artifact, BuildId, Capacity, Epoch, MemberState};
 
     fn capacity(state: MemberState) -> Frame {
         Frame::Capacity(Capacity {
@@ -283,12 +354,73 @@ mod tests {
             vec![
                 capacity(MemberState::Ready),
                 Frame::Complete(Complete {
-                    keys: vec![b"a".to_vec(), b"b".to_vec()],
+                    keys: vec![b"a".to_vec()],
+                }),
+                Frame::Complete(Complete {
+                    keys: vec![b"b".to_vec()],
                 }),
                 Frame::Unclaim(unclaim(b"moved", 3)),
                 Frame::Claim(claim(b"moved", 7)),
             ]
         );
+    }
+
+    /// **Held reports are applied in the order their latest arrived**: a key's
+    /// `UNCLAIM` before the `COMPLETE` that followed it, a `CAPACITY` before
+    /// the `ACK` that followed it — whatever their kinds.
+    #[test]
+    fn held_reports_keep_their_arrival_order() {
+        let mut held = Held::default();
+        held.keep(Frame::Ack(Ack {
+            applied: vec![(1, 1)],
+        }));
+        held.keep(Frame::Unclaim(unclaim(b"k", 3)));
+        held.keep(capacity(MemberState::Ready));
+        held.keep(Frame::Complete(Complete {
+            keys: vec![b"k".to_vec()],
+        }));
+        let ack = Frame::Ack(Ack {
+            applied: vec![(1, 9)],
+        });
+        held.keep(ack.clone());
+        assert_eq!(
+            held.into_frames(),
+            vec![
+                Frame::Unclaim(unclaim(b"k", 3)),
+                capacity(MemberState::Ready),
+                Frame::Complete(Complete {
+                    keys: vec![b"k".to_vec()],
+                }),
+                ack,
+            ]
+        );
+    }
+
+    /// **A build's held frames keep every artifact they named**, merged, as
+    /// its holding is announced artifact by artifact.
+    #[test]
+    fn a_builds_held_artifacts_are_merged() {
+        let build = BuildId {
+            count: 4,
+            hash: "h4".into(),
+            local: String::new(),
+        };
+        let artifact = |kind: &str| Artifact {
+            kind: kind.into(),
+            platform: "windows".into(),
+            size: 1,
+            sha256: [0; 32],
+        };
+        let have = |kinds: &[&str]| {
+            Frame::BuildHave(BuildArtifacts {
+                build: build.clone(),
+                artifacts: kinds.iter().map(|k| artifact(k)).collect(),
+            })
+        };
+        let mut held = Held::default();
+        held.keep(have(&["motherd"]));
+        held.keep(have(&["web", "motherd"]));
+        assert_eq!(held.into_frames(), vec![have(&["motherd", "web"])]);
     }
 
     /// A resync's `HAVE`, a catch-up and a vote are not state reports; a
