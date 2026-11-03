@@ -44,13 +44,13 @@ struct Model {
 }
 
 impl Model {
-    /// `node` left: every key it holds is placed as released by it, but one
-    /// already released, which keeps the release it has.
+    /// `node` left: every key it holds is placed as released by it, its
+    /// current holder, whatever released it before.
     fn left(&mut self, node: u64) {
         self.members.remove(&node);
         for (key, e) in &self.claims {
             if e.node == node {
-                self.released.entry(key.clone()).or_insert(node);
+                self.released.insert(key.clone(), node);
             }
         }
     }

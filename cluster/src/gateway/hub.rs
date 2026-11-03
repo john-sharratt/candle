@@ -45,6 +45,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::machines::MachineTable;
 use std::net::IpAddr;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -182,19 +183,67 @@ pub(super) struct Socket {
     pub pulses_dropped: u64,
 }
 
-/// A session admitted whose socket is not yet in place: its `ADMIT` was built,
-/// and the control frames meant for its node since — relayed claims and
-/// releases, plans — wait here for it, so none falls between the table it was
-/// sent and the socket it is reached on.
+/// The most frames a [`Pending`] keeps, relayed and held back together. A
+/// handshake that lets more pile up fails its admission, and the member dials
+/// again into a quieter moment.
+pub(super) const PENDING_CAP: usize = 4096;
+
+/// A session admitted whose socket is not yet in place: its `ADMIT` was
+/// built, and what has to bring that snapshot up to date waits here for it.
+/// One per node: a newer admission of the node supersedes it, and the
+/// superseded session's own `run` then fails (`take_pending`).
 pub(super) struct Pending {
     session: u64,
+    /// The claim relays and plans for the node since its `ADMIT`'s table was
+    /// built, handed to the new socket under the guard that puts it in place.
     queue: Vec<Frame>,
+    /// The state reports the node's current session sent since — held back,
+    /// not applied, for the session is marked replaced; applied after all if
+    /// the handshake fails (`undo_pending`), dropped if it succeeds.
+    held: Vec<Frame>,
+    /// More than [`PENDING_CAP`] piled up: the admission fails.
+    overflowed: bool,
 }
 
-/// What a session reports of its node's state: dropped once the session is
-/// replaced, for its node's newer session says it of the process that is
-/// there now. A one-time reply — a vote, a catch-up, a build chunk — is still
-/// taken: a process still running sends it once, and a peer awaits it.
+impl Pending {
+    fn keep(&mut self, frame: Frame, held: bool) {
+        if self.overflowed {
+            return;
+        }
+        if self.queue.len() + self.held.len() >= PENDING_CAP {
+            self.overflowed = true;
+            tracing::warn!(
+                session = self.session,
+                "more than {PENDING_CAP} frames arrived during a handshake: its admission fails"
+            );
+            return;
+        }
+        match held {
+            true => self.held.push(frame),
+            false => self.queue.push(frame),
+        }
+    }
+}
+
+/// What `run` finds of its session's [`Pending`].
+pub(super) enum Taken {
+    /// Its own: the frames to hand the new socket.
+    Ready(Vec<Frame>),
+    /// A newer admission of the node superseded it, or the replacement was
+    /// undone: the session goes, and changes nothing.
+    Superseded,
+    /// Too much arrived during the handshake: the session goes, and the
+    /// state reports held back are applied to the node's standing session.
+    Overflowed(Vec<Frame>),
+}
+
+/// What a session reports of its node's state — written into the node's own
+/// entries: its claims, capacity, routes, completeness, coordination state,
+/// what it has applied, and the builds it holds. Dropped once the session is
+/// replaced, for the node's newer session says it of the process that is
+/// there now. A request routed on, or a one-time reply — a vote, a catch-up
+/// answer, a build chunk — still passes: a process still running sends it
+/// once, and a peer awaits it.
 pub(super) fn is_state_report(frame: &Frame) -> bool {
     matches!(
         frame,
@@ -204,7 +253,25 @@ pub(super) fn is_state_report(frame: &Frame) -> bool {
             | Frame::Routes(_)
             | Frame::Complete(_)
             | Frame::Coord(_)
+            | Frame::Ack(_)
+            | Frame::Have(_)
+            | Frame::BuildOffer(_)
+            | Frame::BuildHave(_)
     )
+}
+
+/// `frame`, a state report from the session `replaced` marks, under the state's
+/// guard: held back in the node's [`Pending`] while the replacement can still
+/// be undone and this is the node's standing session, and otherwise dropped.
+fn hold_back(s: &mut State, app: &str, node: u64, replaced: &AtomicBool, frame: Frame) {
+    let key = (app.to_string(), node);
+    let standing = s
+        .sockets
+        .get(&key)
+        .is_some_and(|x| ptr::eq(Arc::as_ptr(&x.replaced), replaced));
+    if let Some(p) = s.pending.get_mut(&key).filter(|_| standing) {
+        p.keep(frame, true);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -281,16 +348,38 @@ fn reserve(s: &mut State) {
 }
 
 /// Undo the replacement [`Hub::decide`] began for `node`'s `session`, whose
-/// handshake failed before its socket was in place: what was kept for it is
-/// dropped, and the node's current session reports again.
-pub(super) fn undo_pending(s: &mut State, app: &str, node: u64, session: u64) {
+/// handshake failed before its socket was in place — only while it is still
+/// the node's pending admission; a newer one owns the replacement. The
+/// relays kept for it are dropped, the node's standing session reports again,
+/// and the state reports it sent meanwhile are returned, to apply.
+pub(super) fn undo_pending(s: &mut State, app: &str, node: u64, session: u64) -> Vec<Frame> {
     let key = (app.to_string(), node);
-    if s.pending.get(&key).is_some_and(|p| p.session == session) {
-        s.pending.remove(&key);
+    if !s.pending.get(&key).is_some_and(|p| p.session == session) {
+        return Vec::new();
+    }
+    let p = s.pending.remove(&key).expect("checked above");
+    if let Some(current) = s.sockets.get(&key) {
+        current.replaced.store(false, Ordering::SeqCst);
+    }
+    p.held
+}
+
+/// The [`Pending`] `run` puts its session's socket in place with: its own, or
+/// none — a newer admission superseded it, or its replacement was undone.
+/// Overflowed, its replacement is undone as a failed handshake's is.
+pub(super) fn take_pending(s: &mut State, app: &str, node: u64, session: u64) -> Taken {
+    let key = (app.to_string(), node);
+    if !s.pending.get(&key).is_some_and(|p| p.session == session) {
+        return Taken::Superseded;
+    }
+    let p = s.pending.remove(&key).expect("checked above");
+    if p.overflowed {
         if let Some(current) = s.sockets.get(&key) {
             current.replaced.store(false, Ordering::SeqCst);
         }
+        return Taken::Overflowed(p.held);
     }
+    Taken::Ready(p.queue)
 }
 
 /// Plan the cast now, under the state's hold, and send a changed plan to every
@@ -310,7 +399,7 @@ fn plan_in(s: &mut State, now: Instant) {
         }
         for ((a, _), p) in s.pending.iter_mut() {
             if a == HOSTING_APP {
-                p.queue.push(frame.clone());
+                p.keep(frame.clone(), false);
             }
         }
     }
@@ -451,21 +540,26 @@ impl Hub {
             .flatten();
         let (_, members) = s.registry.listing(app);
         // **The replacement starts here, under the guard the table is read
-        // under** (`docs/replicated_substrate.md` §5.4): the node's current
+        // under** (`docs/replicated_substrate.md` §5.4): the node's standing
         // session, if any, is marked replaced, so nothing it still reports
-        // lands after this table was built, and every control frame for the
-        // node from now on waits for the new socket in `pending`. A handshake
-        // that fails from here undoes both (`Hub::undo_pending`).
+        // lands after this table was built — it is held back instead, in case
+        // the handshake fails (`undo_pending`) — and every claim relay and
+        // plan for the node from now on waits for the new socket in
+        // `pending`. An earlier admission of the node still pending is
+        // superseded: what it held back carries over, and its `run` fails.
         let claims = s.registry.claims(app).table();
         let key = (app.to_string(), hello.node);
         if let Some(old) = s.sockets.get(&key) {
             old.replaced.store(true, Ordering::SeqCst);
         }
+        let held = s.pending.remove(&key).map(|p| p.held).unwrap_or_default();
         s.pending.insert(
             key,
             Pending {
                 session: admitted.session,
                 queue: Vec::new(),
+                held,
+                overflowed: false,
             },
         );
         drop(s);
@@ -543,9 +637,12 @@ impl Hub {
                 // Admitted, and the ADMIT never reached it: the replacement it
                 // began is undone, and the node's session stays as it was.
                 if let (Some(a), Some((node, _))) = (&decided, &seen) {
-                    let mut s = self.state();
-                    s.admission.left(app, *node, a.session);
-                    undo_pending(&mut s, app, *node, a.session);
+                    let held = {
+                        let mut s = self.state();
+                        s.admission.left(app, *node, a.session);
+                        undo_pending(&mut s, app, *node, a.session)
+                    };
+                    self.apply_held(app, *node, held);
                 }
                 match e {
                     HandshakeError::Refused(close) => {
@@ -594,13 +691,32 @@ impl Hub {
         {
             let mut s = self.state();
             let connected_ms = now_ms();
-            // What was meant for the node since its ADMIT's table was built.
-            let waiting = s
-                .pending
-                .remove(&(app.to_string(), node))
-                .filter(|p| p.session == admitted.session)
-                .map(|p| p.queue)
-                .unwrap_or_default();
+            // What was meant for the node since its ADMIT's table was built —
+            // unless a newer admission of the node superseded this one, or too
+            // much arrived meanwhile: then this session goes, having changed
+            // nothing.
+            let waiting = match take_pending(&mut s, app, node, admitted.session) {
+                Taken::Ready(waiting) => waiting,
+                gone => {
+                    s.admission.left(app, node, admitted.session);
+                    drop(s);
+                    let (why, held) = match gone {
+                        Taken::Overflowed(held) => (
+                            "more changed during the handshake than it could be brought up to date with: dial again",
+                            held,
+                        ),
+                        _ => ("a newer session of this node was admitted", Vec::new()),
+                    };
+                    handle.close(Close::new(CloseCode::Replaced, why));
+                    self.note(
+                        app,
+                        hex(node),
+                        format!("session {} not taken: {why}", admitted.session),
+                    );
+                    self.apply_held(app, node, held);
+                    return;
+                }
+            };
             let replaced = s.sockets.insert(
                 (app.to_string(), node),
                 Socket {
@@ -796,8 +912,11 @@ impl Hub {
         // `CLAIM` would name the node holder of a key its new process never
         // took, and a late `CAPACITY` would describe a process that is gone.
         // Each report re-checks under the guard it changes state with, the
-        // guard the flag is set under ([`Self::decide`]).
+        // guard the flag is set under ([`Self::decide`]). While the
+        // replacement can still be undone, a report is held back rather than
+        // dropped ([`hold_back`]).
         if is_state_report(&frame) && replaced.load(Ordering::SeqCst) {
+            hold_back(&mut self.state(), app, node, replaced, frame);
             return Ok(());
         }
         if let Some((key, text)) = paxos_step(node, &frame) {
@@ -809,6 +928,7 @@ impl Hub {
                 let (changed, spoke) = {
                     let mut s = self.state();
                     if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::Capacity(c));
                         return Ok(());
                     }
                     if let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) {
@@ -830,8 +950,9 @@ impl Hub {
                 let table = RouteTable::decode(&r.table)
                     .map_err(|e| Close::new(CloseCode::Malformed, format!("ROUTES: {e}")))?;
                 let mut s = self.state();
-                if !replaced.load(Ordering::SeqCst) {
-                    s.registry.routes(app, node, table);
+                match replaced.load(Ordering::SeqCst) {
+                    true => hold_back(&mut s, app, node, replaced, Frame::Routes(r)),
+                    false => s.registry.routes(app, node, table),
                 }
             }
             Frame::Claim(c) => {
@@ -848,6 +969,7 @@ impl Hub {
                 let took = {
                     let mut s = self.state();
                     if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::Claim(c));
                         return Ok(());
                     }
                     s.registry.claims(app).claim(&c.key, c.epoch)
@@ -875,6 +997,7 @@ impl Hub {
                 let released = {
                     let mut s = self.state();
                     if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::Unclaim(u));
                         return Ok(());
                     }
                     let released = s.registry.claims(app).unclaim(&u.key, u.epoch);
@@ -900,8 +1023,9 @@ impl Hub {
             // own — no other member reads it.
             Frame::Complete(c) => {
                 let mut s = self.state();
-                if !replaced.load(Ordering::SeqCst) {
-                    s.registry.completed(app, node, &c.keys);
+                match replaced.load(Ordering::SeqCst) {
+                    true => hold_back(&mut s, app, node, replaced, Frame::Complete(c)),
+                    false => s.registry.completed(app, node, &c.keys),
                 }
             }
             Frame::Coord(c) => {
@@ -914,6 +1038,7 @@ impl Hub {
                 let (lines, actions) = {
                     let mut s = self.state();
                     if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::Coord(c));
                         return Ok(());
                     }
                     let key = (app.to_string(), node);
@@ -938,11 +1063,25 @@ impl Hub {
                 self.act(actions);
             }
             Frame::BuildOffer(b) => {
-                self.state().held.announce(node, &b, true);
+                {
+                    let mut s = self.state();
+                    if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::BuildOffer(b));
+                        return Ok(());
+                    }
+                    s.held.announce(node, &b, true);
+                }
                 self.to_every_other(node, Frame::BuildOffer(b));
             }
             Frame::BuildHave(b) => {
-                self.state().held.announce(node, &b, false);
+                {
+                    let mut s = self.state();
+                    if replaced.load(Ordering::SeqCst) {
+                        hold_back(&mut s, app, node, replaced, Frame::BuildHave(b));
+                        return Ok(());
+                    }
+                    s.held.announce(node, &b, false);
+                }
                 self.to_every_other(node, Frame::BuildHave(b));
             }
             Frame::BuildFetch(f) => self.route_fetch(f),
@@ -1366,8 +1505,32 @@ impl Hub {
             .mirrored(app, route, mode, compared, baseline, candidate);
     }
 
-    /// `frame` to every member of `app` but `from` — and kept for each
-    /// session admitted whose socket is not yet in place ([`Pending`]).
+    /// Apply the state reports `node`'s standing session sent while a
+    /// replacement of it was pending, now that the replacement is undone:
+    /// they are that session's, and it is still the node's.
+    pub(super) fn apply_held(&self, app: &str, node: u64, held: Vec<Frame>) {
+        if held.is_empty() {
+            return;
+        }
+        let standing = self
+            .state()
+            .sockets
+            .get(&(app.to_string(), node))
+            .map(|x| (Arc::clone(&x.replaced), x.handle.clone()));
+        let Some((replaced, handle)) = standing else {
+            return;
+        };
+        for frame in held {
+            if let Err(close) = self.on_frame(app, node, &replaced, frame, &handle) {
+                handle.close(close);
+                return;
+            }
+        }
+    }
+
+    /// `frame` to every member of `app` but `from`. A claim relay is also
+    /// kept for each session admitted whose socket is not yet in place
+    /// ([`Pending`]): it brings that session's `ADMIT` table up to date.
     pub(super) fn to_others(&self, app: &str, from: u64, frame: Frame) {
         let mut s = self.state();
         let State {
@@ -1378,22 +1541,21 @@ impl Hub {
                 let _ = socket.handle.control(frame.clone());
             }
         }
-        for ((a, n), p) in pending.iter_mut() {
-            if a == app && *n != from {
-                p.queue.push(frame.clone());
+        if matches!(frame, Frame::Claim(_) | Frame::Unclaim(_)) {
+            for ((a, n), p) in pending.iter_mut() {
+                if a == app && *n != from {
+                    p.keep(frame.clone(), false);
+                }
             }
         }
     }
 
-    /// `frame` to `node` of `app` — and kept for its session admitted whose
-    /// socket is not yet in place.
+    /// `frame` to `node` of `app`, on whichever socket is its current one
+    /// now. A request or reply for a session still in its handshake is not
+    /// kept for it: its process never issued what it answers, and a request
+    /// to a replaced process fails over by its requester's own retry.
     pub(super) fn to_member(&self, app: &str, node: u64, frame: Frame) {
-        let mut s = self.state();
-        let key = (app.to_string(), node);
-        if let Some(p) = s.pending.get_mut(&key) {
-            p.queue.push(frame.clone());
-        }
-        if let Some(socket) = s.sockets.get(&key) {
+        if let Some(socket) = self.state().sockets.get(&(app.to_string(), node)) {
             let _ = socket.handle.control(frame);
         }
     }

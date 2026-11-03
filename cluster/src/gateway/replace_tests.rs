@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::hub::{undo_pending, Hub, Socket};
+use super::hub::{is_state_report, take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
 use super::registry::MemberView;
 use crate::delivery::ReceiptPacer;
 use crate::frame::{BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberState, ModelId};
@@ -131,17 +131,8 @@ async fn a_replaced_session_reports_nothing_of_its_node() {
         MemberState::Loading,
         "the old Ready is not the new session's"
     );
-    hub.on_frame(
-        "zend",
-        1,
-        &old,
-        Frame::Claim(Claim {
-            key: b"k".to_vec(),
-            epoch: Epoch { ms: 5, node: 1 },
-        }),
-        &reply_on,
-    )
-    .unwrap();
+    hub.on_frame("zend", 1, &old, claim(b"k", 5), &reply_on)
+        .unwrap();
     assert_eq!(hub.state().registry.claims("zend").holder(b"k"), None);
 
     let current = AtomicBool::new(false);
@@ -154,27 +145,126 @@ async fn a_replaced_session_reports_nothing_of_its_node() {
     );
 }
 
-/// **A handshake that fails after its admission undoes the replacement**: the
-/// node's standing session reports again, and nothing is kept for the session
-/// that never arrived.
+/// **A handshake that fails after its admission undoes the replacement, and
+/// loses nothing the standing session said meanwhile**: its `CAPACITY` and
+/// `CLAIM`, held back while the replacement was pending, are applied once it
+/// is undone, and it reports again.
 #[tokio::test]
 async fn a_failed_handshake_undoes_the_replacement() {
     let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
     let (first, old) = admitted_once(&hub);
     let (_, second) = hub.decide("zend", &hello(1)).unwrap();
     assert!(old.load(Ordering::SeqCst));
-    {
+    let reply_on = handle();
+    hub.on_frame("zend", 1, &old, ready(), &reply_on).unwrap();
+    hub.on_frame("zend", 1, &old, claim(b"k", 5), &reply_on)
+        .unwrap();
+    assert_eq!(hub.state().registry.claims("zend").holder(b"k"), None);
+
+    let held = {
         let mut s = hub.state();
-        undo_pending(&mut s, "zend", 1, second.session);
+        let held = undo_pending(&mut s, "zend", 1, second.session);
         assert_eq!(s.sockets[&("zend".to_string(), 1)].session, first);
-    }
+        held
+    };
+    assert_eq!(held.len(), 2, "what it said while pending");
     assert!(
         !old.load(Ordering::SeqCst),
         "the standing session reports again"
     );
-    hub.on_frame("zend", 1, &old, ready(), &handle()).unwrap();
+    hub.apply_held("zend", 1, held);
     assert_eq!(
         hub.state().registry.member("zend", 1).unwrap().state(),
         MemberState::Ready
     );
+    assert_eq!(
+        hub.state().registry.claims("zend").holder(b"k"),
+        Some(1),
+        "its claim from the window stands"
+    );
+}
+
+fn claim(key: &[u8], ms: u64) -> Frame {
+    Frame::Claim(Claim {
+        key: key.to_vec(),
+        epoch: Epoch { ms, node: 1 },
+    })
+}
+
+/// **Overlapping handshakes from one node: the newer admission owns the
+/// replacement**, in either order. S1 and S2 are both decided; S1's `run`
+/// finds itself superseded and changes nothing, S2's takes its place. And
+/// when S2 fails first, S1's undo touches nothing, S2's undo restores the
+/// standing session with what it said meanwhile — carried over from S1's
+/// pending — and S1's `run` is still superseded.
+#[tokio::test]
+async fn overlapping_handshakes_leave_the_newer_in_charge() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (_, old) = admitted_once(&hub);
+    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
+    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
+    {
+        let mut s = hub.state();
+        assert!(matches!(
+            take_pending(&mut s, "zend", 1, s1.session),
+            Taken::Superseded
+        ));
+        assert!(old.load(Ordering::SeqCst), "still marked, for S2");
+        assert!(matches!(
+            take_pending(&mut s, "zend", 1, s2.session),
+            Taken::Ready(_)
+        ));
+    }
+
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (_, old) = admitted_once(&hub);
+    let (_, s1) = hub.decide("zend", &hello(1)).unwrap();
+    let reply_on = handle();
+    hub.on_frame("zend", 1, &old, ready(), &reply_on).unwrap();
+    let (_, s2) = hub.decide("zend", &hello(1)).unwrap();
+    let mut s = hub.state();
+    assert!(
+        undo_pending(&mut s, "zend", 1, s1.session).is_empty(),
+        "S1 no longer owns it"
+    );
+    assert!(old.load(Ordering::SeqCst));
+    let held = undo_pending(&mut s, "zend", 1, s2.session);
+    assert_eq!(held.len(), 1, "carried over from S1's pending");
+    assert!(!old.load(Ordering::SeqCst));
+    assert!(matches!(
+        take_pending(&mut s, "zend", 1, s1.session),
+        Taken::Superseded
+    ));
+}
+
+/// **A handshake during which more piles up than it can be brought up to date
+/// with fails its admission**, and the standing session keeps what it said.
+#[tokio::test]
+async fn an_overflowing_handshake_fails_its_admission() {
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw");
+    let (_, old) = admitted_once(&hub);
+    let (_, second) = hub.decide("zend", &hello(1)).unwrap();
+    let reply_on = handle();
+    for _ in 0..=PENDING_CAP {
+        hub.on_frame("zend", 1, &old, ready(), &reply_on).unwrap();
+    }
+    let mut s = hub.state();
+    let Taken::Overflowed(held) = take_pending(&mut s, "zend", 1, second.session) else {
+        panic!("overflowed");
+    };
+    assert_eq!(held.len(), PENDING_CAP);
+    assert!(
+        !old.load(Ordering::SeqCst),
+        "the standing session reports again"
+    );
+}
+
+/// What a replaced session may no longer report — everything written into
+/// the node's own entries — and what it still may: a request routed on, a
+/// one-time reply.
+#[test]
+fn state_reports_are_what_a_node_writes_of_itself() {
+    assert!(is_state_report(&ready()));
+    assert!(is_state_report(&claim(b"k", 1)));
+    assert!(!is_state_report(&Frame::Ping([0; 8])));
 }

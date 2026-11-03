@@ -1,10 +1,17 @@
 //! The gateway's side of the handshake.
 
+use std::time::Duration;
+
+use tokio::time::timeout;
+
 use super::proof::{gateway_proof, nonce, verify_member};
 use super::{next, refuse, send, unexpected, GroupKey, HandshakeError, PROTO};
 use crate::close::{Close, CloseCode};
 use crate::frame::{Admit, Challenge, Frame, Hello};
 use crate::pipe::{PipeRx, PipeTx};
+
+/// The longest an `ADMIT` may take to send.
+pub const ADMIT_SEND: Duration = Duration::from_secs(10);
 
 /// Take a member's `HELLO`, refuse a protocol newer than this gateway's (4426),
 /// challenge it, check its proof (4401), and then ask `decide` — the build
@@ -85,10 +92,13 @@ where
     }
 
     match decide(&hello) {
-        Ok(admit) => {
-            send(tx, &Frame::Admit(admit.clone())).await?;
-            Ok((hello, admit))
-        }
+        // Bounded: an admission decided has begun replacing the node's
+        // standing session, which holds back what it reports until the
+        // `ADMIT` is sent or the handshake fails.
+        Ok(admit) => match timeout(ADMIT_SEND, send(tx, &Frame::Admit(admit.clone()))).await {
+            Ok(sent) => sent.map(|()| (hello, admit)),
+            Err(_) => Err(HandshakeError::Dropped),
+        },
         Err(close) => Err(refuse(tx, close).await),
     }
 }

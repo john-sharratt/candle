@@ -146,8 +146,10 @@ impl Registry {
     /// of its own the gateway heard (`docs/cooperative_admission.md` §2.4), not
     /// to whichever member places first, which may not have applied its last
     /// turn. A hint for this gateway's placement only: nothing is relayed and no
-    /// claim changes. A key that already has a release standing keeps it, with
-    /// the members known to hold it complete; a real release replaces either.
+    /// claim changes. The node is each key's current holder, so the hint
+    /// replaces any earlier release of it — but one that is this same release,
+    /// by this node through these records, which keeps the members known to
+    /// hold it complete. A real release replaces it in turn.
     pub fn leave(&mut self, app: &str, node: u64, session: u64) -> bool {
         let a = self.app(app);
         if a.members.get(&node).is_some_and(|m| m.session == session) {
@@ -155,11 +157,20 @@ impl Registry {
             a.epoch += 1;
             let through = a.seen.get(&node).copied().unwrap_or(0);
             for key in a.claims.keys_of(node) {
-                a.handovers.entry(key).or_insert_with(|| Handover {
-                    by: node,
-                    through,
-                    complete: BTreeSet::new(),
-                });
+                let same = a
+                    .handovers
+                    .get(&key)
+                    .is_some_and(|h| h.by == node && h.through == through);
+                if !same {
+                    a.handovers.insert(
+                        key,
+                        Handover {
+                            by: node,
+                            through,
+                            complete: BTreeSet::new(),
+                        },
+                    );
+                }
             }
             return true;
         }

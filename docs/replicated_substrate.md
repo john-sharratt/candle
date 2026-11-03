@@ -1563,29 +1563,40 @@ the key at a higher epoch from a holder still serving it. These rules keep the t
 instead:
 
 - **A session is replaced in one step** (`Hub::decide`). Under the guard its `ADMIT`'s
-  claim table is read under, the node's current session is marked replaced, and from then
-  every control frame for the node — a relayed `CLAIM` or `UNCLAIM`, a `PLAN` — is kept for
-  the new session as well as sent to the old (`Pending`), and handed to the new socket
-  under the guard that puts it in place, before anything relayed after. So nothing falls
-  between the table the new session was sent and the socket it is reached on, and no claim
-  of the node's own lands after the table was built. A handshake that fails from there
-  undoes it: the mark is cleared, and what was kept is dropped.
-- **A replaced session reports nothing of its node's state.** What it still sends of it —
-  `CLAIM`, `UNCLAIM`, `CAPACITY`, `ROUTES`, `COMPLETE`, `COORD` — is dropped at the
-  gateway, checked against a flag on the session itself, under the guard each changes
-  state with: a process still running says it again on its new session, and one that
-  restarted holds nothing it said. One-time replies — votes, catch-up answers, build
-  chunks — are still taken: a process still running sends each once, and a peer awaits
-  it.
+  claim table is read under, the node's standing session is marked replaced, and from then
+  what brings that table up to date — a relayed `CLAIM` or `UNCLAIM`, a `PLAN` — is kept
+  for the new session as well as sent to the standing one (`Pending`), and handed to the
+  new socket under the guard that puts it in place, before anything relayed after. So
+  nothing falls between the table the new session was sent and the socket it is reached
+  on, and no claim of the node's own lands after the table was built. A request or a
+  one-time reply is not kept: it goes to whichever socket is the node's current one when
+  it is sent, and a request to a replaced process fails over by its requester's own retry.
+  The `ADMIT` must be sent within `ADMIT_SEND`, 10 s, and what is kept is bounded at
+  `PENDING_CAP` frames; past it the admission fails, and the member dials again.
+- **One admission of a node is pending at a time.** A newer one supersedes an older still
+  in its handshake — the older's `run` then finds itself superseded and goes, changing
+  nothing — and only the pending session's own `run` or failure touches the replacement.
+- **A replaced session reports nothing of its node's state.** What it sends that is
+  written into the node's own entries — `CLAIM`, `UNCLAIM`, `CAPACITY`, `ROUTES`,
+  `COMPLETE`, `COORD`, `ACK`, `HAVE`, `BUILD_OFFER`, `BUILD_HAVE` — is not applied, checked
+  against a flag on the session itself, under the guard each changes state with: a process
+  still running says it again on its new session, and one that restarted holds nothing it
+  said. While the replacement is pending such a report is held back, and if the handshake
+  fails it is applied after all, the standing session's still: nothing a live process said
+  is lost to a handshake that came to nothing. Requests routed on and one-time replies —
+  catch-ups and their answers, votes, build chunks — still pass: a process still running
+  sends each once, and a peer awaits it.
 - **A member takes in no claim of its own node at an epoch it does not hold**
-  (`MemberClaims::of_own_node`). `ADMIT`'s table may name this node for a key its process
-  holds nothing of — its previous process's claim, after a restart, or one it let go on a
-  socket that died before the gateway heard — or at an epoch above the one it holds the key
-  at. The member is that claim's holder, so it releases it, at that epoch, with `UNCLAIM
-  { key, epoch, through }` on the new socket, through the key's own last record as any
-  release is; then it announces what it does hold. One below the epoch it holds is
-  released by nobody: its re-announce supersedes it. The gateway relays an `UNCLAIM` only
-  when it let a claim go, so a release that matched nothing reaches no peer's hooks.
+  (`MemberClaims::of_own_node`), **and releases none for a key it holds.** `ADMIT`'s table
+  may name this node for a key its process holds nothing of — its previous process's
+  claim, after a restart, or one it let go on a socket that died before the gateway heard.
+  The member is that claim's holder, so it releases it, at that epoch, with `UNCLAIM { key,
+  epoch, through }` on the new socket, through the key's own last record as any release is.
+  For a key it holds at another epoch, nothing is released — a release of a key it still
+  serves would let a peer take it — and its re-announce corrects the table: an epoch below
+  the held one is superseded by it, and above it the key is claimed again here, above that
+  epoch, and that claim is announced. The gateway relays an `UNCLAIM` only when it let a
+  claim go, so a release that matched nothing reaches no peer's hooks.
 - **Only a node's own claims come from it.** A `CLAIM` or `UNCLAIM` whose epoch names
   another node is a protocol violation, closed `4400`. No gateway relays a node its own
   claims.
@@ -1597,9 +1608,10 @@ request to the departed holder and makes no card busy. **Each key it held is pla
 released by it meanwhile** (`Registry::leave`): its next request goes among the members
 holding the holder's records through the highest of its own the gateway heard
 (`docs/cooperative_admission.md` §2.4), as after a release, not to whichever member places
-first. That is a hint for this gateway's placement alone: nothing is relayed, no claim
-changes, a key with a release already standing keeps that one, and the holder's own
-release, when it comes, replaces it.
+first. That is a hint for this gateway's placement alone: nothing is relayed and no claim
+changes. As the key's current holder, its hint replaces any earlier release of the key but
+this same one — by it, through these records — which keeps the members known to hold it
+complete; the holder's own release, when it comes, replaces it in turn.
 
 A holder that left every cluster loses it without an `UNCLAIM`:
 

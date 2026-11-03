@@ -542,8 +542,9 @@ impl AppMember {
             let mut claims = lock(&self.claims);
             let mut lost: Vec<Vec<u8>> = Vec::new();
             let mut stale: Vec<(Vec<u8>, Epoch)> = Vec::new();
+            let now = now_ms();
             for claim in &admit.claims {
-                match claims.of_own_node(&claim.key, claim.epoch) {
+                match claims.of_own_node(&claim.key, claim.epoch, now) {
                     OwnClaim::Release(epoch) => stale.push((claim.key.clone(), epoch)),
                     OwnClaim::Kept => {}
                     OwnClaim::Hear => {

@@ -31,14 +31,14 @@ pub enum OwnClaim {
     /// Another node's, or this member's own at the epoch it holds: heard as
     /// any claim is ([`MemberClaims::heard`]).
     Hear,
-    /// This node's, at an epoch this member does not hold — its previous
-    /// process's, one it let go on a socket that died before the gateway heard,
-    /// or one above the epoch it holds the key at: released at that epoch, as
-    /// its holder. A key it holds is then announced again at its own.
+    /// This node's, for a key this member does not hold at all — its previous
+    /// process's, or one it let go on a socket that died before the gateway
+    /// heard: released at that epoch, as its holder.
     Release(Epoch),
-    /// This node's, at an epoch below the one this member holds the key at:
-    /// its announcing that claim again on admission supersedes it, and nothing
-    /// is released.
+    /// This node's, for a key this member holds at another epoch: nothing is
+    /// released. Below the held epoch, its announcing that claim again on
+    /// admission supersedes it; above, the key has been claimed again above
+    /// it, and that claim is what is announced.
     Kept,
 }
 
@@ -164,19 +164,35 @@ impl MemberClaims {
     /// the one it holds, leave a claim its re-announce cannot replace and its
     /// own release cannot match. The epoch is seen either way, so a claim this
     /// member takes on the key later sorts above it.
-    pub fn of_own_node(&mut self, key: &[u8], epoch: Epoch) -> OwnClaim {
+    ///
+    /// A key this member holds is never released — releasing a key it still
+    /// serves would let a peer take it, and both serve it. Named at an epoch
+    /// above the one it holds, the key is claimed again here above that one,
+    /// at `now_ms` or past every epoch seen, so the re-announce on admission
+    /// replaces the table's.
+    pub fn of_own_node(&mut self, key: &[u8], epoch: Epoch, now_ms: u64) -> OwnClaim {
         if epoch.node != self.node {
             return OwnClaim::Hear;
         }
-        let held = self.own.get(key).map(|(e, _)| *e);
-        if held == Some(epoch) {
+        let held = self.own.get(key).map(|(e, served)| (*e, *served));
+        if held.is_some_and(|(e, _)| e == epoch) {
             return OwnClaim::Hear;
         }
         self.saw(key, epoch);
-        match held {
-            Some(held) if held > epoch => OwnClaim::Kept,
-            _ => OwnClaim::Release(epoch),
+        let Some((held, served)) = held else {
+            return OwnClaim::Release(epoch);
+        };
+        if epoch > held {
+            let floor = self.seen.get(key).map_or(0, |ms| ms + 1);
+            let again = Epoch {
+                ms: now_ms.max(floor),
+                node: self.node,
+            };
+            self.saw(key, again);
+            self.table.claim(key, again);
+            self.own.insert(key.to_vec(), (again, served));
         }
+        OwnClaim::Kept
     }
 
     /// A claim announced by any member — from `ADMIT`'s table or relayed.
@@ -297,46 +313,48 @@ mod tests {
 
     /// **A claim of this node's at an epoch it does not hold is never taken in.**
     /// Another node's claim, and its own at the epoch it holds, are heard. Its
-    /// own below the epoch it holds is kept to the re-announce. Its own above
-    /// it, or for a key it does not hold — a previous process's, or one let go
-    /// — is released at that epoch. Either way the epoch is seen: the member's
-    /// next claim on the key sorts above it, and the key it holds stays at its
-    /// own epoch.
+    /// own below the epoch it holds is kept to the re-announce; above it, the
+    /// key is never released — it is claimed again above that epoch, for the
+    /// re-announce to replace it with. Its own for a key it does not hold — a
+    /// previous process's, or one let go — is released at that epoch. Either
+    /// way the epoch is seen: the member's next claim on the key sorts above
+    /// it.
     #[test]
     fn a_claim_of_its_own_node_it_does_not_hold_is_never_taken_in() {
         let t = Instant::now();
         let mut c = MemberClaims::new(ME);
         assert_eq!(
-            c.of_own_node(b"other", e(700, 2)),
+            c.of_own_node(b"other", e(700, 2), 600),
             OwnClaim::Hear,
             "another node's"
         );
 
         assert_eq!(c.serve(b"held", 500, t, |_| true), Check::Took(e(500, ME)));
         assert_eq!(
-            c.of_own_node(b"held", e(500, ME)),
+            c.of_own_node(b"held", e(500, ME), 600),
             OwnClaim::Hear,
             "held at that epoch"
         );
         assert_eq!(
-            c.of_own_node(b"held", e(400, ME)),
+            c.of_own_node(b"held", e(400, ME), 600),
             OwnClaim::Kept,
             "below the held epoch: the re-announce supersedes it"
         );
+        assert_eq!(c.own(), vec![(b"held".to_vec(), e(500, ME))]);
         assert_eq!(
-            c.of_own_node(b"held", e(900, ME)),
-            OwnClaim::Release(e(900, ME)),
-            "above the held epoch: released, never adopted"
+            c.of_own_node(b"held", e(900, ME), 600),
+            OwnClaim::Kept,
+            "above the held epoch: never released, never adopted"
         );
         assert_eq!(
             c.own(),
-            vec![(b"held".to_vec(), e(500, ME))],
-            "still held at 500"
+            vec![(b"held".to_vec(), e(901, ME))],
+            "claimed again above it, for the re-announce"
         );
         assert_eq!(c.holder(b"held"), Some(ME));
 
         assert_eq!(
-            c.of_own_node(b"stale", e(800, ME)),
+            c.of_own_node(b"stale", e(800, ME), 600),
             OwnClaim::Release(e(800, ME)),
             "a previous process's"
         );
@@ -352,7 +370,7 @@ mod tests {
         c.follow_use();
         assert_eq!(c.end_use(b"gone"), Some(e(600, ME)), "let go");
         assert_eq!(
-            c.of_own_node(b"gone", e(600, ME)),
+            c.of_own_node(b"gone", e(600, ME), 700),
             OwnClaim::Release(e(600, ME)),
             "a release the gateway never heard"
         );
