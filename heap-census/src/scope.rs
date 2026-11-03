@@ -14,7 +14,9 @@
 
 use std::marker::PhantomData;
 
-use super::thread_state::{replace_scope, shard_and_scope};
+use super::thread_state::replace_scope;
+#[cfg(test)]
+use super::thread_state::shard_and_scope;
 
 /// How many scopes there are. A power of two: a header byte is masked by it,
 /// so no byte read back indexes past the counters.
