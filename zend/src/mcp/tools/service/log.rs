@@ -45,7 +45,10 @@ pub fn definition() -> Value {
 }
 
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
-    let (host, service) = match (string(args, "host"), string(args, "service").and_then(service_of)) {
+    let (host, service) = match (
+        string(args, "host"),
+        string(args, "service").and_then(service_of),
+    ) {
         (Ok(h), Ok(s)) => (h, s),
         (Err(e), _) | (_, Err(e)) => return Answer::error(e),
     };
@@ -97,6 +100,9 @@ mod tests {
             .keys()
             .collect();
         assert_eq!(props[..3], ["host", "service", "mode"]);
-        assert_eq!(d["inputSchema"]["required"], json!(["host", "service", "mode"]));
+        assert_eq!(
+            d["inputSchema"]["required"],
+            json!(["host", "service", "mode"])
+        );
     }
 }

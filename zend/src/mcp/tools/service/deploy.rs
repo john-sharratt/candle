@@ -123,7 +123,10 @@ async fn drive(call: OpsCall, agents: Agents, h: Handle, host: String, service: 
 }
 
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
-    let (host, service) = match (string(args, "host"), string(args, "service").and_then(service_of)) {
+    let (host, service) = match (
+        string(args, "host"),
+        string(args, "service").and_then(service_of),
+    ) {
         (Ok(h), Ok(s)) => (h.to_string(), s),
         (Err(e), _) | (_, Err(e)) => return Answer::error(e),
     };
@@ -141,20 +144,31 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     };
     let node = match on_host(&listed, &host) {
         Ok(n) => n,
-        Err(e) => return Answer::error(format!("{e}: a deploy builds on the machine it deploys to")),
+        Err(e) => {
+            return Answer::error(format!("{e}: a deploy builds on the machine it deploys to"))
+        }
     };
     let host = listed
         .iter()
         .find(|a| u64::from_str_radix(&a.node, 16) == Ok(node))
         .map_or(host, |a| a.host.clone());
-    let (at, view) = match agents.submit(&call.lineage, build_job(service), Some(node)).await {
+    let (at, view) = match agents
+        .submit(&call.lineage, build_job(service), Some(node))
+        .await
+    {
         Ok(started) => started,
         Err(e) => return Answer::error(format!("the build could not start on {host}: {e}")),
     };
     let node = agents.node_of(at).unwrap_or(node);
     let h = Handle::new(node, &view.id);
     tracing::info!(deploy = %h, host, service, "deploy: building");
-    tokio::spawn(drive(call.clone(), agents, h.clone(), host.clone(), service));
+    tokio::spawn(drive(
+        call.clone(),
+        agents,
+        h.clone(),
+        host.clone(),
+        service,
+    ));
     Answer::ok(format!(
         "Deploy {h}: {service} to {host}, building origin/main with `cargo build --release -p \
          {service}` — {}. When it has built, keep on {host} tries it: proven once it serves, or \
@@ -195,7 +209,8 @@ mod tests {
     fn the_next_steps_name_the_deploy_and_its_machine() {
         let next = next_steps(&Handle::new(0xab, "Xe"), "BlackWorld", "motherd");
         assert!(next.contains(r#"`service_status {deploy: "00000000000000ab:Xe", wait_s: 240}`"#));
-        assert!(next.contains(r#"`service_log {host: "BlackWorld", service: "motherd", mode: "tail"}`"#));
+        assert!(next
+            .contains(r#"`service_log {host: "BlackWorld", service: "motherd", mode: "tail"}`"#));
     }
 
     /// The schema names the services keep runs, so the grammar offers only

@@ -81,7 +81,13 @@ pub fn outcome(h: &Handle, s: &Summary) -> String {
     if s.warning_count > 0 {
         out.push_str(&format!("\n{} warnings", s.warning_count));
     }
-    let first = s.errors.first().into_iter().chain(s.failures.first()).map(|l| l.n).min();
+    let first = s
+        .errors
+        .first()
+        .into_iter()
+        .chain(s.failures.first())
+        .map(|l| l.n)
+        .min();
     match first {
         Some(n) => out.push_str(&format!(
             "\nRead around it: `repo_job_log {{job: \"{h}\", mode: \"lines\", from: {}, count: 60}}`.",
@@ -103,7 +109,9 @@ async fn last_line(agents: &Agents, at: At, h: &Handle) -> Option<String> {
         .read_log(at, &h.id, &LogAsk::Tail { lines: 1 })
         .await
         .ok()?;
-    read.lines.last().map(|l| format!("line {}: {}", l.n, l.text))
+    read.lines
+        .last()
+        .map(|l| format!("line {}: {}", l.n, l.text))
 }
 
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
@@ -188,7 +196,10 @@ mod tests {
     fn an_ended_job_says_how_and_where_to_read_on() {
         let s = Summary {
             results: vec![line(90, "test result: FAILED. 9 passed; 1 failed")],
-            failures: vec![line(70, "test a::b ... FAILED"), line(80, "panicked at a.rs:3")],
+            failures: vec![
+                line(70, "test a::b ... FAILED"),
+                line(80, "panicked at a.rs:3"),
+            ],
             errors: Vec::new(),
             failure_count: 2,
             error_count: 0,
@@ -207,14 +218,19 @@ mod tests {
     /// A list past what is quoted says how many more there were.
     #[test]
     fn a_long_list_says_how_many_more() {
-        let errors: Vec<Line> = (1..=9).map(|n| line(n, "error[E0308]: mismatched")).collect();
+        let errors: Vec<Line> = (1..=9)
+            .map(|n| line(n, "error[E0308]: mismatched"))
+            .collect();
         let s = Summary {
             errors,
             error_count: 40,
             ..Summary::default()
         };
         let text = outcome(&Handle::new(1, "x"), &s);
-        assert!(text.contains("\n  6: error[E0308]: mismatched\n  …and 34 more"), "{text}");
+        assert!(
+            text.contains("\n  6: error[E0308]: mismatched\n  …and 34 more"),
+            "{text}"
+        );
         assert!(!text.contains("\n  7:"), "{text}");
         assert!(text.contains("from: 1, count: 60"), "{text}");
     }

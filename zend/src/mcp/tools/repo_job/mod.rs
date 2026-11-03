@@ -31,7 +31,8 @@ pub mod start;
 pub mod status;
 
 /// What a member with no way to any agent answers.
-pub const NO_AGENTS: &str = "this member reaches no agent: it has no cluster and no agent of its own";
+pub const NO_AGENTS: &str =
+    "this member reaches no agent: it has no cluster and no agent of its own";
 
 /// A job: the agent it runs on and its id there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +233,12 @@ mod tests {
         let h = Handle::parse(" 76C3A0F4D39BD9DB:XeV_I_QPzpg ").unwrap();
         assert_eq!(h, Handle::new(0x76c3a0f4d39bd9db, "XeV_I_QPzpg"));
         assert_eq!(h.to_string(), "76c3a0f4d39bd9db:XeV_I_QPzpg");
-        for bad in ["XeV_I_QPzpg", "76c3:XeV", "76c3a0f4d39bd9db:", "76c3a0f4d39bd9db:a b"] {
+        for bad in [
+            "XeV_I_QPzpg",
+            "76c3:XeV",
+            "76c3a0f4d39bd9db:",
+            "76c3a0f4d39bd9db:a b",
+        ] {
             let err = Handle::parse(bad).unwrap_err();
             assert!(err.contains("`<node>:<id>`"), "{bad}: {err}");
         }
@@ -310,7 +316,11 @@ mod tests {
         );
         let done = JobView {
             staged: Some(Staged::At("D:/keep/stage/web.exe".into())),
-            ..view(JobStatus::Exited { code: Some(0) }, Phase::Ended, Some(43_000))
+            ..view(
+                JobStatus::Exited { code: Some(0) },
+                Phase::Ended,
+                Some(43_000),
+            )
         };
         assert_eq!(
             describe(&h, "BlackWorld", &done, 999_999),

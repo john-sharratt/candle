@@ -223,7 +223,13 @@ mod tests {
         assert_eq!(
             shell_line(
                 "cargo",
-                &["test".into(), "-j".into(), "4".into(), "--".into(), "--test-threads=4".into()]
+                &[
+                    "test".into(),
+                    "-j".into(),
+                    "4".into(),
+                    "--".into(),
+                    "--test-threads=4".into()
+                ]
             ),
             None
         );

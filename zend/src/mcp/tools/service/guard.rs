@@ -100,9 +100,16 @@ pub async fn check(call: &OpsCall, host: &str, service: &str) -> Result<(), Stri
     }
     let own = worker_hop::own_node().ok_or("this member is in no cluster")?;
     let member = ops::member(&call.session)?;
-    let status = send_up(&member, Method::GET, "/v1/status", &[], Vec::new(), Some(KEEP_READ))
-        .await
-        .map_err(|e| format!("the cluster's status could not be read: {e:#}"))?;
+    let status = send_up(
+        &member,
+        Method::GET,
+        "/v1/status",
+        &[],
+        Vec::new(),
+        Some(KEEP_READ),
+    )
+    .await
+    .map_err(|e| format!("the cluster's status could not be read: {e:#}"))?;
     let status = json_of(&status).map_err(|e| format!("/v1/status: {e}"))?;
     in_the_way(&status, own, host, service).map_or(Ok(()), Err)
 }

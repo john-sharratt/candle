@@ -399,10 +399,7 @@ mod tests {
         assert_eq!(ns(&s.results), [12]);
         assert_eq!(ns(&s.failures), [6, 10, 11, 13]);
         assert_eq!(ns(&s.errors), [3, 13]);
-        assert_eq!(
-            (s.failure_count, s.error_count, s.warning_count),
-            (4, 2, 1)
-        );
+        assert_eq!((s.failure_count, s.error_count, s.warning_count), (4, 2, 1));
         assert_eq!(s.last.last().map(|l| l.n), Some(13));
         assert_eq!(r.total, 13);
     }

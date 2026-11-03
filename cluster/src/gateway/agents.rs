@@ -353,10 +353,7 @@ mod tests {
     #[test]
     fn a_repo_less_job_fits_any_ready_agent() {
         let a = agent(1, 4, 0, 1);
-        assert_eq!(
-            choose(&[&a], None, &need("", None, false)),
-            Choice::Run(1)
-        );
+        assert_eq!(choose(&[&a], None, &need("", None, false)), Choice::Run(1));
         assert_eq!(
             choose(&[&a], None, &need("not-held", None, false)),
             Choice::NoAgent

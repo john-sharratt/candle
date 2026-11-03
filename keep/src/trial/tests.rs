@@ -259,8 +259,16 @@ fn a_proven_trial_keeps_running_from_the_stable_path() {
     let built_bytes = fs::read(&built).unwrap();
     let log = dir.join(LOG);
 
-    let mut running =
-        switch_to(&staged, &stable, &log, &[], &dir, Duration::from_secs(15), &|| false).unwrap();
+    let mut running = switch_to(
+        &staged,
+        &stable,
+        &log,
+        &[],
+        &dir,
+        Duration::from_secs(15),
+        &|| false,
+    )
+    .unwrap();
     let ended = running.ended.clone();
     let alive = running.child.try_wait().unwrap().is_none();
     let detached = running.child.stdout.is_none() && running.child.stderr.is_none();

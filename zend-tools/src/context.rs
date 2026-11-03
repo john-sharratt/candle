@@ -44,8 +44,8 @@ use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
-use crate::tool::OpsRunner;
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
+use crate::tool::OpsRunner;
 use crate::tools::journal::JournalShelf;
 use zend_vfs::{here, GitError, Push, RepoFiles, Workspace};
 

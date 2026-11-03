@@ -103,7 +103,12 @@ pub fn ask_of(args: &Value) -> Result<LogAsk, String> {
 /// A log read as an answer: what was read, of how much, then the lines, and
 /// how to read on. `what` names the log and `reread` is the call that reads
 /// it again, with `{args}` where the arguments to read on go.
-pub fn render(what: &str, ask: &LogAsk, read: &LogRead, reread: &dyn Fn(String) -> String) -> String {
+pub fn render(
+    what: &str,
+    ask: &LogAsk,
+    read: &LogRead,
+    reread: &dyn Fn(String) -> String,
+) -> String {
     let mut out = format!(
         "{what}: {} lines{}",
         read.total,
@@ -131,7 +136,14 @@ pub fn render(what: &str, ask: &LogAsk, read: &LogRead, reread: &dyn Fn(String) 
         group(&mut out, "failures", &s.failures);
         group(&mut out, "errors", &s.errors);
         group(&mut out, "last lines", &s.last);
-        if let Some(n) = s.errors.first().into_iter().chain(s.failures.first()).map(|l| l.n).min() {
+        if let Some(n) = s
+            .errors
+            .first()
+            .into_iter()
+            .chain(s.failures.first())
+            .map(|l| l.n)
+            .min()
+        {
             out.push_str(&format!(
                 "\nRead around the first: {}.",
                 reread(format!(
@@ -250,7 +262,9 @@ mod tests {
         assert_eq!(ask_of(&json!({"mode": "summary"})), Ok(LogAsk::Summary));
         assert_eq!(
             ask_of(&json!({"mode": "tail"})),
-            Ok(LogAsk::Tail { lines: DEFAULT_TAIL })
+            Ok(LogAsk::Tail {
+                lines: DEFAULT_TAIL
+            })
         );
         assert_eq!(
             ask_of(&json!({"mode": "lines", "from": 40, "count": 900})),
@@ -297,7 +311,12 @@ mod tests {
             ..LogRead::default()
         };
         assert_eq!(
-            render("job h on BlackWorld (exited 101)", &LogAsk::Summary, &read, &reread),
+            render(
+                "job h on BlackWorld (exited 101)",
+                &LogAsk::Summary,
+                &read,
+                &reread
+            ),
             "job h on BlackWorld (exited 101): 900 lines; 1 failures, 0 errors, 2 warnings\ntest \
              results:\n880: test result: FAILED. 1 passed; 1 failed\nfailures:\n850: test x ... \
              FAILED\nlast lines:\n900: error: test failed\nRead around the first: `repo_job_log \

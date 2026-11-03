@@ -522,10 +522,7 @@ impl Jobs {
                 started.handle
             }
             Err(e) => {
-                self.set_prep(
-                    id,
-                    Prep::Stopped(JobStatus::Failed { why: e.to_string() }),
-                );
+                self.set_prep(id, Prep::Stopped(JobStatus::Failed { why: e.to_string() }));
                 let staged = self
                     .asked_to_stage(id)
                     .then(|| Staged::Not("the run did not start, so nothing was staged".into()));
@@ -539,7 +536,11 @@ impl Jobs {
     }
 
     /// Fetch origin for `run` and start it in its checkout's sandbox.
-    async fn start(self: &Arc<Self>, run: RunJob, branch: BranchName) -> Result<StartedJob, JobError> {
+    async fn start(
+        self: &Arc<Self>,
+        run: RunJob,
+        branch: BranchName,
+    ) -> Result<StartedJob, JobError> {
         self.fetch(&run.repo).await?;
         let c = self.checkout(&run.repo)?;
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
@@ -1008,8 +1009,7 @@ impl Jobs {
             None => {
                 return Ok(LogRead {
                     ended,
-                    ..log_read::read(io::empty(), &ask)
-                        .map_err(|e| JobError::Bad(e.to_string()))?
+                    ..log_read::read(io::empty(), &ask).map_err(|e| JobError::Bad(e.to_string()))?
                 })
             }
         };

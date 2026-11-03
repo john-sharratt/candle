@@ -182,7 +182,12 @@ pub fn stage_of(handle: &Handle, view: &JobView, trials: Option<&Value>, now: u6
 
 /// Deploy `handle` as it stands now: its build from the agent, its trial from
 /// keep's board.
-pub async fn resolve(call: &OpsCall, agents: &Agents, handle: &Handle, now: u64) -> Result<Deploy, String> {
+pub async fn resolve(
+    call: &OpsCall,
+    agents: &Agents,
+    handle: &Handle,
+    now: u64,
+) -> Result<Deploy, String> {
     let build = agents
         .view(handle.at(agents), &handle.id)
         .await
@@ -248,12 +253,17 @@ mod tests {
     #[test]
     fn a_deploys_service_is_the_package_it_builds() {
         let words = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
-        assert_eq!(built_service(&words("cargo build --release -p motherd")), Some("motherd"));
+        assert_eq!(
+            built_service(&words("cargo build --release -p motherd")),
+            Some("motherd")
+        );
         assert_eq!(built_service(&words("cargo test -p web")), None);
         assert_eq!(built_service(&words("cargo build -p web")), None);
         assert_eq!(built_service(&words("cargo build --release -p zend")), None);
         assert_eq!(service_of(" WEB "), Ok("web"));
-        assert!(service_of("zend").unwrap_err().contains("not a service keep runs"));
+        assert!(service_of("zend")
+            .unwrap_err()
+            .contains("not a service keep runs"));
     }
 
     /// **A deploy's stage is read from its build and keep's board**: building,
@@ -272,7 +282,8 @@ mod tests {
             Stage::BuildFailed("exited 101".into())
         );
         let built = build(ok.clone(), staged.clone(), Some(1_000));
-        let other = json!({"running": {"artifact": "x", "deploy": "00000000000000ab:Other"}, "last": null});
+        let other =
+            json!({"running": {"artifact": "x", "deploy": "00000000000000ab:Other"}, "last": null});
         assert_eq!(
             stage_of(&h, &built, Some(&other), 30_000),
             Stage::Built {
@@ -282,7 +293,10 @@ mod tests {
         );
         assert!(stage_of(&h, &built, Some(&other), 1_000 + TRIAL_GRACE_MS + 1).is_over());
         let trying = json!({"running": {"artifact": "x", "deploy": h.to_string(), "started_ms": 1}, "last": null});
-        assert!(matches!(stage_of(&h, &built, Some(&trying), 0), Stage::Trying(_)));
+        assert!(matches!(
+            stage_of(&h, &built, Some(&trying), 0),
+            Stage::Trying(_)
+        ));
         let tried = json!({"running": null, "last": {"proven": true, "deploy": h.to_string()}});
         let stage = stage_of(&h, &built, Some(&tried), 0);
         assert!(matches!(stage, Stage::Tried(_)) && stage.is_over());

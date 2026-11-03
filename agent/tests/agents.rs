@@ -218,10 +218,7 @@ fn pause(secs: u32) -> (String, Vec<String>) {
     if cfg!(windows) {
         (
             "cmd".into(),
-            vec![
-                "/C".into(),
-                format!("ping -n {} 127.0.0.1 >NUL", secs + 1),
-            ],
+            vec!["/C".into(), format!("ping -n {} 127.0.0.1 >NUL", secs + 1)],
         )
     } else {
         ("sh".into(), vec!["-c".into(), format!("sleep {secs}")])

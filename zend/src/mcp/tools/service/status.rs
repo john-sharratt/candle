@@ -76,7 +76,10 @@ fn ended(trial: &Value, now: u64) -> String {
 
 /// How far into its proof window `trial`, running on keep's board, is.
 fn trying(trial: &Value, now: u64) -> String {
-    let started = trial.get("started_ms").and_then(Value::as_u64).unwrap_or(now);
+    let started = trial
+        .get("started_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(now);
     format!(
         "keep is trying it: {} in, of a {}-minute window to print that it serves — the window \
          restarts while it is catching up on replication{}",
@@ -227,7 +230,9 @@ async fn building_on(agents: &Agents, node: u64, now: u64) -> Vec<String> {
 /// The last line of `service`'s trial log on `host`, numbered.
 async fn last_trial_line(call: &OpsCall, host: &str, service: &str) -> Option<String> {
     let body = json!({"service": service, "ask": LogAsk::Tail { lines: 1 }});
-    let read = keep(call, Method::POST, KEEP_LOG, host, Some(&body)).await.ok()?;
+    let read = keep(call, Method::POST, KEEP_LOG, host, Some(&body))
+        .await
+        .ok()?;
     let read: LogRead = serde_json::from_value(read).ok()?;
     read.lines.last().map(|l| format!("{}: {}", l.n, l.text))
 }
@@ -252,7 +257,9 @@ async fn overview(call: &OpsCall, agents: &Agents, only: Option<&str>) -> Answer
     }
     if hosts.is_empty() {
         return Answer::error(match only {
-            Some(h) => format!("no agent is connected on {h}, so its keep is not reached through one"),
+            Some(h) => {
+                format!("no agent is connected on {h}, so its keep is not reached through one")
+            }
             None => "no agent is connected".to_string(),
         });
     }
@@ -265,7 +272,10 @@ async fn overview(call: &OpsCall, agents: &Agents, only: Option<&str>) -> Answer
         };
         let building = building_on(agents, node, now).await;
         if !building.is_empty() {
-            block.push_str(&format!("\n- deploys building on its agent ({}):\n", place(node)));
+            block.push_str(&format!(
+                "\n- deploys building on its agent ({}):\n",
+                place(node)
+            ));
             block.push_str(&building.join("\n"));
         }
         blocks.push(block);
@@ -373,18 +383,40 @@ mod tests {
              812 lines.\nThe build's log: `repo_job_log {job: \"00000000000000ab:Xe\", mode: \
              \"tail\"}`."
         );
-        let trying = json!({"artifact": "a", "deploy": "00000000000000ab:Xe", "started_ms": NOW - 61_000});
-        let text = render_deploy(&deploy(Stage::Trying(trying)), NOW, Some("40: syncing 3 records"));
-        assert!(text.contains("keep is trying it: 1 min 1 s in, of a 10-minute window"), "{text}");
-        assert!(text.contains("\nits last line: 40: syncing 3 records\n"), "{text}");
+        let trying =
+            json!({"artifact": "a", "deploy": "00000000000000ab:Xe", "started_ms": NOW - 61_000});
+        let text = render_deploy(
+            &deploy(Stage::Trying(trying)),
+            NOW,
+            Some("40: syncing 3 records"),
+        );
+        assert!(
+            text.contains("keep is trying it: 1 min 1 s in, of a 10-minute window"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nits last line: 40: syncing 3 records\n"),
+            "{text}"
+        );
         let proven = json!({"proven": true, "ended_ms": NOW - 30_000, "detail": "proven"});
         let text = render_deploy(&deploy(Stage::Tried(proven)), NOW, None);
-        assert!(text.starts_with("deploy 00000000000000ab:Xe: motherd to BlackWorld — proven 30 s ago."), "{text}");
-        assert!(text.contains("certified, which is the user's decision"), "{text}");
+        assert!(
+            text.starts_with(
+                "deploy 00000000000000ab:Xe: motherd to BlackWorld — proven 30 s ago."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("certified, which is the user's decision"),
+            "{text}"
+        );
         let back = json!({"proven": false, "cancelled": false, "ended_ms": NOW - 30_000,
                           "detail": "rolled back\nno proof line within the limit"});
         let text = render_deploy(&deploy(Stage::Tried(back)), NOW, None);
-        assert!(text.contains("rolled back 30 s ago — rolled back / no proof line within the limit."), "{text}");
+        assert!(
+            text.contains("rolled back 30 s ago — rolled back / no proof line within the limit."),
+            "{text}"
+        );
         assert!(text.contains("mode: \"summary\"}`"), "{text}");
         let stale = deploy(Stage::Built {
             artifact: "D:/stage/motherd.exe".into(),

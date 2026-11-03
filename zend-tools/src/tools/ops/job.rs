@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::{forward, LogMode, OpsError, Report};
-use crate::{Replay, RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Serialize, Deserialize, JsonSchema, Validate)]
 pub struct StatusRequest {

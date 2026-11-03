@@ -42,11 +42,14 @@ pub struct OpsCall {
 impl OpsCall {
     /// The call an MCP tool call makes.
     pub fn of(ctx: &Ctx) -> OpsCall {
-        let progress = ctx.progress.clone().map(|tx| -> Arc<dyn Fn(String) + Send + Sync> {
-            Arc::new(move |line| {
-                let _ = tx.send(line);
-            })
-        });
+        let progress = ctx
+            .progress
+            .clone()
+            .map(|tx| -> Arc<dyn Fn(String) + Send + Sync> {
+                Arc::new(move |line| {
+                    let _ = tx.send(line);
+                })
+            });
         OpsCall {
             session: Arc::clone(&ctx.session),
             lineage: ctx.caller.key(),
@@ -67,7 +70,10 @@ impl OpsCall {
     /// The seconds a call waits: `wait_s` if given, `default` otherwise, at
     /// most the ceiling; and what it asked for when the ceiling cut it short.
     pub fn wait_of(&self, args: &Value, default: u64) -> (u64, Option<u64>) {
-        let wanted = args.get("wait_s").and_then(Value::as_u64).unwrap_or(default);
+        let wanted = args
+            .get("wait_s")
+            .and_then(Value::as_u64)
+            .unwrap_or(default);
         (
             wanted.min(self.ceiling),
             (wanted > self.ceiling).then_some(wanted),
@@ -94,7 +100,9 @@ fn unfit(tool: &str, role: Role, kind: WorkerKind) -> Option<String> {
         return Some(format!("`{tool}` is not a build or deploy tool"));
     };
     if !role.at_least(Role::Admin) {
-        return Some(format!("`{tool}` is an Admin's, and this task runs as `{role}`"));
+        return Some(format!(
+            "`{tool}` is an Admin's, and this task runs as `{role}`"
+        ));
     }
     (*changes && kind != WorkerKind::Coder)
         .then(|| format!("`{tool}` is a coder's: this task changes nothing"))

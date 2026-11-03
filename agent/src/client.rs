@@ -559,11 +559,7 @@ impl Agents {
     /// Answer `ask` of job `id`'s log, read on agent `at`.
     pub async fn read_log(&self, at: At, id: &str, ask: &LogAsk) -> Result<LogRead, AgentError> {
         match at {
-            At::InProcess => self
-                .own()?
-                .read_log(id, ask.clone())
-                .await
-                .map_err(refused),
+            At::InProcess => self.own()?.read_log(id, ask.clone()).await.map_err(refused),
             At::Agent(node) => {
                 let body = serde_json::to_vec(ask).expect("an ask serialises");
                 self.ask(Method::POST, node, format!("/v1/jobs/{id}/read"), body)

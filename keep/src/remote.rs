@@ -241,7 +241,11 @@ fn trial_log(body: &[u8], slots: &[Slot]) -> Response<Full<Bytes>> {
             format!("no service `{}`", ask.service),
         );
     };
-    match read_trial_log(&slot.trial_log, &ask.ask, BOARD.trials(&slot.name).running.is_none()) {
+    match read_trial_log(
+        &slot.trial_log,
+        &ask.ask,
+        BOARD.trials(&slot.name).running.is_none(),
+    ) {
         Ok(read) => reply(StatusCode::OK, json!(read)),
         Err(e) => refuse(
             StatusCode::NOT_FOUND,
