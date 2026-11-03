@@ -5,6 +5,7 @@
 //! |---|---|
 //! | [`classes`] | Size classes: the power of two a request rounds up to |
 //! | [`shards`] | The census's counters, one shard per thread |
+//! | [`scope`] | Which part of the daemon a block was made in, named in the code |
 //! | [`counting`] | [`Counting`], the global allocator that counts |
 //! | [`os`] | The OS's figures: commit charge, the heap's summary, the machine's commit |
 //! | [`reading`] | One reading of all of it |
@@ -28,7 +29,9 @@ pub mod history;
 pub mod os;
 pub mod reading;
 pub mod report;
+pub mod scope;
 pub mod shards;
 pub mod verdict;
 
 pub use counting::Counting;
+pub use scope::{enter, set_thread, Scope};

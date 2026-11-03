@@ -18,6 +18,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use flume::Sender;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 
 use super::prefix_state::{chain_of, continue_state, state_after};
 use super::{alloc_scratch_slot_on, Sequence};
@@ -585,7 +587,11 @@ impl Sequence {
         };
         if let Err(e) = std::thread::Builder::new()
             .name("submitted-section-seal".into())
-            .spawn(move || job.run())
+            .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::SectionSeal);
+                job.run()
+            })
         {
             let _ = self.substrate.release_owned_section(owner, section);
             return Err(ConversationError::Other(format!(

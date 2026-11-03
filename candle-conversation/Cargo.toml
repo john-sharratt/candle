@@ -33,6 +33,9 @@ story-rewrite = { workspace = true }
 # waits out whenever the writer falls behind. Same polynomial, same values.
 crc32fast = "1.5"
 crossbeam = { workspace = true }
+# The scopes the engine's threads name for the memory census
+# (`docs/memory_census.md` §10); only with the `memory-census` feature.
+heap-census = { path = "../heap-census", optional = true }
 cudarc = { workspace = true }
 # Caller↔scheduler channels (SchedulerRequest queue, TurnEvent streams, one-shot replies,
 # guest receipts): one flume channel serves blocking and async receivers alike with no
@@ -116,8 +119,9 @@ large_enum_variant = "allow"
 [features]
 default = []
 # The memory census's gauge pass (`docs/memory_census.md` §5): once a minute,
-# each store's in-memory structures counted on the persistence pass.
-memory-census = []
+# each store's in-memory structures counted on the persistence pass — and the
+# scope each engine thread makes its blocks in (§10).
+memory-census = ["dep:heap-census"]
 # Feature-gated, zero-cost scoped timing of the projection / reproject hot path
 # (see `scheduler::profile`). Emits an aggregated, sorted-by-cost breakdown.
 # Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,

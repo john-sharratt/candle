@@ -24,7 +24,8 @@ use candle_conversation::store_gauges::{all as store_gauges, StoreGauge};
 use heap_census::history::History;
 use heap_census::os::{machine_commit, MachineCommit, OsHeap};
 use heap_census::reading::Reading;
-use heap_census::verdict::{grown_classes, judge, Growth, Verdict};
+use heap_census::verdict::{grown_classes, grown_scopes, judge, Growth, Verdict};
+use heap_census::{enter, Scope};
 use serde::Serialize;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -135,9 +136,23 @@ fn engine_parts() -> (u64, u64) {
     })
 }
 
+/// The process has finished loading: growth is judged from here on. The load
+/// itself grows the process by the tens of GB its model and stores take, and a
+/// window reaching back into it names that as growth.
+pub fn loaded() {
+    state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .history
+        .clear();
+}
+
 /// Take one reading, judge it, and log what it calls for. Blocking: the heap
 /// summary waits on the heap's lock.
 pub fn read_once() {
+    // A guard, not the thread's own scope: this runs on the blocking pool,
+    // whose threads go on to other work.
+    let _scope = enter(Scope::Census);
     let at_ms = mono_ms();
     let Some(reading) = Reading::take(at_ms) else {
         return;
@@ -226,6 +241,18 @@ fn grown_field(history: &History) -> String {
         .join(", ")
 }
 
+/// The scopes that grew most over the window, as a log field.
+fn grown_scopes_field(history: &History) -> String {
+    let Some((old, new)) = history.window(WINDOW_MS) else {
+        return String::new();
+    };
+    grown_scopes(old, new)
+        .iter()
+        .map(|g| format!("{}: +{} MiB", g.scope, mib_i(g.grew_bytes)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn log_census(
     history: &History,
     r: &Reading,
@@ -248,6 +275,7 @@ fn log_census(
         untracked_mib = untracked.map(mib),
         machine_commit_pct = commit.map(|c| (c.committed_bytes as f64 * 100.0 / c.limit_bytes.max(1) as f64).round()),
         grown_classes = %grown_field(history),
+        grown_scopes = %grown_scopes_field(history),
         "memory census"
     );
     for s in store_gauges() {
@@ -310,15 +338,20 @@ fn log_store(s: &StoreGauge) {
 }
 
 fn log_growing(g: &Growth, untracked: Option<u64>, previous_untracked: Option<u64>) {
-    let (verdict, classes) = match &g.verdict {
-        Verdict::Retention => ("retention", String::new()),
-        Verdict::OutsideHeap => ("outside the heap", String::new()),
-        Verdict::NotHeld => ("not held by our code", String::new()),
-        Verdict::Owner { classes } => (
+    let (verdict, classes, scopes) = match &g.verdict {
+        Verdict::Retention => ("retention", String::new(), String::new()),
+        Verdict::OutsideHeap => ("outside the heap", String::new(), String::new()),
+        Verdict::NotHeld => ("not held by our code", String::new(), String::new()),
+        Verdict::Owner { classes, scopes } => (
             "owner",
             classes
                 .iter()
                 .map(|c| format!("≤{} B: +{} MiB", c.upto_bytes, mib_i(c.grew_bytes)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            scopes
+                .iter()
+                .map(|s| format!("{}: +{} MiB", s.scope, mib_i(s.grew_bytes)))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -334,6 +367,7 @@ fn log_growing(g: &Growth, untracked: Option<u64>, previous_untracked: Option<u6
         untracked_mib = untracked.map(mib),
         untracked_was_mib = previous_untracked.map(mib),
         grown_classes = %classes,
+        grown_scopes = %scopes,
         "memory growing"
     );
 }
@@ -374,8 +408,10 @@ mod tests {
         read_once();
         let now = latest().expect("a reading was taken");
         assert!(now.at_unix_ms > 0);
-        assert!(now.os_heap.is_some(), "this platform summarises its heap");
-        assert!(now.untracked_bytes.is_some());
+        // Windows reads no heap summary (`heap_census::os`), so nothing is
+        // untracked against it there.
+        assert_eq!(now.os_heap.is_some(), cfg!(target_os = "linux"));
+        assert_eq!(now.untracked_bytes.is_some(), cfg!(target_os = "linux"));
         assert!(now.machine_commit_limit_bytes.is_some_and(|l| l > 0));
         assert!(now.growth.is_none(), "one reading is no window");
     }

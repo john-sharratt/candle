@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
 use futures::future::BoxFuture;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::oneshot;
 
@@ -4513,6 +4515,8 @@ pub fn start(rt: Arc<Runtime>, plan: LoadPlan) {
     std::thread::Builder::new()
         .name("npcd-loader".into())
         .spawn(move || {
+            #[cfg(feature = "memory-census")]
+            set_thread(Scope::Loader);
             let Err(e) = load(&rt, &plan, handle) else {
                 return;
             };

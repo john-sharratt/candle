@@ -359,7 +359,9 @@ host's once-a-minute census task, and each store's gauge pass — and leaves the
 types and the readers built, so `/v1/memory` and `/v1/telemetry` report the
 census absent without it. `motherd` turns it on by default while BlackWorld's
 growth is being found; `zend` and `npcd` take it when built with
-`--features memory-census`.
+`--features memory-census`. The feature runs down through `zend`, `npcd`,
+`host`, `candle-conversation` and `substrate-git`, each of which names its
+threads' scopes (§10) only with it.
 
 ## 8.1 The order of the changes, and what each one settles
 
@@ -399,3 +401,45 @@ The first `memory census` line gives it by itself.
 Whatever the verdict, the location index and the residence slab are bounded
 too. They grow with every record and never shrink, which is a slower version of
 this same failure.
+
+## 10. Scopes: which code made the blocks
+
+An owner verdict names a size class, and a class names a band of sizes, not the
+code. On BlackWorld (2026-11-03) the owner was ~600 MiB/h of 64–128 KiB blocks,
+which no gauge matched. A stack trace per allocation would name it and cost far
+more than the census itself, so the census names the code at compile time
+instead.
+
+- **A scope is a name in the code** (`heap-census/src/scope.rs`): one of the
+  `Scope` enum's values — the scheduler, the persistence pass, the log's owner,
+  a remote batch, its adoptions, the summariser, a section's seal, the
+  repositories' follower, the journals, a tenant's load, the log's maintenance,
+  the census itself, the cluster's sockets, and the async runtime. A thread sets
+  its own as it starts (`set_thread`); a call narrows it while a guard lives
+  (`enter`). The guard is not `Send`, so it cannot be held across an `.await`
+  and name the next task's blocks.
+- **A block of 4 KiB or more carries its scope** in a header in front of it:
+  the alignment's size, at least 16 bytes, its last byte the scope. Whether a
+  block has one is decided by its layout alone — at least 4 KiB, aligned to at
+  most 64 — which the free is handed too, so the free reads the scope back and
+  takes the block off it on whichever thread frees it. The header costs under
+  0.4% of such a block; a smaller block is counted by class only, where a
+  header would be a large share of it.
+- **Counted per scope per class**, in the same shards as the classes, with the
+  same `Relaxed` adds. The cost is one thread-local read per allocation, and
+  for a labelled block one byte written and read; the overhead gate (§3) times
+  it with 4 KiB and 30 KB blocks in the mix.
+- **Reported** under `/v1/memory` `process.heap.allocator.scopes` (each scope's
+  live bytes, count and classes), and named in the owner verdict and the
+  `memory census` and `memory growing` lines as `grown_scopes`.
+
+A scope names the code that **made** a block, not whatever holds it after: a
+buffer built in a remote batch and kept by the substrate counts under
+`remote_apply`. That is the question the narrowing asks; when a scope is too
+broad, a guard inside it splits it, and the next deploy narrows again.
+
+**The window starts when the process is loaded.** A load grows the process by
+the tens of GB its model and stores take, and a window reaching back into it
+named that as growth (BlackWorld, 2026-11-03: "+4.4 GB in 30 min", of which the
+growth was ~0.4 GB). The census clears its readings when every tenant is proven
+(`memory_census::loaded`), so a verdict is only ever drawn after the load.

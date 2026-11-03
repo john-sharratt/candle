@@ -119,7 +119,7 @@ default = []
 cuda = []
 # The memory census (`docs/memory_census.md`): the `zend` binary installs the
 # counting allocator, and the host reads, judges and logs it once a minute.
-memory-census = ["dep:heap-census", "host/memory-census"]
+memory-census = ["dep:heap-census", "host/memory-census", "substrate-git/memory-census"]
 # Zero-cost scoped timing of the projection / reproject hot path. Forwards to
 # candle-conversation; emits an aggregated breakdown under
 # `candle_conversation::scheduler::profile`.

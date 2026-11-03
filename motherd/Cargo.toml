@@ -32,7 +32,7 @@ web      = { path = "../web" }
 default = ["memory-census"]
 # The memory census: the counting allocator installed, and the host's census
 # task and the stores' gauge pass running.
-memory-census = ["dep:heap-census", "host/memory-census"]
+memory-census = ["dep:heap-census", "zend/memory-census", "npcd/memory-census"]
 # Zero-cost scoped timing of the hot path; `/v1/profile` reports it.
 profile = ["host/profile", "zend/profile"]
 # The `tensor-assert` harness (CLAUDE.md): every wave drained for non-finite

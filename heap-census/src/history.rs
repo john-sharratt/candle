@@ -29,6 +29,12 @@ impl History {
         self.readings.push_back(r);
     }
 
+    /// Let every reading go: the process has finished loading, and growth is
+    /// judged from here on, not across the load.
+    pub fn clear(&mut self) {
+        self.readings.clear();
+    }
+
     /// The newest reading.
     pub fn newest(&self) -> Option<&Reading> {
         self.readings.back()
@@ -58,6 +64,7 @@ mod tests {
             private_bytes: at_ms,
             heap: None,
             classes: None,
+            scopes: None,
             allocated_total: None,
         }
     }
@@ -82,6 +89,22 @@ mod tests {
         h.push(at(0));
         h.push(at(MIN));
         assert!(h.window(30 * MIN).is_none());
+    }
+
+    /// **A window never reaches back past a clear**: the load's readings are
+    /// not judged against what follows it.
+    #[test]
+    fn a_clear_starts_the_window_again() {
+        let mut h = History::new();
+        for m in 0..=20 {
+            h.push(at(m * MIN));
+        }
+        h.clear();
+        for m in 21..=40 {
+            h.push(at(m * MIN));
+        }
+        let (old, new) = h.window(30 * MIN).unwrap();
+        assert_eq!((old.at_ms, new.at_ms), (21 * MIN, 40 * MIN));
     }
 
     #[test]

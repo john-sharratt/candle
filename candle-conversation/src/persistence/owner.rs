@@ -37,6 +37,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, Select, Sender};
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 
 use super::identity::Minter;
 use super::log_facts::LogFacts;
@@ -199,6 +201,8 @@ impl PersistenceOwner {
         let handle = thread::Builder::new()
             .name("substrate-persistence-owner".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::LogOwner);
                 IS_OWNER.with(|o| o.set(true));
                 let mut loop_ = OwnerLoop {
                     persistence,

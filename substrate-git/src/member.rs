@@ -29,6 +29,8 @@ use agent::client::Agents;
 use agent::fetcher::AgentFetch;
 use candle_conversation::persistence::SharedSubstrate;
 use cluster::replicate::{LeaseEvent, Replicator};
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use zend_vfs::{ObjectDb, Oid, RefName, RemoteUrl};
@@ -455,7 +457,11 @@ impl Repos {
         let inner = Arc::clone(&self.inner);
         thread::Builder::new()
             .name("substrate-git".into())
-            .spawn(move || follow(inner, stopped))?;
+            .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::GitRepos);
+                follow(inner, stopped)
+            })?;
         Ok(())
     }
 }

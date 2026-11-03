@@ -2,6 +2,8 @@
 
 use crate::cancel::CancelToken;
 use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
@@ -532,6 +534,8 @@ impl ConversationEngine {
         let handle = std::thread::Builder::new()
             .name("conversation-scheduler".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Scheduler);
                 let t_init = std::time::Instant::now();
                 let mut scheduler = Scheduler::new(
                     rx,

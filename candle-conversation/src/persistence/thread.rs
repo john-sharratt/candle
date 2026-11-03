@@ -46,6 +46,8 @@ use candle_nn::kv_cache::{
     SealedSequence,
 };
 use crossbeam::channel::{self, Receiver, Sender};
+#[cfg(feature = "memory-census")]
+use heap_census::{enter, set_thread, Scope};
 
 use super::cold_load::preallocate_pinned_scratch;
 use super::flush::{FlushRequest, PassFlush};
@@ -315,6 +317,8 @@ impl PersistenceThread {
         let handle = std::thread::Builder::new()
             .name("substrate-persistence".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Persistence);
                 run_loop(
                     conversation,
                     backings,
@@ -1606,7 +1610,10 @@ fn run_pass(
     // store off every request path, and the gauge walks its maps. Built with
     // the `memory-census` feature.
     #[cfg(feature = "memory-census")]
-    gauge_if_due(conversation, &conversation.substrate_dir());
+    {
+        let _scope = enter(Scope::Census);
+        gauge_if_due(conversation, &conversation.substrate_dir());
+    }
 
     // ── Phase 3: fsync ─────────────────────────────────────────────────
     //
@@ -1634,6 +1641,8 @@ fn run_pass(
     // batches, the next pass serves the flush in its hot→warm phase, and the
     // op carries on after it ([`MaintenanceOp`]).
     let PassMaintenance { op, may_start } = maintenance;
+    #[cfg(feature = "memory-census")]
+    let maintenance_scope = enter(Scope::Maintenance);
     match if !read_only && (op.is_some() || may_start) {
         conversation.step_background_maintenance(op, may_start, &|| flush.waiting())
     } else {
@@ -1649,6 +1658,8 @@ fn run_pass(
         Ok(false) => {}
         Err(e) => tracing::warn!("persist: substrate maintenance failed: {e}"),
     }
+    #[cfg(feature = "memory-census")]
+    drop(maintenance_scope);
 
     // Per-pass aggregate. Only logged when something actually moved.
     if hot_to_warm_count > 0 || warm_to_cold_count > 0 || section_to_cold_count > 0 {

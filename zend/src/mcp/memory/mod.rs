@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use journals::actor::{need_read, Actor};
 use journals::error::Error;
 use journals::ops::{Applied, Op};
@@ -154,7 +156,11 @@ impl Memory {
         let me = Arc::clone(self);
         let spawned = thread::Builder::new()
             .name("journal-sync".into())
-            .spawn(move || me.run(dir));
+            .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Journals);
+                me.run(dir)
+            });
         if let Err(e) = spawned {
             self.set_status(Status::Failed(format!(
                 "the journal thread did not start: {e}"

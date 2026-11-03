@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::thread;
 
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use journals::actor::Actor;
 use journals::ops::Op;
 use journals::path::JournalPath;
@@ -89,7 +91,11 @@ pub fn once<R: Records + 'static>(
     let person = person.clone();
     let spawned = thread::Builder::new()
         .name("journal-move".into())
-        .spawn(move || move_all(&memory, &records, &owner, &group, &person));
+        .spawn(move || {
+            #[cfg(feature = "memory-census")]
+            set_thread(Scope::Journals);
+            move_all(&memory, &records, &owner, &group, &person)
+        });
     if let Err(e) = spawned {
         tracing::warn!("journals: the old notes' move did not start: {e}");
     }

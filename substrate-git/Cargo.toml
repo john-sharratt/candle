@@ -16,6 +16,9 @@ substrate = ["dep:candle-conversation"]
 # A daemon's repositories loaded and followed through the cluster's agents
 # (`member`): zend's and npcd's.
 member = ["substrate", "dep:agent", "dep:cluster", "dep:tokio"]
+# The follower thread names its scope for the memory census
+# (`docs/memory_census.md` §10).
+memory-census = ["dep:heap-census"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -27,6 +30,7 @@ candle-conversation = { path = "../candle-conversation", optional = true }
 agent      = { path = "../agent", optional = true }
 cluster    = { path = "../cluster", optional = true }
 tokio      = { version = "1", features = ["rt", "sync"], optional = true }
+heap-census = { path = "../heap-census", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

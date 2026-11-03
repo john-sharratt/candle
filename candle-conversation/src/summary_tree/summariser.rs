@@ -34,6 +34,8 @@ use std::time::Duration;
 // channel and its one-shot replies; docs/async_wave_submission.md §3.1).
 use crossbeam::channel::{self, Receiver as TriggerReceiver, Sender as TriggerSender};
 use flume::Sender;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 
 use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::scheduler::SchedulerRequest;
@@ -120,6 +122,8 @@ impl SummariserThread {
         let handle = std::thread::Builder::new()
             .name("substrate-summariser".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Summariser);
                 run_loop(
                     conversation,
                     runner,
