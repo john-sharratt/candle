@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::dispatch::KeySource;
-use crate::frame::{BuildId, Epoch};
+use crate::frame::{BuildId, Epoch, Unclaim};
 use crate::gateway::planner::Planner;
 use crate::machines::MachineTable;
 
@@ -266,9 +266,11 @@ fn a_delegated_task_makes_its_machine_busy() {
 }
 
 /// **A member that crashed holding a task's claim leaves its card free once it
-/// is back**: its claims go with its session, and its re-HELLO — admitted
-/// before the old session's close was seen — forgets them too. Kept, they made
-/// the card busy for good and the cast never came back.
+/// is back**: its re-admission — before the old session's close is seen —
+/// forgets its claims, as the hub does before building its `ADMIT`, and each
+/// is released through its own records heard; a session that ends takes its
+/// claims with it. Kept, they made the card busy for good and the cast never
+/// came back.
 #[test]
 fn a_rejoined_member_s_card_is_free_again() {
     let mut r = registry(
@@ -289,6 +291,17 @@ fn a_rejoined_member_s_card_is_free_again() {
     );
 
     // It crashes and comes back as a new session.
+    r.applied("zend", 1, vec![(1, 40)]);
+    let released = r.forget_claims("zend", 1);
+    assert_eq!(
+        released,
+        vec![Unclaim {
+            key: b"task-conversation".to_vec(),
+            epoch: Epoch { ms: 1, node: 1 },
+            through: 40,
+        }],
+        "told to the others, through its records heard"
+    );
     r.join(MemberView {
         session: 11,
         ..on_card("zend", 1, "bw", 7)
@@ -308,6 +321,7 @@ fn a_rejoined_member_s_card_is_free_again() {
         .claim(b"task-conversation", Epoch { ms: 2, node: 1 });
     assert_eq!(r.card_views()[0].latency, 1);
     assert!(r.leave("zend", 1, 11));
+    assert_eq!(r.forget_claims("zend", 1).len(), 1);
     assert!(r.claims("zend").is_empty());
 }
 

@@ -206,11 +206,16 @@ for `RETURN_AFTER`, 120 s: the pause while a person reads a reply and types the
 next message, or between a task's turns. A delegated task runs inside its member
 and never passes the gateway, so its claim is how the plan sees it
 (`Registry::card_views`); the cast leaves a card running a task exactly as it
-leaves one serving a conversation. **A member's claims end with its session**,
-and are forgotten again when its node is admitted anew (`Registry::join`,
-`Registry::leave`): a member still holding them announces them once admitted,
-and one that crashed holds none, so its card is free `RETURN_AFTER` after it
-comes back rather than busy for good.
+leaves one serving a conversation. **A member's claims end with its session**
+(`Registry::forget_claims`): forgotten when the session leaves, and when its
+node is admitted anew — before its `ADMIT` is built, so the table it is sent
+never names it the holder of a key it may no longer hold. Each key forgotten is
+released as its holder would release it, through the highest of its own records
+the gateway heard, and every other member is sent the `UNCLAIM`, so none goes on
+naming it the holder. A member still holding them announces them once admitted;
+one that crashed holds none, so its card is free `RETURN_AFTER` after it comes
+back rather than busy for good, and the gateway, the rejoined member and its
+peers agree on every key's holder.
 
 ### 5.2 Where they run
 
@@ -249,9 +254,9 @@ When a card becomes busy:
    recurrent state are already there: every sealed turn replicates to every
    member. A member the plan lends to is never one lagging on replication, so
    that wait is short. **A hand-back adds to what the lease waits for and never
-   replaces it** (`npc_lease::hand_back`): the lease names the handing holder's
-   writes (`after`) and every earlier holder's still owed (`before`), one entry
-   per origin, its latest. A holder that applied A's writes but never woke the
+   replaces it** (`npc_lease::hand_back`): the lease's `waits` name the handing
+   holder's writes and every earlier holder's still owed, one entry per origin,
+   its latest. A holder that applied A's writes but never woke the
    character, or never caught up with them at all, wrote nothing of it; A's
    writes stay owed, and the next holder wakes it only once it holds every
    origin the lease names (`NpcLease::ready`). Hand A → B → C with B moved on

@@ -18,7 +18,7 @@ use applied_set::AppliedSet;
 use super::agents::named_standby;
 use super::claims::Claims;
 use crate::dispatch::RouteTable;
-use crate::frame::{Capacity, ClaimInfo, MemberInfo};
+use crate::frame::{Capacity, ClaimInfo, MemberInfo, Unclaim};
 use crate::machines::MachineTable;
 use handover::Handover;
 
@@ -132,24 +132,42 @@ impl Registry {
         self.apps.entry(app.to_string()).or_default()
     }
 
-    /// A session admitted. **The claims its node held are forgotten**: a
-    /// member that still holds them announces them again once admitted, and
-    /// one that crashed and came back holds none — kept, they would make its
-    /// card busy for good (`docs/static_placement.md` §5.1).
     pub fn join(&mut self, member: MemberView) {
         let a = self.app(&member.app.clone());
-        a.claims.forget(member.node);
         a.members.insert(member.node, member);
         a.epoch += 1;
     }
 
-    /// `node`'s `session` ended, and the claims it held with it; a newer
-    /// session of the node stays, and keeps them.
+    /// **A node's claims end with its session** (`docs/static_placement.md`
+    /// §5.1): forgotten when the session leaves, and when the node is admitted
+    /// again — before its `ADMIT` is built, so the table it is sent never names
+    /// it the holder of a key it may no longer hold. A member that still holds
+    /// them announces them anew once admitted; one that crashed holds none,
+    /// and kept, they would make its card busy for good. Each key forgotten is
+    /// released as its holder would release it — through the highest of its
+    /// own records heard — and returned as the `UNCLAIM` the other members
+    /// are told, so no one still names the node its holder.
+    pub fn forget_claims(&mut self, app: &str, node: u64) -> Vec<Unclaim> {
+        let a = self.app(app);
+        let through = a.seen.get(&node).copied().unwrap_or(0);
+        let gone = a.claims.forget(node);
+        for (key, _) in &gone {
+            self.released(app, key, node, through);
+        }
+        gone.into_iter()
+            .map(|(key, epoch)| Unclaim {
+                key,
+                epoch,
+                through,
+            })
+            .collect()
+    }
+
+    /// `node`'s `session` ended; a newer session of the node stays.
     pub fn leave(&mut self, app: &str, node: u64, session: u64) -> bool {
         let a = self.app(app);
         if a.members.get(&node).is_some_and(|m| m.session == session) {
             a.members.remove(&node);
-            a.claims.forget(node);
             a.epoch += 1;
             return true;
         }

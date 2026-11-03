@@ -656,8 +656,8 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
     assert!(!moved.is_empty());
     let leases = leases_of(&a.rt.standing.written(&world));
     for npc in moved {
-        let after = leases[&npc].after.expect("moved by a hand-back");
-        assert_eq!(after.origin, a.node(), "b waited for what a wrote");
+        let origins: Vec<u64> = leases[&npc].waits.iter().map(|w| w.origin).collect();
+        assert_eq!(origins, vec![a.node()], "b waited for what a wrote");
     }
 }
 

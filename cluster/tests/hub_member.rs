@@ -304,6 +304,78 @@ async fn members_join_route_and_carry_streams() {
     assert!(hub.clustered("zend"));
 }
 
+/// **A member that restarts holding a claim is not left its holder by anyone**
+/// (`docs/static_placement.md` §5.1). A holds `c-1` and B knows it; a new
+/// process for A's node is admitted, replacing the old. Its `ADMIT` names no
+/// holder of `c-1`, B is told the claim is let go, and the gateway lists none —
+/// so the restarted member, holding nothing, takes the key with a `CLAIM` of
+/// its own when next asked, and all three agree it holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_member_its_peer_and_the_gateway_agree_on_its_keys() {
+    let hub = Hub::new(key(), "gw-test");
+    hub.set_machines(
+        MachineTable::from_yaml(
+            "m1:\n  conversations: {rank: 1, min: 1, max: 4}\n\
+             m2:\n  conversations: {rank: 2, min: 1, max: 4}\n",
+        )
+        .unwrap(),
+    );
+    let (up_tx, _up) = mpsc::unbounded_channel();
+    let a = member(&hub, 1, build(10), model(1), &up_tx);
+    let b = member(&hub, 2, build(10), model(1), &up_tx);
+    for m in [&a, &b] {
+        m.ready.store(true, Ordering::SeqCst);
+    }
+    until("both joined", || {
+        a.app.link() == Link::Joined && b.app.link() == Link::Joined
+    })
+    .await;
+    a.app.capacity_changed();
+    b.app.capacity_changed();
+    let listed = |hub: &Hub| -> Vec<(String, String)> {
+        hub.status(10)
+            .claims
+            .into_iter()
+            .map(|c| (c.key, c.node))
+            .collect()
+    };
+    assert!(matches!(a.app.claim(b"c-1"), Check::Took(_)));
+    until("B told", || b.app.holder_of(b"c-1") == Some(1)).await;
+    until("the gateway told", || {
+        listed(&hub) == vec![("c-1".to_string(), "0000000000000001".to_string())]
+    })
+    .await;
+
+    // A restarts: a new process for node 1, holding nothing.
+    let again = member(&hub, 1, build(10), model(1), &up_tx);
+    again.ready.store(true, Ordering::SeqCst);
+    until("restarted and admitted", || {
+        again.app.link() == Link::Joined
+    })
+    .await;
+    timeout(Duration::from_secs(5), a.stopped)
+        .await
+        .expect("the old session is replaced")
+        .unwrap();
+    assert_eq!(
+        again.app.holder_of(b"c-1"),
+        None,
+        "its ADMIT names no holder"
+    );
+    assert!(again.app.own_claims().is_empty());
+    until("B told it is let go", || b.app.holder_of(b"c-1").is_none()).await;
+    assert!(listed(&hub).is_empty(), "the gateway lists no holder");
+
+    // Asked for it, the restarted member takes it, and everyone agrees.
+    assert!(matches!(again.app.claim(b"c-1"), Check::Took(_)));
+    until("all agree", || {
+        b.app.holder_of(b"c-1") == Some(1)
+            && listed(&hub) == vec![("c-1".to_string(), "0000000000000001".to_string())]
+    })
+    .await;
+    assert_eq!(b.app.claim(b"c-1"), Check::Held(1));
+}
+
 /// A gateway shutting down closes its members `1001`; each counts the ended
 /// attempt and dials again (§3.4). The close is logged, not kept: once the
 /// member is admitted again its view describes the new socket, which nothing

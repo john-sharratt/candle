@@ -84,7 +84,7 @@ use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
 use crate::frame::{
     name, Admit, BuildFetch, BuildId, Capacity, Frame, Hello, Lost, MemberState, Members,
-    Plan as PlanFrame,
+    Plan as PlanFrame, Unclaim,
 };
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, PROTO};
 use crate::pipe::{Message, PipeRx, PipeTx};
@@ -399,8 +399,13 @@ impl Hub {
             .then(|| s.admission.lock(app).map(|m| m.describe.clone()))
             .flatten();
         let (_, members) = s.registry.listing(app);
+        // Admitted again, the node holds none of its old claims until it says
+        // so: the table it is sent does not name it, and no other member goes
+        // on naming it (`Registry::forget_claims`).
+        let forgotten = s.registry.forget_claims(app, hello.node);
         let claims = s.registry.claims(app).table();
         drop(s);
+        self.forgotten(app, hello.node, forgotten);
         if let Some(model) = lock {
             self.note(app, hex(hello.node), format!("model lock set: {model}"));
         }
@@ -638,7 +643,7 @@ impl Hub {
             }
         };
 
-        let (left, gone, lost) = {
+        let (left, gone, lost, forgotten) = {
             let mut s = self.state();
             let key = (app.to_string(), node);
             // A replaced session leaving takes nothing of the node's with it.
@@ -659,12 +664,17 @@ impl Hub {
             s.admission.left(app, node, admitted.session);
             let cleared = locked && s.admission.lock(app).is_none();
             s.last_close.insert(key, describe(&how));
-            (
-                (s.registry.leave(app, node, admitted.session), cleared),
-                gone,
-                lost,
-            )
+            let left = s.registry.leave(app, node, admitted.session);
+            // Its claims end with it; a newer session of the node had them
+            // forgotten at its admission.
+            let forgotten = if left {
+                s.registry.forget_claims(app, node)
+            } else {
+                Vec::new()
+            };
+            ((left, cleared), gone, lost, forgotten)
         };
+        self.forgotten(app, node, forgotten);
         self.act(gone);
         // What it was answering will not be answered: its requesters ask again
         // now, rather than waiting out a silence.
@@ -1238,6 +1248,23 @@ impl Hub {
             if a == app && *n != from {
                 let _ = socket.handle.control(frame.clone());
             }
+        }
+    }
+
+    /// Tell every other member that `node`'s claims in `forgotten` are let go,
+    /// as `node` itself would have (`Registry::forget_claims`).
+    fn forgotten(&self, app: &str, node: u64, forgotten: Vec<Unclaim>) {
+        for u in forgotten {
+            self.note(
+                app,
+                String::from_utf8_lossy(&u.key).into_owned(),
+                format!(
+                    "released for {}, its session over, through oseq {}",
+                    hex(node),
+                    u.through
+                ),
+            );
+            self.to_others(app, node, Frame::Unclaim(u));
         }
     }
 

@@ -41,30 +41,23 @@ pub struct NpcLease {
     /// character back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-    /// The writes of the member that handed the character back, which the
-    /// holder applies before it runs the character.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<After>,
-    /// The writes of the holders before it, each origin's latest, which the
-    /// holder applies too (`docs/static_placement.md` §5.3). A hand-back adds
-    /// to what the lease already waits for and never replaces it: the member
-    /// handing back may never have run the character, or may have applied its
-    /// last holder's writes without the next holder having them yet.
+    /// The writes of every member that handed the character back, one per
+    /// origin, its latest, in origin order: the holder applies them all before
+    /// it runs the character (`docs/static_placement.md` §5.3). A hand-back
+    /// adds to what the lease already waits for and never replaces it: the
+    /// member handing back may never have run the character, or may have
+    /// applied its last holder's writes without the next holder having them
+    /// yet. Empty for a character never handed back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub before: Vec<After>,
+    pub waits: Vec<After>,
 }
 
 impl NpcLease {
-    /// Every wait the lease names: its last hand-back's, and those before.
-    pub fn waits(&self) -> impl Iterator<Item = After> + '_ {
-        self.after.into_iter().chain(self.before.iter().copied())
-    }
-
     /// Whether a member that has applied each origin's records through
     /// `applied(origin)` holds everything the character's holders wrote: it
     /// may run the character.
     pub fn ready(&self, applied: impl Fn(u64) -> u64) -> bool {
-        self.waits().all(|a| applied(a.origin) >= a.through)
+        self.waits.iter().all(|a| applied(a.origin) >= a.through)
     }
 }
 
@@ -218,8 +211,7 @@ pub fn lend(
                         if l.expires_ms.saturating_sub(now_ms) < NPC_TTL_MS / 2 || l.next.is_some()
                         {
                             NpcLease {
-                                after: l.after,
-                                before: l.before.clone(),
+                                waits: l.waits.clone(),
                                 ..fresh(want, now_ms)
                             }
                         } else {
@@ -237,8 +229,7 @@ pub fn lend(
                             l.expires_ms
                         },
                         next: Some(hex(asked.unwrap_or(want))),
-                        after: l.after,
-                        before: l.before.clone(),
+                        waits: l.waits.clone(),
                     },
                     None => fresh(want, now_ms),
                 }
@@ -259,8 +250,7 @@ fn fresh(holder: u64, now_ms: u64) -> NpcLease {
         holder: hex(holder),
         expires_ms: now_ms + NPC_TTL_MS,
         next: None,
-        after: None,
-        before: Vec::new(),
+        waits: Vec::new(),
     }
 }
 
@@ -278,20 +268,15 @@ pub fn hand_back(current: &NpcLease, from: u64, through: u64, now_ms: u64) -> Op
     }
     let next = node_of(current.next.as_deref()?)?;
     let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
-    for a in current.waits().chain([After {
+    for a in current.waits.iter().chain([&After {
         origin: from,
         through,
     }]) {
         let at = latest.entry(a.origin).or_default();
         *at = (*at).max(a.through);
     }
-    let after = After {
-        origin: from,
-        through: latest.remove(&from).unwrap_or(through),
-    };
     Some(NpcLease {
-        after: Some(after),
-        before: latest
+        waits: latest
             .into_iter()
             .map(|(origin, through)| After { origin, through })
             .collect(),
@@ -306,14 +291,17 @@ pub fn released() -> NpcLease {
         holder: String::new(),
         expires_ms: 0,
         next: None,
-        after: None,
-        before: Vec::new(),
+        waits: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn w(origin: u64, through: u64) -> After {
+        After { origin, through }
+    }
 
     fn members(nodes: &[u64]) -> Vec<Weighted> {
         nodes
@@ -379,18 +367,15 @@ mod tests {
         assert_eq!(moved.holder, hex(2));
         assert_eq!(moved.next, None);
         assert_eq!(
-            moved.after,
-            Some(After {
-                origin: 1,
-                through: 40
-            }),
+            moved.waits,
+            vec![w(1, 40)],
             "the new holder waits for what the old one wrote"
         );
         // Renewed by its new holder, it still names what to wait for.
         let mut current = BTreeMap::new();
         current.insert(nid, moved.clone());
         let renewed = lend(&[nid], &current, &after, &joined(&[1, 2]), NOW + 50_000);
-        assert_eq!(renewed[&nid].after, moved.after);
+        assert_eq!(renewed[&nid].waits, moved.waits);
     }
 
     /// **A hand-back adds to what the lease waits for, never replaces it.** A
@@ -406,28 +391,14 @@ mod tests {
             holder: hex(b),
             expires_ms: NOW + NPC_TTL_MS,
             next: Some(hex(c)),
-            after: Some(After {
-                origin: a,
-                through: 900,
-            }),
-            before: Vec::new(),
+            waits: vec![w(a, 900)],
         };
         let at_c = hand_back(&at_b, b, 55, NOW).unwrap();
         assert_eq!(at_c.holder, hex(c));
         assert_eq!(
-            at_c.after,
-            Some(After {
-                origin: b,
-                through: 55
-            })
-        );
-        assert_eq!(
-            at_c.before,
-            vec![After {
-                origin: a,
-                through: 900
-            }],
-            "A's 900 is still owed"
+            at_c.waits,
+            vec![w(a, 900), w(b, 55)],
+            "B's own writes, and A's 900 still owed"
         );
         let applied_b_only = |o: u64| if o == b { 55 } else { 0 };
         assert!(!at_c.ready(applied_b_only), "C has B's writes, not A's");
@@ -444,23 +415,14 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let mut owed: Vec<(u64, u64)> = at_d.waits().map(|w| (w.origin, w.through)).collect();
-        owed.sort();
-        assert_eq!(owed, vec![(a, 900), (b, 55), (c, 70)]);
+        assert_eq!(at_d.waits, vec![w(a, 900), w(b, 55), w(c, 70)]);
 
+        // D hands it on to A, and B is named again, through 80, by a lease
+        // that carried it twice: one wait per origin, its latest.
         let back_to_a = hand_back(
             &NpcLease {
-                holder: hex(d),
                 next: Some(hex(a)),
-                before: at_d
-                    .before
-                    .iter()
-                    .copied()
-                    .chain([After {
-                        origin: b,
-                        through: 80,
-                    }])
-                    .collect(),
+                waits: [at_d.waits.clone(), vec![w(b, 80)]].concat(),
                 ..at_d.clone()
             },
             d,
@@ -468,24 +430,10 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let mut owed: Vec<(u64, u64)> = back_to_a.waits().map(|w| (w.origin, w.through)).collect();
-        owed.sort();
         assert_eq!(
-            owed,
-            vec![(a, 900), (b, 80), (c, 70), (d, 10)],
-            "one wait per origin, its latest"
+            back_to_a.waits,
+            vec![w(a, 900), w(b, 80), w(c, 70), w(d, 10)]
         );
-    }
-
-    /// A lease record from a build that knew no `before` reads with none, and
-    /// one with none written leaves the key out.
-    #[test]
-    fn a_lease_with_no_earlier_waits_reads_and_writes_without_them() {
-        let old = serde_json::json!({"holder": hex(2), "expires_ms": 5,
-            "after": {"origin": 1, "through": 9}});
-        let lease: NpcLease = serde_json::from_value(old.clone()).unwrap();
-        assert!(lease.before.is_empty());
-        assert_eq!(serde_json::to_value(&lease).unwrap(), old);
     }
 
     /// **A move, once asked, completes** (`docs/static_placement.md` §5.5):
@@ -644,13 +592,22 @@ mod tests {
             holder: hex(1),
             expires_ms: 5,
             next: None,
-            after: None,
-            before: Vec::new(),
+            waits: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&l).unwrap(),
             serde_json::json!({"holder": "0000000000000001", "expires_ms": 5})
         );
+        let waiting = NpcLease {
+            next: Some(hex(2)),
+            waits: vec![w(1, 9), w(3, 4)],
+            ..l
+        };
+        let wire = serde_json::json!({"holder": "0000000000000001", "expires_ms": 5,
+            "next": "0000000000000002",
+            "waits": [{"origin": 1, "through": 9}, {"origin": 3, "through": 4}]});
+        assert_eq!(serde_json::to_value(&waiting).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<NpcLease>(wire).unwrap(), waiting);
         assert_eq!(lease_entity(42), "npclease/42");
     }
 
