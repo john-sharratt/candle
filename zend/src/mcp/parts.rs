@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(r.state, "done");
         assert_eq!(
             r.result,
-            "T:review/verify/read — done. Its answer:\nok\n\n\
+            "task:review/verify/read — done. Its answer:\nok\n\n\
              Journal entries:\n\n\
              T:review/verify/read#2\nEntry 2 — read the parser"
         );

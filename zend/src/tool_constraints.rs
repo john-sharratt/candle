@@ -65,7 +65,9 @@ mod tests {
         for def in tool_def::all() {
             if overlays().contains_key(&def.name) {
                 let line = def.json_line();
-                assert!(!line.contains("\"pattern\""), "{}: {line}", def.name);
+                // The keyword, whose value is a string — not a field named
+                // `pattern`, whose value is its schema.
+                assert!(!line.contains("\"pattern\":\""), "{}: {line}", def.name);
             }
         }
     }

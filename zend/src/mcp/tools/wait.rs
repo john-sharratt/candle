@@ -241,7 +241,7 @@ mod tests {
         asks.question = Some("QUESTION: Inclusive?".into());
         assert_eq!(
             result_of(&asks, None),
-            "task:review/v —asks Claude (reply with `repo_task_reply`; it waits until then):\n\
+            "task:review/v — asks Claude (reply with `repo_task_reply`; it waits until then):\n\
              QUESTION: Inclusive?"
         );
         let stuck = worker("v", State::Stuck);
@@ -293,11 +293,11 @@ mod tests {
         done.entries = vec![entry(3, "Entry 3 — a"), entry(4, "Entry 4 — b")];
         assert_eq!(
             result_of(&done, Some(4)),
-            "task:review/v —done. Its answer:\nVerdict: ok"
+            "task:review/v — done. Its answer:\nVerdict: ok"
         );
         assert_eq!(
             result_of(&done, Some(3)),
-            "task:review/v —done. Its answer:\nVerdict: ok\n\n\
+            "task:review/v — done. Its answer:\nVerdict: ok\n\n\
              Journal entries:\n\nT:review/v#4\nEntry 4 — b"
         );
         let mut bare = worker("v", State::Done);
@@ -305,12 +305,12 @@ mod tests {
             Some("its journal draft failed: the entry was refused: Claim 1 cites no turn.".into());
         assert_eq!(
             result_of(&bare, None),
-            "task:review/v —done; no journal entry was kept (its journal draft failed: the entry was \
+            "task:review/v — done; no journal entry was kept (its journal draft failed: the entry was \
              refused: Claim 1 cites no turn.). Its answer:\nVerdict: ok"
         );
         let mut failed = worker("v", State::Error);
         failed.error = Some("boom".into());
-        assert_eq!(result_of(&failed, None), "task:review/v —error: boom");
+        assert_eq!(result_of(&failed, None), "task:review/v — error: boom");
     }
 
     /// **A worker sent back to check its citations says so while it runs.**
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(
             result_of(&checking, None),
             format!(
-                "task:review/v —{}\n  Checking its citations: sent back to open 2 it cited without \
+                "task:review/v — {}\n  Checking its citations: sent back to open 2 it cited without \
                  opening.",
                 checking.doing(workers::now_ms())
             )
@@ -339,7 +339,7 @@ mod tests {
         done.resumable = true;
         assert_eq!(
             result_of(&done, None),
-            "task:review/v —done. Its answer:\nVerdict: ok\n\n\
+            "task:review/v — done. Its answer:\nVerdict: ok\n\n\
              Citation audit: 1 cited — 1 opened, 0 seen only in search results, 0 never seen in the run.\n\n\
              It can be continued with `repo_task_reply` — to check a claim, go deeper, or redo a part — \
              until its thread is archived or it sits a day untouched.\n\n\
