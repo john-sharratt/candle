@@ -217,16 +217,10 @@ impl Registry {
     }
 
     /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
-    /// lineage's holder while it has a free slot, and after `waited` the best
-    /// idle agent; a standby agent only when no other can run it. The agent
-    /// chosen is counted as handed the job until its next `CAPACITY`.
-    pub fn pick_agent(
-        &mut self,
-        app: &str,
-        lineage: Option<&str>,
-        need: &Need,
-        waited: bool,
-    ) -> Choice {
+    /// lineage's holder while it has a free slot, else the best idle agent; a
+    /// standby agent only when no other can run it. The agent chosen is
+    /// counted as handed the job until its next `CAPACITY`.
+    pub fn pick_agent(&mut self, app: &str, lineage: Option<&str>, need: &Need) -> Choice {
         let holder = lineage.and_then(|k| {
             self.apps
                 .get(app)
@@ -238,7 +232,6 @@ impl Registry {
             &self.machines,
             holder,
             need,
-            waited,
         );
         if let Choice::Run(node) = choice {
             if let Some(m) = self.app(app).members.get_mut(&node) {

@@ -938,17 +938,22 @@ fn a_picked_job_is_handed_until_the_next_capacity() {
         toolchain: None,
         push: false,
     };
-    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Run(1));
+    assert_eq!(r.pick_agent("agent", None, &need), Choice::Run(1));
     assert_eq!(r.member("agent", 1).map(|m| m.handed), Some(1));
     assert_eq!(
-        r.pick_agent("agent", None, &need, false),
+        r.pick_agent("agent", None, &need),
         Choice::Run(2),
         "node 1's one slot was handed out"
     );
-    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Wait);
+    assert_eq!(
+        r.pick_agent("agent", None, &need),
+        Choice::Run(1),
+        "every slot handed out: it queues on the best agent"
+    );
+    assert_eq!(r.member("agent", 1).map(|m| m.handed), Some(2));
     r.capacity("agent", 1, capacity(MemberState::Ready, 0, true, 1));
     assert_eq!(r.member("agent", 1).map(|m| m.handed), Some(0));
-    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Run(1));
+    assert_eq!(r.pick_agent("agent", None, &need), Choice::Run(1));
 }
 
 /// A node's older session leaving does not remove its newer one.

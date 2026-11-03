@@ -31,14 +31,14 @@ use tokio::task::{spawn_blocking, AbortHandle};
 use tokio::time::timeout;
 use zend_vfs::{
     BranchName, DiskWriteGrant, FetchBundle, FetchSpec, JobId, JobRequest, JobStatus, Oid,
-    Priority, RemoteName, Rev, RunOutcome, SandboxCommand, VfsStore, ORIGIN,
+    Priority, RemoteName, Rev, RunOutcome, SandboxCommand, StartedJob, VfsStore, ORIGIN,
 };
 
 use crate::checkouts::{Checkout, Checkouts};
 use crate::switch::Switch;
 use crate::wire::{
     decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
-    LogChunk, PushJob, Pushed, RunJob, Staged, Submit,
+    LogChunk, Phase, PushJob, Pushed, RunJob, Staged, Submit,
 };
 
 /// Jobs kept after they end.
@@ -73,11 +73,23 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// How far a run has got towards its sandbox job.
+enum Prep {
+    /// Fetching origin and building its store: it has no sandbox job yet.
+    Fetching,
+    /// Its sandbox job, which says where it stands from here.
+    Started(JobId),
+    /// It ended before its command started — the fetch or the store failed,
+    /// or it was cancelled.
+    Stopped(JobStatus),
+}
+
 enum Kind {
     Run {
-        /// The job's task: aborting it drops the job's handle, which cancels
-        /// the job.
+        /// The job's task — its fetch, its sandbox job and its staging:
+        /// aborting it drops the sandbox job's handle, which cancels the job.
         task: AbortHandle,
+        prep: Prep,
         outcome: Option<RunOutcome>,
         /// What it asked to stage, relative to its checkout.
         stage: Option<String>,
@@ -310,6 +322,7 @@ impl Jobs {
             fetched: None,
             listed: Some(Listed::of(&listed)),
             staged: None,
+            phase: Phase::Ended,
         })
     }
 
@@ -371,6 +384,7 @@ impl Jobs {
                     fetched: Some(Fetched::of(&f)),
                     listed: None,
                     staged: None,
+                    phase: Phase::Ended,
                 })
             }
             Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
@@ -440,65 +454,45 @@ impl Jobs {
             .is_some_and(|at| at.elapsed() < fresh)
     }
 
+    /// Accept `run` and answer at once, in [`Phase::Fetching`]: everything
+    /// that can take time — fetching origin, building its store, waiting for
+    /// the checkout — happens in the job's own task, so a caller has the id
+    /// in the time it takes to check the request.
     async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
-        let c = self.checkout(&run.repo)?;
+        self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
-        let stage = match run.stage {
-            Some(rel) => Some(stage_path(&rel, self.checkouts.stage_dir())?),
+        let stage = match &run.stage {
+            Some(rel) => Some(stage_path(rel, self.checkouts.stage_dir())?),
             None => None,
         };
-        let started_ms = now_ms();
         let line = Line {
             branch: Some(run.branch.clone()),
             command: [run.program.clone()]
                 .into_iter()
                 .chain(run.args.iter().cloned())
                 .collect(),
-            started_ms,
+            started_ms: now_ms(),
             ended_ms: None,
         };
-        self.fetch(&run.repo).await?;
-        let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
-        store
-            .restore(run.overlay)
-            .map_err(|e| JobError::Bad(format!("the overlay: {e}")))?;
-        let command = SandboxCommand::new(run.program)
-            .args(run.args)
-            .timeout(Duration::from_secs(run.timeout_secs))
-            .priority(self.priority);
-        let started = c
-            .server
-            .start_job(
-                DiskWriteGrant::issue(),
-                JobRequest {
-                    branch,
-                    files: Arc::new(store),
-                    command,
-                },
-            )
-            .map_err(|e| JobError::Bad(format!("the job's log: {e}")))?;
-        let id = started.id.to_string();
+        let id = JobId::random().to_string();
         let (ended, _) = watch::channel(false);
         self.running.fetch_add(1, Ordering::Relaxed);
         let jobs = Arc::clone(self);
         let job = id.clone();
-        let handle = started.handle;
+        let repo = run.repo.clone();
         {
-            // Held while the job is kept: a job ending at once records its
-            // outcome only once it is in the table.
+            // Held while the job is kept: its task records how far it got
+            // only once it is in the table.
             let mut t = self.table();
-            let task = tokio::spawn(async move {
-                let outcome = handle.finish().await.ok();
-                let staged = Arc::clone(&jobs).staging(&job, outcome.as_ref()).await;
-                jobs.finished(&job, outcome, staged);
-            });
+            let task = tokio::spawn(async move { jobs.carry(&job, run, branch).await });
             keep_in(
                 &mut t,
                 id.clone(),
                 Entry {
-                    repo: run.repo,
+                    repo,
                     kind: Kind::Run {
                         task: task.abort_handle(),
+                        prep: Prep::Fetching,
                         outcome: None,
                         stage,
                         staged: None,
@@ -509,6 +503,92 @@ impl Jobs {
             );
         }
         self.view(&id)
+    }
+
+    /// Run job `id` from its fetch to its end: fetch origin, start its
+    /// sandbox job, wait for it, and stage what it built.
+    async fn carry(self: Arc<Self>, id: &str, run: RunJob, branch: BranchName) {
+        let handle = match self.start(run, branch).await {
+            Ok(started) => {
+                self.set_prep(id, Prep::Started(started.id));
+                started.handle
+            }
+            Err(e) => {
+                self.set_prep(
+                    id,
+                    Prep::Stopped(JobStatus::Failed { why: e.to_string() }),
+                );
+                let staged = self
+                    .asked_to_stage(id)
+                    .then(|| Staged::Not("the run did not start, so nothing was staged".into()));
+                self.finished(id, None, staged);
+                return;
+            }
+        };
+        let outcome = handle.finish().await.ok();
+        let staged = Arc::clone(&self).staging(id, outcome.as_ref()).await;
+        self.finished(id, outcome, staged);
+    }
+
+    /// Fetch origin for `run` and start it in its checkout's sandbox.
+    async fn start(self: &Arc<Self>, run: RunJob, branch: BranchName) -> Result<StartedJob, JobError> {
+        self.fetch(&run.repo).await?;
+        let c = self.checkout(&run.repo)?;
+        let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
+        store
+            .restore(run.overlay)
+            .map_err(|e| JobError::Bad(format!("the overlay: {e}")))?;
+        let command = SandboxCommand::new(run.program)
+            .args(run.args)
+            .timeout(Duration::from_secs(run.timeout_secs))
+            .priority(self.priority);
+        c.server
+            .start_job(
+                DiskWriteGrant::issue(),
+                JobRequest {
+                    branch,
+                    files: Arc::new(store),
+                    command,
+                },
+            )
+            .map_err(|e| JobError::Bad(format!("the job's log: {e}")))
+    }
+
+    /// Run `id` has got to `prep`.
+    fn set_prep(&self, id: &str, to: Prep) {
+        if let Some(Entry {
+            kind: Kind::Run { prep, .. },
+            ..
+        }) = self.table().0.get_mut(id)
+        {
+            *prep = to;
+        }
+    }
+
+    /// Whether run `id` asked to stage what it builds.
+    fn asked_to_stage(&self, id: &str) -> bool {
+        matches!(
+            self.table().0.get(id),
+            Some(Entry {
+                kind: Kind::Run { stage: Some(_), .. },
+                ..
+            })
+        )
+    }
+
+    /// Run `id`'s sandbox job and the checkout it runs in, once it has one.
+    fn sandbox_of(&self, id: &str) -> Result<Option<(String, JobId)>, JobError> {
+        let t = self.table();
+        let e =
+            t.0.get(id)
+                .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+        Ok(match &e.kind {
+            Kind::Run {
+                prep: Prep::Started(j),
+                ..
+            } => Some((e.repo.clone(), j.clone())),
+            _ => None,
+        })
     }
 
     /// What run `id`, which ended with `outcome`, staged — `None` when it
@@ -637,6 +717,7 @@ impl Jobs {
                 fetched: None,
                 listed: None,
                 staged: None,
+                phase: Phase::Ended,
             },
             Kind::Fetch { status } => JobView {
                 id: id.to_string(),
@@ -649,27 +730,83 @@ impl Jobs {
                 fetched: None,
                 listed: None,
                 staged: None,
+                phase: Phase::Ended,
             },
             Kind::Run {
-                outcome, staged, ..
+                prep,
+                outcome,
+                staged,
+                ..
             } => {
-                let info = JobId::parse(id)
-                    .and_then(|j| self.checkout(&e.repo).ok()?.server.query_job(&j).ok())
-                    .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+                let ended = *e.ended.borrow();
+                let (status, lines, bytes, phase) = match prep {
+                    Prep::Fetching if ended => (JobStatus::Cancelled, 0, 0, Phase::Ended),
+                    Prep::Fetching => (JobStatus::Queued, 0, 0, Phase::Fetching),
+                    Prep::Stopped(status) => (status.clone(), 0, 0, Phase::Ended),
+                    Prep::Started(j) => {
+                        let info = self
+                            .checkout(&e.repo)
+                            .ok()
+                            .and_then(|c| c.server.query_job(j).ok())
+                            .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+                        let phase = match &info.status {
+                            _ if ended => Phase::Ended,
+                            JobStatus::Queued => Phase::Waiting {
+                                behind: self.holding(&t, &e.repo),
+                            },
+                            JobStatus::Running => Phase::Running,
+                            _ => Phase::Staging,
+                        };
+                        // Cancelled: its task is aborted, and the sandbox
+                        // hears of it once the task is next polled.
+                        let status = if ended && !info.status.is_finished() {
+                            JobStatus::Cancelled
+                        } else {
+                            info.status
+                        };
+                        (status, info.lines, info.bytes, phase)
+                    }
+                };
                 JobView {
                     id: id.to_string(),
                     repo: e.repo.clone(),
-                    status: info.status,
-                    lines: info.lines,
-                    bytes: info.bytes,
+                    status,
+                    lines,
+                    bytes,
                     outcome: outcome.clone(),
                     pushed: Vec::new(),
                     fetched: None,
                     listed: None,
                     staged: staged.clone(),
+                    phase,
                 }
             }
         })
+    }
+
+    /// The runs holding `repo`'s checkout: those whose sandbox job is
+    /// running, which the runs queued on it wait behind.
+    fn holding(&self, t: &Table, repo: &str) -> Vec<String> {
+        let Ok(c) = self.checkout(repo) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> =
+            t.0.iter()
+                .filter(|(_, e)| e.repo == repo)
+                .filter_map(|(id, e)| match &e.kind {
+                    Kind::Run {
+                        prep: Prep::Started(j),
+                        ..
+                    } => c
+                        .server
+                        .query_job(j)
+                        .is_ok_and(|i| i.status == JobStatus::Running)
+                        .then(|| id.clone()),
+                    _ => None,
+                })
+                .collect();
+        ids.sort();
+        ids
     }
 
     /// Copy `rel` — what run `id` of `repo` built — to the stage folder, for
@@ -716,42 +853,51 @@ impl Jobs {
         self.view(id)
     }
 
-    /// Job `id`'s log file.
-    pub fn log(&self, id: &str) -> Result<PathBuf, JobError> {
-        let repo = {
-            let t = self.table();
-            t.0.get(id)
-                .ok_or_else(|| JobError::NotFound(id.to_string()))?
-                .repo
-                .clone()
+    /// Job `id`'s log file — `None` while a run has not started its command,
+    /// and so has written no log.
+    pub fn log(&self, id: &str) -> Result<Option<PathBuf>, JobError> {
+        let Some((repo, job)) = self.sandbox_of(id)? else {
+            return Ok(None);
         };
-        JobId::parse(id)
-            .and_then(|j| self.checkout(&repo).ok()?.server.query_job(&j).ok())
-            .map(|info| info.log)
+        self.checkout(&repo)
+            .ok()
+            .and_then(|c| c.server.query_job(&job).ok())
+            .map(|info| Some(info.log))
             .ok_or_else(|| JobError::NotFound(id.to_string()))
     }
 
-    /// Cancel job `id`: its command and everything it started are killed.
+    /// Cancel job `id`: its fetch is abandoned, or its command and everything
+    /// it started are killed.
     pub fn cancel(&self, id: &str) -> Result<JobView, JobError> {
         let aborted = {
-            let t = self.table();
+            let mut t = self.table();
             let e =
-                t.0.get(id)
+                t.0.get_mut(id)
                     .ok_or_else(|| JobError::NotFound(id.to_string()))?;
-            match &e.kind {
-                Kind::Run { task, stage, .. } => {
+            let repo = e.repo.clone();
+            match &mut e.kind {
+                Kind::Run {
+                    task, stage, prep, ..
+                } => {
                     // A run whose command has ended is staging what it built,
                     // or done: its own task records how it ended, and what it
                     // staged.
-                    let ended = JobId::parse(id)
-                        .and_then(|j| self.checkout(&e.repo).ok()?.server.query_job(&j).ok())
-                        .is_some_and(|info| {
-                            !matches!(info.status, JobStatus::Queued | JobStatus::Running)
-                        });
+                    let ended = match prep {
+                        Prep::Fetching => false,
+                        Prep::Stopped(_) => true,
+                        Prep::Started(j) => self
+                            .checkout(&repo)
+                            .ok()
+                            .and_then(|c| c.server.query_job(j).ok())
+                            .is_some_and(|info| info.status.is_finished()),
+                    };
                     if ended {
                         None
                     } else {
                         task.abort();
+                        if matches!(prep, Prep::Fetching) {
+                            *prep = Prep::Stopped(JobStatus::Cancelled);
+                        }
                         Some(stage.is_some())
                     }
                 }
@@ -803,6 +949,7 @@ impl Jobs {
             started_ms: e.line.started_ms,
             ended_ms: e.line.ended_ms,
             changed: view.outcome.map_or(0, |o| o.changed.len()),
+            phase: view.phase,
         })
     }
 
@@ -822,7 +969,9 @@ impl Jobs {
         // Whether it had ended is read before the log is: an ended job's log
         // is then all there, and a reader that has caught up with it is done.
         let ended = self.view(id)?.status.is_finished();
-        let path = self.log(id)?;
+        let Some(path) = self.log(id)? else {
+            return Ok(LogChunk::of(from, &[], 0, ended));
+        };
         let (bytes, size) = spawn_blocking(move || read_from(&path, from, TAIL_MAX))
             .await
             .map_err(|e| JobError::Bad(e.to_string()))?

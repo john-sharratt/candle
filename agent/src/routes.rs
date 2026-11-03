@@ -161,8 +161,10 @@ async fn view(State(api): State<Api>, Path(id): Path<String>, Query(q): Query<Wa
 }
 
 async fn log(State(api): State<Api>, Path(id): Path<String>) -> Response {
+    // A run that has not started its command has written nothing yet.
     let path = match api.jobs.log(&id) {
-        Ok(p) => p,
+        Ok(Some(p)) => p,
+        Ok(None) => return Body::empty().into_response(),
         Err(e) => return failed(e),
     };
     match tokio::fs::read(&path).await {

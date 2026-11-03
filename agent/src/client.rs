@@ -345,10 +345,7 @@ impl Agents {
                     .in_process
                     .as_ref()
                     .ok_or_else(|| AgentError::NoAgent("no agent runs in this process".into()))?;
-                let path = jobs.log(id).map_err(refused)?;
-                tokio::fs::read(&path)
-                    .await
-                    .map_err(|e| AgentError::Transport(e.to_string()))
+                read_log(jobs, id).await
             }
             At::Agent(agent) => self
                 .call(Call {
@@ -738,6 +735,17 @@ fn last_line_of(chunk: &LogChunk) -> String {
         .collect()
 }
 
+/// Job `id`'s log on this process's agent: empty for a run that never started
+/// its command.
+async fn read_log(jobs: &Jobs, id: &str) -> Result<Vec<u8>, AgentError> {
+    let Some(path) = jobs.log(id).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    tokio::fs::read(&path)
+        .await
+        .map_err(|e| AgentError::Transport(e.to_string()))
+}
+
 /// Wait for job `view`, started on this process's agent, to end; it and its
 /// log.
 async fn run_in_process_after(
@@ -753,10 +761,7 @@ async fn run_in_process_after(
             watch(&view, &last.map_or_else(String::new, |c| last_line_of(&c)));
         }
     }
-    let path = jobs.log(&view.id).map_err(refused)?;
-    let log = tokio::fs::read(&path)
-        .await
-        .map_err(|e| AgentError::Transport(e.to_string()))?;
+    let log = read_log(jobs, &view.id).await?;
     Ok(Ran {
         at: At::InProcess,
         outcome: view.outcome.clone(),

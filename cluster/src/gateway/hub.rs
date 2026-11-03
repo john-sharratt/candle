@@ -1814,14 +1814,8 @@ impl Hub {
     }
 
     /// Which agent of `app` runs a job (§11.3).
-    pub fn pick_agent(
-        &self,
-        app: &str,
-        lineage: Option<&str>,
-        need: &Need,
-        waited: bool,
-    ) -> Choice {
-        self.state().registry.pick_agent(app, lineage, need, waited)
+    pub fn pick_agent(&self, app: &str, lineage: Option<&str>, need: &Need) -> Choice {
+        self.state().registry.pick_agent(app, lineage, need)
     }
 
     /// The programs the ready agents of `app` holding `repo` start.

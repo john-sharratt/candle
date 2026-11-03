@@ -2,13 +2,14 @@
 //!
 //! A conversation's jobs go to the agent that last ran them — the holder of
 //! its lineage key — which keeps incremental builds warm. While that agent has
-//! no free job slot the job waits, up to [`SPILL_AFTER`], and then spills to
-//! the **best idle agent**: the one on the machine the table prefers to build
-//! on (`builds`, lower first), then with the most idle cores,
-//! `cores × (1 − load / cores)`, among the agents that hold the job's
-//! repository (with push rights, for a job that pushes) and its toolchain.
-//! A job with no holder goes to the best idle agent at once, and waits like
-//! the rest when every agent is busy.
+//! no free job slot the job spills to the **best idle agent**: the one on the
+//! machine the table prefers to build on (`builds`, lower first), then with
+//! the most idle cores, `cores × (1 − load / cores)`, among the agents that
+//! hold the job's repository (with push rights, for a job that pushes) and its
+//! toolchain. A job with no holder goes to the best idle agent. When every
+//! agent is busy the job queues on its holder, or on the best of them — the
+//! agent queues it on its checkout and answers at once, so the gateway never
+//! holds a job back.
 //!
 //! **An agent at low priority** — one sharing its host with a model member
 //! (§11.5) — is chosen only when no dedicated agent fit for the job, on a
@@ -22,18 +23,14 @@
 //! is a spare: a job goes to it only when no other ready agent can run the
 //! job at all, because they are down, switched off, or hold neither its
 //! repository nor its toolchain ([`choose_with_standby`]). An agent that is
-//! merely busy is waited for, never spilled past onto a standby one. A job
+//! merely busy is queued on, never spilled past onto a standby one. A job
 //! that names its agent (`x-tokera-node`) runs there, standby or not.
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use super::registry::MemberView;
 use crate::machines::MachineTable;
-
-/// How long a job waits for its busy holder before it spills.
-pub const SPILL_AFTER: Duration = Duration::from_secs(5);
 
 /// The header a job's lineage travels in: a conversation's id, a fork
 /// carrying its parent's.
@@ -63,12 +60,10 @@ pub struct Need {
     pub push: bool,
 }
 
-/// The outcome of one look at the agents.
+/// Where a job goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     Run(u64),
-    /// Every agent fit for it is busy: look again shortly.
-    Wait,
     /// No ready agent holds its repository and toolchain.
     NoAgent,
 }
@@ -122,18 +117,20 @@ fn build_rank(agent: &MemberView, machines: &MachineTable) -> Reverse<u32> {
 }
 
 /// Choose among `ready` agents for a job needing `need`, whose lineage
-/// `holder` holds; `waited` once it has waited [`SPILL_AFTER`]. Among the
-/// agents it may go to, the machine table's `builds` preference
-/// (`docs/static_placement.md` §2) comes first — before a dedicated agent
-/// over one at low priority, and before idle cores: the strongest machine
-/// builds whenever it has a slot, though a model member shares it, and a
-/// weaker one only while it has none.
+/// `holder` holds. Among the agents it may go to, the machine table's
+/// `builds` preference (`docs/static_placement.md` §2) comes first — before a
+/// dedicated agent over one at low priority, and before idle cores: the
+/// strongest machine builds whenever it has a slot, though a model member
+/// shares it, and a weaker one only while it has none.
+///
+/// The choice is made at once, never waited on: an agent answers a run the
+/// moment it has checked it and queues it on its checkout itself, so a job
+/// with nowhere free queues on an agent rather than in the gateway.
 pub fn choose(
     ready: &[&MemberView],
     machines: &MachineTable,
     holder: Option<u64>,
     need: &Need,
-    waited: bool,
 ) -> Choice {
     let fit: Vec<&MemberView> = ready.iter().copied().filter(|a| fits(a, need)).collect();
     if fit.is_empty() {
@@ -141,15 +138,11 @@ pub fn choose(
     }
     // What one agent is preferred over another for, before idle cores.
     let standing = |a: &MemberView| (build_rank(a, machines), dedicated(a));
-    if let Some(h) = holder.and_then(|h| fit.iter().find(|a| a.node == h)) {
+    let held = holder.and_then(|h| fit.iter().copied().find(|a| a.node == h));
+    if let Some(h) = held {
         let outranked = fit.iter().any(|a| free(a) && standing(a) > standing(h));
         if free(h) && !outranked {
             return Choice::Run(h.node);
-        }
-        // A busy holder is waited for while no free agent outranks it — its
-        // build is warm — and a free one outranked is not kept.
-        if !free(h) && !waited && !outranked {
-            return Choice::Wait;
         }
     }
     let best = |among: &mut dyn Iterator<Item = &&MemberView>| {
@@ -167,13 +160,12 @@ pub fn choose(
     if let Some(node) = best(&mut fit.iter().filter(|a| free(a))) {
         return Choice::Run(node);
     }
-    if !waited {
-        return Choice::Wait;
-    }
-    // Every agent is still busy: it queues on the best of them, by the same
-    // order — the machine the table prefers to build on, then a dedicated
-    // agent, then the most idle cores.
-    best(&mut fit.iter()).map_or(Choice::NoAgent, Choice::Run)
+    // Every agent is busy: it queues on its holder, whose build is warm, or
+    // on the best of them by the same order — the machine the table prefers
+    // to build on, then a dedicated agent, then the most idle cores.
+    held.map(|h| h.node)
+        .or_else(|| best(&mut fit.iter()))
+        .map_or(Choice::NoAgent, Choice::Run)
 }
 
 /// The programs the `ready` agents holding `repo` start, in order: what a job
@@ -201,14 +193,13 @@ pub fn choose_with_standby(
     machines: &MachineTable,
     holder: Option<u64>,
     need: &Need,
-    waited: bool,
 ) -> Choice {
     let (spares, regular): (Vec<&MemberView>, Vec<&MemberView>) = ready
         .iter()
         .copied()
         .partition(|a| named_standby(standby, &a.host));
-    match choose(&regular, machines, holder, need, waited) {
-        Choice::NoAgent => choose(&spares, machines, holder, need, waited),
+    match choose(&regular, machines, holder, need) {
+        Choice::NoAgent => choose(&spares, machines, holder, need),
         chosen => chosen,
     }
 }
@@ -277,16 +268,16 @@ mod tests {
     }
 
     /// [`super::choose`] with a table that ranks no machine for builds.
-    fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need, waited: bool) -> Choice {
-        super::choose(ready, &MachineTable::default(), holder, need, waited)
+    fn choose(ready: &[&MemberView], holder: Option<u64>, need: &Need) -> Choice {
+        super::choose(ready, &MachineTable::default(), holder, need)
     }
 
     /// **The machine the table prefers to build on takes the job** while it has
     /// a slot — at low priority beside a model member, and with fewer idle
     /// cores than another; full, the next does; a machine the table ranks
     /// nowhere comes last. A lineage stays on BlackWorld beside a free
-    /// dedicated agent, goes back to a holder no free agent outranks, and moves
-    /// off one a free agent does.
+    /// dedicated agent, spills off it at once while it is busy, and moves off
+    /// a holder a free agent outranks.
     #[test]
     fn the_preferred_build_machine_builds_first() {
         let machines = MachineTable::from_yaml(
@@ -301,39 +292,34 @@ mod tests {
         ww.host = "WhiteWorld".into();
         let ready = [&ww, &aw, &bw];
         assert_eq!(
-            super::choose(&ready, &machines, None, &cargo(), false),
+            super::choose(&ready, &machines, None, &cargo()),
             Choice::Run(1),
             "BlackWorld, with the fewest idle cores"
         );
         assert_eq!(
-            super::choose(&ready, &machines, Some(1), &cargo(), false),
+            super::choose(&ready, &machines, Some(1), &cargo()),
             Choice::Run(1),
             "a lineage on BlackWorld stays there, though AlienWorld is dedicated"
         );
         bw.handed = 1;
         let ready = [&ww, &aw, &bw];
         assert_eq!(
-            super::choose(&ready, &machines, Some(1), &cargo(), false),
-            Choice::Wait,
-            "a busy BlackWorld holder is waited for: no free agent outranks it"
-        );
-        assert_eq!(
-            super::choose(&ready, &machines, Some(1), &cargo(), true),
+            super::choose(&ready, &machines, Some(1), &cargo()),
             Choice::Run(2),
-            "and spilled from once the wait is over"
+            "a busy BlackWorld holder is spilled from at once"
         );
         assert_eq!(
-            super::choose(&ready, &machines, None, &cargo(), false),
+            super::choose(&ready, &machines, None, &cargo()),
             Choice::Run(2),
             "BlackWorld full: AlienWorld before an unranked WhiteWorld"
         );
         assert_eq!(
-            super::choose(&ready, &machines, Some(2), &cargo(), false),
+            super::choose(&ready, &machines, Some(2), &cargo()),
             Choice::Run(2),
             "a lineage's holder keeps it while none it ranks below is free"
         );
         assert_eq!(
-            super::choose(&ready, &machines, Some(3), &cargo(), false),
+            super::choose(&ready, &machines, Some(3), &cargo()),
             Choice::Run(2),
             "a lineage on an unranked machine moves to a free ranked one"
         );
@@ -341,15 +327,9 @@ mod tests {
         free_bw.host = "BlackWorld".into();
         busy_ww.host = "WhiteWorld".into();
         assert_eq!(
-            super::choose(
-                &[&busy_ww, &aw, &free_bw],
-                &machines,
-                Some(3),
-                &cargo(),
-                false
-            ),
+            super::choose(&[&busy_ww, &aw, &free_bw], &machines, Some(3), &cargo()),
             Choice::Run(1),
-            "a busy WhiteWorld holder is not waited for while BlackWorld is free"
+            "a busy WhiteWorld holder is passed over while BlackWorld is free"
         );
         assert_eq!(machines.builds("blackworld"), Some(1));
     }
@@ -374,11 +354,11 @@ mod tests {
     fn a_repo_less_job_fits_any_ready_agent() {
         let a = agent(1, 4, 0, 1);
         assert_eq!(
-            choose(&[&a], None, &need("", None, false), false),
+            choose(&[&a], None, &need("", None, false)),
             Choice::Run(1)
         );
         assert_eq!(
-            choose(&[&a], None, &need("not-held", None, false), false),
+            choose(&[&a], None, &need("not-held", None, false)),
             Choice::NoAgent
         );
     }
@@ -388,26 +368,25 @@ mod tests {
     #[test]
     fn a_job_sticks_to_the_agent_that_last_ran_its_lineage() {
         let (a, b) = (agent(1, 4, 3_000, 1), agent(2, 32, 0, 4));
-        assert_eq!(choose(&[&a, &b], Some(1), &cargo(), false), Choice::Run(1));
+        assert_eq!(choose(&[&a, &b], Some(1), &cargo()), Choice::Run(1));
     }
 
-    /// A busy holder makes the job wait, and after the wait it spills to the
-    /// best idle agent.
+    /// **A busy holder's job spills to the best idle agent at once** — no
+    /// wait in the gateway — and queues on the holder when nothing is free.
     #[test]
-    fn a_job_waits_for_its_busy_holder_then_spills() {
+    fn a_busy_holders_job_spills_at_once() {
         let (a, b, c) = (
             agent(1, 8, 0, 0),
             agent(2, 16, 8_000, 2),
             agent(3, 8, 1_000, 2),
         );
-        assert_eq!(
-            choose(&[&a, &b, &c], Some(1), &cargo(), false),
-            Choice::Wait
-        );
         // b has 16 − 8 = 8 idle cores, c 8 − 1 = 7.
+        assert_eq!(choose(&[&a, &b, &c], Some(1), &cargo()), Choice::Run(2));
+        let (busy_b, busy_c) = (agent(2, 16, 8_000, 0), agent(3, 8, 1_000, 0));
         assert_eq!(
-            choose(&[&a, &b, &c], Some(1), &cargo(), true),
-            Choice::Run(2)
+            choose(&[&a, &busy_b, &busy_c], Some(1), &cargo()),
+            Choice::Run(1),
+            "every agent busy: the job queues on its warm holder"
         );
     }
 
@@ -421,7 +400,7 @@ mod tests {
             agent(4, 6, 0, 1),
         );
         // 6000, 5500, 6000 idle: 4 and 5 tie, the lower node wins.
-        assert_eq!(choose(&[&a, &b, &c], None, &cargo(), false), Choice::Run(4));
+        assert_eq!(choose(&[&a, &b, &c], None, &cargo()), Choice::Run(4));
     }
 
     /// **Jobs handed since an agent's last `CAPACITY` count against it**: a
@@ -431,17 +410,17 @@ mod tests {
     fn jobs_handed_since_the_last_report_count_against_an_agent() {
         let mut a = agent(1, 8, 0, 1);
         let b = agent(2, 8, 0, 1);
-        assert_eq!(choose(&[&a, &b], None, &cargo(), false), Choice::Run(1));
+        assert_eq!(choose(&[&a, &b], None, &cargo()), Choice::Run(1));
         a.handed = 1;
         assert_eq!(
-            choose(&[&a, &b], None, &cargo(), false),
+            choose(&[&a, &b], None, &cargo()),
             Choice::Run(2),
             "a's one slot is taken"
         );
         let (mut c, d) = (agent(3, 8, 0, 4), agent(4, 8, 2_500, 4));
         c.handed = 3;
         // c: 8000 − 3000 = 5000 idle; d: 8000 − 2500 = 5500.
-        assert_eq!(choose(&[&c, &d], None, &cargo(), false), Choice::Run(4));
+        assert_eq!(choose(&[&c, &d], None, &cargo()), Choice::Run(4));
     }
 
     /// Only agents holding the repository, the push right when it pushes, and
@@ -451,29 +430,21 @@ mod tests {
         let mut plain = agent(1, 64, 0, 4);
         plain.repos.retain(|r| r.name == "site");
         let fit = agent(2, 2, 1_500, 1);
+        assert_eq!(choose(&[&plain, &fit], None, &cargo()), Choice::Run(2));
         assert_eq!(
-            choose(&[&plain, &fit], None, &cargo(), false),
-            Choice::Run(2)
-        );
-        assert_eq!(
-            choose(
-                &[&plain, &fit],
-                None,
-                &need("candle", Some("npm"), false),
-                false
-            ),
+            choose(&[&plain, &fit], None, &need("candle", Some("npm"), false)),
             Choice::NoAgent
         );
         assert_eq!(
-            choose(&[&plain, &fit], None, &need("site", None, true), false),
+            choose(&[&plain, &fit], None, &need("site", None, true)),
             Choice::NoAgent
         );
         assert_eq!(
-            choose(&[&plain, &fit], None, &need("site", None, false), false),
+            choose(&[&plain, &fit], None, &need("site", None, false)),
             Choice::Run(1)
         );
         assert_eq!(
-            choose(&[&plain, &fit], None, &need("candle", None, true), false),
+            choose(&[&plain, &fit], None, &need("candle", None, true)),
             Choice::Run(2)
         );
     }
@@ -492,36 +463,16 @@ mod tests {
     #[test]
     fn a_low_priority_agent_is_chosen_last() {
         let (gpu, a) = (beside(1, 32, 0, 4), agent(2, 4, 3_000, 1));
-        assert_eq!(choose(&[&gpu, &a], None, &cargo(), false), Choice::Run(2));
-        assert_eq!(
-            choose(&[&gpu, &a], Some(1), &cargo(), false),
-            Choice::Run(2)
-        );
+        assert_eq!(choose(&[&gpu, &a], None, &cargo()), Choice::Run(2));
+        assert_eq!(choose(&[&gpu, &a], Some(1), &cargo()), Choice::Run(2));
         let full = agent(2, 4, 3_000, 0);
-        assert_eq!(
-            choose(&[&gpu, &full], None, &cargo(), false),
-            Choice::Run(1)
-        );
-        assert_eq!(
-            choose(&[&gpu, &full], Some(1), &cargo(), false),
-            Choice::Run(1)
-        );
-        // A dedicated holder that is busy is waited for; a low-priority one is
-        // not, when a dedicated agent is free.
-        assert_eq!(
-            choose(&[&gpu, &full], Some(2), &cargo(), false),
-            Choice::Wait
-        );
-        assert_eq!(
-            choose(&[&gpu, &full], Some(2), &cargo(), true),
-            Choice::Run(1)
-        );
+        assert_eq!(choose(&[&gpu, &full], None, &cargo()), Choice::Run(1));
+        assert_eq!(choose(&[&gpu, &full], Some(1), &cargo()), Choice::Run(1));
+        // A busy dedicated holder spills to the free low-priority agent.
+        assert_eq!(choose(&[&gpu, &full], Some(2), &cargo()), Choice::Run(1));
         // Every agent full: a job queues on a dedicated one first.
         let gpu_full = beside(1, 32, 0, 0);
-        assert_eq!(
-            choose(&[&gpu_full, &full], None, &cargo(), true),
-            Choice::Run(2)
-        );
+        assert_eq!(choose(&[&gpu_full, &full], None, &cargo()), Choice::Run(2));
     }
 
     /// An agent on `host`.
@@ -543,42 +494,31 @@ mod tests {
         assert!(!named_standby(&standby, "BlackWorld"));
         let free = on("blackworld", 1, 2);
         let busy = on("blackworld", 1, 0);
-        let pick = |ready: &[&MemberView], holder, need: &Need, waited| {
-            choose_with_standby(
-                ready,
-                &standby,
-                &MachineTable::default(),
-                holder,
-                need,
-                waited,
-            )
+        let pick = |ready: &[&MemberView], holder, need: &Need| {
+            choose_with_standby(ready, &standby, &MachineTable::default(), holder, need)
         };
+        assert_eq!(pick(&[&spare, &free], None, &cargo()), Choice::Run(1));
         assert_eq!(
-            pick(&[&spare, &free], None, &cargo(), false),
-            Choice::Run(1)
-        );
-        assert_eq!(pick(&[&spare, &busy], None, &cargo(), false), Choice::Wait);
-        assert_eq!(
-            pick(&[&spare, &busy], None, &cargo(), true),
+            pick(&[&spare, &busy], None, &cargo()),
             Choice::Run(1),
             "a busy regular agent is queued on, never spilled past"
         );
-        assert_eq!(pick(&[&spare], None, &cargo(), false), Choice::Run(9));
+        assert_eq!(pick(&[&spare], None, &cargo()), Choice::Run(9));
         assert_eq!(
-            pick(&[&spare, &free], Some(9), &cargo(), false),
+            pick(&[&spare, &free], Some(9), &cargo()),
             Choice::Run(1),
             "a lineage the spare held goes back to a regular agent"
         );
         let mut elsewhere = on("blackworld", 1, 2);
         elsewhere.repos.retain(|r| r.name == "site");
         assert_eq!(
-            pick(&[&spare, &elsewhere], None, &cargo(), false),
+            pick(&[&spare, &elsewhere], None, &cargo()),
             Choice::Run(9),
             "no regular agent holds the repository"
         );
         let mut gone = spare.clone();
         gone.repos.clear();
-        assert_eq!(pick(&[&gone], None, &cargo(), false), Choice::NoAgent);
+        assert_eq!(pick(&[&gone], None, &cargo()), Choice::NoAgent);
         // With no standby hosts named, every agent is a regular one.
         assert_eq!(
             choose_with_standby(
@@ -587,25 +527,20 @@ mod tests {
                 &MachineTable::default(),
                 None,
                 &cargo(),
-                false
             ),
             Choice::Run(9)
         );
     }
 
-    /// With every fit agent busy a job without a holder waits too, then
-    /// queues on the most idle; a holder that no longer fits is passed over.
+    /// With every fit agent busy a job without a holder queues on the most
+    /// idle at once; a holder that no longer fits is passed over.
     #[test]
-    fn all_busy_waits_then_queues_on_the_most_idle() {
+    fn all_busy_queues_on_the_most_idle() {
         let (a, b) = (agent(1, 8, 4_000, 0), agent(2, 8, 1_000, 0));
-        assert_eq!(choose(&[&a, &b], None, &cargo(), false), Choice::Wait);
-        assert_eq!(choose(&[&a, &b], None, &cargo(), true), Choice::Run(2));
+        assert_eq!(choose(&[&a, &b], None, &cargo()), Choice::Run(2));
         let mut gone = agent(3, 8, 0, 4);
         gone.repos.clear();
-        assert_eq!(
-            choose(&[&gone, &b], Some(3), &cargo(), true),
-            Choice::Run(2)
-        );
-        assert_eq!(choose(&[], Some(3), &cargo(), true), Choice::NoAgent);
+        assert_eq!(choose(&[&gone, &b], Some(3), &cargo()), Choice::Run(2));
+        assert_eq!(choose(&[], Some(3), &cargo()), Choice::NoAgent);
     }
 }

@@ -244,6 +244,30 @@ pub struct JobView {
     /// file's path on the agent's machine, or why nothing was staged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged: Option<Staged>,
+    /// Where it has got to (see [`Phase`]).
+    #[serde(default)]
+    pub phase: Phase,
+}
+
+/// Where a job has got to, finer than its status: a run is accepted before
+/// origin is fetched, so its first answer comes back at once and its fetch,
+/// its wait for the checkout and its staging are each a phase a reader sees.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum Phase {
+    /// Fetching origin, so the base it runs on is held here.
+    Fetching,
+    /// Waiting for its checkout, which the runs `behind` hold — jobs on one
+    /// checkout run one at a time.
+    Waiting { behind: Vec<String> },
+    /// Its command is running.
+    Running,
+    /// Its command exited 0 and what it built is being copied to the stage
+    /// folder.
+    Staging,
+    /// Ended, one way or another: the status says which.
+    #[default]
+    Ended,
 }
 
 /// What a run's staging came to.
@@ -287,6 +311,9 @@ pub struct JobLine {
     pub ended_ms: Option<u64>,
     /// The files a run changed, once it has ended.
     pub changed: usize,
+    /// Where it has got to.
+    #[serde(default)]
+    pub phase: Phase,
 }
 
 /// `GET /v1/jobs`: whether the agent takes jobs, its slots, and the jobs it
@@ -560,13 +587,15 @@ mod tests {
             fetched: None,
             listed: None,
             staged: None,
+            phase: Phase::Ended,
         };
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(
             wire,
             json!({
                 "id": "AAAAAAAAAAA", "repo": "candle", "status": "exited", "code": 0,
-                "lines": 3, "bytes": 40, "outcome": null, "pushed": [], "fetched": null
+                "lines": 3, "bytes": 40, "outcome": null, "pushed": [], "fetched": null,
+                "phase": {"at": "ended"}
             })
         );
         assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), view);
@@ -658,6 +687,9 @@ mod tests {
                 started_ms: 1_700_000_000_000,
                 ended_ms: None,
                 changed: 0,
+                phase: Phase::Waiting {
+                    behind: vec!["BBBBBBBBBBB".into()],
+                },
             }],
         };
         let wire = serde_json::to_value(&jobs).unwrap();
@@ -669,11 +701,24 @@ mod tests {
                     "id": "AAAAAAAAAAA", "repo": "candle", "kind": "run", "branch": "zen/x",
                     "command": ["cargo", "test"], "status": "running",
                     "lines": 2, "bytes": 17, "started_ms": 1_700_000_000_000u64,
-                    "ended_ms": null, "changed": 0
+                    "ended_ms": null, "changed": 0,
+                    "phase": {"at": "waiting", "behind": ["BBBBBBBBBBB"]}
                 }]
             })
         );
         assert_eq!(serde_json::from_value::<AgentJobs>(wire).unwrap(), jobs);
+    }
+
+    /// **A view from an agent that names no phase reads as ended**, so a
+    /// member reading an agent one build behind it still decodes its jobs.
+    #[test]
+    fn a_view_with_no_phase_reads_as_ended() {
+        let wire = json!({
+            "id": "AAAAAAAAAAA", "repo": "candle", "status": "running",
+            "lines": 0, "bytes": 0, "outcome": null, "pushed": [], "fetched": null
+        });
+        let view: JobView = serde_json::from_value(wire).unwrap();
+        assert_eq!(view.phase, Phase::Ended);
     }
 
     /// A log chunk carries its bytes in base64 — exactly these — and reads

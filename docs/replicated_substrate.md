@@ -3930,11 +3930,16 @@ one on a machine the table prefers to build on (`builds`, lower first;
 beside one at low priority. A free holder no free agent outranks takes the job; one
 outranked does not, and the job goes elsewhere at once.
 
-If the holder is busy and no free agent outranks it, the job waits up to 5 s for it and
-then spills; if a free agent outranks it, the job spills at once. It spills to the
+If the holder is busy, or a free agent outranks it, the job spills at once to the
 **best idle agent**: the one on the machine the table prefers to build on, then a
 dedicated agent before one at low priority, then the one with the most idle cores,
 `cores × (1 − load/cores)`, among agents that hold the job's repositories and toolchain.
+With every fit agent busy it queues on its holder, whose build is warm, or on the best of
+them by the same order. **The gateway never holds a job back**: an agent accepts a run as
+soon as it has checked it and answers with its id, then fetches origin, waits for its
+checkout and runs it as phases of the job (`agent/src/jobs.rs`), so a job routed to a busy
+agent is queued there and its caller has its id at once
+(`docs/build_deploy_tools.md` §2).
 
 **An agent at low priority** — one sharing its host with a model member (§11.5), which
 says so in its `CAPACITY` — is chosen only when no dedicated agent fit for the job, on a
@@ -3949,7 +3954,7 @@ to a weaker machine.
 names (`web/web.yaml`), the laptop AlienWorld among them. It is given a job only when no
 other ready agent can run it at all: when the others are down, switched off, or hold
 neither the job's repository nor its toolchain (`choose_with_standby`). An agent that is
-merely busy is waited for and queued on, never spilled past onto the spare, and a lineage
+merely busy is queued on, never spilled past onto the spare, and a lineage
 the spare held goes back to a regular agent as soon as one fits. The standing-by is the
 gateway's to know, from the agent's host, so the agent's `CAPACITY` is the same as any
 other's. `/v1/agents` lists it `standby: true`.
@@ -4634,7 +4639,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | tombstone expiry | a tombstone record is kept by every compaction until a complete `compact()` has finished after it **and** its `hlc` is more than *N* days old, and is then replaced by its entry in the `Deleted` record; neither condition alone shrinks it; with paused time, a record for a deleted timeline arriving a year after expiry dies in every arrival order, and a register of that timeline leaves it dead; a keyed entry kills lower-stamped writes and yields to a greater stamp; a catch-up's gone header for an expired tombstone carries its entry, and a member returning after any absence drops the timelines it names and its unsent writes to them die everywhere; `Deleted` survives compaction and reopen byte-exact |
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key, n)`, `n` the first opening whose timeline is free; VFS events are named `(origin, seq)`, two writers' of one number are two events, and a tombstone of another member's event outlives compaction |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
-| agent selection | stickiness, the spill after the wait, and the idle-core ranking with repository and toolchain filters |
+| agent selection | stickiness, the spill off a busy holder, and the idle-core ranking with repository and toolchain filters |
 | fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind_repo.rs`, `npcd/src/tenant.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `motherd.yaml`; an unready mirror starts on no mind |
 | status page | `COORD` encodes to exact bytes; every coordination decision of §12.3 — admission, refusal, mode switch, floor, lock, claim, grant, majority, NPC lease, cut-off, rejoin step, generation fixed, disconnected mode, catch-up, resync, tombstone expiry — driven through an in-process gateway lands in the log with its gateway and subject; `status.json` carries every block of §12.2, and a member reporting a gateway this one cannot see shows in both the `clusters` column and the grant counts |
 

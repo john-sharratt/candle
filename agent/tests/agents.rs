@@ -32,7 +32,7 @@ use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
 use agent::pusher::AgentPush;
 use agent::wire::{
-    encode_bundle, FetchJob, JobKind, JobView, PushJob, PushLine, RunJob, Staged, Submit,
+    encode_bundle, FetchJob, JobKind, JobView, Phase, PushJob, PushLine, RunJob, Staged, Submit,
 };
 use cluster::dial::Connect;
 use cluster::dispatch::RouteTable;
@@ -208,7 +208,113 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
         "the agent's checkout is its own again"
     );
     assert!(!r.agent.join("out.txt").exists());
-    assert!(jobs.log(&view.id).unwrap().is_file());
+    assert!(jobs.log(&view.id).unwrap().unwrap().is_file());
+    assert_eq!(view.phase, Phase::Ended);
+    assert_eq!(jobs.slots(), (2, 0));
+}
+
+/// The shell a test job runs, and its arguments to wait `secs` seconds.
+fn pause(secs: u32) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        (
+            "cmd".into(),
+            vec![
+                "/C".into(),
+                format!("ping -n {} 127.0.0.1 >NUL", secs + 1),
+            ],
+        )
+    } else {
+        ("sh".into(), vec!["-c".into(), format!("sleep {secs}")])
+    }
+}
+
+/// `jobs`'s view of `id` once `done` holds of it.
+async fn view_once(jobs: &Arc<Jobs>, id: &str, done: impl Fn(&JobView) -> bool) -> JobView {
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let view = jobs.view(id).unwrap();
+        if done(&view) {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "never came to pass: {view:?}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// **A run is answered before origin is fetched**: its first view is the
+/// fetch, with no log yet; a second run on the same checkout waits behind the
+/// first, naming it; and cancelling the waiting one ends it, cancelled, while
+/// the first runs on.
+#[tokio::test]
+async fn a_run_answers_at_once_and_says_where_it_is() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let (program, args) = pause(3);
+    let slow = RunJob {
+        program,
+        args,
+        ..run_job(&store)
+    };
+    let first = jobs.submit(Submit::Run(slow.clone())).await.unwrap();
+    assert_eq!(
+        (first.status.clone(), first.phase.clone(), first.bytes),
+        (JobStatus::Queued, Phase::Fetching, 0)
+    );
+    assert_eq!(
+        jobs.tail(&first.id, 0).await.unwrap().size,
+        0,
+        "a run that has not started has no log"
+    );
+    view_once(&jobs, &first.id, |v| v.phase == Phase::Running).await;
+    let second = jobs.submit(Submit::Run(slow)).await.unwrap();
+    let waiting = view_once(&jobs, &second.id, |v| v.phase != Phase::Fetching).await;
+    assert_eq!(
+        waiting.phase,
+        Phase::Waiting {
+            behind: vec![first.id.clone()]
+        }
+    );
+    let cancelled = jobs.cancel(&second.id).unwrap();
+    assert_eq!(
+        (cancelled.status, cancelled.phase),
+        (JobStatus::Cancelled, Phase::Ended)
+    );
+    let done = ended(&jobs, first).await;
+    assert_eq!(done.status, JobStatus::Exited { code: Some(0) }, "{done:?}");
+    assert_eq!(jobs.slots(), (2, 0));
+}
+
+/// **A run whose fetch fails is a failed job, not a refused submit**: it was
+/// accepted at once, so it ends `failed`, naming the fetch, with an empty
+/// log and nothing staged.
+#[tokio::test]
+async fn a_run_whose_fetch_fails_ends_failed() {
+    let r = repos();
+    let gone = r.origin.with_extension("missing");
+    git(
+        &r.agent,
+        &["remote", "set-url", "origin", gone.to_str().unwrap()],
+    );
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let job = RunJob {
+        stage: Some("out.txt".into()),
+        ..run_job(&store)
+    };
+    let view = ended(&jobs, jobs.submit(Submit::Run(job)).await.unwrap()).await;
+    let JobStatus::Failed { why } = &view.status else {
+        panic!("{view:?}");
+    };
+    assert!(why.contains("fetching"), "{why}");
+    assert_eq!(view.phase, Phase::Ended);
+    assert_eq!(
+        view.staged,
+        Some(Staged::Not(
+            "the run did not start, so nothing was staged".into()
+        ))
+    );
+    assert_eq!(jobs.log(&view.id).unwrap(), None);
     assert_eq!(jobs.slots(), (2, 0));
 }
 
@@ -413,7 +519,7 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
         push: false,
     };
     until("the lineage claimed by the agent", || {
-        hub.pick_agent(APP, Some("conv-1"), &need, false) == Choice::Run(0xa1)
+        hub.pick_agent(APP, Some("conv-1"), &need) == Choice::Run(0xa1)
     })
     .await;
 

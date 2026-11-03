@@ -1,7 +1,7 @@
 //! A member's jobs, carried to an agent (§11.3, §11.5). A member opens a
-//! stream towards `group:agent`; each request on it goes to the agent
+//! stream towards `group:agent`; each request on it goes at once to the agent
 //! [`Hub::pick_agent`](cluster::gateway::Hub::pick_agent) chooses — the
-//! lineage's holder, or after [`SPILL_AFTER`] the best idle agent holding the
+//! lineage's holder while it is free, else the best idle agent holding the
 //! job's repository and toolchain — or to the agent `x-tokera-node` names,
 //! which is how a member reads back a job it started — and how an admin's
 //! member reads what an agent is running, or switches it (§11.7). With no
@@ -12,18 +12,16 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cluster::gateway::{
-    Choice, Need, AGENTS_PATH, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, SPILL_AFTER,
+    Choice, Need, AGENTS_PATH, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER,
     TOOLCHAIN_HEADER,
 };
 use serde_json::json;
-use tokio::time::sleep;
 
 use super::Gateway;
 use crate::config::Cache;
@@ -31,9 +29,6 @@ use crate::proxy::{self, Forward, To};
 
 /// The app a job stream reaches.
 pub const AGENT_APP: &str = "agent";
-
-/// How often a waiting job looks at the agents again.
-const LOOK_EVERY: Duration = Duration::from_millis(100);
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
@@ -93,16 +88,11 @@ pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Reques
         node
     } else {
         let need = need_of(req.headers());
-        let lineage = header(req.headers(), LINEAGE_HEADER).map(str::to_string);
-        let start = Instant::now();
-        loop {
-            let waited = start.elapsed() >= SPILL_AFTER;
-            match hub.pick_agent(AGENT_APP, lineage.as_deref(), &need, waited) {
-                Choice::Run(node) => break node,
-                Choice::Wait => sleep(LOOK_EVERY).await,
-                Choice::NoAgent => {
-                    return no_agent(unfit(&need, &hub.agent_programs(AGENT_APP, &need.repo)))
-                }
+        let lineage = header(req.headers(), LINEAGE_HEADER);
+        match hub.pick_agent(AGENT_APP, lineage, &need) {
+            Choice::Run(node) => node,
+            Choice::NoAgent => {
+                return no_agent(unfit(&need, &hub.agent_programs(AGENT_APP, &need.repo)))
             }
         }
     };
