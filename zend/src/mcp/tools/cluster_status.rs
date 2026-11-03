@@ -556,10 +556,15 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\nupgrade zend: older builds served until the grace period ends, in 10 min"),
+            text.contains(
+                "\nupgrade zend: older builds served until the grace period ends, in 10 min"
+            ),
             "{text}"
         );
-        assert!(text.contains("\nfault: zend ww 01: near its disk floor"), "{text}");
+        assert!(
+            text.contains("\nfault: zend ww 01: near its disk floor"),
+            "{text}"
+        );
     }
 
     #[test]
