@@ -9,6 +9,7 @@
 //! replacement when its handshake fails.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fmt;
 use std::time::Instant;
 
