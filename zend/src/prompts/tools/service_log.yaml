@@ -10,6 +10,12 @@ questions:
 - show the last lines the service printed
 - is the trial catching up on sync
 - search the service log for the panic
+- what error made the new build roll back
+- show me what the daemon printed after the deploy
+- did the trial say it was serving
+- read the start of the trial log
+- what was the last thing the new gateway printed
+- find the error lines in the motherd trial
 category: Commands
 description: 'Read a service''s trial log on one machine, where keep writes it: the service''s stderr from the moment its last trial started — loading, catching up on replication, `INFO serving` when it proved itself, or the panic or exit that rolled it back — and, after a proven trial, everything the service has printed since. Read on keep''s machine, so only the answer comes back, every line numbered as it stands in the log. `mode: summary` gives the errors, panics and last lines — read it first; `mode: lines` reads `count` lines from line `from`, what a summary pointed at; `mode: grep` finds `pattern` (plain text, any case) with `context` lines around each hit; `mode: tail` reads the last `lines`. A deploy''s build log is not here: read it with repo_job_log. Use for: why a trial was rolled back, what a running trial is doing. Triggered by "why was it rolled back", "show the trial log". Returns the lines asked for and how to read on.'
 high_risk: true

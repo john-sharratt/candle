@@ -8,6 +8,14 @@ questions:
 - what did the agents run recently
 - is the agent busy
 - show the jobs on whiteworld
+- what is the agent on blackworld running right now
+- find the handle of the build I started earlier
+- is a release build already going
+- how many agent slots are free
+- list the agent jobs that have finished
+- what has been built on the agents today
+- which deploy builds are waiting for the checkout
+- show me the running builds on every machine
 category: Commands
 description: 'List the jobs on the build agents — every machine''s, or one''s — newest first: each job''s handle (`<node>:<id>`, what repo_job_status, repo_job_log and repo_job_cancel take), where it is (fetching, waiting for the checkout, running, or how it ended), its repository and branch, its command, how long it has run and how many lines it has printed; and per machine, how many job slots are busy. Use for: seeing what builds where before a deploy, and finding a job whose handle you no longer have. Jobs live in their agent''s process, so an agent''s restart forgets them. Triggered by "what is building", "list the agent jobs". Returns each machine''s jobs by handle.'
 high_risk: true

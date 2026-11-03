@@ -6,6 +6,16 @@ questions:
 - the agent build is stuck, stop it
 - abort the release build
 - cancel that build job
+- the release build is on the wrong commit, stop it
+- kill the job waiting for the checkout
+- stop the agent job before it runs
+- cancel the deploy's build
+- the build is taking forever, kill it
+- abort the job on whiteworld's agent
+- stop that cargo build on the agent
+- kill the stuck build job
+- cancel the job I just started on the agent
+- end the running build on blackworld
 category: Commands
 description: 'Stop a build-agent job, whatever it is doing: one still fetching origin or waiting for its checkout never runs, and a running one is killed with everything it started; nothing is staged, and the checkout is put back as it was. A job that has already ended is left as it ended, and the answer says how. Cancelling a deploy''s build ends the deploy; once its trial has begun, stop it with service_cancel. `job` is a handle, `<node>:<id>`. Use for: a build started by mistake or one that is stuck. Triggered by "kill that agent job", "stop the build". Returns how the job stands now.'
 high_risk: true
