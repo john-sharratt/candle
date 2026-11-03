@@ -146,7 +146,8 @@ pub fn choose(
         if free(h) && !outranked {
             return Choice::Run(h.node);
         }
-        if !waited && dedicated(h) {
+        // A busy dedicated holder is waited for; a free one outranked is not.
+        if !free(h) && !waited && dedicated(h) {
             return Choice::Wait;
         }
     }
