@@ -17,7 +17,7 @@ questions:
 - watch the test run's output as it comes
 - read the task's prompt and answer
 category: Commands
-description: 'Read one page of a job''s output — 200 lines, numbered across the whole output, so a line number another answer gave is the line here. A build''s output is its log; a deploy''s, its build''s log then its trial''s; a task''s, its prompt, journal entries, answer and turn report; a maintenance job''s, its steps. A page the job is still writing waits until it fills, the job ends, or `wait_s` passes (30 by default, at most 300), then answers what is there: follow a running job by reading the next page as each one fills. A page past the end answers the last page. job_status says how many pages there are and which line a failure is on: page = line ÷ 200, rounded up. Use for: reading what a summary pointed at, or following a job live. Triggered by "read the build log", "show the next page". Returns the page and how to read on.'
+description: 'Read one page of a job''s output — 200 lines, numbered across the whole output, so a line number another answer gave is the line here. A build''s output is its log; a deploy''s, its build''s log then its trial''s; a task''s, its prompt, journal entries, answer and turn report; a maintenance job''s, its steps. A page the job is still writing waits until it fills, the job ends, or `wait_s` passes (at most 300; 0 answers at once — always give it), then answers what is there: follow a running job by reading the next page as each one fills. A page past the end answers the last page. job_status says how many pages there are and which line a failure is on: page = line ÷ 200, rounded up. Use for: reading what a summary pointed at, or following a job live. Triggered by "read the build log", "show the next page". Returns the page and how to read on.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -32,13 +32,14 @@ parameters:
       minimum: 1.0
       type: integer
     wait_s:
-      description: Seconds to wait for the page to fill; 30 by default, 0 to answer at once. Optional.
+      description: Seconds to wait for the page to fill, at most 300; 0 to answer at once. Required — write the wait you mean.
       maximum: 300.0
       minimum: 0.0
       type: integer
   required:
   - job
   - page
+  - wait_s
   title: ReadRequest
   type: object
 examples:
@@ -46,11 +47,11 @@ examples:
   job_status said the first error is on line 812<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Line 812 is on page 5: lines 801 to 1000. The build has ended, so the page answers at once.<|projection|>
+  Line 812 is on page 5: lines 801 to 1000. The build has ended, so there is nothing to wait for.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "job_read", "arguments": {"job": "build:76c3a0f4d39bd9db:XeV_I_QPzpg", "page": 5}}
+  <|projection|>{"name": "job_read", "arguments": {"job": "build:76c3a0f4d39bd9db:XeV_I_QPzpg", "page": 5, "wait_s": 0}}
   </tool_call><|projection|>
 - |-
   follow the deploy as it builds<|im_end|>

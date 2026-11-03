@@ -17,7 +17,7 @@ questions:
 - is the maintenance command on the member done
 - wait on the build and the deploy together
 category: Commands
-description: 'Say where jobs are — tasks, builds and test runs, deploys, maintenance jobs — and wait up to `wait_s` seconds (60 by default, at most 300; 0 answers at once) for any one of them to end. Give every job you are waiting on in one call: it answers as soon as the first ends, so call it again for the rest. For each job: where it is — a build''s phase, a deploy''s stage, a task''s state — and once ended, how it went: a build''s or trial''s test results and first errors and failures with their line numbers, a task''s answer and the journal entries it wrote since you last heard, a maintenance job''s result; then `pages: N` of output, which job_read pages and job_grep searches. Waiting is one call, never a loop of calls. A handle is exactly what the call that started the job answered: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or `cluster:<node>:<n>`. Use for: waiting on what you started. Triggered by "is the build done", "wait for the deploy". Returns each job''s standing and the next call to make.'
+description: 'Say where jobs are — tasks, builds and test runs, deploys, maintenance jobs — and wait up to `wait_s` seconds (at most 300; 0 answers at once — always give it) for any one of them to end. Give every job you are waiting on in one call: it answers as soon as the first ends, so call it again for the rest. For each job: where it is — a build''s phase, a deploy''s stage, a task''s state — and once ended, how it went: a build''s or trial''s test results and first errors and failures with their line numbers, a task''s answer and the journal entries it wrote since you last heard, a maintenance job''s result; then `pages: N` of output, which job_read pages and job_grep searches. Waiting is one call, never a loop of calls. A handle is exactly what the call that started the job answered: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or `cluster:<node>:<n>`. Use for: waiting on what you started. Triggered by "is the build done", "wait for the deploy". Returns each job''s standing and the next call to make.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -30,12 +30,13 @@ parameters:
       minItems: 1
       type: array
     wait_s:
-      description: Seconds to wait for one of them to end; 60 by default, 0 to answer at once. Optional.
+      description: Seconds to wait for one of them to end, at most 300; 0 to answer at once. Required — write the wait you mean.
       maximum: 300.0
       minimum: 0.0
       type: integer
   required:
   - jobs
+  - wait_s
   title: StatusRequest
   type: object
 examples:

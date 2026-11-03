@@ -101,12 +101,12 @@ mod tests {
         let req = job::ReadRequest {
             job: "build:76c3a0f4d39bd9db:Xe".into(),
             page: 2,
-            wait_s: None,
+            wait_s: 120,
         };
         let report = forward(&ctx, "job_read", &req).unwrap();
         assert_eq!(
             report.answer,
-            r#"job_read {"job":"build:76c3a0f4d39bd9db:Xe","page":2}"#
+            r#"job_read {"job":"build:76c3a0f4d39bd9db:Xe","page":2,"wait_s":120}"#
         );
         let refused = forward(
             &ctx,

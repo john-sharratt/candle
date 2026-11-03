@@ -65,11 +65,10 @@ pub struct StatusRequest {
     #[validate(length(min = 1, max = 16))]
     pub jobs: Vec<String>,
     /// Seconds to wait for one of them to end, at most 300 — a worker's
-    /// ceiling. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
+    /// ceiling; 0 answers at once. Required: an optional wait is the one the
+    /// model leaves out, and the call then waits a default nobody chose.
     #[validate(range(max = 300))]
-    pub wait_s: Option<u32>,
+    pub wait_s: u32,
 }
 
 pub struct JobStatus;
@@ -101,11 +100,10 @@ pub struct ReadRequest {
     /// The page, from 1. Required.
     #[validate(range(min = 1))]
     pub page: u64,
-    /// Seconds to wait for the page to fill. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
+    /// Seconds to wait for the page to fill, at most 300; 0 answers at once.
+    /// Required, as `job_status`'s is.
     #[validate(range(max = 300))]
-    pub wait_s: Option<u32>,
+    pub wait_s: u32,
 }
 
 pub struct JobRead;
