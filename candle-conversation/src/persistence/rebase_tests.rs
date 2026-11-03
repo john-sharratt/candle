@@ -115,6 +115,10 @@ fn a_rejoin_fixes_the_generation_wherever_records_are_read_back() {
     };
     let check = |substrate: &Substrate, sp: &mut SubstratePersistence, context: &str| {
         assert!(!sp.is_detached(), "{context}");
+        assert!(
+            !sp.own_hold.said_detached(),
+            "{context}: a rebased record placed again is not written detached"
+        );
         for (stream, id) in [first, second] {
             let fixed = RecordIdentity { gen: 1, ..id };
             assert_eq!(held(substrate, sp, stream), fixed, "{context}");

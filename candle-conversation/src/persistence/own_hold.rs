@@ -54,6 +54,12 @@ impl OwnHold {
         );
     }
 
+    /// Whether this process has said it writes detached.
+    #[cfg(test)]
+    pub(super) fn said_detached(&self) -> bool {
+        self.detached.load(Ordering::Relaxed)
+    }
+
     /// The gap to say at `now_ms`: one that has held [`SAY_AFTER`], once.
     fn note(&self, hold: Option<(u64, u64)>, now_ms: u64) -> Option<(u64, u64)> {
         let Some((start, end)) = hold else {

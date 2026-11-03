@@ -1968,7 +1968,9 @@ impl SubstratePersistence {
     /// The runtime twin of [`observe_replica`]: a record just placed at
     /// `(segment, offset)` is where its identity is now; another origin's
     /// record is applied; and one of this node's own, written for the first
-    /// time and not cut off, is tapped (§6.3).
+    /// time and not cut off, is tapped (§6.3). A compaction places records
+    /// again, so one written cut off is judged by the generation a rejoin fixed
+    /// for it, not the provisional one its header still carries.
     fn track_identity(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64) {
         let id = h.identity();
         if id.is_none() {
@@ -1979,7 +1981,7 @@ impl SubstratePersistence {
             if self.replica.applied.insert(id.origin, id.oseq) {
                 self.replica_dirty = true;
             }
-        } else if id.gen == GEN_DETACHED {
+        } else if self.rebases.fix(id).gen == GEN_DETACHED {
             self.own_hold.wrote_detached(id.oseq);
         } else if self.own_written.insert(id.oseq) {
             if let Some(tap) = &self.tap {
