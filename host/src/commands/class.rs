@@ -68,7 +68,7 @@ pub fn class_of(name: &str) -> Option<Class> {
 impl Command {
     pub fn class(&self) -> Class {
         match self {
-            Command::Audit | Command::SelfCheck | Command::CheckDisk => Class::Look,
+            Command::Audit { .. } | Command::SelfCheck | Command::CheckDisk => Class::Look,
             Command::Drain
             | Command::Undrain
             | Command::Compact
