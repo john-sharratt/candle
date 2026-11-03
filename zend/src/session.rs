@@ -1528,7 +1528,7 @@ impl InferenceState {
         }
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/grounding/tools_intro) →
-        // then the `tools` collection (90+ tool sections, top_k=3) →
+        // then the `tools` collection (90+ tool sections, top_k=5) →
         // then `tools_outro`.  The pre-collection prelude is what we
         // pass as the engine's `system_prompt` so it gets ChatML-wrapped
         // for the dialect; everything after the first Collection is
@@ -9328,7 +9328,8 @@ mod projection_schema_tests {
         );
         // Strict normalized-band gate (reverted from the too-permissive min 112).
         assert_eq!(tools.policy.config.min_score, 800.0);
-        assert_eq!(tools.policy.config.budget_max, 3);
+        // Five signatures a turn: a delegated task names several tools.
+        assert_eq!(tools.policy.config.budget_max, 5);
 
         // Dialogue stays recency-driven — no scan concepts apply.
         let dialogue = layer("dialogue");

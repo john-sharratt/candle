@@ -634,7 +634,7 @@ system_prompt:
       # overrides this bundled catalog (a mind/game's own tools; empty = tool-free).
       # The belief-driven tool scope on the NORMALIZED 0–1000 hit-level band
       # (Concept A, docs/provenance_adaptive_projection.md §3): RelLeak β0.40,
-      # hysteresis min112/evict60, budget 1..4, pinned-per-turn. `tags: [tool]`
+      # hysteresis min800/evict600, budget 1..5, pinned-per-turn. `tags: [tool]`
       # scopes the gather to tool-tagged calibration turns plus any live
       # conversation that reinforces them. Thresholds from the full-corpus
       # normalized sweep (results doc §25.8: 745 turns × 93 tools).
@@ -684,10 +684,15 @@ system_prompt:
         early_window_tokens: 64
         early_min_score: 250
         early_evict_score: 187.5
-      # `selection` mirrors the policy budget (max 3) for the pre-belief
+        # Up to five signatures a turn. Three left a delegated task that names
+        # several tools — "call job_status …, then job_grep …" — showing none of
+        # them: build-flavoured tools matched the prompt's cargo words and took
+        # every slot, and the model guessed the named tools' arguments.
+        budget: { min: 1, max: 5 }
+      # `selection` mirrors the policy budget (max 5) for the pre-belief
       # selection path; once the belief loop drives selection the policy's
       # budget is the single source of truth.
-      selection: { kind: top_k, k: 3 }
+      selection: { kind: top_k, k: 5 }
       sections: []
 
     - kind: template

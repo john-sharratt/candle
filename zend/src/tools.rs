@@ -111,7 +111,7 @@ pub struct ToolResult {
 /// Static framing sections (mode/frame/grounding/tools_intro/
 /// tools_outro) are *outside* the collection — they always emit.  The
 /// collection's own selection rule (declared in YAML, typically
-/// `TopK { k: 3 }`) is what filters the tool list.
+/// `TopK { k: 5 }`) is what filters the tool list.
 pub fn install_tool_catalog(
     builder: &mut ProjectionBuilder,
 ) -> anyhow::Result<Vec<(String, SectionId, String)>> {
