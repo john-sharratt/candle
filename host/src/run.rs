@@ -53,6 +53,8 @@ use crate::telemetry::Telemetry;
 use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
 use agent::config::AgentConfig;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 
 /// One forward in this many records its GPU spans in a profiling build (see
 /// `set_gpu_span_period`). At a decode step of ~35 ms that is a sampled forward
@@ -236,7 +238,13 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     let installer = HostInstaller::new(Arc::clone(&stopping));
     let upgrade = upgrade_setup(cfg.binary, &launch, &state_dir, &cfg.args);
 
-    let runtime = match RuntimeBuilder::new_multi_thread().enable_all().build() {
+    let mut builder = RuntimeBuilder::new_multi_thread();
+    builder.enable_all();
+    // Every runtime thread — worker and blocking pool alike — makes its blocks
+    // in the async scope unless a guard narrows it.
+    #[cfg(feature = "memory-census")]
+    builder.on_thread_start(|| set_thread(Scope::Async));
+    let runtime = match builder.build() {
         Ok(r) => r,
         Err(e) => fail(&format!("could not start the runtime: {e}")),
     };
@@ -316,6 +324,10 @@ fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
             }
             if ready {
                 eprintln!("{PROOF}");
+                // Loaded: the census judges growth from here, not across the
+                // load.
+                #[cfg(feature = "memory-census")]
+                memory_census::loaded();
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;

@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8198,6 +8201,8 @@ impl ZendSession {
         let loader_handle = std::thread::Builder::new()
             .name("zend-loader".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Loader);
                 load_progress.set_step(LoadStep::Model);
                 status_tx.send("Checking for model…".into()).ok();
 

@@ -4,6 +4,9 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "memory-census")]
+use heap_census::{enter, Scope};
+
 use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePayload};
 use super::super::replica::DeferredRecord;
@@ -111,11 +114,15 @@ impl SubstratePersistence {
         checks: &[Checked],
         n_layers: usize,
     ) -> Result<RemoteBatch> {
+        #[cfg(feature = "memory-census")]
+        let _scope = enter(Scope::RemoteApply);
         let decided = self.decide_remote(substrate, records, checks)?;
         let reload = substrate.take_reload_due();
         let adopted = if reload {
             Vec::new()
         } else {
+            #[cfg(feature = "memory-census")]
+            let _scope = enter(Scope::Adoption);
             plan_adoptions(self, substrate, &decided.turns, n_layers)?
                 .iter()
                 .filter_map(|a| a.place(substrate))
@@ -142,6 +149,8 @@ impl SubstratePersistence {
         checks: &[Checked],
         n_layers: usize,
     ) -> Result<RemoteBatch> {
+        #[cfg(feature = "memory-census")]
+        let _scope = enter(Scope::RemoteApply);
         let t0 = Instant::now();
         let mut work = Substrate::clone(&lock.read());
         let t_clone = t0.elapsed();
@@ -151,6 +160,8 @@ impl SubstratePersistence {
         let plans = if planned_reload {
             Vec::new()
         } else {
+            #[cfg(feature = "memory-census")]
+            let _scope = enter(Scope::Adoption);
             plan_adoptions(self, &work, &decided.turns, n_layers)?
         };
         let t_plan = t0.elapsed() - t_clone - t_decide;

@@ -32,6 +32,8 @@ use crate::stencil::{
     TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner.
 use crate::substrate::{ConvCompression, Substrate};
@@ -532,6 +534,8 @@ impl ConversationEngine {
         let handle = std::thread::Builder::new()
             .name("conversation-scheduler".into())
             .spawn(move || {
+                #[cfg(feature = "memory-census")]
+                set_thread(Scope::Scheduler);
                 let t_init = std::time::Instant::now();
                 let mut scheduler = Scheduler::new(
                     rx,

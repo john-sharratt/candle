@@ -3,6 +3,7 @@
 use super::classes::CLASSES;
 use super::counting::{installed, CENSUS};
 use super::os::{process_memory, OsHeap};
+use super::scope::SCOPES;
 
 /// What the process held at one moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,9 @@ pub struct Reading {
     /// Live bytes per size class from the counting allocator, when it is
     /// installed.
     pub classes: Option<[u64; CLASSES]>,
+    /// Live bytes per scope of the blocks that carry one, when the counting
+    /// allocator is installed.
+    pub scopes: Option<[u64; SCOPES]>,
     /// Bytes ever allocated through the counting allocator, when installed.
     pub allocated_total: Option<u64>,
 }
@@ -39,21 +43,26 @@ impl Reading {
     /// Read now, at `at_ms`. `None` where the platform reads no process.
     pub fn take(at_ms: u64) -> Option<Reading> {
         let p = process_memory()?;
-        let (classes, allocated_total) = if installed() {
+        let (classes, scopes, allocated_total) = if installed() {
             let n = CENSUS.counts();
             let mut c = [0u64; CLASSES];
             for (k, class) in n.classes.iter().enumerate() {
                 c[k] = class.bytes;
             }
-            (Some(c), Some(n.allocated_total))
+            let mut s = [0u64; SCOPES];
+            for (i, bytes) in s.iter_mut().enumerate() {
+                *bytes = n.scope_bytes(i);
+            }
+            (Some(c), Some(s), Some(n.allocated_total))
         } else {
-            (None, None)
+            (None, None, None)
         };
         Some(Reading {
             at_ms,
             private_bytes: p.private_bytes,
             heap: p.heap,
             classes,
+            scopes,
             allocated_total,
         })
     }

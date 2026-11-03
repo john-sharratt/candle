@@ -72,6 +72,8 @@ use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
 use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
+#[cfg(feature = "memory-census")]
+use heap_census::{set_thread, Scope};
 use tokio::runtime::{Handle, Runtime};
 use tokio::time::interval;
 use tokio_rustls::TlsConnector;
@@ -235,10 +237,14 @@ impl Cluster {
         };
         // Four workers. A session task can sit in one while the readers and
         // writers are still polled on the others.
-        let sockets = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             .worker_threads(4)
             .thread_name("cluster-socket")
-            .enable_all()
+            .enable_all();
+        #[cfg(feature = "memory-census")]
+        builder.on_thread_start(|| set_thread(Scope::Cluster));
+        let sockets = builder
             .build()
             .map_err(|e| anyhow::anyhow!("could not start the cluster socket runtime: {e}"))?;
         // A watchdog on that runtime: a reader it does not poll for 45 s closes

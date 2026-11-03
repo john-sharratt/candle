@@ -45,7 +45,7 @@ fn kept_buffers_are_named_as_an_owner_in_their_class() {
 
     let g = judge(&before, &after, THRESHOLD);
     match &g.verdict {
-        Verdict::Owner { classes } => {
+        Verdict::Owner { classes, .. } => {
             assert_eq!(classes[0].class, 15, "{g:?}");
             assert!(classes[0].grew_bytes >= LEAKED as i64, "{g:?}");
         }

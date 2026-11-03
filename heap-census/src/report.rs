@@ -1,10 +1,14 @@
 //! The census as `/v1/memory` carries it under `process`.
 
+use std::cmp::Reverse;
+
 use serde::Serialize;
 
-use super::classes::upto_bytes;
-use super::counting::{installed, CENSUS};
+use super::classes::{upto_bytes, CLASSES};
+use super::counting::{installed, CENSUS, LABELLED_FROM};
 use super::os::{private_bytes, OsHeap};
+use super::scope::Scope;
+use super::shards::ClassCount;
 
 /// One non-empty size class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -24,6 +28,36 @@ pub struct AllocatorCounts {
     pub freed_total: u64,
     /// The non-empty classes, smallest first.
     pub classes: Vec<ClassLine>,
+    /// The smallest block that carries its scope: every scope line counts
+    /// blocks of this many bytes or more.
+    pub scoped_from_bytes: usize,
+    /// The scopes holding anything, most bytes first.
+    pub scopes: Vec<ScopeLine>,
+}
+
+/// What one scope's blocks hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeLine {
+    pub scope: &'static str,
+    pub live_bytes: u64,
+    pub live_count: u64,
+    /// Its non-empty classes, smallest first.
+    pub classes: Vec<ClassLine>,
+}
+
+/// The non-empty classes of `counts`, smallest first.
+fn class_lines(counts: &[ClassCount; CLASSES]) -> Vec<ClassLine> {
+    counts
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.count > 0 || c.bytes > 0)
+        .map(|(k, c)| ClassLine {
+            class: k,
+            upto_bytes: upto_bytes(k),
+            live_bytes: c.bytes,
+            live_count: c.count,
+        })
+        .collect()
 }
 
 /// The process heap's own figures, as reported.
@@ -76,24 +110,26 @@ pub fn allocator_counts() -> Option<AllocatorCounts> {
         return None;
     }
     let n = CENSUS.counts();
-    let classes = n
-        .classes
+    let mut scopes: Vec<ScopeLine> = Scope::ALL
         .iter()
-        .enumerate()
-        .filter(|(_, c)| c.count > 0 || c.bytes > 0)
-        .map(|(k, c)| ClassLine {
-            class: k,
-            upto_bytes: upto_bytes(k),
-            live_bytes: c.bytes,
-            live_count: c.count,
+        .zip(&n.scopes)
+        .map(|(s, counts)| ScopeLine {
+            scope: s.name(),
+            live_bytes: counts.iter().map(|c| c.bytes).sum(),
+            live_count: counts.iter().map(|c| c.count).sum(),
+            classes: class_lines(counts),
         })
+        .filter(|l| l.live_bytes > 0 || l.live_count > 0)
         .collect();
+    scopes.sort_by_key(|l| Reverse(l.live_bytes));
     Some(AllocatorCounts {
         live_bytes: n.live_bytes(),
         live_count: n.live_count(),
         allocated_total: n.allocated_total,
         freed_total: n.freed_total(),
-        classes,
+        classes: class_lines(&n.classes),
+        scoped_from_bytes: LABELLED_FROM,
+        scopes,
     })
 }
 

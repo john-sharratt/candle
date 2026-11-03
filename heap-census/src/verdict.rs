@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use super::classes::{upto_bytes, CLASSES};
 use super::reading::Reading;
+use super::scope::Scope;
 
 /// One size class's growth over the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -25,6 +26,13 @@ pub struct ClassGrowth {
     pub class: usize,
     /// The largest request the class holds.
     pub upto_bytes: u64,
+    pub grew_bytes: i64,
+}
+
+/// One scope's growth over the window, in the blocks that carry their scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScopeGrowth {
+    pub scope: &'static str,
     pub grew_bytes: i64,
 }
 
@@ -36,9 +44,12 @@ pub enum Verdict {
     Steady,
     /// The heap committed more while our code held no more: freed memory kept.
     Retention,
-    /// Our code holds more. The classes that grew most, largest first, when the
-    /// counting allocator is installed.
-    Owner { classes: Vec<ClassGrowth> },
+    /// Our code holds more. The classes and the scopes that grew most, largest
+    /// first, when the counting allocator is installed.
+    Owner {
+        classes: Vec<ClassGrowth>,
+        scopes: Vec<ScopeGrowth>,
+    },
     /// The process grew, but neither its heap nor our code did: a native
     /// library's own heap, a mapping, or direct virtual allocation.
     OutsideHeap,
@@ -83,6 +94,7 @@ pub fn judge(old: &Reading, new: &Reading, threshold: u64) -> Growth {
     } else if explains(live_grew) && heap_grew {
         Verdict::Owner {
             classes: grown_classes(old, new),
+            scopes: grown_scopes(old, new),
         }
     } else if committed_grew.is_none() {
         Verdict::NotHeld
@@ -119,16 +131,41 @@ pub fn grown_classes(old: &Reading, new: &Reading) -> Vec<ClassGrowth> {
     grown
 }
 
+/// The scopes that grew most from `old` to `new`, largest first, at most
+/// [`NAMED_CLASSES`]; none without the counting allocator.
+pub fn grown_scopes(old: &Reading, new: &Reading) -> Vec<ScopeGrowth> {
+    let (Some(o), Some(n)) = (&old.scopes, &new.scopes) else {
+        return Vec::new();
+    };
+    let mut grown: Vec<ScopeGrowth> = Scope::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ScopeGrowth {
+            scope: s.name(),
+            grew_bytes: n[i] as i64 - o[i] as i64,
+        })
+        .filter(|g| g.grew_bytes > 0)
+        .collect();
+    grown.sort_by_key(|g| Reverse(g.grew_bytes));
+    grown.truncate(NAMED_CLASSES);
+    grown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::os::OsHeap;
+    use crate::scope::SCOPES;
 
     const GIB: u64 = 1 << 30;
 
+    /// A reading whose live bytes are all in class 15, made in the remote
+    /// apply's scope.
     fn reading(at_ms: u64, private: u64, committed: u64, live: u64) -> Reading {
         let mut classes = [0u64; CLASSES];
         classes[15] = live;
+        let mut scopes = [0u64; SCOPES];
+        scopes[Scope::RemoteApply as usize] = live;
         Reading {
             at_ms,
             private_bytes: private,
@@ -138,6 +175,7 @@ mod tests {
                 read_us: 0,
             }),
             classes: Some(classes),
+            scopes: Some(scopes),
             allocated_total: Some(0),
         }
     }
@@ -168,9 +206,9 @@ mod tests {
         );
     }
 
-    /// **Live up: an owner, named by the class that grew.**
+    /// **Live up: an owner, named by the class and the scope that grew.**
     #[test]
-    fn live_growing_is_an_owner_named_by_its_class() {
+    fn live_growing_is_an_owner_named_by_its_class_and_scope() {
         let g = judge(
             &reading(0, 225 * GIB, 60 * GIB, 30 * GIB),
             &reading(1, 229 * GIB, 64 * GIB, 34 * GIB),
@@ -183,8 +221,26 @@ mod tests {
                     class: 15,
                     upto_bytes: 32_768,
                     grew_bytes: 4 * GIB as i64
+                }],
+                scopes: vec![ScopeGrowth {
+                    scope: "remote_apply",
+                    grew_bytes: 4 * GIB as i64
                 }]
             }
+        );
+    }
+
+    /// **An owner serialises with its classes and its scopes.**
+    #[test]
+    fn an_owner_reads_as_json() {
+        let g = judge(
+            &reading(0, 0, 0, 0),
+            &reading(60_000, 4 * GIB, 4 * GIB, 4 * GIB),
+            2 * GIB,
+        );
+        assert_eq!(
+            serde_json::to_string(&g).unwrap(),
+            r#"{"over_ms":60000,"private_grew":4294967296,"committed_grew":4294967296,"live_grew":4294967296,"verdict":"owner","classes":[{"class":15,"upto_bytes":32768,"grew_bytes":4294967296}],"scopes":[{"scope":"remote_apply","grew_bytes":4294967296}]}"#
         );
     }
 
