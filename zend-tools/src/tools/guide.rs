@@ -32,7 +32,7 @@ impl ToolError for GuideError {
 }
 
 /// What a guide tool answers.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct GuideText {
     pub text: String,
 }
