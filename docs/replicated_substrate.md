@@ -1092,7 +1092,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `CAPACITY` | `{ state, power, idle, slots_free, decodes, prefill_backlog, vram_free_mib, cores, load, …, prefill_tok_s, decode_step_next_us, decode_step_wide_us, prefill_tok_s_wide }` every 1 s or on change | control |
 | `PING` / `PONG` | 8-byte nonce | control |
 | `ROUTES` | the member's dispatch table (§5.2) | control |
-| `CLAIM` / `UNCLAIM` | `{ key, epoch }` / `{ key, epoch, through }` — this member serves `key` (a sticky key or a lease), or has let it go with its own `oseq` at `through` (§5.4, §9) | control |
+| `CLAIM` / `UNCLAIM` | `{ key, epoch }` / `{ key, epoch, through }` — this member serves `key` (a sticky key or a lease), or has let it go through the key's own last state record at `through` (§5.4, §9). Only the holder's node sends either: a gateway relays them and never makes one up | control |
 | `PREPARE` / `PROMISE` / `NACK` | `{ key, ballot }` / `{ key, ballot, accepted, from, reply_to }` / `{ key, promised, from, reply_to }` — Paxos phase 1 between members: a proposer asking, each member answering as an acceptor (§5.9). A request's sender is its ballot's node; a reply names its acceptor in `from`, so a quorum counts distinct acceptors however many clusters a reply came through | control |
 | `PROPOSE` / `ACCEPTED` | `{ key, ballot, value }` / `{ key, ballot, from, reply_to }` — Paxos phase 2 | control |
 | `RELEASE` | `{ key, ballot, through }` — a lease holder handing the lease back (§5.9, §9.6) | control |
@@ -1142,7 +1142,7 @@ misread, and on an admitted socket closes it 4400.
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding: each route's methods, path, dispatch, mirror and, from protocol 6, `u8 reach`) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
-| `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` (the key's own last state record's `oseq`, protocol 4) |
+| `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` (the key's own last state record's `oseq`, or the member's own `oseq` when the app names none for the key, protocol 4) |
 | `COORD` | 17 | `blob state` (§12.1's encoding) |
 | `COMPLETE` | 18 | `list<blob> keys` — keys let go that the member holds complete (protocol 4; `cooperative_admission.md` §2.2) |
 | `PLAN` | 19 | `u64 epoch` · `list<u64 node · u32 weight>` — the weights the app's characters are lent by, gateway to member (protocol 7; `cooperative_admission.md` §4.4) |
@@ -1553,6 +1553,30 @@ that released — drained for an install and back under the same node — and it
 at the first gap a purge left (§7.8) and would hold the wait below `through` for ever:
 on 2026-11-01 WhiteWorld's npcd, the only one in its group, came back from an install
 and ran no world for as long as it was up.
+
+**Only the holder releases a claim, and a gateway keeps one until it does** — through
+the holder's sessions ending, reconnecting, or being replaced. A gateway never makes up
+an `UNCLAIM` on a member's behalf: it does not know the key's last record, it cannot tell
+a member that reconnected still holding its claims from one that restarted, and a release
+it sent between a reconnect and the member's re-announced `CLAIM` would let a peer take
+the key at a higher epoch from a holder still serving it. Two rules keep the table true
+instead:
+
+- **A member admitted takes in no claim of its own node that it does not hold**
+  (`MemberClaims::admitted`). `ADMIT`'s table may name this node at an epoch its process
+  holds nothing at: its previous process's, after a restart, or one it let go on a socket
+  that died before the gateway heard. The member is that claim's holder, so it releases it
+  with `UNCLAIM { key, epoch, through }` on the new socket, through the key's own last
+  record as any release is; the gateway relays it, and the gateway and every peer stop
+  naming it. A member that reconnected in the same process holds the claim at that epoch,
+  keeps it, and announces it again.
+- **A replaced session claims nothing.** A `CLAIM` still queued on a socket the node has
+  reconnected past is dropped at the gateway: a process still holding the claim announces
+  it on its new session, and one that restarted holds nothing.
+
+A gateway's table names a holder that has left — every one of its sessions over — until
+that holder returns and releases or re-announces it; routing and the plan consult only
+members present, so such an entry sends nothing anywhere.
 
 A holder that left every cluster loses it without an `UNCLAIM`:
 

@@ -18,7 +18,7 @@ use applied_set::AppliedSet;
 use super::agents::named_standby;
 use super::claims::Claims;
 use crate::dispatch::RouteTable;
-use crate::frame::{Capacity, ClaimInfo, MemberInfo, Unclaim};
+use crate::frame::{Capacity, ClaimInfo, MemberInfo};
 use crate::machines::MachineTable;
 use handover::Handover;
 
@@ -136,31 +136,6 @@ impl Registry {
         let a = self.app(&member.app.clone());
         a.members.insert(member.node, member);
         a.epoch += 1;
-    }
-
-    /// **A node's claims end with its session** (`docs/static_placement.md`
-    /// §5.1): forgotten when the session leaves, and when the node is admitted
-    /// again — before its `ADMIT` is built, so the table it is sent never names
-    /// it the holder of a key it may no longer hold. A member that still holds
-    /// them announces them anew once admitted; one that crashed holds none,
-    /// and kept, they would make its card busy for good. Each key forgotten is
-    /// released as its holder would release it — through the highest of its
-    /// own records heard — and returned as the `UNCLAIM` the other members
-    /// are told, so no one still names the node its holder.
-    pub fn forget_claims(&mut self, app: &str, node: u64) -> Vec<Unclaim> {
-        let a = self.app(app);
-        let through = a.seen.get(&node).copied().unwrap_or(0);
-        let gone = a.claims.forget(node);
-        for (key, _) in &gone {
-            self.released(app, key, node, through);
-        }
-        gone.into_iter()
-            .map(|(key, epoch)| Unclaim {
-                key,
-                epoch,
-                through,
-            })
-            .collect()
     }
 
     /// `node`'s `session` ended; a newer session of the node stays.

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::dispatch::KeySource;
-use crate::frame::{BuildId, Epoch, Unclaim};
+use crate::frame::{BuildId, Epoch};
 use crate::gateway::planner::Planner;
 use crate::machines::MachineTable;
 
@@ -266,11 +266,11 @@ fn a_delegated_task_makes_its_machine_busy() {
 }
 
 /// **A member that crashed holding a task's claim leaves its card free once it
-/// is back**: its re-admission — before the old session's close is seen —
-/// forgets its claims, as the hub does before building its `ADMIT`, and each
-/// is released through its own records heard; a session that ends takes its
-/// claims with it. Kept, they made the card busy for good and the cast never
-/// came back.
+/// is back.** The gateway keeps the claim — only its holder releases one
+/// (§5.4) — so the card is busy while the old process is gone and the new one
+/// rejoins; a departed member's claims make no card busy, having no card here.
+/// The restarted process, sent the claim in its `ADMIT` and holding nothing,
+/// releases it (`MemberClaims::admitted`), and the card is free 120 s after.
 #[test]
 fn a_rejoined_member_s_card_is_free_again() {
     let mut r = registry(
@@ -290,39 +290,35 @@ fn a_rejoined_member_s_card_is_free_again() {
         "busy with the task"
     );
 
-    // It crashes and comes back as a new session.
-    r.applied("zend", 1, vec![(1, 40)]);
-    let released = r.forget_claims("zend", 1);
-    assert_eq!(
-        released,
-        vec![Unclaim {
-            key: b"task-conversation".to_vec(),
-            epoch: Epoch { ms: 1, node: 1 },
-            through: 40,
-        }],
-        "told to the others, through its records heard"
-    );
+    // It crashes: gone, it makes no card busy, but the claim stands.
+    assert!(r.leave("zend", 1, 1));
+    assert_eq!(r.claims("zend").holder(b"task-conversation"), Some(1));
+    assert_eq!(r.card_views()[0].latency, 0, "no member, no work here");
+
+    // It comes back as a new process, sent the claim in its ADMIT, and lets
+    // it go as its holder.
     r.join(MemberView {
         session: 11,
         ..on_card("zend", 1, "bw", 7)
     });
-    assert!(!r.leave("zend", 1, 1), "the old session's close, late");
+    assert_eq!(r.card_views()[0].latency, 1, "busy until it says otherwise");
     let back = t0 + Duration::from_secs(5);
-    assert_eq!(p.plan(back, &r.card_views()).weights, vec![(2, 0), (3, 1)]);
+    p.plan(back, &r.card_views());
+    assert!(r
+        .claims("zend")
+        .unclaim(b"task-conversation", Epoch { ms: 1, node: 1 }));
+    r.released("zend", b"task-conversation", 1, 40);
+    assert_eq!(
+        p.plan(back + Duration::from_secs(119), &r.card_views())
+            .weights,
+        vec![(2, 0), (3, 1)]
+    );
     assert_eq!(
         p.plan(back + Duration::from_secs(121), &r.card_views())
             .weights,
         vec![(2, 3), (3, 1)],
-        "free 120 s after it came back"
+        "free 120 s after its release"
     );
-
-    // A session that ends takes its claims with it.
-    r.claims("zend")
-        .claim(b"task-conversation", Epoch { ms: 2, node: 1 });
-    assert_eq!(r.card_views()[0].latency, 1);
-    assert!(r.leave("zend", 1, 11));
-    assert_eq!(r.forget_claims("zend", 1).len(), 1);
-    assert!(r.claims("zend").is_empty());
 }
 
 /// **A canary of an app that runs no model, alone and on a drawing card, makes

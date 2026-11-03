@@ -534,17 +534,33 @@ impl AppMember {
         F: Fn(VirtualConn) + Send + Sync + 'static,
     {
         let handle = session.handle.clone();
-        let lost: Vec<Vec<u8>> = {
+        // The table names this node the holder of claims it does not hold —
+        // its previous process's, or one let go on a socket that died before
+        // the gateway heard — and they are released here, as their holder,
+        // through each key's own last record (§5.4).
+        let (lost, stale) = {
             let mut claims = lock(&self.claims);
-            admit
-                .claims
-                .iter()
-                .filter(|claim| claims.heard(&claim.key, claim.epoch))
-                .map(|claim| claim.key.clone())
-                .collect()
+            let mut lost: Vec<Vec<u8>> = Vec::new();
+            let mut stale: Vec<(Vec<u8>, Epoch)> = Vec::new();
+            for claim in &admit.claims {
+                if let Some(epoch) = claims.admitted(&claim.key, claim.epoch) {
+                    stale.push((claim.key.clone(), epoch));
+                } else if claims.heard(&claim.key, claim.epoch) {
+                    lost.push(claim.key.clone());
+                }
+            }
+            (lost, stale)
         };
         for key in &lost {
             self.lost(key);
+        }
+        for (key, epoch) in stale {
+            let through = self.through_for(&key, self.own_through());
+            let _ = handle.control(Frame::Unclaim(Unclaim {
+                key,
+                epoch,
+                through,
+            }));
         }
         if admit.routes_wanted {
             let _ = handle.control(Frame::Routes(Routes {

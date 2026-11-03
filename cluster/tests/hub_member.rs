@@ -6,7 +6,7 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -14,12 +14,13 @@ use tokio::time::{sleep, timeout};
 
 use cluster::dial::{Connect, Stopped};
 use cluster::dispatch::{Dispatch, Route, RouteTable};
-use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
+use cluster::frame::{BuildId, Capacity, Epoch, Frame, Hello, MemberState, ModelId, Prove};
 use cluster::gateway::{Hub, MemberStream, Pick};
-use cluster::handshake::GroupKey;
+use cluster::handshake::{member_proof, nonce, GroupKey, PROTO};
 use cluster::machines::MachineTable;
 use cluster::member::{AppMember, Check, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
+use cluster::pipe::{Message, PipeRx, PipeTx};
 use cluster::session::VirtualConn;
 
 const IP: [u8; 4] = [10, 0, 0, 7];
@@ -304,15 +305,21 @@ async fn members_join_route_and_carry_streams() {
     assert!(hub.clustered("zend"));
 }
 
-/// **A member that restarts holding a claim is not left its holder by anyone**
-/// (`docs/static_placement.md` §5.1). A holds `c-1` and B knows it; a new
-/// process for A's node is admitted, replacing the old. Its `ADMIT` names no
-/// holder of `c-1`, B is told the claim is let go, and the gateway lists none —
-/// so the restarted member, holding nothing, takes the key with a `CLAIM` of
-/// its own when next asked, and all three agree it holds it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restarted_member_its_peer_and_the_gateway_agree_on_its_keys() {
-    let hub = Hub::new(key(), "gw-test");
+/// The claims the gateway lists: key, holder, epoch.
+fn listed(hub: &Hub) -> Vec<(String, String, u64)> {
+    hub.status(10)
+        .claims
+        .into_iter()
+        .map(|c| (c.key, c.node, c.epoch_ms))
+        .collect()
+}
+
+/// A hub with A (node 1) and B (node 2) ready, A holding `c-1` at the epoch
+/// returned, and B and the gateway told.
+async fn a_holds_c1(
+    hub: &Arc<Hub>,
+    up_tx: &mpsc::UnboundedSender<MemberStream>,
+) -> (Member, Member, u64) {
     hub.set_machines(
         MachineTable::from_yaml(
             "m1:\n  conversations: {rank: 1, min: 1, max: 4}\n\
@@ -320,9 +327,8 @@ async fn a_restarted_member_its_peer_and_the_gateway_agree_on_its_keys() {
         )
         .unwrap(),
     );
-    let (up_tx, _up) = mpsc::unbounded_channel();
-    let a = member(&hub, 1, build(10), model(1), &up_tx);
-    let b = member(&hub, 2, build(10), model(1), &up_tx);
+    let a = member(hub, 1, build(10), model(1), up_tx);
+    let b = member(hub, 2, build(10), model(1), up_tx);
     for m in [&a, &b] {
         m.ready.store(true, Ordering::SeqCst);
     }
@@ -332,19 +338,29 @@ async fn a_restarted_member_its_peer_and_the_gateway_agree_on_its_keys() {
     .await;
     a.app.capacity_changed();
     b.app.capacity_changed();
-    let listed = |hub: &Hub| -> Vec<(String, String)> {
-        hub.status(10)
-            .claims
-            .into_iter()
-            .map(|c| (c.key, c.node))
-            .collect()
+    let Check::Took(epoch) = a.app.claim(b"c-1") else {
+        panic!("A takes c-1");
     };
-    assert!(matches!(a.app.claim(b"c-1"), Check::Took(_)));
     until("B told", || b.app.holder_of(b"c-1") == Some(1)).await;
     until("the gateway told", || {
-        listed(&hub) == vec![("c-1".to_string(), "0000000000000001".to_string())]
+        listed(hub) == vec![("c-1".into(), "0000000000000001".into(), epoch.ms)]
     })
     .await;
+    (a, b, epoch.ms)
+}
+
+/// **A member that restarts holding a claim releases it, and everyone agrees**
+/// (§5.4). A holds `c-1` and B knows it; a new process for A's node is
+/// admitted, replacing the old. Its `ADMIT` still names node 1 the holder — the
+/// gateway keeps a claim until its holder lets it go — and the new process,
+/// holding nothing, does: it takes nothing in and `UNCLAIM`s it. B and the
+/// gateway hear the release, and the key, next asked for, is taken with a
+/// `CLAIM` of the new process's own that all three agree on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_member_releases_its_old_claims_and_everyone_agrees() {
+    let hub = Hub::new(key(), "gw-test");
+    let (up_tx, _up) = mpsc::unbounded_channel();
+    let (a, b, _) = a_holds_c1(&hub, &up_tx).await;
 
     // A restarts: a new process for node 1, holding nothing.
     let again = member(&hub, 1, build(10), model(1), &up_tx);
@@ -360,20 +376,137 @@ async fn a_restarted_member_its_peer_and_the_gateway_agree_on_its_keys() {
     assert_eq!(
         again.app.holder_of(b"c-1"),
         None,
-        "its ADMIT names no holder"
+        "it takes in no claim of its node it does not hold"
     );
     assert!(again.app.own_claims().is_empty());
-    until("B told it is let go", || b.app.holder_of(b"c-1").is_none()).await;
-    assert!(listed(&hub).is_empty(), "the gateway lists no holder");
+    until("released, and B and the gateway told", || {
+        b.app.holder_of(b"c-1").is_none() && listed(&hub).is_empty()
+    })
+    .await;
 
     // Asked for it, the restarted member takes it, and everyone agrees.
-    assert!(matches!(again.app.claim(b"c-1"), Check::Took(_)));
+    let Check::Took(epoch) = again.app.claim(b"c-1") else {
+        panic!("the restarted member takes c-1");
+    };
     until("all agree", || {
         b.app.holder_of(b"c-1") == Some(1)
-            && listed(&hub) == vec![("c-1".to_string(), "0000000000000001".to_string())]
+            && listed(&hub) == vec![("c-1".into(), "0000000000000001".into(), epoch.ms)]
     })
     .await;
     assert_eq!(b.app.claim(b"c-1"), Check::Held(1));
+}
+
+/// **A process that reconnects still holding its claims keeps them**: nobody
+/// releases them on its behalf. The gateway drops every socket; A and B dial
+/// again in the same processes. A's claim on `c-1` stands at its epoch at the
+/// gateway and at B throughout — never released, so B never had it to take —
+/// and A, still its holder, announces it again on its new session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_keeps_its_claims() {
+    let hub = Hub::new(key(), "gw-test");
+    let (up_tx, _up) = mpsc::unbounded_channel();
+    let (a, b, epoch_ms) = a_holds_c1(&hub, &up_tx).await;
+    let first = hub.member("zend", 1).unwrap().session;
+    let held = vec![("c-1".to_string(), "0000000000000001".to_string(), epoch_ms)];
+
+    hub.close_all("a blip");
+    until("A back on a new session", || {
+        hub.member("zend", 1).is_some_and(|m| m.session != first)
+            && a.app.link() == Link::Joined
+            && b.app.link() == Link::Joined
+    })
+    .await;
+    assert_eq!(listed(&hub), held, "the gateway kept it");
+    assert_eq!(
+        a.app.own_claims(),
+        vec![(
+            b"c-1".to_vec(),
+            Epoch {
+                ms: epoch_ms,
+                node: 1
+            }
+        )]
+    );
+    until("B sees its holder again", || {
+        b.app.holder_of(b"c-1") == Some(1)
+    })
+    .await;
+    assert_eq!(b.app.claim(b"c-1"), Check::Held(1));
+    let released = hub
+        .log
+        .read(Some("zend"), None, 100)
+        .into_iter()
+        .any(|e| e.text.starts_with("released"));
+    assert!(!released, "nobody let it go");
+}
+
+/// **A handshake that fails after its admission was decided changes nothing.**
+/// A second connection for node 1 proves itself and is decided — and is gone
+/// before its `ADMIT` can be sent. A stays admitted on its session, and its
+/// claim stands at the gateway and at B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_handshake_changes_nothing() {
+    let hub = Hub::new(key(), "gw-test");
+    let (up_tx, _up) = mpsc::unbounded_channel();
+    let (a, b, epoch_ms) = a_holds_c1(&hub, &up_tx).await;
+    let first = hub.member("zend", 1).unwrap().session;
+
+    let (m, g) = pair(1 << 20);
+    let served = {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            hub.serve("zend", IpAddr::from(IP), g.tx, g.rx, |_| {})
+                .await;
+        })
+    };
+    let (mut tx, mut rx) = (m.tx, m.rx);
+    let hello = Hello {
+        proto: PROTO,
+        app: "zend".into(),
+        node: 1,
+        host: "m1".into(),
+        card: 1,
+        build: build(10),
+        rejected: false,
+        model: Some(model(1)),
+        power: 101,
+        repos: vec![],
+        now_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        nonce: nonce(),
+    };
+    tx.send(Message::Frame(
+        Frame::Hello(Box::new(hello.clone())).encode(),
+    ))
+    .await
+    .unwrap();
+    let Some(Message::Frame(bytes)) = rx.recv().await else {
+        panic!("a CHALLENGE");
+    };
+    let Ok(Frame::Challenge(challenge)) = Frame::decode(&bytes) else {
+        panic!("a CHALLENGE");
+    };
+    let proof = member_proof(&key(), "zend", 1, &challenge.nonce, &hello.nonce);
+    // Gone before the ADMIT: the gateway decides it, and cannot send it.
+    drop(rx);
+    tx.send(Message::Frame(Frame::Prove(Prove { proof }).encode()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), served)
+        .await
+        .expect("the failed handshake ends")
+        .unwrap();
+
+    assert_eq!(hub.member("zend", 1).map(|m| m.session), Some(first));
+    assert_eq!(a.app.link(), Link::Joined);
+    assert_eq!(
+        listed(&hub),
+        vec![("c-1".into(), "0000000000000001".into(), epoch_ms)]
+    );
+    assert_eq!(b.app.holder_of(b"c-1"), Some(1));
+    assert_eq!(a.app.own_claims().len(), 1);
 }
 
 /// A gateway shutting down closes its members `1001`; each counts the ended

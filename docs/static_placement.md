@@ -206,15 +206,13 @@ for `RETURN_AFTER`, 120 s: the pause while a person reads a reply and types the
 next message, or between a task's turns. A delegated task runs inside its member
 and never passes the gateway, so its claim is how the plan sees it
 (`Registry::card_views`); the cast leaves a card running a task exactly as it
-leaves one serving a conversation. **A member's claims end with its session**
-(`Registry::forget_claims`): forgotten when the session leaves, and when its
-node is admitted anew — before its `ADMIT` is built, so the table it is sent
-never names it the holder of a key it may no longer hold. Each key forgotten is
-released as its holder would release it, through the highest of its own records
-the gateway heard, and every other member is sent the `UNCLAIM`, so none goes on
-naming it the holder. A member still holding them announces them once admitted;
-one that crashed holds none, so its card is free `RETURN_AFTER` after it comes
-back rather than busy for good, and the gateway, the rejoined member and its
+leaves one serving a conversation. A member that has left makes no card busy —
+the plan counts only members present. **A member that crashed and came back
+releases the claims of its previous process itself** (`MemberClaims::admitted`,
+`docs/replicated_substrate.md` §5.4): its `ADMIT` still names its node the holder,
+since a gateway keeps a claim until its holder lets it go, and the new process,
+holding none of them, `UNCLAIM`s each. Its card is then free `RETURN_AFTER`
+after, rather than busy for good, and the gateway, the restarted member and its
 peers agree on every key's holder.
 
 ### 5.2 Where they run

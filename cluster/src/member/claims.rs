@@ -137,6 +137,25 @@ impl MemberClaims {
         *ms = (*ms).max(epoch.ms);
     }
 
+    /// A claim in an `ADMIT`'s table: heard as [`Self::heard`] — or, when it
+    /// names this member's node at an epoch this member does not hold, **not
+    /// taken in, and returned for this member to release**. Only the holder may
+    /// release a claim, and only the holder knows which it holds: a gateway
+    /// that kept the claim of this node's previous process — one that
+    /// restarted — or of a release it never heard would otherwise name this
+    /// member the holder of a key it is not serving, and the member would
+    /// answer for the key as its own without ever announcing it, while every
+    /// peer refused it naming this node. `Some` with the claim's epoch to
+    /// `UNCLAIM`; `None` once heard.
+    pub fn admitted(&mut self, key: &[u8], epoch: Epoch) -> Option<Epoch> {
+        let held = self.own.get(key).map(|(e, _)| *e);
+        if epoch.node == self.node && held != Some(epoch) {
+            self.saw(key, epoch);
+            return Some(epoch);
+        }
+        None
+    }
+
     /// A claim announced by any member — from `ADMIT`'s table or relayed.
     /// Returns whether another member took a key this member held or last let
     /// go: its own claim goes, and whatever it keeps of the key may now fall

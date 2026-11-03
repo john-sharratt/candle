@@ -51,24 +51,6 @@ impl Claims {
         held
     }
 
-    /// Forget every key `node` holds, returning each with the claim that held
-    /// it, in key order: its session has ended, or it is being admitted again.
-    /// A member that still holds them announces them anew once admitted; one
-    /// that crashed holds none.
-    pub fn forget(&mut self, node: u64) -> Vec<(Vec<u8>, Epoch)> {
-        let mut gone: Vec<(Vec<u8>, Epoch)> = self
-            .held
-            .iter()
-            .filter(|(_, epoch)| epoch.node == node)
-            .map(|(key, epoch)| (key.clone(), *epoch))
-            .collect();
-        gone.sort();
-        for (key, _) in &gone {
-            self.held.remove(key);
-        }
-        gone
-    }
-
     /// The whole table, as `ADMIT` sends it.
     pub fn table(&self) -> Vec<ClaimInfo> {
         let mut t: Vec<ClaimInfo> = self
@@ -121,20 +103,5 @@ mod tests {
         assert_eq!(c.holder(b"k"), Some(2));
         assert!(c.unclaim(b"k", e(2, 2)));
         assert_eq!(c.holder(b"k"), None);
-    }
-
-    #[test]
-    fn forgetting_a_node_lets_go_only_its_keys() {
-        let mut c = Claims::new();
-        c.claim(b"a", e(1, 1));
-        c.claim(b"b", e(1, 1));
-        c.claim(b"c", e(1, 2));
-        assert_eq!(
-            c.forget(1),
-            vec![(b"a".to_vec(), e(1, 1)), (b"b".to_vec(), e(1, 1))]
-        );
-        assert_eq!(c.holder(b"a"), None);
-        assert_eq!(c.holder(b"c"), Some(2));
-        assert!(c.forget(1).is_empty());
     }
 }
