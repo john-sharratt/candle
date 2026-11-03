@@ -130,6 +130,10 @@ maintenance jobs at `GET /v1/cluster/command/jobs`.
    (`zend/src/mcp/tools/service/guard.rs`).
 3. Start `cargo build --release -p <service>` on that machine's agent, on
    `main`, staging `target/release/<service>.exe`; answer the deploy's handle.
+   A `motherd` is built with the connector it releases (`-p motherd -p mcp`),
+   and a build queued ahead of it on the same agent stages that connector, so
+   the trial's daemon follows it and offers it to the members that install
+   the release (`docs/replicated_substrate.md` §3.9).
 4. The driver waits for the build and, once it is staged, posts the trial to
    that machine's keep with the deploy's handle.
 5. keep runs the trial: proven on `INFO serving` within ten minutes, the window

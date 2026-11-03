@@ -86,6 +86,7 @@ mod tests {
             source: Source::Kept("12-h12".into()),
             leases: vec!["upgrade/zend".into()],
             protect: vec![],
+            connector: None,
         };
         assert_eq!(i.install(job.clone()), Ok(()));
         assert_eq!(stopping.ending(), Some(Ending::Install));

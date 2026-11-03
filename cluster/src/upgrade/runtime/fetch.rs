@@ -1,8 +1,10 @@
 //! Fetching a build, and serving one (§3.9).
 //!
-//! **Fetching.** A member fetches the one artifact of the build it would
-//! install — or of the newest build offered above its own — that it needs: its
-//! own binary, by kind and platform, which carries its UI compiled in. One
+//! **Fetching.** A member fetches the artifacts of the build it would install —
+//! or of the newest build offered above its own — that it needs: its own
+//! binary, by kind and platform, which carries its UI compiled in; then, when
+//! its machine runs a connector, the build's `mcp`, which follows the daemon's
+//! release ([`connector_of`]). One artifact at a time, one
 //! chunk at a time: `BUILD_FETCH` asks for the next up to 1 MiB at the part
 //! file's length, and the gateway picks a holder for it (`from_node` 0), so
 //! later fetches spread across every holder. A chunk that does not come within
@@ -28,8 +30,10 @@ use super::Upgrader;
 use crate::frame::{
     Artifact, BuildArtifacts, BuildChunk, BuildFetch, BuildId, Frame, MAX_BUILD_CHUNK,
 };
+use crate::upgrade::artifacts::binary;
 use crate::upgrade::decisions::build_name;
 use crate::upgrade::parts::{Finished, Standing, Wrote};
+use crate::version::info::MCP;
 
 /// How long a chunk may take before it is asked for again.
 pub const CHUNK_WAIT: Duration = Duration::from_secs(30);
@@ -62,6 +66,18 @@ pub fn needed(offer: &BuildArtifacts, kind: &str, platform: &str) -> Result<Arti
                 build_name(&offer.build)
             )
         })
+}
+
+/// The connector of `offer` this member's machine needs: its `mcp` for
+/// `platform`, when the machine runs a connector — keep holds one beside the
+/// executable at `exe`. The connector follows the daemon's release
+/// (`docs/replicated_substrate.md` §3.9).
+pub fn connector_of(offer: &BuildArtifacts, exe: &Path, platform: &str) -> Option<Artifact> {
+    let dir = exe.parent()?;
+    if !binary(dir, MCP).is_file() {
+        return None;
+    }
+    needed(offer, MCP, platform).ok()
 }
 
 /// The app to ask through after `current`'s chunk did not come: the next of
@@ -108,7 +124,7 @@ impl Upgrader {
         let Some(offer) = offer else {
             return;
         };
-        let artifact = match needed(&offer, &self.setup.info.kind, &self.setup.info.platform) {
+        let own = match needed(&offer, &self.setup.info.kind, &self.setup.info.platform) {
             Ok(a) => a,
             Err(reason) => {
                 self.state().stranded = Some(reason);
@@ -116,13 +132,26 @@ impl Upgrader {
             }
         };
         self.state().stranded = None;
-        let offset = match self.parts.standing(&offer.build, &artifact) {
-            Standing::Verified(path) => {
-                self.verified(&offer.build, &artifact, &path).await;
-                self.state().fetch = None;
-                return;
+        // Its own binary first, then the connector its machine runs: each
+        // fetched in turn, the next once the one before is verified.
+        let wanted = std::iter::once(own).chain(connector_of(
+            &offer,
+            &self.setup.exe,
+            &self.setup.info.platform,
+        ));
+        let mut next = None;
+        for artifact in wanted {
+            match self.parts.standing(&offer.build, &artifact) {
+                Standing::Verified(path) => self.verified(&offer.build, &artifact, &path).await,
+                Standing::Resume(offset) => {
+                    next = Some((artifact, offset));
+                    break;
+                }
             }
-            Standing::Resume(offset) => offset,
+        }
+        let Some((artifact, offset)) = next else {
+            self.state().fetch = None;
+            return;
         };
         let ask = {
             let mut s = self.state();
@@ -395,6 +424,26 @@ mod tests {
             needed(&o, "tokera-agent", "linux-x86_64").unwrap_err(),
             "build 12-h12 has no tokera-agent for linux-x86_64"
         );
+    }
+
+    /// **A machine that runs a connector fetches the build's connector too**;
+    /// one that runs none, or a build that carries none, fetches nothing more.
+    #[test]
+    fn a_machine_running_a_connector_fetches_the_builds() {
+        let t = tempfile::TempDir::new().unwrap();
+        let exe = binary(t.path(), "motherd");
+        let o = offer(vec![
+            a("motherd", "windows-x86_64", 1),
+            a(MCP, "windows-x86_64", 2),
+            a(MCP, "linux-x86_64", 3),
+        ]);
+        assert_eq!(connector_of(&o, &exe, "windows-x86_64"), None, "no connector here");
+        std::fs::write(binary(t.path(), MCP), b"old").unwrap();
+        assert_eq!(
+            connector_of(&o, &exe, "windows-x86_64"),
+            Some(a(MCP, "windows-x86_64", 2))
+        );
+        assert_eq!(connector_of(&offer(vec![a("motherd", "windows-x86_64", 1)]), &exe, "windows-x86_64"), None);
     }
 
     #[test]

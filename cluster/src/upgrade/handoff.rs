@@ -1,7 +1,9 @@
 //! The old process's last act (§3.9): once it has drained, flushed, released
 //! its substrate and closed its sockets, it copies the new build to
 //! `keep/stage/` and posts that path to `keep`. The running executable is not
-//! replaced. `keep` starts the staged file. This process then exits.
+//! replaced. `keep` starts the staged file. This process then exits. The
+//! release's connector, when the install carries one, is staged beside it for
+//! the new process to follow.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -16,6 +18,7 @@ use super::swap::{Source, Swapped};
 use super::switch::{copy_to_stage, FORCE_HEADER, SWITCH_ADDR};
 use super::watchdog::{write_plan, WatchPlan, PLAN, READY_WITHIN};
 use crate::launch::LaunchSpec;
+use crate::version::info::MCP;
 
 /// Where `source`'s executable bytes are.
 fn source_file(launch: &LaunchSpec, source: &Source) -> io::Result<PathBuf> {
@@ -51,10 +54,15 @@ pub fn stage(launch: &LaunchSpec, source: &Source) -> io::Result<PathBuf> {
     )
 }
 
+/// The connector's file name, as keep's `mcp` service names it.
+fn connector_name() -> String {
+    format!("{MCP}{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// Post `path` to `keep`. `Ok` when `keep` answered: it is running either the
 /// trial or the stable file. `Err` when `keep` did not take the path, so the
 /// caller relaunches itself.
-fn ask_keep(path: &Path) -> io::Result<()> {
+pub(crate) fn ask_keep(path: &Path) -> io::Result<()> {
     let body = path.to_str().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "the staged path is not utf-8")
     })?;
@@ -102,6 +110,11 @@ pub fn hand_off(
     log: Option<PathBuf>,
 ) -> io::Result<()> {
     let staged = stage(launch, &job.source)?;
+    // The release's connector waits in the stage beside it, for the new
+    // process to follow once it is ready (`runtime::connector`).
+    if let Some(connector) = &job.connector {
+        copy_to_stage(&launch.cwd, &connector_name(), connector, &launch.exe)?;
+    }
     // `swapped.exe` is the staged file, not the running one. A restore that
     // read this plan would remove the staged file and would not remove the
     // executable this process is running from. `keep` does not restore from

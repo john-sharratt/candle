@@ -21,10 +21,12 @@
 //! reads.
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::decide::{holding_back, target, Lease};
+use super::fetch::connector_of;
 use super::served::HeldAs;
 use super::Upgrader;
 use crate::frame::BuildId;
@@ -64,6 +66,9 @@ pub struct InstallJob {
     pub leases: Vec<String>,
     /// The builds never pruned after it: a forced rollout's target.
     pub protect: Vec<BuildId>,
+    /// The build's connector, fetched for this machine: staged beside the new
+    /// executable, for the new process to follow ([`super::connector`]).
+    pub connector: Option<PathBuf>,
 }
 
 /// Leases a returning process takes back and releases.
@@ -90,7 +95,7 @@ fn lease_wait_step(missing: &[&str]) -> String {
 
 impl Upgrader {
     /// Whether every app it serves is joined and ready.
-    fn ready(&self) -> bool {
+    pub(super) fn ready(&self) -> bool {
         let apps = self.apps();
         !apps.is_empty()
             && apps.iter().all(|m| {
@@ -219,6 +224,24 @@ impl Upgrader {
         Some((Source::Fetched(exe.path.clone()), opens))
     }
 
+    /// The connector `build` brings this machine: `Ok(None)` when the machine
+    /// runs none or the build carries none, `Ok(Some)` its verified download,
+    /// `Err` while that is still being fetched.
+    fn connector_for(&self, build: &BuildId) -> Result<Option<PathBuf>, ()> {
+        let s = self.state();
+        let Some(offer) = s.known.get(&(build.count, build.hash.clone())) else {
+            return Ok(None);
+        };
+        let Some(wanted) = connector_of(offer, &self.setup.exe, &self.setup.info.platform) else {
+            return Ok(None);
+        };
+        s.served
+            .iter()
+            .find(|i| i.artifact.sha256 == wanted.sha256 && i.from == HeldAs::Verified)
+            .map(|i| Some(i.path.clone()))
+            .ok_or(())
+    }
+
     /// What a build must open to replace this one: the log format and model
     /// its own build opens, and every record type its substrates hold.
     pub(super) fn needs(&self) -> Needs {
@@ -251,6 +274,15 @@ impl Upgrader {
         let Some((source, opens)) = self.source_for(&t.build) else {
             self.state().step = if upgrading { "upgrading" } else { "waiting" }.into();
             return;
+        };
+        // The connector moves with the daemon: an install waits for it when the
+        // machine runs one and the build carries one.
+        let connector = match self.connector_for(&t.build) {
+            Ok(c) => c,
+            Err(()) => {
+                self.state().step = "waiting: the connector is fetching".into();
+                return;
+            }
         };
         if let Err(reason) = check(&opens, &self.needs()) {
             let mut s = self.state();
@@ -335,6 +367,7 @@ impl Upgrader {
             source,
             leases,
             protect,
+            connector,
         };
         if let Err(e) = self.installer.install(job) {
             tracing::error!("the install did not start: {e}");

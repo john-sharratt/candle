@@ -897,6 +897,27 @@ no certification and no grace period.
 or an ordinary member if its build is already the floor. The automatic path is how the
 rest of the group follows.
 
+**The connector follows the daemon.** A machine's MCP connector (`mcp`) holds no
+substrate and is never certified on its own, but it changes with every tool and guide
+the daemon serves, and two connectors of different builds answering one client is
+worse than either. So it moves with the daemon's release, one machine at a time:
+
+- **Built with it.** A daemon's deploy builds `-p motherd -p mcp` and stages the
+  connector in `keep/stage/` beside the daemon (`docs/jobs.md` §6).
+- **Offered with it.** A candidate offers every binary of its build found beside it or
+  in keep's stage — the connector among them (`cluster::upgrade::artifacts::KINDS`).
+- **Fetched with it.** A member whose machine runs a connector — keep holds `mcp`
+  beside the member's executable — fetches the build's connector after its own
+  binary, and an install waits for it (`runtime::fetch::connector_of`).
+- **Installed after it.** The install stages the fetched connector beside the new
+  executable. Once the process that comes up is ready, if keep's stage holds a
+  connector of its own build and the one keep runs is of another, it asks keep to try
+  the staged one (`runtime::connector`). keep proves it on its proof line or puts the
+  previous back. The upgrade lease the install took keeps the machines one at a time.
+
+`keep` and the gateway are not released this way: keep is what installs and rolls back,
+and the gateway is the cluster's one front door. Each is deployed on its machine by hand.
+
 ### 3.10 Local builds: testing uncommitted work against the cluster
 
 A **local build** is one whose `local` digest is set: built with commits not yet on

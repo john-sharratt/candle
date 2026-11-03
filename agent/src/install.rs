@@ -82,6 +82,7 @@ mod tests {
             source: Source::Kept("12-h12".into()),
             leases: vec![],
             protect: vec![],
+            connector: None,
         }
     }
 

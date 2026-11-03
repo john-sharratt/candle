@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::time::timeout;
 
+use super::connector;
 use super::facts_read::blocked_step;
 use super::served::{offered, HeldAs};
 use super::Upgrader;
@@ -276,13 +277,27 @@ impl Upgrader {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_default();
+        // Beside it, and in keep's stage, where the deploy that built it
+        // staged the release's connector: a kind found beside it is not
+        // offered twice.
+        let stage = connector::paths(&self.setup.exe)
+            .and_then(|(staged, _)| staged.parent().map(PathBuf::from));
         let probe = self.probe.clone();
         let build = own.clone();
-        let found = tokio::task::spawn_blocking(move || siblings(&dir, &build, &*probe))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let found = tokio::task::spawn_blocking(move || {
+            let mut found = siblings(&dir, &build, &*probe).unwrap_or_default();
+            for o in stage
+                .and_then(|s| siblings(&s, &build, &*probe).ok())
+                .unwrap_or_default()
+            {
+                if !found.iter().any(|f| f.artifact.kind == o.artifact.kind) {
+                    found.push(o);
+                }
+            }
+            found
+        })
+        .await
+        .unwrap_or_default();
         let mut s = self.state();
         s.served.extend(offered(&own, found));
         s.announce_due = true;

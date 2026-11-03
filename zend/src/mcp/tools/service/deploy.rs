@@ -29,6 +29,10 @@ const BRANCH: &str = "main";
 /// How long a build may run: a first one on a machine compiles the workspace.
 const BUILD_TIMEOUT_S: u64 = 3_600;
 
+/// The daemon, and the connector released with it.
+const DAEMON: &str = "motherd";
+const CONNECTOR: &str = "mcp";
+
 /// The longest one wait on the build is held.
 const STEP: Duration = Duration::from_secs(25);
 
@@ -64,18 +68,47 @@ pub fn definition() -> Value {
     })
 }
 
-/// The job that builds `service` from origin/main and stages it.
+/// The job that builds `service` from origin/main and stages it. The daemon is
+/// built with the connector, which is released with it: one build, so the
+/// connector [`connector_job`] stages is the daemon's build.
 pub fn build_job(service: &str) -> RunJob {
+    let mut args: Vec<String> = ["build", "--release", "-p", service]
+        .map(str::to_string)
+        .to_vec();
+    if service == DAEMON {
+        args.extend(["-p", CONNECTOR].map(str::to_string));
+    }
     RunJob {
         repo: REPO.to_string(),
         branch: BRANCH.to_string(),
         overlay: Snapshot::default(),
         program: "cargo".to_string(),
-        args: ["build", "--release", "-p", service]
-            .map(str::to_string)
-            .to_vec(),
+        args,
         timeout_secs: BUILD_TIMEOUT_S,
         stage: Some(format!("target/release/{service}.exe")),
+    }
+}
+
+/// The job queued ahead of a daemon's deploy on the same agent: the same build
+/// — the daemon and the connector — staging the connector, so the daemon the
+/// trial starts finds its release's connector in keep's stage and follows it
+/// (`cluster::upgrade::runtime::connector`), and offers it to the members that
+/// install the release after it. Its packages are named `--package`, so it is
+/// a build, never read as a deploy of its own.
+pub fn connector_job() -> RunJob {
+    RunJob {
+        args: [
+            "build",
+            "--release",
+            "--package",
+            DAEMON,
+            "--package",
+            CONNECTOR,
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        stage: Some(format!("target/release/{CONNECTOR}.exe")),
+        ..build_job(CONNECTOR)
     }
 }
 
@@ -154,6 +187,14 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
         .iter()
         .find(|a| u64::from_str_radix(&a.node, 16) == Ok(node))
         .map_or(host, |a| a.host.clone());
+    if service == DAEMON {
+        if let Err(e) = agents.submit(&call.lineage, connector_job(), Some(node)).await {
+            return Answer::error(format!(
+                "the connector's build could not start on {host}, so the daemon is not deployed \
+                 without it: {e}"
+            ));
+        }
+    }
     let (at, view) = match agents
         .submit(&call.lineage, build_job(service), Some(node))
         .await
@@ -200,6 +241,29 @@ mod tests {
         let mut command = vec![job.program.clone()];
         command.extend(job.args);
         assert_eq!(built_service(&command), Some("web"));
+    }
+
+    /// **The daemon is built with its connector**, and the job ahead of it
+    /// stages the connector from that same build without reading as a deploy.
+    #[test]
+    fn the_daemon_is_built_with_the_connector_it_releases() {
+        let daemon = build_job("motherd");
+        assert_eq!(daemon.args, ["build", "--release", "-p", "motherd", "-p", "mcp"]);
+        assert_eq!(daemon.stage.as_deref(), Some("target/release/motherd.exe"));
+        let connector = connector_job();
+        assert_eq!(
+            connector.args,
+            ["build", "--release", "--package", "motherd", "--package", "mcp"]
+        );
+        assert_eq!(connector.stage.as_deref(), Some("target/release/mcp.exe"));
+        assert_eq!((connector.repo.as_str(), connector.branch.as_str()), ("candle", "main"));
+        let words = |j: &RunJob| {
+            let mut w = vec![j.program.clone()];
+            w.extend(j.args.iter().cloned());
+            w
+        };
+        assert_eq!(built_service(&words(&daemon)), Some("motherd"));
+        assert_eq!(built_service(&words(&connector)), None, "a build, not a deploy");
     }
 
     #[test]

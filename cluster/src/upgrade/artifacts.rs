@@ -11,10 +11,11 @@ use std::process::{Command, Stdio};
 
 use super::sum::file_sha256;
 use crate::frame::{Artifact, BuildId};
-use crate::version::info::{BuildInfo, AGENT, BUILD_INFO_FLAG, MOTHERD, NPCD, ZEND};
+use crate::version::info::{BuildInfo, AGENT, BUILD_INFO_FLAG, MCP, MOTHERD, NPCD, ZEND};
 
-/// Every binary a build produces, by kind.
-pub const KINDS: [&str; 4] = [ZEND, NPCD, MOTHERD, AGENT];
+/// Every binary a build produces, by kind. `mcp`, the connector, is released
+/// with the daemon (`runtime::connector`).
+pub const KINDS: [&str; 5] = [ZEND, NPCD, MOTHERD, AGENT, MCP];
 
 /// Asks a binary for its build.
 pub trait Probe {

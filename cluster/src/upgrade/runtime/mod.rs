@@ -13,6 +13,7 @@
 //! | a candidate's verdicts and its `certify` proposal | [`candidate`] |
 //! | the upgrade commands: verdicts, pauses and rollouts by hand, rollback | [`commands`] |
 //! | taking the lease, the install, `ok`, and handing the lease back | [`install`] |
+//! | the machine's connector following the release | [`connector`] |
 //! | what it serves | [`served`] |
 //! | the builds it never tries again | [`refused`] |
 //! | what `COORD` reports | [`view`] |
@@ -20,6 +21,7 @@
 mod announce;
 mod candidate;
 pub mod commands;
+pub mod connector;
 pub mod decide;
 mod facts;
 mod facts_read;
@@ -105,6 +107,8 @@ struct State {
     reads: BTreeMap<String, FactsRead>,
     /// The step while a store has not answered: what it is blocked on.
     blocked: Option<String>,
+    /// The machine's connector was looked at once this process was ready.
+    connector_followed: bool,
 }
 
 /// See the module documentation.
@@ -273,6 +277,7 @@ impl Upgrader {
             self.own_verdicts().await;
         }
         self.finish_install().await;
+        self.connector_tick();
         if fresh {
             self.candidate_tick(store_wait).await;
         }
