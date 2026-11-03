@@ -139,11 +139,23 @@ impl Registry {
     }
 
     /// `node`'s `session` ended; a newer session of the node stays.
+    ///
+    /// **Its claims stand** — only a holder releases one (§5.4) — **but each
+    /// key it held is placed as released** while it is away: its next request
+    /// goes among the members that hold the node's records through the highest
+    /// of its own the gateway heard (`docs/cooperative_admission.md` §2.4), not
+    /// to whichever member places first, which may not have applied its last
+    /// turn. A hint for this gateway's placement only: nothing is relayed and no
+    /// claim changes. A real release or a later one replaces it.
     pub fn leave(&mut self, app: &str, node: u64, session: u64) -> bool {
         let a = self.app(app);
         if a.members.get(&node).is_some_and(|m| m.session == session) {
             a.members.remove(&node);
             a.epoch += 1;
+            let through = a.seen.get(&node).copied().unwrap_or(0);
+            for key in a.claims.keys_of(node) {
+                self.released(app, &key, node, through);
+            }
             return true;
         }
         false

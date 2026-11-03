@@ -594,7 +594,7 @@ function renderDiagnostics(s, earlier) {
     reported.map((m) => [td(appName(m.app)), td(m.host), td(m.coord.tombstones.held, "m"), td(m.coord.tombstones.waiting_age, "m")]),
     "No member has reported."), null);
   section("claims", () => table(["App", "Key", "Holder", "Since"],
-    s.claims.map((c) => [td(appName(c.app)), td(c.key, "m"), td(c.node, "m"), td(when(c.epoch_ms), "m")]), "No conversation is claimed."), s.claims.length || null);
+    s.claims.map((c) => [td(appName(c.app)), td(c.key, "m"), td(c.holder_here ? c.node : c.node + " (left)", "m"), td(when(c.epoch_ms), "m")]), "No conversation is claimed."), s.claims.length || null);
   section("traffic", () => {
     const t = s.traffic, prev = earlier && earlier.traffic;
     const span = earlier ? Math.max(1, (s.now_ms - earlier.now_ms) / 1000) : 1;

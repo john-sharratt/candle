@@ -83,8 +83,8 @@ use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
 use crate::frame::{
-    name, Admit, BuildFetch, BuildId, Capacity, Frame, Hello, Lost, MemberState, Members,
-    Plan as PlanFrame,
+    name, Admit, BuildFetch, BuildId, Capacity, Claim, ClaimInfo, Frame, Hello, Lost, MemberState,
+    Members, Plan as PlanFrame,
 };
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter, PROTO};
 use crate::pipe::{Message, PipeRx, PipeTx};
@@ -469,8 +469,8 @@ impl Hub {
             },
         )
         .await;
-        let hello = match handshake {
-            Ok((hello, _)) => hello,
+        let (hello, sent) = match handshake {
+            Ok((hello, admit)) => (hello, admit.claims),
             Err(e) => {
                 // Admitted, and the ADMIT never reached it.
                 if let (Some(a), Some((node, _))) = (&decided, &seen) {
@@ -490,14 +490,18 @@ impl Hub {
             }
         };
         let admitted = decided.expect("an ADMIT was decided");
-        self.run(app, hello, admitted, tx, rx, streams).await;
+        self.run(app, hello, admitted, sent, tx, rx, streams).await;
     }
 
+    /// The admitted session's life. `sent` is the claim table its `ADMIT`
+    /// carried.
+    #[allow(clippy::too_many_arguments)]
     async fn run<T, R, F>(
         self: &Arc<Self>,
         app: &str,
         hello: Hello,
         admitted: Admitted,
+        sent: Vec<ClaimInfo>,
         tx: T,
         rx: R,
         streams: F,
@@ -571,6 +575,24 @@ impl Hub {
                 handed: 0,
                 closing: false,
             });
+            // The node's claims taken since its ADMIT's table was built — on
+            // the session this one replaces, until now the current one — are
+            // sent on, under the same guard that made this session current, so
+            // a claim its new process does not hold reaches it to release
+            // (`MemberClaims::unheld_own`) rather than standing unseen.
+            let late: Vec<ClaimInfo> = s
+                .registry
+                .claims(app)
+                .table()
+                .into_iter()
+                .filter(|c| c.epoch.node == node && !sent.contains(c))
+                .collect();
+            for c in late {
+                let _ = handle.control(Frame::Claim(Claim {
+                    key: c.key,
+                    epoch: c.epoch,
+                }));
+            }
         }
         let local = if hello.build.is_local() {
             format!(", local {}", hello.build.local)
@@ -704,6 +726,16 @@ impl Hub {
         frame: Frame,
         reply_on: &SessionHandle,
     ) -> Result<(), Close> {
+        // **A replaced session changes nothing.** Its frames still queued here
+        // are from a socket the node has reconnected past: a process that
+        // still runs says it all again on its new session, and one that
+        // restarted holds nothing it said. Kept, a late `CLAIM` would name the
+        // node holder of a key its new process never took, and a late
+        // `CAPACITY` or `ROUTES` would describe a process that is gone. The
+        // claim frames re-check under the guard they change the table with.
+        if !Self::current(&self.state(), app, node, session) {
+            return Ok(());
+        }
         if let Some((key, text)) = paxos_step(node, &frame) {
             self.note(app, key, text);
         }
@@ -743,21 +775,13 @@ impl Hub {
                         ),
                     ));
                 }
-                // **A replaced session claims nothing.** Its frames still
-                // queued here are from a socket the node has reconnected past:
-                // a process that still holds the claim announces it again on
-                // its new session, and one that restarted holds nothing — kept,
-                // a late `CLAIM` would name the node holder of a key its new
-                // process never took.
-                let current = self
-                    .state()
-                    .sockets
-                    .get(&(app.to_string(), node))
-                    .is_some_and(|x| x.session == session);
-                if !current {
-                    return Ok(());
-                }
-                let took = self.state().registry.claims(app).claim(&c.key, c.epoch);
+                let took = {
+                    let mut s = self.state();
+                    if !Self::current(&s, app, node, session) {
+                        return Ok(());
+                    }
+                    s.registry.claims(app).claim(&c.key, c.epoch)
+                };
                 if took {
                     self.note(
                         app,
@@ -768,8 +792,21 @@ impl Hub {
                 self.to_others(app, node, Frame::Claim(c));
             }
             Frame::Unclaim(u) => {
+                if u.epoch.node != node {
+                    return Err(Close::new(
+                        CloseCode::Malformed,
+                        format!(
+                            "an UNCLAIM from {} names node {}",
+                            hex(node),
+                            hex(u.epoch.node)
+                        ),
+                    ));
+                }
                 let released = {
                     let mut s = self.state();
+                    if !Self::current(&s, app, node, session) {
+                        return Ok(());
+                    }
                     let released = s.registry.claims(app).unclaim(&u.key, u.epoch);
                     if released {
                         s.registry.released(app, &u.key, node, u.through);
@@ -1250,6 +1287,14 @@ impl Hub {
             .mirrored(app, route, mode, compared, baseline, candidate);
     }
 
+    /// Whether `session` is `node`'s current session for `app`: the one its
+    /// socket here was last admitted on.
+    fn current(s: &State, app: &str, node: u64, session: u64) -> bool {
+        s.sockets
+            .get(&(app.to_string(), node))
+            .is_some_and(|x| x.session == session)
+    }
+
     pub(super) fn to_others(&self, app: &str, from: u64, frame: Frame) {
         let s = self.state();
         for ((a, n), socket) in &s.sockets {
@@ -1696,15 +1741,13 @@ impl Hub {
         let claims = APPS
             .iter()
             .flat_map(|app| {
-                s.registry
-                    .claims_table(app)
-                    .into_iter()
-                    .map(move |c| ClaimView {
-                        app: app.to_string(),
-                        key: String::from_utf8_lossy(&c.key).into_owned(),
-                        node: hex(c.epoch.node),
-                        epoch_ms: c.epoch.ms,
-                    })
+                s.registry.claims_table(app).into_iter().map(|c| ClaimView {
+                    app: app.to_string(),
+                    key: String::from_utf8_lossy(&c.key).into_owned(),
+                    node: hex(c.epoch.node),
+                    epoch_ms: c.epoch.ms,
+                    holder_here: s.registry.member(app, c.epoch.node).is_some(),
+                })
             })
             .collect();
         HubStatus {

@@ -42,6 +42,18 @@ impl Claims {
         self.held.get(key).map(|e| e.node)
     }
 
+    /// The keys `node` holds, in key order.
+    pub fn keys_of(&self, node: u64) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = self
+            .held
+            .iter()
+            .filter(|(_, epoch)| epoch.node == node)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// How many keys each node holds.
     pub fn held_by(&self) -> HashMap<u64, u32> {
         let mut held = HashMap::new();
@@ -103,5 +115,15 @@ mod tests {
         assert_eq!(c.holder(b"k"), Some(2));
         assert!(c.unclaim(b"k", e(2, 2)));
         assert_eq!(c.holder(b"k"), None);
+    }
+
+    #[test]
+    fn a_node_s_keys_are_listed_in_order() {
+        let mut c = Claims::new();
+        c.claim(b"b", e(1, 1));
+        c.claim(b"a", e(1, 1));
+        c.claim(b"c", e(1, 2));
+        assert_eq!(c.keys_of(1), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(c.keys_of(3).is_empty());
     }
 }

@@ -35,10 +35,41 @@ struct Model {
     /// A gateway keeps every claim it hears until its holder's `UNCLAIM`,
     /// whatever its holder's sessions do (§5.4): only the holder releases.
     claims: BTreeMap<String, Epoch>,
+    /// Each key whose holder has left, and that holder: the key's next
+    /// request goes to a member holding what it wrote
+    /// (`docs/cooperative_admission.md` §2.4) — here only the holder itself,
+    /// since no member reports applying another's records.
+    released: BTreeMap<String, u64>,
     rr: usize,
 }
 
 impl Model {
+    /// `node` left: every key it holds is placed as released by it.
+    fn left(&mut self, node: u64) {
+        self.members.remove(&node);
+        for (key, e) in &self.claims {
+            if e.node == node {
+                self.released.insert(key.clone(), node);
+            }
+        }
+    }
+
+    /// Where a request for released `key` goes: to its releaser while it is
+    /// ready, else as any unit. The release is forgotten once every ready
+    /// member holds it — the releaser alone is ready, or nobody is.
+    fn after_release(&mut self, key: &str, by: u64) -> Option<u64> {
+        let ready: Vec<u64> = self.ready().iter().map(|(n, _)| *n).collect();
+        let holding = ready.contains(&by);
+        if ready.len() == usize::from(holding) {
+            self.released.remove(key);
+        }
+        if holding {
+            Some(by)
+        } else {
+            self.best()
+        }
+    }
+
     fn ready(&self) -> Vec<(u64, Cap)> {
         self.members
             .iter()
@@ -84,7 +115,10 @@ impl Model {
             Dispatch::Sticky(_) | Dispatch::Owner(_) => {
                 match key.and_then(|k| self.claims.get(k)).map(|e| e.node) {
                     Some(h) if self.members.contains_key(&h) => Some(h),
-                    _ => self.best(),
+                    _ => match key.and_then(|k| Some((k, *self.released.get(k)?))) {
+                        Some((k, by)) => self.after_release(k, by),
+                        None => self.best(),
+                    },
                 }
             }
             Dispatch::Ui => {
@@ -190,7 +224,7 @@ fn h6_routing_decisions_match_the_reference() {
                     let held = registry.member(APP, node).map(|m| m.session);
                     if let Some(s) = held {
                         assert!(registry.leave(APP, node, s));
-                        model.members.remove(&node);
+                        model.left(node);
                     }
                 }
                 2..=6 => {

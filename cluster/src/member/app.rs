@@ -543,7 +543,7 @@ impl AppMember {
             let mut lost: Vec<Vec<u8>> = Vec::new();
             let mut stale: Vec<(Vec<u8>, Epoch)> = Vec::new();
             for claim in &admit.claims {
-                if let Some(epoch) = claims.admitted(&claim.key, claim.epoch) {
+                if let Some(epoch) = claims.unheld_own(&claim.key, claim.epoch) {
                     stale.push((claim.key.clone(), epoch));
                 } else if claims.heard(&claim.key, claim.epoch) {
                     lost.push(claim.key.clone());
@@ -554,8 +554,9 @@ impl AppMember {
         for key in &lost {
             self.lost(key);
         }
+        let own_through = self.own_through();
         for (key, epoch) in stale {
-            let through = self.through_for(&key, self.own_through());
+            let through = self.through_for(&key, own_through);
             let _ = handle.control(Frame::Unclaim(Unclaim {
                 key,
                 epoch,
@@ -693,6 +694,19 @@ impl AppMember {
                 // Claimed again: whatever this member reported of it is for a
                 // release that is over.
                 lock(&self.reported).remove(&claim.key);
+                // One of this node's this process does not hold — taken on the
+                // session this one replaced, after the ADMIT's table was built
+                // — is released as its holder, as one in ADMIT is.
+                let unheld = lock(&self.claims).unheld_own(&claim.key, claim.epoch);
+                if let Some(epoch) = unheld {
+                    let through = self.through_for(&claim.key, self.own_through());
+                    self.announce(Frame::Unclaim(Unclaim {
+                        key: claim.key,
+                        epoch,
+                        through,
+                    }));
+                    return;
+                }
                 let lost = lock(&self.claims).heard(&claim.key, claim.epoch);
                 if lost {
                     self.lost(&claim.key);

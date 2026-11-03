@@ -208,7 +208,7 @@ and never passes the gateway, so its claim is how the plan sees it
 (`Registry::card_views`); the cast leaves a card running a task exactly as it
 leaves one serving a conversation. A member that has left makes no card busy —
 the plan counts only members present. **A member that crashed and came back
-releases the claims of its previous process itself** (`MemberClaims::admitted`,
+releases the claims of its previous process itself** (`MemberClaims::unheld_own`,
 `docs/replicated_substrate.md` §5.4): its `ADMIT` still names its node the holder,
 since a gateway keeps a claim until its holder lets it go, and the new process,
 holding none of them, `UNCLAIM`s each. Its card is then free `RETURN_AFTER`
@@ -384,3 +384,21 @@ With the table of §2.
 `CAPACITY` still carries a member's power and learned rates; the status page
 shows them, and a member's own admission uses its rates. Placement reads
 neither.
+
+## 11. Deploying it
+
+**motherd first, then the gateways.** No frame changes, so either side
+admits the other; what changes is who releases a stale claim. The gateway keeps a
+claim until its holder lets it go, and it is a member — `MemberClaims::unheld_own`
+— that releases a claim of its node that its process does not hold
+(`docs/replicated_substrate.md` §5.4). A member of the earlier build does not, so
+behind a new gateway, a member that restarts holding a claim leaves it standing —
+its card busy, its peers answering `409` for it — for as long as that gateway
+runs: nothing else releases it, and only a gateway restart forgets it. With
+motherd rolled out first, every member that restarts behind the new gateway
+releases its own.
+
+The new `web.exe` reads `cluster.machines_file` from `web/web.yaml`, which the
+earlier one refuses as an unknown field. A machine that restarted its earlier
+gateway with that line removed must have it back when the new gateway is installed:
+without it the gateway has no table and places no unit.

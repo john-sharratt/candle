@@ -453,6 +453,37 @@ fn units_fill_to_each_min_in_rank_order_then_go_round_to_each_max() {
     assert_eq!(placed(&mut r), Err(Pick::Wait));
 }
 
+/// **A holder that leaves keeps its claim, and its keys are placed as released
+/// by it** (`docs/cooperative_admission.md` §2.4): the key's next request goes
+/// to a member holding its records through the highest of its own heard — not
+/// to the first-ranked member, which has not applied them. Its own release
+/// replaces the hint.
+#[test]
+fn a_departed_holder_s_keys_go_where_its_records_are() {
+    let mut r = Registry::new();
+    r.set_machines(table(&[("m2", 1, 4, 4), ("m3", 2, 4, 4)]));
+    for node in [1, 2, 3] {
+        r.join(member(node, node));
+        r.capacity("zend", node, capacity(MemberState::Ready, 1, true, 1));
+    }
+    r.claims("zend").claim(b"k", Epoch { ms: 1, node: 1 });
+    r.applied("zend", 1, vec![(1, 40)]);
+    r.applied("zend", 3, vec![(1, 40)]);
+    let sticky = Dispatch::sticky_path("id");
+    assert!(r.leave("zend", 1, 1));
+    assert_eq!(r.claims("zend").holder(b"k"), Some(1), "its claim stands");
+    assert_eq!(
+        r.pick("zend", &sticky, None, Some("k"), None),
+        Pick::Member(3),
+        "m3 holds node 1's records; m2 ranks first but does not"
+    );
+    assert_eq!(
+        r.pick("zend", &sticky, None, Some("other"), None),
+        Pick::Member(2),
+        "a key it never held places as ever"
+    );
+}
+
 /// **A machine the table does not name is given no work**, whatever else it
 /// is: a unit waits for a named machine's room rather than going to it — and
 /// it waits too while the named machine's member still loads, or has not

@@ -270,7 +270,7 @@ fn a_delegated_task_makes_its_machine_busy() {
 /// (§5.4) — so the card is busy while the old process is gone and the new one
 /// rejoins; a departed member's claims make no card busy, having no card here.
 /// The restarted process, sent the claim in its `ADMIT` and holding nothing,
-/// releases it (`MemberClaims::admitted`), and the card is free 120 s after.
+/// releases it (`MemberClaims::unheld_own`), and the card is free 120 s after.
 #[test]
 fn a_rejoined_member_s_card_is_free_again() {
     let mut r = registry(

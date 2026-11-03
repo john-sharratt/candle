@@ -262,6 +262,11 @@ pub struct ClaimView {
     pub key: String,
     pub node: String,
     pub epoch_ms: u64,
+    /// Whether its holder is a member here now. One that is not has left
+    /// holding it: the gateway keeps the claim until the holder returns and
+    /// releases or announces it again (§5.4), and routes the key meanwhile as
+    /// released by it.
+    pub holder_here: bool,
 }
 
 /// A refused handshake (§12.2 Refusals).
