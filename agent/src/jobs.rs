@@ -643,7 +643,9 @@ impl Jobs {
             *s = staged;
         }
         e.line.ended_ms = Some(now_ms());
-        let _ = e.ended.send(true);
+        // Stored whether or not anyone waits on it: `send` drops a value no
+        // receiver is subscribed to, and the job's view reads it.
+        e.ended.send_replace(true);
         self.running.fetch_sub(1, Ordering::Relaxed);
     }
 
