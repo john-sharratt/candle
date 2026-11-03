@@ -12,6 +12,10 @@ questions:
 - what happened to the trial
 - what version is each machine on
 - tell me when the deploy is done
+- is keep still trying the new build
+- how far into the trial is it
+- did the deploy to whiteworld prove itself
+- which build is installed on each machine
 category: Commands
 description: 'Say where deploys are. With `deploy` — the handle service_deploy answered — that deploy''s stage: building (its phase, time and lines), build failed, built and staged, being tried by keep (how far into its ten-minute proof window, and the trial log''s last line), or ended: proven and now installed, rolled back with keep''s reason, or cancelled. It waits up to `wait_s` seconds (60 by default; 0 answers at once) for the deploy to end, so one call with a long `wait_s` waits it out; do not call it again and again. Without `deploy`, every machine''s services, or `host`''s alone, as its keep reports them: each service''s installed build, whether it runs, the trial running and how the last one ended, with the deploy each belongs to, and the deploys still building there. Use for: following a deploy to its end, and seeing what each machine runs before deploying. Triggered by "how is the deploy going", "did the trial pass", "what does whiteworld run". Returns the stage, and the next call to make.'
 high_risk: true

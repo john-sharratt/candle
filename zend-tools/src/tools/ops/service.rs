@@ -41,14 +41,17 @@ pub struct StatusRequest {
     /// A deploy's handle, `<node>:<id>`. Optional: without it, every
     /// machine's services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     #[validate(length(min = 18, max = 64))]
     pub deploy: Option<String>,
     /// Without `deploy`: one machine only. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     #[validate(length(min = 1, max = 32))]
     pub host: Option<String>,
     /// With `deploy`: seconds to wait for it to end. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
     #[validate(range(max = 3600))]
     pub wait_s: Option<u32>,
 }
@@ -85,22 +88,27 @@ pub struct ServiceLogRequest {
     pub mode: LogMode,
     /// `grep`: the text to find, ignoring case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     #[validate(length(min = 1, max = 200))]
     pub pattern: Option<String>,
     /// `grep`: lines either side of each hit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
     #[validate(range(max = 5))]
     pub context: Option<u32>,
     /// `lines`: the first line; `grep`: search from this line on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u64")]
     #[validate(range(min = 1))]
     pub from: Option<u64>,
     /// `lines`: how many lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
     #[validate(range(min = 1, max = 200))]
     pub count: Option<u32>,
     /// `tail`: how many of the last lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
     #[validate(range(min = 1, max = 200))]
     pub lines: Option<u32>,
 }

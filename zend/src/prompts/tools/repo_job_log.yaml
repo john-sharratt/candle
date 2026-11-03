@@ -8,6 +8,14 @@ questions:
 - read around the failure in that agent job
 - search the agent build log for the warning
 - summarise the build job's output
+- what did the compiler say in the deploy's build
+- read the end of the agent build log
+- grep the deploy build for the linker error
+- show me the lines around that build error
+- which crate failed in the release build
+- find the panic in the agent job's log
+- read the agent build log from the first error
+- what warnings did the release build print
 category: Commands
 description: 'Read what a build-agent job printed — a deploy''s build among them — read on the agent so only the answer comes back, every line numbered as it stands in the log. `mode: summary` gives cargo''s test results, the failures and compiler errors with their line numbers, the warning count and the last lines — read it first; `mode: lines` reads `count` lines from line `from`, what a summary pointed at; `mode: grep` finds `pattern` (plain text, any case) with `context` lines around each hit, and past 200 hits says the `from` to go on with; `mode: tail` reads the last `lines`. Works while the job runs and after. `job` is a handle, `<node>:<id>`: a deploy''s handle is its build job''s. Your own run_command runs are read with run_output, not here. Use for: why a deploy''s build failed. Triggered by "why did the build fail", "read the agent build log". Returns the lines asked for and how to read on.'
 high_risk: true
