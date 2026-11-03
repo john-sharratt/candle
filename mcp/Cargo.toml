@@ -16,11 +16,11 @@ clap         = { workspace = true }
 cluster      = { path = "../cluster" }
 cluster-dial = { path = "../cluster-dial" }
 futures      = { workspace = true }
+# The guides it serves (`src/guides/`), read through their library.
+guides       = { path = "../guides" }
 # The gateway's streams, served with the listener's router.
 hyper        = { version = "1", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
-# The guides, embedded at build time (`src/guides/`).
-include_dir  = { version = "0.7" }
 mcp-server   = { path = "../mcp-server" }
 reqwest      = { version = "0.12", default-features = false, features = ["stream", "json"] }
 serde        = { workspace = true }

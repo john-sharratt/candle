@@ -1,0 +1,109 @@
+name: guide_read
+questions:
+- read the deploy guide
+- how is a release done here
+- what are the steps to test a branch on the agents
+- read the procedure for rolling back
+- how should an incident be handled
+- what does the debug guide say
+- read the guide for cluster care
+- how is an A/B trial run
+- what is the method for a code review
+- read the guide for upgrading a member
+- how do I watch a release
+- what does the logs guide say to do
+- read the substrate guide
+- how is a guide changed
+- what are the steps for writing tests
+- read the guide on health checks
+category: Commands
+description: 'Read one guide: the method for a kind of work, step by step — what to check before, which tools to call in which order, what to do on each way it can end, what to report. `deploy` is a service deployed to one machine; `test` is building and testing on the agents; `release` takes a build across the cluster; `rollback`, `ab-trial`, `cluster-care`, `debug`, `incident`, `logs`, `health` and `upgrade` cover the cluster''s care; the rest cover reviews, research, the bots and the memory. guide_list says what each is for. Read the guide before starting work of its kind, and follow it. Use for: how a kind of work is done here. Triggered by "read the deploy guide", "how is a release done". Returns the guide''s text.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    name:
+      description: The guide's name, as guide_list gives it. Required.
+      enum:
+      - ab-trial
+      - ask
+      - bot-campaign
+      - bot-debrief
+      - bot-discord
+      - bot-documents
+      - bot-message
+      - bot-mission
+      - bot-watch
+      - bots
+      - branch
+      - briefing
+      - cluster-care
+      - compare
+      - debug
+      - delegate
+      - deploy
+      - docs-write
+      - fact-check
+      - feature
+      - gateway
+      - grok
+      - guide-change
+      - handoff
+      - health
+      - image
+      - implement
+      - incident
+      - journal
+      - journal-restructure
+      - knowledge
+      - literature
+      - logs
+      - memory
+      - overnight
+      - perf
+      - postmortem
+      - refactor
+      - release
+      - release-watch
+      - research
+      - research-to-bots
+      - review
+      - rollback
+      - security-review
+      - steer
+      - substrate
+      - test
+      - test-write
+      - thread
+      - upgrade
+      - verify
+      - wait
+      - watch
+      - zen-chat
+      type: string
+  required:
+  - name
+  title: ReadRequest
+  type: object
+examples:
+- |-
+  the fix is merged, deploy it to whiteworld<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Deploying has a written procedure: what to check before, the calls in order, what to do when it rolls back. I read it first.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "guide_read", "arguments": {"name": "deploy"}}
+  </tool_call><|projection|>
+- |-
+  run the tests for that crate on the agents<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Building and testing on the agents is the test guide: how to start the job, wait for it in one call and read the failures.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "guide_read", "arguments": {"name": "test"}}
+  </tool_call><|projection|>
+- read the release guide<|im_end|>

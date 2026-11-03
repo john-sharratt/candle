@@ -60,6 +60,9 @@ zend-vfs = { path = "../zend-vfs" }
 # A file as anchored units: what `file_read` shows and `file_edit` names
 # (docs/npcd_anchored_edits.md).
 doc-units = { path = "../doc-units" }
+# `guide_list` and `guide_read` read the guide library the MCP connector
+# serves, embedded the same way.
+guides = { path = "../guides" }
 # The journal tools read and search a conversation's journal text with the
 # logic npcd's characters share.
 journal-core = { path = "../journal-core" }

@@ -1,0 +1,38 @@
+name: guide_list
+questions:
+- what guides are there
+- is there a procedure for deploying
+- how should I go about a release
+- which guide covers testing a branch
+- list the methods for this kind of work
+- is there a guide for debugging the cluster
+- what is the right way to roll back
+- how do I do an A/B trial
+- where is the method for a code review
+- what guides cover the bots
+- is there a guide for cluster maintenance
+- which guide is for an incident
+- how do I change a guide
+- what is the procedure for watching a release
+- is there a guide for writing tests
+- what methods are written down for this
+category: Commands
+description: 'List the guides: the written methods for doing work with these tools — building and testing on the agents (`test`), deploying a service (`deploy`), releasing a build across the cluster (`release`), rolling back, an A/B trial, cluster maintenance, debugging, incidents, reviews, research, the bots and more — each with when to use it. They are the procedures Claude follows, from the same library. Read the one for the work with guide_read before starting it. Use for: finding out how a kind of work is done here before doing it. Triggered by "is there a procedure for", "how should I go about". Returns each guide''s name and what it is for.'
+high_risk: false
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties: {}
+  title: ListRequest
+  type: object
+examples:
+- |-
+  deploy the fix once it is merged<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A deploy has a written procedure here. The guides say which one covers it; then I read it before starting.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "guide_list", "arguments": {}}
+  </tool_call><|projection|>
+- what procedures are written down for the cluster<|im_end|>

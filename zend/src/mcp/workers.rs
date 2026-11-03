@@ -245,8 +245,13 @@ pub fn start(
         thread,
         name,
         prompt,
-        (Some(caller.person.clone()), caller.role),
-        (priority, effort, kind),
+        (
+            Some(caller.person.clone()),
+            caller.role,
+            priority,
+            effort,
+            kind,
+        ),
         now,
     );
     note(
@@ -294,8 +299,13 @@ pub(super) fn fresh(
     thread: &str,
     name: String,
     prompt: &str,
-    (person, role): (Option<Person>, AccessRole),
-    (priority, effort, kind): (Priority, Effort, WorkerKind),
+    (person, role, priority, effort, kind): (
+        Option<Person>,
+        AccessRole,
+        Priority,
+        Effort,
+        WorkerKind,
+    ),
     now: u64,
 ) -> Worker {
     let conv_id = threads::conv_id(owner, thread, &name);
@@ -354,8 +364,13 @@ pub fn start_part(
         &parent.thread,
         name,
         prompt,
-        (parent.person.clone(), parent.role),
-        (parent.priority, parent.effort, parent.kind),
+        (
+            parent.person.clone(),
+            parent.role,
+            parent.priority,
+            parent.effort,
+            parent.kind,
+        ),
         now,
     );
     let message = format!("{prompt}{}", part_close(&parent.path()));

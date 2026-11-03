@@ -1030,6 +1030,7 @@ use crate::tools::{
         GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
         GIT_RESET, GIT_SHOW, GIT_STATUS, GIT_SWITCH,
     },
+    guide::{GUIDE_LIST, GUIDE_READ},
     hash::{HASH_COMPUTE, HASH_SCAN},
     hash_state::{HASH_STATE_FINALIZE, HASH_STATE_INIT, HASH_STATE_UPDATE},
     http_session::{
@@ -1280,6 +1281,9 @@ fn register_all() -> &'static [RegisteredTool] {
         CLUSTER_LOGS.requires(NET),
         CLUSTER_AUDIT.requires(NET),
         CLUSTER_JOB_STATUS.requires(NET),
+        // Guides (2) — read from the library embedded in this binary.
+        GUIDE_LIST,
+        GUIDE_READ,
     ];
     TOOLS
 }

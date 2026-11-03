@@ -1129,6 +1129,21 @@ mod tests {
         }
     }
 
+    /// **`guide_read` offers exactly the guides the library holds**, so a guide
+    /// added to `mcp/src/guides/` cannot be left out of Zen's grammar, nor a
+    /// removed one left in it.
+    #[test]
+    fn guide_read_offers_every_guide() {
+        let def = find("guide_read").expect("guide_read is defined");
+        let offered: Vec<String> = def.parameters["properties"]["name"]["enum"]
+            .as_array()
+            .expect("an enum of the guides")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(offered, zend_tools::tools::guide::names());
+    }
+
     /// A coding-agent workspace (no `projection.yaml`) uses the bundled catalog
     /// even when it contains an unrelated `tools/` directory (the regression that
     /// shadowed the built-ins with an empty catalog); a mind workspace (with a

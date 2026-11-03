@@ -1,0 +1,13 @@
+[package]
+name = "guides"
+version = "0.1.0"
+edition = "2021"
+description = "The guide library: the methods for doing work with the tools, embedded from mcp/src/guides, read by the MCP connector and by Zen's own guide tools alike"
+
+[dependencies]
+anyhow       = { workspace = true }
+# The guides, embedded at build time from `mcp/src/guides/`.
+include_dir  = { version = "0.7" }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }

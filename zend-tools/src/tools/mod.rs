@@ -20,6 +20,7 @@
 //! | `crypto` | `aead_*`, `hmac_compute`, `signature_*`, `kdf_derive`, `hkdf_*` | RustCrypto |
 //! | `datetime` | `datetime` | chrono + chrono-tz; stateless |
 //! | `file` | `file_{write,read,edit,list,search,grep,delete,image,present}` | VFS tools; `search`/`grep` find by name and by content, `image` makes resized copies |
+//! | `guide` | `guide_list`, `guide_read` | The guide library the MCP connector serves, embedded |
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |
@@ -51,6 +52,7 @@ pub mod crypto;
 pub mod datetime;
 pub mod file;
 pub mod git;
+pub mod guide;
 pub mod hash;
 pub mod hash_state;
 pub mod http_session;
