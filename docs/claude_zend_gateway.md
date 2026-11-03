@@ -824,9 +824,14 @@ its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
    `StreamItem::Handed { to, call_turn, iteration }` and leaves its resume
    entry in place.
 2. The worker loop stops beating, waits for the turn's commit to land
-   (`ZendSession::committed_through`), and asks member `to` to take it:
-   `POST /v1/mcp/worker/continue` with a `Handing {owner, thread, name,
-   call_turn, iteration, through, signed_ms}`, addressed by `x-tokera-node`.
+   (`ZendSession::committed_through`) and for every write it queued to reach
+   the log (`ZendSession::written_through`), and asks member `to` to take it:
+   `POST /v1/mcp/worker/continue` with a `Handing {from, to, owner, thread,
+   name, call_turn, iteration, through, written, signed_ms}`, addressed by
+   `x-tokera-node`. `through` is the turn's commit; `written` is the `oseq`
+   the member's own records are written through. That point is past the
+   commit: the round's resume entry and the worker's record land after it,
+   and a member holding the commit without them finds no round to run.
    The gateway lets a member address a peer this way, as it lets an admin.
    A client reaching a member's own port may not: the member's listener
    strips the header, as it strips a client's identity.
@@ -846,6 +851,25 @@ its tools run. The turn asks whether a ready member is at least `HOP_RATIO`
    and carries the worker on from `iteration`, so the round cap counts on.
    From then on it owns the worker's beat, its settling and its answers. A
    nudge or a stop is read there, at the next boundary.
+5. **A member that lacks the records says which** (`zend/src/hand_records.rs`).
+   It looks again for `CONTINUE_HOLD_WAIT` (10 s). If it still cannot take the
+   worker and lacks any of the handing member's `oseq`s through `written`,
+   it answers `409 {error: "missing", missing: [[start, end], …]}`, naming
+   the newest 256 ranges. On WhiteWorld → BlackWorld (2026-11-04) a handing
+   was refused this way because the receiver held the commit but not the
+   resume entry written after it.
+   The handing member lists those ranges (at most 65,536 `oseq`s) and chooses
+   by size. It carries every record lacked when they fit in 30 MB. If not, it
+   carries the conversation's own: its turns' streams and the records no
+   stream holds, which include the resume entry and the worker's record. If
+   even those are over 30 MB, it carries nothing and the worker stays. It
+   logs the turns it carries, then asks once more, the records after the
+   handing's JSON under the same signature: a newline, then each record's
+   `oseq` and length (little-endian `u64`, `u32`) and its bytes as they
+   travel. The taker applies them as the stream's arrivals are applied
+   (`Replicator::apply_carried`), counted and reloaded the same way. A record
+   that later arrives by the stream is a duplicate. Then it looks again.
+   A handing is carried at most once.
 
 **The record says who runs a worker.** Only its runner beats it: a beat that
 finds another member named stops, and so does a settling. A handing whose

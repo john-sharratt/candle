@@ -106,6 +106,17 @@ impl Conversation {
         committed
     }
 
+    /// Each turn of `timeline` that `origin` declared, as its index and its
+    /// stream id — which of a member's records are a conversation's turns,
+    /// when a member taking the conversation lacks some of them.
+    pub fn turn_streams_by(&self, timeline: TimelineId, origin: u64) -> Vec<(u32, u64)> {
+        let read = self.read();
+        read.turn_streams_of(timeline.raw())
+            .filter(|(_, key, _)| key.writer == origin)
+            .map(|(idx, key, _)| (idx.0, key.stream_id.0))
+            .collect()
+    }
+
     /// Whether this member holds `timeline` complete through `origin`'s
     /// commit `through`: that commit applied here, and every turn up to the
     /// one it committed held — placed, so complete, with no gap below it.

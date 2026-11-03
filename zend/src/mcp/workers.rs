@@ -60,6 +60,7 @@ use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
+use crate::hand_records::{self, Carrying};
 use crate::ingest_lease::{self, Guard, Share};
 use crate::session::{NoDraft, Resume, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::tools::Dispatch;
@@ -900,13 +901,18 @@ fn give_up(session: &Arc<ZendSession>, records: &dyn Records, owner: &str, worke
 /// How long a handed turn's commit may take to land before the member keeps
 /// the round itself.
 const HAND_COMMIT_WAIT: Duration = Duration::from_secs(20);
-/// How long the member a turn is handed to may take to answer — it waits to
-/// hold the turn's records first ([`CONTINUE_HOLD_WAIT`]). With the commit's
-/// wait, [`TAKEN_WAIT`] and a beat's interval, under the beat's own limit
-/// (`threads::BEAT_LOST_MS`): the beat is stopped while the handing runs.
-const HAND_ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// How long the member a turn is handed to may take to answer each of the
+/// handing's two asks — it waits to hold the turn's records first
+/// ([`CONTINUE_HOLD_WAIT`]), and the second ask carries the records it lacked.
+/// Both, with the commit's wait, [`TAKEN_WAIT`] and a beat's interval, are
+/// under the beat's own limit (`threads::BEAT_LOST_MS`): the beat is stopped
+/// while the handing runs.
+const HAND_ANSWER_WAIT: Duration = Duration::from_secs(25);
 /// How long the member taking a handed worker waits to hold its records.
-pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(20);
+pub const CONTINUE_HOLD_WAIT: Duration = Duration::from_secs(10);
+/// The error a member taking a worker answers when it lacks the handing
+/// member's records, with the ranges it lacks as `missing`.
+pub const MISSING: &str = "missing";
 /// The route a worker is handed on (`crate::api::worker_continue`).
 pub const CONTINUE_PATH: &str = "/v1/mcp/worker/continue";
 
@@ -926,15 +932,34 @@ pub struct Handing {
     pub iteration: usize,
     /// The handing member's newest commit of the worker's conversation.
     pub through: u64,
+    /// Every record the handing member wrote up to this `oseq` is in its log:
+    /// the commit, and the round's resume entry and the worker's record after
+    /// it. A member lacking any of them says which (`crate::hand_records`).
+    pub written: u64,
     /// When it was signed, Unix ms (`worker_hop::fresh`).
     pub signed_ms: u64,
 }
 
+/// The ranges a refusal says its member lacks of the handing member's
+/// records, when it is one that says so ([`MISSING`]).
+pub fn lacked(status: u16, body: &[u8]) -> Option<Vec<(u64, u64)>> {
+    if status != 409 {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("error").and_then(Value::as_str) != Some(MISSING) {
+        return None;
+    }
+    serde_json::from_value(v.get("missing")?.clone()).ok()
+}
+
 /// Hand `worker`, whose turn stopped before running round `iteration`'s call
 /// turn `call_turn`, to member `to` (`crate::worker_hop`): once this member's
-/// commit of it has landed, `to` is asked to take it, signed with the members'
-/// handing key, and answers once it holds the commit and runs the worker.
-/// `Err` keeps the worker here.
+/// commit of it has landed and its writes are in the log, `to` is asked to
+/// take it, signed with the members' handing key, and answers once it holds
+/// the commit and runs the worker. When `to` answers that it lacks records of
+/// this member's, it is asked again carrying them, if they are few enough
+/// (`crate::hand_records`). `Err` keeps the worker here.
 async fn hand_on(
     session: &ZendSession,
     owner: &str,
@@ -948,48 +973,75 @@ async fn hand_on(
         .committed_through(&worker.conv_id, HAND_COMMIT_WAIT)
         .await
         .ok_or("its turn's commit did not land in time")?;
+    let written = session
+        .written_through()
+        .await
+        .ok_or("its writes could not be waited for")?;
     let from = worker_hop::own_node().ok_or("this member is in no cluster")?;
-    let body = serde_json::to_vec(&Handing {
-        from,
-        to,
-        owner: owner.to_string(),
-        thread: worker.thread.clone(),
-        name: worker.name.clone(),
-        call_turn,
-        iteration,
-        through,
-        signed_ms: now_ms(),
-    })
-    .map_err(|e| e.to_string())?;
-    let proof = worker_hop::sign(&body).ok_or("this member holds no handing key")?;
-    let headers = [
-        (
-            HeaderName::from_static(NODE_HEADER),
-            HeaderValue::from_str(&format!("{to:016x}")).map_err(|e| e.to_string())?,
-        ),
-        (
-            HeaderName::from_static(worker_hop::PROOF_HEADER),
-            HeaderValue::from_str(&proof).map_err(|e| e.to_string())?,
-        ),
-    ];
-    let reply = send_up(
-        &member,
-        Method::POST,
-        CONTINUE_PATH,
-        &headers,
-        body,
-        Some(HAND_ANSWER_WAIT),
-    )
-    .await
-    .map_err(|e| format!("the gateway could not be reached: {e:#}"))?;
-    if reply.status == 202 {
-        Ok(())
-    } else {
-        Err(format!(
+    let mut carrying = Carrying::default();
+    loop {
+        let handing = serde_json::to_vec(&Handing {
+            from,
+            to,
+            owner: owner.to_string(),
+            thread: worker.thread.clone(),
+            name: worker.name.clone(),
+            call_turn,
+            iteration,
+            through,
+            written,
+            signed_ms: now_ms(),
+        })
+        .map_err(|e| e.to_string())?;
+        let body = hand_records::encode(&handing, &carrying.records);
+        let proof = worker_hop::sign(&body).ok_or("this member holds no handing key")?;
+        let headers = [
+            (
+                HeaderName::from_static(NODE_HEADER),
+                HeaderValue::from_str(&format!("{to:016x}")).map_err(|e| e.to_string())?,
+            ),
+            (
+                HeaderName::from_static(worker_hop::PROOF_HEADER),
+                HeaderValue::from_str(&proof).map_err(|e| e.to_string())?,
+            ),
+        ];
+        let reply = send_up(
+            &member,
+            Method::POST,
+            CONTINUE_PATH,
+            &headers,
+            body,
+            Some(HAND_ANSWER_WAIT),
+        )
+        .await
+        .map_err(|e| format!("the gateway could not be reached: {e:#}"))?;
+        if reply.status == 202 {
+            return Ok(());
+        }
+        let refused = format!(
             "{to:016x} answered {}: {}",
             reply.status,
             String::from_utf8_lossy(&reply.body)
-        ))
+        );
+        // Asked once carrying what it lacked, it is not asked again.
+        let missing = match lacked(reply.status, &reply.body) {
+            Some(missing) if carrying.records.is_empty() => missing,
+            _ => return Err(refused),
+        };
+        carrying = session
+            .carrying(&worker.conv_id, missing)
+            .await
+            .map_err(|why| format!("{refused} — and none are carried: {why}"))?;
+        if carrying.records.is_empty() {
+            return Err(format!("{refused} — and this member holds none of them"));
+        }
+        tracing::info!(
+            conv_id = %worker.conv_id,
+            to = %format!("{to:016x}"),
+            "mcp: the member taking the worker lacks records of this member's, so the handing \
+             carries them: {}",
+            carrying.told()
+        );
     }
 }
 

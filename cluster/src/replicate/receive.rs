@@ -160,6 +160,42 @@ impl Replicator {
         }
     }
 
+    /// Apply records `origin` wrote that `origin` sent here itself, outside
+    /// any socket's stream — what a member handing work on carries of its own
+    /// records the member taking it lacks — counted as arrivals are, and
+    /// reloaded when the store asks. How many the store took; none in fault
+    /// mode. Each one that also arrives by the stream is a duplicate there.
+    pub async fn apply_carried(
+        self: &Arc<Self>,
+        origin: u64,
+        records: Vec<(u64, Vec<u8>)>,
+    ) -> usize {
+        if records.is_empty() || self.faulted() {
+            return 0;
+        }
+        let batch: Vec<(u64, u64, Vec<u8>)> = records
+            .into_iter()
+            .map(|(oseq, bytes)| (origin, oseq, bytes))
+            .collect();
+        let store = self.store.clone();
+        let Ok(Applied { taken, reload }) =
+            tokio::task::spawn_blocking(move || store.apply(&batch)).await
+        else {
+            return 0;
+        };
+        let applied = taken.iter().filter(|t| **t).count();
+        {
+            let mut s = self.state();
+            s.stats.applied += applied as u64;
+            s.stats.refused += (taken.len() - applied) as u64;
+            s.ack_dirty |= applied > 0;
+        }
+        if reload {
+            self.reload().await;
+        }
+        applied
+    }
+
     /// A `HEADERS` of one of this member's catch-ups.
     ///
     /// A listed record of a type this store never takes is counted gone, not

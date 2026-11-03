@@ -108,6 +108,7 @@ use crate::deletions::Deletions;
 use crate::engine_asks;
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
+use crate::hand_records::{self, Carrying};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
@@ -8866,6 +8867,55 @@ impl ZendSession {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// The `oseq` this member's own records are written through once every
+    /// write queued so far is in the log: what a member taking a worker from
+    /// this one must hold, its turn's commit and the round's resume entry and
+    /// the worker's record after it among them.
+    pub async fn written_through(&self) -> Option<u64> {
+        let conversation = self.inference.load_full()?.engine.conversation();
+        tokio::task::spawn_blocking(move || {
+            conversation.wait_written(conversation.write_ticket());
+            conversation.own_through()
+        })
+        .await
+        .ok()
+    }
+
+    /// What this member lacks of `origin`'s records `1..=written`
+    /// ([`hand_records::missing`]).
+    pub async fn lacks_of(&self, origin: u64, written: u64) -> Vec<(u64, u64)> {
+        let Some(state) = self.inference.load_full() else {
+            return Vec::new();
+        };
+        let conversation = state.engine.conversation();
+        tokio::task::spawn_blocking(move || {
+            hand_records::missing(conversation.applied_set().origin(origin), written)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// What a handing of `conv_id` carries of this member's records in
+    /// `missing`, the ranges its taker lacks ([`hand_records::gather`]).
+    pub async fn carrying(
+        &self,
+        conv_id: &str,
+        missing: Vec<(u64, u64)>,
+    ) -> Result<Carrying, String> {
+        let state = self
+            .inference
+            .load_full()
+            .ok_or("the engine is not loaded")?;
+        let conversation = state.engine.conversation();
+        let timeline = timeline_for(conv_id);
+        tokio::task::spawn_blocking(move || {
+            let origin = conversation.node();
+            hand_records::gather(&conversation, timeline, origin, &missing)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     // See the note on `run_inference_stream`.

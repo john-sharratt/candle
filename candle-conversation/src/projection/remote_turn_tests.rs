@@ -235,6 +235,12 @@ fn a_released_conversation_is_held_complete_by_its_own_commit() {
         "not this conversation's commit"
     );
     assert_eq!(conv.last_commit_oseq(tl, A), Some(30));
+    assert_eq!(
+        conv.turn_streams_by(tl, A),
+        vec![(0, decl(0).stream_id().0), (1, decl(1).stream_id().0)],
+        "each turn the writer declared, by its stream"
+    );
+    assert_eq!(conv.turn_streams_by(tl, A + 1), vec![], "none by another");
 
     let short = TempDir::new().unwrap();
     let conv = reload(&short);

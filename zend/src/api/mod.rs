@@ -364,7 +364,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             "/v1/mcp/worker/continue",
             Role::Unauthenticated,
             Dispatch::Any,
-            post(worker_continue::post),
+            post(worker_continue::post).body_limit(worker_continue::BODY_LIMIT),
         )
 }
 
