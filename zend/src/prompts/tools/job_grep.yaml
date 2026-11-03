@@ -1,0 +1,66 @@
+name: job_grep
+questions:
+- find the error in the deploy build
+- search the agent build log for the warning
+- grep the deploy build for the linker error
+- which crate failed in the release build
+- find the panic in the agent job's log
+- where did the test run print FAILED
+- search the trial's log for serving
+- find every warning in the build output
+- did the build log mention out of memory
+- search the test output for the test that failed
+- find where the trial lost the gateway
+- grep the build for unresolved import
+- where in the deploy log did keep roll back
+- find the first error line in the test run
+- search the task's output for its verdict
+- which page has the panic on it
+category: Commands
+description: 'Search a job''s whole output for `pattern` — plain text, any case, not a regular expression — searched where the output is written, so only the hits come back: each line that holds it, numbered as in the output with the page it is on, and `context` lines around it (0 to 5). Past 200 hits it says how many more there were: search for something narrower. Read around a hit with job_read on its page. Use for: finding a failure in a long log without paging through it. Triggered by "find the error in the build", "search the log for". Returns each hit with its line and page.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    job:
+      description: The job's handle, as the call that started it or job_list answered it. Required.
+      maxLength: 200
+      minLength: 8
+      type: string
+    pattern:
+      description: The text to find, ignoring case; plain text. Required.
+      maxLength: 200
+      minLength: 1
+      type: string
+    context:
+      description: Lines to show either side of each hit, 0 to 5; 0 by default. Optional.
+      maximum: 5.0
+      minimum: 0.0
+      type: integer
+  required:
+  - job
+  - pattern
+  title: GrepRequest
+  type: object
+examples:
+- |-
+  which test failed in that run<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  cargo prints FAILED beside each failing test; a few lines of context show its panic.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_grep", "arguments": {"job": "build:76c3a0f4d39bd9db:XeV_I_QPzpg", "pattern": "FAILED", "context": 3}}
+  </tool_call><|projection|>
+- |-
+  why did keep roll the deploy back<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The trial's part of the deploy's output says why; keep writes rolled back where it gave up.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_grep", "arguments": {"job": "deploy:76c3a0f4d39bd9db:XeV_I_QPzpg", "pattern": "rolled back", "context": 5}}
+  </tool_call><|projection|>
+- find the error in the log<|im_end|>

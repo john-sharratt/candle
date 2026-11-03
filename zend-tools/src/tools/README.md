@@ -59,22 +59,23 @@ The sandboxes themselves — one per git repository, logs in the workspace's
 `jobs/` — are `crate::sandboxes`, reached only through
 `ToolContext::sandboxes`, which requires `Exec`.
 
-### Builds and deploys (8 tools)
+### Jobs, builds and deploys (7 tools)
 
 Each is a typed request handed whole to the `OpsRunner` the daemon injects,
-which runs the same implementation as its MCP tools (`docs/build_deploy_tools.md`
-§6), so a worker and Claude get one answer from one code path.
+which runs the same implementation as its MCP tools (`docs/jobs.md` §8), so a
+worker and Claude get one answer from one code path. A job is named by its
+handle: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or
+`cluster:<node>:<n>`.
 
 | Tool | File | Notes |
 |------|------|-------|
+| `job_list` | `ops/job.rs` | Every job the caller can see, newest first, by handle. `Network` |
+| `job_status` | `ops/job.rs` | Where each job is, waiting up to `wait_s` (at most 300) for any one to end; its summary and `pages: N`. `Network` |
+| `job_read` | `ops/job.rs` | One 200-line page of a job's output; a page not yet full waits for it to fill. `Network` |
+| `job_grep` | `ops/job.rs` | A job's whole output searched for plain text, each hit with its line and page. `Network` |
+| `job_cancel` | `ops/job.rs` | Stops a job of any kind. `Network` + `Exec` + `DiskWrite` |
 | `service_deploy` | `ops/service.rs` | Builds origin/main on the machine's agent and has keep try it; answers the deploy's handle at once. `Network` + `Exec` + `DiskWrite` |
-| `service_status` | `ops/service.rs` | One deploy's stage, waited on with `wait_s`; or every machine's services. `Network` |
-| `service_log` | `ops/service.rs` | A trial log, read on keep's machine: `mode` summary / tail / lines / grep. `Network` |
-| `service_cancel` | `ops/service.rs` | Stops a deploy's build, or rolls its trial back. `Network` + `Exec` + `DiskWrite` |
-| `repo_job_status` | `ops/job.rs` | A job by its `<node>:<id>` handle, waited on with `wait_s`. `Network` |
-| `repo_job_log` | `ops/job.rs` | A job's log, read on the agent, in the same four modes. `Network` |
-| `repo_job_list` | `ops/job.rs` | The agents' jobs by handle. `Network` |
-| `repo_job_cancel` | `ops/job.rs` | Stops a job at any phase. `Network` + `Exec` + `DiskWrite` |
+| `service_status` | `ops/service.rs` | What each machine's keep runs, and the deploys building there. `Network` |
 
 ### Git (12 tools)
 

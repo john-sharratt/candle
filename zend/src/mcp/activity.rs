@@ -94,7 +94,7 @@ fn changed_a_file(tool: &str, result: &Value) -> bool {
 
 impl Activity {
     /// [`Self::observe`], also timing the tool calls at `now_ms` and keeping
-    /// how each came out: what `repo_task_report` reads.
+    /// how each came out: what a task's turn report reads (`tools::turn_report`).
     pub fn observe_at(&mut self, item: &StreamItem, now_ms: u64) -> bool {
         if let StreamItem::Tool(status) = item {
             match status.phase {

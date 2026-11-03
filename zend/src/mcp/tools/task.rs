@@ -1,6 +1,7 @@
 //! `repo_task_start {thread, name, prompt, role?, priority?, effort?, wait_s?}`: start a
-//! task on a new worker, and wait for it up to `wait_s`
-//! (`docs/claude_zend_gateway.md` §3.2, §3.3, §3.4).
+//! task on a new worker, and wait for it up to `wait_s`; it answers the task's
+//! handle, `task:<thread>/<name>` (`docs/claude_zend_gateway.md` §3.2, §3.4,
+//! `docs/jobs.md` §1).
 
 use serde_json::{json, Value};
 
@@ -22,10 +23,10 @@ pub fn definition() -> Value {
             what to do, what to verify before answering, and the shape of the final response (verdict, \
             findings, pointers such as file:line). Name the worker for what it does, as a kebab-case slug \
             (`verify-expiry`), never a number; a name already used on the thread gets the next free one \
-            (`verify-expiry.2`), so wait on the path this answers, not the name asked for. Answers `done` \
-            with the worker's final response and its journal entries, or `running` with its path and what it \
-            has done so far — then call `repo_task_wait` on it, or start more tasks first and wait on them \
-            all at once.",
+            (`verify-expiry.2`), so use the handle this answers, `task:<thread>/<name>`, not the name asked \
+            for. Answers done, with the task's final response and its journal entries, or running, with its \
+            handle and what it has done so far — then wait on it with `job_status`, or start more jobs first \
+            and wait on them all in one `job_status` call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -35,7 +36,7 @@ pub fn definition() -> Value {
                 "role": {"type": "string", "enum": ["coder", "researcher", "reviewer"], "description": "The kind of work it does, which puts that kind's working rules in its system prompt: `coder` by default, for changing code; `researcher` to answer a question from evidence; `reviewer` to read a change and report what is wrong with it."},
                 "priority": {"type": "string", "enum": ["normal", "high"], "description": "How soon its turns decode — scheduling only, not how hard it thinks: today both decode at the top band beside a live dialogue, since someone is waiting on the task; `normal` is the default."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard it thinks (`deep` by default). `exhaustive` for work that must weigh many sources or results against each other — research that reconciles what it fetched, a review that cross-checks findings — where catching a contradiction takes thought; `balanced` for routine, mechanical tasks."},
-                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (45 by default)."}
+                "wait_s": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "Seconds to wait for it to settle before answering that it runs; 45 by default."}
             },
             "required": ["thread", "name", "prompt"],
             "additionalProperties": false

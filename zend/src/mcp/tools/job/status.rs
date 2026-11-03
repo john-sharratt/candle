@@ -21,12 +21,23 @@ const MAX_JOBS: usize = 16;
 const DEFAULT_WAIT_S: u64 = 60;
 
 /// The handle pattern every `job` takes (`docs/jobs.md` §7).
-pub const HANDLE_PATTERN: &str = "(task:[a-z0-9-]+(/[a-z0-9-]+)+|(build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})";
+pub const HANDLE_PATTERN: &str = "(task:[a-z0-9-]+(/[a-z0-9-]+([.][0-9]+)?)+|(build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})";
+
+/// The task part of [`HANDLE_PATTERN`]: what a tool that steers a task takes.
+pub const TASK_PATTERN: &str = "task:[a-z0-9-]+(/[a-z0-9-]+([.][0-9]+)?)+";
+
+/// What a tool that steers a task says of the `task` it takes.
+pub fn task_schema() -> Value {
+    json!({
+        "type": "string", "minLength": 8, "maxLength": 200, "pattern": TASK_PATTERN,
+        "description": "The task's handle, `task:<thread>/<name>`, as `repo_task_start` or `job_list` answered it."
+    })
+}
 
 /// What every tool says of the `job` it takes.
 pub fn job_schema() -> Value {
     json!({
-        "type": "string", "minLength": 6, "maxLength": 96, "pattern": HANDLE_PATTERN,
+        "type": "string", "minLength": 8, "maxLength": 200, "pattern": HANDLE_PATTERN,
         "description": "The job's handle, as the call that started it or `job_list` answered it: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or `cluster:<node>:<n>`."
     })
 }
@@ -171,6 +182,7 @@ mod tests {
         for ok in [
             "task:review/verify",
             "task:review/verify/read",
+            "task:review/verify.2/read.3",
             "build:76c3a0f4d39bd9db:XeV_I_QPzpg",
             "deploy:76c3a0f4d39bd9db:XeV_I_QPzpg",
             "cluster:a0ac88178cb2b57d:7",
@@ -179,6 +191,7 @@ mod tests {
         }
         for bad in [
             "task:review",
+            "task:review/verify.",
             "build:76c3a0f4d39bd9db:XeV_I_QPzpZ",
             "build:76C3A0F4D39BD9DB:XeV_I_QPzpg",
             "cluster:a0ac88178cb2b57d:",
@@ -187,6 +200,10 @@ mod tests {
         ] {
             assert!(!re.is_match(bad), "{bad}");
         }
+        assert!(
+            HANDLE_PATTERN.starts_with(&format!("({TASK_PATTERN}|")),
+            "a task's pattern is the task part of every handle's"
+        );
     }
 
     #[test]

@@ -12,7 +12,6 @@ use super::super::{pages, JobHandle, Standing};
 use super::Row;
 use crate::mcp::ops::{json_of, why};
 use crate::mcp::ops_tools::OpsCall;
-use crate::mcp::tools::cluster_job_status::summarise;
 use crate::mcp::tools::cluster_status::ago;
 use crate::mcp::tools::Answer;
 use crate::mcp::workers::now_ms;
@@ -58,6 +57,74 @@ async fn stream(call: &OpsCall, node: &str, n: u64) -> Result<(String, bool), St
         )),
         status => Err(format!("cluster:{node}:{n}: {status} — {}", why(&reply))),
     }
+}
+
+/// The steps a summary quotes, from the end.
+const STEPS_SHOWN: usize = 12;
+
+/// A job's stream as far as it was read, summarised: its state, then its last
+/// steps.
+pub fn summarise(ndjson: &str, complete: bool) -> String {
+    let lines: Vec<Value> = ndjson
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let event = |l: &Value| {
+        l.get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let command = lines
+        .iter()
+        .find(|l| event(l) == "started")
+        .and_then(|l| l.get("command").and_then(Value::as_str))
+        .unwrap_or("the command")
+        .to_string();
+    let steps: Vec<String> = lines
+        .iter()
+        .filter(|l| event(l) == "step")
+        .map(|l| {
+            format!(
+                "- {}: {}",
+                l.get("step").and_then(Value::as_str).unwrap_or(""),
+                l.get("detail").and_then(Value::as_str).unwrap_or("")
+            )
+        })
+        .collect();
+    let last = lines.last();
+    let mut out = match last.map(event).as_deref() {
+        Some("done") => format!(
+            "`{command}` is done. Result: {}",
+            last.and_then(|l| l.get("result"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        ),
+        Some("error") => format!(
+            "`{command}` failed: {} — {}",
+            last.and_then(|l| l.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            last.and_then(|l| l.get("detail"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        ),
+        _ if complete => format!("`{command}`'s stream ended with no result: the job was lost"),
+        _ => format!("`{command}` is still running"),
+    };
+    if !steps.is_empty() {
+        let from = steps.len().saturating_sub(STEPS_SHOWN);
+        out.push_str(&format!(
+            "\nSteps ({} in all, the last {}):",
+            steps.len(),
+            steps.len() - from
+        ));
+        for s in &steps[from..] {
+            out.push('\n');
+            out.push_str(s);
+        }
+    }
+    out
 }
 
 /// The job's output, as text.
@@ -168,6 +235,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    const STARTED: &str = r#"{"event":"started","command":"drain","args":{"app":"zend"}}"#;
+    const STEP: &str = r#"{"event":"step","step":"zend","detail":"3 of 9 handed off"}"#;
+
+    #[test]
+    fn a_job_reads_as_running_done_failed_or_lost() {
+        assert_eq!(
+            summarise(&format!("{STARTED}\n{STEP}\n"), false),
+            "`drain` is still running\nSteps (1 in all, the last 1):\n- zend: 3 of 9 handed off"
+        );
+        let done = format!("{STARTED}\n{{\"event\":\"done\",\"result\":{{\"zend\":\"ok\"}}}}\n");
+        assert_eq!(
+            summarise(&done, true),
+            "`drain` is done. Result: {\"zend\":\"ok\"}"
+        );
+        let failed = format!(
+            "{STARTED}\n{{\"event\":\"error\",\"error\":\"command_failed\",\"detail\":\"no cluster\"}}\n"
+        );
+        assert_eq!(
+            summarise(&failed, true),
+            "`drain` failed: command_failed — no cluster"
+        );
+        assert_eq!(
+            summarise(&format!("{STARTED}\n"), true),
+            "`drain`'s stream ended with no result: the job was lost"
+        );
+    }
 
     #[test]
     fn each_event_is_a_line() {

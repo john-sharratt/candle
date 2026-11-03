@@ -5,7 +5,9 @@
 //! their commands, the build agents, each machine's service supervisor, the
 //! substrate — and every one but `cluster_status` and `cluster_logs` is for
 //! Admins only, with each decision gated on the user's approval
-//! ([`super::ops`]).
+//! ([`super::ops`]). Whatever runs longer than a call — a task, a build, a
+//! deploy, a maintenance job — is a job, watched, read and stopped with the
+//! five `job_*` tools ([`job`], `docs/jobs.md`).
 //!
 //! A tool's name says what it acts on and what it does to it —
 //! `repo_task_start`, `service_status` — never the process that serves it.
@@ -39,7 +41,6 @@ mod archive;
 mod attach;
 pub mod cluster_audit;
 mod cluster_command;
-pub mod cluster_job_status;
 pub mod cluster_logs;
 pub mod cluster_status;
 mod fit;
@@ -65,14 +66,13 @@ pub mod mem;
 mod nudge;
 mod reply;
 pub mod repo_job;
-mod repo_task_report;
 pub mod service;
 mod service_control;
-mod stop;
 mod task;
 mod threads;
 mod timeline_delete;
 mod timeline_read;
+pub mod turn_report;
 mod user_context;
 mod user_episode;
 pub(crate) mod wait;
@@ -157,11 +157,8 @@ pub fn definitions() -> Value {
         user_context::definition(),
         attach::definition(),
         task::definition(),
-        wait::definition(),
-        repo_task_report::definition(),
         reply::definition(),
         nudge::definition(),
-        stop::definition(),
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
@@ -190,17 +187,10 @@ pub fn definitions() -> Value {
         cluster_logs::definition(),
         cluster_audit::definition(),
         cluster_command::definition(),
-        cluster_job_status::definition(),
         gateway_command::definition(),
         repo_job::start::definition(),
-        repo_job::status::definition(),
-        repo_job::log::definition(),
-        repo_job::list::definition(),
-        repo_job::cancel::definition(),
         service::deploy::definition(),
         service::status::definition(),
-        service::log::definition(),
-        service::cancel::definition(),
         service_control::definition(),
         layer_read::definition(),
         layer_toggle::definition(),
@@ -228,11 +218,8 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         journal_forget::NAME => blocking(ctx, args, journal_forget::call).await,
         attach::NAME => blocking(ctx, args, attach::call).await,
         task::NAME => task::call(ctx, args).await,
-        wait::NAME => wait::call(ctx, args).await,
-        repo_task_report::NAME => blocking(ctx, args, repo_task_report::call).await,
         reply::NAME => reply::call(ctx, args).await,
         nudge::NAME => blocking(ctx, args, nudge::call).await,
-        stop::NAME => stop::call(ctx, args).await,
         journal_read::NAME => blocking(ctx, args, journal_read::call).await,
         journal_note::NAME => blocking(ctx, args, journal_note::call).await,
         journal_grep::NAME => blocking(ctx, args, journal_grep::call).await,
@@ -260,17 +247,10 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
-        cluster_job_status::NAME => cluster_job_status::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
         repo_job::start::NAME => repo_job::start::call(ctx, args).await,
-        repo_job::status::NAME => repo_job::status::call(ctx, args).await,
-        repo_job::log::NAME => repo_job::log::call(ctx, args).await,
-        repo_job::list::NAME => repo_job::list::call(ctx, args).await,
-        repo_job::cancel::NAME => repo_job::cancel::call(ctx, args).await,
         service::deploy::NAME => service::deploy::call(ctx, args).await,
         service::status::NAME => service::status::call(ctx, args).await,
-        service::log::NAME => service::log::call(ctx, args).await,
-        service::cancel::NAME => service::cancel::call(ctx, args).await,
         service_control::NAME => service_control::call(ctx, args).await,
         layer_read::NAME => blocking(ctx, args, layer_read::call).await,
         layer_toggle::NAME => layer_toggle::call(ctx, args).await,
@@ -352,11 +332,8 @@ mod tests {
                 "get_user_context",
                 "thread_attach",
                 "repo_task_start",
-                "repo_task_wait",
-                "repo_task_report",
                 "repo_task_reply",
                 "repo_task_nudge",
-                "repo_task_stop",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
@@ -385,17 +362,10 @@ mod tests {
                 "cluster_logs",
                 "cluster_audit",
                 "cluster_command",
-                "cluster_job_status",
                 "gateway_command",
                 "repo_job_start",
-                "repo_job_status",
-                "repo_job_log",
-                "repo_job_list",
-                "repo_job_cancel",
                 "service_deploy",
                 "service_status",
-                "service_log",
-                "service_cancel",
                 "service_control",
                 "layer_read",
                 "layer_toggle",
@@ -422,8 +392,6 @@ mod tests {
             read_only,
             [
                 "get_user_context",
-                "repo_task_wait",
-                "repo_task_report",
                 "journal_read",
                 "journal_grep",
                 "thread_list",
@@ -435,12 +403,7 @@ mod tests {
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
-                "cluster_job_status",
-                "repo_job_status",
-                "repo_job_log",
-                "repo_job_list",
                 "service_status",
-                "service_log",
                 "layer_read",
                 "timeline_read"
             ]

@@ -17,7 +17,7 @@ questions:
 - replace the running service with what main holds
 - test the release on a live machine before anyone rolls it out
 category: Commands
-description: 'Deploy a service to one machine: build it as origin/main holds it on that machine''s build agent (`cargo build --release -p <service>`), stage the binary, and try it through keep, the supervisor that runs the machine''s services. keep starts the new build in place of the installed one and keeps it once it prints that it is serving — within ten minutes, the window restarting while it catches up on replication — and otherwise puts the previous binary back, so a bad build cannot keep a machine down. Answers at once with the deploy''s handle (`<node>:<id>`, also its build job''s handle), the machine and the build''s phase; it does not wait. Then watch it with service_status, passing the handle as `deploy` and a long `wait_s` — one call that holds until it is proven, rolled back or failed — and read its build with repo_job_log (the handle as `job`) or its trial with service_log. Only origin/main is built: your branch reaches it by merging and pushing, and a branch is checked with run_command. `motherd` is the daemon (models, Zen, npcd), and trying it stops every app on that machine for the trial; `web` is the gateway; `mcp` is the connector. Refused on the machine running this conversation, and on a machine holding an app''s only ready member. One machine per call: rolling a build out to the others is the user''s decision. Use for: putting a merged build on a machine. Triggered by "deploy this", "try the build on whiteworld". Returns the deploy''s handle, the machine, and the calls that watch it.'
+description: 'Deploy a service to one machine: build it as origin/main holds it on that machine''s build agent (`cargo build --release -p <service>`), stage the binary, and try it through keep, the supervisor that runs the machine''s services. keep starts the new build in place of the installed one and keeps it once it prints that it is serving — within ten minutes, the window restarting while it catches up on replication — and otherwise puts the previous binary back, so a bad build cannot keep a machine down. Answers at once with the deploy''s handle (`deploy:<node>:<id>`), the machine and the build''s phase; it does not wait. Then wait on it with job_status and a long `wait_s` — one call that holds until it is proven, rolled back or failed — read its output (the build''s log, then the trial''s) with job_read and job_grep, and stop it with job_cancel. Only origin/main is built: your branch reaches it by merging and pushing, and a branch is checked with run_command. `motherd` is the daemon (models, Zen, npcd), and trying it stops every app on that machine for the trial; `web` is the gateway; `mcp` is the connector. Refused on the machine running this conversation, and on a machine holding an app''s only ready member. One machine per call: rolling a build out to the others is the user''s decision. Use for: putting a merged build on a machine. Triggered by "deploy this", "try the build on whiteworld". Returns the deploy''s handle, the machine, and the calls that watch it.'
 high_risk: true
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -44,7 +44,7 @@ examples:
   the gateway fix is on main, get it running on blackworld<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  It is merged, so it can be built. The gateway is the `web` service. service_deploy starts the build on that machine and answers with a handle at once; I watch it with service_status after.<|projection|>
+  It is merged, so it can be built. The gateway is the `web` service. service_deploy starts the build on that machine and answers with a handle at once; I wait on it with job_status after.<|projection|>
   </think>
 
   <tool_call>
@@ -66,7 +66,7 @@ examples:
   it is merged, try it on the other machine<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The change is on main, so a trial is the next step. service_deploy builds main on that machine's agent and hands keep the trial; the call answers with the deploy's handle, and its outcome comes from service_status.<|projection|>
+  The change is on main, so a trial is the next step. service_deploy builds main on that machine's agent and hands keep the trial; the call answers with the deploy's handle, and its outcome comes from job_status.<|projection|>
   </think>
 
   <tool_call>

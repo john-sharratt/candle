@@ -8,7 +8,7 @@
 //! | [`deploy`] | a deploy: its build, then keep's trial |
 //! | [`cluster`] | a maintenance command's job on a member |
 
-use cluster::log_read::{LogAsk, LogRead};
+use ::cluster::log_read::{LogAsk, LogRead};
 
 use super::{JobHandle, Standing};
 use crate::mcp::ops_tools::OpsCall;

@@ -1,38 +1,12 @@
-//! `repo_task_report {worker}`: how a worker's latest turn went, by the numbers
-//! its turn's stream counted (`docs/claude_zend_gateway.md` §3.3): where the time
-//! went, its calls by tool, what failed and how, and when it first changed a
-//! file and first committed. Reading a run from its conversation a turn at a
-//! time took hundreds of requests for what is one table.
+//! How a task's latest turn went, by the numbers its turn's stream counted:
+//! where the time went, its calls by tool, what failed and how, and when it
+//! first changed a file and first committed — the close of a task's output
+//! (`docs/jobs.md` §3), counted from the turn itself, never summarised by a
+//! model.
 
-use serde_json::{json, Value};
-
-use super::{string, Answer, Ctx, LOADING};
+use super::wait::handle;
 use crate::mcp::activity::{duration, Activity};
-use crate::mcp::names::Path;
-use crate::mcp::threads::{self, Worker};
-use crate::mcp::workers::now_ms;
-
-pub const NAME: &str = "repo_task_report";
-
-pub fn definition() -> Value {
-    json!({
-        "name": NAME,
-        "annotations": {"readOnlyHint": true},
-        "description": "Report how a worker's latest turn went, running or ended, for judging a run rather than \
-            reading it: time in tools against time in the model, rounds and thinking tokens, its calls by \
-            tool, every failed call by how it failed, and when it first changed a file and first committed. \
-            The numbers are counted from the turn itself, never summarised by a model. For what the worker \
-            found or decided, read its journal with `journal_read`.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "worker": {"type": "string", "description": "The worker's path, `T:<thread>/<name>`."}
-            },
-            "required": ["worker"],
-            "additionalProperties": false
-        }
-    })
-}
+use crate::mcp::threads::Worker;
 
 /// `when`, an epoch time, as how far into the turn begun at `from` it fell.
 fn into_turn(when: Option<u64>, from: u64) -> String {
@@ -67,7 +41,7 @@ fn by_tool(activity: &Activity) -> Vec<String> {
 
 /// The report on `worker`, read at `now`.
 pub fn render(worker: &Worker, now: u64) -> String {
-    let path = worker.path();
+    let path = handle(worker);
     let state = format!("{:?}", worker.state).to_lowercase();
     let Some(activity) = &worker.activity else {
         return format!("{path}: {state}, and no turn has begun.");
@@ -101,32 +75,10 @@ pub fn render(worker: &Worker, now: u64) -> String {
     lines.join("\n")
 }
 
-pub fn call(ctx: &Ctx, args: &Value) -> Answer {
-    let path = match string(args, "worker") {
-        Ok(path) => path,
-        Err(e) => return Answer::error(e),
-    };
-    let (thread, name) = match Path::parse(path) {
-        Ok(Path::Worker { thread, worker }) => (thread, worker),
-        Ok(_) => {
-            return Answer::error(format!(
-                "`{path}` is not a worker; a worker is `T:<thread>/<name>`"
-            ))
-        }
-        Err(e) => return Answer::error(e),
-    };
-    let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error(LOADING);
-    };
-    let now = now_ms();
-    match threads::worker(&records, &ctx.caller.key(), &thread, &name) {
-        Some(worker) => Answer::ok(render(&worker.observed(now), now)),
-        None => Answer::error(format!("there is no worker `T:{thread}/{name}`")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn worker() -> Worker {
@@ -162,7 +114,7 @@ mod tests {
         });
         assert_eq!(
             render(&w, 900_000),
-            "T:icons/regen: done, its latest turn 10m00s, 12 rounds, 3000 thinking tokens.\n\
+            "task:icons/regen: done, its latest turn 10m00s, 12 rounds, 3000 thinking tokens.\n\
              Time: 4m00s in tools, 6m00s in the model.\n\
              First change: 5m00s in. First commit: never.\n\
              10 calls, 5 failed:\n  \
@@ -191,7 +143,7 @@ mod tests {
     fn a_worker_with_no_turn_says_so() {
         assert_eq!(
             render(&worker(), 2_000),
-            "T:icons/regen: done, and no turn has begun."
+            "task:icons/regen: done, and no turn has begun."
         );
     }
 }

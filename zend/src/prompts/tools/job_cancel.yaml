@@ -1,0 +1,55 @@
+name: job_cancel
+questions:
+- kill that agent job
+- stop the build on the agent
+- cancel the job on blackworld
+- the agent build is stuck, stop it
+- abort the release build
+- the release build is on the wrong commit, stop it
+- kill the job waiting for the checkout
+- cancel the deploy
+- roll the trial back now
+- the build is taking forever, kill it
+- stop the deploy to whiteworld
+- stop the task, it is going the wrong way
+- halt the worker that keeps repeating itself
+- kill the stuck build job
+- cancel the test run I just started
+- abort keep's trial of the new motherd
+category: Commands
+description: 'Stop one job. A build or test run is killed at whatever phase it is in, and nothing it built is staged. A deploy''s build is killed and nothing is tried; a deploy keep is trying is rolled back to the previous binary. A task stops at its next tool round and answers with what it has; it is then stopped but live. A maintenance job runs to its end once started and cannot be stopped. A job that has ended is left as it ended, and the answer says how. Use for: a job started by mistake, one that is stuck, a deploy going wrong. Triggered by "kill that job", "cancel the deploy". Returns how the job stands now.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    job:
+      description: The job's handle, as the call that started it or job_list answered it. Required.
+      maxLength: 200
+      minLength: 8
+      type: string
+  required:
+  - job
+  title: CancelRequest
+  type: object
+examples:
+- |-
+  that build is on the wrong branch, stop it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The handle the start answered names it; a cancel kills it at whatever phase it is in.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_cancel", "arguments": {"job": "build:76c3a0f4d39bd9db:XeV_I_QPzpg"}}
+  </tool_call><|projection|>
+- |-
+  the trial is failing, roll it back<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Cancelling the deploy while keep tries it rolls the machine back to its previous binary.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_cancel", "arguments": {"job": "deploy:76c3a0f4d39bd9db:XeV_I_QPzpg"}}
+  </tool_call><|projection|>
+- stop that job<|im_end|>

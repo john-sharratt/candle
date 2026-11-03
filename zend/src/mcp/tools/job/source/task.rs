@@ -10,8 +10,8 @@ use super::Row;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::reported::{self, Mark};
 use crate::mcp::threads::{self, State, Worker};
-use crate::mcp::tools::repo_task_report;
-use crate::mcp::tools::wait::result_of;
+use crate::mcp::tools::turn_report;
+use crate::mcp::tools::wait::{handle, result_of};
 use crate::mcp::tools::{Answer, LOADING};
 use crate::mcp::workers::{self, now_ms};
 
@@ -33,7 +33,7 @@ fn worker(call: &OpsCall, thread: &str, name: &str) -> Result<(String, Worker), 
 
 /// A task's output, as text: what `job_read` pages.
 pub fn output(w: &Worker, now: u64) -> String {
-    let mut out = format!("task {}: {}\n", w.path(), w.prompt.trim());
+    let mut out = format!("{}: {}\n", handle(w), w.prompt.trim());
     for e in &w.entries {
         out.push_str(&format!("── journal entry {}#{} ──\n{}\n", w.path(), e.id, e.text.trim()));
     }
@@ -51,7 +51,7 @@ pub fn output(w: &Worker, now: u64) -> String {
         )),
         State::Running => {}
     }
-    out.push_str(&format!("── its turn ──\n{}\n", repo_task_report::render(w, now)));
+    out.push_str(&format!("── its turn ──\n{}\n", turn_report::render(w, now)));
     out
 }
 
@@ -102,7 +102,7 @@ pub fn cancel(call: &OpsCall, job: &JobHandle, thread: &str, name: &str) -> Answ
         return Answer::error("a task is stopped as the person it works for, and this call names none");
     };
     match workers::stop(&call.session, caller, thread, name, "stopped with job_cancel") {
-        Ok(()) => Answer::ok(format!(
+        Ok(_) => Answer::ok(format!(
             "Stopping {job}: it stops at its next tool round and answers with what it has; it is \
              then stopped but live, and `repo_task_reply` redirects it. `job_status {{jobs: \
              [\"{job}\"], wait_s: 120}}` says when it has stopped."

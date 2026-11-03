@@ -5,7 +5,7 @@
 //! conversation, submitted as `POST /v1/chat/completions` submits one, so it is
 //! projected with provenance, the working set and the journal like any
 //! dialogue. It runs in a task of its own, never inside a tool call: the call
-//! that started it answers within `wait_s`, and `repo_task_wait` reads how it stands.
+//! that started it answers within `wait_s`, and `job_status` reads how it stands.
 //!
 //! When a turn ends, the task asks for a journal draft at once instead of
 //! waiting for the cadence, waits for it, and takes the entries written since
@@ -394,7 +394,7 @@ pub fn answer(
     }
     let _held = holding();
     let Some(found) = threads::worker(&records, &owner, thread, name) else {
-        return Err(format!("there is no worker `T:{thread}/{name}`"));
+        return Err(format!("there is no task `task:{thread}/{name}`"));
     };
     let mut worker = found.observed(now_ms());
     if archiving::being_archived(&worker.conv_id) {
@@ -651,7 +651,7 @@ pub fn nudge(
         return Err("the `message` is empty".into());
     }
     let Some(found) = threads::worker(&records, &owner, thread, name) else {
-        return Err(format!("there is no worker `T:{thread}/{name}`"));
+        return Err(format!("there is no task `task:{thread}/{name}`"));
     };
     let worker = found.observed(now_ms());
     if !worker.state.working() {
@@ -691,7 +691,7 @@ pub fn stop(
     // turn before it.
     let _held = holding();
     let Some(found) = threads::worker(&records, &owner, thread, name) else {
-        return Err(format!("there is no worker `T:{thread}/{name}`"));
+        return Err(format!("there is no task `task:{thread}/{name}`"));
     };
     let worker = found.observed(now_ms());
     if !worker.state.working() {
@@ -1116,7 +1116,7 @@ enum Turned {
 }
 
 impl Ended {
-    /// Whether Claude stopped the turn (`repo_task_stop`).
+    /// Whether Claude stopped the turn (`job_cancel`).
     fn stopped(&self) -> bool {
         matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CLAUDE)
     }
@@ -1871,7 +1871,7 @@ pub async fn wait(
         let read: Vec<(String, Option<Worker>)> = wanted
             .iter()
             .map(|(thread, name)| {
-                let path = format!("T:{thread}/{name}");
+                let path = format!("task:{thread}/{name}");
                 (
                     path,
                     threads::worker(&records, owner, thread, name).map(|w| w.observed(now)),

@@ -1,114 +1,37 @@
-//! `repo_job_status`, `repo_job_log`, `repo_job_list`, `repo_job_cancel`: a
-//! build-agent job watched, read, found and stopped by its handle — what a
-//! worker reads a deploy's build with (`docs/build_deploy_tools.md` §2, §3).
+//! `job_list`, `job_status`, `job_read`, `job_grep`, `job_cancel`: whatever
+//! outlives a call — a task, a build or test run, a deploy, a maintenance job —
+//! listed, waited on, paged, searched and stopped by its handle
+//! (`docs/jobs.md`). A handle is `task:<thread>/<name>`, `build:<node>:<id>`,
+//! `deploy:<node>:<id>` or `cluster:<node>:<n>`, exactly as an answer wrote it.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{forward, LogMode, OpsError, Report};
+use super::{forward, OpsError, Report};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
-#[derive(Serialize, Deserialize, JsonSchema, Validate)]
-pub struct StatusRequest {
-    /// The job's handle, `<node>:<id>`. Required.
-    #[validate(length(min = 18, max = 64))]
-    pub job: String,
-    /// Seconds to wait for it to end. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
-    #[validate(range(max = 3600))]
-    pub wait_s: Option<u32>,
-}
-
-pub struct JobStatus;
-
-impl Tool for JobStatus {
-    const NAME: &'static str = "repo_job_status";
-    const DESCRIPTION: &'static str =
-        "Where a build-agent job is — its machine, phase, time and lines — waiting up to wait_s for it \
-         to end; an ended job's answer carries its test results, errors and failures by line.";
-
-    type Request = StatusRequest;
-    type Response = Report;
-    type Error = OpsError;
-
-    fn run(ctx: &ToolContext, req: StatusRequest) -> Result<Report, OpsError> {
-        forward(ctx, Self::NAME, &req)
-    }
-
-    fn replay(_req: &StatusRequest) -> Replay {
-        Replay::Safe
-    }
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Validate)]
-pub struct LogRequest {
-    /// The job's handle, `<node>:<id>`. Required.
-    #[validate(length(min = 18, max = 64))]
-    pub job: String,
-    /// How to read it. Required.
-    pub mode: LogMode,
-    /// `grep`: the text to find, ignoring case.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String")]
-    #[validate(length(min = 1, max = 200))]
-    pub pattern: Option<String>,
-    /// `grep`: lines either side of each hit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
-    #[validate(range(max = 5))]
-    pub context: Option<u32>,
-    /// `lines`: the first line; `grep`: search from this line on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u64")]
-    #[validate(range(min = 1))]
-    pub from: Option<u64>,
-    /// `lines`: how many lines.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
-    #[validate(range(min = 1, max = 200))]
-    pub count: Option<u32>,
-    /// `tail`: how many of the last lines.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "u32")]
-    #[validate(range(min = 1, max = 200))]
-    pub lines: Option<u32>,
-}
-
-pub struct JobLog;
-
-impl Tool for JobLog {
-    const NAME: &'static str = "repo_job_log";
-    const DESCRIPTION: &'static str =
-        "Read what a build-agent job printed — summary, tail, a range of lines, or a search — read on \
-         the agent, every line numbered.";
-
-    type Request = LogRequest;
-    type Response = Report;
-    type Error = OpsError;
-
-    fn run(ctx: &ToolContext, req: LogRequest) -> Result<Report, OpsError> {
-        forward(ctx, Self::NAME, &req)
-    }
-
-    fn replay(_req: &LogRequest) -> Replay {
-        Replay::Safe
-    }
+/// A kind of job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Task,
+    Build,
+    Deploy,
+    Cluster,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
-    /// One agent only: its machine or node. Optional.
+    /// Only jobs of one kind. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String")]
-    #[validate(length(min = 1, max = 32))]
-    pub node: Option<String>,
-    /// Only jobs not yet ended. Optional.
+    #[schemars(with = "Kind")]
+    pub kind: Option<Kind>,
+    /// Only jobs still running; false adds those that ended lately. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "bool")]
     pub running: Option<bool>,
-    /// The most jobs listed per agent. Optional.
+    /// The most jobs listed. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "u32")]
     #[validate(range(min = 1, max = 100))]
@@ -118,10 +41,10 @@ pub struct ListRequest {
 pub struct JobList;
 
 impl Tool for JobList {
-    const NAME: &'static str = "repo_job_list";
+    const NAME: &'static str = "job_list";
     const DESCRIPTION: &'static str =
-        "The jobs on the build agents, newest first, each by its handle, with where it is and what it \
-         runs.";
+        "Every job you can see — tasks, builds and test runs, deploys, maintenance jobs — newest \
+         first, a line each with its handle, where it is and how many pages of output it has.";
 
     type Request = ListRequest;
     type Response = Report;
@@ -137,18 +60,124 @@ impl Tool for JobList {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Validate)]
+pub struct StatusRequest {
+    /// The jobs to wait on, by handle. Required.
+    #[validate(length(min = 1, max = 16))]
+    pub jobs: Vec<String>,
+    /// Seconds to wait for one of them to end, at most 300 — a worker's
+    /// ceiling. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
+    #[validate(range(max = 300))]
+    pub wait_s: Option<u32>,
+}
+
+pub struct JobStatus;
+
+impl Tool for JobStatus {
+    const NAME: &'static str = "job_status";
+    const DESCRIPTION: &'static str =
+        "Where each job is, waiting up to wait_s for any one of them to end; an ended job's answer \
+         carries how it went — test results and failures by line, a task's answer — and its pages.";
+
+    type Request = StatusRequest;
+    type Response = Report;
+    type Error = OpsError;
+
+    fn run(ctx: &ToolContext, req: StatusRequest) -> Result<Report, OpsError> {
+        forward(ctx, Self::NAME, &req)
+    }
+
+    fn replay(_req: &StatusRequest) -> Replay {
+        Replay::Safe
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Validate)]
+pub struct ReadRequest {
+    /// The job's handle. Required.
+    #[validate(length(min = 8, max = 200))]
+    pub job: String,
+    /// The page, from 1. Required.
+    #[validate(range(min = 1))]
+    pub page: u64,
+    /// Seconds to wait for the page to fill. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
+    #[validate(range(max = 300))]
+    pub wait_s: Option<u32>,
+}
+
+pub struct JobRead;
+
+impl Tool for JobRead {
+    const NAME: &'static str = "job_read";
+    const DESCRIPTION: &'static str =
+        "One page — 200 numbered lines — of a job's output; a page still being written waits until \
+         it fills, the job ends or wait_s passes.";
+
+    type Request = ReadRequest;
+    type Response = Report;
+    type Error = OpsError;
+
+    fn run(ctx: &ToolContext, req: ReadRequest) -> Result<Report, OpsError> {
+        forward(ctx, Self::NAME, &req)
+    }
+
+    fn replay(_req: &ReadRequest) -> Replay {
+        Replay::Safe
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Validate)]
+pub struct GrepRequest {
+    /// The job's handle. Required.
+    #[validate(length(min = 8, max = 200))]
+    pub job: String,
+    /// The text to find, ignoring case; plain text. Required.
+    #[validate(length(min = 1, max = 200))]
+    pub pattern: String,
+    /// Lines either side of each hit. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
+    #[validate(range(max = 5))]
+    pub context: Option<u32>,
+}
+
+pub struct JobGrep;
+
+impl Tool for JobGrep {
+    const NAME: &'static str = "job_grep";
+    const DESCRIPTION: &'static str =
+        "Search a job's whole output for plain text, each hit with its line number and its page.";
+
+    type Request = GrepRequest;
+    type Response = Report;
+    type Error = OpsError;
+
+    fn run(ctx: &ToolContext, req: GrepRequest) -> Result<Report, OpsError> {
+        forward(ctx, Self::NAME, &req)
+    }
+
+    fn replay(_req: &GrepRequest) -> Replay {
+        Replay::Safe
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Validate)]
 pub struct CancelRequest {
-    /// The job's handle, `<node>:<id>`. Required.
-    #[validate(length(min = 18, max = 64))]
+    /// The job's handle. Required.
+    #[validate(length(min = 8, max = 200))]
     pub job: String,
 }
 
 pub struct JobCancel;
 
 impl Tool for JobCancel {
-    const NAME: &'static str = "repo_job_cancel";
+    const NAME: &'static str = "job_cancel";
     const DESCRIPTION: &'static str =
-        "Stop a build-agent job at whatever phase it is in; one that has ended is left as it ended.";
+        "Stop a job: a build at whatever phase it is in, a deploy's build or its trial (rolled \
+         back), a task at its next tool round. One that has ended is left as it ended.";
 
     type Request = CancelRequest;
     type Response = Report;
@@ -159,7 +188,8 @@ impl Tool for JobCancel {
     }
 }
 
-pub const REPO_JOB_STATUS: RegisteredTool = RegisteredTool::new::<JobStatus>();
-pub const REPO_JOB_LOG: RegisteredTool = RegisteredTool::new::<JobLog>();
-pub const REPO_JOB_LIST: RegisteredTool = RegisteredTool::new::<JobList>();
-pub const REPO_JOB_CANCEL: RegisteredTool = RegisteredTool::new::<JobCancel>();
+pub const JOB_LIST: RegisteredTool = RegisteredTool::new::<JobList>();
+pub const JOB_STATUS: RegisteredTool = RegisteredTool::new::<JobStatus>();
+pub const JOB_READ: RegisteredTool = RegisteredTool::new::<JobRead>();
+pub const JOB_GREP: RegisteredTool = RegisteredTool::new::<JobGrep>();
+pub const JOB_CANCEL: RegisteredTool = RegisteredTool::new::<JobCancel>();

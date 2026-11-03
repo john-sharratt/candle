@@ -27,7 +27,7 @@
 //! | `journal` | `journal_read`, `journal_grep` | The conversation's own journal text, through `ToolContext::journal` |
 //! | `network_diag` | `dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info` | subprocess |
 //! | `notes` | `notes_{write,read,search,list}` | In-memory KV with FTS |
-//! | `ops` | `service_{deploy,status,log,cancel}`, `repo_job_{status,log,list,cancel}` | Handed whole to the `OpsRunner` the daemon injects, which runs its MCP tools' implementation |
+//! | `ops` | `job_{list,status,read,grep,cancel}`, `service_{deploy,status}`, `cluster_{status,logs,audit}` | Handed whole to the `OpsRunner` the daemon injects, which runs its MCP tools' implementation |
 //! | `random` | `random` | rand crate; real OS entropy |
 //! | `remote_fs` | `remote_fs_session_*` (10 tools) | SFTP via ssh2 |
 //! | `run` | `run_command`, `run_output` | A program in the repository's sandbox, on the conversation's branch |

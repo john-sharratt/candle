@@ -1,5 +1,5 @@
-//! Claude stopping a running worker — `repo_task_stop`
-//! (`docs/claude_zend_gateway.md` §6.2).
+//! Claude stopping a running worker — `job_cancel` on a task
+//! (`docs/claude_zend_gateway.md` §6.2, `docs/jobs.md`).
 //!
 //! Like a nudge, a stop never interrupts a decoding turn: it is read where the
 //! worker's next tool round ends, and that round then closes the loop as the

@@ -110,9 +110,9 @@ pub trait SubagentRunner: Send + Sync + 'static {
     fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String>;
 }
 
-/// Injected by the daemon to run the build and deploy tools — `service_*`
-/// and the `repo_job_*` readers (`docs/build_deploy_tools.md` §6) — with the
-/// same implementation the daemon's MCP tools run, so the two surfaces answer
+/// Injected by the daemon to run the operations tools — the `job_*` tools,
+/// `service_*` and the cluster readers (`docs/jobs.md` §8) — with the same
+/// implementation the daemon's MCP tools run, so the two surfaces answer
 /// alike.
 pub trait OpsRunner: Send + Sync + 'static {
     /// Run `tool` with `args` for the conversation `caller`: its answer, or

@@ -1,0 +1,65 @@
+name: job_read
+questions:
+- read the build log on the agent
+- show the compiler errors from the release build
+- what did the agent job print at the end
+- read around the failure in that agent job
+- read the next page of the build
+- follow the deploy's output as it builds
+- read the trial's log on blackworld
+- show me page three of the test run
+- what did the task write in its journal so far
+- read the end of the agent build log
+- show me the lines around that build error
+- read the steps of the maintenance command
+- what did keep's trial print
+- read the first page of the deploy
+- watch the test run's output as it comes
+- read the task's prompt and answer
+category: Commands
+description: 'Read one page of a job''s output — 200 lines, numbered across the whole output, so a line number another answer gave is the line here. A build''s output is its log; a deploy''s, its build''s log then its trial''s; a task''s, its prompt, journal entries, answer and turn report; a maintenance job''s, its steps. A page the job is still writing waits until it fills, the job ends, or `wait_s` passes (30 by default, at most 300), then answers what is there: follow a running job by reading the next page as each one fills. A page past the end answers the last page. job_status says how many pages there are and which line a failure is on: page = line ÷ 200, rounded up. Use for: reading what a summary pointed at, or following a job live. Triggered by "read the build log", "show the next page". Returns the page and how to read on.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    job:
+      description: The job's handle, as the call that started it or job_list answered it. Required.
+      maxLength: 200
+      minLength: 8
+      type: string
+    page:
+      description: The page, from 1; one past the end reads the last. Required.
+      minimum: 1.0
+      type: integer
+    wait_s:
+      description: Seconds to wait for the page to fill; 30 by default, 0 to answer at once. Optional.
+      maximum: 300.0
+      minimum: 0.0
+      type: integer
+  required:
+  - job
+  - page
+  title: ReadRequest
+  type: object
+examples:
+- |-
+  job_status said the first error is on line 812<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Line 812 is on page 5: lines 801 to 1000. The build has ended, so the page answers at once.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_read", "arguments": {"job": "build:76c3a0f4d39bd9db:XeV_I_QPzpg", "page": 5}}
+  </tool_call><|projection|>
+- |-
+  follow the deploy as it builds<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The last answer was page 2, still being written; reading it again with a wait holds until it fills.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_read", "arguments": {"job": "deploy:76c3a0f4d39bd9db:XeV_I_QPzpg", "page": 2, "wait_s": 120}}
+  </tool_call><|projection|>
+- read the task's output<|im_end|>

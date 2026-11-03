@@ -21,9 +21,10 @@ own turns are still steered with `repo_task_reply` and `repo_task_nudge`.
 
 They replace `repo_task_wait`, `repo_task_report`, `repo_task_stop`,
 `repo_job_status`, `repo_job_log`, `repo_job_list`, `repo_job_cancel`,
-`service_status`'s deploy mode, `service_log`, `service_cancel`,
-`cluster_job_status` and Zen's `run_output`. `service_status` keeps what is not
-a job: what each machine's keep runs.
+`service_status`'s deploy mode, `service_log`, `service_cancel` and
+`cluster_job_status`. `service_status` keeps what is not a job: what each
+machine's keep runs. A task's own turns are steered by its handle:
+`repo_task_reply {task, answer}` and `repo_task_nudge {task, message}`.
 
 ## 1. Handles
 
@@ -148,7 +149,7 @@ begin and leaves every right one open:
 |---|---|
 | **Required first, in order; optionals after, in order**, so the field a choice depends on is written before what depends on it. Calibration examples write their fields in that order. | every definition |
 | **No modes.** Reading, searching, status and stopping are separate tools, so the tool's name settles the call's shape. | the five tools |
-| **A handle has its kind's exact shape.** `job` is held to `task:[a-z0-9-]+(/[a-z0-9-]+)*`, `build:`/`deploy:` + 16 hex + `:` + an 11-character job id whose last character is one of 16, `cluster:` + 16 hex + `:` + digits — the prefix a choice of four. | `tool_constraints.yaml` |
+| **A handle has its kind's exact shape.** `job` is held to `task:` + a thread and one or more names below it, each a kebab slug, a name possibly numbered (`verify.2`), `build:`/`deploy:` + 16 hex + `:` + an 11-character job id whose last character is one of 16, `cluster:` + 16 hex + `:` + digits — the prefix a choice of four. | `tool_constraints.yaml` |
 | **A handle is one the round can name.** Each round, `job`'s values are narrowed to the handles of the jobs that exist for the caller ([`stencil::live_values`]); a tool with none to name is taken out of the round. | the stencil's live values |
 | **Closed sets are enums, read from the source of truth**: a machine is one `host/machines.yaml` names, a service one keep runs, a guide one the library holds. | the definitions, at startup |
 | **No `null`.** An optional field is left out. | `#[schemars(with = …)]` |
@@ -167,9 +168,14 @@ calibration questions and worked examples, and executed through the daemon's
 `OpsRunner`, which runs **the implementation the MCP tools run**
 (`zend/src/mcp/ops_tools.rs`). A worker acts as the person it works for: its
 record carries them (`threads::Worker::person`), and every request it sends
-states them, so each hop checks their role. A worker's own builds and tests
-stay `run_command`, whose run is a job of its own (`build:` on its agent) read
-with the same tools.
+states them, so each hop checks their role.
+
+A worker's own builds and tests stay `run_command`, which is not a job: it runs
+on the conversation's branch with its uncommitted changes, waits for the run
+within the call, and records what the run changed in the conversation's store.
+What it printed past the first page is read with `run_output`, from the log the
+call kept — in a daemon with agents and in one running its own sandboxes alike,
+and for a worker of any role. The job tools are for what outlives a call.
 
 ## 9. Guides
 

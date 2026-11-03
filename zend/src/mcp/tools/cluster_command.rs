@@ -22,6 +22,7 @@ use axum::http::Method;
 use host::commands::class::{class_of, Class, COMMANDS};
 use serde_json::{json, Value};
 
+use super::job::JobHandle;
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of, why};
 
@@ -43,8 +44,8 @@ pub fn definition() -> Value {
         "name": NAME,
         "description": format!(
             "Run one maintenance command on one member of the cluster — a machine running the motherd daemon — \
-            named by its node id as `cluster_status` lists it. Answers the job it started; read that with \
-            `cluster_job_status`. Commands come in three kinds. Look commands only read ({}) and Care \
+            named by its node id as `cluster_status` lists it. Answers the job it started, \
+            `cluster:<node>:<n>`: wait on it with `job_status` and read its steps with `job_read`. Commands come in three kinds. Look commands only read ({}) and Care \
             commands are routine upkeep ({}): both run as asked. Decide commands change what the cluster \
             runs ({}): ask the user first, and pass `confirm: \"approved by the user\"` only with their \
             approval for that command on that member. A command's own arguments go in `args` — `app`, \
@@ -84,12 +85,20 @@ pub fn gate(name: &str, confirm: Option<&str>) -> Result<Class, String> {
 
 /// A started job as the tool answers it.
 pub fn render_started(member: &str, answer: &Value) -> String {
-    format!(
-        "Started `{}` on {member} as job {} — read it with `cluster_job_status {{member: \"{member}\", job: {}}}`.",
-        answer.get("command").and_then(Value::as_str).unwrap_or("?"),
-        answer.get("job").map_or_else(|| "?".into(), Value::to_string),
-        answer.get("job").map_or_else(|| "?".into(), Value::to_string),
-    )
+    let command = answer.get("command").and_then(Value::as_str).unwrap_or("?");
+    match answer.get("job").and_then(Value::as_u64) {
+        Some(n) => {
+            let job = JobHandle::Cluster {
+                node: member.to_string(),
+                n,
+            };
+            format!(
+                "Started {job}: `{command}` on {member}. `job_status {{jobs: [\"{job}\"], wait_s: \
+                 240}}` waits for it to end and says how it went."
+            )
+        }
+        None => format!("`{command}` on {member} answered no job: {answer}"),
+    }
 }
 
 async fn rollout(ctx: &Ctx, args: &Value, confirm: Option<&str>) -> Answer {
@@ -173,8 +182,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
             Err(e) => Answer::error(e),
         },
         409 => Answer::error(format!(
-            "{member} is busy with another command: {} — read its job with `cluster_job_status`, \
-             then try again",
+            "{member} is busy with another command: {} — `job_list {{kind: \"cluster\"}}` names \
+             its job; wait on it with `job_status`, then try again",
             why(&reply)
         )),
         status => Answer::error(format!("`{name}` on {member}: {status} — {}", why(&reply))),
@@ -208,8 +217,9 @@ mod tests {
     fn a_started_command_names_its_job_and_how_to_read_it() {
         assert_eq!(
             render_started("00000000000000ab", &json!({"job": 7, "command": "drain"})),
-            "Started `drain` on 00000000000000ab as job 7 — read it with `cluster_job_status \
-             {member: \"00000000000000ab\", job: 7}`."
+            "Started cluster:00000000000000ab:7: `drain` on 00000000000000ab. `job_status {jobs: \
+             [\"cluster:00000000000000ab:7\"], wait_s: 240}` waits for it to end and says how it \
+             went."
         );
     }
 

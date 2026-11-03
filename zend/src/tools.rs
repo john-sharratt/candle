@@ -921,7 +921,7 @@ impl ToolHost {
     }
 
     /// This host with `runner` running every context's build and deploy tools
-    /// (`docs/build_deploy_tools.md` §6).
+    /// (`docs/jobs.md` §8).
     pub fn running_ops(self, runner: Arc<dyn OpsRunner>) -> Self {
         Self {
             contexts: self.contexts.map(|ctx| {

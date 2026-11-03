@@ -997,8 +997,13 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "run_output",
-        &["command_output", "job_output", "read_output", "run_log"],
+        &["command_output", "read_output", "run_log"],
     ),
+    ("job_list", &["jobs", "list_jobs", "jobs_list"]),
+    ("job_status", &["job_wait", "wait_job", "jobs_status", "wait_jobs"]),
+    ("job_read", &["job_log", "read_job", "job_page", "job_output"]),
+    ("job_grep", &["job_search", "grep_job", "search_job"]),
+    ("job_cancel", &["job_stop", "cancel_job", "stop_job", "job_kill"]),
     (
         "sub_run",
         &[
@@ -1039,9 +1044,9 @@ use crate::tools::{
     journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
-    ops::cluster::{CLUSTER_AUDIT, CLUSTER_JOB_STATUS, CLUSTER_LOGS, CLUSTER_STATUS},
-    ops::job::{REPO_JOB_CANCEL, REPO_JOB_LIST, REPO_JOB_LOG, REPO_JOB_STATUS},
-    ops::service::{SERVICE_CANCEL, SERVICE_DEPLOY, SERVICE_LOG, SERVICE_STATUS},
+    ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS},
+    ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
+    ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
     random::REGISTRATION as RANDOM,
     remote_fs::{
         REMOTE_FS_SESSION_CLOSE, REMOTE_FS_SESSION_DELETE, REMOTE_FS_SESSION_GET,
@@ -1263,24 +1268,22 @@ fn register_all() -> &'static [RegisteredTool] {
         // runs to read.
         RUN_COMMAND.requires(NET_EXEC_DISK),
         RUN_OUTPUT.requires(EXEC),
-        // Builds and deploys (8) — through the daemon to the cluster's agents
-        // and keeps. A deploy replaces a running service on a machine, and a
-        // cancel stops a build or rolls a trial back: both act as a command
-        // does. The readers reach the cluster and change nothing.
+        // Jobs, builds and deploys (7) — through the daemon to the cluster's
+        // agents and keeps. A deploy replaces a running service on a machine,
+        // and a cancel stops a build or rolls a trial back: both act as a
+        // command does. The readers reach the cluster and change nothing.
         SERVICE_DEPLOY.requires(NET_EXEC_DISK),
-        SERVICE_CANCEL.requires(NET_EXEC_DISK),
-        REPO_JOB_CANCEL.requires(NET_EXEC_DISK),
+        JOB_CANCEL.requires(NET_EXEC_DISK),
         SERVICE_STATUS.requires(NET),
-        SERVICE_LOG.requires(NET),
-        REPO_JOB_STATUS.requires(NET),
-        REPO_JOB_LOG.requires(NET),
-        REPO_JOB_LIST.requires(NET),
-        // The cluster (4) — read through the gateway as the person the task
+        JOB_LIST.requires(NET),
+        JOB_STATUS.requires(NET),
+        JOB_READ.requires(NET),
+        JOB_GREP.requires(NET),
+        // The cluster (3) — read through the gateway as the person the task
         // works for; nothing changes.
         CLUSTER_STATUS.requires(NET),
         CLUSTER_LOGS.requires(NET),
         CLUSTER_AUDIT.requires(NET),
-        CLUSTER_JOB_STATUS.requires(NET),
         // Guides (2) — read from the library embedded in this binary.
         GUIDE_LIST,
         GUIDE_READ,

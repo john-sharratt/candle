@@ -1,11 +1,11 @@
-//! The operations tools a worker reaches (`docs/build_deploy_tools.md` §6):
-//! `service_deploy`, `service_status`, `service_log`, `service_cancel`;
-//! `repo_job_status`, `repo_job_log`, `repo_job_list`, `repo_job_cancel` for
-//! watching what a deploy builds; and `cluster_status`, `cluster_logs`,
-//! `cluster_audit`, `cluster_job_status` for reading the cluster. Each is a typed request handed whole to
-//! the daemon's [`OpsRunner`], which runs the implementation its MCP tools
-//! run, so a worker and Claude get one answer from one code path. The answer
-//! is the text Claude reads too.
+//! The operations tools a worker reaches (`docs/jobs.md` §8): the five job
+//! tools — `job_list`, `job_status`, `job_read`, `job_grep`, `job_cancel` —
+//! over its tasks, builds, deploys and maintenance jobs; `service_deploy` and
+//! `service_status`; and `cluster_status`, `cluster_logs`, `cluster_audit` for
+//! reading the cluster. Each is a typed request handed whole to the daemon's
+//! [`OpsRunner`], which runs the implementation its MCP tools run, so a worker
+//! and Claude get one answer from one code path. The answer is the text Claude
+//! reads too.
 //!
 //! [`OpsRunner`]: crate::OpsRunner
 
@@ -52,16 +52,6 @@ pub enum Service {
     Mcp,
 }
 
-/// How a log is read (`docs/build_deploy_tools.md` §3).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum LogMode {
-    Summary,
-    Tail,
-    Lines,
-    Grep,
-}
-
 /// Hand `req` to the daemon's runner as tool `tool`.
 pub fn forward<R: Serialize>(
     ctx: &ToolContext,
@@ -95,7 +85,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((caller.to_string(), tool.to_string(), args.clone()));
-            if tool == "service_cancel" {
+            if tool == "job_cancel" {
                 return Err("nothing to stop".into());
             }
             Ok(format!("{tool} {args}"))
@@ -108,31 +98,38 @@ mod tests {
     fn a_request_reaches_the_runner_whole() {
         let echo = Arc::new(Echo::default());
         let ctx = ToolContext::new().with_ops_runner(Arc::clone(&echo) as Arc<dyn OpsRunner>);
-        let req = job::LogRequest {
-            job: "76c3a0f4d39bd9db:Xe".into(),
-            mode: LogMode::Grep,
-            pattern: Some("FAILED".into()),
-            context: None,
-            from: None,
-            count: None,
-            lines: None,
+        let req = job::ReadRequest {
+            job: "build:76c3a0f4d39bd9db:Xe".into(),
+            page: 2,
+            wait_s: None,
         };
-        let report = forward(&ctx, "repo_job_log", &req).unwrap();
+        let report = forward(&ctx, "job_read", &req).unwrap();
         assert_eq!(
             report.answer,
-            r#"repo_job_log {"job":"76c3a0f4d39bd9db:Xe","mode":"grep","pattern":"FAILED"}"#
+            r#"job_read {"job":"build:76c3a0f4d39bd9db:Xe","page":2}"#
         );
         let refused = forward(
             &ctx,
-            "service_cancel",
-            &service::CancelRequest {
-                deploy: "76c3a0f4d39bd9db:Xe".into(),
+            "job_cancel",
+            &job::CancelRequest {
+                job: "deploy:76c3a0f4d39bd9db:Xe".into(),
             },
         );
         assert!(matches!(refused, Err(OpsError::Refused(why)) if why == "nothing to stop"));
+        let listed = forward(
+            &ctx,
+            "job_list",
+            &job::ListRequest {
+                kind: Some(job::Kind::Deploy),
+                running: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.answer, r#"job_list {"kind":"deploy"}"#);
         let asked = echo.0.lock().unwrap();
-        assert_eq!(asked[0].1, "repo_job_log");
-        assert_eq!(asked[1].2, json!({"deploy": "76c3a0f4d39bd9db:Xe"}));
+        assert_eq!(asked[0].1, "job_read");
+        assert_eq!(asked[1].2, json!({"job": "deploy:76c3a0f4d39bd9db:Xe"}));
         assert!(matches!(
             forward(&ToolContext::new(), "service_status", &json!({})),
             Err(OpsError::NotConfigured)

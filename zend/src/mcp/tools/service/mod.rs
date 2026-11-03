@@ -1,17 +1,15 @@
-//! The `service_*` deploy tools (`docs/build_deploy_tools.md` §4): a service
-//! built from origin/main on one machine and tried there through keep, the
-//! supervisor that runs the machine's services — and everything a caller does
-//! with a deploy after: watch it, read the trial's log, stop it.
+//! The `service_*` tools (`docs/jobs.md` §6): a service built from
+//! origin/main on one machine and tried there through keep, the supervisor
+//! that runs the machine's services, and what each keep runs. A deploy is a
+//! job, watched, read and stopped with the `job_*` tools.
 //!
 //! | Module | Tool |
 //! |---|---|
 //! | [`deploy`] | `service_deploy` |
 //! | [`status`] | `service_status` |
-//! | [`log`] | `service_log` |
-//! | [`cancel`] | `service_cancel` |
 //! | [`guard`] | what a worker's deploy may not take down |
 //!
-//! **A deploy is its build job's handle.** Its state is read from the agent
+//! **A deploy is named by its build job.** Its state is read from the agent
 //! that builds it and from the keep that tries it, which records the handle on
 //! the trial — never from the memory of the member that started it, so any
 //! member answers for any deploy ([`resolve`]).
@@ -28,10 +26,8 @@ use super::repo_job::{host_of, lost, state, Handle};
 use crate::mcp::ops::{self, json_of};
 use crate::mcp::ops_tools::OpsCall;
 
-pub mod cancel;
 pub mod deploy;
 pub mod guard;
-pub mod log;
 pub mod status;
 
 /// The services keep runs, each built from the package of its name.
@@ -194,8 +190,8 @@ pub async fn resolve(
         .map_err(|e| lost(handle, &e))?;
     let service = built_service(&build.command).ok_or_else(|| {
         format!(
-            "job {handle} is not a deploy: it runs `{}`, not `cargo build --release -p <service>` — \
-             read it with `repo_job_status`",
+            "deploy:{handle} is not a deploy: it runs `{}`, not `cargo build --release -p \
+             <service>` — it is build:{handle}",
             build.command.join(" ")
         )
     })?;

@@ -1,0 +1,72 @@
+name: job_status
+questions:
+- is the deploy's build done
+- wait for the build on the agent
+- how far is the release build on blackworld
+- did the agent job finish
+- is that agent job still waiting for the checkout
+- how long has the deploy been building
+- did the build for the deploy pass
+- wait until the deploy is proven or rolled back
+- has the trial on whiteworld finished
+- what exit code did the agent job end with
+- block until the agent build is done
+- did the tests pass on the agent
+- tell me when the build job on whiteworld finishes
+- wait for the task to answer
+- is the maintenance command on the member done
+- wait on the build and the deploy together
+category: Commands
+description: 'Say where jobs are — tasks, builds and test runs, deploys, maintenance jobs — and wait up to `wait_s` seconds (60 by default, at most 300; 0 answers at once) for any one of them to end. Give every job you are waiting on in one call: it answers as soon as the first ends, so call it again for the rest. For each job: where it is — a build''s phase, a deploy''s stage, a task''s state — and once ended, how it went: a build''s or trial''s test results and first errors and failures with their line numbers, a task''s answer and the journal entries it wrote since you last heard, a maintenance job''s result; then `pages: N` of output, which job_read pages and job_grep searches. Waiting is one call, never a loop of calls. A handle is exactly what the call that started the job answered: `task:<thread>/<name>`, `build:<node>:<id>`, `deploy:<node>:<id>` or `cluster:<node>:<n>`. Use for: waiting on what you started. Triggered by "is the build done", "wait for the deploy". Returns each job''s standing and the next call to make.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    jobs:
+      description: The jobs to wait on, by handle, one to sixteen; the answer comes as soon as any one ends. Required.
+      items:
+        type: string
+      maxItems: 16
+      minItems: 1
+      type: array
+    wait_s:
+      description: Seconds to wait for one of them to end; 60 by default, 0 to answer at once. Optional.
+      maximum: 300.0
+      minimum: 0.0
+      type: integer
+  required:
+  - jobs
+  title: StatusRequest
+  type: object
+examples:
+- |-
+  wait for the deploy to finish<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  service_deploy answered the deploy's handle; one call with a long wait holds until it is proven or rolled back.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_status", "arguments": {"jobs": ["deploy:76c3a0f4d39bd9db:XeV_I_QPzpg"], "wait_s": 300}}
+  </tool_call><|projection|>
+- |-
+  wait on both test runs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Both handles in one call: it answers when the first ends, and I wait again on the other.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_status", "arguments": {"jobs": ["build:76c3a0f4d39bd9db:XeV_I_QPzpg", "build:a0ac88178cb2b57d:Tq3kLw9ZpXA"], "wait_s": 240}}
+  </tool_call><|projection|>
+- |-
+  where is the drain on that member<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A look at once, without waiting: wait_s 0.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_status", "arguments": {"jobs": ["cluster:a0ac88178cb2b57d:7"], "wait_s": 0}}
+  </tool_call><|projection|>
+- is the agent's build still going<|im_end|>

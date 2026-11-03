@@ -1,6 +1,7 @@
 //! `service_deploy {host, service}`: build a service from origin/main on one
-//! machine's agent and try it there through keep (`docs/build_deploy_tools.md`
-//! §4). It answers once the build job is accepted, with the deploy's handle;
+//! machine's agent and try it there through keep (`docs/jobs.md` §6). It
+//! answers once the build job is accepted, with the deploy's handle,
+//! `deploy:<node>:<id>`;
 //! a driver task in this member waits for the build and asks keep for the
 //! trial, tagged with the handle, and keep runs the trial from there.
 
@@ -15,6 +16,7 @@ use zend_vfs::{JobStatus, Snapshot};
 use super::{guard, keep, service_of, trial_body, KEEP_TRIAL, SERVICES};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
+use crate::mcp::tools::job::JobHandle;
 use crate::mcp::tools::repo_job::{on_host, phase, Handle, NO_AGENTS};
 use crate::mcp::tools::{string, Answer, Ctx};
 
@@ -39,10 +41,11 @@ pub fn definition() -> Value {
             installed one and keeps it once it prints that it is serving — within ten minutes, the window \
             restarting while it catches up on replication — and otherwise puts the previous binary back, \
             so a bad build cannot keep a machine down. Answers at once with the deploy's handle \
-            (`<node>:<id>`, which is also its build job's handle), the machine and the build's phase. Then \
-            watch it with `service_status {deploy, wait_s}` — one call that holds until the deploy is \
-            proven, rolled back or failed — read its build with `repo_job_log {job: <deploy>}` and its \
-            trial with `service_log {host, service}`, and stop it with `service_cancel {deploy}`. Only \
+            (`deploy:<node>:<id>`), the machine and the build's phase. Then wait on it with `job_status` — \
+            one call that holds until it is proven, rolled back or failed — whose pages are its build's \
+            log then its trial's, read with `job_read` and searched with `job_grep`; stop it with \
+            `job_cancel`, which rolls a trial back. Read `service_status` first to see what each machine \
+            runs. Only \
             origin/main is built: merge and push first. `motherd` is the daemon — models, Zen, npcd; \
             trying it stops every app on that machine for the trial. `web` is the gateway; `mcp` is the \
             connector. One machine per call: a new motherd joins the cluster as a candidate and the others \
@@ -52,7 +55,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `repo_job_list` name it: `BlackWorld`, `WhiteWorld`."},
+                "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `service_status` name it: `BlackWorld`, `WhiteWorld`."},
                 "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway) or `mcp` (the connector)."}
             },
             "required": ["host", "service"],
@@ -76,13 +79,12 @@ pub fn build_job(service: &str) -> RunJob {
     }
 }
 
-/// What a caller does next with deploy `h` of `service` to `host`.
-pub fn next_steps(h: &Handle, host: &str, service: &str) -> String {
+/// What a caller does next with deploy `job`.
+pub fn next_steps(job: &JobHandle) -> String {
     format!(
-        "Next: `service_status {{deploy: \"{h}\", wait_s: 240}}` waits for it and says where it is; \
-         `repo_job_log {{job: \"{h}\"}}` summarises the build; once the trial starts, \
-         `service_log {{host: \"{host}\", service: \"{service}\", mode: \"tail\"}}` reads it; \
-         `service_cancel {{deploy: \"{h}\"}}` stops it."
+        "Next: `job_status {{jobs: [\"{job}\"], wait_s: 240}}` waits for it and says where it is; \
+         `job_read {{job: \"{job}\", page: 1}}` reads its output — the build's log, then the \
+         trial's; `job_cancel {{job: \"{job}\"}}` stops it."
     )
 }
 
@@ -162,19 +164,14 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let node = agents.node_of(at).unwrap_or(node);
     let h = Handle::new(node, &view.id);
     tracing::info!(deploy = %h, host, service, "deploy: building");
-    tokio::spawn(drive(
-        call.clone(),
-        agents,
-        h.clone(),
-        host.clone(),
-        service,
-    ));
+    let job = JobHandle::Deploy(h.clone());
+    tokio::spawn(drive(call.clone(), agents, h, host.clone(), service));
     Answer::ok(format!(
-        "Deploy {h}: {service} to {host}, building origin/main with `cargo build --release -p \
+        "Started {job}: {service} to {host}, building origin/main with `cargo build --release -p \
          {service}` — {}. When it has built, keep on {host} tries it: proven once it serves, or \
          rolled back.\n{}",
         phase(&view.phase, node),
-        next_steps(&h, &host, service)
+        next_steps(&job)
     ))
 }
 
@@ -207,10 +204,9 @@ mod tests {
 
     #[test]
     fn the_next_steps_name_the_deploy_and_its_machine() {
-        let next = next_steps(&Handle::new(0xab, "Xe"), "BlackWorld", "motherd");
-        assert!(next.contains(r#"`service_status {deploy: "00000000000000ab:Xe", wait_s: 240}`"#));
-        assert!(next
-            .contains(r#"`service_log {host: "BlackWorld", service: "motherd", mode: "tail"}`"#));
+        let next = next_steps(&JobHandle::Deploy(Handle::new(0xab, "Xe")));
+        assert!(next.contains(r#"`job_status {jobs: ["deploy:00000000000000ab:Xe"], wait_s: 240}`"#));
+        assert!(next.contains(r#"`job_cancel {job: "deploy:00000000000000ab:Xe"}`"#));
     }
 
     /// The schema names the services keep runs, so the grammar offers only

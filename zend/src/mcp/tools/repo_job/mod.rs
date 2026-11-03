@@ -1,19 +1,11 @@
-//! The `repo_job_*` tools (`docs/build_deploy_tools.md`): a program run on a
-//! build agent — a cluster machine that checks out a repository and runs
-//! programs on it, never one serving traffic — against a branch as origin holds
-//! it, and everything a caller does with it after: watch it, read its log,
-//! list it, cancel it. Admins only.
+//! `repo_job_start` (`docs/jobs.md` §2): a program run on a build agent — a
+//! cluster machine that checks out a repository and runs programs on it, never
+//! one serving traffic — against a branch as origin holds it. The run is a
+//! job, `build:<node>:<id>`, watched, read and stopped with the `job_*` tools.
+//! Admins only.
 //!
-//! | Module | Tool |
-//! |---|---|
-//! | [`start`] | `repo_job_start` |
-//! | [`status`] | `repo_job_status` |
-//! | [`log`] | `repo_job_log` |
-//! | [`list`] | `repo_job_list` |
-//! | [`cancel`] | `repo_job_cancel` |
-//!
-//! A job is named by one handle, `<node>:<id>` ([`Handle`]), the way every
-//! answer writes it and every tool takes it back (§1).
+//! [`Handle`] is a job on an agent, `<node>:<id>`: the id of a `build:` or a
+//! `deploy:` handle (§1).
 
 use std::fmt;
 
@@ -24,11 +16,7 @@ use zend_vfs::JobStatus;
 
 use crate::mcp::ops;
 
-pub mod cancel;
-pub mod list;
-pub mod log;
 pub mod start;
-pub mod status;
 
 /// What a member with no way to any agent answers.
 pub const NO_AGENTS: &str =
@@ -54,8 +42,8 @@ impl Handle {
         let text = text.trim();
         let bad = || {
             format!(
-                "`{text}` is not a job: a job is `<node>:<id>` as the answer that started it wrote \
-                 it, e.g. `76c3a0f4d39bd9db:XeV_I_QPzpg` — `repo_job_list` lists them"
+                "`{text}` is not a job on an agent: one is `<node>:<id>`, e.g. \
+                 `76c3a0f4d39bd9db:XeV_I_QPzpg`"
             )
         };
         let (node, id) = text.split_once(':').ok_or_else(bad)?;
@@ -222,8 +210,8 @@ pub fn describe(label: &str, host: &str, view: &JobView, now: u64) -> String {
 /// What a job that could not be read answers: why, and what that means.
 pub fn lost(handle: &Handle, e: &impl fmt::Display) -> String {
     format!(
-        "job {handle}: {e} — a job lives in its agent's process, and one lost to a restart is \
-         gone: start it again"
+        "job {handle} on its agent: {e} — a job lives in its agent's process, and one lost to a \
+         restart is gone: start it again"
     )
 }
 
@@ -245,7 +233,7 @@ mod tests {
             "76c3a0f4d39bd9db:a b",
         ] {
             let err = Handle::parse(bad).unwrap_err();
-            assert!(err.contains("`<node>:<id>`"), "{bad}: {err}");
+            assert!(err.contains("one is `<node>:<id>`"), "{bad}: {err}");
         }
     }
 

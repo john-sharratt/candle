@@ -1,4 +1,4 @@
-//! What a worker's deploy may not take down (`docs/build_deploy_tools.md` §4).
+//! What a worker's deploy may not take down (`docs/jobs.md` §6).
 //! keep refuses anything but a build of origin/main and restores the previous
 //! binary when one does not serve, so a bad build cannot keep a member down;
 //! what is left here is what keep cannot see:

@@ -1,7 +1,7 @@
 //! `repo_job_start {repo, branch, program, args, timeout_s?, stage?, node?}`:
 //! run a program on a build agent against a branch as origin holds it
-//! (`docs/build_deploy_tools.md` §2). It answers the moment the agent has
-//! accepted the job — before origin is fetched — with the job's handle, the
+//! (`docs/jobs.md` §2). It answers the moment the agent has accepted the job —
+//! before origin is fetched — with the job's handle, `build:<node>:<id>`, the
 //! machine and what to call next.
 //!
 //! The job goes over this member's own agent stream, placed as the gateway
@@ -18,6 +18,7 @@ use zend_vfs::Snapshot;
 use super::{host_in, phase, pinned, Handle, NO_AGENTS};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
+use crate::mcp::tools::job::JobHandle;
 use crate::mcp::tools::{string, Answer, Ctx};
 
 pub const NAME: &str = "repo_job_start";
@@ -40,18 +41,19 @@ pub fn definition() -> Value {
             that checks out a repository and runs programs on it, never one serving traffic. It runs \
             against `branch` exactly as origin holds it, so push first; nothing of yours that is not pushed \
             is in it. Answers at once, before the agent fetches origin, with the job's handle \
-            (`<node>:<id>`), the machine it runs on and its phase; the job then fetches, waits for the \
-            checkout if another job holds it, runs, and stages what it built when `stage` asks. \
+            (`build:<node>:<id>`), the machine it runs on and its phase; the job then fetches, waits for \
+            the checkout if another job holds it, runs, and stages what it built when `stage` asks. \
             Give a program and its arguments, one entry each — `cargo test -p web` is program `cargo`, args \
             `[\"test\", \"-p\", \"web\"]` — never a shell line: there is no shell, so `&&`, `|`, `;` and \
             redirects are refused; run one program per job. The agent runs only programs on its allow-list \
             (`cargo`); a program no agent runs is refused naming those that do. Run the narrowest thing \
             that answers the question — one crate's tests, `cargo check` or `clippy` for a compile — since a \
             workspace-wide test run takes many minutes. On a machine short of memory pass `-j 4` to cargo \
-            and `--test-threads=4` after `--`. Then wait for it with `repo_job_status {job, wait_s}` — one \
-            call that holds until the job ends, never a loop of calls — and read what it printed with \
-            `repo_job_log {job}`, whose default summary gives the test results, errors and failures with \
-            their line numbers. Stop it with `repo_job_cancel {job}`. Name `node` (a machine such as \
+            and `--test-threads=4` after `--`. Start every job you need first, then wait on them together \
+            with `job_status {jobs, wait_s}` — one call that holds until one ends, never a loop of calls — \
+            whose answer gives each one's test results, errors and failures with their line numbers and \
+            pages; `job_read` reads a page and `job_grep` searches the log. Stop it with `job_cancel`. Name \
+            `node` (a machine such as \
             `BlackWorld`, or a 16-hex-digit node) to pin an agent; otherwise the gateway places it, keeping \
             a caller's jobs on the agent whose build is warm. A standby agent (AlienWorld) takes a job only \
             when no other agent can, or when `node` names it. To build and try a service, use \
@@ -64,7 +66,7 @@ pub fn definition() -> Value {
                 "program": {"type": "string", "minLength": 1, "maxLength": 64, "description": "The program alone, e.g. `cargo` — no arguments, no shell."},
                 "args": {"type": "array", "maxItems": MAX_ARGS, "items": {"type": "string", "maxLength": 400}, "description": "Its arguments, one entry each, passed exactly as written: `[\"clippy\", \"-p\", \"web\", \"--tests\", \"--\", \"-D\", \"warnings\"]`."},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_S, "description": "Seconds before it and everything it started are killed; 1800 by default."},
-                "stage": {"type": "string", "minLength": 1, "maxLength": 200, "description": "A file it builds, relative to the checkout — `target/release/motherd.exe` — copied to that machine's stage folder once the job exits 0; `repo_job_status` says where."},
+                "stage": {"type": "string", "minLength": 1, "maxLength": 200, "description": "A file it builds, relative to the checkout — `target/release/motherd.exe` — copied to that machine's stage folder once the job exits 0; `job_status` says where."},
                 "node": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The agent to run on: its machine (`BlackWorld`) or its 16-hex-digit node. Left out, the gateway places it."}
             },
             "required": ["repo", "branch", "program", "args"],
@@ -129,12 +131,12 @@ pub fn job_of(args: &Value) -> Result<RunJob, String> {
     })
 }
 
-/// What a caller does next with job `h`.
-pub fn next_steps(h: &Handle) -> String {
+/// What a caller does next with job `job`.
+pub fn next_steps(job: &JobHandle) -> String {
     format!(
-        "Next: `repo_job_status {{job: \"{h}\", wait_s: 180}}` waits for it to end and says how it \
-         went; `repo_job_log {{job: \"{h}\"}}` summarises its log — test results, errors, \
-         failures, with line numbers; `repo_job_cancel {{job: \"{h}\"}}` stops it."
+        "Next: `job_status {{jobs: [\"{job}\"], wait_s: 180}}` waits for it to end and says how it \
+         went — test results, errors and failures with their line numbers, and its pages; \
+         `job_cancel {{job: \"{job}\"}}` stops it."
     )
 }
 
@@ -172,12 +174,12 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
             ))
         }
     };
-    let h = Handle::new(node, &view.id);
+    let job = JobHandle::Build(Handle::new(node, &view.id));
     Answer::ok(format!(
-        "Started job {h} on {}: `{command}` on {place} — {}.\n{}",
+        "Started {job} on {}: `{command}` on {place} — {}.\n{}",
         host_in(&listed, node),
         phase(&view.phase, node),
-        next_steps(&h)
+        next_steps(&job)
     ))
 }
 
@@ -240,8 +242,8 @@ mod tests {
 
     #[test]
     fn the_next_steps_name_the_handle() {
-        let next = next_steps(&Handle::new(0xab, "Xe"));
-        assert!(next.contains(r#"`repo_job_status {job: "00000000000000ab:Xe", wait_s: 180}`"#));
-        assert!(next.contains(r#"`repo_job_cancel {job: "00000000000000ab:Xe"}`"#));
+        let next = next_steps(&JobHandle::Build(Handle::new(0xab, "Xe")));
+        assert!(next.contains(r#"`job_status {jobs: ["build:00000000000000ab:Xe"], wait_s: 180}`"#));
+        assert!(next.contains(r#"`job_cancel {job: "build:00000000000000ab:Xe"}`"#));
     }
 }

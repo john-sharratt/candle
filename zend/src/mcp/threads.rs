@@ -51,7 +51,7 @@ impl State {
         matches!(self, Self::Running | Self::Question | Self::Stuck)
     }
 
-    /// Whether zend is still working on it: what `repo_task_wait` waits out.
+    /// Whether zend is still working on it: what a wait on its task waits out.
     pub fn working(self) -> bool {
         matches!(self, Self::Running)
     }
@@ -198,7 +198,7 @@ pub struct Worker {
     /// Why its turn ended with no journal entry, as the draft recorded it;
     /// none when it kept one.
     pub no_entry: Option<String>,
-    /// Whether Claude stopped its last turn (`repo_task_stop`): it is stuck, live,
+    /// Whether Claude stopped its last turn (`job_cancel`): it is stuck, live,
     /// for `repo_task_reply` to redirect.
     #[serde(default)]
     pub stopped: bool,

@@ -1,41 +1,21 @@
-//! `repo_task_wait {workers, wait_s?}`: wait on one or more workers, answering as
-//! soon as any of them stops running (`docs/claude_zend_gateway.md` §3.3).
+//! A task's answer, waited for: what `repo_task_start` and `repo_task_reply`
+//! answer, and what `job_status` says of a task once it settles
+//! (`docs/jobs.md` §4). A task is named by its handle, `task:<thread>/<name>`;
+//! its journal entries by their addresses, `T:<thread>/<name>#<id>`.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use super::{wait_secs, Answer, Ctx, Wait, LOADING};
-use crate::mcp::names::Path;
+use super::{Answer, Ctx, Wait, LOADING};
 use crate::mcp::reported::{self, Mark};
 use crate::mcp::threads::{State, Worker};
 use crate::mcp::workers;
 
-pub const NAME: &str = "repo_task_wait";
-
 /// The line a wait's answer opens its workers still running under.
 pub const STILL_RUNNING: &str = "Still running:";
 
-pub fn definition() -> Value {
-    json!({
-        "name": NAME,
-        "annotations": {"readOnlyHint": true},
-        "description": "Wait on running workers, by the paths `repo_task_start` answered (`T:<thread>/<name>`). \
-            Answers as soon as any one stops running — done, failed, asking you a question, or stuck — with a \
-            line for each still running. So start every task first and wait on them all, handle the one that \
-            settled (reply to a question or a stuck worker with `repo_task_reply`), then wait again on the rest. A \
-            worker that is done answers with its final response in full. If `wait_s` passes first, each says \
-            what it has done so far, with any journal entries it wrote since you last heard: call again, or \
-            stop waiting if the entries already answer you. No entry is given twice. The work goes on whether \
-            or not anyone waits.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workers": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "The workers' paths."},
-                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering with every one still running (45 by default)."}
-            },
-            "required": ["workers"],
-            "additionalProperties": false
-        }
-    })
+/// The task's handle, as every job tool takes it.
+pub fn handle(w: &Worker) -> String {
+    format!("task:{}/{}", w.thread, w.name)
 }
 
 /// The worker's journal entries after `seen` — the newest one already handed
@@ -66,42 +46,42 @@ pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
                 .unwrap_or_default();
             format!(
                 "{} — {}{checking}{entries}",
-                w.path(),
+                handle(w),
                 w.doing(workers::now_ms())
             )
         }
         State::Question => format!(
             "{} — asks Claude (reply with `repo_task_reply`; it waits until then):\n{}{entries}",
-            w.path(),
+            handle(w),
             w.question.as_deref().unwrap_or("")
         ),
         State::Stuck if w.stopped => format!(
             "{} — stopped, as you asked; it is live. Redirect it with `repo_task_reply`, or end it \
              with `thread_archive`. Its closing response:\n{}{entries}",
-            w.path(),
+            handle(w),
             w.final_text
         ),
         State::Stuck => format!(
             "{} — stuck: the repeat guard or the round cap closed its tools. Say how to go on \
              with `repo_task_reply`. Its closing response:\n{}{entries}",
-            w.path(),
+            handle(w),
             w.final_text
         ),
         State::Error => format!(
             "{} — error: {}{entries}",
-            w.path(),
+            handle(w),
             w.error.as_deref().unwrap_or("the task failed")
         ),
         State::Done if w.entries.is_empty() => format!(
             "{} — done; no journal entry was kept ({}). Its answer:\n{}{}",
-            w.path(),
+            handle(w),
             w.no_entry.as_deref().unwrap_or("no journal draft ran"),
             w.final_text,
             done_close(w)
         ),
         State::Done => format!(
             "{} — done. Its answer:\n{}{}{entries}",
-            w.path(),
+            handle(w),
             w.final_text,
             done_close(w)
         ),
@@ -152,9 +132,10 @@ pub fn render(read: &[(String, Option<Worker>)], seen: &dyn Fn(&Worker) -> Optio
 
 /// Wait on `wanted` up to `wait`, telling each step on the call's progress,
 /// and answer with [`render`], carrying the entries it hands over as marks to
-/// keep once it is delivered, so the next answer gives only newer ones. A wait
-/// its client's ceiling cut short says so while anything still runs. What
-/// `repo_task_wait`, `repo_task_start` and `repo_task_reply` answer.
+/// keep once it is delivered, so the next answer gives only newer ones. While
+/// anything still runs it names the call that keeps waiting, and says when its
+/// client's ceiling cut the wait short. What `repo_task_start` and
+/// `repo_task_reply` answer.
 pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Wait) -> Answer {
     let owner = ctx.caller.key();
     let read = match workers::wait(
@@ -185,39 +166,27 @@ pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Wait) -> A
         })
         .collect();
     let mut text = render(&read, &seen);
-    let still_running = read
+    let running: Vec<String> = read
         .iter()
-        .any(|(_, w)| w.as_ref().is_some_and(|w| w.state.working()));
-    if let Some(note) = wait.note().filter(|_| still_running) {
-        text.push_str("\n\n");
-        text.push_str(&note);
+        .filter_map(|(_, w)| w.as_ref().filter(|w| w.state.working()).map(handle))
+        .collect();
+    if !running.is_empty() {
+        text.push_str(&keep_waiting(&running));
+        if let Some(note) = wait.note() {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
     }
     Answer::ok(text).marking(marks)
 }
 
-pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
-    let Some(list) = args.get("workers").and_then(Value::as_array) else {
-        return Answer::error("`workers` is missing: a list of worker paths");
-    };
-    let mut wanted = Vec::new();
-    for item in list {
-        let Some(text) = item.as_str() else {
-            return Answer::error("each of `workers` is a path string");
-        };
-        match Path::parse(text) {
-            Ok(Path::Worker { thread, worker }) => wanted.push((thread, worker)),
-            Ok(_) => {
-                return Answer::error(format!(
-                    "`{text}` is not a worker; a worker is `T:<thread>/<name>`"
-                ))
-            }
-            Err(e) => return Answer::error(e),
-        }
-    }
-    if wanted.is_empty() {
-        return Answer::error("`workers` is empty");
-    }
-    answer_for(ctx, &wanted, wait_secs(ctx, args)).await
+/// The call that waits on the tasks `running`.
+fn keep_waiting(running: &[String]) -> String {
+    format!(
+        "\n\n`job_status {{jobs: {}, wait_s: 120}}` waits for it to settle; the work goes on \
+         whether or not anyone waits.",
+        json!(running)
+    )
 }
 
 #[cfg(test)]
@@ -272,7 +241,7 @@ mod tests {
         asks.question = Some("QUESTION: Inclusive?".into());
         assert_eq!(
             result_of(&asks, None),
-            "T:review/v — asks Claude (reply with `repo_task_reply`; it waits until then):\n\
+            "task:review/v —asks Claude (reply with `repo_task_reply`; it waits until then):\n\
              QUESTION: Inclusive?"
         );
         let stuck = worker("v", State::Stuck);
@@ -299,18 +268,18 @@ mod tests {
             entry(2, "Entry 2 — fetched"),
         ];
         let read = vec![
-            ("T:review/check".to_string(), Some(check)),
-            ("T:review/verify".to_string(), Some(done)),
-            ("T:review/gone".to_string(), None),
+            ("task:review/check".to_string(), Some(check)),
+            ("task:review/verify".to_string(), Some(done)),
+            ("task:review/gone".to_string(), None),
         ];
         let seen = |w: &Worker| (w.name == "check").then_some(1);
         assert_eq!(
             render(&read, &seen),
-            "T:review/verify — done. Its answer:\nVerdict: ok\n\n\
+            "task:review/verify — done. Its answer:\nVerdict: ok\n\n\
              Journal entries:\n\nT:review/verify#4\nEntry 4 — verified\n\n\
-             T:review/gone — no such worker\n\n\
+             task:review/gone — no such worker\n\n\
              Still running:\n\
-             T:review/check — running 0s, 2 rounds: 1,934 thinking tokens, 3 tool calls \
+             task:review/check — running 0s, 2 rounds: 1,934 thinking tokens, 3 tool calls \
              (web_fetch 3); now thinking\n\n\
              Journal entries:\n\nT:review/check#2\nEntry 2 — fetched"
         );
@@ -324,11 +293,11 @@ mod tests {
         done.entries = vec![entry(3, "Entry 3 — a"), entry(4, "Entry 4 — b")];
         assert_eq!(
             result_of(&done, Some(4)),
-            "T:review/v — done. Its answer:\nVerdict: ok"
+            "task:review/v —done. Its answer:\nVerdict: ok"
         );
         assert_eq!(
             result_of(&done, Some(3)),
-            "T:review/v — done. Its answer:\nVerdict: ok\n\n\
+            "task:review/v —done. Its answer:\nVerdict: ok\n\n\
              Journal entries:\n\nT:review/v#4\nEntry 4 — b"
         );
         let mut bare = worker("v", State::Done);
@@ -336,12 +305,12 @@ mod tests {
             Some("its journal draft failed: the entry was refused: Claim 1 cites no turn.".into());
         assert_eq!(
             result_of(&bare, None),
-            "T:review/v — done; no journal entry was kept (its journal draft failed: the entry was \
+            "task:review/v —done; no journal entry was kept (its journal draft failed: the entry was \
              refused: Claim 1 cites no turn.). Its answer:\nVerdict: ok"
         );
         let mut failed = worker("v", State::Error);
         failed.error = Some("boom".into());
-        assert_eq!(result_of(&failed, None), "T:review/v — error: boom");
+        assert_eq!(result_of(&failed, None), "task:review/v —error: boom");
     }
 
     /// **A worker sent back to check its citations says so while it runs.**
@@ -353,7 +322,7 @@ mod tests {
         assert_eq!(
             result_of(&checking, None),
             format!(
-                "T:review/v — {}\n  Checking its citations: sent back to open 2 it cited without \
+                "task:review/v —{}\n  Checking its citations: sent back to open 2 it cited without \
                  opening.",
                 checking.doing(workers::now_ms())
             )
@@ -370,7 +339,7 @@ mod tests {
         done.resumable = true;
         assert_eq!(
             result_of(&done, None),
-            "T:review/v — done. Its answer:\nVerdict: ok\n\n\
+            "task:review/v —done. Its answer:\nVerdict: ok\n\n\
              Citation audit: 1 cited — 1 opened, 0 seen only in search results, 0 never seen in the run.\n\n\
              It can be continued with `repo_task_reply` — to check a claim, go deeper, or redo a part — \
              until its thread is archived or it sits a day untouched.\n\n\

@@ -1,5 +1,5 @@
-//! The operations tools — building, deploying, and reading the cluster — as one
-//! implementation two surfaces call (`docs/build_deploy_tools.md` §6): Claude
+//! The operations tools — the jobs, building, deploying, and reading the
+//! cluster — as one implementation two surfaces call (`docs/jobs.md` §8): Claude
 //! through the MCP connector, and a worker of Zen's through its own tool round
 //! ([`OpsTools`], the daemon's [`OpsRunner`]). Each tool runs against an
 //! [`OpsCall`] — whom it is for and how it may wait — so neither surface has a
@@ -19,9 +19,7 @@ use super::caller::Caller;
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
-use super::tools::{
-    cluster_audit, cluster_job_status, cluster_logs, cluster_status, repo_job, service, Answer, Ctx,
-};
+use super::tools::{cluster_audit, cluster_logs, cluster_status, job, repo_job, service, Answer, Ctx};
 use crate::session::ZendSession;
 
 /// The longest a worker's call waits: it has no client to cut it off, and a
@@ -135,18 +133,16 @@ enum Needs {
 /// The tools a worker of Zen's reaches through [`OpsRunner`], and what each
 /// needs.
 const WORKER_TOOLS: &[(&str, Needs)] = &[
+    (job::list::NAME, Needs::ReadsAsPerson),
+    (job::status::NAME, Needs::ReadsAsPerson),
+    (job::read::NAME, Needs::ReadsAsPerson),
+    (job::grep::NAME, Needs::ReadsAsPerson),
+    (job::cancel::NAME, Needs::Changes),
     (service::deploy::NAME, Needs::Changes),
-    (service::cancel::NAME, Needs::Changes),
     (service::status::NAME, Needs::Reads),
-    (service::log::NAME, Needs::Reads),
-    (repo_job::status::NAME, Needs::Reads),
-    (repo_job::log::NAME, Needs::Reads),
-    (repo_job::list::NAME, Needs::Reads),
-    (repo_job::cancel::NAME, Needs::Changes),
     (cluster_status::NAME, Needs::ReadsAsPerson),
     (cluster_logs::NAME, Needs::ReadsAsPerson),
     (cluster_audit::NAME, Needs::ReadsAsPerson),
-    (cluster_job_status::NAME, Needs::ReadsAsPerson),
 ];
 
 /// Why a worker of `role` doing `kind`'s work, working for a person or not
@@ -178,16 +174,14 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         cluster_status::NAME => cluster_status::run(call, args).await,
         cluster_logs::NAME => cluster_logs::run(call, args).await,
         cluster_audit::NAME => cluster_audit::run(call, args).await,
-        cluster_job_status::NAME => cluster_job_status::run(call, args).await,
+        job::list::NAME => job::list::run(call, args).await,
+        job::status::NAME => job::status::run(call, args).await,
+        job::read::NAME => job::read::run(call, args).await,
+        job::grep::NAME => job::grep::run(call, args).await,
+        job::cancel::NAME => job::cancel::run(call, args).await,
         repo_job::start::NAME => repo_job::start::run(call, args).await,
-        repo_job::status::NAME => repo_job::status::run(call, args).await,
-        repo_job::log::NAME => repo_job::log::run(call, args).await,
-        repo_job::list::NAME => repo_job::list::run(call, args).await,
-        repo_job::cancel::NAME => repo_job::cancel::run(call, args).await,
         service::deploy::NAME => service::deploy::run(call, args).await,
         service::status::NAME => service::status::run(call, args).await,
-        service::log::NAME => service::log::run(call, args).await,
-        service::cancel::NAME => service::cancel::run(call, args).await,
         other => Answer::error(format!("`{other}` is not an operations tool")),
     }
 }
@@ -273,7 +267,7 @@ mod tests {
                 .unwrap()
                 .contains("coder")
         );
-        assert!(unfit(repo_job::log::NAME, Role::User, WorkerKind::Coder, true)
+        assert!(unfit(job::read::NAME, Role::User, WorkerKind::Coder, true)
             .unwrap()
             .contains("Admin"));
         assert_eq!(
@@ -284,6 +278,11 @@ mod tests {
             unfit(cluster_logs::NAME, Role::Admin, WorkerKind::Coder, false)
                 .unwrap()
                 .contains("names none")
+        );
+        assert!(
+            unfit(job::cancel::NAME, Role::Admin, WorkerKind::Reviewer, true)
+                .unwrap()
+                .contains("coder")
         );
         assert!(unfit("repo_job_start", Role::Admin, WorkerKind::Coder, true)
             .unwrap()

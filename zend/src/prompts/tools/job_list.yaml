@@ -1,0 +1,64 @@
+name: job_list
+questions:
+- what is building on the agents
+- is anything running on blackworld's agent
+- list the build jobs
+- find the deploy's handle
+- which jobs are still running
+- what did the agents run recently
+- find the handle of the build I started earlier
+- is a release build already going
+- list the jobs that have finished
+- which deploys are under way
+- what tasks are running on the thread
+- is a maintenance command already running on a member
+- show every job I have going
+- what has been deployed lately
+- list the running deploys and builds
+- is somebody else already deploying motherd
+category: Commands
+description: 'List jobs — tasks, builds and test runs on the agents, deploys, maintenance jobs on the members — newest first, a line each: its handle, where it runs, where it is, how long it has run, what it is, and how many pages of output it has. Running ones only, unless `running: false` adds those that ended lately; `kind` narrows to one kind. A deploy is listed once, as a deploy, never again as its build. Use for: seeing what is already under way before starting more, and finding a job whose handle you no longer have — then job_status waits on it. Triggered by "what is building", "list the jobs". Returns each job by handle.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    kind:
+      description: 'Only jobs of one kind: `task`, `build`, `deploy` or `cluster`. Optional.'
+      enum:
+      - task
+      - build
+      - deploy
+      - cluster
+      type: string
+    running:
+      description: Only jobs still running, true by default; false adds those that ended lately. Optional.
+      type: boolean
+    limit:
+      description: The most jobs listed; 20 by default. Optional.
+      maximum: 100.0
+      minimum: 1.0
+      type: integer
+  title: ListRequest
+  type: object
+examples:
+- |-
+  is anyone already deploying<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Running deploys alone answer it; the kind narrows the list to them.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_list", "arguments": {"kind": "deploy"}}
+  </tool_call><|projection|>
+- |-
+  what ran on the agents today<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Ended builds too, so running is false; a larger limit covers the day.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "job_list", "arguments": {"kind": "build", "running": false, "limit": 50}}
+  </tool_call><|projection|>
+- what jobs are there<|im_end|>

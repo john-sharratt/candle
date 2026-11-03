@@ -24,7 +24,7 @@ testing, reviewing — goes to Zen's workers with repo_task_start; keep orchestr
 approvals yourself, and do web research with your own tools. Call guide_list first. Attach to the \
 feature's thread with thread_attach before working on it, and again after your context is compacted. \
 Start tasks with repo_task_start — state each in full and name it for what it does — and wait on them \
-together with repo_task_wait. A task's result is its worker's journal entry: an entry is evidence, not \
+together with job_status, which waits on builds, deploys and maintenance jobs too. A task's result is its worker's journal entry: an entry is evidence, not \
 truth, so check a claim against the turns it cites (journal_read with the entry) before acting on it.";
 
 /// What the server is, plainly. The name and the moon are branding borrowed

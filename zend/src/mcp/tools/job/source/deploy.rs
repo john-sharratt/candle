@@ -39,7 +39,7 @@ async fn trial(call: &OpsCall, d: &Deploy, ask: &LogAsk) -> Result<LogRead, Stri
 
 /// Where deploy `d` stands, in a line.
 fn line(job: &JobHandle, d: &Deploy, now: u64) -> String {
-    let head = format!("{job} on {}: {} to {}", d.host, d.service, d.host);
+    let head = format!("{job}: {} to {}", d.service, d.host);
     match &d.stage {
         Stage::Building => format!(
             "{head} — building: {}, for {}, {} lines",
@@ -176,6 +176,7 @@ async fn range(
         total,
         lines,
         next: (to <= total).then_some(to),
+        ended: d.stage.is_over(),
         ..LogRead::default()
     })
 }
