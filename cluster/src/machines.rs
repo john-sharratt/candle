@@ -125,6 +125,15 @@ impl MachineTable {
         self.get(host).and_then(|m| m.pictures)
     }
 
+    /// Whether any machine of the table takes a unit: one that draws, for a
+    /// draw, and one that takes conversations for any other.
+    pub fn any_takes(&self, draw: bool) -> bool {
+        self.machines.values().any(|m| match draw {
+            true => m.pictures.is_some(),
+            false => m.conversations.is_some(),
+        })
+    }
+
     /// `host`'s share of the cast; zero for a machine the table does not name.
     pub fn characters(&self, host: &str) -> u32 {
         self.get(host).map_or(0, |m| m.characters)
@@ -177,6 +186,18 @@ AlienWorld: {}
         assert_eq!(t.get("AlienWorld"), Some(&Machine::default()));
         assert_eq!(t.conversations("AlienWorld"), None);
         assert_eq!(t.characters("AlienWorld"), 0);
+    }
+
+    /// Whether the table takes a unit at all: a conversation or a draw.
+    #[test]
+    fn a_table_says_whether_any_machine_takes_a_unit() {
+        let t = MachineTable::from_yaml(TABLE).unwrap();
+        assert!(t.any_takes(false) && t.any_takes(true));
+        let cast_only = MachineTable::from_yaml("AlienWorld:\n  characters: 1\n").unwrap();
+        assert!(!cast_only.any_takes(false) && !cast_only.any_takes(true));
+        let talks = MachineTable::from_yaml("WhiteWorld:\n  conversations: {rank: 1}\n").unwrap();
+        assert!(talks.any_takes(false) && !talks.any_takes(true));
+        assert!(!MachineTable::default().any_takes(false));
     }
 
     /// A machine is matched in any case, and one the table does not name

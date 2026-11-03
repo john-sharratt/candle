@@ -126,16 +126,9 @@ pub enum WorldOp {
         text: String,
     },
     /// A character's holder hands it back at a turn boundary, its own writes
-    /// reaching `through`, for its next holder to wait for. A holder that
-    /// `never_ran` the character — handed it back before it had what its own
-    /// last holder wrote — wrote nothing of it, and the lease's unmet wait is
-    /// carried on for the next holder in its place.
-    HandBack {
-        npc: u64,
-        through: u64,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        never_ran: bool,
-    },
+    /// reaching `through`, for its next holder to wait for along with every
+    /// wait the lease already names.
+    HandBack { npc: u64, through: u64 },
     /// An admin frees a character's lease, for a holder that will not return.
     Release { npc: u64 },
     /// Notes or credentials set on a device part, named by its network address
@@ -263,35 +256,13 @@ mod tests {
             },
             "a member that sends no origin sends one from the console"
         );
-        assert_eq!(
-            serde_json::to_value(WorldOp::HandBack {
-                npc: 3,
-                through: 40,
-                never_ran: false,
-            })
-            .unwrap(),
-            json!({"op": "hand_back", "npc": 3, "through": 40})
-        );
-        let unran = json!({"op": "hand_back", "npc": 3, "through": 40, "never_ran": true});
-        assert_eq!(
-            serde_json::to_value(WorldOp::HandBack {
-                npc: 3,
-                through: 40,
-                never_ran: true,
-            })
-            .unwrap(),
-            unran
-        );
-        assert_eq!(
-            serde_json::from_value::<WorldOp>(json!({"op": "hand_back", "npc": 3, "through": 40}))
-                .unwrap(),
-            WorldOp::HandBack {
-                npc: 3,
-                through: 40,
-                never_ran: false,
-            },
-            "a hand-back that says nothing ran the character"
-        );
+        let back = WorldOp::HandBack {
+            npc: 3,
+            through: 40,
+        };
+        let wire = json!({"op": "hand_back", "npc": 3, "through": 40});
+        assert_eq!(serde_json::to_value(&back).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), back);
     }
 
     /// **A server channel's message and a notice travel as these**, exactly.

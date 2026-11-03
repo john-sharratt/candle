@@ -74,7 +74,8 @@ pub(crate) enum Placed {
     /// Every eligible card is full: the unit waits at the gateway (§3.4).
     Full,
     /// No machine of the pool takes the unit at all — named nowhere in the
-    /// table, or without the key the unit needs: waiting would never end.
+    /// table, or without the key the unit needs. The registry refuses it only
+    /// when no machine of the whole table takes it (`Registry::unplaced`).
     Unplaced,
     /// Nobody is eligible.
     Nobody,

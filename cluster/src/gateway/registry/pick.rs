@@ -348,8 +348,20 @@ impl Registry {
         match placed {
             Placed::To(node) => Pick::Member(node),
             Placed::Full => Pick::Wait,
-            Placed::Unplaced => Pick::Unplaced,
+            Placed::Unplaced => self.unplaced(draw),
             Placed::Nobody => Pick::Configured,
+        }
+    }
+
+    /// A unit no member that may take work now can take: refused only when
+    /// **no machine of the table takes it at all** (`docs/static_placement.md`
+    /// §3.4). While one does, the unit waits for it — a named machine whose
+    /// member still loads, or is behind, or has not joined yet, comes to take
+    /// it; refusing would answer 502 for a machine that is only starting.
+    fn unplaced(&self, draw: Option<u64>) -> Pick {
+        match self.machines.any_takes(draw.is_some()) {
+            true => Pick::Wait,
+            false => Pick::Unplaced,
         }
     }
 
@@ -420,15 +432,16 @@ impl Registry {
             Placed::To(node) => Pick::Member(node),
             Placed::Full => Pick::Wait,
             missed if missed.missed() && canary_room => Pick::Member(canary),
-            Placed::Unplaced => Pick::Unplaced,
+            Placed::Unplaced => self.unplaced(draw),
             // Nobody but the candidate, and its card has no room: it waits when
-            // the candidate's machine can come to have room, and is refused when
-            // it takes nothing of the unit at all.
+            // the candidate's machine can come to have room — or, for an app
+            // that runs no model, when the candidate is only drawing — and is
+            // refused when no machine takes the unit at all.
             _ => {
                 let alone: Vec<&MemberView> = self.member(app, canary).into_iter().collect();
                 match place(app, alone, draw, &self.weigh(app, &cards)) {
-                    Placed::Full => Pick::Wait,
-                    _ => Pick::Unplaced,
+                    Placed::Full | Placed::To(_) => Pick::Wait,
+                    _ => self.unplaced(draw),
                 }
             }
         }

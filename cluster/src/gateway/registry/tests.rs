@@ -455,9 +455,10 @@ fn units_fill_to_each_min_in_rank_order_then_go_round_to_each_max() {
 
 /// **A machine the table does not name is given no work**, whatever else it
 /// is: a unit waits for a named machine's room rather than going to it — and
-/// when no machine the unit could go to takes conversations at all, it does not
-/// wait for room that will never come: it is refused, unplaced. So is a
-/// canary's baseline with nobody but an unnamed candidate.
+/// it waits too while the named machine's member still loads, or has not
+/// joined at all: that machine comes to take it. Only when **no machine of the
+/// table takes conversations** does it not wait for room that will never come:
+/// it is refused, unplaced. So is a canary's baseline.
 #[test]
 fn a_machine_the_table_does_not_name_takes_nothing() {
     let mut r = Registry::new();
@@ -473,11 +474,34 @@ fn a_machine_the_table_does_not_name_takes_nothing() {
     unnamed.set_machines(table(&[("m1", 1, 1, 1)]));
     unnamed.join(member(9, 9));
     unnamed.capacity("zend", 9, capacity(MemberState::Ready, 1, true, 1));
-    assert_eq!(placed(&mut unnamed), Err(Pick::Unplaced));
+    assert_eq!(
+        placed(&mut unnamed),
+        Err(Pick::Wait),
+        "m1 has not joined yet"
+    );
     assert_eq!(
         unnamed.pick_canary("zend", &Dispatch::Best, None, None, None, 9, &mut || true),
-        Pick::Unplaced,
+        Pick::Wait,
         "a candidate no machine names, with nobody else"
+    );
+    unnamed.join(member(1, 1));
+    unnamed.capacity("zend", 1, capacity(MemberState::Loading, 1, true, 1));
+    assert_eq!(placed(&mut unnamed), Err(Pick::Wait), "m1 still loads");
+    unnamed.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(placed(&mut unnamed), Ok(1), "and takes it once ready");
+
+    let mut nowhere = Registry::new();
+    nowhere.set_machines(MachineTable::from_yaml("m1:\n  characters: 1\n").unwrap());
+    nowhere.join(member(9, 9));
+    nowhere.capacity("zend", 9, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(
+        placed(&mut nowhere),
+        Err(Pick::Unplaced),
+        "no machine takes conversations"
+    );
+    assert_eq!(
+        nowhere.pick_canary("zend", &Dispatch::Best, None, None, None, 9, &mut || true),
+        Pick::Unplaced,
     );
     let mut empty = Registry::new();
     empty.join(member(1, 1));

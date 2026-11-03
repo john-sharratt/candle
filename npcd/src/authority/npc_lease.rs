@@ -45,6 +45,27 @@ pub struct NpcLease {
     /// holder applies before it runs the character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<After>,
+    /// The writes of the holders before it, each origin's latest, which the
+    /// holder applies too (`docs/static_placement.md` §5.3). A hand-back adds
+    /// to what the lease already waits for and never replaces it: the member
+    /// handing back may never have run the character, or may have applied its
+    /// last holder's writes without the next holder having them yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<After>,
+}
+
+impl NpcLease {
+    /// Every wait the lease names: its last hand-back's, and those before.
+    pub fn waits(&self) -> impl Iterator<Item = After> + '_ {
+        self.after.into_iter().chain(self.before.iter().copied())
+    }
+
+    /// Whether a member that has applied each origin's records through
+    /// `applied(origin)` holds everything the character's holders wrote: it
+    /// may run the character.
+    pub fn ready(&self, applied: impl Fn(u64) -> u64) -> bool {
+        self.waits().all(|a| applied(a.origin) >= a.through)
+    }
 }
 
 /// A member's own records, through an `oseq`.
@@ -198,6 +219,7 @@ pub fn lend(
                         {
                             NpcLease {
                                 after: l.after,
+                                before: l.before.clone(),
                                 ..fresh(want, now_ms)
                             }
                         } else {
@@ -216,6 +238,7 @@ pub fn lend(
                         },
                         next: Some(hex(asked.unwrap_or(want))),
                         after: l.after,
+                        before: l.before.clone(),
                     },
                     None => fresh(want, now_ms),
                 }
@@ -237,49 +260,41 @@ fn fresh(holder: u64, now_ms: u64) -> NpcLease {
         expires_ms: now_ms + NPC_TTL_MS,
         next: None,
         after: None,
+        before: Vec::new(),
     }
 }
 
-/// Whether the member holding `lease`, which has applied each origin's records
-/// through `applied(origin)`, never ran the character under it.
-///
-/// **A fact about what the member holds, not about whether the character is
-/// awake now.** A character is woken only once the wait its lease names is met,
-/// and an applied record stays applied, a restart included: a wait still unmet
-/// means the member never woke it. One met, or none, may have run — after a
-/// restart the character is asleep and ran for hours — and its holder hands
-/// back its own writes.
-pub fn never_ran(lease: &NpcLease, applied: impl Fn(u64) -> u64) -> bool {
-    lease.after.is_some_and(|a| applied(a.origin) < a.through)
-}
-
 /// The holder `from` handed `nid` back, its own writes reaching `through`: the
-/// lease goes to its `next`, who waits for them. A holder that `never_ran` the
-/// character wrote nothing of it, so the next holder waits for what the lease
-/// already named instead — the last holder that did run it. Rewritten to the
-/// holder's own writes, a move asked before the holder had caught up let the
-/// next one wake the character ahead of its previous holder's turns. `None`
-/// when `from` is not its holder or no move was asked.
-pub fn hand_back(
-    current: &NpcLease,
-    from: u64,
-    through: u64,
-    never_ran: bool,
-    now_ms: u64,
-) -> Option<NpcLease> {
+/// lease goes to its `next`, who waits for them **and for everything the lease
+/// already waited for** — each origin's latest. A holder that applied its last
+/// holder's writes but never woke the character, or one that never caught up
+/// at all, says nothing of those writes by its own, so they stay owed; the
+/// next holder wakes the character only once it holds every one. The list
+/// holds at most one entry per member. `None` when `from` is not its holder or
+/// no move was asked.
+pub fn hand_back(current: &NpcLease, from: u64, through: u64, now_ms: u64) -> Option<NpcLease> {
     if node_of(&current.holder) != Some(from) {
         return None;
     }
     let next = node_of(current.next.as_deref()?)?;
-    let after = match never_ran {
-        true => current.after,
-        false => Some(After {
-            origin: from,
-            through,
-        }),
+    let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
+    for a in current.waits().chain([After {
+        origin: from,
+        through,
+    }]) {
+        let at = latest.entry(a.origin).or_default();
+        *at = (*at).max(a.through);
+    }
+    let after = After {
+        origin: from,
+        through: latest.remove(&from).unwrap_or(through),
     };
     Some(NpcLease {
-        after,
+        after: Some(after),
+        before: latest
+            .into_iter()
+            .map(|(origin, through)| After { origin, through })
+            .collect(),
         ..fresh(next, now_ms)
     })
 }
@@ -292,6 +307,7 @@ pub fn released() -> NpcLease {
         expires_ms: 0,
         next: None,
         after: None,
+        before: Vec::new(),
     }
 }
 
@@ -358,12 +374,8 @@ mod tests {
         let moving = lend(&[nid], &held, &after, &joined(&[1, 2]), NOW + 1_000);
         assert_eq!(moving[&nid].holder, hex(1), "still running where it is");
         assert_eq!(moving[&nid].next.as_deref(), Some(hex(2).as_str()));
-        assert_eq!(
-            hand_back(&moving[&nid], 2, 9, false, NOW),
-            None,
-            "not its holder"
-        );
-        let moved = hand_back(&moving[&nid], 1, 40, false, NOW + 2_000).unwrap();
+        assert_eq!(hand_back(&moving[&nid], 2, 9, NOW), None, "not its holder");
+        let moved = hand_back(&moving[&nid], 1, 40, NOW + 2_000).unwrap();
         assert_eq!(moved.holder, hex(2));
         assert_eq!(moved.next, None);
         assert_eq!(
@@ -381,51 +393,99 @@ mod tests {
         assert_eq!(renewed[&nid].after, moved.after);
     }
 
-    /// **A holder that never ran a character carries its last holder's wait
-    /// on.** A hands N to B naming its writes through 900; a move to C is asked
-    /// before B has them, and B hands N back unwoken. C waits for A's 900, not
-    /// for B's writes, which hold nothing of N.
+    /// **A hand-back adds to what the lease waits for, never replaces it.** A
+    /// hands N to B naming its writes through 900. B has applied them, but has
+    /// not woken N, when a move to C is asked; B hands N back with its own
+    /// writes through 55. C must wait for both: B's 55 and A's 900. Moved on
+    /// again by C, through 70, D waits for all three origins — and a later
+    /// hand-back from an origin already named keeps only its latest.
     #[test]
-    fn a_holder_that_never_ran_it_carries_the_wait_on() {
-        let lease = NpcLease {
-            holder: hex(2),
+    fn a_hand_back_keeps_every_earlier_wait() {
+        let (a, b, c, d) = (1, 2, 3, 4);
+        let at_b = NpcLease {
+            holder: hex(b),
             expires_ms: NOW + NPC_TTL_MS,
-            next: Some(hex(3)),
+            next: Some(hex(c)),
             after: Some(After {
-                origin: 1,
+                origin: a,
                 through: 900,
             }),
+            before: Vec::new(),
         };
-        let unran = hand_back(&lease, 2, 55, true, NOW).unwrap();
-        assert_eq!(unran.holder, hex(3));
+        let at_c = hand_back(&at_b, b, 55, NOW).unwrap();
+        assert_eq!(at_c.holder, hex(c));
         assert_eq!(
-            unran.after,
+            at_c.after,
             Some(After {
-                origin: 1,
-                through: 900
+                origin: b,
+                through: 55
             })
         );
-        // B has applied A's records only to 400: it never ran N. Once it holds
-        // them through 900 it may have — asleep after a restart, it ran for
-        // hours — and a lease naming no wait may have run too.
-        assert!(never_ran(&lease, |_| 400));
-        assert!(!never_ran(&lease, |_| 900));
-        assert!(!never_ran(
-            &NpcLease {
-                after: None,
-                ..lease.clone()
-            },
-            |_| 0
-        ));
-        let ran = hand_back(&lease, 2, 55, false, NOW).unwrap();
         assert_eq!(
-            ran.after,
-            Some(After {
-                origin: 2,
-                through: 55
-            }),
-            "one that ran it names its own writes"
+            at_c.before,
+            vec![After {
+                origin: a,
+                through: 900
+            }],
+            "A's 900 is still owed"
         );
+        let applied_b_only = |o: u64| if o == b { 55 } else { 0 };
+        assert!(!at_c.ready(applied_b_only), "C has B's writes, not A's");
+        let applied_both = |o: u64| if o == a { 900 } else { 55 };
+        assert!(at_c.ready(applied_both));
+
+        let at_d = hand_back(
+            &NpcLease {
+                next: Some(hex(d)),
+                ..at_c.clone()
+            },
+            c,
+            70,
+            NOW,
+        )
+        .unwrap();
+        let mut owed: Vec<(u64, u64)> = at_d.waits().map(|w| (w.origin, w.through)).collect();
+        owed.sort();
+        assert_eq!(owed, vec![(a, 900), (b, 55), (c, 70)]);
+
+        let back_to_a = hand_back(
+            &NpcLease {
+                holder: hex(d),
+                next: Some(hex(a)),
+                before: at_d
+                    .before
+                    .iter()
+                    .copied()
+                    .chain([After {
+                        origin: b,
+                        through: 80,
+                    }])
+                    .collect(),
+                ..at_d.clone()
+            },
+            d,
+            10,
+            NOW,
+        )
+        .unwrap();
+        let mut owed: Vec<(u64, u64)> = back_to_a.waits().map(|w| (w.origin, w.through)).collect();
+        owed.sort();
+        assert_eq!(
+            owed,
+            vec![(a, 900), (b, 80), (c, 70), (d, 10)],
+            "one wait per origin, its latest"
+        );
+    }
+
+    /// A lease record from a build that knew no `before` reads with none, and
+    /// one with none written leaves the key out.
+    #[test]
+    fn a_lease_with_no_earlier_waits_reads_and_writes_without_them() {
+        let old = serde_json::json!({"holder": hex(2), "expires_ms": 5,
+            "after": {"origin": 1, "through": 9}});
+        let lease: NpcLease = serde_json::from_value(old.clone()).unwrap();
+        assert!(lease.before.is_empty());
+        assert_eq!(serde_json::to_value(&lease).unwrap(), old);
     }
 
     /// **A move, once asked, completes** (`docs/static_placement.md` §5.5):
@@ -585,6 +645,7 @@ mod tests {
             expires_ms: 5,
             next: None,
             after: None,
+            before: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&l).unwrap(),

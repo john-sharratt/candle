@@ -239,14 +239,10 @@ impl Runtime {
             {
                 OpReply::Done { ok: false }
             }
-            WorldOp::HandBack {
-                npc,
-                through,
-                never_ran,
-            } => {
+            WorldOp::HandBack { npc, through } => {
                 let lease = from.and_then(|from| {
                     let current = leases_of(&self.standing.written(world));
-                    hand_back(current.get(&npc)?, from, through, never_ran, now_ms())
+                    hand_back(current.get(&npc)?, from, through, now_ms())
                 });
                 let ok = lease.is_some();
                 if let Some(lease) = lease {

@@ -265,6 +265,73 @@ fn a_delegated_task_makes_its_machine_busy() {
     );
 }
 
+/// **A member that crashed holding a task's claim leaves its card free once it
+/// is back**: its claims go with its session, and its re-HELLO — admitted
+/// before the old session's close was seen — forgets them too. Kept, they made
+/// the card busy for good and the cast never came back.
+#[test]
+fn a_rejoined_member_s_card_is_free_again() {
+    let mut r = registry(
+        "bw:\n  conversations: {rank: 1, min: 4}\n  characters: 3\n\
+         ww:\n  conversations: {rank: 2, min: 1}\n  characters: 1\n",
+    );
+    r.join(on_card("zend", 1, "bw", 7));
+    r.join(on_card("npcd", 2, "bw", 7));
+    r.join(on_card("npcd", 3, "ww", 8));
+    let t0 = Instant::now();
+    let mut p = Planner::default();
+    r.claims("zend")
+        .claim(b"task-conversation", Epoch { ms: 1, node: 1 });
+    assert_eq!(
+        p.plan(t0, &r.card_views()).weights,
+        vec![(2, 0), (3, 1)],
+        "busy with the task"
+    );
+
+    // It crashes and comes back as a new session.
+    r.join(MemberView {
+        session: 11,
+        ..on_card("zend", 1, "bw", 7)
+    });
+    assert!(!r.leave("zend", 1, 1), "the old session's close, late");
+    let back = t0 + Duration::from_secs(5);
+    assert_eq!(p.plan(back, &r.card_views()).weights, vec![(2, 0), (3, 1)]);
+    assert_eq!(
+        p.plan(back + Duration::from_secs(121), &r.card_views())
+            .weights,
+        vec![(2, 3), (3, 1)],
+        "free 120 s after it came back"
+    );
+
+    // A session that ends takes its claims with it.
+    r.claims("zend")
+        .claim(b"task-conversation", Epoch { ms: 2, node: 1 });
+    assert_eq!(r.card_views()[0].latency, 1);
+    assert!(r.leave("zend", 1, 11));
+    assert!(r.claims("zend").is_empty());
+}
+
+/// **A canary of an app that runs no model, alone and on a drawing card, makes
+/// the unit wait** — the draw ends, and the card takes it — rather than
+/// refusing it as though no machine ever would.
+#[test]
+fn a_lone_drawing_canary_of_a_model_less_app_waits() {
+    let mut r = registry("box:\n  conversations: {rank: 1, min: 4}\n  pictures: 1\n");
+    r.join(on_card("npcd", 2, "box", 7));
+    r.join(on_card("agent", 3, "box", 7));
+    r.begin("npcd", 2, true);
+    assert_eq!(
+        r.pick_canary("agent", &Dispatch::Best, None, None, None, 3, &mut || true),
+        Pick::Wait
+    );
+    let session = r.member("npcd", 2).unwrap().session;
+    r.end("npcd", 2, session, true);
+    assert_eq!(
+        r.pick_canary("agent", &Dispatch::Best, None, None, None, 3, &mut || true),
+        Pick::Member(3)
+    );
+}
+
 /// **A key's holder is never held back for room** (rule 1 before rule 3): a
 /// full card still takes the conversation it holds.
 #[test]

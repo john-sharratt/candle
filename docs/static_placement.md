@@ -108,13 +108,18 @@ among the members with room, so a lagging one still takes what every other is
 too full for, and after the holders of a released conversation are found, so a
 lagging member that alone holds a conversation still takes it.
 
-When no machine the unit could go to takes conversations at all — none named in
-the table, or none with a `conversations` entry — the unit is **unplaced**: the
-gateway refuses it, `502` with no retry, since there is no room to wait for, and
-it goes to no machine the table gives nothing, a member still loading included.
-A narrower pool that comes out unplaced — a member's ask for a peer without the
-sender, a released conversation among its holders — falls through to the wider
-one, as an empty pool does.
+A unit goes to no machine the table gives nothing. When none of the members
+that may take work now is on a machine that takes conversations, the unit
+**waits** while the table names any machine that does — its member still
+loading, behind, or not yet joined, it comes to take it. Only when **no machine
+of the table takes conversations at all** — none with a `conversations` entry —
+is the unit **unplaced**: the gateway refuses it, `502` with no retry, since
+there is no room to wait for (`Registry::unplaced`, over
+`MachineTable::any_takes`). A narrower pool that comes out unplaced — a
+member's ask for a peer without the sender, a released conversation among its
+holders — falls through to the wider one, as an empty pool does. A canary of an
+app that runs no model, alone and on a drawing card, makes the unit wait for
+the draw to end.
 
 Among the eligible machines below their `max`:
 
@@ -186,8 +191,9 @@ fixes) and holds that card's admission while it runs.
   end. A draw that has waited `RESERVE_FOR`, 60 s, takes its card as it stands
   at the next release.
 - **Every card that may draw it is drawing:** the draw waits for one to finish.
-- **No machine draws at all** — none named with a `pictures` preference: the
-  draw is unplaced, and refused (§3.2).
+- **No machine draws at all** — none in the table with a `pictures`
+  preference: the draw is unplaced, and refused (§3.2). While one does, a draw
+  no member that may draw now can take waits for it.
 
 ## 5. Characters
 
@@ -200,7 +206,11 @@ for `RETURN_AFTER`, 120 s: the pause while a person reads a reply and types the
 next message, or between a task's turns. A delegated task runs inside its member
 and never passes the gateway, so its claim is how the plan sees it
 (`Registry::card_views`); the cast leaves a card running a task exactly as it
-leaves one serving a conversation.
+leaves one serving a conversation. **A member's claims end with its session**,
+and are forgotten again when its node is admitted anew (`Registry::join`,
+`Registry::leave`): a member still holding them announces them once admitted,
+and one that crashed holds none, so its card is free `RETURN_AFTER` after it
+comes back rather than busy for good.
 
 ### 5.2 Where they run
 
@@ -238,16 +248,14 @@ When a card becomes busy:
    (`HandBack.through`, the old holder's own records). The character's K/V and
    recurrent state are already there: every sealed turn replicates to every
    member. A member the plan lends to is never one lagging on replication, so
-   that wait is short. A holder that **never ran** the character wrote nothing
-   of it, and says so (`HandBack.never_ran`): the lease keeps the wait it
-   already named, so the next holder waits for the last holder that did run it.
-   Never ran is a fact about what the holder has applied, not about whether the
-   character is awake (`npc_lease::never_ran`): a character is woken only once
-   its lease's wait is met, and an applied record stays applied, a restart
-   included, so a wait still unmet means the holder never woke it. One met may
-   have run — asleep after a restart, it ran for hours — and hands back its own
-   writes. Every branch that hands a character back decides it so, a member that
-   runs no characters included.
+   that wait is short. **A hand-back adds to what the lease waits for and never
+   replaces it** (`npc_lease::hand_back`): the lease names the handing holder's
+   writes (`after`) and every earlier holder's still owed (`before`), one entry
+   per origin, its latest. A holder that applied A's writes but never woke the
+   character, or never caught up with them at all, wrote nothing of it; A's
+   writes stay owed, and the next holder wakes it only once it holds every
+   origin the lease names (`NpcLease::ready`). Hand A → B → C with B moved on
+   before it woke the character: C waits for A's writes and B's.
 
 ### 5.4 A fast return
 
@@ -326,8 +334,9 @@ while a card sits idle. The invariants that prevent it:
    with it — or after `RESERVE_FOR`, when the draw takes its card as it stands.
    It never holds a card idle: it waits only for turns already running there.
 5. **No room and no machine are different outcomes.** A unit waits only when a
-   machine that takes it could come to have room; one that no machine of its
-   pool takes at all is refused, unplaced.
+   machine that takes it could come to have room — one still loading, or not
+   yet joined, included; one that no machine of the table takes at all is
+   refused, unplaced.
 6. **Characters always have a home.** Busy cards lend again when no free card
    can host (§5.2), and a move whose target cannot host is withdrawn (§5.5).
 7. **The holder of a key is never refused** (rule 1). A conversation mid-turn on

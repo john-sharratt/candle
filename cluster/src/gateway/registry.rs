@@ -132,17 +132,24 @@ impl Registry {
         self.apps.entry(app.to_string()).or_default()
     }
 
+    /// A session admitted. **The claims its node held are forgotten**: a
+    /// member that still holds them announces them again once admitted, and
+    /// one that crashed and came back holds none — kept, they would make its
+    /// card busy for good (`docs/static_placement.md` §5.1).
     pub fn join(&mut self, member: MemberView) {
         let a = self.app(&member.app.clone());
+        a.claims.forget(member.node);
         a.members.insert(member.node, member);
         a.epoch += 1;
     }
 
-    /// `node`'s `session` ended; a newer session of the node stays.
+    /// `node`'s `session` ended, and the claims it held with it; a newer
+    /// session of the node stays, and keeps them.
     pub fn leave(&mut self, app: &str, node: u64, session: u64) -> bool {
         let a = self.app(app);
         if a.members.get(&node).is_some_and(|m| m.session == session) {
             a.members.remove(&node);
+            a.claims.forget(node);
             a.epoch += 1;
             return true;
         }

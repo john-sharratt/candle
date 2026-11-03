@@ -14,7 +14,7 @@ use std::time::Instant;
 use cluster::consensus::rendezvous::Weighted;
 use cluster::frame::MemberState;
 
-use super::npc_lease::{by_plan, hex, leases_of, never_ran};
+use super::npc_lease::{by_plan, hex, leases_of};
 use super::ops::{OpReply, WorldOp};
 use crate::engine::environment;
 use crate::engine::event::{EventKind, Salience};
@@ -116,7 +116,6 @@ impl Runtime {
                 let mine = lease.is_some_and(|l| l.holder == me);
                 let awake = self.scheduler.pace_of(npc).is_some();
                 let handing = self.standing.handing(npc);
-                let never_ran = lease.is_some_and(|l| never_ran(l, applied));
                 if !self.standing.characters() {
                     // **A member that runs no characters runs none**, whatever
                     // its leases say. One still naming it — lent before it was
@@ -127,7 +126,7 @@ impl Runtime {
                     }
                     let next = lease.is_some_and(|l| l.next.is_some());
                     if mine && next && !handing && self.standing.begin_handing(npc) {
-                        self.hand_back(&world, npc, never_ran);
+                        self.hand_back(&world, npc);
                     } else if !mine && handing {
                         self.standing.end_handing(npc);
                     }
@@ -138,16 +137,16 @@ impl Runtime {
                     // **Held here, not running, and asked to move: handed back
                     // now**, with no turn to wait for. Woken first, it waited on
                     // its last holder's writes before it could move on; never
-                    // woken, it was never handed back, and ran nowhere.
+                    // woken, it was never handed back, and ran nowhere. The
+                    // hand-back keeps every wait the lease names, so the next
+                    // holder still waits for what this one never took in.
                     (true, false) if moving && !handing => {
                         if self.standing.begin_handing(npc) {
-                            self.hand_back(&world, npc, never_ran);
+                            self.hand_back(&world, npc);
                         }
                     }
                     (true, false) if !handing => {
-                        let ready = lease
-                            .and_then(|l| l.after)
-                            .is_none_or(|a| applied(a.origin) >= a.through);
+                        let ready = lease.is_none_or(|l| l.ready(applied));
                         let now = Instant::now();
                         if ready {
                             if let Some(waited) = self.standing.arrived(npc, now) {
@@ -166,7 +165,7 @@ impl Runtime {
                     (true, true) => {
                         if moving && !self.standing.turning(npc) && self.standing.begin_handing(npc)
                         {
-                            self.hand_back(&world, npc, never_ran);
+                            self.hand_back(&world, npc);
                         }
                     }
                     (false, true) if !handing => self.put_down(npc),
@@ -219,9 +218,8 @@ impl Runtime {
     }
 
     /// Hand `npc` back to `world`'s authority, with how far this member's
-    /// writes reach — or, when it `never_ran` here, for the wait its lease
-    /// names to be carried on — and put it down once the authority has it.
-    fn hand_back(self: &Arc<Self>, world: &str, npc: u64, never_ran: bool) {
+    /// writes reach, and put it down once the authority has it.
+    fn hand_back(self: &Arc<Self>, world: &str, npc: u64) {
         let Some(handle) = self.spawner() else {
             self.standing.end_handing(npc);
             return;
@@ -235,14 +233,7 @@ impl Runtime {
         let world = world.to_string();
         handle.spawn(async move {
             match rt
-                .world_write(
-                    &world,
-                    WorldOp::HandBack {
-                        npc,
-                        through,
-                        never_ran,
-                    },
-                )
+                .world_write(&world, WorldOp::HandBack { npc, through })
                 .await
             {
                 Ok(OpReply::Done { ok: true }) => rt.put_down(npc),
