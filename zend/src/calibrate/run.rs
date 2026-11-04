@@ -27,7 +27,7 @@
 //! the unit is scored, and is then archived — the commit — and distilled
 //! provenance-only: its K/V is dropped and its signatures stay.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,7 +45,7 @@ use candle_conversation::{ConversationEngine, FinishOrder, Sequence, SequenceCon
 use super::permits::Permits;
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
-use super::reply::{calibrate_replies, retire_gone};
+use super::retire_replies::retire_reply_records;
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
@@ -117,7 +117,7 @@ pub struct Report {
     pub waiting: usize,
     /// Calibrations retired, and drafts a crash left.
     pub retired: usize,
-    /// Pages whose reply record this pass calibrated.
+    /// Reply records this pass ended ([`retire_reply_records`]).
     pub replies: usize,
 }
 
@@ -264,7 +264,7 @@ pub fn calibrate_layer(
     report.sealed = sealed.into_inner();
     report.failed = failed.into_inner();
     report.elsewhere = elsewhere.into_inner();
-    report.replies = sweep_replies(engine, layer, frame);
+    report.replies = retire_reply_records(engine);
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,
@@ -274,51 +274,10 @@ pub fn calibrate_layer(
         elsewhere = report.elsewhere,
         waiting = report.waiting,
         retired = report.retired,
+        replies_ended = report.replies,
         "the layer's calibration pass ended",
     );
     report
-}
-
-/// Bring every ready unit's reply records to the current recipe — a unit read
-/// before the layer recorded replies included — and end the records of units
-/// no longer there. Returns the pages it calibrated.
-fn sweep_replies(engine: &ConversationEngine, layer: &Layer<'_>, frame: &Frame<'_>) -> usize {
-    let spec = layer.spec;
-    if spec.reply.is_none() {
-        return 0;
-    }
-    let units = units(engine, layer);
-    let present: HashSet<&str> = units.iter().map(|u| u.key.as_str()).collect();
-    let retired = retire_gone(engine, &present);
-    let mut calibrated = 0;
-    for unit in units.iter().filter(|u| u.ready) {
-        if crate::ingest_cancel::cancelled() {
-            break;
-        }
-        match calibrate_replies(
-            engine,
-            spec,
-            layer.base,
-            (unit.timeline, &unit.subject, &unit.key),
-            frame.system_prompt,
-        ) {
-            Ok(n) => calibrated += n,
-            Err(e) => tracing::warn!(
-                target: "zend::calibrate",
-                layer = %spec.layer,
-                subject = %unit.subject,
-                "reply calibration failed: {e:#}",
-            ),
-        }
-    }
-    tracing::info!(
-        target: "zend::calibrate",
-        layer = %spec.layer,
-        calibrated,
-        retired,
-        "the layer's reply records are current",
-    );
-    calibrated
 }
 
 /// Whether a calibration carrying `marker` stands — one another member sealed
@@ -424,15 +383,7 @@ pub fn calibrate_committed(
         ready: true,
         prior_failures: None,
     };
-    calibrate_one(ctx.engine, spec, base, &frame, None, &unit)?;
-    calibrate_replies(
-        ctx.engine,
-        spec,
-        base,
-        (timeline, subject, key),
-        frame.system_prompt,
-    )
-    .map(|_| ())
+    calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
 }
 
 /// Ask `unit` for its questions — holding one of `drafts`, when given, while
@@ -746,7 +697,6 @@ mod tests {
             questions: 4,
             think: 64,
             prompt: "ask".into(),
-            reply: None,
         };
         let said = |tl: TimelineId, text: &str| {
             conv.record_turn(

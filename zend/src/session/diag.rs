@@ -47,12 +47,8 @@ use super::replay::{
 };
 use super::{
     think_mode_from_selection, timeline_for, turn_projection, turn_sampling, turn_triggers,
-    InferenceState, Sequence, ZendSession,
+    Sequence, ZendSession,
 };
-use crate::branch_ingest::keys::CONTENT_KEY;
-use crate::calibrate::reply::calibrate_replies;
-use crate::code_read::PATH_KEY;
-use crate::reply_record::{self, slot_key};
 use crate::tools::{tool_round_blocks, tool_round_text};
 use crate::types::ToolMode;
 
@@ -78,10 +74,6 @@ pub struct DiagRun {
     /// ids then belong to another prompt, so the reply decodes free from its
     /// first token.
     pub user: Option<String>,
-    /// Each `in_context` block of the target's user half replays its page's
-    /// recurrent record, as a live serve does — calibrated first when the page
-    /// has none (`docs/recurrent_reply_calibration.md`).
-    pub inject: bool,
     /// Text put into the target's user half before it is submitted, the
     /// recorded reply kept.
     pub splices: Vec<Splice>,
@@ -131,7 +123,7 @@ impl HistoryDiffers {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpanArmed {
     pub bytes: Range<usize>,
-    /// `inject`, `capture:<name>` or `merge:<name>`.
+    /// `capture:<name>` or `merge:<name>`.
     pub kind: String,
 }
 
@@ -262,80 +254,13 @@ fn piece_turn(label: &str) -> Option<(u64, u32)> {
     Some((timeline.parse().ok()?, index.parse().ok()?))
 }
 
-/// The page an `in_context` reply names — its file (`<repo>/<path>`) and page
-/// — or `None` for any other block.
-fn served_page(body: &str) -> Option<(String, u32)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if v.get("status")?.as_str()? != "in_context" {
-        return None;
-    }
-    let anchor = v.get("anchor")?.as_str()?;
-    let field = |name: &str| {
-        anchor
-            .split(' ')
-            .find_map(|part| part.strip_prefix(name))
-            .map(str::to_string)
-    };
-    Some((field("file=")?, field("page=")?.parse().ok()?))
-}
-
-/// A replay span per `in_context` block of `user_half`, each with its page's
-/// record — calibrated now, on its unit, when the page has none.
-fn served_replays(state: &InferenceState, user_half: &str) -> anyhow::Result<Vec<TextSpan>> {
-    let Some(blocks) = tool_round_blocks(user_half) else {
-        return Ok(Vec::new());
-    };
-    let Some(layer) = state
-        .branch_layers
-        .iter()
-        .map(|(il, _)| il)
-        .find(|il| il.calibrate.as_ref().is_some_and(|c| c.reply.is_some()))
-    else {
-        bail!("no layer records replies");
-    };
-    let spec = layer.calibrate.as_deref().expect("found by it");
-    let base = state.ingest_base(&layer.name)?;
-    let store = state.engine.conversation().shared();
-    let mut spans = Vec::new();
-    for b in blocks {
-        let Some((file, page)) = served_page(&user_half[b.body.clone()]) else {
-            continue;
-        };
-        let rows = state
-            .engine
-            .find_conversations_by_metadata(PATH_KEY, &file)
-            .into_iter()
-            .find_map(|tl| {
-                let key = state.engine.conversation_metadata(tl)?.get(CONTENT_KEY)?.clone();
-                let slot = slot_key(&key, page);
-                if reply_record::record(&store, &slot).is_none() {
-                    let unit = (tl, file.as_str(), key.as_str());
-                    if let Err(e) = calibrate_replies(&state.engine, spec, base, unit, &state.formatted_prompt) {
-                        tracing::warn!(file = %file, page, "diag: calibrating the page's reply failed: {e:#}");
-                        return None;
-                    }
-                }
-                reply_record::rows(&store, &slot).ok().flatten()
-            });
-        let Some(rows) = rows else {
-            bail!("no record of page {page} of {file} could be had");
-        };
-        spans.push(TextSpan {
-            bytes: b.block,
-            kind: ArmKind::Replay(rows),
-        });
-    }
-    Ok(spans)
-}
-
 /// The spans `run` arms on `half`, the user half it submits, in the half's
-/// order: its pages' replays (`injected`) and its merges, then its capture.
+/// order: its merges, then its capture.
 /// The capture is the half's last span, since an arm replaces the one before
 /// it and a capture is handed back as the turn ends.
 fn armed_spans(
     run: &DiagRun,
     half: &str,
-    injected: Vec<TextSpan>,
     captures: &HashMap<String, Arc<ReplyRows>>,
 ) -> anyhow::Result<(Vec<TextSpan>, Vec<SpanArmed>)> {
     let block = |b: usize| -> anyhow::Result<Range<usize>> {
@@ -346,10 +271,7 @@ fn armed_spans(
             .map(|x| x.block.clone())
             .with_context(|| format!("the round holds {} blocks, so no block {b}", blocks.len()))
     };
-    let mut armed: Vec<(TextSpan, String)> = injected
-        .into_iter()
-        .map(|s| (s, "inject".to_string()))
-        .collect();
+    let mut armed: Vec<(TextSpan, String)> = Vec::new();
     for m in &run.merge {
         let rows = captures
             .get(&m.name)
@@ -606,12 +528,7 @@ impl ZendSession {
             ),
         };
         let half_text = half.text();
-        let injected = if run.inject {
-            served_replays(&state, &half_text)?
-        } else {
-            Vec::new()
-        };
-        let (recurrent_spans, spans) = armed_spans(run, &half_text, injected, captures)?;
+        let (recurrent_spans, spans) = armed_spans(run, &half_text, captures)?;
         tracing::info!(run = run_index, spans = ?spans, "diag: the target's armed spans");
         let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
@@ -760,20 +677,6 @@ mod tests {
         assert_eq!(first_divergence(&a[..1], &a), Some(6));
     }
 
-    /// The anchor the fast path serves names the file and the page; any other
-    /// block names nothing.
-    #[test]
-    fn an_in_context_reply_names_its_page() {
-        assert_eq!(
-            served_page(
-                r#"{"status":"in_context","anchor":"file=candle/zend/src/a.rs page=2 pages=3"}"#
-            ),
-            Some(("candle/zend/src/a.rs".to_string(), 2))
-        );
-        assert_eq!(served_page(r#"{"status":"ok"}"#), None);
-        assert_eq!(served_page("not json"), None);
-    }
-
     const ROUND: &str = "<tool_response>a</tool_response>\n<tool_response>bb</tool_response>";
 
     fn run_of(capture: Option<NamedBlock>, merge: Vec<NamedBlock>) -> DiagRun {
@@ -783,7 +686,6 @@ mod tests {
             without: Vec::new(),
             catch_up: Vec::new(),
             user: None,
-            inject: false,
             splices: Vec::new(),
             capture,
             merge,
@@ -820,7 +722,7 @@ mod tests {
     #[test]
     fn a_run_arms_its_merges_then_its_capture_by_block() {
         let run = run_of(Some(named("page", 1)), vec![named("read", 0)]);
-        let (spans, report) = armed_spans(&run, ROUND, Vec::new(), &captured("read")).unwrap();
+        let (spans, report) = armed_spans(&run, ROUND, &captured("read")).unwrap();
         assert_eq!(
             reported(&report),
             [(0..32, "merge:read"), (33..66, "capture:page")]
@@ -832,7 +734,7 @@ mod tests {
     #[test]
     fn a_capture_before_another_span_is_refused() {
         let run = run_of(Some(named("page", 0)), vec![named("read", 1)]);
-        let err = armed_spans(&run, ROUND, Vec::new(), &captured("read")).unwrap_err();
+        let err = armed_spans(&run, ROUND, &captured("read")).unwrap_err();
         assert_eq!(
             err.to_string(),
             "the capture of block 0 is not the half's last armed span"
@@ -843,14 +745,14 @@ mod tests {
     fn a_merge_of_nothing_captured_or_of_no_block_is_refused() {
         let unknown = run_of(None, vec![named("read", 0)]);
         assert_eq!(
-            armed_spans(&unknown, ROUND, Vec::new(), &HashMap::new())
+            armed_spans(&unknown, ROUND, &HashMap::new())
                 .unwrap_err()
                 .to_string(),
             "no earlier run of the call captured read"
         );
         let far = run_of(None, vec![named("read", 5)]);
         assert_eq!(
-            armed_spans(&far, ROUND, Vec::new(), &captured("read"))
+            armed_spans(&far, ROUND, &captured("read"))
                 .unwrap_err()
                 .to_string(),
             "the round holds 2 blocks, so no block 5"

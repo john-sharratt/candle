@@ -34,8 +34,6 @@ struct Raw {
     questions: usize,
     think: usize,
     prompt: String,
-    #[serde(default)]
-    reply: Option<String>,
 }
 
 /// How a layer's conversations are calibrated.
@@ -50,11 +48,6 @@ pub struct CalibrateSpec {
     /// What it is asked, with `<<n>>`, `<<subject>>`, and for a file subject
     /// `<<file>>`, `<<repo>>` and `<<path>>` filled in.
     pub prompt: String,
-    /// The request a served read of one of the unit's pages answers in its
-    /// reply calibration (`docs/recurrent_reply_calibration.md` §6), with
-    /// `<<page>>` and the prompt's subject fields filled in. A layer that
-    /// declares none records no replies.
-    pub reply: Option<String>,
 }
 
 impl CalibrateSpec {
@@ -82,15 +75,11 @@ impl CalibrateSpec {
         if raw.prompt.trim().is_empty() {
             anyhow::bail!("layer '{}': `calibrate.prompt` is empty", layer.name);
         }
-        if raw.reply.as_deref().is_some_and(|r| r.trim().is_empty()) {
-            anyhow::bail!("layer '{}': `calibrate.reply` is empty", layer.name);
-        }
         Ok(Some(Self {
             layer: layer.name.clone(),
             questions: raw.questions,
             think: raw.think,
             prompt: raw.prompt,
-            reply: raw.reply,
         }))
     }
 
@@ -98,14 +87,6 @@ impl CalibrateSpec {
     /// workspace-relative path, its repository first, or a day.
     pub fn prompt_for(&self, subject: &str) -> String {
         fill(&self.prompt, self.questions, subject)
-    }
-
-    /// The reply request for page `page` of the unit whose subject is
-    /// `subject`, when the layer declares one.
-    pub fn reply_for(&self, subject: &str, page: u32) -> Option<String> {
-        self.reply
-            .as_deref()
-            .map(|r| fill(r, self.questions, subject).replace("<<page>>", &page.to_string()))
     }
 
     /// The calibration marker of the unit committed under `content_key`: the
@@ -161,19 +142,7 @@ mod tests {
             questions: 3,
             think: 64,
             prompt: "<<n>> about `<<path>>` in <<repo>> (<<file>>, <<subject>>)".into(),
-            reply: Some("page <<page>> of `<<path>>` in <<repo>>".into()),
         }
-    }
-
-    #[test]
-    fn a_reply_request_names_its_page() {
-        assert_eq!(
-            spec().reply_for("candle/docs/paper.md", 2).as_deref(),
-            Some("page 2 of `docs/paper.md` in candle")
-        );
-        let mut none = spec();
-        none.reply = None;
-        assert_eq!(none.reply_for("candle/a.rs", 1), None);
     }
 
     #[test]

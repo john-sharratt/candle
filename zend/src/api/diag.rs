@@ -43,10 +43,6 @@ pub struct RunBody {
     /// The target turn's user half in place of the recorded one.
     #[serde(default)]
     pub user: Option<String>,
-    /// Each `in_context` block of the target's user half replays its page's
-    /// recurrent record.
-    #[serde(default)]
-    pub inject: bool,
     /// `{at, text, literal}`: text put into the target's user half at byte
     /// `at`, the recorded reply kept.
     #[serde(default)]
@@ -115,7 +111,6 @@ pub async fn start(
                 without: r.without.clone(),
                 catch_up: r.catch_up.clone(),
                 user: r.user.clone(),
-                inject: r.inject,
                 splices: r.splices.clone(),
                 capture: r.capture.clone(),
                 merge: r.merge.clone(),

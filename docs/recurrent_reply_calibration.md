@@ -1,9 +1,13 @@
 # Recurrent reply calibration: a served read the recurrence has seen
 
-**Status: built, not yet deployed or measured.** Answers the `in_context` gap: a page the fast
-path places is attended and recalled verbatim once cued, yet the model says it
-cannot see it. This document is authoritative for the calibration step, the
-record it writes, and how a live conversation applies it.
+**Status: withdrawn (2026-11-04).** The stored records cost ~20.8 MB per page
+on every member (§3), which the substrates could not carry. The calibration,
+the records and the live replay are removed; a served page's reply prefills as
+any other again. Each calibration pass ends whatever records remain
+(`zend/src/calibrate/retire_replies.rs`: the object ceased, its blob retired).
+The span arms in the engine stay: the diagnostic decode captures and merges
+rows in memory. What follows is the design as it was built, kept for the
+measurement in §1.
 
 ## 1. The problem, and what was measured
 

@@ -25,7 +25,7 @@
 pub mod permits;
 pub mod plan;
 pub mod questions;
-pub mod reply;
+pub mod retire_replies;
 pub mod run;
 pub mod spec;
 pub mod thinking;
