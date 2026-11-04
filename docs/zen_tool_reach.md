@@ -284,20 +284,10 @@ and nothing for text it has read to talk it into. Its prompt says nothing
 about them either: no "do not start tasks" rule, which would only name what it
 cannot see. A task simply works with the tools it has.
 
-**Two backstops behind the hiding**, which a task never meets. They catch a
-bug in how the tool list is built:
-
-1. **Refused at the call.** `repo_task_start` resolves the calling
-   conversation's record before anything starts (**new** check), and refuses
-   when the caller is a task or a part, with the error
-   `task_from_task: the calling conversation is a task`. It is an error, not
-   guidance: reaching it means the list was built wrong, and the fix is in the
-   code.
-2. **Recorded on the task.** Every task records the conversation that started
-   it (`started_by`, **new**, on the worker's record), and that conversation
-   must not itself be a task. A record with a task as its `started_by` is
-   refused when it is written, so the substrate can never hold a chain of
-   tasks.
+**Hiding is the whole mechanism.** The stencil a turn decodes under is built
+from the tools it was offered, so a call to a tool outside that list cannot be
+decoded at all. Nothing a task writes can name a task tool, so no check at the
+call or on the record is needed behind it.
 
 **What a task does instead: the work.** A task is already the level where
 work is done. When it finds more work that its brief needs, it does that work
@@ -349,9 +339,7 @@ trial:
    guard, and Decide through approvals. This step moves the `confirm` gate of
    `docs/claude_zend_gateway.md` §8.2 onto `approval_grant`.
 4. **Memory** (§6.2): the read-out mark and the four memory writers.
-5. **Starting work** (§6.3), with the hiding and both backstops in the same
-   step: no conversation gains the task tools before a task is unable to
-   start one.
+5. **Starting work** (§6.3).
    Then **bots' actions and images** (§6.4).
 
 Every step is certified and rolled out like any build. The rollout stays the
@@ -363,12 +351,9 @@ person's decision.
   is refused, or answers `needs_approval`, exactly as the table says. The test
   is table-driven from the same table, so a new tool cannot be added without
   a row.
-- No task starts a task (§6.3):
-  - a task's and a part's offered tool list holds none of the task tools, and
-    its prompt names none of them;
-  - each backstop alone: `repo_task_start` called on the runner from a task
-    or a part, with the tool list bypassed, is refused `task_from_task`, and a
-    worker record whose `started_by` is a task is refused when written.
+- No task starts a task (§6.3): for every task kind and for a part, the
+  offered tool list, and the stencil built from it, hold none of the task
+  tools, and the prompt names none of them.
 
   A dialogue and a chat each start a task, and that task's answer comes back
   as the conversation's tool result.
