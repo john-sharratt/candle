@@ -74,7 +74,7 @@ are in what the operations runner will serve, and in which tools only
 | D3 | No `service_control` (restart, start, stop through keep) | `/mcp` only (§8.4) |
 | D4 | No `gateway_command`, `layer_toggle` or `timeline_delete` | `/mcp` only (§8.2, §8.5) |
 | D5 | A chat may not deploy or cancel | `Needs::Changes` (`ops_tools.rs:166`) |
-| D6 | Zen cannot write memory: no `journal_note`, `_create`, `_link`, `_focus` | Zen holds `journal_read`, `_grep`, `_check`, `_move` (`zend-tools/src/tools/journal/`); memory reaches its journals only by distillation |
+| D6 | Zen cannot write memory: no `journal_note`, `_create`, `_link` | Zen holds `journal_read`, `_grep`, `_check`, `_move` (`zend-tools/src/tools/journal/`); memory reaches its journals only by distillation |
 | D7 | A dialogue or a chat cannot start long work: no `repo_task_start` or task tools. Tasks stay unable to start tasks (§6.3) | A worker splits its own work with `sub_run` (§6.1), but nothing starts a task from a dialogue |
 | D8 | No bot actions: mission give/step/cancel, message send, channel post | npcd's tools, on `/mcp` only |
 | D9 | No images: `image_generate`, `image_edit`, `image_upload` | `/mcp` only |
@@ -245,23 +245,29 @@ a column for each kind. A dialogue run by an Admin counts as a coder:
 
 ### 6.2 Memory (D6)
 
-Zen gains `journal_note`, `journal_create`, `journal_link` and `journal_focus`
-on the memory journals, `~/…` and `@group/…` (`docs/memory_backbone.md` §6).
-These are the same implementations `/mcp` serves, run in process.
-`journal_note` is the one tool of that name: its `journal` defaults to `self`,
-which keeps a note in its turn (`docs/zend_journal.md` §5.2), and names a
-memory journal to write a line there under the limits below. Two limits
-keep untrusted text out of everyone's prompts, the reason thread and project
-journals stay Claude's (`claude_zend_gateway.md` §11):
+Zen gains `journal_note`, `journal_create` and `journal_link` on the memory
+journals, `@group/…` and paths from the person's group
+(`docs/memory_backbone.md` §6). They are the same implementations `/mcp`
+serves (`note_in`, `create_in`, `link_in`), run through the operations runner
+as the conversation's person, who must write in their group; the runner runs
+them on the blocking pool. `journal_note` is the one tool of that name: left
+without a `journal`, or with `self`, it keeps a note in its turn
+(`docs/zend_journal.md` §5.2), and naming a memory journal it writes a line
+there. `journal_focus` is not Zen's: it sets the speaker of an MCP
+conversation's own memory journal, `here`, which a conversation of Zen's does
+not keep. Two limits keep untrusted text out of everyone's prompts, the reason
+thread and project journals stay Claude's (`claude_zend_gateway.md` §11):
 
-- **A turn that read untrusted content cannot write memory.** A turn that has
-  called `web_fetch`, `web_search`, `http_request`, any `*_session_recv`, or
-  `file_read` on a path outside the conversation's own repositories is marked
-  **read-out** for its remaining rounds (**new**, on the `ToolContext`). A
-  memory write from a read-out turn answers `needs_approval` (§5): the person,
-  or Claude, sees exactly the line to be written and grants it or not.
-- **Notes are stamped.** Each line Zen writes names its conversation and turn,
-  as the memory already does for an MCP caller (`journal_focus`'s speaker), so
+- **A turn that read untrusted content cannot write memory alone.** A call to
+  any of `tool_round::READS_UNTRUSTED` — the web, a network session's reply, a
+  remote shell's output, a remote file, a database query — marks its
+  conversation **read-out** for the rest of the turn, before the call runs
+  (`OpsRunner::reading_untrusted`; a turn starts clean). A memory write from a
+  read-out turn answers `needs_approval` (§5): the person, or Claude, sees
+  exactly the line to be written and grants it or not. The workspace's own
+  repositories are the person's, and reading them marks nothing.
+- **Lines are stamped.** Each line Zen writes is written through the `zen`
+  channel (`journals::scope::Channel::Zen`), so it reads "John via Zen", and
   `journal_forget` can find what Zen wrote.
 
 Thread and project journals stay Claude's alone. `journal_edit`,

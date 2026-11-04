@@ -371,8 +371,7 @@ questions `Normal`, zend's `--self-check` `Low`.
 
 ### 5.2 Notes: the thinking's conclusions, kept as the work goes
 
-**Status: built.** `journal_note` writes to the conversation's own journal; a
-memory journal as its `journal` comes with `docs/zen_tool_reach.md` §6.2.
+**Status: built.**
 
 **Why.** A turn's reasoning is attendable in exactly one later projection
 (`docs/thinking_span_projection.md` §1). A long agentic task alternates short
@@ -407,9 +406,12 @@ section is fixed text, sealed once and shared.
 (`candle-conversation/src/stencil/tool_call.rs`) gains a branch that is active
 only when the conversation has a journal. When the model opens a round of tool
 calls, the branch forces one `journal_note` call first, then the round's own
-calls. The forced call's grammar holds `text` alone, so a forced note always
-goes to the conversation's own journal and never to shared memory. The note
-therefore states the conclusions behind the calls that follow it. Opening a call is the sign that the model is in the middle of something. A
+calls. The note therefore states the conclusions behind the calls that
+follow it. The tool's description tells the model to leave `journal` out of
+it, so it stays in the conversation's own journal; a note that names a memory
+journal anyway is a memory write, under `docs/zen_tool_reach.md` §6.2's
+limits — written as the person, and from a turn that read content from
+outside, held for their approval. Opening a call is the sign that the model is in the middle of something. A
 final answer opens no call, so a finished turn is never forced to note. The
 grammar sets no length bound on `text`: the description asks for a short note.
 

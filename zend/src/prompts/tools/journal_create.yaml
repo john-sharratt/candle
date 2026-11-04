@@ -1,0 +1,56 @@
+name: journal_create
+questions:
+- open a memory journal for the Da Nang trip
+- start a topic for the house extension
+- make a journal for the new project
+- add a person to the memory for Yen's sister
+- create a sub-topic for the permits under the house topic
+- this deserves its own journal in the memory
+- open a topic for the car's service history
+- start following the paper's review as its own topic
+- give the new crate a journal under topics
+- make a people journal for the new contractor
+- open a journal for the kids' school term
+- create a topic for the cluster's next machine
+- split the trip planning out into a topic of its own
+- start a journal to remember the garden plans
+- add a topic under candle for the release process
+- open a memory journal so this is remembered later
+category: Journal
+description: 'Open a new memory journal for something worth following on its own: a topic or a project (`topics`, or under a topic as a sub-topic), or a person (`people`). Find where it belongs by the topics'' cues first. `name` is a short kebab-case slug; `cue` says in a line when to open it, and is what every index shows. Then link it with journal_link from the journals a reader would come from, and keep what was said on it with journal_note naming it. Everyone in the group reads it. A journal holds at most ten live sub-journals: an eleventh means part of the tree needs reorganising, which is a coding task. From a turn that read the web or a remote session it waits for the person''s approval. Use for: giving a new subject or person a place in the memory. Triggered by "open a journal for", "start a topic". Returns the journal opened and who reads it.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    under:
+      description: 'Where it goes: `topics`, `people`, or a journal below one, such as `topics/house-extension`. Required.'
+      maxLength: 200
+      minLength: 1
+      type: string
+    name:
+      description: A kebab-case slug of at most 40 characters, such as `permits`. Required.
+      maxLength: 40
+      minLength: 1
+      type: string
+    cue:
+      description: 'One line: when to open it ("open for the Da Nang trip: flights, hotels, the itinerary"). Required.'
+      maxLength: 300
+      minLength: 1
+      type: string
+  required:
+  - under
+  - name
+  - cue
+  title: CreateRequest
+  type: object
+examples:
+- |-
+  we should remember the house extension plans properly<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  It is a project, so a topic at the top of topics, with a cue saying when to open it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_create", "arguments": {"under": "topics", "name": "house-extension", "cue": "open for the house extension: plans, permits, builders and costs"}}
+  </tool_call><|projection|>
+- start a topic for the trip<|im_end|>

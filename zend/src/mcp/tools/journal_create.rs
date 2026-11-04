@@ -6,7 +6,7 @@ use journals::ops::{OnTaken, Op};
 use journals::slug::Slug;
 use serde_json::{json, Value};
 
-use super::mem::{APPEND_ONLY, PATHS};
+use super::mem::{Mem, APPEND_ONLY, PATHS};
 use super::{mem, string, Answer, Ctx};
 
 pub const NAME: &str = "journal_create";
@@ -36,6 +36,14 @@ pub fn definition() -> Value {
 }
 
 pub fn call(ctx: &Ctx, args: &Value) -> Answer {
+    match mem::open(ctx) {
+        Ok(m) => create_in(&m, args),
+        Err(e) => Answer::error(e),
+    }
+}
+
+/// The journal `args` ask for, opened as `m`'s caller writes.
+pub fn create_in(m: &Mem, args: &Value) -> Answer {
     let (under, name, cue) = match (
         string(args, "under"),
         string(args, "name"),
@@ -46,10 +54,6 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let name = match Slug::parse(name) {
         Ok(n) => n,
-        Err(e) => return Answer::error(e),
-    };
-    let m = match mem::open(ctx) {
-        Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
     if let Err(e) = m.need_person() {

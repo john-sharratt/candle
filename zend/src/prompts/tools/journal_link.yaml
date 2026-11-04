@@ -1,0 +1,62 @@
+name: journal_link
+questions:
+- link the trip topic from Yen's journal
+- point John's journal at the candle topic
+- make the house topic findable from the family story
+- add a reference from people/john to the new crate's topic
+- connect the permits journal to the builders' topic
+- so readers of the car topic find the service history
+- link the paper topic from the blog topic
+- put a reference to the release topic under candle
+- make the new person's journal reachable from the project
+- link the related topic so it shows in the index
+- add a cross reference between the two trip journals
+- lead from the cluster topic to the new machine's journal
+- make the garden plans show up under the house topic
+- link the contractor's journal from the extension project
+- reference the school term journal from the kids' journals
+- add a way from the wasmer topic to the crates topic
+category: Journal
+description: 'Put a reference to one memory journal inside another, so a reader of the second finds the first: a person''s journal leading to a topic they work on, a topic to a related one. `under` is where the reference goes, `name` its own kebab-case slug, `to` the journal it leads to, and `cue` the line an index shows for it. Everyone in the group reads it. From a turn that read the web or a remote session it waits for the person''s approval. Use for: making a journal findable from where a reader would look. Triggered by "link it from", "make it findable". Returns the reference made.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    under:
+      description: The journal the reference goes in, such as `people/john`. Required.
+      maxLength: 200
+      minLength: 1
+      type: string
+    name:
+      description: The reference's own name, a kebab-case slug. Required.
+      maxLength: 40
+      minLength: 1
+      type: string
+    to:
+      description: The journal it leads to, such as `topics/house-extension`. Required.
+      maxLength: 200
+      minLength: 1
+      type: string
+    cue:
+      description: 'One line: when to follow it. Required.'
+      maxLength: 300
+      minLength: 1
+      type: string
+  required:
+  - under
+  - name
+  - to
+  - cue
+  title: LinkRequest
+  type: object
+examples:
+- |-
+  John runs the house extension, link it from his journal<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A reference in people/john leading to the topic, with a cue for when to follow it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_link", "arguments": {"under": "people/john", "name": "house-extension", "to": "topics/house-extension", "cue": "follow for the extension John is running"}}
+  </tool_call><|projection|>
+- link the topic from Yen's journal<|im_end|>

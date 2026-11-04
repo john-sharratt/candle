@@ -32,12 +32,14 @@ use crate::{ToolContext, ToolError};
 
 pub mod check;
 pub mod grep;
+pub mod memory;
 pub mod mv;
 pub mod note;
 pub mod read;
 
 pub use check::JOURNAL_CHECK;
 pub use grep::JOURNAL_GREP;
+pub use memory::{JOURNAL_CREATE, JOURNAL_LINK};
 pub use mv::JOURNAL_MOVE;
 pub use note::JOURNAL_NOTE;
 pub use read::JOURNAL_READ;

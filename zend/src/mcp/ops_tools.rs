@@ -5,13 +5,14 @@
 //! [`OpsCall`] — whom it is for and how it may wait — so neither surface has a
 //! copy of its own to drift.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, Method};
 use host::cluster::up::Reply;
 use host::commands::class::Class;
+use journals::scope::Channel;
 use serde_json::Value;
 use tokio::runtime::Handle;
 use web::auth::Role;
@@ -22,11 +23,12 @@ use super::caller::{Caller, Person};
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
+use super::tools::mem::Mem;
 use super::tools::service::guard;
 use super::tools::{
-    cluster_audit, cluster_command, cluster_logs, cluster_status, gateway_command, job, layer_read,
-    layer_toggle, member_status, repo_job, service, service_control, timeline_delete,
-    timeline_read, Answer, Ctx,
+    cluster_audit, cluster_command, cluster_logs, cluster_status, gateway_command, job,
+    journal_create, journal_link, journal_note, layer_read, layer_toggle, member_status, repo_job,
+    service, service_control, timeline_delete, timeline_read, Answer, Ctx,
 };
 use super::workers::now_ms;
 use crate::session::ZendSession;
@@ -167,6 +169,10 @@ enum Needs {
     ByCall,
     /// It is a decision, held for a person's approval ([`approvals`]).
     Decides,
+    /// It writes to the memory's journals, as the person: any member who
+    /// writes in their group, held for approval from a turn that read content
+    /// from outside.
+    Memory,
 }
 
 /// The tools a conversation of Zen's reaches through [`OpsRunner`], and what
@@ -191,6 +197,9 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (layer_toggle::NAME, Needs::Changes),
     (gateway_command::NAME, Needs::Decides),
     (timeline_delete::NAME, Needs::Decides),
+    (journal_note::NAME, Needs::Memory),
+    (journal_create::NAME, Needs::Memory),
+    (journal_link::NAME, Needs::Memory),
 ];
 
 /// The Care commands that take a member out of service, which a conversation
@@ -287,6 +296,19 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
     let Some((_, needs)) = WORKER_TOOLS.iter().find(|(name, _)| *name == tool) else {
         return Some(format!("`{tool}` is not an operations tool"));
     };
+    // The memory is every member's, not an Admin's: a person writes in their
+    // own group, as the person the conversation is with.
+    if *needs == Needs::Memory {
+        return match (person, role.at_least(Role::User)) {
+            (false, _) => Some(format!(
+                "`{tool}` writes as the person this conversation is with, and it names none"
+            )),
+            (true, false) => Some(format!(
+                "`{tool}` is a member's, and this conversation runs as `{role}`"
+            )),
+            (true, true) => None,
+        };
+    }
     if !role.at_least(Role::Admin) {
         return Some(format!(
             "`{tool}` is an Admin's, and this conversation runs as `{role}`"
@@ -332,8 +354,41 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         layer_toggle::NAME => layer_toggle::run(call, args).await,
         gateway_command::NAME => gateway_command::run(call, args).await,
         timeline_delete::NAME => timeline_delete::run(call, args).await,
+        journal_note::NAME | journal_create::NAME | journal_link::NAME => {
+            memory(name, call, args).await
+        }
         other => Answer::error(format!("`{other}` is not an operations tool")),
     }
+}
+
+/// A memory write for `call`, as its person writes through Zen: on the
+/// blocking pool, since a write commits to the journals' repository.
+async fn memory(name: &str, call: &OpsCall, args: &Value) -> Answer {
+    let Some(caller) = call.caller.clone() else {
+        return Answer::error(format!(
+            "`{name}` writes as a person, and this call names none"
+        ));
+    };
+    let (session, name, args) = (Arc::clone(&call.session), name.to_string(), args.clone());
+    tokio::task::spawn_blocking(move || {
+        let m = match Mem::of(&session, &caller, Channel::Zen) {
+            Ok(m) => m,
+            Err(e) => return Answer::error(e),
+        };
+        match name.as_str() {
+            journal_note::NAME => {
+                let (journal, text) = (
+                    args.get("journal").and_then(Value::as_str).unwrap_or(""),
+                    args.get("text").and_then(Value::as_str).unwrap_or(""),
+                );
+                journal_note::note_in(&m, journal, text)
+            }
+            journal_create::NAME => journal_create::create_in(&m, &args),
+            _ => journal_link::link_in(&m, &args),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Answer::error(format!("the memory write stopped: {e}")))
 }
 
 /// The [`OpsRunner`] of one session: the operations tools of every
@@ -348,6 +403,10 @@ pub struct OpsTools {
     /// turn, by conversation id. A dialogue's tools read the cluster as them.
     /// Held in memory, as the turn and its tool rounds run in this process.
     people: Mutex<HashMap<String, Person>>,
+    /// The conversations whose current turn has read content from outside
+    /// (`tool_round::READS_UNTRUSTED`): what they write to memory waits for a
+    /// person (`docs/zen_tool_reach.md` §6.2). A turn starts clean.
+    read_out: Mutex<HashSet<String>>,
 }
 
 impl OpsTools {
@@ -370,6 +429,23 @@ impl OpsTools {
         }
     }
 
+    /// Conversation `conv_id` began a turn: it has read nothing from outside
+    /// in it yet.
+    pub fn turn_began(&self, conv_id: &str) {
+        self.read_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conv_id);
+    }
+
+    /// Whether conversation `conv_id`'s turn has read content from outside.
+    fn is_read_out(&self, conv_id: &str) -> bool {
+        self.read_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(conv_id)
+    }
+
     /// Whose message started dialogue `conv_id`'s turn.
     fn dialogue_person(&self, conv_id: &str) -> Option<Person> {
         self.people
@@ -381,6 +457,13 @@ impl OpsTools {
 }
 
 impl OpsRunner for OpsTools {
+    fn reading_untrusted(&self, caller: &str) {
+        self.read_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(caller.to_string());
+    }
+
     fn run(&self, caller: &str, tool: &str, args: Value) -> Result<String, String> {
         let (session, runtime) = self
             .bound
@@ -410,8 +493,17 @@ impl OpsRunner for OpsTools {
         let decides = WORKER_TOOLS
             .iter()
             .any(|(name, needs)| *name == tool && *needs == Needs::Decides);
+        let writes_memory = WORKER_TOOLS
+            .iter()
+            .any(|(name, needs)| *name == tool && *needs == Needs::Memory);
         let mut held = if decides {
             Some(format!("`{tool}` is a decision"))
+        } else if writes_memory && self.is_read_out(caller) {
+            Some(
+                "this turn read content from outside, and a memory line written from it is read \
+                 by everyone in the group: a person checks it first"
+                    .into(),
+            )
         } else {
             held_by_call(tool, &args, acting)?
         };
@@ -486,7 +578,7 @@ mod tests {
         assert!(unfit(job::cancel::NAME, Role::Admin, REVIEWER, true)
             .unwrap()
             .contains("coder"));
-        assert!(unfit("repo_job_start", Role::Admin, CODER, true)
+        assert!(unfit("bot_list", Role::Admin, CODER, true)
             .unwrap()
             .contains("not an operations tool"));
     }
@@ -594,6 +686,35 @@ mod tests {
             confirmed(&json!({"name": "restart"})),
             json!({"name": "restart", "confirm": ops::APPROVED})
         );
+    }
+
+    /// **The memory is a member's, not an Admin's**: a User's conversation
+    /// writes it as its person, and one naming no person writes nothing.
+    #[test]
+    fn a_memory_write_needs_a_member_not_an_admin() {
+        for tool in [journal_note::NAME, journal_create::NAME, journal_link::NAME] {
+            assert_eq!(unfit(tool, Role::User, Acting::Dialogue, true), None);
+            assert_eq!(unfit(tool, Role::Admin, RESEARCHER, true), None);
+            assert!(unfit(tool, Role::User, Acting::Dialogue, false)
+                .unwrap()
+                .contains("names none"));
+            assert!(unfit(tool, Role::Guest, Acting::Dialogue, true)
+                .unwrap()
+                .contains("member's"));
+        }
+    }
+
+    /// **A turn that reads from outside is read-out until the next begins**,
+    /// one conversation at a time.
+    #[test]
+    fn a_turn_is_read_out_after_it_reads_from_outside_until_the_next() {
+        let ops = OpsTools::default();
+        assert!(!ops.is_read_out("c1"));
+        ops.reading_untrusted("c1");
+        assert!(ops.is_read_out("c1"));
+        assert!(!ops.is_read_out("c2"));
+        ops.turn_began("c1");
+        assert!(!ops.is_read_out("c1"));
     }
 
     /// **A dialogue's person is the one whose message started its latest

@@ -8948,6 +8948,9 @@ impl ZendSession {
             .find(|m| m.role == Role::User)
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        // A turn starts having read nothing from outside
+        // (`docs/zen_tool_reach.md` §6.2).
+        self.mcp.ops().turn_began(&conv_id);
 
         let inference = Arc::clone(&self.inference);
         let mut ready_rx = self.ready_tx.subscribe();

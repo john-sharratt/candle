@@ -1033,9 +1033,11 @@ mod tests {
             "git_reset",
             "git_fetch",
             "git_push",
-            // A command runs in one repository's sandbox.
+            // A command runs in one repository's sandbox, and a build on an
+            // agent against one repository's branch.
             "run_command",
             "run_output",
+            "repo_job_start",
         ];
         let any_repo = ["file_search", "file_grep"];
         for def in load_bundled() {

@@ -118,6 +118,11 @@ pub trait OpsRunner: Send + Sync + 'static {
     /// Run `tool` with `args` for the conversation `caller`: its answer, or
     /// why it was refused or failed.
     fn run(&self, caller: &str, tool: &str, args: serde_json::Value) -> Result<String, String>;
+
+    /// The conversation `caller` is about to read content from outside — the
+    /// web, a network session, a remote shell or file — in its current turn.
+    /// A runner that holds what such a turn may write marks it here.
+    fn reading_untrusted(&self, _caller: &str) {}
 }
 
 /// A tool implementation.

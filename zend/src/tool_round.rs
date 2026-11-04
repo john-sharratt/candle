@@ -160,6 +160,37 @@ fn unquote(value: &mut Value) {
 /// independent by construction — fan-out is what the tool is for.
 const CONCURRENT: &str = "sub_run";
 
+/// The tools that bring content from outside into the turn: the web, a
+/// network session's reply, a remote shell's output, a remote file. A turn
+/// that has run one is read-out, and what it writes to memory is checked by a
+/// person first (`docs/zen_tool_reach.md` §6.2).
+pub const READS_UNTRUSTED: [&str; 14] = [
+    "web_fetch",
+    "web_search",
+    "weather",
+    "http_request",
+    "tcp_session_recv",
+    "udp_session_recv",
+    "tls_session_recv",
+    "telnet_send",
+    "ssh_session_exec",
+    "ssh_session_exec_async",
+    "ssh_session_poll",
+    "remote_fs_session_get",
+    "remote_fs_session_list_dir",
+    "sql_session_query",
+];
+
+/// Mark `ctx`'s conversation read-out before `call` runs, when `call` reads
+/// from outside.
+fn note_reading(ctx: &ToolContext, call: &ToolCall) {
+    if READS_UNTRUSTED.contains(&call.name.as_str()) {
+        if let Some(runner) = &ctx.ops_runner {
+            runner.reading_untrusted(ctx.lineage());
+        }
+    }
+}
+
 /// Run a planned round in order, results in the order of the calls. A
 /// [`Step::Refuse`] contributes its result without running anything.
 ///
@@ -185,10 +216,13 @@ pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
                 }
                 out.extend(run_together(ctx, batch));
             }
-            Step::Run(call) => out.push(ToolResult {
-                response: run_tool(ctx, &call),
-                call,
-            }),
+            Step::Run(call) => {
+                note_reading(ctx, &call);
+                out.push(ToolResult {
+                    response: run_tool(ctx, &call),
+                    call,
+                })
+            }
             Step::Refuse(result) => {
                 tracing::warn!(
                     tool = %result.call.name,
@@ -328,9 +362,53 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
-    use zend_tools::{Grants, SubagentRequest, SubagentResponse, SubagentRunner};
+    use zend_tools::{
+        registry, Grants, OpsRunner, SubagentRequest, SubagentResponse, SubagentRunner,
+    };
+    use zend_vfs::RepoFiles;
 
     use super::*;
+
+    /// **Every tool that reads from outside is a real tool**, so a rename
+    /// cannot silently drop one from the read-out mark.
+    #[test]
+    fn every_tool_that_reads_from_outside_is_registered() {
+        for name in READS_UNTRUSTED {
+            assert!(registry::find(name).is_some(), "{name}");
+        }
+    }
+
+    /// A runner that keeps which conversations it was told read from outside.
+    #[derive(Default)]
+    struct Marks(Mutex<Vec<String>>);
+
+    impl OpsRunner for Marks {
+        fn run(&self, _caller: &str, _tool: &str, _args: Value) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        fn reading_untrusted(&self, caller: &str) {
+            self.0.lock().unwrap().push(caller.to_string());
+        }
+    }
+
+    /// **A call that reads from outside marks its conversation before it
+    /// runs**, and one that does not marks nothing.
+    #[test]
+    fn a_call_that_reads_from_outside_marks_its_conversation() {
+        let marks = Arc::new(Marks::default());
+        let ctx = ToolContext::new()
+            .with_ops_runner(Arc::clone(&marks) as Arc<dyn OpsRunner>)
+            .with_files(Arc::new(RepoFiles::detached()), "c1");
+        let call = |name: &str| ToolCall {
+            name: name.into(),
+            arguments: json!({"url": "http://127.0.0.1/"}),
+        };
+        note_reading(&ctx, &call("datetime"));
+        assert!(marks.0.lock().unwrap().is_empty());
+        note_reading(&ctx, &call("web_fetch"));
+        assert_eq!(*marks.0.lock().unwrap(), ["c1"]);
+    }
 
     /// `text` with every tag in it written as a tag — the shape of a turn whose
     /// markers were all control tokens.

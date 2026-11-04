@@ -109,7 +109,9 @@ pub fn name_at(at: Stamp, channel: Channel) -> Slug {
 pub fn followed_by(channel: Channel, person: &Slug, group: &Slug, session: &str) -> String {
     match channel {
         Channel::Grok => format!("{person}@{group}:{}", channel.name()),
-        Channel::ClaudeCode | Channel::ClaudeAi | Channel::Other => session.to_string(),
+        Channel::ClaudeCode | Channel::ClaudeAi | Channel::Zen | Channel::Other => {
+            session.to_string()
+        }
     }
 }
 

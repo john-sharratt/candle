@@ -407,6 +407,9 @@ mod tests {
             [
                 ("/v1/chat/completions", "user"),
                 ("/v1/models", "unauthenticated"),
+                ("/v1/approvals/:id", "admin"),
+                ("/v1/approvals/:id/grant", "admin"),
+                ("/v1/approvals/:id/refuse", "admin"),
                 ("/v1/repo_map", "user"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/system-prompt", "admin"),

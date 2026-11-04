@@ -160,15 +160,18 @@ pub enum Channel {
     ClaudeCode,
     Grok,
     ClaudeAi,
+    /// Zen itself, writing from one of its own conversations.
+    Zen,
     /// Claude Desktop, or any other app.
     Other,
 }
 
 impl Channel {
-    pub const ALL: [Channel; 4] = [
+    pub const ALL: [Channel; 5] = [
         Channel::ClaudeCode,
         Channel::Grok,
         Channel::ClaudeAi,
+        Channel::Zen,
         Channel::Other,
     ];
 
@@ -177,6 +180,7 @@ impl Channel {
             Self::ClaudeCode => "claude-code",
             Self::Grok => "grok",
             Self::ClaudeAi => "claude-ai",
+            Self::Zen => "zen",
             Self::Other => "other",
         }
     }
@@ -191,6 +195,7 @@ impl Channel {
             Self::ClaudeCode => "Claude Code",
             Self::Grok => "Grok",
             Self::ClaudeAi => "claude.ai",
+            Self::Zen => "Zen",
             Self::Other => "another app",
         }
     }

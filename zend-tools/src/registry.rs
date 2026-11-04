@@ -1047,7 +1047,10 @@ use crate::tools::{
     http_session::{
         HTTP_SESSION_CLOSE, HTTP_SESSION_LIST, HTTP_SESSION_OPEN, HTTP_SESSION_REQUEST,
     },
-    journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_NOTE, JOURNAL_READ},
+    journal::{
+        JOURNAL_CHECK, JOURNAL_CREATE, JOURNAL_GREP, JOURNAL_LINK, JOURNAL_MOVE, JOURNAL_NOTE,
+        JOURNAL_READ,
+    },
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
     ops::act::{
@@ -1175,6 +1178,10 @@ fn register_all() -> &'static [RegisteredTool] {
         JOURNAL_READ,
         JOURNAL_GREP,
         JOURNAL_NOTE,
+        // The memory's journals, written as the conversation's person through
+        // the daemon's runner, which holds a write from a read-out turn
+        JOURNAL_CREATE,
+        JOURNAL_LINK,
         JOURNAL_CHECK,
         JOURNAL_MOVE,
         // Credential tools (3) — all high-risk (secrets)

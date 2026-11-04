@@ -9,7 +9,7 @@
 use journals::ops::Op;
 use serde_json::{json, Value};
 
-use super::mem::{APPEND_ONLY, PATHS};
+use super::mem::{Mem, APPEND_ONLY, PATHS};
 use super::{mem, string, Answer, Ctx};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
@@ -139,10 +139,19 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 /// Keep `text` on the memory's journal `journal`, as the caller's AI wrote
 /// it through this session's client, from whoever the focus says is speaking.
 fn note_memory(ctx: &Ctx, journal: &str, text: &str) -> Answer {
-    let m = match mem::open(ctx) {
-        Ok(m) => m,
-        Err(e) => return Answer::error(e),
-    };
+    match mem::open(ctx) {
+        Ok(m) => note_in(&m, journal, text),
+        Err(e) => Answer::error(e),
+    }
+}
+
+/// Keep `text` on the memory's journal `journal`, as `m`'s caller writes.
+pub fn note_in(m: &Mem, journal: &str, text: &str) -> Answer {
+    if text.chars().count() > MAX_NOTE {
+        return Answer::error(format!(
+            "the note is longer than {MAX_NOTE} characters: one note per decision, in a sentence or two"
+        ));
+    }
     if let Err(e) = m.need_person() {
         return Answer::error(e);
     }
