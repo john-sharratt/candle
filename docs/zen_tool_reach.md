@@ -7,6 +7,10 @@ that needs a person's approval is asked and granted. It amends
 `docs/zen_chat.md`; the amendments are listed in §9. Where it names machinery
 that already exists, that machinery's document stays authoritative.
 
+Decided by the user on 2026-11-04: a chat acts as a coder does (§6.1), and the
+bots' and images' tools are forwarded to npcd's own MCP server, never
+reimplemented in zend (§4.3, §6.4).
+
 Every statement about existing code below was checked against the tree on
 2026-11-04 and carries its source. Everything that does not exist yet is marked
 **new**.
@@ -234,7 +238,10 @@ a column for each kind. A dialogue run by an Admin counts as a coder:
 
 Zen gains `journal_note`, `journal_create`, `journal_link` and `journal_focus`
 on the memory journals, `~/…` and `@group/…` (`docs/memory_backbone.md` §6).
-These are the same implementations `/mcp` serves, run in process. Two limits
+These are the same implementations `/mcp` serves, run in process.
+`journal_note` is the one tool of that name: its `journal` defaults to `self`,
+which keeps a note in its turn (`docs/zend_journal.md` §5.2), and names a
+memory journal to write a line there under the limits below. Two limits
 keep untrusted text out of everyone's prompts, the reason thread and project
 journals stay Claude's (`claude_zend_gateway.md` §11):
 

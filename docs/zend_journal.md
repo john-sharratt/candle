@@ -387,10 +387,12 @@ by step.
 A note is the model's own compression of its thinking, written while the
 thinking is still in front of it.
 
-**The tool.** `journal_note {text}`. It is the same act as the `/mcp` tool of
-that name (`docs/claude_zend_gateway.md` §3.2): one name, one purpose, writing
-down what is worth keeping. In a Zen turn it notes into the conversation's own
-journal. Its description, projected with it, says what a note is: a short
+**The tool.** `journal_note {text, journal?}`. It is the same act as the
+`/mcp` tool of that name (`docs/claude_zend_gateway.md` §3.2): one name, one
+purpose, writing down what is worth keeping. `journal` defaults to `self`, the
+conversation's own journal, where a note is kept in its turn as below; naming a
+memory journal (`~/…`, `@group/…`) writes a line there, under the rules of
+`docs/zen_tool_reach.md` §6.2. Its description, projected with it, says what a note is: a short
 mental note, a conclusion drawn from the thinking, kept in the current journal
 entry so that it is still there when the thinking is gone.
 
@@ -404,8 +406,9 @@ section is fixed text, sealed once and shared.
 (`candle-conversation/src/stencil/tool_call.rs`) gains a branch that is active
 only when the conversation has a journal. When the model opens a round of tool
 calls, the branch forces one `journal_note` call first, then the round's own
-calls. The note therefore states the conclusions behind the calls that follow
-it. Opening a call is the sign that the model is in the middle of something. A
+calls. The forced call's grammar holds `text` alone, so a forced note always
+goes to the conversation's own journal and never to shared memory. The note
+therefore states the conclusions behind the calls that follow it. Opening a call is the sign that the model is in the middle of something. A
 final answer opens no call, so a finished turn is never forced to note. The
 grammar sets no length bound on `text`: the description asks for a short note.
 
