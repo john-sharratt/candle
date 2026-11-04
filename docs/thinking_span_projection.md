@@ -2,7 +2,8 @@
 
 **Status:** implemented, authoritative. §8.1–§8.9 are all landed; the clean-turn
 re-prefill (`enqueue_clean_turn_reprefill`) and the `keep_reasoning` tool-call
-carve-out are gone.
+carve-out are gone. §6.3a, thinking kept through a tool loop, is designed and
+not built, gated on its measurement.
 
 Two things this document records as *settled by measurement*, not by argument,
 because both were reasoned to the wrong answer first:
@@ -478,6 +479,80 @@ layer to buy fidelity in a case that degrades gracefully anyway. The trade is
 not worth the coupling. **This is the design's central simplicity decision and
 the one most likely to be revisited under pressure; revisit it only with a
 measured failure, never with a hypothetical one.**
+
+#### 6.3a Revisited: thinking kept through a tool loop (designed, not built)
+
+**The failure, as observed.** Zen's long agentic tasks alternate short and
+long reasoning blocks with runs of several tool calls, and they run for many
+steps against each person's message. The tool results are prefilled as large
+user sides, so a loop's turns are mostly tool output. Under one-turn-back,
+every step but the newest is windowed to its prose, and in an agentic loop the
+prose is almost nothing: a `<tool_call>` and little else. So on the attention
+layers the loop's plan survives only as the sequence of calls it produced. The
+recurrent layers still hold the reasoning (§6.2), but as a gated fold that
+fades and cannot be addressed, so it keeps the gist of the plan and loses its
+specifics. "Graceful degradation" holds for three steps, not for thirty.
+
+**The rule, revised:**
+
+> **A turn seals with everything it decoded. At projection, every turn since
+> the newest turn whose user side is a person's message is injected whole,
+> newest first, while their reasoning fits within `REASONING_KEEP` tokens;
+> every other turn is injected with its `<think>…</think>` span windowed
+> out. The most recent turn is always injected whole.**
+
+This is the Qwen template's `last_query_index` (§6.3), with a budget. Without
+the budget, a long loop would carry every step's reasoning into every later
+step.
+
+**What the projection reads to apply it** is one property of each turn, fixed
+when the turn seals: whether its user side is a person's message or tool
+results (`TurnDecl::user_side`, **new**: `Person | ToolResults`). The session
+knows this as it submits the turn: a round's results become the next turn's
+input (`session.rs`, the tool loop). It is recorded once and never changes.
+§6.3's objection was to threading tool *state* through the projection layer.
+This is not tool state. It is a fact about the turn's own content, read like
+its index, with no tool knowledge in the projection. The rule is still
+positional, counted from a different anchor.
+
+**It fixes §6.3's second degradation for free.** A summary turn's user side
+is no person's message, so a summary appended between a call turn and its
+result does not move the anchor. The call turn keeps its reasoning, and the
+special case §6.3 recorded no longer exists.
+
+**What it costs:**
+- **No prefill and no storage.** Every turn already seals its reasoning K/V
+  (§6.5). The rule changes only which windows an existing rebuild injects
+  (§3).
+- **Attention reads more K/V inside a loop**: at most `REASONING_KEEP` tokens
+  more per projection. Outside a tool loop nothing changes, because every
+  turn's predecessor is then a person's turn, and the rule reduces to
+  one-turn-back exactly.
+- **`REASONING_KEEP` is set by the measurement below**, not by argument. The
+  starting point to measure from is 8,192 tokens, the size of the projection's
+  `recent` stratum, so the kept reasoning never outweighs the recent tail it
+  sits beside.
+
+**The measurement gate**, run on the old rule and then on the new one, with
+the commit recorded against every figure (§8.10's discipline):
+- **From real conversations.** Using `timeline_read`'s calls and turns, take
+  the stored tool loops of eight or more steps against one person's message.
+  Count, per loop:
+  - tool calls repeated with the same name and arguments;
+  - files re-read over a range already read in the same loop;
+  - closes by the repeat guard or the round cap;
+  - steps to the loop's final answer.
+
+  These are the failure's footprint: a model that has lost its plan redoes
+  work it has done.
+- **A probe.** Extends "Recall of the fold" (§8): a fact stated only inside the
+  reasoning of step *k* of a tool loop, needed at step *k*+5. Under the old
+  rule only the fold can supply it. Under the new one attention can, until the
+  budget windows it.
+- **Lands only if** the probe passes on the new rule, and the repeat and
+  re-read counts fall on the same conversations replayed.
+
+Until it lands, §1's rule stands as written.
 
 #### The second known degradation: a summary in the window
 
