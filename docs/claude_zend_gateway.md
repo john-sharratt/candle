@@ -272,7 +272,9 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   `tools: comprehensive` — the agents, the git tools, web search — within the
   guardrails of §11; anyone else's are served `restricted`, which grants no
   commands, network or push (`access.rs:63-80`). A skill that needs
-  Comprehensive tells a non-admin it cannot run.
+  Comprehensive tells a non-admin it cannot run. Which operations, memory,
+  bot and task tools each kind of conversation reaches — a task, a chat, a
+  person's dialogue — is `docs/zen_tool_reach.md` §6.1's table.
 - **`effort` `deep` by default, `think` on**, no verbosity cap: tokens are not
   the constraint. `repo_task_start` takes `effort` — `balanced`, `deep` or
   `exhaustive`, the effort dial's levels 2–4 (`threads::Effort`) — kept on the
@@ -1216,8 +1218,10 @@ endpoint and by zend, not asked of anyone in a prompt:
   git in any spelling (`zend-vfs/src/sandbox/git_use.rs`).
 - **Decide needs the user.** A Decide command, a rollout, a rollback and a
   timeline delete are refused without the endpoint's `confirm` (§8.2). A zend
-  worker is never given it: a delegated release stops at each Decide step and
-  asks, and Claude passes it on only with the user's approval.
+  worker is never given it: a Decide call from a conversation of Zen's is held
+  as an approval (`docs/zen_tool_reach.md` §5), which Claude grants with
+  `approval_grant` and `confirm` only with the user's approval, or the person
+  grants from their own browser.
 - **Trials only of `origin/main`** (§8.4).
 - **Merging to `main` and committing under `CLAUDE.md`'s rule need the user's
   approval**, whoever did the work.
@@ -1228,7 +1232,9 @@ endpoint and by zend, not asked of anyone in a prompt:
   `security_review` keeps (`docs/zend_layers.md`, "Search, never fetch").
 - **Shared journals are Claude's.** Only Claude writes a thread or project
   journal (§5.3), so text a worker read cannot reach every other worker's
-  prompt.
+  prompt. The memory's journals Zen writes as its person, and a write from a
+  turn that read content from outside waits for a person's approval
+  (`docs/zen_tool_reach.md` §6.2).
 
 ## 12. Identity and access
 

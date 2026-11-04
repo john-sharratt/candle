@@ -86,7 +86,9 @@ four differences, all keyed on its kind (`WorkerKind::Chat`):
 The `chat` option of the `role` selector (`zend/src/prompts/projection.yaml`)
 tells Zen what the conversation is: Claude writing to it from a session of its
 own, answered plainly, the chat deleted afterwards. A chat worker runs with the
-tools of the caller's role, like a task.
+tools of the caller's role, like a task, and acts as a coder does: it deploys,
+restarts and runs Care commands, and it starts and steers tasks of its own,
+which a task never does (`docs/zen_tool_reach.md` §6.1, §6.3).
 
 A failed turn's worker is not continued, and — unlike a failed task — its
 conversation is not distilled: it is left as it is until disposal tombstones it.

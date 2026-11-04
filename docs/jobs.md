@@ -166,10 +166,13 @@ begin and leaves every right one open:
 
 ## 8. Zen's surface
 
-A worker gets the five `job_*` tools, `service_deploy`, `service_status`,
-`cluster_status`, `cluster_logs`, `cluster_audit`, `timeline_read` (another
-run's turns, calls, projections and prompt, for diagnosing it), `guide_list`
-and `guide_read`, each defined in `zend/src/prompts/tools/<name>.yaml` with
+A conversation of Zen's — a task, a chat, a person's dialogue — gets the five
+`job_*` tools, `repo_job_start` (a branch as origin holds it, on a machine it
+names), `service_deploy`, `service_status`, `cluster_status`, `cluster_logs`,
+`cluster_audit`, `member_status`, `timeline_read` (another run's turns, calls,
+projections and prompt, for diagnosing it), `layer_read`, the acting tools of
+`docs/zen_tool_reach.md` §6.1, `guide_list` and `guide_read`, each defined in
+`zend/src/prompts/tools/<name>.yaml` with
 calibration questions and worked examples, and executed through the daemon's
 `OpsRunner`, which runs **the implementation the MCP tools run**
 (`zend/src/mcp/ops_tools.rs`). A worker acts as the person it works for: its

@@ -1,6 +1,6 @@
 # Zen's reach: closing the gap between Zen's tools and Claude's
 
-**Status: designed, not built.** This document is authoritative over which
+**Status: built.** This document is authoritative over which
 tools Zen's own conversations, task workers and chats reach, and how a call
 that needs a person's approval is asked and granted. It amends
 `docs/claude_zend_gateway.md` (§3.4, §8, §11), `docs/jobs.md` §8 and
