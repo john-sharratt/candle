@@ -1,0 +1,64 @@
+name: repo_task_start
+questions:
+- start a research task on the expert cache's eviction policy
+- hand the refactor of the gateway routes to a worker
+- get a reviewer to read the diff on my branch
+- run a long investigation in the background while we talk
+- have a coder implement the spec in the design doc
+- delegate writing the tests for the approvals module
+- start a worker to find every caller of the old tool
+- research which crates still pin the old toolchain
+- kick off a review of the security of the new route
+- put a coder on fixing the failing clippy lints
+- spin up a task to measure the baseline footprint
+- have someone trace why the deploy rolled back
+- start a researcher comparing the two quant ladders
+- give the doc rewrite to a task and keep talking
+- delegate the audit of the stale branches
+- start a coding task with exhaustive effort on the scheduler bug
+category: Commands
+description: 'Start a task on a worker of its own — a model conversation with the repositories'' analysis to read and its own tools to read, run and edit with — and let it run while this conversation goes on. State it in full in `prompt`: what to do, what to verify before answering, and the shape of its answer (verdict, findings, file:line). Name it for what it does, a kebab-case slug (`verify-expiry`). `role` is `coder` by default, `researcher` to answer from evidence, `reviewer` to read a change and say what is wrong with it; `effort` is `deep` by default, `exhaustive` for work that weighs many results against each other. A task does all its work itself and starts no tasks of its own. Answers at once with its handle, `task:<thread>/<name>`: wait on it with job_status, which gives its answer and journal entries; answer its questions with repo_task_reply. Use for: long or parallel work this conversation should not do inline. Triggered by "start a task", "delegate it". Returns the task''s handle.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    name:
+      description: The task's name, a kebab-case slug of at most 40 characters saying what it does. Required.
+      maxLength: 40
+      minLength: 1
+      type: string
+    prompt:
+      description: The task, stated in full. Required.
+      minLength: 1
+      type: string
+    role:
+      description: '`coder` (the default), `researcher` or `reviewer`.'
+      enum:
+      - coder
+      - researcher
+      - reviewer
+      type: string
+    effort:
+      description: '`balanced`, `deep` (the default) or `exhaustive`.'
+      enum:
+      - balanced
+      - deep
+      - exhaustive
+      type: string
+  required:
+  - name
+  - prompt
+  title: StartRequest
+  type: object
+examples:
+- |-
+  have a reviewer read the approvals change while we talk<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A review that runs on its own: repo_task_start as a reviewer, stated in full, then wait on it with job_status.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_task_start", "arguments": {"name": "review-approvals", "prompt": "Review the approvals change on zen-reach (zend/src/mcp/approvals.rs, zend/src/api/approvals.rs): say what is wrong with it, each finding with file:line, and verify each against the code before answering.", "role": "reviewer"}}
+  </tool_call><|projection|>
+- start a task on it<|im_end|>

@@ -128,6 +128,7 @@ use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
+use crate::mcp::zen_tasks::TASK_TOOLS;
 use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, tending, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
@@ -4518,6 +4519,13 @@ fn run_inference_stream(
         let mut closing = false;
         // What the catalog offers this turn, and what is out of it for now.
         let offered = crate::tools::offered_tool_names(tools_mode);
+        // A task never starts a task: its rounds' grammar holds none of the
+        // tools that start or steer one (`docs/zen_tool_reach.md` §6.3). A
+        // chat and a person's dialogue are conversations, and do.
+        let is_task = conv_names(&conv_id).is_some_and(|(o, t, n)| {
+            threads::worker(&state.engine.conversation().shared(), o, t, n)
+                .is_none_or(|w| !w.kind.is_chat())
+        });
         for iteration in start_iteration.. {
             // The closing turn the cap gives runs below it ([`closes_at_cap`]);
             // a turn resumed at or past the cap ends here.
@@ -4571,7 +4579,10 @@ fn run_inference_stream(
             if state.journaling {
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
-            let withheld = unavailable(&state.tool_host.availability_facts(), &offered);
+            let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
+            if is_task {
+                withheld.tools.extend(TASK_TOOLS);
+            }
             if let Some(summary) = tool_summary_section(tools_mode) {
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }

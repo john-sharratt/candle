@@ -1060,6 +1060,7 @@ use crate::tools::{
     ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS, MEMBER_STATUS},
     ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
     ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
+    ops::task::{REPO_TASK_NUDGE, REPO_TASK_REPLY, REPO_TASK_START},
     ops::timeline::{LAYER_READ, TIMELINE_READ},
     random::REGISTRATION as RANDOM,
     remote_fs::{
@@ -1319,6 +1320,11 @@ fn register_all() -> &'static [RegisteredTool] {
         LAYER_TOGGLE.requires(NET_EXEC_DISK),
         GATEWAY_COMMAND.requires(NET_EXEC_DISK),
         TIMELINE_DELETE.requires(NET_EXEC_DISK),
+        // Tasks (3) — a conversation's, never a task's: a task's grammar
+        // holds none of them. A task runs programs and pushes as its starter.
+        REPO_TASK_START.requires(NET_EXEC_DISK),
+        REPO_TASK_REPLY.requires(NET_EXEC_DISK),
+        REPO_TASK_NUDGE.requires(NET_EXEC_DISK),
         // Guides (2) — read from the library embedded in this binary.
         GUIDE_LIST,
         GUIDE_READ,

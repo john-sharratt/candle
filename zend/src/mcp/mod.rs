@@ -61,3 +61,4 @@ pub mod threads;
 mod latency_tests;
 pub mod tools;
 pub mod workers;
+pub mod zen_tasks;

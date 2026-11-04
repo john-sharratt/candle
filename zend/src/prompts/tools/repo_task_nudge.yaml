@@ -1,0 +1,50 @@
+name: repo_task_nudge
+questions:
+- steer the running task toward the scheduler file
+- tell the worker mid-run to skip the docs
+- nudge the researcher to cite its sources
+- remind the running coder to run the tests before answering
+- redirect the task that is reading the wrong crate
+- tell the busy worker the branch has moved
+- point the running review at the security issue
+- ask the task in flight to stop widening its search
+- give the running task a hint without stopping it
+- the worker is going in circles, steer it
+- let the coder know the lint was fixed upstream
+- nudge it to finish with what it has
+- tell the running task which machine to build on
+- steer the researcher to the newer paper
+- send guidance to the worker before its next round
+- correct the running task's misunderstanding
+category: Commands
+description: 'Send guidance to a task this conversation started while it runs: it reaches the task when its next tool round ends, without stopping it. `task` is its handle, `task:<thread>/<name>`; `message` is a sentence or two. To answer a question it asked, or to continue it once it has finished, use repo_task_reply instead. Use for: correcting or steering a running task. Triggered by "steer it", "tell the running worker". Returns that the guidance is queued.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    task:
+      description: The task's handle, `task:<thread>/<name>`. Required.
+      maxLength: 200
+      minLength: 6
+      type: string
+    message:
+      description: The guidance, in a sentence or two. Required.
+      minLength: 1
+      type: string
+  required:
+  - task
+  - message
+  title: NudgeRequest
+  type: object
+examples:
+- |-
+  the running worker is reading the wrong crate, point it at zend<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  It is still running, so a nudge reaches it at its next round without stopping it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_task_nudge", "arguments": {"task": "task:dialogue-3f2a9c01b7/find-callers", "message": "The callers are in the zend crate, not zend-tools: search zend/src."}}
+  </tool_call><|projection|>
+- steer the running task<|im_end|>

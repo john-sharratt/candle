@@ -20,6 +20,7 @@ pub mod act;
 pub mod cluster;
 pub mod job;
 pub mod service;
+pub mod task;
 pub mod timeline;
 
 #[derive(Debug, Error)]

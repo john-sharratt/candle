@@ -31,6 +31,7 @@ use super::tools::{
     service, service_control, timeline_delete, timeline_read, Answer, Ctx,
 };
 use super::workers::now_ms;
+use super::zen_tasks;
 use crate::session::ZendSession;
 
 /// The longest a worker's call waits: it has no client to cut it off, and a
@@ -173,6 +174,9 @@ enum Needs {
     /// writes in their group, held for approval from a turn that read content
     /// from outside.
     Memory,
+    /// It starts or steers a task, as the person: a dialogue's or a chat's,
+    /// since a task's own tool list never holds it (`zen_tasks`).
+    Starts,
 }
 
 /// The tools a conversation of Zen's reaches through [`OpsRunner`], and what
@@ -200,6 +204,9 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (journal_note::NAME, Needs::Memory),
     (journal_create::NAME, Needs::Memory),
     (journal_link::NAME, Needs::Memory),
+    (zen_tasks::START, Needs::Starts),
+    (zen_tasks::REPLY, Needs::Starts),
+    (zen_tasks::NUDGE, Needs::Starts),
 ];
 
 /// The Care commands that take a member out of service, which a conversation
@@ -298,10 +305,10 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
     };
     // The memory is every member's, not an Admin's: a person writes in their
     // own group, as the person the conversation is with.
-    if *needs == Needs::Memory {
+    if matches!(needs, Needs::Memory | Needs::Starts) {
         return match (person, role.at_least(Role::User)) {
             (false, _) => Some(format!(
-                "`{tool}` writes as the person this conversation is with, and it names none"
+                "`{tool}` acts as the person this conversation is with, and it names none"
             )),
             (true, false) => Some(format!(
                 "`{tool}` is a member's, and this conversation runs as `{role}`"
@@ -357,6 +364,9 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         journal_note::NAME | journal_create::NAME | journal_link::NAME => {
             memory(name, call, args).await
         }
+        zen_tasks::START => zen_tasks::start(call, args),
+        zen_tasks::REPLY => zen_tasks::reply(call, args),
+        zen_tasks::NUDGE => zen_tasks::nudge(call, args),
         other => Answer::error(format!("`{other}` is not an operations tool")),
     }
 }

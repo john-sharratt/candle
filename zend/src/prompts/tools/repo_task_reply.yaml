@@ -1,0 +1,50 @@
+name: repo_task_reply
+questions:
+- answer the worker's question about which option to take
+- tell the stuck task what to do instead
+- reply to the task that asked whether to keep the old schema
+- ask the finished task to check one of its claims
+- continue the review with the second file
+- the researcher asked for a pointer, give it one
+- tell the coder to go with its second option
+- unstick the task that ran out of rounds
+- ask the done task to go deeper on the failing test
+- give the worker the decision it was waiting on
+- redo the part of the task that cited the wrong line
+- answer the question block the task ended with
+- send the worker the result of the approved restart
+- tell the reviewer the diff moved to another branch
+- reply to the task with the missing context
+- follow up on the finished research with one more question
+category: Commands
+description: 'Reply to a task this conversation started that asked a question, is stuck, was stopped, or finished. The reply becomes its next message and it carries on with everything it read and did still in its context. To a question, make the reply the decision itself: pick one of its options, or say what to do instead. To a finished task, ask for the follow-up — check a claim, go deeper, redo a part — rather than starting a new task that would read everything again. `task` is its handle, `task:<thread>/<name>`. Answers at once; wait on it again with job_status. Use for: answering a task''s question or continuing it. Triggered by "tell the worker", "answer its question". Returns the task''s handle.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    task:
+      description: The task's handle, `task:<thread>/<name>`. Required.
+      maxLength: 200
+      minLength: 6
+      type: string
+    answer:
+      description: 'The reply: the decision, or what to do instead. Required.'
+      minLength: 1
+      type: string
+  required:
+  - task
+  - answer
+  title: ReplyRequest
+  type: object
+examples:
+- |-
+  the worker asked whether to keep the old schema; keep it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Its question gets the decision itself as the reply.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_task_reply", "arguments": {"task": "task:dialogue-3f2a9c01b7/migrate-schema", "answer": "Keep the old schema: add the new field beside it and read both."}}
+  </tool_call><|projection|>
+- answer its question<|im_end|>

@@ -291,25 +291,29 @@ could restate its own findings to itself indefinitely, each round reading the
 last one's output as its brief, with no person or Claude in the loop to see
 that it has stopped making progress.
 
-**Where the tools run.** They are `/mcp`'s implementations, run in process
-with the conversation's person as caller (§4.1). A dialogue's tasks go on a
-thread named for it (`D:<conversation>`, **new**,
-`docs/claude_zend_gateway.md` §5.2). A chat's tasks go on the thread Claude
-attached the chat's session to. A task's `question` comes back into the
-conversation as the tool's result, so the person, or Claude, sees it there.
+**Where the tools run.** They are `/mcp`'s implementations (`workers::start`,
+`answer`, `nudge`), run through the operations runner with the conversation's
+person as caller (§4.1, `zend/src/mcp/zen_tasks.rs`), and each answers at once
+with the task's handle; the conversation waits on it with `job_status`, which
+gives its answer, its question and its journal entries. A dialogue's tasks go
+on a thread named for it, `dialogue-<ten hex digits of its id's sha256>`. A
+chat's tasks go on the chat's own thread.
 
-**The tools are hidden from a task.** The tool list a turn is offered is
-built from the conversation's kind (§6.1's table). For a task worker
-(`Coder`, `Researcher`, `Reviewer`) and for every part, the task tools are not
-in it. A task does not know they exist, so there is nothing for it to resist
-and nothing for text it has read to talk it into. Its prompt says nothing
-about them either: no "do not start tasks" rule, which would only name what it
-cannot see. A task simply works with the tools it has.
+**The tools are hidden from a task.** Each round of a task worker (`Coder`,
+`Researcher`, `Reviewer`) and of every part withholds the task tools from its
+grammar (`zen_tasks::TASK_TOOLS` in the round's withheld set,
+`zend/src/session.rs`): the conversation's worker record says whether it is a
+task or a chat, and a dialogue has none. Its prompt adds no "do not start
+tasks" rule, which would only name what it cannot use. A task simply works
+with the tools it has.
 
-**Hiding is the whole mechanism.** The stencil a turn decodes under is built
-from the tools it was offered, so a call to a tool outside that list cannot be
-decoded at all. Nothing a task writes can name a task tool, so no check at the
-call or on the record is needed behind it.
+**Hiding is the whole mechanism.** The stencil a round decodes under holds
+only the tools it was offered, so a call to a withheld tool cannot be decoded
+at all. Nothing a task writes can name a task tool, so no check at the call or
+on the record is needed behind it. (The catalog summary at the head of the
+tools section is sealed once per tools mode and shared by every conversation
+of that mode, so it still lists the task tools' names; what a task can call is
+the grammar's to say, and it holds none of them.)
 
 **What a task does instead: the work.** A task is already the level where
 work is done. When it finds more work that its brief needs, it does that work

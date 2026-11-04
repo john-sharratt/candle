@@ -257,6 +257,7 @@ mod tests {
             ("2026-10-31-0930-claude-code-permits", Channel::ClaudeCode),
             ("2026-10-31-0930-other.2", Channel::Other),
             ("2026-10-31-0017-claude-ai", Channel::ClaudeAi),
+            ("2026-11-04-0712-zen", Channel::Zen),
         ] {
             assert_eq!(conversation_channel(name), Some(channel), "{name}");
         }
@@ -265,7 +266,7 @@ mod tests {
             "2026-10-31-0712",
             "2026-10-31-0712-tesla",
             "2026-10-31-0712-grokking",
-            "2026-10-31-0712-zen",
+            "2026-10-31-0712-zenith",
             "2026-10-31-0712grok",
             "20261031-0712-grok",
         ] {
