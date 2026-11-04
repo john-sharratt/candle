@@ -354,75 +354,62 @@ drawn for it; a note still being decoded fills its bubble as it arrives.
 
 #### 1.4a Job blocks: async work, live under the call that started it
 
-**Status: designed, not built.** A tool call that starts async work — a build,
-a deploy, a maintenance command, a task, a `sub_run` part — gets a block right
-after its card that shows the job as it runs, and a wait on that job shows a
-window onto its newest output. A conversation shows only the jobs **it**
-started: the block hangs off the call that started it, never off anything
-else the person owns.
+**Status: built.** A tool call that starts async work — a build, a deploy, a
+maintenance command, a task — gets a block right after its card that shows the
+job as it runs, and a wait on that job shows a window onto its newest output.
+A conversation shows only the jobs **it** started: the block hangs off the call
+that started it, never off anything else the person owns.
 
 **Three pieces, and nothing new stored.**
 
-1. **The result names its job.** Every call that starts async work already
-   answers with a handle — `build:<node>:<id>`, `deploy:<node>:<id>`,
-   `cluster:<node>:<n>`, `task:<thread>/<name>`, or a part's path
-   (`docs/jobs.md`, `docs/claude_zend_gateway.md` §6.1). The tool result gains
-   one structured field, `job: <handle>`, which the SSE `tool` event carries
-   (**new**). The GUI reads that field, never the result's text.
-2. **One follow stream.** `GET /v1/jobs/:handle/follow` (**new**) is SSE: the
-   job from its start, then live until it ends, then a final `end` event
-   (`done`, `failed`, `cancelled` or `lost`). It answers only the job's owner
-   or an Admin, by the check the job tools already make. Two bodies:
-   - **a log job** (build, deploy, maintenance): `line` events, read where the
-     job writes them through the readers `job_read` follows with
-     (`docs/jobs.md` §3);
-   - **a conversation job** (task, part): the worker's turns as the frames
-     `POST /v1/chat/completions` already sends — `status`, token deltas,
-     `think`, `tool`, and the note bubbles of §1.4 — so it renders through the
-     same handlers.
+1. **The result names its job.** Every call that starts async work answers
+   with its handle — `build:<node>:<id>`, `deploy:<node>:<id>`,
+   `cluster:<node>:<n>`, `task:<thread>/<name>` (`docs/jobs.md`). The GUI
+   reads it from the answer of a call that starts work (`STARTS`:
+   `service_deploy`, `repo_job_start`, `repo_task_start`, `repo_task_reply`,
+   `cluster_command`) by the handle grammar `job_status` takes (`JOB_HANDLE`),
+   live and on a reload alike, since both hold the same answer. A listing
+   names many jobs and starts none, so it draws no blocks.
+2. **Two reads** (`zend/src/api/jobs.rs`), as the signed-in person reads with
+   the job tools: a task by the person who started it, any other kind by an
+   Admin.
+   - `GET /v1/jobs/view?handle=…` — its kind, whether it has ended, its line
+     (`job_list`'s), and for a task the conversation its worker runs in.
+   - `GET /v1/jobs/lines?handle=…&from=N`, or `&tail=N` — its output from line
+     `N`, 200 lines at most, or its last `N`, through the same readers
+     `job_read` uses.
 
-   A job keeps its log and a task keeps its conversation already; the stream
-   only reads them.
-3. **One `JobBlock` component**, placed after the starting call's card:
+   The page follows a running job by asking every two seconds from the line
+   after the last it holds (`pollJobs`). A task's conversation is read through
+   the conversation route the page already has. A job keeps its log and a task
+   keeps its conversation already; these only read them.
+3. **One job block**, placed after the starting call's card (`jobBlock`):
    - **Collapsed by default:** one line — the kind's icon (hammer for a build,
      rocket for a deploy, wrench for a maintenance command, a person for a
-     task or part), the job's name, its state, its elapsed time, and its
-     activity sentence (`docs/claude_zend_gateway.md` §3.3). While it runs, a
-     thin indeterminate bar slides along the line's bottom edge; when it ends
-     the bar becomes a settled mark — a tick, a cross, or a hollow circle for
-     `lost`.
-   - **Expanded:** a log job's lines in a monospace view that follows the
-     bottom while it runs. A conversation job's turns, indented one step and
-     drawn with a thin vertical bar down their left in the kind's tint, using
-     the conversation's own message components — so a part inside a task
-     nests the same way, one more step in.
+     task), its handle, its line, its elapsed time. While it runs, a thin
+     indeterminate bar slides along the line's bottom edge; when it ends the
+     bar becomes a settled mark, a tick or a cross.
+   - **Expanded:** a log job's lines in a monospace view. A task's
+     conversation, indented one step and drawn with a thin bar down its left,
+     its replies through the conversation's own renderer, so their notes and
+     tool cards draw as they do in the main conversation.
    - **Rehydrated:** a block rebuilds from its handle when the conversation is
-     opened again. An ended job shows its end state collapsed, and expanding
-     it replays the stream from the start.
+     opened again, an ended job in its end state.
 
-**The wait window.** When a later call waits on jobs — `job_status` or
-`job_read` with `wait_s`, or a `sub_run` while its part runs — its card shows
-a **fixed-height view of the bottom of each waited job's stream**: about eight
-lines, pinned to the newest, its top edge fading out. Several jobs waited on
-together stack one small window each, at most three; any beyond that are one
-line, `+N more`. Clicking a window scrolls to and expands the job's block.
-When the wait returns, each window freezes on the lines it showed last. The
-window is a clipped view of the same follow stream, not a second source.
+**The wait window.** When a later call waits on jobs — `job_status`, or
+`job_read` — its card shows a **fixed-height view of the bottom of each waited
+job's output** (`waitWindows`): its last eight lines, the top edge fading out.
+Several jobs waited on together stack one small window each, at most three;
+any beyond that are one line, `+N more`. Clicking a window opens the job's
+block and scrolls to it. A job that has ended stops being polled, so its
+window holds the lines it showed last.
 
-**Tests:**
-- A tool result with `job` renders a collapsed block after its card, its bar
-  moving while the stream runs and settling to the `end` state; a result
-  without `job` renders none; a job the conversation did not start never
-  renders.
-- Expanding a log job shows its lines and follows the bottom; expanding a task
-  renders its turns indented with the bar, and a part inside it one step
-  further in.
-- The follow stream refuses a caller who neither owns the job nor is an Admin.
-- A wait on one job shows one eight-line window of its newest lines; on four,
-  three windows and `+1 more`; clicking a window expands that job's block; the
-  window freezes when the wait returns.
-- Reopening a conversation rebuilds each block from its handle, ended ones in
-  their end state.
+**Tests** (`zend/web-tests/zend.spec.js`, against the mock):
+- A started build renders a collapsed block after its card, its bar moving
+  while it runs and settling to a tick when it ends; opening it shows its log.
+- A wait on it shows a window onto its newest lines.
+- The reads: a range reads on from where the page is, and a tail is bounded
+  (`api::jobs` tests).
 **Tests:** think block present and **closed** during stream; word count updates;
 toggling open persists after the next token re-render; complete tool card shows
 parsed args; trailing incomplete tool call renders the pending pulsing card.

@@ -146,6 +146,28 @@
      output's length in tokens as it sits in the context. */
   .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
   .zmd .tool-call-out-tokens { text-transform: none; letter-spacing: 0; color: #7d766e; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .zmd .job-block { margin: -.2rem 0 .7rem 1.5rem; max-width: 46rem; border: 1px solid #38342f; border-radius: 8px; background: #221f1c; overflow: hidden; font-size: .82rem; }
+  .zmd .job-head { position: relative; display: flex; align-items: center; gap: .5rem; padding: .38rem .7rem; cursor: pointer; user-select: none; }
+  .zmd .job-head:hover { background: #26231f; }
+  .zmd .job-icon { flex-shrink: 0; }
+  .zmd .job-name { font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .76rem; color: #c9a87a; flex-shrink: 0; }
+  .zmd .job-line { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a99a88; }
+  .zmd .job-time { color: #7c736a; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .zmd .job-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; overflow: hidden; }
+  .zmd .job-bar::after { content: ''; position: absolute; top: 0; bottom: 0; width: 30%; background: linear-gradient(90deg, transparent, #c98a3e, transparent); animation: zjob 1.6s ease-in-out infinite; }
+  @keyframes zjob { from { left: -30%; } to { left: 100%; } }
+  .zmd .job-end { flex-shrink: 0; font-weight: 700; }
+  .zmd .job-end.ok { color: #8fbf7f; }
+  .zmd .job-end.bad { color: #e08a7a; }
+  .zmd .job-log { margin: 0; max-height: 22rem; overflow: auto; padding: .5rem .75rem; background: #1a1816; border-top: 1px solid #2e2b27; font-size: .74rem; line-height: 1.5; color: #b9ab98; white-space: pre-wrap; word-break: break-word; }
+  .zmd .job-conv { margin: 0 .5rem .5rem 1rem; padding-left: .8rem; border-left: 2px solid #8c5f28; }
+  .zmd .job-msg.user { margin: .5rem 0; color: #a99a88; font-size: .9em; white-space: pre-wrap; max-height: 8rem; overflow: hidden; }
+  .zmd .job-empty { color: #7c736a; padding: .4rem 0; }
+  .zmd .job-waits { margin: -.2rem 0 .7rem 1.5rem; max-width: 46rem; display: flex; flex-direction: column; gap: .35rem; }
+  .zmd .job-wait { border: 1px solid #38342f; border-radius: 7px; background: #1a1816; cursor: pointer; overflow: hidden; }
+  .zmd .job-wait-name { padding: .25rem .6rem; font-size: .72rem; color: #c9a87a; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; }
+  .zmd .job-wait-tail { position: relative; margin: 0; height: 9.5em; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; padding: 0 .6rem .35rem; font-size: .72rem; line-height: 1.2; color: #a99a88; white-space: pre-wrap; -webkit-mask-image: linear-gradient(transparent, #000 35%); mask-image: linear-gradient(transparent, #000 35%); }
+  .zmd .job-wait-more { font-size: .74rem; color: #7c736a; padding-left: .2rem; }
   .zmd .approval { margin: -.2rem 0 .8rem 1.5rem; padding: .6rem .8rem; max-width: 46rem; background: #2a231a; border: 1px solid #5a4424; border-left: 3px solid #c98a3e; border-radius: 8px; font-size: .84rem; color: #d9cbb8; }
   .zmd .approval-head { font-weight: 650; color: #f0c88a; margin-bottom: .35rem; }
   .zmd .approval-call { display: block; white-space: pre-wrap; word-break: break-word; font-size: .78rem; color: #c9b9a4; background: #1e1b19; border-radius: 5px; padding: .3rem .5rem; }
@@ -548,6 +570,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // does not open its siblings.
     toolOpen: {},
     approvals: {},                 // approval id → { pending, grant } | { state, answer } | { error }
+    jobs: {},                      // job handle → { kind, ended, line, conversation, lines, tail, open, began, messages }
+    jobGen: 0,                     // bumped whenever S.jobs changes, so memoised turns redraw their blocks
     upload: null,
     // The daemon's background ingestion backlog (GET /v1/status
     // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
@@ -960,7 +984,103 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>' +
-      (resp ? approvalBox(name, args, resp.raw) : '');
+      (resp ? approvalBox(name, args, resp.raw) : '') +
+      (WAITS[name] ? waitWindows(WAITS[name](args)) : (resp && STARTS[name] ? jobBlocks(resp.raw) : ''));
+  }
+  // ── Job blocks (docs/zend_ui_redesign.md §1.4a) ────────────────────────────
+  // A call that starts async work answers its job's handle; the block hangs
+  // under that call, collapsed to one line with a moving bar while it runs,
+  // and opens onto its output — a log's lines, or a task's own conversation.
+  // A call that waits on jobs shows a short live tail of each instead.
+  const JOB_HANDLE = /(task:[a-z0-9-]+(?:\/[a-z0-9-]+(?:\.[0-9]+)?)+|(?:build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})/g;
+  // The calls that start a job, whose answer names it. A listing names many
+  // jobs and starts none, so it draws no blocks.
+  const STARTS = { service_deploy: 1, repo_job_start: 1, repo_task_start: 1, repo_task_reply: 1, cluster_command: 1 };
+  // The calls that wait on jobs, and the handles each waits on.
+  const WAITS = {
+    job_status: (a) => Array.isArray(a.jobs) ? a.jobs : [],
+    job_read: (a) => typeof a.job === 'string' ? [a.job] : [],
+  };
+  const JOB_ICON = { build: '🔨', deploy: '🚀', cluster: '🔧', task: '👤' };
+  // Every distinct handle `raw` names, in order.
+  function handlesIn(raw) {
+    const seen = [];
+    for (const m of (raw || '').matchAll(JOB_HANDLE)) if (seen.indexOf(m[1]) === -1) seen.push(m[1]);
+    return seen;
+  }
+  // Note a job the page now draws, so the poller follows it.
+  function followJob(h) {
+    if (S.jobs[h]) return;
+    S.jobs = Object.assign({}, S.jobs, { [h]: { kind: h.split(':')[0], line: '', ended: false, lines: [], tail: [], open: false, began: _now() } });
+    S.jobGen++;
+    setTimeout(pollJobs, 0);
+  }
+  function elapsed(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return s < 90 ? s + ' s' : Math.round(s / 60) + ' min';
+  }
+  function jobBlocks(raw) {
+    return handlesIn(raw).map(jobBlock).join('');
+  }
+  function jobBlock(h) {
+    followJob(h);
+    const j = S.jobs[h];
+    const mark = !j.ended ? '<span class="job-bar"></span>'
+      : /fail|error|rolled back|lost|cancel/i.test(j.line) ? '<span class="job-end bad">✕</span>' : '<span class="job-end ok">✓</span>';
+    const head = '<div class="job-head" data-job-toggle="' + esc(h) + '">' +
+      '<span class="job-icon">' + (JOB_ICON[j.kind] || '⚙') + '</span>' +
+      '<span class="job-name">' + esc(h) + '</span>' +
+      '<span class="job-line">' + esc(j.line || 'starting…') + '</span>' +
+      (j.ended ? '' : '<span class="job-time">' + elapsed(_now() - j.began) + '</span>') + mark + '</div>';
+    if (!j.open) return '<div class="job-block" data-job="' + esc(h) + '">' + head + '</div>';
+    let body;
+    if (j.kind === 'task') {
+      const msgs = (j.messages || []).filter((m) => m.role === 'assistant' || m.role === 'user');
+      body = '<div class="job-conv">' + (msgs.length ? msgs.map((m) =>
+        '<div class="job-msg ' + m.role + '">' + (m.role === 'assistant' ? renderContent(m.content || '', false, false, null, null, null, null) : esc(m.content || '')) + '</div>').join('')
+        : '<div class="job-empty">Its conversation is loading…</div>') + '</div>';
+    } else {
+      body = '<pre class="job-log">' + esc(j.lines.map((l) => l.text).join('\n')) + '</pre>';
+    }
+    return '<div class="job-block open" data-job="' + esc(h) + '">' + head + body + '</div>';
+  }
+  // A waited job's newest lines, in a fixed-height window: at most three
+  // windows, the rest named in one line.
+  function waitWindows(handles) {
+    const shown = handles.slice(0, 3);
+    shown.forEach(followJob);
+    const more = handles.length - shown.length;
+    return '<div class="job-waits">' + shown.map((h) => {
+      const j = S.jobs[h];
+      return '<div class="job-wait" data-job-open="' + esc(h) + '"><div class="job-wait-name">' + esc(h) + (j.ended ? ' · ended' : '') + '</div>' +
+        '<pre class="job-wait-tail">' + esc((j.tail || []).map((l) => l.text).join('\n')) + '</pre></div>';
+    }).join('') + (more > 0 ? '<div class="job-wait-more">+' + more + ' more</div>' : '') + '</div>';
+  }
+  // Follow every job the page draws: its line until it ends, its log from
+  // the line after the last held while it is open, its tail while it runs,
+  // and a task's conversation while it is open. One request per job per tick.
+  let jobPoll = null;
+  function pollJobs() {
+    clearTimeout(jobPoll);
+    const live = Object.keys(S.jobs).filter((h) => !S.jobs[h].ended || (S.jobs[h].open && !S.jobs[h].read));
+    if (!live.length) return;
+    const set = (h, patch) => { S.jobs = Object.assign({}, S.jobs, { [h]: Object.assign({}, S.jobs[h], patch) }); S.jobGen++; };
+    Promise.all(live.map((h) => API.jobView(h).then((v) => {
+      const j = S.jobs[h];
+      set(h, { kind: v.kind, ended: v.ended, line: v.line, conversation: v.conversation });
+      const reads = [API.jobLines(h, { tail: 8 }).then((r) => set(h, { tail: r.lines }))];
+      if (j.open && v.kind !== 'task') {
+        const from = j.lines.length ? j.lines[j.lines.length - 1].n + 1 : 1;
+        reads.push(API.jobLines(h, { from }).then((r) => set(h, { lines: j.lines.concat(r.lines), read: v.ended && r.lines.length < 200 })));
+      }
+      if (j.open && v.kind === 'task' && v.conversation) {
+        reads.push(API.getConversation(v.conversation).then((c) => set(h, { messages: c.history || [], read: v.ended })));
+      }
+      return Promise.all(reads);
+    }).catch(() => set(h, { line: 'not readable', ended: true })))).then(() => {
+      render();
+      jobPoll = setTimeout(pollJobs, 2000);
+    });
   }
   // A call the conversation was not allowed to make alone, held for the
   // person's approval (docs/zen_tool_reach.md §5): its result says
@@ -1206,9 +1326,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // An approval settled under a card redraws its box, so its state is part
     // of the key too.
     const ap = S.approvals || null;
-    if (c && c.content === msg.content && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap) return c.html;
+    // A job block under a card redraws as its job moves.
+    const jg = S.jobGen;
+    if (c && c.content === msg.content && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap && c.jg === jg) return c.html;
     const html = nodeHtml(msg, open, toolOutputs, toolTokens);
-    msg._htmlCache = { content: msg.content, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, html: html };
+    msg._htmlCache = { content: msg.content, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, jg: jg, html: html };
     return html;
   }
   function sameOutputs(a, b) {
@@ -4107,6 +4229,25 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   document.addEventListener('click', (e) => {
     const retry = e.target.closest && e.target.closest('.zerr-act');
     if (retry) { retryTurn(S.activeId, retry.getAttribute('data-retry')); return; }
+    // A job block opens and closes on its head; a wait window opens the
+    // block of the job it shows.
+    const jt = e.target.closest && (e.target.closest('[data-job-toggle]') || e.target.closest('[data-job-open]'));
+    if (jt) {
+      const h = jt.getAttribute('data-job-toggle') || jt.getAttribute('data-job-open');
+      const j = S.jobs[h];
+      if (j) {
+        const open = jt.hasAttribute('data-job-open') ? true : !j.open;
+        S.jobs = Object.assign({}, S.jobs, { [h]: Object.assign({}, j, { open, read: false }) });
+        S.jobGen++;
+        render();
+        pollJobs();
+        if (jt.hasAttribute('data-job-open')) {
+          const block = document.querySelector('.job-block[data-job="' + CSS.escape(h) + '"]');
+          if (block) block.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      }
+      return;
+    }
     // An approval is settled by this click alone — the person's own request —
     // and what the call answered is sent to the conversation as their next
     // message, so the model hears the outcome of what it asked for.

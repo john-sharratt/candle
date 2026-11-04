@@ -34,6 +34,7 @@ mod compressed;
 pub mod conversations;
 pub mod diag;
 pub mod files;
+pub mod jobs;
 pub mod journal;
 pub mod journals;
 pub mod models;
@@ -146,6 +147,16 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Admin,
             Dispatch::Any,
             post(approvals::refuse),
+        )
+        // A job a conversation started, read for its block in the GUI
+        // (`docs/zend_ui_redesign.md` §1.4a): a task by the person who
+        // started it, any other kind by an Admin.
+        .route("/v1/jobs/view", Role::User, Dispatch::Any, get(jobs::view))
+        .route(
+            "/v1/jobs/lines",
+            Role::User,
+            Dispatch::Any,
+            get(jobs::lines),
         )
         .route(
             "/v1/repo_map",
@@ -410,6 +421,8 @@ mod tests {
                 ("/v1/approvals/:id", "admin"),
                 ("/v1/approvals/:id/grant", "admin"),
                 ("/v1/approvals/:id/refuse", "admin"),
+                ("/v1/jobs/view", "user"),
+                ("/v1/jobs/lines", "user"),
                 ("/v1/repo_map", "user"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/system-prompt", "admin"),

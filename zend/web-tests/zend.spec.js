@@ -129,6 +129,18 @@ test.describe('1.2 chat rendering', () => {
     await expect(box.locator('.approval-state')).toHaveText('Approved');
     await expect(page.locator('[data-msg]').last()).toBeVisible();
   });
+  test('a started job draws a collapsed block that runs, ends and opens onto its log', async ({ page }) => {
+    await boot(page, { conv: '7' });
+    const block = page.locator('.job-block').first();
+    await expect(block).toBeVisible();
+    await expect(block.locator('.job-name')).toHaveText('build:76c3a0f4d39bd9db:XzBY8ehGFz0');
+    await expect(block.locator('.job-log')).toHaveCount(0);
+    await block.locator('.job-head').click();
+    await expect(block.locator('.job-log')).toContainText('Compiling crate-1');
+    await expect(block.locator('.job-end.ok')).toBeVisible({ timeout: 30000 });
+    // The wait shows a window onto the job's newest lines.
+    await expect(page.locator('.job-wait').first()).toBeVisible();
+  });
   test('code copy button copies', async ({ page }) => {
     await boot(page, { conv: '1' });
     await page.locator('.copy-btn').first().click();

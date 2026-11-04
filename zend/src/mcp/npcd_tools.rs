@@ -75,10 +75,10 @@ pub fn message_of(body: &[u8]) -> Option<Value> {
         return Some(v);
     }
     text.lines()
+        .rev()
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
-        .filter(|m| m.get("result").is_some() || m.get("error").is_some())
-        .last()
+        .find(|m| m.get("result").is_some() || m.get("error").is_some())
 }
 
 /// A `tools/call` answer as Zen reads it: its text blocks, a picture standing

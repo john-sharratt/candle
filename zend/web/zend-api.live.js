@@ -287,6 +287,17 @@
       };
     },
 
+    // GET /v1/jobs/view|lines — a job a conversation started, for its block
+    // (docs/zend_ui_redesign.md §1.4a): where it stands, then its output from
+    // line `from`, or its last `tail` lines.
+    jobView(handle) {
+      return getJSON('/v1/jobs/view?handle=' + enc(handle));
+    },
+    jobLines(handle, ask) {
+      const q = ask && ask.tail ? '&tail=' + ask.tail : '&from=' + ((ask && ask.from) || 1);
+      return getJSON('/v1/jobs/lines?handle=' + enc(handle) + q);
+    },
+
     // POST /v1/approvals/{id}/grant|refuse — settle a call the conversation
     // was not allowed to make alone (docs/zen_tool_reach.md §5). A grant runs
     // it, as the signed-in person, and answers what it answered.

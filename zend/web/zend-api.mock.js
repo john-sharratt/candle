@@ -73,6 +73,7 @@
         { id: '4', title: 'Explain the tokenizer ChatML decoder', archived: false, updated_ms: now - 72e5, turn_count: 2, history: [] },
         { id: '5', title: 'Scratch notes on WS reconnect backoff', archived: true, updated_ms: now - 18e6, turn_count: 3, history: [] },
         { id: '6', title: 'Restart the member that will not rejoin', archived: false, updated_ms: now - 24e6, turn_count: 2, history: [] },
+        { id: '7', title: 'Check main compiles', archived: false, updated_ms: now - 30e6, turn_count: 2, history: [] },
       ];
       this.seedProjections(convs[0]);
       convs[0].files = this._seedFiles();
@@ -113,6 +114,28 @@
         return Object.assign({}, seed, { dials });
       }
       const title = seed ? seed.title : 'Conversation';
+      // Conversation 7 starts a build and waits on it: a job block under the
+      // start, and a wait window under the wait.
+      if (String(id) === '7') {
+        return {
+          id: '7', title, dials, archived: false,
+          updated_ms: seed ? seed.updated_ms : Date.now(), turn_count: 2,
+          history: [
+            { role: 'user', content: title },
+            { role: 'assistant', content: J([
+              '<tool_call>{"name":"repo_job_start","arguments":{"repo":"candle","branch":"main","program":"cargo","args":["check"]}}</tool_call>',
+              '<tool_call>{"name":"job_status","arguments":{"jobs":["build:76c3a0f4d39bd9db:XzBY8ehGFz0"],"wait_s":60}}</tool_call>',
+            ]) },
+            { role: 'user', content: J([
+              '<tool_response>[1/2 repo_job_start]',
+              '{"answer":"Started build:76c3a0f4d39bd9db:XzBY8ehGFz0 on BlackWorld: `cargo check`."}</tool_response>',
+              '<tool_response>[2/2 job_status]',
+              '{"answer":"build:76c3a0f4d39bd9db:XzBY8ehGFz0 — running"}</tool_response>',
+            ]) },
+            { role: 'assistant', content: 'The check is running.' },
+          ],
+        };
+      }
       // Conversation 6 holds a call the conversation could not make alone,
       // answered as the daemon's runner answers one: held for approval.
       if (String(id) === '6') {
@@ -595,6 +618,27 @@
     // result is prefilled with progress (`prefill` events) before the answer.
     // The mock keeps no reply running between requests, so there is never one
     // to follow: the stored conversation is always complete.
+    // A job as the daemon reads one: a build that writes a line every call
+    // and ends after twelve, and a task whose worker conversation is seeded.
+    _jobLines: {},
+    async jobView(handle) {
+      await delay(40);
+      const n = (this._jobLines[handle] = (this._jobLines[handle] || 0) + 1);
+      const task = handle.startsWith('task:');
+      return {
+        handle, kind: task ? 'task' : handle.split(':')[0], ended: n >= 12,
+        line: n >= 12 ? 'done — exited 0' : 'running — compiling zend',
+        total: n, conversation: task ? '4' : null,
+      };
+    },
+    async jobLines(handle, ask) {
+      await delay(40);
+      const total = this._jobLines[handle] || 1;
+      const all = Array.from({ length: total }, (_, i) => ({ n: i + 1, text: '   Compiling crate-' + (i + 1) + ' v0.1.0' }));
+      const lines = ask && ask.tail ? all.slice(-ask.tail) : all.slice(((ask && ask.from) || 1) - 1);
+      return { lines, total, ended: total >= 12 };
+    },
+
     // An approval settled as the daemon settles one: a grant answers what the
     // held call answered, a refusal only its state.
     async settleApproval(id, grant) {
