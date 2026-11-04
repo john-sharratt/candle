@@ -329,6 +329,27 @@ Empty-state greeting + prompt cards. Auto-scroll.
 by default even while streaming**, chevron rotates on open, per-message open
 state persists across re-renders. `<tool_call>{json}</tool_call>` → card with
 tool name + arg rows; pending (incomplete) card pulses.
+
+A `journal_note` call (`docs/zend_journal.md` §5.2; designed, not built) is not
+drawn as a tool card. It renders as a **note bubble**, placed after the call
+that wrote it and before the response turn, in the order the turn decoded:
+- **always open**: no `<details>`, no chevron, no toggle. A note is short, and
+  it is what the reader wants to see;
+- **indented** a step in from the message column, so it reads as an aside to
+  the work rather than part of the answer;
+- **like a thought bubble**: rounded corners, a soft tint of the theme's
+  accent as its background with a hairline border one shade deeper, a small
+  thought-bubble tail at its top left toward the call above it, and the note's
+  text in the body font, slightly smaller and in a muted tone. It sits beside
+  the thinking block's style as its quieter cousin: the thinking is the
+  working, collapsed; the note is the conclusion, open;
+- **both themes**: the tint and border are theme tokens, so the bubble reads in
+  light and dark alike, and its text keeps body contrast;
+- its `noted` response is not shown.
+
+**Tests:** a turn with a note renders the bubble open after its call and
+before the response, with no toggle; no tool card and no `noted` row is
+drawn for it; the bubble's colours come from theme tokens in both themes.
 **Tests:** think block present and **closed** during stream; word count updates;
 toggling open persists after the next token re-render; complete tool card shows
 parsed args; trailing incomplete tool call renders the pending pulsing card.

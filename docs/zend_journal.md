@@ -369,6 +369,93 @@ to that band in place of its parent layer's (`scheduler/ephemeral_fork.rs`).
 Every asker names its band: the journal `Normal`, npcd's guardian and journal
 questions `Normal`, zend's `--self-check` `Low`.
 
+### 5.2 Notes: the thinking's conclusions, kept as the work goes
+
+**Status: designed, not built.**
+
+**Why.** A turn's reasoning is attendable in exactly one later projection
+(`docs/thinking_span_projection.md` §1). A long agentic task alternates short
+and long reasoning blocks with runs of tool calls, against one person's
+message, and its tool results are prefilled as large user sides. So a turn or
+two after any step, attention sees only that step's prose. In a tool loop the
+prose is little more than the calls themselves. The recurrent layers still
+hold the reasoning (§6.2 there), but as a gated fold that fades and cannot be
+addressed. The model keeps what it did and loses why. Entries come every 16
+turns (§6), so they are too coarse to carry a loop's working conclusions step
+by step.
+
+A note is the model's own compression of its thinking, written while the
+thinking is still in front of it.
+
+**The tool.** `journal_note {text}`. It is the same act as the `/mcp` tool of
+that name (`docs/claude_zend_gateway.md` §3.2): one name, one purpose, writing
+down what is worth keeping. In a Zen turn it notes into the conversation's own
+journal. Its description, projected with it, says what a note is: a short
+mental note, a conclusion drawn from the thinking, kept in the current journal
+entry so that it is still there when the thinking is gone.
+
+**Mandatory where there is a journal.** In a conversation with a journal,
+`journal_note` is projected on every round (`ToolDef::mandatory`, as
+`journal_read` and `journal_grep` are). The model therefore always holds its
+description, including on the rounds where the stencil forces the call. Its
+section is fixed text, sealed once and shared.
+
+**Forced when a tool call opens.** The tool-calling stencil
+(`candle-conversation/src/stencil/tool_call.rs`) gains a branch that is active
+only when the conversation has a journal. When the model opens a round of tool
+calls, the branch forces one `journal_note` call first, then the round's own
+calls. The note therefore states the conclusions behind the calls that follow
+it. Opening a call is the sign that the model is in the middle of something. A
+final answer opens no call, so a finished turn is never forced to note. The
+grammar sets no length bound on `text`: the description asks for a short note.
+
+**Its response is `noted`.** The note's `<tool_response>` is one fixed word,
+the same bytes every time. Its only job is to say that the note was kept, and
+it is dead weight in the projection, so it is as small as it can be.
+
+**Nothing new is stored.** The note's text is already in its turn: it is the
+`text` argument of the call the reply decoded, in the turn's text and its K/V.
+The turn gains metadata (**new**) naming each note's place in its text, an
+offset and a length. The metadata holds no copy of the words, so there is one
+source of a note's text: the turn. There is no separate record, and the
+projection injects nothing.
+
+**What follows, with no other machinery:**
+
+- **It survives the thinking's windowing.** A note is the turn's visible text,
+  so the projection carries it with the turn's prose and calls whenever the
+  turn is projected, after its `<think>` span is windowed out.
+- **It reaches an entry before its turn is lost.** A draft starts under
+  selection pressure when a round's projection leaves out a turn that no entry
+  covers (§6), and the drafter sees every reply part of its stretch, notes
+  included. So the entry that covers a turn is written from its notes, at the
+  latest when the turn first drops out of the projection.
+- **Compression in layers.** Thinking, for one turn. Then notes, for as long as
+  their turn is projected. Then the entry's line, in the prompt for as long as
+  the entry lives. Then the folds into days, weeks, months and years (§4.2).
+  Each layer is written from the one below it, while that one is still in view.
+- **Readable later.** The turns behind an entry are filed with it (§4.1), so
+  `journal_read` shows a stretch's notes, marked as notes by the metadata, and
+  `journal_grep` finds them. A model that wants the conclusions behind an old
+  entry reads them there.
+- **Shown in the GUI**, inline under the call that wrote them
+  (`docs/zend_ui_redesign.md` §1.4).
+
+**Tests:**
+- The stencil: with a journal, a round that opens a tool call decodes one
+  `journal_note` before its other calls. Without a journal, or on a turn that
+  opens no call, no note is forced.
+- The response: a kept note answers exactly `noted`.
+- The metadata: each note's offset and length select exactly its `text` from
+  the sealed turn's text. Asserted on raw bytes.
+- The journal: a filed stretch's parts show its notes, `journal_read` marks
+  them, and `journal_grep` finds a note's words.
+- **The footprint, measured** on long tool loops before and after: tool calls
+  repeated with the same name and arguments, files re-read over a range
+  already read, closes by the repeat guard, and steps to the final answer.
+  These are what a model that has lost its plan does, so notes that work
+  bring them down.
+
 ## 6. Cadence
 
 zend counts sealed dialogue turns (each tool round seals one)

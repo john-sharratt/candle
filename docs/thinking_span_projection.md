@@ -479,6 +479,13 @@ not worth the coupling. **This is the design's central simplicity decision and
 the one most likely to be revisited under pressure; revisit it only with a
 measured failure, never with a hypothetical one.**
 
+Long agentic loops are where the degradation stops being graceful: a loop of
+many steps keeps each step's calls and loses why it made them. The answer
+leaves this rule as it is and gives the conclusions somewhere to live outside
+the `<think>` span. A turn that opens a tool call first writes a
+`journal_note`, which is visible text and so survives the windowing
+(`docs/zend_journal.md` §5.2).
+
 #### The second known degradation: a summary in the window
 
 An asynchronous summary turn can be appended between a call turn's seal and its
