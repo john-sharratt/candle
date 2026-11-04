@@ -146,6 +146,11 @@
      output's length in tokens as it sits in the context. */
   .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
   .zmd .tool-call-out-tokens { text-transform: none; letter-spacing: 0; color: #7d766e; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .zmd .note-bubble { position: relative; margin: .75rem 0 .7rem 1.5rem; padding: .5rem .85rem; max-width: 46rem; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); border-radius: 14px; color: #bfb3a8; font-size: .86em; line-height: 1.55; }
+  .zmd .note-bubble::before, .zmd .note-bubble::after { content: ''; position: absolute; border-radius: 50%; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); }
+  .zmd .note-bubble::before { left: -.55rem; top: -.5rem; width: .55rem; height: .55rem; }
+  .zmd .note-bubble::after { left: -1rem; top: -.95rem; width: .32rem; height: .32rem; }
+  .zmd .note-bubble.writing { color: #9a8f86; }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -944,6 +949,36 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
       (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
   }
+  // A note the turn wrote with `journal_note` (docs/zend_journal.md §5.2): the
+  // text of the call, or `null` for any other call. Read from either call
+  // syntax — a JSON object, or a function block — and from a call still being
+  // written, so the bubble fills as the note is decoded.
+  function noteOf(json) {
+    const body = json.trim();
+    try {
+      const p = JSON.parse(body);
+      if (p && p.name === 'journal_note') {
+        const a = p.arguments || p.parameters || {};
+        return typeof a.text === 'string' ? a.text : '';
+      }
+      return null;
+    } catch (_) { /* a function block, or a call still arriving */ }
+    if (/^\{\s*"name"\s*:\s*"journal_note"/.test(body)) {
+      const m = /"text"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(body);
+      if (!m) return '';
+      try { return JSON.parse('"' + m[1].replace(/\\$/, '') + '"'); } catch (_) { return m[1]; }
+    }
+    if (/^<function=journal_note>/.test(body)) {
+      const m = /<parameter=text>\n?([\s\S]*?)(?:\n?<\/parameter>|$)/.exec(body);
+      return m ? m[1] : '';
+    }
+    return null;
+  }
+  // The note as an always-open thought bubble, indented under the call that
+  // wrote it; its `noted` result is never shown.
+  function noteBubble(text, complete) {
+    return '<div class="note-bubble' + (complete ? '' : ' writing') + '">' + esc(text.trim()) + '</div>';
+  }
   // The prefill of a tool round's results: tokens read so far of the total, as
   // a count and a bar, in the tool card's chrome.
   function prefillCard(p) {
@@ -1041,7 +1076,14 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       else {
         const s = segs[parseInt(parts[i], 10)];
         if (s.kind === 'think') { html += renderThink(s, open); }
-        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null, toolIdx); toolIdx++; }
+        else {
+          // A note keeps its place among the calls, so the results after it
+          // still pair with theirs by position.
+          const note = noteOf(s.json);
+          if (note != null) html += noteBubble(note, s.complete);
+          else html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running, toolTokens ? toolTokens[toolIdx] : null, toolIdx);
+          toolIdx++;
+        }
       }
     }
     return html;

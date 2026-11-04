@@ -343,13 +343,14 @@ that wrote it and before the response turn, in the order the turn decoded:
   text in the body font, slightly smaller and in a muted tone. It sits beside
   the thinking block's style as its quieter cousin: the thinking is the
   working, collapsed; the note is the conclusion, open;
-- **both themes**: the tint and border are theme tokens, so the bubble reads in
-  light and dark alike, and its text keeps body contrast;
+- **both themes**: drawn in the page's own palette, as the thinking block is,
+  so the light theme's filter over the page turns it with everything else, and
+  its text keeps body contrast;
 - its `noted` response is not shown.
 
 **Tests:** a turn with a note renders the bubble open after its call and
 before the response, with no toggle; no tool card and no `noted` row is
-drawn for it; the bubble's colours come from theme tokens in both themes.
+drawn for it; a note still being decoded fills its bubble as it arrives.
 
 #### 1.4a Job blocks: async work, live under the call that started it
 

@@ -1174,8 +1174,8 @@ mod tests {
     }
 
     /// The file tools a coding turn needs whatever the question, the two web
-    /// tools and the two journal readers project on every turn; nothing else
-    /// does. A mandatory tool rides on top of the belief top-k, so adding one
+    /// tools, the two journal readers and the note every acting turn opens
+    /// with project on every turn; nothing else does. A mandatory tool rides on top of the belief top-k, so adding one
     /// here widens every prompt — the set is pinned so that is a deliberate
     /// change.
     #[test]
@@ -1194,6 +1194,7 @@ mod tests {
                 "file_read",
                 "file_search",
                 "journal_grep",
+                "journal_note",
                 "journal_read",
                 "web_fetch",
                 "web_search",

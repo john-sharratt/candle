@@ -72,7 +72,7 @@ pub use compile::compile;
 pub use driver::{Healed, PathStats, StencilDriver, StepMask};
 pub use error::{BuildError, WalkError};
 pub use function_block::function_blocks_to_json;
-pub use held_arms::{held_branches, HeldBranches};
+pub use held_arms::{held_branches, held_branches_first, HeldBranches};
 pub use mask::{ban, boost, AllowedSet};
 pub use named_arm::{arm_name, named_arm};
 pub use session::{Observe, StencilAction, StencilSession};

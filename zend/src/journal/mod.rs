@@ -9,6 +9,7 @@
 //! | Module | Concern |
 //! |---|---|
 //! | [`origin`] | the dialogue's turns as citable parts, and what each supports |
+//! | [`notes`] | a turn's notes — its thinking's conclusions — as the journal reads them |
 //! | [`state`] | a session's journal and its cadence |
 //! | [`pressure`] | whether the projection has started leaving out unread turns |
 //! | [`style`] | the UTC dates and coding words an entry reads in |
@@ -29,6 +30,7 @@
 pub mod carry;
 pub mod desk;
 pub mod draft;
+pub mod notes;
 pub mod origin;
 pub mod pressure;
 pub mod record;

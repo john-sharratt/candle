@@ -1047,7 +1047,7 @@ use crate::tools::{
     http_session::{
         HTTP_SESSION_CLOSE, HTTP_SESSION_LIST, HTTP_SESSION_OPEN, HTTP_SESSION_REQUEST,
     },
-    journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_READ},
+    journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_NOTE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
     ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS, MEMBER_STATUS},
@@ -1166,9 +1166,11 @@ fn register_all() -> &'static [RegisteredTool] {
         NOTES_READ,
         NOTES_SEARCH,
         NOTES_LIST,
-        // Journal tools (2) — read the conversation's own journal text
+        // Journal tools — read the conversation's own journal text, and note
+        // what a turn's thinking concluded (kept in the turn itself)
         JOURNAL_READ,
         JOURNAL_GREP,
+        JOURNAL_NOTE,
         JOURNAL_CHECK,
         JOURNAL_MOVE,
         // Credential tools (3) — all high-risk (secrets)

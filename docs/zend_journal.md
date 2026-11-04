@@ -371,7 +371,8 @@ questions `Normal`, zend's `--self-check` `Low`.
 
 ### 5.2 Notes: the thinking's conclusions, kept as the work goes
 
-**Status: designed, not built.**
+**Status: built.** `journal_note` writes to the conversation's own journal; a
+memory journal as its `journal` comes with `docs/zen_tool_reach.md` §6.2.
 
 **Why.** A turn's reasoning is attendable in exactly one later projection
 (`docs/thinking_span_projection.md` §1). A long agentic task alternates short
@@ -418,10 +419,11 @@ it is dead weight in the projection, so it is as small as it can be.
 
 **Nothing new is stored.** The note's text is already in its turn: it is the
 `text` argument of the call the reply decoded, in the turn's text and its K/V.
-The turn gains metadata (**new**) naming each note's place in its text, an
-offset and a length. The metadata holds no copy of the words, so there is one
-source of a note's text: the turn. There is no separate record, and the
-projection injects nothing.
+A note is recognised where it is read, by its call (`zend/src/journal/notes.rs`,
+and the GUI's `noteOf`), so the turn is the one source of a note's words: there
+is no separate record and no metadata to agree with it, and the projection
+injects nothing. In the parts a draft is shown and the text an entry keeps, a
+note call reads as `Note: <text>`.
 
 **What follows, with no other machinery:**
 
@@ -438,7 +440,7 @@ projection injects nothing.
   the entry lives. Then the folds into days, weeks, months and years (§4.2).
   Each layer is written from the one below it, while that one is still in view.
 - **Readable later.** The turns behind an entry are filed with it (§4.1), so
-  `journal_read` shows a stretch's notes, marked as notes by the metadata, and
+  `journal_read` shows a stretch's notes, each reading `Note: …`, and
   `journal_grep` finds them. A model that wants the conclusions behind an old
   entry reads them there.
 - **Shown in the GUI**, inline under the call that wrote them
@@ -449,10 +451,9 @@ projection injects nothing.
   `journal_note` before its other calls. Without a journal, or on a turn that
   opens no call, no note is forced.
 - The response: a kept note answers exactly `noted`.
-- The metadata: each note's offset and length select exactly its `text` from
-  the sealed turn's text. Asserted on raw bytes.
-- The journal: a filed stretch's parts show its notes, `journal_read` marks
-  them, and `journal_grep` finds a note's words.
+- The journal: a reply's note call reads as `Note: <text>` in its part, in
+  both call syntaxes, and every other call stays as written; so a filed
+  stretch shows its notes, and `journal_grep` finds a note's words.
 - **The footprint, measured** on long tool loops before and after: tool calls
   repeated with the same name and arguments, files re-read over a range
   already read, closes by the repeat guard, and steps to the final answer.

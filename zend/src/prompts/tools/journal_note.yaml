@@ -1,0 +1,44 @@
+name: journal_note
+questions:
+- note that the stall is the scan's lock, not the GPU
+- jot down what I just worked out about the failing test
+- keep a mental note of which file holds the bug
+- record my conclusion before I make the next call
+- write down the plan I settled on while thinking
+- remember that the second build failed for a different reason
+- save the finding that the config key was renamed
+- note which approach I ruled out and why
+- keep track of what is left to check after this read
+- capture the cause I found in that log
+- note that the deploy is waiting on the trial window
+- remember the line numbers I need to edit next
+- note the decision to keep the old schema
+- write a short reminder of what this step proved
+- note what the grep turned up before I move on
+- keep the conclusion from my reasoning so I still have it later
+category: Journal
+mandatory: true
+description: "Note a short mental note: a conclusion your thinking reached — what you found, what you decided, what you mean to do next, what you ruled out and why. Your thinking is gone a turn after you write it; a note stays, kept in your journal's current entry, so you still see it as the work goes on and it feeds the entry written for this stretch. A turn that makes calls opens with one. Keep each to a sentence or two of what the thinking settled, not a retelling of it. Returns `noted`."
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    text:
+      description: The note — one or two sentences of what the thinking concluded. Required.
+      minLength: 1
+      type: string
+  required:
+  - text
+  title: NoteRequest
+  type: object
+examples:
+- |-
+  the scan stalls on the 3090 but not the 5090<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  sm_86 has no native FP8, so the scan falls back to the slow rung there. That explains the difference; next read the fallback in scan.rs.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_note", "arguments": {"text": "The 3090 stall is the provenance scan's non-FP8 fallback on sm_86; read the fallback rung in scan.rs next."}}
+  </tool_call><|projection|>
+- note what you concluded before reading the next file<|im_end|>

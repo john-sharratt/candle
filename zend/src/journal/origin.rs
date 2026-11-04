@@ -23,6 +23,8 @@ use candle_conversation::{RecoveredMessage, Role};
 use journal_core::entry::Kind;
 use journal_core::span::SpanTurn;
 
+use super::notes::marked;
+
 /// The markup a tool result is returned in.
 const TOOL_RESPONSE: &str = "<tool_response>";
 
@@ -109,7 +111,10 @@ pub fn parts_after(
             if id <= after {
                 return None;
             }
-            let body = without_reasoning(&message.text);
+            let body = match message.role {
+                Role::Assistant => marked(&without_reasoning(&message.text)),
+                _ => without_reasoning(&message.text),
+            };
             if body.trim().is_empty() {
                 return None;
             }
@@ -197,6 +202,24 @@ mod tests {
         );
         assert!(!without_reasoning("<think>a</think>b<think>c").contains('c'));
         assert_eq!(without_reasoning("x<think>a</think>y"), "xy");
+    }
+
+    /// **A reply's notes read as notes**: the drafter and the kept text see
+    /// the conclusion, not the call that carried it.
+    #[test]
+    fn a_replys_notes_read_as_notes() {
+        let h = vec![message(
+            Role::Assistant,
+            2,
+            "<think>The lock is held across the await.</think><tool_call>\n{\"name\": \
+             \"journal_note\", \"arguments\": {\"text\": \"scan.rs holds its lock across \
+             the await\"}}\n</tool_call>",
+        )];
+        let part = &parts_after(&h, &[], 0)[0];
+        assert_eq!(
+            part.text,
+            "You: Note: scan.rs holds its lock across the await"
+        );
     }
 
     #[test]

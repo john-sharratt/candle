@@ -57,9 +57,24 @@ pub fn held_branches(
     names: &[String],
     decode: impl Fn(&[TokenId]) -> Option<String>,
 ) -> HeldBranches {
+    held_branches_first(tree, names, None, decode)
+}
+
+/// [`held_branches`], with the first call held to `first` alone when given:
+/// the turn's opening call is that tool, and every call after it may be any
+/// of `names`. A turn whose first call must say something before it acts —
+/// a note of what its thinking concluded (`docs/zend_journal.md` §5.2) — is
+/// held this way.
+pub fn held_branches_first(
+    tree: &StencilTree,
+    names: &[String],
+    first_call: Option<&str>,
+    decode: impl Fn(&[TokenId]) -> Option<String>,
+) -> HeldBranches {
     let Some(first) = tree.first_branch() else {
         return HeldBranches::default();
     };
+    let opening = tree.first_branch_node();
     let named = |arm: &Vec<TokenId>| -> String {
         decode(arm)
             .map(|text| arm_name(text.as_bytes()).to_string())
@@ -80,10 +95,14 @@ pub fn held_branches(
         if sorted != catalog {
             continue;
         }
+        let allowed = |name: &str| match first_call {
+            Some(only) if Some(node) == opening => name == only,
+            _ => names.iter().any(|n| n == name),
+        };
         let held: Vec<Vec<TokenId>> = arms
             .into_iter()
             .zip(&spelled)
-            .filter(|(_, name)| names.iter().any(|n| n == *name))
+            .filter(|(_, name)| allowed(name))
             .map(|(arm, _)| arm)
             .collect();
         if !held.is_empty() {
@@ -172,6 +191,34 @@ mod tests {
         for i in 0..t.len() as u32 {
             if let Some(arms) = held.arms_at(NodeId(i)) {
                 assert_eq!(names(arms, &v), ["file_read"]);
+            }
+        }
+    }
+
+    /// **A turn's first call can be held to one tool and the rest to the
+    /// turn's**: the opening name branch offers only `first`, every later
+    /// level the names given.
+    #[test]
+    fn the_first_call_is_held_to_its_own_tool() {
+        let v = TestVocab::new();
+        let t = looped(&v, 3);
+        let decode = |tokens: &[TokenId]| String::from_utf8(v.decode(tokens)).ok();
+        let held = held_branches_first(
+            &t,
+            &given(&["file_read", "write"]),
+            Some("file_list"),
+            decode,
+        );
+        assert_eq!(held.len(), 3);
+        let opening = t.first_branch_node().unwrap();
+        assert_eq!(names(held.arms_at(opening).unwrap(), &v), ["file_list"]);
+        for i in 0..t.len() as u32 {
+            let node = NodeId(i);
+            if node == opening {
+                continue;
+            }
+            if let Some(arms) = held.arms_at(node) {
+                assert_eq!(names(arms, &v), ["file_read", "write"]);
             }
         }
     }

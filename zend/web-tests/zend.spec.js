@@ -110,6 +110,16 @@ test.describe('1.2 chat rendering', () => {
     await expect(page.locator('.tool-call-card').first()).toBeVisible();
     await expect(page.locator('details.think-block').first()).toBeVisible();
   });
+  test('a note renders as an open thought bubble after its call, not as a tool card', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    const bubble = page.locator('.note-bubble').first();
+    await expect(bubble).toBeVisible();
+    await expect(bubble).toHaveText('Substrate::recover is the boot path; read the replay loop in redo.rs next.');
+    // No toggle: the bubble is not a <details>, and the note is no tool card.
+    await expect(page.locator('details.note-bubble')).toHaveCount(0);
+    await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'journal_note' })).toHaveCount(0);
+    await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'read_file' })).toBeVisible();
+  });
   test('code copy button copies', async ({ page }) => {
     await boot(page, { conv: '1' });
     await page.locator('.copy-btn').first().click();

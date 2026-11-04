@@ -27,7 +27,7 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_loop, held_branches, HfVocab, StencilTree,
+    compile, compile_think_tree, compile_tool_call_loop, held_branches_first, HfVocab, StencilTree,
     ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec,
     TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
@@ -2124,7 +2124,7 @@ impl ConversationEngine {
 
     /// `triggers` with every tool call held to `tools`: each name branch of
     /// the call loop narrowed to the arms those names spell
-    /// ([`held_branches`]), so a call can write only a tool the turn was
+    /// ([`held_branches_first`]), so a call can write only a tool the turn was
     /// given. The compiled catalog is shared and untouched; the turn carries
     /// the held arms, a few tokens per tool per call level.
     ///
@@ -2132,10 +2132,14 @@ impl ConversationEngine {
     /// decodes the catalog's name arms once per call level. `triggers` without
     /// a tool call is returned as it is. A list naming no tool the catalog
     /// holds is an error — a turn given tools it can never call.
+    ///
+    /// `first_call`, when given, holds the turn's opening call to that one
+    /// tool, and the calls after it to `tools` ([`held_branches_first`]).
     pub fn holding_tools(
         &self,
         triggers: &Arc<TriggerRegistry>,
         tools: &[String],
+        first_call: Option<&str>,
     ) -> crate::Result<Arc<TriggerRegistry>> {
         let tokenizer = &self.core.tokenizer;
         let Some(trigger) = tokenizer.token_to_id("<tool_call>") else {
@@ -2144,7 +2148,8 @@ impl ConversationEngine {
         let Some(tree) = triggers.tree_for(trigger) else {
             return Ok(Arc::clone(triggers));
         };
-        let held = held_branches(tree, tools, |t| tokenizer.decode(t, false).ok());
+        let held =
+            held_branches_first(tree, tools, first_call, |t| tokenizer.decode(t, false).ok());
         if held.is_empty() {
             return Err(ConversationError::from(candle::Error::Msg(format!(
                 "tool stencil: none of {tools:?} is in the turn's catalog"

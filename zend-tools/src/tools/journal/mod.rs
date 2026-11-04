@@ -1,4 +1,4 @@
-//! Journal tools: `journal_read` and `journal_grep`.
+//! Journal tools: `journal_read`, `journal_grep` and `journal_note`.
 //!
 //! A conversation's journal shows one line per entry. What each entry was
 //! written from — the turns it covers, whole — is kept beside it, and these
@@ -33,11 +33,13 @@ use crate::{ToolContext, ToolError};
 pub mod check;
 pub mod grep;
 pub mod mv;
+pub mod note;
 pub mod read;
 
 pub use check::JOURNAL_CHECK;
 pub use grep::JOURNAL_GREP;
 pub use mv::JOURNAL_MOVE;
+pub use note::JOURNAL_NOTE;
 pub use read::JOURNAL_READ;
 
 /// What `journal` names the caller's own journal with.

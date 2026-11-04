@@ -112,6 +112,7 @@ use crate::hand_records::{self, Carrying};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
+use crate::journal::notes::JOURNAL_NOTE_TOOL;
 use crate::journal::record::{kept_in, metadata_of};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
@@ -624,10 +625,13 @@ type HeldKey = (u8, String, Vec<&'static str>);
 /// Every [`round_triggers`] held so far, swapped whole so a round never waits.
 type HeldStencils = HashMap<HeldKey, Arc<TriggerRegistry>>;
 
-/// [`turn_triggers`] with a call to any of `unavailable`'s tools taken out of the
-/// grammar. Held once per mode, dial and set: a set changes only as sessions open
-/// and close, and holding decodes the catalog's name arms. The base is what a
-/// round falls back to, as a tool the grammar leaves in is only refused.
+/// [`turn_triggers`] for one round of a conversation, every one of which keeps
+/// a journal: its opening call held to `journal_note`, so a round that acts
+/// first notes what its thinking concluded (`docs/zend_journal.md` §5.2), and
+/// a call to any of `unavailable`'s tools taken out of the grammar. Held once
+/// per mode, dial and set: a set changes only as sessions open and close, and
+/// holding decodes the catalog's name arms. The base is what a round falls
+/// back to, as a tool the grammar leaves in is only refused.
 fn round_triggers(
     state: &InferenceState,
     think_mode: ThinkMode,
@@ -635,7 +639,9 @@ fn round_triggers(
     unavailable: &Unavailable,
 ) -> Arc<TriggerRegistry> {
     let base = turn_triggers(state, think_mode, tools_mode);
-    if unavailable.tools.is_empty() {
+    let offered = crate::tools::offered_tool_names(tools_mode);
+    let noting = offered.contains(JOURNAL_NOTE_TOOL);
+    if unavailable.tools.is_empty() && !noting {
         return base;
     }
     let names: Vec<&'static str> = unavailable.tools.iter().copied().collect();
@@ -643,11 +649,12 @@ fn round_triggers(
     if let Some(triggers) = state.held_stencils.load().get(&key) {
         return Arc::clone(triggers);
     }
-    let allowed: Vec<String> = crate::tools::offered_tool_names(tools_mode)
+    let allowed: Vec<String> = offered
         .into_iter()
         .filter(|name| !unavailable.tools.contains(name.as_str()))
         .collect();
-    match state.engine.holding_tools(&base, &allowed) {
+    let first = noting.then_some(JOURNAL_NOTE_TOOL);
+    match state.engine.holding_tools(&base, &allowed, first) {
         Ok(triggers) => {
             state.held_stencils.rcu(|held| {
                 let mut held = HeldStencils::clone(held);
@@ -1695,6 +1702,7 @@ impl InferenceState {
             .holding_tools(
                 &tool_stencils[ToolMode::Restricted.level() as usize],
                 &[FILE_READ_TOOL.to_string()],
+                None,
             )
             .map_err(|e| anyhow::anyhow!("file reading's tool stencil: {e}"))?;
         // The thinking-block steering trees (one per non-off effort dial),

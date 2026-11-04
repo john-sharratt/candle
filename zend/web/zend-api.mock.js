@@ -52,6 +52,7 @@
               "I'll show the replay loop itself and cite the function rather than just describing it.",
               '</think>', '',
               'On startup the daemon opens the redo log and replays each committed turn before it starts serving requests.', '',
+              '<tool_call>{"name":"journal_note","arguments":{"text":"Substrate::recover is the boot path; read the replay loop in redo.rs next."}}</tool_call>',
               '<tool_call>{"name":"read_file","arguments":{"path":"crates/substrate/src/redo.rs","range":"1-40"}}</tool_call>', '',
               'The replay happens in `Substrate::recover`:', '',
               '```rust',

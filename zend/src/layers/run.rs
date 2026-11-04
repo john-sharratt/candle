@@ -529,7 +529,7 @@ fn unit_triggers(
         return Ok(triggers);
     }
     ctx.engine
-        .holding_tools(&triggers, &spec.tools)
+        .holding_tools(&triggers, &spec.tools, None)
         .map_err(|e| anyhow::anyhow!("layer `{}`: {e}", spec.layer))
 }
 
