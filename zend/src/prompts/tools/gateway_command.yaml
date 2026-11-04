@@ -1,0 +1,49 @@
+name: gateway_command
+questions:
+- raise the zend floor now instead of waiting out the grace period
+- cancel the pending floor rise for npcd
+- end the grace period for the old build
+- stop routing to members on the older build
+- the rollout is done, raise the floor
+- hold the floor where it is, cancel the rise
+- make the gateway drop the old zend build now
+- cancel raising the floor until the second member upgrades
+- raise npcd's floor to the new build
+- the new build is bad, cancel the floor rise
+- force the floor up so nothing routes to the old daemon
+- undo the scheduled floor change
+- move the routing floor to the certified build
+- keep serving the older build, cancel the floor
+- ask for the floor to be raised on zend
+- raise the floor for both apps after the rollout
+category: Commands
+description: 'One of the gateway''s own upgrade commands, for an app (`zend`, the coding service, or `npcd`, the bots'') whose members are moving to a new build. During an upgrade the gateway keeps routing to members on the older build for a grace period, until the app''s floor — the oldest build it still routes to — rises. `raise-floor` raises it now; `cancel-floor` drops a pending rise. Pass `args: {app}`. Each is a decision, held for a person''s approval: it answers `needs_approval` with its id. Use for: asking to end or keep an upgrade''s grace period. Triggered by "raise the floor", "cancel the floor rise". Returns the approval it is held as.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    name:
+      description: '`raise-floor` or `cancel-floor`. Required.'
+      enum:
+      - raise-floor
+      - cancel-floor
+      type: string
+    args:
+      description: '`{app}`: `zend` or `npcd`.'
+      type: object
+  required:
+  - name
+  title: GatewayRequest
+  type: object
+examples:
+- |-
+  the rollout finished, raise the zend floor<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Raising the floor is a decision; it is held for the person's approval and I say why I asked.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "gateway_command", "arguments": {"name": "raise-floor", "args": {"app": "zend"}}}
+  </tool_call><|projection|>
+- cancel the pending floor rise<|im_end|>

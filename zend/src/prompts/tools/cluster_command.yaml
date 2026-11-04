@@ -1,0 +1,77 @@
+name: cluster_command
+questions:
+- audit the substrate on blackworld
+- run a self-check on the new member
+- check the disk on whiteworld's member
+- compact whiteworld's substrate now
+- run maintenance on the member that is behind
+- expire the old tombstones on blackworld
+- catch the member up from its peer
+- release the leases the stuck member holds
+- pause the rollout of the zend build
+- resume the paused rollout
+- drain whiteworld before its restart
+- restart the member that will not rejoin
+- show me the gateway's rollout plan for the new build
+- prune the old builds whiteworld downloaded
+- certify the candidate anyway
+- resync the member whose substrate diverged
+category: Commands
+description: 'Run one maintenance command on one member of the cluster — a machine running the motherd daemon — named by its 16-hex-digit node as cluster_status lists it. Answers the job it started, `cluster:<node>:<n>`: wait on it with job_status and read its steps with job_read. Look commands only read (`audit`, `self-check`, `check-disk`) and run as asked. Care commands are routine upkeep (`compact`, `maintain`, `expire-tombstones`, `catch-up`, `release-leases`, `pause-rollout`, `resume-rollout`, `undrain`) and run as asked. `drain`, `resync` and `rejoin` take a member out of service, and the Decide commands change what the cluster runs (`restart`, `shutdown`, `set-quorum`, `certify-anyway`, `reject-build`, `rollout`, `rollback`, `prune-builds`, `upgrade-now`): both are held for a person''s approval and answer `needs_approval` with its id — say what you asked to run and why, and carry on with what does not depend on it. A command''s own arguments go in `args` (`app`, `build`, `newest` for an audit that samples the newest segments); `rollout` without `args.confirm` answers the gateway''s plan and changes nothing. Use for: checking a member''s substrate or disk, routine upkeep, and asking for a decision. Triggered by "audit blackworld", "compact the substrate". Returns the job started, or the approval it is held as.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    member:
+      description: The member's node id, 16 hex digits, as cluster_status lists it. Not used for `rollout`.
+      maxLength: 16
+      minLength: 16
+      type: string
+    name:
+      description: The command. Required.
+      enum:
+      - audit
+      - self-check
+      - check-disk
+      - drain
+      - undrain
+      - compact
+      - maintain
+      - expire-tombstones
+      - catch-up
+      - resync
+      - rejoin
+      - release-leases
+      - pause-rollout
+      - resume-rollout
+      - restart
+      - shutdown
+      - set-quorum
+      - certify-anyway
+      - reject-build
+      - rollout
+      - rollback
+      - prune-builds
+      - upgrade-now
+      maxLength: 32
+      minLength: 1
+      type: string
+    args:
+      description: The command's own arguments, an object.
+      type: object
+  required:
+  - name
+  title: CommandRequest
+  type: object
+examples:
+- |-
+  audit blackworld's substrate, just the newest segments<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  An audit is a Look, so it runs. The member is BlackWorld's zend node, and `newest` samples instead of walking everything.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "cluster_command", "arguments": {"member": "a0ac88178cb2b57d", "name": "audit", "args": {"newest": 20}}}
+  </tool_call><|projection|>
+- compact the substrate on whiteworld<|im_end|>

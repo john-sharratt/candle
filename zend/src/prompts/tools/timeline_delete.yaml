@@ -1,0 +1,45 @@
+name: timeline_delete
+questions:
+- delete the corrupt code reading so the next pass rebuilds it
+- remove timeline 3931131315647773441
+- tombstone the stored reading with the wrong content
+- the repo map timeline is broken, delete it
+- drop the stale reading of scan.rs
+- delete the conversation whose records are fine but whose content is wrong
+- rebuild the reading of session.rs from scratch
+- get rid of the reading that quotes a deleted file
+- clear the bad analysis so ingest redoes it
+- delete that timeline on every member
+- the summary in that timeline is wrong, remove it
+- wipe one stored conversation by its id
+- delete the poisoned code reading
+- remove the timeline layer_read listed as broken
+- tombstone the reading so the layer reads it again
+- delete the duplicate reading of the gateway's routes
+category: Commands
+description: 'Delete one stored conversation — a timeline, by the id layer_read lists — on every member. The repair for a conversation whose content is wrong: one a layer''s analysis built is built again by the next analysis pass. It cannot be undone, so it is a decision, held for a person''s approval: it answers `needs_approval` with its id. Use for: asking to delete a wrong reading so it is rebuilt. Triggered by "delete that timeline", "rebuild the reading". Returns the approval it is held as.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    id:
+      description: The timeline id, a decimal number as layer_read lists it. Required.
+      maxLength: 24
+      minLength: 1
+      type: string
+  required:
+  - id
+  title: DeleteRequest
+  type: object
+examples:
+- |-
+  the reading of scan.rs quotes code that is gone, rebuild it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Deleting its timeline makes the next pass read the file again. It cannot be undone, so it is held for approval.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "timeline_delete", "arguments": {"id": "3931131315647773441"}}
+  </tool_call><|projection|>
+- delete that broken timeline<|im_end|>

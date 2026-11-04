@@ -1050,6 +1050,10 @@ use crate::tools::{
     journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_NOTE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
+    ops::act::{
+        CLUSTER_COMMAND, GATEWAY_COMMAND, LAYER_TOGGLE, REPO_JOB_START, SERVICE_CONTROL,
+        TIMELINE_DELETE,
+    },
     ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS, MEMBER_STATUS},
     ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
     ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
@@ -1298,6 +1302,16 @@ fn register_all() -> &'static [RegisteredTool] {
         // changes. `probe` runs a prefill, and changes nothing either.
         TIMELINE_READ.requires(NET),
         LAYER_READ.requires(NET),
+        // Acting on the cluster (6) — a build on a named agent, a member's
+        // command, a service's restart, a layer's switch, the gateway's floor,
+        // a timeline's delete. Each acts as a command does; the daemon's
+        // runner holds a decision for a person's approval.
+        REPO_JOB_START.requires(NET_EXEC_DISK),
+        CLUSTER_COMMAND.requires(NET_EXEC_DISK),
+        SERVICE_CONTROL.requires(NET_EXEC_DISK),
+        LAYER_TOGGLE.requires(NET_EXEC_DISK),
+        GATEWAY_COMMAND.requires(NET_EXEC_DISK),
+        TIMELINE_DELETE.requires(NET_EXEC_DISK),
         // Guides (2) — read from the library embedded in this binary.
         GUIDE_LIST,
         GUIDE_READ,

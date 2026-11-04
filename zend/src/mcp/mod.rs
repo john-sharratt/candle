@@ -34,6 +34,7 @@
 //! | [`chats`] | Zen chat: a private conversation named by its id, disposed of when closed or idle (`docs/zen_chat.md`) |
 
 pub mod activity;
+pub mod approvals;
 pub mod archiving;
 pub mod audit;
 pub mod caller;

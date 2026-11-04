@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use super::{Answer, Ctx, LOADING};
 use crate::mcp::ops;
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "timeline_delete";
 
@@ -35,6 +36,12 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    run(&OpsCall::of(ctx), args).await
+}
+
+/// The delete for `call`, whose caller is checked an Admin, only with
+/// `confirm`.
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let Some(raw) = args
         .get("id")
         .and_then(|v| {
@@ -53,7 +60,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     ) {
         return Answer::error(e);
     }
-    let session = ctx.session.clone();
+    let session = call.session.clone();
     let done = tokio::task::spawn_blocking(move || session.tombstone_timeline_raw(raw)).await;
     match done {
         Ok(Some(Ok(()))) => Answer::ok(format!("Timeline {raw} is tombstoned.")),

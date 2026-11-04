@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::{ToolContext, ToolError};
 
+pub mod act;
 pub mod cluster;
 pub mod job;
 pub mod service;

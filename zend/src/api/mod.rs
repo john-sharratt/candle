@@ -27,6 +27,7 @@ use crate::mcp;
 use crate::session::ZendSession;
 
 pub mod agents;
+pub mod approvals;
 pub mod chat;
 mod chat_frames;
 mod compressed;
@@ -125,6 +126,26 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Unauthenticated,
             Dispatch::Any,
             get(models::list),
+        )
+        // A dialogue's approvals, settled by its person (`docs/zen_tool_reach.md`
+        // §5): records in the substrate, so any member reads and runs one.
+        .route(
+            "/v1/approvals/:id",
+            Role::Admin,
+            Dispatch::Any,
+            get(approvals::read),
+        )
+        .route(
+            "/v1/approvals/:id/grant",
+            Role::Admin,
+            Dispatch::Any,
+            post(approvals::grant),
+        )
+        .route(
+            "/v1/approvals/:id/refuse",
+            Role::Admin,
+            Dispatch::Any,
+            post(approvals::refuse),
         )
         .route(
             "/v1/repo_map",

@@ -146,6 +146,17 @@
      output's length in tokens as it sits in the context. */
   .zmd .tool-call-out-label { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; }
   .zmd .tool-call-out-tokens { text-transform: none; letter-spacing: 0; color: #7d766e; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .zmd .approval { margin: -.2rem 0 .8rem 1.5rem; padding: .6rem .8rem; max-width: 46rem; background: #2a231a; border: 1px solid #5a4424; border-left: 3px solid #c98a3e; border-radius: 8px; font-size: .84rem; color: #d9cbb8; }
+  .zmd .approval-head { font-weight: 650; color: #f0c88a; margin-bottom: .35rem; }
+  .zmd .approval-call { display: block; white-space: pre-wrap; word-break: break-word; font-size: .78rem; color: #c9b9a4; background: #1e1b19; border-radius: 5px; padding: .3rem .5rem; }
+  .zmd .approval-why { margin-top: .35rem; color: #a99a88; }
+  .zmd .approval-acts { display: flex; gap: .5rem; margin-top: .55rem; }
+  .zmd .approval-act { font: inherit; font-size: .8rem; padding: .25rem .9rem; border-radius: 6px; border: 1px solid #5a4424; background: #1e1b19; color: #e6d6c0; cursor: pointer; }
+  .zmd .approval-act.grant { background: #3a2a14; border-color: #c98a3e; color: #f6dcb0; }
+  .zmd .approval-act:hover { filter: brightness(1.15); }
+  .zmd .approval-state { margin-top: .5rem; color: #e6c08a; font-weight: 600; }
+  .zmd .approval-state.err { color: #e08a7a; }
+  .zmd .approval-answer { margin: .35rem 0 0; white-space: pre-wrap; font-size: .76rem; color: #b9ab98; }
   .zmd .note-bubble { position: relative; margin: .75rem 0 .7rem 1.5rem; padding: .5rem .85rem; max-width: 46rem; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); border-radius: 14px; color: #bfb3a8; font-size: .86em; line-height: 1.55; }
   .zmd .note-bubble::before, .zmd .note-bubble::after { content: ''; position: absolute; border-radius: 50%; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); }
   .zmd .note-bubble::before { left: -.55rem; top: -.5rem; width: .55rem; height: .55rem; }
@@ -536,6 +547,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // never wired up. Keyed per card rather than per message, so opening one
     // does not open its siblings.
     toolOpen: {},
+    approvals: {},                 // approval id → { pending, grant } | { state, answer } | { error }
     upload: null,
     // The daemon's background ingestion backlog (GET /v1/status
     // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
@@ -947,7 +959,36 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     return '<details class="tool-call-card" data-tool="' + idx + '">' +
       '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + subHtml + badge +
       '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
-      (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
+      (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>' +
+      (resp ? approvalBox(name, args, resp.raw) : '');
+  }
+  // A call the conversation was not allowed to make alone, held for the
+  // person's approval (docs/zen_tool_reach.md §5): its result says
+  // `needs_approval <id>`. Drawn open under the card with the call laid out
+  // and its two buttons; once settled, what it answered.
+  function approvalBox(name, args, raw) {
+    const m = /needs_approval ([0-9a-f]{12})/.exec(raw || '');
+    if (!m) return '';
+    const id = m[1];
+    const why = (/was not run — (.*?)\. It is held/.exec(raw) || [])[1] || '';
+    const settled = S.approvals && S.approvals[id];
+    const call = esc(name) + ' ' + esc(JSON.stringify(args));
+    let foot;
+    if (!settled) {
+      foot = '<div class="approval-acts"><button class="approval-act grant" data-approval="' + id + '" data-grant="1">Approve</button>' +
+        '<button class="approval-act refuse" data-approval="' + id + '" data-grant="0">Refuse</button></div>';
+    } else if (settled.pending) {
+      foot = '<div class="approval-state">' + (settled.grant ? 'Running…' : 'Refusing…') + '</div>';
+    } else if (settled.error) {
+      foot = '<div class="approval-state err">' + esc(settled.error) + '</div>';
+    } else {
+      foot = '<div class="approval-state">' + (settled.state === 'granted' ? 'Approved' : 'Refused') + '</div>' +
+        (settled.answer ? '<pre class="approval-answer">' + esc(settled.answer) + '</pre>' : '');
+    }
+    return '<div class="approval" data-approval-box="' + id + '">' +
+      '<div class="approval-head">Needs your approval</div>' +
+      '<code class="approval-call">' + call + '</code>' +
+      (why ? '<div class="approval-why">' + esc(why) + '</div>' : '') + foot + '</div>';
   }
   // A note the turn wrote with `journal_note` (docs/zend_journal.md §5.2): the
   // text of the call, or `null` for any other call. Read from either call
@@ -1162,9 +1203,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // The reasoning lengths label the think blocks, so they are part of the key.
     const thKey = (msg.thinking || []).map((t) => t.tokens + (t.exact ? '' : '~')).join(',') +
       '|' + (toolTokens || msg.toolTokens || []).join(',');
-    if (c && c.content === msg.content && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen) return c.html;
+    // An approval settled under a card redraws its box, so its state is part
+    // of the key too.
+    const ap = S.approvals || null;
+    if (c && c.content === msg.content && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap) return c.html;
     const html = nodeHtml(msg, open, toolOutputs, toolTokens);
-    msg._htmlCache = { content: msg.content, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, html: html };
+    msg._htmlCache = { content: msg.content, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, html: html };
     return html;
   }
   function sameOutputs(a, b) {
@@ -4063,6 +4107,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   document.addEventListener('click', (e) => {
     const retry = e.target.closest && e.target.closest('.zerr-act');
     if (retry) { retryTurn(S.activeId, retry.getAttribute('data-retry')); return; }
+    // An approval is settled by this click alone — the person's own request —
+    // and what the call answered is sent to the conversation as their next
+    // message, so the model hears the outcome of what it asked for.
+    const act = e.target.closest && e.target.closest('.approval-act');
+    if (act) {
+      const id = act.getAttribute('data-approval');
+      const grant = act.getAttribute('data-grant') === '1';
+      const mark = (v) => { S.approvals = Object.assign({}, S.approvals, { [id]: v }); render(); };
+      mark({ pending: true, grant });
+      API.settleApproval(id, grant).then((res) => {
+        mark({ state: res.state, answer: res.answer || '' });
+        send(grant
+          ? 'Approved ' + id + ': `' + res.tool + '` ran, and answered:\n' + (res.answer || '')
+          : 'Refused ' + id + ': do not run `' + res.tool + '`.');
+      }).catch((err) => mark({ error: String(err && err.message || err) }));
+      return;
+    }
     const btn = e.target.closest && e.target.closest('.copy-btn');
     if (!btn) return;
     const cb = btn.closest('.code-block'); const code = cb && cb.querySelector('code');

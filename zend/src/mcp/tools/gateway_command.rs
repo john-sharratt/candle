@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "gateway_command";
 
@@ -52,6 +53,12 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    run(&OpsCall::of(ctx), args).await
+}
+
+/// The command for `call`, whose caller is checked an Admin, only with
+/// `confirm`.
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let name = match string(args, "name") {
         Ok(n) => n,
         Err(e) => return Answer::error(e),
@@ -66,9 +73,9 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error(e);
     }
     let body = args.get("args").cloned().unwrap_or_else(|| json!({}));
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
+    let reply = match ops::up_as(
+        &call.session,
+        call.headers(),
         Method::POST,
         &path,
         None,

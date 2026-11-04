@@ -72,6 +72,7 @@
         { id: '3', title: 'Add archive endpoint to conversations API', archived: false, updated_ms: now - 36e5, turn_count: 6, history: [] },
         { id: '4', title: 'Explain the tokenizer ChatML decoder', archived: false, updated_ms: now - 72e5, turn_count: 2, history: [] },
         { id: '5', title: 'Scratch notes on WS reconnect backoff', archived: true, updated_ms: now - 18e6, turn_count: 3, history: [] },
+        { id: '6', title: 'Restart the member that will not rejoin', archived: false, updated_ms: now - 24e6, turn_count: 2, history: [] },
       ];
       this.seedProjections(convs[0]);
       convs[0].files = this._seedFiles();
@@ -112,6 +113,23 @@
         return Object.assign({}, seed, { dials });
       }
       const title = seed ? seed.title : 'Conversation';
+      // Conversation 6 holds a call the conversation could not make alone,
+      // answered as the daemon's runner answers one: held for approval.
+      if (String(id) === '6') {
+        return {
+          id: '6', title, dials, archived: false,
+          updated_ms: seed ? seed.updated_ms : Date.now(), turn_count: 2,
+          history: [
+            { role: 'user', content: title },
+            { role: 'assistant', content: '<tool_call>{"name":"cluster_command","arguments":{"member":"a0ac88178cb2b57d","name":"restart"}}</tool_call>' },
+            { role: 'user', content: J([
+              '<tool_response>',
+              '{"error":"ops_refused","detail":"needs_approval 0123456789ab: `cluster_command` was not run — `restart` is a decision. It is held as approval 0123456789ab until a person grants or refuses it."}</tool_response>',
+            ]) },
+            { role: 'assistant', content: 'The restart is held for your approval.' },
+          ],
+        };
+      }
       // Conversation 3 holds a round of two calls to one tool, the second
       // refused — stored as the daemon stores a round of several calls, each
       // result labelled `[i/n name]` ahead of its body.
@@ -577,6 +595,15 @@
     // result is prefilled with progress (`prefill` events) before the answer.
     // The mock keeps no reply running between requests, so there is never one
     // to follow: the stored conversation is always complete.
+    // An approval settled as the daemon settles one: a grant answers what the
+    // held call answered, a refusal only its state.
+    async settleApproval(id, grant) {
+      await delay(80);
+      return grant
+        ? { id, tool: 'cluster_command', state: 'granted', answer: 'Started cluster:a0ac88178cb2b57d:7: `restart` on a0ac88178cb2b57d.', is_error: false }
+        : { id, tool: 'cluster_command', state: 'refused' };
+    },
+
     // With `window.__ZEND_MOCK_DAEMON_TURNS__` set, a reply runs as the
     // daemon runs one (`daemonTurn`) and an unfinished one is followed from
     // its first frame.

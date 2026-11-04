@@ -1,0 +1,79 @@
+name: repo_job_start
+questions:
+- run clippy on the web crate on blackworld
+- build main on whiteworld's agent
+- run the zend tests against the branch I pushed
+- check the branch compiles on the 5090 machine
+- start the cluster crate's tests on a build agent
+- run cargo check on battle-cities main
+- build the release motherd and stage it on blackworld
+- test my pushed branch with four test threads
+- run the conversation crate's hub tests on an agent
+- start a long test run and let me wait on it
+- compile the branch on the machine with the warm build
+- run cargo fmt check on main
+- pin the build to blackworld instead of letting the gateway pick
+- run the latency gate on a quiet machine
+- start a workspace clippy on the pushed branch
+- build the web gateway on whiteworld without deploying it
+category: Commands
+description: 'Start a program — a build, a test run, clippy — on a build agent, a cluster machine that checks out a repository and runs it, against `branch` exactly as origin holds it, so push first. Answers at once with the job''s handle (`build:<node>:<id>`) and the machine; wait on it with job_status and read its output with job_read and job_grep. `program` and `args` are one entry each — `cargo`, `["test", "-p", "web"]` — never a shell line. `node` names the machine (`BlackWorld`) when it should run there; left out, the gateway places it on the agent whose build is warm. `stage` copies a file it builds to that machine''s stage folder once it exits 0, which a deploy uses. Your own uncommitted changes are run with run_command; this runs a branch. Use for: building or testing a pushed branch on a named machine. Triggered by "run clippy on blackworld", "test the branch". Returns the job''s handle and where it runs.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    repo:
+      description: 'The repository, by name: `candle`, `battle-cities`. Required.'
+      maxLength: 64
+      minLength: 1
+      type: string
+    branch:
+      description: 'The branch on origin to run on: `main`, or one you pushed. Required.'
+      maxLength: 200
+      minLength: 1
+      type: string
+    program:
+      description: The program alone, e.g. `cargo` — no arguments, no shell. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    args:
+      description: 'Its arguments, one entry each, exactly as written: `["clippy", "-p", "web", "--tests", "--", "-D", "warnings"]`. Required.'
+      items:
+        type: string
+      maxItems: 48
+      type: array
+    timeout_s:
+      description: Seconds before it and everything it started are killed; 1800 by default.
+      maximum: 14400.0
+      minimum: 1.0
+      type: integer
+    stage:
+      description: A file it builds, relative to the checkout — `target/release/motherd.exe` — copied to that machine's stage folder once it exits 0.
+      maxLength: 200
+      minLength: 1
+      type: string
+    node:
+      description: 'The machine to run on (`BlackWorld`), or its 16-hex-digit node. Left out, the gateway places it.'
+      maxLength: 32
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - branch
+  - program
+  - args
+  title: BuildRequest
+  type: object
+examples:
+- |-
+  run clippy on the web crate on blackworld<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A branch as origin holds it, on a named machine: repo_job_start with node set. It answers a handle at once and I wait on it with job_status.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "repo_job_start", "arguments": {"repo": "candle", "branch": "main", "program": "cargo", "args": ["clippy", "-p", "web", "--tests", "--", "-D", "warnings"], "node": "BlackWorld"}}
+  </tool_call><|projection|>
+- test the branch I pushed<|im_end|>

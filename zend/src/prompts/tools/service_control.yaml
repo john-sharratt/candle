@@ -1,0 +1,61 @@
+name: service_control
+questions:
+- restart motherd on whiteworld
+- bounce the gateway on blackworld
+- start the connector again on whiteworld
+- restart the mcp service that stopped answering
+- bring the stopped daemon back up
+- stop the gateway on the other machine
+- restart the web service after its config changed
+- start motherd again after it was held down
+- give the daemon on blackworld a clean restart on the same binary
+- the connector is wedged, restart it
+- hold whiteworld's motherd down for the disk swap
+- restart keep's mcp service without a trial
+- turn the gateway back on
+- restart the service without deploying anything new
+- the daemon will not come up, start it
+- stop the connector on whiteworld
+category: Commands
+description: 'Restart, start or stop a service — `motherd` (the daemon that runs the models), `web` (the gateway) or `mcp` (the connector) — on one machine, through keep, the supervisor that runs them. A restart runs the installed binary again with no trial; a start lifts a stop. A restart of the motherd this conversation runs on, or of an app''s only ready member, and any stop — which holds the service down until it is started again — are held for a person''s approval and answer `needs_approval` with its id. To put a new build on a machine use service_deploy. Use for: a wedged service, or one held down. Triggered by "restart motherd on whiteworld", "start the gateway again". Returns what keep did, or the approval it is held as.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    host:
+      description: The machine, by name, as cluster_status names it. Required.
+      maxLength: 32
+      minLength: 1
+      type: string
+    service:
+      description: 'The service: `motherd`, `web` or `mcp`. Required.'
+      enum:
+      - motherd
+      - web
+      - mcp
+      type: string
+    action:
+      description: '`restart`, `start` or `stop`. Required.'
+      enum:
+      - restart
+      - start
+      - stop
+      type: string
+  required:
+  - host
+  - service
+  - action
+  title: ControlRequest
+  type: object
+examples:
+- |-
+  the connector on whiteworld stopped answering, restart it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A restart of the installed connector, no new build: service_control with `restart`.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "service_control", "arguments": {"host": "WhiteWorld", "service": "mcp", "action": "restart"}}
+  </tool_call><|projection|>
+- restart the gateway on blackworld<|im_end|>

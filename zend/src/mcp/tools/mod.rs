@@ -37,14 +37,15 @@ use crate::session::ZendSession;
 
 pub use fit::fit;
 
+mod approval_grant;
 mod archive;
 mod attach;
 pub mod cluster_audit;
-mod cluster_command;
+pub mod cluster_command;
 pub mod cluster_logs;
 pub mod cluster_status;
 mod fit;
-mod gateway_command;
+pub mod gateway_command;
 pub mod group_add;
 pub mod group_create;
 pub mod group_default;
@@ -61,17 +62,17 @@ mod journal_link;
 mod journal_note;
 mod journal_read;
 pub mod layer_read;
-mod layer_toggle;
+pub mod layer_toggle;
 pub mod mem;
 pub mod member_status;
 mod nudge;
 mod reply;
 pub mod repo_job;
 pub mod service;
-mod service_control;
+pub mod service_control;
 mod task;
 mod threads;
-mod timeline_delete;
+pub mod timeline_delete;
 pub mod timeline_read;
 pub mod turn_report;
 mod user_context;
@@ -190,6 +191,7 @@ pub fn definitions() -> Value {
         member_status::definition(),
         cluster_command::definition(),
         gateway_command::definition(),
+        approval_grant::definition(),
         repo_job::start::definition(),
         service::deploy::definition(),
         service::status::definition(),
@@ -251,6 +253,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         member_status::NAME => member_status::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
+        approval_grant::NAME => approval_grant::call(ctx, args).await,
         repo_job::start::NAME => repo_job::start::call(ctx, args).await,
         service::deploy::NAME => service::deploy::call(ctx, args).await,
         service::status::NAME => service::status::call(ctx, args).await,
@@ -367,6 +370,7 @@ mod tests {
                 "member_status",
                 "cluster_command",
                 "gateway_command",
+                "approval_grant",
                 "repo_job_start",
                 "service_deploy",
                 "service_status",

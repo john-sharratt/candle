@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "service_control";
 
@@ -49,6 +50,12 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    run(&OpsCall::of(ctx), args).await
+}
+
+/// The action for `call`, whose caller is checked an Admin: a stop only with
+/// `confirm`.
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let (host, service, action) = match (
         string(args, "host"),
         string(args, "service"),
@@ -60,9 +67,9 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = gate(action, args.get("confirm").and_then(Value::as_str)) {
         return Answer::error(e);
     }
-    let reply = ops::to_keep(
-        &ctx.session,
-        &ctx.caller,
+    let reply = ops::keep_with(
+        &call.session,
+        call.headers(),
         Method::POST,
         &format!("/v1/keep/service/{service}/{action}"),
         host,

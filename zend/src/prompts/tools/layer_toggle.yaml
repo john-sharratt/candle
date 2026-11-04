@@ -1,0 +1,45 @@
+name: layer_toggle
+questions:
+- switch the code_reading layer off to test the answer without it
+- turn the repo map back on
+- exclude the dialogue layer from projections for now
+- is the bad answer coming from the review layer, switch it off
+- disable a layer's kill switch
+- bring the excluded layer back into projections
+- stop workers reading the stale analysis layer
+- flip the code_review layer
+- try the question again with that layer excluded
+- re-enable the layer I switched off earlier
+- take the code readings out of the prompt on every member
+- see whether the repo map causes the wrong citations
+- put the layer back before the restart does it anyway
+- toggle the analysis layer on both machines
+- check what happens without the background readings
+- switch off the layer the answer kept quoting
+category: Commands
+description: 'Switch one projection layer off, or back on, on every member. A layer is one kind of analysis kept about the repositories — `repo_map`, `code_reading` — and while it is off, workers do not read from it: use it to test whether a layer''s content is behind a bad answer. Held in memory, so a restart switches it back on. Answers each member''s new state. Use for: ruling a layer in or out of a wrong answer. Triggered by "switch the layer off", "turn the repo map back on". Returns each member''s state.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    name:
+      description: The layer, as layer_read names it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - name
+  title: ToggleRequest
+  type: object
+examples:
+- |-
+  is the code_reading layer behind the wrong answer<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Switch it off on every member, ask again, then switch it back on.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "layer_toggle", "arguments": {"name": "code_reading"}}
+  </tool_call><|projection|>
+- turn the repo map back on<|im_end|>

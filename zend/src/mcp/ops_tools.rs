@@ -11,19 +11,24 @@ use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, Method};
 use host::cluster::up::Reply;
+use host::commands::class::Class;
 use serde_json::Value;
 use tokio::runtime::Handle;
 use web::auth::Role;
 use zend_tools::{run_watch, OpsRunner};
 
+use super::approvals::{self, Approval};
 use super::caller::{Caller, Person};
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
+use super::tools::service::guard;
 use super::tools::{
-    cluster_audit, cluster_logs, cluster_status, job, layer_read, member_status, repo_job, service,
+    cluster_audit, cluster_command, cluster_logs, cluster_status, gateway_command, job, layer_read,
+    layer_toggle, member_status, repo_job, service, service_control, timeline_delete,
     timeline_read, Answer, Ctx,
 };
+use super::workers::now_ms;
 use crate::session::ZendSession;
 
 /// The longest a worker's call waits: it has no client to cut it off, and a
@@ -156,10 +161,16 @@ enum Needs {
     /// It reads as the person the worker works for: the gateway answers only
     /// an Admin's identity.
     ReadsAsPerson,
+    /// What it is depends on the call — a maintenance command's class, a
+    /// service's action, a build's `stage` ([`held_by_call`]) — and it acts
+    /// as the person.
+    ByCall,
+    /// It is a decision, held for a person's approval ([`approvals`]).
+    Decides,
 }
 
-/// The tools a worker of Zen's reaches through [`OpsRunner`], and what each
-/// needs.
+/// The tools a conversation of Zen's reaches through [`OpsRunner`], and what
+/// each needs (`docs/zen_tool_reach.md` §6.1).
 const WORKER_TOOLS: &[(&str, Needs)] = &[
     (job::list::NAME, Needs::ReadsAsPerson),
     (job::status::NAME, Needs::ReadsAsPerson),
@@ -174,7 +185,101 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (member_status::NAME, Needs::ReadsAsPerson),
     (timeline_read::NAME, Needs::ReadsAsPerson),
     (layer_read::NAME, Needs::ReadsAsPerson),
+    (repo_job::start::NAME, Needs::ByCall),
+    (cluster_command::NAME, Needs::ByCall),
+    (service_control::NAME, Needs::ByCall),
+    (layer_toggle::NAME, Needs::Changes),
+    (gateway_command::NAME, Needs::Decides),
+    (timeline_delete::NAME, Needs::Decides),
 ];
+
+/// The Care commands that take a member out of service, which a conversation
+/// of Zen's asks a person for rather than runs: one could be the member it is
+/// running on.
+const OUT_OF_SERVICE: [&str; 3] = ["drain", "resync", "rejoin"];
+
+/// What a call of `tool` with `args` by a conversation `acting` as it does
+/// is, beyond what [`unfit`] checks: run as asked (`Ok(None)`), held for a
+/// person's approval with why (`Ok(Some(why))`), or refused with why.
+fn held_by_call(tool: &str, args: &Value, acting: Acting) -> Result<Option<String>, String> {
+    let changes = |what: &str| {
+        if acting.may_change() {
+            Ok(())
+        } else {
+            Err(format!("{what} is a coder's: this task changes nothing"))
+        }
+    };
+    match tool {
+        repo_job::start::NAME if args.get("stage").is_some() => {
+            changes("a build that stages what it builds").map(|()| None)
+        }
+        cluster_command::NAME => {
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("?");
+            match cluster_command::class_of_call(args)? {
+                Class::Look => Ok(None),
+                Class::Care if OUT_OF_SERVICE.contains(&name) => changes(&format!("`{name}`"))
+                    .map(|()| Some(format!("`{name}` takes a member out of service"))),
+                Class::Care => changes(&format!("`{name}`")).map(|()| None),
+                Class::Decide => Ok(Some(format!("`{name}` is a decision"))),
+                Class::OnTheMachine => Err(format!("`{name}` is done on the member's machine")),
+            }
+        }
+        service_control::NAME => match args.get("action").and_then(Value::as_str) {
+            Some("stop") => Ok(Some("stopping a service is a decision".into())),
+            Some(a @ ("restart" | "start")) => changes(&format!("a service's {a}")).map(|()| None),
+            _ => Err("`action` is restart, stop or start".into()),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The machine and service a call of `tool` with `args` would stop, when the
+/// deploy guard covers it: a deploy, and a service's restart.
+fn guarded(tool: &str, args: &Value) -> Option<(String, String)> {
+    let host = args.get("host").and_then(Value::as_str)?;
+    let service = args.get("service").and_then(Value::as_str)?;
+    let stops = match tool {
+        service::deploy::NAME => true,
+        service_control::NAME => args.get("action").and_then(Value::as_str) == Some("restart"),
+        _ => false,
+    };
+    stops.then(|| (host.to_string(), service.to_ascii_lowercase()))
+}
+
+/// Hold `tool` with `args`, asked by `call`'s conversation, for its person's
+/// approval: what the conversation is told.
+fn hold(call: &OpsCall, tool: &str, args: &Value, why: &str) -> Result<String, String> {
+    let owner = call
+        .caller
+        .as_ref()
+        .map(Caller::key)
+        .ok_or("a call held for approval needs a person to approve it, and none is named")?;
+    let records = call
+        .session
+        .shared_substrate()
+        .ok_or("the model is still loading")?;
+    approvals::ask(&records, &owner, &call.lineage, tool, args, why, now_ms())
+        .map(|a| a.asked())
+        .map_err(|e| {
+            format!("`{tool}` needs a person's approval, and it could not be asked for: {e}")
+        })
+}
+
+/// Run a granted `approval` for `call`: its tool with its arguments as
+/// recorded, the user's `confirm` added, as the granter.
+pub async fn run_granted(approval: &Approval, call: &OpsCall) -> Answer {
+    run(&approval.tool, call, &confirmed(&approval.args)).await
+}
+
+/// `args` as a granted approval runs them: with the user's `confirm`, which
+/// the call was held for.
+pub fn confirmed(args: &Value) -> Value {
+    let mut args = args.clone();
+    if let Some(map) = args.as_object_mut() {
+        map.insert("confirm".into(), Value::String(ops::APPROVED.into()));
+    }
+    args
+}
 
 /// Why a conversation `acting` as it does, run as `role`, for a person or not
 /// (`person`), may not run `tool`.
@@ -191,7 +296,7 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
         Needs::Changes if !acting.may_change() => {
             Some(format!("`{tool}` is a coder's: this task changes nothing"))
         }
-        Needs::ReadsAsPerson if !person => Some(match acting {
+        Needs::ReadsAsPerson | Needs::ByCall | Needs::Decides if !person => Some(match acting {
             Acting::Dialogue => format!(
                 "`{tool}` reads the cluster as the person this conversation is with, and no \
                  signed-in person's message started this turn"
@@ -222,6 +327,11 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         repo_job::start::NAME => repo_job::start::run(call, args).await,
         service::deploy::NAME => service::deploy::run(call, args).await,
         service::status::NAME => service::status::run(call, args).await,
+        cluster_command::NAME => cluster_command::run(call, args).await,
+        service_control::NAME => service_control::run(call, args).await,
+        layer_toggle::NAME => layer_toggle::run(call, args).await,
+        gateway_command::NAME => gateway_command::run(call, args).await,
+        timeline_delete::NAME => timeline_delete::run(call, args).await,
         other => Answer::error(format!("`{other}` is not an operations tool")),
     }
 }
@@ -297,6 +407,14 @@ impl OpsRunner for OpsTools {
         if let Some(why) = unfit(tool, role, acting, person.is_some()) {
             return Err(why);
         }
+        let decides = WORKER_TOOLS
+            .iter()
+            .any(|(name, needs)| *name == tool && *needs == Needs::Decides);
+        let mut held = if decides {
+            Some(format!("`{tool}` is a decision"))
+        } else {
+            held_by_call(tool, &args, acting)?
+        };
         let progress = run_watch::current().map(|watch| -> Arc<dyn Fn(String) + Send + Sync> {
             Arc::new(move |line| watch(line))
         });
@@ -308,6 +426,19 @@ impl OpsRunner for OpsTools {
             ceiling: WORKER_WAIT_S,
             worker: true,
         };
+        // **A step the guard refuses becomes a person's decision**, not a dead
+        // end: a deploy or restart of the motherd this conversation runs on,
+        // or of an app's only ready member (`tools/service/guard.rs`).
+        if held.is_none() {
+            if let Some((host, service)) = guarded(tool, &args) {
+                if let Err(why) = runtime.block_on(guard::check(&call, &host, &service)) {
+                    held = Some(why);
+                }
+            }
+        }
+        if let Some(why) = held {
+            return Err(hold(&call, tool, &args, &why)?);
+        }
         let answer = runtime.block_on(run(tool, &call, &args));
         if answer.is_error {
             Err(answer.text)
@@ -384,6 +515,84 @@ mod tests {
             unfit(cluster_status::NAME, Role::User, Acting::Dialogue, true)
                 .unwrap()
                 .contains("Admin")
+        );
+    }
+
+    /// **Each call is run, held for a person, or refused, as §6.1's table
+    /// says**: a Look runs for anyone; a Care runs for a conversation that may
+    /// change things; a Decide, a stop, and a step that takes a member out of
+    /// service are held; the machine's own switches are refused.
+    #[test]
+    fn each_call_runs_is_held_or_is_refused_by_its_class() {
+        use serde_json::json;
+        let cmd = |name: &str| json!({"member": "a0ac88178cb2b57d", "name": name});
+        assert_eq!(
+            held_by_call(cluster_command::NAME, &cmd("audit"), REVIEWER),
+            Ok(None)
+        );
+        assert_eq!(
+            held_by_call(cluster_command::NAME, &cmd("compact"), CHAT),
+            Ok(None)
+        );
+        assert!(
+            held_by_call(cluster_command::NAME, &cmd("compact"), RESEARCHER)
+                .unwrap_err()
+                .contains("coder")
+        );
+        assert_eq!(
+            held_by_call(cluster_command::NAME, &cmd("drain"), CODER),
+            Ok(Some("`drain` takes a member out of service".into()))
+        );
+        assert_eq!(
+            held_by_call(cluster_command::NAME, &cmd("restart"), Acting::Dialogue),
+            Ok(Some("`restart` is a decision".into()))
+        );
+        assert!(held_by_call(cluster_command::NAME, &cmd("offline"), CODER).is_err());
+        let control =
+            |action: &str| json!({"host": "WhiteWorld", "service": "mcp", "action": action});
+        assert_eq!(
+            held_by_call(service_control::NAME, &control("restart"), CODER),
+            Ok(None)
+        );
+        assert_eq!(
+            held_by_call(service_control::NAME, &control("stop"), CODER),
+            Ok(Some("stopping a service is a decision".into()))
+        );
+        let build =
+            json!({"repo": "candle", "branch": "main", "program": "cargo", "args": ["check"]});
+        assert_eq!(
+            held_by_call(repo_job::start::NAME, &build, REVIEWER),
+            Ok(None)
+        );
+        let mut staged = build.clone();
+        staged["stage"] = json!("target/release/motherd.exe");
+        assert!(held_by_call(repo_job::start::NAME, &staged, REVIEWER).is_err());
+        assert_eq!(
+            held_by_call(repo_job::start::NAME, &staged, CODER),
+            Ok(None)
+        );
+    }
+
+    /// **A deploy and a restart are the guard's; a granted call carries the
+    /// user's `confirm`.**
+    #[test]
+    fn the_guard_covers_what_stops_a_service_and_a_grant_confirms() {
+        use serde_json::json;
+        let restart = json!({"host": "BlackWorld", "service": "motherd", "action": "restart"});
+        assert_eq!(
+            guarded(service_control::NAME, &restart),
+            Some(("BlackWorld".into(), "motherd".into()))
+        );
+        let start = json!({"host": "BlackWorld", "service": "motherd", "action": "start"});
+        assert_eq!(guarded(service_control::NAME, &start), None);
+        let deploy = json!({"host": "WhiteWorld", "service": "motherd"});
+        assert_eq!(
+            guarded(service::deploy::NAME, &deploy),
+            Some(("WhiteWorld".into(), "motherd".into()))
+        );
+        assert_eq!(
+            confirmed(&json!({"name": "restart"})),
+            json!({"name": "restart", "confirm": ops::APPROVED})
         );
     }
 

@@ -287,6 +287,16 @@
       };
     },
 
+    // POST /v1/approvals/{id}/grant|refuse — settle a call the conversation
+    // was not allowed to make alone (docs/zen_tool_reach.md §5). A grant runs
+    // it, as the signed-in person, and answers what it answered.
+    async settleApproval(id, grant) {
+      const resp = await fetch('/v1/approvals/' + enc(id) + (grant ? '/grant' : '/refuse'), { method: 'POST' });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error || ('HTTP ' + resp.status));
+      return body;
+    },
+
     // GET /v1/conversations/{id}/live — the reply in flight, from its first
     // frame, then live until it ends. For a page that opened (or reloaded, or
     // lost its connection) while the daemon was still answering: the turn runs

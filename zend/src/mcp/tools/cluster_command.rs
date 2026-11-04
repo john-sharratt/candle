@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use super::job::JobHandle;
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of, why};
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "cluster_command";
 
@@ -102,7 +103,27 @@ pub fn render_started(member: &str, answer: &Value) -> String {
     }
 }
 
-async fn rollout(ctx: &Ctx, args: &Value, confirm: Option<&str>) -> Answer {
+/// What a call of this tool with `args` is: Look, Care or Decide — a rollout
+/// with its build typed in `args.confirm` starts one, and without it only
+/// answers the plan — or why it cannot be sent at all.
+pub fn class_of_call(args: &Value) -> Result<Class, String> {
+    let name = string(args, "name")?;
+    if name == "rollout" {
+        let typed = args.pointer("/args/confirm").and_then(Value::as_str);
+        return Ok(if typed.is_some() {
+            Class::Decide
+        } else {
+            Class::Look
+        });
+    }
+    match class_of(name) {
+        None => Err(format!("there is no maintenance command `{name}`")),
+        Some(Class::OnTheMachine) => gate(name, None).map(|_| Class::OnTheMachine),
+        Some(class) => Ok(class),
+    }
+}
+
+async fn rollout(call: &OpsCall, args: &Value, confirm: Option<&str>) -> Answer {
     let typed = args.get("confirm").and_then(Value::as_str);
     // The plan changes nothing; starting it is the decision.
     if typed.is_some() {
@@ -110,9 +131,9 @@ async fn rollout(ctx: &Ctx, args: &Value, confirm: Option<&str>) -> Answer {
             return Answer::error(e);
         }
     }
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
+    let reply = match ops::up_as(
+        &call.session,
+        call.headers(),
         Method::POST,
         "/gateway/upgrade/rollout",
         None,
@@ -144,6 +165,12 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    run(&OpsCall::of(ctx), args).await
+}
+
+/// The command for `call`, whose caller is checked an Admin: a Decide one only
+/// with `confirm` (`docs/claude_zend_gateway.md` §8.2).
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let name = match string(args, "name") {
         Ok(n) => n,
         Err(e) => return Answer::error(e),
@@ -154,7 +181,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error("`args` is an object of the command's own arguments");
     }
     if name == "rollout" {
-        return rollout(ctx, &body, confirm).await;
+        return rollout(call, &body, confirm).await;
     }
     if let Err(e) = gate(name, confirm) {
         return Answer::error(e);
@@ -163,9 +190,9 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
-    let reply = match ops::up(
-        &ctx.session,
-        &ctx.caller,
+    let reply = match ops::up_as(
+        &call.session,
+        call.headers(),
         Method::POST,
         &format!("/v1/cluster/command/{name}"),
         Some(&member),
@@ -194,6 +221,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_def;
 
     /// **A Decide command is refused without the user's approval**, a Look or
     /// a Care runs as asked, and the machine's own switch never goes through.
@@ -212,6 +240,51 @@ mod tests {
             gate("frobnicate", None).unwrap_err(),
             "there is no maintenance command `frobnicate`"
         );
+    }
+
+    /// **Zen's `cluster_command` offers exactly the commands this tool sends**:
+    /// its YAML's enum is the members' own table less the machine's switches,
+    /// so a command added there is a test failure here until Zen offers it.
+    #[test]
+    fn zens_definition_offers_the_commands_this_tool_sends() {
+        let zen = tool_def::find(NAME).expect("cluster_command is one of Zen's tools");
+        let mut offered: Vec<String> = zen.parameters["properties"]["name"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let mut sent: Vec<String> = definition()["inputSchema"]["properties"]["name"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        offered.sort();
+        sent.sort();
+        assert_eq!(offered, sent);
+    }
+
+    /// **A call is classed by its command**, and a rollout by whether its
+    /// build is typed: the plan only reads, the start is the decision.
+    #[test]
+    fn a_call_is_classed_by_its_command() {
+        assert_eq!(class_of_call(&json!({"name": "audit"})), Ok(Class::Look));
+        assert_eq!(class_of_call(&json!({"name": "drain"})), Ok(Class::Care));
+        assert_eq!(
+            class_of_call(&json!({"name": "restart"})),
+            Ok(Class::Decide)
+        );
+        assert_eq!(
+            class_of_call(&json!({"name": "rollout", "args": {"app": "zend"}})),
+            Ok(Class::Look)
+        );
+        assert_eq!(
+            class_of_call(&json!({"name": "rollout", "args": {"confirm": "4419-6ecd6158"}})),
+            Ok(Class::Decide)
+        );
+        assert!(class_of_call(&json!({"name": "offline"})).is_err());
+        assert!(class_of_call(&json!({"name": "frobnicate"})).is_err());
     }
 
     #[test]

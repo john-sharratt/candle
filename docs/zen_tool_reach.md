@@ -173,20 +173,25 @@ A call that needs approval does not run. It answers `needs_approval {id}`, and
 the turn carries on or ends with a question, as the work allows. **Who grants
 it depends on who asked:**
 
-- **A task or a chat** (Claude's): the `question` state of
-  `docs/claude_zend_gateway.md` §6.2 carries the approval's id and call.
-  Claude asks the person. With their yes, Claude calls `approval_grant {id}`
-  (**new**, `/mcp`, `confirm: "approved by the user"`), which runs the recorded
-  call as the person, unchanged, and answers its result to the worker's next
-  turn. The `confirm` gate of §8.2 moves onto `approval_grant`. The call
-  itself is unchanged from today's `cluster_command`.
-- **A dialogue** (the person is already there): zend's UI shows the approval
-  under Zen's message, with the call laid out, an **Approve** button and a
-  **Refuse** button (**new**). The button posts to
-  `POST /v1/approvals/:id/grant` from the person's own signed-in session. The
-  route checks that the caller is the conversation's person and an Admin, then
-  runs the call. Typing "yes" grants nothing: an approval is a request the
-  person's browser makes, which no text in a turn can produce.
+- **A task or a chat** (Claude's): the worker's answer, or its question
+  (`docs/claude_zend_gateway.md` §6.2), carries the approval's id and call.
+  Claude asks the person. With their yes, Claude calls
+  `approval_grant {id, confirm}` (`/mcp`, `confirm: "approved by the user"`,
+  `zend/src/mcp/tools/approval_grant.rs`), which runs the recorded call as
+  Claude's caller, unchanged, and answers what it answered; Claude passes that
+  to the worker with `repo_task_reply`. The `confirm` gate of §8.2 stands on
+  `approval_grant` for a held call, and on the Decide tools Claude calls
+  itself.
+- **A dialogue** (the person is already there): zend's UI draws the approval
+  under the call that was held, with the call laid out, an **Approve** button
+  and a **Refuse** button (`approvalBox`, `zend/web/index.html`). A button
+  posts to `POST /v1/approvals/:id/grant` or `…/refuse` from the person's own
+  signed-in session (`zend/src/api/approvals.rs`). The route settles only an
+  approval kept under the caller's own key, so another person's id names
+  nothing, and runs the call as them. What it answered is then sent to the
+  dialogue as the person's next message, so the model hears the outcome.
+  Typing "yes" grants nothing: an approval is a request the person's browser
+  makes, which no text in a turn can produce.
 
 **What an approval cannot do:**
 
@@ -215,6 +220,7 @@ a column for each kind. A dialogue run by an Admin counts as a coder:
 | `service_deploy`, `job_cancel` | Care | ✓ | — | ✓ (D5) | ✓ |
 | `cluster_command`, Look class | Look | ✓ | ✓ | ✓ | ✓ |
 | `cluster_command`, Care class | Care | ✓ | — | ✓ | ✓ |
+| `cluster_command` `drain`, `resync`, `rejoin` | takes a member out of service | approval (§5) | — | approval | approval |
 | `service_control` `restart`, `start` | Care | ✓ | — | ✓ | ✓ |
 | `layer_toggle` | Care | ✓ | — | ✓ | ✓ |
 | `cluster_command` Decide, `service_control stop`, `gateway_command`, `timeline_delete` | Decide | approval (§5) | approval | approval | approval |
@@ -224,13 +230,15 @@ a column for each kind. A dialogue run by an Admin counts as a coder:
   Claude's behalf, with Claude's role. Holding it to reads made Claude start a
   task for a one-line restart. Researchers and reviewers stay read-only: what
   they read is untrusted, and they have no business changing what runs.
-- **The deploy guard covers every Care step that stops a service.**
+- **The deploy guard covers every step that stops a service.**
   `service_deploy` refuses a trial of motherd on the machine running the
-  worker, and where an app has no other ready member
-  (`zend/src/mcp/tools/service/guard.rs`). The same guard covers
-  `service_control restart`, a `cluster_command` `drain`, and a `resync` or
-  `rejoin` of the worker's own member (**new**). A refusal by the guard becomes
-  an approval (§5), not a dead end.
+  conversation, and where an app has no other ready member
+  (`zend/src/mcp/tools/service/guard.rs`); the same guard covers a
+  `service_control restart`. A refusal by the guard becomes an approval (§5),
+  not a dead end. The Care commands that take a member out of service —
+  `drain`, `resync`, `rejoin` — are held for approval whichever member they
+  name, since the member could be the one the conversation runs on
+  (`OUT_OF_SERVICE`, `zend/src/mcp/ops_tools.rs`).
 - **`repo_job_start` takes `node`.** So Zen can pin a machine, as Claude does,
   with the rule kept in the tool: no job on a machine whose agent is
   `standby`, unless named (`docs/jobs.md`).

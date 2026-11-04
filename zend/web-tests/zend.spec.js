@@ -120,6 +120,15 @@ test.describe('1.2 chat rendering', () => {
     await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'journal_note' })).toHaveCount(0);
     await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'read_file' })).toBeVisible();
   });
+  test('a held call draws an approval, and approving it runs it and tells the conversation', async ({ page }) => {
+    await boot(page, { conv: '6' });
+    const box = page.locator('.approval').first();
+    await expect(box).toBeVisible();
+    await expect(box.locator('.approval-head')).toHaveText('Needs your approval');
+    await box.locator('.approval-act.grant').click();
+    await expect(box.locator('.approval-state')).toHaveText('Approved');
+    await expect(page.locator('[data-msg]').last()).toBeVisible();
+  });
   test('code copy button copies', async ({ page }) => {
     await boot(page, { conv: '1' });
     await page.locator('.copy-btn').first().click();

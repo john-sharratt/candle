@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
+use crate::mcp::ops_tools::OpsCall;
 
 pub const NAME: &str = "layer_toggle";
 
@@ -74,21 +75,26 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    run(&OpsCall::of(ctx), args).await
+}
+
+/// The toggle for `call`, whose caller is checked an Admin.
+pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let name = match string(args, "name") {
         Ok(n) => n,
         Err(e) => return Answer::error(e),
     };
-    if ctx.session.cluster_member().is_none() {
-        return match ctx.session.toggle_projection_layer(name) {
+    if call.session.cluster_member().is_none() {
+        return match call.session.toggle_projection_layer(name) {
             Some(disabled) => Answer::ok(single(name, disabled)),
             None => Answer::error(format!(
                 "there is no layer `{name}`, or the model is still loading"
             )),
         };
     }
-    let reply = ops::up(
-        &ctx.session,
-        &ctx.caller,
+    let reply = ops::up_as(
+        &call.session,
+        call.headers(),
         Method::POST,
         &format!("/v1/substrate/zend/layer/{name}/toggle"),
         None,
