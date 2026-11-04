@@ -23,6 +23,7 @@ zend       = { path = "../zend" }
 npcd       = { path = "../npcd" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 web      = { path = "../web" }
 

@@ -1,0 +1,79 @@
+name: image_edit
+questions:
+- add a red door to that picture
+- make the drawing brighter
+- resize the picture to 512 wide
+- rotate the image a quarter turn
+- remove the background from the portrait
+- mirror the picture left to right
+- turn the lighthouse picture into night
+- take the boat out of the picture
+- make the colours less saturated
+- redraw it with the cat wearing a hat
+- give the picture more contrast
+- make a png of it with a transparent background
+- flip the image upside down
+- change the sky to a sunset
+- shrink the picture for a thumbnail
+- edit the last picture to add snow
+category: Bots
+description: 'Change a picture an earlier draw or edit answered with, by its link or id in `image`. `mode`: `prompt` (the default) redraws it with `prompt` saying the whole picture as it should end up, the change in it; `resize` to `width` or `height`; `adjust` brightness, contrast or saturation; `rotate` by `rotate` degrees (90, 180, 270) and `flip` (horizontal or vertical); `remove_background`, always a png. `format` is `jpeg` or `png`. Answers a link to the new file. Use for: adding or removing a detail, resizing, rotating, recolouring a picture. Triggered by "add a", "make it brighter", "remove the background". Returns the new picture''s link.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    image:
+      description: The picture to edit, the link or image id an earlier answer gave. Required.
+      minLength: 1
+      type: string
+    mode:
+      description: '`prompt` (the default), `resize`, `adjust`, `rotate` or `remove_background`.'
+      enum:
+      - prompt
+      - resize
+      - adjust
+      - rotate
+      - remove_background
+      type: string
+    prompt:
+      description: 'prompt: the whole picture as it should end up, with the change in it.'
+      type: string
+    width:
+      description: 'prompt or resize: width in pixels.'
+      minimum: 1.0
+      type: integer
+    height:
+      description: 'prompt or resize: height in pixels.'
+      minimum: 1.0
+      type: integer
+    rotate:
+      description: 'rotate: degrees clockwise, 90, 180 or 270.'
+      minimum: 0.0
+      type: integer
+    flip:
+      description: 'rotate: `horizontal` or `vertical`.'
+      enum:
+      - horizontal
+      - vertical
+      type: string
+    format:
+      description: '`jpeg` (the default) or `png`.'
+      enum:
+      - jpeg
+      - png
+      type: string
+  required:
+  - image
+  title: EditRequest
+  type: object
+examples:
+- |-
+  add a red door to the lighthouse picture<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A prompt edit names the whole picture as it should end up.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "image_edit", "arguments": {"image": "https://bot.tokera.com/v1/image/ab12.jpg", "prompt": "A lighthouse on a rocky point at dusk with a red door, its beam on a calm sea"}}
+  </tool_call><|projection|>
+- make it brighter<|im_end|>

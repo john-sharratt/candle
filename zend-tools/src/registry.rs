@@ -1057,6 +1057,11 @@ use crate::tools::{
         CLUSTER_COMMAND, GATEWAY_COMMAND, LAYER_TOGGLE, REPO_JOB_START, SERVICE_CONTROL,
         TIMELINE_DELETE,
     },
+    ops::bots::{
+        BOT_CHANNEL_POST, BOT_CHANNEL_READ, BOT_DISCORD_READ, BOT_LIST, BOT_MESSAGE_READ,
+        BOT_MESSAGE_SEND, BOT_MISSION_CANCEL, BOT_MISSION_GIVE, BOT_MISSION_READ, BOT_MISSION_STEP,
+        BOT_THREAD_READ, IMAGE_EDIT, IMAGE_GENERATE,
+    },
     ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS, MEMBER_STATUS},
     ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
     ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
@@ -1320,6 +1325,22 @@ fn register_all() -> &'static [RegisteredTool] {
         LAYER_TOGGLE.requires(NET_EXEC_DISK),
         GATEWAY_COMMAND.requires(NET_EXEC_DISK),
         TIMELINE_DELETE.requires(NET_EXEC_DISK),
+        // The bots and the pictures (13) — npcd's own tools, reached through
+        // the daemon as the conversation's person. Reading a bot and drawing
+        // a picture reach the network; managing a bot acts as a command does.
+        BOT_LIST.requires(NET),
+        BOT_MISSION_READ.requires(NET),
+        BOT_MESSAGE_READ.requires(NET),
+        BOT_CHANNEL_READ.requires(NET),
+        BOT_DISCORD_READ.requires(NET),
+        BOT_THREAD_READ.requires(NET),
+        IMAGE_GENERATE.requires(NET),
+        IMAGE_EDIT.requires(NET),
+        BOT_MISSION_GIVE.requires(NET_EXEC_DISK),
+        BOT_MISSION_STEP.requires(NET_EXEC_DISK),
+        BOT_MISSION_CANCEL.requires(NET_EXEC_DISK),
+        BOT_MESSAGE_SEND.requires(NET_EXEC_DISK),
+        BOT_CHANNEL_POST.requires(NET_EXEC_DISK),
         // Tasks (3) — a conversation's, never a task's: a task's grammar
         // holds none of them. A task runs programs and pushes as its starter.
         REPO_TASK_START.requires(NET_EXEC_DISK),

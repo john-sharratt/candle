@@ -1,0 +1,68 @@
+name: image_generate
+questions:
+- draw a picture of a lighthouse at dusk
+- generate an image of the moon base's command room
+- make a poster for the market day
+- paint a watercolour of the garden plans
+- create an illustration for the blog post
+- draw the courier bot as a character portrait
+- generate a logo idea for the project
+- make a square picture of a cat reading
+- draw a wide banner of the city skyline
+- picture the house extension finished
+- render a png of the diagram as an illustration
+- draw the same picture again with that seed
+- make an image of a robot gardener
+- generate a birthday card picture
+- draw a map-like picture of the world
+- create a photo-style image of the new machine
+category: Bots
+description: 'Draw a picture with the user''s own image model. `prompt` says what to draw; `width` and `height` are pixels, multiples of 16 up to 1024 (1024 square by default); `steps` 12 by default; `seed` repeats a draw; `format` is `jpeg` (smaller) or `png` (lossless). Answers a link to the file: the person may not see the picture otherwise, so give them the link. Change it afterwards with image_edit, by that link. Use for: any request to draw, paint or create a picture. Triggered by "draw", "make a picture of". Returns the picture''s link.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    prompt:
+      description: What to draw. Required.
+      minLength: 1
+      type: string
+    width:
+      description: Width in pixels, a multiple of 16, at most 1024.
+      maximum: 1024.0
+      minimum: 16.0
+      type: integer
+    height:
+      description: Height in pixels, a multiple of 16, at most 1024.
+      maximum: 1024.0
+      minimum: 16.0
+      type: integer
+    steps:
+      description: Denoise steps; 12 by default.
+      maximum: 100.0
+      minimum: 1.0
+      type: integer
+    seed:
+      description: Seed, for repeating a draw; random when left out.
+      minimum: 0.0
+      type: integer
+    format:
+      description: '`jpeg` (the default) or `png`.'
+      enum:
+      - jpeg
+      - png
+      type: string
+  required:
+  - prompt
+  title: DrawRequest
+  type: object
+examples:
+- |-
+  draw a lighthouse at dusk<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A picture goes to the image model; the answer is a link to give the person.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "image_generate", "arguments": {"prompt": "A lighthouse on a rocky point at dusk, its beam on a calm sea, warm last light"}}
+  </tool_call><|projection|>
+- make a picture of it<|im_end|>

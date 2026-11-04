@@ -1,0 +1,44 @@
+name: bot_discord_read
+questions:
+- what has Maker posted on Discord
+- did the bot's Discord bridge send anything
+- what did the bot read from the Discord server
+- is the bot's Discord bridge working
+- show what the bot said in the Discord channels
+- what messages did the bot pick up on Discord
+- did the bot answer the Discord ping
+- check the Discord activity of the courier bot
+- has the bridge mirrored the world channel to Discord
+- what did the bot post to the guild today
+- why is the bot silent on Discord
+- show the bot's Discord outbound messages
+- did the Discord bridge drop any messages
+- read the bot's recent Discord history
+- which Discord channels does the bot speak in
+- has the bot reacted to anyone on Discord
+category: Bots
+description: 'What a bot''s Discord bridge has done: what it posted and what it read, channel by channel. `bot` is the bot''s id. Only the bot''s owner or an admin reads it. Use for: checking a bot''s Discord activity, or why it is silent there. Triggered by "what has the bot posted on Discord", "is the bridge working". Returns the bridge''s recent activity.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - bot
+  title: BotRequest
+  type: object
+examples:
+- |-
+  has Maker posted anything on Discord<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The bridge's record says what it posted.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_discord_read", "arguments": {"bot": "c3f1a07e"}}
+  </tool_call><|projection|>
+- check the bot's Discord bridge<|im_end|>

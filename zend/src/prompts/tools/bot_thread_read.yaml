@@ -1,0 +1,52 @@
+name: bot_thread_read
+questions:
+- which handset threads does Maker have
+- read the bot's thread with the archivist
+- what has the courier been texting other bots
+- show the last twenty messages of thread th3
+- who does the bot talk to on its handset
+- list the bot's conversations with other characters
+- read the bot's thread with Yen
+- what did the bot and Rook agree on
+- show the bot's handset inbox
+- open the thread the bot started this morning
+- what is in the bot's private threads
+- read more of that handset thread
+- which characters has the bot messaged
+- show the last few messages in the bot's group thread
+- how does the bot talk to the other bots
+- list the threads on the courier's handset
+category: Bots
+description: 'A bot''s handset threads — every conversation it holds with people and other bots — or, with `thread` (an id like `th3`, or a name), that thread''s last `limit` messages (20 by default). `bot` is the bot''s id. Only the bot''s owner or an admin reads it. Use for: seeing whom a bot talks to and what was said. Triggered by "which threads does the bot have", "read its thread with". Returns the threads, or one thread''s messages.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    thread:
+      description: A thread's id (`th3`) or name; leave out to list them.
+      type: string
+    limit:
+      description: How many of its last messages to show; 20 when left out.
+      maximum: 200.0
+      minimum: 1.0
+      type: integer
+  required:
+  - bot
+  title: ThreadReadRequest
+  type: object
+examples:
+- |-
+  who does Maker talk to on its handset<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Without a thread the tool lists them.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_thread_read", "arguments": {"bot": "c3f1a07e"}}
+  </tool_call><|projection|>
+- read that handset thread<|im_end|>

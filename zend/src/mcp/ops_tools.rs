@@ -20,6 +20,7 @@ use zend_tools::{run_watch, OpsRunner};
 
 use super::approvals::{self, Approval};
 use super::caller::{Caller, Person};
+use super::npcd_tools;
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
@@ -177,6 +178,13 @@ enum Needs {
     /// It starts or steers a task, as the person: a dialogue's or a chat's,
     /// since a task's own tool list never holds it (`zen_tasks`).
     Starts,
+    /// npcd's: reads a bot or a world, or draws a picture, as the person
+    /// (`npcd_tools`), which npcd checks itself.
+    Bots,
+    /// npcd's: manages a bot, as the person — a conversation that may change
+    /// things; one that says something others read, from a read-out turn, is
+    /// held for the person's approval.
+    BotActs,
 }
 
 /// The tools a conversation of Zen's reaches through [`OpsRunner`], and what
@@ -207,6 +215,19 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (zen_tasks::START, Needs::Starts),
     (zen_tasks::REPLY, Needs::Starts),
     (zen_tasks::NUDGE, Needs::Starts),
+    ("bot_list", Needs::Bots),
+    ("bot_mission_read", Needs::Bots),
+    ("bot_message_read", Needs::Bots),
+    ("bot_channel_read", Needs::Bots),
+    ("bot_discord_read", Needs::Bots),
+    ("bot_thread_read", Needs::Bots),
+    ("image_generate", Needs::Bots),
+    ("image_edit", Needs::Bots),
+    ("bot_mission_give", Needs::BotActs),
+    ("bot_mission_step", Needs::BotActs),
+    ("bot_mission_cancel", Needs::BotActs),
+    ("bot_message_send", Needs::BotActs),
+    ("bot_channel_post", Needs::BotActs),
 ];
 
 /// The Care commands that take a member out of service, which a conversation
@@ -305,7 +326,10 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
     };
     // The memory is every member's, not an Admin's: a person writes in their
     // own group, as the person the conversation is with.
-    if matches!(needs, Needs::Memory | Needs::Starts) {
+    if matches!(
+        needs,
+        Needs::Memory | Needs::Starts | Needs::Bots | Needs::BotActs
+    ) {
         return match (person, role.at_least(Role::User)) {
             (false, _) => Some(format!(
                 "`{tool}` acts as the person this conversation is with, and it names none"
@@ -313,6 +337,9 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
             (true, false) => Some(format!(
                 "`{tool}` is a member's, and this conversation runs as `{role}`"
             )),
+            (true, true) if *needs == Needs::BotActs && !acting.may_change() => {
+                Some(format!("`{tool}` is a coder's: this task changes nothing"))
+            }
             (true, true) => None,
         };
     }
@@ -367,6 +394,9 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         zen_tasks::START => zen_tasks::start(call, args),
         zen_tasks::REPLY => zen_tasks::reply(call, args),
         zen_tasks::NUDGE => zen_tasks::nudge(call, args),
+        bot if npcd_tools::READS.contains(&bot) || npcd_tools::ACTS.contains(&bot) => {
+            npcd_tools::call(call, bot, args).await
+        }
         other => Answer::error(format!("`{other}` is not an operations tool")),
     }
 }
@@ -514,6 +544,12 @@ impl OpsRunner for OpsTools {
                  by everyone in the group: a person checks it first"
                     .into(),
             )
+        } else if npcd_tools::SAYS.contains(&tool) && self.is_read_out(caller) {
+            Some(
+                "this turn read content from outside, and what it says here others read: a \
+                 person checks it first"
+                    .into(),
+            )
         } else {
             held_by_call(tool, &args, acting)?
         };
@@ -588,7 +624,7 @@ mod tests {
         assert!(unfit(job::cancel::NAME, Role::Admin, REVIEWER, true)
             .unwrap()
             .contains("coder"));
-        assert!(unfit("bot_list", Role::Admin, CODER, true)
+        assert!(unfit("web_fetch", Role::Admin, CODER, true)
             .unwrap()
             .contains("not an operations tool"));
     }

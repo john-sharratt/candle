@@ -146,13 +146,17 @@ read Claude made over the LAN on 2026-11-03.
 - The bots' read tools: `bot_list`, `bot_message_read`, `bot_channel_read`,
   `bot_discord_read`, `bot_mission_read`, `bot_thread_read`. These are npcd's,
   served by its MCP server at `/v1/mcp` behind the aggregator
-  (`docs/mcp_app.md`). zend reaches them by **new** forwarding: `OpsCall::mcp`
-  sends one `tools/call` to npcd's `/v1/mcp` through the gateway, as the
-  caller, the way the aggregator calls a backend. So npcd stays the only
-  implementation, and its role checks stand. Each becomes a zend-tools tool
-  whose request is the npcd tool's own schema, fetched from npcd's
-  `tools/list` when the daemon binds its runner. A schema npcd changes reaches
-  Zen at the next bind, with no zend change.
+  (`docs/mcp_app.md`). zend reaches them by forwarding
+  (`zend/src/mcp/npcd_tools.rs`): one `tools/call` to npcd's `/v1/npc/mcp`, up
+  this member's cluster socket as the conversation's person, in the 2026-07-28
+  protocol, the way the aggregator calls a backend. So npcd stays the only
+  implementation, and its role checks stand. Each is a zend-tools tool whose
+  arguments are written in zend's catalog as a subset of the npcd tool's own
+  schema (the image tools leave out a crop box and an admin's authorization),
+  and `motherd/tests/bot_schemas.rs` — which links both — holds them inside
+  npcd's: every argument Zen offers is one npcd takes, of the same type, and
+  the two require the same. Reading a bot needs a member (User), not an
+  Admin.
 
 ## 5. Asking a person: the approval
 
@@ -345,7 +349,7 @@ class: a coder's or an Admin dialogue's. `bot_message_send` and
 turn (§6.2) each needs an approval, for the same reason a memory write does.
 
 `image_generate` and `image_edit` are forwarded the same way, Look-class for
-any Admin conversation: they make a picture and change nothing.
+any member's conversation: they make a picture and change nothing.
 `image_upload` takes a file from the caller's machine, which a Zen turn does
 not have, so it is not offered.
 

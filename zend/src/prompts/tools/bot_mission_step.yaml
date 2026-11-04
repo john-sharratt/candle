@@ -1,0 +1,57 @@
+name: bot_mission_step
+questions:
+- sign off the first step of Maker's mission
+- mark the delivery step as achieved
+- the bot couldn't reach the ward, mark that step thwarted
+- add a step to the courier's mission
+- tick off the step the bot finished
+- add a stop at the dispatch room to the bot's errand
+- record that the bot failed the patrol step
+- the bot did the pickup, sign it off
+- extend the mission with one more step
+- mark the step done and add the next one
+- note the step was thwarted by the locked door
+- confirm the bot reached the plant room
+- add a final report step to the mission
+- sign off the bot's greeting step
+- the step went well, mark it achieved
+- put another task on the bot's list
+category: Bots
+description: 'Sign off a step of a bot''s mission — `done` names it, `outcome` says how it went, `achieved` (the default) or `thwarted` — or add one with `add`, or both. `bot` is the bot''s id. Use for: telling a bot a step is settled, or extending its mission. Triggered by "sign off the step", "add a step". Returns the mission as it now stands.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    done:
+      description: The step to sign off.
+      type: string
+    outcome:
+      description: How it went, `achieved` (the default) or `thwarted`.
+      enum:
+      - achieved
+      - thwarted
+      type: string
+    add:
+      description: A step to add.
+      type: string
+  required:
+  - bot
+  title: StepRequest
+  type: object
+examples:
+- |-
+  Maker got the valve, sign that off<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The step is done and achieved.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_mission_step", "arguments": {"bot": "c3f1a07e", "done": "take the coolant valve"}}
+  </tool_call><|projection|>
+- add a step to the mission<|im_end|>

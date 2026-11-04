@@ -1,0 +1,58 @@
+name: bot_mission_give
+questions:
+- give Maker a mission to deliver the parcel to the ward
+- send the courier to the plant room and back
+- ask the archivist to catalogue the north studio
+- give the bot a job with three steps
+- queue a mission for Rook at the command table
+- have the bot fetch the coolant valve
+- set the bot a task to greet the new arrivals
+- give the idle bot something to do
+- tell the bot to patrol the nest hall tonight
+- start a mission for the bot right away
+- assign the bot a brief to find the missing tool
+- hand the courier a delivery round
+- give the bot a mission but don't start it yet
+- ask the bot to investigate the leak in band three
+- set the archivist a research mission
+- send Maker on an errand to the dispatch room
+category: Bots
+description: 'Give a bot a mission: `brief` says what is asked of it, and `steps`, in order, each addressed to the bot ("go to the plant room"). It carries it now unless `start` is false, which queues it at the command table. `bot` is the bot''s id. Follow it with bot_mission_read. Use for: setting a bot to work. Triggered by "give the bot a mission", "send the bot to". Returns the mission as the bot holds it.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    brief:
+      description: What is asked of the bot. Required.
+      minLength: 1
+      type: string
+    steps:
+      description: The steps, in order, each addressed to the bot ("go to the plant room").
+      items:
+        type: string
+      type: array
+    start:
+      description: Carry it now (true, the default) or queue it at the command table (false).
+      type: boolean
+  required:
+  - bot
+  - brief
+  title: GiveRequest
+  type: object
+examples:
+- |-
+  send Maker to fetch the coolant valve from the plant room<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A mission with a brief and its steps in order.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_mission_give", "arguments": {"bot": "c3f1a07e", "brief": "Fetch the coolant valve from the plant room.", "steps": ["go to the plant room", "take the coolant valve", "bring it to the ward room"]}}
+  </tool_call><|projection|>
+- give the bot a mission<|im_end|>

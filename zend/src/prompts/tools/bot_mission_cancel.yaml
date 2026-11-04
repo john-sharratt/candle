@@ -1,0 +1,45 @@
+name: bot_mission_cancel
+questions:
+- call off Maker's mission
+- stop the courier's delivery
+- cancel what the bot is doing
+- abort the patrol mission
+- the mission is no longer needed, cancel it
+- tell the archivist to drop the cataloguing job
+- end the bot's current errand
+- recall the bot from its mission
+- cancel the queued mission for Rook
+- stop the bot before it reaches the ward
+- the bot is on the wrong job, cancel it
+- scrap the mission I gave by mistake
+- free the bot up by cancelling its task
+- halt the bot's investigation
+- the plan changed, call the bot back
+- cancel every step the bot has left
+category: Bots
+description: 'Call off a bot''s mission: it stops carrying it and is free for another. `bot` is the bot''s id. Use for: stopping a mission that is wrong or no longer needed. Triggered by "call off the mission", "cancel what the bot is doing". Returns that the mission is cancelled.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - bot
+  title: BotRequest
+  type: object
+examples:
+- |-
+  call off Maker's delivery<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Cancelling its mission stops it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_mission_cancel", "arguments": {"bot": "c3f1a07e"}}
+  </tool_call><|projection|>
+- cancel the bot's mission<|im_end|>

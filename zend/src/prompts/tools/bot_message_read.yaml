@@ -1,0 +1,44 @@
+name: bot_message_read
+questions:
+- did Maker reply to my message
+- read my handset thread with the courier
+- what did the bot say back
+- show the messages between me and Rook
+- has the archivist answered yet
+- what was the last thing the bot texted me
+- read the bot's reply to my question
+- what did I tell the bot earlier
+- catch me up on my chat with the bot
+- did the bot acknowledge the instructions
+- is there a new message from the bot
+- show the whole conversation with Maker
+- what has the courier been telling me
+- read the bot's answer about the delivery
+- what did the bot ask me
+- check my thread with the bot for a reply
+category: Bots
+description: 'Your message thread with a bot on its handset, newest last: what you sent and what it replied. `bot` is the bot''s id. Use for: reading a bot''s reply to bot_message_send. Triggered by "did the bot reply", "read my thread with". Returns the thread, a line per message.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - bot
+  title: BotRequest
+  type: object
+examples:
+- |-
+  did Maker answer me<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Its reply is in my thread with it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_message_read", "arguments": {"bot": "c3f1a07e"}}
+  </tool_call><|projection|>
+- read my thread with the bot<|im_end|>

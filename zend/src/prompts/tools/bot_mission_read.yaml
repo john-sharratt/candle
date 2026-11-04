@@ -1,0 +1,44 @@
+name: bot_mission_read
+questions:
+- what is Maker doing right now
+- how far has the courier got with its mission
+- which steps of the bot's mission are done
+- how did the bot's last mission go
+- is the archivist still on the delivery job
+- what mission is Rook carrying
+- did the bot finish what I asked it
+- which step is the bot stuck on
+- show me the bot's current brief
+- what happened on the bot's previous mission
+- has the bot started the mission I gave it
+- what is left on the bot's to-do
+- is the mission thwarted or achieved
+- check the progress of the bot's errand
+- what did the bot report when its mission ended
+- read the bot's mission status
+category: Bots
+description: 'What a bot is carrying now — its mission''s brief and its steps, which are done and which are left — and how its last mission went. `bot` is the bot''s id, as bot_list gives it. Use for: following a mission you gave. Triggered by "what is the bot doing", "how far has it got". Returns the mission and its steps.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - bot
+  title: BotRequest
+  type: object
+examples:
+- |-
+  how far has Maker got with the delivery<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Its mission and steps say how far it is.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_mission_read", "arguments": {"bot": "c3f1a07e"}}
+  </tool_call><|projection|>
+- what is the bot doing<|im_end|>

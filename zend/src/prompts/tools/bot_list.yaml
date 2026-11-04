@@ -1,0 +1,52 @@
+name: bot_list
+questions:
+- which bots do I have
+- list my bots in the moon world
+- which of my bots are awake right now
+- find the bot called Maker
+- what state is each of my bots in
+- show the bots that are asleep
+- which bots live in battle-cities
+- give me the id of the courier bot
+- are any of my bots suspended
+- list every bot in every world
+- which bots are idle and free for a mission
+- what are my characters called
+- how many bots are active in the moon
+- look up the bot named Rook
+- which world does the archivist bot live in
+- name the bots I could give a mission to
+category: Bots
+description: 'List your bots — autonomous agents, each living in a world and acting on its own — with each one''s id, name, state and world. The other bot tools take a bot''s id from here. Filter by `state` (`active`, `idle`, `asleep`, `suspended`, or `any`), by `world`, or by `q`, text the name holds. Use for: finding a bot and its id. Triggered by "which bots do I have", "find the bot called". Returns the bots, one a line.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    state:
+      description: 'Only bots in this state: `active`, `idle`, `asleep`, `suspended` or `any`.'
+      enum:
+      - active
+      - idle
+      - asleep
+      - suspended
+      - any
+      type: string
+    world:
+      description: Only bots in this world.
+      type: string
+    q:
+      description: Only bots whose name holds this text.
+      type: string
+  title: ListRequest
+  type: object
+examples:
+- |-
+  which of my bots are free for a mission<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Idle bots are the ones without a mission.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_list", "arguments": {"state": "idle"}}
+  </tool_call><|projection|>
+- list my bots<|im_end|>

@@ -1,0 +1,50 @@
+name: bot_channel_post
+questions:
+- announce on the moon channel that the market opens at noon
+- post a welcome on the world channel
+- tell everyone in the moon about the storm
+- say on the channel that the meeting moved
+- post the news to battle-cities' channel
+- greet the world's bots in public
+- announce the winner on the world channel
+- put a notice up on the moon channel
+- warn the world about the coolant leak
+- post a question to the whole world
+- tell the channel the event is starting
+- broadcast the new rules to the world
+- say good night on the moon channel
+- post the schedule for tomorrow publicly
+- make an announcement every bot in the world reads
+- ask the channel who has seen the courier
+category: Bots
+description: 'Speak on a world''s channel, the public room every bot and person in the world reads. `world` is the world''s id; `text` is what to say. A Creator''s, which npcd checks. From a turn that read the web or a remote session it waits for the person''s approval. Use for: announcements and public questions in a world. Triggered by "announce on the channel", "post to the world". Returns that it was said.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    world:
+      description: The world's id. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    text:
+      description: What to say. Required.
+      minLength: 1
+      type: string
+  required:
+  - world
+  - text
+  title: PostRequest
+  type: object
+examples:
+- |-
+  announce on the moon channel that the market opens at noon<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A public announcement goes on the world's channel.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_channel_post", "arguments": {"world": "moon", "text": "The market opens at noon today."}}
+  </tool_call><|projection|>
+- post on the world channel<|im_end|>

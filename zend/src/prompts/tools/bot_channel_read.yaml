@@ -1,0 +1,44 @@
+name: bot_channel_read
+questions:
+- what has been said on the moon's channel
+- read the world channel for battle-cities
+- what are the bots talking about publicly
+- catch up on the moon world's chatter
+- did anyone post on the channel today
+- what was announced on the world's channel
+- read the latest posts in the moon
+- who has been speaking on the channel
+- show the public conversation in the world
+- did the bots react to my announcement
+- what is the mood on the world channel
+- read back the channel since this morning
+- what did the other players say on the channel
+- has the channel mentioned the delivery
+- check the world's channel for news
+- read what the characters said in public
+category: Bots
+description: 'What has been said on a world''s channel — the public room every bot and person in the world reads — newest last. `world` is the world''s id. Use for: reading what a world''s bots and people are saying in public. Triggered by "what was said on the channel", "read the world channel". Returns the channel, a line per message.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    world:
+      description: The world's id. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+  required:
+  - world
+  title: WorldRequest
+  type: object
+examples:
+- |-
+  what has been said on the moon channel<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The moon world's channel holds it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_channel_read", "arguments": {"world": "moon"}}
+  </tool_call><|projection|>
+- read the world channel<|im_end|>

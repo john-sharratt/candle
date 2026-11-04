@@ -1,0 +1,50 @@
+name: bot_message_send
+questions:
+- text Maker to ask where it is
+- message the courier that the parcel is ready
+- ask the bot how its mission is going
+- tell the archivist thanks for the catalogue
+- send the bot a reminder about the meeting
+- message Rook to come to the command room
+- ask the bot what it saw in the plant room
+- tell the bot to hurry up
+- send a note to the bot's handset
+- ask the bot whether it needs anything
+- let the bot know the door is unlocked now
+- text the bot a question about the leak
+- tell the courier the route has changed
+- send the bot a good morning message
+- ask the bot to report back when done
+- message the bot directly
+category: Bots
+description: 'Message a bot on its handset: it reads it and answers in its own time, and its reply is read with bot_message_read. `bot` is the bot''s id; `text` is what to say. From a turn that read the web or a remote session it waits for the person''s approval. Use for: talking to a bot directly. Triggered by "text the bot", "ask the bot". Returns that the message is sent.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    bot:
+      description: The bot's id, as bot_list gives it. Required.
+      maxLength: 64
+      minLength: 1
+      type: string
+    text:
+      description: What to say. Required.
+      minLength: 1
+      type: string
+  required:
+  - bot
+  - text
+  title: MessageRequest
+  type: object
+examples:
+- |-
+  ask Maker how the delivery is going<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A message on its handset; its reply comes later.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "bot_message_send", "arguments": {"bot": "c3f1a07e", "text": "How is the delivery going?"}}
+  </tool_call><|projection|>
+- text the bot<|im_end|>
