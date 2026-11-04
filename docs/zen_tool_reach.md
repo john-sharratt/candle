@@ -71,7 +71,7 @@ are in what the operations runner will serve, and in which tools only
 | D4 | No `gateway_command`, `layer_toggle` or `timeline_delete` | `/mcp` only (§8.2, §8.5) |
 | D5 | A chat may not deploy or cancel | `Needs::Changes` (`ops_tools.rs:166`) |
 | D6 | Zen cannot write memory: no `journal_note`, `_create`, `_link`, `_focus` | Zen holds `journal_read`, `_grep`, `_check`, `_move` (`zend-tools/src/tools/journal/`); memory reaches its journals only by distillation |
-| D7 | A dialogue cannot start long work: no `repo_task_start` or task tools | A worker splits its own work with `sub_run` (§6.1), but nothing starts a task from a dialogue |
+| D7 | A dialogue or a chat cannot start long work: no `repo_task_start` or task tools. Tasks stay unable to start tasks (§6.3) | A worker splits its own work with `sub_run` (§6.1), but nothing starts a task from a dialogue |
 | D8 | No bot actions: mission give/step/cancel, message send, channel post | npcd's tools, on `/mcp` only |
 | D9 | No images: `image_generate`, `image_edit`, `image_upload` | `/mcp` only |
 
@@ -213,6 +213,7 @@ a column for each kind. A dialogue run by an Admin counts as a coder:
 | `service_control` `restart`, `start` | Care | ✓ | — | ✓ | ✓ |
 | `layer_toggle` | Care | ✓ | — | ✓ | ✓ |
 | `cluster_command` Decide, `service_control stop`, `gateway_command`, `timeline_delete` | Decide | approval (§5) | approval | approval | approval |
+| the task tools: `repo_task_start`, `_reply`, `_nudge`, a task's `job_*` | Start work | — never (§6.3) | — never | ✓ | ✓ |
 
 - **A chat may change things (D5).** A chat is Claude asking Zen to act on
   Claude's behalf, with Claude's role. Holding it to reads made Claude start a
@@ -251,21 +252,68 @@ Thread and project journals stay Claude's alone. `journal_edit`,
 `journal_forget`, `journal_accept` and the `group_*` tools stay the person's
 and Claude's (K6).
 
-### 6.3 Starting work (D7)
+### 6.3 Starting work (D7): conversations start tasks, tasks never do
 
-A dialogue run by an Admin gains `repo_task_start`, `repo_task_reply`,
-`repo_task_nudge` and the task forms of `job_status`, `job_read` and
-`job_cancel`. They are `/mcp`'s implementations, run in process with the
-dialogue's person as caller. The tasks go on a thread named for the dialogue
-(`D:<conversation>`, **new**, `docs/claude_zend_gateway.md` §5.2). A task's
-`question` comes back into the dialogue as the tool result, and the person
-sees it there.
+**The rule: the tools that start and steer research and coding tasks belong to
+conversations, never to tasks.** Those tools are `repo_task_start`,
+`repo_task_reply`, `repo_task_nudge` and the task forms of `job_status`,
+`job_read` and `job_cancel`. A dialogue run by an Admin, and a chat, may start
+tasks. A task, and any part of one, may not.
 
-Workers do not gain them. A worker that needs parts has `sub_run`
-(`docs/claude_zend_gateway.md` §6.1), which runs and waits server-side. A
-worker starting tasks would be fan-out with no orchestrator above it, and
-orchestration is what Claude and the person are for. A dialogue's tasks may
-not start tasks of their own for the same reason.
+So work starts at exactly one level. The person, or Claude, talks to a
+conversation. The conversation starts tasks. Each task does its work, splitting
+it with `sub_run` when it must, and answers. Nothing a task produces can start
+more tasks, so a task's output can never come back round as the instruction
+for the next task. The hazard is real: a task whose answer starts another task
+could restate its own findings to itself indefinitely, each round reading the
+last one's output as its brief, with no person or Claude in the loop to see
+that it has stopped making progress.
+
+**Where the tools run.** They are `/mcp`'s implementations, run in process
+with the conversation's person as caller (§4.1). A dialogue's tasks go on a
+thread named for it (`D:<conversation>`, **new**,
+`docs/claude_zend_gateway.md` §5.2). A chat's tasks go on the thread Claude
+attached the chat's session to. A task's `question` comes back into the
+conversation as the tool's result, so the person, or Claude, sees it there.
+
+**Enforced three times, so no single slip opens a loop:**
+
+1. **Never offered.** The tool list a turn is offered is built from the
+   conversation's kind (§6.1's table). The task tools are absent from the
+   tool list of a task worker (`Coder`, `Researcher`, `Reviewer`) and of every
+   part. A model cannot call a tool it was never shown, whatever text it has
+   read.
+2. **Refused at the call.** `repo_task_start` resolves the calling
+   conversation's record before anything starts (**new** check), and refuses
+   when the caller is a task or a part. That holds whatever the call's
+   arguments say, and covers a call that reaches the runner by some other path
+   than the tool list: `task_from_task: a task does not start tasks; say in
+   your answer what further work you would start, and the conversation that
+   started you decides`.
+3. **Recorded on the task.** Every task records the conversation that started
+   it (`started_by`, **new**, on the worker's record), and that conversation
+   must not itself be a task. A record with a task as its `started_by` is
+   refused when it is written, so the substrate can never hold a chain of
+   tasks, even one written by a bug in the first two checks.
+
+**What a task does instead.** A task that finds further work says so in its
+answer, as a list of tasks it would start and why. The conversation that
+started it reads that answer, and the person or Claude decides whether to
+start them. That one step is where someone judges whether the next round of
+work is worth running.
+
+**`sub_run` is not an exception.** Parts are how one task splits its own
+work, every part waits under its task, and depth is capped: a task's part may
+start parts, a part's part may not (`parts::MAX_DEPTH`,
+`docs/claude_zend_gateway.md` §6.1). A part ends when its task does, and it
+reports only to its task, never to a thread. The cap and the waiting together
+keep parts bounded in a way tasks would not be.
+
+**A conversation's own loop is bounded by its turn.** A dialogue or chat that
+starts a task, reads the answer and starts another is one turn's tool rounds.
+Its round cap and repeat guard close it as they close any turn
+(`docs/claude_zend_gateway.md` §6.2). The next round of work then waits for
+the person's or Claude's next message.
 
 ### 6.4 Bots and images (D8, D9)
 
@@ -296,7 +344,9 @@ trial:
    guard, and Decide through approvals. This step moves the `confirm` gate of
    `docs/claude_zend_gateway.md` §8.2 onto `approval_grant`.
 4. **Memory** (§6.2): the read-out mark and the four memory writers.
-5. **Starting work** (§6.3), then **bots' actions and images** (§6.4).
+5. **Starting work** (§6.3), with all three of its checks in the same step:
+   no conversation gains the task tools before a task is unable to start one.
+   Then **bots' actions and images** (§6.4).
 
 Every step is certified and rolled out like any build. The rollout stays the
 person's decision.
@@ -307,6 +357,14 @@ person's decision.
   is refused, or answers `needs_approval`, exactly as the table says. The test
   is table-driven from the same table, so a new tool cannot be added without
   a row.
+- No task starts a task (§6.3), each check alone:
+  - a task's and a part's offered tool list holds none of the task tools;
+  - `repo_task_start` called on the runner from a task or a part is refused
+    `task_from_task`, with the tool list bypassed;
+  - a worker record whose `started_by` is a task is refused when written.
+
+  A dialogue and a chat each start a task, and that task's answer comes back
+  as the conversation's tool result.
 - A dialogue's caller: a turn started by an Admin reads the cluster as that
   Admin; one started by a User reads nothing an Admin's identity guards; an
   unauthenticated turn reads nothing that names a person.
