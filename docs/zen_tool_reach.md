@@ -261,10 +261,10 @@ conversations, never to tasks.** Those tools are `repo_task_start`,
 tasks. A task, and any part of one, may not.
 
 So work starts at exactly one level. The person, or Claude, talks to a
-conversation. The conversation starts tasks. Each task does its work, splitting
-it with `sub_run` when it must, and answers. Nothing a task produces can start
-more tasks, so a task's output can never come back round as the instruction
-for the next task. The hazard is real: a task whose answer starts another task
+conversation. The conversation starts tasks. Each task does all of its work
+itself, splitting it with `sub_run` when it must, and answers with what it
+did. Nothing a task produces can start more tasks, so a task's output can
+never come back round as the instruction for the next task. The hazard is real: a task whose answer starts another task
 could restate its own findings to itself indefinitely, each round reading the
 last one's output as its brief, with no person or Claude in the loop to see
 that it has stopped making progress.
@@ -287,20 +287,21 @@ conversation as the tool's result, so the person, or Claude, sees it there.
    conversation's record before anything starts (**new** check), and refuses
    when the caller is a task or a part. That holds whatever the call's
    arguments say, and covers a call that reaches the runner by some other path
-   than the tool list: `task_from_task: a task does not start tasks; say in
-   your answer what further work you would start, and the conversation that
-   started you decides`.
+   than the tool list: `task_from_task: a task does not start tasks; do this
+   work here, with your own tools, or split it off with sub_run`.
 3. **Recorded on the task.** Every task records the conversation that started
    it (`started_by`, **new**, on the worker's record), and that conversation
    must not itself be a task. A record with a task as its `started_by` is
    refused when it is written, so the substrate can never hold a chain of
    tasks, even one written by a bug in the first two checks.
 
-**What a task does instead.** A task that finds further work says so in its
-answer, as a list of tasks it would start and why. The conversation that
-started it reads that answer, and the person or Claude decides whether to
-start them. That one step is where someone judges whether the next round of
-work is worth running.
+**What a task does instead: the work.** A task is already the level where
+work is done. When it finds more work that its brief needs, it does that work
+itself, in its own rounds, with its own tools: it reads, edits, builds, tests
+and researches inline, and splits off a part with `sub_run` when a piece of
+it runs better on its own. It never hands the work back as a proposal, and it
+never answers with a list of tasks someone else should start. What it answers
+is what it did.
 
 **`sub_run` is not an exception.** Parts are how one task splits its own
 work, every part waits under its task, and depth is capped: a task's part may
