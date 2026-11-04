@@ -140,6 +140,35 @@ impl Tool for ClusterAudit {
     }
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Validate)]
+pub struct MemberStatusRequest {
+    /// The member's node id, 16 hex digits. Required.
+    #[validate(length(equal = 16))]
+    pub node: String,
+}
+
+pub struct MemberStatus;
+
+impl Tool for MemberStatus {
+    const NAME: &'static str = "member_status";
+    const DESCRIPTION: &'static str =
+        "One member's own status, whole: its apps' link to the cluster and replication — phase, \
+         generation, unsent events, catch-ups, quorum and leases — its upgrade and maintenance.";
+
+    type Request = MemberStatusRequest;
+    type Response = Report;
+    type Error = OpsError;
+
+    fn run(ctx: &ToolContext, req: MemberStatusRequest) -> Result<Report, OpsError> {
+        forward(ctx, Self::NAME, &req)
+    }
+
+    fn replay(_req: &MemberStatusRequest) -> Replay {
+        Replay::Safe
+    }
+}
+
 pub const CLUSTER_STATUS: RegisteredTool = RegisteredTool::new::<ClusterStatus>();
+pub const MEMBER_STATUS: RegisteredTool = RegisteredTool::new::<MemberStatus>();
 pub const CLUSTER_LOGS: RegisteredTool = RegisteredTool::new::<ClusterLogs>();
 pub const CLUSTER_AUDIT: RegisteredTool = RegisteredTool::new::<ClusterAudit>();

@@ -60,9 +60,10 @@ mod journal_grep;
 mod journal_link;
 mod journal_note;
 mod journal_read;
-mod layer_read;
+pub mod layer_read;
 mod layer_toggle;
 pub mod mem;
+pub mod member_status;
 mod nudge;
 mod reply;
 pub mod repo_job;
@@ -186,6 +187,7 @@ pub fn definitions() -> Value {
         cluster_status::definition(),
         cluster_logs::definition(),
         cluster_audit::definition(),
+        member_status::definition(),
         cluster_command::definition(),
         gateway_command::definition(),
         repo_job::start::definition(),
@@ -246,6 +248,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         cluster_status::NAME => cluster_status::call(ctx, args).await,
         cluster_logs::NAME => cluster_logs::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
+        member_status::NAME => member_status::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
         repo_job::start::NAME => repo_job::start::call(ctx, args).await,
@@ -361,6 +364,7 @@ mod tests {
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
+                "member_status",
                 "cluster_command",
                 "gateway_command",
                 "repo_job_start",
@@ -403,6 +407,7 @@ mod tests {
                 "cluster_status",
                 "cluster_logs",
                 "cluster_audit",
+                "member_status",
                 "service_status",
                 "layer_read",
                 "timeline_read"

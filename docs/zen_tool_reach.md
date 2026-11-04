@@ -100,13 +100,15 @@ rather than from a task record:
 
 - **A task or a chat**, `mcp:<owner>:<thread>/<name>`: as today, its record's
   person, role and kind (`threads::worker`).
-- **A dialogue** (**new**): the person whose request started the turn, and
-  their role, as the gateway stated them (`host::access`). This is the identity
-  `access::effective_mode` already reads for the turn's tools mode. The turn
-  carries it into its `ToolContext` (**new**: `ToolContext::with_turn_caller`),
-  and the runner states it on every request it sends up (`OpsCall::headers`),
-  so each member and the gateway check the role themselves, as for a task.
-  A dialogue counts as kind `Dialogue` (**new**, `roles::WorkerKind`).
+- **A dialogue**: the person whose request started the turn, as the gateway
+  stated them (`host::access`), the identity `access::effective_mode` already
+  reads for the turn's tools mode. The chat route notes them on the runner by
+  conversation id before it submits the turn (`OpsTools::note_dialogue_person`;
+  the turn and its tool rounds run in this process), and the runner reads their
+  role from the estate's table at each call. It states them on every request it
+  sends up (`OpsCall::headers`), so each member and the gateway check the role
+  themselves, as for a task. A dialogue acts as `Acting::Dialogue`
+  (`zend/src/mcp/ops_tools.rs`).
 
 A conversation with no person behind it (an unauthenticated turn, or a
 scheduled one that names nobody) reads nothing that `Needs::ReadsAsPerson`
@@ -114,12 +116,11 @@ guards, and says why.
 
 ### 4.2 What a member holds of itself (S2, S3)
 
-`cluster_status` gains, **new**, per member and per substrate (zend, npcd),
-the replicator's own block from `/v1/status`. That block already carries
-`phase`, `link`, `generation` and `catchups`. It gains, **new**, the first
-`oseq` written detached when there is one (`Origination::detached_range`) and
-`own_through`, the replicator's own line of what it has written. A member whose phase is not `joined`, or whose link is cut off, is
-listed first, as a problem. Claude and Zen read the same answer, because the
+`cluster_status` renders, per member and per app (zend, npcd), the
+replicator's own block from `/v1/status` (`cluster.apps.<app>`): its `phase`,
+`link`, `generation`, unsent events and catch-ups in flight. A member whose
+phase or link is not `joined` is cut off or rejoining, and is listed first, as
+a problem. Claude and Zen read the same answer, because the
 tool has one implementation (`docs/jobs.md` §8).
 
 `cluster_status` also joins keep's state (`GET /v1/keep/state`, which

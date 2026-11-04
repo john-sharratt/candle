@@ -7,6 +7,8 @@ use std::time::Duration;
 use axum::http::Method;
 use serde_json::{json, Value};
 
+use super::service::status::trying;
+use super::service::{keep, KEEP_STATE};
 use super::{Answer, Ctx};
 use crate::mcp::ops::json_of;
 use crate::mcp::ops_tools::OpsCall;
@@ -67,7 +69,50 @@ fn build_of(v: &Value, key: &str) -> Option<String> {
     ))
 }
 
-/// The members' own statuses, as the gateway's envelope gathered them.
+/// Each app's replication on one member, from its own `/v1/status` body
+/// (`cluster.apps.<app>`): a line naming each app's phase and generation, and
+/// what is wrong — an app whose phase or link is not `joined` is cut off or
+/// rejoining, and what it writes reaches no peer until it rejoins.
+fn replication_of(body: &Value) -> (Option<String>, Vec<String>) {
+    let Some(apps) = body.pointer("/cluster/apps").and_then(Value::as_object) else {
+        return (None, Vec::new());
+    };
+    let mut said = Vec::new();
+    let mut wrong = Vec::new();
+    for (app, a) in apps {
+        let link = str_of(a, "link");
+        let r = a.get("replication").cloned().unwrap_or(Value::Null);
+        let phase = str_of(&r, "phase");
+        let mut part = format!(
+            "{app} {phase} gen {}",
+            r.get("generation")
+                .map_or_else(|| "?".into(), Value::to_string)
+        );
+        if link != "joined" {
+            part.push_str(&format!(" (link {link})"));
+        }
+        let unsent = r.get("unsent").and_then(Value::as_u64).unwrap_or(0);
+        if unsent > 0 {
+            part.push_str(&format!(", {unsent} unsent"));
+        }
+        let catchups = r
+            .get("catchups")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if catchups > 0 {
+            part.push_str(&format!(", {catchups} catching up"));
+        }
+        if phase != "joined" || link != "joined" {
+            wrong.push(format!("{app} is {phase}, link {link}"));
+        }
+        said.push(part);
+    }
+    ((!said.is_empty()).then(|| said.join(", ")), wrong)
+}
+
+/// The members' own statuses, as the gateway's envelope gathered them: any
+/// member whose replication is not joined first, as a problem, then each
+/// member's line.
 pub fn render_members(envelope: &Value, now: u64) -> String {
     let members = envelope
         .get("members")
@@ -75,6 +120,20 @@ pub fn render_members(envelope: &Value, now: u64) -> String {
         .cloned()
         .unwrap_or_default();
     let mut out = format!("Members answering /v1/status: {}", members.len());
+    let problems: Vec<String> = members
+        .iter()
+        .filter(|m| m.get("status").and_then(Value::as_u64) == Some(200))
+        .flat_map(|m| {
+            let who = format!("{} {}", str_of(m, "host"), str_of(m, "node"));
+            let body = m.get("body").cloned().unwrap_or(Value::Null);
+            replication_of(&body).1.into_iter().map(move |w| {
+                format!("\nproblem: {who}: {w} — what it writes reaches no peer until it rejoins")
+            })
+        })
+        .collect();
+    for p in problems {
+        out.push_str(&p);
+    }
     for m in &members {
         let (host, node) = (str_of(m, "host"), str_of(m, "node"));
         let code = m.get("status").and_then(Value::as_u64).unwrap_or(0);
@@ -107,6 +166,9 @@ pub fn render_members(envelope: &Value, now: u64) -> String {
                 .map(|(name, s)| format!("{name} {}", str_of(s, "state")))
                 .collect();
             line.push_str(&format!("; tenants: {}", t.join(", ")));
+        }
+        if let Some(r) = replication_of(&body).0 {
+            line.push_str(&format!("; replication: {r}"));
         }
         out.push_str(&line);
     }
@@ -353,6 +415,72 @@ pub fn render_gateway(status: &Value) -> String {
     out
 }
 
+/// A machine no member answered for, as its keep `state` says it stands: a
+/// trial in progress is a member coming up, a running motherd that does not
+/// answer is loading or stuck, and a stopped one is down.
+pub fn absent_line(host: &str, state: &Value, now: u64) -> String {
+    let motherd = state
+        .get("services")
+        .and_then(Value::as_array)
+        .and_then(|s| {
+            s.iter()
+                .find(|s| s.get("name").and_then(Value::as_str) == Some("motherd"))
+        });
+    let Some(m) = motherd else {
+        return format!("- {host}: not answering, and its keep runs no motherd");
+    };
+    let build = build_of(m, "build").unwrap_or_else(|| "?".into());
+    if let Some(t) = m.pointer("/trials/running").filter(|t| !t.is_null()) {
+        return format!(
+            "- {host}: not answering — {} (installed {build})",
+            trying(t, now)
+        );
+    }
+    match m.get("running").and_then(Value::as_u64) {
+        Some(pid) => format!(
+            "- {host}: not answering — keep runs motherd {build} as pid {pid}, so it is \
+             loading or stuck: read its lines with `cluster_logs`"
+        ),
+        None => format!("- {host}: not answering — keep has motherd {build} stopped"),
+    }
+}
+
+/// The machines with an agent but no member in `envelope`, as their keeps
+/// say they stand.
+async fn absent(call: &OpsCall, envelope: &Value) -> Vec<String> {
+    let Some(agents) = call.session.agents() else {
+        return Vec::new();
+    };
+    let Ok(listed) = agents.listing().await else {
+        return Vec::new();
+    };
+    let answered: Vec<String> = envelope
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|m| str_of(m, "host").to_ascii_lowercase())
+        .collect();
+    let mut hosts: Vec<String> = listed
+        .iter()
+        .map(|a| a.host.clone())
+        .filter(|h| !answered.contains(&h.to_ascii_lowercase()))
+        .collect();
+    hosts.sort_by_key(|h| h.to_ascii_lowercase());
+    hosts.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let now = now_ms();
+    let mut lines = Vec::new();
+    for host in hosts {
+        lines.push(
+            match keep(call, Method::GET, KEEP_STATE, &host, None).await {
+                Ok(state) => absent_line(&host, &state, now),
+                Err(e) => format!("- {host}: not answering, and its keep could not be read: {e}"),
+            },
+        );
+    }
+    lines
+}
+
 pub async fn run(call: &OpsCall, _args: &Value) -> Answer {
     let within = Duration::from_secs(15);
     let members = call.up(Method::GET, "/v1/status", None, within);
@@ -372,10 +500,18 @@ pub async fn run(call: &OpsCall, _args: &Value) -> Answer {
         Ok(r) => r,
         Err(e) => return Answer::error(e),
     };
-    let mut out = match json_of(&reply) {
-        Ok(v) => render_members(&v, now_ms()),
+    let envelope = match json_of(&reply) {
+        Ok(v) => v,
         Err(e) => return Answer::error(format!("/v1/status: {e}")),
     };
+    let mut out = render_members(&envelope, now_ms());
+    if call.admin() {
+        let gone = absent(call, &envelope).await;
+        if !gone.is_empty() {
+            out.push_str("\nMachines with no member answering:\n");
+            out.push_str(&gone.join("\n"));
+        }
+    }
     if let Some(gateway) = gateway {
         out.push_str("\n\n");
         match gateway {
@@ -553,6 +689,82 @@ mod tests {
         assert!(
             text.contains("\nfault: zend ww 01: near its disk floor"),
             "{text}"
+        );
+    }
+
+    /// A member's `/v1/status` body as it writes its apps' replication.
+    fn member_body(zend_phase: &str, zend_link: &str) -> Value {
+        json!({
+            "state": "ready", "build": {"count": 4419, "hash": "6ecd6158", "local": ""},
+            "detail": "", "started_at_ms": NOW - 60_000,
+            "cluster": {"apps": {
+                "npcd": {"link": "joined", "replication": {"phase": "joined", "generation": 64,
+                         "unsent": 0, "catchups": []}},
+                "zend": {"link": zend_link, "replication": {"phase": zend_phase, "generation": 64,
+                         "unsent": 12, "catchups": [{"purpose": "Admission"}]}}
+            }}
+        })
+    }
+
+    /// **Each member says its apps' replication, and one not joined is a
+    /// problem said first** — the state that tells a cut-off member from a
+    /// joined one, which nothing else in the status shows.
+    #[test]
+    fn a_member_says_its_replication_and_a_cut_off_one_is_a_problem() {
+        let envelope = json!({"members": [
+            {"node": "a0ac88178cb2b57d", "host": "BlackWorld", "status": 200,
+             "body": member_body("joined", "joined")},
+            {"node": "893959beacadc372", "host": "WhiteWorld", "status": 200,
+             "body": member_body("cut_off", "cut_off")}
+        ]});
+        assert_eq!(
+            render_members(&envelope, NOW),
+            "Members answering /v1/status: 2\n\
+             problem: WhiteWorld 893959beacadc372: zend is cut_off, link cut_off — what it \
+             writes reaches no peer until it rejoins\n\
+             - BlackWorld a0ac88178cb2b57d build 4419-6ecd6158: ready, started 60 s ago; \
+             replication: npcd joined gen 64, zend joined gen 64, 12 unsent, 1 catching up\n\
+             - WhiteWorld 893959beacadc372 build 4419-6ecd6158: ready, started 60 s ago; \
+             replication: npcd joined gen 64, zend cut_off gen 64 (link cut_off), 12 unsent, \
+             1 catching up"
+        );
+    }
+
+    /// **A machine with no member answering says why, from its keep**: a
+    /// member coming up under a trial, a motherd running but not answering,
+    /// or one stopped.
+    #[test]
+    fn a_machine_with_no_member_says_what_its_keep_runs() {
+        let build = json!({"count": 4419, "hash": "6ecd6158", "local": ""});
+        let state = |running: Value, trial: Value| {
+            json!({"services": [{"name": "motherd", "running": running, "build": build,
+                                 "trials": {"running": trial, "last": null}}]})
+        };
+        assert_eq!(
+            absent_line(
+                "WhiteWorld",
+                &state(
+                    json!(464),
+                    json!({"artifact": "stage/motherd.exe", "started_ms": NOW - 51_000})
+                ),
+                NOW
+            ),
+            "- WhiteWorld: not answering — keep is trying it: 51 s in, of a 10-minute window to \
+             print that it serves — the window restarts while it is catching up on replication \
+             (installed 4419-6ecd6158)"
+        );
+        assert_eq!(
+            absent_line("WhiteWorld", &state(json!(464), Value::Null), NOW),
+            "- WhiteWorld: not answering — keep runs motherd 4419-6ecd6158 as pid 464, so it is \
+             loading or stuck: read its lines with `cluster_logs`"
+        );
+        assert_eq!(
+            absent_line("WhiteWorld", &state(Value::Null, Value::Null), NOW),
+            "- WhiteWorld: not answering — keep has motherd 4419-6ecd6158 stopped"
+        );
+        assert_eq!(
+            absent_line("AlienWorld", &json!({"services": []}), NOW),
+            "- AlienWorld: not answering, and its keep runs no motherd"
         );
     }
 

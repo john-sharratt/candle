@@ -1050,10 +1050,10 @@ use crate::tools::{
     journal::{JOURNAL_CHECK, JOURNAL_GREP, JOURNAL_MOVE, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
-    ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS},
+    ops::cluster::{CLUSTER_AUDIT, CLUSTER_LOGS, CLUSTER_STATUS, MEMBER_STATUS},
     ops::job::{JOB_CANCEL, JOB_GREP, JOB_LIST, JOB_READ, JOB_STATUS},
     ops::service::{SERVICE_DEPLOY, SERVICE_STATUS},
-    ops::timeline::TIMELINE_READ,
+    ops::timeline::{LAYER_READ, TIMELINE_READ},
     random::REGISTRATION as RANDOM,
     remote_fs::{
         REMOTE_FS_SESSION_CLOSE, REMOTE_FS_SESSION_DELETE, REMOTE_FS_SESSION_GET,
@@ -1286,14 +1286,16 @@ fn register_all() -> &'static [RegisteredTool] {
         JOB_STATUS.requires(NET),
         JOB_READ.requires(NET),
         JOB_GREP.requires(NET),
-        // The cluster (3) — read through the gateway as the person the task
-        // works for; nothing changes.
+        // The cluster (4) — read through the gateway as the person the
+        // conversation works for; nothing changes.
         CLUSTER_STATUS.requires(NET),
         CLUSTER_LOGS.requires(NET),
         CLUSTER_AUDIT.requires(NET),
-        // A stored conversation (1) — read through the daemon; nothing
+        MEMBER_STATUS.requires(NET),
+        // Stored conversations (2) — read through the daemon; nothing
         // changes. `probe` runs a prefill, and changes nothing either.
         TIMELINE_READ.requires(NET),
+        LAYER_READ.requires(NET),
         // Guides (2) — read from the library embedded in this binary.
         GUIDE_LIST,
         GUIDE_READ,

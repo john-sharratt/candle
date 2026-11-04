@@ -1,0 +1,55 @@
+name: member_status
+questions:
+- is whiteworld really joined or cut off
+- what replication phase is blackworld's zend in
+- which generation does each member write under
+- does that member have unsent events
+- is a catch-up still running on the new member
+- which leases does blackworld hold right now
+- is the quorum two members or one
+- why does the log say the node is writing detached
+- show me one member's own status in full
+- is npcd on whiteworld rejoining after the restart
+- what does the member report about its upgrade step
+- how many events has the member applied since it started
+- is the member's link to the gateway admitted
+- which member holds the git lease for candle
+- has the restarted member caught up yet
+- read the raw status of node 893959beacadc372
+category: Commands
+description: 'One member''s own status, whole, as it reports itself through the gateway: its state and build, and for each app it hosts its link to the cluster and its replication — phase (joined, cut off, rejoining), generation, unsent events, catch-ups in flight, applied and refused counts, quorum, and the leases it holds — its upgrade step, and each tenant''s maintenance. `cluster_status` summarises every member; read this one when the summary does not settle it, such as whether a member is truly joined or what a log line about being detached means. `node` is the member''s 16-hex-digit node id as `cluster_status` lists it. Use for: whether a member is cut off, caught up, or holding a lease. Triggered by "is it really joined", "what phase is it in". Returns the member''s status as JSON.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    node:
+      description: 'The member''s node id, 16 hex digits, as `cluster_status` lists it. Required.'
+      maxLength: 16
+      minLength: 16
+      type: string
+  required:
+  - node
+  title: MemberStatusRequest
+  type: object
+examples:
+- |-
+  the log says whiteworld is writing detached, is it actually cut off<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  A member's own status names each app's replication phase and link; joined on both means the line is about something else.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "member_status", "arguments": {"node": "893959beacadc372"}}
+  </tool_call><|projection|>
+- has the member that just restarted caught up<|im_end|>
+- |-
+  which member holds the candle git lease<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The leases are in each member's replication block; read the member's own status.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "member_status", "arguments": {"node": "a0ac88178cb2b57d"}}
+  </tool_call><|projection|>

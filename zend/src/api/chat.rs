@@ -19,6 +19,7 @@ use host::access::role;
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::access;
+use crate::mcp::caller::Caller;
 use crate::mcp::ownership;
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
@@ -182,6 +183,12 @@ pub async fn completions(
         if !ownership::may_open(&conv_id, &headers, session.roles()) {
             return ownership::not_found();
         }
+        // The turn's operations tools read the cluster as whoever sent it
+        // (`docs/zen_tool_reach.md` §4.1).
+        session.mcp().ops().note_dialogue_person(
+            &conv_id,
+            Caller::of(&headers, session.roles()).map(|c| c.person),
+        );
         session
             .submit(
                 messages,

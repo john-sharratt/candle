@@ -5,7 +5,8 @@
 //! [`OpsCall`] — whom it is for and how it may wait — so neither surface has a
 //! copy of its own to drift.
 
-use std::sync::{Arc, OnceLock, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, Method};
@@ -15,12 +16,13 @@ use tokio::runtime::Handle;
 use web::auth::Role;
 use zend_tools::{run_watch, OpsRunner};
 
-use super::caller::Caller;
+use super::caller::{Caller, Person};
 use super::ops;
 use super::roles::WorkerKind;
 use super::threads;
 use super::tools::{
-    cluster_audit, cluster_logs, cluster_status, job, repo_job, service, timeline_read, Answer, Ctx,
+    cluster_audit, cluster_logs, cluster_status, job, layer_read, member_status, repo_job, service,
+    timeline_read, Answer, Ctx,
 };
 use crate::session::ZendSession;
 
@@ -123,6 +125,27 @@ impl OpsCall {
     }
 }
 
+/// Which conversation is calling: a task or chat Claude delegated through
+/// `/mcp`, by its kind, or a person's dialogue with Zen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acting {
+    Worker(WorkerKind),
+    Dialogue,
+}
+
+impl Acting {
+    /// Whether it may change what runs (`docs/zen_tool_reach.md` §6.1): a
+    /// coder, a chat — which acts for Claude, with Claude's role — and a
+    /// person's dialogue. A researcher and a reviewer read untrusted content
+    /// and change nothing.
+    fn may_change(self) -> bool {
+        matches!(
+            self,
+            Acting::Dialogue | Acting::Worker(WorkerKind::Coder | WorkerKind::Chat)
+        )
+    }
+}
+
 /// What a worker's tool needs of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Needs {
@@ -148,28 +171,36 @@ const WORKER_TOOLS: &[(&str, Needs)] = &[
     (cluster_status::NAME, Needs::ReadsAsPerson),
     (cluster_logs::NAME, Needs::ReadsAsPerson),
     (cluster_audit::NAME, Needs::ReadsAsPerson),
+    (member_status::NAME, Needs::ReadsAsPerson),
     (timeline_read::NAME, Needs::ReadsAsPerson),
+    (layer_read::NAME, Needs::ReadsAsPerson),
 ];
 
-/// Why a worker of `role` doing `kind`'s work, working for a person or not
+/// Why a conversation `acting` as it does, run as `role`, for a person or not
 /// (`person`), may not run `tool`.
-fn unfit(tool: &str, role: Role, kind: WorkerKind, person: bool) -> Option<String> {
+fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String> {
     let Some((_, needs)) = WORKER_TOOLS.iter().find(|(name, _)| *name == tool) else {
         return Some(format!("`{tool}` is not an operations tool"));
     };
     if !role.at_least(Role::Admin) {
         return Some(format!(
-            "`{tool}` is an Admin's, and this task runs as `{role}`"
+            "`{tool}` is an Admin's, and this conversation runs as `{role}`"
         ));
     }
     match needs {
-        Needs::Changes if kind != WorkerKind::Coder => {
+        Needs::Changes if !acting.may_change() => {
             Some(format!("`{tool}` is a coder's: this task changes nothing"))
         }
-        Needs::ReadsAsPerson if !person => Some(format!(
-            "`{tool}` reads the cluster as the person this task works for, and its record names \
-             none: it was started before tasks carried one. Ask Claude to start it again"
-        )),
+        Needs::ReadsAsPerson if !person => Some(match acting {
+            Acting::Dialogue => format!(
+                "`{tool}` reads the cluster as the person this conversation is with, and no \
+                 signed-in person's message started this turn"
+            ),
+            Acting::Worker(_) => format!(
+                "`{tool}` reads the cluster as the person this task works for, and its record \
+                 names none: it was started before tasks carried one. Ask Claude to start it again"
+            ),
+        }),
         _ => None,
     }
 }
@@ -180,7 +211,9 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
         cluster_status::NAME => cluster_status::run(call, args).await,
         cluster_logs::NAME => cluster_logs::run(call, args).await,
         cluster_audit::NAME => cluster_audit::run(call, args).await,
+        member_status::NAME => member_status::run(call, args).await,
         timeline_read::NAME => timeline_read::run(call, args).await,
+        layer_read::NAME => layer_read::run(call, args),
         job::list::NAME => job::list::run(call, args).await,
         job::status::NAME => job::status::run(call, args).await,
         job::read::NAME => job::read::run(call, args).await,
@@ -193,12 +226,18 @@ pub async fn run(name: &str, call: &OpsCall, args: &Value) -> Answer {
     }
 }
 
-/// The [`OpsRunner`] of one session: a worker's build and deploy tools.
+/// The [`OpsRunner`] of one session: the operations tools of every
+/// conversation of Zen's — a delegated task's, a chat's, and a person's
+/// dialogue's.
 #[derive(Default)]
 pub struct OpsTools {
     /// The session it runs for, and the runtime its sockets live on: a call
     /// arrives on a tool round's own thread.
     bound: OnceLock<(Weak<ZendSession>, Handle)>,
+    /// Each dialogue's person: whose signed-in message started its latest
+    /// turn, by conversation id. A dialogue's tools read the cluster as them.
+    /// Held in memory, as the turn and its tool rounds run in this process.
+    people: Mutex<HashMap<String, Person>>,
 }
 
 impl OpsTools {
@@ -206,27 +245,56 @@ impl OpsTools {
     pub fn bind(&self, session: Weak<ZendSession>, runtime: Handle) {
         let _ = self.bound.set((session, runtime));
     }
+
+    /// Note who started dialogue `conv_id`'s turn: `None` for a message no
+    /// signed-in person sent, which reads nothing as anyone.
+    pub fn note_dialogue_person(&self, conv_id: &str, person: Option<Person>) {
+        let mut people = self.people.lock().unwrap_or_else(|e| e.into_inner());
+        match person {
+            Some(p) => {
+                people.insert(conv_id.to_string(), p);
+            }
+            None => {
+                people.remove(conv_id);
+            }
+        }
+    }
+
+    /// Whose message started dialogue `conv_id`'s turn.
+    fn dialogue_person(&self, conv_id: &str) -> Option<Person> {
+        self.people
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conv_id)
+            .cloned()
+    }
 }
 
 impl OpsRunner for OpsTools {
     fn run(&self, caller: &str, tool: &str, args: Value) -> Result<String, String> {
-        let Some((owner, thread, name)) = threads::conv_names(caller) else {
-            return Err(format!(
-                "`{tool}` is for a task Claude delegated through this MCP server, and this \
-                 conversation is not one"
-            ));
-        };
         let (session, runtime) = self
             .bound
             .get()
             .and_then(|(s, rt)| Some((s.upgrade()?, rt.clone())))
             .ok_or("the model is not running")?;
-        let records = session
-            .shared_substrate()
-            .ok_or("the model is still loading")?;
-        let worker = threads::worker(&records, owner, thread, name)
-            .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
-        if let Some(why) = unfit(tool, worker.role, worker.kind, worker.person.is_some()) {
+        let (acting, person, role) = match threads::conv_names(caller) {
+            Some((owner, thread, name)) => {
+                let records = session
+                    .shared_substrate()
+                    .ok_or("the model is still loading")?;
+                let worker = threads::worker(&records, owner, thread, name)
+                    .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
+                (Acting::Worker(worker.kind), worker.person, worker.role)
+            }
+            None => {
+                let person = self.dialogue_person(caller);
+                let role = person
+                    .as_ref()
+                    .map_or(Role::Unauthenticated, |p| p.role(session.roles()));
+                (Acting::Dialogue, person, role)
+            }
+        };
+        if let Some(why) = unfit(tool, role, acting, person.is_some()) {
             return Err(why);
         }
         let progress = run_watch::current().map(|watch| -> Arc<dyn Fn(String) + Send + Sync> {
@@ -235,10 +303,7 @@ impl OpsRunner for OpsTools {
         let call = OpsCall {
             session,
             lineage: caller.to_string(),
-            caller: worker.person.map(|person| Caller {
-                person,
-                role: worker.role,
-            }),
+            caller: person.map(|person| Caller { person, role }),
             progress,
             ceiling: WORKER_WAIT_S,
             worker: true,
@@ -259,55 +324,84 @@ mod tests {
     /// **A worker reads as an Admin, changes as an Admin's coder, and reads
     /// the cluster as the person it works for**; a tool outside the set is
     /// refused by name.
+    const CODER: Acting = Acting::Worker(WorkerKind::Coder);
+    const REVIEWER: Acting = Acting::Worker(WorkerKind::Reviewer);
+    const RESEARCHER: Acting = Acting::Worker(WorkerKind::Researcher);
+    const CHAT: Acting = Acting::Worker(WorkerKind::Chat);
+
     #[test]
     fn a_worker_reads_as_an_admin_and_changes_as_a_coder() {
         assert_eq!(
-            unfit(
-                service::status::NAME,
-                Role::Admin,
-                WorkerKind::Reviewer,
-                false
-            ),
+            unfit(service::status::NAME, Role::Admin, REVIEWER, false),
             None
         );
         assert_eq!(
-            unfit(service::deploy::NAME, Role::Admin, WorkerKind::Coder, false),
+            unfit(service::deploy::NAME, Role::Admin, CODER, false),
             None
         );
-        assert!(unfit(
-            service::deploy::NAME,
-            Role::Admin,
-            WorkerKind::Researcher,
-            true
-        )
-        .unwrap()
-        .contains("coder"));
-        assert!(unfit(job::read::NAME, Role::User, WorkerKind::Coder, true)
+        assert!(unfit(service::deploy::NAME, Role::Admin, RESEARCHER, true)
+            .unwrap()
+            .contains("coder"));
+        assert!(unfit(job::read::NAME, Role::User, CODER, true)
             .unwrap()
             .contains("Admin"));
         assert_eq!(
-            unfit(
-                cluster_status::NAME,
-                Role::Admin,
-                WorkerKind::Reviewer,
-                true
-            ),
+            unfit(cluster_status::NAME, Role::Admin, REVIEWER, true),
             None
         );
+        assert!(unfit(cluster_logs::NAME, Role::Admin, CODER, false)
+            .unwrap()
+            .contains("names none"));
+        assert!(unfit(job::cancel::NAME, Role::Admin, REVIEWER, true)
+            .unwrap()
+            .contains("coder"));
+        assert!(unfit("repo_job_start", Role::Admin, CODER, true)
+            .unwrap()
+            .contains("not an operations tool"));
+    }
+
+    /// **A chat acts as a coder does, and so does an Admin's dialogue**
+    /// (`docs/zen_tool_reach.md` §6.1): both deploy and cancel. A dialogue
+    /// reads as the person whose message started its turn, and with no such
+    /// person it reads nothing as anyone.
+    #[test]
+    fn a_chat_and_a_dialogue_act_as_a_coder() {
+        for acting in [CHAT, Acting::Dialogue] {
+            assert_eq!(
+                unfit(service::deploy::NAME, Role::Admin, acting, true),
+                None
+            );
+            assert_eq!(unfit(job::cancel::NAME, Role::Admin, acting, true), None);
+            assert_eq!(unfit(member_status::NAME, Role::Admin, acting, true), None);
+            assert_eq!(unfit(layer_read::NAME, Role::Admin, acting, true), None);
+        }
         assert!(
-            unfit(cluster_logs::NAME, Role::Admin, WorkerKind::Coder, false)
+            unfit(cluster_status::NAME, Role::Admin, Acting::Dialogue, false)
                 .unwrap()
-                .contains("names none")
+                .contains("no signed-in person")
         );
         assert!(
-            unfit(job::cancel::NAME, Role::Admin, WorkerKind::Reviewer, true)
+            unfit(cluster_status::NAME, Role::User, Acting::Dialogue, true)
                 .unwrap()
-                .contains("coder")
+                .contains("Admin")
         );
-        assert!(
-            unfit("repo_job_start", Role::Admin, WorkerKind::Coder, true)
-                .unwrap()
-                .contains("not an operations tool")
-        );
+    }
+
+    /// **A dialogue's person is the one whose message started its latest
+    /// turn**; a turn no signed-in person started forgets the last one.
+    #[test]
+    fn a_dialogue_remembers_the_person_of_its_turn() {
+        let ops = OpsTools::default();
+        let person = Person {
+            provider: "google".into(),
+            sub: "boss".into(),
+            email: String::new(),
+            name: String::new(),
+        };
+        ops.note_dialogue_person("c1", Some(person.clone()));
+        assert_eq!(ops.dialogue_person("c1"), Some(person));
+        assert_eq!(ops.dialogue_person("c2"), None);
+        ops.note_dialogue_person("c1", None);
+        assert_eq!(ops.dialogue_person("c1"), None);
     }
 }

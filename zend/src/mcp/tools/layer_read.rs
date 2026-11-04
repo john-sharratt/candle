@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx, LOADING};
 use crate::mcp::ops;
+use crate::mcp::ops_tools::OpsCall;
+use crate::session::ZendSession;
 
 pub const NAME: &str = "layer_read";
 
@@ -80,6 +82,16 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
+    read(&ctx.session, args)
+}
+
+/// The read for a conversation of Zen's, through the operations runner, which
+/// has checked the caller is an Admin.
+pub fn run(call: &OpsCall, args: &Value) -> Answer {
+    read(&call.session, args)
+}
+
+fn read(session: &ZendSession, args: &Value) -> Answer {
     let name = match string(args, "name") {
         Ok(n) => n,
         Err(e) => return Answer::error(e),
@@ -90,10 +102,10 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_LIMIT as u64) as usize)
         .clamp(1, MAX_LIMIT);
-    if !ctx.session.is_loaded() {
+    if !session.is_loaded() {
         return Answer::error(LOADING);
     }
-    match ctx.session.substrate_layer(name) {
+    match session.substrate_layer(name) {
         Some(layer) => Answer::ok(render(name, &layer, offset, limit)),
         None => Answer::error(format!("there is no layer `{name}`")),
     }

@@ -78,4 +78,42 @@ impl Tool for TimelineRead {
     }
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Validate)]
+pub struct LayerReadRequest {
+    /// The layer: `repo_map`, `code_reading`, `dialogue`, … Required.
+    #[validate(length(min = 1, max = 64))]
+    pub name: String,
+    /// The first conversation. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
+    pub offset: Option<u32>,
+    /// How many conversations. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "u32")]
+    #[validate(range(min = 1, max = 500))]
+    pub limit: Option<u32>,
+}
+
+pub struct LayerRead;
+
+impl Tool for LayerRead {
+    const NAME: &'static str = "layer_read";
+    const DESCRIPTION: &'static str =
+        "List the stored conversations one projection layer holds, a page at a time: each with its \
+         timeline id, label, repository, turns and tokens, to read with `timeline_read`.";
+
+    type Request = LayerReadRequest;
+    type Response = Report;
+    type Error = OpsError;
+
+    fn run(ctx: &ToolContext, req: LayerReadRequest) -> Result<Report, OpsError> {
+        forward(ctx, Self::NAME, &req)
+    }
+
+    fn replay(_req: &LayerReadRequest) -> Replay {
+        Replay::Safe
+    }
+}
+
 pub const TIMELINE_READ: RegisteredTool = RegisteredTool::new::<TimelineRead>();
+pub const LAYER_READ: RegisteredTool = RegisteredTool::new::<LayerRead>();

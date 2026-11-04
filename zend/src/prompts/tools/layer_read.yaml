@@ -1,0 +1,64 @@
+name: layer_read
+questions:
+- which conversations does the code_reading layer hold
+- list the repo_map timelines
+- how many conversations are in the dialogue layer
+- find the timeline id of the reading of scan.rs
+- page through the code readings of candle
+- which layers have readings for battle-cities
+- show me the next fifty entries of the layer
+- how many tokens does the repo map take
+- which code readings are archived
+- what branches is the reading of session.rs tied to
+- give me the timeline ids so I can open one with timeline_read
+- what did the background analysis store about the zend crate
+- is there a stored reading of the gateway's route table
+- which repository files have been read into the substrate
+- how many turns does each reading in the layer have
+- list what the projection keeps about the web crate
+category: Commands
+description: 'List the stored conversations one projection layer holds, a page at a time. A layer is one kind of analysis kept about the repositories — `repo_map`, `code_reading`, `dialogue` — and each piece of it is a stored conversation, a timeline: each line gives its timeline id, its repository and label, the branches it is tied to, its turns and tokens, and whether it is archived. Read one of them with `timeline_read` by its id. Use for: finding the stored reading of a file, or how much a layer holds. Triggered by "which readings are there", "list the layer". Admins only. Returns a page of the layer''s conversations.'
+high_risk: true
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    name:
+      description: 'The layer: `repo_map`, `code_reading`, `dialogue`. Required.'
+      maxLength: 64
+      minLength: 1
+      type: string
+    offset:
+      description: 'The first conversation; 0 by default.'
+      minimum: 0.0
+      type: integer
+    limit:
+      description: 'How many conversations; 50 by default.'
+      maximum: 500.0
+      minimum: 1.0
+      type: integer
+  required:
+  - name
+  title: LayerReadRequest
+  type: object
+examples:
+- |-
+  is there a stored reading of scan.rs<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The code_reading layer lists every file read into the substrate, each with its timeline id.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "layer_read", "arguments": {"name": "code_reading"}}
+  </tool_call><|projection|>
+- how big is the repo map<|im_end|>
+- |-
+  show the next page of code readings<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The first page ended at 50, so the next starts there.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "layer_read", "arguments": {"name": "code_reading", "offset": 50}}
+  </tool_call><|projection|>

@@ -58,7 +58,7 @@ fn ended(trial: &Value, now: u64) -> String {
 }
 
 /// How far into its proof window `trial`, running on keep's board, is.
-fn trying(trial: &Value, now: u64) -> String {
+pub fn trying(trial: &Value, now: u64) -> String {
     let started = trial
         .get("started_ms")
         .and_then(Value::as_u64)
