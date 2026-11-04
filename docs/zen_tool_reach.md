@@ -276,24 +276,28 @@ thread named for it (`D:<conversation>`, **new**,
 attached the chat's session to. A task's `question` comes back into the
 conversation as the tool's result, so the person, or Claude, sees it there.
 
-**Enforced three times, so no single slip opens a loop:**
+**The tools are hidden from a task.** The tool list a turn is offered is
+built from the conversation's kind (§6.1's table). For a task worker
+(`Coder`, `Researcher`, `Reviewer`) and for every part, the task tools are not
+in it. A task does not know they exist, so there is nothing for it to resist
+and nothing for text it has read to talk it into. Its prompt says nothing
+about them either: no "do not start tasks" rule, which would only name what it
+cannot see. A task simply works with the tools it has.
 
-1. **Never offered.** The tool list a turn is offered is built from the
-   conversation's kind (§6.1's table). The task tools are absent from the
-   tool list of a task worker (`Coder`, `Researcher`, `Reviewer`) and of every
-   part. A model cannot call a tool it was never shown, whatever text it has
-   read.
-2. **Refused at the call.** `repo_task_start` resolves the calling
+**Two backstops behind the hiding**, which a task never meets. They catch a
+bug in how the tool list is built:
+
+1. **Refused at the call.** `repo_task_start` resolves the calling
    conversation's record before anything starts (**new** check), and refuses
-   when the caller is a task or a part. That holds whatever the call's
-   arguments say, and covers a call that reaches the runner by some other path
-   than the tool list: `task_from_task: a task does not start tasks; do this
-   work here, with your own tools, or split it off with sub_run`.
-3. **Recorded on the task.** Every task records the conversation that started
+   when the caller is a task or a part, with the error
+   `task_from_task: the calling conversation is a task`. It is an error, not
+   guidance: reaching it means the list was built wrong, and the fix is in the
+   code.
+2. **Recorded on the task.** Every task records the conversation that started
    it (`started_by`, **new**, on the worker's record), and that conversation
    must not itself be a task. A record with a task as its `started_by` is
    refused when it is written, so the substrate can never hold a chain of
-   tasks, even one written by a bug in the first two checks.
+   tasks.
 
 **What a task does instead: the work.** A task is already the level where
 work is done. When it finds more work that its brief needs, it does that work
@@ -345,8 +349,9 @@ trial:
    guard, and Decide through approvals. This step moves the `confirm` gate of
    `docs/claude_zend_gateway.md` §8.2 onto `approval_grant`.
 4. **Memory** (§6.2): the read-out mark and the four memory writers.
-5. **Starting work** (§6.3), with all three of its checks in the same step:
-   no conversation gains the task tools before a task is unable to start one.
+5. **Starting work** (§6.3), with the hiding and both backstops in the same
+   step: no conversation gains the task tools before a task is unable to
+   start one.
    Then **bots' actions and images** (§6.4).
 
 Every step is certified and rolled out like any build. The rollout stays the
@@ -358,11 +363,12 @@ person's decision.
   is refused, or answers `needs_approval`, exactly as the table says. The test
   is table-driven from the same table, so a new tool cannot be added without
   a row.
-- No task starts a task (§6.3), each check alone:
-  - a task's and a part's offered tool list holds none of the task tools;
-  - `repo_task_start` called on the runner from a task or a part is refused
-    `task_from_task`, with the tool list bypassed;
-  - a worker record whose `started_by` is a task is refused when written.
+- No task starts a task (§6.3):
+  - a task's and a part's offered tool list holds none of the task tools, and
+    its prompt names none of them;
+  - each backstop alone: `repo_task_start` called on the runner from a task
+    or a part, with the tool list bypassed, is refused `task_from_task`, and a
+    worker record whose `started_by` is a task is refused when written.
 
   A dialogue and a chat each start a task, and that task's answer comes back
   as the conversation's tool result.
