@@ -1,7 +1,8 @@
 # Zen coding sessions: why one failed, and the fixes
 
-**Status:** designed, not built (2026-11-05). `file_edit` is already mandatory
-(Cause 3, commit `934225224`); everything else below is the work.
+**Status:** built (2026-11-05), except as noted under each cause. `file_edit`
+was made mandatory first (Cause 3, commit `934225224`). Where the build
+departs from the design below, the departure is recorded beside it.
 
 **Source:** web-UI conversation `451502ff-4526-4407-a68d-69225467477a`
 (code.tokera.com): 64 turns, 226,566 tokens, 156 tool calls. At turn #41 it was
@@ -64,10 +65,14 @@ share the 12-byte prefix `</parameter>`, so matching costs nothing until that
 prefix appears, then checks a short tail against a small trie built once per
 span.
 
-1. **Only `</parameter>` belongs to the value.** The separator and tag are
-   lookahead, pushed back to the next node (the mechanism `JsonNumber` uses,
-   `is_lookahead`). `Feed::Close` reports which marker fired, and the tree takes
-   that branch.
+1. **The whole close is consumed, and the span forks.** Pushing the separator
+   and tag back to the next node cannot work: the stencil commits each token as
+   it decodes, and lookahead push-back holds only within one token, while the
+   tail arrives over several. So a function block's value is a
+   `NodeSpec::Element` that consumes `</parameter>`, the separator and the tag,
+   and `TerminatorState::fired` says which tail it was; the span goes to that
+   tail's fork (`FreeTextSpan::forks`), the continuation with the tag already
+   written (`ToolTreeBuilder::after_written`).
 2. **No marker completes means content.** `</parameter>` followed by anything
    else is written into the value, and matching starts again.
 3. **The tree supplies the markers.** If a required parameter is still missing,
@@ -155,10 +160,17 @@ the GUI draws segments in the order they arrive.
 | `run` | `ids` | These calls have started executing (was `tool` `phase: running`) |
 | `result` | `id`, `result`, `tokens` | A call's result and its length in tokens in the context (was `tool` `done`, by position) |
 
-An `id` is `<turn>.<n>`, the n-th part of the turn, the same in the stream and
-in the history. So a reload draws what the stream drew, and a result always
-lands on its own call. With 1a the stencil knows each parameter's span as it
-decodes, so the `arg` chunks cost nothing extra.
+An `id` is `p<n>`, the n-th part of the reply, the same in the stream and in
+the history. So a reload draws what the stream drew, and a result always lands
+on its own call.
+
+**As built**, the events come from a splitter on the server
+(`zend/src/parts.rs`) that reads the streamed text with the rule the grammar
+closes values on (`element_close`), not from inside the stencil — the same
+events, with no engine plumbing. A history message's call `args` is a list of
+`[name, value]` pairs, in the order written. The job panel's task transcripts
+are still drawn from their text (`renderContent`): they come from a worker's
+stored turns, which have no parts yet.
 
 **History shape.** Each message in `GET /v1/conversations/:id` carries `parts`,
 in order:
@@ -382,8 +394,8 @@ answered with an error.
 | # | Issue | Evidence | Fix |
 | --- | --- | --- | --- |
 | S1 | `code_session_exec` keeps earlier declarations, so a second `const src` collided | #57 | Its description says the session persists and every earlier name stays bound, so reuse or reassign rather than redeclare |
-| S2 | A `file_grep` with no `prefix` searched the whole repository and wasted a turn | #62 | `prefix` is required; a call without one is refused by the schema and, through the grammar, cannot be decoded |
-| S3 | The `timeline_read` schema the client sees lacks `view` and `turn`, though the server accepts them, so a client following its schema cannot read a turn | this review | Trace where the connector's tool list comes from and why it is stale, and fix that cause. Test: every tool's advertised schema equals its `definition()` |
+| S2 | A `file_grep` with no `prefix` searched the whole repository and wasted a turn | #62 | Dropped: a required prefix would break `repo: "*"` searches and force a guess for "where is X defined" |
+| S3 | The `timeline_read` schema the client sees lacks `view` and `turn`, though the server accepts them, so a client following its schema cannot read a turn | this review | Cause found: the server advertises `tools.listChanged: false` (`mcp-server/src/protocol.rs`), so a client keeps the listing it took when it connected — this one predates `view` (`bf1fd4d2f`, 2026-11-04). The fix is to send `notifications/tools/list_changed` when a member's tool set changes, which needs a server-to-client channel; open |
 | S4 | The `calls` view cuts each argument short, so the failed writes' raw text was not visible | #50, #55 | Not a defect: `view: turn` reads a turn whole. The `calls` view says so in its last line, naming the turn to read in full |
 | S5 | Every connector call appends the ~2k-token user-context block, and the conversation id changes between calls (`…-0159-claude-code`, then `…-1109-claude-code`) | every Zen call in this review | The block is appended to the first call of a connector session only. Fix why a session's calls each open a new conversation. Test: two calls in one session, the block on the first alone, one conversation id |
 

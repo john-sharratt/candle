@@ -2408,14 +2408,9 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Sorted by first tail: `\n</function>` before `\n<parameter=`.
         follows.sort_by_key(|t| t[0]);
-        assert_eq!(
-            follows,
-            [
-                Follows::Element.tails(),
-                Follows::Close.tails(),
-            ]
-        );
+        assert_eq!(follows, [Follows::Close.tails(), Follows::Element.tails()]);
     }
 
     /// It still compiles against a real vocabulary — the shape being right is
@@ -2536,7 +2531,8 @@ mod tests {
                         term: Terminator::JsonStringValue | Terminator::Until { .. },
                         limits,
                         ..
-                    } => Some(limits.forced_after),
+                    }
+                    | NodeSpec::Element { limits, .. } => Some(limits.forced_after),
                     _ => None,
                 })
                 .collect();
