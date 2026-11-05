@@ -153,7 +153,7 @@ begin and leaves every right one open:
 |---|---|
 | **Required first, in order; optionals after, in order**, so the field a choice depends on is written before what depends on it. Calibration examples write their fields in that order. | every definition |
 | **No modes.** Reading, searching, status and stopping are separate tools, so the tool's name settles the call's shape. | the five tools |
-| **A handle has its kind's exact shape.** `job` is held to `task:` + a thread and one or more names below it, each a kebab slug, a name possibly numbered (`verify.2`), `build:`/`deploy:` + 16 hex + `:` + an 11-character job id whose last character is one of 16, `cluster:` + 16 hex + `:` + digits — the prefix a choice of four. | `tool_constraints.yaml` |
+| **A handle has its kind's exact shape.** `job` is held to `task:` + a thread and the one worker below it, each a kebab slug, the worker possibly numbered (`verify.2`), `build:`/`deploy:` + 16 hex + `:` + an 11-character job id whose last character is one of 16, `cluster:` + 16 hex + `:` + digits — the prefix a choice of four. | `tool_constraints.yaml` |
 | **A handle is one the round can name.** Each round, `job`'s values are narrowed to the handles of the jobs that exist for the caller ([`stencil::live_values`]); a tool with none to name is taken out of the round. | the stencil's live values |
 | **Closed sets are enums, read from the source of truth**: a machine is one `host/machines.yaml` names, a service one keep runs, a guide one the library holds. | the definitions, at startup |
 | **No `null`.** An optional field is left out. | `#[schemars(with = …)]` |
