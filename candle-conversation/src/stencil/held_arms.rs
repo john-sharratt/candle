@@ -349,7 +349,10 @@ mod tests {
                 ending > 0 && ending < arms.len()
             })
         };
-        let all: Vec<NodeId> = (0..t.len() as u32).map(NodeId).filter(|n| is_choice(*n)).collect();
+        let all: Vec<NodeId> = (0..t.len() as u32)
+            .map(NodeId)
+            .filter(|n| is_choice(*n))
+            .collect();
         let held = held_branches_first(&t, &given(&["file_read"]), Some("file_list"), decode);
         let held_choices: Vec<NodeId> = all
             .iter()
@@ -357,10 +360,14 @@ mod tests {
             .filter(|n| held.arms_at(*n).is_some())
             .collect();
         assert!(held_choices.len() > 1, "one copy per way the call closes");
-        assert_eq!(held_choices.len() * 2, all.len(), "the first call's, not the second's");
+        assert_eq!(
+            held_choices.len() * 2,
+            all.len(),
+            "the first call's, not the second's"
+        );
         for node in held_choices {
             let trie = t.branch(node).unwrap();
-            for arm in held.arms_at(node).unwrap() {
+            for arm in held.arms_at(node).unwrap().iter() {
                 let next = trie.target_of(arm).unwrap();
                 assert!(!matches!(t.node(next), StencilNode::End), "going on");
             }

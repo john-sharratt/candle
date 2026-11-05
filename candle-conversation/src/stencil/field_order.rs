@@ -126,7 +126,10 @@ mod tests {
         assert_eq!(after(&["path", "content"]), Some(Follows::Either));
         assert_eq!(after(&["path", "content", "mode"]), Some(Follows::Either));
         assert_eq!(after(&["path", "content", "note"]), Some(Follows::Close));
-        assert_eq!(after(&["path", "content", "mode", "note"]), Some(Follows::Close));
+        assert_eq!(
+            after(&["path", "content", "mode", "note"]),
+            Some(Follows::Close)
+        );
         assert_eq!(after(&["path", "stray"]), None);
         assert_eq!(after(&[]), None);
     }

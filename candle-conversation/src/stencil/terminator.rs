@@ -455,7 +455,9 @@ impl TerminatorState {
             .map_or(0, |end| end + 1);
         let layout = [&self.recent[end..], b"\n"].concat();
         self.recent[..end].ends_with(marker)
-            && SEPARATORS.iter().any(|sep| sep.as_bytes() == layout.as_slice())
+            && SEPARATORS
+                .iter()
+                .any(|sep| sep.as_bytes() == layout.as_slice())
     }
 
     /// See [`Terminator::JsonStringValue`]. Before the opening quote only

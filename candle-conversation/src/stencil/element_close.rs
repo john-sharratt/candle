@@ -206,7 +206,10 @@ mod tests {
         assert_eq!(value_end("no close at all", 0, either), None);
         // A tag the grammar does not offer there is content.
         let text = "a</parameter>\n<parameter=b>c</parameter>\n</function>";
-        assert_eq!(value_end(text, 0, Follows::Close), Some(text.rfind(PARAM_CLOSE).unwrap()));
+        assert_eq!(
+            value_end(text, 0, Follows::Close),
+            Some(text.rfind(PARAM_CLOSE).unwrap())
+        );
         assert_eq!(value_end(text, 0, Follows::Element), Some(1));
     }
 
