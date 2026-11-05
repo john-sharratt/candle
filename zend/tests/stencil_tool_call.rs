@@ -597,12 +597,12 @@ fn held_value(pattern: &str) -> &'static str {
         "(?i)(javascript|js|node|nodejs|ecmascript)" => "js",
         "[A-Za-z0-9_./+-]+" => "a",
         "[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]" => "AAAAAAAAAAA",
-        r#"[^-\s~^:?*\["][^\s~^:?*\["]*"# | r#"[^-\s"][^\s"]*"# => "a",
+        r#"[^-\s~^:?*\["][^\s~^:?*\["]*"# | r#"[^\s"][^\s"]*"# => "a",
         "[0-9a-f]{40}([0-9a-f]{24})?" => "0000000000000000000000000000000000000000",
         "[A-Za-z0-9_-]{4}" => "AAAA",
         r#"(?i)[^"]*\.(png|jpe?g|webp|ico)"# => "a.png",
         r#"https?://[^\s"]+"# => "http://a",
-        r#"sftp://[^/\s"]+[^\s"]*"# => "sftp://a",
+        r#"sftp://[^/\s"][^\s"]*"# => "sftp://a",
         r"[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}" => "10.0.0.0/8",
         "([0-9a-fA-F]{2})*" | "[0-9a-fA-F]*" => "",
         "[0-9a-fA-F]+" | "([0-9a-fA-F]{2})+" => "00",
@@ -612,11 +612,10 @@ fn held_value(pattern: &str) -> &'static str {
         "[A-Za-z0-9+/]+={0,2}" | "[A-Za-z0-9_-]+" => "AA",
         "[<>]?([0-9]*[BHILQbhilqfds])*[0-9]*" => "",
         r#"[^"]*\.yaml"# => "a.yaml",
-        "(task:[a-z0-9-]+(/[a-z0-9-]+([.][0-9]+)?)+|(build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})" => "task:a/a",
+        "(task:[a-z0-9-]+/[a-z0-9-]+([.][0-9]+)?|(build|deploy):[0-9a-f]{16}:[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]|cluster:[0-9a-f]{16}:[0-9]{1,10})" => "task:a/a",
         other => panic!("no minimal value for pattern {other:?}"),
     }
 }
-
 /// `"key": value` for every field a minimal call writes, in the tree's order.
 fn required_fields(params: &[Param]) -> String {
     let (required, optional): (Vec<&Param>, Vec<&Param>) = params.iter().partition(|p| p.required);
