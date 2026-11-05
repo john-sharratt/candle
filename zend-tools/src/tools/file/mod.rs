@@ -166,6 +166,7 @@ impl Paging {
 
 pub mod delete;
 pub mod edit;
+pub(crate) mod edit_changes;
 pub mod grep;
 pub mod image;
 pub mod list;
