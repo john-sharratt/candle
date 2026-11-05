@@ -403,8 +403,8 @@ design that this replaced.** The candle-conversation lock tier it describes
 
 #### The former screen
 
-The screen stays in `fast_path.rs`; its admission changes and four checks are
-added.
+The screen lived in `zend/src/fast_path.rs`, now removed; its admission
+changed and four checks were added.
 
 - **A lock dislodges nothing.** `WorkingSet::lock` enters on top of the
   voluntary budget; when the locks would pass `lock_tokens`, it refuses and the
@@ -653,13 +653,11 @@ these numbers.
 | Filling the groups; off the flexbox, emitted verbatim | `projection/project.rs` (Step 4b), `projection/working_set_pick.rs` |
 | The dialogue group holds lineage + its own turns; members per group | `projection/resolver.rs` (`TargetedRead::group_turns`, `working_set_members`) |
 | Pinned turn not hot is an error | `scheduler/projection_assembler.rs` (`is_promised`) |
-| Screen: lock, first-write split, reworded reply | `zend/src/fast_path.rs` |
-| Coverage check, cached per chain | `zend/src/fast_path/coverage.rs` |
-| Registry check of `release_on`, alias-aware release, `round_marks` | `zend/src/working_set.rs` |
-| How long a promise lasts: departure from the projection, per-file write release | `zend/src/working_set/promises.rs` |
+| Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate.rs` / `engine.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
+| Which ingested readings stand for a file, and whether a reading covers it whole | `zend/src/working_set/corpus.rs`, `zend/src/working_set/coverage.rs` |
+| Registry check of `release_on` (the lock tier's config, which zend does not drive) | `zend/src/working_set.rs` |
 | Seed resolution | `zend/src/working_set/seeds.rs` |
-| Locks restored from the marks | `zend/src/working_set/restore.rs` |
-| Open, departures after each projection, write release on rounds (live and resumed), marks on the next turn | `zend/src/session.rs` (`run_inference_stream`, `end_written_promises`) |
+| Open, the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
 
 ## 7. Tests (CPU unless marked)

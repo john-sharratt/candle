@@ -79,20 +79,30 @@ span.
    `</function>` is not offered; if every parameter is written, `<parameter=` is
    not. A branch the tree would refuse must never fire, or a real close would be
    read as content.
-4. **`completion()` is unchanged.** A value cut short by EOS or the hard limit
-   is still finished with `</parameter>`.
+4. **`completion()` writes no second close.** A value cut short by EOS or the
+   hard limit is finished with `</parameter>`, unless it already ends on it with
+   layout that, before the successor's newline, is a separator; any other
+   layout is the value's, and `</parameter>` closes it again.
 
 **Extraction uses the same rule.** `function_blocks_to_json` finds each value's
 end by the same marker set, not `find("</parameter>")` or `find("</function>")`.
-It takes the text raw and lets `serde_json` escape it into the JSON string. One
-function holds the marker set and is shared by the grammar, the conversion, the
-splitter and npcd's `act.rs`, so they cannot drift.
+It takes the text raw and lets `serde_json` escape it into the JSON string.
+**Which markers end a value is the tree's, so a reader asks the catalog.** One
+statement of the field order (`stencil/field_order.rs`) decides what may follow
+each argument — the next element, the close, or either — for the grammar's
+gates and for `element_close::follows_in`, which the readers holding the
+catalog the grammar was compiled from use: the conversion, the passthrough
+splitter (the client's specs) and the GUI's part splitter (the daemon's
+catalog). A last value holding `</parameter>\n<parameter=` then reads back
+whole, as it decoded.
 
 **The splitter, in the same change.** `zend/src/tool_call_split.rs` counts a
 `</tool_call>` only after a real `</function>`, by the shared rule.
 
 **npcd, in the same change.** `npcd/src/engine/act.rs` moves onto the shared
-rule, so every reader of the format uses the one function.
+reader. Its parse names no catalog, so it closes a value on either tag
+(`Follows::Either`): a character's last value holding another element's tags
+is split there.
 
 **Tests, byte for byte**
 
@@ -100,9 +110,12 @@ rule, so every reader of the format uses the one function.
   decodes and extracts intact.
 - Each separator closes a value; a close hard against prose still closes.
 - A `</parameter>` followed by a branch the tree refuses is content.
-- The one remaining ambiguity, content holding a full marker such as
-  `</parameter>\n<parameter=`, ends the value. The test pins that so the
-  behaviour is written down.
+- Content holding a full marker the tree offers there, such as
+  `</parameter>\n<parameter=` before a later element, ends the value; after the
+  last argument it is content, for the grammar and the catalog's readers alike
+  (`a_block_reads_back_as_its_grammar_closed_it`).
+- Every copy of the go-again choice after a forced first call is held, one per
+  way its last value can close (`every_copy_of_the_choice_after_a_function_block_is_held`).
 
 **Design doc:** `docs/stencil_tree.md`, in the same change.
 

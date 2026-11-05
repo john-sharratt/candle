@@ -21,6 +21,7 @@ use crate::parts::{Out as PartOut, PartEvent, PartSplit};
 use crate::reasoning_split::{Piece, ReasoningSplit};
 use crate::think_gate::{gate_leading_think, ThinkGate};
 use crate::tool_call_split::{Out, ToolCallSplit};
+use crate::tools::tool_catalog;
 use crate::types::{ChatCompletionChunk, ChunkChoice, Delta, DeltaToolCall, Usage};
 
 /// How a reply's text is shaped for the client.
@@ -91,7 +92,7 @@ impl Framer {
                 gate_open: false,
                 reasoning: framing.split_reasoning.then(ReasoningSplit::default),
                 tools: framing.tools.map(ToolCallSplit::new),
-                parts: framing.parts.then(PartSplit::default),
+                parts: framing.parts.then(|| PartSplit::new(tool_catalog())),
                 usage: None,
                 finish: FinishReason::Stop,
             }),

@@ -289,7 +289,10 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // finished with `</parameter>`, so a block with an unclosed value was
         // not the grammar's and is left as text too.
         let block = &rest[at..];
-        let Some(read) = read_block(block) else {
+        // Read without the catalog, closing a value on either tag: a parse
+        // here names no tool list, so a last value holding another element's
+        // tags is split where the grammar kept it whole.
+        let Some(read) = read_block(block, &[]) else {
             // From the block's start, NOT `rest`: the narration before it was
             // already pushed above, so re-emitting the whole remainder would
             // duplicate it.

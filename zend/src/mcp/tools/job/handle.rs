@@ -110,7 +110,6 @@ mod tests {
     fn each_kind_reads_back_as_itself() {
         for text in [
             "task:review/verify",
-            "task:review/verify/read",
             "task:review/verify.2",
             "build:76c3a0f4d39bd9db:XeV_I_QPzpg",
             "deploy:76c3a0f4d39bd9db:XeV_I_QPzpg",

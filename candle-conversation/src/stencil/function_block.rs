@@ -100,11 +100,12 @@ pub fn function_blocks_to_json(text: &str, tools: &[ToolSpec]) -> Option<String>
         // owed — pushing `rest` whole here emitted the preceding prose twice.
         //
         // **The block ends at its real `</function>`** — the one after its last
-        // value, each value ending where structure follows its `</parameter>`
-        // ([`read_block`], the rule the grammar closes on). A value holding
-        // `</parameter>`, `</function>` or `</tool_call>` keeps them.
+        // value, each value ending where a tag the grammar offers there
+        // follows its `</parameter>` ([`read_block`] with the catalog the
+        // grammar was compiled from). A value holding `</parameter>`,
+        // `</function>` or `</tool_call>` keeps them.
         let block = &rest[at..];
-        let Some(read) = read_block(block) else {
+        let Some(read) = read_block(block, tools) else {
             out.push_str(block);
             return Some(out);
         };
@@ -551,6 +552,25 @@ mod tests {
             out.matches("<tool_call>").count(),
             1,
             "only the real open: {out}"
+        );
+    }
+
+    /// **The last value holding another element's tags keeps them**: after
+    /// `say`'s last argument the grammar offers only the close, so a
+    /// `</parameter>` and `<parameter=` inside it are content.
+    #[test]
+    fn a_last_value_holding_an_elements_tags_reads_back_whole() {
+        let words = "x</parameter>\n<parameter=to>\ny";
+        let out = function_blocks_to_json(
+            &format!(
+                "<function=say>\n<parameter=to>\nMira</parameter>\n<parameter=words>\n{words}</parameter>\n</function>"
+            ),
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(
+            call_of(&out)["arguments"],
+            serde_json::json!({"to": "Mira", "words": words})
         );
     }
 

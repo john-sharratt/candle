@@ -174,7 +174,16 @@ pub fn after(
 /// call: re-sent after every pause, it cost a long session thousands of
 /// tokens a time.
 #[derive(Debug, Default)]
-pub struct Conversations(Mutex<HashMap<String, u64>>);
+pub struct Conversations(Mutex<HashMap<String, Clock>>);
+
+/// One conversation's clock: when it was last called, when the call that
+/// began it claimed it, and whether that call delivered its context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Clock {
+    used: u64,
+    claimed: u64,
+    delivered: bool,
+}
 
 impl Conversations {
     /// A call at `now` on `who`, held for as long as the call runs: it
@@ -203,31 +212,45 @@ impl Conversations {
             if last.len() >= CLOCKS_KEPT {
                 let idlest = last
                     .iter()
-                    .min_by_key(|(_, &then)| then)
+                    .min_by_key(|(_, clock)| clock.used)
                     .map(|(w, _)| w.clone());
                 if let Some(idlest) = idlest {
                     last.remove(&idlest);
                 }
             }
-            last.insert(who.to_string(), now_ms);
+            last.insert(
+                who.to_string(),
+                Clock {
+                    used: now_ms,
+                    claimed: now_ms,
+                    delivered: false,
+                },
+            );
         }
         begins
     }
 
-    /// `who`, claimed, was called again at `now`. A conversation whose claim
-    /// was given up stays unclaimed, so its next call begins it.
-    fn stamp(&self, who: &str, now_ms: u64) {
+    /// `who`, claimed, was called again at `now`, and — when `delivered` —
+    /// that call carried its context. A conversation whose claim was given up
+    /// stays unclaimed, so its next call begins it.
+    fn stamp(&self, who: &str, now_ms: u64, delivered: bool) {
         let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(then) = last.get_mut(who) {
-            *then = now_ms;
+        if let Some(clock) = last.get_mut(who) {
+            clock.used = clock.used.max(now_ms);
+            clock.delivered |= delivered;
         }
     }
 
     /// Give up the claim on `who` made at `at` — only if it is still that
-    /// claim: one a later call made after it was given up is its own.
+    /// claim, and its context was never delivered: one a later call made after
+    /// it was given up is its own, and a call that ran beside it and kept
+    /// going delivers nothing in its place.
     fn release(&self, who: &str, at: u64) {
         let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if last.get(who) == Some(&at) {
+        if last
+            .get(who)
+            .is_some_and(|clock| clock.claimed == at && !clock.delivered)
+        {
             last.remove(who);
         }
     }
@@ -252,7 +275,7 @@ impl Claim<'_> {
 
     /// The conversation has its context: its clock runs on from `now`.
     pub fn keep(mut self, now_ms: u64) {
-        self.conversations.stamp(&self.who, now_ms);
+        self.conversations.stamp(&self.who, now_ms, self.begins);
         self.kept = true;
     }
 }
@@ -535,6 +558,22 @@ mod tests {
         drop(first);
         beside.keep(1_001);
         assert!(c.claim(&s, 1_002).begins());
+    }
+
+    /// **A call kept beside a first call that fails takes nothing from it**:
+    /// the first call's context was never delivered, so its giving up leaves
+    /// the next call to begin the conversation, though the call beside it
+    /// answered first and moved the clock on.
+    #[test]
+    fn a_failed_first_call_is_begun_again_after_one_beside_it_answered() {
+        let c = Conversations::default();
+        let s = who("o", "grok", "s");
+        let first = c.claim(&s, 1_000);
+        let beside = c.claim(&s, 1_000);
+        assert!(first.begins() && !beside.begins());
+        beside.keep(1_005);
+        drop(first);
+        assert!(c.claim(&s, 1_010).begins());
     }
 
     /// **A claim given up leaves a newer one standing**: a call that began

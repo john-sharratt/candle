@@ -25,6 +25,7 @@
 
 use std::sync::OnceLock;
 
+use candle_conversation::stencil::element_close::{value_end, Follows, PARAM_CLOSE, PARAM_TAG};
 use candle_conversation::TurnText;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -34,6 +35,7 @@ use crate::tools::{answer_text, calls_in_answer, parse_call, run_tool, ToolCall,
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
+const FN_OPEN: &str = "<function=";
 
 /// What a quoted `<` becomes in [`scan_text`]: a private-use character no
 /// scanner matches, mapped back to `<` in every argument a planned call
@@ -85,6 +87,8 @@ struct Ending {
     chars: usize,
     /// The last parameter the call opened, when it opened one.
     parameter: Option<String>,
+    /// Whether the call is a function block rather than a JSON object.
+    block: bool,
 }
 
 impl Ending {
@@ -92,6 +96,7 @@ impl Ending {
         Ending {
             chars: body.chars().count(),
             parameter: last_parameter(body),
+            block: body.trim_start().starts_with(FN_OPEN),
         }
     }
 
@@ -107,16 +112,32 @@ impl Ending {
     }
 }
 
-/// The last parameter a call's text opens: a function block's
-/// `<parameter=name>`, or a JSON object's last `"key":` inside `arguments`.
+/// The last parameter a call's text opens: a function block's last element,
+/// found by walking its elements value by value (`element_close`) so a tag a
+/// value quotes is not taken for one; or a JSON object's last `"key":` inside
+/// `arguments`.
 fn last_parameter(body: &str) -> Option<String> {
-    static ELEMENT: OnceLock<Regex> = OnceLock::new();
-    static KEY: OnceLock<Regex> = OnceLock::new();
-    let element =
-        ELEMENT.get_or_init(|| Regex::new(r"<parameter=([^>\s]+)>").expect("static regex"));
-    if let Some(c) = element.captures_iter(body).last() {
-        return Some(c[1].to_string());
+    let body = body.trim_start();
+    if let Some(named) = body.strip_prefix(FN_OPEN) {
+        let mut at = FN_OPEN.len() + named.find('>')? + 1;
+        let mut last = None;
+        loop {
+            let rest = &body[at..];
+            at += rest.len() - rest.trim_start().len();
+            let Some(element) = body[at..].strip_prefix(PARAM_TAG) else {
+                return last;
+            };
+            let key_len = element.find('>')?;
+            let key = element[..key_len].trim().to_string();
+            let value = at + PARAM_TAG.len() + key_len + 1;
+            match value_end(body, value, Follows::Either) {
+                Some(close) => at = close + PARAM_CLOSE.len(),
+                None => return Some(key),
+            }
+            last = Some(key);
+        }
     }
+    static KEY: OnceLock<Regex> = OnceLock::new();
     let args = body.find("\"arguments\"")?;
     let key =
         KEY.get_or_init(|| Regex::new(r#""([A-Za-z_][A-Za-z0-9_]*)"\s*:"#).expect("static regex"));
@@ -301,8 +322,13 @@ fn unreadable_blocks(answer: &str) -> Vec<(usize, Option<String>, Problem)> {
 }
 
 /// The tool a call names, read from its text when the call itself does not
-/// parse — `"name": "write"` survives a value cut off after it.
+/// parse — a function block's `<function=write>`, or `"name": "write"`, both
+/// survive a value cut off after them.
 fn named_tool(body: &str) -> Option<String> {
+    if let Some(named) = body.trim_start().strip_prefix(FN_OPEN) {
+        let name = named[..named.find('>')?].trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
     static NAME: OnceLock<Regex> = OnceLock::new();
     NAME.get_or_init(|| {
         Regex::new(r#""(?:name|function|tool)"\s*:\s*"([^"\\]+)""#).expect("static regex")
@@ -329,9 +355,13 @@ fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
             "error": "malformed_call",
             "detail": format!(
                 "This {label} call could not be read ({why}), so it was not run and \
-                 nothing changed. {} Issue it again as one JSON object with \"name\" \
-                 and \"arguments\".",
-                ending.sentence()
+                 nothing changed. {} Issue it again as {}.",
+                ending.sentence(),
+                match ending.block {
+                    true => "one complete function block, each parameter closed and the \
+                             function closed after the last",
+                    false => "one JSON object with \"name\" and \"arguments\"",
+                }
             ),
         }),
     };
@@ -454,6 +484,10 @@ mod tests {
         let json = r#"{"name": "write", "arguments": {"path": "a", "content": "ab"#;
         assert_eq!(last_parameter(json).as_deref(), Some("content"));
         assert_eq!(last_parameter(r#"{"name": "wri"#), None);
+        // A tag the value quotes is content, not the parameter it ended in.
+        let quoting =
+            "<function=write>\n<parameter=content>\nsee <parameter=path> here</parameter> and";
+        assert_eq!(last_parameter(quoting).as_deref(), Some("content"));
         assert_eq!(Ending::of("abc").sentence(), "It ended 3 characters in.");
         assert_eq!(
             Ending::of(block).sentence(),
@@ -462,6 +496,25 @@ mod tests {
                 block.chars().count()
             )
         );
+    }
+
+    /// **A function block cut short is answered under its own tool**, told
+    /// to write a function block again, not a JSON object.
+    #[test]
+    fn a_function_block_cut_short_is_named_and_told_its_own_shape() {
+        let text = "<tool_call>\n<function=file_write>\n<parameter=path>\na.md</parameter>\n<parameter=content>\nhalf";
+        let steps = plan(&tagged(text));
+        assert_eq!(runs(&steps), ["file_write"]);
+        assert_eq!(error_of(&steps[0]), "call_cut_off");
+        let block = "<function=file_write>\n<parameter=path>\na.md</parameter>\n</function";
+        let r = refusal(
+            named_tool(block),
+            &Problem::Invalid("x".into(), Ending::of(block)),
+        );
+        let detail = r.response["detail"].as_str().unwrap();
+        assert!(detail.starts_with("This file_write call"), "{detail}");
+        assert!(detail.contains("one complete function block"), "{detail}");
+        assert!(!detail.contains("JSON"), "{detail}");
     }
 
     /// Complete but not JSON: refused as malformed, with the parser's reason.

@@ -169,9 +169,9 @@ cites, against what the worker actually did in its turns:
 | never seen | cited, but nothing in the run touched it — inferred or invented |
 
 A turn's tool results are its user half's `<tool_response>` blocks
-(`fast_path::coverage::response_bodies`), so the audit is deterministic and
-cheap. It reads every normal turn of the worker's conversation and of each
-part it started (`ZendSession::conversation_detail`), and goes at the end of
+(`working_set::coverage::response_bodies`), so the audit is deterministic and
+cheap. It reads every normal turn of the worker's conversation
+(`ZendSession::conversation_detail`), and goes at the end of
 what `job_status` / `repo_task_start` answer for a `done` worker. An answer citing no
 URL carries no audit.
 

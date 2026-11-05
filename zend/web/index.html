@@ -1267,7 +1267,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       if (p.kind === 'prose') { if (p.text) html += renderMd(p.text); continue; }
       if (p.kind === 'think') {
         const closed = !streaming || p.closed;
-        html += renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length: lengths[thinkNo++] || null }, open);
+        const length = lengths[thinkNo++] || (p.counted != null ? { tokens: p.counted, exact: true } : null);
+        html += renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open);
         continue;
       }
       const args = {};
@@ -1315,7 +1316,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       p.text += ev.text || '';
       if (ev.tokens != null) p.live = ev.tokens;
     } else if (ev.op === 'close') {
-      p.closed = true; p.ok = ev.ok; p.error = ev.error || null; p.live = null;
+      // A closed block keeps its last running count as its length until the
+      // history's `thinking` labels it.
+      p.closed = true; p.ok = ev.ok; p.error = ev.error || null;
+      if (p.live != null) p.counted = p.live;
+      p.live = null;
     } else if (ev.op === 'result') {
       p.result = ev.result; p.tokens = ev.tokens; p.running = false;
     }

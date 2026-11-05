@@ -10,6 +10,7 @@
 //! (see [`JsonLexer`]), and a token that would make the value invalid comes back
 //! as [`Feed::Rewrite`] — the bytes to commit in its place.
 
+use super::element_close::SEPARATORS;
 use super::json_lexer::{Effect, JsonLexer};
 
 /// What ends a free-text span.
@@ -258,8 +259,10 @@ impl TerminatorState {
                 false => b" \"\"".to_vec(),
             },
             // The marker already written with only layout after it — a close
-            // whose tag never came — needs nothing more: the successor's own
-            // separator and tag follow it.
+            // whose tag never came — needs nothing more when the successor's
+            // own newline and tag make that layout a separator a reader takes
+            // (`element_close::SEPARATORS`). Any other layout is the value's,
+            // and the marker is written again to close it.
             (Terminator::Until { marker, tails }, _)
                 if !tails.is_empty() && self.ends_on_marker(marker.as_bytes()) =>
             {
@@ -441,14 +444,18 @@ impl TerminatorState {
         Feed::Continue
     }
 
-    /// Whether what was written ends on `marker` with only layout after it.
+    /// Whether what was written ends on `marker` with only layout after it
+    /// that, followed by the newline a successor writes first, is a separator
+    /// ([`SEPARATORS`]).
     fn ends_on_marker(&self, marker: &[u8]) -> bool {
-        let trimmed = self
+        let end = self
             .recent
             .iter()
             .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-            .map_or(&self.recent[..0], |end| &self.recent[..=end]);
-        trimmed.ends_with(marker)
+            .map_or(0, |end| end + 1);
+        let layout = [&self.recent[end..], b"\n"].concat();
+        self.recent[..end].ends_with(marker)
+            && SEPARATORS.iter().any(|sep| sep.as_bytes() == layout.as_slice())
     }
 
     /// See [`Terminator::JsonStringValue`]. Before the opening quote only
@@ -1022,16 +1029,24 @@ mod tests {
     }
 
     /// **A value cut short is finished with the marker** — unless it already
-    /// ends on the marker with only layout after it, which the successor's own
-    /// separator and tag complete.
+    /// ends on the marker with only layout after it that the successor's own
+    /// newline and tag make a separator. Layout no separator holds is the
+    /// value's, and the marker closes it again.
     #[test]
     fn a_followed_marker_completes_once() {
         let mut st = ELEMENT.start();
         st.feed(b"half a value");
         assert_eq!(st.completion(), b"</parameter>");
-        let mut st = ELEMENT.start();
-        st.feed(b"done</parameter>\n");
-        assert!(st.completion().is_empty());
+        for layout in ["", "\n", " ", "\r"] {
+            let mut st = ELEMENT.start();
+            st.feed(format!("done</parameter>{layout}").as_bytes());
+            assert!(st.completion().is_empty(), "{layout:?}");
+        }
+        for layout in ["\n\n", "\r\n", "\t", "  "] {
+            let mut st = ELEMENT.start();
+            st.feed(format!("done</parameter>{layout}").as_bytes());
+            assert_eq!(st.completion(), b"</parameter>", "{layout:?}");
+        }
         let mut st = ELEMENT.start();
         st.feed(b"quoted </parameter> then more");
         assert_eq!(st.completion(), b"</parameter>");

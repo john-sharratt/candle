@@ -19,15 +19,16 @@ const CLOSE: &str = "</tool_call>";
 
 /// Where an open call's `</tool_call>` is in `body`, the text after its
 /// opener: the first one after the call itself has ended — a function block
-/// at its real `</function>` (`element_close`), a JSON object at its closing
-/// brace — so a value holding `</tool_call>` does not end the call. A body
-/// that is neither is the model's text, ending at the first close. `None`
-/// while the call is still arriving.
-fn close_of(body: &str) -> Option<usize> {
+/// at its real `</function>`, read with the catalog its grammar was compiled
+/// from (`element_close`), a JSON object at its closing brace — so a value
+/// holding `</tool_call>` does not end the call. A body that is neither is the
+/// model's text, ending at the first close. `None` while the call is still
+/// arriving.
+fn close_of(body: &str, specs: &[ToolSpec]) -> Option<usize> {
     let lead = body.len() - body.trim_start().len();
     let rest = &body[lead..];
     let ended = if rest.starts_with("<function=") {
-        lead + function_end(rest)?
+        lead + function_end(rest, specs)?
     } else if rest.starts_with('{') {
         lead + object_end(rest)?
     } else {
@@ -92,7 +93,7 @@ impl ToolCallSplit {
         let mut out = Vec::new();
         loop {
             if self.in_call {
-                let Some(close) = close_of(&self.pending) else {
+                let Some(close) = close_of(&self.pending, &self.specs) else {
                     return out;
                 };
                 let body: String = self.pending.drain(..close).collect();
@@ -208,12 +209,15 @@ mod tests {
         );
         let block = "\n<function=write>\n<parameter=content>\na</tool_call></function></parameter>\n</function>\n";
         let body = format!("{block}</tool_call> after");
-        assert_eq!(super::close_of(&body), Some(block.len()));
+        assert_eq!(super::close_of(&body, &[]), Some(block.len()));
         assert_eq!(
-            super::close_of("\n<function=write>\n<parameter=content>\na</tool_call>"),
+            super::close_of(
+                "\n<function=write>\n<parameter=content>\na</tool_call>",
+                &[]
+            ),
             None
         );
-        assert_eq!(super::close_of("nope</tool_call>"), Some(4));
+        assert_eq!(super::close_of("nope</tool_call>", &[]), Some(4));
     }
 
     #[test]

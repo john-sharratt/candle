@@ -113,34 +113,42 @@ pub fn held_branches_first(
         }
     }
     if let (Some(only), Some(opening)) = (first_call, opening) {
-        if let Some(goes_on) = continuation_after(tree, opening, only, &decode) {
-            by_node.push(goes_on);
-        }
+        by_node.extend(continuation_after(tree, opening, only, &decode));
     }
     HeldBranches { by_node }
 }
 
-/// The go-again-or-finish choice a call reaches once the tool `first` is
-/// written at the branch `opening`, held to the arms that go again.
+/// The go-again-or-finish choices a call reaches once the tool `first` is
+/// written at the branch `opening`, each held to the arms that go again.
 ///
-/// That choice is the one branch a call's body leads to with an arm straight
-/// to the tree's end — finishing the turn — beside one that does not, opening
-/// the next call. Every way through the call's arguments meets it before
-/// anything of the next call, so the first such branch a walk from `first`'s
-/// arm finds is the one after this call.
+/// A choice is a branch a call's body leads to with an arm straight to the
+/// tree's end — finishing the turn — beside one that does not, opening the
+/// next call. Every way through the call's arguments meets one before anything
+/// of the next call. There is one copy of it per way the call can close: a
+/// value span that closed on a tail it wrote goes on through that tail's fork
+/// (`FreeTextSpan::forks`), each fork lowered to its own copy of what follows,
+/// so the walk follows every fork as well as `next`, and stops at each choice
+/// it meets rather than walking on into the next call.
 fn continuation_after(
     tree: &StencilTree,
     opening: NodeId,
     first: &str,
     decode: &impl Fn(&[TokenId]) -> Option<String>,
-) -> Option<(NodeId, Arc<[Vec<TokenId>]>)> {
-    let names = tree.branch(opening)?;
-    let arm = names
+) -> Vec<(NodeId, Arc<[Vec<TokenId>]>)> {
+    let Some(names) = tree.branch(opening) else {
+        return Vec::new();
+    };
+    let Some(start) = names
         .arms()
         .into_iter()
-        .find(|a| decode(a).is_some_and(|t| arm_name(t.as_bytes()) == first))?;
+        .find(|a| decode(a).is_some_and(|t| arm_name(t.as_bytes()) == first))
+        .and_then(|arm| names.target_of(&arm))
+    else {
+        return Vec::new();
+    };
     let ends = |node: NodeId| matches!(tree.node(node), StencilNode::End);
-    let mut todo = vec![names.target_of(&arm)?];
+    let mut held = Vec::new();
+    let mut todo = vec![start];
     let mut seen = HashSet::new();
     while let Some(node) = todo.pop() {
         if !seen.insert(node) {
@@ -148,7 +156,10 @@ fn continuation_after(
         }
         match tree.node(node) {
             StencilNode::Static { next, .. } => todo.push(*next),
-            StencilNode::FreeText(span) => todo.push(span.next),
+            StencilNode::FreeText(span) => {
+                todo.push(span.next);
+                todo.extend(span.forks.iter().copied());
+            }
             StencilNode::End => {}
             StencilNode::Branch { trie } => {
                 let arms = trie.arms();
@@ -158,13 +169,14 @@ fn continuation_after(
                     .cloned()
                     .collect();
                 if !again.is_empty() && again.len() < arms.len() {
-                    return Some((node, Arc::from(again)));
+                    held.push((node, Arc::from(again)));
+                    continue;
                 }
                 todo.extend(arms.iter().filter_map(|a| trie.target_of(a)));
             }
         }
     }
-    None
+    held
 }
 
 #[cfg(test)]
@@ -306,5 +318,52 @@ mod tests {
             3,
             "with no first call held, no choice is"
         );
+    }
+
+    /// **A function-block call goes on whichever way its last value closed**:
+    /// each tail a value can close on forks to its own copy of the choice
+    /// after the call, and every copy after the first call is held to going
+    /// on — and none after the second, which the turn may end on.
+    #[test]
+    fn every_copy_of_the_choice_after_a_function_block_is_held() {
+        let v = TestVocab::new();
+        let spec = compile_tool_call_loop(
+            &parse_tools(CATALOG).unwrap(),
+            &ToolCallEnvelope::qwen35(),
+            3,
+            "<|im_end|>",
+        )
+        .unwrap();
+        let t = compile(&spec, &v).unwrap();
+        let decode = |tokens: &[TokenId]| String::from_utf8(v.decode(tokens)).ok();
+        let is_choice = |node: NodeId| {
+            t.branch(node).is_some_and(|trie| {
+                let arms = trie.arms();
+                let ending = arms
+                    .iter()
+                    .filter(|a| {
+                        trie.target_of(a)
+                            .is_some_and(|n| matches!(t.node(n), StencilNode::End))
+                    })
+                    .count();
+                ending > 0 && ending < arms.len()
+            })
+        };
+        let all: Vec<NodeId> = (0..t.len() as u32).map(NodeId).filter(|n| is_choice(*n)).collect();
+        let held = held_branches_first(&t, &given(&["file_read"]), Some("file_list"), decode);
+        let held_choices: Vec<NodeId> = all
+            .iter()
+            .copied()
+            .filter(|n| held.arms_at(*n).is_some())
+            .collect();
+        assert!(held_choices.len() > 1, "one copy per way the call closes");
+        assert_eq!(held_choices.len() * 2, all.len(), "the first call's, not the second's");
+        for node in held_choices {
+            let trie = t.branch(node).unwrap();
+            for arm in held.arms_at(node).unwrap() {
+                let next = trie.target_of(arm).unwrap();
+                assert!(!matches!(t.node(next), StencilNode::End), "going on");
+            }
+        }
     }
 }

@@ -33,6 +33,7 @@ use crate::mcp::ownership;
 use crate::parts::{parts_of, Part};
 use crate::projection_event::ProjectionSpanOut;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
+use crate::tools::tool_catalog;
 use crate::types::Role;
 use crate::working_set::coverage::response_bodies;
 
@@ -302,7 +303,7 @@ fn attach_parts(messages: &mut [HistoryMessage]) {
                     .collect()
             })
             .unwrap_or_default();
-        messages[i].parts = parts_of(&messages[i].content, &results);
+        messages[i].parts = parts_of(&messages[i].content, tool_catalog(), &results);
     }
 }
 

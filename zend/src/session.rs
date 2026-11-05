@@ -4644,6 +4644,8 @@ fn run_inference_stream(
             let mut think_resolved = false;
             let mut think_progress = ThinkProgress::default();
             let mut done_resp = None;
+            // The finished turn's report, sent once its last text is out.
+            let mut turn_end: Option<StreamItem> = None;
             let mut turn_error: Option<anyhow::Error> = None;
             // Whether the client stopped reading. Observational only: a turn is
             // not abandoned because nobody is listening. It decodes, runs its
@@ -4786,17 +4788,18 @@ fn run_inference_stream(
                                 prefill_ms = resp.stats.prefill_ms as u32,
                                 "turn complete",
                             );
-                            // Report the finished turn — usage + finish_reason —
-                            // to the client, async like the rest of this stream.
-                            let _ = tx
-                                .send(Ok(StreamItem::TurnEnd {
-                                    usage: Usage::for_turn(
-                                        resp.stats.context_tokens,
-                                        resp.stats.tokens_generated,
-                                    ),
-                                    finish: resp.stats.finish,
-                                }))
-                                .await;
+                            // The finished turn — usage + finish_reason — goes to
+                            // the client after the turn's last text: the held
+                            // tail and a cut-off call's close are still to come,
+                            // and a reader that ends the turn on this item would
+                            // take them for the next turn's.
+                            turn_end = Some(StreamItem::TurnEnd {
+                                usage: Usage::for_turn(
+                                    resp.stats.context_tokens,
+                                    resp.stats.tokens_generated,
+                                ),
+                                finish: resp.stats.finish,
+                            });
                             done_resp = Some(resp);
                         }
                         TurnEvent::Error(e) => {
@@ -4877,6 +4880,9 @@ fn run_inference_stream(
                 );
                 // As a turn that ended without its Done: the scope it was given
                 // goes with it.
+                if let Some(end) = turn_end.take() {
+                    let _ = tx.send(Ok(end)).await;
+                }
                 state.engine.clear_retrieval_scope(timeline);
                 break;
             }
@@ -4970,6 +4976,9 @@ fn run_inference_stream(
                 let _ = tx
                     .send(Ok(StreamItem::Token("\n</tool_call>".to_string())))
                     .await;
+            }
+            if let Some(end) = turn_end.take() {
+                let _ = tx.send(Ok(end)).await;
             }
 
             // If tools will run, tell the GUI *now* — before sealing/persisting
