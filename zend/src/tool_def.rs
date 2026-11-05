@@ -1175,9 +1175,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The file tools a coding turn needs whatever the question, the two web
-    /// tools, the two journal readers and the note every acting turn opens
-    /// with project on every turn; nothing else does. A mandatory tool rides on top of the belief top-k, so adding one
+    /// The file tools a coding turn needs whatever the question — reading,
+    /// searching, editing and writing — the two web tools, the two journal
+    /// readers and the note every acting turn opens with project on every
+    /// turn; nothing else does. A mandatory tool rides on top of the belief top-k, so adding one
     /// here widens every prompt — the set is pinned so that is a deliberate
     /// change.
     #[test]
@@ -1191,6 +1192,7 @@ mod tests {
         assert_eq!(
             mandatory,
             [
+                "file_edit",
                 "file_grep",
                 "file_list",
                 "file_read",
