@@ -422,10 +422,7 @@ fn lower_terminal(
             Ok(push(
                 arena,
                 StencilNode::FreeText(FreeTextSpan {
-                    term: Terminator::Until {
-                        marker: *marker,
-                        tails: *tails,
-                    },
+                    term: Terminator::Until { marker, tails },
                     eos_ends: false,
                     limits: *limits,
                     close_token: None,

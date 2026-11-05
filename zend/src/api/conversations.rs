@@ -24,12 +24,15 @@ use axum::{
 use candle_conversation::turn_layout::ThinkingLength;
 use candle_conversation::{RecoveredMessage, Role as TurnRole};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::chat;
 use super::compressed;
 use crate::chatml::split_turn;
 use crate::mcp::ownership;
+use crate::parts::{parts_of, Part};
 use crate::projection_event::ProjectionSpanOut;
+use crate::working_set::coverage::response_bodies;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
 use crate::types::Role;
 
@@ -153,6 +156,7 @@ pub async fn get(
                 spans: Vec::new(),
                 files,
                 error: None,
+                parts: Vec::new(),
             });
         }
     };
@@ -199,6 +203,7 @@ pub async fn get(
                 spans: Vec::new(),
                 files: Vec::new(),
                 error: None,
+                parts: Vec::new(),
             });
         }
         attach_turn_error(&mut messages[first_bubble..], error);
@@ -207,6 +212,7 @@ pub async fn get(
     // Any uploads recorded past the last turn (uploaded after the final turn)
     // append at the end.
     emit_uploads(&mut messages, u32::MAX);
+    attach_parts(&mut messages);
     if let Some(turn) = &live {
         messages.push(HistoryMessage {
             role: role_str(Role::User),
@@ -217,6 +223,7 @@ pub async fn get(
             spans: Vec::new(),
             files: Vec::new(),
             error: None,
+            parts: Vec::new(),
         });
     }
 
@@ -268,6 +275,35 @@ fn cut_reply(history: &mut Vec<RecoveredMessage>, history_before: usize) -> usiz
         .count();
     history.truncate(cut);
     assistant
+}
+
+/// Give every assistant bubble its parts (`crate::parts`), each call with the
+/// result that answered it: the tool results of the next user bubble, in call
+/// order, with their lengths. The GUI draws a reply from these and parses no
+/// text.
+fn attach_parts(messages: &mut [HistoryMessage]) {
+    for i in 0..messages.len() {
+        if messages[i].role != "assistant" {
+            continue;
+        }
+        let results: Vec<(Value, Option<usize>)> = messages[i + 1..]
+            .iter()
+            .find(|m| m.role == "user" || m.role == "assistant")
+            .filter(|m| m.role == "user")
+            .map(|m| {
+                response_bodies(&m.content)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, body)| {
+                        let value = serde_json::from_str(body.trim())
+                            .unwrap_or_else(|_| Value::String(body.to_string()));
+                        (value, m.tool_tokens.get(k).map(|&t| t as usize))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        messages[i].parts = parts_of(&messages[i].content, &results);
+    }
 }
 
 /// Put a failed turn's `error` on the last assistant bubble the turn split
@@ -366,6 +402,10 @@ pub struct HistoryMessage {
     /// live stream did instead of a reply that just ends.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// On an assistant bubble: its prose, reasoning and calls, each call with
+    /// its result (`crate::parts`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
 }
 
 /// One uploaded file as the history/pane wire shape — the metadata the GUI
@@ -424,7 +464,27 @@ mod tests {
             spans: Vec::new(),
             files: Vec::new(),
             error: None,
+            parts: Vec::new(),
         }
+    }
+
+    /// **An assistant bubble carries its parts, each call answered by the
+    /// next user bubble's results in order**; a bubble with no tool results
+    /// after it has calls with none.
+    #[test]
+    fn an_assistant_bubble_carries_its_answered_parts() {
+        let call = "<tool_call>\n<function=datetime>\n</function>\n</tool_call>";
+        let mut results = bubble("user", "<tool_response>\n{\"now\": 1}\n</tool_response>\n");
+        results.tool_tokens = vec![5];
+        let mut messages = vec![bubble("assistant", call), results, bubble("assistant", call)];
+        attach_parts(&mut messages);
+        let first = serde_json::to_value(&messages[0].parts).unwrap();
+        assert_eq!(first[0]["kind"], "call");
+        assert_eq!(first[0]["result"], serde_json::json!({"now": 1}));
+        assert_eq!(first[0]["tokens"], 5);
+        let last = serde_json::to_value(&messages[2].parts).unwrap();
+        assert!(last[0].get("result").is_none(), "{last}");
+        assert!(messages[1].parts.is_empty(), "a user bubble has none");
     }
 
     /// **A failed turn's error goes on its last assistant bubble** — where its

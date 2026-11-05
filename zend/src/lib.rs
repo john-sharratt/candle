@@ -31,6 +31,7 @@ pub mod conv_sweep;
 pub mod deletions;
 mod engine_asks;
 pub mod hand_records;
+pub mod parts;
 pub mod handover;
 pub mod ingest;
 pub mod ingest_backlog;

@@ -1123,8 +1123,8 @@ fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
                 forks,
                 next,
             } => NodeSpec::Element {
-                marker: *marker,
-                tails: *tails,
+                marker,
+                tails,
                 limits: *limits,
                 forks: forks.iter().map(|f| remap(*f)).collect(),
                 next: remap(*next),

@@ -18,6 +18,7 @@ use candle_conversation::{
 use host::access::role;
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
+use super::CONVERSATION_HEADER;
 use crate::access;
 use crate::mcp::caller::Caller;
 use crate::mcp::ownership;
@@ -156,6 +157,9 @@ pub async fn completions(
         split_reasoning: passthrough,
         tools: (passthrough && !client_tools.is_empty())
             .then(|| openai_tools::specs(&client_tools)),
+        // The GUI names its conversation in a header, and reads the reply as
+        // its parts (`crate::parts`).
+        parts: !passthrough && headers.contains_key(CONVERSATION_HEADER),
     };
     let token_stream = if passthrough {
         session
@@ -351,6 +355,7 @@ pub(crate) fn follow_sse(token_stream: TokenStream) -> Response {
     let framing = Framing {
         split_reasoning: false,
         tools: None,
+        parts: true,
     };
     let id = format!("chatcmpl-{}", unix_ms());
     stream_sse(
@@ -393,6 +398,10 @@ fn stream_sse(
             // A running program's line is for a worker's watchers, not the
             // tool cards, which know `running` and `done`.
             Ok(StreamItem::Tool(status)) if status.phase == "progress" => Vec::new(),
+            // The GUI's calls run and answer by their ids.
+            Ok(StreamItem::Tool(status)) if tokens.in_parts() => {
+                tokens.tool(status.phase, &status.results, &status.tokens)
+            }
             Ok(StreamItem::Tool(status)) => vec![serde_json::to_string(&status)
                 .map_err(|e| anyhow::anyhow!(e))
                 .map(|data| Event::default().event("tool").data(data))],
@@ -402,6 +411,7 @@ fn stream_sse(
                 vec![Ok(Event::default().event("prefill").data(data))]
             }
 
+            Ok(StreamItem::Think { tokens: n, .. }) if tokens.in_parts() => tokens.think(n),
             Ok(StreamItem::Think { tokens, done }) => {
                 let data = serde_json::json!({ "tokens": tokens, "done": done }).to_string();
                 vec![Ok(Event::default().event("think").data(data))]
@@ -411,7 +421,7 @@ fn stream_sse(
 
             Ok(StreamItem::TurnEnd { usage, finish }) => {
                 tokens.turn_end(usage, finish);
-                Vec::new()
+                tokens.end_turn()
             }
 
             Ok(StreamItem::Error(message)) => vec![Ok(turn_error_event(&message))],
@@ -573,6 +583,7 @@ mod collect_tests {
         Framing {
             split_reasoning: false,
             tools: None,
+            parts: false,
         }
     }
 
