@@ -597,7 +597,7 @@ fn held_value(pattern: &str) -> &'static str {
         "(?i)(javascript|js|node|nodejs|ecmascript)" => "js",
         "[A-Za-z0-9_./+-]+" => "a",
         "[A-Za-z0-9_-]{10}[AEIMQUYcgkosw048]" => "AAAAAAAAAAA",
-        r#"[^-\s~^:?*\["][^\s~^:?*\["]*"# | r#"[^\s"][^\s"]*"# => "a",
+        r#"[^-\s~^:?*\["][^\s~^:?*\["]*"# | r#"[^-\s"][^\s"]*"# => "a",
         "[0-9a-f]{40}([0-9a-f]{24})?" => "0000000000000000000000000000000000000000",
         "[A-Za-z0-9_-]{4}" => "AAAA",
         r#"(?i)[^"]*\.(png|jpe?g|webp|ico)"# => "a.png",
