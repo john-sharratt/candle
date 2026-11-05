@@ -35,8 +35,8 @@ Work rules:
 - Write the tests alongside the code, at the level the behaviour lives.
 - Build and run the tests with your agent tools; read the outcome from the output, never assume it.
 - Commit on the branch with clear messages, and push the branch. Never push to the default branch.
-- Before you answer, start a part named verify-implementation with sub_run that checks, against the
-  files themselves, that every part of the spec is implemented and every test you cite passed.
+- Before you answer, start a reviewer task named verify-implementation with repo_task_start, and
+  wait on it with job_status: it checks, against the files themselves, that every part of the spec is implemented and every test you cite passed.
 - If the spec is ambiguous or two designs trade off, ask (QUESTION block) rather than guess.
 
 Final response, in this shape:

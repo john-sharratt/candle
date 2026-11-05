@@ -1,11 +1,11 @@
 //! The journals a dialogue's `journal_read` and `journal_grep` reach by name
 //! (`docs/claude_zend_gateway.md` §5.3): `"self"`, its own; and for a
 //! conversation owned through `/mcp`, each journal above it — its thread's and
-//! its project's notes, and the journal of each worker above a part — by its
-//! full path or its bare name, resolved upward, nearest first.
+//! its project's notes — by its full path or its bare name, resolved upward,
+//! nearest first.
 //!
-//! A drafted journal — a conversation's own, or a worker's above it — lists
-//! its entries and reads the turns behind them. A thread's or project's
+//! A drafted journal — a conversation's own — lists its entries and reads the
+//! turns behind them. A thread's or project's
 //! journal is Claude's notes, records with no turns behind them, so an entry
 //! of it reads as the note itself.
 

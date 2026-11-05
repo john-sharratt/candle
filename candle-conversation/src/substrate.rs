@@ -3554,6 +3554,22 @@ impl Substrate {
         arc_mut(&mut self.working_sets, &target).is_some_and(|ws| ws.release_one(read, released))
     }
 
+    /// Keep `reads` from entering `target`'s working set
+    /// ([`WorkingSet::withhold`]).
+    pub fn working_set_withhold(&mut self, target: TimelineId, reads: &[TimelineId]) {
+        if !reads.is_empty() {
+            self.working_set_mut(target).withhold(reads.iter().copied());
+        }
+    }
+
+    /// Let `target`'s withheld conversations enter again
+    /// ([`WorkingSet::clear_withheld`]).
+    pub fn working_set_clear_withheld(&mut self, target: TimelineId) {
+        if let Some(ws) = arc_mut(&mut self.working_sets, &target) {
+            ws.clear_withheld();
+        }
+    }
+
     /// Fold one reprojection's per-file fresh scores into `target`'s working
     /// set ([`WorkingSet::observe`]).
     pub fn working_set_observe(

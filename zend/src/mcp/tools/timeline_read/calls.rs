@@ -14,20 +14,27 @@ use crate::tools::extract_tool_calls;
 /// How much of a call's arguments a line shows.
 const ARGS: usize = 200;
 
-/// A call's arguments as one line, cut at [`ARGS`] characters.
-fn args_line(args: &serde_json::Value) -> String {
+/// A call's arguments as one line, cut at [`ARGS`] characters, and whether
+/// they were cut.
+fn args_line(args: &serde_json::Value) -> (String, bool) {
     let text = args.to_string();
     match text.char_indices().nth(ARGS) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text,
+        Some((at, _)) => (format!("{}…", &text[..at]), true),
+        None => (text, false),
     }
 }
+
+/// The page's last line when a call on it was cut short: where its whole
+/// arguments are.
+const WHOLE: &str = "A call ending in … was cut short here: `view: turn` with that `turn` \
+                     reads it whole.";
 
 /// The calls of turns `offset..offset + limit`, a line each, repeats of any
 /// earlier call of the conversation flagged with where it was first made.
 pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
     let mut first: HashMap<String, u32> = HashMap::new();
     let (mut calls, mut repeats) = (0, 0);
+    let mut cut = false;
     let mut lines = Vec::new();
     for (at, turn) in t.turns.iter().enumerate() {
         let shown = (offset..offset + limit).contains(&at);
@@ -37,7 +44,8 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
         }
         for c in made {
             let key = format!("{} {}", c.name, c.arguments);
-            let line = format!("{} {}", c.name, args_line(&c.arguments));
+            let (args, was_cut) = args_line(&c.arguments);
+            let line = format!("{} {args}", c.name);
             let seen = first.get(&key).copied();
             if seen.is_none() {
                 first.insert(key, turn.index);
@@ -45,6 +53,7 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
             if !shown {
                 continue;
             }
+            cut |= was_cut;
             calls += 1;
             match seen {
                 Some(was) => {
@@ -64,6 +73,10 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
     for l in lines {
         out.push('\n');
         out.push_str(&l);
+    }
+    if cut {
+        out.push('\n');
+        out.push_str(WHOLE);
     }
     out
 }
@@ -118,6 +131,24 @@ mod tests {
             "{text}"
         );
         assert_eq!(lines[4], "#2 no calls");
+    }
+
+    /// **A call cut short names where it reads whole**, once, as the page's
+    /// last line; a page with no cut call says nothing of it.
+    #[test]
+    fn a_cut_call_names_where_it_reads_whole() {
+        let long = "x".repeat(ARGS + 10);
+        let call = format!(
+            "<tool_call>\n{{\"name\": \"write\", \"arguments\": {{\"content\": \"{long}\"}}}}\n</tool_call>"
+        );
+        let mut t = timeline();
+        t.turns = vec![turn_view(0, "a", &call), turn_view(1, "b", &call)];
+        let text = render(&t, 0, 2);
+        assert_eq!(text.lines().last(), Some(WHOLE), "{text}");
+        assert_eq!(text.matches(WHOLE).count(), 1, "{text}");
+        let short = "<tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
+        t.turns = vec![turn_view(0, "a", short)];
+        assert!(!render(&t, 0, 1).contains(WHOLE));
     }
 
     /// **A repeat of a call made before the page is still a repeat.**

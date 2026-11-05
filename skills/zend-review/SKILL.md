@@ -28,8 +28,8 @@ Review <branch | these files | this diff> of <repository> for:
 - breaks of the repository's conventions (its CLAUDE.md; the project journal holds them).
 
 Read every file you cite. For each finding, re-read the lines and quote them.
-Before you answer, start a part named verify-findings with sub_run, giving it your findings: it
-re-reads each cited line and keeps only the findings it can confirm, marking each CONFIRMED or
+Before you answer, start a reviewer task named verify-findings with repo_task_start, giving it
+your findings, and wait on it with job_status: it re-reads each cited line and keeps only the findings it can confirm, marking each CONFIRMED or
 REFUTED with its reason.
 
 Final response, in this shape, confirmed findings only, most severe first:

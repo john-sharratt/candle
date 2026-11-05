@@ -1,6 +1,6 @@
 ---
 name: implement
-description: How to have a worker implement a written spec — on its own branch, tests alongside, built and run, pushed, verified by a part — then review it before anything merges.
+description: How to have a worker implement a written spec — on its own branch, tests alongside, built and run, pushed, verified by a reviewer task — then review it before anything merges.
 tools: [repo_task_start, job_status, repo_task_reply, journal_read, repo_job_start, job_read]
 ---
 # Implementing a spec
@@ -43,9 +43,10 @@ METHOD:
    rather than guess.
 
 VERIFY BEFORE ANSWERING:
-- Start a part named verify-implementation with sub_run: it checks against the
-  files themselves that every part of the spec is implemented, and that every
-  test you cite passed in the output.
+- Start a reviewer task named verify-implementation with repo_task_start, and
+  wait on it with job_status: it checks against the files themselves that
+  every part of the spec is implemented, and that every test you cite passed
+  in the output.
 
 FINAL RESPONSE, in this shape:
 VERDICT: implemented | partly implemented | blocked

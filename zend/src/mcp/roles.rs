@@ -1,6 +1,6 @@
 //! What kind of work a worker does (`docs/claude_zend_gateway.md` §5.1).
 //!
-//! A task names its kind when it starts and a part takes its worker's. The kind
+//! A task names its kind when it starts. The kind
 //! selects an option of the `role` selector in `projection.yaml`: every option
 //! is pre-sealed at startup, so a worker's first round already reads its
 //! document and nothing is prefilled for it. A conversation that is no worker

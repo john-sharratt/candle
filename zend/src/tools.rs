@@ -48,7 +48,7 @@ use zend_tools::executor::Executor;
 use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::JournalShelf;
-use zend_tools::{alias_pins, registry, replay, OpsRunner, Replay, SubagentRunner, ToolContext};
+use zend_tools::{alias_pins, registry, replay, OpsRunner, Replay, ToolContext};
 use zend_vfs::sandbox::programs;
 use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
 
@@ -641,7 +641,7 @@ fn not_replayed(name: &str) -> Value {
 }
 
 /// Dispatch every parsed tool call as a round ([`tool_round::run`]): in order,
-/// pairing each call with its result, with a run of `sub_run` calls at once.
+/// pairing each call with its result.
 ///
 /// On [`Dispatch::Resumed`] each call is put to its tool first: the ones that
 /// leave what they left the first time are run, and the rest are answered with
@@ -805,8 +805,8 @@ pub fn tool_round_blocks(text: &str) -> Option<Vec<RoundBlock>> {
 // ── Public helper bundle ─────────────────────────────────────────────────────
 
 /// Tool execution context for the daemon: one [`ToolContext`] per tools mode,
-/// each carrying the session's [`SubagentRunner`] once
-/// [`Self::running_parts`] gives it one. Cloned cheaply (Arc-shared stores).
+/// each carrying the session's operations runner once [`Self::running_ops`]
+/// gives it one. Cloned cheaply (Arc-shared stores).
 ///
 /// One host serves the whole daemon, but the `file_*` overlay does not: each
 /// conversation has its own file stores ([`Self::conversation_files`]), and a
@@ -907,17 +907,6 @@ impl ToolHost {
             contexts,
             default_branches: Arc::default(),
         })
-    }
-
-    /// This host with `runner` starting the parts every context's `sub_run`
-    /// asks for.
-    pub fn running_parts(self, runner: Arc<dyn SubagentRunner>) -> Self {
-        Self {
-            contexts: self.contexts.map(|ctx| {
-                Arc::new(Arc::unwrap_or_clone(ctx).with_subagent_runner(Arc::clone(&runner)))
-            }),
-            ..self
-        }
     }
 
     /// This host with `runner` running every context's build and deploy tools

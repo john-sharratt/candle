@@ -1126,7 +1126,8 @@ fn stream_response(
             TurnEvent::HealthWarning(msg) => {
                 println!("\n\x1b[33m{} decode health: {}\x1b[0m", indent, msg);
             }
-            TurnEvent::Projection(_) => {}
+            // This generator arms no recurrent span, so it captures no rows.
+            TurnEvent::Projection(_) | TurnEvent::RecurrentCapture(_) => {}
         }
     }
 

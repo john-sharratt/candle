@@ -910,7 +910,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // shown as it arrives, under the tool and the file it is going to, so a long
   // write reads as work in progress rather than a frozen "Calling tool…".
   function pendingCallCard(json) {
-    const call = window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null };
+    return pendingCard(window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null });
+  }
+  // `call` = { name, args, writing }: the writing box while it writes a value
+  // other than its target, else a one-line "Calling …" card.
+  function pendingCard(call) {
     if (call.writing && TARGET_KEYS.indexOf(call.writing) === -1) return authoringCard(call);
     const label = call.name ? 'Calling ' + esc(call.name) + '…' : 'Calling tool…';
     return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + label + '</span></div></div>';
@@ -1249,7 +1253,93 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     return html;
   }
+  // A reply drawn from its parts (`zend/src/parts.rs`): prose, reasoning and
+  // calls, each call carrying its own result. Nothing here reads markup — the
+  // daemon split the reply with the rule the grammar closes values on, so a
+  // value holding `</tool_call>` or `<think>` stays inside its call.
+  // `thinking` labels the k-th reasoning block with its length.
+  function renderParts(parts, streaming, open, thinking) {
+    let html = '';
+    let thinkNo = 0;
+    let callNo = 0;
+    const lengths = Array.isArray(thinking) ? thinking : (thinking ? [thinking] : []);
+    for (const p of parts) {
+      if (p.kind === 'prose') { if (p.text) html += renderMd(p.text); continue; }
+      if (p.kind === 'think') {
+        const closed = !streaming || p.closed;
+        const length = lengths[thinkNo++] || (p.counted != null ? { tokens: p.counted, exact: true } : null);
+        html += renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open);
+        continue;
+      }
+      const args = {};
+      for (const [name, text] of (p.args || [])) args[name] = text;
+      const closed = !streaming || p.closed;
+      // A note is its bubble, filled as its text decodes.
+      if (p.tool === 'journal_note') { html += noteBubble(args.text || '', closed); callNo++; continue; }
+      if (!closed) {
+        const writing = p.args && p.args.length ? p.args[p.args.length - 1][0] : null;
+        html += pendingCard({ name: p.tool || null, args, writing });
+        callNo++;
+        continue;
+      }
+      // A call that failed to parse is drawn as failed, with why, until the
+      // round's own answer to it arrives.
+      let output = null;
+      if (p.result != null) output = typeof p.result === 'string' ? p.result : JSON.stringify(p.result, null, 2);
+      else if (p.ok === false) output = JSON.stringify({ error: 'call_failed', detail: p.error || 'the call could not be read' });
+      const json = JSON.stringify({ name: p.tool || 'tool call', arguments: args });
+      html += toolCard(json, true, output, p.running ? [p.tool] : null, p.tokens != null ? p.tokens : null, callNo++);
+    }
+    return html;
+  }
+  // A failed turn's notice, with the retry it offers.
+  function failedTurnHtml(msg) {
+    const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
+    const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
+    return '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
+  }
+  // The part a streaming reply's `part` event names, by id.
+  function partById(m, id) {
+    return (m.parts || []).find((p) => p.id === id);
+  }
+  // Fold one `part` event into a streaming reply's parts.
+  function applyPart(m, ev) {
+    m.parts = m.parts || [];
+    if (ev.op === 'open') { m.parts.push({ kind: ev.kind, id: ev.id, tool: ev.tool || null, text: '', args: [], closed: false }); return; }
+    if (ev.op === 'run') { for (const id of ev.ids || []) { const p = partById(m, id); if (p) p.running = true; } return; }
+    const p = partById(m, ev.id);
+    if (!p) return;
+    if (ev.op === 'arg') {
+      const last = p.args[p.args.length - 1];
+      if (last && last[0] === ev.name) last[1] += ev.text; else p.args.push([ev.name, ev.text]);
+    } else if (ev.op === 'text') {
+      p.text += ev.text || '';
+      if (ev.tokens != null) p.live = ev.tokens;
+    } else if (ev.op === 'close') {
+      // A closed block keeps its last running count as its length until the
+      // history's `thinking` labels it.
+      p.closed = true; p.ok = ev.ok; p.error = ev.error || null;
+      if (p.live != null) p.counted = p.live;
+      p.live = null;
+    } else if (ev.op === 'result') {
+      p.result = ev.result; p.tokens = ev.tokens; p.running = false;
+    }
+  }
+  // A streaming reply's prose delta: the end of its last prose part, or a new one.
+  function appendProse(m, text) {
+    m.parts = m.parts || [];
+    const last = m.parts[m.parts.length - 1];
+    if (last && last.kind === 'prose') last.text += text; else m.parts.push({ kind: 'prose', text });
+  }
   function nodeHtml(msg, open, toolOutputs, toolTokens) {
+    // A reply the daemon gave as parts draws from them alone.
+    if (msg.role === 'assistant' && msg.parts && msg.parts.length) {
+      let html = renderParts(msg.parts, !!msg.streaming, open, msg.thinking);
+      if (msg.error) return html + failedTurnHtml(msg);
+      if (msg.streaming && msg.prefill) html += prefillCard(msg.prefill);
+      if (msg.streaming) html += '<span class="zcursor"></span>';
+      return html;
+    }
     // Paired from the history (`toolOutputs`/`toolTokens`), or stashed on the
     // streaming message by the `tool` done events.
     const tokens = toolTokens || msg.toolTokens;
@@ -1259,9 +1349,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const think = { lengths: msg.thinking, live: msg.thinkLive };
     if (msg.error) {
       const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null, think, tokens) : '';
-      const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
-      const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
-      return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
+      return body + failedTurnHtml(msg);
     }
     if (msg.streaming && !msg.content) {
       // Bouncing dots while waiting; the italic word only appears if the daemon
@@ -1328,9 +1416,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const ap = S.approvals || null;
     // A job block under a card redraws as its job moves.
     const jg = S.jobGen;
-    if (c && c.content === msg.content && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap && c.jg === jg) return c.html;
+    if (c && c.content === msg.content && c.parts === msg.parts && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap && c.jg === jg) return c.html;
     const html = nodeHtml(msg, open, toolOutputs, toolTokens);
-    msg._htmlCache = { content: msg.content, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, jg: jg, html: html };
+    msg._htmlCache = { content: msg.content, parts: msg.parts, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, jg: jg, html: html };
     return html;
   }
   function sameOutputs(a, b) {
@@ -1767,33 +1855,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         hydrateConv(convId);
       },
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
-      onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; m.prefill = null; }); },
+      // The reply's prose: the daemon sends calls and reasoning as parts, so
+      // this text holds no markup.
+      onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; appendProse(m, delta); m.status = ''; m.prefill = null; }); },
       onProjection: (span) => appendProjection(convId, span),
-      // Tool lifecycle: `running` names the in-flight tools (drives the card
-      // spinners); `done` stashes their results so the cards resolve at once,
-      // and clears the spinners. Both are superseded by the post-stream hydrate.
-      onTool: (st) => patchStream(convId, (m) => {
-        m.prefill = null;
-        if (st && st.phase === 'running') {
-          m.runningTools = st.tools || [];
-        } else {
-          const results = (st && st.results) || [];
-          m.toolOutputs = (m.toolOutputs || []).concat(results);
-          // One length per result, kept aligned with the outputs.
-          m.toolTokens = (m.toolTokens || []).concat(results.map((_, k) => (st.tokens || [])[k]));
-          m.runningTools = [];
-        }
+      // A part of the reply (`zend/src/parts.rs`): reasoning or a call opening,
+      // its text or arguments as they decode, its close, its calls running,
+      // and each result by its call's id. Superseded by the post-stream hydrate,
+      // whose history carries the same parts.
+      onPart: (ev) => patchStream(convId, (m) => {
+        if (!ev) return;
+        applyPart(m, ev);
+        if (ev.op === 'result' || ev.op === 'open') m.prefill = null;
+        m.status = '';
       }),
       // How far the next turn's input has been read in. After a tool round that
       // is the tools' results, which can be long; the bar under the cards shows
       // it and goes the moment the prefill completes (or the answer starts).
-      // The reasoning's length as the daemon counts it: `live` while a think
-      // block runs, and each block's total (in order) once it closes.
-      onThink: (t) => patchStream(convId, (m) => {
-        if (!t) return;
-        if (t.done) { m.thinking = (m.thinking || []).concat([{ tokens: t.tokens, exact: true }]); m.thinkLive = null; }
-        else m.thinkLive = t.tokens;
-      }),
       onPrefill: (p) => patchStream(convId, (m) => {
         m.prefill = (p && p.total > 0 && p.done < p.total) ? { done: p.done, total: p.total } : null;
       }),

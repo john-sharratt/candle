@@ -264,6 +264,20 @@ impl TokenTrie {
         }
     }
 
+    /// Where `arm` resumes the outer tree once it is written whole: its leaf's
+    /// `next`. `None` when `arm` is not one of this trie's arms.
+    pub fn target_of(&self, arm: &[TokenId]) -> Option<NodeId> {
+        let mut pos = self.root;
+        for (i, &token) in arm.iter().enumerate() {
+            match self.step(pos, token)? {
+                Step::Descend(next) => pos = next,
+                Step::Accept(next) if i + 1 == arm.len() => return Some(next),
+                Step::Accept(_) | Step::Spill(_) => return None,
+            }
+        }
+        None
+    }
+
     /// Number of distinct arms (accepting nodes) — used by the compiler to fold
     /// single-arm branches.
     pub fn arm_count(&self) -> usize {

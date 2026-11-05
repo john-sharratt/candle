@@ -27,9 +27,9 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_loop, held_branches_first, HfVocab, StencilTree,
-    ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec,
-    TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
+    compile, compile_think_tree, compile_tool_call_loop, held_branches, held_branches_first,
+    HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope,
+    ToolSpec, TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
 #[cfg(feature = "memory-census")]
@@ -1334,6 +1334,21 @@ impl ConversationEngine {
             .update(|s| s.working_set_release_one(target, read, released))
     }
 
+    /// Keep `reads` out of `target`'s working set until
+    /// [`Self::working_set_clear_withheld`]: the files they read are verbatim
+    /// in its dialogue, read for real this turn. A member among them stays.
+    pub fn working_set_withhold(&self, target: TimelineId, reads: &[TimelineId]) {
+        self.conversation
+            .update(|s| s.working_set_withhold(target, reads));
+    }
+
+    /// Let `target`'s withheld conversations enter its working set again: the
+    /// turn that read them has ended.
+    pub fn working_set_clear_withheld(&self, target: TimelineId) {
+        self.conversation
+            .update(|s| s.working_set_clear_withheld(target));
+    }
+
     /// A copy of `target`'s working set, when it has one.
     pub fn working_set(&self, target: TimelineId) -> Option<WorkingSet> {
         self.conversation.read().working_set(target).cloned()
@@ -2133,13 +2148,16 @@ impl ConversationEngine {
     /// a tool call is returned as it is. A list naming no tool the catalog
     /// holds is an error — a turn given tools it can never call.
     ///
-    /// `first_call`, when given, holds the turn's opening call to that one
-    /// tool, and the calls after it to `tools` ([`held_branches_first`]).
+    /// `first_call`, when given as `(tool, min_reasoning)`, holds the turn's
+    /// opening call to that one tool, the calls after it to `tools`, and the
+    /// turn to at least one call after it ([`held_branches_first`]) — once the
+    /// turn has reasoned for `min_reasoning` tokens. A call opened sooner is
+    /// held to `tools` alone.
     pub fn holding_tools(
         &self,
         triggers: &Arc<TriggerRegistry>,
         tools: &[String],
-        first_call: Option<&str>,
+        first_call: Option<(&str, u32)>,
     ) -> crate::Result<Arc<TriggerRegistry>> {
         let tokenizer = &self.core.tokenizer;
         let Some(trigger) = tokenizer.token_to_id("<tool_call>") else {
@@ -2148,14 +2166,28 @@ impl ConversationEngine {
         let Some(tree) = triggers.tree_for(trigger) else {
             return Ok(Arc::clone(triggers));
         };
-        let held =
-            held_branches_first(tree, tools, first_call, |t| tokenizer.decode(t, false).ok());
-        if held.is_empty() {
+        let decode = |t: &[TokenId]| tokenizer.decode(t, false).ok();
+        let plain = held_branches(tree, tools, decode);
+        if plain.is_empty() {
             return Err(ConversationError::from(candle::Error::Msg(format!(
                 "tool stencil: none of {tools:?} is in the turn's catalog"
             ))));
         }
-        Ok(Arc::new(triggers.holding(trigger, Arc::new(held))))
+        // A first call held to one tool is held only once the turn has
+        // reasoned for `min_reasoning` tokens; a call opened sooner is held
+        // to the turn's tools alone.
+        Ok(Arc::new(match first_call {
+            Some((first, min_reasoning)) => {
+                let held = held_branches_first(tree, tools, Some(first), decode);
+                triggers.holding_after_reasoning(
+                    trigger,
+                    Arc::new(held),
+                    min_reasoning,
+                    Some(Arc::new(plain)),
+                )
+            }
+            None => triggers.holding(trigger, Arc::new(plain)),
+        }))
     }
 
     /// Compile the thinking-block steering trees (one per effort dial, `Off`

@@ -53,7 +53,9 @@ use serde_json::Value;
 
 use candle_transformers::models::dialect::{CallStyle, Dialect};
 
+use super::element_close::{Follows, FUNCTION_TAG, PARAM_CLOSE, PARAM_TAG};
 use super::error::BuildError;
+use super::field_order::Owed;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
 use super::tree::{FreeTextLimits, MAX_STRING_VALUE_TOKENS};
@@ -1115,6 +1117,19 @@ fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
                 limits: *limits,
                 next: remap(*next),
             },
+            NodeSpec::Element {
+                marker,
+                tails,
+                limits,
+                forks,
+                next,
+            } => NodeSpec::Element {
+                marker,
+                tails,
+                limits: *limits,
+                forks: forks.iter().map(|f| remap(*f)).collect(),
+                next: remap(*next),
+            },
         };
         host.nodes.push(moved);
     }
@@ -1323,17 +1338,6 @@ struct FieldMemo {
     values: HashMap<(usize, Owed), (String, SpecId)>,
 }
 
-/// Where an object stands on the choice among its optionals ([`Pick`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Owed {
-    /// No choice, or one that is made and allows more.
-    Nothing,
-    /// No member written yet: the close is withheld.
-    AMember,
-    /// An `ExactlyOne` member is written: no other is offered.
-    NoMore,
-}
-
 /// Whether the grammar can begin a value of this schema — offer every way it
 /// can start as an arm. Only such elements can be guided inside an array: the
 /// arms carry the separator and the opening together (`, {`, `, true`), and an
@@ -1417,11 +1421,7 @@ impl<'a> ToolTreeBuilder<'a> {
         let Some((&p, rest)) = required.split_first() else {
             // Optional gates start with emitted_any = (a required field precedes them).
             let mut memo = FieldMemo::default();
-            let owed = if optional.iter().any(|p| p.pick != Pick::None) {
-                Owed::AMember
-            } else {
-                Owed::Nothing
-            };
+            let owed = Owed::initial(optional);
             return self.opt_gates(optional, 0, !first, owed, close, end, &mut memo);
         };
         let decides = !p.requires.is_empty() || !p.shapes.is_empty();
@@ -1566,11 +1566,8 @@ impl<'a> ToolTreeBuilder<'a> {
     }
 
     /// The gate over optionals `idx..`, given whether a field was already
-    /// emitted and where the object stands on its choice.
-    ///
-    /// **A gate that owes a member can always pay it.** While one is owed,
-    /// nothing past the last member is offered, so a walk cannot step over the
-    /// choice and arrive at a gate with no way on.
+    /// emitted and where the object stands on its choice: the optionals
+    /// [`Owed::offers`] and, when it [`Owed::may_close`], the close.
     #[allow(clippy::too_many_arguments)]
     fn opt_gates(
         &mut self,
@@ -1594,15 +1591,9 @@ impl<'a> ToolTreeBuilder<'a> {
             memo.gates.insert((idx, emitted_any, owed), id);
             return Ok(id);
         }
-        let last_member = opts.iter().rposition(|p| p.pick != Pick::None);
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(opts.len() - idx + 1);
         for (j, p) in opts.iter().enumerate().skip(idx) {
-            let offered = match owed {
-                Owed::AMember => last_member.is_some_and(|last| j <= last),
-                Owed::NoMore => p.pick == Pick::None,
-                Owed::Nothing => true,
-            };
-            if !offered {
+            if !owed.offers(opts, j) {
                 continue;
             }
             let (leadin, value) = match memo.values.get(&(j, owed)) {
@@ -1610,11 +1601,7 @@ impl<'a> ToolTreeBuilder<'a> {
                 None => {
                     // Include optional j: a field is emitted, so everything
                     // after has emitted_any = true.
-                    let settled = match (p.pick, owed) {
-                        (Pick::ExactlyOne, _) => Owed::NoMore,
-                        (Pick::AtLeastOne, _) => Owed::Nothing,
-                        (Pick::None, standing) => standing,
-                    };
+                    let settled = owed.after(p.pick);
                     let after = self.opt_gates(opts, j + 1, true, settled, close, end, memo)?;
                     let built = self.build_value(p, after)?;
                     memo.values.insert((j, owed), built.clone());
@@ -1624,7 +1611,7 @@ impl<'a> ToolTreeBuilder<'a> {
             arms.push((self.key(p, !emitted_any, &leadin), value));
         }
         // The "stop" arm: close the object, once it may.
-        if owed != Owed::AMember {
+        if owed.may_close() {
             arms.push((close.to_string(), end));
         }
         let id = match <[(String, SpecId); 1]>::try_from(arms) {
@@ -1685,17 +1672,7 @@ impl<'a> ToolTreeBuilder<'a> {
             // Every type is raw text here — there is no JSON to be structurally
             // valid against, and the act that receives the call parses its own
             // scalars exactly as it does on the other styles.
-            let span = self.spec.push(NodeSpec::FreeText {
-                term: Terminator::Until {
-                    marker: self.env.param_close,
-                },
-                eos_ends: false,
-                limits: self.env.string_limits(p),
-                close_token: None,
-                suppress_close: false,
-                next,
-            });
-            return Ok((String::new(), span));
+            return Ok((String::new(), self.element_value(p, next)));
         }
         // **A plain string's opening quote is the model's.** The key stops at
         // the colon, because which token opens a string depends on the value:
@@ -1933,9 +1910,97 @@ impl<'a> ToolTreeBuilder<'a> {
         match self.spec.node(next) {
             NodeSpec::Static { text, next } => vec![(text.clone(), *next)],
             NodeSpec::Branch { arms } => arms.clone(),
-            NodeSpec::FreeText { .. } | NodeSpec::Value { .. } | NodeSpec::End => {
-                vec![(String::new(), next)]
+            NodeSpec::FreeText { .. }
+            | NodeSpec::Value { .. }
+            | NodeSpec::Element { .. }
+            | NodeSpec::End => vec![(String::new(), next)],
+        }
+    }
+
+    /// A function block's raw value for `p`, going on to `next`.
+    ///
+    /// **It closes where structure follows `</parameter>`**
+    /// (`element_close`), so a value holding the tag keeps it. The close is
+    /// the marker, a separator and the next element's tag, all the model's —
+    /// so what follows is `next` with that tag already written, one fork per
+    /// tag `next` can open with ([`Self::after_written`]): the tags `next`
+    /// cannot open with are not offered, and a close the tree would refuse
+    /// never fires. A value cut short still goes to `next`, which writes the
+    /// whole continuation after the completed `</parameter>`.
+    fn element_value(&mut self, p: &Param, next: SpecId) -> SpecId {
+        let marker = self.env.param_close;
+        let element = self.after_written(next, &self.env.param_open.clone());
+        let close = self.after_written(next, &format!("\n{FUNCTION_TAG}"));
+        let follows = match (element, close) {
+            (Some(_), Some(_)) => Some(Follows::Either),
+            (Some(_), None) => Some(Follows::Element),
+            (None, Some(_)) => Some(Follows::Close),
+            (None, None) => None,
+        };
+        let limits = self.env.string_limits(p);
+        let Some(follows) = follows.filter(|_| marker == PARAM_CLOSE) else {
+            // A layout with no tag this rule knows: the marker alone ends it.
+            return self.spec.push(NodeSpec::FreeText {
+                term: Terminator::Until { marker, tails: &[] },
+                eos_ends: false,
+                limits,
+                close_token: None,
+                suppress_close: false,
+                next,
+            });
+        };
+        let forks = (0..follows.tails().len())
+            .map(|k| match follows.tag(k) {
+                PARAM_TAG => element,
+                _ => close,
+            })
+            .map(|fork| fork.expect("a tail is offered only for a tag `next` opens with"))
+            .collect();
+        self.spec.push(NodeSpec::Element {
+            marker,
+            tails: follows.tails(),
+            limits,
+            forks,
+            next,
+        })
+    }
+
+    /// What follows `node` once `written` — the start of its text — has been
+    /// written by the model rather than by the grammar. `None` when `node`
+    /// cannot begin with `written`.
+    ///
+    /// A static loses `written` from its front; a branch keeps the arms that
+    /// begin with it, each without it. A static shorter than `written` hands
+    /// the rest on to its successor.
+    fn after_written(&mut self, node: SpecId, written: &str) -> Option<SpecId> {
+        match self.spec.node(node).clone() {
+            NodeSpec::Static { text, next } => {
+                if let Some(rest) = text.strip_prefix(written) {
+                    return Some(match rest.is_empty() {
+                        true => next,
+                        false => self.spec.push(NodeSpec::Static {
+                            text: rest.to_string(),
+                            next,
+                        }),
+                    });
+                }
+                let more = written.strip_prefix(text.as_str())?;
+                self.after_written(next, more)
             }
+            NodeSpec::Branch { arms } => {
+                let kept: Vec<(String, SpecId)> = arms
+                    .iter()
+                    .filter_map(|(text, n)| Some((text.strip_prefix(written)?.to_string(), *n)))
+                    .collect();
+                if kept.is_empty() || kept.iter().any(|(text, _)| text.is_empty()) {
+                    return None;
+                }
+                Some(match <[(String, SpecId); 1]>::try_from(kept) {
+                    Ok([(text, next)]) => self.spec.push(NodeSpec::Static { text, next }),
+                    Err(arms) => self.spec.push(NodeSpec::Branch { arms }),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -2248,27 +2313,80 @@ mod tests {
     /// so the `ask` appeared to carry `reflect`'s arguments — and the injected
     /// close then wrote a second tag on top. The tag alone is the model's
     /// close; the newlines around it belong to the grammar.
+    ///
+    /// **And the tag alone is content.** A value closes where structure
+    /// follows the tag — a separator and the next element's tag — so a file
+    /// holding `</parameter>` writes intact (`element_close`). Each fork goes
+    /// on after the tag the model wrote, and only tags the tree offers next
+    /// can close.
     #[test]
     fn a_free_value_is_terminated_by_the_element_and_not_by_a_quote() {
         let spec = compile_tool_call_tree(&catalog(), &ToolCallEnvelope::qwen35()).unwrap();
-        let terms: Vec<Terminator> = spec
+        assert!(
+            !spec
+                .nodes
+                .iter()
+                .any(|n| matches!(n, NodeSpec::FreeText { .. })),
+            "every raw value is an element"
+        );
+        let elements: Vec<(&str, &[&str], &Vec<SpecId>)> = spec
             .nodes
             .iter()
             .filter_map(|n| match n {
-                NodeSpec::FreeText { term, .. } => Some(*term),
+                NodeSpec::Element {
+                    marker,
+                    tails,
+                    forks,
+                    ..
+                } => Some((*marker, *tails, forks)),
                 _ => None,
             })
             .collect();
-        assert!(!terms.is_empty(), "no free span at all");
-        assert!(
-            terms.iter().all(|t| matches!(
-                t,
-                Terminator::Until {
-                    marker: "</parameter>"
+        assert!(!elements.is_empty(), "no raw value at all");
+        for (marker, tails, forks) in elements {
+            assert_eq!(marker, "</parameter>");
+            assert_eq!(tails.len(), forks.len());
+            for (tail, fork) in tails.iter().zip(forks) {
+                let text = match spec.node(*fork) {
+                    NodeSpec::Static { text, .. } => text.clone(),
+                    NodeSpec::Branch { arms } => arms[0].0.clone(),
+                    other => panic!("{other:?}"),
+                };
+                if tail.ends_with("<parameter=") {
+                    assert!(
+                        text.ends_with(">\n") && !text.contains('<'),
+                        "{tail:?} → {text:?}"
+                    );
+                } else {
+                    assert!(text.starts_with("\n</tool_call>"), "{tail:?} → {text:?}");
                 }
-            )),
-            "{terms:?}"
-        );
+            }
+        }
+    }
+
+    /// **The tree supplies the tags**: a value with a required element still
+    /// owed may not close the function, and the last value may not open
+    /// another element.
+    #[test]
+    fn a_value_closes_only_on_a_tag_the_tree_offers_next() {
+        let catalog = parse_tools(
+            r#"[{"name":"pair","params":[
+                {"name":"a","type":"string","required":true},
+                {"name":"b","type":"string","required":true}]}]"#,
+        )
+        .unwrap();
+        let spec = compile_tool_call_tree(&catalog, &ToolCallEnvelope::qwen35()).unwrap();
+        let mut follows: Vec<&[&str]> = spec
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                NodeSpec::Element { tails, .. } => Some(*tails),
+                _ => None,
+            })
+            .collect();
+        // Sorted by first tail: `\n</function>` before `\n<parameter=`.
+        follows.sort_by_key(|t| t[0]);
+        assert_eq!(follows, [Follows::Close.tails(), Follows::Element.tails()]);
     }
 
     /// It still compiles against a real vocabulary — the shape being right is
@@ -2348,7 +2466,8 @@ mod tests {
                             | Terminator::Until { .. },
                         limits,
                         ..
-                    } => Some(limits.forced_after),
+                    }
+                    | NodeSpec::Element { limits, .. } => Some(limits.forced_after),
                     _ => None,
                 })
                 .collect()
@@ -2388,7 +2507,8 @@ mod tests {
                         term: Terminator::JsonStringValue | Terminator::Until { .. },
                         limits,
                         ..
-                    } => Some(limits.forced_after),
+                    }
+                    | NodeSpec::Element { limits, .. } => Some(limits.forced_after),
                     _ => None,
                 })
                 .collect();

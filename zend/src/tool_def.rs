@@ -1241,7 +1241,6 @@ mod tests {
             "telnet_send",
             "ping_icmp",
             "trace_route",
-            "sub_run",
             "sql_session_query",
             "run_command",
             "run_output",

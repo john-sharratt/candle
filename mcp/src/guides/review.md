@@ -32,9 +32,10 @@ METHOD:
 3. Check yourself: drop duplicates; rank by severity.
 
 VERIFY BEFORE ANSWERING:
-- Start a part named verify-findings with sub_run, giving it your findings: it
-  re-reads each cited line and keeps only what it can confirm, marking each
-  CONFIRMED or REFUTED with its reason.
+- Start a reviewer task named verify-findings with repo_task_start, giving it
+  your findings, and wait on it with job_status: it re-reads each cited line
+  and keeps only what it can confirm, marking each CONFIRMED or REFUTED with
+  its reason.
 
 FINAL RESPONSE, confirmed findings only, most severe first:
 FINDINGS:

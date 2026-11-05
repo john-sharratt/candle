@@ -20,12 +20,28 @@ pub struct TriggerRegistry {
 }
 
 /// A trigger's tree, whether entering it spends the trigger for the turn, and
-/// the branches a walk of it is held on (see [`TriggerRegistry::holding`]).
+/// the branches a walk of it is held on (see [`TriggerRegistry::holding`]):
+/// `held` once the turn has reasoned for `min_reasoning` tokens, `unreasoned`
+/// before (see [`TriggerRegistry::holding_after_reasoning`]).
 #[derive(Debug, Clone)]
 struct Binding {
     tree: Arc<StencilTree>,
     once: bool,
     held: Option<Arc<HeldBranches>>,
+    min_reasoning: u32,
+    unreasoned: Option<Arc<HeldBranches>>,
+}
+
+impl Binding {
+    fn of(tree: Arc<StencilTree>, once: bool) -> Self {
+        Binding {
+            tree,
+            once,
+            held: None,
+            min_reasoning: 0,
+            unreasoned: None,
+        }
+    }
 }
 
 impl TriggerRegistry {
@@ -38,14 +54,7 @@ impl TriggerRegistry {
     /// Register `tree` to start when `token` is emitted in free decode.
     /// Replaces any tree already bound to `token` (last write wins).
     pub fn register(&mut self, token: TokenId, tree: Arc<StencilTree>) {
-        self.by_token.insert(
-            token,
-            Binding {
-                tree,
-                once: false,
-                held: None,
-            },
-        );
+        self.by_token.insert(token, Binding::of(tree, false));
     }
 
     /// [`Self::with_trigger`] for a trigger that fires at most once per turn:
@@ -61,14 +70,7 @@ impl TriggerRegistry {
     #[must_use]
     pub fn with_once_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
         let mut by_token = self.by_token.clone();
-        by_token.insert(
-            token,
-            Binding {
-                tree,
-                once: true,
-                held: None,
-            },
-        );
+        by_token.insert(token, Binding::of(tree, true));
         TriggerRegistry { by_token }
     }
 
@@ -94,14 +96,7 @@ impl TriggerRegistry {
     #[must_use]
     pub fn with_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
         let mut by_token = self.by_token.clone();
-        by_token.insert(
-            token,
-            Binding {
-                tree,
-                once: false,
-                held: None,
-            },
-        );
+        by_token.insert(token, Binding::of(tree, false));
         TriggerRegistry { by_token }
     }
 
@@ -115,9 +110,30 @@ impl TriggerRegistry {
     /// registry as it is.
     #[must_use]
     pub fn holding(&self, token: TokenId, held: Arc<HeldBranches>) -> Self {
+        self.holding_after_reasoning(token, held, 0, None)
+    }
+
+    /// [`Self::holding`] for a hold that needs reasoning behind it: a walk
+    /// `token` starts once the turn has reasoned for at least `min_reasoning`
+    /// tokens is held on `held`, and one started before that on `otherwise`
+    /// (on nothing when `None`).
+    ///
+    /// A note of what the thinking concluded (`docs/zend_journal.md` §5.2) is
+    /// the case: forced when there was reasoning to conclude from, and not
+    /// when a call follows a few tokens of it.
+    #[must_use]
+    pub fn holding_after_reasoning(
+        &self,
+        token: TokenId,
+        held: Arc<HeldBranches>,
+        min_reasoning: u32,
+        otherwise: Option<Arc<HeldBranches>>,
+    ) -> Self {
         let mut by_token = self.by_token.clone();
         if let Some(binding) = by_token.get_mut(&token) {
             binding.held = Some(held);
+            binding.min_reasoning = min_reasoning;
+            binding.unreasoned = otherwise;
         }
         TriggerRegistry { by_token }
     }
@@ -155,12 +171,24 @@ impl TriggerRegistry {
     }
 
     /// If `token` is a trigger, return a fresh [`StencilDriver`] walking the
-    /// triggered tree — the decode-loop entry point.  An empty registry never
-    /// triggers, so a turn with no tools simply free-decodes.
+    /// triggered tree, held as a turn that has reasoned enough is.  An empty
+    /// registry never triggers, so a turn with no tools simply free-decodes.
     pub fn driver_for(&self, token: TokenId) -> Option<StencilDriver> {
+        self.driver_after(token, u32::MAX)
+    }
+
+    /// [`Self::driver_for`] in a turn that has reasoned for `reasoned` tokens —
+    /// the decode-loop entry point. The walk is held on the binding's `held`
+    /// branches once `reasoned` reaches its `min_reasoning`, and on its
+    /// `unreasoned` ones before.
+    pub fn driver_after(&self, token: TokenId, reasoned: u32) -> Option<StencilDriver> {
         self.by_token.get(&token).map(|b| {
             let mut driver = StencilDriver::new(Arc::clone(&b.tree));
-            if let Some(held) = &b.held {
+            let held = match reasoned >= b.min_reasoning {
+                true => &b.held,
+                false => &b.unreasoned,
+            };
+            if let Some(held) = held {
                 driver.hold_branches(Arc::clone(held));
             }
             driver

@@ -14,11 +14,14 @@ use axum::response::sse::Event;
 
 use candle_conversation::stencil::ToolSpec;
 use candle_conversation::FinishReason;
+use serde_json::Value;
 
 use crate::openai_tools::{wire_function, Call};
+use crate::parts::{Out as PartOut, PartEvent, PartSplit};
 use crate::reasoning_split::{Piece, ReasoningSplit};
 use crate::think_gate::{gate_leading_think, ThinkGate};
 use crate::tool_call_split::{Out, ToolCallSplit};
+use crate::tools::tool_catalog;
 use crate::types::{ChatCompletionChunk, ChunkChoice, Delta, DeltaToolCall, Usage};
 
 /// How a reply's text is shaped for the client.
@@ -27,6 +30,10 @@ pub struct Framing {
     pub split_reasoning: bool,
     /// The client's tools, when it runs its own: calls go out as `tool_calls`.
     pub tools: Option<Vec<ToolSpec>>,
+    /// The daemon's GUI: the reply's prose as `content` and its reasoning and
+    /// calls as `part` events ([`crate::parts`]), with a call's result by its
+    /// id — no markup for the client to parse.
+    pub parts: bool,
 }
 
 /// The id a reply's `index`-th tool call goes out under.
@@ -54,6 +61,7 @@ struct State {
     gate_open: bool,
     reasoning: Option<ReasoningSplit>,
     tools: Option<ToolCallSplit>,
+    parts: Option<PartSplit>,
     /// The reply's token counts, folded over its turns; none until one ends.
     usage: Option<Usage>,
     /// How the reply's last finished turn ended.
@@ -84,6 +92,7 @@ impl Framer {
                 gate_open: false,
                 reasoning: framing.split_reasoning.then(ReasoningSplit::default),
                 tools: framing.tools.map(ToolCallSplit::new),
+                parts: framing.parts.then(|| PartSplit::new(tool_catalog())),
                 usage: None,
                 finish: FinishReason::Stop,
             }),
@@ -123,7 +132,69 @@ impl Framer {
         for out in outs {
             frames.push(self.out_frame(s, out));
         }
+        frames.extend(self.end_parts(s));
         frames
+    }
+
+    /// Whether the reply goes out as parts ([`Framing::parts`]).
+    pub fn in_parts(&self) -> bool {
+        self.state.lock().unwrap().parts.is_some()
+    }
+
+    /// The `part` events a round's tool notice makes: its calls started, or
+    /// each result on its own call. Empty for a reply not framed as parts.
+    pub fn tool(
+        &self,
+        phase: &str,
+        results: &[Value],
+        tokens: &[usize],
+    ) -> Vec<anyhow::Result<Event>> {
+        let mut s = self.state.lock().unwrap();
+        let Some(split) = s.parts.as_mut() else {
+            return Vec::new();
+        };
+        let events = match phase {
+            "running" => split.run().into_iter().collect(),
+            _ => split.results(results, tokens),
+        };
+        events.iter().map(part_event).collect()
+    }
+
+    /// The `part` event the reasoning's running length makes.
+    pub fn think(&self, tokens: usize) -> Vec<anyhow::Result<Event>> {
+        let s = self.state.lock().unwrap();
+        s.parts
+            .as_ref()
+            .and_then(|split| split.think_tokens(tokens))
+            .iter()
+            .map(part_event)
+            .collect()
+    }
+
+    /// A turn of the reply ended: what its parts still held.
+    pub fn end_turn(&self) -> Vec<anyhow::Result<Event>> {
+        let mut guard = self.state.lock().unwrap();
+        self.end_parts(&mut guard)
+    }
+
+    fn end_parts(&self, s: &mut State) -> Vec<anyhow::Result<Event>> {
+        let outs = s.parts.as_mut().map(PartSplit::finish).unwrap_or_default();
+        outs.into_iter()
+            .map(|out| self.part_frame(s, out))
+            .collect()
+    }
+
+    fn part_frame(&self, s: &mut State, out: PartOut) -> anyhow::Result<Event> {
+        match out {
+            PartOut::Prose(text) => self.delta(
+                s,
+                Delta {
+                    content: Some(text),
+                    ..Delta::default()
+                },
+            ),
+            PartOut::Part(event) => part_event(&event),
+        }
     }
 
     /// The closing frame, carrying the reply's [`finish_reason`].
@@ -172,6 +243,13 @@ impl Framer {
                 ..Delta::default()
             };
             frames.push(self.delta(s, delta));
+        }
+        if let Some(split) = s.parts.as_mut() {
+            let outs = split.push(&piece.content);
+            for out in outs {
+                frames.push(self.part_frame(s, out));
+            }
+            return frames;
         }
         let outs = match s.tools.as_mut() {
             Some(split) => split.push(&piece.content),
@@ -236,6 +314,13 @@ impl Framer {
     }
 }
 
+/// One part event as a named `part` SSE event.
+fn part_event(event: &PartEvent) -> anyhow::Result<Event> {
+    serde_json::to_string(event)
+        .map_err(|e| anyhow::anyhow!(e))
+        .map(|data| Event::default().event("part").data(data))
+}
+
 /// One chunk as an SSE `data:` frame.
 fn encode(chunk: &ChatCompletionChunk) -> anyhow::Result<Event> {
     serde_json::to_string(chunk)
@@ -283,6 +368,7 @@ mod tests {
             Framing {
                 split_reasoning: false,
                 tools: None,
+                parts: false,
             },
         )
     }

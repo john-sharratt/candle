@@ -2,7 +2,7 @@
 //! §4.5).
 //!
 //! A chain can close without reading every page — cut at the round cap, or a
-//! page skipped — and serving it as "the full contents" would promise lines
+//! page skipped — and placing it as "the full contents" would promise lines
 //! the model never gets. The chain's own record decides: each call turn's
 //! `file_read` pages, paired in order with the `<tool_response>` blocks of the
 //! turn after it, count when the response carries no `error`. The chain is

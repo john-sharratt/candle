@@ -23,11 +23,6 @@
 //!
 //! Each settling is entered on the thread. An answer is the worker's next turn,
 //! and the worker settles again after it.
-//!
-//! A **part** — what a worker starts under itself with `sub_run`
-//! (`super::parts`) — runs the same way, as the role its worker runs as, but
-//! asks nobody: it ends `done` or `error`, is archived either way, and its
-//! settling is its worker's business, not an entry on Claude's thread.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -113,18 +108,6 @@ OPTIONS: each choice you see, and what it leads to\n\
 TRIED: what you already did, and what happened\n\
 POINTERS: the files and lines, commands or turns the question rests on\n\
 Never ask what you can settle yourself by reading, running or searching.";
-
-/// What every part's prompt ends with: whose part it is, and that nobody
-/// answers it.
-pub fn part_close(parent: &str) -> String {
-    format!(
-        "\n\n---\nYou are a part of the task of {parent}, which started you with `sub_run` and \
-         waits for you: your final response, and the journal entry drafted from it, are what it \
-         gets back. Nobody can answer a question from you. If something blocks you, say exactly \
-         what in your final response — what you tried, what happened, and the files, lines or \
-         commands it rests on — and end there."
-    )
-}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -226,6 +209,7 @@ pub fn start(
     wanted: &str,
     prompt: &str,
     (priority, effort, kind): (Priority, Effort, WorkerKind),
+    by_task: bool,
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -239,8 +223,8 @@ pub fn start(
     let _held = holding();
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
     let taken = taken(&records, &owner, thread, now);
-    let name = names::child_name(thread, "", wanted, &taken)?;
-    let worker = fresh(
+    let name = names::worker_name(thread, wanted, &taken)?;
+    let mut worker = fresh(
         session,
         &owner,
         thread,
@@ -255,11 +239,17 @@ pub fn start(
         ),
         now,
     );
+    worker.by_task = by_task;
+    let started = if by_task {
+        "A task started:"
+    } else {
+        "Claude started:"
+    };
     note(
         &records,
         &owner,
         &worker,
-        "Claude started:",
+        started,
         first_line(prompt, PROMPT_QUOTE),
     )?;
     begin(
@@ -271,7 +261,7 @@ pub fn start(
     )
 }
 
-/// Every conversation under `thread`, by lineage name, and whether it is live.
+/// Every worker under `thread`, by name, and whether it is live.
 ///
 /// A name is taken by its record's key, read or not: a record that no longer
 /// decodes still names a conversation that exists, so its name is never given
@@ -339,43 +329,8 @@ pub(super) fn fresh(
         checked: false,
         // `begin` names the member it begins on.
         runner: None,
+        by_task: false,
     }
-}
-
-/// Start a part named after `wanted` under `parent`, running `prompt` as the
-/// role `parent` runs as; the part's record, `running`.
-pub fn start_part(
-    session: &Arc<ZendSession>,
-    owner: &str,
-    parent: &Worker,
-    wanted: &str,
-    prompt: &str,
-) -> Result<Worker, String> {
-    let records = session.shared_substrate().ok_or_else(loading)?;
-    if prompt.trim().is_empty() {
-        return Err("the part's `prompt` is empty: state its task in full".into());
-    }
-    let now = now_ms();
-    let _held = holding();
-    let taken = taken(&records, owner, &parent.thread, now);
-    let name = names::child_name(&parent.thread, &parent.name, wanted, &taken)?;
-    let part = fresh(
-        session,
-        owner,
-        &parent.thread,
-        name,
-        prompt,
-        (
-            parent.person.clone(),
-            parent.role,
-            parent.priority,
-            parent.effort,
-            parent.kind,
-        ),
-        now,
-    );
-    let message = format!("{prompt}{}", part_close(&parent.path()));
-    begin(session, &records, owner, part, message)
 }
 
 /// Answer the worker `name` of `thread`, which asked, is stuck, or finished
@@ -414,7 +369,7 @@ pub fn answer(
                 worker.path()
             ))
         }
-        State::Done if !worker.is_part() => {
+        State::Done => {
             return Err(format!(
                 "`{}` finished and was archived, so it cannot be continued: start a new task, \
                  citing its entries",
@@ -593,7 +548,7 @@ pub fn resume(
 /// last run stopped in the middle of: the worker is carried on from there, with
 /// its beat, its settling and its lease, so no other member takes it for lost
 /// and starts it over the same round. `false` when the worker is not one to
-/// carry on — it ended, it is a part, or it was cut off too often — and the
+/// carry on — it ended, or it was cut off too often — and the
 /// round is simply finished. `true` too when another member holds its turns.
 pub async fn carry_on(
     session: &Arc<ZendSession>,
@@ -605,8 +560,7 @@ pub async fn carry_on(
     let records = session.shared_substrate().ok_or_else(loading)?;
     let cut_off = |w: &Worker| {
         let seen = w.clone().observed(now_ms());
-        !seen.is_part()
-            && seen.resumes < resuming::MAX_RESUMES
+        seen.resumes < resuming::MAX_RESUMES
             && (seen.state == State::Running || archiving::lost(&seen))
     };
     let Some(found) = threads::worker(&records, owner, thread, name).filter(cut_off) else {
@@ -877,7 +831,7 @@ fn give_up(session: &Arc<ZendSession>, records: &dyn Records, owner: &str, worke
     worker.ended_ms = Some(now_ms());
     // A chat hears of it as of any answer that failed, and one closed while
     // it waited is disposed of now.
-    let chat = worker.kind.is_chat() && !worker.is_part();
+    let chat = worker.kind.is_chat();
     if chat {
         talk::answered(records, owner, worker);
     }
@@ -1325,9 +1279,6 @@ async fn run(
         if let Some(drafted) = drafted.filter(|_| worker.entries.is_empty()) {
             worker.no_entry = Some(why_no_entry(view.as_ref(), drafted));
         }
-        if worker.is_part() {
-            break settle_part(&mut worker, ended);
-        }
         if worker.kind.is_chat() {
             break settle_chat(&mut worker, ended);
         }
@@ -1341,7 +1292,7 @@ async fn run(
             let round = keep_first_answer(&mut worker, answer, &audit);
             break (label, format!("{outcome}; its citation check {round}"));
         }
-        let audit = match audit_of(&session, &records, &owner, &worker).await {
+        let audit = match audit_of(&session, &worker).await {
             Ok(audit) => audit,
             // Said, so an answer is never read as citing nothing because its
             // audit could not run.
@@ -1407,10 +1358,10 @@ async fn run(
         worker.ended_ms = Some(now_ms());
         // A finished task is kept whole, to be continued with `repo_task_reply`,
         // until its thread is archived or it sits a day idle
-        // (`super::archiving`); a part and a failed task are archived now. A
-        // chat's conversation is never distilled: disposal tombstones it
+        // (`super::archiving`); a failed task is archived now. A chat's
+        // conversation is never distilled: disposal tombstones it
         // (`docs/zen_chat.md` §4).
-        worker.resumable = worker.state == State::Done && !worker.is_part();
+        worker.resumable = worker.state == State::Done;
         if !worker.resumable && !worker.kind.is_chat() {
             match session.archive_worker(&worker.conv_id) {
                 Some(Ok(())) | None => {}
@@ -1421,7 +1372,7 @@ async fn run(
             }
         }
     }
-    let chat = worker.kind.is_chat() && !worker.is_part();
+    let chat = worker.kind.is_chat();
     // Said on the chat before the record says the answer ended, so a reader
     // woken by the record finds the message there.
     if chat {
@@ -1430,12 +1381,8 @@ async fn run(
     if let Err(e) = threads::put_worker(&records, &owner, &worker) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
     }
-    // The thread is Claude's record of what Claude did; a part's outcome goes
-    // to the worker that started it, as its `sub_run` result.
-    if !worker.is_part() {
-        if let Err(e) = note(&records, &owner, &worker, label, outcome) {
-            tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
-        }
+    if let Err(e) = note(&records, &owner, &worker, label, outcome) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
     }
     // A chat closed while Zen answered is disposed of once the answer has
     // ended.
@@ -1524,31 +1471,15 @@ async fn beat(
 }
 
 /// The citation audit of `worker`'s final response, over every turn of its
-/// conversation and of each part it started (`super::audit`): decoding them
-/// reads the substrate, so it runs off the runtime's threads.
-async fn audit_of(
-    session: &Arc<ZendSession>,
-    records: &SharedSubstrate,
-    owner: &str,
-    worker: &Worker,
-) -> Result<Audit, String> {
-    let below = format!("{}/", worker.name);
-    let (records, owner, thread) = (records.clone(), owner.to_string(), worker.thread.clone());
+/// conversation (`super::audit`): decoding them reads the substrate, so it
+/// runs off the runtime's threads.
+async fn audit_of(session: &Arc<ZendSession>, worker: &Worker) -> Result<Audit, String> {
     let own = worker.conv_id.clone();
     let session = Arc::clone(session);
     let answer = worker.final_text.clone();
     let audited = tokio::task::spawn_blocking(move || {
-        let convs: Vec<String> = threads::workers(&records, &owner, &thread)
-            .into_iter()
-            .filter(|w| w.name.starts_with(&below))
-            .map(|w| w.conv_id)
-            .chain([own])
-            .collect();
-        let details: Vec<TimelineDetail> = convs
-            .iter()
-            .filter_map(|c| session.conversation_detail(c))
-            .collect();
-        let turns: Vec<Turn<'_>> = details
+        let detail: Option<TimelineDetail> = session.conversation_detail(&own);
+        let turns: Vec<Turn<'_>> = detail
             .iter()
             .flat_map(|d| &d.turns)
             .filter(|t| t.kind == "normal")
@@ -1670,38 +1601,6 @@ fn settle_chat(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
             worker.final_text = final_reply(&text);
             worker.state = State::Done;
             ("Chat answer:", "done".into())
-        }
-    }
-}
-
-/// Settle the part `part` on how its turn `ended`: `done` with its final
-/// response — a part asks nobody, so a question block or a closed loop is
-/// still its answer, said as such — or `error`.
-fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
-    match ended {
-        Ended::Failed(error) => {
-            let line = format!("error: {}", first_line(&error, 200));
-            part.error = Some(error);
-            part.state = State::Error;
-            ("Part ended:", line)
-        }
-        Ended::Closed { text, by } => {
-            let why = if by == CLOSED_BY_CLAUDE {
-                "Claude stopped it"
-            } else {
-                "the same call repeated, or the round cap reached"
-            };
-            part.final_text = format!(
-                "Its tools were closed before it finished — {why} — and it ended:\n{}",
-                final_reply(&text)
-            );
-            part.state = State::Done;
-            ("Part ended:", "its tools were closed".into())
-        }
-        Ended::Replied(text) => {
-            part.final_text = final_reply(&text);
-            part.state = State::Done;
-            ("Part ended:", "done".into())
         }
     }
 }
@@ -1962,7 +1861,7 @@ pub async fn wait(
 mod tests {
     use super::*;
     use crate::mcp::records::MemRecords;
-    use crate::session::{CLOSED_BY_CAP, CLOSED_BY_REPEATS};
+    use crate::session::CLOSED_BY_REPEATS;
     use serde_json::json;
 
     fn view() -> Value {
@@ -2007,6 +1906,7 @@ mod tests {
             audit: None,
             checked: false,
             runner: None,
+            by_task: false,
         }
     }
 
@@ -2119,7 +2019,7 @@ mod tests {
             t,
             [("old".to_string(), false), ("verify".to_string(), true)]
         );
-        assert_eq!(names::child_name("review", "", "old", &t).unwrap(), "old.2");
+        assert_eq!(names::worker_name("review", "old", &t).unwrap(), "old.2");
     }
 
     #[test]
@@ -2328,42 +2228,6 @@ mod tests {
         assert!(ASKING.contains("OPTIONS:") && ASKING.contains("POINTERS:"));
     }
 
-    /// **A part never waits on anyone**: a question block or a closed loop is
-    /// its answer, settled `done` — said as such — and only a failure is
-    /// `error`. Either way it is no longer live.
-    #[test]
-    fn a_part_settles_done_or_failed_and_never_waits() {
-        let part = || Worker {
-            name: "verify/read".into(),
-            ..worker()
-        };
-        let mut p = part();
-        settle_part(&mut p, Ended::Replied("Read it.\nQUESTION: which?".into()));
-        assert_eq!(p.state, State::Done);
-        assert_eq!(p.final_text, "Read it.\nQUESTION: which?");
-        assert_eq!(p.question, None);
-
-        let mut p = part();
-        settle_part(
-            &mut p,
-            Ended::Closed {
-                text: "<think>x</think>I could not finish.".into(),
-                by: CLOSED_BY_CAP,
-            },
-        );
-        assert_eq!(p.state, State::Done);
-        assert_eq!(
-            p.final_text,
-            "Its tools were closed before it finished — the same call repeated, or the \
-             round cap reached — and it ended:\nI could not finish."
-        );
-
-        let mut p = part();
-        settle_part(&mut p, Ended::Failed("boom".into()));
-        assert_eq!((p.state, p.error.as_deref()), (State::Error, Some("boom")));
-        assert!(!p.state.live());
-    }
-
     /// **Zen's side of a chat settles done with its reply, never as a
     /// question** — Zen asks Claude in the chat itself — and its message ends
     /// with no question block; resumed, it is told the message it was
@@ -2424,17 +2288,6 @@ mod tests {
         let task = worker();
         note(&r, "o", &task, "Claude started:", "verify".into()).unwrap();
         assert_eq!(threads::note_count(&r, "o", &task.thread), 1);
-    }
-
-    #[test]
-    fn a_part_is_told_whose_it_is_and_that_nobody_answers_it() {
-        let close = part_close("T:review/verify");
-        assert!(close.contains("the task of T:review/verify"), "{close}");
-        assert!(
-            close.contains("Nobody can answer a question from you"),
-            "{close}"
-        );
-        assert!(!close.contains(QUESTION_MARK));
     }
 
     #[test]

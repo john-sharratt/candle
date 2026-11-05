@@ -195,17 +195,9 @@ pub const DELEGATED: Style = Style {
     ..CODING
 };
 
-/// The wording of a part's journal — what a task's worker started under
-/// itself with `sub_run`: its user turns are that worker's.
-pub const PART: Style = Style {
-    heard: "Its worker said:",
-    ..CODING
-};
-
 /// The wording `conv_id`'s journal is kept in.
 pub fn style_for(conv_id: &str) -> &'static Style {
     match conv_names(conv_id) {
-        Some((_, _, lineage)) if lineage.contains('/') => &PART,
         Some(_) => &DELEGATED,
         None => &CODING,
     }
@@ -239,7 +231,7 @@ mod tests {
     /// when the call offers it.
     #[test]
     fn no_question_offers_a_fact_and_only_the_per_question_tells_of_per() {
-        for style in [&CODING, &DELEGATED, &PART] {
+        for style in [&CODING, &DELEGATED] {
             assert!(!style.facts);
             for asked in [style.write_question, style.per_question] {
                 assert!(!asked.contains("typed"), "{asked}");
@@ -323,10 +315,6 @@ mod tests {
              - Claude said: Asked for the expiry check."
         );
         assert_eq!(style_for("c-123").heard, "User said:");
-        assert_eq!(
-            style_for("mcp:abc:review/verify/read").heard,
-            "Its worker said:"
-        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ src/
 │   ├── notes.rs         NotesStore
 │   ├── secrets.rs       Secrets (API keys and tokens, read from ~/.zend/secrets.yaml)
 │   └── sessions.rs      SessionRegistry (all protocol entries)
-└── tools/           — 95 tool implementations
+└── tools/           — 94 tool implementations
     ├── bytes/       — bytes_transcode, bytes_pack, bytes_unpack, bytes_xor
     ├── calculator.rs
     ├── code/        — code_run, code_session_{open,exec,list,close}
@@ -61,7 +61,6 @@ src/
     ├── remote_fs/   — remote_fs_session_{open,list_dir,stat,get,put,delete,mkdir,rename,list,close}
     ├── sql_session/ — sql_session_{open,query,list,close}
     ├── ssh/         — ssh_session_{open,exec,exec_async,poll,list,close}
-    ├── subagent.rs
     ├── tcp_session/ — tcp_session_{open,send,recv,list,close}
     ├── telnet/      — telnet_session_{open,send,list,close}
     ├── tls_session/ — tls_session_{open,send,recv,list,close}
@@ -101,7 +100,6 @@ tests/
 | **Hash state** | `hash_state_{init,update,finalize}` | Web chat only | Streaming hash for large/chunked data |
 | **Byte utilities** | `bytes_transcode`, `bytes_pack`, `bytes_unpack`, `bytes_xor` | Web chat only | struct.pack/unpack semantics; hex/base64 |
 | **Code execution** | `code_run`, `code_session_{open,exec,list,close}` | Web chat only | Python/Node subprocess; persistent REPL |
-| **Subagent** | `subagent_run` | Web chat only | Nested agent loop via SubagentRunner trait |
 
 ---
 

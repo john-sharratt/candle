@@ -6363,7 +6363,8 @@ impl Scheduler {
             // `batch_decode_step`, never this one, so check it here too —
             // otherwise steering silently never engages for those calls.
             None => {
-                let d = work.triggers.driver_for(first_token);
+                // The reply's first token: nothing reasoned before it.
+                let d = work.triggers.driver_after(first_token, 0);
                 // A once-trigger (the think block) is spent by firing, so the
                 // rest of the turn decodes that token as text.
                 if let Some(rest) = work.triggers.after_firing(first_token) {

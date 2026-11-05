@@ -18,8 +18,7 @@
 //! | [`archiving`] | Archiving threads and workers: by `thread_archive`, and after a day idle |
 //! | [`activity`] | What a running worker is doing, counted from its stream and said in one sentence |
 //! | [`reported`] | The journal entries already handed to Claude, so a later result gives only new ones |
-//! | [`parts`] | `sub_run`: a worker's parts, started under it and waited on |
-//! | [`lineage`] | The journals a worker or part inherits from above it |
+//! | [`lineage`] | The journals a worker inherits from above it |
 //! | [`ops`] | What the operations tools share: Admins only, the decision gate, the way up |
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
 //! | [`stops`] | Claude stopping a running worker, at its next tool round |
@@ -47,7 +46,6 @@ pub mod nudges;
 pub mod ops;
 pub mod ops_tools;
 pub mod ownership;
-pub mod parts;
 pub mod records;
 pub mod reported;
 pub mod resuming;

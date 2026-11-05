@@ -178,11 +178,11 @@ mod tests {
     /// Only tools the caller can run are suggested.
     #[test]
     fn suggestions_are_tools_the_grants_can_run() {
-        for tool in suggested(&unknown_tool("sub_runn", Grants::NONE)) {
+        for tool in suggested(&unknown_tool("run_commnd", Grants::NONE)) {
             let t = registry::find(tool).unwrap();
             assert!(t.requires.is_empty(), "`{tool}` needs {:?}", t.requires);
         }
-        assert!(suggested(&unknown_tool("sub_runn", Grants::ALL)).contains(&"sub_run"));
+        assert!(suggested(&unknown_tool("run_commnd", Grants::ALL)).contains(&"run_command"));
     }
 
     /// **A refused call learns the signature.** Any other response, success

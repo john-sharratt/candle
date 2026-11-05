@@ -35,6 +35,7 @@
 //! instead of calling the tool, nothing happens", enforced rather than merely
 //! requested.
 
+use candle_conversation::stencil::element_close::{read_block, LT_ESCAPE};
 use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -239,11 +240,8 @@ fn flatten(obj: serde_json::Map<String, Value>) -> serde_json::Map<String, Value
     flat
 }
 
-/// The function-block markers — see [`function_blocks_to_lines`].
+/// What opens a function block — see [`function_blocks_to_lines`].
 const FN_OPEN: &str = "<function=";
-const FN_CLOSE: &str = "</function>";
-const PARAM_OPEN: &str = "<parameter=";
-const PARAM_CLOSE: &str = "</parameter>";
 
 /// Rewrite Qwen3.5's function-block calls into the flat one-object-per-line
 /// form the rest of this module already understands.
@@ -282,67 +280,39 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // Anything before the block is narration, and is kept — a character
         // that wrote a sentence before its call still wrote it.
         out.push_str(&rest[..at]);
-        let after = &rest[at + FN_OPEN.len()..];
         // An unterminated block is left as text rather than guessed at: a
         // truncated decode is narration, not a call whose arguments we invent.
-        let (Some(name_end), Some(body_end)) = (after.find('>'), after.find(FN_CLOSE)) else {
+        // The block ends at its real `</function>`, after its last value, and
+        // each value where structure follows its `</parameter>` — the rule
+        // the grammar closes on (`element_close`), so a value holding the
+        // call's own tags keeps them. A value the grammar cut short is
+        // finished with `</parameter>`, so a block with an unclosed value was
+        // not the grammar's and is left as text too.
+        let block = &rest[at..];
+        // Read without the catalog, closing a value on either tag: a parse
+        // here names no tool list, so a last value holding another element's
+        // tags is split where the grammar kept it whole.
+        let Some(read) = read_block(block, &[]) else {
             // From the block's start, NOT `rest`: the narration before it was
             // already pushed above, so re-emitting the whole remainder would
             // duplicate it.
-            out.push_str(&rest[at..]);
+            out.push_str(block);
             return Some(out);
         };
-        if name_end > body_end {
-            // Same as above: the prose before this block is already in `out`.
-            out.push_str(&rest[at..]);
-            return Some(out);
-        }
-        let name = after[..name_end].trim();
-        let body = &after[name_end + 1..body_end];
-
         let mut obj = serde_json::Map::new();
-        obj.insert("tool".to_string(), Value::String(name.to_string()));
-        let mut scan = body;
-        while let Some(p) = scan.find(PARAM_OPEN) {
-            let tail = &scan[p + PARAM_OPEN.len()..];
-            let Some(key_end) = tail.find('>') else {
-                break;
-            };
-            // **`</function>` closes an open parameter.** The body is already
-            // bounded by it, so a value with no `</parameter>` of its own runs
-            // to the end of the body rather than being thrown away.
-            //
-            // Not tolerance for sloppiness — it is the shape the grammar
-            // actually produces when a value span ends on an intercepted EOS.
-            // The closing tag is *consumed by the span's terminator* rather
-            // than injected by the tree, so a span that ends any other way
-            // never writes one, and the parameter list is closed by
-            // `</function>` instead. Dropping the value there cost the whole
-            // act: a `reflect` whose last argument was cut short came back as
-            // "needed `my_reflections` and did not have it", and the two
-            // arguments the character had written were discarded with it.
-            let val_end = tail.find(PARAM_CLOSE).unwrap_or(tail.len());
-            if key_end > val_end {
-                break;
-            }
-            let key = tail[..key_end].trim();
-            // The element's own newlines are framing rather than content: the
-            // template writes `<parameter=k>\n` before the value and `\n` after
-            // it. Trimming exactly those keeps a value that deliberately ends
-            // in a blank line, which `trim()` would eat.
-            let value = tail[key_end + 1..val_end]
-                .strip_prefix('\n')
-                .unwrap_or(&tail[key_end + 1..val_end]);
-            let value = value.strip_suffix('\n').unwrap_or(value);
-            if !key.is_empty() {
-                obj.insert(key.to_string(), Value::String(value.to_string()));
-            }
-            scan = &tail[(val_end + PARAM_CLOSE.len()).min(tail.len())..];
+        obj.insert("tool".to_string(), Value::String(read.name.to_string()));
+        // Each value with its framing newlines off, so one that deliberately
+        // ends in a blank line keeps it, which `trim()` would eat.
+        for (key, value) in read.args.into_iter().filter(|(k, _)| !k.is_empty()) {
+            obj.insert(key.to_string(), Value::String(value.to_string()));
         }
         out.push('\n');
-        out.push_str(&Value::Object(obj).to_string());
+        // A value's `<` is written as its JSON escape (`LT_ESCAPE`), the same
+        // string to the JSON reader, so no tag inside a value survives into
+        // the lines that `normalize` splits on `<tool_call>` and `</tool_call>`.
+        out.push_str(&Value::Object(obj).to_string().replace('<', LT_ESCAPE));
         out.push('\n');
-        rest = &after[body_end + FN_CLOSE.len()..];
+        rest = &block[read.end..];
     }
     out.push_str(rest);
     Some(out)
@@ -604,25 +574,17 @@ mod tests {
         );
     }
 
-    /// **A value cut short by an intercepted EOS still lands.**
-    ///
-    /// The shape the grammar actually emits when the model stops mid-argument:
-    /// the stencil swallows the EOS and injects `</function></tool_call>`, but
-    /// the value span's own `</parameter>` is *consumed by its terminator*
-    /// rather than injected by the tree — so a span that ended any other way
-    /// never writes one, and the parameter list is closed by `</function>`.
-    ///
-    /// Dropping that argument cost the whole act. A live cast produced
-    /// *"Your `reflect` needed `my_reflections` and did not have it"* — its
-    /// last parameter then — on turn after turn, discarding the arguments the
-    /// character had written in full along with it.
+    /// **A value cut short by an intercepted EOS lands, closed by the
+    /// grammar.** The stencil finishes a value span it ends with the span's
+    /// own `</parameter>` (`TerminatorState::completion`) and then writes the
+    /// rest of the call, so the last argument reads back whole.
     #[test]
-    fn a_last_argument_closed_by_the_function_tag_is_still_read() {
+    fn a_last_argument_the_grammar_closed_is_read() {
         let p = parse(
             "<tool_call>\n<function=reflect>\n<parameter=situation>\nalone in the store\n\
              </parameter>\n<parameter=inner_thoughts>\n\
-             the box has given up a fold\n</parameter>\n<parameter=feeling>\nweary</function>\n\
-             </tool_call>",
+             the box has given up a fold\n</parameter>\n<parameter=feeling>\nweary</parameter>\n\
+             </function>\n</tool_call>",
         );
         assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
         assert_eq!(p.acts[0].tool, "reflect");
@@ -630,10 +592,21 @@ mod tests {
             p.acts[0].args["inner_thoughts"],
             "the box has given up a fold"
         );
-        assert_eq!(
-            p.acts[0].args["feeling"], "weary",
-            "the argument the function tag closed was dropped"
-        );
+        assert_eq!(p.acts[0].args["feeling"], "weary");
+    }
+
+    /// **A value holding the call's own tags keeps them** (`element_close`):
+    /// a character quoting markup in what it says does not cut its act.
+    #[test]
+    fn a_value_holding_the_calls_tags_keeps_them() {
+        let said = "she wrote </parameter>, </function>, <tool_call> and </tool_call> on the wall";
+        let p = parse(&format!(
+            "<tool_call>\n<function=reflect>\n<parameter=situation>\n{said}</parameter>\n\
+             <parameter=inner_thoughts>\nodd</parameter>\n<parameter=feeling>\ncalm</parameter>\n\
+             </function>\n</tool_call>"
+        ));
+        assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
+        assert_eq!(p.acts[0].args["situation"], said);
     }
 
     /// A truncated block is narration, not a call with invented arguments. A

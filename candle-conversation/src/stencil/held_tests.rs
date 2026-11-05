@@ -102,6 +102,31 @@ fn a_held_call_can_name_only_a_given_tool() {
     );
 }
 
+/// **A hold that needs reasoning applies only after it.** A walk started once
+/// the turn has reasoned for the threshold is held on the reasoned branches;
+/// one started before, on the others.
+#[test]
+fn a_reasoned_hold_applies_only_after_the_reasoning() {
+    let v = TestVocab::new();
+    let t = tree(&v);
+    let decode = |t: &[TokenId]| String::from_utf8(v.decode(t)).ok();
+    let only = |name: &str| Arc::new(held_branches(&t, &[name.to_string()], decode));
+    let mut registry = TriggerRegistry::new();
+    registry.register(TRIGGER, Arc::clone(&t));
+    let registry =
+        registry.holding_after_reasoning(TRIGGER, only("file_list"), 200, Some(only("write")));
+    let named = |reasoned: u32| {
+        names(&every_path(
+            registry.driver_after(TRIGGER, reasoned).unwrap(),
+            &v,
+        ))
+    };
+    assert_eq!(named(200), BTreeSet::from(["file_list".into()]));
+    assert_eq!(named(5_000), BTreeSet::from(["file_list".into()]));
+    assert_eq!(named(199), BTreeSet::from(["write".into()]));
+    assert_eq!(named(0), BTreeSet::from(["write".into()]));
+}
+
 /// **The hold ends with its branch.** `write`'s `mode` enum — one of whose
 /// values is spelled like a tool — still offers every value after a name held
 /// to `write`.

@@ -81,11 +81,8 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .filter(|t| !is_chat_thread(&t.name))
         .filter(|t| include_archived || !t.archived)
         .map(|t| {
-            // A thread's tasks are Claude's; the parts its workers started
-            // are theirs, and wait on nobody.
             let workers: Vec<Worker> = threads::workers(&records, &owner, &t.name)
                 .into_iter()
-                .filter(|w| !w.is_part())
                 .map(|w| w.observed(now))
                 .collect();
             let last = threads::last_note(&records, &owner, &t.name)
@@ -130,6 +127,7 @@ mod tests {
             stopped: false,
             resumable: false,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,

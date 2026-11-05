@@ -111,10 +111,13 @@ the user's spoken approval, then the `mcp` service rebuilt and trialled
 
 ### 2.5 Context on the first call
 
-A conversation is a person's MCP session through a client: a new session is a
-new conversation, and one silent for `CONVERSATION_GAP_MS` (30 minutes) is
-one again — the only boundary a client that keeps one session, or none, can
-be given. The first call of a conversation reads the context *beside* its own
+A conversation is a person's MCP session through a client, for as long as the
+session lasts: a new session is a new conversation, and a long silence within
+one is not. The context is delivered once per session — re-sent after every
+half-hour pause, it cost a long working session about 2k tokens each time, and
+zend named a new conversation journal at each pause
+(`docs/zen_coding_session_fixes.md`, S5). zend's own boundary is the same
+(`zend/src/mcp/memory/conversations.rs`). The first call of a conversation reads the context *beside* its own
 work, and never waits for it: when the read has finished by the time the call
 answers, its answer gets a second text block, "Before you answer — …"
 followed by the user context (guide and memory). A read the call answered

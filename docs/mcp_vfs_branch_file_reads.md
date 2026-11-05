@@ -69,7 +69,7 @@ worker with a journal and a commit path.
 
 The argument is `conversation`, and it names one of two things:
 
-1. **A worker's path** — `T:<thread>/<worker>`, or a part below it, as `mcp::names::Path`
+1. **A worker's path** — `T:<thread>/<worker>`, as `mcp::names::Path`
    parses them (`zend/src/mcp/names.rs:49`). The worker's conversation id is
    `mcp:<owner>:<thread>/<name>` (`zend/src/mcp/threads.rs:338`), and the caller may name one
    only if they own it or are an Admin, which is `owner_of` / `may_open`

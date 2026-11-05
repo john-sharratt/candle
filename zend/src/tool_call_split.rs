@@ -8,6 +8,7 @@
 //! A block that turns out not to be a call, or never closes, goes out as the
 //! text it is.
 
+use candle_conversation::stencil::element_close::function_end;
 use candle_conversation::stencil::ToolSpec;
 
 use crate::openai_tools::{parse_call, Call};
@@ -15,6 +16,50 @@ use crate::reasoning_split::marker_start_len;
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
+
+/// Where an open call's `</tool_call>` is in `body`, the text after its
+/// opener: the first one after the call itself has ended — a function block
+/// at its real `</function>`, read with the catalog its grammar was compiled
+/// from (`element_close`), a JSON object at its closing brace — so a value
+/// holding `</tool_call>` does not end the call. A body that is neither is the
+/// model's text, ending at the first close. `None` while the call is still
+/// arriving.
+fn close_of(body: &str, specs: &[ToolSpec]) -> Option<usize> {
+    let lead = body.len() - body.trim_start().len();
+    let rest = &body[lead..];
+    let ended = if rest.starts_with("<function=") {
+        lead + function_end(rest, specs)?
+    } else if rest.starts_with('{') {
+        lead + object_end(rest)?
+    } else {
+        0
+    };
+    body[ended..].find(CLOSE).map(|at| ended + at)
+}
+
+/// The offset just past the JSON object opening `text`, its strings read
+/// whole so a brace or a tag inside one is text. `None` while it is open.
+pub(crate) fn object_end(text: &str) -> Option<usize> {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, b) in text.bytes().enumerate() {
+        match (in_string, escaped, b) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (true, false, b'"') => in_string = false,
+            (true, false, _) => {}
+            (false, _, b'"') => in_string = true,
+            (false, _, b'{' | b'[') => depth += 1,
+            (false, _, b'}' | b']') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            (false, _, _) => {}
+        }
+    }
+    None
+}
 
 /// What one fragment of the answer releases, in order.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,7 +93,7 @@ impl ToolCallSplit {
         let mut out = Vec::new();
         loop {
             if self.in_call {
-                let Some(close) = self.pending.find(CLOSE) else {
+                let Some(close) = close_of(&self.pending, &self.specs) else {
                     return out;
                 };
                 let body: String = self.pending.drain(..close).collect();
@@ -142,6 +187,37 @@ mod tests {
             out,
             vec![Out::Text("Reading.\n\n".into()), call("read_files")]
         );
+    }
+
+    /// **A value holding `</tool_call>` does not end the call**, in either
+    /// syntax: the close counts only after the call itself has ended.
+    #[test]
+    fn a_value_holding_the_close_stays_inside_the_call() {
+        let out = run(&[
+            "<tool_call>{\"name\": \"write\", \"arguments\": {\"content\": \"x</tool_",
+            "call>y\"}}</tool_call> done",
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                Out::Call(Call {
+                    name: "write".into(),
+                    arguments: json!({"content": "x</tool_call>y"}),
+                }),
+                Out::Text(" done".into())
+            ]
+        );
+        let block = "\n<function=write>\n<parameter=content>\na</tool_call></function></parameter>\n</function>\n";
+        let body = format!("{block}</tool_call> after");
+        assert_eq!(super::close_of(&body, &[]), Some(block.len()));
+        assert_eq!(
+            super::close_of(
+                "\n<function=write>\n<parameter=content>\na</tool_call>",
+                &[]
+            ),
+            None
+        );
+        assert_eq!(super::close_of("nope</tool_call>", &[]), Some(4));
     }
 
     #[test]

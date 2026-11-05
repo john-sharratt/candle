@@ -27,7 +27,6 @@ use web::auth::oidc::random_token;
 
 use super::memory::Memory;
 use super::ops_tools::OpsTools;
-use super::parts::Parts;
 use super::records::Records;
 
 /// The longest any call waits when it names no `wait_s`: short enough that a
@@ -182,11 +181,10 @@ impl<R: Records> Store for RecordStore<R> {
     }
 }
 
-/// What `/v1/mcp` holds in memory: the change signal, the runner that
-/// starts workers' parts, the memory backbone, and the sessions' noted use.
+/// What `/v1/mcp` holds in memory: the change signal, the runner of the ops
+/// tools, the memory backbone, and the sessions' noted use.
 pub struct McpState {
     changed: watch::Sender<u64>,
-    parts: Arc<Parts>,
     ops: Arc<OpsTools>,
     memory: Arc<Memory>,
     used: Arc<Used>,
@@ -196,7 +194,6 @@ impl Default for McpState {
     fn default() -> Self {
         Self {
             changed: watch::channel(0).0,
-            parts: Arc::default(),
             ops: Arc::default(),
             memory: Arc::default(),
             used: Arc::default(),
@@ -213,11 +210,6 @@ impl McpState {
     /// The memory backbone the `journal_*` tools read and write.
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
-    }
-
-    /// The `sub_run` runner every tool context carries.
-    pub fn parts(&self) -> &Arc<Parts> {
-        &self.parts
     }
 
     /// The runner of the build and deploy tools every tool context carries.

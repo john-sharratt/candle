@@ -5,7 +5,7 @@
 //! did. A conversation that only reads writes nothing: its frame names the
 //! journal it would open, so `here` means the same before and after.
 //!
-//! A conversation is a session's run of calls with no gap of [`GAP_SECS`] —
+//! A conversation is a session's calls, for as long as the session lasts —
 //! the aggregator's own boundary (`docs/mcp_user_context.md` §2.5). Every
 //! memory call of a session moves its clock on. A session this process has
 //! not seen — a new conversation, or one carried here by a restart or from
@@ -28,10 +28,6 @@ use journals::time::Stamp;
 
 use super::{held, Memory};
 
-/// A conversation ends after this long without a call: the aggregator's
-/// `CONVERSATION_GAP_MS`.
-pub const GAP_SECS: i64 = 30 * 60;
-
 /// The sessions remembered; past this, the idlest are let go.
 const KEPT: usize = 4_096;
 
@@ -51,11 +47,8 @@ enum Kept {
 struct Sessions(HashMap<String, (Kept, Stamp)>);
 
 impl Sessions {
-    fn get(&self, session: &str, now: Stamp) -> Option<&Kept> {
-        self.0
-            .get(session)
-            .filter(|(_, last)| now.secs() - last.secs() < GAP_SECS)
-            .map(|(k, _)| k)
+    fn get(&self, session: &str) -> Option<&Kept> {
+        self.0.get(session).map(|(k, _)| k)
     }
 
     fn keep(&mut self, session: &str, kept: Kept, at: Stamp) {
@@ -135,7 +128,7 @@ fn kept(
 ) -> Result<Kept, String> {
     let tree = memory.tree()?;
     let mut sessions = held(&memory.conversations.sessions);
-    let kept = match sessions.get(session, now) {
+    let kept = match sessions.get(session) {
         Some(Kept::Open(p)) if p.group() == group && tree.get(p).is_some() => Kept::Open(p.clone()),
         Some(Kept::Begun(at, name)) => Kept::Begun(*at, name.clone()),
         _ => {
@@ -241,15 +234,16 @@ mod tests {
         }
     }
 
+    /// **A session is one conversation however long it pauses**, and another
+    /// session is another.
     #[test]
-    fn a_session_silent_past_the_gap_is_a_new_conversation() {
+    fn a_session_is_one_conversation_however_long_it_pauses() {
         let mut s = Sessions::default();
         let p = Kept::Open(section(&zen()));
         let t = Stamp::parse("2026-10-30T12:00:00Z").unwrap();
         s.keep("s", p.clone(), t);
-        assert_eq!(s.get("s", t.plus(GAP_SECS - 1)), Some(&p));
-        assert_eq!(s.get("s", t.plus(GAP_SECS)), None);
-        assert_eq!(s.get("other", t), None);
+        assert_eq!(s.get("s"), Some(&p));
+        assert_eq!(s.get("other"), None);
     }
 
     /// **A conversation that has only read reserves the name its journal
@@ -288,8 +282,7 @@ mod tests {
             s.keep(&format!("s{i}"), p.clone(), Stamp::from_secs(i as i64));
         }
         assert_eq!(s.0.len(), KEPT);
-        let late = Stamp::from_secs(KEPT as i64);
-        assert!(s.get("s0", late).is_none() && s.get("s2", late).is_none());
-        assert!(s.get(&format!("s{}", KEPT + 2), late).is_some());
+        assert!(s.get("s0").is_none() && s.get("s2").is_none());
+        assert!(s.get(&format!("s{}", KEPT + 2)).is_some());
     }
 }

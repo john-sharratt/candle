@@ -15,9 +15,9 @@ use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::ConversationEngine;
 use zend_vfs::RepoFiles;
 
+use super::corpus::file_conversation;
+use super::coverage::Coverage;
 use crate::code_read::chain_finished;
-use crate::fast_path::coverage::Coverage;
-use crate::fast_path::file_conversation;
 
 /// Finds the committed `repo_map` unit for a folder — repository and path
 /// inside it, `""` for its root — as the conversation's base lists it

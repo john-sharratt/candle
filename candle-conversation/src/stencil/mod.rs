@@ -32,8 +32,10 @@
 mod builder;
 mod compile;
 mod driver;
+pub mod element_close;
 mod encode_cache;
 mod error;
+mod field_order;
 mod function_block;
 mod held_arms;
 mod json_lexer;

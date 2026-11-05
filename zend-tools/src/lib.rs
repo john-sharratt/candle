@@ -1,6 +1,6 @@
 //! Tool registry and execution engine for the Zen Code daemon (`zend`).
 //!
-//! This crate implements all 95 server-side tools described in `docs/tool-system.md`.
+//! This crate implements all 94 server-side tools described in `docs/tool-system.md`.
 //! Tools are stateless Rust functions — all shared state lives in [`ToolContext`].
 //! The orchestrator calls [`run`] with a tool name and JSON arguments and always
 //! gets back a JSON value that the LLM can act on, whether the call succeeded or
@@ -9,7 +9,7 @@
 //! # Module structure
 //!
 //! - [`tool`] — the [`Tool`] trait every tool implements, plus [`ToolError`],
-//!   [`ConfirmationDetails`], and the subagent runner interface
+//!   [`ConfirmationDetails`], and the operations runner interface
 //! - [`registry`] — the static [`RegisteredTool`] table and name-based lookup
 //! - [`runner`] — [`run`], [`confirmation`] and [`replay`], the three dispatch
 //!   entry points used by the orchestrator
@@ -25,7 +25,7 @@
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
 //!   [`state::Secrets`]; the file stores the `file_*` tools work through are
 //!   `zend_vfs`'s
-//! - [`tools`] — all 95 tool implementations, one module per tool group
+//! - [`tools`] — all 94 tool implementations, one module per tool group
 //!
 //! # Authoring a tool
 //!
@@ -96,7 +96,4 @@ pub use context::ToolContext;
 pub use grants::{Capability, Grants, NotPermitted};
 pub use registry::RegisteredTool;
 pub use runner::{confirmation, replay, run};
-pub use tool::{
-    ConfirmationDetails, OpsRunner, Replay, SubagentRequest, SubagentResponse, SubagentRunner,
-    Tool, ToolError,
-};
+pub use tool::{ConfirmationDetails, OpsRunner, Replay, Tool, ToolError};

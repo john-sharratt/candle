@@ -1,7 +1,8 @@
 # Zen coding sessions: why one failed, and the fixes
 
-**Status:** designed, not built (2026-11-05). `file_edit` is already mandatory
-(Cause 3, commit `934225224`); everything else below is the work.
+**Status:** built (2026-11-05), except as noted under each cause. `file_edit`
+was made mandatory first (Cause 3, commit `934225224`). Where the build
+departs from the design below, the departure is recorded beside it.
 
 **Source:** web-UI conversation `451502ff-4526-4407-a68d-69225467477a`
 (code.tokera.com): 64 turns, 226,566 tokens, 156 tool calls. At turn #41 it was
@@ -17,7 +18,7 @@ its call listing (`timeline_read`, view `calls`) and its projection record
 | 1a Decoding | A parameter value holding `</parameter>`, `</function>` or `</tool_call>` ended the call early, so every write of the bubble's code failed (#48–#60) | A value ends only at a `</parameter>` that structure follows: `Until` takes a fixed set of markers, and the grammar, the XML-to-JSON conversion, the splitter and npcd share one rule |
 | 1b Visual | The GUI finds calls by searching the streamed text for tags, so it has 1a's blind spot, pairs results by position, and drew failed rounds as progress | The GUI draws from call events on the live stream and from call records in the history; it parses no text |
 | 2 `in_context` | A read answered with a pointer, not the page; the model could not tie it to the placed content and looped (#23–#62) | The `in_context` reply and the locks go; every read runs for real; provenance skips files the turn's loop has read |
-| 3 Delegation | "Launch a research task" went to `sub_run`, which cannot run in a dialogue, so the research ran inline (#4–#10) | `sub_run` is withheld in dialogues and chats; a task never starts a task |
+| 3 Delegation | "Launch a research task" went to `sub_run`, which cannot run in a dialogue, so the research ran inline (#4–#10) | `sub_run` is removed; dialogues, chats and tasks start tasks, which nest one level |
 | 4 Forced note | The forced `journal_note` was the only call that landed in failed rounds, and was forced with nothing to say | A forced note is followed by a forced call; failed calls answer with an error; a note is forced only after 200 tokens of reasoning |
 | S1–S5 | Smaller issues: sandbox scope, repository-wide grep, a stale tool schema, a cut-short view, a context block on every connector call | All in scope |
 
@@ -64,30 +65,44 @@ share the 12-byte prefix `</parameter>`, so matching costs nothing until that
 prefix appears, then checks a short tail against a small trie built once per
 span.
 
-1. **Only `</parameter>` belongs to the value.** The separator and tag are
-   lookahead, pushed back to the next node (the mechanism `JsonNumber` uses,
-   `is_lookahead`). `Feed::Close` reports which marker fired, and the tree takes
-   that branch.
+1. **The whole close is consumed, and the span forks.** Pushing the separator
+   and tag back to the next node cannot work: the stencil commits each token as
+   it decodes, and lookahead push-back holds only within one token, while the
+   tail arrives over several. So a function block's value is a
+   `NodeSpec::Element` that consumes `</parameter>`, the separator and the tag,
+   and `TerminatorState::fired` says which tail it was; the span goes to that
+   tail's fork (`FreeTextSpan::forks`), the continuation with the tag already
+   written (`ToolTreeBuilder::after_written`).
 2. **No marker completes means content.** `</parameter>` followed by anything
    else is written into the value, and matching starts again.
 3. **The tree supplies the markers.** If a required parameter is still missing,
    `</function>` is not offered; if every parameter is written, `<parameter=` is
    not. A branch the tree would refuse must never fire, or a real close would be
    read as content.
-4. **`completion()` is unchanged.** A value cut short by EOS or the hard limit
-   is still finished with `</parameter>`.
+4. **`completion()` writes no second close.** A value cut short by EOS or the
+   hard limit is finished with `</parameter>`, unless it already ends on it with
+   layout that, before the successor's newline, is a separator; any other
+   layout is the value's, and `</parameter>` closes it again.
 
 **Extraction uses the same rule.** `function_blocks_to_json` finds each value's
 end by the same marker set, not `find("</parameter>")` or `find("</function>")`.
-It takes the text raw and lets `serde_json` escape it into the JSON string. One
-function holds the marker set and is shared by the grammar, the conversion, the
-splitter and npcd's `act.rs`, so they cannot drift.
+It takes the text raw and lets `serde_json` escape it into the JSON string.
+**Which markers end a value is the tree's, so a reader asks the catalog.** One
+statement of the field order (`stencil/field_order.rs`) decides what may follow
+each argument — the next element, the close, or either — for the grammar's
+gates and for `element_close::follows_in`, which the readers holding the
+catalog the grammar was compiled from use: the conversion, the passthrough
+splitter (the client's specs) and the GUI's part splitter (the daemon's
+catalog). A last value holding `</parameter>\n<parameter=` then reads back
+whole, as it decoded.
 
 **The splitter, in the same change.** `zend/src/tool_call_split.rs` counts a
 `</tool_call>` only after a real `</function>`, by the shared rule.
 
 **npcd, in the same change.** `npcd/src/engine/act.rs` moves onto the shared
-rule, so every reader of the format uses the one function.
+reader. Its parse names no catalog, so it closes a value on either tag
+(`Follows::Either`): a character's last value holding another element's tags
+is split there.
 
 **Tests, byte for byte**
 
@@ -95,9 +110,12 @@ rule, so every reader of the format uses the one function.
   decodes and extracts intact.
 - Each separator closes a value; a close hard against prose still closes.
 - A `</parameter>` followed by a branch the tree refuses is content.
-- The one remaining ambiguity, content holding a full marker such as
-  `</parameter>\n<parameter=`, ends the value. The test pins that so the
-  behaviour is written down.
+- Content holding a full marker the tree offers there, such as
+  `</parameter>\n<parameter=` before a later element, ends the value; after the
+  last argument it is content, for the grammar and the catalog's readers alike
+  (`a_block_reads_back_as_its_grammar_closed_it`).
+- Every copy of the go-again choice after a forced first call is held, one per
+  way its last value can close (`every_copy_of_the_choice_after_a_function_block_is_held`).
 
 **Design doc:** `docs/stencil_tree.md`, in the same change.
 
@@ -155,10 +173,17 @@ the GUI draws segments in the order they arrive.
 | `run` | `ids` | These calls have started executing (was `tool` `phase: running`) |
 | `result` | `id`, `result`, `tokens` | A call's result and its length in tokens in the context (was `tool` `done`, by position) |
 
-An `id` is `<turn>.<n>`, the n-th part of the turn, the same in the stream and
-in the history. So a reload draws what the stream drew, and a result always
-lands on its own call. With 1a the stencil knows each parameter's span as it
-decodes, so the `arg` chunks cost nothing extra.
+An `id` is `p<n>`, the n-th part of the reply, the same in the stream and in
+the history. So a reload draws what the stream drew, and a result always lands
+on its own call.
+
+**As built**, the events come from a splitter on the server
+(`zend/src/parts.rs`) that reads the streamed text with the rule the grammar
+closes values on (`element_close`), not from inside the stencil — the same
+events, with no engine plumbing. A history message's call `args` is a list of
+`[name, value]` pairs, in the order written. The job panel's task transcripts
+are still drawn from their text (`renderContent`): they come from a worker's
+stored turns, which have no parts yet.
 
 **History shape.** Each message in `GET /v1/conversations/:id` carries `parts`,
 in order:
@@ -273,46 +298,36 @@ The model chose `sub_run` instead, which starts parts of a task delegated
 through the MCP server. It was refused (#4), and the model then did the research
 inline: all 30 pages of `rate.rs` over #5–#10.
 
-1. **Withhold `sub_run` outside tasks.** Today a task has `repo_task_start`,
-   `repo_task_reply` and `repo_task_nudge` withheld (`TASK_TOOLS`,
-   `zend/src/session.rs:4578–4580`). The mirror: in a person's dialogue and in a
-   chat Claude holds with Zen, `sub_run` is withheld. A withheld tool is out of
-   the signatures and out of the stencil's grammar (`round_triggers`,
-   `session.rs:634–670`), so the model cannot take that path. Only tasks and
-   their parts get `sub_run`; dialogues and chats get the `repo_task_*` tools.
-2. **`sub_run` starts a task where it cannot start a part.** It has no refusal
-   message. If it is ever called by a conversation that is not a task
-   (`zend/src/mcp/parts.rs:117`), it starts a task on that conversation's
-   thread, as `repo_task_start` would (`zen_tasks::thread_of`), and answers with
-   its handle.
+1. **`sub_run` is removed.** Parts duplicated what tasks with roles already
+   do: a task that wants a piece done apart starts a task of its own. The tool,
+   its runner (`zend/src/mcp/parts.rs`), the `subagent` tool in zend-tools, the
+   lineage of parts below a worker and their journals, and the guides' and
+   skills' verifier parts are gone; a verifier is a reviewer or researcher task.
+2. **Tasks nest one level.** A dialogue, a chat, and a task Claude or a person
+   started each have the `repo_task_*` tools. A task a task started
+   (`Worker::by_task`) has them withheld from its signatures and its grammar
+   alike (`zen_tasks::level_of`, `withhold_by_level`,
+   `SelectionState::withhold_members`), and `repo_task_start` from it is
+   refused. The one level keeps the task that started the others in the loop:
+   no chain of tasks can feed its own output back as the next one's brief.
 3. **The `repo_task_*` tools stay scored, not mandatory.** `repo_task_start`'s
    trigger questions already include "start a research task on …". Check the
    `projections` view of turn #1 for whether it was shown; if it was not, tune
    its trigger questions.
 
-**No recursion: a task never starts a task.** A dialogue or chat starts tasks;
-a task does all its work itself, and may split it only into parts.
-
-- A task, and every part under it, has `repo_task_start`, `repo_task_reply` and
-  `repo_task_nudge` withheld (`TASK_TOOLS`), from its signatures and its grammar
-  alike.
-- A task's `sub_run` always starts a part, never a task: the fallback in item 2
-  is only for a caller that is not a task, and a task's caller always resolves
-  (`threads::conv_names`). The fallback checks this, not assumes it.
-- Parts are bounded in depth: a task, its part, and that part's part
-  (`MAX_DEPTH = 3`, `zend/src/mcp/parts.rs:41`).
-- A task the fallback starts is a task like any other, with `TASK_TOOLS`
-  withheld, so the fallback cannot open a path round the rule.
-
 **Tests**
 
-- A dialogue's and a chat's offered tools hold no `sub_run`, and their grammar
-  cannot emit it; a task's hold `sub_run` and no `repo_task_*`.
-- A `sub_run` called by a conversation that is not a task starts a task on that
-  conversation's thread and answers with its handle.
-- A task, and a part, offer no `repo_task_*` and their grammar cannot emit one.
-- A task's `sub_run` starts a part under it, never a task, and a part at
-  `MAX_DEPTH` is refused.
+- A nested task holds out the task tools, and only those its mode offers; a
+  dialogue and a task at the top hold out nothing
+  (`zen_tasks::a_nested_task_holds_out_the_task_tools`).
+- A conversation's level is read from its worker record: a dialogue and a chat
+  are conversations, a task started from one is a task, a task a task started
+  is nested, and a record that no longer reads is nested
+  (`a_level_is_read_from_the_record`).
+- A withheld member is never projected
+  (`projection::tests::a_withheld_member_is_never_projected`).
+- A task a chat started on its thread neither blocks the chat's next message
+  nor answers it (`chats::talk::a_send_while_zen_answers_is_refused`).
 
 **Design doc:** `docs/zen_tool_reach.md` §6.3, in the same change.
 
@@ -382,8 +397,8 @@ answered with an error.
 | # | Issue | Evidence | Fix |
 | --- | --- | --- | --- |
 | S1 | `code_session_exec` keeps earlier declarations, so a second `const src` collided | #57 | Its description says the session persists and every earlier name stays bound, so reuse or reassign rather than redeclare |
-| S2 | A `file_grep` with no `prefix` searched the whole repository and wasted a turn | #62 | `prefix` is required; a call without one is refused by the schema and, through the grammar, cannot be decoded |
-| S3 | The `timeline_read` schema the client sees lacks `view` and `turn`, though the server accepts them, so a client following its schema cannot read a turn | this review | Trace where the connector's tool list comes from and why it is stale, and fix that cause. Test: every tool's advertised schema equals its `definition()` |
+| S2 | A `file_grep` with no `prefix` searched the whole repository and wasted a turn | #62 | Dropped: a required prefix would break `repo: "*"` searches and force a guess for "where is X defined" |
+| S3 | The `timeline_read` schema the client sees lacks `view` and `turn`, though the server accepts them, so a client following its schema cannot read a turn | this review | Cause found: the server advertises `tools.listChanged: false` (`mcp-server/src/protocol.rs`), so a client keeps the listing it took when it connected — this one predates `view` (`bf1fd4d2f`, 2026-11-04). The fix is to send `notifications/tools/list_changed` when a member's tool set changes, which needs a server-to-client channel; open |
 | S4 | The `calls` view cuts each argument short, so the failed writes' raw text was not visible | #50, #55 | Not a defect: `view: turn` reads a turn whole. The `calls` view says so in its last line, naming the turn to read in full |
 | S5 | Every connector call appends the ~2k-token user-context block, and the conversation id changes between calls (`…-0159-claude-code`, then `…-1109-claude-code`) | every Zen call in this review | The block is appended to the first call of a connector session only. Fix why a session's calls each open a new conversation. Test: two calls in one session, the block on the first alone, one conversation id |
 
@@ -397,7 +412,7 @@ next: it hides tools' arguments from every client.
 | 1a | `Until` with a marker set; one shared rule for the grammar, XML-to-JSON, the splitter and npcd | a value holding every closing tag decodes and extracts byte for byte | `docs/stencil_tree.md` |
 | 1b | `part` events on the live stream; `parts` in the history; the GUI parses no text | stream events equal the history's records; the bubble streams from `arg` chunks | `docs/zend_ui_redesign.md` |
 | 2 | Remove the `in_context` reply and the locks; every read runs for real; provenance skips files read in the turn's loop | a held file's read returns its body; a file read in a round does not enter provenance for the loop | `docs/zend_working_set.md` §1, §4.6 + the `projection.yaml` rule |
-| 3 | `sub_run` withheld in dialogues and chats; called outside a task it starts a task; no task starts a task | no `sub_run` in a dialogue's or chat's tools or grammar; no `repo_task_*` in a task's | `docs/zen_tool_reach.md` §6.3 |
+| 3 | `sub_run` removed; tasks nest one level | no `repo_task_*` in a nested task's tools, grammar or prompt; a dialogue's, a chat's and a top task's hold them | `docs/zen_tool_reach.md` §6.3 |
 | 4 | A forced note is followed by a forced call; failed calls answer with an error; notes forced only after 200 tokens of reasoning on a round that opens a call | no round closes after its note; a cut call gets an error naming where; under 200 tokens no forced note | `docs/zend_journal.md` §5.2 |
 | S1–S5 | The smaller issues | S2's refusal; S3's schema equality; S5's once-per-session block | `docs/tool-system.md` for S1, S2 |
 

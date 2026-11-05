@@ -25,6 +25,7 @@
 
 use std::sync::OnceLock;
 
+use candle_conversation::stencil::element_close::{value_end, Follows, PARAM_CLOSE, PARAM_TAG};
 use candle_conversation::TurnText;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -34,6 +35,7 @@ use crate::tools::{answer_text, calls_in_answer, parse_call, run_tool, ToolCall,
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
+const FN_OPEN: &str = "<function=";
 
 /// What a quoted `<` becomes in [`scan_text`]: a private-use character no
 /// scanner matches, mapped back to `<` in every argument a planned call
@@ -53,11 +55,6 @@ pub enum Step {
     Run(ToolCall),
     /// A call that could not be read. Nothing runs; this is its result.
     Refuse(ToolResult),
-    /// A call already satisfied without running it — the fast path resolved it
-    /// to content this conversation now carries (see [`crate::fast_path`]).
-    /// Unlike [`Step::Refuse`] this is a success: the call is answered, it just
-    /// costs no read.
-    Served(ToolResult),
     /// A call a resumed turn does not run again, since doing so could repeat
     /// an effect that already happened; this is its result, saying so.
     Withheld(ToolResult),
@@ -68,20 +65,85 @@ impl Step {
     pub fn name(&self) -> &str {
         match self {
             Step::Run(call) => &call.name,
-            Step::Refuse(result) | Step::Served(result) | Step::Withheld(result) => {
-                &result.call.name
-            }
+            Step::Refuse(result) | Step::Withheld(result) => &result.call.name,
         }
     }
 }
 
-/// Why a `<tool_call>` block could not be read.
+/// Why a `<tool_call>` block could not be read, and where it ended: how many
+/// characters of the call were written, and the parameter it was in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Problem {
     /// The call's JSON ends before the call does — the decode stopped partway.
-    CutOff,
+    CutOff(Ending),
     /// The call's JSON is complete but not valid, or names no tool.
-    Invalid(String),
+    Invalid(String, Ending),
+}
+
+/// Where an unreadable call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ending {
+    /// The call's length as written, in characters.
+    chars: usize,
+    /// The last parameter the call opened, when it opened one.
+    parameter: Option<String>,
+    /// Whether the call is a function block rather than a JSON object.
+    block: bool,
+}
+
+impl Ending {
+    fn of(body: &str) -> Self {
+        Ending {
+            chars: body.chars().count(),
+            parameter: last_parameter(body),
+            block: body.trim_start().starts_with(FN_OPEN),
+        }
+    }
+
+    /// "It ended 556 characters in, inside parameter `content`."
+    fn sentence(&self) -> String {
+        match &self.parameter {
+            Some(p) => format!(
+                "It ended {} characters in, inside parameter `{p}`.",
+                self.chars
+            ),
+            None => format!("It ended {} characters in.", self.chars),
+        }
+    }
+}
+
+/// The last parameter a call's text opens: a function block's last element,
+/// found by walking its elements value by value (`element_close`) so a tag a
+/// value quotes is not taken for one; or a JSON object's last `"key":` inside
+/// `arguments`.
+fn last_parameter(body: &str) -> Option<String> {
+    let body = body.trim_start();
+    if let Some(named) = body.strip_prefix(FN_OPEN) {
+        let mut at = FN_OPEN.len() + named.find('>')? + 1;
+        let mut last = None;
+        loop {
+            let rest = &body[at..];
+            at += rest.len() - rest.trim_start().len();
+            let Some(element) = body[at..].strip_prefix(PARAM_TAG) else {
+                return last;
+            };
+            let key_len = element.find('>')?;
+            let key = element[..key_len].trim().to_string();
+            let value = at + PARAM_TAG.len() + key_len + 1;
+            match value_end(body, value, Follows::Either) {
+                Some(close) => at = close + PARAM_CLOSE.len(),
+                None => return Some(key),
+            }
+            last = Some(key);
+        }
+    }
+    static KEY: OnceLock<Regex> = OnceLock::new();
+    let args = body.find("\"arguments\"")?;
+    let key =
+        KEY.get_or_init(|| Regex::new(r#""([A-Za-z_][A-Za-z0-9_]*)"\s*:"#).expect("static regex"));
+    key.captures_iter(&body[args + "\"arguments\"".len()..])
+        .last()
+        .map(|c| c[1].to_string())
 }
 
 /// The calls `response` makes, runnable and not, in the order it makes them.
@@ -155,11 +217,6 @@ fn unquote(value: &mut Value) {
     }
 }
 
-/// The tool whose calls in one round run at once: each starts a part, which
-/// runs for as long as its own task does, and the parts of one round are
-/// independent by construction — fan-out is what the tool is for.
-const CONCURRENT: &str = "sub_run";
-
 /// The tools that bring content from outside into the turn: the web, a
 /// network session's reply, a remote shell's output, a remote file. A turn
 /// that has run one is read-out, and what it writes to memory is checked by a
@@ -192,30 +249,13 @@ fn note_reading(ctx: &ToolContext, call: &ToolCall) {
 }
 
 /// Run a planned round in order, results in the order of the calls. A
-/// [`Step::Refuse`] contributes its result without running anything.
-///
-/// A run of consecutive [`CONCURRENT`] calls runs at once, each on its own
-/// thread, and the round goes on once every one of them has answered. Every
-/// other call runs alone and in turn, since a write and the read after it
-/// depend on that order.
+/// [`Step::Refuse`] contributes its result without running anything. Every
+/// call runs alone and in turn, since a write and the read after it depend on
+/// that order.
 pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
     let mut out = Vec::with_capacity(steps.len());
-    let mut steps = steps.into_iter().peekable();
-    while let Some(step) = steps.next() {
+    for step in steps {
         match step {
-            Step::Run(call) if call.name == CONCURRENT => {
-                let mut batch = vec![call];
-                while let Some(Step::Run(next)) = steps.peek() {
-                    if next.name != CONCURRENT {
-                        break;
-                    }
-                    let Some(Step::Run(next)) = steps.next() else {
-                        unreachable!("peeked a run")
-                    };
-                    batch.push(next);
-                }
-                out.extend(run_together(ctx, batch));
-            }
             Step::Run(call) => {
                 note_reading(ctx, &call);
                 out.push(ToolResult {
@@ -231,46 +271,12 @@ pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
                 );
                 out.push(result);
             }
-            // Already answered by the fast path; running it would re-read a
-            // file whose content this conversation is now carrying.
-            Step::Served(result) => out.push(result),
+            // A resumed turn's call whose effect may already have happened.
             Step::Withheld(result) => {
                 tracing::info!(tool = %result.call.name, "resumed turn: call not re-issued");
                 out.push(result);
             }
         }
-    }
-    out
-}
-
-/// How many [`CONCURRENT`] calls run at once: a round asking for more runs
-/// them in waves of this many, so one answer cannot hold a thread per call
-/// for as long as its parts run.
-const AT_ONCE: usize = 16;
-
-/// Run `calls` at once, one thread each, at most [`AT_ONCE`] at a time; their
-/// results in their order.
-fn run_together(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult> {
-    let mut out = Vec::with_capacity(calls.len());
-    let mut calls = calls.into_iter().peekable();
-    while calls.peek().is_some() {
-        let wave: Vec<ToolCall> = calls.by_ref().take(AT_ONCE).collect();
-        std::thread::scope(|scope| {
-            let running: Vec<_> = wave
-                .into_iter()
-                .map(|call| {
-                    scope.spawn(move || ToolResult {
-                        response: run_tool(ctx, &call),
-                        call,
-                    })
-                })
-                .collect();
-            out.extend(
-                running
-                    .into_iter()
-                    .map(|h| h.join().expect("a tool call's thread panicked")),
-            );
-        });
     }
     out
 }
@@ -306,9 +312,9 @@ fn unreadable_blocks(answer: &str) -> Vec<(usize, Option<String>, Problem)> {
         }
         let problem = match parse_call(body) {
             Ok(Some(_)) => continue,
-            Ok(None) => Problem::Invalid("the call names no tool".to_string()),
-            Err(e) if e.is_eof() || !closed => Problem::CutOff,
-            Err(e) => Problem::Invalid(e.to_string()),
+            Ok(None) => Problem::Invalid("the call names no tool".to_string(), Ending::of(body)),
+            Err(e) if e.is_eof() || !closed => Problem::CutOff(Ending::of(body)),
+            Err(e) => Problem::Invalid(e.to_string(), Ending::of(body)),
         };
         out.push((at, named_tool(body), problem));
     }
@@ -316,8 +322,13 @@ fn unreadable_blocks(answer: &str) -> Vec<(usize, Option<String>, Problem)> {
 }
 
 /// The tool a call names, read from its text when the call itself does not
-/// parse — `"name": "write"` survives a value cut off after it.
+/// parse — a function block's `<function=write>`, or `"name": "write"`, both
+/// survive a value cut off after them.
 fn named_tool(body: &str) -> Option<String> {
+    if let Some(named) = body.trim_start().strip_prefix(FN_OPEN) {
+        let name = named[..named.find('>')?].trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
     static NAME: OnceLock<Regex> = OnceLock::new();
     NAME.get_or_init(|| {
         Regex::new(r#""(?:name|function|tool)"\s*:\s*"([^"\\]+)""#).expect("static regex")
@@ -331,20 +342,26 @@ fn named_tool(body: &str) -> Option<String> {
 fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
     let label = name.as_deref().unwrap_or("tool");
     let response = match problem {
-        Problem::CutOff => json!({
+        Problem::CutOff(ending) => json!({
             "error": "call_cut_off",
             "detail": format!(
                 "This {label} call was cut off before it was complete, so it was not \
-                 run and nothing changed. If it carried a large value — a whole \
-                 file's content — split the work across several smaller calls."
+                 run and nothing changed. {} If it carried a large value — a whole \
+                 file's content — split the work across several smaller calls.",
+                ending.sentence()
             ),
         }),
-        Problem::Invalid(why) => json!({
+        Problem::Invalid(why, ending) => json!({
             "error": "malformed_call",
             "detail": format!(
                 "This {label} call could not be read ({why}), so it was not run and \
-                 nothing changed. Issue it again as one JSON object with \"name\" \
-                 and \"arguments\"."
+                 nothing changed. {} Issue it again as {}.",
+                ending.sentence(),
+                match ending.block {
+                    true => "one complete function block, each parameter closed and the \
+                             function closed after the last",
+                    false => "one JSON object with \"name\" and \"arguments\"",
+                }
             ),
         }),
     };
@@ -359,12 +376,9 @@ fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
 
-    use zend_tools::{
-        registry, Grants, OpsRunner, SubagentRequest, SubagentResponse, SubagentRunner,
-    };
+    use zend_tools::{registry, OpsRunner};
     use zend_vfs::RepoFiles;
 
     use super::*;
@@ -424,7 +438,6 @@ mod tests {
         match step {
             Step::Refuse(r) => r.response["error"].as_str().unwrap(),
             Step::Run(c) => panic!("{} was planned to run", c.name),
-            Step::Served(r) => panic!("{} was served by the fast path", r.call.name),
             Step::Withheld(r) => panic!("{} was withheld from a resumed turn", r.call.name),
         }
     }
@@ -455,6 +468,53 @@ mod tests {
         assert_eq!(runs(&steps), ["write"]);
         assert_eq!(error_of(&steps[0]), "call_cut_off");
         assert!(ends_inside_a_call(&tagged(text)));
+        let Step::Refuse(r) = &steps[0] else {
+            panic!("refused")
+        };
+        let detail = r.response["detail"].as_str().unwrap();
+        assert!(detail.contains("inside parameter `content`"), "{detail}");
+    }
+
+    /// **A refusal says where the call ended**: how far it got, and the
+    /// parameter it was in — a function block's element or a JSON key.
+    #[test]
+    fn a_refusal_names_where_the_call_ended() {
+        let block = "<function=write>\n<parameter=path>\na.js</parameter>\n<parameter=content>\nx";
+        assert_eq!(last_parameter(block).as_deref(), Some("content"));
+        let json = r#"{"name": "write", "arguments": {"path": "a", "content": "ab"#;
+        assert_eq!(last_parameter(json).as_deref(), Some("content"));
+        assert_eq!(last_parameter(r#"{"name": "wri"#), None);
+        // A tag the value quotes is content, not the parameter it ended in.
+        let quoting =
+            "<function=write>\n<parameter=content>\nsee <parameter=path> here</parameter> and";
+        assert_eq!(last_parameter(quoting).as_deref(), Some("content"));
+        assert_eq!(Ending::of("abc").sentence(), "It ended 3 characters in.");
+        assert_eq!(
+            Ending::of(block).sentence(),
+            format!(
+                "It ended {} characters in, inside parameter `content`.",
+                block.chars().count()
+            )
+        );
+    }
+
+    /// **A function block cut short is answered under its own tool**, told
+    /// to write a function block again, not a JSON object.
+    #[test]
+    fn a_function_block_cut_short_is_named_and_told_its_own_shape() {
+        let text = "<tool_call>\n<function=file_write>\n<parameter=path>\na.md</parameter>\n<parameter=content>\nhalf";
+        let steps = plan(&tagged(text));
+        assert_eq!(runs(&steps), ["file_write"]);
+        assert_eq!(error_of(&steps[0]), "call_cut_off");
+        let block = "<function=file_write>\n<parameter=path>\na.md</parameter>\n</function";
+        let r = refusal(
+            named_tool(block),
+            &Problem::Invalid("x".into(), Ending::of(block)),
+        );
+        let detail = r.response["detail"].as_str().unwrap();
+        assert!(detail.starts_with("This file_write call"), "{detail}");
+        assert!(detail.contains("one complete function block"), "{detail}");
+        assert!(!detail.contains("JSON"), "{detail}");
     }
 
     /// Complete but not JSON: refused as malformed, with the parser's reason.
@@ -586,85 +646,6 @@ mod tests {
             scan_text(&text),
             "<tool_call><function=write>\u{E000}tool_call>\u{E000}/think></tool_call>"
         );
-    }
-
-    /// A runner that holds every part until `width` of them are running at
-    /// once, so a round that ran them one after another would never finish.
-    struct Rendezvous {
-        width: usize,
-        arrived: Mutex<usize>,
-        all_here: Condvar,
-    }
-
-    impl Rendezvous {
-        fn of(width: usize) -> Arc<Self> {
-            Arc::new(Self {
-                width,
-                arrived: Mutex::new(0),
-                all_here: Condvar::new(),
-            })
-        }
-    }
-
-    impl SubagentRunner for Rendezvous {
-        fn run(&self, _parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
-            let mut n = self.arrived.lock().unwrap();
-            *n += 1;
-            self.all_here.notify_all();
-            let (n, timeout) = self
-                .all_here
-                .wait_timeout_while(n, Duration::from_secs(10), |n| *n < self.width)
-                .unwrap();
-            if timeout.timed_out() {
-                return Err(format!("only {} of {} ran at once", *n, self.width));
-            }
-            Ok(SubagentResponse {
-                path: req.name.clone(),
-                state: "done".into(),
-                result: req.prompt,
-            })
-        }
-    }
-
-    fn sub_run(name: &str) -> Step {
-        Step::Run(ToolCall {
-            name: "sub_run".into(),
-            arguments: json!({"name": name, "prompt": format!("p-{name}")}),
-        })
-    }
-
-    /// **A round's consecutive `sub_run` calls run at once**, and their
-    /// results come back in the order the calls were written.
-    #[test]
-    fn consecutive_parts_run_at_once_in_order() {
-        let ctx = ToolContext::new()
-            .granting(Grants::ALL)
-            .with_subagent_runner(Rendezvous::of(3));
-        let results = run(&ctx, vec![sub_run("a"), sub_run("b"), sub_run("c")]);
-        let paths: Vec<&str> = results
-            .iter()
-            .map(|r| r.response["path"].as_str().unwrap_or("<error>"))
-            .collect();
-        assert_eq!(paths, ["a", "b", "c"], "{results:?}");
-        assert_eq!(results[1].response["result"], "p-b");
-    }
-
-    /// Another call between them splits the batch: the parts before it have
-    /// all answered before it runs.
-    #[test]
-    fn another_call_between_parts_splits_the_batch() {
-        let ctx = ToolContext::new()
-            .granting(Grants::ALL)
-            .with_subagent_runner(Rendezvous::of(1));
-        let datetime = Step::Run(ToolCall {
-            name: "datetime".into(),
-            arguments: json!({}),
-        });
-        let results = run(&ctx, vec![sub_run("a"), datetime, sub_run("b")]);
-        let names: Vec<&str> = results.iter().map(|r| r.call.name.as_str()).collect();
-        assert_eq!(names, ["sub_run", "datetime", "sub_run"]);
-        assert_eq!(results[0].response["path"], "a");
-        assert_eq!(results[2].response["path"], "b");
     }
 
     #[test]

@@ -163,7 +163,7 @@ fn distil_claimed(
             ));
             continue;
         }
-        if lost(&before) && !before.is_part() {
+        if lost(&before) {
             let note = Note {
                 at_ms: now,
                 label: "Task ended:".into(),
@@ -475,6 +475,7 @@ mod tests {
             stopped: false,
             resumable: state == State::Done,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,

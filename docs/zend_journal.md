@@ -100,7 +100,7 @@ fork already holds every turn in full. A reply's reasoning block is left out.
 | Kind | Cited part | Rendered under |
 |---|---|---|
 | `Observed` | a user side carrying `<tool_response>` blocks: a file read, a grep, a command's output | `Saw:` |
-| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp`, `Its worker said:` in a part (`style::style_for`) |
+| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp` (`style::style_for`) |
 | `Did` | a reply: the call it made, or what it told the user | `Did:` |
 | `Inferred` | nothing the session saw supports it | `Concluded, not seen:` |
 
@@ -178,8 +178,8 @@ the conversation's — one per entry the journal holds (`journal/<id>`), plus
 - **Last before the close**, so a new entry changes nothing above it.
 - **A task inherits its lineage's journals.** A conversation owned through
   `/mcp` carries, in the same collection and the same chain, its ancestors'
-  journals ahead of its own — the project's standing rules, its thread's notes,
-  and for a part each worker's above it — as sections `lineage/<n>`, and a
+  journals ahead of its own — the project's standing rules and its thread's
+  notes — as sections `lineage/<n>`, and a
   reader's line, `lineage/reader`, after its own (`mcp::lineage`,
   `docs/claude_zend_gateway.md` §5.1).
 - The collection is not a section sink: `ingest::section_sinks` never fills it
@@ -402,12 +402,26 @@ entry so that it is still there when the thinking is gone.
 description, including on the rounds where the stencil forces the call. Its
 section is fixed text, sealed once and shared.
 
-**Forced when a tool call opens.** The tool-calling stencil
-(`candle-conversation/src/stencil/tool_call.rs`) gains a branch that is active
-only when the conversation has a journal. When the model opens a round of tool
-calls, the branch forces one `journal_note` call first, then the round's own
-calls. The note therefore states the conclusions behind the calls that
-follow it. The tool's description tells the model to leave `journal` out of
+**Forced when a tool call opens after enough reasoning.** In a conversation
+with a journal, the round's tool-call grammar is held
+(`TriggerRegistry::holding_after_reasoning`, `zend::session::round_triggers`)
+so that when both hold — the model opens a tool call, and the round's own
+reasoning, the `<think>` span that opened it, ran to at least 200 tokens
+(`NOTE_AFTER_REASONING`) — the first call is a `journal_note`. Below 200 tokens
+there is no conclusion to keep, and the round goes straight to its calls; the
+note stays mandatory, so the model can still write one by choice. The note
+therefore states the conclusions behind the calls that follow it.
+
+**A forced note is always followed by a call.** The choice after the note —
+open another call, or end the turn — is held to opening another
+(`held_branches_first`, `candle-conversation/src/stencil/held_arms.rs`). A
+round that is a note and nothing else cannot be decoded, so a failed real call
+can never leave a note standing in for progress.
+
+**A call that cannot be read is answered with an error.** A call cut short or
+malformed gets an error result in its place, naming the call, how far it got
+and the parameter it was in (`tool_round::plan`), so the model never reads a
+note's `noted` and silence as success. The tool's description tells the model to leave `journal` out of
 it, so it stays in the conversation's own journal; a note that names a memory
 journal anyway is a memory write, under `docs/zen_tool_reach.md` §6.2's
 limits — written as the person, and from a turn that read content from

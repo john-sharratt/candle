@@ -547,12 +547,10 @@
       try { if (handlers.onProjection) handlers.onProjection(JSON.parse(data)); } catch (_) {}
       return;
     }
-    if (event === 'tool') {
-      try { if (handlers.onTool) handlers.onTool(JSON.parse(data)); } catch (_) {}
-      return;
-    }
-    if (event === 'think') {
-      try { if (handlers.onThink) handlers.onThink(JSON.parse(data)); } catch (_) {}
+    // A part of the reply — reasoning or a call — as the daemon split it
+    // (`zend/src/parts.rs`); the reply's text frames carry only its prose.
+    if (event === 'part') {
+      try { if (handlers.onPart) handlers.onPart(JSON.parse(data)); } catch (_) {}
       return;
     }
     if (event === 'prefill') {

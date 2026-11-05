@@ -5359,6 +5359,40 @@ fn top_k_force_tool_pin_overrides_belief_then_falls_back() {
     );
 }
 
+/// **A withheld member is never shown**, however it scores: the top-k is
+/// filled from the rest, so the prompt holds only tools the round can call.
+#[test]
+fn a_withheld_member_is_never_projected() {
+    use crate::projection::{ProjectionMode, SelectionState};
+    let b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("dialogue").unwrap(),
+        group: b.id_for_group("convo").unwrap(),
+        timeline: TimelineId::for_test(1),
+    };
+    let id = |name: &str| b.id_for_system_section(name).unwrap();
+    let resolver = MockResolver::new()
+        .with_section_score(id("tool_a"), 0.3)
+        .with_section_score(id("tool_b"), 0.9)
+        .with_section_score(id("tool_c"), 0.05)
+        .with_section_score(id("tool_d"), 0.8);
+    let mut sel = SelectionState::new();
+    sel.withhold_members(["tool_b"]);
+    let p = b.project_with_selection(target, &resolver, ProjectionMode::Decode, &sel);
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            id("framing"),
+            id("tools_intro"),
+            id("tool_a"),
+            id("tool_d"),
+            id("tools_outro")
+        ],
+        "the best-scored member is held out and the next fills its place"
+    );
+}
+
 /// A mandatory member is emitted on every belief-driven projection and does NOT
 /// take one of the budget's slots: the top-k is filled from the other members.
 #[test]

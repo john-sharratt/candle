@@ -6,27 +6,28 @@
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a voluntary token budget (150K, with
-locks on top under a 150K ceiling of their own) of
+Every dialogue carries a **working set**: a voluntary token budget (150K) of
 already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
-always a **whole ingest conversation** — one file or one folder — so an item
-moves between tiers without changing shape or place.
+always a **whole ingest conversation** — one file or one folder.
 
-1. **Locks** — files the model asked for with `file_read` that the corpus
-   already holds whole. The call is answered `in_context` and the content is
-   pinned for as long as that reply is in the dialogue's projection (§4.6). A
-   `file_list` is never served: it runs and its listing is prefilled (§4.5).
-2. **Provenance** — the files the conversation keeps attending to, by a
-   per-file momentum score. A released lock becomes provenance where it
-   stands.
-3. **Seeds** — documents, folders and files named in `projection.yaml` that a
+1. **Provenance** — the files the conversation keeps attending to, by a
+   per-file momentum score.
+2. **Seeds** — documents, folders and files named in `projection.yaml` that a
    conversation starts out attending to: its first provenance, at the momentum
    of one full-strength hit (1000), fading like any other file it stops
    attending to.
 
+**Every `file_read` runs for real** (§4.5). The working set once answered a read
+of a file the corpus held whole with an `in_context` pointer and locked that
+reading in; the content was placed, but in the short term the model did not
+tie the pointer to it, and a re-fetch got the same pointer
+(`docs/zen_coding_session_fixes.md`, Cause 2). The page now arrives as a tool
+result in the dialogue, and a file the turn's loop has read is kept out of the
+working set until the next question, so it is never carried twice.
+
 ```
-[system + priming chain][ provenance, in insertion order | locks, newest first ][ dialogue … question ]
+[system + priming chain][ provenance, in insertion order ][ dialogue … question ]
                                                          ^ every member enters here
 ```
 
@@ -371,10 +372,39 @@ fresh scores momentum is built from.
 The dialogue group loses its injection splice (`resolver.rs:4546-4551`): it holds
 lineage and its own turns only, and its 116K window is its own again.
 
-### 4.5 Locks — the screen
+### 4.5 Reads — every one runs, and the loop withholds what it read
 
-The screen stays in `fast_path.rs`; its admission changes and four checks are
-added.
+**There is no screen.** A `file_read` runs and its page is prefilled as the
+tool's response, like every other call. `zend/src/fast_path.rs`, the lock
+promises and their restore are gone, and so is the `in_context` reply; the
+system prompt's rule for placed content (`placed_content`, `projection.yaml`)
+keeps the anchor and fade guidance and names no tool.
+
+**The loop withholds what it read** (`zend::session::withhold_read_files`,
+`zend::working_set::corpus::readings_of`, `WorkingSet::withhold`). After a
+round, every successful `file_read`'s file, at the version the read returned,
+names its ingested readings, and those are kept from entering the working set
+for the rest of the turn's loop:
+
+1. **Entry is blocked; nothing is evicted.** A withheld conversation cannot be
+   admitted, but keeps its momentum. One already placed when the model reads
+   it stays where it is: evicting it would close the gap and re-prefill every
+   later member and the whole dialogue, for one file's tokens.
+2. **The whole file.** A read of any page withholds the file's readings.
+3. **Until the next question.** A new user turn clears the set
+   (`working_set_clear_withheld`): the reads may be summarised away by then,
+   and provenance may bring the file back. A resumed round keeps its loop's.
+4. **A file the conversation changed withholds nothing**: its read returned
+   its own copy, which no reading holds.
+
+**What follows below in this section and in §4.6 and §4.8 records the lock
+design that this replaced.** The candle-conversation lock tier it describes
+(`WorkingSet::lock`, the lock marks) is no longer driven by zend.
+
+#### The former screen
+
+The screen lived in `zend/src/fast_path.rs`, now removed; its admission
+changed and four checks were added.
 
 - **A lock dislodges nothing.** `WorkingSet::lock` enters on top of the
   voluntary budget; when the locks would pass `lock_tokens`, it refuses and the
@@ -623,13 +653,11 @@ these numbers.
 | Filling the groups; off the flexbox, emitted verbatim | `projection/project.rs` (Step 4b), `projection/working_set_pick.rs` |
 | The dialogue group holds lineage + its own turns; members per group | `projection/resolver.rs` (`TargetedRead::group_turns`, `working_set_members`) |
 | Pinned turn not hot is an error | `scheduler/projection_assembler.rs` (`is_promised`) |
-| Screen: lock, first-write split, reworded reply | `zend/src/fast_path.rs` |
-| Coverage check, cached per chain | `zend/src/fast_path/coverage.rs` |
-| Registry check of `release_on`, alias-aware release, `round_marks` | `zend/src/working_set.rs` |
-| How long a promise lasts: departure from the projection, per-file write release | `zend/src/working_set/promises.rs` |
+| Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate.rs` / `engine.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
+| Which ingested readings stand for a file, and whether a reading covers it whole | `zend/src/working_set/corpus.rs`, `zend/src/working_set/coverage.rs` |
+| Registry check of `release_on` (the lock tier's config, which zend does not drive) | `zend/src/working_set.rs` |
 | Seed resolution | `zend/src/working_set/seeds.rs` |
-| Locks restored from the marks | `zend/src/working_set/restore.rs` |
-| Open, departures after each projection, write release on rounds (live and resumed), marks on the next turn | `zend/src/session.rs` (`run_inference_stream`, `end_written_promises`) |
+| Open, the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
 
 ## 7. Tests (CPU unless marked)

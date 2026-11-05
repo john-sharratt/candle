@@ -1,20 +1,18 @@
 //! Journals inherited down the lineage (`docs/claude_zend_gateway.md` §5.1).
 //!
 //! A conversation owned through `/mcp` carries, ahead of its own journal, the
-//! journals of everything above it: the project's standing rules (`P:<repo>`),
-//! its thread's notes (`T:<thread>`), and — for a part — the journal of each
-//! worker above it. So a worker opens knowing what Claude decided and what
-//! earlier tasks found, and a part knows what its worker has learned, with no
-//! briefing in its prompt. Last comes the reader's line, naming which
-//! conversation is reading.
+//! journals of everything above it: the project's standing rules (`P:<repo>`)
+//! and its thread's notes (`T:<thread>`). So a worker opens knowing what
+//! Claude decided and what earlier tasks found, with no briefing in its
+//! prompt. Last comes the reader's line, naming which conversation is reading.
 //!
 //! Each inherited journal is one section of the reader's journal collection,
 //! sealed once and read again every round until its text changes. They are
-//! carried most stable first — the project's moves least, a worker's most — so
-//! an append reseals the least. Every one is framed in the third person,
+//! carried most stable first — the project's moves least, the thread's more —
+//! so an append reseals the least. Every one is framed in the third person,
 //! headed by its path, and the inherited text is bounded: at most
-//! [`MAX_CHARS`] across the chain, the nearest ancestor served first, so a deep
-//! or long-lived lineage drops its outermost journals' oldest lines from the
+//! [`MAX_CHARS`] across the chain, the nearest ancestor served first, so a
+//! long-lived lineage drops its outermost journals' oldest lines from the
 //! prompt — never from the tools, which read them whole.
 
 /// The most inherited text a conversation carries, in characters: about 8K
@@ -49,8 +47,6 @@ pub enum Whose {
     Project,
     /// The thread's notes: what Claude started, decided and was told.
     Thread,
-    /// A worker above the reader: what it did, drafted from its turns.
-    Worker,
 }
 
 /// One ancestor's journal: its path, whose it is, and its lines oldest first.
@@ -66,9 +62,6 @@ impl Ancestor {
         let by = match self.whose {
             Whose::Project => "the standing rules of the project, noted by Claude",
             Whose::Thread => "the notes of the thread, written by Claude",
-            Whose::Worker => {
-                "the journal of a worker above this conversation, drafted from its turns"
-            }
         };
         format!(
             "{} — {by}; oldest first, and a later entry overrides an earlier one:",
@@ -85,7 +78,7 @@ pub struct Inherited {
 }
 
 /// The sections the conversation at `reader` carries for `nearest_first` —
-/// its ancestors from its parent outward — then the reader's line: the
+/// its ancestors from the nearest outward — then the reader's line: the
 /// journals outermost first, each keeping its newest lines within what the
 /// budget leaves once every nearer one has been served. A journal with no
 /// lines, or none left, is not carried.
@@ -161,11 +154,10 @@ mod tests {
     }
 
     /// **The lineage is carried outermost first and the reader's line last**:
-    /// the project, the thread, then the worker that started this part.
+    /// the project, then the thread.
     #[test]
     fn the_journals_are_carried_outermost_first_then_the_readers_line() {
         let nearest_first = [
-            ancestor("T:review/verify", Whose::Worker, &["#2 Read the plan."]),
             ancestor("T:review", Whose::Thread, &["#1 Claude started: verify"]),
             ancestor(
                 "P:candle",
@@ -173,24 +165,25 @@ mod tests {
                 &["#1 Claude said: never push main"],
             ),
         ];
-        let s = sections("T:review/verify/read", &nearest_first);
+        let s = sections("T:review/verify", &nearest_first);
         let names: Vec<&str> = s.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["lineage/0", "lineage/1", "lineage/2", "lineage/reader"]
-        );
+        assert_eq!(names, ["lineage/0", "lineage/1", "lineage/reader"]);
         assert_eq!(
             s[0].text,
             "P:candle — the standing rules of the project, noted by Claude; oldest first, and a \
              later entry overrides an earlier one:\n#1 Claude said: never push main"
         );
-        assert!(s[1].text.starts_with("T:review — the notes of the thread"));
-        assert!(s[2].text.ends_with(":\n#2 Read the plan."));
+        assert!(s[1].text.ends_with(":\n#1 Claude started: verify"));
         assert!(
-            s[3].text
-                .starts_with("This conversation is T:review/verify/read."),
+            s[1].text.starts_with("T:review — the notes of the thread"),
             "{}",
-            s[3].text
+            s[1].text
+        );
+        assert!(
+            s[2].text
+                .starts_with("This conversation is T:review/verify."),
+            "{}",
+            s[2].text
         );
     }
 
@@ -234,16 +227,16 @@ mod tests {
     #[test]
     fn the_outermost_journals_oldest_lines_go_first() {
         let long = "x".repeat(MAX_CHARS / 2);
-        let near = ancestor("T:t/w", Whose::Worker, &[long.as_str()]);
+        let near = ancestor("T:t", Whose::Thread, &[long.as_str()]);
         let far_lines: Vec<String> = (0..2_000)
             .map(|i| format!("#{i} {}", "y".repeat(20)))
             .collect();
         let far = Ancestor {
-            path: "T:t".into(),
-            whose: Whose::Thread,
+            path: "P:candle".into(),
+            whose: Whose::Project,
             lines: far_lines.clone(),
         };
-        let s = sections("T:t/w/p", &[near, far]);
+        let s = sections("T:t/w", &[near, far]);
         let total: usize = s[..2].iter().map(|i| i.text.len()).sum();
         assert!(total <= MAX_CHARS + 200, "{total}");
         assert!(s[1].text.ends_with(&long), "the nearest is whole");
