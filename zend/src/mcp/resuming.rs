@@ -40,9 +40,7 @@ pub const RESUME_AFTER_MS: u64 = 10 * 60 * 1000;
 /// as long as the archive sweep waits has been given up on.
 pub fn due(w: &Worker, now: u64) -> bool {
     let silent = now.saturating_sub(w.beat_ms);
-    lost(w)
-        && w.resumes < MAX_RESUMES
-        && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
+    lost(w) && w.resumes < MAX_RESUMES && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
 }
 
 /// Whether the thread `thread` may have its lost tasks started again: any

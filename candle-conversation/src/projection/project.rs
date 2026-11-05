@@ -742,7 +742,10 @@ mod prior_belief_tests {
         // Scores halve so the fresh decode-Q of a new query can overtake the
         // stale leader early; the `selected` flags are the ranking input, not
         // the lever, so they carry unchanged.
-        assert_eq!(carried.coll("tools")["repo_task_start"], (504.5, true, true));
+        assert_eq!(
+            carried.coll("tools")["repo_task_start"],
+            (504.5, true, true)
+        );
         assert_eq!(carried.coll("tools")["datetime"], (0.0, false, false));
         assert_eq!(carried.coll("notes")["pinned"], (20.0, true, true));
     }

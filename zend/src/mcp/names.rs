@@ -196,15 +196,7 @@ mod tests {
             "T:review/verify.2"
         );
         for bad in [
-            "review",
-            "T:",
-            "T:Review",
-            "T:a/B",
-            "T:a/b.1",
-            "P:",
-            "P:a/b",
-            "P:a b",
-            "T:a/b//c",
+            "review", "T:", "T:Review", "T:a/B", "T:a/b.1", "P:", "P:a/b", "P:a b", "T:a/b//c",
             "T:a/b/c",
         ] {
             assert!(Path::parse(bad).is_err(), "{bad}");

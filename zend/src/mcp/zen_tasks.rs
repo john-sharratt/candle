@@ -222,9 +222,7 @@ mod tests {
     /// its mode offers.
     #[test]
     fn a_nested_task_holds_out_the_task_tools() {
-        let offered: HashSet<String> = [START, REPLY, NUDGE, "file_read"]
-            .map(String::from)
-            .into();
+        let offered: HashSet<String> = [START, REPLY, NUDGE, "file_read"].map(String::from).into();
         let held = |level: Level, offered: &HashSet<String>| {
             let mut tools = BTreeSet::new();
             withhold_by_level(&mut tools, offered, level);

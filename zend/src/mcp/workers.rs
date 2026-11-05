@@ -240,7 +240,11 @@ pub fn start(
         now,
     );
     worker.by_task = by_task;
-    let started = if by_task { "A task started:" } else { "Claude started:" };
+    let started = if by_task {
+        "A task started:"
+    } else {
+        "Claude started:"
+    };
     note(
         &records,
         &owner,

@@ -180,7 +180,8 @@ mod tests {
             s[1].text
         );
         assert!(
-            s[2].text.starts_with("This conversation is T:review/verify."),
+            s[2].text
+                .starts_with("This conversation is T:review/verify."),
             "{}",
             s[2].text
         );
