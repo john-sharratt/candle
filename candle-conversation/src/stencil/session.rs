@@ -556,7 +556,7 @@ impl StencilSession {
     ) -> Observe {
         match term.feed(bytes) {
             Feed::Close { consumed } => {
-                self.cursor = Cursor::At(span.next);
+                self.cursor = Cursor::At(span.after(term.fired()));
                 self.carried = bytes[consumed..].to_vec();
                 // A lookahead terminator's delimiter belongs to the next node.
                 // When it is its own token (consumed == 0, the byte-level /

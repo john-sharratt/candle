@@ -770,7 +770,10 @@ fn a_forced_close_writes_the_marker_its_terminator_would_have_consumed() {
         .root("v")
         .free_text(
             "v",
-            Terminator::Until { marker: "</p>" },
+            Terminator::Until {
+                marker: "</p>",
+                tails: &[],
+            },
             false,
             limits,
             "next",

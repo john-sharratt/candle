@@ -75,6 +75,9 @@ fn successors(node: &NodeSpec) -> Vec<SpecId> {
     match node {
         NodeSpec::Static { next, .. } => vec![*next],
         NodeSpec::FreeText { next, .. } | NodeSpec::Value { next, .. } => vec![*next],
+        NodeSpec::Element { next, forks, .. } => {
+            [*next].into_iter().chain(forks.iter().copied()).collect()
+        }
         NodeSpec::Branch { arms } => arms.iter().map(|(_, s)| *s).collect(),
         NodeSpec::End => vec![],
     }
@@ -103,6 +106,13 @@ fn dfs(
             }
             let mut all = true;
             for (_, s) in arms {
+                all &= dfs(spec, *s, color, reaches_end)?;
+            }
+            all
+        }
+        NodeSpec::Element { next, forks, .. } => {
+            let mut all = dfs(spec, *next, color, reaches_end)?;
+            for s in forks {
                 all &= dfs(spec, *s, color, reaches_end)?;
             }
             all
@@ -391,6 +401,37 @@ fn lower_terminal(
                     close_token: *close_token,
                     suppress_close: *suppress_close,
                     rule: None,
+                    forks: Arc::from([]),
+                    next: next_id,
+                }),
+            ))
+        }
+        NodeSpec::Element {
+            marker,
+            tails,
+            limits,
+            forks,
+            next,
+        } => {
+            // As a free-text span: every successor from a fresh boundary.
+            let next_id = lower(spec, vocab, *next, "", arena)?;
+            let mut lowered = Vec::with_capacity(forks.len());
+            for &fork in forks {
+                lowered.push(lower(spec, vocab, fork, "", arena)?);
+            }
+            Ok(push(
+                arena,
+                StencilNode::FreeText(FreeTextSpan {
+                    term: Terminator::Until {
+                        marker: *marker,
+                        tails: *tails,
+                    },
+                    eos_ends: false,
+                    limits: *limits,
+                    close_token: None,
+                    suppress_close: false,
+                    rule: None,
+                    forks: Arc::from(lowered),
                     next: next_id,
                 }),
             ))
@@ -415,6 +456,7 @@ fn lower_terminal(
                     close_token: None,
                     suppress_close: false,
                     rule,
+                    forks: Arc::from([]),
                     next: next_id,
                 }),
             ))

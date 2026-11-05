@@ -32,6 +32,7 @@
 mod builder;
 mod compile;
 mod driver;
+pub mod element_close;
 mod encode_cache;
 mod error;
 mod function_block;

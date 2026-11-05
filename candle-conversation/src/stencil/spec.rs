@@ -51,6 +51,19 @@ pub enum NodeSpec {
         limits: FreeTextLimits,
         next: SpecId,
     },
+    /// A function block's raw value: free text closed by `marker` and then one
+    /// of `tails` — a separator and the next element's tag — so a value that
+    /// holds `marker` itself keeps it. Tail `k` was the model writing the
+    /// opening of `forks[k]`'s continuation, so the walk goes on there; a value
+    /// cut short goes to `next`, which writes the whole continuation. See
+    /// [`Terminator::Until`].
+    Element {
+        marker: &'static str,
+        tails: &'static [&'static str],
+        limits: FreeTextLimits,
+        forks: Vec<SpecId>,
+        next: SpecId,
+    },
     /// Terminal.
     End,
 }

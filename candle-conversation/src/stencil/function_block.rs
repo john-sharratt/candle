@@ -64,18 +64,11 @@
 
 use serde_json::{Map, Number, Value};
 
+use super::element_close::{function_end, value_end, PARAM_CLOSE, PARAM_TAG as PARAM_OPEN};
 use super::tool_call::{ParamType, ToolSpec};
 
 /// Opens the call and precedes its name. Mirrors `ToolCallEnvelope::open`'s tail.
 const FN_OPEN: &str = "<function=";
-/// Closes the call. Mirrors `ToolCallEnvelope::close`'s head.
-const FN_CLOSE: &str = "</function>";
-/// Opens one argument and precedes its name. Mirrors `param_open`.
-const PARAM_OPEN: &str = "<parameter=";
-/// Ends one argument's value. Mirrors `param_close` — and, as there, it is the
-/// tag *alone*: the grammar's value span consumes it, so no layout is implied
-/// around it and none may be required here.
-const PARAM_CLOSE: &str = "</parameter>";
 
 /// Rewrite every function-block call in `text` as a canonical JSON call object,
 /// typing each argument through `tools`.
@@ -106,56 +99,58 @@ pub fn function_blocks_to_json(text: &str, tools: &[ToolSpec]) -> Option<String>
         // a half-call dispatched is worse than a half-call shown.
         // `rest[..at]` is already out, so only the block and what follows it are
         // owed — pushing `rest` whole here emitted the preceding prose twice.
-        let (Some(name_end), Some(body_end)) = (after.find('>'), after.find(FN_CLOSE)) else {
-            out.push_str(&rest[at..]);
+        //
+        // **The block ends at its real `</function>`** — the one after its last
+        // value, each value ending where structure follows its `</parameter>`
+        // ([`element_close`], the rule the grammar closes on). A value holding
+        // `</parameter>`, `</function>` or `</tool_call>` keeps them.
+        let block = &rest[at..];
+        let (Some(end), Some(name_end)) = (function_end(block), after.find('>')) else {
+            out.push_str(block);
             return Some(out);
         };
-        if name_end > body_end {
-            out.push_str(&rest[at..]);
-            return Some(out);
-        }
         let name = after[..name_end].trim();
-        let body = &after[name_end + 1..body_end];
         let spec = tools.iter().find(|t| t.name == name);
 
         let mut args = Map::new();
-        let mut scan = body;
-        while let Some(p) = scan.find(PARAM_OPEN) {
-            let tail = &scan[p + PARAM_OPEN.len()..];
-            let Some(key_end) = tail.find('>') else {
-                break;
-            };
-            // **`</function>` closes an open parameter.** The body is already
-            // bounded by it, so a value with no `</parameter>` of its own runs to
-            // the end of the body instead of being discarded.
-            //
-            // Not tolerance for sloppiness — it is what the grammar produces when
-            // a value span ends on an intercepted EOS. The closing tag is
-            // consumed by the span's terminator rather than emitted by the tree,
-            // so a span that ends any other way never writes one.
-            let val_end = tail.find(PARAM_CLOSE).unwrap_or(tail.len());
-            if key_end > val_end {
+        let mut pos = FN_OPEN.len() + name_end + 1;
+        loop {
+            let rest_of = &block[pos..];
+            pos += rest_of.len() - rest_of.trim_start().len();
+            if !block[pos..].starts_with(PARAM_OPEN) {
                 break;
             }
-            let key = tail[..key_end].trim();
+            let key_start = pos + PARAM_OPEN.len();
+            let Some(key_len) = block[key_start..].find('>') else {
+                break;
+            };
+            let value_start = key_start + key_len + 1;
+            let Some(close) = value_end(block, value_start) else {
+                break;
+            };
+            let key = block[key_start..key_start + key_len].trim();
             // The element's own newlines are framing, not content: the grammar
             // writes `<parameter=k>\n` before the value. Stripping exactly one
             // leading and one trailing newline keeps a value that deliberately
             // ends in a blank line, which `trim` would eat.
-            let raw = &tail[key_end + 1..val_end];
+            let raw = &block[value_start..close];
             let raw = raw.strip_prefix('\n').unwrap_or(raw);
             let raw = raw.strip_suffix('\n').unwrap_or(raw);
             if !key.is_empty() {
                 args.insert(key.to_string(), typed_value(raw, param_type(spec, key)));
             }
-            scan = &tail[(val_end + PARAM_CLOSE.len()).min(tail.len())..];
+            pos = close + PARAM_CLOSE.len();
         }
 
         let mut obj = Map::new();
         obj.insert("name".to_string(), Value::String(name.to_string()));
         obj.insert("arguments".to_string(), Value::Object(args));
-        out.push_str(&Value::Object(obj).to_string());
-        rest = &after[body_end + FN_CLOSE.len()..];
+        // **No tag survives inside the object.** A value's `<` is written
+        // `<` — the same string to any JSON reader — so a value holding
+        // `<tool_call>` or `</tool_call>` cannot open or end a call for a
+        // scanner that looks for those tags in the translated text.
+        out.push_str(&Value::Object(obj).to_string().replace('<', "\\u003c"));
+        rest = &block[end..];
     }
     out.push_str(rest);
     Some(out)
@@ -544,20 +539,36 @@ mod tests {
 
     // ── the shapes a truncated decode produces ──────────────────────────────
 
-    /// **`</function>` closes an open parameter.** The grammar's value span
-    /// consumes its own closing tag, so a span ended by an intercepted EOS never
-    /// writes one — and dropping the value there cost the whole call.
+    /// **A value with no close of its own is not a call.** A span the grammar
+    /// cut short is finished with `</parameter>` (`TerminatorState::completion`),
+    /// so a block whose value never closed was not written by the grammar, and
+    /// guessing where it ends could take `</function>` out of a file's content.
+    /// It is left as text, and the round answers it as a call cut short.
     #[test]
-    fn a_parameter_with_no_close_runs_to_the_end_of_the_block() {
+    fn a_value_with_no_close_leaves_the_block_as_text() {
+        let unclosed = "<function=say>\n<parameter=words>\ncut short here\n</function>";
+        assert_eq!(
+            function_blocks_to_json(unclosed, &catalog()).as_deref(),
+            Some(unclosed),
+        );
+    }
+
+    /// **A value holding the call's own tags reads back whole** — the failure
+    /// that made every write of a file about the call format fail.
+    #[test]
+    fn a_value_holding_every_closing_tag_reads_back_whole() {
+        let content = "a</parameter> b </function> c </tool_call> <tool_call>\n</parameter>x";
         let out = function_blocks_to_json(
-            "<function=say>\n<parameter=words>\ncut short here\n</function>",
+            &format!(
+                "<tool_call>\n<function=say>\n<parameter=words>\n{content}</parameter>\n</function>\n</tool_call>"
+            ),
             &catalog(),
         )
         .unwrap();
-        assert_eq!(
-            call_of(&out)["arguments"]["words"],
-            serde_json::json!("cut short here"),
-        );
+        assert_eq!(call_of(&out)["arguments"]["words"], serde_json::json!(content));
+        assert!(out.ends_with("}\n</tool_call>"), "{out}");
+        assert_eq!(out.matches("</tool_call>").count(), 1, "only the real close: {out}");
+        assert_eq!(out.matches("<tool_call>").count(), 1, "only the real open: {out}");
     }
 
     /// An unterminated *block* is prose. Nothing is invented from a decode that

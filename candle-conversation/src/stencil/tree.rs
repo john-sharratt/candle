@@ -51,7 +51,21 @@ pub struct FreeTextSpan {
     pub suppress_close: bool,
     /// What the span's value may spell. `None` leaves it free.
     pub rule: Option<Arc<ValueRule>>,
+    /// Where the span goes when it closed on its terminator. Empty for one
+    /// successor, `next`; otherwise one per tail of a
+    /// [`Terminator::Until`], the tail that fired choosing — a raw value's
+    /// close has already written the next element's tag, so what follows is
+    /// what comes after that tag. A span ended any other way (EOS, the limit)
+    /// goes to `next`, which writes the whole continuation.
+    pub forks: Arc<[NodeId]>,
     pub next: NodeId,
+}
+
+impl FreeTextSpan {
+    /// Where the span goes once its terminator closed it on tail `fired`.
+    pub fn after(&self, fired: usize) -> NodeId {
+        self.forks.get(fired).copied().unwrap_or(self.next)
+    }
 }
 
 /// Span-scoped EOS-style limits, mirroring `SamplingConfig`'s whole-turn ramp.

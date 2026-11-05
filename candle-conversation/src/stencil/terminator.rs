@@ -91,7 +91,18 @@ pub enum Terminator {
     /// Matching runs across token boundaries: a marker is several BPE pieces
     /// (`</parameter>` is not a special token in any vocabulary this targets),
     /// so a partial match at the end of one token has to survive into the next.
-    Until { marker: &'static str },
+    ///
+    /// **With `tails`, the marker closes only where structure follows it.** A
+    /// raw value may itself hold the marker — a file about the call format
+    /// does — so `marker` alone is content, and the span closes when `marker`
+    /// and then one of `tails` (a separator and the next element's tag) has
+    /// been written. All of it is consumed, and which tail fired is
+    /// [`TerminatorState::fired`]: the span's successor depends on it. Empty
+    /// `tails` close on `marker` alone.
+    Until {
+        marker: &'static str,
+        tails: &'static [&'static str],
+    },
 }
 
 impl Terminator {
@@ -111,6 +122,8 @@ impl Terminator {
             started: false,
             spaced: false,
             matched: 0,
+            recent: Vec::new(),
+            fired: 0,
             json: match self {
                 Terminator::JsonString => Some(JsonLexer::string()),
                 Terminator::JsonValue => Some(JsonLexer::value()),
@@ -143,6 +156,12 @@ pub struct TerminatorState {
     /// spans tokens — `</parameter>` is several BPE pieces — so a partial match
     /// at the end of one token must survive into the next.
     matched: usize,
+    /// [`Terminator::Until`] with tails: the last bytes written, enough to
+    /// hold the marker and its longest tail, so a close spread over many
+    /// tokens is seen when its last byte arrives.
+    recent: Vec<u8>,
+    /// [`Terminator::Until`] with tails: which tail closed the span.
+    fired: usize,
     /// [`Terminator::JsonString`] / [`Terminator::JsonValue`]: the value's
     /// full JSON state. [`Terminator::JsonStringValue`] gains it at its opening
     /// quote, so `None` there means the value has not opened.
@@ -194,8 +213,15 @@ impl TerminatorState {
             // No byte pattern ever closes this span — only a close token, EOS,
             // or the hard limit (all handled by the session, not the lexer).
             Terminator::Never => Feed::Continue,
-            Terminator::Until { marker } => self.feed_until(bytes, marker.as_bytes()),
+            Terminator::Until { marker, tails: [] } => self.feed_until(bytes, marker.as_bytes()),
+            Terminator::Until { marker, tails } => self.feed_followed(bytes, marker, tails),
         }
+    }
+
+    /// Which of a [`Terminator::Until`]'s tails closed the span — `0` for any
+    /// other terminator, and before a close.
+    pub fn fired(&self) -> usize {
+        self.fired
     }
 
     /// The text that finishes the span as written so far — what the tree writes
@@ -231,7 +257,15 @@ impl TerminatorState {
                 true => b"\"\"".to_vec(),
                 false => b" \"\"".to_vec(),
             },
-            (Terminator::Until { marker }, _) => marker.as_bytes().to_vec(),
+            // The marker already written with only layout after it — a close
+            // whose tag never came — needs nothing more: the successor's own
+            // separator and tag follow it.
+            (Terminator::Until { marker, tails }, _)
+                if !tails.is_empty() && self.ends_on_marker(marker.as_bytes()) =>
+            {
+                Vec::new()
+            }
+            (Terminator::Until { marker, .. }, _) => marker.as_bytes().to_vec(),
             (Terminator::Balanced { close, .. }, _) => vec![close; self.depth.max(1) as usize],
             _ => Vec::new(),
         }
@@ -371,6 +405,50 @@ impl TerminatorState {
             }
         }
         Feed::Continue
+    }
+
+    /// Raw bytes until `marker` followed by one of `tails`, all of it consumed.
+    /// See [`Terminator::Until`].
+    ///
+    /// The bytes are kept in a short window, and a close is looked for only
+    /// on a byte that ends some tail — a tag's `=` or `>` — so ordinary text
+    /// costs one push and one comparison per byte. A tail ends exactly where
+    /// a close does, and no two of them can end at the same byte, since every
+    /// tail is a separator and a tag and the byte before each separator is the
+    /// marker's last.
+    fn feed_followed(&mut self, bytes: &[u8], marker: &str, tails: &[&str]) -> Feed {
+        let marker = marker.as_bytes();
+        let longest = marker.len() + tails.iter().map(|t| t.len()).max().unwrap_or(0);
+        for (i, &b) in bytes.iter().enumerate() {
+            self.recent.push(b);
+            if self.recent.len() > 2 * longest {
+                let drop = self.recent.len() - longest;
+                self.recent.drain(..drop);
+            }
+            for (k, tail) in tails.iter().enumerate() {
+                let tail = tail.as_bytes();
+                if tail.last() != Some(&b) || !self.recent.ends_with(tail) {
+                    continue;
+                }
+                let before = &self.recent[..self.recent.len() - tail.len()];
+                if before.ends_with(marker) {
+                    self.fired = k;
+                    self.recent.clear();
+                    return Feed::Close { consumed: i + 1 };
+                }
+            }
+        }
+        Feed::Continue
+    }
+
+    /// Whether what was written ends on `marker` with only layout after it.
+    fn ends_on_marker(&self, marker: &[u8]) -> bool {
+        let trimmed = self
+            .recent
+            .iter()
+            .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .map_or(&self.recent[..0], |end| &self.recent[..=end]);
+        trimmed.ends_with(marker)
     }
 
     /// See [`Terminator::JsonStringValue`]. Before the opening quote only
@@ -860,7 +938,11 @@ mod tests {
         st.feed(b"abc\\");
         assert_eq!(st.completion(), b"\\\"");
 
-        let st = Terminator::Until { marker: "</p>" }.start();
+        let st = Terminator::Until {
+            marker: "</p>",
+            tails: &[],
+        }
+        .start();
         assert_eq!(st.completion(), b"</p>");
         assert!(Terminator::Never.start().completion().is_empty());
 
@@ -892,7 +974,53 @@ mod tests {
 
     const PARAM: Terminator = Terminator::Until {
         marker: "\n</parameter>",
+        tails: &[],
     };
+
+    /// The function-block value's close: the marker, then a separator and the
+    /// next element's tag.
+    const ELEMENT: Terminator = Terminator::Until {
+        marker: "</parameter>",
+        tails: &["\n<parameter=", "\n</function>", "<parameter=", "\r\n</function>"],
+    };
+
+    /// **The marker alone is content; with structure after it, it closes**,
+    /// consuming the tail, and says which tail it was — across any token
+    /// boundaries.
+    #[test]
+    fn a_followed_marker_closes_only_where_structure_follows() {
+        let content = "a</parameter> b </parameter>x </function> <tool_call>";
+        assert_eq!(feed_all(ELEMENT, &[content]), None);
+        let mut st = ELEMENT.start();
+        assert_eq!(st.feed(b"text</parameter>"), Feed::Continue);
+        assert_eq!(st.feed(b"\n</fun"), Feed::Continue);
+        assert_eq!(st.feed(b"ction>\n"), Feed::Close { consumed: 6 });
+        assert_eq!(st.fired(), 1);
+        let mut st = ELEMENT.start();
+        let one = "v</parameter><parameter=";
+        assert_eq!(st.feed(one.as_bytes()), Feed::Close { consumed: one.len() });
+        assert_eq!(st.fired(), 2);
+        let mut st = ELEMENT.start();
+        let crlf = "v</parameter>\r\n</function>";
+        assert_eq!(st.feed(crlf.as_bytes()), Feed::Close { consumed: crlf.len() });
+        assert_eq!(st.fired(), 3);
+    }
+
+    /// **A value cut short is finished with the marker** — unless it already
+    /// ends on the marker with only layout after it, which the successor's own
+    /// separator and tag complete.
+    #[test]
+    fn a_followed_marker_completes_once() {
+        let mut st = ELEMENT.start();
+        st.feed(b"half a value");
+        assert_eq!(st.completion(), b"</parameter>");
+        let mut st = ELEMENT.start();
+        st.feed(b"done</parameter>\n");
+        assert!(st.completion().is_empty());
+        let mut st = ELEMENT.start();
+        st.feed(b"quoted </parameter> then more");
+        assert_eq!(st.completion(), b"</parameter>");
+    }
 
     /// Feed `chunks` in order; give back where it closed and how much of that
     /// chunk the span took. Chunks stand in for tokens, which is the whole

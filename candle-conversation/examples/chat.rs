@@ -718,7 +718,8 @@ fn stream_turn(
             TurnEvent::HealthWarning(msg) => {
                 eprintln!("\n\x1b[33m⚠ decode health: {msg}\x1b[0m");
             }
-            TurnEvent::Projection(_) => {}
+            // This chat arms no recurrent span, so it captures no rows.
+            TurnEvent::Projection(_) | TurnEvent::RecurrentCapture(_) => {}
         }
     }
 
