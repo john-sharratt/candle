@@ -72,6 +72,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         name,
         prompt,
         (priority, effort, kind),
+        false,
     ) {
         Ok(w) => w,
         Err(e) => return Answer::error(e),

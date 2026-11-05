@@ -225,6 +225,11 @@ pub struct Worker {
     /// the worker on.
     #[serde(default)]
     pub runner: Option<u64>,
+    /// Whether another task started it with `repo_task_start`. Tasks nest one
+    /// level: a task Claude or a person started may start tasks, and a task a
+    /// task started may not (`docs/zen_tool_reach.md` §6.3).
+    #[serde(default)]
+    pub by_task: bool,
 }
 
 /// How often the member running a task says so on its record.
@@ -601,6 +606,7 @@ mod tests {
             stopped: false,
             resumable: false,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,

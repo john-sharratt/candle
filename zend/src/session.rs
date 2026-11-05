@@ -124,7 +124,7 @@ use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::zen_tasks::withhold_by_kind;
+use crate::mcp::zen_tasks::{starts_of, withhold_by_kind};
 use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, tending, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
@@ -4496,13 +4496,9 @@ fn run_inference_stream(
         let mut closing = false;
         // What the catalog offers this turn, and what is out of it for now.
         let offered = crate::tools::offered_tool_names(tools_mode);
-        // A task never starts a task: its rounds' grammar holds none of the
-        // tools that start or steer one (`docs/zen_tool_reach.md` §6.3). A
-        // chat and a person's dialogue are conversations, and do.
-        let is_task = conv_names(&conv_id).is_some_and(|(o, t, n)| {
-            threads::worker(&state.engine.conversation().shared(), o, t, n)
-                .is_none_or(|w| !w.kind.is_chat())
-        });
+        // What this conversation may start (`docs/zen_tool_reach.md` §6.3):
+        // its rounds' grammar and prompt hold out the rest.
+        let starts = starts_of(&state.engine.conversation().shared(), &conv_id);
         // A new question starts a new loop: the files the last one read may
         // be placed again, since its reads may be summarised away by now. A
         // resumed round goes on with the loop it belongs to.
@@ -4570,7 +4566,9 @@ fn run_inference_stream(
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
             let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
-            withhold_by_kind(&mut withheld.tools, &offered, is_task);
+            withhold_by_kind(&mut withheld.tools, &offered, starts);
+            // The prompt shows what the grammar lets the turn call, and no more.
+            round_selection.withhold_members(withheld.tools.iter().copied());
             if let Some(summary) = tool_summary_section(tools_mode) {
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }

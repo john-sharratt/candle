@@ -93,7 +93,7 @@
 //! converged), strictly correct in edge cases the literal algorithm got
 //! wrong, and visibly simpler.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::adaptive::AnchorMember;
 use super::ids::{
@@ -1023,9 +1023,24 @@ pub struct SelectionState {
     /// The members a played-back projection selected, by name, in place of
     /// any selection (`super::script`).
     scripted_members: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    /// Members no collection projects, by name: tools a round's grammar holds
+    /// out, so the prompt never shows a signature the turn cannot call.
+    withheld_members: BTreeSet<String>,
 }
 
 impl SelectionState {
+    /// Project none of `names` from any collection, mandatory or not — the
+    /// tools a round's grammar holds out, so what the prompt shows is what the
+    /// turn can call. Replaces any earlier set.
+    pub fn withhold_members<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> &mut Self {
+        self.withheld_members = names.into_iter().map(str::to_string).collect();
+        self
+    }
+
+    /// Whether `name` is held out of every collection.
+    fn is_withheld(&self, name: &str) -> bool {
+        self.withheld_members.contains(name)
+    }
     /// Select exactly `members` from every collection, as a recording did.
     pub(super) fn script_members(
         &mut self,
@@ -2732,8 +2747,11 @@ fn select_collection_sections<R: ContentResolver>(
                 SelectionRule::Offered { selector, .. } => Some(selection_state.members(selector)),
                 _ => None,
             };
-            let is_offered =
-                |s: &SectionSchema| offered.is_none_or(|named| named.contains(&s.name));
+            // A member the round's grammar holds out is never shown either.
+            let is_offered = |s: &SectionSchema| {
+                offered.is_none_or(|named| named.contains(&s.name))
+                    && !selection_state.is_withheld(&s.name)
+            };
             // Forced-member pin: when the runtime sets `FORCE_TOOL_SELECTOR`, emit
             // exactly the named members and skip belief selection, so a prefilled
             // tool_call is always backed by a present tool definition. Same by-name

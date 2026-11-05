@@ -475,6 +475,7 @@ mod tests {
             stopped: false,
             resumable: state == State::Done,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,

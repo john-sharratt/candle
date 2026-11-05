@@ -226,6 +226,7 @@ pub fn start(
     wanted: &str,
     prompt: &str,
     (priority, effort, kind): (Priority, Effort, WorkerKind),
+    by_task: bool,
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -240,7 +241,7 @@ pub fn start(
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
     let taken = taken(&records, &owner, thread, now);
     let name = names::child_name(thread, "", wanted, &taken)?;
-    let worker = fresh(
+    let mut worker = fresh(
         session,
         &owner,
         thread,
@@ -255,11 +256,13 @@ pub fn start(
         ),
         now,
     );
+    worker.by_task = by_task;
+    let started = if by_task { "A task started:" } else { "Claude started:" };
     note(
         &records,
         &owner,
         &worker,
-        "Claude started:",
+        started,
         first_line(prompt, PROMPT_QUOTE),
     )?;
     begin(
@@ -339,6 +342,7 @@ pub(super) fn fresh(
         checked: false,
         // `begin` names the member it begins on.
         runner: None,
+        by_task: false,
     }
 }
 
@@ -2007,6 +2011,7 @@ mod tests {
             audit: None,
             checked: false,
             runner: None,
+            by_task: false,
         }
     }
 

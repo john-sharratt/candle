@@ -222,6 +222,7 @@ mod tests {
             stopped: false,
             resumable: false,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,

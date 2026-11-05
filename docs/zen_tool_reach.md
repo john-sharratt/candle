@@ -278,22 +278,28 @@ Thread and project journals stay Claude's alone. `journal_edit`,
 `journal_forget`, `journal_accept` and the `group_*` tools stay the person's
 and Claude's (K6).
 
-### 6.3 Starting work (D7): conversations start tasks, tasks never do
+### 6.3 Starting work (D7): conversations start tasks, and tasks nest one level
 
-**The rule: the tools that start and steer research and coding tasks belong to
-conversations, never to tasks.** Those tools are `repo_task_start`,
-`repo_task_reply`, `repo_task_nudge` and the task forms of `job_status`,
-`job_read` and `job_cancel`. A dialogue run by an Admin, and a chat, may start
-tasks. A task, and any part of one, may not.
+**The rule: tasks nest one level.** The tools that start and steer research
+and coding tasks are `repo_task_start`, `repo_task_reply`, `repo_task_nudge`
+and the task forms of `job_status`, `job_read` and `job_cancel`. A dialogue run
+by an Admin, and a chat, may start tasks. So may a task that Claude or a person
+started — a coder handing a research question to a researcher of its own, say.
+A task a task started (`Worker::by_task`), and any part of a task, may not:
+its grammar holds the task tools out, and `repo_task_start` from it is refused
+(`zend/src/mcp/zen_tasks.rs`, `Starts`).
 
-So work starts at exactly one level. The person, or Claude, talks to a
-conversation. The conversation starts tasks. Each task does all of its work
-itself, splitting it with `sub_run` when it must, and answers with what it
-did. Nothing a task produces can start more tasks, so a task's output can
-never come back round as the instruction for the next task. The hazard is real: a task whose answer starts another task
-could restate its own findings to itself indefinitely, each round reading the
-last one's output as its brief, with no person or Claude in the loop to see
-that it has stopped making progress.
+So work nests at most one level below where a person or Claude started it.
+The person, or Claude, talks to a conversation or starts a task; that task may
+hand pieces to tasks of its own; those do all of their work themselves,
+splitting it with `sub_run` when they must, and answer with what they did.
+Nothing a second-level task produces can start more tasks, so no chain of
+tasks can feed its own output back as the next one's brief. The hazard is
+real: a task whose answer starts another task could restate its own findings
+to itself indefinitely, each round reading the last one's output as its brief,
+with no person or Claude in the loop to see that it has stopped making
+progress. One level keeps the task that started the others in the loop: it
+reads their answers and decides.
 
 **Where the tools run.** They are `/mcp`'s implementations (`workers::start`,
 `answer`, `nudge`), run through the operations runner with the conversation's
@@ -303,13 +309,15 @@ gives its answer, its question and its journal entries. A dialogue's tasks go
 on a thread named for it, `dialogue-<ten hex digits of its id's sha256>`. A
 chat's tasks go on the chat's own thread.
 
-**The tools are hidden from a task.** Each round of a task worker (`Coder`,
-`Researcher`, `Reviewer`) and of every part withholds the task tools from its
-grammar (`zen_tasks::TASK_TOOLS` in the round's withheld set,
-`zend/src/session.rs`): the conversation's worker record says whether it is a
-task or a chat, and a dialogue has none. Its prompt adds no "do not start
-tasks" rule, which would only name what it cannot use. A task simply works
-with the tools it has.
+**The tools are hidden from a task a level down.** Each round of a task a
+task started, and of every part, withholds the task tools; each round of a
+dialogue or a chat withholds `sub_run` (`zen_tasks::starts_of` and
+`withhold_by_kind`, `zend/src/session.rs`). The worker record says whether a
+conversation is a task or a chat, and whether a task started it
+(`Worker::by_task`); a dialogue has none. A withheld tool is out of the
+round's grammar and out of its prompt alike (`SelectionState::withhold_members`),
+so the turn is never shown a signature it cannot call. Its prompt adds no "do
+not start tasks" rule, which would only name what it cannot use.
 
 **Hiding is the whole mechanism.** The stencil a round decodes under holds
 only the tools it was offered, so a call to a withheld tool cannot be decoded

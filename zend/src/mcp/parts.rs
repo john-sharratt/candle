@@ -38,7 +38,7 @@ use super::names::{leaf, parent_of, split_numbered};
 use super::threads::{self, State, Worker};
 use super::tools::wait::result_of;
 use super::workers::{self, now_ms};
-use super::zen_tasks::{self, task_handle};
+use super::zen_tasks::{self, starts_of, task_handle};
 use crate::session::ZendSession;
 
 /// The tool that starts a part, as the catalog names it: what a conversation
@@ -168,12 +168,12 @@ impl SubagentRunner for Parts {
         let records = session
             .shared_substrate()
             .ok_or("the model is still loading")?;
-        let parent = threads::worker(&records, owner, thread, name)
-            .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
         // A chat is a conversation, not a task: it starts tasks.
-        if parent.kind.is_chat() {
+        if !starts_of(&records, caller).parts {
             return self.start_task(caller, req);
         }
+        let parent = threads::worker(&records, owner, thread, name)
+            .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
         check_depth(&parent)?;
         let mut part = {
             // Finding and starting are one step, so two calls for one name in
@@ -245,6 +245,7 @@ mod tests {
             stopped: false,
             resumable: false,
             resumes: 0,
+            by_task: false,
             audit: None,
             checked: false,
             runner: None,
@@ -325,6 +326,33 @@ mod tests {
         let mut failed = worker("verify/read", 0, State::Error);
         failed.ended_ms = Some(9);
         assert!(!lost(&failed));
+    }
+
+    /// **Tasks nest one level** (`starts_of`): a dialogue and a chat start
+    /// tasks; a task at the top starts tasks and parts; a task a task started,
+    /// a part, and a task whose record is gone start only parts.
+    #[test]
+    fn what_each_conversation_may_start() {
+        use crate::mcp::records::MemRecords;
+        use crate::mcp::roles::WorkerKind;
+        use crate::mcp::zen_tasks::Starts;
+        let r = MemRecords::default();
+        let top = worker("top", 0, State::Running);
+        let mut nested = worker("nested", 0, State::Running);
+        nested.by_task = true;
+        let part = worker("top/read", 0, State::Running);
+        let mut chat = worker("chat", 0, State::Running);
+        chat.kind = WorkerKind::Chat;
+        for w in [&top, &nested, &part, &chat] {
+            threads::put_worker(&r, "o", w).unwrap();
+        }
+        let of = |name: &str| starts_of(&r, &threads::conv_id("o", "review", name));
+        assert_eq!(starts_of(&r, "1a7f30b0-dialogue"), Starts::CONVERSATION);
+        assert_eq!(of("chat"), Starts::CONVERSATION);
+        assert_eq!(of("top"), Starts::task(false));
+        assert_eq!(of("nested"), Starts::task(true));
+        assert_eq!(of("top/read"), Starts::task(true));
+        assert_eq!(of("gone"), Starts::task(true));
     }
 
     /// Records each call it runs, and answers it.

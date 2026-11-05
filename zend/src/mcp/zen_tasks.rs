@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use super::caller::Caller;
 use super::ops_tools::OpsCall;
 use super::parts::SUB_RUN;
+use super::records::Records;
 use super::roles::WorkerKind;
 use super::threads::{self, Effort, Priority};
 use super::tools::job::JobHandle;
@@ -30,17 +31,62 @@ pub const NUDGE: &str = "repo_task_nudge";
 /// Every tool here: what a task's tool list never holds.
 pub const TASK_TOOLS: [&str; 3] = [START, REPLY, NUDGE];
 
-/// Hold out of a round's grammar the tools its conversation never calls. A
-/// task, and every part under it, starts parts and never tasks; a person's
-/// dialogue and a chat start tasks and never parts. `offered` is what the
-/// round's mode offers: a tool it does not offer has no path to hold out.
+/// What a conversation may start: parts with `sub_run`, tasks with the task
+/// tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Starts {
+    pub parts: bool,
+    pub tasks: bool,
+}
+
+impl Starts {
+    /// A person's dialogue, or a chat: tasks, never parts.
+    pub const CONVERSATION: Starts = Starts {
+        parts: false,
+        tasks: true,
+    };
+
+    /// A task: parts always, and tasks only when it is not itself `nested` —
+    /// started by a task, or a part of one. Tasks nest one level.
+    pub fn task(nested: bool) -> Starts {
+        Starts {
+            parts: true,
+            tasks: !nested,
+        }
+    }
+}
+
+/// Hold out of a round's grammar the tools its conversation may not call
+/// ([`Starts`]). `offered` is what the round's mode offers: a tool it does not
+/// offer has no path to hold out.
 pub fn withhold_by_kind(
     tools: &mut BTreeSet<&'static str>,
     offered: &HashSet<String>,
-    is_task: bool,
+    starts: Starts,
 ) {
-    let out: &[&'static str] = if is_task { &TASK_TOOLS } else { &[SUB_RUN] };
-    tools.extend(out.iter().copied().filter(|t| offered.contains(*t)));
+    let mut out: Vec<&'static str> = Vec::new();
+    if !starts.parts {
+        out.push(SUB_RUN);
+    }
+    if !starts.tasks {
+        out.extend(TASK_TOOLS);
+    }
+    tools.extend(out.into_iter().filter(|t| offered.contains(*t)));
+}
+
+/// What the conversation `conv_id` may start: a dialogue (no worker names)
+/// and a chat are conversations; a task a task started (`Worker::by_task`),
+/// a part (a name under its task's), or a record that no longer reads, is a
+/// task one level down; any other task is a task at the top.
+pub fn starts_of(records: &dyn Records, conv_id: &str) -> Starts {
+    let Some((owner, thread, name)) = threads::conv_names(conv_id) else {
+        return Starts::CONVERSATION;
+    };
+    match threads::worker(records, owner, thread, name) {
+        Some(w) if w.kind.is_chat() => Starts::CONVERSATION,
+        Some(w) => Starts::task(w.by_task || name.contains('/')),
+        None => Starts::task(true),
+    }
 }
 
 /// A task's handle, `task:<thread>/<name>`.
@@ -99,6 +145,19 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
         Ok(k) => k,
         Err(e) => return Answer::error(e),
     };
+    let Some(records) = call.session.shared_substrate() else {
+        return Answer::error("the model is still loading");
+    };
+    let starts = starts_of(&records, &call.lineage);
+    if !starts.tasks {
+        return Answer::error(
+            "tasks nest one level, and this one is already a level down: do the work in your \
+             own rounds, or split it with `sub_run`",
+        );
+    }
+    // A conversation starts parts only when it is a task: then what it starts
+    // is a level down.
+    let by_task = starts.parts;
     let thread = thread_of(&call.lineage);
     match workers::start(
         &call.session,
@@ -107,6 +166,7 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
         name,
         prompt,
         (Priority::Normal, effort, kind),
+        by_task,
     ) {
         Ok(w) => following(&w.thread, &w.name, "Started"),
         Err(e) => Answer::error(e),
@@ -169,21 +229,30 @@ mod tests {
         assert_ne!(d, thread_of("another"));
     }
 
-    /// **A task never starts a task, and a dialogue never starts a part**:
-    /// each holds the other's tools out, and only the tools its mode offers.
+    /// **Tasks nest one level, and a dialogue never starts a part**: a
+    /// dialogue holds out `sub_run`; a task Claude or a person started holds
+    /// out nothing; a task a task started, or a part, holds out the task
+    /// tools — and only tools its mode offers are held out.
     #[test]
-    fn each_kind_holds_out_the_others_tools() {
+    fn each_kind_holds_out_what_it_may_not_start() {
         let offered: HashSet<String> = [SUB_RUN, START, REPLY, NUDGE, "file_read"]
             .map(String::from)
             .into();
-        let mut task = BTreeSet::new();
-        withhold_by_kind(&mut task, &offered, true);
-        assert_eq!(task, BTreeSet::from(TASK_TOOLS));
-        let mut dialogue = BTreeSet::new();
-        withhold_by_kind(&mut dialogue, &offered, false);
-        assert_eq!(dialogue, BTreeSet::from([SUB_RUN]));
-        let mut bare = BTreeSet::new();
-        withhold_by_kind(&mut bare, &HashSet::from(["file_read".to_string()]), false);
-        assert!(bare.is_empty(), "{bare:?}");
+        let held = |starts: Starts, offered: &HashSet<String>| {
+            let mut tools = BTreeSet::new();
+            withhold_by_kind(&mut tools, offered, starts);
+            tools
+        };
+        assert_eq!(
+            held(Starts::CONVERSATION, &offered),
+            BTreeSet::from([SUB_RUN])
+        );
+        assert!(held(Starts::task(false), &offered).is_empty());
+        assert_eq!(
+            held(Starts::task(true), &offered),
+            BTreeSet::from(TASK_TOOLS)
+        );
+        let bare = HashSet::from(["file_read".to_string()]);
+        assert!(held(Starts::CONVERSATION, &bare).is_empty());
     }
 }
