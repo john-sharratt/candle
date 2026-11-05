@@ -307,7 +307,9 @@ person as caller (§4.1, `zend/src/mcp/zen_tasks.rs`), and each answers at once
 with the task's handle; the conversation waits on it with `job_status`, which
 gives its answer, its question and its journal entries. A dialogue's tasks go
 on a thread named for it, `dialogue-<ten hex digits of its id's sha256>`. A
-chat's tasks go on the chat's own thread.
+chat's tasks go on one named for it too, `chat-<its id>`: the chat's own thread
+(`~<id>`) is Zen's side of it, disposed of with the chat, and no slug a task's
+handle can carry. A task's tasks go on its own thread.
 
 **The tools are hidden from a task a level down.** Each round of a task a
 task started withholds the task tools (`zen_tasks::level_of` and

@@ -14,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::caller::Caller;
+use super::chats::naming::id_of;
 use super::ops_tools::OpsCall;
 use super::records::Records;
 use super::roles::WorkerKind;
@@ -84,11 +85,17 @@ pub fn task_handle(thread: &str, name: &str) -> String {
     .to_string()
 }
 
-/// The thread a conversation's tasks go on: a chat's own thread, or one named
-/// for a dialogue, `dialogue-<first ten hex digits of its id's sha256>`.
+/// The thread a conversation's tasks go on: a task's own thread; for a chat,
+/// one named for it, `chat-<its id>` — a chat's own thread is Zen's side of
+/// it, kept apart and disposed of with it, and its name is no slug a task's
+/// handle can carry; for a dialogue, `dialogue-<first ten hex digits of its
+/// id's sha256>`.
 pub fn thread_of(conversation: &str) -> String {
     match threads::conv_names(conversation) {
-        Some((_, thread, _)) => thread.to_string(),
+        Some((_, thread, _)) => match id_of(thread) {
+            Some(chat) => format!("chat-{chat}"),
+            None => thread.to_string(),
+        },
         None => {
             let digest = Sha256::digest(conversation.as_bytes());
             let hex: String = digest[..5].iter().map(|b| format!("{b:02x}")).collect();
@@ -200,14 +207,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::mcp::names;
     use crate::mcp::records::MemRecords;
     use crate::mcp::threads::Worker;
 
-    /// **A chat's tasks go on its own thread; a dialogue's on one named for
-    /// it**, the same name every turn.
+    /// **A task's tasks go on its own thread; a chat's and a dialogue's on one
+    /// named for it**, the same name every turn, and a name a handle carries.
     #[test]
     fn a_conversations_tasks_go_on_its_thread() {
-        assert_eq!(thread_of("mcp:154797f34c5a6ca6:zen-ops/zen"), "zen-ops");
+        assert_eq!(thread_of("mcp:154797f34c5a6ca6:zen-ops/coder"), "zen-ops");
+        let chat = thread_of("mcp:154797f34c5a6ca6:~3aaf283faecca2a7/zen");
+        assert_eq!(chat, "chat-3aaf283faecca2a7");
+        assert!(names::check(&chat).is_ok(), "{chat}");
         let d = thread_of("1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015");
         assert!(
             d.starts_with("dialogue-") && d.len() == "dialogue-".len() + 10,
