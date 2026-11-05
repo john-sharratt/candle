@@ -160,7 +160,10 @@ mod tests {
             function_end("<function=datetime>\n</function>"),
             Some("<function=datetime>\n</function>".len())
         );
-        assert_eq!(function_end("<function=write>\n<parameter=path>\na.js"), None);
+        assert_eq!(
+            function_end("<function=write>\n<parameter=path>\na.js"),
+            None
+        );
     }
 
     /// The tails split by tag, separators in the same order on both sides.

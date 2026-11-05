@@ -209,7 +209,10 @@ mod tests {
         let block = "\n<function=write>\n<parameter=content>\na</tool_call></function></parameter>\n</function>\n";
         let body = format!("{block}</tool_call> after");
         assert_eq!(super::close_of(&body), Some(block.len()));
-        assert_eq!(super::close_of("\n<function=write>\n<parameter=content>\na</tool_call>"), None);
+        assert_eq!(
+            super::close_of("\n<function=write>\n<parameter=content>\na</tool_call>"),
+            None
+        );
         assert_eq!(super::close_of("nope</tool_call>"), Some(4));
     }
 

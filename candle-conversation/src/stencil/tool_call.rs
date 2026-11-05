@@ -2380,7 +2380,10 @@ mod tests {
                     other => panic!("{other:?}"),
                 };
                 if tail.ends_with("<parameter=") {
-                    assert!(text.ends_with(">\n") && !text.contains('<'), "{tail:?} → {text:?}");
+                    assert!(
+                        text.ends_with(">\n") && !text.contains('<'),
+                        "{tail:?} → {text:?}"
+                    );
                 } else {
                     assert!(text.starts_with("\n</tool_call>"), "{tail:?} → {text:?}");
                 }

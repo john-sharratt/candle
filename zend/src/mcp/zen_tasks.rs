@@ -34,7 +34,11 @@ pub const TASK_TOOLS: [&str; 3] = [START, REPLY, NUDGE];
 /// task, and every part under it, starts parts and never tasks; a person's
 /// dialogue and a chat start tasks and never parts. `offered` is what the
 /// round's mode offers: a tool it does not offer has no path to hold out.
-pub fn withhold_by_kind(tools: &mut BTreeSet<&'static str>, offered: &HashSet<String>, is_task: bool) {
+pub fn withhold_by_kind(
+    tools: &mut BTreeSet<&'static str>,
+    offered: &HashSet<String>,
+    is_task: bool,
+) {
     let out: &[&'static str] = if is_task { &TASK_TOOLS } else { &[SUB_RUN] };
     tools.extend(out.iter().copied().filter(|t| offered.contains(*t)));
 }

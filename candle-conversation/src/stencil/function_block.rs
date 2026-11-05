@@ -565,10 +565,21 @@ mod tests {
             &catalog(),
         )
         .unwrap();
-        assert_eq!(call_of(&out)["arguments"]["words"], serde_json::json!(content));
+        assert_eq!(
+            call_of(&out)["arguments"]["words"],
+            serde_json::json!(content)
+        );
         assert!(out.ends_with("}\n</tool_call>"), "{out}");
-        assert_eq!(out.matches("</tool_call>").count(), 1, "only the real close: {out}");
-        assert_eq!(out.matches("<tool_call>").count(), 1, "only the real open: {out}");
+        assert_eq!(
+            out.matches("</tool_call>").count(),
+            1,
+            "only the real close: {out}"
+        );
+        assert_eq!(
+            out.matches("<tool_call>").count(),
+            1,
+            "only the real open: {out}"
+        );
     }
 
     /// An unterminated *block* is prose. Nothing is invented from a decode that

@@ -54,7 +54,11 @@ pub enum PartEvent {
         tool: Option<String>,
     },
     /// The next chunk of a call's argument `name`, as decoded.
-    Arg { id: String, name: String, text: String },
+    Arg {
+        id: String,
+        name: String,
+        text: String,
+    },
     /// The next chunk of reasoning, and how many tokens it has run to.
     Text {
         id: String,
@@ -172,7 +176,11 @@ impl PartSplit {
                     false => id,
                 };
                 if let Call::Value { name, started } = call {
-                    let text = if started { rest } else { strip_lead(&rest).to_string() };
+                    let text = if started {
+                        rest
+                    } else {
+                        strip_lead(&rest).to_string()
+                    };
                     if !text.is_empty() {
                         out.push(Out::Part(PartEvent::Arg {
                             id: id.clone(),
@@ -181,7 +189,11 @@ impl PartSplit {
                         }));
                     }
                 }
-                self.closed_call(&mut out, id, Some("the call was cut short before it was complete"));
+                self.closed_call(
+                    &mut out,
+                    id,
+                    Some("the call was cut short before it was complete"),
+                );
             }
         }
         out
@@ -327,13 +339,22 @@ impl PartSplit {
                     };
                     let name = named[..name_len].trim().to_string();
                     self.pending.drain(..lead + PARAM_TAG.len() + name_len + 1);
-                    self.state = State::Call(id, Call::Value { name, started: false });
+                    self.state = State::Call(
+                        id,
+                        Call::Value {
+                            name,
+                            started: false,
+                        },
+                    );
                     true
                 } else if rest.starts_with(FUNCTION_TAG) {
                     self.pending.drain(..lead + FUNCTION_TAG.len());
                     self.state = State::Call(id, Call::Done);
                     true
-                } else if rest.is_empty() || PARAM_TAG.starts_with(rest) || FUNCTION_TAG.starts_with(rest) {
+                } else if rest.is_empty()
+                    || PARAM_TAG.starts_with(rest)
+                    || FUNCTION_TAG.starts_with(rest)
+                {
                     false
                 } else {
                     self.state = State::Call(id, Call::Junk);
@@ -416,11 +437,17 @@ impl PartSplit {
     /// A JSON call, whole: its tool, its arguments, its close.
     fn json_call(&mut self, out: &mut Vec<Out>, body: &str) {
         let parsed: Option<(String, serde_json::Map<String, Value>)> =
-            serde_json::from_str::<Value>(body.trim()).ok().and_then(|v| {
-                let name = v.get("name")?.as_str()?.to_string();
-                let args = v.get("arguments").and_then(Value::as_object).cloned().unwrap_or_default();
-                Some((name, args))
-            });
+            serde_json::from_str::<Value>(body.trim())
+                .ok()
+                .and_then(|v| {
+                    let name = v.get("name")?.as_str()?.to_string();
+                    let args = v
+                        .get("arguments")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    Some((name, args))
+                });
         let Some((name, args)) = parsed else {
             let id = self.open(out, Kind::Call, None);
             self.closed_call(out, id, Some("the call could not be read"));
@@ -550,10 +577,19 @@ pub fn parts_of(text: &str, results: &[(Value, Option<usize>)]) -> Vec<Part> {
                 Some(Part::Prose { text: before }) => before.push_str(&text),
                 _ => parts.push(Part::Prose { text }),
             },
-            Out::Part(PartEvent::Open { id, kind: Kind::Think, .. }) => {
-                parts.push(Part::Think { id, text: String::new() })
-            }
-            Out::Part(PartEvent::Open { id, kind: Kind::Call, tool }) => parts.push(Part::Call {
+            Out::Part(PartEvent::Open {
+                id,
+                kind: Kind::Think,
+                ..
+            }) => parts.push(Part::Think {
+                id,
+                text: String::new(),
+            }),
+            Out::Part(PartEvent::Open {
+                id,
+                kind: Kind::Call,
+                tool,
+            }) => parts.push(Part::Call {
                 id,
                 tool,
                 args: Vec::new(),
@@ -563,20 +599,29 @@ pub fn parts_of(text: &str, results: &[(Value, Option<usize>)]) -> Vec<Part> {
                 tokens: None,
             }),
             Out::Part(PartEvent::Text { id, text, .. }) => {
-                if let Some(Part::Think { text: body, .. }) = find(&mut parts, &id).map(|i| &mut parts[i]) {
+                if let Some(Part::Think { text: body, .. }) =
+                    find(&mut parts, &id).map(|i| &mut parts[i])
+                {
                     body.push_str(&text);
                 }
             }
             Out::Part(PartEvent::Arg { id, name, text }) => {
-                if let Some(Part::Call { args, .. }) = find(&mut parts, &id).map(|i| &mut parts[i]) {
+                if let Some(Part::Call { args, .. }) = find(&mut parts, &id).map(|i| &mut parts[i])
+                {
                     match args.last_mut() {
                         Some((last, value)) if *last == name => value.push_str(&text),
                         _ => args.push((name, text)),
                     }
                 }
             }
-            Out::Part(PartEvent::Close { id, ok: closed_ok, error: why }) => {
-                if let Some(Part::Call { ok, error, .. }) = find(&mut parts, &id).map(|i| &mut parts[i]) {
+            Out::Part(PartEvent::Close {
+                id,
+                ok: closed_ok,
+                error: why,
+            }) => {
+                if let Some(Part::Call { ok, error, .. }) =
+                    find(&mut parts, &id).map(|i| &mut parts[i])
+                {
                     *ok = closed_ok;
                     *error = why;
                 }
@@ -616,12 +661,20 @@ mod tests {
             match (merged.last_mut(), &out) {
                 (Some(Out::Prose(a)), Out::Prose(b)) => a.push_str(b),
                 (
-                    Some(Out::Part(PartEvent::Arg { id: i, name: n, text: a })),
+                    Some(Out::Part(PartEvent::Arg {
+                        id: i,
+                        name: n,
+                        text: a,
+                    })),
                     Out::Part(PartEvent::Arg { id, name, text }),
                 ) if i == id && n == name => a.push_str(text),
                 (
                     Some(Out::Part(PartEvent::Text { id: i, text: a, .. })),
-                    Out::Part(PartEvent::Text { id, text, tokens: None }),
+                    Out::Part(PartEvent::Text {
+                        id,
+                        text,
+                        tokens: None,
+                    }),
                 ) if i == id => a.push_str(text),
                 _ => merged.push(out),
             }
@@ -711,7 +764,14 @@ mod tests {
     fn a_call_cut_short_closes_failed() {
         let got = run(&["<tool_call>\n<function=write>\n<parameter=content>\nhalf"]);
         assert_eq!(got[1], arg("p0", "content", "half"));
-        assert!(matches!(&got[2], Out::Part(PartEvent::Close { ok: false, error: Some(_), .. })));
+        assert!(matches!(
+            &got[2],
+            Out::Part(PartEvent::Close {
+                ok: false,
+                error: Some(_),
+                ..
+            })
+        ));
     }
 
     /// **Results land on their own calls by id**, oldest unanswered first.
@@ -719,13 +779,26 @@ mod tests {
     fn results_answer_the_calls_in_order() {
         let mut split = PartSplit::default();
         split.push("<tool_call>\n<function=a>\n</function>\n</tool_call><tool_call>{\"name\": \"b\", \"arguments\": {\"x\": 1}}</tool_call>");
-        assert_eq!(split.run(), Some(PartEvent::Run { ids: vec!["p0".into(), "p1".into()] }));
+        assert_eq!(
+            split.run(),
+            Some(PartEvent::Run {
+                ids: vec!["p0".into(), "p1".into()]
+            })
+        );
         let got = split.results(&[json!("one"), json!("two")], &[3, 4]);
         assert_eq!(
             got,
             vec![
-                PartEvent::Result { id: "p0".into(), result: json!("one"), tokens: Some(3) },
-                PartEvent::Result { id: "p1".into(), result: json!("two"), tokens: Some(4) },
+                PartEvent::Result {
+                    id: "p0".into(),
+                    result: json!("one"),
+                    tokens: Some(3)
+                },
+                PartEvent::Result {
+                    id: "p1".into(),
+                    result: json!("two"),
+                    tokens: Some(4)
+                },
             ]
         );
         assert_eq!(split.run(), None);

@@ -142,7 +142,12 @@ impl Framer {
 
     /// The `part` events a round's tool notice makes: its calls started, or
     /// each result on its own call. Empty for a reply not framed as parts.
-    pub fn tool(&self, phase: &str, results: &[Value], tokens: &[usize]) -> Vec<anyhow::Result<Event>> {
+    pub fn tool(
+        &self,
+        phase: &str,
+        results: &[Value],
+        tokens: &[usize],
+    ) -> Vec<anyhow::Result<Event>> {
         let mut s = self.state.lock().unwrap();
         let Some(split) = s.parts.as_mut() else {
             return Vec::new();
@@ -173,7 +178,9 @@ impl Framer {
 
     fn end_parts(&self, s: &mut State) -> Vec<anyhow::Result<Event>> {
         let outs = s.parts.as_mut().map(PartSplit::finish).unwrap_or_default();
-        outs.into_iter().map(|out| self.part_frame(s, out)).collect()
+        outs.into_iter()
+            .map(|out| self.part_frame(s, out))
+            .collect()
     }
 
     fn part_frame(&self, s: &mut State, out: PartOut) -> anyhow::Result<Event> {

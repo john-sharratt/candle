@@ -32,9 +32,9 @@ use crate::chatml::split_turn;
 use crate::mcp::ownership;
 use crate::parts::{parts_of, Part};
 use crate::projection_event::ProjectionSpanOut;
-use crate::working_set::coverage::response_bodies;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
 use crate::types::Role;
+use crate::working_set::coverage::response_bodies;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
@@ -476,7 +476,11 @@ mod tests {
         let call = "<tool_call>\n<function=datetime>\n</function>\n</tool_call>";
         let mut results = bubble("user", "<tool_response>\n{\"now\": 1}\n</tool_response>\n");
         results.tool_tokens = vec![5];
-        let mut messages = vec![bubble("assistant", call), results, bubble("assistant", call)];
+        let mut messages = vec![
+            bubble("assistant", call),
+            results,
+            bubble("assistant", call),
+        ];
         attach_parts(&mut messages);
         let first = serde_json::to_value(&messages[0].parts).unwrap();
         assert_eq!(first[0]["kind"], "call");

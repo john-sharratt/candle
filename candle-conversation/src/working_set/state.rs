@@ -371,7 +371,9 @@ impl WorkingSet {
         let mut newcomers: Vec<(TimelineId, f32)> = self
             .momentum
             .iter()
-            .filter(|(timeline, _)| !self.is_member(**timeline) && !self.withheld.contains(timeline))
+            .filter(|(timeline, _)| {
+                !self.is_member(**timeline) && !self.withheld.contains(timeline)
+            })
             .map(|(timeline, m)| (*timeline, *m))
             .collect();
         newcomers.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
@@ -549,7 +551,11 @@ mod tests {
         observe(&mut ws, &[(1, 900.0)], 1_000);
         ws.withhold([tl(1), tl(2)]);
         observe(&mut ws, &[(2, 900.0)], 1_000);
-        assert_eq!(order(&ws), vec![1], "a member keeps its place; a newcomer waits");
+        assert_eq!(
+            order(&ws),
+            vec![1],
+            "a member keeps its place; a newcomer waits"
+        );
         ws.clear_withheld();
         observe(&mut ws, &[], 1_000);
         assert_eq!(order(&ws), vec![1, 2], "it enters on the momentum it kept");

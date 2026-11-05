@@ -265,7 +265,11 @@ mod tests {
             Some("file_list"),
             decode,
         );
-        assert_eq!(held.len(), 4, "three name branches and the choice after the first");
+        assert_eq!(
+            held.len(),
+            4,
+            "three name branches and the choice after the first"
+        );
         let opening = t.first_branch_node().unwrap();
         assert_eq!(names(held.arms_at(opening).unwrap(), &v), ["file_list"]);
         let mut choices = 0;
@@ -282,9 +286,14 @@ mod tests {
                 choices += 1;
                 assert_eq!(arms.len(), 1, "held to going on alone");
                 let next = trie.target_of(&arms[0]).unwrap();
-                assert!(!matches!(t.node(next), StencilNode::End), "going on, not ending");
                 assert!(
-                    String::from_utf8(v.decode(&arms[0])).unwrap().contains("<tool_call>"),
+                    !matches!(t.node(next), StencilNode::End),
+                    "going on, not ending"
+                );
+                assert!(
+                    String::from_utf8(v.decode(&arms[0]))
+                        .unwrap()
+                        .contains("<tool_call>"),
                     "the arm opens the next call"
                 );
             } else {

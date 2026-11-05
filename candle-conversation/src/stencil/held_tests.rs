@@ -115,7 +115,12 @@ fn a_reasoned_hold_applies_only_after_the_reasoning() {
     registry.register(TRIGGER, Arc::clone(&t));
     let registry =
         registry.holding_after_reasoning(TRIGGER, only("file_list"), 200, Some(only("write")));
-    let named = |reasoned: u32| names(&every_path(registry.driver_after(TRIGGER, reasoned).unwrap(), &v));
+    let named = |reasoned: u32| {
+        names(&every_path(
+            registry.driver_after(TRIGGER, reasoned).unwrap(),
+            &v,
+        ))
+    };
     assert_eq!(named(200), BTreeSet::from(["file_list".into()]));
     assert_eq!(named(5_000), BTreeSet::from(["file_list".into()]));
     assert_eq!(named(199), BTreeSet::from(["write".into()]));

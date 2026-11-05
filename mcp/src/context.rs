@@ -201,7 +201,10 @@ impl Conversations {
         let begins = !last.contains_key(who);
         if begins {
             if last.len() >= CLOCKS_KEPT {
-                let idlest = last.iter().min_by_key(|(_, &then)| then).map(|(w, _)| w.clone());
+                let idlest = last
+                    .iter()
+                    .min_by_key(|(_, &then)| then)
+                    .map(|(w, _)| w.clone());
                 if let Some(idlest) = idlest {
                     last.remove(&idlest);
                 }
@@ -497,7 +500,10 @@ mod tests {
         assert!(!again.begins(), "kept, it does not begin again");
         again.keep(2_000);
         let hours_later = 2_000 + 6 * 60 * 60 * 1000;
-        assert!(!c.claim(&s1, hours_later).begins(), "a pause is not a new conversation");
+        assert!(
+            !c.claim(&s1, hours_later).begins(),
+            "a pause is not a new conversation"
+        );
         assert!(
             c.claim(&who("o", "grok", "s2"), 2_000).begins(),
             "a new session"
@@ -555,7 +561,10 @@ mod tests {
         }
         c.claim("new", CLOCKS_KEPT as u64).keep(CLOCKS_KEPT as u64);
         assert_eq!(c.0.lock().unwrap().len(), CLOCKS_KEPT);
-        assert!(c.claim("old0", CLOCKS_KEPT as u64 + 1).begins(), "the idlest went");
+        assert!(
+            c.claim("old0", CLOCKS_KEPT as u64 + 1).begins(),
+            "the idlest went"
+        );
         assert!(!c.claim("old5", CLOCKS_KEPT as u64 + 1).begins());
         assert!(!c.claim("new", CLOCKS_KEPT as u64 + 1).begins());
     }

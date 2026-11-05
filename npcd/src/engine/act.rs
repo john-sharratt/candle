@@ -35,7 +35,9 @@
 //! instead of calling the tool, nothing happens", enforced rather than merely
 //! requested.
 
-use candle_conversation::stencil::element_close::{function_end, value_end, PARAM_CLOSE, PARAM_TAG};
+use candle_conversation::stencil::element_close::{
+    function_end, value_end, PARAM_CLOSE, PARAM_TAG,
+};
 use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 use serde_json::{Map, Value};

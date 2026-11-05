@@ -981,7 +981,12 @@ mod tests {
     /// next element's tag.
     const ELEMENT: Terminator = Terminator::Until {
         marker: "</parameter>",
-        tails: &["\n<parameter=", "\n</function>", "<parameter=", "\r\n</function>"],
+        tails: &[
+            "\n<parameter=",
+            "\n</function>",
+            "<parameter=",
+            "\r\n</function>",
+        ],
     };
 
     /// **The marker alone is content; with structure after it, it closes**,
@@ -998,11 +1003,21 @@ mod tests {
         assert_eq!(st.fired(), 1);
         let mut st = ELEMENT.start();
         let one = "v</parameter><parameter=";
-        assert_eq!(st.feed(one.as_bytes()), Feed::Close { consumed: one.len() });
+        assert_eq!(
+            st.feed(one.as_bytes()),
+            Feed::Close {
+                consumed: one.len()
+            }
+        );
         assert_eq!(st.fired(), 2);
         let mut st = ELEMENT.start();
         let crlf = "v</parameter>\r\n</function>";
-        assert_eq!(st.feed(crlf.as_bytes()), Feed::Close { consumed: crlf.len() });
+        assert_eq!(
+            st.feed(crlf.as_bytes()),
+            Feed::Close {
+                consumed: crlf.len()
+            }
+        );
         assert_eq!(st.fired(), 3);
     }
 

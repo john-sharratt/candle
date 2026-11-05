@@ -63,9 +63,7 @@ impl Step {
     pub fn name(&self) -> &str {
         match self {
             Step::Run(call) => &call.name,
-            Step::Refuse(result) | Step::Withheld(result) => {
-                &result.call.name
-            }
+            Step::Refuse(result) | Step::Withheld(result) => &result.call.name,
         }
     }
 }
@@ -114,12 +112,14 @@ impl Ending {
 fn last_parameter(body: &str) -> Option<String> {
     static ELEMENT: OnceLock<Regex> = OnceLock::new();
     static KEY: OnceLock<Regex> = OnceLock::new();
-    let element = ELEMENT.get_or_init(|| Regex::new(r"<parameter=([^>\s]+)>").expect("static regex"));
+    let element =
+        ELEMENT.get_or_init(|| Regex::new(r"<parameter=([^>\s]+)>").expect("static regex"));
     if let Some(c) = element.captures_iter(body).last() {
         return Some(c[1].to_string());
     }
     let args = body.find("\"arguments\"")?;
-    let key = KEY.get_or_init(|| Regex::new(r#""([A-Za-z_][A-Za-z0-9_]*)"\s*:"#).expect("static regex"));
+    let key =
+        KEY.get_or_init(|| Regex::new(r#""([A-Za-z_][A-Za-z0-9_]*)"\s*:"#).expect("static regex"));
     key.captures_iter(&body[args + "\"arguments\"".len()..])
         .last()
         .map(|c| c[1].to_string())
@@ -512,13 +512,13 @@ mod tests {
         let json = r#"{"name": "write", "arguments": {"path": "a", "content": "ab"#;
         assert_eq!(last_parameter(json).as_deref(), Some("content"));
         assert_eq!(last_parameter(r#"{"name": "wri"#), None);
-        assert_eq!(
-            Ending::of("abc").sentence(),
-            "It ended 3 characters in."
-        );
+        assert_eq!(Ending::of("abc").sentence(), "It ended 3 characters in.");
         assert_eq!(
             Ending::of(block).sentence(),
-            format!("It ended {} characters in, inside parameter `content`.", block.chars().count())
+            format!(
+                "It ended {} characters in, inside parameter `content`.",
+                block.chars().count()
+            )
         );
     }
 

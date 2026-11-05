@@ -4235,9 +4235,7 @@ fn run_inference_stream(
                 let open_state = Arc::clone(&state);
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let t_open = Instant::now();
-                    open_state
-                        .engine
-                        .working_set_clear(timeline);
+                    open_state.engine.working_set_clear(timeline);
                     let clear_ms = t_open.elapsed().as_millis() as u64;
                     let t_scope = Instant::now();
                     // Scope it first. A seed is admitted only as the
