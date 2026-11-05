@@ -30,7 +30,6 @@ pub mod conv_overlay;
 pub mod conv_sweep;
 pub mod deletions;
 mod engine_asks;
-pub mod fast_path;
 pub mod hand_records;
 pub mod handover;
 pub mod ingest;

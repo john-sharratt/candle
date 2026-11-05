@@ -53,11 +53,6 @@ pub enum Step {
     Run(ToolCall),
     /// A call that could not be read. Nothing runs; this is its result.
     Refuse(ToolResult),
-    /// A call already satisfied without running it — the fast path resolved it
-    /// to content this conversation now carries (see [`crate::fast_path`]).
-    /// Unlike [`Step::Refuse`] this is a success: the call is answered, it just
-    /// costs no read.
-    Served(ToolResult),
     /// A call a resumed turn does not run again, since doing so could repeat
     /// an effect that already happened; this is its result, saying so.
     Withheld(ToolResult),
@@ -68,20 +63,66 @@ impl Step {
     pub fn name(&self) -> &str {
         match self {
             Step::Run(call) => &call.name,
-            Step::Refuse(result) | Step::Served(result) | Step::Withheld(result) => {
+            Step::Refuse(result) | Step::Withheld(result) => {
                 &result.call.name
             }
         }
     }
 }
 
-/// Why a `<tool_call>` block could not be read.
+/// Why a `<tool_call>` block could not be read, and where it ended: how many
+/// characters of the call were written, and the parameter it was in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Problem {
     /// The call's JSON ends before the call does — the decode stopped partway.
-    CutOff,
+    CutOff(Ending),
     /// The call's JSON is complete but not valid, or names no tool.
-    Invalid(String),
+    Invalid(String, Ending),
+}
+
+/// Where an unreadable call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ending {
+    /// The call's length as written, in characters.
+    chars: usize,
+    /// The last parameter the call opened, when it opened one.
+    parameter: Option<String>,
+}
+
+impl Ending {
+    fn of(body: &str) -> Self {
+        Ending {
+            chars: body.chars().count(),
+            parameter: last_parameter(body),
+        }
+    }
+
+    /// "It ended 556 characters in, inside parameter `content`."
+    fn sentence(&self) -> String {
+        match &self.parameter {
+            Some(p) => format!(
+                "It ended {} characters in, inside parameter `{p}`.",
+                self.chars
+            ),
+            None => format!("It ended {} characters in.", self.chars),
+        }
+    }
+}
+
+/// The last parameter a call's text opens: a function block's
+/// `<parameter=name>`, or a JSON object's last `"key":` inside `arguments`.
+fn last_parameter(body: &str) -> Option<String> {
+    static ELEMENT: OnceLock<Regex> = OnceLock::new();
+    static KEY: OnceLock<Regex> = OnceLock::new();
+    let element = ELEMENT.get_or_init(|| Regex::new(r"<parameter=([^>\s]+)>").expect("static regex"));
+    if let Some(c) = element.captures_iter(body).last() {
+        return Some(c[1].to_string());
+    }
+    let args = body.find("\"arguments\"")?;
+    let key = KEY.get_or_init(|| Regex::new(r#""([A-Za-z_][A-Za-z0-9_]*)"\s*:"#).expect("static regex"));
+    key.captures_iter(&body[args + "\"arguments\"".len()..])
+        .last()
+        .map(|c| c[1].to_string())
 }
 
 /// The calls `response` makes, runnable and not, in the order it makes them.
@@ -233,7 +274,6 @@ pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
             }
             // Already answered by the fast path; running it would re-read a
             // file whose content this conversation is now carrying.
-            Step::Served(result) => out.push(result),
             Step::Withheld(result) => {
                 tracing::info!(tool = %result.call.name, "resumed turn: call not re-issued");
                 out.push(result);
@@ -306,9 +346,9 @@ fn unreadable_blocks(answer: &str) -> Vec<(usize, Option<String>, Problem)> {
         }
         let problem = match parse_call(body) {
             Ok(Some(_)) => continue,
-            Ok(None) => Problem::Invalid("the call names no tool".to_string()),
-            Err(e) if e.is_eof() || !closed => Problem::CutOff,
-            Err(e) => Problem::Invalid(e.to_string()),
+            Ok(None) => Problem::Invalid("the call names no tool".to_string(), Ending::of(body)),
+            Err(e) if e.is_eof() || !closed => Problem::CutOff(Ending::of(body)),
+            Err(e) => Problem::Invalid(e.to_string(), Ending::of(body)),
         };
         out.push((at, named_tool(body), problem));
     }
@@ -331,20 +371,22 @@ fn named_tool(body: &str) -> Option<String> {
 fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
     let label = name.as_deref().unwrap_or("tool");
     let response = match problem {
-        Problem::CutOff => json!({
+        Problem::CutOff(ending) => json!({
             "error": "call_cut_off",
             "detail": format!(
                 "This {label} call was cut off before it was complete, so it was not \
-                 run and nothing changed. If it carried a large value — a whole \
-                 file's content — split the work across several smaller calls."
+                 run and nothing changed. {} If it carried a large value — a whole \
+                 file's content — split the work across several smaller calls.",
+                ending.sentence()
             ),
         }),
-        Problem::Invalid(why) => json!({
+        Problem::Invalid(why, ending) => json!({
             "error": "malformed_call",
             "detail": format!(
                 "This {label} call could not be read ({why}), so it was not run and \
-                 nothing changed. Issue it again as one JSON object with \"name\" \
-                 and \"arguments\"."
+                 nothing changed. {} Issue it again as one JSON object with \"name\" \
+                 and \"arguments\".",
+                ending.sentence()
             ),
         }),
     };
@@ -424,7 +466,6 @@ mod tests {
         match step {
             Step::Refuse(r) => r.response["error"].as_str().unwrap(),
             Step::Run(c) => panic!("{} was planned to run", c.name),
-            Step::Served(r) => panic!("{} was served by the fast path", r.call.name),
             Step::Withheld(r) => panic!("{} was withheld from a resumed turn", r.call.name),
         }
     }
@@ -455,6 +496,30 @@ mod tests {
         assert_eq!(runs(&steps), ["write"]);
         assert_eq!(error_of(&steps[0]), "call_cut_off");
         assert!(ends_inside_a_call(&tagged(text)));
+        let Step::Refuse(r) = &steps[0] else {
+            panic!("refused")
+        };
+        let detail = r.response["detail"].as_str().unwrap();
+        assert!(detail.contains("inside parameter `content`"), "{detail}");
+    }
+
+    /// **A refusal says where the call ended**: how far it got, and the
+    /// parameter it was in — a function block's element or a JSON key.
+    #[test]
+    fn a_refusal_names_where_the_call_ended() {
+        let block = "<function=write>\n<parameter=path>\na.js</parameter>\n<parameter=content>\nx";
+        assert_eq!(last_parameter(block).as_deref(), Some("content"));
+        let json = r#"{"name": "write", "arguments": {"path": "a", "content": "ab"#;
+        assert_eq!(last_parameter(json).as_deref(), Some("content"));
+        assert_eq!(last_parameter(r#"{"name": "wri"#), None);
+        assert_eq!(
+            Ending::of("abc").sentence(),
+            "It ended 3 characters in."
+        );
+        assert_eq!(
+            Ending::of(block).sentence(),
+            format!("It ended {} characters in, inside parameter `content`.", block.chars().count())
+        );
     }
 
     /// Complete but not JSON: refused as malformed, with the parser's reason.

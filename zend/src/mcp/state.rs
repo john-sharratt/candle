@@ -194,10 +194,13 @@ pub struct McpState {
 
 impl Default for McpState {
     fn default() -> Self {
+        let parts: Arc<Parts> = Arc::default();
+        let ops: Arc<OpsTools> = Arc::default();
+        parts.starting_tasks_with(Arc::clone(&ops) as _);
         Self {
             changed: watch::channel(0).0,
-            parts: Arc::default(),
-            ops: Arc::default(),
+            parts,
+            ops,
             memory: Arc::default(),
             used: Arc::default(),
         }

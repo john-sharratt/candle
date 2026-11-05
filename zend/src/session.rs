@@ -48,7 +48,6 @@ use candle_conversation::stencil::{
 use candle_conversation::substrate::pcoll::POrdMap;
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
-use candle_conversation::working_set::marks::RELEASE_TAG;
 use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::FinishReason;
 use candle_conversation::LoadPhase;
@@ -105,8 +104,6 @@ use crate::conv_overlay::{self, Mirror};
 use crate::conv_sweep::{CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::deletions::Deletions;
 use crate::engine_asks;
-use crate::fast_path::coverage::Coverage;
-use crate::fast_path::{self, Screen};
 use crate::hand_records::{self, Carrying};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
@@ -127,7 +124,7 @@ use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::zen_tasks::TASK_TOOLS;
+use crate::mcp::zen_tasks::withhold_by_kind;
 use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, tending, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
@@ -152,10 +149,9 @@ use crate::tools::{
 use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::worker_hop;
-use crate::working_set::promises::{self, Release};
-use crate::working_set::restore::restore_locks;
+use crate::working_set::coverage::Coverage;
 use crate::working_set::seeds::Seeding;
-use crate::working_set::{dialogue_config, round_marks};
+use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 
 pub mod diag;
@@ -387,10 +383,6 @@ struct ConvState {
     /// The journal sections this conversation holds, reconciled with its
     /// journal at the head of every round (`docs/zend_journal.md`).
     journal: Carried,
-    /// The working-set promises a decode found ended — locks whose replies its
-    /// projection left out — marked on the next turn this conversation submits,
-    /// whichever request that is (`working_set::promises`).
-    promise_marks: Vec<String>,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -624,10 +616,17 @@ type HeldKey = (u8, String, Vec<&'static str>);
 /// Every [`round_triggers`] held so far, swapped whole so a round never waits.
 type HeldStencils = HashMap<HeldKey, Arc<TriggerRegistry>>;
 
+/// How many tokens of reasoning a round runs before its opening call is held
+/// to `journal_note` (`docs/zend_journal.md` §5.2): below it there is no
+/// conclusion to keep, and the round goes straight to its calls.
+const NOTE_AFTER_REASONING: u32 = 200;
+
 /// [`turn_triggers`] for one round of a conversation, every one of which keeps
-/// a journal: its opening call held to `journal_note`, so a round that acts
-/// first notes what its thinking concluded (`docs/zend_journal.md` §5.2), and
-/// a call to any of `unavailable`'s tools taken out of the grammar. Held once
+/// a journal: once the round has reasoned for [`NOTE_AFTER_REASONING`] tokens,
+/// its opening call held to `journal_note` and a call after it held to come,
+/// so a round that acts first notes what its thinking concluded and then acts
+/// on it (`docs/zend_journal.md` §5.2); and a call to any of `unavailable`'s
+/// tools taken out of the grammar. Held once
 /// per mode, dial and set: a set changes only as sessions open and close, and
 /// holding decodes the catalog's name arms. The base is what a round falls
 /// back to, as a tool the grammar leaves in is only refused.
@@ -652,7 +651,7 @@ fn round_triggers(
         .into_iter()
         .filter(|name| !unavailable.tools.contains(name.as_str()))
         .collect();
-    let first = noting.then_some(JOURNAL_NOTE_TOOL);
+    let first = noting.then_some((JOURNAL_NOTE_TOOL, NOTE_AFTER_REASONING));
     match state.engine.holding_tools(&base, &allowed, first) {
         Ok(triggers) => {
             state.held_stencils.rcu(|held| {
@@ -4098,7 +4097,6 @@ fn run_inference_stream(
                         // An earlier run may have left this conversation's
                         // sections: the first reconcile looks for them.
                         journal: Carried::new(false),
-                        promise_marks: Vec::new(),
                     }));
                     let guard = Arc::clone(&arc)
                         .try_lock_owned()
@@ -4231,9 +4229,8 @@ fn run_inference_stream(
             conv_overlay::restore(&state.engine, timeline, &files, &mirror);
             // Its working set is in-memory and did not survive. The seeds
             // resolve again on its own branch and enter provenance at the
-            // seeding momentum; the locks come back from the marks its turns
-            // carry — the promises it was actually given — and the rest of
-            // the momentum rebuilds from the scan.
+            // seeding momentum, and the rest of the momentum rebuilds from
+            // the scan.
             if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
                 if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -4243,12 +4240,11 @@ fn run_inference_stream(
                         .working_set_clear(timeline);
                     let clear_ms = t_open.elapsed().as_millis() as u64;
                     let t_scope = Instant::now();
-                    // Scope it first. A seed or a restored lock is admitted only
-                    // as the conversation's scope offers it, and the scope is
+                    // Scope it first. A seed is admitted only as the
+                    // conversation's scope offers it, and the scope is
                     // otherwise first set right before its first submit — after
-                    // this — so every seed and every lock was refused: measured
-                    // 2026-10-24, no dialogue had carried a seed since scoping
-                    // landed.
+                    // this — so every seed was refused: measured 2026-10-24, no
+                    // dialogue had carried a seed since scoping landed.
                     open_state
                         .retrieval_scope
                         .apply(&open_state.engine, timeline, &files);
@@ -4256,19 +4252,14 @@ fn run_inference_stream(
                     let t_seed = Instant::now();
                     let seeded = seed_working_set(&open_state, timeline, &files, &config);
                     let seed_ms = t_seed.elapsed().as_millis() as u64;
-                    let t_restore = Instant::now();
-                    let restored = restore_locks(&open_state.engine, timeline);
-                    let restore_ms = t_restore.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
                         timeline = timeline.raw(),
                         seeded,
-                        restored,
                         clear_ms,
                         scope_ms,
                         seed_ms,
-                        restore_ms,
-                        "working set opened: seeds in provenance, locks restored from the turn marks",
+                        "working set opened: seeds in provenance",
                     );
                 })
                 .await
@@ -4405,10 +4396,6 @@ fn run_inference_stream(
         // cognitive tasks — so one held across the await would make this whole
         // task non-`Send`, and the spawn would not compile.
         let mut start_iteration = 0usize;
-        // The working-set marks the next submitted turn carries: what the
-        // round it answers did to the working set, in the order it happened
-        // (`docs/zend_working_set.md` §4.8).
-        let mut marks: Vec<String> = Vec::new();
         if let Some(Resume {
             call_turn,
             dispatch,
@@ -4444,9 +4431,6 @@ fn run_inference_stream(
                     return;
                 }
             };
-            // A resumed round never passed the screen, but it can still have
-            // written: then what it wrote ends, exactly as a live round's would.
-            marks.extend(end_written_promises(&state, timeline, &results).await);
             let text = format_tool_responses(&results);
             if text.is_blank() {
                 tracing::warn!(
@@ -4521,6 +4505,19 @@ fn run_inference_stream(
             threads::worker(&state.engine.conversation().shared(), o, t, n)
                 .is_none_or(|w| !w.kind.is_chat())
         });
+        // A new question starts a new loop: the files the last one read may
+        // be placed again, since its reads may be summarised away by now. A
+        // resumed round goes on with the loop it belongs to.
+        if start_iteration == 0 && state.working_set.is_some() {
+            let engine_state = Arc::clone(&state);
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                engine_state.engine.working_set_clear_withheld(timeline);
+            })
+            .await
+            {
+                tracing::warn!(conv_id = %conv_id, "clearing the withheld files panicked: {e}");
+            }
+        }
         for iteration in start_iteration.. {
             // The closing turn the cap gives runs below it ([`closes_at_cap`]);
             // a turn resumed at or past the cap ends here.
@@ -4575,9 +4572,7 @@ fn run_inference_stream(
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
             let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
-            if is_task {
-                withheld.tools.extend(TASK_TOOLS);
-            }
+            withhold_by_kind(&mut withheld.tools, &offered, is_task);
             if let Some(summary) = tool_summary_section(tools_mode) {
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }
@@ -4594,12 +4589,6 @@ fn run_inference_stream(
                 },
                 selection: round_selection,
                 triggers: round_triggers(&state, think_mode, tools_mode, &withheld),
-                // The promises the last decode found ended come first: they
-                // ended before this round's reads were served.
-                tags: std::mem::take(&mut cs.promise_marks)
-                    .into_iter()
-                    .chain(std::mem::take(&mut marks))
-                    .collect(),
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
@@ -5041,25 +5030,6 @@ fn run_inference_stream(
                 turn_events.push(out.clone());
                 let _ = tx.send(Ok(StreamItem::Projection(out))).await;
             }
-            // A served read's lock stands while the reply that promised it is
-            // read: once this decode's projection left that reply out, the
-            // promise is no longer in view and its lock ends — marked on the
-            // next turn the conversation submits.
-            if let (Some(config), Some(selected), Some(current)) = (
-                state.working_set.as_ref(),
-                selected_turns.as_deref(),
-                resp.seal.as_ref().and_then(|s| s.turn_index),
-            ) {
-                let engine = &state.engine;
-                let gone = promises::departed(engine, timeline, selected, current);
-                cs.promise_marks.extend(promises::release(
-                    engine,
-                    timeline,
-                    &gone,
-                    config.released_momentum(),
-                ));
-            }
-
             // Persist this turn's events to the substrate redo log so the
             // timeline survives a browser reload AND a daemon restart. Keyed to
             // the just-sealed turn; served back on hydrate via the substrate.
@@ -5153,65 +5123,6 @@ fn run_inference_stream(
                 break;
             }
 
-            // Answer what the corpus has already ingested before dispatching the
-            // rest. A `file_read` of a file an existing `code_reading`
-            // conversation read whole is served by locking that conversation
-            // into this one's working set — the K/V exists, so it costs an
-            // elevation rather than a prefill and a decode. Every other call,
-            // a `file_list` included, runs and is prefilled. Anything
-            // unsure (changed file, no complete conversation, the working set
-            // full) is left in the round and runs for real, and so is every
-            // call from the round's first write on. Each served call marks the
-            // turn that carries the results, so a restart restores the lock.
-            // On the blocking pool, like the dispatch below: the lookups are
-            // git work, and this task's every wait is an await.
-            let mut served: Vec<TimelineId> = Vec::new();
-            let round = match state.working_set.clone() {
-                None => round,
-                Some(config) => {
-                    let screen_state = Arc::clone(&state);
-                    let screen_files = Arc::clone(&cs.files);
-                    let unscreened = round.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        fast_path::screen(
-                            &Screen {
-                                engine: &screen_state.engine,
-                                target: timeline,
-                                workspace: &screen_state.workspace,
-                                files: &screen_files,
-                                config: &config,
-                                coverage: &screen_state.read_coverage,
-                            },
-                            round,
-                        )
-                    })
-                    .await
-                    {
-                        Ok(screened) => {
-                            for hit in &screened.served {
-                                tracing::info!(
-                                    conv_id = %conv_id,
-                                    iteration,
-                                    tool = hit.tool,
-                                    path = %hit.path,
-                                    timeline = hit.timeline.raw(),
-                                    "tool call served from the working set — nothing re-read",
-                                );
-                                served.push(hit.timeline);
-                            }
-                            screened.steps
-                        }
-                        Err(e) => {
-                            // The fast path is an optimisation; losing it costs
-                            // reads, not correctness. Dispatch the round as the
-                            // model wrote it.
-                            tracing::warn!(conv_id = %conv_id, "fast-path screen panicked: {e}");
-                            unscreened
-                        }
-                    }
-                }
-            };
-
             tracing::info!(
                 conv_id = %conv_id,
                 iteration,
@@ -5267,10 +5178,7 @@ fn run_inference_stream(
                     crate::ingest_worker::request(wake);
                 }
             }
-            // The reads the round served, then what its writes ended — so the
-            // results turn's marks read in the order the round ran.
-            marks.extend(round_marks(&served));
-            marks.extend(end_written_promises(&state, timeline, &results).await);
+            withhold_read_files(&state, timeline, &cs.files, &results).await;
             let now_out = unavailable(&state.tool_host.availability_facts(), &offered);
             announce_returned(&mut results, &withheld, &now_out);
             if repeat_guard.screen(&mut results) == Verdict::Close {
@@ -5398,41 +5306,44 @@ fn run_inference_stream(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-/// End the working-set promises a dispatched round's writes broke, and return
-/// the marks that record it: the lock on each file a write named, or every
-/// lock after a call whose effects cannot be named (`working_set::promises`).
-async fn end_written_promises(
+/// Keep the readings of every file `results` read out of `timeline`'s working
+/// set for the rest of its turn's loop (`docs/zend_working_set.md` §4.5): the
+/// page each read returned stands verbatim in the dialogue, so placing the
+/// reading again would carry the file twice. A read that failed returned no
+/// page and withholds nothing. On the blocking pool: finding the version a
+/// read returned is git work.
+async fn withhold_read_files(
     state: &Arc<InferenceState>,
     timeline: TimelineId,
+    files: &Arc<RepoFiles>,
     results: &[ToolResult],
-) -> Vec<String> {
-    let Some(config) = state.working_set.clone() else {
-        return Vec::new();
-    };
-    match promises::round_release(&config, results, &state.workspace) {
-        Release::Nothing => Vec::new(),
-        Release::All => {
-            release_working_set(state, timeline).await;
-            vec![RELEASE_TAG.to_string()]
-        }
-        Release::Files(files) => {
-            // On the blocking pool, as every release is: it writes through the
-            // persistence owner, whose flow control can wait for room.
-            let state = Arc::clone(state);
-            tokio::task::spawn_blocking(move || {
-                let engine = &state.engine;
-                let held = promises::holding(engine, timeline, &files);
-                promises::release(engine, timeline, &held, config.released_momentum())
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    timeline = timeline.raw(),
-                    "ending the written files' locks panicked: {e}"
-                );
-                Vec::new()
-            })
-        }
+) {
+    if state.working_set.is_none() {
+        return;
+    }
+    let read: Vec<ToolCall> = results
+        .iter()
+        .filter(|r| r.response.get("error").is_none())
+        .map(|r| r.call.clone())
+        .collect();
+    if read.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let files = Arc::clone(files);
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        let readings: Vec<TimelineId> = read
+            .iter()
+            .flat_map(|call| corpus::readings_of(&state.engine, &files, &state.workspace, call))
+            .collect();
+        state.engine.working_set_withhold(timeline, &readings);
+    })
+    .await
+    {
+        tracing::warn!(
+            timeline = timeline.raw(),
+            "withholding the round's read files panicked: {e}"
+        );
     }
 }
 
@@ -5974,30 +5885,6 @@ fn spawn_journal_folds(
             reconcile_journal_now(&state, &conv_id, timeline).await;
         }
     });
-}
-
-/// Release `timeline`'s working-set locks into provenance
-/// (`docs/zend_working_set.md` §4.6). The seeds are not touched: they entered
-/// provenance when the conversation opened and fade there like any other file.
-/// On the blocking pool: it writes through the persistence owner, whose flow
-/// control can wait for room.
-async fn release_working_set(state: &Arc<InferenceState>, timeline: TimelineId) {
-    let Some(config) = state.working_set.clone() else {
-        return;
-    };
-    let state = Arc::clone(state);
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        state
-            .engine
-            .working_set_release(timeline, config.released_momentum());
-    })
-    .await
-    {
-        tracing::warn!(
-            timeline = timeline.raw(),
-            "releasing the working set panicked: {e}"
-        );
-    }
 }
 
 /// Resolve `config`'s seeds for `timeline` on its own branch and seed its

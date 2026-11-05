@@ -8,11 +8,14 @@
 //! answer at once with the task's handle: the conversation waits on it with
 //! `job_status`, which reads a task as it reads any job.
 
+use std::collections::{BTreeSet, HashSet};
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::caller::Caller;
 use super::ops_tools::OpsCall;
+use super::parts::SUB_RUN;
 use super::roles::WorkerKind;
 use super::threads::{self, Effort, Priority};
 use super::tools::job::JobHandle;
@@ -27,8 +30,17 @@ pub const NUDGE: &str = "repo_task_nudge";
 /// Every tool here: what a task's tool list never holds.
 pub const TASK_TOOLS: [&str; 3] = [START, REPLY, NUDGE];
 
+/// Hold out of a round's grammar the tools its conversation never calls. A
+/// task, and every part under it, starts parts and never tasks; a person's
+/// dialogue and a chat start tasks and never parts. `offered` is what the
+/// round's mode offers: a tool it does not offer has no path to hold out.
+pub fn withhold_by_kind(tools: &mut BTreeSet<&'static str>, offered: &HashSet<String>, is_task: bool) {
+    let out: &[&'static str] = if is_task { &TASK_TOOLS } else { &[SUB_RUN] };
+    tools.extend(out.iter().copied().filter(|t| offered.contains(*t)));
+}
+
 /// A task's handle, `task:<thread>/<name>`.
-fn task_handle(thread: &str, name: &str) -> String {
+pub fn task_handle(thread: &str, name: &str) -> String {
     JobHandle::Task {
         thread: thread.to_string(),
         name: name.to_string(),
@@ -151,5 +163,23 @@ mod tests {
         );
         assert_eq!(d, thread_of("1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015"));
         assert_ne!(d, thread_of("another"));
+    }
+
+    /// **A task never starts a task, and a dialogue never starts a part**:
+    /// each holds the other's tools out, and only the tools its mode offers.
+    #[test]
+    fn each_kind_holds_out_the_others_tools() {
+        let offered: HashSet<String> = [SUB_RUN, START, REPLY, NUDGE, "file_read"]
+            .map(String::from)
+            .into();
+        let mut task = BTreeSet::new();
+        withhold_by_kind(&mut task, &offered, true);
+        assert_eq!(task, BTreeSet::from(TASK_TOOLS));
+        let mut dialogue = BTreeSet::new();
+        withhold_by_kind(&mut dialogue, &offered, false);
+        assert_eq!(dialogue, BTreeSet::from([SUB_RUN]));
+        let mut bare = BTreeSet::new();
+        withhold_by_kind(&mut bare, &HashSet::from(["file_read".to_string()]), false);
+        assert!(bare.is_empty(), "{bare:?}");
     }
 }

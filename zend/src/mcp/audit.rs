@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::fast_path::coverage::response_bodies;
+use crate::working_set::coverage::response_bodies;
 
 /// A URL as it appears in text: up to the first character that ends one.
 /// Parentheses are kept — a path may hold them — and an unbalanced closing

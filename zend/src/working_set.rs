@@ -1,18 +1,17 @@
 //! The dialogue's working set, as the daemon drives it
-//! (`docs/zend_working_set.md`): which calls release it, how long a served
-//! read's lock stands ([`promises`]), what it is seeded with, and how its locks
-//! come back after a restart.
+//! (`docs/zend_working_set.md`): what it is seeded with ([`seeds`]), which
+//! ingested readings stand for a file ([`corpus`]), and whether a reading
+//! covers its whole file ([`coverage`]).
 //!
 //! The state and the projection rule live in `candle_conversation`; this is
 //! the part that knows about tools, repositories and turns.
 
-pub mod promises;
-pub mod restore;
+pub mod corpus;
+pub mod coverage;
 pub mod seeds;
 
 use anyhow::bail;
-use candle_conversation::projection::{LayerId, Schema, TimelineId};
-use candle_conversation::working_set::marks::lock_tag;
+use candle_conversation::projection::{LayerId, Schema};
 use candle_conversation::working_set::WorkingSetConfig;
 use zend_tools::registry;
 
@@ -46,75 +45,12 @@ pub fn dialogue_config(
     Ok(Some(config))
 }
 
-/// The lock marks the turn carrying a round's results gets: one per call the
-/// working set served, in the order served. What the round's writes ended
-/// follows them ([`promises::Release`]): served calls always precede the
-/// round's first write, so replaying the marks ends them too — exactly as the
-/// live round did.
-pub fn round_marks(served: &[TimelineId]) -> Vec<String> {
-    served.iter().map(|&tl| lock_tag(tl)).collect()
-}
-
-/// Whether a call to `tool` — under any name the registry answers to —
-/// releases the working set's locks.
-pub fn releases(config: &WorkingSetConfig, tool: &str) -> bool {
-    let canonical = |name: &str| registry::find(name).map(|t| t.name);
-    let Some(called) = canonical(tool) else {
-        return false;
-    };
-    config
-        .release_on
-        .iter()
-        .any(|name| canonical(name) == Some(called))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
 
     use candle_conversation::models::Dialect;
     use candle_conversation::projection::Builder;
-
-    fn config(release_on: &[&str]) -> WorkingSetConfig {
-        WorkingSetConfig {
-            budget_tokens: 1_000,
-            folder_tokens: 100,
-            lock_tokens: 1_000,
-            beta: 0.2,
-            min_momentum: 100.0,
-            max_file_tokens: 500,
-            seeds: Vec::new(),
-            release_on: release_on.iter().map(|s| s.to_string()).collect(),
-            max_admits: NonZeroUsize::new(2).unwrap(),
-        }
-    }
-
-    /// The results turn carries a lock per served call, in order; a round that
-    /// served nothing carries none.
-    #[test]
-    fn a_rounds_marks_are_its_locks_in_order() {
-        let tl = |raw: u64| TimelineId::from_raw(raw).unwrap();
-        assert_eq!(
-            round_marks(&[tl(7), tl(3)]),
-            vec![
-                "working_set:lock:7".to_string(),
-                "working_set:lock:3".to_string(),
-            ]
-        );
-        assert!(round_marks(&[]).is_empty());
-    }
-
-    /// A write releases under its own name and under any alias; a read never.
-    #[test]
-    fn a_write_releases_under_any_of_its_names() {
-        let c = config(&["write", "git_commit"]);
-        assert!(releases(&c, "write"));
-        assert!(releases(&c, "file_write"));
-        assert!(releases(&c, "git_commit"));
-        assert!(!releases(&c, "file_read"));
-        assert!(!releases(&c, "no_such_tool"));
-    }
 
     /// Every name in the bundled schema's `release_on` is a registered tool —
     /// the check `dialogue_config` makes at load.

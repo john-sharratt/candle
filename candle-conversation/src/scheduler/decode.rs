@@ -1734,7 +1734,10 @@ impl Scheduler {
                         }
                     }
                     None => {
-                        if let Some(mut driver) = state.triggers.driver_for(token) {
+                        // Held as a turn that has reasoned for as long as this
+                        // one's block ran: what the first `</think>` closed.
+                        let reasoned = state.think_close_at.unwrap_or(0);
+                        if let Some(mut driver) = state.triggers.driver_after(token, reasoned) {
                             // A trigger token (e.g. `<tool_call>`) opened a grammar:
                             // steer the rest of this call to the catalog's shape.
                             // A once-trigger (the think block) is spent by firing,

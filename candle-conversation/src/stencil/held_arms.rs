@@ -12,10 +12,11 @@
 //! branch nodes and those arms' token sequences — a few tokens per tool per
 //! level.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::named_arm::arm_name;
-use super::tree::{NodeId, StencilTree};
+use super::tree::{NodeId, StencilNode, StencilTree};
 use super::vocab::TokenId;
 
 /// The arms each name branch of a tree is held to, by branch node.
@@ -61,10 +62,12 @@ pub fn held_branches(
 }
 
 /// [`held_branches`], with the first call held to `first` alone when given:
-/// the turn's opening call is that tool, and every call after it may be any
-/// of `names`. A turn whose first call must say something before it acts —
-/// a note of what its thinking concluded (`docs/zend_journal.md` §5.2) — is
-/// held this way.
+/// the turn's opening call is that tool, every call after it may be any of
+/// `names`, and the turn may not end after the first — the choice that follows
+/// it is held to the arm that opens another call. A turn whose first call must
+/// say something before it acts — a note of what its thinking concluded
+/// (`docs/zend_journal.md` §5.2) — is held this way, so a note is always
+/// followed by the act it was written for.
 pub fn held_branches_first(
     tree: &StencilTree,
     names: &[String],
@@ -109,7 +112,59 @@ pub fn held_branches_first(
             by_node.push((node, Arc::from(held)));
         }
     }
+    if let (Some(only), Some(opening)) = (first_call, opening) {
+        if let Some(goes_on) = continuation_after(tree, opening, only, &decode) {
+            by_node.push(goes_on);
+        }
+    }
     HeldBranches { by_node }
+}
+
+/// The go-again-or-finish choice a call reaches once the tool `first` is
+/// written at the branch `opening`, held to the arms that go again.
+///
+/// That choice is the one branch a call's body leads to with an arm straight
+/// to the tree's end — finishing the turn — beside one that does not, opening
+/// the next call. Every way through the call's arguments meets it before
+/// anything of the next call, so the first such branch a walk from `first`'s
+/// arm finds is the one after this call.
+fn continuation_after(
+    tree: &StencilTree,
+    opening: NodeId,
+    first: &str,
+    decode: &impl Fn(&[TokenId]) -> Option<String>,
+) -> Option<(NodeId, Arc<[Vec<TokenId>]>)> {
+    let names = tree.branch(opening)?;
+    let arm = names
+        .arms()
+        .into_iter()
+        .find(|a| decode(a).is_some_and(|t| arm_name(t.as_bytes()) == first))?;
+    let ends = |node: NodeId| matches!(tree.node(node), StencilNode::End);
+    let mut todo = vec![names.target_of(&arm)?];
+    let mut seen = HashSet::new();
+    while let Some(node) = todo.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        match tree.node(node) {
+            StencilNode::Static { next, .. } => todo.push(*next),
+            StencilNode::FreeText(span) => todo.push(span.next),
+            StencilNode::End => {}
+            StencilNode::Branch { trie } => {
+                let arms = trie.arms();
+                let again: Vec<Vec<TokenId>> = arms
+                    .iter()
+                    .filter(|a| trie.target_of(a).is_some_and(|t| !ends(t)))
+                    .cloned()
+                    .collect();
+                if !again.is_empty() && again.len() < arms.len() {
+                    return Some((node, Arc::from(again)));
+                }
+                todo.extend(arms.iter().filter_map(|a| trie.target_of(a)));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -197,9 +252,10 @@ mod tests {
 
     /// **A turn's first call can be held to one tool and the rest to the
     /// turn's**: the opening name branch offers only `first`, every later
-    /// level the names given.
+    /// level the names given — and the choice after the first call is held to
+    /// going on, so the turn cannot end on it.
     #[test]
-    fn the_first_call_is_held_to_its_own_tool() {
+    fn the_first_call_is_held_to_its_own_tool_and_goes_on() {
         let v = TestVocab::new();
         let t = looped(&v, 3);
         let decode = |tokens: &[TokenId]| String::from_utf8(v.decode(tokens)).ok();
@@ -209,17 +265,37 @@ mod tests {
             Some("file_list"),
             decode,
         );
-        assert_eq!(held.len(), 3);
+        assert_eq!(held.len(), 4, "three name branches and the choice after the first");
         let opening = t.first_branch_node().unwrap();
         assert_eq!(names(held.arms_at(opening).unwrap(), &v), ["file_list"]);
+        let mut choices = 0;
         for i in 0..t.len() as u32 {
             let node = NodeId(i);
             if node == opening {
                 continue;
             }
-            if let Some(arms) = held.arms_at(node) {
+            let Some(arms) = held.arms_at(node) else {
+                continue;
+            };
+            let trie = t.branch(node).unwrap();
+            if trie.arm_count() == 2 {
+                choices += 1;
+                assert_eq!(arms.len(), 1, "held to going on alone");
+                let next = trie.target_of(&arms[0]).unwrap();
+                assert!(!matches!(t.node(next), StencilNode::End), "going on, not ending");
+                assert!(
+                    String::from_utf8(v.decode(&arms[0])).unwrap().contains("<tool_call>"),
+                    "the arm opens the next call"
+                );
+            } else {
                 assert_eq!(names(arms, &v), ["file_read", "write"]);
             }
         }
+        assert_eq!(choices, 1);
+        assert_eq!(
+            held_branches(&t, &given(&["file_read"]), decode).len(),
+            3,
+            "with no first call held, no choice is"
+        );
     }
 }

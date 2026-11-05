@@ -47,7 +47,8 @@ impl Tool for CodeSessionExec {
     const NAME: &'static str = "code_session_exec";
     const DESCRIPTION: &'static str =
         "Execute JavaScript in a persistent session. Variable/function/const definitions from \
-         earlier calls remain in scope. Returns stdout, stderr, an ok flag, the final \
+         earlier calls remain in scope, so a name an earlier call declared with const or let \
+         cannot be declared again: use it as it stands, or declare a new name. Returns stdout, stderr, an ok flag, the final \
          expression's value in result, and error details when ok=false.";
     type Request = SessionExecReq;
     type Response = SessionExecResp;

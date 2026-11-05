@@ -95,7 +95,9 @@ pub struct SubagentRequest {
 pub struct SubagentResponse {
     /// The part's address, which the caller cites.
     pub path: String,
-    /// `done` or `error`: a part asks nobody, so it never waits.
+    /// `done` or `error`: a part asks nobody, so it never waits. `started`
+    /// for a task a conversation that is not a task started in its place,
+    /// which runs on while the call returns.
     pub state: String,
     /// The part's journal entry — its line, claims and address — or, with no
     /// entry kept, the end of its final response or its error.

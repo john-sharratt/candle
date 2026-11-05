@@ -334,6 +334,17 @@ start parts, a part's part may not (`parts::MAX_DEPTH`,
 reports only to its task, never to a thread. The cap and the waiting together
 keep parts bounded in a way tasks would not be.
 
+**A conversation never starts a part.** The mirror of the rule above: a
+person's dialogue and a chat have `sub_run` withheld from their grammar, as a
+task has the task tools withheld (`zen_tasks::withhold_by_kind`). A research
+ask from a dialogue therefore has one path, `repo_task_start`. Should a
+`sub_run` reach the runner from a conversation that is not a task anyway, it
+starts a task on that conversation's thread through `repo_task_start`, as its
+person, and answers with the task's handle (`zend/src/mcp/parts.rs`); it is
+never refused. A task's own `sub_run` always starts a part, so this path can
+never start a task from a task, and a task it starts has the task tools
+withheld like any other.
+
 **A conversation's own loop is bounded by its turn.** A dialogue or chat that
 starts a task, reads the answer and starts another is one turn's tool rounds.
 Its round cap and repeat guard close it as they close any turn

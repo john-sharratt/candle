@@ -1,7 +1,7 @@
 //! One dialogue's working set: the conversations it carries ahead of its own
 //! turns, in the order they entered (`docs/zend_working_set.md` §4.3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::projection::{TimelineId, WorkingSetShare};
@@ -99,9 +99,25 @@ pub struct WorkingSet {
     /// Momentum per conversation — members and candidates alike. A locked
     /// member's entry is frozen until its release.
     momentum: HashMap<TimelineId, f32>,
+    /// Conversations that may not enter for now: the readings of files the
+    /// current turn's loop read for real, already verbatim in its dialogue
+    /// ([`Self::withhold`]). They keep their momentum, and a member among them
+    /// keeps its place — evicting it would rebuild the slot past it for one
+    /// file's tokens.
+    withheld: HashSet<TimelineId>,
 }
 
 impl WorkingSet {
+    /// Keep `timelines` from entering until [`Self::clear_withheld`]. A member
+    /// among them stays where it is.
+    pub fn withhold(&mut self, timelines: impl IntoIterator<Item = TimelineId>) {
+        self.withheld.extend(timelines);
+    }
+
+    /// Let every withheld conversation enter again: the turn's loop has ended.
+    pub fn clear_withheld(&mut self) {
+        self.withheld.clear();
+    }
     /// Every member in emission order, each with whether it is locked.
     pub fn members(&self) -> Vec<(TimelineId, bool)> {
         self.members
@@ -355,7 +371,7 @@ impl WorkingSet {
         let mut newcomers: Vec<(TimelineId, f32)> = self
             .momentum
             .iter()
-            .filter(|(timeline, _)| !self.is_member(**timeline))
+            .filter(|(timeline, _)| !self.is_member(**timeline) && !self.withheld.contains(timeline))
             .map(|(timeline, m)| (*timeline, *m))
             .collect();
         newcomers.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
@@ -521,6 +537,22 @@ mod tests {
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
         let fresh: HashMap<TimelineId, f32> = fresh.iter().map(|&(r, s)| (tl(r), s)).collect();
         ws.observe(&fresh, 0.2, 100.0, limits(budget), NonZeroUsize::MAX, &info);
+    }
+
+    /// **A withheld conversation does not enter, and a withheld member stays**:
+    /// the turn's loop read that file for real, so placing it again would be a
+    /// duplicate, and evicting it would rebuild the slot. Cleared, it enters on
+    /// the momentum it kept.
+    #[test]
+    fn a_withheld_conversation_waits_and_a_withheld_member_stays() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(1, 900.0)], 1_000);
+        ws.withhold([tl(1), tl(2)]);
+        observe(&mut ws, &[(2, 900.0)], 1_000);
+        assert_eq!(order(&ws), vec![1], "a member keeps its place; a newcomer waits");
+        ws.clear_withheld();
+        observe(&mut ws, &[], 1_000);
+        assert_eq!(order(&ws), vec![1, 2], "it enters on the momentum it kept");
     }
 
     /// **Locks enter just before the insertion point**: the oldest lock stays

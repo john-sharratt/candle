@@ -15,21 +15,35 @@
 //! sibling. A part from an earlier turn of the same worker is not that call's
 //! part, so asking for its name again starts a numbered sibling.
 //!
+//! **A caller that is not a task starts a task.** A person's dialogue and a
+//! chat have `sub_run` withheld from their rounds (`docs/zen_tool_reach.md`
+//! §6.3), so the call reaches here only from a task or its part. Should one
+//! arrive from a conversation that is not a task anyway, it starts a task on
+//! that conversation's thread through `repo_task_start`, run as its person,
+//! and answers with the task's handle — never a part, and never a refusal. A
+//! task's own call always starts a part, so a task never starts a task.
+//!
 //! The runner is held by the session's `/mcp` state and handed to every tool
 //! context; it reaches the session through a weak handle, bound when the
 //! session starts loading, so a context never keeps the session alive.
 
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use serde_json::json;
 use tokio::runtime::Handle;
-use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner};
+use zend_tools::{OpsRunner, SubagentRequest, SubagentResponse, SubagentRunner};
 
 use super::names::{leaf, parent_of, split_numbered};
 use super::threads::{self, State, Worker};
 use super::tools::wait::result_of;
 use super::workers::{self, now_ms};
+use super::zen_tasks::{self, task_handle};
 use crate::session::ZendSession;
+
+/// The tool that starts a part, as the catalog names it: what a conversation
+/// that is not a task never holds.
+pub const SUB_RUN: &str = "sub_run";
 
 /// How long one wait on a part runs before it reads the record again. A part
 /// is waited on to its end; the slice only bounds how stale a read can be.
@@ -71,6 +85,9 @@ pub struct Parts {
     bound: OnceLock<(Weak<ZendSession>, Handle)>,
     /// Held while a call finds or starts its part.
     claiming: Mutex<()>,
+    /// What starts a task for a caller that is not one: the runner of the
+    /// conversations' own `repo_task_start`.
+    tasks: OnceLock<Arc<dyn OpsRunner>>,
 }
 
 impl Parts {
@@ -78,6 +95,28 @@ impl Parts {
     /// that session's tasks are spawned on.
     pub fn bind(&self, session: Weak<ZendSession>, runtime: Handle) {
         let _ = self.bound.set((session, runtime));
+    }
+
+    /// Start a caller's tasks through `ops`, the runner its `repo_task_start`
+    /// runs on.
+    pub fn starting_tasks_with(&self, ops: Arc<dyn OpsRunner>) {
+        let _ = self.tasks.set(ops);
+    }
+
+    /// Start `req` as a task on `caller`'s thread, for a caller that is not a
+    /// task.
+    fn start_task(&self, caller: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
+        let ops = self
+            .tasks
+            .get()
+            .ok_or("no runner starts this conversation's tasks")?;
+        let args = json!({"name": req.name, "prompt": req.prompt});
+        let result = ops.run(caller, zen_tasks::START, args)?;
+        Ok(SubagentResponse {
+            path: task_handle(&zen_tasks::thread_of(caller), &req.name),
+            state: "started".into(),
+            result,
+        })
     }
 }
 
@@ -114,12 +153,9 @@ pub fn response(part: &Worker) -> SubagentResponse {
 
 impl SubagentRunner for Parts {
     fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
-        let Some((owner, thread, name)) = threads::conv_names(parent) else {
-            return Err(
-                "`sub_run` starts parts of a task Claude delegated through this MCP server, \
-                 and this conversation is not one"
-                    .into(),
-            );
+        let caller = parent;
+        let Some((owner, thread, name)) = threads::conv_names(caller) else {
+            return self.start_task(caller, req);
         };
         let (session, runtime) = self
             .bound
@@ -134,6 +170,10 @@ impl SubagentRunner for Parts {
             .ok_or("the model is still loading")?;
         let parent = threads::worker(&records, owner, thread, name)
             .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
+        // A chat is a conversation, not a task: it starts tasks.
+        if parent.kind.is_chat() {
+            return self.start_task(caller, req);
+        }
         check_depth(&parent)?;
         let mut part = {
             // Finding and starting are one step, so two calls for one name in
@@ -287,21 +327,50 @@ mod tests {
         assert!(!lost(&failed));
     }
 
-    /// A conversation that is not an `/mcp` worker cannot start parts, and
-    /// says why; nothing is bound, so no session is touched.
+    /// Records each call it runs, and answers it.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(String, String, serde_json::Value)>>);
+
+    impl OpsRunner for Recording {
+        fn run(&self, caller: &str, tool: &str, args: serde_json::Value) -> Result<String, String> {
+            let mut calls = self.0.lock().unwrap();
+            calls.push((caller.into(), tool.into(), args));
+            Ok("Started".into())
+        }
+    }
+
+    /// **A conversation that is not a task starts a task, not a part**: its
+    /// `sub_run` runs `repo_task_start` as that conversation, on its thread,
+    /// and answers with the task's handle. Nothing is bound, so no session is
+    /// touched.
     #[test]
-    fn a_conversation_not_delegated_through_mcp_is_refused() {
+    fn a_conversation_that_is_not_a_task_starts_a_task() {
         let parts = Parts::default();
-        let err = parts
+        let ops = Arc::new(Recording::default());
+        parts.starting_tasks_with(Arc::clone(&ops) as _);
+        let dialogue = "1a7f30b0-2e8d-4ba4-ab2e-13cc882fc015";
+        let r = parts
             .run(
-                "c-123",
+                dialogue,
                 SubagentRequest {
                     name: "read".into(),
                     prompt: "p".into(),
                 },
             )
-            .err()
             .unwrap();
-        assert!(err.contains("not one"), "{err}");
+        assert_eq!(r.state, "started");
+        assert_eq!(
+            r.path,
+            format!("task:{}/read", zen_tasks::thread_of(dialogue))
+        );
+        let calls = ops.0.lock().unwrap();
+        assert_eq!(
+            *calls,
+            [(
+                dialogue.to_string(),
+                zen_tasks::START.to_string(),
+                json!({"name": "read", "prompt": "p"})
+            )]
+        );
     }
 }
