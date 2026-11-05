@@ -360,17 +360,41 @@ mod tests {
             .filter(|n| held.arms_at(*n).is_some())
             .collect();
         assert!(held_choices.len() > 1, "one copy per way the call closes");
-        assert_eq!(
-            held_choices.len() * 2,
-            all.len(),
-            "the first call's, not the second's"
-        );
-        for node in held_choices {
+        assert!(held_choices.len() < all.len(), "the later calls' are free");
+        // Everything a held choice's go-on arm leads to is the next call's:
+        // no choice there is held.
+        let mut later = HashSet::new();
+        let mut todo: Vec<NodeId> = Vec::new();
+        for &node in &held_choices {
             let trie = t.branch(node).unwrap();
             for arm in held.arms_at(node).unwrap().iter() {
                 let next = trie.target_of(arm).unwrap();
                 assert!(!matches!(t.node(next), StencilNode::End), "going on");
+                todo.push(next);
             }
         }
+        while let Some(node) = todo.pop() {
+            if !later.insert(node) {
+                continue;
+            }
+            match t.node(node) {
+                StencilNode::Static { next, .. } => todo.push(*next),
+                StencilNode::FreeText(span) => {
+                    todo.push(span.next);
+                    todo.extend(span.forks.iter().copied());
+                }
+                StencilNode::Branch { trie } => {
+                    todo.extend(trie.arms().iter().filter_map(|a| trie.target_of(a)))
+                }
+                StencilNode::End => {}
+            }
+        }
+        for node in &held_choices {
+            assert!(!later.contains(node), "a later call's choice is held");
+        }
+        assert!(
+            all.iter().any(|n| later.contains(n)),
+            "the walk reached the later calls"
+        );
     }
 }
