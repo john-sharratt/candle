@@ -23,6 +23,24 @@
   const J = (a) => a.join('\n');
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // A finished reply's parts, as the daemon's history stores them: built from
+  // the reply's prose and its `part` events.
+  function storedProse(parts, text) {
+    const last = parts[parts.length - 1];
+    if (last && last.kind === 'prose') last.text += text; else parts.push({ kind: 'prose', text });
+  }
+  function storedPart(parts, ev) {
+    if (ev.op === 'open') { parts.push({ kind: ev.kind, id: ev.id, tool: ev.tool || null, text: '', args: [], ok: false }); return; }
+    const p = parts.find((x) => x.id === ev.id);
+    if (!p) return;
+    if (ev.op === 'arg') {
+      const last = p.args[p.args.length - 1];
+      if (last && last[0] === ev.name) last[1] += ev.text; else p.args.push([ev.name, ev.text]);
+    } else if (ev.op === 'text') p.text += ev.text || '';
+    else if (ev.op === 'close') { p.ok = ev.ok; if (ev.error) p.error = ev.error; }
+    else if (ev.op === 'result') { p.result = ev.result; p.tokens = ev.tokens; }
+  }
+
   const ZendMockAPI = {
     _fileSeq: 1000,
     _spanSeq: 0,
@@ -697,15 +715,17 @@
       this._liveTurns = this._liveTurns || {};
       this._liveTurns[id] = turn;
       const fan = { onError: () => {} };
-      ['onStatus', 'onToken', 'onProjection', 'onTool', 'onThink', 'onPrefill', 'onLog'].forEach((k) => {
+      turn.parts = [];
+      ['onStatus', 'onToken', 'onProjection', 'onPart', 'onPrefill', 'onLog'].forEach((k) => {
         fan[k] = (...args) => {
-          if (k === 'onToken') turn.content += args[0];
+          if (k === 'onToken') { turn.content += args[0]; storedProse(turn.parts, args[0]); }
+          if (k === 'onPart') storedPart(turn.parts, args[0]);
           turn.frames.push([k, args]);
           turn.clients.forEach((c) => { if (c[k]) c[k](...args); });
         };
       });
       fan.onDone = () => {
-        stored.history = stored.history.concat([{ role: 'assistant', content: turn.content }]);
+        stored.history = stored.history.concat([{ role: 'assistant', content: turn.content, parts: turn.parts }]);
         turn.done = true;
         delete this._liveTurns[id];
         const clients = turn.clients;
@@ -753,26 +773,50 @@
         later(34, () => { handlers.onError(failure.message, { reached: !!failure.reached }); handlers.onDone(); });
         return { cancel: () => { cancelled = true; timers.forEach((t) => clearTimeout(t)); } };
       }
-      const streamText = (reply, then) => {
-        const tokens = reply.match(/\S+\s*|\s+/g) || [reply];
-        let i = 0, acc = '', thinkEmitted = false, thinkClosed = false;
+      // The daemon sends a reply's prose as text and its reasoning and calls
+      // as parts (`zend/src/parts.rs`); the mock does the same.
+      let nextPart = 0;
+      const partId = () => 'p' + (nextPart++);
+      const part = (ev) => { if (handlers.onPart) handlers.onPart(ev); };
+      // Stream `chunks` one at a time through `each`, then `then`.
+      const drip = (chunks, each, then) => {
+        let i = 0;
         const timer = setInterval(() => {
           if (cancelled) { clearInterval(timer); return; }
-          if (i >= tokens.length) { clearInterval(timer); then(); return; }
-          acc += tokens[i];
-          // The reasoning's running count and, at `</think>`, its total — sent
-          // ahead of the token that carries it, as the daemon does.
-          if (!thinkClosed && acc.includes('<think>') && handlers.onThink) {
-            thinkClosed = acc.includes('</think>');
-            handlers.onThink({ tokens: i + 1, done: thinkClosed });
-          }
-          handlers.onToken(tokens[i]);
-          // A think-phase event lands on the timeline the moment reasoning closes.
-          if (!thinkEmitted && acc.includes('</think>')) { thinkEmitted = true; handlers.onProjection(this.mkProjEvent(conv, 'think')); }
+          if (i >= chunks.length) { clearInterval(timer); then(); return; }
+          each(chunks[i], i);
           if (i % 7 === 0 && handlers.onLog) handlers.onLog();
           i++;
         }, 34);
         timers.push(timer);
+      };
+      const words = (s) => s.match(/\S+\s*|\s+/g) || [s];
+      // A canned reply: its reasoning as a part, then its prose.
+      const streamText = (reply, then) => {
+        const open = reply.indexOf('<think>');
+        const close = reply.indexOf('</think>');
+        const prose = () => drip(words(close >= 0 ? reply.slice(close + 8) : reply), (w) => handlers.onToken(w), then);
+        if (open < 0 || close < 0) { prose(); return; }
+        const id = partId();
+        part({ op: 'open', id, kind: 'think' });
+        drip(words(reply.slice(open + 7, close)), (w, i) => part({ op: 'text', id, text: w, tokens: i + 1 }), () => {
+          part({ op: 'close', id, ok: true });
+          // A think-phase event lands on the timeline the moment reasoning closes.
+          handlers.onProjection(this.mkProjEvent(conv, 'think'));
+          prose();
+        });
+      };
+      // A call, its arguments written as they decode, then run and answered.
+      const streamCall = (tool, args, result, tokens, then) => {
+        const id = partId();
+        part({ op: 'open', id, kind: 'call', tool });
+        const chunks = [];
+        Object.keys(args).forEach((name) => words(args[name]).forEach((w) => chunks.push([name, w])));
+        drip(chunks, ([name, w]) => part({ op: 'arg', id, name, text: w }), () => {
+          part({ op: 'close', id, ok: true });
+          part({ op: 'run', ids: [id] });
+          later(250, () => { part({ op: 'result', id, result, tokens }); then(); });
+        });
       };
       const answer = () => streamText(this.cannedReply(text, opts), () => {
         handlers.onProjection(this.mkProjEvent(conv, 'answer')); // decode-end event (final t/s)
@@ -793,13 +837,7 @@
       };
       const toolRound = () => {
         const path = 'crates/substrate/src/redo.rs';
-        streamText('<tool_call>{"name":"read_file","arguments":{"path":"' + path + '"}}</tool_call>\n\n', () => {
-          if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['read_file'] });
-          later(250, () => {
-            if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['read_file'], results: [{ path, content: this._fileContent[1] || '' }], tokens: [2140] });
-            prefillThen(18432, answer);
-          });
-        });
+        streamCall('read_file', { path }, { path, content: this._fileContent[1] || '' }, 2140, () => prefillThen(18432, answer));
       };
       // A message asking to write a file streams a `write` whose content runs
       // long — the case the live writing box exists for — then its result.
@@ -817,14 +855,7 @@
           '## Recovery', '',
           'On open the reader replays every segment in order, rebuilding the substrate from',
           'the records it can verify. A torn tail is truncated, not repaired.'].join('\n');
-        const call = JSON.stringify({ name: 'write', arguments: { path, content: body } });
-        streamText('<tool_call>' + call + '</tool_call>\n\n', () => {
-          if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['write'] });
-          later(250, () => {
-            if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['write'], results: [{ path, bytes: body.length }], tokens: [24] });
-            prefillThen(6144, answer);
-          });
-        });
+        streamCall('write', { path, content: body }, { path, bytes: body.length }, 24, () => prefillThen(6144, answer));
       };
       later(34, () => {
         handlers.onStatus('');

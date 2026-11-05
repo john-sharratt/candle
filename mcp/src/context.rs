@@ -55,11 +55,8 @@ pub fn needs_memory(tool: &str, args: &Value) -> bool {
     MEMORY.contains(&tool)
 }
 
-/// The silence after which a call is the first of a new conversation, for a
-/// client that keeps one session across them.
-pub const CONVERSATION_GAP_MS: u64 = 30 * 60 * 1000;
-/// How many conversations' clocks are kept before the stale are let go — a
-/// clock older than [`CONVERSATION_GAP_MS`] says what no clock says.
+/// How many conversations' clocks are kept; past this, the idlest is let go,
+/// and its session's next call begins a conversation again.
 const CLOCKS_KEPT: usize = 4096;
 
 /// The memory's own tools: what they do is the memory, never an episode.
@@ -171,21 +168,23 @@ pub fn after(
 }
 
 /// When each conversation last had a call: what tells the first call of the
-/// next. A conversation is a person's session through a client — a new
-/// session is a new conversation — and a session silent for
-/// [`CONVERSATION_GAP_MS`] is one again.
+/// next. A conversation is a person's session through a client, for as long
+/// as the session lasts — a new session is a new conversation, and a long
+/// silence within one is not. Its context is delivered once, on its first
+/// call: re-sent after every pause, it cost a long session thousands of
+/// tokens a time.
 #[derive(Debug, Default)]
 pub struct Conversations(Mutex<HashMap<String, u64>>);
 
 impl Conversations {
     /// A call at `now` on `who`, held for as long as the call runs: it
     /// [`Claim::begins`] the conversation when the conversation has never been
-    /// stamped, or not since [`CONVERSATION_GAP_MS`]. Beginning claims the
-    /// conversation in the same step, so a client that opens with several
-    /// calls at once has one of them begin it, and the context is read once
-    /// and follows one answer. A claim that begins and is not kept — its
-    /// context never delivered, the client gone, the call unwound — is given
-    /// up when it drops, and the next call begins the conversation again.
+    /// stamped. Beginning claims the conversation in the same step, so a
+    /// client that opens with several calls at once has one of them begin it,
+    /// and the context is read once and follows one answer. A claim that
+    /// begins and is not kept — its context never delivered, the client gone,
+    /// the call unwound — is given up when it drops, and the next call begins
+    /// the conversation again.
     pub fn claim(&self, who: &str, now_ms: u64) -> Claim<'_> {
         Claim {
             begins: self.begin(who, now_ms),
@@ -199,12 +198,13 @@ impl Conversations {
     /// Whether `who` begins at `now`, stamping it in the same step if so.
     fn begin(&self, who: &str, now_ms: u64) -> bool {
         let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let begins = last
-            .get(who)
-            .is_none_or(|&then| now_ms.saturating_sub(then) > CONVERSATION_GAP_MS);
+        let begins = !last.contains_key(who);
         if begins {
             if last.len() >= CLOCKS_KEPT {
-                last.retain(|_, then| now_ms.saturating_sub(*then) <= CONVERSATION_GAP_MS);
+                let idlest = last.iter().min_by_key(|(_, &then)| then).map(|(w, _)| w.clone());
+                if let Some(idlest) = idlest {
+                    last.remove(&idlest);
+                }
             }
             last.insert(who.to_string(), now_ms);
         }
@@ -221,7 +221,7 @@ impl Conversations {
     }
 
     /// Give up the claim on `who` made at `at` — only if it is still that
-    /// claim: one a later call made after a gap is its own.
+    /// claim: one a later call made after it was given up is its own.
     fn release(&self, who: &str, at: u64) {
         let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if last.get(who) == Some(&at) {
@@ -485,20 +485,19 @@ mod tests {
         assert!(!stamp(GET, true, true, false), "a failed one is not");
     }
 
-    /// **A conversation begins on a session's first call, or after half an
-    /// hour of silence**; each later call keeps its clock running.
+    /// **A conversation begins on a session's first call, and only then**:
+    /// however long the session is silent, its next call carries no context
+    /// again.
     #[test]
-    fn a_conversation_begins_on_a_new_session_or_after_a_gap() {
+    fn a_conversation_begins_once_per_session() {
         let c = Conversations::default();
         let s1 = who("o", "grok", "s1");
         c.claim(&s1, 1_000).keep(1_000);
         let again = c.claim(&s1, 2_000);
         assert!(!again.begins(), "kept, it does not begin again");
         again.keep(2_000);
-        let later = c.claim(&s1, 2_000 + CONVERSATION_GAP_MS);
-        assert!(!later.begins());
-        later.keep(2_000 + CONVERSATION_GAP_MS);
-        assert!(c.claim(&s1, 2_001 + 2 * CONVERSATION_GAP_MS).begins());
+        let hours_later = 2_000 + 6 * 60 * 60 * 1000;
+        assert!(!c.claim(&s1, hours_later).begins(), "a pause is not a new conversation");
         assert!(
             c.claim(&who("o", "grok", "s2"), 2_000).begins(),
             "a new session"
@@ -532,30 +531,33 @@ mod tests {
         assert!(c.claim(&s, 1_002).begins());
     }
 
-    /// **A slow claim given up leaves a newer one standing**: a call that
-    /// began the conversation again after a gap keeps its own claim.
+    /// **A claim given up leaves a newer one standing**: a call that began
+    /// the conversation again after the first claim was given up keeps its
+    /// own.
     #[test]
-    fn a_stale_claim_given_up_leaves_a_newer_one() {
+    fn a_claim_given_up_leaves_a_newer_one() {
         let c = Conversations::default();
         let s = who("o", "grok", "s");
         let slow = c.claim(&s, 1_000);
-        let after_gap = c.claim(&s, 1_001 + CONVERSATION_GAP_MS);
-        assert!(slow.begins() && after_gap.begins());
         drop(slow);
-        after_gap.keep(1_002 + CONVERSATION_GAP_MS);
-        assert!(!c.claim(&s, 1_003 + CONVERSATION_GAP_MS).begins());
+        let next = c.claim(&s, 1_001);
+        assert!(next.begins());
+        next.keep(1_002);
+        assert!(!c.claim(&s, 1_003).begins());
     }
 
+    /// **Past the cap the idlest clock is let go**, and only it.
     #[test]
-    fn old_clocks_are_let_go_once_many_are_kept() {
+    fn the_idlest_clock_is_let_go_once_many_are_kept() {
         let c = Conversations::default();
         for i in 0..CLOCKS_KEPT {
-            c.claim(&format!("old{i}"), 0).keep(0);
+            c.claim(&format!("old{i}"), i as u64).keep(i as u64);
         }
-        c.claim("new", CONVERSATION_GAP_MS + 1)
-            .keep(CONVERSATION_GAP_MS + 1);
-        assert_eq!(c.0.lock().unwrap().len(), 1);
-        assert!(!c.claim("new", CONVERSATION_GAP_MS + 2).begins());
+        c.claim("new", CLOCKS_KEPT as u64).keep(CLOCKS_KEPT as u64);
+        assert_eq!(c.0.lock().unwrap().len(), CLOCKS_KEPT);
+        assert!(c.claim("old0", CLOCKS_KEPT as u64 + 1).begins(), "the idlest went");
+        assert!(!c.claim("old5", CLOCKS_KEPT as u64 + 1).begins());
+        assert!(!c.claim("new", CLOCKS_KEPT as u64 + 1).begins());
     }
 
     #[test]

@@ -194,21 +194,34 @@ seedLogs() -> LogLine[]                              // backlog
 subscribeLogs(onLine) -> unsubscribe()              // live stream
 ```
 `opts = { think: boolean, effort: 0..4, verbosity: 0..4 }`.
-`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onTool?({phase, tools, results?}), onThink?({tokens, done}), onPrefill?({done, total}), onLog?(), onError?(message), onDone() }`.
+`handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onPart?(event), onPrefill?({done, total}), onLog?(), onError?(message), onDone() }`.
 
-`onThink` reports the turn's reasoning length in generated tokens (live: the SSE
-`think` event): while its `<think>` block is open, and once more with `done` and
-the total when it closes. It is counted the way the turn records its reasoning at
-seal — every generated token through `</think>` — so the total matches the
-`thinking` length a reloaded history carries for the same turn
-(`{tokens, exact}`, on the assistant message; `exact: false` when the turn's
-reasoning K/V was dropped and the length is an estimate from its prose).
+**The GUI reads a reply as its parts, never as markup**
+(`zend/src/parts.rs`, `docs/zen_coding_session_fixes.md` Cause 1b). The daemon
+splits each reply on the server with the rule the grammar closes values on
+(`candle_conversation::stencil::element_close`): `onToken` carries only the
+reply's prose, and `onPart` (the SSE `part` event, on a request that names its
+conversation in `x-tokera-conversation`) carries its reasoning and calls:
 
-A tool result's length in tokens rides with it the same way: live, the `tool`
-`done` notice carries `tokens` (one per result, encoded as the next turn will
-encode it); on reload, the tool-response user message carries `tool_tokens` (one
-per `<tool_response>` block, counted off the sealed turn's own ids). The two
-agree, and the expanded tool card shows the count in its output header.
+| `op` | Fields | Meaning |
+| --- | --- | --- |
+| `open` | `id`, `kind` (`think` or `call`), `tool` | A part starts |
+| `arg` | `id`, `name`, `text` | The next chunk of a call's argument, as decoded |
+| `text` | `id`, `text`, `tokens` | The next chunk of reasoning, and its running length |
+| `close` | `id`, `ok`, `error` | The part ended; a call that could not be read says why |
+| `run` | `ids` | These calls have started running |
+| `result` | `id`, `result`, `tokens` | A call's result, and its length in tokens in the context |
+
+An id is `p<n>`, the reply's n-th part. A result lands on its own call by id,
+so one call that cannot be read moves no other result. On reload each assistant
+message carries the same `parts` (`prose`, `think`, `call` with `args`, `ok`,
+`error`, `result`, `tokens`), read from its stored text with the same splitter
+and answered by the next tool-response message's results in order, so a reload
+draws what the stream drew. A journal note is a `call` part of
+`journal_note`, drawn as its bubble from its `text` argument as it decodes.
+The reasoning's length on reload is the message's `thinking` (`{tokens,
+exact}`; `exact: false` when the turn's reasoning K/V was dropped and the
+length is an estimate from its prose).
 
 `onPrefill` reports how far the prefill of each turn's input has got, in tokens
 (live: the SSE `prefill` event). After a tool round that input is the tools'

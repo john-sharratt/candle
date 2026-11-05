@@ -321,13 +321,11 @@ impl PartSplit {
             Call::Between => {
                 let lead = self.pending.len() - self.pending.trim_start().len();
                 let rest = &self.pending[lead..];
-                if rest.starts_with(PARAM_TAG) {
-                    let Some(name_len) = rest[PARAM_TAG.len()..].find('>') else {
+                if let Some(named) = rest.strip_prefix(PARAM_TAG) {
+                    let Some(name_len) = named.find('>') else {
                         return false;
                     };
-                    let name = rest[PARAM_TAG.len()..PARAM_TAG.len() + name_len]
-                        .trim()
-                        .to_string();
+                    let name = named[..name_len].trim().to_string();
                     self.pending.drain(..lead + PARAM_TAG.len() + name_len + 1);
                     self.state = State::Call(id, Call::Value { name, started: false });
                     true
