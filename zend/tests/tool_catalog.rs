@@ -136,14 +136,17 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     );
 }
 
-/// The file tools — `file_search`, `file_grep`, `file_read`, `file_list` and
-/// `write` — the two web tools and the journal's two readers are marked
-/// mandatory on the `tools` collection, so they project on every turn on top of
-/// the belief top-k. Finding is in the set alongside reading because a turn
-/// holding only the read pair answers "where is this" by guessing, `write`
+/// The file tools — `file_search`, `file_grep`, `file_read`, `file_list`,
+/// `file_edit` and `write` — the two web tools, the journal's two readers and
+/// its note are marked mandatory on the `tools` collection, so they project on
+/// every turn on top of the belief top-k. Finding is in the set alongside
+/// reading because a turn holding only the read pair answers "where is this" by
+/// guessing, editing because a coding turn's next call is so often an edit that
+/// a projection leaving it out mid-reply left the model without it, `write`
 /// because the edit tool cannot create a file, the web pair because a tool
-/// shown only by name is one the model concludes it does not have, and the
-/// journal readers because the journal's entries point at them every round.
+/// shown only by name is one the model concludes it does not have, the journal
+/// readers because the journal's entries point at them every round, and the
+/// note because the grammar may hold a round's first call to it.
 #[test]
 fn install_tool_catalog_marks_the_mandatory_tools() {
     let mut builder = build_test_projection();
@@ -158,11 +161,13 @@ fn install_tool_catalog_marks_the_mandatory_tools() {
     assert_eq!(
         names,
         [
+            "file_edit",
             "file_grep",
             "file_list",
             "file_read",
             "file_search",
             "journal_grep",
+            "journal_note",
             "journal_read",
             "web_fetch",
             "web_search",
