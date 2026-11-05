@@ -196,11 +196,6 @@ fn unquote(value: &mut Value) {
     }
 }
 
-/// The tool whose calls in one round run at once: each starts a part, which
-/// runs for as long as its own task does, and the parts of one round are
-/// independent by construction — fan-out is what the tool is for.
-const CONCURRENT: &str = "sub_run";
-
 /// The tools that bring content from outside into the turn: the web, a
 /// network session's reply, a remote shell's output, a remote file. A turn
 /// that has run one is read-out, and what it writes to memory is checked by a
@@ -233,30 +228,13 @@ fn note_reading(ctx: &ToolContext, call: &ToolCall) {
 }
 
 /// Run a planned round in order, results in the order of the calls. A
-/// [`Step::Refuse`] contributes its result without running anything.
-///
-/// A run of consecutive [`CONCURRENT`] calls runs at once, each on its own
-/// thread, and the round goes on once every one of them has answered. Every
-/// other call runs alone and in turn, since a write and the read after it
-/// depend on that order.
+/// [`Step::Refuse`] contributes its result without running anything. Every
+/// call runs alone and in turn, since a write and the read after it depend on
+/// that order.
 pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
     let mut out = Vec::with_capacity(steps.len());
-    let mut steps = steps.into_iter().peekable();
-    while let Some(step) = steps.next() {
+    for step in steps {
         match step {
-            Step::Run(call) if call.name == CONCURRENT => {
-                let mut batch = vec![call];
-                while let Some(Step::Run(next)) = steps.peek() {
-                    if next.name != CONCURRENT {
-                        break;
-                    }
-                    let Some(Step::Run(next)) = steps.next() else {
-                        unreachable!("peeked a run")
-                    };
-                    batch.push(next);
-                }
-                out.extend(run_together(ctx, batch));
-            }
             Step::Run(call) => {
                 note_reading(ctx, &call);
                 out.push(ToolResult {
@@ -272,45 +250,12 @@ pub fn run(ctx: &ToolContext, steps: Vec<Step>) -> Vec<ToolResult> {
                 );
                 out.push(result);
             }
-            // Already answered by the fast path; running it would re-read a
-            // file whose content this conversation is now carrying.
+            // A resumed turn's call whose effect may already have happened.
             Step::Withheld(result) => {
                 tracing::info!(tool = %result.call.name, "resumed turn: call not re-issued");
                 out.push(result);
             }
         }
-    }
-    out
-}
-
-/// How many [`CONCURRENT`] calls run at once: a round asking for more runs
-/// them in waves of this many, so one answer cannot hold a thread per call
-/// for as long as its parts run.
-const AT_ONCE: usize = 16;
-
-/// Run `calls` at once, one thread each, at most [`AT_ONCE`] at a time; their
-/// results in their order.
-fn run_together(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult> {
-    let mut out = Vec::with_capacity(calls.len());
-    let mut calls = calls.into_iter().peekable();
-    while calls.peek().is_some() {
-        let wave: Vec<ToolCall> = calls.by_ref().take(AT_ONCE).collect();
-        std::thread::scope(|scope| {
-            let running: Vec<_> = wave
-                .into_iter()
-                .map(|call| {
-                    scope.spawn(move || ToolResult {
-                        response: run_tool(ctx, &call),
-                        call,
-                    })
-                })
-                .collect();
-            out.extend(
-                running
-                    .into_iter()
-                    .map(|h| h.join().expect("a tool call's thread panicked")),
-            );
-        });
     }
     out
 }
@@ -401,12 +346,9 @@ fn refusal(name: Option<String>, problem: &Problem) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
 
-    use zend_tools::{
-        registry, Grants, OpsRunner, SubagentRequest, SubagentResponse, SubagentRunner,
-    };
+    use zend_tools::{registry, OpsRunner};
     use zend_vfs::RepoFiles;
 
     use super::*;
@@ -651,85 +593,6 @@ mod tests {
             scan_text(&text),
             "<tool_call><function=write>\u{E000}tool_call>\u{E000}/think></tool_call>"
         );
-    }
-
-    /// A runner that holds every part until `width` of them are running at
-    /// once, so a round that ran them one after another would never finish.
-    struct Rendezvous {
-        width: usize,
-        arrived: Mutex<usize>,
-        all_here: Condvar,
-    }
-
-    impl Rendezvous {
-        fn of(width: usize) -> Arc<Self> {
-            Arc::new(Self {
-                width,
-                arrived: Mutex::new(0),
-                all_here: Condvar::new(),
-            })
-        }
-    }
-
-    impl SubagentRunner for Rendezvous {
-        fn run(&self, _parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
-            let mut n = self.arrived.lock().unwrap();
-            *n += 1;
-            self.all_here.notify_all();
-            let (n, timeout) = self
-                .all_here
-                .wait_timeout_while(n, Duration::from_secs(10), |n| *n < self.width)
-                .unwrap();
-            if timeout.timed_out() {
-                return Err(format!("only {} of {} ran at once", *n, self.width));
-            }
-            Ok(SubagentResponse {
-                path: req.name.clone(),
-                state: "done".into(),
-                result: req.prompt,
-            })
-        }
-    }
-
-    fn sub_run(name: &str) -> Step {
-        Step::Run(ToolCall {
-            name: "sub_run".into(),
-            arguments: json!({"name": name, "prompt": format!("p-{name}")}),
-        })
-    }
-
-    /// **A round's consecutive `sub_run` calls run at once**, and their
-    /// results come back in the order the calls were written.
-    #[test]
-    fn consecutive_parts_run_at_once_in_order() {
-        let ctx = ToolContext::new()
-            .granting(Grants::ALL)
-            .with_subagent_runner(Rendezvous::of(3));
-        let results = run(&ctx, vec![sub_run("a"), sub_run("b"), sub_run("c")]);
-        let paths: Vec<&str> = results
-            .iter()
-            .map(|r| r.response["path"].as_str().unwrap_or("<error>"))
-            .collect();
-        assert_eq!(paths, ["a", "b", "c"], "{results:?}");
-        assert_eq!(results[1].response["result"], "p-b");
-    }
-
-    /// Another call between them splits the batch: the parts before it have
-    /// all answered before it runs.
-    #[test]
-    fn another_call_between_parts_splits_the_batch() {
-        let ctx = ToolContext::new()
-            .granting(Grants::ALL)
-            .with_subagent_runner(Rendezvous::of(1));
-        let datetime = Step::Run(ToolCall {
-            name: "datetime".into(),
-            arguments: json!({}),
-        });
-        let results = run(&ctx, vec![sub_run("a"), datetime, sub_run("b")]);
-        let names: Vec<&str> = results.iter().map(|r| r.call.name.as_str()).collect();
-        assert_eq!(names, ["sub_run", "datetime", "sub_run"]);
-        assert_eq!(results[0].response["path"], "a");
-        assert_eq!(results[2].response["path"], "b");
     }
 
     #[test]

@@ -283,8 +283,3 @@ object ids, ISO dates, binary reported rather than mangled).
 | `code_session_list` | `code/session_list.rs` | |
 | `code_session_close` | `code/session_close.rs` | Kills subprocess |
 
-### Subagent (1 tool) — web chat only
-
-| Tool | File | Notes |
-|------|------|-------|
-| `sub_run` | `subagent.rs` | Nested agent loop via `SubagentRunner` trait |

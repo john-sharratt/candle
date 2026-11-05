@@ -11,8 +11,8 @@ tool, as the signed-in caller.
 - **zend** serves the engineering tools: `thread_*`, `task_*`, `journal_*`,
   `layer_*`, `timeline_*`, and the operations tools (`cluster_*`,
   `gateway_command`, `agent_*`, `service_*`). They are zend's own. A task's
-  turn streams in zend's process, `sub_run` calls back into the worker
-  lifecycle, and the operations tools ride zend's cluster socket (§3).
+  turn streams in zend's process, a task's `repo_task_start` calls back into
+  the worker lifecycle, and the operations tools ride zend's cluster socket (§3).
 - **npcd** serves the `bot_*` tools (§4). A **bot** is what Claude is shown
   of an npcd character: an autonomous agent, living in a world, to be
   managed. Each tool lists bots, gives or manages a mission, messages a bot,

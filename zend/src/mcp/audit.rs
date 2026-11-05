@@ -1,6 +1,6 @@
 //! A finished task's citation audit (`docs/mcp_guides.md` §4): each URL its
 //! final response cites, against what the tools actually returned to the
-//! worker — and to the parts it started — in their turns.
+//! worker in its turns.
 //!
 //! | Mark | Meaning |
 //! |---|---|
@@ -100,8 +100,6 @@ pub fn urls_in(text: &str) -> Vec<String> {
 enum Returned {
     /// A page came back — the URLs asked for and reached.
     Page(Vec<String>),
-    /// A part's `sub_run` answer: a model's words, not a tool's finding.
-    Part,
     /// Anything else a tool returned.
     Other,
 }
@@ -114,12 +112,6 @@ fn classify(body: &str) -> Returned {
     let Ok(v) = serde_json::from_str::<Value>(body.trim()) else {
         return Returned::Other;
     };
-    if ["path", "state", "result"]
-        .iter()
-        .all(|k| v.get(k).is_some())
-    {
-        return Returned::Part;
-    }
     let Some(reached) = v.get("final_url").and_then(Value::as_str) else {
         return Returned::Other;
     };
@@ -143,19 +135,13 @@ impl Audit {
         let mut opened_loosely: BTreeMap<String, String> = BTreeMap::new();
         let mut touched = BTreeSet::new();
         for body in turns.iter().flat_map(|user| response_bodies(user)) {
-            match classify(body) {
-                // The part's own turns are audited with the worker's; what it
-                // says it found is not evidence.
-                Returned::Part => continue,
-                Returned::Page(urls) => {
-                    for url in urls {
-                        opened.insert(normal(&url));
-                        opened_loosely
-                            .entry(loose(&url))
-                            .or_insert_with(|| trimmed(&url).to_string());
-                    }
+            if let Returned::Page(urls) = classify(body) {
+                for url in urls {
+                    opened.insert(normal(&url));
+                    opened_loosely
+                        .entry(loose(&url))
+                        .or_insert_with(|| trimmed(&url).to_string());
                 }
-                Returned::Other => {}
             }
             for url in urls_in(body) {
                 touched.insert(normal(&url));
@@ -308,18 +294,14 @@ mod tests {
     }
 
     /// **Only a page that came back is opened**: an `http_request` that
-    /// answered an error opened nothing, and a part's `sub_run` answer is its
-    /// words, not a finding — what it cites is not even seen.
+    /// answered an error opened nothing.
     #[test]
-    fn a_failed_request_and_a_parts_answer_are_not_evidence() {
+    fn a_failed_request_is_not_evidence() {
         let failed =
             response(r#"{"status":404,"headers":{},"body":"","final_url":"https://x.com/paper"}"#);
         let ok =
             response(r#"{"status":200,"headers":{},"body":"…","final_url":"https://x.com/data"}"#);
-        let part = response(
-            r#"{"path":"T:r/v/read","state":"done","result":"see https://made-up.example/report"}"#,
-        );
-        let turns = [failed.as_str(), ok.as_str(), part.as_str()];
+        let turns = [failed.as_str(), ok.as_str()];
         assert_eq!(
             Audit::of(
                 "https://x.com/paper https://x.com/data https://made-up.example/report",

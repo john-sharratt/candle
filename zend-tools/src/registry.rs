@@ -1010,17 +1010,6 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
         "job_cancel",
         &["job_stop", "cancel_job", "stop_job", "job_kill"],
     ),
-    (
-        "sub_run",
-        &[
-            "subagent",
-            "run_subagent",
-            "delegate",
-            "spawn_agent",
-            "sub_agent",
-            "nested_agent",
-        ],
-    ),
 ];
 
 use crate::tools::{
@@ -1080,7 +1069,6 @@ use crate::tools::{
         SSH_SESSION_CLOSE, SSH_SESSION_EXEC, SSH_SESSION_EXEC_ASYNC, SSH_SESSION_LIST,
         SSH_SESSION_OPEN, SSH_SESSION_POLL,
     },
-    subagent::REGISTRATION as SUBAGENT,
     tcp_session::{
         TCP_SESSION_CLOSE, TCP_SESSION_LIST, TCP_SESSION_OPEN, TCP_SESSION_RECV, TCP_SESSION_SEND,
     },
@@ -1285,8 +1273,6 @@ fn register_all() -> &'static [RegisteredTool] {
         CODE_SESSION_EXEC.requires(SANDBOX),
         CODE_SESSION_LIST.requires(SANDBOX),
         CODE_SESSION_CLOSE.requires(SANDBOX),
-        // Subagent (1) — high-risk (delegated agency)
-        SUBAGENT.requires(EXEC),
         // Commands (2) — a program run on this host, in a repository's
         // sandbox: `Exec` to start it, `DiskWrite` for the checkout it runs
         // on, `Network` for what the listed toolchains fetch. Reading a run's
@@ -1419,7 +1405,7 @@ mod capability_tests {
             assert!(needs(name).contains(&Capability::Network), "{name}");
         }
         // Exec is a program running on this host.
-        for name in ["ping_icmp", "trace_route", "sub_run", "run_output"] {
+        for name in ["ping_icmp", "trace_route", "run_output"] {
             assert!(needs(name).contains(&Capability::Exec), "{name}");
         }
         // A command runs on a checkout of the repository's folder, and what

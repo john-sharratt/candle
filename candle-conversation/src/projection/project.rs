@@ -731,9 +731,9 @@ mod prior_belief_tests {
     #[test]
     fn decay_scores_scales_scores_and_leaves_selected_flags() {
         let mut carried = PriorBelief::default();
-        // A carried tool lock-on (sub_run) plus a runner-up (datetime), as at
+        // A carried tool lock-on (repo_task_start) plus a runner-up (datetime), as at
         // a topic-changed turn boundary.
-        carried.set("tools", "sub_run", 1009.0, true, true);
+        carried.set("tools", "repo_task_start", 1009.0, true, true);
         carried.set("tools", "datetime", 0.0, false, false);
         carried.set("notes", "pinned", 40.0, true, true);
 
@@ -742,7 +742,7 @@ mod prior_belief_tests {
         // Scores halve so the fresh decode-Q of a new query can overtake the
         // stale leader early; the `selected` flags are the ranking input, not
         // the lever, so they carry unchanged.
-        assert_eq!(carried.coll("tools")["sub_run"], (504.5, true, true));
+        assert_eq!(carried.coll("tools")["repo_task_start"], (504.5, true, true));
         assert_eq!(carried.coll("tools")["datetime"], (0.0, false, false));
         assert_eq!(carried.coll("notes")["pinned"], (20.0, true, true));
     }
@@ -854,7 +854,7 @@ mod prior_belief_tests {
         // Carried a single (topic-stale) tool from the previous turn; the new
         // query's strongest fresh signal is a below-threshold datetime.
         let mut b = PriorBelief::default();
-        b.set("tools", "sub_run", 350.0, true, true);
+        b.set("tools", "repo_task_start", 350.0, true, true);
         // budget_max 3 with one incumbent → room for the challenger, no eviction.
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
@@ -863,7 +863,7 @@ mod prior_belief_tests {
             1000.0,
         );
         // The incumbent survives; datetime is seated selected at the seed score.
-        assert_eq!(b.coll("tools")["sub_run"], (350.0, true, true));
+        assert_eq!(b.coll("tools")["repo_task_start"], (350.0, true, true));
         // Seated selected, but unqualified: it is below the bar by construction.
         assert_eq!(b.coll("tools")["datetime"], (1000.0, true, false));
         // A weaker fresh rival is NOT seated — only the single strongest.
@@ -874,7 +874,7 @@ mod prior_belief_tests {
     fn challenger_evicts_the_weakest_incumbent_when_full() {
         let mut b = PriorBelief::default();
         b.set("tools", "http_request", 1800.0, true, true);
-        b.set("tools", "sub_run", 400.0, true, true); // weakest incumbent
+        b.set("tools", "repo_task_start", 400.0, true, true); // weakest incumbent
         b.set("tools", "code_run", 1200.0, true, true);
         // At budget_max=3 → the challenger displaces the lowest-scored incumbent.
         b.seat_turn_boundary_challenger(
@@ -883,7 +883,7 @@ mod prior_belief_tests {
             3,
             1000.0,
         );
-        assert_eq!(b.coll("tools")["sub_run"], (0.0, false, false)); // evicted
+        assert_eq!(b.coll("tools")["repo_task_start"], (0.0, false, false)); // evicted
         assert_eq!(b.coll("tools")["datetime"], (1000.0, true, false)); // seated, unqualified
                                                                         // The strong incumbents survive.
         assert_eq!(b.coll("tools")["http_request"], (1800.0, true, true));
@@ -910,14 +910,14 @@ mod prior_belief_tests {
     fn challenger_does_not_apply_below_top_3() {
         // A top-1/top-2 collection has no spare slot to lend a challenger.
         let mut b = PriorBelief::default();
-        b.set("tools", "sub_run", 350.0, true, true);
+        b.set("tools", "repo_task_start", 350.0, true, true);
         b.seat_turn_boundary_challenger(
             GroupKey::Collection("tools".into()),
             &[("datetime".into(), 246.0)],
             2,
             1000.0,
         );
-        assert_eq!(b.coll("tools")["sub_run"], (350.0, true, true));
+        assert_eq!(b.coll("tools")["repo_task_start"], (350.0, true, true));
         assert!(b.coll("tools").get("datetime").is_none());
     }
 }

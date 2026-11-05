@@ -33,8 +33,7 @@ fn new_entries(w: &Worker, seen: Option<u64>) -> String {
 }
 
 /// One worker's result, as a block of text, giving only the journal entries
-/// after `seen`: what a wait answers for it, and what `sub_run` answers for a
-/// part.
+/// after `seen`: what a wait answers for it.
 pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
     let entries = new_entries(w, seen);
     match w.state {

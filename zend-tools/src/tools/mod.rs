@@ -33,7 +33,6 @@
 //! | `run` | `run_command`, `run_output` | A program in the repository's sandbox, on the conversation's branch |
 //! | `sql_session` | `sql_session_{open,query,list,close}` | rusqlite |
 //! | `ssh` | `ssh_session_{open,exec,exec_async,poll,list,close}` | ssh2 |
-//! | `subagent` | `sub_run` | Calls `SubagentRunner` trait impl injected by daemon |
 //! | `tcp_session` | `tcp_session_{open,send,recv,list,close}` | Raw TCP; hex wire format |
 //! | `telnet` | `telnet_session_{open,send,list,close}` | Raw TCP; prompt-regex |
 //! | `tls_session` | `tls_session_{open,send,recv,list,close}` | native-tls |
@@ -65,7 +64,6 @@ pub mod remote_fs;
 pub mod run;
 pub mod sql_session;
 pub mod ssh;
-pub mod subagent;
 pub mod tcp_session;
 pub mod telnet;
 pub mod tls_session;

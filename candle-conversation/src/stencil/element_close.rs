@@ -34,6 +34,10 @@ pub const PARAM_TAG: &str = "<parameter=";
 /// What closes the function, after its last element.
 pub const FUNCTION_TAG: &str = "</function>";
 
+/// The JSON escape a reader writes for `<` in a block translated to JSON, so
+/// no tag inside a value survives into the translation.
+pub const LT_ESCAPE: &str = "\\u003c";
+
 /// What may stand between a value's `</parameter>` and the next tag: the
 /// template's newline, and the few variants a model writes instead.
 pub const SEPARATORS: [&str; 5] = ["\n", "\r\n", "\n\n", " \n", ""];
@@ -102,27 +106,56 @@ pub fn value_end(text: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Where the function block opening at `text`'s start ends: the offset just
-/// past its real `</function>` — the one after its last value, read value by
-/// value with [`value_end`], so a value holding `</function>` or
-/// `</tool_call>` keeps it. `None` when the block is not complete.
-pub fn function_end(text: &str) -> Option<usize> {
+/// One function block, read whole: its tool, its arguments in order, and the
+/// offset just past its real `</function>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block<'a> {
+    pub name: &'a str,
+    /// Each argument's name and raw value, its framing newlines — one after
+    /// the opening tag, one before the close — taken off.
+    pub args: Vec<(&'a str, &'a str)>,
+    pub end: usize,
+}
+
+/// The function block opening at `text`'s first `<function=`, read value by
+/// value with [`value_end`], so a value holding `</parameter>`, `</function>`
+/// or `</tool_call>` keeps it. `None` when the block is not complete — a value
+/// with no close that structure follows, or anything but an element or the
+/// close between elements.
+pub fn read_block(text: &str) -> Option<Block<'_>> {
     let open = text.find("<function=")?;
-    let mut at = open + text[open..].find('>')? + 1;
+    let name_end = open + text[open..].find('>')?;
+    let name = text[open + "<function=".len()..name_end].trim();
+    let mut args = Vec::new();
+    let mut at = name_end + 1;
     loop {
         let rest = &text[at..];
-        let skipped = rest.len() - rest.trim_start().len();
-        at += skipped;
+        at += rest.len() - rest.trim_start().len();
         let rest = &text[at..];
         if rest.starts_with(FUNCTION_TAG) {
-            return Some(at + FUNCTION_TAG.len());
+            return Some(Block {
+                name,
+                args,
+                end: at + FUNCTION_TAG.len(),
+            });
         }
-        if !rest.starts_with(PARAM_TAG) {
-            return None;
-        }
-        let value = at + rest.find('>')? + 1;
-        at = value_end(text, value)? + PARAM_CLOSE.len();
+        let named = rest.strip_prefix(PARAM_TAG)?;
+        let key_len = named.find('>')?;
+        let key = named[..key_len].trim();
+        let value = at + PARAM_TAG.len() + key_len + 1;
+        let close = value_end(text, value)?;
+        let raw = &text[value..close];
+        let raw = raw.strip_prefix('\n').unwrap_or(raw);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        args.push((key, raw));
+        at = close + PARAM_CLOSE.len();
     }
+}
+
+/// Where the function block opening at `text`'s first `<function=` ends: the
+/// offset just past its real `</function>` ([`read_block`]).
+pub fn function_end(text: &str) -> Option<usize> {
+    read_block(text).map(|b| b.end)
 }
 
 #[cfg(test)]
@@ -153,9 +186,11 @@ mod tests {
         let block = format!(
             "<function=write>\n<parameter=path>\na.js</parameter>\n<parameter=content>\n{content}</parameter>\n</function>\n</tool_call>"
         );
-        let end = function_end(&block).unwrap();
-        assert!(block[..end].ends_with(&format!("{content}</parameter>\n</function>")));
-        assert_eq!(&block[end..], "\n</tool_call>");
+        let read = read_block(&block).unwrap();
+        assert_eq!(read.name, "write");
+        assert_eq!(read.args, [("path", "a.js"), ("content", content)]);
+        assert_eq!(&block[read.end..], "\n</tool_call>");
+        assert_eq!(function_end(&block), Some(read.end));
         assert_eq!(
             function_end("<function=datetime>\n</function>"),
             Some("<function=datetime>\n</function>".len())

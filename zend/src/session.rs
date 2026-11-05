@@ -80,7 +80,7 @@ use web::auth::Roles;
 use zend_tools::run_watch::{self, RunWatch};
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::{JournalBook, JournalShelf};
-use zend_tools::{OpsRunner, SubagentRunner};
+use zend_tools::OpsRunner;
 use zend_vfs::{RepoFiles, Workspace};
 
 use crate::api::chat::{
@@ -124,8 +124,8 @@ use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::zen_tasks::{starts_of, withhold_by_kind};
-use crate::mcp::{archiving, lineage, names, nudges, resuming, stops, tending, threads, workers};
+use crate::mcp::zen_tasks::{level_of, withhold_by_level};
+use crate::mcp::{archiving, lineage, nudges, resuming, stops, tending, threads, workers};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -1358,7 +1358,7 @@ impl InferenceState {
         status_tx: watch::Sender<String>,
         progress: Arc<LoadProgress>,
         loading_substrate: Arc<OnceLock<Conversation>>,
-        (parts, ops): (Arc<dyn SubagentRunner>, Arc<dyn OpsRunner>),
+        ops: Arc<dyn OpsRunner>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -3119,7 +3119,6 @@ impl InferenceState {
             think_closer_phrase,
             tokenizer,
             tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref(), agent.as_ref())?
-                .running_parts(parts)
                 .running_ops(ops)
                 .guarding_defaults(&base_branches),
             repositories,
@@ -4496,9 +4495,10 @@ fn run_inference_stream(
         let mut closing = false;
         // What the catalog offers this turn, and what is out of it for now.
         let offered = crate::tools::offered_tool_names(tools_mode);
-        // What this conversation may start (`docs/zen_tool_reach.md` §6.3):
-        // its rounds' grammar and prompt hold out the rest.
-        let starts = starts_of(&state.engine.conversation().shared(), &conv_id);
+        // Where this conversation stands in the nesting of tasks
+        // (`docs/zen_tool_reach.md` §6.3): a nested task's rounds' grammar and
+        // prompt hold out the task tools.
+        let level = level_of(&state.engine.conversation().shared(), &conv_id);
         // A new question starts a new loop: the files the last one read may
         // be placed again, since its reads may be summarised away by now. A
         // resumed round goes on with the loop it belongs to.
@@ -4566,7 +4566,7 @@ fn run_inference_stream(
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
             let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
-            withhold_by_kind(&mut withheld.tools, &offered, starts);
+            withhold_by_level(&mut withheld.tools, &offered, level);
             // The prompt shows what the grammar lets the turn call, and no more.
             round_selection.withhold_members(withheld.tools.iter().copied());
             if let Some(summary) = tool_summary_section(tools_mode) {
@@ -5415,8 +5415,8 @@ async fn carry_journal(
 }
 
 /// The journals `conv_id` inherits, as the sections that carry them — none for
-/// a conversation not owned through `/mcp`: its project's, its thread's, and
-/// for a part each worker's above it (`docs/claude_zend_gateway.md` §5.1).
+/// a conversation not owned through `/mcp`: its thread's and its projects'
+/// (`docs/claude_zend_gateway.md` §5.1).
 fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherited> {
     let Some((_, thread, name)) = conv_names(conv_id) else {
         return Vec::new();
@@ -5428,44 +5428,24 @@ fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inh
     lineage::sections(&format!("T:{thread}/{name}"), &nearest_first)
 }
 
-/// One journal above a conversation: the ancestor it is, the bare name it
-/// answers to, and — for a worker's — the conversation that drafts it.
+/// One journal above a conversation: the ancestor it is and the bare name it
+/// answers to.
 struct JournalAbove {
     ancestor: lineage::Ancestor,
     name: String,
-    conv_id: Option<String>,
-    /// The entries a citation may name: a worker's journal's ids and those its
-    /// folds took, a thread's or project's notes numbered from 1.
+    /// The entries a citation may name: its notes, numbered from 1.
     entries: Vec<u64>,
 }
 
 /// The journals above `conv_id`, nearest first — none for a conversation not
-/// owned through `/mcp`: for a part each worker's above it, its own worker's
-/// first, then its thread's notes, then each project's standing rules.
+/// owned through `/mcp`: its thread's notes, then each project's standing
+/// rules.
 fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
-    let Some((owner, thread, name)) = conv_names(conv_id) else {
+    let Some((owner, thread, _)) = conv_names(conv_id) else {
         return Vec::new();
     };
     let records = state.engine.conversation().shared();
     let mut nearest_first = Vec::new();
-    let mut above = names::parent_of(name);
-    while !above.is_empty() {
-        let id = threads::conv_id(owner, thread, above);
-        let (lines, mut entries) = journal_of(state, &id);
-        // A fold's entries are still cited by their addresses, which read.
-        entries.extend(journal_text(state, conversation_timeline(&id)).folded());
-        nearest_first.push(JournalAbove {
-            ancestor: lineage::Ancestor {
-                path: format!("T:{thread}/{above}"),
-                whose: lineage::Whose::Worker,
-                lines,
-            },
-            name: names::leaf(above).to_string(),
-            conv_id: Some(id),
-            entries,
-        });
-        above = names::parent_of(above);
-    }
     let notes = |journal: &str| threads::note_lines(&threads::notes(&records, owner, journal));
     let numbered = |lines: &[String]| (1..=lines.len() as u64).collect();
     let lines = notes(thread);
@@ -5477,7 +5457,6 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
             lines,
         },
         name: thread.to_string(),
-        conv_id: None,
     });
     for repo in state
         .workspace
@@ -5495,7 +5474,6 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
                 whose: lineage::Whose::Project,
             },
             name: repo.name.clone(),
-            conv_id: None,
         });
     }
     nearest_first
@@ -5631,8 +5609,8 @@ fn journal_desk(
     asker: UnsealedAsker,
     max_tokens: usize,
 ) -> ZendDesk {
-    // A conversation with a lineage — the one `style_for` and the journals
-    // above it read — is the one whose entries are cited from below.
+    // A worker's conversation — the one `style_for` and the journals above
+    // it read — is the one whose entries are cited by address.
     let folds_keep_turns = conv_names(conv_id).is_some();
     let dialect = state.refresh_config.dialect.clone();
     let env = ToolCallEnvelope::for_assistant_calls(&dialect);
@@ -5733,19 +5711,10 @@ fn shelf_of(state: &InferenceState, conv_id: &str, timeline: TimelineId) -> Shel
     let own = Drafted::new(journal_of(state, conv_id).0, journal_text(state, timeline));
     let above = journals_above(state, conv_id)
         .into_iter()
-        .map(|a| {
-            let book: Arc<dyn JournalBook> = match a.conv_id {
-                Some(id) => Arc::new(Drafted::new(
-                    a.ancestor.lines,
-                    journal_text(state, conversation_timeline(&id)),
-                )),
-                None => Arc::new(Notes::new(a.ancestor.lines)),
-            };
-            Above {
-                path: a.ancestor.path,
-                name: a.name,
-                book,
-            }
+        .map(|a| Above {
+            path: a.ancestor.path,
+            name: a.name,
+            book: Arc::new(Notes::new(a.ancestor.lines)) as Arc<dyn JournalBook>,
         })
         .collect();
     Shelf::new(Arc::new(own), above)
@@ -8037,7 +8006,6 @@ impl ZendSession {
         let summarize = self.config.summarize;
         let tombstone_retention = self.config.tombstone_retention;
         let cluster = self.config.cluster.clone();
-        let parts: Arc<dyn SubagentRunner> = Arc::clone(self.mcp.parts()) as _;
         let ops: Arc<dyn OpsRunner> = Arc::clone(self.mcp.ops()) as _;
         // The memory its writer keeps current once the engine is up.
         let memory = Arc::clone(self.mcp.memory());
@@ -8057,13 +8025,12 @@ impl ZendSession {
         // before `mark_ready()`, wedging the loading screen. We re-enter this
         // handle after the download phase so the worker can spawn.
         let rt_handle = Handle::try_current().ok();
-        // The runner a worker's `sub_run` starts its parts with, bound to this
-        // session by a weak handle so no tool context keeps it alive. A session
-        // loaded with no runtime around it serves no `/mcp`, so has no parts.
-        // The same runtime runs the sweep that archives the `/mcp` workers and
-        // threads left idle a day.
+        // The runner the ops tools reach the MCP implementation through, bound
+        // to this session by a weak handle so no tool context keeps it alive. A
+        // session loaded with no runtime around it serves no `/mcp`. The same
+        // runtime runs the sweep that archives the `/mcp` workers and threads
+        // left idle a day.
         if let Some(rt) = &rt_handle {
-            self.mcp.parts().bind(Arc::downgrade(self), rt.clone());
             self.mcp.ops().bind(Arc::downgrade(self), rt.clone());
             archiving::start_sweeping(self, rt);
             resuming::start_resuming(self, rt);
@@ -8169,7 +8136,7 @@ impl ZendSession {
                     status_tx.clone(),
                     load_progress_for_blocking,
                     loading_substrate,
-                    (parts, ops),
+                    ops,
                 ) {
                     Ok(Some(state)) => {
                         slot.store(Some(Arc::clone(&state)));

@@ -163,7 +163,7 @@ fn distil_claimed(
             ));
             continue;
         }
-        if lost(&before) && !before.is_part() {
+        if lost(&before) {
             let note = Note {
                 at_ms: now,
                 label: "Task ended:".into(),

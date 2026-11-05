@@ -75,7 +75,7 @@ are in what the operations runner will serve, and in which tools only
 | D4 | No `gateway_command`, `layer_toggle` or `timeline_delete` | `/mcp` only (§8.2, §8.5) |
 | D5 | A chat may not deploy or cancel | `Needs::Changes` (`ops_tools.rs:166`) |
 | D6 | Zen cannot write memory: no `journal_note`, `_create`, `_link` | Zen holds `journal_read`, `_grep`, `_check`, `_move` (`zend-tools/src/tools/journal/`); memory reaches its journals only by distillation |
-| D7 | A dialogue or a chat cannot start long work: no `repo_task_start` or task tools. Tasks stay unable to start tasks (§6.3) | A worker splits its own work with `sub_run` (§6.1), but nothing starts a task from a dialogue |
+| D7 | A dialogue or a chat cannot start long work: no `repo_task_start` or task tools | Nothing starts a task from a dialogue; §6.3 gives dialogues, chats and tasks the task tools, nesting one level |
 | D8 | No bot actions: mission give/step/cancel, message send, channel post | npcd's tools, on `/mcp` only |
 | D9 | No images: `image_generate`, `image_edit`, `image_upload` | `/mcp` only |
 
@@ -285,14 +285,14 @@ and coding tasks are `repo_task_start`, `repo_task_reply`, `repo_task_nudge`
 and the task forms of `job_status`, `job_read` and `job_cancel`. A dialogue run
 by an Admin, and a chat, may start tasks. So may a task that Claude or a person
 started — a coder handing a research question to a researcher of its own, say.
-A task a task started (`Worker::by_task`), and any part of a task, may not:
-its grammar holds the task tools out, and `repo_task_start` from it is refused
-(`zend/src/mcp/zen_tasks.rs`, `Starts`).
+A task a task started (`Worker::by_task`) may not: its grammar holds the task
+tools out, and `repo_task_start` from it is refused
+(`zend/src/mcp/zen_tasks.rs`, `Level`).
 
 So work nests at most one level below where a person or Claude started it.
 The person, or Claude, talks to a conversation or starts a task; that task may
-hand pieces to tasks of its own; those do all of their work themselves,
-splitting it with `sub_run` when they must, and answer with what they did.
+hand pieces to tasks of its own; those do all of their work themselves and
+answer with what they did.
 Nothing a second-level task produces can start more tasks, so no chain of
 tasks can feed its own output back as the next one's brief. The hazard is
 real: a task whose answer starts another task could restate its own findings
@@ -310,9 +310,8 @@ on a thread named for it, `dialogue-<ten hex digits of its id's sha256>`. A
 chat's tasks go on the chat's own thread.
 
 **The tools are hidden from a task a level down.** Each round of a task a
-task started, and of every part, withholds the task tools; each round of a
-dialogue or a chat withholds `sub_run` (`zen_tasks::starts_of` and
-`withhold_by_kind`, `zend/src/session.rs`). The worker record says whether a
+task started withholds the task tools (`zen_tasks::level_of` and
+`withhold_by_level`, `zend/src/session.rs`). The worker record says whether a
 conversation is a task or a chat, and whether a task started it
 (`Worker::by_task`); a dialogue has none. A withheld tool is out of the
 round's grammar and out of its prompt alike (`SelectionState::withhold_members`),
@@ -330,28 +329,16 @@ the grammar's to say, and it holds none of them.)
 **What a task does instead: the work.** A task is already the level where
 work is done. When it finds more work that its brief needs, it does that work
 itself, in its own rounds, with its own tools: it reads, edits, builds, tests
-and researches inline, and splits off a part with `sub_run` when a piece of
-it runs better on its own. It never hands the work back as a proposal, and it
+and researches inline. It never hands the work back as a proposal, and it
 never answers with a list of tasks someone else should start. What it answers
 is what it did.
 
-**`sub_run` is not an exception.** Parts are how one task splits its own
-work, every part waits under its task, and depth is capped: a task's part may
-start parts, a part's part may not (`parts::MAX_DEPTH`,
-`docs/claude_zend_gateway.md` §6.1). A part ends when its task does, and it
-reports only to its task, never to a thread. The cap and the waiting together
-keep parts bounded in a way tasks would not be.
-
-**A conversation never starts a part.** The mirror of the rule above: a
-person's dialogue and a chat have `sub_run` withheld from their grammar, as a
-task has the task tools withheld (`zen_tasks::withhold_by_kind`). A research
-ask from a dialogue therefore has one path, `repo_task_start`. Should a
-`sub_run` reach the runner from a conversation that is not a task anyway, it
-starts a task on that conversation's thread through `repo_task_start`, as its
-person, and answers with the task's handle (`zend/src/mcp/parts.rs`); it is
-never refused. A task's own `sub_run` always starts a part, so this path can
-never start a task from a task, and a task it starts has the task tools
-withheld like any other.
+**There is one way to split work: a task.** A task at the top that wants a
+piece done apart — a verifier re-reading its findings, a researcher answering
+a question its code depends on — starts a task of its own with
+`repo_task_start`, with the role that piece needs, and waits on it with
+`job_status`. It goes on the same thread, is listed beside its starter, and
+keeps its own journal. No second mechanism splits a task inside its own turn.
 
 **A conversation's own loop is bounded by its turn.** A dialogue or chat that
 starts a task, reads the answer and starts another is one turn's tool rounds.
@@ -400,9 +387,10 @@ person's decision.
   is refused, or answers `needs_approval`, exactly as the table says. The test
   is table-driven from the same table, so a new tool cannot be added without
   a row.
-- No task starts a task (§6.3): for every task kind and for a part, the
-  offered tool list, and the stencil built from it, hold none of the task
-  tools, and the prompt names none of them.
+- Tasks nest one level (§6.3): for a task a task started, the offered tool
+  list, and the stencil built from it, hold none of the task tools, and the
+  prompt names none of them (`zen_tasks::a_nested_task_holds_out_the_task_tools`,
+  `a_level_is_read_from_the_record`).
 
   A dialogue and a chat each start a task, and that task's answer comes back
   as the conversation's tool result.

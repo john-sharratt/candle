@@ -190,8 +190,9 @@ Only what tools returned counts: the `<tool_response>` blocks of the turns.
 A page is opened when a `web_fetch` returned it (a result with `final_url`; the
 URL asked for and the one reached both count) or an `http_request` answered it
 with a success status — a fetch that failed opened nothing. A URL named in a
-prompt, Claude's or the correction's, is not evidence, and neither is a part's
-`sub_run` answer: the part's own turns are audited with its worker's.
+prompt, Claude's or the correction's, is not evidence. A task a worker started
+is audited on its own answer; what the worker read of it through `job_status`
+counts as seen, never opened.
 
 ## 5. The research guide
 

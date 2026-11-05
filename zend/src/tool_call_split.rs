@@ -38,7 +38,7 @@ fn close_of(body: &str) -> Option<usize> {
 
 /// The offset just past the JSON object opening `text`, its strings read
 /// whole so a brace or a tag inside one is text. `None` while it is open.
-fn object_end(text: &str) -> Option<usize> {
+pub(crate) fn object_end(text: &str) -> Option<usize> {
     let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
     for (i, b) in text.bytes().enumerate() {
         match (in_string, escaped, b) {

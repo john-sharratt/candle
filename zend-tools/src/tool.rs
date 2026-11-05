@@ -82,36 +82,6 @@ pub enum Replay {
     Unsafe,
 }
 
-/// A part to start under the calling conversation.
-pub struct SubagentRequest {
-    /// What the part is for, as a kebab-case slug; with the caller's path it is
-    /// the part's address.
-    pub name: String,
-    /// The part's task, in full.
-    pub prompt: String,
-}
-
-/// How a part ended.
-pub struct SubagentResponse {
-    /// The part's address, which the caller cites.
-    pub path: String,
-    /// `done` or `error`: a part asks nobody, so it never waits. `started`
-    /// for a task a conversation that is not a task started in its place,
-    /// which runs on while the call returns.
-    pub state: String,
-    /// The part's journal entry — its line, claims and address — or, with no
-    /// entry kept, the end of its final response or its error.
-    pub result: String,
-}
-
-/// Injected by the daemon to run parts: each a conversation of its own under
-/// the calling one, run to its end before the call returns.
-pub trait SubagentRunner: Send + Sync + 'static {
-    /// Start, or find again, the part `req` names under the conversation
-    /// `parent`, and wait for it to end.
-    fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String>;
-}
-
 /// Injected by the daemon to run the operations tools — the `job_*` tools,
 /// `service_*` and the cluster readers (`docs/jobs.md` §8) — with the same
 /// implementation the daemon's MCP tools run, so the two surfaces answer

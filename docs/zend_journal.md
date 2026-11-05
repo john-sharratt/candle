@@ -100,7 +100,7 @@ fork already holds every turn in full. A reply's reasoning block is left out.
 | Kind | Cited part | Rendered under |
 |---|---|---|
 | `Observed` | a user side carrying `<tool_response>` blocks: a file read, a grep, a command's output | `Saw:` |
-| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp`, `Its worker said:` in a part (`style::style_for`) |
+| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp` (`style::style_for`) |
 | `Did` | a reply: the call it made, or what it told the user | `Did:` |
 | `Inferred` | nothing the session saw supports it | `Concluded, not seen:` |
 
@@ -178,8 +178,8 @@ the conversation's — one per entry the journal holds (`journal/<id>`), plus
 - **Last before the close**, so a new entry changes nothing above it.
 - **A task inherits its lineage's journals.** A conversation owned through
   `/mcp` carries, in the same collection and the same chain, its ancestors'
-  journals ahead of its own — the project's standing rules, its thread's notes,
-  and for a part each worker's above it — as sections `lineage/<n>`, and a
+  journals ahead of its own — the project's standing rules and its thread's
+  notes — as sections `lineage/<n>`, and a
   reader's line, `lineage/reader`, after its own (`mcp::lineage`,
   `docs/claude_zend_gateway.md` §5.1).
 - The collection is not a section sink: `ingest::section_sinks` never fills it

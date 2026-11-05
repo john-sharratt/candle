@@ -84,7 +84,6 @@ for unit testing a single tool call in isolation.
 | `remote_fs_session.rs` | `remote_fs_session_*` |
 | `sql_session.rs` | `sql_session_*` |
 | `ssh_session.rs` | `ssh_session_*` |
-| `subagent.rs` | `sub_run` |
 | `tcp_session.rs` | `tcp_session_*` |
 | `telnet_session.rs` | `telnet_session_*` |
 | `tls_session.rs` | `tls_session_*` |

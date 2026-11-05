@@ -91,7 +91,7 @@ Every conversation is addressed by its own `conv_id`; there is no default conver
 |---|---|---|
 | `none` | none | none |
 | `restricted` | the safe subset, needing no grant and not high-risk: the file tools (reads, writes, edits, deletes) and the git readers | none |
-| `comprehensive` | every tool: the network, credentials, the `code_*` JS sandbox, the git writers, SQLite, the command sandbox (`run_command`, `run_output`), and programs on this host (`ping_icmp`, `trace_route`, `sub_run`) | all |
+| `comprehensive` | every tool: the network, credentials, the `code_*` JS sandbox, the git writers, SQLite, the command sandbox (`run_command`, `run_output`), and programs on this host (`ping_icmp`, `trace_route`) | all |
 
 In every mode the file tools work on the conversation's own overlay: a write, edit or delete is held in memory, recorded in the substrate as VFS events, and never reaches the workspace on disk. A conversation's changes reach a repository only through `git_commit`, which is Comprehensive's. So Restricted may write files and still runs nothing — no command line, no code, no network. Each mode projects, and summarises, exactly the tools its grants cover.
 

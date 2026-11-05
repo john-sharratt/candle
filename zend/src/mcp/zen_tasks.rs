@@ -1,7 +1,7 @@
 //! The tasks a conversation of Zen's starts and steers
-//! (`docs/zen_tool_reach.md` §6.3): a person's dialogue, or a chat Claude
-//! holds with Zen. A task's own tool list never holds these tools, so a task
-//! does all of its work itself and never starts another.
+//! (`docs/zen_tool_reach.md` §6.3): a person's dialogue, a chat Claude holds
+//! with Zen, or a task one of those started. Tasks nest one level: a task a
+//! task started holds none of these tools, so it does its work itself.
 //!
 //! They run through the operations runner as the conversation's person, with
 //! `/mcp`'s own implementation (`workers::start`, `answer`, `nudge`), and
@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 
 use super::caller::Caller;
 use super::ops_tools::OpsCall;
-use super::parts::SUB_RUN;
 use super::records::Records;
 use super::roles::WorkerKind;
 use super::threads::{self, Effort, Priority};
@@ -31,61 +30,48 @@ pub const NUDGE: &str = "repo_task_nudge";
 /// Every tool here: what a task's tool list never holds.
 pub const TASK_TOOLS: [&str; 3] = [START, REPLY, NUDGE];
 
-/// What a conversation may start: parts with `sub_run`, tasks with the task
-/// tools.
+/// Where a conversation stands in the nesting of tasks, which is one level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Starts {
-    pub parts: bool,
-    pub tasks: bool,
+pub enum Level {
+    /// A person's dialogue, or a chat: it starts tasks.
+    Conversation,
+    /// A task a conversation, Claude or a person started: it starts tasks,
+    /// each a level down.
+    Task,
+    /// A task a task started: it starts none.
+    Nested,
 }
 
-impl Starts {
-    /// A person's dialogue, or a chat: tasks, never parts.
-    pub const CONVERSATION: Starts = Starts {
-        parts: false,
-        tasks: true,
-    };
-
-    /// A task: parts always, and tasks only when it is not itself `nested` —
-    /// started by a task, or a part of one. Tasks nest one level.
-    pub fn task(nested: bool) -> Starts {
-        Starts {
-            parts: true,
-            tasks: !nested,
-        }
+impl Level {
+    pub fn starts_tasks(self) -> bool {
+        self != Level::Nested
     }
 }
 
-/// Hold out of a round's grammar the tools its conversation may not call
-/// ([`Starts`]). `offered` is what the round's mode offers: a tool it does not
-/// offer has no path to hold out.
-pub fn withhold_by_kind(
+/// Hold out of a round's grammar the task tools a conversation at `level`
+/// may not call. `offered` is what the round's mode offers: a tool it does
+/// not offer has no path to hold out.
+pub fn withhold_by_level(
     tools: &mut BTreeSet<&'static str>,
     offered: &HashSet<String>,
-    starts: Starts,
+    level: Level,
 ) {
-    let mut out: Vec<&'static str> = Vec::new();
-    if !starts.parts {
-        out.push(SUB_RUN);
+    if !level.starts_tasks() {
+        tools.extend(TASK_TOOLS.into_iter().filter(|t| offered.contains(*t)));
     }
-    if !starts.tasks {
-        out.extend(TASK_TOOLS);
-    }
-    tools.extend(out.into_iter().filter(|t| offered.contains(*t)));
 }
 
-/// What the conversation `conv_id` may start: a dialogue (no worker names)
-/// and a chat are conversations; a task a task started (`Worker::by_task`),
-/// a part (a name under its task's), or a record that no longer reads, is a
-/// task one level down; any other task is a task at the top.
-pub fn starts_of(records: &dyn Records, conv_id: &str) -> Starts {
+/// The level of the conversation `conv_id`: a dialogue (no worker names) and
+/// a chat are conversations; a task a task started (`Worker::by_task`), or a
+/// record that no longer reads, is nested; any other task is a task.
+pub fn level_of(records: &dyn Records, conv_id: &str) -> Level {
     let Some((owner, thread, name)) = threads::conv_names(conv_id) else {
-        return Starts::CONVERSATION;
+        return Level::Conversation;
     };
     match threads::worker(records, owner, thread, name) {
-        Some(w) if w.kind.is_chat() => Starts::CONVERSATION,
-        Some(w) => Starts::task(w.by_task || name.contains('/')),
-        None => Starts::task(true),
+        Some(w) if w.kind.is_chat() => Level::Conversation,
+        Some(w) if !w.by_task => Level::Task,
+        _ => Level::Nested,
     }
 }
 
@@ -148,16 +134,14 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
     let Some(records) = call.session.shared_substrate() else {
         return Answer::error("the model is still loading");
     };
-    let starts = starts_of(&records, &call.lineage);
-    if !starts.tasks {
+    let level = level_of(&records, &call.lineage);
+    if !level.starts_tasks() {
         return Answer::error(
             "tasks nest one level, and this one is already a level down: do the work in your \
-             own rounds, or split it with `sub_run`",
+             own rounds",
         );
     }
-    // A conversation starts parts only when it is a task: then what it starts
-    // is a level down.
-    let by_task = starts.parts;
+    let by_task = level == Level::Task;
     let thread = thread_of(&call.lineage);
     match workers::start(
         &call.session,
@@ -213,7 +197,11 @@ pub fn nudge(call: &OpsCall, args: &Value) -> Answer {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::mcp::records::MemRecords;
+    use crate::mcp::threads::Worker;
 
     /// **A chat's tasks go on its own thread; a dialogue's on one named for
     /// it**, the same name every turn.
@@ -229,30 +217,55 @@ mod tests {
         assert_ne!(d, thread_of("another"));
     }
 
-    /// **Tasks nest one level, and a dialogue never starts a part**: a
-    /// dialogue holds out `sub_run`; a task Claude or a person started holds
-    /// out nothing; a task a task started, or a part, holds out the task
-    /// tools — and only tools its mode offers are held out.
+    /// **Tasks nest one level**: a dialogue and a task at the top hold out
+    /// nothing; a nested task holds out the task tools — and only the tools
+    /// its mode offers.
     #[test]
-    fn each_kind_holds_out_what_it_may_not_start() {
-        let offered: HashSet<String> = [SUB_RUN, START, REPLY, NUDGE, "file_read"]
+    fn a_nested_task_holds_out_the_task_tools() {
+        let offered: HashSet<String> = [START, REPLY, NUDGE, "file_read"]
             .map(String::from)
             .into();
-        let held = |starts: Starts, offered: &HashSet<String>| {
+        let held = |level: Level, offered: &HashSet<String>| {
             let mut tools = BTreeSet::new();
-            withhold_by_kind(&mut tools, offered, starts);
+            withhold_by_level(&mut tools, offered, level);
             tools
         };
-        assert_eq!(
-            held(Starts::CONVERSATION, &offered),
-            BTreeSet::from([SUB_RUN])
-        );
-        assert!(held(Starts::task(false), &offered).is_empty());
-        assert_eq!(
-            held(Starts::task(true), &offered),
-            BTreeSet::from(TASK_TOOLS)
-        );
-        let bare = HashSet::from(["file_read".to_string()]);
-        assert!(held(Starts::CONVERSATION, &bare).is_empty());
+        assert!(held(Level::Conversation, &offered).is_empty());
+        assert!(held(Level::Task, &offered).is_empty());
+        assert_eq!(held(Level::Nested, &offered), BTreeSet::from(TASK_TOOLS));
+        let partial = HashSet::from([START.to_string()]);
+        assert_eq!(held(Level::Nested, &partial), BTreeSet::from([START]));
+    }
+
+    fn worker(name: &str, kind: &str, by_task: bool) -> Worker {
+        serde_json::from_value(json!({
+            "thread": "t", "name": name, "conv_id": threads::conv_id("o", "t", name),
+            "prompt": "p", "state": "running", "role": "admin", "priority": "normal",
+            "kind": kind, "started_ms": 0, "turn_ms": 0, "beat_ms": 0, "by_task": by_task,
+            "activity": null, "no_entry": null
+        }))
+        .unwrap()
+    }
+
+    /// **A conversation's level is read from its worker's record**: a
+    /// dialogue and a chat are conversations, a task started from one is a
+    /// task, a task a task started is nested, and so is one whose record no
+    /// longer reads.
+    #[test]
+    fn a_level_is_read_from_the_record() {
+        let r = MemRecords::default();
+        for w in [
+            worker("zen", "chat", false),
+            worker("top", "coder", false),
+            worker("under", "researcher", true),
+        ] {
+            threads::put_worker(&r, "o", &w).unwrap();
+        }
+        let level = |name: &str| level_of(&r, &threads::conv_id("o", "t", name));
+        assert_eq!(level_of(&r, "1a7f30b0-2e8d"), Level::Conversation);
+        assert_eq!(level("zen"), Level::Conversation);
+        assert_eq!(level("top"), Level::Task);
+        assert_eq!(level("under"), Level::Nested);
+        assert_eq!(level("gone"), Level::Nested);
     }
 }

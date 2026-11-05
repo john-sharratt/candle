@@ -35,9 +35,7 @@
 //! instead of calling the tool, nothing happens", enforced rather than merely
 //! requested.
 
-use candle_conversation::stencil::element_close::{
-    function_end, value_end, PARAM_CLOSE, PARAM_TAG,
-};
+use candle_conversation::stencil::element_close::{read_block, LT_ESCAPE};
 use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -282,7 +280,6 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // Anything before the block is narration, and is kept — a character
         // that wrote a sentence before its call still wrote it.
         out.push_str(&rest[..at]);
-        let after = &rest[at + FN_OPEN.len()..];
         // An unterminated block is left as text rather than guessed at: a
         // truncated decode is narration, not a call whose arguments we invent.
         // The block ends at its real `</function>`, after its last value, and
@@ -292,52 +289,27 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // finished with `</parameter>`, so a block with an unclosed value was
         // not the grammar's and is left as text too.
         let block = &rest[at..];
-        let (Some(end), Some(name_end)) = (function_end(block), after.find('>')) else {
+        let Some(read) = read_block(block) else {
             // From the block's start, NOT `rest`: the narration before it was
             // already pushed above, so re-emitting the whole remainder would
             // duplicate it.
             out.push_str(block);
             return Some(out);
         };
-        let name = after[..name_end].trim();
-
         let mut obj = serde_json::Map::new();
-        obj.insert("tool".to_string(), Value::String(name.to_string()));
-        let mut pos = FN_OPEN.len() + name_end + 1;
-        loop {
-            let ahead = &block[pos..];
-            pos += ahead.len() - ahead.trim_start().len();
-            if !block[pos..].starts_with(PARAM_TAG) {
-                break;
-            }
-            let key_start = pos + PARAM_TAG.len();
-            let Some(key_len) = block[key_start..].find('>') else {
-                break;
-            };
-            let value_start = key_start + key_len + 1;
-            let Some(close) = value_end(block, value_start) else {
-                break;
-            };
-            let key = block[key_start..key_start + key_len].trim();
-            // The element's own newlines are framing rather than content: the
-            // template writes `<parameter=k>\n` before the value and `\n` after
-            // it. Trimming exactly those keeps a value that deliberately ends
-            // in a blank line, which `trim()` would eat.
-            let value = &block[value_start..close];
-            let value = value.strip_prefix('\n').unwrap_or(value);
-            let value = value.strip_suffix('\n').unwrap_or(value);
-            if !key.is_empty() {
-                obj.insert(key.to_string(), Value::String(value.to_string()));
-            }
-            pos = close + PARAM_CLOSE.len();
+        obj.insert("tool".to_string(), Value::String(read.name.to_string()));
+        // Each value with its framing newlines off, so one that deliberately
+        // ends in a blank line keeps it, which `trim()` would eat.
+        for (key, value) in read.args.into_iter().filter(|(k, _)| !k.is_empty()) {
+            obj.insert(key.to_string(), Value::String(value.to_string()));
         }
         out.push('\n');
-        // A value's `<` is written `<`, the same string to the JSON
-        // reader, so no tag inside a value survives into the lines that
-        // `normalize` splits on `<tool_call>` and `</tool_call>`.
-        out.push_str(&Value::Object(obj).to_string().replace('<', "\\u003c"));
+        // A value's `<` is written as its JSON escape (`LT_ESCAPE`), the same
+        // string to the JSON reader, so no tag inside a value survives into
+        // the lines that `normalize` splits on `<tool_call>` and `</tool_call>`.
+        out.push_str(&Value::Object(obj).to_string().replace('<', LT_ESCAPE));
         out.push('\n');
-        rest = &block[end..];
+        rest = &block[read.end..];
     }
     out.push_str(rest);
     Some(out)

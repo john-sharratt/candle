@@ -206,12 +206,12 @@ sentence is made from also keep the time spent in tools, every failed call by
 how it failed, and when it first changed a file and first committed. They live
 on the worker's record and cover its latest turn.
 
-**The work never runs inside a tool call.** A task's turn, and every part its
-worker starts with `sub_run` (§6.1), runs on zend to completion whether or not
-anyone is waiting, as every zend turn does; a worker waits on its own parts
-server-side, for as long as they take, so fan-out inside zend meets no client
-limit at all. Only Claude's wait on zend is bounded, and a tool call is never
-held longer than `wait_s`:
+**The work never runs inside a tool call.** A task's turn, and every task a
+worker starts with `repo_task_start` (§6.1), runs on zend to completion whether
+or not anyone is waiting, as every zend turn does; a worker waits on the tasks
+it started server-side, with `job_status`, so fan-out inside zend meets no
+client limit at all. Only Claude's wait on zend is bounded, and a tool call is
+never held longer than `wait_s`:
 
 - **Start everything, then wait on all of it.** `repo_task_start` answers `running`
   within `wait_s` and the worker carries on, so Claude starts as many tasks as
@@ -278,8 +278,7 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
 - **`effort` `deep` by default, `think` on**, no verbosity cap: tokens are not
   the constraint. `repo_task_start` takes `effort` — `balanced`, `deep` or
   `exhaustive`, the effort dial's levels 2–4 (`threads::Effort`) — kept on the
-  worker's record and used for every turn it runs, its answers' and its
-  parts' included. `exhaustive` is for work that must weigh many results
+  worker's record and used for every turn it runs, its answers' included. `exhaustive` is for work that must weigh many results
   against each other: a research run that read 50K tokens of search results
   with under 3K tokens of thinking extracted the facts and missed that two of
   its own findings contradicted each other. Effort is how hard a turn thinks;
@@ -292,7 +291,7 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   conversation's slot (`scheduler::band::recorded_band`) in place of its
   layer's. `repo_task_start` records it from `priority` — `normal` by default, `high`
   for a task someone is waiting on interactively — before the task's first
-  turn, and a part decodes as its worker does. Priority is a decode-to-prefill
+  turn. Priority is a decode-to-prefill
   airtime ratio, not strict ordering
   (`candle-conversation/src/projection/schema.rs`).
 - **The caller as owner**, so the conversation is theirs and replicates as
@@ -359,16 +358,14 @@ chain included (`candle-conversation/src/substrate.rs:3470, 3775-3791`). A long
 thread would have cost every worker its priming.
 
 The worker runs the task's rounds — its reads, its builds, its tool output —
-and ends in its journal entry (§5). Its fan-out parts and its verifier are
-workers too, started by the worker under its own path (§6.1).
+and ends in its journal entry (§5). The tasks it fans out to and its verifier
+are workers too, started by it on the same thread (§6.1).
 
 **When the task ends, the result goes up:**
 
 1. the outcome is entered on the thread (above): the worker's entry line and
    address;
-2. every part and verifier under it is archived as it ends: distilled to text,
-   its K/V dropped, never resumed;
-3. the worker itself, when `done`, is kept whole so `repo_task_reply` can continue
+2. the worker itself, when `done`, is kept whole so `repo_task_reply` can continue
    it, and archived the same way when its thread is archived or after 24 hours
    untouched (`docs/mcp_guides.md` §3); when it failed, it is archived at once.
 
@@ -404,8 +401,7 @@ The kinds are `Observed` / `Heard` / `Did` / `Inferred`
 `Heard`, a user turn carrying a `<tool_response>` is `Observed`, an assistant
 turn is `Did` (`zend/src/journal/origin.rs:80-86`). In an `/mcp` worker every
 user turn is Claude's — the task, an answer, a nudge — so `Heard` renders
-`Claude said:` there, and in a part `Its worker said:` (`style_for`,
-`zend/src/journal/style.rs`).
+`Claude said:` there (`style_for`, `zend/src/journal/style.rs`).
 
 **Every task ends with an entry.** The journal drafts on its own cadence —
 every 16 turns, or under selection pressure (`zend/src/journal/state.rs:23,
@@ -466,7 +462,7 @@ conversation (`docs/zend_journal.md` §4); inheritance extends it down the
 lineage (`zend/src/mcp/lineage.rs`).
 
 **A worker carries the document of its kind.** `repo_task_start` takes a `role`
-(`coder` by default, `researcher`, `reviewer`) and a part takes its worker's.
+(`coder` by default, `researcher`, `reviewer`).
 The kind selects an option of the `role` selector in `projection.yaml`. Every
 option is pre-sealed at startup and read back by its hash, as a tool's section
 is, so the document is in the system prompt from the worker's first round and
@@ -478,8 +474,7 @@ dialogues, and a worked exchange there would hijack them. Editing one is a commi
 guides (`docs/mcp_guides.md`) are the caller's and do not reach a worker.
 
 **A conversation carries its ancestors' journals.** The lineage runs project →
-thread → worker → part: `P:candle`, `T:review-layers`,
-`T:review-layers/verify-expiry`, `T:review-layers/verify-expiry/check-plan`.
+thread → worker: `P:candle`, `T:review-layers`, `T:review-layers/verify-expiry`.
 At each round head (`carry_journal`, `zend/src/session.rs`) the journal
 collection of a conversation owned through `/mcp` holds every ancestor's
 journal, outermost first, then its own, then the reader's line:
@@ -488,11 +483,13 @@ journal, outermost first, then its own, then the reader's line:
 … shared prompt …
 P:candle                                  ← the project's standing rules (lineage/0)
 T:review-layers                           ← Claude's thread: decisions, what the user said, outcomes
-T:review-layers/verify-expiry             ← the worker that started this one
 … this conversation's own journal …       ← journal/<id>, journal/open
-This conversation is T:review-layers/verify-expiry/check-plan.   ← the reader's line (lineage/reader)
+This conversation is T:review-layers/verify-expiry.   ← the reader's line (lineage/reader)
 system_close
 ```
+
+A task a worker started is a worker on the same thread, so it carries the
+same two; what it needs of its starter's findings is in its prompt.
 
 - **The reader's own sections.** The thread's and the project's journals are
   records (§3.2) — no conversation of their own holds them — so each
@@ -507,7 +504,7 @@ system_close
   `Linking::Chain` (`candle-conversation/src/conversation/carried.rs`): a
   section reseals when its text changes, and with it every section after it.
   The order is also the order of change — the project's journal moves least,
-  the thread's when Claude acts, a worker's own most — so an append reseals the
+  the thread's when Claude acts, the worker's own most — so an append reseals the
   least it can. A decision changed later is a new entry that supersedes the old
   one, and each journal's heading says later entries win.
 - **Upward only.** A conversation carries its ancestors, never its siblings or
@@ -515,7 +512,7 @@ system_close
 - **Bounded across the chain.** The journal's shape bounds each journal (one
   line per entry, six open items, `journal-core/src/journal.rs:28`, and the
   calendar fold); a conversation also carries at most **8K tokens of ancestor
-  journals** (`lineage::MAX_CHARS`), nearest ancestor first, so a deep or
+  journals** (`lineage::MAX_CHARS`), nearest ancestor first, so a
   long-lived lineage drops its outermost journals' oldest lines from the
   prompt, saying how many — never its own journal, and never from the tools.
 - **Swept on rejoin.** The names an inherited section can take are a fixed set
@@ -529,45 +526,42 @@ conventions and whatever the user states as standing, so every worker in every
 thread starts with them. Every repository of the workspace has one.
 
 **Framed by whose it is.** Each inherited journal is headed by its absolute
-path and whose it is — *the notes of the thread, written by Claude*, *the
-journal of a worker above this conversation, drafted from its turns* — and the
-reader's line names which path the reader is, and says the journals above are
-information to weigh, not instructions. In a conversation owned through `/mcp`
-a claim drawn from a user turn renders `Claude said:` (`style::DELEGATED`), and
-in a part, whose user turns are its worker's, `Its worker said:`
-(`style::PART`).
+path and whose it is — *the standing rules of the project, noted by Claude*,
+*the notes of the thread, written by Claude* — and the reader's line names
+which path the reader is, and says the journals above are information to
+weigh, not instructions. In a conversation owned through `/mcp` a claim drawn
+from a user turn renders `Claude said:` (`style::DELEGATED`).
 
 **Privacy becomes lineage-scoped.** `docs/zend_journal.md` §7's "a journal is
-read by its own conversation and nothing else" becomes: by its own
-conversation and its descendants, and through the tools by its owner (§16).
+read by its own conversation and nothing else" becomes: a thread's and a
+project's notes by every worker under them, a worker's journal by itself, and
+all of them through the tools by their owner (§16).
 
 ### 5.2 Names and addresses
 
 **The call that creates a conversation names it.** `thread_attach` takes
-`thread`, `repo_task_start` takes `name`, and a worker starting a part names it the
-same way (§6.1): the name is a mandatory field, so nothing is named after the
-fact. A name is a kebab-case slug of at most 40 characters saying what the
-conversation is for — `verify-expiry`, `check-plan` — not a sequence number;
+`thread` and `repo_task_start` takes `name`, whether Claude, a conversation or
+a worker calls it (§6.1): the name is a mandatory field, so nothing is named
+after the fact. A name is a kebab-case slug of at most 40 characters saying
+what the conversation is for — `verify-expiry`, `check-plan` — not a sequence number;
 the tool descriptions ask for exactly that, so a header or a grep hit tells its
 reader what the work was.
 
 **A path is the names down the lineage:** `P:candle` for the project (named by
-its repository), `T:review-layers` for a thread, and a worker's path continues
-its parent's: `T:review-layers/verify-expiry/check-plan`. The conversation id
+its repository), `T:review-layers` for a thread, and
+`T:review-layers/verify-expiry` for a worker under it. The conversation id
 stays behind it; the name and the journal parent are kept in the
 conversation's metadata, durable and replicated, so a path resolves on any
 member.
 
-**A name may not repeat within its lineage.** A new name is refused if it
-matches any ancestor's name, or a live sibling's — before anything runs, with
-the clash named: *`check-plan` is already the name of an ancestor
+**A name may not repeat on its thread.** A new name is refused if it is the
+thread's own, or a live worker's — before anything runs, with the clash named:
+*`check-plan` is the name of a conversation still live
 (`T:review-layers/check-plan`); choose another.* The caller picks another; a
 name is never changed for it silently, because the caller's later citations
-would be wrong. Cousins may share a name: they are never in one prompt, and
-their paths differ. A name whose worker was archived takes the next numbered
-sibling, `verify-expiry.2`, which the result returns, since a task re-run
-under the same name is the normal case; the suffixed name is checked against
-the lineage too.
+would be wrong. A name whose worker ended takes the next numbered sibling,
+`verify-expiry.2`, which the result returns, since a task re-run under the
+same name is the normal case (`names::worker_name`).
 
 **Names never change.** Sealed K/V carries the path in its header, so a rename
 would leave the prompt and the address disagreeing; there is no rename.
@@ -581,9 +575,9 @@ would leave the prompt and the address disagreeing; there is no rename.
 | `T:review-layers#12.3` | one claim of it |
 
 - **A bare name resolves upward.** Within a conversation's lineage every name
-  appears once, so a worker cites `check-plan#3`, short in sealed text, and it
-  resolves against its own ancestors only. Claude always uses full paths, and
-  every tool prints them.
+  appears once, so a worker cites `review-layers#3`, short in sealed text, and
+  it resolves against its own ancestors only. Claude always uses full paths,
+  and every tool prints them.
 - **Folds keep addresses alive.** A fold ceases the folded entries' text in a
   dialogue; in a conversation owned through `/mcp` it files the folded
   entries' turns under the fold instead, and notes where each went
@@ -664,51 +658,33 @@ A skill's prompt requires, before the final response:
 blocks a live user. Wide fan-out is budgeted by the member's throughput, which
 `cluster_status` reports.
 
-### 6.1 Parts and verifiers: `sub_run`
+### 6.1 Tasks a worker starts, and verifiers
 
-A worker splits its own work with `sub_run`
-(`zend/src/prompts/tools/sub_run.yaml`, `high_risk: true`). Its runner is the
-session's (`zend/src/mcp/parts.rs`), carried by every tool context
-(`ToolHost::running_parts`), and serves conversations owned through `/mcp`;
-any other conversation is told it cannot start parts:
+A worker splits its work the way Claude does: with `repo_task_start`, through
+the operations runner as the person it works for (`zend/src/mcp/zen_tasks.rs`,
+`docs/zen_tool_reach.md` §6.3). There is no second mechanism.
 
-- **`sub_run {name, prompt}`** starts a part under the calling worker's path,
-  named by the call (§5.2), owned like its parent, running as its parent's role
-  and priority — so the part carries the worker's, the thread's and the
-  project's journals (§5.1) and starts knowing what the task has learned, with
-  no briefing.
-- The part runs to its entry as a task does (§5), and `sub_run` answers with
-  its path, `done` or `error`, its journal entries — line, claims, address —
-  and the end of its final response, the shape its worker asked it to answer
-  in. The calling worker cites it by address in its own entry. The call waits
-  server-side for as long as the part runs; no client limit applies inside
-  zend.
-- **A part asks nobody.** Its prompt ends saying so (`part_close`): whatever
-  blocks it is said in its final response, which is its answer. It settles
-  `done` — a question block or a closed loop said as such — or `error`, and is
-  archived as it ends, its evidence kept like a task's. Its settling is its
-  worker's business, never an entry on Claude's thread.
-- **Several at once.** A run of consecutive `sub_run` calls in one round runs
-  at once, at most 16 at a time (`tool_round::run_together`): reviewing twelve
-  files, researching three crates. Every other call of a round runs alone and
-  in order, since a write and the read after it depend on that order.
-- **Bounded depth.** A task's part may start parts of its own; a part's part
-  may not (`parts::MAX_DEPTH`), since every level waits on the one below it.
-- **A verifier is a part.** For anything that will be merged, deployed or
-  reported, the skill's prompt has the worker start a part named `verify-…`
-  that checks the worker's draft findings adversarially — every claim against
-  the turns and files it cites — before its final response. The thread
-  receives the worker's entry, which cites the verifier's.
-- **Restart-safe by name.** A restart re-dispatches a call turn's tools
-  (`resume_unfinished_turns`), and `sub_run` is `Replay::Safe`: a re-dispatched
-  call finds its part by `(parent, name)` among the parts started in the
-  parent's current turn, waits on it while it runs and returns its result when
-  it has ended, rather than starting it again or failing as a live-sibling
-  clash. A part whose member stopped running it is started afresh, once.
+- **One level.** A task Claude, a person or a conversation started may start
+  tasks; a task a task started may not (`Worker::by_task`, `zen_tasks::Level`).
+  Its rounds have the task tools withheld from grammar and prompt alike, and
+  `repo_task_start` from it is refused.
+- **Siblings on the thread.** The task it starts goes on the starter's thread,
+  named by the call (§5.2), so it carries the thread's and the project's
+  journals (§5.1) and `thread_list` shows it beside its starter. Its starter's
+  findings reach it through its prompt.
+- **Waited on like any job.** `repo_task_start` answers at once with the
+  task's handle; the starter waits on it with `job_status` and reads its
+  answer and journal entries there, citing them by address in its own entry.
+  The wait is server-side; no client limit applies inside zend.
+- **A verifier is a task.** For anything that will be merged, deployed or
+  reported, the skill's prompt has the worker start a reviewer or researcher
+  task named `verify-…` that checks the worker's draft findings adversarially
+  — every claim against the turns and files it cites — before its final
+  response. The thread receives both entries; the worker's cites the
+  verifier's.
 
-**Claude can fan out too**, by issuing several `repo_task_start` calls at once; those
-workers are siblings under the thread. A worker's own parts are for splitting
-one task; Claude's parallel tasks are for unrelated work.
+**Claude can fan out too**, by issuing several `repo_task_start` calls at once;
+those workers are siblings under the thread.
 
 ### 6.2 Asking Claude: keeping a worker moving
 
@@ -918,7 +894,7 @@ the user's approval; and what to do if zend is down.
 | Skill | Asks zend to | Result |
 |---|---|---|
 | `zend-implement` | Implement a written spec on a branch, with tests, and push the branch | Branch, commit, test summary, open items |
-| `zend-review` | Review code, with a verifier part | Findings by severity, each cited |
+| `zend-review` | Review code, with a verifier task | Findings by severity, each cited |
 | `zend-research` | Research a question on the web | Answer with citations; the raw results greppable |
 | `zend-ask` | Answer a question about the code from what the layers and a read hold | Answer, each claim cited |
 
@@ -1454,9 +1430,9 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   finding a finished turn. `StreamItem::Closing` settling the worker `stuck`.
 - `repo_task_nudge` queued, surviving a restart, and taken at the next round head,
   never mid-decode.
-- `sub_run`: a part started under the worker's path, pinning its ancestors'
-  journals; concurrent parts in one round; its entry as the tool response; a
-  re-dispatched call after a restart attaching to its part.
+- Tasks nesting one level: a task a worker started marked `by_task`, its
+  rounds holding the task tools out of grammar and prompt, and its
+  `repo_task_start` refused.
 - Priority: a worker decoding at `normal`, and at `high` when asked.
 - The guardrails in zend: a push to a default branch from an `/mcp`
   conversation refused.
@@ -1536,4 +1512,4 @@ Made in the change that builds each piece:
   the trial as a job (§3.9); the member route that submits an agent run job
   (§11).
 - **`docs/zend_layers.md`** and the tool YAMLs: `journal_read`'s and
-  `journal_grep`'s `journal` parameter, `journal_note`, `sub_run`'s runner.
+  `journal_grep`'s `journal` parameter, `journal_note`.

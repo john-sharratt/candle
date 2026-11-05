@@ -36,13 +36,11 @@ pub const MAX_RESUMES: u32 = 3;
 /// [`super::threads::BEAT_LOST_MS`], and a restart's load is within it.
 pub const RESUME_AFTER_MS: u64 = 10 * 60 * 1000;
 
-/// Whether `w`, as observed at `now`, should be started again. A part is not:
-/// the worker that started it is, and starts what it still needs. One silent
-/// for as long as the archive sweep waits has been given up on.
+/// Whether `w`, as observed at `now`, should be started again. One silent for
+/// as long as the archive sweep waits has been given up on.
 pub fn due(w: &Worker, now: u64) -> bool {
     let silent = now.saturating_sub(w.beat_ms);
     lost(w)
-        && !w.is_part()
         && w.resumes < MAX_RESUMES
         && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
 }
@@ -154,10 +152,6 @@ mod tests {
         assert!(
             !due(&worker("a", MAX_RESUMES).observed(after), after),
             "carried through enough restarts"
-        );
-        assert!(
-            !due(&worker("a/part", 0).observed(after), after),
-            "its worker starts its parts"
         );
         let late = 1_000 + LOST_ARCHIVE_MS;
         assert!(!due(&worker("a", 0).observed(late), late), "given up on");

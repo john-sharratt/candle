@@ -64,7 +64,7 @@
 
 use serde_json::{Map, Number, Value};
 
-use super::element_close::{function_end, value_end, PARAM_CLOSE, PARAM_TAG as PARAM_OPEN};
+use super::element_close::{read_block, LT_ESCAPE};
 use super::tool_call::{ParamType, ToolSpec};
 
 /// Opens the call and precedes its name. Mirrors `ToolCallEnvelope::open`'s tail.
@@ -93,7 +93,6 @@ pub fn function_blocks_to_json(text: &str, tools: &[ToolSpec]) -> Option<String>
         // Anything before the block is the model's prose and is kept: an answer
         // that explained itself before calling still said it.
         out.push_str(&rest[..at]);
-        let after = &rest[at + FN_OPEN.len()..];
         // **An unterminated block is left as text rather than guessed at.** A
         // truncated decode is prose, not a call whose arguments we invent — and
         // a half-call dispatched is worse than a half-call shown.
@@ -102,55 +101,28 @@ pub fn function_blocks_to_json(text: &str, tools: &[ToolSpec]) -> Option<String>
         //
         // **The block ends at its real `</function>`** — the one after its last
         // value, each value ending where structure follows its `</parameter>`
-        // ([`element_close`], the rule the grammar closes on). A value holding
+        // ([`read_block`], the rule the grammar closes on). A value holding
         // `</parameter>`, `</function>` or `</tool_call>` keeps them.
         let block = &rest[at..];
-        let (Some(end), Some(name_end)) = (function_end(block), after.find('>')) else {
+        let Some(read) = read_block(block) else {
             out.push_str(block);
             return Some(out);
         };
-        let name = after[..name_end].trim();
-        let spec = tools.iter().find(|t| t.name == name);
-
+        let spec = tools.iter().find(|t| t.name == read.name);
         let mut args = Map::new();
-        let mut pos = FN_OPEN.len() + name_end + 1;
-        loop {
-            let rest_of = &block[pos..];
-            pos += rest_of.len() - rest_of.trim_start().len();
-            if !block[pos..].starts_with(PARAM_OPEN) {
-                break;
-            }
-            let key_start = pos + PARAM_OPEN.len();
-            let Some(key_len) = block[key_start..].find('>') else {
-                break;
-            };
-            let value_start = key_start + key_len + 1;
-            let Some(close) = value_end(block, value_start) else {
-                break;
-            };
-            let key = block[key_start..key_start + key_len].trim();
-            // The element's own newlines are framing, not content: the grammar
-            // writes `<parameter=k>\n` before the value. Stripping exactly one
-            // leading and one trailing newline keeps a value that deliberately
-            // ends in a blank line, which `trim` would eat.
-            let raw = &block[value_start..close];
-            let raw = raw.strip_prefix('\n').unwrap_or(raw);
-            let raw = raw.strip_suffix('\n').unwrap_or(raw);
-            if !key.is_empty() {
-                args.insert(key.to_string(), typed_value(raw, param_type(spec, key)));
-            }
-            pos = close + PARAM_CLOSE.len();
+        for (key, raw) in read.args.iter().filter(|(key, _)| !key.is_empty()) {
+            args.insert(key.to_string(), typed_value(raw, param_type(spec, key)));
         }
 
         let mut obj = Map::new();
-        obj.insert("name".to_string(), Value::String(name.to_string()));
+        obj.insert("name".to_string(), Value::String(read.name.to_string()));
         obj.insert("arguments".to_string(), Value::Object(args));
-        // **No tag survives inside the object.** A value's `<` is written
-        // `<` — the same string to any JSON reader — so a value holding
+        // **No tag survives inside the object.** Every `<` is written as its
+        // JSON escape, the same string to any JSON reader, so a value holding
         // `<tool_call>` or `</tool_call>` cannot open or end a call for a
         // scanner that looks for those tags in the translated text.
-        out.push_str(&Value::Object(obj).to_string().replace('<', "\\u003c"));
-        rest = &block[end..];
+        out.push_str(&Value::Object(obj).to_string().replace('<', LT_ESCAPE));
+        rest = &block[read.end..];
     }
     out.push_str(rest);
     Some(out)

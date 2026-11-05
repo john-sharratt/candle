@@ -89,15 +89,14 @@ pub fn too_many() -> String {
 }
 
 /// The worker that answers the next message on the chat whose thread is
-/// `thread` and whose workers, as observed, are `workers`.
+/// `thread` and whose workers, as observed, are `workers`: Zen's side of the
+/// chat, never a task the chat started on its thread.
 pub fn next(workers: &[Worker], thread: &str) -> Result<Next, String> {
-    if workers.iter().any(|w| w.state.working()) {
+    let zen = || workers.iter().filter(|w| w.kind.is_chat());
+    if zen().any(|w| w.state.working()) {
         return Err(still_answering(id_of(thread).unwrap_or(thread)));
     }
-    let newest = workers
-        .iter()
-        .filter(|w| !w.is_part())
-        .max_by_key(|w| w.started_ms);
+    let newest = zen().max_by_key(|w| w.started_ms);
     match newest {
         Some(w)
             if w.state == State::Done && w.resumable && !archiving::being_archived(&w.conv_id) =>
@@ -109,7 +108,7 @@ pub fn next(workers: &[Worker], thread: &str) -> Result<Next, String> {
                 .iter()
                 .map(|w| (w.name.clone(), w.state.live()))
                 .collect();
-            names::child_name(thread, "", ZEN, &taken).map(Next::Fresh)
+            names::worker_name(thread, ZEN, &taken).map(Next::Fresh)
         }
     }
 }
@@ -263,7 +262,7 @@ pub fn view(records: &dyn Records, owner: &str, id: &str, now: u64) -> View {
     let answering = threads::workers(records, owner, &thread_of(id))
         .into_iter()
         .map(|w| w.observed(now))
-        .filter(|w| !w.is_part() && w.state.working())
+        .filter(|w| w.kind.is_chat() && w.state.working())
         .max_by_key(|w| w.started_ms);
     View {
         chat: record::chat(records, owner, id),
@@ -360,8 +359,8 @@ pub fn render(v: &View, id: &str, from: usize, now: u64) -> String {
 /// ended in, said as Zen's message — before its record says it ended, so a
 /// reader woken by the record finds it.
 pub fn answered(records: &dyn Records, owner: &str, worker: &Worker) {
-    // A part's ending is its worker's to read, as its `sub_run` result.
-    let Some(id) = id_of(&worker.thread).filter(|_| !worker.is_part()) else {
+    // A task the chat started ends in its own record, read with `job_status`.
+    let Some(id) = id_of(&worker.thread).filter(|_| worker.kind.is_chat()) else {
         return;
     };
     // Ordered against a disposal marking the chat closing, which this write
@@ -479,8 +478,16 @@ mod tests {
         );
     }
 
-    /// **One message is answered at a time**: a send while Zen answers — or
-    /// while a part of its answer runs — is refused.
+    /// A task the chat started on its thread.
+    fn task(name: &str, state: &str, started_ms: u64) -> Worker {
+        let mut w = worker(name, state, started_ms, false);
+        w.kind = WorkerKind::Researcher;
+        w
+    }
+
+    /// **One message is answered at a time**: a send while Zen answers is
+    /// refused, and a task the chat started neither blocks the next message
+    /// nor answers it.
     #[test]
     fn a_send_while_zen_answers_is_refused() {
         let now = now_ms();
@@ -491,10 +498,10 @@ mod tests {
         );
         let running = worker("zen", "running", now, false);
         assert_eq!(next(&[running], THREAD), refused);
-        let part = worker("zen/look", "running", now, false);
+        let done = worker("zen", "done", 1, true);
         assert_eq!(
-            next(&[worker("zen", "done", 1, true), part], THREAD),
-            refused
+            next(&[done.clone(), task("look", "running", now)], THREAD),
+            Ok(Next::Continue(Box::new(done)))
         );
     }
 
@@ -622,7 +629,7 @@ mod tests {
     }
 
     /// **Zen's answer becomes its message**, a failure said as one, and the
-    /// chat's last message is marked; a part's ending is no message.
+    /// chat's last message is marked; a task's ending is no message.
     #[test]
     fn zens_answer_is_said_as_its_message() {
         let r = MemRecords::default();
@@ -644,7 +651,7 @@ mod tests {
         let mut failed = worker("zen", "error", 1, false);
         failed.error = Some("the model is still loading".into());
         answered(&r, "o", &failed);
-        answered(&r, "o", &worker("zen/look", "done", 1, false));
+        answered(&r, "o", &task("look", "done", 1));
         let got = record::said(&r, "o", id);
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(

@@ -60,8 +60,9 @@ RULES:
   anything cited that you did not open sends you back to open it.
 - Keep vendor claims apart: "the vendor reports …" for what only the vendor
   says.
-- Before answering, start a part named verify-sources with sub_run: it
-  re-opens each URL you rely on and checks the claim is there.
+- Before answering, start a researcher task named verify-sources with
+  repo_task_start, and wait on it with job_status: it re-opens each URL you
+  rely on and checks the claim is there.
 
 FINAL RESPONSE, in this shape:
 ANSWER: the answer, in a few sentences

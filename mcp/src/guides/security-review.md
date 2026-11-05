@@ -33,7 +33,8 @@ METHOD:
 4. Check yourself: a pattern match is not a finding; only an exploit path is.
 
 VERIFY BEFORE ANSWERING:
-- Start a part named verify-findings with sub_run: it re-reads each path and
+- Start a reviewer task named verify-findings with repo_task_start, giving it
+  your findings, and wait on it with job_status: it re-reads each path and
   keeps only findings with a concrete exploit. Put its verdict in your answer.
 
 FINAL RESPONSE:
@@ -43,18 +44,19 @@ FINDINGS (most severe first):
   EXPLOIT: the input, the path it takes, what the attacker gains
   EVIDENCE: the quoted lines
 SOUND: trust boundaries checked and found to hold, each with file:line
-VERIFIED BY PART: what verify-findings kept and dropped, and why
+VERIFIED: what verify-findings kept and dropped, and why
 UNVERIFIED: what you could not confirm, and what you could not read
 COULD NOT DO: what was not covered, and why
 ```
 
 ## While it works
 
-The verify-findings part runs inside the worker's turn: `thread_list` does
-not list it and the thread's journal holds no entry of its own. While it runs
-the worker's progress line reads `sub_run` with counters that do not move,
-sometimes for half an hour — that is the part working, not a hang. Its verdict
-reaches you in the worker's VERIFIED BY PART.
+The verify-findings task is the worker's own: it goes on the same thread and
+`thread_list` lists it beside the worker. While it runs the worker's progress
+line reads `job_status` with counters that do not move, sometimes for half an
+hour — that is the worker waiting on its verifier, not a hang. The verdict
+reaches you in the worker's VERIFIED. Tasks nest one level, so the verifier
+starts no task of its own.
 
 ## Read the result
 

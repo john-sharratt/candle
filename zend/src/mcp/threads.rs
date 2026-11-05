@@ -22,7 +22,7 @@ use web::auth::Role;
 
 use super::activity::Activity;
 use super::caller::Person;
-use super::names::{parent_of, Path};
+use super::names::Path;
 use super::records::Records;
 use super::roles::WorkerKind;
 
@@ -133,41 +133,38 @@ pub struct Entry {
     pub text: String,
 }
 
-/// A worker's record — a task Claude started, or a part a worker started
-/// under itself with `sub_run`.
+/// A worker's record: a task Claude, a person, a conversation or another task
+/// started, or Zen's side of a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub thread: String,
-    /// Its lineage name below the thread: `verify` for a task, `verify/read`
-    /// for a part of it ([`super::names`]).
+    /// Its name below the thread, possibly numbered: `verify`, `verify.2`
+    /// ([`super::names`]).
     pub name: String,
     /// The zend conversation the task runs in.
     pub conv_id: String,
     pub prompt: String,
     pub state: State,
     /// The role its current turn runs as: its owner's role when the turn
-    /// began, read afresh for every task and answer, so a part runs with
-    /// exactly the tools its worker has.
+    /// began, read afresh for every task and answer.
     pub role: Role,
     /// The person it works for, as the call that started or last answered it
     /// named them: whom its cluster, guide and memory tools act as, their role
-    /// checked again by each member and gateway a call reaches. A part works
-    /// for whom its worker does. `None` on a record kept before workers carried
-    /// it: such a task's tools that act as a person are refused.
+    /// checked again by each member and gateway a call reaches. `None` on a
+    /// record kept before workers carried it: such a task's tools that act as
+    /// a person are refused.
     #[serde(default)]
     pub person: Option<Person>,
-    /// How urgently its turns decode; a part decodes as its worker does.
+    /// How urgently its turns decode.
     pub priority: Priority,
-    /// How hard its turns think; a part thinks as its worker does.
+    /// How hard its turns think.
     #[serde(default)]
     pub effort: Effort,
-    /// The kind of work it does, which picks the document it carries; a part
-    /// does what its worker does.
+    /// The kind of work it does, which picks the document it carries.
     #[serde(default)]
     pub kind: WorkerKind,
     pub started_ms: u64,
-    /// When its current turn began: a part this worker started in an earlier
-    /// turn is never mistaken for the answer to a call in this one.
+    /// When its current turn began.
     pub turn_ms: u64,
     /// When the member running the task last said it still was
     /// ([`BEAT_EVERY_MS`]).
@@ -272,12 +269,6 @@ impl Worker {
             None => Activity::default().sentence(elapsed),
         }
     }
-
-    /// Whether it is a part of another worker's task, not a task Claude
-    /// started.
-    pub fn is_part(&self) -> bool {
-        !parent_of(&self.name).is_empty()
-    }
 }
 
 /// A thread's record.
@@ -344,7 +335,7 @@ pub fn conv_id(owner: &str, thread: &str, name: &str) -> String {
     format!("mcp:{owner}:{thread}/{name}")
 }
 
-/// The owner, thread and lineage name a worker's conversation id names —
+/// The owner, thread and worker name a worker's conversation id names —
 /// [`conv_id`] read back; `None` for any other conversation.
 pub fn conv_names(conv_id: &str) -> Option<(&str, &str, &str)> {
     let (owner, rest) = conv_id.strip_prefix("mcp:")?.split_once(':')?;
@@ -697,26 +688,19 @@ mod tests {
         }
     }
 
-    /// A record reads back as written, and a part is told from a task by its
-    /// lineage name.
+    /// A record reads back as written, and is addressed under its thread.
     #[test]
-    fn a_part_is_known_by_its_name() {
+    fn a_record_reads_back_under_its_path() {
         let kept = serde_json::json!({
-            "thread": "t", "name": "verify/read", "conv_id": "c", "prompt": "p",
+            "thread": "t", "name": "verify.2", "conv_id": "c", "prompt": "p",
             "state": "running", "role": "admin", "priority": "high",
             "started_ms": 0, "turn_ms": 5, "beat_ms": 5
         });
         let w: Worker = serde_json::from_value(kept).unwrap();
         assert_eq!(
-            (w.role, w.priority, w.turn_ms),
-            (Role::Admin, Priority::High, 5)
+            (w.role, w.priority, w.turn_ms, w.by_task),
+            (Role::Admin, Priority::High, 5, false)
         );
-        assert!(w.is_part());
-        assert_eq!(w.path(), "T:t/verify/read");
-        let task = Worker {
-            name: "verify".into(),
-            ..w
-        };
-        assert!(!task.is_part());
+        assert_eq!(w.path(), "T:t/verify.2");
     }
 }

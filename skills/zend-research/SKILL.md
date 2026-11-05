@@ -52,8 +52,8 @@ Work in three phases.
 - Say nothing about this codebase you did not read in this task: a file, symbol or setting
   named in your answer cites the file:line you read it at, or is marked UNVERIFIED. What you
   know from your context is not a reading.
-- Before you answer, start a part named verify-sources with sub_run that re-opens each cited
-  URL you rely on and checks the claim is there — and checks each conclusion you drew from it
+- Before you answer, start a researcher task named verify-sources with repo_task_start, and wait
+  on it with job_status: it re-opens each cited URL you rely on and checks the claim is there — and checks each conclusion you drew from it
   (what a method needs, what it changes) against what the source says.
 
 Final response, in this shape:

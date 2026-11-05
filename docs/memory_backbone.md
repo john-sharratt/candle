@@ -103,7 +103,7 @@ pub enum Section {
     Conversations,
     /// Everything durable the group talks about: projects, themes, places.
     Topics,
-    /// Zen feature threads, their workers and parts.
+    /// Zen feature threads and their workers.
     Threads,
     /// The group's bots, and what each did.
     Bots,
@@ -137,7 +137,7 @@ app.
 
 Every journal below the fixed levels is named at runtime: a kebab-case slug of
 at most 40 characters, unique among its siblings, numbered `.2`, `.3` when a
-name recurs (`names::child_name`). Each carries a one-line **cue**, "open
+name recurs, as a worker's name does (`names::worker_name`). Each carries a one-line **cue**, "open
 this when…", which its parent's index shows (§5.2).
 
 **A journal is named the way its section's journals are** (`Section::naming`):
@@ -169,7 +169,7 @@ workspace repository is named that no topic claims, the server creates
 | Children | Created by | An eleventh live child |
 |---|---|---|
 | conversations | the server, at a conversation's first call; or by hand (§6.7) | **folds the oldest**: the window slides |
-| threads, workers, parts | Zen, at `thread_attach` / `repo_task_start` / `sub_run` | **folds the least recently active finished one**; a running one never |
+| threads, workers | Zen, at `thread_attach` / `repo_task_start` | **folds the least recently active finished one**; a running one never |
 | bots | npcd, when a member comes to own a bot | folds the least recently active |
 | topics, people | the server for a workspace repository (§2.2); otherwise an AI, or a person by hand | **refused**: "candle has 10 sub-journals; restructuring it is a coding task" (§2.6) |
 | a member's own `people/<person>` | joining the group (§3.5) | **folds the least recently active journal of someone who is not a member**; refused only when all ten are members' |

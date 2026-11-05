@@ -13,7 +13,7 @@ rely on it, and check in proportion to what rides on it.
 ## 1. Read the citation audit
 
 A finished task's answer that cites any URL ends with an audit of each one,
-against what the tools returned to the worker and to the parts it started:
+against what the tools returned to the worker:
 
 - **opened** — a `web_fetch` of it returned the page. A fetch that failed
   opened nothing.
@@ -63,7 +63,7 @@ entry's address in the prompt gives it nothing to open.
 
 - `journal_grep {journal: "T:<thread>/<name>", pattern}` for a URL, a file, a
   figure — each hit names the turn it is in. `T:<thread>/*` searches every
-  worker on the thread, parts included.
+  worker on the thread, the tasks a worker started included.
 - `journal_read {journal: "T:<thread>/<name>"}` lists the worker's entries —
   its claims. With an entry's address (`…#<n>`) it pages the raw turns behind
   that entry, which run to hundreds of lines: find the turn with

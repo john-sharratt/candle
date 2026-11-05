@@ -910,7 +910,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // shown as it arrives, under the tool and the file it is going to, so a long
   // write reads as work in progress rather than a frozen "Calling tool…".
   function pendingCallCard(json) {
-    const call = window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null };
+    return pendingCard(window.ZendPartialCall ? window.ZendPartialCall.parse(json) : { name: null, args: {}, writing: null });
+  }
+  // `call` = { name, args, writing }: the writing box while it writes a value
+  // other than its target, else a one-line "Calling …" card.
+  function pendingCard(call) {
     if (call.writing && TARGET_KEYS.indexOf(call.writing) === -1) return authoringCard(call);
     const label = call.name ? 'Calling ' + esc(call.name) + '…' : 'Calling tool…';
     return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + label + '</span></div></div>';
@@ -1273,11 +1277,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       if (p.tool === 'journal_note') { html += noteBubble(args.text || '', closed); callNo++; continue; }
       if (!closed) {
         const writing = p.args && p.args.length ? p.args[p.args.length - 1][0] : null;
-        const call = { name: p.tool || null, args, writing };
-        html += call.writing && TARGET_KEYS.indexOf(call.writing) === -1
-          ? authoringCard(call)
-          : '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' +
-            (call.name ? 'Calling ' + esc(call.name) + '…' : 'Calling tool…') + '</span></div></div>';
+        html += pendingCard({ name: p.tool || null, args, writing });
         callNo++;
         continue;
       }
@@ -1290,6 +1290,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       html += toolCard(json, true, output, p.running ? [p.tool] : null, p.tokens != null ? p.tokens : null, callNo++);
     }
     return html;
+  }
+  // A failed turn's notice, with the retry it offers.
+  function failedTurnHtml(msg) {
+    const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
+    const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
+    return '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
   }
   // The part a streaming reply's `part` event names, by id.
   function partById(m, id) {
@@ -1324,11 +1330,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // A reply the daemon gave as parts draws from them alone.
     if (msg.role === 'assistant' && msg.parts && msg.parts.length) {
       let html = renderParts(msg.parts, !!msg.streaming, open, msg.thinking);
-      if (msg.error) {
-        const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
-        const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
-        return html + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
-      }
+      if (msg.error) return html + failedTurnHtml(msg);
       if (msg.streaming && msg.prefill) html += prefillCard(msg.prefill);
       if (msg.streaming) html += '<span class="zcursor"></span>';
       return html;
@@ -1342,9 +1344,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const think = { lengths: msg.thinking, live: msg.thinkLive };
     if (msg.error) {
       const body = msg.content ? renderContent(msg.content, false, open, toolOutputs || msg.toolOutputs, null, think, tokens) : '';
-      const act = msg.retry === 'resend' ? 'Try again' : msg.retry === 'reload' ? 'Reload conversation' : '';
-      const btn = act ? '<button type="button" class="zerr-act" data-retry="' + msg.retry + '">' + act + '</button>' : '';
-      return body + '<div class="zerr" role="alert"><b>Generation failed.</b> ' + esc(msg.error) + btn + '</div>';
+      return body + failedTurnHtml(msg);
     }
     if (msg.streaming && !msg.content) {
       // Bouncing dots while waiting; the italic word only appears if the daemon

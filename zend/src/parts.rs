@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::reasoning_split::marker_start_len;
+use crate::tool_call_split::object_end;
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
@@ -490,26 +491,8 @@ fn undecided_from(text: &str) -> usize {
 /// string-aware, so a value holding the tag stays inside.
 fn json_close(text: &str) -> Option<usize> {
     let lead = text.len() - text.trim_start().len();
-    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
-    for (i, b) in text[lead..].bytes().enumerate() {
-        match (in_string, escaped, b) {
-            (true, true, _) => escaped = false,
-            (true, false, b'\\') => escaped = true,
-            (true, false, b'"') => in_string = false,
-            (true, false, _) => {}
-            (false, _, b'"') => in_string = true,
-            (false, _, b'{' | b'[') => depth += 1,
-            (false, _, b'}' | b']') => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    let end = lead + i + 1;
-                    return text[end..].find(CALL_CLOSE).map(|c| end + c);
-                }
-            }
-            (false, _, _) => {}
-        }
-    }
-    None
+    let end = lead + object_end(&text[lead..])?;
+    text[end..].find(CALL_CLOSE).map(|c| end + c)
 }
 
 fn strip_lead(text: &str) -> &str {

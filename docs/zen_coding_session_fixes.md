@@ -18,7 +18,7 @@ its call listing (`timeline_read`, view `calls`) and its projection record
 | 1a Decoding | A parameter value holding `</parameter>`, `</function>` or `</tool_call>` ended the call early, so every write of the bubble's code failed (#48–#60) | A value ends only at a `</parameter>` that structure follows: `Until` takes a fixed set of markers, and the grammar, the XML-to-JSON conversion, the splitter and npcd share one rule |
 | 1b Visual | The GUI finds calls by searching the streamed text for tags, so it has 1a's blind spot, pairs results by position, and drew failed rounds as progress | The GUI draws from call events on the live stream and from call records in the history; it parses no text |
 | 2 `in_context` | A read answered with a pointer, not the page; the model could not tie it to the placed content and looped (#23–#62) | The `in_context` reply and the locks go; every read runs for real; provenance skips files the turn's loop has read |
-| 3 Delegation | "Launch a research task" went to `sub_run`, which cannot run in a dialogue, so the research ran inline (#4–#10) | `sub_run` is withheld in dialogues and chats; a task never starts a task |
+| 3 Delegation | "Launch a research task" went to `sub_run`, which cannot run in a dialogue, so the research ran inline (#4–#10) | `sub_run` is removed; dialogues, chats and tasks start tasks, which nest one level |
 | 4 Forced note | The forced `journal_note` was the only call that landed in failed rounds, and was forced with nothing to say | A forced note is followed by a forced call; failed calls answer with an error; a note is forced only after 200 tokens of reasoning |
 | S1–S5 | Smaller issues: sandbox scope, repository-wide grep, a stale tool schema, a cut-short view, a context block on every connector call | All in scope |
 
@@ -285,46 +285,36 @@ The model chose `sub_run` instead, which starts parts of a task delegated
 through the MCP server. It was refused (#4), and the model then did the research
 inline: all 30 pages of `rate.rs` over #5–#10.
 
-1. **Withhold `sub_run` outside tasks.** Today a task has `repo_task_start`,
-   `repo_task_reply` and `repo_task_nudge` withheld (`TASK_TOOLS`,
-   `zend/src/session.rs:4578–4580`). The mirror: in a person's dialogue and in a
-   chat Claude holds with Zen, `sub_run` is withheld. A withheld tool is out of
-   the signatures and out of the stencil's grammar (`round_triggers`,
-   `session.rs:634–670`), so the model cannot take that path. Only tasks and
-   their parts get `sub_run`; dialogues and chats get the `repo_task_*` tools.
-2. **`sub_run` starts a task where it cannot start a part.** It has no refusal
-   message. If it is ever called by a conversation that is not a task
-   (`zend/src/mcp/parts.rs:117`), it starts a task on that conversation's
-   thread, as `repo_task_start` would (`zen_tasks::thread_of`), and answers with
-   its handle.
+1. **`sub_run` is removed.** Parts duplicated what tasks with roles already
+   do: a task that wants a piece done apart starts a task of its own. The tool,
+   its runner (`zend/src/mcp/parts.rs`), the `subagent` tool in zend-tools, the
+   lineage of parts below a worker and their journals, and the guides' and
+   skills' verifier parts are gone; a verifier is a reviewer or researcher task.
+2. **Tasks nest one level.** A dialogue, a chat, and a task Claude or a person
+   started each have the `repo_task_*` tools. A task a task started
+   (`Worker::by_task`) has them withheld from its signatures and its grammar
+   alike (`zen_tasks::level_of`, `withhold_by_level`,
+   `SelectionState::withhold_members`), and `repo_task_start` from it is
+   refused. The one level keeps the task that started the others in the loop:
+   no chain of tasks can feed its own output back as the next one's brief.
 3. **The `repo_task_*` tools stay scored, not mandatory.** `repo_task_start`'s
    trigger questions already include "start a research task on …". Check the
    `projections` view of turn #1 for whether it was shown; if it was not, tune
    its trigger questions.
 
-**No recursion: a task never starts a task.** A dialogue or chat starts tasks;
-a task does all its work itself, and may split it only into parts.
-
-- A task, and every part under it, has `repo_task_start`, `repo_task_reply` and
-  `repo_task_nudge` withheld (`TASK_TOOLS`), from its signatures and its grammar
-  alike.
-- A task's `sub_run` always starts a part, never a task: the fallback in item 2
-  is only for a caller that is not a task, and a task's caller always resolves
-  (`threads::conv_names`). The fallback checks this, not assumes it.
-- Parts are bounded in depth: a task, its part, and that part's part
-  (`MAX_DEPTH = 3`, `zend/src/mcp/parts.rs:41`).
-- A task the fallback starts is a task like any other, with `TASK_TOOLS`
-  withheld, so the fallback cannot open a path round the rule.
-
 **Tests**
 
-- A dialogue's and a chat's offered tools hold no `sub_run`, and their grammar
-  cannot emit it; a task's hold `sub_run` and no `repo_task_*`.
-- A `sub_run` called by a conversation that is not a task starts a task on that
-  conversation's thread and answers with its handle.
-- A task, and a part, offer no `repo_task_*` and their grammar cannot emit one.
-- A task's `sub_run` starts a part under it, never a task, and a part at
-  `MAX_DEPTH` is refused.
+- A nested task holds out the task tools, and only those its mode offers; a
+  dialogue and a task at the top hold out nothing
+  (`zen_tasks::a_nested_task_holds_out_the_task_tools`).
+- A conversation's level is read from its worker record: a dialogue and a chat
+  are conversations, a task started from one is a task, a task a task started
+  is nested, and a record that no longer reads is nested
+  (`a_level_is_read_from_the_record`).
+- A withheld member is never projected
+  (`projection::tests::a_withheld_member_is_never_projected`).
+- A task a chat started on its thread neither blocks the chat's next message
+  nor answers it (`chats::talk::a_send_while_zen_answers_is_refused`).
 
 **Design doc:** `docs/zen_tool_reach.md` §6.3, in the same change.
 
@@ -409,7 +399,7 @@ next: it hides tools' arguments from every client.
 | 1a | `Until` with a marker set; one shared rule for the grammar, XML-to-JSON, the splitter and npcd | a value holding every closing tag decodes and extracts byte for byte | `docs/stencil_tree.md` |
 | 1b | `part` events on the live stream; `parts` in the history; the GUI parses no text | stream events equal the history's records; the bubble streams from `arg` chunks | `docs/zend_ui_redesign.md` |
 | 2 | Remove the `in_context` reply and the locks; every read runs for real; provenance skips files read in the turn's loop | a held file's read returns its body; a file read in a round does not enter provenance for the loop | `docs/zend_working_set.md` §1, §4.6 + the `projection.yaml` rule |
-| 3 | `sub_run` withheld in dialogues and chats; called outside a task it starts a task; no task starts a task | no `sub_run` in a dialogue's or chat's tools or grammar; no `repo_task_*` in a task's | `docs/zen_tool_reach.md` §6.3 |
+| 3 | `sub_run` removed; tasks nest one level | no `repo_task_*` in a nested task's tools, grammar or prompt; a dialogue's, a chat's and a top task's hold them | `docs/zen_tool_reach.md` §6.3 |
 | 4 | A forced note is followed by a forced call; failed calls answer with an error; notes forced only after 200 tokens of reasoning on a round that opens a call | no round closes after its note; a cut call gets an error naming where; under 200 tokens no forced note | `docs/zend_journal.md` §5.2 |
 | S1–S5 | The smaller issues | S2's refusal; S3's schema equality; S5's once-per-session block | `docs/tool-system.md` for S1, S2 |
 
