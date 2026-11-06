@@ -165,8 +165,7 @@ async fn overlay_of(call: &OpsCall, repo: &str) -> Snapshot {
     spawn_blocking(move || {
         session
             .saved_files(&conv)
-            .repo(&repo)
-            .map(|store| store.snapshot())
+            .and_then(|files| files.repo(&repo).ok().map(|store| store.snapshot()))
             .unwrap_or_default()
     })
     .await
@@ -288,10 +287,7 @@ mod tests {
     /// a task, and from a task its uncommitted files, or that it has none.
     #[test]
     fn the_answer_says_what_work_the_job_carries() {
-        assert_eq!(
-            carried(false, &Snapshot::default()),
-            " as origin holds it"
-        );
+        assert_eq!(carried(false, &Snapshot::default()), " as origin holds it");
         assert_eq!(
             carried(true, &Snapshot::default()),
             " as origin holds it — you have no uncommitted changes in it"

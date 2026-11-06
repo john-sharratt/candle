@@ -6816,6 +6816,12 @@ impl ZendSession {
             .find(|u| u.id == id)
     }
 
+    /// `conv_id`'s file stores as its saved events hold them; `None` while
+    /// the model is not loaded.
+    pub fn saved_files(&self, conv_id: &str) -> Option<Arc<RepoFiles>> {
+        Some(self.loaded()?.saved_files(conv_id))
+    }
+
     /// Upload `id`'s bytes, from `conv_id`'s uploads store. The outer `None`
     /// while the model is not loaded; the inner when there is no such upload.
     pub fn upload_content(&self, conv_id: &str, id: u64) -> Option<Option<Vec<u8>>> {

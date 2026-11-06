@@ -47,11 +47,7 @@ pub fn unaccounted(steps: &[String], answer: &str) -> Vec<usize> {
     if steps.len() < 2 {
         return Vec::new();
     }
-    let section: Vec<&str> = answer
-        .lines()
-        .skip_while(|l| !heading(l))
-        .skip(1)
-        .collect();
+    let section: Vec<&str> = answer.lines().skip_while(|l| !heading(l)).skip(1).collect();
     (1..=steps.len())
         .filter(|n| {
             !section.iter().any(|l| {

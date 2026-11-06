@@ -1318,8 +1318,7 @@ async fn run(
             let mut told = Vec::new();
             let mut why = Vec::new();
             if audit.unopened() {
-                let to_correct =
-                    audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
+                let to_correct = audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
                 told.push(audit.correction());
                 why.push(format!(
                     "{to_correct} of its answer's citations are not by an address it opened"

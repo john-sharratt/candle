@@ -68,7 +68,10 @@ impl RoundTiming {
         let mut words = value.split_whitespace();
         let queued_ms = words.next()?.strip_prefix("queued=")?.parse().ok()?;
         let pair = |word: Option<&str>, name: &str| -> Option<(u64, u64)> {
-            let (n, ms) = word?.strip_prefix(name)?.strip_suffix("ms")?.split_once('/')?;
+            let (n, ms) = word?
+                .strip_prefix(name)?
+                .strip_suffix("ms")?
+                .split_once('/')?;
             Some((n.parse().ok()?, ms.parse().ok()?))
         };
         let (prefill_tokens, prefill_ms) = pair(words.next(), "prefill=")?;
@@ -147,7 +150,10 @@ mod tests {
     #[test]
     fn a_round_reads_back_as_it_was_written() {
         let r = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
-        assert_eq!(r.value(), "queued=2500 prefill=512/1400ms decode=210/6100ms");
+        assert_eq!(
+            r.value(),
+            "queued=2500 prefill=512/1400ms decode=210/6100ms"
+        );
         assert_eq!(RoundTiming::parse(&r.value()), Some(r));
         assert_eq!(RoundTiming::parse("queued=x"), None);
         assert_eq!(
