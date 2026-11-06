@@ -139,7 +139,8 @@ service_keys:
   - name: yenbot
     key_file: secrets/yenbot.key
     identity: "service:yenbot"
-    routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit]
+    routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit,
+             /gateway/google/token]
     topics:
       subscribe: ["repo/yenbot", "gate/yenbot"]
       publish: ["gate/yenbot/result/*", "service/yenbot/*"]
@@ -150,6 +151,30 @@ backend (`trusted_backends`), is forwarded with that identity on the routes
 the key names and no others; `host/roles.yaml` grants the identity what the
 daemons should let it do. The key is a file only the service and the gateway
 read, never logged, never on a command line.
+
+### 4.1 Upstream keys: the other direction
+
+A service key proves the service to the gateway; a site behind the gateway
+needs the converse, proof that a request with identity headers came from the
+gateway. Binding loopback does not give it: a Zen worker's `tcp_session_open`
+can open a raw socket to `127.0.0.1` and write any header it likes. So a site
+upstream carries a key:
+
+```yaml
+sites:
+  - name: yenbot
+    api: [{prefix: /, upstream: "http://127.0.0.1:8096", upstream_key_file: secrets/yenbot-upstream.key}]
+```
+
+The gateway strips `X-Tokera-Upstream-Key` from every incoming request and
+sets it on each one it forwards to that upstream; the site believes
+`X-Tokera-*` only alongside it, compared in constant time.
+
+The hole is closed at its source as well: `tcp_session_open` refuses
+loopback, link-local and the machine's own addresses, as a worker has no
+business reaching a daemon on the machine it runs on by a path the gateway
+does not see. keep's HTTP API on `127.0.0.1:8092` is the daemon this matters
+for today.
 
 ## 5. The gateway's pub/sub
 
@@ -248,16 +273,16 @@ The sources are:
 `log_grep` with `source: "cluster"` is what `cluster_logs` answers today, so
 `cluster_logs` is removed and the guides that name it name `log_grep`.
 
-### 6.3 Sites: stored data
+### 6.3 What is not a tool
 
-A site that lets Claude read what its apps stored serves one read-only route,
-and the gateway lists it with `data: true`:
-
-| Tool | Route | What it answers |
-|---|---|---|
-| `site_data {site, app, coll, where?, limit?}` | `GET /v1/site/data` | What the app stored, as rows. |
-
-How a page looks is not a tool: the person pastes a screenshot into the chat.
+Logs are tools because they are read first and most, often while a task is
+running, and span the cluster and the sites alike. Anything else a site holds
+— its records, jobs, accounts, usage — is that site's API, which Claude calls
+from a Zen task with the workers' HTTP tools (`http_session_open`,
+`http_request`) and a credential saved for the site
+(`docs/yenbot_app_host.md` §6.3). There is no connector tool per site or per
+kind of thing a site holds. How a page looks is not a tool either: the person
+pastes a screenshot into the chat.
 
 ### 6.4 Who they act as
 
@@ -299,8 +324,9 @@ request-path budget.
 | zend's push paths | Publish `repo/<name>` after each push. |
 | `web/src/` and `web/web.yaml` | `service_keys:`; the bus and `/gateway/events`. |
 | `cluster/` | A publish (and subscribe) message on the member's socket. |
-| `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`; `site_data`. |
-| `web/web.yaml`, `web/src/` | `logs` and `data` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
+| `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`. |
+| `web/web.yaml`, `web/src/` | `logs` on a site; the gateway gathering a site's `/v1/logs` beside the members'; `upstream_key_file` on a site upstream (§4.1). |
+| `zend-tools/src/tools/tcp_session/` | `tcp_session_open` refuses loopback, link-local and the machine's own addresses (§4.1). |
 | `zend-vfs/src/workspace.rs`, zend's push paths | `gate:` in the manifest; every push to a gated repository through `gate/<repo>` first. |
 | `CLAUDE.md` | `file_edit_and_commit` as the request-path budget's exception. |
 | `mcp/src/guides/` | The connector's guides name the file and log tools, `log_grep` where they named `cluster_logs`, and when a task is the better tool. |
@@ -310,8 +336,9 @@ request-path budget.
 1. `author:` in the manifest; `file_edit_and_commit` on the git layer, with
    its tests against real repositories.
 2. The read tools on the connector.
-3. Service keys at the gateway.
+3. Service keys and upstream keys at the gateway; `tcp_session_open` off
+   loopback.
 4. The bus, its WebSocket and the members' publish.
 5. zend publishing `repo/<name>` on every push, and gating the pushes of a
    gated repository.
-6. Log sources and the log tools, replacing `cluster_logs`; `site_data`.
+6. Log sources and the log tools, replacing `cluster_logs`.

@@ -26,12 +26,13 @@ by rule — before it goes live.
 
 | Principle | Decision |
 |---|---|
-| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3). An edit is one `file_edit_and_commit` from claude.ai; Zen announces the commit on the gateway's bus and the site takes it within a second (§5.4). No build, no restart; only platform changes rebuild the binary. |
+| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3), and the platform's own web files — framework, design system, landing page — are served from disk by the gateway, as zend's and npcd's consoles are (§5.2). An edit is one `file_edit_and_commit` from claude.ai, live within a second (§5.4). Only Rust changes rebuild the binary, through the existing `service_deploy` (§5.5). |
 | Many apps, like tokera.com | One site, many apps under `/a/<app>/`, each a folder with a manifest (§5). |
 | One common framework | Every app is built on the platform's frontend framework, design system and SDK, served from `/_/` (§8). |
 | An advanced frontend framework that stays simple | Components, signals and a router, with fixed conventions and no build step (§8.2–§8.4). |
-| One Rust binary that serves its pages | `yenbot.exe` embeds the platform: the landing page, the framework, the design system, fonts and icons, the API, the store, the scheduler and the workflow runtime (§4). Apps and the art library come from directories beside it. |
-| A common API for every app | `/api/v1/…`: identity, data, files, events, AI, pictures, notifications, jobs, settings (§6). |
+| One Rust binary that serves its pages | `yenbot.exe` embeds the platform: the landing page, the framework, the design system, fonts and icons, the API, the store, the scheduler and the workflow runtime (§4), so it serves the whole site on its own. Apps and the art library come from directories beside it. |
+| A common API for every app — and for everything | `/api/v1/…`: identity, data, files, events, AI, pictures, notifications, jobs, settings, and every admin action. Nothing on the site, the admin page included, does anything the API does not (§6). |
+| Claude and Zen use the API | A Zen task calls it with its HTTP tools and a yenbot API token held as a Zen credential; the API is documented in full in the repository (§6.3, §17.1). |
 | A state store inside the binary | SQLite, compiled in (`rusqlite` with `bundled`), one file on disk, migrations embedded, backups kept locally (§7). |
 | Scheduled jobs from the records | Jobs are rows in the store, scheduled by time, by repeat rule, or by a field in an app's own records (§9). |
 | Workflows run from the jobs | A workflow is an async JavaScript function in the app's folder, run by an embedded engine, hot like the pages (§10). |
@@ -46,8 +47,8 @@ by rule — before it goes live.
 | Yen is not a coder | The framework, templates, the art library, guides, an extensive `CLAUDE.md` and the checks are all there from the first day (§8, §15–§17). |
 | The app-building guide is read for every new app | Every app's manifest carries the guide's edition it was built to; the gate refuses an app built against an older one (§17.3). |
 | No command line | Everything is done with the connector's file tools or a Zen task; the platform does on load what a tool would otherwise do — sizing art, renaming apps, migrating data (§15.2, §20.1). |
-| The styling must be amazing, to her attention to detail | One design system with fixed tokens, a living catalogue, and a check that renders every screen to pictures Claude looks at before publishing (§8.5, §17.4). |
-| Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; stored data through `site_data`; and Yen pastes a screenshot when she wants Claude to see a page (§18). |
+| The styling must be amazing, to her attention to detail | One design system with fixed tokens, hot like the apps; an app may override a few named tokens for itself; a living catalogue; and Yen's eye on the result (§8.5). |
+| Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; anything else — stored data, jobs, usage — is the API, called from a Zen task; and Yen pastes a screenshot when she wants Claude to see a page (§18). |
 | An edit is all or nothing | `file_edit_and_commit` returns live or refused: the site checks the change before `main` moves (§5.4). |
 | Claude remembers between chats | The `yenbot` journal holds each app's purpose, Yen's decisions and her preferences (§17.6). |
 | No approvals while iterating | Nothing in editing, publishing or a Zen task on the yenbot repository waits on an approval (§17.7). |
@@ -55,7 +56,9 @@ by rule — before it goes live.
 | Real apps' queries | Counts, sums and groups, full-text search, batches, pages (§7.6). |
 | English, Vietnamese-safe | English interfaces; type, input, search and sorting that handle Vietnamese correctly (§8.7). |
 | Families share | Groups, and roles per collection and per record; children with their own Google accounts (§12.5). |
-| Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped (§12.6). |
+| Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped, and identity believed only with the gateway's key (§12.6). |
+| Google services through the gateway | The gateway's Google client, already used for sign-in, gains a "connect Google" flow; yenbot asks the gateway for a person's access token (§19.3). |
+| Usage is visible | Every app open is recorded; the API and the admin page sum it (§6, §20.3). |
 | tokera.com links to it | An entry in the estate dropdown (§21). |
 
 ## 3. Where it runs
@@ -79,8 +82,9 @@ browser ──TLS──► Cloudflare (yenbot.com.au, proxied) ──HTTP :80─
 - **BlackWorld only**, beside the gateway, supervised by keep as the service
   `yenbot` (`keep/stable/yenbot.exe`). It binds **loopback**, so nothing on
   the LAN reaches it except through the gateway, and it believes the gateway's
-  identity headers from loopback alone — the model `mcp` already follows
-  (`mcp/mcp.yaml`, `mcp/src/believed.rs`).
+  identity headers only when they arrive with the gateway's key for it
+  (§12.6) — loopback alone is not enough, since a Zen worker can open a raw
+  socket to loopback.
 - **It is not a cluster member.** It holds its own store and has no replicas;
   BlackWorld down means Yen Bots down, its jobs held until it is back (§9.4),
   as with any keep service that is not clustered (`docs/mcp_app.md`).
@@ -108,13 +112,14 @@ yenbot/
   src/                        the platform, one concern per file
     main.rs  config.rs  serve/  api/  store/  accounts/  jobs/  workflows/
     push/  ai/  apps/  library/  check/
-  platform/                   embedded into the binary at build time
-    landing/  admin/          the home page and the admin page
-    framework/                yen.js: components, signals, router, SDK (§8)
-    ui/                       design system: tokens.css, yen.css, components/
-    vendor/                   pinned third-party modules (Lit, signals), served from /_/
+  web/                        the platform's web files: served from disk by the gateway,
+                              and embedded into the binary at build time (§5.2)
+    index.html  _admin/       the landing page and the admin page
+    _/framework/              yen.js: components, signals, router, SDK (§8)
+    _/ui/                     design system: tokens.css, yen.css, components/
+    _/vendor/                 pinned third-party modules (Lit, signals)
+    _/icons/  _/fonts/        the vector UI icon set and the typefaces
     sw.js                     the service worker: push and offline (§11)
-    icons/  fonts/            the vector UI icon set and the typefaces
   apps/                       one folder per app — served from disk, hot
     <app-id>/
       app.yaml                manifest (§5.1)
@@ -125,14 +130,16 @@ yenbot/
     catalogue.yaml
     tiles/  illustrations/  empty/  backgrounds/  stickers/
   templates/                  starting points for a new app (§16)
-  docs/                       the manual (§17)
+  docs/                       the manual, the API's reference included (§17)
   yenbot.yaml                 the service's config
   tests/
 ```
 
-The platform is embedded with `include_dir!`, so the binary is whole on its
-own; `apps/` and `library/` are read from the live directory at runtime. A
-platform change is a rebuild; an app or art change never is.
+`web/` is embedded with `include_dir!`, so the binary is whole on its own and
+serves the site with no checkout beside it; the gateway serves the same
+directory from the live checkout (§5.2), so a change to it is live as an
+app's is. `apps/` and `library/` are read from the live directory at runtime.
+Only a change under `src/` is a rebuild.
 
 ## 5. Apps
 
@@ -172,15 +179,28 @@ version.
 
 ### 5.2 Serving
 
-`/a/<id>/…` serves the app's folder. Static files carry an `ETag` from their
-content hash and `Cache-Control: no-cache`, so a changed file is fetched on
-the next load and an unchanged one costs a 304. The platform's own files
-under `/_/` are versioned by the build and cached for a year.
+Two places serve the platform's web files, for two jobs — the arrangement
+zend's and npcd's consoles already use (`docs/shared_model_host.md` §3.4):
+
+- **yenbot embeds `web/`** (`include_dir!`, with the build script rerun when a
+  file under it changes), so the binary serves the whole site on its own.
+- **The gateway serves the same directory from disk**: the yenbot site in
+  `web/web.yaml` has `roots: ["D:/yenbot/live/web"]`, read per request
+  (`Roots::disk`), and forwards to yenbot only `/a/`, `/api/`, `/v1/`,
+  `/hooks/` and the reload stream. So the framework, the design system and
+  the landing page change as an app does — a commit through the gate, live on
+  the next load — and the binary catches up at its next release.
+
+`/a/<id>/…` is yenbot's, from the app's folder in the live checkout. Every
+file goes through the same responder as the consoles' (`web::asset::respond`):
+a strong `ETag` over the content, `304` when it matches, gzip, and a short
+`max-age` for HTML, JS and CSS.
 
 ### 5.3 Hot reload
 
-A watcher on `apps/` and `library/` reloads a changed manifest, its schedules
-and its workflows, and drops its cached files, within a second. A page open in
+A watcher on `apps/`, `library/` and `web/` reloads a changed manifest, its
+schedules and its workflows, and drops its cached files, within a second. A
+page open in
 a browser reloads itself when its app changes: the framework keeps an
 `EventSource` on `/api/v1/events/_reload` while the tab is visible. Yen sees a
 change Claude made without touching her phone.
@@ -218,18 +238,40 @@ setting it `live`. It runs on the live store like any app. **Undoing** is
 failing forward: a new edit that puts back what was there, from the journal
 (§17.6) or the chat.
 
-**Platform releases** go the ordinary way: an agent build on BlackWorld,
-staged to keep, tried, and kept when it prints `INFO serving` (`CLAUDE.md`,
-"Releasing and Testing Locally"; keep's trial in `keep/src/main.rs`).
-`service_deploy` learns the `yenbot` service and its repository for this
-(§22).
+### 5.5 Releasing the binary
+
+A change under `src/` — the Rust: the API, the store, the scheduler, the
+workflow runtime — is a release, through the build and deploy that already
+release motherd, web and mcp (`zend/src/mcp/tools/service/deploy.rs`):
+
+1. A Zen task makes the change, tests it and commits it through the gate.
+2. `service_deploy {host: BlackWorld, service: yenbot}` builds it on
+   BlackWorld's agent from its checkout of the yenbot repository
+   (`cargo build --release -p yenbot`), stages `yenbot.exe` for keep, and has
+   keep try it: keep runs the new binary and keeps it once it prints
+   `INFO serving`, or restores the old one (`keep/src/trial.rs`). keep accepts
+   only a build of a commit on `origin/main` (`--build-info` with no local
+   part, `keep/src/remote.rs`).
+3. `service_status` and the job tools (`job_status`, `job_read`) watch it.
+
+`service_deploy` names its repository and services in constants today
+(`REPO = "candle"`, `SERVICES = [motherd, web, mcp]`); they become a table of
+service → (repository, package), with yenbot's row (§22). The yenbot binary
+answers `--build-info` from the cluster crate's version module and prints
+`INFO serving` once listening, as mcp does.
 
 ## 6. The API
 
-Every route is under `/api/v1`, answers JSON, and acts as the signed-in
-account. The app is named by the path or the `X-Yen-App` header the framework
-sets; an account without access to the app gets 403, and an account not yet
-approved gets nothing but `/me` (§12.2).
+**Everything has an API.** The pages — the landing page, the admin page, every
+app — are clients of it and do nothing it does not, so anything a person can
+do on the site a Zen task can do through it (§6.3). Every route is under
+`/api/v1`, answers JSON, and acts as the account the request carries: a
+signed-in browser's, or an API token's (§6.3). The app is named by the path
+or the `X-Yen-App` header the framework sets; an account without access to
+the app gets 403, and an account not yet approved gets nothing but `/me`
+(§12.2).
+
+### 6.1 The apps' routes
 
 | Route | What it does |
 |---|---|
@@ -256,11 +298,66 @@ approved gets nothing but `/me` (§12.2).
 | `GET/PUT /settings/<app>` | A small per-app, per-account settings object. |
 | `GET /library?kind=…&tag=…` | The art library's catalogue (§15). |
 | `GET /export/<app>`, `POST /import/<app>` | An app's data as JSON or CSV, out and back in (§20.1). |
-| `/admin/…` | The admins': accounts, groups, app visibility, jobs, secrets, check results (§13.2). |
+| `POST /opens/<app>` | The framework records that this account opened the app (§20.3). |
+| `GET/POST /google/<app>/connect`, `GET /google/<app>/status` | Connect this account's Google services for the app, and whether they are (§19.3). |
 
-Outside `/api/v1`, three groups of routes serve something other than an app's
-own pages: `/hooks/<app>/<name>` (inbound hooks, §19.2), `/v1/logs` (§18.2)
-and `/v1/site/data` (stored data for the connector, §18.3).
+### 6.2 The admins' routes
+
+Everything the admin page shows and does, under `/api/v1/admin`:
+
+| Route | What it does |
+|---|---|
+| `GET /admin/accounts`, `POST /admin/accounts/<id>/approve\|refuse\|block\|delete` | Accounts and their state (§12.2). |
+| `GET/POST/DELETE /admin/groups[/<name>[/members/<id>]]` | Groups and who is in them (§12.5). |
+| `GET /admin/apps`, `PUT /admin/apps/<id>/visibility`, `PUT /admin/apps/<id>/shares`, `PUT /admin/apps/order` | Apps, public or private, who they are shared with, their order on the landing page (§12.4). |
+| `GET /admin/apps/<id>/check` | The app's last check: ok, or each refusal with its rule, file and line (§17.4). |
+| `GET /admin/data/<app>/<coll>?…` | Any collection, every account's records, read-only. |
+| `GET /admin/jobs?app=…&state=…` | Jobs: next run, last runs and their outcomes (§9). |
+| `POST /admin/jobs/<id>/run`, `POST /admin/jobs/<id>/hold\|release` | Run a job now; hold or release it. |
+| `POST /admin/workflows/<app>/<name>` | Run a workflow now as the app, with arguments, answering its outcome and log (§10). |
+| `GET /admin/usage?app=…&since=…&by=day\|account` | Opens, active accounts and AI calls, summed (§20.3). |
+| `GET /admin/errors?app=…`, `GET /admin/feedback?app=…` | Browser errors and feedback notes. |
+| `PUT/DELETE /admin/secrets/<app>/<name>`, `GET /admin/secrets/<app>` | An app's integration keys: set, remove, list names (§19.1). |
+| `POST /admin/apps/<id>/archive\|restore`, `GET /admin/archive` | Deleted apps' data, kept thirty days (§20.1). |
+| `GET/POST/DELETE /admin/tokens` | API tokens (§6.3). |
+| `PUT /admin/registration` | Approve or open (§12.2). |
+
+### 6.3 API tokens: how a Zen task calls it
+
+A Zen task reaches the site with the HTTP tools every coding worker of an
+Admin already has — `http_session_open` and `http_request`
+(`zend-tools/src/tools/http_session/`): any method, headers, a JSON body, a
+response up to 1 MiB. A request through the gateway carries no identity of
+its own (the gateway believes a bearer token only on `/mcp`,
+`docs/claude_zend_gateway.md` §12), so the site issues its own:
+
+- **An API token** is made on the admin page (`/api/v1/admin/tokens`) for an
+  admin's account, named, with an expiry, and shown once. yenbot keeps only
+  its hash.
+- **It is held as a Zen credential**, `yenbot`, saved once with
+  `credential_save`, so a task names it rather than ever seeing it: 
+  `http_session_open {base_url: "https://yenbot.com.au", credential_name:
+  "yenbot"}`, then `http_request {path: "/api/v1/admin/jobs", …}`. The
+  gateway passes the `Authorization` header to yenbot unread; yenbot matches
+  the token's hash and acts as its account.
+- **A request with a token** is answered as that account, admin routes
+  included, and logged with the token's name.
+
+The docs (§17.1) carry the recipe whole: opening the session, every route
+with a request and its answer, the errors, and what to check after a write.
+
+### 6.4 The reference
+
+`docs/api/` holds a page per group of routes — every route, its parameters,
+its body, its answer and its errors, each with a complete example — and the
+site serves the same description as `/api/v1/openapi.json`, generated from the
+routes' own definitions, so the reference cannot drift from the code: a test
+fails when a route has no page or its page names a field the route does not
+take.
+
+Outside `/api/v1`, two groups of routes serve something other than an app's
+own pages: `/hooks/<app>/<name>` (inbound hooks, §19.2) and `/v1/logs`
+(§18.2).
 
 ## 7. The store
 
@@ -477,6 +574,25 @@ The look is the platform's, not each app's. `/_/yen.css` carries:
 dark, at phone and desktop width. It is the reference Claude builds against
 and the page Yen points at when something looks wrong.
 
+**An app may override a few named tokens for itself**, in its manifest:
+
+```yaml
+theme:
+  accent: "#d94f70"          # the app's colour: buttons, links, its tile
+  accent-dark: "#f07a95"     # the same in dark mode
+  surface: warm              # one of the palette's named surfaces
+  radius: round              # soft | round | square
+  type: display              # text | display — the face for headings
+  density: roomy             # compact | normal | roomy
+```
+
+The platform writes these as custom properties on the app's root, so every
+component takes them without the app touching CSS. Only these names exist; the
+check refuses any other, and refuses an accent whose contrast against its
+surface falls below WCAG AA in either mode, so an override can change an app's
+character but never break its legibility. `/_design?app=<id>` shows the
+catalogue in the app's theme.
+
 ### 8.6 What every app gets without asking
 
 The shell (title, back to the landing page, the account's avatar), sign-in
@@ -650,9 +766,10 @@ inbox.
 
 The gateway signs people in with Google and yenbot believes it. yenbot never
 holds a Google secret or the session key; it reads `X-Tokera-User`, `-Email`,
-`-Name` and `-Picture` on requests from loopback, which the gateway strips from
-every incoming request and sets only from a session it verified
-(`web/src/proxy.rs`, `web/src/server.rs`).
+`-Name` and `-Picture`, which the gateway strips from every incoming request
+and sets only from a session it verified (`web/src/proxy.rs`,
+`web/src/server.rs`) — and only on a request that also carries the gateway's
+key for the site (§12.6).
 
 **The gateway needs one change.** Its session cookie is set on `.tokera.com`,
 its Google callback is `https://tokera.com/auth/callback`, and its post-login
@@ -757,6 +874,19 @@ common holes for every app, without the app asking:
   collection's `file` field allows, with a size ceiling; images are re-encoded
   when thumbnailed, which drops anything hidden in them.
 - **Secrets never reach a browser** (§19.1).
+- **Identity only with the gateway's key.** The gateway sends every request it
+  forwards to the site with `X-Tokera-Upstream-Key`, a secret per site upstream
+  (`upstream_key_file:` in the site's `web.yaml` entry, the file
+  `D:\yenbot\secrets\gateway.key` on yenbot's side), and strips the header from
+  anything arriving from outside. yenbot compares it in constant time and
+  treats a request without it as signed out, identity headers or not. Loopback
+  is not a credential: a Zen worker's `tcp_session_open` can reach
+  `127.0.0.1` today, so a daemon that believes `X-Tokera-*` from loopback
+  alone believes anyone who can start a task — which is also why
+  `tcp_session_open` stops reaching loopback (`docs/mcp_file_tools.md` §4.1).
+- **API tokens** (§6.3) are a second way in, never a way around the first: a
+  bearer token is believed only alongside the gateway's key, is stored only as
+  its hash, acts as one account, expires, and is revoked on the admin page.
 
 ## 13. Pages
 
@@ -931,6 +1061,17 @@ read the code.
   happened — logs, errors, data, and Yen's screenshots; the journal (§17.6);
   exporting, importing and deleting; backups and restoring; what to do when it
   breaks.
+- **`docs/api/`** — the API reference (§6.4): a page per group of routes, each
+  route with its parameters, body, answer, errors and a complete example,
+  tested against the routes themselves.
+- **`docs/calling-the-api.md`** — how Claude reaches the API: claude.ai has no
+  HTTP of its own, so it starts a Zen task on the yenbot repository whose brief
+  says which calls to make; the task opens `http_session_open {base_url:
+  "https://yenbot.com.au", credential_name: "yenbot"}` and makes them with
+  `http_request`, and its result carries the answers. The doc gives the brief
+  to copy for each common need — see an app's records, list the jobs and run
+  one now, approve an account, read the usage, check a write landed — and what
+  to tell Yen while it runs.
 
 Every rule comes with its reason, every API and every `ctx` call with a
 complete working example, every component with its states, and every common
@@ -969,8 +1110,9 @@ extensive:
   read, how to know it is done), and building, testing and releasing the
   platform inside one.
 - **Seeing what happened** — `log_list`, `log_read` and `log_grep` for the
-  site's and each app's lines, browser errors included; `site_data` to see
-  what an app stored (§18). Look before guessing.
+  site's and each app's lines, browser errors included; the API from a Zen
+  task for anything stored — records, jobs, usage, accounts
+  (`docs/calling-the-api.md`, §18). Look before guessing.
 - **When something breaks** — reading the app's log first, failing forward,
   restoring a backup, and when to stop and ask.
 
@@ -1012,8 +1154,9 @@ what it shows.
 `yen-apps` (`mcp/src/guides/yen-apps.md`), derived from this design and kept
 short, because it is read at the start of every chat and her context is not
 spent on it. It says what Yen Bots is, the tools the work uses
-(`file_read`, `file_edit_and_commit`, the log tools, `site_data`, the journal
-tools, `repo_task_start` and its watching), the order of work, and that
+(`file_read`, `file_edit_and_commit`, the log tools, the journal tools,
+`repo_task_start` and its watching — which is also how the API is called), the
+order of work, and that
 everything else is in the yenbot repository: `CLAUDE.md` first, then
 `docs/index.md`, reading only the docs the task needs. Every Claude session
 Yen opens, on any device, reads it first, as `guide_list` already asks.
@@ -1041,7 +1184,7 @@ framework, the design system's components — goes to a Zen task
 (`repo_task_start`) and, for the binary, a release (`service_deploy`). A task
 runs for minutes; a claude.ai chat does not wake on its own. So the docs say
 how to watch one: start it, tell Yen roughly how long it will take, check it
-with `repo_task_wait` while she waits or when she comes back, read its result
+with `job_status` while she waits or when she comes back, read its result
 and its commits, and confirm on the site that it landed.
 
 **Nothing in this iteration waits on an approval**: `file_edit_and_commit`,
@@ -1095,19 +1238,24 @@ yenbot serves `GET /v1/logs` with the cluster members' query
 plus `source`, and `GET /v1/logs/sources`, which lists `yenbot` and every app
 with how many lines each holds. Lines are kept in the store, thirty days.
 
-### 18.3 Stored data
+### 18.3 Everything else is the API
 
-`GET /v1/site/data?app=…&coll=…&where=…&limit=…` — what an app stored,
-read-only, for the admins only.
+What an app stored, its jobs and their runs, accounts, usage, check results:
+each is an admin route (§6.2), and Claude reads it the way it does anything
+else on the site — a Zen task with the HTTP tools (§6.3,
+`docs/calling-the-api.md`). There is no connector tool per kind of thing the
+site holds; the API is the one way in, for the pages, for Zen and for Claude.
 
 ### 18.4 In the connector
 
-The connector reads it all with general tools (`docs/mcp_file_tools.md` §6):
+Logs are the one exception, because they are what Claude reads first and
+most, often while a task is running, and they are not the site's alone: the
+connector reads them with general tools (`docs/mcp_file_tools.md` §6).
 `log_list` names every log source — the cluster's members and yenbot's apps
-alike — `log_read` reads one's newest lines, `log_grep` searches one or all,
-and `site_data` calls §18.3. They act as the person whose connector it is, so
-yenbot sees an admin. What a page looks like comes from Yen: a screenshot
-pasted into the chat.
+alike — `log_read` reads one's newest lines and `log_grep` searches one or
+all. They answer in the chat, at once, with no task; they act as the person
+whose connector it is, so yenbot sees an admin. What a page looks like comes
+from Yen: a screenshot pasted into the chat.
 
 ## 19. Integrations
 
@@ -1126,6 +1274,38 @@ request, for a service that calls in — a form elsewhere, a shortcut on her
 phone. A hook is reachable without signing in, so each carries a token made
 on the admin page, in its URL or as an HMAC signature with an app secret; an
 unsigned call is refused and logged.
+
+### 19.3 Google services, through the gateway
+
+An app that reads a person's calendar, writes to their Drive or adds a task
+needs that person's Google consent. The gateway already holds the site's
+Google client and signs people in with it (`web/src/auth/oidc.rs`), asking only
+`openid email profile` and keeping no Google token past the callback. It
+grows a **connect** flow; yenbot holds no Google secret and no refresh token.
+
+- **The app declares what it needs**: `google: [calendar.readonly,
+  tasks]` in its manifest; the check refuses a scope outside the platform's
+  allowed list.
+- **Connecting**: the framework's `app.google.connect()` sends the person to
+  the gateway's `/auth/google/connect?scopes=…&next=…`, which asks Google for
+  those scopes on top of sign-in (`include_granted_scopes=true`,
+  `access_type=offline`) and stores the refresh token it gets, encrypted with
+  the gateway's session key, keyed by Google subject and scope set.
+  `/api/v1/google/<app>/status` answers whether the person has granted what
+  the app declares, so the app shows a "Connect Google" button only when it
+  is needed.
+- **Using it**: a workflow calls `ctx.google.fetch(url, init)` for an account;
+  yenbot asks the gateway `POST /gateway/google/token {user, scopes}` with its
+  service key — a route in the key's list — and gets a short-lived access
+  token, which it uses at once and never stores. The gateway refreshes and
+  answers `not_connected` when the person has not granted the scopes or has
+  revoked them, which `ctx.google.fetch` raises for the app to handle.
+- **Disconnecting**: the account's menu has "Disconnect Google", which revokes
+  the token at Google and deletes it at the gateway.
+
+The Google Cloud console needs the scopes on the consent screen; while the
+client is unverified for sensitive scopes, the accounts that may grant them
+are its listed test users, which is the family. John adds them.
 
 ## 20. Lifecycle and health
 
@@ -1154,6 +1334,26 @@ each site upstream's health in its status, so `cluster_status` shows Yen Bots
 beside the cluster, and a site that stays down is a line there rather than a
 silence.
 
+### 20.3 Usage
+
+Which apps get used is what tells Yen what to build next, so it is recorded:
+
+```sql
+CREATE TABLE app_opens (
+  app      TEXT NOT NULL,
+  account  TEXT NOT NULL,
+  day      TEXT NOT NULL,          -- YYYY-MM-DD, site time
+  opens    INTEGER NOT NULL,
+  PRIMARY KEY (app, account, day)
+);
+```
+
+The framework posts `/api/v1/opens/<app>` once per page load; the row's count
+goes up. `GET /api/v1/admin/usage` sums `app_opens` and `ai_calls` (§14) by
+app, account and day, and the admin page shows the same: each app's opens and
+active accounts over the last weeks, and what it asked of the model and the
+image engine.
+
 ## 21. tokera.com
 
 The estate dropdown lists the sites in `ESTATE` (`web/src/site/tokera/page.rs`)
@@ -1166,14 +1366,17 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | Where | Change |
 |---|---|
 | `web/web.yaml` | A `yenbot` site: `hosts: [yenbot.com.au]`, `api: [{prefix: /, upstream: "http://127.0.0.1:8096"}]`; `www.yenbot.com.au` as a redirect site. |
-| `web/src/auth/` | Sign-in per cookie domain (§12.1). |
+| `web/src/auth/` | Sign-in per cookie domain (§12.1); the Google connect flow, the encrypted refresh-token store and `/gateway/google/token` (§19.3). |
+| `web/src/proxy.rs`, `web.yaml` | `upstream_key_file:` per site upstream, sent as `X-Tokera-Upstream-Key` and stripped from incoming requests (§12.6). |
+| `web/web.yaml` roots | `D:/yenbot/live/web` as the yenbot site's disk root (§5.2). |
 | `web/src/`, `web.yaml`, zend | Service keys, the gateway's bus, `repo/<name>` on every push, and the connector's file tools — `docs/mcp_file_tools.md`. |
 | `host/roles.yaml` | `service:yenbot` as a user. |
-| Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client. John does this. |
+| Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client; the scopes apps may ask for on the consent screen, and the family as test users (§19.3). John does this. |
+| Zen credentials | `yenbot`, an API token for Yen's account, saved with `credential_save` (§6.3). |
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
 | `service_deploy` | Learns `yenbot`: its repository and its package. |
-| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs`, and `site_data` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
+| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
 | Zen's memory | The `yenbot` journal (§17.6). |
 | Zen grants | No approval on any step of the iteration (§17.7). |
 | `web/web.yaml` | yenbot as a log source and a site whose health the gateway reports (§20.2). |
@@ -1203,9 +1406,20 @@ Taken 2026-11-06:
   like anyone else.
 - **English interfaces, Vietnamese-safe** throughout.
 - **No vision** in the first version.
-- **Claude sees the site through general, read-only connector tools** — logs
-  by source (`log_list`, `log_read`, `log_grep`) and stored data — and sees a
-  page when Yen pastes a screenshot and says what it shows.
+- **Claude sees the site's logs through general connector tools**
+  (`log_list`, `log_read`, `log_grep`), **and everything else through the
+  API**, called from a Zen task with the HTTP tools and an API token held as a
+  Zen credential. There are no site-specific connector tools. It sees a page
+  when Yen pastes a screenshot and says what it shows.
+- **Everything has an API**, the admin page's actions included, documented in
+  `docs/api/` and served as OpenAPI.
+- **The binary is released with the existing `service_deploy`**; the
+  platform's web files are served from disk by the gateway, so only Rust
+  changes need it.
+- **Apps may override a fixed set of named tokens**, contrast-checked.
+- **Google services go through the gateway's existing client**, which keeps
+  the refresh tokens; yenbot only ever holds a short-lived access token.
+- **Identity needs the gateway's key**, not loopback.
 - **Memory between chats is the `yenbot` journal.**
 - **No approvals** anywhere in the iteration.
 - **The connector's guide is short** and points into the repository's
@@ -1213,15 +1427,16 @@ Taken 2026-11-06:
 
 ## 24. Order of work
 
-1. The gateway and zend: sign-in per domain, the yenbot site and route, and
-   `docs/mcp_file_tools.md` — service keys, the bus, `repo/<name>`, gates,
-   the connector's file and log tools.
+1. The gateway and zend: sign-in per domain, the yenbot site, its route,
+   disk root and upstream key, and `docs/mcp_file_tools.md` — service keys,
+   the bus, `repo/<name>`, gates, the connector's file and log tools.
 2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
    watcher and the publisher, its logs and `/v1/logs`, health, keep and
    `INFO serving`.
 3. The API — fields and validation, queries, sums, search, batches, groups and
-   shares — with tests against a real SQLite file.
+   shares, every admin route, API tokens, OpenAPI and `docs/api/` with the
+   test that keeps them equal — with tests against a real SQLite file.
 4. The frontend framework: `yen.js`, the vendored modules, routing, stores,
    forms, offline writes, error reporting.
 5. The design system, its type and its Vietnamese test page, its catalogue
@@ -1232,11 +1447,12 @@ Taken 2026-11-06:
    `ctx`, migrations.
 9. Notifications: the service worker, Web Push, the inbox.
 10. AI and pictures through Zen, and asking about an app's data.
-11. Integrations: secrets, outbound calls, inbound hooks.
-12. The admin page, export, import, deleting and archiving.
-13. Templates, the repository's `docs/` derived from this design, `CLAUDE.md`,
-    the connector's `yen-apps` guide, the `yenbot` journal, the claude.ai
-    Project.
+11. Integrations: secrets, outbound calls, inbound hooks, and Google through
+    the gateway's connect flow.
+12. The admin page, usage, export, import, deleting and archiving.
+13. Templates, the repository's `docs/` derived from this design (with
+    `docs/calling-the-api.md`), `CLAUDE.md`, the connector's `yen-apps` guide,
+    the `yenbot` journal, the `yenbot` Zen credential, the claude.ai Project.
 14. `service_deploy` for yenbot, no approvals on the iteration, the estate
     entry, `deployment.md`.
 15. Yen's first app, built by her in claude.ai from the docs alone — the test
