@@ -187,4 +187,35 @@ mod tests {
             }
         );
     }
+    /// **A value missing any of its fields is refused, not completed with a
+    /// zero.** `rounds` drops what will not parse, so a turn whose timing
+    /// reached it truncated leaves the turn out of the totals rather than
+    /// contributing a zero for the field it lost: a zero decode reads as a
+    /// round that decoded nothing, a zero queue as a round that never waited,
+    /// and both are the plausible-looking wrong numbers this module exists to
+    /// keep off the console. Each case below is well-formed up to the field it
+    /// is missing, so it fails at that field and not at an earlier one.
+    #[test]
+    fn a_value_missing_a_field_is_refused_not_zero_filled() {
+        let whole = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
+        assert_eq!(RoundTiming::parse(&whole.value()), Some(whole));
+        for missing in [
+            "decode=210/6100ms",                              // no queued
+            "queued=2500 decode=210/6100ms",                  // no prefill
+            "queued=2500 prefill=512/1400ms",                 // no decode
+            "queued=2500 prefill=512 decode=210/6100ms",      // prefill without its ms
+            "queued=2500 prefill=512ms decode=210/6100ms",    // prefill without its /
+            "queued=2500 prefill=512/1400ms decode=210/6100", // decode without its ms
+            "queued=2500 prefill=512/1400ms decode=6100ms",   // decode without its /
+        ] {
+            assert_eq!(RoundTiming::parse(missing), None, "{missing}");
+        }
+        // And the turn carrying one is absent from the rounds, not present at zero.
+        let custom = BTreeMap::from([
+            (key(1), whole.value()),
+            (key(2), "queued=2500 prefill=512/1400ms".to_string()),
+        ]);
+        assert_eq!(rounds(&custom), BTreeMap::from([(1, whole)]));
+        assert_eq!(total(rounds(&custom).values()), (1, whole));
+    }
 }
