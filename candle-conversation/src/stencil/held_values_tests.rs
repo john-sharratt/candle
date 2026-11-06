@@ -133,17 +133,23 @@ fn walk(
         if stop(&text) {
             return (text, allowed(&set));
         }
-        let byte = if text.ends_with(':') {
+        let only = set
+            .as_ref()
+            .filter(|s| s.tokens().len() == 1)
+            .and_then(|s| v.token_bytes(s.tokens()[0]).first().copied());
+        let byte = if let Some(only) = only {
+            only
+        } else if text.ends_with(':') {
             b' '
         } else if let Some((field, written)) = writing(&text) {
             let want = format!("\"{}\"", values[field]);
             want.as_bytes()[written.len()]
         } else {
             // A choice between fields: `from` while it is still to write.
-            let more = values.contains_key("from") && !text.contains("\"from\"");
-            match more {
-                true => b',',
-                false => b'}',
+            if values.contains_key("from") && !text.contains("\"from\"") {
+                b','
+            } else {
+                b'}'
             }
         };
         let token = byte as TokenId;

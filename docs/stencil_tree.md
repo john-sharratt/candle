@@ -759,9 +759,11 @@ call that was just refused for one.
   and `file_edit.dest` are held to the anchors of the file named;
   `file_edit.from` and `file_edit.to` to `+1` through the length of the part
   named.
-- **A refused value is not offered again.** A call refused `invalid_arguments`
-  for a held field leaves that value out of the field's held values for the
-  rest of the turn, so the repeat the guard used to end cannot be decoded.
+- **A refused value is not offered again**, because it is not offered at all:
+  the held values are read again each round from the file as it stands, so an
+  anchor or a line that does not exist — the repeat the guard used to end — is
+  never among them. The files a conversation has read or edited are noted
+  after each round (`FilesSeen::note`), its 32 most recent held.
 
 **Cost.** A held rule is a few literal values: a file of a hundred parts is a
 rule of about four hundred states, under `ValueRule`'s cap of 512 (a file past

@@ -106,6 +106,7 @@ use crate::conv_sweep::{CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::deletions::Deletions;
 use crate::engine_asks;
 use crate::hand_records::{self, Carrying};
+use crate::held_values::FilesSeen;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
@@ -386,6 +387,9 @@ struct ConvState {
     /// The journal sections this conversation holds, reconciled with its
     /// journal at the head of every round (`docs/zend_journal.md`).
     journal: Carried,
+    /// The files its calls have read or edited: what each round's calls to
+    /// them are held to (`held_values`, `docs/stencil_tree.md` §9.2).
+    seen: FilesSeen,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -4099,6 +4103,7 @@ fn run_inference_stream(
                         // An earlier run may have left this conversation's
                         // sections: the first reconcile looks for them.
                         journal: Carried::new(false),
+                        seen: FilesSeen::default(),
                     }));
                     let guard = Arc::clone(&arc)
                         .try_lock_owned()
@@ -4582,6 +4587,25 @@ fn run_inference_stream(
             if let Some(summary) = tool_summary_section(tools_mode) {
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }
+            // The round's calls to the files it has read or edited are held to
+            // what those files hold now (`docs/stencil_tree.md` §9.2). Reading
+            // them and building the rules is blocking work.
+            let base = round_triggers(&state, think_mode, tools_mode, &withheld);
+            let (hold_state, seen, held_files) =
+                (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
+            let triggers = match tokio::task::spawn_blocking(move || {
+                hold_state
+                    .engine
+                    .holding_values(&base, &seen.holds(&held_files))
+            })
+            .await
+            {
+                Ok(triggers) => triggers,
+                Err(e) => {
+                    tracing::warn!(conv_id = %conv_id, "holding a round's values panicked: {e}");
+                    round_triggers(&state, think_mode, tools_mode, &withheld)
+                }
+            };
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(this_turn),
@@ -4594,7 +4618,7 @@ fn run_inference_stream(
                     None
                 },
                 selection: round_selection,
-                triggers: round_triggers(&state, think_mode, tools_mode, &withheld),
+                triggers,
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
@@ -5213,6 +5237,7 @@ fn run_inference_stream(
                 }
             }
             withhold_read_files(&state, timeline, &cs.files, &results).await;
+            cs.seen.note(&results);
             let now_out = unavailable(&state.tool_host.availability_facts(), &offered);
             announce_returned(&mut results, &withheld, &now_out);
             if repeat_guard.screen(&mut results) == Verdict::Close {
