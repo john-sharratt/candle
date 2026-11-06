@@ -170,6 +170,35 @@ mod tests {
         );
     }
 
+    /// **A value missing any one of its fields is not one this wrote.** Each
+    /// case is the full value with one field taken out and every other field
+    /// left exactly as it was written, so the absence is the only reason to
+    /// refuse it.
+    #[test]
+    fn a_value_missing_any_one_of_its_fields_is_refused() {
+        let r = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
+        // The control: the whole value parses, so the refusals below cannot all
+        // hold because `parse` answers `None` for everything.
+        assert_eq!(RoundTiming::parse(&r.value()), Some(r));
+        for (missing, value) in [
+            ("queued_ms", "prefill=512/1400ms decode=210/6100ms"),
+            (
+                "prefill_tokens",
+                "queued=2500 prefill=1400ms decode=210/6100ms",
+            ),
+            ("prefill_ms", "queued=2500 prefill=512 decode=210/6100ms"),
+            ("generated", "queued=2500 prefill=512/1400ms decode=6100ms"),
+            ("decode_ms", "queued=2500 prefill=512/1400ms decode=210"),
+            ("decode", "queued=2500 prefill=512/1400ms"),
+        ] {
+            assert_eq!(
+                RoundTiming::parse(value),
+                None,
+                "{missing} is missing from {value:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_rounds_of_a_conversation_are_read_by_turn_and_totalled() {
         let a = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
