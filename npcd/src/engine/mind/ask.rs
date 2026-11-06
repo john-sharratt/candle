@@ -121,7 +121,7 @@ impl Minds {
     ) -> anyhow::Result<Answer> {
         let started = Instant::now();
         let spec = answer_spec(choices)?;
-        let tree = self.answer_tree(&[spec.clone()])?;
+        let tree = self.answer_tree(std::slice::from_ref(&spec))?;
         let put = Put {
             scope: AskScope::Whole,
             tree,
