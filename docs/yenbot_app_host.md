@@ -26,7 +26,7 @@ by rule — before it goes live.
 
 | Principle | Decision |
 |---|---|
-| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3). Publishing an app is a git push: no build, no restart. Only platform changes rebuild the binary. |
+| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3). An edit is one `file_edit_and_commit` from claude.ai; Zen announces the commit on the gateway's bus and the site takes it within a second (§5.4). No build, no restart; only platform changes rebuild the binary. |
 | Many apps, like tokera.com | One site, many apps under `/a/<app>/`, each a folder with a manifest (§5). |
 | One common framework | Every app is built on the platform's frontend framework, design system and SDK, served from `/_/` (§8). |
 | An advanced frontend framework that stays simple | Components, signals and a router, with fixed conventions and no build step (§8.2–§8.4). |
@@ -62,7 +62,8 @@ browser ──TLS──► Cloudflare (yenbot.com.au, proxied) ──HTTP :80─
                                                           │  push:   ──► browser push services
                                                           ▼
                      gateway (loopback), service key ──► zend /v1/chat/completions  (code.tokera.com)
-                                                     └─► npcd /v1/image/generate|edit (bot.tokera.com)
+                                                     ├─► npcd /v1/image/generate|edit (bot.tokera.com)
+                                                     └─► /gateway/events  (subscribed: repo/yenbot)
 ```
 
 - **BlackWorld only**, beside the gateway, supervised by keep as the service
@@ -174,10 +175,22 @@ change Claude made without touching her phone.
 
 ### 5.4 Publishing
 
-Publishing is a push to `main`. yenbot fetches `origin/main` every 10 s in the
-background, fast-forwards `D:\yenbot\live` when it moved, and the watcher does
-the rest; the fetch runs off every request path. A push that rewrites history
-is refused (fast-forward only) and logged.
+Publishing is a commit on `main`. The fast path is the Zen connector's
+`file_edit_and_commit` (`docs/mcp_file_tools.md` §3): Claude reads a file with
+`file_read`, sends its edits, and the call commits them to `main` as Yen and
+pushes them — one call, one commit. A larger change made by a Zen task lands
+the same way, as the task's commits.
+
+Every push Zen makes is announced on the gateway's bus as `repo/yenbot`
+(`docs/mcp_file_tools.md` §5). yenbot holds a WebSocket subscription to it;
+on a message it fetches `origin/main`, fast-forwards `D:\yenbot\live`, checks
+the apps whose paths changed (§17.4, the rules only), and swaps in each that
+passes — about a second after the push, and the open tab reloads itself
+(§5.3). An app that fails keeps its last good version, and the reason goes on
+the admin page. On every (re)connection, and every 60 s as a backstop for a
+push made outside Zen, yenbot fetches regardless. The fetch runs off every
+request path, and a history rewrite is refused (fast-forward only) and
+logged.
 
 **Drafts**: an app with `status: draft` is live for the admin only, its
 schedules held, so a new app is tried on the real site before anyone else
@@ -587,11 +600,14 @@ its `id`.
 
 ```yaml
 admins:
-  - <Yen's Google address>     # to be filled in; asked of Yen
+  - yensharratt@gmail.com      # Yen
+  - johnathan.sharratt@gmail.com
+registration: approve
 ```
 
-The admin sees drafts, the admin page and every app's jobs. John can be added
-to the list; nobody else is admin, and the list is changed only in the file.
+The admins see drafts, the admin page and every app's jobs. Nobody else is
+admin, and the list is changed only in the file. Yen is the one notified of a
+new account; either admin may approve it.
 
 ### 12.4 Public and private apps
 
@@ -647,17 +663,13 @@ Zen.
 code.tokera.com` for text, `Host: bot.tokera.com` for pictures — so the
 cluster routes each to a ready member, not only BlackWorld's.
 
-**The credential is a service key, which is new.** There is no
-service-to-service credential today: the daemons authenticate by the gateway's
-identity headers, and the only key-like gateway credential is the operator's
-`ops_key`, which is admin on every route and is not for an app
-(`web/web.yaml`). The change: the gateway's config gains `service_keys:`, each
-a key file, the identity it stands for (`service:yenbot`) and the routes it
-may call (`/v1/chat/completions`, `/v1/models`, `/v1/image/generate`,
-`/v1/image/edit`). A request bearing the key is forwarded with that identity;
-`host/roles.yaml` grants `service:yenbot` the user role. The key lives in
-yenbot's secrets (`D:\yenbot\secrets\zen.key`), is read at start and never
-logged, and the gateway accepts it only from its trusted backends.
+**The credential is a service key**, which is new
+(`docs/mcp_file_tools.md` §4): yenbot's key names the identity
+`service:yenbot`, the routes it may call (`/v1/chat/completions`,
+`/v1/models`, `/v1/image/generate`, `/v1/image/edit`) and the bus topics it
+may use; `host/roles.yaml` grants `service:yenbot` the user role. The key
+lives in yenbot's secrets (`D:\yenbot\secrets\zen.key`), is read at start and
+never logged, and the gateway accepts it only from its trusted backends.
 
 **No budget.** An app chooses its prompt, its length, its dials and its
 picture sizes, and nothing caps how much it asks for. Every call is recorded
@@ -770,6 +782,8 @@ extensive:
   app (§17.3); start from a template with `yenbot new`; build in the
   conventions; draw missing art into the library; run the check and look at
   every screenshot; publish as a draft; show Yen; go public only when she says.
+  Small edits go through `file_read` and `file_edit_and_commit`, a commit
+  each; larger work through a Zen task.
 - **The rules, each with its reason** — tokens only, never literal colours or
   sizes; nothing from outside the site; a component never reaches into a
   store; one component per file; library art by id; never edit the live
@@ -838,29 +852,38 @@ with its tile under `web/content/common/brand/`, and in the footer.
 |---|---|
 | `web/web.yaml` | A `yenbot` site: `hosts: [yenbot.com.au]`, `api: [{prefix: /, upstream: "http://127.0.0.1:8096"}]`; `www.yenbot.com.au` as a redirect site. |
 | `web/src/auth/` | Sign-in per cookie domain (§12.1). |
-| `web/src/` and `web.yaml` | `service_keys:` (§14). |
+| `web/src/`, `web.yaml`, zend | Service keys, the gateway's bus, `repo/<name>` on every push, and the connector's file tools — `docs/mcp_file_tools.md`. |
 | `host/roles.yaml` | `service:yenbot` as a user. |
 | Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client. John does this. |
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
-| `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent. |
+| `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
 | `service_deploy` | Learns `yenbot`: its repository and its package. |
-| Zen grants | Yen's account may work on and deploy the yenbot repository, and draw pictures; not candle. |
+| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4). |
 | Zen jobs | A job's screenshots come back to the session as pictures (§17.4). |
 | `mcp/src/guides/` | `yen-apps.md` (§17.5). |
 | `web/src/site/tokera/page.rs`, `estate.js` | The estate entry (§18). |
 | `docs/deployment.md` | The service, its port, its paths and its launch line. |
 
-## 20. Open questions
+## 20. Decisions
 
-- **Yen's Google address** — for `admins:`; asked of Yen.
-- **Registration** — `approve` (the default) or `open`. With no AI budget,
-  `open` lets anyone with a Google account use the AI and the image engine
-  through any public app.
-- **John as an admin** — added to `admins:`, or not.
+Taken 2026-11-06:
+
+- **Yen is `yensharratt@gmail.com`**: admin, and the author of every commit to
+  the yenbot repository.
+- **John is admin too.**
+- **Registration is approved by an admin.** With no AI budget, open
+  registration would let any Google account use the model and the image
+  engine through a public app.
+- **No AI budget, no email, backups local.**
+- **Edits are commits**, through `file_edit_and_commit`, announced on the
+  gateway's bus; the site subscribes rather than being called
+  (`docs/mcp_file_tools.md`).
 
 ## 21. Order of work
 
-1. The gateway: sign-in per domain, service keys, the yenbot site and route.
+1. The gateway and zend: sign-in per domain, the yenbot site and route, and
+   `docs/mcp_file_tools.md` — service keys, the bus, `repo/<name>`, the
+   connector's file tools.
 2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
    watcher and the publisher, keep and `INFO serving`.
