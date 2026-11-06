@@ -36,6 +36,7 @@ use candle_conversation::persistence::elevate::{elevate_to_hot, evict_from_hot};
 use candle_conversation::persistence::streams::StreamId;
 use candle_conversation::persistence::thread::PersistenceThread;
 use candle_conversation::persistence::transfer::seal_to_chunk_images;
+use candle_conversation::persistence::warm_ledger::WarmLedger;
 use candle_conversation::projection::{
     Conversation, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
@@ -435,6 +436,7 @@ fn full_cold_warm_hot_round_trip() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -849,6 +851,7 @@ fn quant_blend_warm_round_trip() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -930,6 +933,7 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
         snap
@@ -1035,6 +1039,7 @@ fn cold_marker_turn_passes_existence_check() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
     }
@@ -1154,6 +1159,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -1315,6 +1321,7 @@ fn quant_blend_cold_round_trip() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -1414,6 +1421,7 @@ fn elevate_edge_cases() {
         Arc::new(backings.clone()),
         device.clone(),
         None,
+        WarmLedger::new().join(),
     );
     persist.shutdown();
     // With install_warm_and_hot, hot stays populated after persist.
@@ -1577,6 +1585,7 @@ fn multi_chunk_turn_round_trip() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -1682,6 +1691,7 @@ fn archive_state_survives_restart() {
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -1823,6 +1833,7 @@ fn quantize_on_evict_full_round_trip() {
         Arc::new(backings.clone()),
         device.clone(),
         Some(policy),
+        WarmLedger::new().join(),
     );
     persist.shutdown();
 
@@ -1881,6 +1892,7 @@ fn quantize_on_evict_actually_compresses() {
             Arc::new(backings.clone()),
             device.clone(),
             policy_opt,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
         let view = conv.read();
@@ -1953,6 +1965,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
             Arc::new(backings.clone()),
             device.clone(),
             Some(policy),
+            WarmLedger::new().join(),
         );
         persist.shutdown();
     }
@@ -2559,6 +2572,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             Arc::new(backings.clone()),
             device.clone(),
             Some(policy),
+            WarmLedger::new().join(),
         );
         persist.shutdown();
 
@@ -2819,6 +2833,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             Arc::new(backings.clone()),
             device.clone(),
             None,
+            WarmLedger::new().join(),
         );
         persist.shutdown();
         key
@@ -3568,6 +3583,7 @@ fn demote_fixture(device: &Device) -> DemoteFixture {
         Arc::new(backings.clone()),
         device.clone(),
         None,
+        WarmLedger::new().join(),
     );
     persist.shutdown();
     for &key in &turn_keys {

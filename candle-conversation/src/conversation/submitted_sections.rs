@@ -56,7 +56,10 @@ struct Settled {
     changed: Condvar,
     /// The recurrent state the section's seal ended on, when its prefill ran
     /// here: where a section continuing it starts. Absent for one restored from
-    /// the log, whose successor works its start out instead.
+    /// the log, whose successor works its start out instead — and let go once
+    /// a section sealed after this one and its successor has sealed
+    /// ([`forget_passed_end_states`]): a host copy of every delta-rule layer's
+    /// state, it is the largest thing a section holds.
     end: Mutex<Option<SharedState>>,
 }
 
@@ -132,6 +135,11 @@ impl SectionRef {
     /// in this process — see [`Settled::end`].
     fn end_state(&self) -> Option<SharedState> {
         self.settled.end.lock().unwrap().clone()
+    }
+
+    /// Let go of the end state: no section will start from it again.
+    fn forget_end_state(&self) {
+        *self.settled.end.lock().unwrap() = None;
     }
 
     /// Block until the section is sealed, returning its block count. Fails when
@@ -245,6 +253,25 @@ struct Sealed {
     start_ms: u64,
 }
 
+/// Let go of the end states of the sections a just-sealed section continues,
+/// all but the last.
+///
+/// A section starts from the end state of the one it continues directly
+/// ([`SealJob::start_state`]), so of a chain only the end of its last link
+/// before the section can be asked for again: by the common reseal, a new
+/// entry appended after it. Every earlier link's end was read by its own
+/// successor, which has sealed — the section just sealed waited for all of
+/// them — and a later reseal mid-chain works its start out from the log
+/// ([`continue_state`]). Kept, those ends held a copy of every delta-rule
+/// layer's state per link for as long as the conversation lived.
+fn forget_passed_end_states(after: &[SectionRef]) {
+    if let Some((_, passed)) = after.split_last() {
+        for section in passed {
+            section.forget_end_state();
+        }
+    }
+}
+
 fn millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -286,6 +313,7 @@ impl SealJob {
                     total_ms = millis(started),
                     "submitted section sealed",
                 );
+                forget_passed_end_states(&self.after);
                 if self.substrate.owned_section_named(self.owner, &self.name) != Some(self.section)
                 {
                     self.discard();
@@ -820,6 +848,50 @@ layers:
             settled: removed,
         };
         assert!(handle.wait().unwrap_err().to_string().contains("removed"));
+    }
+
+    fn sealed_with_end(name: &str, raw: u32) -> SectionRef {
+        let settled = Settled::new();
+        *settled.end.lock().unwrap() = Some(SharedState {
+            schedule_hash: u64::from(raw),
+            layers: Arc::from(Vec::new()),
+            aux: Arc::from(vec![0xA5u8; 4]),
+        });
+        settled.settle(SectionState::Ready { blocks: 1 });
+        SectionRef {
+            section: SectionId::new(raw),
+            name: name.into(),
+            settled,
+        }
+    }
+
+    /// **A seal lets go of every end state it passed but the last**: a chain
+    /// of three keeps only the end of the link a new entry would continue.
+    #[test]
+    fn a_seal_keeps_only_the_end_state_it_may_be_asked_for_again() {
+        let chain = [
+            sealed_with_end("journal/1", 1),
+            sealed_with_end("journal/2", 2),
+            sealed_with_end("journal/3", 3),
+        ];
+        forget_passed_end_states(&chain);
+        assert!(chain[0].end_state().is_none());
+        assert!(chain[1].end_state().is_none());
+        assert_eq!(
+            chain[2]
+                .end_state()
+                .map(|s| (s.schedule_hash, s.aux.to_vec())),
+            Some((3, vec![0xA5; 4]))
+        );
+    }
+
+    /// **A section sealed after nothing, or after one, lets go of nothing.**
+    #[test]
+    fn a_seal_after_one_section_or_none_keeps_its_end_state() {
+        forget_passed_end_states(&[]);
+        let one = [sealed_with_end("journal/1", 1)];
+        forget_passed_end_states(&one);
+        assert!(one[0].end_state().is_some());
     }
 
     #[test]
