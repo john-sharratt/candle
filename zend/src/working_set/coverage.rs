@@ -168,7 +168,8 @@ mod tests {
 
     const FIRST: &str = "```rust file=candle/a.rs part=Qm7x lines=1-3 scope=\"fn a\"\n +1 …\n```\n\
                          end of candle/a.rs lines 1-198 of 350 — next: lines=199-350\n";
-    const LAST: &str = "```rust file=candle/a.rs part=b4_K lines=199-350 scope=\"fn b\"\n +1 …\n```\n\
+    const LAST: &str =
+        "```rust file=candle/a.rs part=b4_K lines=199-350 scope=\"fn b\"\n +1 …\n```\n\
                         end of candle/a.rs lines 199-350 of 350 — the end of the file\n";
 
     /// Two call turns answered in turn, then the summary: both ranges count.
@@ -249,6 +250,9 @@ mod tests {
             held("line 4 is part=Qm7x +2\n…\nend of candle/a.rs lines 4 of 9 — next: lines=5-9\n"),
             Some((4, 4))
         );
-        assert_eq!(held("end of part Qm7x of candle/a.rs — lines 3-5 of 9\n"), None);
+        assert_eq!(
+            held("end of part Qm7x of candle/a.rs — lines 3-5 of 9\n"),
+            None
+        );
     }
 }

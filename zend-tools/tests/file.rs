@@ -116,7 +116,7 @@ fn file_edit_refusals_say_what_to_send() {
         json!({"path": "e.txt", "at": "abc", "do": "replace", "text": "y"}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
-    assert!(detail.contains("four characters"), "{detail}");
+    assert!(detail.contains("four-character anchor"), "{detail}");
     assert!(detail.contains("\"abc\""), "{detail}");
     let resp = edit(
         &ctx,

@@ -114,7 +114,10 @@ fn closing(file: &str, doc: &Doc, first: usize, end: usize) -> String {
 
 /// What a read of a file with no parts says.
 fn empty(file: &str, doc: &Doc) -> String {
-    format!("{file} holds no text — {} line(s), all blank.\n", doc.line_count())
+    format!(
+        "{file} holds no text — {} line(s), all blank.\n",
+        doc.line_count()
+    )
 }
 
 /// A read of lines `from`..=`to` (from 1) of `path` in `repo`: the whole parts
@@ -286,10 +289,14 @@ mod tests {
             "line 4 is part={} +2\n```rust file=r/a.rs part={}",
             a[1], a[1]
         )));
-        assert!(lines_read("r", "a.rs", &doc, 2, 2)
-            .starts_with(&format!("line 2 is a blank line between parts\n```rust file=r/a.rs part={}", a[1])));
-        assert!(lines_read("r", "a.rs", &doc, 99, 99)
-            .starts_with(&format!("r/a.rs has 5 lines\n```rust file=r/a.rs part={}", a[1])));
+        assert!(lines_read("r", "a.rs", &doc, 2, 2).starts_with(&format!(
+            "line 2 is a blank line between parts\n```rust file=r/a.rs part={}",
+            a[1]
+        )));
+        assert!(lines_read("r", "a.rs", &doc, 99, 99).starts_with(&format!(
+            "r/a.rs has 5 lines\n```rust file=r/a.rs part={}",
+            a[1]
+        )));
     }
 
     #[test]

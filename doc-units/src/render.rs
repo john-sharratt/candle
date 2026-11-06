@@ -190,7 +190,11 @@ pub fn around(doc: &Doc, touched: &[usize], at_line: usize, source: Source<'_>) 
                 Some(a) => a.checked_sub(1),
                 None => n.checked_sub(1),
             };
-            return before.into_iter().chain(after).map(|i| entry(doc, i)).collect();
+            return before
+                .into_iter()
+                .chain(after)
+                .map(|i| entry(doc, i))
+                .collect();
         }
     };
     let mut out = String::new();
@@ -262,7 +266,14 @@ mod tests {
     fn crlf_is_not_shown_and_an_empty_tag_reads_text() {
         let doc = Doc::new("a.txt", "One.\r\nTwo.\r\n");
         assert_eq!(
-            block(&doc, 0, Source { file: "r/a.txt", tag: "" }),
+            block(
+                &doc,
+                0,
+                Source {
+                    file: "r/a.txt",
+                    tag: ""
+                }
+            ),
             format!(
                 "```text file=r/a.txt part={} lines=1-2 scope=\"One.\"\n +1 One.\n +2 Two.\n```\n",
                 doc.units()[0].anchor

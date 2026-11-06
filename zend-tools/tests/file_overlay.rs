@@ -670,7 +670,9 @@ fn a_read_of_lines_holds_whole_parts_and_names_the_next() {
             blocks(&doc, 2..4, source)
         ),
     );
-    assert!(read("161-320").contains("lines=161-240 scope=\"line 161\"\n +1 line 161\n +2 line 162\n"));
+    assert!(
+        read("161-320").contains("lines=161-240 scope=\"line 161\"\n +1 line 161\n +2 line 162\n")
+    );
     // Asked for more than a read holds, it holds what fits and says where on.
     assert_eq!(
         read("1-900"),
@@ -690,7 +692,9 @@ fn a_read_of_lines_holds_whole_parts_and_names_the_next() {
         ),
     );
     assert!(read("9999").starts_with("proj/big.txt has 900 lines\n```text file=proj/big.txt"));
-    assert!(read("9999").ends_with("end of proj/big.txt lines 881-900 of 900 — the end of the file\n"));
+    assert!(
+        read("9999").ends_with("end of proj/big.txt lines 881-900 of 900 — the end of the file\n")
+    );
 }
 
 /// **A one-line read says which part and line it is**, and a blank line

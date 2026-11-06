@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use validator::Validate;
 
-use super::render::{list_read, lines_read, part_read};
+use super::render::{lines_read, list_read, part_read};
 use super::FileError;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
@@ -195,13 +195,19 @@ mod tests {
             What::of(&request(None, Some("84"), None)).unwrap(),
             What::Lines(84, 84)
         );
-        assert_eq!(What::of(&request(None, None, Some(2))).unwrap(), What::List(2));
+        assert_eq!(
+            What::of(&request(None, None, Some(2))).unwrap(),
+            What::List(2)
+        );
         for req in [
             request(None, None, None),
             request(Some("KehT"), Some("1"), None),
             request(Some("KehT"), None, Some(1)),
         ] {
-            assert!(matches!(What::of(&req), Err(FileError::InvalidArguments(_))));
+            assert!(matches!(
+                What::of(&req),
+                Err(FileError::InvalidArguments(_))
+            ));
         }
     }
 

@@ -166,5 +166,4 @@ mod tests {
         assert!(!heading("#hashtag"));
         assert!(!heading("####### seven"));
     }
-
 }

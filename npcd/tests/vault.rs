@@ -1006,7 +1006,10 @@ async fn the_file_acts_reach_the_store_through_the_runtime() {
     // as a model takes it.
     let mut at = None;
     for line in read.lines() {
-        if let Some((_, rest)) = line.strip_prefix("```").and_then(|l| l.split_once(" part=")) {
+        if let Some((_, rest)) = line
+            .strip_prefix("```")
+            .and_then(|l| l.split_once(" part="))
+        {
             at = rest.split_whitespace().next().map(str::to_string);
         }
         if line.contains("in the spring") {
