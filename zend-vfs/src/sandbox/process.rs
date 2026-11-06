@@ -321,7 +321,7 @@ mod tests {
         // down, and it carries this one.
         let own = {
             let out = if cfg!(windows) {
-                std::process::Command::new("powershell")
+                Command::new("powershell")
                     .args([
                         "-NoProfile",
                         "-Command",
@@ -329,9 +329,7 @@ mod tests {
                     ])
                     .output()
             } else {
-                std::process::Command::new("sh")
-                    .args(["-c", "nice"])
-                    .output()
+                Command::new("sh").args(["-c", "nice"]).output()
             };
             String::from_utf8(out.expect("this process can read its own priority").stdout)
                 .unwrap()
