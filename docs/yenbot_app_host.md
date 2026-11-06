@@ -44,7 +44,8 @@ by rule — before it goes live.
 | AI and pictures through Zen, from this site only | Browsers and workflows call yenbot; yenbot calls zend for text and Zen's image engine for pictures, with a service key nothing else holds. No budget (§14). |
 | A library to draw on | Tile icons, illustrations, empty-state art, backgrounds and stickers drawn with Zen's image engine in one house style, catalogued and reused (§15). |
 | Yen is not a coder | The framework, templates, the art library, guides, an extensive `CLAUDE.md` and the checks are all there from the first day (§8, §15–§17). |
-| The app-building guide is read for every new app | `yenbot new` starts every app and stamps the guide's edition; the check refuses an app built against an older one (§17.3). |
+| The app-building guide is read for every new app | Every app's manifest carries the guide's edition it was built to; the gate refuses an app built against an older one (§17.3). |
+| No command line | Everything is done with the connector's file tools or a Zen task; the platform does on load what a tool would otherwise do — sizing art, renaming apps, migrating data (§15.2, §20.1). |
 | The styling must be amazing, to her attention to detail | One design system with fixed tokens, a living catalogue, and a check that renders every screen to pictures Claude looks at before publishing (§8.5, §17.4). |
 | Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; stored data through `site_data`; and Yen pastes a screenshot when she wants Claude to see a page (§18). |
 | An edit is all or nothing | `file_edit_and_commit` returns live or refused: the site checks the change before `main` moves (§5.4). |
@@ -859,10 +860,14 @@ same for every kind), what never appears (text, logos, photographs of real
 people), and a fixed preamble every prompt begins with. Pictures are drawn in
 families — one prompt, varied seeds — and the best of each is kept.
 
-`yenbot library add <file> --kind … --tags …` sizes a kept picture to its
-kind's sizes as WebP (and PNG where transparency needs it), writes it under
-`library/<kind>/`, and adds it to `library/catalogue.yaml` with its prompt,
-seed, tags and dominant colour, so any picture can be drawn again in kind.
+A kept picture is committed once, at full size, as `library/<kind>/<id>.png`,
+with a line in `library/catalogue.yaml`: its kind, tags, prompt and seed, so
+any picture can be drawn again in kind. Pictures are binary, so a Zen task
+commits them (§17.7) — the worker takes the link `image_generate` answered
+with. The platform does the rest on load: it sizes each picture to its kind's
+sizes as WebP (PNG where transparency needs it), reads its dominant colour,
+and caches the results; a catalogue line naming a picture that is not there,
+or a picture with no line, is refused by the gate.
 
 ### 15.3 How apps use it
 
@@ -891,7 +896,10 @@ with images, search, tags); a planner (a week and a month view); a tracker
 the app sets); a picture maker (describe it, draw it, keep it); reminders
 (records with a due time, a notification at it); a daily digest (a morning
 workflow that gathers and notifies); a form that saves answers and a page
-that sums them up. A new app is `yenbot new <id> --from <template>`.
+that sums them up. A new app starts as a copy of the closest template, under
+its new id, with the template's id replaced and `guide:` set to the building
+guide's current edition — made by Claude with the file tools for a small
+template, by a Zen task for a large one.
 
 ## 17. Docs, CLAUDE.md, the checks and the connector's guide
 
@@ -943,20 +951,23 @@ extensive:
 - **The map** — the repository's layout (§4), where every kind of thing
   goes, and what is served from disk versus embedded.
 - **The order of work** — read the app's journal entries (§17.6); read
-  `docs/building-an-app.md` before every new app (§17.3); start from a template
-  with `yenbot new`; build in the conventions; draw missing art into the
-  library; edit through `file_read` and `file_edit_and_commit`, which answers
-  live or refused; ask Yen to look; note what was decided in the journal. A
-  bigger change — the platform, anything that is not an app's own files — goes
-  to a Zen task, watched to its end (§17.7).
+  `docs/building-an-app.md` before every new app (§17.3); start from a copy of
+  the closest template (§16); build in the conventions; edit through
+  `file_read` and `file_edit_and_commit`, which answers live or refused; ask
+  Yen to look; note what was decided in the journal. Anything bigger or
+  structural — a new app from a large template, new art, renaming, the
+  platform, anything that is not a handful of an app's own text files — goes to
+  a Zen task, briefed fully and watched to its end (§17.7).
 - **The rules, each with its reason** — tokens only, never literal colours or
   sizes; nothing from outside the site; a component never reaches into a
   store; one component per file; library art by id; never edit the live
   directory; never commit a secret; never set an app live or make one public
   without Yen; undo by failing forward; platform changes are releases, app
   changes are edits.
-- **The commands** — `yenbot new`, `yenbot check`, `yenbot library add`,
-  building and testing the platform, and releasing it.
+- **There is no command line.** The connector's tools and Zen tasks do
+  everything; for a task, how to brief it (what to change, which docs it must
+  read, how to know it is done), and building, testing and releasing the
+  platform inside one.
 - **Seeing what happened** — `log_list`, `log_read` and `log_grep` for the
   site's and each app's lines, browser errors included; `site_data` to see
   what an app stored (§18). Look before guessing.
@@ -967,21 +978,22 @@ extensive:
 
 A rule a model might skip is enforced where it can be:
 
-- `yenbot new` is the only way an app is started. It copies the template and
-  writes `guide: <edition>` into the manifest — the edition of
-  `building-an-app.md` it was started against.
-- The check refuses an app whose `guide:` is older than the guide's current
-  edition. When the guide changes its edition, an app changed afterwards must
-  be brought up to it, which means reading it again.
+- Every manifest carries `guide: <edition>`, the edition of
+  `building-an-app.md` the app was built to, written when the app is started
+  from its template.
+- The gate refuses a new app without it, and any changed app whose `guide:`
+  is older than the guide's current edition. When the guide changes its
+  edition, an app changed afterwards must be brought up to it, which means
+  reading it again.
 - `CLAUDE.md` and the Zen MCP guide both open with the rule, and the
   building guide ends with a short checklist the session confirms to Yen
   before it publishes.
 
 ### 17.4 The check, which is the gate
 
-`yenbot check <app>` — a subcommand of the binary, the check the gate runs on
-every candidate (§5.4), and the result the admin page shows — refuses an app
-that: has a manifest error; names a
+The check is the platform's, run inside the binary: by the gate on every
+candidate (§5.4), on load for anything that arrived without one, and shown on
+the admin page. It refuses an app that: has a manifest error; names a
 workflow, collection, tile or library picture that is not there; is built to
 an older guide edition; uses a literal colour, font or pixel size where a
 token exists; breaks the layout conventions (§8.3) — a page or component
@@ -1122,8 +1134,10 @@ unsigned call is refused and logged.
 - **Deleting an app** is removing its folder. Its data, files and jobs are
   moved to an archive and kept thirty days, shown on the admin page with
   restore; then a platform job purges them.
-- **Renaming an app** is `yenbot rename <old> <new>`, which moves its folder,
-  its data and its jobs together.
+- **Renaming an app** is moving its folder to the new id and adding
+  `renamed_from: <old>` to its manifest, in one commit (a Zen task, for an app
+  of any size). On load the platform moves the app's data, files, jobs and
+  access to the new id, once, and serves the old URL as a redirect.
 - **Export and import**: an app's data as JSON (every collection) or CSV (one
   collection), from the admin page and `/api/v1/export`; an import is
   validated against the fields like any write.
@@ -1212,8 +1226,8 @@ Taken 2026-11-06:
    forms, offline writes, error reporting.
 5. The design system, its type and its Vietnamese test page, its catalogue
    page and the components.
-6. The gate: `yenbot check` answering candidates on the bus.
-7. The art library: the house style, `yenbot library`, the first library.
+6. The gate: the platform's check answering candidates on the bus.
+7. The art library: the house style, sizing on load, the first library.
 8. Jobs and workflows: the scheduler, the record-driven schedules, QuickJS and
    `ctx`, migrations.
 9. Notifications: the service worker, Web Push, the inbox.
