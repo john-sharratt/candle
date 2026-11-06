@@ -94,15 +94,18 @@ the workspace manifest (`D:\prog\workspace.yaml`, read by
 `zend-vfs::workspace`):
 
 ```yaml
-author: {name: John, email: johnathan.sharratt@gmail.com}   # every repository's, unless it names its own
+author: {name: John, email: <John's address>}   # every repository's, unless it names its own
 repos:
   - name: candle
   - name: battle-cities
   - name: journals
   - name: yenbot
-    author: {name: Yen, email: yensharratt@gmail.com}
+    author: {name: Yen, email: <Yen's address>}
     gate: yenbot                # the service that checks a change before the branch moves
 ```
+
+The addresses live in the manifest on the machine, never in this public
+repository.
 
 The committer is the author. A commit carries no attribution to a model or an
 assistant (`CLAUDE.md`, "No AI attribution anywhere"). A repository's `gate`

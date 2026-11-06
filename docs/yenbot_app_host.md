@@ -832,14 +832,17 @@ its `id`.
 
 ### 12.3 The admin
 
-`yenbot.yaml` names the admin by Google address:
+`yenbot.yaml` names the admins by Google address:
 
 ```yaml
 admins:
-  - yensharratt@gmail.com      # Yen
-  - johnathan.sharratt@gmail.com
+  - <Yen's Google address>
+  - <John's Google address>
 registration: approve
 ```
+
+The addresses are written only in the private yenbot repository's config,
+never in this public one.
 
 The admins see drafts, the admin page and every app's jobs. Nobody else is
 admin, and the list is changed only in the file. Yen is the one notified of a
@@ -1392,7 +1395,7 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client; the scopes apps may ask for on the consent screen, and the family as test users (§19.3). John does this. |
 | Zen credentials | `yenbot`, an API token for Yen's account, saved with `credential_save` (§6.3). |
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
-| `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
+| `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: <Yen's address>}`. |
 | `service_deploy`, `service_control`, `service_status` | Learn `yenbot`: its repository and its package (§5.5). |
 | Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
 | Zen's memory | The `yenbot` journal (§17.6). |
@@ -1407,7 +1410,7 @@ with its tile under `web/content/common/brand/`, and in the footer.
 
 Taken 2026-11-06:
 
-- **Yen is `yensharratt@gmail.com`**: admin, and the author of every commit to
+- **Yen's Google account** (the one in Zen's `persons/yen` record) is admin, and the author of every commit to
   the yenbot repository.
 - **John is admin too.**
 - **Registration is approved by an admin.** With no AI budget, open
