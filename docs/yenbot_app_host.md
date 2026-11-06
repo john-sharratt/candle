@@ -26,7 +26,7 @@ by rule — before it goes live.
 
 | Principle | Decision |
 |---|---|
-| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3), and the platform's own web files — framework, design system, landing page — are served from disk by the gateway, as zend's and npcd's consoles are (§5.2). An edit is one `file_edit_and_commit` from claude.ai, live within a second (§5.4). Only Rust changes rebuild the binary, through the existing `service_deploy` (§5.5). |
+| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3), and the platform's own web files — framework, design system, landing page — are built into the binary and released with it (§5.2). An edit is one `file_edit_and_commit` from claude.ai, live within a second (§5.4). Only Rust changes rebuild the binary, through the existing `service_deploy` (§5.5). |
 | Many apps, like tokera.com | One site, many apps under `/a/<app>/`, each a folder with a manifest (§5). |
 | One common framework | Every app is built on the platform's frontend framework, design system and SDK, served from `/_/` (§8). |
 | An advanced frontend framework that stays simple | Components, signals and a router, with fixed conventions and no build step (§8.2–§8.4). |
@@ -179,17 +179,17 @@ version.
 
 ### 5.2 Serving
 
-Two places serve the platform's web files, for two jobs — the arrangement
-zend's and npcd's consoles already use (`docs/shared_model_host.md` §3.4):
+The gateway forwards the whole site to yenbot (`web/web.yaml`: the `yenbot`
+site, `{prefix: /, upstream: "http://127.0.0.1:8096"}`), and yenbot serves
+everything: the platform's web files, the apps, the API.
 
 - **yenbot embeds `web/`** (`include_dir!`, with the build script rerun when a
   file under it changes), so the binary serves the whole site on its own.
-- **The gateway serves the same directory from disk**: the yenbot site in
-  `web/web.yaml` has `roots: ["D:/yenbot/live/web"]`, read per request
-  (`Roots::disk`), and forwards to yenbot only `/a/`, `/api/`, `/v1/`,
-  `/hooks/` and the reload stream. So the framework, the design system and
-  the landing page change as an app does — a commit through the gate, live on
-  the next load — and the binary catches up at its next release.
+- **The gateway does not read the live checkout from disk.** A site root must
+  exist wherever `web.yaml` is parsed — every machine's gateway and the web
+  crate's own tests — and `D:/yenbot/live` exists on BlackWorld alone. So the
+  platform's web files change with a release of the binary; an app's own files
+  (`apps/`) are read from the live checkout and change on the next load.
 
 `/a/<id>/…` is yenbot's, from the app's folder in the live checkout. Every
 file goes through the same responder as the consoles' (`web::asset::respond`):
