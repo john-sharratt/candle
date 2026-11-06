@@ -226,9 +226,13 @@ all or nothing:
 1. The call commits the edits as Yen and pushes them to a candidate ref, not
    to `main`.
 2. It publishes a check request on the gateway's bus, `gate/yenbot`
-   (`docs/mcp_file_tools.md` §5.4). yenbot is the repository's gate: it
-   fetches the candidate, runs the rule check (§17.4) on the apps the change
-   touches, and answers ok or refused with the rule, file and line.
+   (`docs/mcp_file_tools.md` §5.4). yenbot is the repository's gate
+   (`src/gate/`): it fetches the candidate into a ref of its own in the live
+   checkout — never its working tree — runs the rule check (§17.4) on the
+   apps the candidate changes against what `main` held, and answers ok or
+   refused with each refusal's file, line and what to do instead. A push to
+   any branch but `main` is answered ok at once, as only `main` is served;
+   `main`'s deletion is refused; a candidate it cannot read is refused.
 3. On ok, the call moves `main` to the candidate (compare-and-swap) and
    publishes `repo/yenbot`; yenbot fast-forwards `D:\yenbot\live`, swaps the
    apps in, and the open tab reloads itself (§5.3). The call answers live, with
@@ -1202,17 +1206,46 @@ A rule a model might skip is enforced where it can be:
 
 ### 17.4 The check, which is the gate
 
-The check is the platform's, run inside the binary: by the gate on every
-candidate (§5.4), on load for anything that arrived without one, and shown on
-the admin page. It refuses an app that: has a manifest error; names a
-workflow, collection, tile or library picture that is not there; is built to
-an older guide edition; uses a literal colour, font or pixel size where a
-token exists; breaks the layout conventions (§8.3) — a page or component
-outside its folder, a component reaching into a store, two components in one
-file; has an image without `alt`; lacks an empty or error state on a list;
-uses `unsafeHTML`; writes a field its collection does not declare; raises a
-collection's version without its migration; loads anything from outside the
-site; or has a workflow that does not parse or exports no function.
+The check is the platform's, run inside the binary (`src/check/`, one rule
+to a file): by the gate on every candidate (§5.4), on load for anything that
+arrived without one, and shown on the admin page
+(`GET /admin/apps/<id>/check`). It refuses an app that:
+
+- **manifest** — has no `app.yaml`, or one that does not parse or is refused
+  (names, reserved fields, a theme too pale to read);
+- **references** — names a tile, a schedule's workflow or a collection that
+  is not there; lowers a collection's version, or raises it without
+  `workflows/migrate-<coll>-<n>.js` for each step;
+- **guide** — is new with no `guide:`, or changed and built to an older
+  edition (§17.3);
+- **layout** — has a file outside the shape of §8.3; defines a component
+  outside `pages/` or `components/`, two in one file, or one whose file is
+  not named for its tag; has a component importing a store;
+- **tokens** — uses a literal colour anywhere in its styles, a literal size
+  for spacing, corners, type or line height, or a named font;
+- **markup** — uses `unsafeHTML` or its kin, writes markup from a string
+  (`innerHTML`), runs code from one (`eval`); has an `<img>` without `alt`
+  or an inline `style="…"`; draws a store's records with `.map` rather than
+  `<yen-list>`, which has the loading, empty and error states;
+- **outside** — loads a script, style, picture, font or call from outside
+  the site;
+- **workflows** — has a workflow that does not compile in QuickJS, imports
+  anything but the app's other workflow files, does work as it loads, or
+  exports no default function.
+
+**Every rule is deterministic** — the same files always get the same answer,
+and no rule asks a model anything. Most decide exactly (a file that is not
+there, an import of a store); the style and markup rules match the source as
+written, so what they refuse is always wrong, though code assembled to hide
+from them could pass. What cannot be decided from the source is enforced at
+run time instead: a field a collection does not declare is refused by the
+API on every write (§7.5), not by the check. A workflow's top level runs
+under an instruction budget counted in the engine's interrupt checks, not in
+time, so the answer is the same on every machine.
+
+An app refused on load keeps its last good version whole: its manifest, and
+its files served from the commit it last passed at, read from the
+repository's objects rather than the working tree.
 
 It runs in well under a second, so it can stand in front of every edit. How a
 page looks is Yen's to judge: she pastes a screenshot into the chat and says
