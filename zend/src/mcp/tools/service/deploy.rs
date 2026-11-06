@@ -8,10 +8,11 @@
 use std::time::Duration;
 
 use agent::client::Agents;
+use agent::overlay::Overlay;
 use agent::wire::{RunJob, Staged};
 use axum::http::Method;
 use serde_json::{json, Value};
-use zend_vfs::{JobStatus, Snapshot};
+use zend_vfs::JobStatus;
 
 use super::{guard, keep, service_of, trial_body, KEEP_TRIAL, SERVICES};
 use crate::mcp::ops;
@@ -81,7 +82,7 @@ pub fn build_job(service: &str) -> RunJob {
     RunJob {
         repo: REPO.to_string(),
         branch: BRANCH.to_string(),
-        overlay: Snapshot::default(),
+        overlay: Overlay::default(),
         program: "cargo".to_string(),
         args,
         timeout_secs: BUILD_TIMEOUT_S,
@@ -240,7 +241,7 @@ mod tests {
         assert_eq!(job.program, "cargo");
         assert_eq!(job.args, ["build", "--release", "-p", "web"]);
         assert_eq!(job.stage.as_deref(), Some("target/release/web.exe"));
-        assert_eq!(job.overlay, Snapshot::default());
+        assert_eq!(job.overlay, Overlay::default());
         let mut command = vec![job.program.clone()];
         command.extend(job.args);
         assert_eq!(built_service(&command), Some("web"));

@@ -10,6 +10,8 @@
 //! | [`config`] | the agent's file: its checkouts, its job slots, its jobs folder |
 //! | [`checkouts`] | each checkout: its repository, sandbox and origin |
 //! | [`wire`] | the job API's bodies |
+//! | [`overlay`] | a run's overlay, its chains named by digest |
+//! | [`chains`] | the chains an agent has been sent, by digest |
 //! | [`jobs`] | running jobs, pushes and fetches, and what each came to |
 //! | [`switch`] | whether the agent takes jobs: an admin's, kept across restarts |
 //! | [`routes`] | the job API's routes |
@@ -19,6 +21,7 @@
 //! | [`fetcher`] | a member's fetches, made by an agent |
 //! | [`install`] | installing a new build of the agent (§3.9) |
 
+pub mod chains;
 pub mod checkouts;
 pub mod client;
 pub mod config;
@@ -26,6 +29,7 @@ pub mod fetcher;
 pub mod install;
 pub mod jobs;
 pub mod member;
+pub mod overlay;
 pub mod pusher;
 pub mod routes;
 pub mod sweep;

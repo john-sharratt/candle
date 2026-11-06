@@ -1,6 +1,6 @@
 # Zen coding challenges: what slowed them, and the next fixes
 
-**Status:** reviewed with the user (2026-11-06); nothing built yet. Each cause
+**Status:** reviewed with the user (2026-11-06), and built. Each cause
 gives its evidence, the decision, and where the change lands. All are
 decided, except whether the stacked-layer machinery stays (Cleanup).
 
@@ -22,11 +22,14 @@ departure is recorded here:
 - **Cause 4**'s line ranges are zend's `file_edit` (`part`, `from`, `to`,
   `through`). npcd's bench act keeps the whole-unit form under its turn
   grammar's path budget (`docs/npcd_anchored_edits.md` §6).
-- **Cause 5** carries the task's overlay inline in the job, as `run_command`'s
-  `AgentExecutor` already does: the agent holds no substrate, and the job
-  request is the path the overlay already takes. The agent-side cache with
-  its `409 missing` and resubmit is not built; it would save resending
-  unchanged deltas, and is open with the user.
+- **Cause 5** names each file's chain by the SHA-256 of its JSON, not by its
+  record's `oseq`. `run_command`'s `AgentExecutor` holds a store snapshot,
+  not records, so a content digest is the one identity both senders share,
+  and the agent can check it. The agent keeps the chains it was sent in
+  memory, up to 256 MiB, least recently used out first
+  (`agent/src/chains.rs`). A `409 missing` resend carries exactly the chains
+  named, with no size budget beyond the store's own 10 MiB cap. An agent
+  restart loses the cache, and the next run asks again.
 
 **Source:** six worker tasks run on 2026-11-06 after
 `docs/zen_coding_session_fixes.md` was built:
@@ -526,13 +529,13 @@ worker's edits were missing.
 changes, by the hand-off's handshake.
 
 1. The job request names the overlay it expects: for each repository, the base
-   commit and the identity of each file's latest delta (its record's `oseq`).
+   commit and the identity of each file's chain (the SHA-256 of its JSON).
 2. The agent holds overlays it has been sent, by those identities, as it holds
    its warm checkout. If it holds every delta named, it runs. Otherwise it
    answers `409 missing` with the deltas it lacks.
-3. The caller resubmits with those deltas in the body, from the substrate,
-   which already holds them, under a size budget. The agent restores the store,
-   materialises it and runs.
+3. The caller resubmits to that agent with those chains in the body, from the
+   snapshot it named them from. The agent checks each against its name,
+   restores the store, materialises it and runs.
 4. A job's answer names the commit and how many uncommitted files were laid onto
    it. A pass is always a pass of what was asked.
 5. A caller with no conversation (Claude through the gateway) names no overlay,
@@ -550,10 +553,13 @@ as it stands, without a commit first.
 **Where.**
 
 - `zend/src/mcp/tools/repo_job/start.rs` and `zend/src/agent_exec.rs`, the two
-  senders.
-- `agent/src/jobs.rs`: the overlay cache, and the 409.
-- `zend/src/hand_records.rs`: reused for gathering and encoding.
-- `docs/jobs.md`; `docs/zend_workspace_execution.md`.
+  senders, both through `Agents::submit` (`agent/src/client.rs`), which sends
+  the names and resends what is missing.
+- `agent/src/overlay.rs`: the overlay by name, and the `409` body.
+- `agent/src/chains.rs`: the agent's chains by digest.
+- `agent/src/jobs.rs` and `agent/src/routes.rs`: resolving a run's overlay, and
+  the 409.
+- `docs/jobs.md`; `docs/replicated_substrate.md` §11.4.
 
 ## Cause 6 — `branch: main` reads a local cache of origin
 

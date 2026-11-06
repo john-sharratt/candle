@@ -30,6 +30,7 @@ use agent::config::{AgentConfig, CheckoutConfig, SweepConfig};
 use agent::fetcher::AgentFetch;
 use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
+use agent::overlay::Overlay;
 use agent::pusher::AgentPush;
 use agent::wire::{
     encode_bundle, FetchJob, JobKind, JobView, Phase, PushJob, PushLine, RunJob, Staged, Submit,
@@ -164,7 +165,7 @@ fn run_job(store: &VfsStore) -> RunJob {
     RunJob {
         repo: "r".into(),
         branch: "main".into(),
-        overlay: store.snapshot(),
+        overlay: Overlay::of(&store.snapshot()),
         program,
         args,
         timeout_secs: 60,
@@ -212,6 +213,41 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
     assert!(jobs.log(&view.id).unwrap().unwrap().is_file());
     assert_eq!(view.phase, Phase::Ended);
     assert_eq!(jobs.slots(), (2, 0));
+}
+
+/// **A run whose chains the agent lacks is refused naming them, and runs once
+/// they are sent**: names alone are refused `Missing` with each digest, kept
+/// as no job; the same run carrying them starts; and the names alone then
+/// start too, from the chains the agent holds.
+#[tokio::test]
+async fn a_run_by_name_asks_for_the_chains_it_lacks() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let job = run_job(&store);
+    let named = RunJob {
+        overlay: job.overlay.named(),
+        ..job.clone()
+    };
+    let digests: Vec<String> = job.overlay.chains.values().cloned().collect();
+    assert_eq!(
+        jobs.submit(Submit::Run(named.clone())).await.unwrap_err(),
+        JobError::Missing(digests.clone())
+    );
+    assert!(jobs.list(10).jobs.is_empty(), "a refused run is kept as no job");
+    let carrying = RunJob {
+        overlay: job.overlay.carrying(&digests),
+        ..job.clone()
+    };
+    let first = ended(&jobs, jobs.submit(Submit::Run(carrying)).await.unwrap()).await;
+    assert_eq!(first.status, JobStatus::Exited { code: Some(0) }, "{first:?}");
+    let again = ended(&jobs, jobs.submit(Submit::Run(named)).await.unwrap()).await;
+    assert_eq!(again.status, JobStatus::Exited { code: Some(0) }, "{again:?}");
+    let changed = &again.outcome.unwrap().changed;
+    assert!(
+        matches!(&changed[0].delta.delta, FileDelta::Replace { content } if content == "changed\n"),
+        "the run by name laid the held chain down: {changed:?}"
+    );
 }
 
 /// The shell a test job runs, and its arguments to wait `secs` seconds.
