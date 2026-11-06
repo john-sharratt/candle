@@ -95,7 +95,8 @@ browser ──TLS──► Cloudflare (yenbot.com.au, proxied) ──HTTP :80─
 
 ## 4. The repository
 
-A new repository, `john-sharratt/yenbot`, added to zend's workspace
+A new private repository, `john-sharratt/yenbots` (named `yenbot` in the
+workspace and on disk), added to zend's workspace
 (`D:\prog\workspace.yaml`) and to the agent's checkouts (`motherd/agent.yaml`,
 `push: true`), so Zen reads, edits, builds, tests, commits and pushes it as
 it does candle. Two working copies on BlackWorld, never the same one:
