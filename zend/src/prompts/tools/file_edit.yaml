@@ -60,11 +60,9 @@ parameters:
       type: string
     from:
       description: For replace, the inserts and delete — the first line of the part the edit covers, `+N` as the read numbers it beside the line (e.g. `+3`). Leave it out to edit the part whole.
-      pattern: '\+[1-9][0-9]?'
       type: string
     to:
       description: For replace and delete with `from` — the last line of the part covered, `+N`; left out, `from` alone.
-      pattern: '\+[1-9][0-9]?'
       type: string
     old:
       description: For a whole-part replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`.
