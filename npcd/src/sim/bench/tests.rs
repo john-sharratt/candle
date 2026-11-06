@@ -336,7 +336,9 @@ fn an_edit_changes_the_paragraph_its_anchor_names() {
     assert_eq!(
         reply,
         format!(
-            "layers/eras/third.md: Changed {at}.\n{now}| the third era\nburned in the autumn\n"
+            "layers/eras/third.md: Changed {at}.\n```markdown file=layers/eras/third.md \
+             part={now} lines=1-2 scope=\"the third era\"\n +1 the third era\n +2 burned in the \
+             autumn\n```\n"
         )
     );
 }
@@ -933,13 +935,13 @@ fn an_excerpt_shows_your_own_changes() {
     b.write("m1", "x", "layers/eras/third.md", "one\ntwo\nthree\n", &s)
         .unwrap();
     let mine = b.excerpt("m1", "layers/eras/third.md", 1, &s).unwrap();
-    assert!(mine.contains("| one\ntwo\nthree\n"), "{mine}");
+    assert!(mine.contains("\n +1 one\n +2 two\n +3 three\n"), "{mine}");
     let theirs = b.excerpt("m2", "layers/eras/third.md", 1, &s).unwrap();
     assert!(theirs.contains("burned in the spring"), "{theirs}");
 }
 
-/// A paragraph's lines stand as they are under its anchor — indentation and
-/// all — so what a read shows is the text an edit changes.
+/// A paragraph's lines stand as they are behind their numbers — indentation
+/// and all — so what a read shows is the text an edit changes.
 #[test]
 fn a_paragraph_shows_its_lines_as_they_are() {
     let (b, root, s) = rooted("lines");
@@ -949,8 +951,8 @@ fn a_paragraph_shows_its_lines_as_they_are() {
     )
     .unwrap();
     let out = b.excerpt("m1", "layers/eras/long.md", 1, &s).unwrap();
-    assert!(out.contains("| first\n  indented\n"), "{out}");
-    assert!(out.contains("| second\n"), "{out}");
+    assert!(out.contains("\n +1 first\n +2   indented\n```\n"), "{out}");
+    assert!(out.contains("\n +1 second\n```\n"), "{out}");
 }
 
 /// An edit is applied to the document, not its rendering — the anchors a

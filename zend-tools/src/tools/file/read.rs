@@ -32,13 +32,21 @@ pub struct ReadRequest {
     /// Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
+    // Each is absent rather than null: inside the definition's `oneOf` a
+    // nullable member would let the grammar close a call that names nothing
+    // with one `null`, so the schema is the value's own type, not an `Option`.
     /// One part, by its anchor (`KehT`). One of `part`, `lines`, `list`.
+    #[serde(default)]
+    #[schemars(with = "String")]
     pub part: Option<String>,
     /// Lines of the file, from 1: `84`, or `120-180`. One of `part`, `lines`, `list`.
+    #[serde(default)]
+    #[schemars(with = "String")]
     pub lines: Option<String>,
     /// A page of the list of the file's parts, from 1. One of `part`, `lines`, `list`.
+    #[serde(default)]
     #[validate(range(min = 1))]
-    #[schemars(range(min = 1))]
+    #[schemars(with = "u32", range(min = 1))]
     pub list: Option<u32>,
 }
 

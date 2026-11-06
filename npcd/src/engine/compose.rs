@@ -530,12 +530,13 @@ mod tests {
             !q.contains("Every other event"),
             "a story has no life's voice"
         );
-        // The piece is shown under its anchors, and mended by them.
+        // The piece is shown as blocks naming its anchors, and mended by them.
         let a = &Doc::new("layers/stories/the-count.md", "You count the fleet.").anchors()[0];
         assert!(
             q.contains(&format!(
-                "\n# `layers/stories/the-count.md` as it stands, each paragraph under its \
-                 anchor\n\n{a}| You count the fleet.\n"
+                "\n# `layers/stories/the-count.md` as it stands, each paragraph a block naming \
+                 its anchor\n\n```markdown file=layers/stories/the-count.md part={a} lines=1 \
+                 scope=\"You count the fleet.\"\n +1 You count the fleet.\n```\n"
             )),
             "{q}"
         );

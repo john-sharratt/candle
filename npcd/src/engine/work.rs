@@ -3052,11 +3052,14 @@ mod tests {
             ),
         );
         assert!(out.happened(), "{out:?}");
-        // The answer shows the paragraph under its new anchor.
+        // The answer shows the paragraph as a block under its new anchor.
         let now = anchor(path, "the third era\nburned in the autumn\n", 0);
         assert_eq!(
             out.line().unwrap(),
-            format!("{path}: Changed {at}.\n{now}| the third era\nburned in the autumn\n")
+            format!(
+                "{path}: Changed {at}.\n```markdown file={path} part={now} lines=1-2 scope=\"the \
+                 third era\"\n +1 the third era\n +2 burned in the autumn\n```\n"
+            )
         );
         perform(
             &h,
