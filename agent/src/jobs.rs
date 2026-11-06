@@ -539,13 +539,7 @@ impl Jobs {
 
     /// Run job `id` from its fetch to its end: fetch origin, start its
     /// sandbox job, wait for it, and stage what it built.
-    async fn carry(
-        self: Arc<Self>,
-        id: &str,
-        run: RunJob,
-        overlay: Snapshot,
-        branch: BranchName,
-    ) {
+    async fn carry(self: Arc<Self>, id: &str, run: RunJob, overlay: Snapshot, branch: BranchName) {
         let handle = match self.start(run, overlay, branch).await {
             Ok(started) => {
                 self.set_prep(id, Prep::Started(started.id));

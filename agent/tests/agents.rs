@@ -234,15 +234,26 @@ async fn a_run_by_name_asks_for_the_chains_it_lacks() {
         jobs.submit(Submit::Run(named.clone())).await.unwrap_err(),
         JobError::Missing(digests.clone())
     );
-    assert!(jobs.list(10).jobs.is_empty(), "a refused run is kept as no job");
+    assert!(
+        jobs.list(10).jobs.is_empty(),
+        "a refused run is kept as no job"
+    );
     let carrying = RunJob {
         overlay: job.overlay.carrying(&digests),
         ..job.clone()
     };
     let first = ended(&jobs, jobs.submit(Submit::Run(carrying)).await.unwrap()).await;
-    assert_eq!(first.status, JobStatus::Exited { code: Some(0) }, "{first:?}");
+    assert_eq!(
+        first.status,
+        JobStatus::Exited { code: Some(0) },
+        "{first:?}"
+    );
     let again = ended(&jobs, jobs.submit(Submit::Run(named)).await.unwrap()).await;
-    assert_eq!(again.status, JobStatus::Exited { code: Some(0) }, "{again:?}");
+    assert_eq!(
+        again.status,
+        JobStatus::Exited { code: Some(0) },
+        "{again:?}"
+    );
     let changed = &again.outcome.unwrap().changed;
     assert!(
         matches!(&changed[0].delta.delta, FileDelta::Replace { content } if content == "changed\n"),

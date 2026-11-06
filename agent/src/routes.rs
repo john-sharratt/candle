@@ -135,7 +135,7 @@ fn failed(e: JobError) -> Response {
                 .into_response()
         }
         JobError::Missing(missing) => {
-            return (StatusCode::CONFLICT, Json(Missing::of(missing))).into_response()
+            return (StatusCode::CONFLICT, Json(Missing::of(missing.clone()))).into_response()
         }
         JobError::Bad(_) => StatusCode::BAD_REQUEST,
     };
