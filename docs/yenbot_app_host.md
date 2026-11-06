@@ -56,7 +56,7 @@ by rule — before it goes live.
 | Real apps' queries | Counts, sums and groups, full-text search, batches, pages (§7.6). |
 | English, Vietnamese-safe | English interfaces; type, input, search and sorting that handle Vietnamese correctly (§8.7). |
 | Families share | Groups, and roles per collection and per record; children with their own Google accounts (§12.5). |
-| Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped, and identity believed only with the gateway's key (§12.6). |
+| Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped, hashed API tokens; loopback identity is a known hole, noted (§12.6). |
 | Google services through the gateway | The gateway's Google client, already used for sign-in, gains a "connect Google" flow; yenbot asks the gateway for a person's access token (§19.3). |
 | Usage is visible | Every app open is recorded; the API and the admin page sum it (§6, §20.3). |
 | tokera.com links to it | An entry in the estate dropdown (§21). |
@@ -82,9 +82,8 @@ browser ──TLS──► Cloudflare (yenbot.com.au, proxied) ──HTTP :80─
 - **BlackWorld only**, beside the gateway, supervised by keep as the service
   `yenbot` (`keep/stable/yenbot.exe`). It binds **loopback**, so nothing on
   the LAN reaches it except through the gateway, and it believes the gateway's
-  identity headers only when they arrive with the gateway's key for it
-  (§12.6) — loopback alone is not enough, since a Zen worker can open a raw
-  socket to loopback.
+  identity headers on loopback, as the other daemons do — a known hole,
+  accepted for now (§12.6).
 - **It is not a cluster member.** It holds its own store and has no replicas;
   BlackWorld down means Yen Bots down, its jobs held until it is back (§9.4),
   as with any keep service that is not clustered (`docs/mcp_app.md`).
@@ -768,8 +767,7 @@ The gateway signs people in with Google and yenbot believes it. yenbot never
 holds a Google secret or the session key; it reads `X-Tokera-User`, `-Email`,
 `-Name` and `-Picture`, which the gateway strips from every incoming request
 and sets only from a session it verified (`web/src/proxy.rs`,
-`web/src/server.rs`) — and only on a request that also carries the gateway's
-key for the site (§12.6).
+`web/src/server.rs`), on requests from loopback (§12.6).
 
 **The gateway needs one change.** Its session cookie is set on `.tokera.com`,
 its Google callback is `https://tokera.com/auth/callback`, and its post-login
@@ -874,19 +872,17 @@ common holes for every app, without the app asking:
   collection's `file` field allows, with a size ceiling; images are re-encoded
   when thumbnailed, which drops anything hidden in them.
 - **Secrets never reach a browser** (§19.1).
-- **Identity only with the gateway's key.** The gateway sends every request it
-  forwards to the site with `X-Tokera-Upstream-Key`, a secret per site upstream
-  (`upstream_key_file:` in the site's `web.yaml` entry, the file
-  `D:\yenbot\secrets\gateway.key` on yenbot's side), and strips the header from
-  anything arriving from outside. yenbot compares it in constant time and
-  treats a request without it as signed out, identity headers or not. Loopback
-  is not a credential: a Zen worker's `tcp_session_open` can reach
-  `127.0.0.1` today, so a daemon that believes `X-Tokera-*` from loopback
-  alone believes anyone who can start a task — which is also why
-  `tcp_session_open` stops reaching loopback (`docs/mcp_file_tools.md` §4.1).
-- **API tokens** (§6.3) are a second way in, never a way around the first: a
-  bearer token is believed only alongside the gateway's key, is stored only as
-  its hash, acts as one account, expires, and is revoked on the admin page.
+- **API tokens** (§6.3) are stored only as their hash, act as one account,
+  expire, and are revoked on the admin page.
+
+**A known hole, accepted for now.** yenbot believes `X-Tokera-*` on any
+request from loopback, as the daemons behind the gateway do. A Zen worker's
+`tcp_session_open` can reach `127.0.0.1`, so a task could claim any identity
+there. Only John and Yen start tasks, so it stays open for now; the fix, when
+it is closed, is a per-upstream key set by the gateway
+(`docs/mcp_file_tools.md` §4.1). A worker's sessions close when its
+conversation is archived (`docs/mcp_file_tools.md` §4.2), so none outlives the
+task that opened it.
 
 ## 13. Pages
 
@@ -1367,7 +1363,7 @@ with its tile under `web/content/common/brand/`, and in the footer.
 |---|---|
 | `web/web.yaml` | A `yenbot` site: `hosts: [yenbot.com.au]`, `api: [{prefix: /, upstream: "http://127.0.0.1:8096"}]`; `www.yenbot.com.au` as a redirect site. |
 | `web/src/auth/` | Sign-in per cookie domain (§12.1); the Google connect flow, the encrypted refresh-token store and `/gateway/google/token` (§19.3). |
-| `web/src/proxy.rs`, `web.yaml` | `upstream_key_file:` per site upstream, sent as `X-Tokera-Upstream-Key` and stripped from incoming requests (§12.6). |
+| `zend-tools`, `zend/src/mcp/archiving.rs` | A worker's tool sessions closed when its conversation is archived (`docs/mcp_file_tools.md` §4.2). |
 | `web/web.yaml` roots | `D:/yenbot/live/web` as the yenbot site's disk root (§5.2). |
 | `web/src/`, `web.yaml`, zend | Service keys, the gateway's bus, `repo/<name>` on every push, and the connector's file tools — `docs/mcp_file_tools.md`. |
 | `host/roles.yaml` | `service:yenbot` as a user. |
@@ -1419,7 +1415,8 @@ Taken 2026-11-06:
 - **Apps may override a fixed set of named tokens**, contrast-checked.
 - **Google services go through the gateway's existing client**, which keeps
   the refresh tokens; yenbot only ever holds a short-lived access token.
-- **Identity needs the gateway's key**, not loopback.
+- **Loopback identity stays a known hole for now**; a worker's sessions close
+  when its conversation is archived.
 - **Memory between chats is the `yenbot` journal.**
 - **No approvals** anywhere in the iteration.
 - **The connector's guide is short** and points into the repository's
@@ -1427,9 +1424,9 @@ Taken 2026-11-06:
 
 ## 24. Order of work
 
-1. The gateway and zend: sign-in per domain, the yenbot site, its route,
-   disk root and upstream key, and `docs/mcp_file_tools.md` — service keys,
-   the bus, `repo/<name>`, gates, the connector's file and log tools.
+1. The gateway and zend: sign-in per domain, the yenbot site, its route and
+   disk root, and `docs/mcp_file_tools.md` — service keys, sessions closed on
+   archive, the bus, `repo/<name>`, gates, the connector's file and log tools.
 2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
    watcher and the publisher, its logs and `/v1/logs`, health, keep and

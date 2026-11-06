@@ -152,29 +152,37 @@ the key names and no others; `host/roles.yaml` grants the identity what the
 daemons should let it do. The key is a file only the service and the gateway
 read, never logged, never on a command line.
 
-### 4.1 Upstream keys: the other direction
+### 4.1 A known hole: identity from loopback
 
-A service key proves the service to the gateway; a site behind the gateway
-needs the converse, proof that a request with identity headers came from the
-gateway. Binding loopback does not give it: a Zen worker's `tcp_session_open`
-can open a raw socket to `127.0.0.1` and write any header it likes. So a site
-upstream carries a key:
+The daemons behind the gateway — yenbot among them, and keep's HTTP API on
+`127.0.0.1:8092` — believe `X-Tokera-*` identity headers on any request from
+loopback, because the gateway is what reaches them there. A Zen worker can
+also reach them there: `tcp_session_open` refuses private addresses but keeps
+loopback open (`zend-tools/src/tools/tcp_session/open.rs`, for local test
+services), so a task can open a raw socket to `127.0.0.1` and write any
+identity it likes.
 
-```yaml
-sites:
-  - name: yenbot
-    api: [{prefix: /, upstream: "http://127.0.0.1:8096", upstream_key_file: secrets/yenbot-upstream.key}]
-```
+This is accepted for now (2026-11-06): only John and Yen start tasks. When it
+is closed, the fix is a key per site upstream that the gateway sets and strips
+(`X-Tokera-Upstream-Key`), believed by the site in constant time, rather than
+trust in the address.
 
-The gateway strips `X-Tokera-Upstream-Key` from every incoming request and
-sets it on each one it forwards to that upstream; the site believes
-`X-Tokera-*` only alongside it, compared in constant time.
+### 4.2 Tool sessions close with their conversation
 
-The hole is closed at its source as well: `tcp_session_open` refuses
-loopback, link-local and the machine's own addresses, as a worker has no
-business reaching a daemon on the machine it runs on by a path the gateway
-does not see. keep's HTTP API on `127.0.0.1:8092` is the daemon this matters
-for today.
+A worker's sessions — `tcp_session_*` first, and every other kind the session
+registry holds (`zend-tools/src/state/sessions.rs`: HTTP, TLS, UDP, SSH,
+telnet, SQL, remote file systems, code) — belong to the conversation that
+opened them. When that conversation is archived (`zend/src/mcp/archiving.rs`:
+by `thread_archive`, or by the sweep a day after the worker last moved), every
+session it opened is closed and removed: the socket dropped, the buffers
+freed, an HTTP session's credential released. An archived worker is never
+continued, so nothing could use them again, and a socket that outlived its
+conversation is a connection nobody is watching. A finished worker that is not
+yet archived keeps its sessions, as `repo_task_reply` may continue it.
+
+The registry records each session's conversation (its context's lineage) so
+the archive can find them; `close_conversation(lineage)` closes them all at
+once and answers how many it closed, which the archive's log line carries.
 
 ## 5. The gateway's pub/sub
 
@@ -311,6 +319,9 @@ request-path budget.
   too.
 - **`repo/<name>`**: a push through each of the three paths publishes once,
   with the commit and the paths.
+- **Sessions and archiving**: a worker that opened a TCP and an HTTP session
+  and finished keeps both; archiving it closes both and leaves another
+  conversation's sessions open; `close_conversation` answers the count.
 - **Log sources**: `log_list` over the cluster and a site with sub-sources;
   `log_grep` across all of them, and with `source: "cluster"` answering what
   `cluster_logs` did; a site refusing a person it does not admit.
@@ -325,8 +336,8 @@ request-path budget.
 | `web/src/` and `web/web.yaml` | `service_keys:`; the bus and `/gateway/events`. |
 | `cluster/` | A publish (and subscribe) message on the member's socket. |
 | `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`. |
-| `web/web.yaml`, `web/src/` | `logs` on a site; the gateway gathering a site's `/v1/logs` beside the members'; `upstream_key_file` on a site upstream (§4.1). |
-| `zend-tools/src/tools/tcp_session/` | `tcp_session_open` refuses loopback, link-local and the machine's own addresses (§4.1). |
+| `web/web.yaml`, `web/src/` | `logs` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
+| `zend-tools/src/state/sessions.rs`, `zend/src/mcp/archiving.rs` | Each session records its conversation; archiving a worker closes every session it opened (§4.2). |
 | `zend-vfs/src/workspace.rs`, zend's push paths | `gate:` in the manifest; every push to a gated repository through `gate/<repo>` first. |
 | `CLAUDE.md` | `file_edit_and_commit` as the request-path budget's exception. |
 | `mcp/src/guides/` | The connector's guides name the file and log tools, `log_grep` where they named `cluster_logs`, and when a task is the better tool. |
@@ -336,8 +347,8 @@ request-path budget.
 1. `author:` in the manifest; `file_edit_and_commit` on the git layer, with
    its tests against real repositories.
 2. The read tools on the connector.
-3. Service keys and upstream keys at the gateway; `tcp_session_open` off
-   loopback.
+3. Service keys at the gateway; tool sessions closed when their conversation
+   is archived.
 4. The bus, its WebSocket and the members' publish.
 5. zend publishing `repo/<name>` on every push, and gating the pushes of a
    gated repository.
