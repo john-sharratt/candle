@@ -18,6 +18,9 @@ use super::vocab::TokenId;
 #[derive(Debug, Default, Clone)]
 pub struct TriggerRegistry {
     by_token: HashMap<TokenId, Binding>,
+    /// The tree an end token sampled in free decode hands over to, in place of
+    /// ending the turn ([`Self::with_tail`]).
+    tail: Option<Arc<StencilTree>>,
 }
 
 /// A trigger's tree, whether entering it spends the trigger for the turn, and
@@ -53,6 +56,7 @@ impl TriggerRegistry {
     pub fn new() -> Self {
         TriggerRegistry {
             by_token: HashMap::new(),
+            tail: None,
         }
     }
 
@@ -74,9 +78,9 @@ impl TriggerRegistry {
     /// times in one 2383-token reply.
     #[must_use]
     pub fn with_once_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
-        let mut by_token = self.by_token.clone();
-        by_token.insert(token, Binding::of(tree, true));
-        TriggerRegistry { by_token }
+        let mut out = self.clone();
+        out.by_token.insert(token, Binding::of(tree, true));
+        out
     }
 
     /// The registry for the rest of the turn once `token` has fired: without
@@ -100,9 +104,37 @@ impl TriggerRegistry {
     /// re-deriving for the same dial replaces rather than accumulates.
     #[must_use]
     pub fn with_trigger(&self, token: TokenId, tree: Arc<StencilTree>) -> Self {
-        let mut by_token = self.by_token.clone();
-        by_token.insert(token, Binding::of(tree, false));
-        TriggerRegistry { by_token }
+        let mut out = self.clone();
+        out.by_token.insert(token, Binding::of(tree, false));
+        out
+    }
+
+    /// A copy of this registry in which an end token sampled in free decode
+    /// does not end the turn: it is dropped, and `tree` writes in its place
+    /// and ends the turn itself. Once — the tree's own close is not free
+    /// decode. A task's `Steps:` section is the case
+    /// ([`compile_steps_tail`](super::compile_steps_tail)).
+    #[must_use]
+    pub fn with_tail(&self, tree: Arc<StencilTree>) -> Self {
+        let mut out = self.clone();
+        out.tail = Some(tree);
+        out
+    }
+
+    /// A walk of the tail, when there is one.
+    pub fn tail_driver(&self) -> Option<StencilDriver> {
+        self.tail
+            .as_ref()
+            .map(|tree| StencilDriver::new(Arc::clone(tree)))
+    }
+
+    /// This registry without its tail: what the rest of a turn whose tail has
+    /// fired decodes under.
+    #[must_use]
+    pub fn without_tail(&self) -> Self {
+        let mut out = self.clone();
+        out.tail = None;
+        out
     }
 
     /// A copy of this registry in which every walk `token` starts is held on
@@ -134,13 +166,13 @@ impl TriggerRegistry {
         min_reasoning: u32,
         otherwise: Option<Arc<HeldBranches>>,
     ) -> Self {
-        let mut by_token = self.by_token.clone();
-        if let Some(binding) = by_token.get_mut(&token) {
+        let mut out = self.clone();
+        if let Some(binding) = out.by_token.get_mut(&token) {
             binding.held = Some(held);
             binding.min_reasoning = min_reasoning;
             binding.unreasoned = otherwise;
         }
-        TriggerRegistry { by_token }
+        out
     }
 
     /// A copy of this registry in which every walk `token` starts holds its
@@ -149,11 +181,11 @@ impl TriggerRegistry {
     /// it is.
     #[must_use]
     pub fn holding_values(&self, token: TokenId, values: Arc<HeldValues>) -> Self {
-        let mut by_token = self.by_token.clone();
-        if let Some(binding) = by_token.get_mut(&token) {
+        let mut out = self.clone();
+        if let Some(binding) = out.by_token.get_mut(&token) {
             binding.values = Some(values);
         }
-        TriggerRegistry { by_token }
+        out
     }
 
     /// The tree `token` starts, when it is a trigger.
@@ -166,13 +198,13 @@ impl TriggerRegistry {
     /// selects a mode that needs none (e.g. the empty-block leaf).
     #[must_use]
     pub fn without_trigger(&self, token: TokenId) -> Self {
-        let mut by_token = self.by_token.clone();
-        by_token.remove(&token);
-        TriggerRegistry { by_token }
+        let mut out = self.clone();
+        out.by_token.remove(&token);
+        out
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_token.is_empty()
+        self.by_token.is_empty() && self.tail.is_none()
     }
 
     /// Whether emitting `token` in free decode starts a walk.

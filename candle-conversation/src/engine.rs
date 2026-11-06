@@ -28,9 +28,10 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_loop, held_branches, held_branches_first,
-    HeldValues, HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId,
-    ToolCallEnvelope, ToolSpec, TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
+    compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
+    held_branches_first, HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode,
+    ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
 #[cfg(feature = "memory-census")]
@@ -2200,12 +2201,15 @@ impl ConversationEngine {
     /// `triggers` with every tool call's keyed fields held to `holds`
     /// (`docs/stencil_tree.md` §9.2): a field whose values are known — a
     /// file's anchors, a part's lines — can be written only as one of them.
-    /// Built for one round and dropped with it. `triggers` without a tool call,
-    /// or `holds` that build to nothing, come back as they are.
+    /// Built for one round and dropped with it, each set's rule taken from
+    /// `kept` when the round before built it ([`HeldRules`]). `triggers`
+    /// without a tool call, or `holds` that build to nothing, come back as
+    /// they are.
     pub fn holding_values(
         &self,
         triggers: &Arc<TriggerRegistry>,
         holds: &ValueHolds,
+        kept: &mut HeldRules,
     ) -> Arc<TriggerRegistry> {
         if holds.fields.is_empty() {
             return Arc::clone(triggers);
@@ -2213,11 +2217,34 @@ impl ConversationEngine {
         let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
             return Arc::clone(triggers);
         };
-        let held = HeldValues::build(holds, &self.vocab());
+        let held = HeldValues::build(holds, &self.vocab(), kept);
         if held.is_empty() {
             return Arc::clone(triggers);
         }
         Arc::new(triggers.holding_values(trigger, Arc::new(held)))
+    }
+
+    /// `triggers` with an answer that ends written on into its `Steps:`
+    /// section ([`compile_steps_tail`]): one line per step of `steps`, each
+    /// held to an outcome, and the turn closed by the grammar. Fewer than two
+    /// steps ask for no section, and `triggers` come back as they are, as
+    /// they do when the tree cannot be built (logged).
+    pub fn ending_with_steps(
+        &self,
+        triggers: &Arc<TriggerRegistry>,
+        steps: &[String],
+    ) -> Arc<TriggerRegistry> {
+        if steps.len() < 2 {
+            return Arc::clone(triggers);
+        }
+        let close_turn = ToolCallEnvelope::turn_close(&self.core.dialect);
+        match compile(&compile_steps_tail(steps, &close_turn), &self.vocab()) {
+            Ok(tree) => Arc::new(triggers.with_tail(Arc::new(tree))),
+            Err(e) => {
+                tracing::warn!("an answer's steps could not be built into its grammar: {e}");
+                Arc::clone(triggers)
+            }
+        }
     }
 
     /// Compile the thinking-block steering trees (one per effort dial, `Off`

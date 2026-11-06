@@ -10,6 +10,7 @@
 //! every pattern for the process's life and would grow by one per round.
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
 use super::value_rule::ValueRule;
@@ -49,6 +50,26 @@ pub struct HeldValues {
     by_field: HashMap<(String, Arc<str>), Held>,
 }
 
+/// The rules the last [`HeldValues::build`] made, by value set, so a set that
+/// has not changed since — a file no edit touched, a part of the same length —
+/// is not built again. It holds only the sets that build used, so it never
+/// grows past one turn's.
+#[derive(Debug, Default)]
+pub struct HeldRules {
+    rules: HashMap<Vec<String>, Option<Arc<ValueRule>>>,
+}
+
+impl HeldRules {
+    /// How many value sets it holds.
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
+
 /// A pattern matching exactly `values`: each escaped, alternated.
 pub fn literal_pattern(values: &[String]) -> String {
     let arms: Vec<String> = values.iter().map(|v| escape(v)).collect();
@@ -68,13 +89,15 @@ fn escape(value: &str) -> String {
 }
 
 impl HeldValues {
-    /// `holds` built over `vocab`. A set with no values, or one whose rule
-    /// cannot be built (past the rule's state cap), is left out: its field
-    /// keeps its own pattern.
-    pub fn build(holds: &ValueHolds, vocab: &dyn Vocab) -> HeldValues {
+    /// `holds` built over `vocab`, taking each set's rule from `kept` when
+    /// the last build made it, and leaving `kept` with this build's. A set with
+    /// no values, or one whose rule cannot be built (past the rule's state
+    /// cap), is left out: its field keeps its own pattern.
+    pub fn build(holds: &ValueHolds, vocab: &dyn Vocab, kept: &mut HeldRules) -> HeldValues {
         let mut by_field = HashMap::new();
+        let mut last = mem::take(&mut kept.rules);
         // One rule per distinct set: every part of three lines has the same.
-        let mut built: HashMap<Vec<String>, Option<Arc<ValueRule>>> = HashMap::new();
+        let built = &mut kept.rules;
         for hold in &holds.fields {
             let field: Arc<str> = Arc::from(hold.field.as_str());
             let mut rules = HashMap::new();
@@ -83,12 +106,14 @@ impl HeldValues {
                     continue;
                 }
                 let rule = built.entry(values.clone()).or_insert_with(|| {
-                    ValueRule::owned(&literal_pattern(values), vocab)
-                        .map_err(|e| {
-                            tracing::debug!(field = %hold.field, "a held value set was left to its pattern: {e}");
-                        })
-                        .ok()
-                        .map(Arc::new)
+                    last.remove(values).unwrap_or_else(|| {
+                        ValueRule::owned(&literal_pattern(values), vocab)
+                            .map_err(|e| {
+                                tracing::debug!(field = %hold.field, "a held value set was left to its pattern: {e}");
+                            })
+                            .ok()
+                            .map(Arc::new)
+                    })
                 });
                 if let Some(rule) = rule {
                     rules.insert(given.clone(), Arc::clone(rule));
@@ -133,6 +158,7 @@ impl HeldValues {
 
 #[cfg(test)]
 mod tests {
+    use super::super::vocab::TestVocab;
     use super::*;
 
     /// **A literal pattern matches its values and nothing else**, whatever
@@ -144,5 +170,51 @@ mod tests {
             r"(?:\+1|\+12|a\-b)"
         );
         assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
+    }
+
+    fn parts(table: &[(&str, &[&str])]) -> ValueHolds {
+        ValueHolds {
+            fields: vec![FieldHold {
+                tools: vec!["file_edit".into()],
+                field: "part".into(),
+                on: vec!["path".into()],
+                table: table
+                    .iter()
+                    .map(|(path, values)| {
+                        (
+                            vec![path.to_string()],
+                            values.iter().map(|v| v.to_string()).collect(),
+                        )
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// **A set unchanged since the last build is the same rule**, a changed
+    /// one is built afresh, and a set the build no longer uses is let go.
+    #[test]
+    fn an_unchanged_set_keeps_its_rule_across_builds() {
+        let v = TestVocab::new();
+        let mut kept = HeldRules::default();
+        let field: Arc<str> = Arc::from("part");
+        let rule = |held: &HeldValues, path: &str| {
+            let written = HashMap::from([(Arc::from("path"), path.to_string())]);
+            held.rule_for("file_edit", &field, &written).unwrap()
+        };
+        let first = HeldValues::build(
+            &parts(&[("a.rs", &["KehT"]), ("b.rs", &["r7Lm"])]),
+            &v,
+            &mut kept,
+        );
+        assert_eq!(kept.len(), 2);
+        let second = HeldValues::build(
+            &parts(&[("a.rs", &["KehT"]), ("b.rs", &["r7Lm", "Zq0p"])]),
+            &v,
+            &mut kept,
+        );
+        assert!(Arc::ptr_eq(&rule(&first, "a.rs"), &rule(&second, "a.rs")));
+        assert!(!Arc::ptr_eq(&rule(&first, "b.rs"), &rule(&second, "b.rs")));
+        assert_eq!(kept.len(), 2, "`r7Lm` alone is no longer used");
     }
 }

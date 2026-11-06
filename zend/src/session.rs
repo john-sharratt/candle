@@ -83,6 +83,7 @@ use zend_tools::tools::journal::{JournalBook, JournalShelf};
 use zend_tools::{OpsRunner, ToolContext};
 use zend_vfs::{RepoFiles, Workspace};
 
+use crate::answer_steps;
 use crate::api::chat::{
     apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
     RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
@@ -4588,15 +4589,17 @@ fn run_inference_stream(
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }
             // The round's calls to the files it has read or edited are held to
-            // what those files hold now (`docs/stencil_tree.md` §9.2). Reading
-            // them and building the rules is blocking work.
+            // what those files hold now (`docs/stencil_tree.md` §9.2), and a
+            // task's answer ends in the `Steps:` section of the steps it was
+            // given (`answer_steps`). Reading the files and building the
+            // grammar is blocking work.
             let base = round_triggers(&state, think_mode, tools_mode, &withheld);
             let (hold_state, seen, held_files) =
                 (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
             let triggers = match tokio::task::spawn_blocking(move || {
-                hold_state
-                    .engine
-                    .holding_values(&base, &seen.holds(&held_files))
+                let engine = &hold_state.engine;
+                let held = seen.triggers(engine, &base, &held_files);
+                engine.ending_with_steps(&held, &answer_steps::of(engine, timeline))
             })
             .await
             {
@@ -6864,6 +6867,17 @@ impl ZendSession {
             &state.engine,
             conversation_timeline(conv_id),
             starter,
+        ))
+    }
+
+    /// Record `steps` as what the conversation `conv_id`'s answers account
+    /// for ([`answer_steps`]). `None` while the model is not loaded.
+    pub fn answer_steps(&self, conv_id: &str, steps: &[String]) -> Option<EngineResult<()>> {
+        let state = self.loaded()?;
+        Some(answer_steps::mark(
+            &state.engine,
+            conversation_timeline(conv_id),
+            steps,
         ))
     }
 
