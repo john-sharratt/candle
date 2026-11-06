@@ -27,6 +27,9 @@ pub struct Pending {
     /// Where to send the browser afterwards. Validated against the cookie
     /// domain before use — an unchecked `next` is an open redirect.
     pub next: String,
+    /// The callback this sign-in asked the provider to return to — the
+    /// estate's it started on. The exchange must name the same one.
+    pub redirect_uri: String,
     pub exp: u64,
 }
 
@@ -50,9 +53,9 @@ pub struct Start {
     pub pending: Pending,
 }
 
-/// Build the provider redirect and the state that has to survive until the
-/// callback.
-pub fn start(p: &Provider, next: &str, ttl_secs: u64) -> Start {
+/// Build the provider redirect, returning to `redirect_uri`, and the state that
+/// has to survive until the callback.
+pub fn start(p: &Provider, redirect_uri: &str, next: &str, ttl_secs: u64) -> Start {
     let state = random_token();
     let nonce = random_token();
     let verifier = random_token();
@@ -63,7 +66,7 @@ pub fn start(p: &Provider, next: &str, ttl_secs: u64) -> Start {
         p.auth_endpoint,
         query(&[
             ("client_id", &p.client_id),
-            ("redirect_uri", &p.redirect_uri),
+            ("redirect_uri", redirect_uri),
             ("response_type", "code"),
             ("scope", "openid email profile"),
             ("state", &state),
@@ -83,6 +86,7 @@ pub fn start(p: &Provider, next: &str, ttl_secs: u64) -> Start {
             nonce,
             verifier,
             next: next.to_string(),
+            redirect_uri: redirect_uri.to_string(),
             exp: session::now_secs() + ttl_secs,
         },
     }
@@ -93,13 +97,15 @@ struct TokenResponse {
     id_token: String,
 }
 
-/// Exchange the code for an `id_token` and read its claims.
+/// Exchange the code for an `id_token` and read its claims. `redirect_uri` is
+/// the one the sign-in started with ([`Pending::redirect_uri`]).
 pub async fn exchange(
     http: &reqwest::Client,
     p: &Provider,
     secret: &str,
     code: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> anyhow::Result<Claims> {
     let res = http
         .post(&p.token_endpoint)
@@ -107,7 +113,7 @@ pub async fn exchange(
             ("code", code),
             ("client_id", p.client_id.as_str()),
             ("client_secret", secret),
-            ("redirect_uri", p.redirect_uri.as_str()),
+            ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
             ("code_verifier", verifier),
         ])
@@ -296,7 +302,7 @@ mod tests {
 
     #[test]
     fn the_redirect_carries_everything_the_provider_needs() {
-        let s = start(&provider(), "/", 600);
+        let s = start(&provider(), "https://tokera.com/auth/callback", "/", 600);
         for expect in [
             "client_id=cid",
             "response_type=code",
@@ -315,10 +321,25 @@ mod tests {
             .contains(&format!("state={}", urlencode(&s.pending.state))));
     }
 
+    /// **A sign-in started on another estate returns to that estate's
+    /// callback**, and remembers it for the exchange.
+    #[test]
+    fn a_sign_in_returns_to_the_callback_of_the_estate_it_started_on() {
+        let s = start(&provider(), "https://yenbot.com.au/auth/callback", "/", 600);
+        assert!(s
+            .redirect_to
+            .contains("redirect_uri=https%3A%2F%2Fyenbot.com.au%2Fauth%2Fcallback"));
+        assert_eq!(
+            s.pending.redirect_uri,
+            "https://yenbot.com.au/auth/callback"
+        );
+    }
+
     #[test]
     fn every_start_is_unguessable_and_different() {
-        let a = start(&provider(), "/", 600).pending;
-        let b = start(&provider(), "/", 600).pending;
+        let cb = "https://tokera.com/auth/callback";
+        let a = start(&provider(), cb, "/", 600).pending;
+        let b = start(&provider(), cb, "/", 600).pending;
         assert_ne!(a.state, b.state);
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.verifier, b.verifier);

@@ -795,12 +795,20 @@ and sets only from a session it verified (`web/src/proxy.rs`,
 its Google callback is `https://tokera.com/auth/callback`, and its post-login
 redirect is allowed only within that domain (`web/web.yaml`,
 `web/src/auth/oidc.rs` `safe_next`). A sign-in on tokera.com therefore never
-reaches `yenbot.com.au`. The change: sign-in per cookie domain — `auth.yaml`
-lists each domain with its own callback (`https://yenbot.com.au/auth/callback`,
-registered as a second redirect URI on the same Google client), the session
-cookie is set for the domain the request arrived on, and `safe_next` accepts
-the domain the sign-in started on. One Google client, one session key, two
-cookies.
+reaches `yenbot.com.au`. So sign-in is per cookie domain (`web/src/auth/`,
+built): `auth.yaml` lists the further domains, each with its own callback —
+
+```yaml
+domains:
+  - {cookie_domain: .yenbot.com.au, redirect_uri: https://yenbot.com.au/auth/callback}
+```
+
+— registered as a second redirect URI on the same Google client. A request
+signs in on the domain whose cookie domain covers its host
+(`Auth::domain_for`), else on `cookie_domain`: the login returns to that
+domain's callback, which the signed pending state carries to the exchange; the
+session cookie is set and cleared there; and `next` must stay on it. One
+Google client, one session key, two cookies.
 
 ### 12.2 Accounts
 

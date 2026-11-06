@@ -50,7 +50,7 @@ pub use gateways::Gateways;
 pub use role::{Person, Principal, Role, Roles};
 pub use session::Identity;
 
-use crate::config::Auth as AuthConfig;
+use crate::config::{Auth as AuthConfig, CookieDomain};
 use session::Key;
 
 /// How long a browser has to complete the round trip to the provider.
@@ -208,9 +208,26 @@ struct LoginQuery {
     next: Option<String>,
 }
 
-async fn login(State(auth): State<Arc<Auth>>, Query(q): Query<LoginQuery>) -> Response {
+/// The estate a request signs in on, by the host it arrived on, and whether
+/// its cookies are `Secure` — read from that estate's own callback.
+fn estate(auth: &Auth, headers: &HeaderMap) -> (CookieDomain, bool) {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let domain = auth.cfg.domain_for(host);
+    let secure = domain.redirect_uri.starts_with("https://");
+    (domain, secure)
+}
+
+async fn login(
+    State(auth): State<Arc<Auth>>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
+    let (domain, secure) = estate(&auth, &headers);
     let next = q.next.unwrap_or_else(|| "/".into());
-    if !oidc::safe_next(&next, &auth.cfg.cookie_domain) {
+    if !oidc::safe_next(&next, &domain.cookie_domain) {
         return problem(
             StatusCode::BAD_REQUEST,
             "bad_redirect",
@@ -218,14 +235,19 @@ async fn login(State(auth): State<Arc<Auth>>, Query(q): Query<LoginQuery>) -> Re
         );
     }
 
-    let start = oidc::start(&auth.cfg.google, &next, PENDING_TTL_SECS);
+    let start = oidc::start(
+        &auth.cfg.google,
+        &domain.redirect_uri,
+        &next,
+        PENDING_TTL_SECS,
+    );
     let sealed = oidc::seal(&auth.key, &start.pending);
     let jar = cookie::set(
         cookie::PENDING,
         &sealed,
-        &auth.cfg.cookie_domain,
+        &domain.cookie_domain,
         PENDING_TTL_SECS as i64,
-        auth.secure,
+        secure,
     );
 
     see_other(&start.redirect_to, &[jar])
@@ -247,7 +269,8 @@ async fn callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    let drop_pending = cookie::clear(cookie::PENDING, &auth.cfg.cookie_domain, auth.secure);
+    let (domain, secure) = estate(&auth, &headers);
+    let drop_pending = cookie::clear(cookie::PENDING, &domain.cookie_domain, secure);
 
     if let Some(err) = q.error {
         // Cancelling is not a failure; put them back where they started.
@@ -296,6 +319,7 @@ async fn callback(
         &auth.client_secret,
         &code,
         &pending.verifier,
+        &pending.redirect_uri,
     )
     .await
     {
@@ -343,9 +367,9 @@ async fn callback(
     let jar = cookie::set(
         cookie::SESSION,
         &token,
-        &auth.cfg.cookie_domain,
+        &domain.cookie_domain,
         ttl as i64,
-        auth.secure,
+        secure,
     );
 
     tracing::info!(
@@ -357,11 +381,16 @@ async fn callback(
     see_other(&pending.next, &[jar, drop_pending])
 }
 
-async fn logout(State(auth): State<Arc<Auth>>, Query(q): Query<LoginQuery>) -> Response {
-    let jar = cookie::clear(cookie::SESSION, &auth.cfg.cookie_domain, auth.secure);
+async fn logout(
+    State(auth): State<Arc<Auth>>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
+    let (domain, secure) = estate(&auth, &headers);
+    let jar = cookie::clear(cookie::SESSION, &domain.cookie_domain, secure);
     let next = q
         .next
-        .filter(|n| oidc::safe_next(n, &auth.cfg.cookie_domain))
+        .filter(|n| oidc::safe_next(n, &domain.cookie_domain))
         .unwrap_or_else(|| "/".into());
     see_other(&next, &[jar])
 }
@@ -469,6 +498,56 @@ mod tests {
         let anon: Value =
             serde_json::from_slice(&to_bytes(anon.into_body(), 1 << 16).await.unwrap()).unwrap();
         assert_eq!(anon, json!({ "authenticated": false }));
+    }
+
+    /// **Each estate signs in on its own domain**: a login on yenbot.com.au
+    /// returns to its own callback and sets its cookie there; one on any other
+    /// host is tokera.com's.
+    #[tokio::test]
+    async fn each_estate_signs_in_on_its_own_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("session.key"), [7u8; 48]).unwrap();
+        fs::write(dir.path().join("client.secret"), "s3cret\n").unwrap();
+        let cfg: AuthConfig = serde_yaml::from_str(&format!(
+            "cookie_domain: .tokera.com\n\
+             session_secret_file: '{}'\n\
+             google:\n  client_id: c\n  client_secret_file: '{}'\n  \
+             redirect_uri: https://tokera.com/auth/callback\n\
+             domains:\n  - {{cookie_domain: .yenbot.com.au, redirect_uri: https://yenbot.com.au/auth/callback}}\n",
+            dir.path().join("session.key").display(),
+            dir.path().join("client.secret").display()
+        ))
+        .unwrap();
+        let auth = Arc::new(Auth::new(cfg, Roles::default()).unwrap());
+        let on = |host: &'static str, next: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_static(host));
+            let q = LoginQuery {
+                next: Some(next.into()),
+            };
+            login(State(auth.clone()), headers, Query(q))
+        };
+
+        let yen = on("yenbot.com.au", "https://yenbot.com.au/a/recipes/").await;
+        assert_eq!(yen.status(), StatusCode::SEE_OTHER);
+        let to = yen.headers()[header::LOCATION].to_str().unwrap();
+        assert!(
+            to.contains("redirect_uri=https%3A%2F%2Fyenbot.com.au%2Fauth%2Fcallback"),
+            "{to}"
+        );
+        let jar = yen.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(jar.contains("Domain=.yenbot.com.au"), "{jar}");
+
+        let tokera = on("bot.tokera.com", "/").await;
+        let jar = tokera.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(jar.contains("Domain=.tokera.com"), "{jar}");
+
+        let away = on("yenbot.com.au", "https://tokera.com/").await;
+        assert_eq!(
+            away.status(),
+            StatusCode::BAD_REQUEST,
+            "a sign-in stays on the estate it started on"
+        );
     }
 
     #[test]

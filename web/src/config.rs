@@ -208,6 +208,47 @@ pub struct Auth {
     /// secret. Rotating it signs everyone out, which is the intended lever.
     pub session_secret_file: PathBuf,
     pub google: Provider,
+    /// Further estates signed in through the same client and the same session
+    /// key — `yenbot.com.au` beside `tokera.com` — each with its own cookie
+    /// domain and its own callback registered on the client. A request signs
+    /// in on the domain it arrived on ([`Auth::domain_for`]).
+    #[serde(default)]
+    pub domains: Vec<CookieDomain>,
+}
+
+/// One estate a sign-in can belong to: the cookie's `Domain` and the callback
+/// the provider returns to on it.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CookieDomain {
+    pub cookie_domain: String,
+    pub redirect_uri: String,
+}
+
+impl Auth {
+    /// The estate a request to `host` signs in on: the one of
+    /// [`domains`](Self::domains) whose cookie domain covers it, else the
+    /// first — `cookie_domain` and the provider's `redirect_uri`.
+    pub fn domain_for(&self, host: &str) -> CookieDomain {
+        let host = host
+            .rsplit_once(':')
+            .map_or(host, |(h, _)| h)
+            .to_ascii_lowercase();
+        self.domains
+            .iter()
+            .find(|d| covers(&d.cookie_domain, &host))
+            .cloned()
+            .unwrap_or_else(|| CookieDomain {
+                cookie_domain: self.cookie_domain.clone(),
+                redirect_uri: self.google.redirect_uri.clone(),
+            })
+    }
+}
+
+/// Whether cookie domain `domain` reaches `host`.
+fn covers(domain: &str, host: &str) -> bool {
+    let apex = domain.trim_start_matches('.').to_ascii_lowercase();
+    !apex.is_empty() && (host == apex || host.ends_with(&format!(".{apex}")))
 }
 
 fn d_session_hours() -> u64 {
@@ -1288,6 +1329,31 @@ google:
             a.session_secret_file,
             dir.join("secrets").join("session.key")
         );
+    }
+
+    /// **A host signs in on the estate whose cookie domain covers it**, port
+    /// and case aside; any other host on the first.
+    #[test]
+    fn a_host_signs_in_on_the_estate_that_covers_it() {
+        let dir = tmpdir();
+        let mut a = with_auth_file(&dir, Some(AUTH)).unwrap().auth.unwrap();
+        a.domains = vec![CookieDomain {
+            cookie_domain: ".yenbot.com.au".into(),
+            redirect_uri: "https://yenbot.com.au/auth/callback".into(),
+        }];
+        let yen = CookieDomain {
+            cookie_domain: ".yenbot.com.au".into(),
+            redirect_uri: "https://yenbot.com.au/auth/callback".into(),
+        };
+        let tokera = CookieDomain {
+            cookie_domain: ".tokera.com".into(),
+            redirect_uri: a.google.redirect_uri.clone(),
+        };
+        assert_eq!(a.domain_for("yenbot.com.au"), yen);
+        assert_eq!(a.domain_for("WWW.Yenbot.com.au:443"), yen);
+        assert_eq!(a.domain_for("bot.tokera.com"), tokera);
+        assert_eq!(a.domain_for("notyenbot.com.au"), tokera);
+        assert_eq!(a.domain_for(""), tokera);
     }
 
     /// Present but broken is fatal. By then the deployment has said it wants
