@@ -28,12 +28,16 @@ const STEP_QUOTE: usize = 80;
 /// The most tokens one step's line may run to before the grammar ends it.
 const LINE_TOKENS: u32 = 200;
 
-/// `step`'s words as its line quotes them: its first line, cut at
-/// [`STEP_QUOTE`] characters with an ellipsis.
+/// `step`'s words as its line quotes them: its first line, cut at the last
+/// word that ends within [`STEP_QUOTE`] characters, with an ellipsis.
 fn quote(step: &str) -> String {
     let line = step.lines().next().unwrap_or("").trim();
     match line.char_indices().nth(STEP_QUOTE) {
-        Some((at, _)) => format!("{}…", line[..at].trim_end()),
+        Some((at, _)) => {
+            let cut = &line[..at];
+            let cut = cut.rfind(' ').map_or(cut, |space| &cut[..space]);
+            format!("{}…", cut.trim_end())
+        }
         None => line.to_string(),
     }
 }
