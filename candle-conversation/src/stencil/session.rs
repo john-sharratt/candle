@@ -159,9 +159,11 @@ impl StencilSession {
     /// else its own.
     fn rule_at(&self, node: NodeId, span: &FreeTextSpan) -> Option<Arc<ValueRule>> {
         let key = self.tree.key_of(node);
-        let held = self.held.as_ref().zip(key).and_then(|(held, key)| {
-            held.rule_for(self.call.tool(), key, self.call.written())
-        });
+        let held = self
+            .held
+            .as_ref()
+            .zip(key)
+            .and_then(|(held, key)| held.rule_for(self.call.tool(), key, self.call.written()));
         held.or_else(|| span.rule.clone())
     }
 

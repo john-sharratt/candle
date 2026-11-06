@@ -186,7 +186,14 @@ fn a_held_part_is_one_of_the_files_anchors() {
 #[test]
 fn a_held_line_is_one_of_the_parts_lines() {
     let v = TestVocab::new();
-    let at = |part: &'static str| [("repo", "r"), ("path", "a.rs"), ("part", part), ("from", "+1")];
+    let at = |part: &'static str| {
+        [
+            ("repo", "r"),
+            ("path", "a.rs"),
+            ("part", part),
+            ("from", "+1"),
+        ]
+    };
     let (_, three) = walk(&v, &at("KehT"), |t| t.ends_with("\"from\": \"+"));
     assert_eq!(three, bytes("123"));
     let (_, one) = walk(&v, &at("r7Lm"), |t| t.ends_with("\"from\": \"+"));
@@ -200,7 +207,12 @@ fn a_held_line_is_one_of_the_parts_lines() {
 #[test]
 fn a_held_call_completes_and_an_unheld_file_keeps_its_pattern() {
     let v = TestVocab::new();
-    let held = [("repo", "r"), ("path", "a.rs"), ("part", "KehT"), ("from", "+2")];
+    let held = [
+        ("repo", "r"),
+        ("path", "a.rs"),
+        ("part", "KehT"),
+        ("from", "+2"),
+    ];
     let (text, _) = walk(&v, &held, |_| false);
     assert!(
         text.contains("\"part\": \"KehT\"") && text.contains("\"from\": \"+2\""),
@@ -208,5 +220,8 @@ fn a_held_call_completes_and_an_unheld_file_keeps_its_pattern() {
     );
     let free = [("repo", "r"), ("path", "b.rs"), ("part", "ZZZZ")];
     let (_, allowed) = walk(&v, &free, |t| t.ends_with("\"part\": \""));
-    assert!(allowed.contains(&b'Z') && allowed.contains(&b'9'), "{allowed:?}");
+    assert!(
+        allowed.contains(&b'Z') && allowed.contains(&b'9'),
+        "{allowed:?}"
+    );
 }

@@ -95,7 +95,12 @@ fn holds_of(docs: &[(&str, &str, Doc)]) -> ValueHolds {
         for unit in doc.units() {
             let mut at = file.clone();
             at.push(unit.anchor.clone());
-            lines.insert(at, (1..=unit.end - unit.start).map(|n| format!("+{n}")).collect());
+            lines.insert(
+                at,
+                (1..=unit.end - unit.start)
+                    .map(|n| format!("+{n}"))
+                    .collect(),
+            );
         }
     }
     let mut fields = Vec::new();
@@ -144,10 +149,16 @@ mod tests {
         let mut seen = FilesSeen::default();
         seen.note(&[
             result("file_read", json!({"repo": "r", "path": "a.rs", "list": 1})),
-            result("file_edit", json!({"repo": "r", "path": "b.rs", "part": "KehT"})),
+            result(
+                "file_edit",
+                json!({"repo": "r", "path": "b.rs", "part": "KehT"}),
+            ),
             result("file_grep", json!({"repo": "r", "pattern": "x"})),
             result("file_read", json!({"repo": "r"})),
-            result("file_read", json!({"repo": "r", "path": "a.rs", "part": "KehT"})),
+            result(
+                "file_read",
+                json!({"repo": "r", "path": "a.rs", "part": "KehT"}),
+            ),
         ]);
         assert_eq!(
             seen.files,
