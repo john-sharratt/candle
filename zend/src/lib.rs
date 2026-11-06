@@ -25,6 +25,7 @@ pub mod coding_sampling;
 pub mod config;
 pub mod conv_branches;
 pub mod conv_files;
+pub mod conv_inherit;
 pub mod conv_order;
 pub mod conv_overlay;
 pub mod conv_sweep;

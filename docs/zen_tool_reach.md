@@ -289,6 +289,13 @@ A task a task started (`Worker::by_task`) may not: its grammar holds the task
 tools out, and `repo_task_start` from it is refused
 (`zend/src/mcp/zen_tasks.rs`, `Level`).
 
+**A task a conversation starts begins on its starter's work**: on the
+starter's branches, with the starter's uncommitted changes as its last finished
+tool round saved them, copied into the task's own file events when its
+conversation is first built (`zend/src/conv_inherit.rs`,
+`docs/zen_coding_challenge_fixes.md` Cause 5). A reviewer reads the change
+without a commit first; what the task changes stays its own until it commits.
+
 So work nests at most one level below where a person or Claude started it.
 The person, or Claude, talks to a conversation or starts a task; that task may
 hand pieces to tasks of its own; those do all of their work themselves and

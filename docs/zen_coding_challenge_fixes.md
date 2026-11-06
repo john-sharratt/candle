@@ -2,7 +2,7 @@
 
 **Status:** reviewed with the user (2026-11-06), and built. Each cause
 gives its evidence, the decision, and where the change lands. All are
-decided, except whether the stacked-layer machinery stays (Cleanup).
+decided.
 
 **Built** (2026-11-06): every cause. Cause 4's read format shipped first, in
 build 4471 (`5dddd4896`). Where the build departs from the decision, the
@@ -544,11 +544,23 @@ changes, by the hand-off's handshake.
    carries a conversation's changes to an agent, and a long session's unchanged
    deltas are sent once, not on every run.
 
-**Open.** Sub-agent tasks: a task a worker starts sees only its starter's
-findings, through its prompt. Since the starter's changes are records already,
-the new task's store could start from the starter's (its `VfsEvent`s copied
-under the new timeline). A reviewer or a test-writer would then read the change
+**Sub-agent tasks** (decided with the user, 2026-11-06, and built). A task a
+conversation of Zen's starts used to see only its starter's findings, through
+its prompt. It now begins on the starter's branches and uncommitted changes
+(`zend/src/conv_inherit.rs`). A reviewer or a test-writer then reads the change
 as it stands, without a commit first.
+
+1. `repo_task_start` from a conversation names the starter on the new task's
+   conversation before its first turn (metadata `files_from`).
+2. When that conversation is first built, its fresh stores are put on the
+   starter's branches. They are given the starter's changes as its last
+   finished tool round saved them, and saved as the task's own file events.
+   The mark is then cleared, so a later rebuild restores the task's own
+   events and takes nothing again.
+3. From then on each side's changes are its own: the task's edits stay off the
+   starter's stores until the task commits.
+4. A task Claude starts through `/mcp` has no starting conversation, and
+   begins on the base branches as before.
 
 **Where.**
 
@@ -689,10 +701,9 @@ and that misled this study into costing a re-read of layers above
 - The two docs drop the layer, or say it was removed.
 - `docs/archived/` is left as it is.
 
-**Not in this cleanup.** Whether the stacked-layer machinery in
-`zend/src/layers/` (`ingest:` specs, `after:`, edges, expiry, `unit_key`) stays
-for layers to come, or goes as unused, is the user's call. It is not decided
-here.
+**Not in this cleanup.** The stacked-layer machinery in `zend/src/layers/`
+(`ingest:` specs, `after:`, edges, expiry, `unit_key`) stays for layers to
+come, though no live layer stacks (decided with the user, 2026-11-06).
 
 ## Out of scope
 
