@@ -4594,9 +4594,7 @@ fn run_inference_stream(
             let (hold_state, seen, held_files) =
                 (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
             let triggers = match tokio::task::spawn_blocking(move || {
-                hold_state
-                    .engine
-                    .holding_values(&base, &seen.holds(&held_files))
+                seen.triggers(&hold_state.engine, &base, &held_files)
             })
             .await
             {

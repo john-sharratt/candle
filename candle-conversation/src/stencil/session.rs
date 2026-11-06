@@ -436,6 +436,13 @@ impl StencilSession {
             // the delimiter isn't legal here.
             StencilNode::Static { .. } | StencilNode::FreeText(_) | StencilNode::End => Out::Bad,
         };
+        // A name branch entered on a pushed-back delimiter names its call as
+        // one entered from `next_action` does.
+        let naming = self.tree.is_name_branch(node);
+        if naming {
+            self.call.begin_naming();
+            self.call.name(tok);
+        }
         match out {
             Out::Static { rest, next } => {
                 self.cursor = Cursor::At(next);
@@ -454,6 +461,9 @@ impl StencilSession {
                 StencilAction::MaskedDecode(AllowedSet::from_tokens(frontier))
             }
             Out::BranchAccept(n) => {
+                if naming {
+                    self.name_call(node, &[tok]);
+                }
                 self.cursor = Cursor::At(n);
                 self.next_action()
             }
@@ -461,9 +471,11 @@ impl StencilSession {
             // taken as written; anything the span would have rewritten is out
             // of reach, and bails like any token the grammar cannot take.
             Out::BranchSpill(spill) => {
-                let span = self.free_span(spill.next).clone();
-                let term = span.term.start();
-                match self.feed_span(spill.next, &span, term, 1, tok, &spill.rest) {
+                if naming {
+                    self.name_call(node, &spill.arm);
+                }
+                let rest = spill.rest.clone();
+                match self.spill_into(spill, tok, &rest) {
                     Observe::Continue => self.next_action(),
                     _ => {
                         self.rewrite = None;
@@ -498,14 +510,17 @@ impl StencilSession {
                     }
                     Some(Step::Accept(next)) => {
                         if naming {
-                            let tool = self.tree.tool_named(node, self.call.naming()).cloned();
-                            self.call.named(tool);
+                            let arm = self.call.naming().to_vec();
+                            self.name_call(node, &arm);
                         }
                         self.cursor = Cursor::At(next);
                         Ok(Observe::ArmComplete)
                     }
                     Some(Step::Spill(id)) => {
                         let spill = self.branch_trie(node).spill(id).clone();
+                        if naming {
+                            self.name_call(node, &spill.arm);
+                        }
                         Ok(self.spill_into(spill, token, bytes))
                     }
                     None => {
@@ -531,6 +546,13 @@ impl StencilSession {
                 Err(WalkError::NotDecoding)
             }
         }
+    }
+
+    /// The name branch at `node` completed `arm`: the call is of the tool it
+    /// names.
+    fn name_call(&mut self, node: NodeId, arm: &[TokenId]) {
+        let tool = self.tree.tool_named(node, arm).cloned();
+        self.call.named(tool);
     }
 
     /// The value being recorded is the call's once the walk has left its span.

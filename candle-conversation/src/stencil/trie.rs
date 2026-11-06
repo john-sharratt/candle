@@ -39,6 +39,8 @@ pub struct SpillId(pub u32);
 /// A token completing an arm and running past it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spill {
+    /// The arm the token completed, as the trie was built with it.
+    pub arm: Vec<TokenId>,
     /// Where the completed arm resumes the outer tree.
     pub next: NodeId,
     /// The token's bytes past the arm: the successor's first.
@@ -166,7 +168,11 @@ impl TokenTrie {
                 continue;
             }
             let id = SpillId(self.spills.len() as u32);
-            self.spills.push(Spill { next, rest });
+            self.spills.push(Spill {
+                arm: arm.to_vec(),
+                next,
+                rest,
+            });
             let node = &mut self.nodes[at.0 as usize];
             node.spills.push((token, id));
             node.spills.sort_by_key(|(t, _)| *t);
@@ -391,6 +397,7 @@ mod tests {
         assert_eq!(
             trie.spill(id),
             &Spill {
+                arm: vec![comma, quote],
                 next: nid(10),
                 rest: b"--".to_vec()
             }

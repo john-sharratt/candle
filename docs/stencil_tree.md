@@ -743,17 +743,22 @@ call that was just refused for one.
   the values its span may take, and a value may depend on fields already written
   in the same call: `file_edit.part` on `repo` and `path`, `from` and `to` on
   `repo`, `path` and `part`. Each is a `ValueRule` over the literal values,
-  built for the turn with `ValueRule::new` — never `ValueRule::shared`, whose
-  cache keeps every pattern for the process's life and would grow by one per
-  round.
+  built with `ValueRule::owned` — never `ValueRule::shared`, whose cache keeps
+  every pattern for the process's life and would grow by one per round.
 - **The session holds a keyed span to its held rule** in place of the span's
-  own: entering a span, it looks up the key and the call's written fields
-  (`StencilSession::written`), and walks the held rule when there is one. A key
-  with no held values, or whose fields name nothing held (a file the
-  conversation never read), keeps the span's own rule. Each keyed span's value
-  is recorded as the call writes it, so a later field can depend on it.
+  own: entering a span, it looks up the key with the call's tool and written
+  fields (`CallSoFar`, `stencil/call_so_far.rs`), and walks the held rule when
+  there is one. A key with no held values, or whose fields name nothing held (a
+  file the conversation never read), keeps the span's own rule. Each keyed
+  span's value is recorded as the call writes it, so a later field can depend on
+  it.
+- **The call's tool is the arm its name branch took**, mapped at compile time
+  from each arm's tokens to the tool it names. However the branch is left — its
+  last token, a token running past the arm into a value (a spill, which carries
+  the arm it completed), or a delimiter pushed back from the span before it —
+  the call is named the same way.
 - **What a turn holds is the conversation's own** (`zend/src/held_values.rs`):
-  for each file the conversation has read, grepped or edited, the anchors it
+  for each file the conversation has read or edited, the anchors it
   carves into now — in the conversation's store, its own edits included — and
   each part's line count. `file_read.part`, `file_edit.part`, `file_edit.through`
   and `file_edit.dest` are held to the anchors of the file named;
@@ -767,8 +772,12 @@ call that was just refused for one.
 
 **Cost.** A held rule is a few literal values: a file of a hundred parts is a
 rule of about four hundred states, under `ValueRule`'s cap of 512 (a file past
-it keeps the pattern). It is built once per round from files already in
-memory, and dropped with the turn.
+it keeps the pattern). A round builds only what changed since the last one: a
+file is carved again only when its content's digest differs from the one it
+was carved from, and a value set's rule is taken from the last round's
+(`HeldRules`) when the same set was built there. Both keep only what the
+current round used, so neither grows past one round's files. A file the store
+cannot read is held to nothing, and logged.
 
 ---
 

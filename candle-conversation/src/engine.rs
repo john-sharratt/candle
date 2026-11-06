@@ -29,7 +29,7 @@ use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_loop, held_branches, held_branches_first,
-    HeldValues, HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId,
+    HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId,
     ToolCallEnvelope, ToolSpec, TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
@@ -2200,12 +2200,15 @@ impl ConversationEngine {
     /// `triggers` with every tool call's keyed fields held to `holds`
     /// (`docs/stencil_tree.md` §9.2): a field whose values are known — a
     /// file's anchors, a part's lines — can be written only as one of them.
-    /// Built for one round and dropped with it. `triggers` without a tool call,
-    /// or `holds` that build to nothing, come back as they are.
+    /// Built for one round and dropped with it, each set's rule taken from
+    /// `kept` when the round before built it ([`HeldRules`]). `triggers`
+    /// without a tool call, or `holds` that build to nothing, come back as
+    /// they are.
     pub fn holding_values(
         &self,
         triggers: &Arc<TriggerRegistry>,
         holds: &ValueHolds,
+        kept: &mut HeldRules,
     ) -> Arc<TriggerRegistry> {
         if holds.fields.is_empty() {
             return Arc::clone(triggers);
@@ -2213,7 +2216,7 @@ impl ConversationEngine {
         let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
             return Arc::clone(triggers);
         };
-        let held = HeldValues::build(holds, &self.vocab());
+        let held = HeldValues::build(holds, &self.vocab(), kept);
         if held.is_empty() {
             return Arc::clone(triggers);
         }

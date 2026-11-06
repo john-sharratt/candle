@@ -9,9 +9,12 @@ use serde_json::json;
 
 use super::compile::compile;
 use super::driver::{StencilDriver, StepMask};
-use super::held_values::{FieldHold, HeldValues, ValueHolds};
+use super::held_values::{FieldHold, HeldRules, HeldValues, ValueHolds};
 use super::mask::AllowedSet;
+use super::session::{StencilAction, StencilSession};
+use super::spec::{NodeSpec, TreeSpec};
 use super::tool_call::{compile_tool_call_tree, ToolCallEnvelope, ToolSpec};
+use super::tree::FreeTextLimits;
 use super::trigger::TriggerRegistry;
 use super::vocab::{TestVocab, TokenId, Vocab};
 
@@ -82,7 +85,10 @@ fn driver(v: &TestVocab) -> StencilDriver {
     let tree = Arc::new(compile(&spec, v).unwrap());
     let registry = TriggerRegistry::new()
         .with_trigger(TRIGGER, tree)
-        .holding_values(TRIGGER, Arc::new(HeldValues::build(&holds(), v)));
+        .holding_values(
+            TRIGGER,
+            Arc::new(HeldValues::build(&holds(), v, &mut HeldRules::default())),
+        );
     registry.driver_for(TRIGGER).unwrap()
 }
 
@@ -224,4 +230,55 @@ fn a_held_call_completes_and_an_unheld_file_keeps_its_pattern() {
         allowed.contains(&b'Z') && allowed.contains(&b'9'),
         "{allowed:?}"
     );
+}
+
+/// **A name finished by a token that runs on names its call**: `cd"` closed by
+/// `"K`, which also writes the part's first character, is a call of `cd`, so
+/// the part goes on held to `cd`'s `KehT` — `e` and nothing else.
+#[test]
+fn a_name_spilled_into_its_value_still_names_the_call() {
+    const QUOTE_K: TokenId = 300;
+    let v = TestVocab::new().with_special("\"K", QUOTE_K);
+    let mut spec = TreeSpec::new("spill");
+    let end = spec.push(NodeSpec::End);
+    let part = spec.push(NodeSpec::Value {
+        pattern: "[A-Za-z0-9]{4}".into(),
+        opened: true,
+        limits: FreeTextLimits::json_string(),
+        next: end,
+    });
+    let name = spec.push(NodeSpec::Branch {
+        arms: vec![("ab\"".into(), part), ("cd\"".into(), part)],
+    });
+    spec.root = name;
+    spec.keys.insert(part, Arc::from("part"));
+    spec.name_branches.insert(name);
+    let tree = Arc::new(compile(&spec, &v).unwrap());
+    let holds = ValueHolds {
+        fields: vec![FieldHold {
+            tools: vec!["cd".into()],
+            field: "part".into(),
+            on: vec![],
+            table: HashMap::from([(vec![], vec!["KehT".into()])]),
+        }],
+    };
+    let mut session = StencilSession::new(tree);
+    session.hold_values(Arc::new(HeldValues::build(
+        &holds,
+        &v,
+        &mut HeldRules::default(),
+    )));
+    for (token, bytes) in [(b'c' as TokenId, &b"c"[..]), (b'd' as TokenId, b"d")] {
+        assert!(matches!(session.next_action(), StencilAction::MaskedDecode(_)));
+        session.observe(token, bytes).unwrap();
+    }
+    let StencilAction::MaskedDecode(after_name) = session.next_action() else {
+        panic!("the name's close is a choice");
+    };
+    assert!(after_name.tokens().contains(&QUOTE_K), "`\"K` spills");
+    session.observe(QUOTE_K, b"\"K").unwrap();
+    let StencilAction::MaskedDecode(next) = session.next_action() else {
+        panic!("the part is held");
+    };
+    assert_eq!(next.tokens(), [b'e' as TokenId]);
 }
