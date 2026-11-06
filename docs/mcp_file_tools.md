@@ -135,25 +135,28 @@ to call Zen's model and image routes, and to use the bus. The daemons know
 callers only by the gateway's identity headers, and the only key the gateway
 honours is the operator's `ops_key`, admin on every route (`web/web.yaml`).
 
-The gateway's config gains:
+The gateway's `cluster:` block gains (`web/src/cluster/service_key.rs`):
 
 ```yaml
-service_keys:
-  - name: yenbot
-    key_file: secrets/yenbot.key
-    identity: "service:yenbot"
-    routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit,
-             /gateway/google/token]
-    topics:
-      subscribe: ["repo/yenbot", "gate/yenbot"]
-      publish: ["gate/yenbot/result/*", "service/yenbot/*"]
+cluster:
+  service_keys:
+    - name: yenbot                       # its identity is the subject service:yenbot
+      key_file: secrets/yenbot.key       # 64 hex digits, as `web --new-ops-key` writes
+      routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit,
+               /gateway/google/token]
+      topics:
+        subscribe: ["repo/yenbot", "gate/yenbot"]
+        publish: ["gate/yenbot/result/*", "service/yenbot/*"]
 ```
 
 A request bearing a service key as `Authorization: Bearer`, from a trusted
-backend (`trusted_backends`), is forwarded with that identity on the routes
-the key names and no others; `host/roles.yaml` grants the identity what the
-daemons should let it do. The key is a file only the service and the gateway
-read, never logged, never on a command line.
+backend (`server.trusted_backends`), is the key's identity on the routes the
+key names (each with everything under it) and nobody elsewhere. The identity is
+provider `service-key`, subject `service:<name>`, no email — a subject no
+sign-in can produce — and `host/roles.yaml` grants it a role by that subject
+(`sub: "service:yenbot"`). The key never leaves the gateway: the request is
+forwarded without its `Authorization` header, like the ops key's. It is a file
+only the service and the gateway read, never logged, never on a command line.
 
 ### 4.1 A known hole: identity from loopback
 
@@ -208,11 +211,24 @@ segments; a subscription may end in `*`.
 {"op": "refused",     "topic": "repo/candle", "why": "not subscribable by service:yenbot"}
 ```
 
-- **Services** connect over loopback with their service key and may subscribe
-  and publish only on the topics their key names (§4).
-- **Cluster members** publish over the cluster socket they already hold to
-  the gateway (`docs/replicated_substrate.md`), on any topic, as members are
-  already trusted there; they may subscribe the same way.
+- **Services** connect from a trusted backend with their service key and may
+  subscribe and publish only on the topics their key names (§4).
+- **Cluster members** use it over the cluster socket they already hold to the
+  gateway (`docs/replicated_substrate.md` §5.8), on any topic, as members are
+  already trusted there.
+
+Beside the socket, for a caller that publishes rather than listens
+(`web/src/bus/http.rs`), the same callers under the same rules:
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /gateway/events/publish` | `{topic, payload}` | `{reached}`: how many subscribers it reached |
+| `POST /gateway/events/request` | `{topic, payload, reply, timeout_ms}` | the first payload published on `reply` (200); `no_subscriber` (404) when nothing listens on `topic`; `timeout` (504). At most 30 s. |
+
+A request subscribes to `reply` before it publishes, so an answer cannot
+arrive unseen. Each gateway has its own bus: a member publishes to every
+gateway it holds a socket to, and asks a request of each until one answers
+other than `no_subscriber` — the gate is subscribed on one of them.
 
 A slow subscriber is dropped rather than buffered without bound, and
 reconnects; a message is small (a few hundred bytes), so a subscriber that

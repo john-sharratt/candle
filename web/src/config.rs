@@ -88,6 +88,31 @@ pub struct OpsKeyConfig {
     pub admin: String,
 }
 
+/// One of the `cluster:` block's `service_keys` (`docs/mcp_file_tools.md` §4).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceKeyConfig {
+    /// The service: its identity's subject is `service:<name>`.
+    pub name: String,
+    /// The key's file, resolved against this config.
+    pub key_file: PathBuf,
+    /// The paths it may call, each with everything under it.
+    pub routes: Vec<String>,
+    /// The bus topics it may use.
+    #[serde(default)]
+    pub topics: ServiceTopics,
+}
+
+/// A service key's bus topics; a trailing `*` admits everything under it.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceTopics {
+    #[serde(default)]
+    pub subscribe: Vec<String>,
+    #[serde(default)]
+    pub publish: Vec<String>,
+}
+
 /// The `cluster:` block.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +131,10 @@ pub struct Cluster {
     /// Absent, those take an admin's session. `web --new-ops-key` writes one.
     #[serde(default)]
     pub ops_key: Option<OpsKeyConfig>,
+    /// The services on this gateway's machine that act as themselves
+    /// (`docs/mcp_file_tools.md` §4), each on the routes and topics it names.
+    #[serde(default)]
+    pub service_keys: Vec<ServiceKeyConfig>,
     /// This gateway's name in the coordination log; default its bind address.
     #[serde(default)]
     pub name: Option<String>,
@@ -700,6 +729,20 @@ impl Config {
                     ops.file = base.join(&ops.file);
                 }
             }
+            for key in &mut cluster.service_keys {
+                if key.key_file.is_relative() {
+                    key.key_file = base.join(&key.key_file);
+                }
+            }
+            let mut names: Vec<&str> = cluster
+                .service_keys
+                .iter()
+                .map(|k| k.name.as_str())
+                .collect();
+            names.sort_unstable();
+            if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+                bail!("`cluster.service_keys` names `{}` twice", w[0]);
+            }
             if cluster.machines_file.is_relative() {
                 cluster.machines_file = base.join(&cluster.machines_file);
             }
@@ -1008,6 +1051,43 @@ sites:
                 file: Path::new("/srv/web").join("secrets/ops.key"),
                 admin: "op@tokera.com".into(),
             })
+        );
+        // Service keys: none unless named; each file resolves the same way,
+        // and a name given twice is refused.
+        assert!(cluster.service_keys.is_empty());
+        let one = "{name: yenbot, key_file: \"secrets/yenbot.key\", routes: [/v1/models], \
+                   topics: {subscribe: [repo/yenbot], publish: [\"gate/yenbot/result/*\"]}}";
+        let services = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                &format!("{{service_keys: [{one}], group_key_file:"),
+            ),
+            Path::new("/srv/web"),
+        )
+        .unwrap();
+        assert_eq!(
+            services.cluster.unwrap().service_keys,
+            vec![ServiceKeyConfig {
+                name: "yenbot".into(),
+                key_file: Path::new("/srv/web").join("secrets/yenbot.key"),
+                routes: vec!["/v1/models".into()],
+                topics: ServiceTopics {
+                    subscribe: vec!["repo/yenbot".into()],
+                    publish: vec!["gate/yenbot/result/*".into()],
+                },
+            }]
+        );
+        let twice = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                &format!("{{service_keys: [{one}, {one}], group_key_file:"),
+            ),
+            Path::new("/srv/web"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{twice:#}").contains("names `yenbot` twice"),
+            "{twice:#}"
         );
         let tuned = Config::from_yaml(
             &ok.replace(

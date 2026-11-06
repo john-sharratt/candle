@@ -41,6 +41,7 @@
 pub mod acme;
 pub mod asset;
 pub mod auth;
+pub mod bus;
 pub mod cluster;
 pub mod compress;
 pub mod config;

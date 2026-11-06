@@ -40,6 +40,7 @@ use crate::acme::{Challenges, Manager};
 use crate::asset;
 use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Gateways};
+use crate::bus;
 use crate::cluster::peers::dial_all;
 use crate::cluster::route::{self, Routed};
 use crate::cluster::{endpoint, page, stamp_served_by, ClusterPeer, Gateway, MemberOrigin};
@@ -251,11 +252,16 @@ impl Builder {
         let challenge_routes = self.challenges.router();
         // The cluster's socket and status page, on every host, like `/auth/*`.
         let cluster_routes = match &self.cluster {
-            Some(gw) => endpoint::router(gw.clone()).merge(page::router(
-                gw.clone(),
-                self.auth.clone(),
-                self.cfg.roles.clone(),
-            )),
+            Some(gw) => endpoint::router(gw.clone())
+                .merge(page::router(
+                    gw.clone(),
+                    self.auth.clone(),
+                    self.cfg.roles.clone(),
+                ))
+                .merge(bus::http::router(
+                    gw.clone(),
+                    self.cfg.server.trusted_backends.clone(),
+                )),
             None => Router::new(),
         };
         let cluster = self.cluster.clone();
@@ -641,6 +647,14 @@ async fn handle(
         origin
             .is_none()
             .then(|| gateway.and_then(|gw| gw.key_holder(req.headers())))
+            .flatten()
+    });
+    // **A service key** (`Gateway::service_caller`): the service itself, on
+    // the routes its key names, from a trusted backend only.
+    let identity = identity.or_else(|| {
+        origin
+            .is_none()
+            .then(|| gateway.and_then(|gw| gw.service_caller(req.headers(), &path, from_backend)))
             .flatten()
     });
     if gateway.is_some_and(|gw| gw.presents_key(req.headers())) {

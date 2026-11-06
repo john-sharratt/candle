@@ -43,7 +43,9 @@ use tower::Service;
 use web::auth::{Person, Principal, Role, Roles};
 use web::cluster::bearer_key::BearerKey;
 use web::cluster::ops_key::OpsKey;
+use web::cluster::service_key::ServiceKey;
 use web::cluster::{ClusterPeer, Gateway};
+use web::config::{ServiceKeyConfig, ServiceTopics};
 use web::{Builder, Config};
 
 fn key() -> GroupKey {
@@ -982,6 +984,58 @@ async fn the_ops_key_reaches_every_site_route_and_no_key_leaves_the_gateway() {
     let seen = seen.json();
     assert_eq!(seen["email"], "");
     assert_eq!(seen["authorization"], other, "not the gateway's to take");
+}
+
+/// **A service key is its service on its own routes, from a trusted backend,
+/// and the key never leaves the gateway** (`docs/mcp_file_tools.md` §4).
+#[tokio::test]
+async fn a_service_key_is_its_service_on_its_routes_only() {
+    let witness = spawn(Router::new().fallback(|headers: HeaderMap| async move {
+        axum::Json(json!({
+            "user": header(&headers, "x-tokera-user"),
+            "provider": header(&headers, "x-tokera-provider"),
+            "authorization": header(&headers, "authorization"),
+        }))
+    }))
+    .await;
+    let yaml = format!(
+        r#"
+server: {{trusted_backends: ["127.0.0.1"]}}
+cluster: {{group_key_file: "secrets/group.key", machines_file: "../host/machines.yaml"}}
+sites:
+  - name: zend
+    hosts: ["code.test"]
+    default: true
+    api:
+      - {{prefix: /, upstream: "http://{witness}"}}
+"#
+    );
+    let cfg = Config::from_yaml(&yaml, content_dir()).unwrap();
+    let service = "5e".repeat(32);
+    let yenbot = ServiceKey::new(
+        BearerKey::from_hex(&service).unwrap(),
+        &ServiceKeyConfig {
+            name: "yenbot".into(),
+            key_file: "unused".into(),
+            routes: vec!["/v1/models".into()],
+            topics: ServiceTopics::default(),
+        },
+    );
+    let gw = Gateway::with_hub_and_services(Hub::new(key(), "gw-test"), None, None, vec![yenbot]);
+    let addr = spawn(Builder::new(cfg).cluster(gw).router()).await;
+    let bearer = format!("Bearer {service}");
+    let with_key = [("authorization", bearer.as_str())];
+
+    let seen = ask(addr, "GET", "/v1/models", &with_key, "").await.json();
+    assert_eq!(seen["user"], "service:yenbot");
+    assert_eq!(seen["provider"], "service-key");
+    assert_eq!(seen["authorization"], "", "the key stays at the gateway");
+
+    let seen = ask(addr, "GET", "/v1/conversations", &with_key, "")
+        .await
+        .json();
+    assert_eq!(seen["user"], "", "not a route the key names");
+    assert_eq!(seen["authorization"], "", "and still never forwarded");
 }
 
 /// **The cluster socket** refuses an app that is none of the three, and a

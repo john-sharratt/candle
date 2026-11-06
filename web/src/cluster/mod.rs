@@ -16,6 +16,7 @@
 //! | [`page`] | the status page |
 //! | [`bearer_key`] | the keys that stand in for a session: status, ops |
 //! | [`ops_key`] | the admin an operator on the box acts as, for emergencies |
+//! | [`service_key`] | a service on the box acting as itself, on its own routes |
 //! | [`peers`] | the peer gateways: node id, identity, dial loops (§13.4) |
 //! | [`upgrade`] | the socket's WebSocket upgrade, over a transport that stamps its reads |
 //! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
@@ -35,6 +36,7 @@ pub mod ops_key;
 pub mod page;
 pub mod peers;
 pub mod route;
+pub mod service_key;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;
@@ -60,10 +62,12 @@ use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
 use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Identity};
+use crate::bus::Bus;
 use crate::config::{Cluster as ClusterConfig, Config};
 use axum::http::HeaderMap;
 use bearer_key::BearerKey;
 use ops_key::OpsKey;
+use service_key::ServiceKey;
 
 /// How often the upgrades are judged: verdicts due, members left behind.
 const UPGRADE_TICK: Duration = Duration::from_secs(1);
@@ -126,6 +130,11 @@ pub struct Gateway {
     /// The key an operator acts as an admin with, without a session, when
     /// `cluster.ops_key` names one ([`OpsKey`]).
     pub ops_key: Option<OpsKey>,
+    /// The services on this machine that act as themselves
+    /// (`cluster.service_keys`, [`ServiceKey`]).
+    pub service_keys: Vec<ServiceKey>,
+    /// The pub/sub bus its members and services use (`crate::bus`).
+    pub bus: Bus,
     /// The ACME shared with the peers, once the TLS entrance's certificates
     /// are loaded.
     acme: OnceLock<Arc<AcmePeers>>,
@@ -184,12 +193,21 @@ impl Gateway {
             .as_ref()
             .map(|o| OpsKey::load(&o.file, &o.admin))
             .transpose()?;
+        let service_keys = cluster
+            .service_keys
+            .iter()
+            .map(|k| {
+                ServiceKey::load(k).with_context(|| format!("the service key of `{}`", k.name))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Arc::new(Gateway {
             hub,
             node: voter,
             peering,
             status_key,
             ops_key,
+            service_keys,
+            bus: Bus::new(),
             acme: OnceLock::new(),
             sites: groups(cfg).into_iter().map(|g| g.site).collect(),
             router: OnceLock::new(),
@@ -242,12 +260,24 @@ impl Gateway {
         status_key: Option<BearerKey>,
         ops_key: Option<OpsKey>,
     ) -> Arc<Gateway> {
+        Gateway::with_hub_and_services(hub, status_key, ops_key, Vec::new())
+    }
+
+    /// [`Self::with_hub_and_keys`], with its service keys.
+    pub fn with_hub_and_services(
+        hub: Arc<Hub>,
+        status_key: Option<BearerKey>,
+        ops_key: Option<OpsKey>,
+        service_keys: Vec<ServiceKey>,
+    ) -> Arc<Gateway> {
         Arc::new(Gateway {
             hub,
             node: 0,
             peering: None,
             status_key,
             ops_key,
+            service_keys,
+            bus: Bus::new(),
             acme: OnceLock::new(),
             sites: Vec::new(),
             router: OnceLock::new(),
@@ -279,11 +309,27 @@ impl Gateway {
         self.ops_key.as_ref().and_then(|k| k.caller(headers))
     }
 
+    /// Who a request is by a service key ([`ServiceKey`]): the service, on a
+    /// route its key names, when it came from a trusted backend — the key is
+    /// a file on this machine, and its holder calls from this machine.
+    pub fn service_caller(
+        &self,
+        headers: &HeaderMap,
+        path: &str,
+        from_backend: bool,
+    ) -> Option<Identity> {
+        if !from_backend {
+            return None;
+        }
+        service_key::presented(&self.service_keys, headers).and_then(|k| k.caller(headers, path))
+    }
+
     /// Whether `headers` present one of this gateway's keys, accepted or not
     /// — a request that does is never forwarded with it, so no member or
     /// upstream ever holds a key.
     pub fn presents_key(&self, headers: &HeaderMap) -> bool {
-        self.ops_key.as_ref().is_some_and(|k| k.presented(headers))
+        service_key::presented(&self.service_keys, headers).is_some()
+            || self.ops_key.as_ref().is_some_and(|k| k.presented(headers))
             || self
                 .status_key
                 .as_ref()
