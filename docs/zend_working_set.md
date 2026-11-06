@@ -523,20 +523,20 @@ names no tool and no format, so a new kind of placed content needs no prompt
 change — the literal anchor arrives in the reply.
 
 **The anchor is byte-identical to what the content begins with.** A file's is the
-`file=<repo>/<path>` attribute every page's opening fence carries
-(`zend_tools::tools::file::render::file_anchor`, used by both the fence and the
-reply). Measured 2026-09-30: told only "in your context", the model searched its
+`file=<repo>/<path>` attribute every part's block opens with
+(`zend_tools::tools::file::render`). Measured 2026-09-30: told only "in your context", the model searched its
 own reads, found none, called the reply false and refused to use the file —
 although both of the file's ingest turns were pinned in every projection of that
 turn. The status is not "already read" for the same reason: a served file is
 usually a background read, not one the dialogue made.
 
-**Each page names its file at both ends.** A page opens on a fence carrying
-`file=<repo>/<path> page=N/M lines=T` and closes on `end of <repo>/<path> page
-N/M`, with no header line before it. Measured 2026-09-30: with a single header
-line above 200 numbered lines, the model bound content near the bottom of a page to
-the wrong file among look-alike pages — the name sat 200 lines away from the text
-it labelled. Bracketing the page puts its identity next to both halves of it.
+**Every part names its file.** Each part's block opens on a fence carrying
+`file=<repo>/<path> part=… lines=…`, at most 80 lines from any line it holds, and
+a read closes on `end of <repo>/<path> lines A-B of N`. Measured 2026-09-30: with
+a single header line above 200 numbered lines, the model bound content near the
+bottom of a page to the wrong file among look-alike pages — the name sat 200
+lines away from the text it labelled. A fence per part keeps its identity next
+to every line.
 
 A re-read after release is cheap either way: the file is still in the corpus, so
 the screen serves it again and re-locks it — an elevation, not a read.

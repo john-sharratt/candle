@@ -40,11 +40,11 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
-| `file_read` | `file/read.rs` | A page of the file's parts under their anchors; `repo`, `path`, `page` required, `line` optional |
+| `file_read` | `file/read.rs` | A `part`, a run of `lines` or a page of the `list` of parts — exactly one; each part a fenced block |
 | `file_edit` | `file/edit.rs` | One anchored edit — replace, insert, delete, move — named by `at` |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
 | `file_search` | `file/search.rs` | Find files by name/path; substring or `*` glob, whole project |
-| `file_grep` | `file/grep.rs` | Regex over file contents; path, line, part anchor and page per hit |
+| `file_grep` | `file/grep.rs` | Regex over file contents; path, line, part anchor, line in the part and scope per hit |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |
 | `file_present` | `file/present.rs` | Foreground presentation gesture |
 
@@ -117,7 +117,7 @@ repositories on disk, and the `exec`/`disk` guards hold every line under
 | `git_push` | `git/push.rs` | Atomic, leased; no unconditional force; a tag is never published as a same-named branch |
 
 Every reader takes a **required** `page`, sized so a page costs about what a
-`file_read` page does, and no field in the family admits `null` — an optional
+`file_read` of 200 lines does, and no field in the family admits `null` — an optional
 field is left out, never nulled.
 
 Shared pieces: `git/mod.rs` (error mapping, repo resolution, the flat `RevArg`

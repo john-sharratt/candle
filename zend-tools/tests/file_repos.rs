@@ -88,20 +88,16 @@ fn groups<'a>(
         .collect()
 }
 
-/// The text of a rendered `file_read` page of a plain-text file: its parts
-/// with their `XXXX| ` anchors taken off.
+/// The text of a rendered `file_read` of a plain-text file: its parts' lines,
+/// without their blocks' fences, the `+N` before each, or the closing line.
 fn excerpt_source(resp: &serde_json::Value) -> String {
     let text = resp.as_str().expect("file_read returns a rendered string");
-    let body = text
-        .split_once("```")
-        .and_then(|(_, rest)| rest.split_once('\n'))
-        .and_then(|(_, rest)| rest.rsplit_once("```"))
-        .map(|(body, _)| body)
-        .unwrap_or("");
-    body.lines()
-        .map(|l| match l.split_once("| ") {
-            Some((a, rest)) if doc_units::anchor::is_anchor(a) => rest,
-            _ => l,
+    text.lines()
+        .filter(|l| !l.starts_with("```") && !l.starts_with("end of "))
+        .map(|l| {
+            let numbered = l.trim_start().trim_start_matches('+');
+            let line = numbered.trim_start_matches(|c: char| c.is_ascii_digit());
+            line.strip_prefix(' ').unwrap_or(line)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -118,7 +114,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
 
     let a = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "shared.txt", "page": 1}),
+        json!({"repo": "a", "path": "shared.txt", "list": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&a), "content from a");
@@ -126,7 +122,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
 
     let b = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "b", "path": "shared.txt", "page": 1}),
+        json!({"repo": "b", "path": "shared.txt", "list": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&b), "content from b");
@@ -139,7 +135,7 @@ fn an_unknown_repo_names_every_repo_the_workspace_lists() {
     let c = ctx(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "c", "path": "shared.txt", "page": 1}),
+        json!({"repo": "c", "path": "shared.txt", "list": 1}),
         &c,
     );
     let detail = harness::expect_error(&resp, "unknown_repo");
@@ -156,7 +152,7 @@ fn parent_traversal_cannot_reach_a_sibling_repository() {
     let c = ctx(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "../b/only_b.txt", "page": 1}),
+        json!({"repo": "a", "path": "../b/only_b.txt", "list": 1}),
         &c,
     );
     harness::expect_error(&resp, "not_found");
@@ -194,7 +190,7 @@ fn every_file_tool_refuses_a_call_without_a_repo() {
         ("file_list", json!({"path": "", "page": 1})),
         ("file_search", json!({"query": "shared.txt", "page": 1})),
         ("file_grep", json!({"pattern": "marker", "page": 1})),
-        ("file_read", json!({"path": "shared.txt", "page": 1})),
+        ("file_read", json!({"path": "shared.txt", "list": 1})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         harness::expect_error(&resp, "invalid_arguments");
@@ -241,7 +237,7 @@ fn only_the_search_tools_take_all_repos() {
     for (tool, args) in [
         (
             "file_read",
-            json!({"repo": "*", "path": "shared.txt", "page": 1}),
+            json!({"repo": "*", "path": "shared.txt", "list": 1}),
         ),
         ("file_list", json!({"repo": "*", "path": "", "page": 1})),
     ] {
@@ -396,7 +392,7 @@ fn a_write_into_one_repo_is_not_visible_through_the_other_and_never_reaches_disk
     // Visible in `a`...
     let read_a = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "planted.txt", "page": 1}),
+        json!({"repo": "a", "path": "planted.txt", "list": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&read_a), "from a");
@@ -404,7 +400,7 @@ fn a_write_into_one_repo_is_not_visible_through_the_other_and_never_reaches_disk
     // ...absent in `b`.
     let read_b = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "b", "path": "planted.txt", "page": 1}),
+        json!({"repo": "b", "path": "planted.txt", "list": 1}),
         &c,
     );
     harness::expect_error(&read_b, "not_found");

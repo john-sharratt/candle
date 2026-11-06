@@ -602,9 +602,9 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read one page of a file, in its parts under their anchors (`docs/npcd_anchored_edits.md`). Use for: reading a source file, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`repo`, `path` and `page` are all required, and a call returns one page — whole parts, at most 200 lines of them; there is no whole-file read.** `line` (optional) reads the page holding that line instead, for an error's or a stack trace's line number. For remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read a file in its parts (`docs/npcd_anchored_edits.md`, `docs/zen_coding_challenge_fixes.md` Cause 4): one `part`, a run of `lines`, or a page of the `list` of its parts. Use for: reading a source file, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`repo` and `path` are required, and exactly one of `part`, `lines` and `list`; every read is bounded — there is no whole-file read.** `lines` takes an error's or a stack trace's line number, or a range, and a one-line read says which part and line of it that is. A `list` of a short file returns it whole. For remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
 
-**Why the page is mandatory rather than merely encouraged.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because `required` drives the constrained-decode stencil: a call with no page is not discouraged, it is undecodable.
+**Why every read is bounded rather than merely encouraged to be.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because it drives the constrained-decode stencil: its `oneOf` makes a call name exactly one thing to read, and each is bounded — a part is at most 80 lines, a run of lines at most 200 of whole parts whatever range is asked, a list one line a part.
 
 **Parameters**
 
@@ -614,31 +614,34 @@ Read one page of a file, in its parts under their anchors (`docs/npcd_anchored_e
   "properties": {
     "repo": {"type": "string"},
     "path": {"type": "string"},
-    "page": {"type": "integer", "minimum": 1, "description": "Page of the file, from 1; whole parts up to 200 lines. Required."},
-    "line": {"type": ["integer", "null"], "minimum": 1, "description": "A line number, to read the page holding it instead of `page`. Optional."}
+    "part": {"type": "string", "pattern": "[A-Za-z0-9_-]{4}", "description": "One part, by its anchor."},
+    "lines": {"type": "string", "pattern": "[1-9][0-9]{0,6}(-[1-9][0-9]{0,6})?", "description": "`84` or `120-180`: the whole parts they touch, up to 200 lines."},
+    "list": {"type": "integer", "minimum": 1, "description": "A page of the list of the file's parts, from 1."}
   },
-  "required": ["repo", "path", "page"]
+  "required": ["repo", "path"],
+  "oneOf": [{"required": ["part"]}, {"required": ["lines"]}, {"required": ["list"]}]
 }
 ```
 
 **Returns**
 
-A rendered string, not a JSON object — each part (a function, a type, a block of imports, a paragraph) under its four-character anchor, a code part with its scope path:
+A rendered string, not a JSON object — each part (a function, a type, a block of imports, a paragraph) a fenced block naming the file, the part's anchor, its lines and its scope, each line behind its number in the part:
 
 ````
-```rust file=app/src/main.rs page=1 pages=1 lines=5
-Zp0_| use std::env;
-r7Lm| fn main
-fn main() {
-    println!("hello");
-}
+```rust file=app/src/main.rs part=Zp0_ lines=1 scope="use std::env;"
+ +1 use std::env;
 ```
-end of app/src/main.rs page 1 of 1 — the last page
+```rust file=app/src/main.rs part=r7Lm lines=3-5 scope="fn main"
+ +1 fn main() {
+ +2     println!("hello");
+ +3 }
+```
+end of app/src/main.rs lines 1-5 of 5 — the end of the file
 ````
 
-The fence names the file, the page, how many pages there are and the file's length; the closing line names the next page, or says this is the last. A page past the end returns the last page; page 0 is refused. An empty file reads `lines=0` with no page.
+The closing line names the lines the read held, the file's length, and the range to read next — or that this was the end. A range past the end reads the last part. A list names each part in one line (`part=r7Lm lines=3-5 fn main`). A file with nothing but blank lines reads `holds no text — N line(s), all blank`.
 
-**Errors.** Missing file returns `{"error": "not_found", ...}`. A call missing `repo`, `path` or `page` returns `{"error": "invalid_arguments", ...}` naming the absent field. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
+**Errors.** Missing file returns `{"error": "not_found", ...}`. A call missing `repo` or `path`, or naming none or more than one of `part`, `lines` and `list`, returns `{"error": "invalid_arguments", ...}`. A `part` the file does not have returns `{"error": "stale", ...}`. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
 
 ---
 
@@ -669,20 +672,20 @@ Change one part of an existing file by its anchor (`docs/npcd_anchored_edits.md`
 **Returns**
 
 ```json
-{"repo": "app", "path": "src/main.rs", "result": "Changed r7Lm.\nZp0_| use std::env;\nQx2c| fn main\nfn main() {\n    println!(\"hi\");\n}\n", "bytes": 64}
+{"repo": "app", "path": "src/main.rs", "result": "Changed r7Lm.\npart=Zp0_ lines=1 use std::env;\n```rust file=app/src/main.rs part=Qx2c lines=3-5 scope=\"fn main\"\n +1 fn main() {\n +2     println!(\"hi\");\n +3 }\n```\nChanged lines:\n…", "bytes": 64}
 ```
 
-`result` names what was done and shows the parts it wrote, whole, under their new anchors, between the parts either side of them in one line each — so the next edit needs no read. An edit that leaves a code file unparseable still applies, and `result` says so.
+`result` names what was done and shows the parts it wrote, whole, as blocks under their new anchors, between the parts either side of them in one line each — so the next edit needs no read — then the lines that changed. An edit that leaves a code file unparseable still applies, and `result` says so. A `text` whose every line starts with a `+N` number, copied from a read with its gutter, is refused.
 
 **Why this shape.** It replaced `old_text`/`new_text`, which replaced a unified-diff `patch`. A model could not drive the diff (invented line numbers, missing `@@` headers), and quoting the old text cost a decoded copy of it — often the whole function — refused on any slip or duplicate. An anchor is four characters copied off the read above; `old` names only the words being changed.
 
-**Implementation.** `doc-units`: the file is carved into parts (tree-sitter scopes for code, paragraphs for Markdown and text, lines for YAML), each anchored by four base64url characters of SHA-256 over a seed and its text. **An anchor the file no longer has is `stale`** — its part changed since it was read — so nothing is applied to text the caller never saw, and a replace or delete re-sent after it landed is refused rather than compounding `retries = 3` → `30` → `300`. An insert leaves its anchor as it was, so it is the one edit a resumed turn may not re-issue. An insert is set apart by a blank line where the file sets its parts apart; a delete takes the separator after it; line endings and a missing final newline are the file's own. `old` must occur once in its part (`ambiguous` / `not_found` otherwise).
+**Implementation.** `doc-units`: the file is carved into parts (tree-sitter scopes for code, paragraphs for Markdown, YAML and text), each anchored by four base64url characters of SHA-256 over a seed and its text. **An anchor the file no longer has is `stale`** — its part changed since it was read — so nothing is applied to text the caller never saw, and a replace or delete re-sent after it landed is refused rather than compounding `retries = 3` → `30` → `300`. An insert leaves its anchor as it was, so it is the one edit a resumed turn may not re-issue. An insert is set apart by a blank line where the file sets its parts apart; a delete takes the separator after it; line endings and a missing final newline are the file's own. `old` must occur once in its part (`ambiguous` / `not_found` otherwise).
 
 ---
 
 ### `file_list`
 
-Enumerate **one** directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Its files come back, and its immediate subdirectories come back as names to list in turn; nothing from inside them does. Use for: seeing what is in a specific directory, checking what the session has created, stepping down a path one level at a time. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s fence instead (`page=1 pages=12 lines=2499`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+Enumerate **one** directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Its files come back, and its immediate subdirectories come back as names to list in turn; nothing from inside them does. Use for: seeing what is in a specific directory, checking what the session has created, stepping down a path one level at a time. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s closing line instead (`lines 1-198 of 2499`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
 
 **To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 

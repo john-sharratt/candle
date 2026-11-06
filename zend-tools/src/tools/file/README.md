@@ -19,10 +19,10 @@ which is what most unit tests use.
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
 | `image.rs` | `file_image` | Resized copies of a picture: PNG, JPEG, WebP, multi-size ICO |
-| `read.rs` | `file_read` | Return a page of a file — its parts under their anchors — in a fenced block; `repo`, `path` and `page` are required, `line` optional |
+| `read.rs` | `file_read` | Read a `part`, a run of `lines` or a page of the `list` of a file's parts — exactly one — each part a fenced block |
 | `edit.rs` | `file_edit` | One anchored edit — replace, insert, delete, move — by the anchors `file_read` shows; the engine is `doc-units` |
-| `grep.rs` | `file_grep` | Regex over file contents; each hit names its part's anchor and the page holding it |
-| `render.rs` | — | The page format, shared with the `code_reading` ingest |
+| `grep.rs` | `file_grep` | Regex over file contents; each hit names its part's anchor, its line in the part and the part's scope |
+| `render.rs` | — | The read format, shared with the `code_reading` ingest |
 | `list.rs` | `file_list` | Paged, one-level union listing of a directory's project + session files |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
 | `present.rs` | `file_present` | Foreground presentation gesture |
@@ -56,19 +56,35 @@ true size but fail to read with `unreadable`.
 
 A file is shown and edited in its parts (`docs/npcd_anchored_edits.md`): a
 function, a type or a block of imports for code (carved by tree-sitter), a
-paragraph for Markdown and text, a line for YAML. Each part carries a
-four-character anchor hashed from its own text, so a part another hand
-changed no longer has the anchor it was read under. `doc-units` is the engine.
+paragraph for Markdown, YAML and text. Each part carries a four-character
+anchor hashed from its own text, so a part another hand changed no longer has
+the anchor it was read under. `doc-units` is the engine.
 
-## `file_read` paging
+Each part is shown as a fenced block of its own, its lines numbered from `+1`:
 
-`repo`, `path` and `page` are required — there is no whole-file read. `page`
-counts from 1 and every page holds whole parts, up to
-[`PAGE_LINES`](render.rs) lines (200) of them; a page past the end clamps to
-the last one rather than failing, and page 0 is refused. `line` reads the page
-holding that line instead. The fence opens `page=P pages=N lines=L` and closes
-`end of <file> page P of N — next: page=P+1`, or `— the last page`, so the
-model reads straight off it whether and where to keep going.
+````text
+```rust file=candle/npcd/src/engine/act.rs part=1Uax lines=46-52 scope="struct Act"
+ +1 /// One act a character took.
+ +2 #[derive(Clone, Debug, PartialEq, Serialize)]
+ +3 pub struct Act {
+…
+```
+````
+
+## What `file_read` reads
+
+`repo` and `path`, and exactly one of — there is no whole-file read:
+
+- `part` — one part, by its anchor;
+- `lines` — `84` or `120-180`: the whole parts those lines touch, up to
+  [`PAGE_LINES`](render.rs) lines (200) of them, from the part holding the
+  first. A one-line read says which part and line of it that is
+  (`line 84 is part=KehT +30`). The read closes `end of <file> lines A-B of N —
+  next: lines=C-D`, or `— the end of the file`, so the model reads straight off
+  it whether and where to keep going;
+- `list` — a page of the file's parts, one line each
+  (`part=KehT lines=55-101 impl Act > fn summary`); a file one read holds
+  comes back whole instead.
 
 ## `file_edit` operations
 

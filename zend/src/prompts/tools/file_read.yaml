@@ -24,9 +24,12 @@ questions:
 - read that config file for me
 - what's in README.md
 - read back the notes file from this session
+- what functions are in that file
+- give me an outline of the module
+- show me that part again
 category: Files
 mandatory: true
-description: 'Read a file, one page at a time. Resolves against this session''s edits first, then falls through to the repository on disk, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. The repo, the path within it, and the page are all required; pages count from 1, and page 1 is the top of the file — a short file''s whole content. The file comes back in its parts — each function, type, block of imports or paragraph under a four-character anchor and, for code, its scope path (`r7Lm| impl Cache > fn seal`), then its lines exactly as they are — whole parts, up to 200 lines a page; `file_edit` names a part by its anchor. The page sits in a fenced block whose opening fence names the file, the page, how many pages there are, and the file''s length — `rust file=candle/src/lib.rs page=2 pages=5 lines=940` — and which ends naming the next page to read, `end of candle/src/lib.rs page 2 of 5 — next: page=3`, or saying it was the last, `end of candle/src/lib.rs page 5 of 5 — the last page`. There is no need to find a file''s length before reading it: read page 1 and its fence reports it. To read where an error, a stack trace or a line number points, pass that `line` and the page holding it comes back. To find the code worth reading, use file_grep, whose hits name the part and the page they are on, rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read. **This reads the file as it stands on disk right now, uncommitted edits included.** For the file as a COMMIT, BRANCH or TAG holds it — "show me this file as of that commit", "what did it look like on the release branch" — use git_show with `what: file`. **A repository''s `.git/` folder is refused outright**: for branches, tags, remotes or counts of them use git_refs, for history git_log, and for a file at a revision git_show — never `.git/packed-refs`, `.git/refs/…` or `.git/config`, which are a database rather than text and give wrong answers when read as files.'
+description: 'Read a file: one part, a run of lines, or the list of its parts. Resolves against this session''s edits first, then falls through to the repository on disk, so real project files can be read directly. Name the repo, the path within it, and exactly one of `part`, `lines` or `list`. `part` is one part by its anchor — a hit''s `part`, a list entry''s, an edit''s answer''s. `lines` is a line number or a range of them, `84` or `120-180`: the whole parts those lines touch, up to 200 lines, from the part holding the first; a read of one line says which part and line of it that is (`line 84 is part=KehT +30`). `list` is a page of the list of the file''s parts, from 1, one line each (`part=KehT lines=55-101 impl Act > fn summary`) — and a short file comes back whole, so `list: 1` reads it. Each part — a function, a type, a block of imports, a paragraph — is a fenced block whose fence names the file, the part''s anchor, the file''s lines it holds and its scope: `rust file=candle/npcd/src/engine/act.rs part=KehT lines=55-101 scope="impl Act > fn summary"`. Its lines follow exactly as they are, each behind its number in the part from `+1` — the number is not part of the file; `file_edit` names a part by its anchor. A read of lines ends naming the next range to read, `end of candle/src/lib.rs lines 1-198 of 940 — next: lines=199-391`, or saying it was the end of the file. There is no need to find a file''s length first. To read where an error or a stack trace points, pass its line as `lines`. To find the code worth reading, use file_grep, whose hits name their part, rather than reading a large file through looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read. **This reads the file as it stands on disk right now, uncommitted edits included.** For the file as a COMMIT, BRANCH or TAG holds it — "show me this file as of that commit", "what did it look like on the release branch" — use git_show with `what: file`. **A repository''s `.git/` folder is refused outright**: for branches, tags, remotes or counts of them use git_refs, for history git_log, and for a file at a revision git_show — never `.git/packed-refs`, `.git/refs/…` or `.git/config`, which are a database rather than text and give wrong answers when read as files.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -38,22 +41,29 @@ parameters:
       description: Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
-    page:
-      description: Page of the file to return, from 1; a page is whole parts of the file, up to 200 lines of them. Required — pass 1 for the top of the file. Its fence names how many pages there are and the next one to read, or says it is the last. A page past the end returns the last one.
+    part:
+      description: One part, by its four-character anchor — the `part=` of its block, a `file_grep` hit's `part`, a list entry's (e.g. `KehT`). One of `part`, `lines`, `list`.
+      pattern: '[A-Za-z0-9_-]{4}'
+      type: string
+    lines:
+      description: Lines of the file, from 1 — one, `84`, or a range, `120-180` — read as the whole parts they touch, up to 200 lines. One of `part`, `lines`, `list`.
+      pattern: '[1-9][0-9]{0,6}(-[1-9][0-9]{0,6})?'
+      type: string
+    list:
+      description: A page of the list of the file's parts, from 1 — `1` to start; a short file comes back whole. One of `part`, `lines`, `list`.
       format: uint32
       minimum: 1.0
       type: integer
-    line:
-      description: A line number, from 1 — an error's, a stack trace's — to read the page holding it instead of `page`. Optional.
-      format: uint32
-      minimum: 1.0
-      type:
-      - integer
-      - 'null'
   required:
   - repo
   - path
-  - page
+  oneOf:
+  - required:
+    - part
+  - required:
+    - lines
+  - required:
+    - list
   title: ReadRequest
   type: object
 examples:
@@ -61,178 +71,168 @@ examples:
   show me the contents of Cargo.toml<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user wants to see Cargo.toml. No repository was named, so the workspace's generic app repository is where a bare Cargo.toml at the root would live. No specific location was named either, so I start at page 1 — the top of the file, and all of it if it's short.<|projection|> file_read requires repo, path and page, so I pass 1 explicitly. The response's fence states the file, the page and how many pages it has.
+  The user wants to see Cargo.toml. No repository was named, so the workspace's generic app repository is where a bare Cargo.toml at the root would live. No part or lines were named, so the list of its parts is the read:<|projection|> a manifest is short, and a short file comes back whole from `list: 1`.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "list": 1}}
   </tool_call><|projection|>
 - |-
   read the file src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of src/main.rs. No repository was named, so the workspace's app repository holds the generic src/main.rs entry point. No page location was named either, so I start at page 1,<|projection|> each part under its anchor so I can point at — and edit — any of them. If its fence names a next page I'll ask for it.
+  A direct read of src/main.rs. No repository was named, so the workspace's app repository holds the generic src/main.rs entry point. Nothing narrower was named, so `list: 1`: the whole file if it is short,<|projection|> or the list of its parts if not, each named by its anchor so I can read it with `part` and edit it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "list": 1}}
   </tool_call><|projection|>
 - |-
   what's in .gitignore<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user asks what .gitignore contains, without naming a repository — the workspace's app repository is the generic one a bare root file like this belongs to. That's a first-page read, so file_read with repo, path and page 1 — a .gitignore<|projection|> is short, and it's all on the first page.
+  The user asks what .gitignore contains, without naming a repository — the workspace's app repository is the generic one a bare root file like this belongs to. A .gitignore is short, so `list: 1`<|projection|> returns it whole.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": ".gitignore", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": ".gitignore", "list": 1}}
   </tool_call><|projection|>
 - |-
   cat docs/architecture.md for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "cat" means show the file, which is what file_read returns a page of. No repository was named, so the workspace's generic app repository is where this docs/architecture.md sits. The call names repo app, path docs/architecture.md,<|projection|> and page 1, since no specific spot was named.
+  "cat" means show the file. No repository was named, so the workspace's generic app repository is where this docs/architecture.md sits. The call names repo app, path docs/architecture.md,<|projection|> and `list: 1`, which is the whole file when it is short and its parts when it is not.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "docs/architecture.md", "page": 1}}
-  </tool_call><|projection|>
-- |-
-  read src/main.rs<|im_end|>
-  <|im_start|>assistant
-  <|projection|><think>
-  The user wants the contents of src/main.rs, without naming a repository — the workspace's app repository holds the generic src/main.rs. file_read resolves a path against this session's edits first and then falls through to the repository on disk, so it will return the<|projection|> real file's page 1. No location was named, so repo plus path plus page 1, and the top of the file comes back.
-  </think>
-
-  <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "docs/architecture.md", "list": 1}}
   </tool_call><|projection|>
 - |-
   what does the README say<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user is asking about the README's contents, without naming a repository — the workspace's app repository is the generic one holding a root README. That means actually reading it rather than guessing, so file_read on README.md.<|projection|> Page 1, since nothing narrower was named — that's the whole README unless its fence names a next page.
+  The user is asking about the README's contents, without naming a repository — the workspace's app repository is the generic one holding a root README. That means actually reading it rather than guessing, so file_read on README.md<|projection|> with `list: 1` — the whole README unless it is long, and then the list of its sections.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "README.md", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "README.md", "list": 1}}
   </tool_call><|projection|>
 - |-
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted, and no repository was named — the workspace's app repository is where this generic src/lib.rs belongs. The top of a file is page 1,<|projection|> so the call names repo, path and page 1, and the first thirty lines are the first parts of what comes back.
+  Only the top of src/lib.rs is wanted, and no repository was named — the workspace's app repository is where this generic src/lib.rs belongs. The first thirty lines are lines 1 to 30,<|projection|> and a read of lines returns the whole parts they touch.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "lines": "1-30"}}
   </tool_call><|projection|>
 - |-
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user named a range but no repository — the workspace's app repository holds this generic src/auth/handler.rs. file_read pages, it doesn't take an arbitrary range, so I pass `line` 47 and get the page holding where the range starts;<|projection|> its parts come back whole, so the code around 47-93 is there with it, and if the fence shows the range runs on, the next page has the rest.
+  The user named a range but no repository — the workspace's app repository holds this generic src/auth/handler.rs. `lines` takes exactly that range;<|projection|> the parts it touches come back whole, so the code around 47-93 is there with it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 1, "line": 47}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "lines": "47-93"}}
   </tool_call><|projection|>
 - |-
   what does line 450 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The path names zend/src/prompts, which is this candle codebase's daemon crate, so the repo is candle. Line 450 is well past the top of the file, and I don't know which page it is on — a page is whole parts, so its line range depends on the file —<|projection|> so I pass `line` 450 and get the page holding it directly, rather than paging through from page 1.
+  The path names zend/src/prompts, which is this candle codebase's daemon crate, so the repo is candle. One line is asked about, so `lines` is 450:<|projection|> the part holding it comes back whole, and the read says which line of that part it is.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/prompts/projection.yaml", "page": 1, "line": 450}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/prompts/projection.yaml", "lines": "450"}}
   </tool_call><|projection|>
 - |-
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  No repository was named, so the workspace's generic app repository holds this src/server.rs. The error points at line 240, so I pass it as `line`:<|projection|> the page holding it comes back, the failing line inside its whole function, with plenty of context around it.
+  No repository was named, so the workspace's generic app repository holds this src/server.rs. The error points at line 240, so I pass it as `lines`:<|projection|> the part holding it comes back, the failing line inside its whole function, and the read names the part and its line in it so I can edit there.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 1, "line": 240}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "lines": "240"}}
   </tool_call><|projection|>
 - |-
   what's around line 850 in that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "That file" is still src/server.rs in the app repo from the read above. Line 850 is well past the first few pages, and `line` takes me straight to the page holding it — no counting pages.<|projection|>
+  "That file" is still src/server.rs in the app repo from the read above. Around line 850 is the part holding it and its neighbours, so a range either side of it:<|projection|> the whole parts it touches come back.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 1, "line": 850}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "lines": "830-870"}}
   </tool_call><|projection|>
 - |-
   show me the rest of that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The previous read was page 1 of src/auth/handler.rs in the app repo and its fence ended with "next: page=2", so "the rest" starts there.<|projection|> I read the page each fence names until one says it is the last page.
+  The previous read was lines 1-198 of src/auth/handler.rs in the app repo and its closing line said "next: lines=199-391", so "the rest" starts there.<|projection|> I read the range each read names until one says it is the end of the file.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 2}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "lines": "199-391"}}
   </tool_call><|projection|>
 - |-
   what does zend/src/session.rs set up at startup<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The path names zend/src, which is the candle workspace's daemon crate, so the repo is candle. Nobody named a page, so I choose one from what the question is about. session.rs is one of the largest modules in the daemon and startup lives at the top — the module doc,<|projection|> the imports and the constants — so page 1 is where the answer should be. The fence reports how many pages the file has, so if it is not there I know how much is left and can read on.
+  The path names zend/src, which is the candle workspace's daemon crate, so the repo is candle. session.rs is one of the largest modules in the daemon, so reading it through would cost far more than the question needs.<|projection|> The list of its parts names every function by its scope, so I can see which ones set things up and read those by their anchors.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/session.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/session.rs", "list": 1}}
   </tool_call><|projection|>
 - |-
   so what does that function actually do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs, in the candle repo, and the hit named its part's page: page 3. That page holds the function whole, signature and body<|projection|> — page 1 or 2 would miss it entirely.
+  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs, in the candle repo, and the hit named its part: zQ4p. That part is the function whole, signature and body,<|projection|> so I read it by its anchor.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "page": 3}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "part": "zQ4p"}}
   </tool_call><|projection|>
 - |-
-  that page cut off before the match arm, show me more<|im_end|>
+  that read cut off before the match arm, show me more<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Page 3 of candle-conversation/src/wave/stager.rs in the candle repo ended before the match arm, and its fence named page 4, so the arm's part is there.<|projection|> A page is whole parts and not a window I can widen, so I read on rather than re-asking for a wider one.
+  The read of candle-conversation/src/wave/stager.rs in the candle repo ended before the match arm, and its closing line named the next range, lines=401-596, so the arm's part is there.<|projection|> A read holds whole parts up to 200 lines, so I read on from where it stopped.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "page": 4}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "candle-conversation/src/wave/stager.rs", "lines": "401-596"}}
   </tool_call><|projection|>
 - |-
   compare src/main.rs, src/lib.rs and Cargo.toml for me<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Three files, all named, none pointing at a specific repository, so the workspace's generic app repository is where these generic root paths belong. None of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so page 1 of each;<|projection|> any fence that names a next page tells me where to read on.
+  Three files, all named, none pointing at a specific repository, so the workspace's generic app repository is where these generic root paths belong. None of the reads depends on another's result — so they are one reply with three calls, not three replies. Each is likely short, so `list: 1` of each<|projection|> returns it whole.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "list": 1}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "page": 1}}
+  {"name": "file_read", "arguments": {"repo": "app", "path": "src/lib.rs", "list": 1}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "page": 1}}
+  {"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "list": 1}}
   </tool_call><|projection|>
 - |-
   so how do the two parsers in that listing differ<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs, both in the candle repo. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The top of each file is where the parser's entry point and its types are declared, so page 1 of each.
+  The listing above named zend/src/code_read/parsers/rust.rs and zend/src/code_read/parsers/python.rs, both in the candle repo. Comparing them needs both, and I already know both paths, so I read them together rather than one now and the other next turn.<|projection|> The list of each file's parts shows its entry point and its types, so `list: 1` of each.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/rust.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/rust.rs", "list": 1}}
   </tool_call>
   <tool_call>
-  {"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/python.rs", "page": 1}}
+  {"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/code_read/parsers/python.rs", "list": 1}}
   </tool_call><|projection|>

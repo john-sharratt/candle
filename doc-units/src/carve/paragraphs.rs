@@ -1,5 +1,5 @@
-//! The line-structured carves: paragraphs of prose, Markdown's paragraphs,
-//! and YAML's lines.
+//! The line-structured carves: paragraphs of prose and YAML, and Markdown's
+//! paragraphs.
 
 use super::types::{ChunkKind, Scope};
 use super::{blank, trimmed};
@@ -22,19 +22,6 @@ pub fn runs(lines: &[&str], start: u32, end: u32) -> Vec<Scope> {
         l += 1;
     }
     out
-}
-
-/// Every non-blank line its own unit.
-pub fn lines(lines: &[&str]) -> Vec<Scope> {
-    (1..=lines.len() as u32)
-        .filter(|&l| !blank(lines[l as usize - 1]))
-        .map(|l| Scope {
-            path: Vec::new(),
-            kind: ChunkKind::Line,
-            start_line: l,
-            end_line: l,
-        })
-        .collect()
 }
 
 /// Markdown's units: paragraphs, with
@@ -180,12 +167,4 @@ mod tests {
         assert!(!heading("####### seven"));
     }
 
-    #[test]
-    fn yaml_is_carved_into_lines() {
-        let src = "name: Bram\n\nmood:\n  calm: 2\n";
-        assert_eq!(
-            spans(&lines(&split_lines(src))),
-            vec![(1, 1), (3, 3), (4, 4)]
-        );
-    }
 }

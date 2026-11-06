@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use doc_units::render::head;
+use doc_units::render::scope;
 use doc_units::Doc;
 use regex::RegexBuilder;
 use schemars::JsonSchema;
@@ -12,7 +12,6 @@ use validator::Validate;
 use zend_vfs::vfs::GrepOutcome;
 use zend_vfs::VfsStore;
 
-use super::render::page_of;
 use super::{stores_for, FileError, Paging};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
@@ -63,13 +62,17 @@ pub struct GrepMatch {
     pub path: String,
     /// 1-based line number.
     pub line: u32,
-    /// The part of the file the hit is in, as `file_read` shows it — its
-    /// anchor and its scope path or first line (`r7Lm| impl Cache > fn
-    /// seal`) — so the part can be edited by that anchor without a read.
+    /// The anchor of the part of the file the hit is in, as `file_read` names
+    /// it (`KehT`), so the part can be read with `part` or edited by it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub part: String,
-    /// The `file_read` page that holds that part.
-    pub page: u32,
+    /// The hit's line in that part, from `+1`: what an edit of it names.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub at: String,
+    /// The part's scope: its code path (`impl Act > fn summary`) or its first
+    /// line.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
     /// The matching line, trimmed of trailing whitespace and truncated if very
     /// long.
     pub text: String,
@@ -122,13 +125,13 @@ impl Tool for FileGrep {
          contain\", \"grep for\", \"which file has\", \"find the string\". Takes a \
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
          narrow the search, and optional ignore_case. Returns the matches grouped by \
-         repo — path, line number, the matching line, and the part of the file it is in under \
-         its anchor (`r7Lm| impl Cache > fn seal`) with the file_read page that holds it — \
-         paged, with files_searched so an empty result is unambiguous. `page` is required and \
+         repo — path, line number, the matching line, the anchor of the part of the file it \
+         is in (`part`), its line in that part (`at`, `+30`) and the part's scope — paged, \
+         with files_searched so an empty result is unambiguous. `page` is required and \
          counts from 1 — pass 1 to start, and the response's `paging.next_page` for the next. \
          THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing at \
          directory names with file_list. Use file_search to find a file by its NAME; use \
-         file_read with a hit's page to see the part whole, and file_edit with its anchor to \
+         file_read with a hit's `part` to see the part whole, and file_edit with it to \
          change it.";
 
     type Request = GrepRequest;
@@ -178,7 +181,8 @@ impl Tool for FileGrep {
                         path: h.path,
                         line: h.line_no,
                         part: String::new(),
-                        page: 1,
+                        at: String::new(),
+                        scope: String::new(),
                         text: truncate(&h.line),
                         modified: h.modified,
                     },
@@ -206,8 +210,10 @@ impl Tool for FileGrep {
                 });
             let Some(doc) = doc else { continue };
             if let Some(i) = doc.unit_at(hit.line as usize - 1) {
-                hit.part = head(doc, i).trim_end().to_string();
-                hit.page = page_of(doc, i);
+                let unit = &doc.units()[i];
+                hit.part = unit.anchor.clone();
+                hit.at = format!("+{}", hit.line as usize - unit.start);
+                hit.scope = scope(doc, i);
             }
         }
 
@@ -259,7 +265,8 @@ mod tests {
             path: path.into(),
             line,
             part: String::new(),
-            page: 1,
+            at: String::new(),
+            scope: String::new(),
             text: "x".into(),
             modified: false,
         }

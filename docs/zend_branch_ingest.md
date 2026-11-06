@@ -112,14 +112,17 @@ The walk's output is a **corpus**: every distinct `code_reading` unit and every 
 
 ## 6. Content keys
 
-Every key carries a **version** (`KEY_VERSION`, `branch_ingest/keys.rs`, now 2):
+Every key carries a **version** (`KEY_VERSION`, `branch_ingest/keys.rs`, now 4):
 the version of what a unit's turns say beyond its content — the calls and
 responses rendered around it. A change to that rendering bumps it, which re-reads
 every unit: each new key is queued, the old conversation stays readable until its
 replacement commits, and the next pass tombstones it (§7.2); a unit past the depth
-bound, which nothing re-reads, is tombstoned at once. Version 2 is pages counted
-from 1 — `file_read`'s and `file_list`'s `page`, and the `page=1 pages=N` fence —
-so no zero-based call or fence is left in what a conversation is shown.
+bound, which nothing re-reads, is tombstoned at once. Version 2 counted pages
+from 1; version 3 read a file's parts under inline anchors; version 4 shows each
+part as a fenced block, its lines numbered from `+1`, and reads a file by
+`lines` ranges of whole parts (`docs/zen_coding_challenge_fixes.md` Cause 4). A
+file unit records the file's line count (`lines`), which the working set checks
+the chain's reads covered before it serves the reading.
 
 Every key states its version as a `v<N>:` prefix — a key with none is version 1,
 the form before versions — and **a member judges only conversations at its own
@@ -197,7 +200,7 @@ A `file_read` of a file the conversation has not changed is looked up by the fil
 
 **A `file_list` is never served; it runs and its listing is prefilled.** A listing is short, so serving it saved little, and what stood in for it was the folder's `repo_map` unit — a placed `file_list` round trip whose request the model is told came from the indexer. Handed that as the answer to its own listing, the model lost track of whether it had listed the folder at all. `repo_map` units still reach a dialogue as seeds and through the gather (§8.2); they are only no longer an answer to a call.
 
-A finished chain (`chain_health`) gates a served read, and a file is served only when its chain read every page. How a hit is then held in context — the budget, locks, release, restart, and the provenance tier beside them — is the working set, `docs/zend_working_set.md`.
+A finished chain (`chain_health`) gates a served read, and a file is served only when its chain's reads covered every line. How a hit is then held in context — the budget, locks, release, restart, and the provenance tier beside them — is the working set, `docs/zend_working_set.md`.
 
 ### 8.2 The gather
 

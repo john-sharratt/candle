@@ -2,12 +2,12 @@
 //!
 //! `docs/npcd_anchored_edits.md` is the design. In brief:
 //!
-//! - [`carve`] cuts a file into units — paragraphs of prose, lines of YAML,
-//!   semantic scopes of code — that partition its non-blank lines.
+//! - [`carve`] cuts a file into units — paragraphs of prose and YAML, semantic
+//!   scopes of code — that partition its non-blank lines.
 //! - [`anchor`] names each unit with four base64url characters hashed from
 //!   its own text, a seed making every anchor in a document unique.
-//! - [`Doc`] is a file carved and anchored; [`render`] shows a page of it the
-//!   way a read returns it.
+//! - [`Doc`] is a file carved and anchored; [`render`] shows each unit as the
+//!   fenced block a read returns, its lines numbered from `+1`.
 //! - [`edit`] applies one anchored operation — replace, insert, delete, move —
 //!   and reports the units it touched under their new anchors.
 //!

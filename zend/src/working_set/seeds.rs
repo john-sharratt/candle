@@ -111,7 +111,6 @@ impl Seeding<'_> {
             }
             Seed::File { repo, rel } => {
                 file_conversation(self.engine, self.files, self.coverage, repo, rel)
-                    .map(|(tl, _)| tl)
             }
         }
     }

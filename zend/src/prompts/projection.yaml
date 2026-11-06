@@ -468,7 +468,7 @@ system_prompt:
     # 1f283ffd), turn one stated three facts it had never fetched — and that a
     # remembered item no longer here faded, so the model re-fetches instead of
     # taking its own correct quotations for fabrications. A re-fetch always runs
-    # for real: every `file_read` reads its page (`docs/zend_working_set.md`
+    # for real: every `file_read` reads the file (`docs/zend_working_set.md`
     # §4.5). Gated on tools: it tells the model to call one.
     - kind: section
       id: placed_content

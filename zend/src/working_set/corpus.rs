@@ -17,7 +17,7 @@ use candle_conversation::ConversationEngine;
 use zend_vfs::{Oid, RepoFiles, Workspace};
 
 use super::coverage::Coverage;
-use crate::branch_ingest::keys::{file_key, CONTENT_KEY, PAGES_KEY};
+use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
 use crate::code_read::chain_finished;
 use crate::tools::ToolCall;
 
@@ -82,17 +82,16 @@ pub fn readings_of(
 }
 
 /// The finished, complete `code_reading` conversation that read `rel` in
-/// `repo` at the blob the conversation's base holds, with its page count —
-/// `None` when the conversation changed the file (its own copy is what its
-/// read must return), no conversation read that version, or none that did
-/// read every page.
+/// `repo` at the blob the conversation's base holds — `None` when the
+/// conversation changed the file (its own copy is what its read must return),
+/// no conversation read that version, or none that read every line.
 pub fn file_conversation(
     engine: &ConversationEngine,
     files: &RepoFiles,
     coverage: &Coverage,
     repo: &str,
     rel: &str,
-) -> Option<(TimelineId, u32)> {
+) -> Option<TimelineId> {
     let (blob, _) = committed(files, repo, rel)?;
     engine
         .find_conversations_by_metadata(CONTENT_KEY, &file_key(&format!("{repo}/{rel}"), &blob))
@@ -105,11 +104,8 @@ pub fn file_conversation(
         // that wrote them, or retired — places nothing for them; another
         // reading of the same version may be whole.
         .filter(|&tl| engine.holds_whole(tl))
-        .find_map(|tl| {
-            let pages = pages_of(engine, tl)?;
-            coverage
-                .is_complete(engine, tl, pages)
-                .then_some((tl, pages))
+        .find(|&tl| {
+            lines_of(engine, tl).is_some_and(|lines| coverage.is_complete(engine, tl, lines))
         })
 }
 
@@ -120,14 +116,14 @@ fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
     files.repo(repo).ok()?.content_id(rel).ok()?
 }
 
-/// How many pages the file `timeline` read reads as, as its ingest recorded
-/// it. `None` for a conversation that recorded none.
-fn pages_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<u32> {
-    pages_in(&engine.conversation_metadata(timeline)?)
+/// How many lines the file `timeline` read has, as its ingest recorded it.
+/// `None` for a conversation that recorded none.
+fn lines_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<usize> {
+    lines_in(&engine.conversation_metadata(timeline)?)
 }
 
-fn pages_in(meta: &BTreeMap<String, String>) -> Option<u32> {
-    meta.get(PAGES_KEY)?.parse().ok()
+fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
+    meta.get(LINES_KEY)?.parse().ok()
 }
 
 #[cfg(test)]
@@ -249,15 +245,15 @@ mod tests {
         assert_eq!(committed(&files, "other", "a.rs"), None);
     }
 
-    /// **The page count is the one the ingest recorded**, and a conversation
+    /// **The line count is the one the ingest recorded**, and a conversation
     /// that recorded none — or something that is no count — answers nothing.
     #[test]
-    fn the_page_count_is_the_one_the_ingest_recorded() {
+    fn the_line_count_is_the_one_the_ingest_recorded() {
         let mut meta = BTreeMap::from([(CONTENT_KEY.to_string(), "k".to_string())]);
-        assert_eq!(pages_in(&meta), None);
-        meta.insert(PAGES_KEY.to_string(), "3".to_string());
-        assert_eq!(pages_in(&meta), Some(3));
-        meta.insert(PAGES_KEY.to_string(), "many".to_string());
-        assert_eq!(pages_in(&meta), None);
+        assert_eq!(lines_in(&meta), None);
+        meta.insert(LINES_KEY.to_string(), "350".to_string());
+        assert_eq!(lines_in(&meta), Some(350));
+        meta.insert(LINES_KEY.to_string(), "many".to_string());
+        assert_eq!(lines_in(&meta), None);
     }
 }

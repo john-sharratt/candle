@@ -1,11 +1,12 @@
 //! file_edit tool — one anchored edit (`docs/npcd_anchored_edits.md` §6).
 
-use doc_units::render::around;
+use doc_units::render::{around, Source};
 use doc_units::{apply, Doc, Edit, EditError, Op, Place};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::render::fence_tag_for_path;
 use super::{edit_changes, FileError};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
@@ -37,7 +38,7 @@ pub struct EditRequest {
     /// Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
-    /// The anchor of the part to change: the four characters before the `|` that `file_read` shows it under (e.g. `r7Lm`). Required.
+    /// The anchor of the part to change: the `part=` of its block in `file_read` (e.g. `r7Lm`). Required.
     #[validate(length(min = 1))]
     pub at: String,
     /// What to do there: `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
@@ -76,12 +77,13 @@ impl Tool for FileEdit {
     const DESCRIPTION: &'static str =
         "Change one part of an existing file by its anchor, leaving the rest exactly as it is. \
          `file_read` shows every part of a file — a function, a type, a block of imports, a \
-         paragraph — under a four-character anchor (`r7Lm| impl Cache > fn seal`); name the part \
-         as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just \
-         those words inside it), `insert_before` / `insert_after` it a new part `text`, `delete` \
-         it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move \
-         over a run of consecutive parts, `at` through `to`. Write `text` as the part is to \
-         stand, indentation included — never with anchors in it. Use for: changing a function \
+         paragraph — as a block whose fence names its four-character anchor (`part=r7Lm`); name \
+         the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace \
+         just those words inside it), `insert_before` / `insert_after` it a new part `text`, \
+         `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete \
+         and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is \
+         to stand, indentation included — never with the `+N` numbers a read shows beside its \
+         lines. Use for: changing a function \
          body, adding a method after another, fixing a value in a config, removing dead code, \
          reordering items. An anchor that no longer names a part — the file changed since it was \
          read — is refused; read it again. Returns what was done and the parts it wrote under \
@@ -115,6 +117,9 @@ impl Tool for FileEdit {
             .read(&req.path)?
             .ok_or_else(|| FileError::NothingToEdit(req.path.clone()))?;
         let edit = edit_of(&req)?;
+        if let Some(why) = req.text.as_deref().and_then(numbered) {
+            return Err(FileError::InvalidArguments(why));
+        }
         let doc = Doc::new(&req.path, &content);
         let done = apply(&doc, &edit)?;
         let text = done.doc.text();
@@ -139,10 +144,15 @@ impl Tool for FileEdit {
         // Recorded as an edit — the changed lines only, not the file they
         // landed in.
         store.edit(&req.path, text)?;
+        let file = format!("{}/{}", req.repo, req.path);
+        let source = Source {
+            file: &file,
+            tag: fence_tag_for_path(&req.path),
+        };
         let mut result = format!(
             "{}\n{}",
             done.summary,
-            around(&done.doc, &done.touched, done.at_line)
+            around(&done.doc, &done.touched, done.at_line, source)
         );
         if !changes.is_empty() {
             result.push_str(&format!("Changed lines:\n{changes}"));
@@ -182,13 +192,31 @@ fn clobbers(before: usize, after: usize, written: usize) -> Option<String> {
     })
 }
 
+/// Why `text` reads as lines copied out of a read with their numbers, if it
+/// does: every line that has anything on it starts with a `+N` gutter. Written
+/// into the file, each would gain the number as content.
+fn numbered(text: &str) -> Option<String> {
+    let gutter = |line: &str| {
+        let digits = line.trim_start().strip_prefix('+')?;
+        let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+        (n > 0 && matches!(digits.as_bytes().get(n), None | Some(b' '))).then_some(())
+    };
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty()).peekable();
+    lines.peek()?;
+    lines.all(|l| gutter(l).is_some()).then(|| {
+        "every line of `text` starts with a `+N` number, as a read shows it beside the \
+         line; write the lines without their numbers — they are not part of the file"
+            .to_string()
+    })
+}
+
 /// The request as the edit it names, or why it names none.
 fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
     let invalid = |why: &str| FileError::InvalidArguments(why.to_string());
     if req.at.chars().count() != 4 {
         return Err(invalid(&format!(
-            "`at` is the four characters before the `|`; {:?} is not — copy the anchor whole \
-             from `file_read`",
+            "`at` is a part's four-character anchor, the `part=` of its block; {:?} is not — \
+             copy the anchor whole from `file_read`",
             req.at
         )));
     }
@@ -278,6 +306,19 @@ mod tests {
         assert_eq!(clobbers(100, 95, 35), None, "a rewrite of about its size");
         assert_eq!(clobbers(100, 95, 1), None, "a six-line part");
         assert_eq!(clobbers(100, 105, 45), None, "it grew");
+    }
+
+    /// **Text copied with its gutter is refused**: every line numbered as a read
+    /// numbers it. A line that only starts with `+` is content.
+    #[test]
+    fn text_copied_with_its_numbers_is_refused() {
+        assert!(numbered(" +1 fn go() {\n +2     1\n +3 }\n").is_some());
+        assert!(numbered("+1 x\n\n+2\n").is_some());
+        assert_eq!(numbered("fn go() {}\n"), None);
+        assert_eq!(numbered("+1 x\nplain\n"), None, "one line without");
+        assert_eq!(numbered("+x\n"), None);
+        assert_eq!(numbered("+10px\n"), None);
+        assert_eq!(numbered(""), None);
     }
 
     /// **`old` is offered before `text`.** The tool grammar emits optional

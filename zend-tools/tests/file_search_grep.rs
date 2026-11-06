@@ -2,7 +2,6 @@
 
 mod harness;
 
-use doc_units::render::{pages, PAGE_LINES};
 use doc_units::Doc;
 use serde_json::json;
 use tempfile::TempDir;
@@ -158,11 +157,11 @@ fn a_literal_is_found_with_its_line_number() {
     assert_eq!(r["repos"][0]["matches"][0]["text"], "    // TODO: cache");
 }
 
-/// A hit names the part it is in under its anchor, and the `file_read` page
-/// that holds it — so the pair composes without the model losing the hit, and
-/// the part can be edited straight from the hit.
+/// A hit names the part it is in by its anchor, its line in that part and the
+/// part's scope — so the pair composes without the model losing the hit, and
+/// the part can be read or edited straight from the hit.
 #[test]
-fn a_hit_names_its_part_and_page() {
+fn a_hit_names_its_part_and_its_line_in_it() {
     let dir = workspace();
     let c = ctx(&dir);
     let r = harness::expect_success(harness::invoke_with_ctx(
@@ -175,15 +174,23 @@ fn a_hit_names_its_part_and_page() {
     assert_eq!(hit["line"], 3);
     let text = "pub fn run() {\n    // TODO: cache\n    let API_KEY = 1;\n}\n";
     let a = &Doc::new(&path, text).anchors()[0];
-    assert_eq!(hit["part"], format!("{a}| fn run"));
-    assert_eq!(hit["page"], 1);
+    assert_eq!(hit["part"], a.as_str());
+    assert_eq!(hit["at"], "+3");
+    assert_eq!(hit["scope"], "fn run");
 
-    let page = harness::expect_success(harness::invoke_with_ctx(
+    let part = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": path, "page": hit["page"]}),
+        json!({"repo": REPO, "path": path, "part": hit["part"]}),
         &c,
     ));
-    assert!(page.as_str().unwrap().contains(&format!("{a}| fn run\n")));
+    assert_eq!(
+        part,
+        format!(
+            "```rust file={REPO}/{path} part={a} lines=1-4 scope=\"fn run\"\n +1 pub fn run() {{\n \
+             +2     // TODO: cache\n +3     let API_KEY = 1;\n +4 }}\n```\n\
+             end of part {a} of {REPO}/{path} — lines 1-4 of 4\n"
+        )
+    );
 
     // The hit's anchor edits the part with no read in between.
     harness::expect_success(harness::invoke_with_ctx(
@@ -194,10 +201,10 @@ fn a_hit_names_its_part_and_page() {
     ));
 }
 
-/// Pages hold whole parts, so a hit deep in a long file names the page its
-/// part is on, not one derived from its line number.
+/// A hit deep in a long file names its part and its line in that part, and a
+/// read of the hit's line says the same.
 #[test]
-fn a_hit_in_a_long_file_names_the_page_its_part_is_on() {
+fn a_hit_in_a_long_file_names_its_part_and_line() {
     let dir = tempfile::tempdir().unwrap();
     let root = harness::repo_root(dir.path());
     std::fs::create_dir_all(&root).unwrap();
@@ -217,14 +224,22 @@ fn a_hit_in_a_long_file_names_the_page_its_part_is_on() {
         .iter()
         .position(|u| u.label.as_deref() == Some("fn f99"))
         .unwrap();
-    let page = pages(&doc, PAGE_LINES)
-        .iter()
-        .position(|p| p.contains(&i))
-        .unwrap()
-        + 1;
-    assert_eq!(hit["page"], page);
-    assert!(page > 1, "a page past the first: {page}");
-    assert_eq!(hit["part"], format!("{}| fn f99", doc.units()[i].anchor));
+    let anchor = &doc.units()[i].anchor;
+    assert_eq!(hit["line"], 397);
+    assert_eq!(hit["part"], anchor.as_str());
+    assert_eq!(hit["at"], "+1");
+    assert_eq!(hit["scope"], "fn f99");
+    let read = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": "long.rs", "lines": "397"}),
+        &harness::workspace_ctx(dir.path()),
+    ));
+    assert!(
+        read.as_str()
+            .unwrap()
+            .starts_with(&format!("line 397 is part={anchor} +1\n")),
+        "{read}"
+    );
 }
 
 #[test]

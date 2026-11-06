@@ -999,17 +999,15 @@ async fn the_file_acts_reach_the_store_through_the_runtime() {
         )
         .feed;
     assert!(
-        read.contains("| # the third era\n"),
+        read.contains(" +1 # the third era\n"),
         "not the real anchored read: {read}"
     );
-    // The anchor of the paragraph holding the words, off the read — as a
-    // model takes it.
+    // The anchor of the paragraph holding the words, off its block's fence —
+    // as a model takes it.
     let mut at = None;
     for line in read.lines() {
-        if let Some((a, _)) = line.split_once("| ") {
-            if doc_units::anchor::is_anchor(a) {
-                at = Some(a.to_string());
-            }
+        if let Some((_, rest)) = line.strip_prefix("```").and_then(|l| l.split_once(" part=")) {
+            at = rest.split_whitespace().next().map(str::to_string);
         }
         if line.contains("in the spring") {
             break;

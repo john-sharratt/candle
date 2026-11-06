@@ -15,7 +15,7 @@
 //! as live tool calls or turn boundaries.
 
 /// Characters of a tool result the record keeps: enough for the header that
-/// names what came back (`file=… page=…`, a listing's first entries, an error).
+/// names what came back (`file=… part=…`, a listing's first entries, an error).
 const TOOL_RESULT_CHARS: usize = 240;
 /// Characters of a person's message the record keeps.
 const MESSAGE_CHARS: usize = 800;
@@ -104,7 +104,7 @@ mod tests {
                 "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>",
             ),
             turn(
-                "<tool_response>\n```rust file=r/a.rs page=1 pages=1\n1 fn main() {}\n```\n</tool_response>",
+                "<tool_response>\n```rust file=r/a.rs part=Qm7x lines=1 scope=\"fn main\"\n +1 fn main() {}\n```\n</tool_response>",
                 "**Purpose:** `a.rs` is the entry point.",
             ),
         ]);
@@ -115,7 +115,7 @@ mod tests {
              ASSISTANT: [tool call] {\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n\
              \n\
              [turn 2]\n\
-             TOOL RESULT: ```rust file=r/a.rs page=1 pages=1 1 fn main() {} ```\n\
+             TOOL RESULT: ```rust file=r/a.rs part=Qm7x lines=1 scope=\"fn main\" +1 fn main() {} ```\n\
              ASSISTANT: **Purpose:** `a.rs` is the entry point.\n"
         );
     }

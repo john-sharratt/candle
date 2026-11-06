@@ -178,6 +178,10 @@ fn emit_split(
 /// while each is a comment/attribute/decorator AND ends on the line directly above
 /// the current earliest start (a blank line or real code breaks the run), and take
 /// the earliest — so an item and the comment that documents it are one unit.
+///
+/// A sibling ends on the last line its text is on. A node that holds its own
+/// newline — tree-sitter-rust's `///` doc comment — ends at column 0 of the
+/// line after, which is not a line it has any text on.
 fn start_with_leading_comments(node: &Node) -> u32 {
     let mut earliest = (node.start_position().row as u32) + 1;
     let mut prev = node.prev_sibling();
@@ -187,7 +191,11 @@ fn start_with_leading_comments(node: &Node) -> u32 {
         if !attachable {
             break;
         }
-        let p_end = (p.end_position().row as u32) + 1;
+        let end = p.end_position();
+        let p_end = match end.column {
+            0 if end.row > p.start_position().row => end.row as u32,
+            _ => end.row as u32 + 1,
+        };
         // Contiguous only: the sibling must end on the line directly above the
         // current earliest — a blank line or intervening code breaks attachment so
         // an unrelated earlier comment is never swept in.

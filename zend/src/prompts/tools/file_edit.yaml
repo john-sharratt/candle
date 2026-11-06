@@ -31,7 +31,7 @@ questions:
 - rewrite the body of that function
 category: Files
 mandatory: true
-description: 'Change one part of an existing file of the named repo by its anchor, leaving the rest exactly as it is. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `file_read` shows every part of a file — a function, a type, a block of imports, a paragraph — under a four-character anchor, and for code its scope path (`r7Lm| impl Cache > fn seal`); name the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just those words inside it), `insert_before` or `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is to stand, indentation included — never with anchors in it. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. An anchor that no longer names a part — the file changed since it was read — is refused as stale; read it again and edit by the anchors it shows. Returns what was done and the parts it wrote under their new anchors, between the parts either side of them, so the next edit needs no read. It also lists the lines that changed — `-` for what was removed, `+` for what was written, `…` where unchanged lines lie between runs: a line listed there that you did not mean to change is a slip to fix with the next edit. Triggered by "change X to Y in the file", "update this function", "add this after", "remove that", "move this". For a new file, or rewriting most of one, use write.'
+description: 'Change one part of an existing file of the named repo by its anchor, leaving the rest exactly as it is. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `file_read` shows every part of a file — a function, a type, a block of imports, a paragraph — as a fenced block whose fence names its four-character anchor and its scope (`part=r7Lm lines=120-134 scope="impl Cache > fn seal"`); name the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just those words inside it), `insert_before` or `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is to stand, indentation included — never with anchors in it, and never with the `+N` numbers a read shows beside each line, which are not part of the file. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. An anchor that no longer names a part — the file changed since it was read — is refused as stale; read it again and edit by the anchors it shows. Returns what was done and the parts it wrote under their new anchors, between the parts either side of them, so the next edit needs no read. It also lists the lines that changed — `-` for what was removed, `+` for what was written, `…` where unchanged lines lie between runs: a line listed there that you did not mean to change is a slip to fix with the next edit. Triggered by "change X to Y in the file", "update this function", "add this after", "remove that", "move this". For a new file, or rewriting most of one, use write.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -45,7 +45,7 @@ parameters:
       minLength: 1
       type: string
     at:
-      description: The anchor of the part to change — the four characters before the `|` that `file_read` shows it under (e.g. `r7Lm`). Required.
+      description: The anchor of the part to change — the `part=` of its block in `file_read` (e.g. `r7Lm`). Required.
       maxLength: 4
       minLength: 4
       type: string
@@ -156,7 +156,7 @@ examples:
   change the path in that function to the new file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  file_read showed the function under its anchor. One word inside it changes, so `replace` with `old` holding those exact words touches nothing else, and the anchor is the four characters before the bar.<|projection|>
+  file_read showed the function as a block with its anchor in the fence. One word inside it changes, so `replace` with `old` holding those exact words touches nothing else, and the anchor is the block's `part=`.<|projection|>
   </think>
 
   <tool_call>

@@ -36,8 +36,9 @@
 //! # Anchored parts
 //!
 //! `file_read` shows a file in its parts — a function, a type, a block of
-//! imports, a paragraph — each under a four-character anchor hashed from its
-//! text, and `file_edit` names a part by that anchor and says what to do there:
+//! imports, a paragraph — each a fenced block naming a four-character anchor
+//! hashed from its text, its lines numbered from `+1`, and `file_edit` names a
+//! part by that anchor and says what to do there:
 //! replace it (or words inside it), insert beside it, delete it, move it
 //! (`docs/npcd_anchored_edits.md`). An anchor that names no part of the file as
 //! it stands is `stale`: the part changed since it was read, so the edit is
@@ -108,12 +109,12 @@ pub struct RepoPath {
 /// token turn. Listings are therefore paged and report here how much they held
 /// back.
 ///
-/// `file_read` is bounded too, but carries no `Paging`: its page is required and
-/// holds whole parts up to [`render::PAGE_LINES`] lines, and the page's fence
-/// is its own paging record — `page=P pages=N lines=total` — in the
-/// `code_reading` ingest's format. The header serves the model directly, in the
-/// text it is already reading, where a structured field beside a rendered
-/// string would have to be correlated with it.
+/// `file_read` is bounded too, but carries no `Paging`: a read holds whole
+/// parts up to [`render::PAGE_LINES`] lines, and its closing line is its own
+/// paging record — the lines it held, the file's length and the range to read
+/// next — in the `code_reading` ingest's format. That line serves the model
+/// directly, in the text it is already reading, where a structured field beside
+/// a rendered string would have to be correlated with it.
 ///
 /// **Pages are numbered from 1**, as a person numbers them, in everything the
 /// model writes and reads: page 1 is the first, `pages` is the last, and the

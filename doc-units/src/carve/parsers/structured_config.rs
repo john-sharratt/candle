@@ -1,6 +1,6 @@
 //! TOML / JSON carver — splits at TOML tables and top-level keys. A
 //! pragmatic line-scanner; no full parser is pulled in for unit boundaries.
-//! (YAML is carved line by line instead — see `carve::paragraphs::lines`.)
+//! (YAML is carved into paragraphs instead — see `carve::paragraphs::runs`.)
 
 use crate::carve::types::{ChunkKind, Scope};
 

@@ -49,10 +49,10 @@ pub fn quant_tags(
 /// Conversation metadata: a file unit's blob id.
 pub const BLOB_KEY: &str = "blob";
 
-/// Conversation metadata: how many `file_read` pages a file unit's file reads
-/// as — what a chain must have read in full to be served, and what a fast-path
-/// answer tells the model it already has.
-pub const PAGES_KEY: &str = "pages";
+/// Conversation metadata: how many lines a file unit's file has, as
+/// `file_read` counts them — what a chain's reads must have covered, `1` to
+/// this, to be served.
+pub const LINES_KEY: &str = "lines";
 
 /// Conversation metadata: every branch whose tip holds the unit, comma
 /// separated in walk order — the repository's default branch first
@@ -81,10 +81,16 @@ pub const COMMIT_KEY: &str = "commit";
 /// up to 200 lines a page (`docs/npcd_anchored_edits.md`). A unit read under 2
 /// holds line-numbered pages, a format no tool returns any more.
 ///
+/// 4: each part is a fenced block of its own, its lines numbered from `+1`, and
+/// a file is read by `lines` ranges of whole parts rather than by page
+/// (`docs/zen_coding_challenge_fixes.md` Cause 4). A unit read under 3 holds
+/// anchors written inline and `page` calls, which nothing reads any more, and
+/// its parts were carved with doc comments cut from their items.
+///
 /// Every key states its version as a `v<N>:` prefix ([`key_version`]), so a
 /// member can tell a unit read under a NEWER version — a peer's, upgraded before
 /// it — from one it should replace, and leaves it alone.
-pub const KEY_VERSION: u32 = 3;
+pub const KEY_VERSION: u32 = 4;
 
 /// The first key version that writes its `v<N>:` prefix — the oldest a
 /// folder's earlier reading can be recomputed at ([`dir_key_at`]). A key from
@@ -117,7 +123,7 @@ pub fn branches_value(names: &[String]) -> String {
 }
 
 /// A file's key: the [`KEY_VERSION`], its workspace-relative path and its blob
-/// id — `v3:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
+/// id — `v4:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
 /// ingested conversation names the path; the blob id is git's hash of the
 /// bytes `file_read` returns.
 pub fn file_key(path: &str, blob: &Oid) -> String {
@@ -125,7 +131,7 @@ pub fn file_key(path: &str, blob: &Oid) -> String {
 }
 
 /// The workspace-relative path a [`file_key`] names — `candle/zend/src/main.rs`
-/// out of `v3:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
+/// out of `v4:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
 /// file's.
 pub fn file_key_path(key: &str) -> Option<&str> {
     let rest = match key.strip_prefix('v').and_then(|r| r.split_once(':')) {
@@ -216,7 +222,7 @@ mod tests {
     fn a_file_key_is_its_path_and_blob() {
         assert_eq!(
             file_key("candle/zend/src/main.rs", &oid(A)),
-            "v3:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v4:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -246,16 +252,20 @@ mod tests {
         };
         assert_eq!(
             dir_key("r/a/", &listing, None),
-            "v3:6861d14a1ee273cf707cd34ded936e235be09979861451fd2a84fe001e955dc9"
+            "v4:5c5a50fdde36f12cb3a142b3bdccb922f3a0af5790a964a8a31a1830935f9302"
         );
         let hint = ModuleHint::CargoPackage {
             name: "demo".into(),
         };
         assert_eq!(
-            dir_key("r/a/", &listing, Some(&hint)),
+            dir_key_at(3, "r/a/", &listing, Some(&hint)),
             "v3:0a2a1cadd262f54c1fade2189774367179f06703daea1db7671c110514af3395"
         );
         // An earlier version's key is the one that version wrote.
+        assert_eq!(
+            dir_key_at(3, "r/a/", &listing, None),
+            "v3:6861d14a1ee273cf707cd34ded936e235be09979861451fd2a84fe001e955dc9"
+        );
         assert_eq!(
             dir_key_at(2, "r/a/", &listing, None),
             "v2:717794e220eb93b6dd9585eca5034757489450c3b49532f42057f23df22e749c"

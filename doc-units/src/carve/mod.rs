@@ -9,7 +9,9 @@
 //!   lines — with a heading its own unit, a fenced code block one unit whatever
 //!   blank lines it holds, and YAML front matter one unit
 //!   ([`paragraphs::markdown`]).
-//! - **YAML**: the line ([`paragraphs::lines`]).
+//! - **YAML** and plain text: the paragraph ([`paragraphs::runs`]). An edit
+//!   names lines within a unit, so a unit need not be a line to make a
+//!   one-line change.
 //! - **Code**: the semantic scope. Tier 1 is the language's tree-sitter parser
 //!   (Rust, Python, TypeScript/TSX, JavaScript, Go, C, C++, Java, Ruby, PHP,
 //!   Bash, HTML, CSS); tier 2 splits TOML and JSON at top-level keys. What no
@@ -48,8 +50,7 @@ pub fn carve(source: &str, language: Language) -> Vec<Scope> {
     let lines: Vec<&str> = split_lines(source);
     let units = match language {
         Language::Markdown => paragraphs::markdown(&lines),
-        Language::Yaml => paragraphs::lines(&lines),
-        Language::PlainText => paragraphs::runs(&lines, 1, lines.len() as u32),
+        Language::Yaml | Language::PlainText => paragraphs::runs(&lines, 1, lines.len() as u32),
         _ => partition(
             carve_raw(source, language),
             file_header_end(source, language),
@@ -384,6 +385,30 @@ mod tests {
         let src = "// lone comment\nfn a() { let _ = 0; }\n";
         let units = carve(src, Language::Rust);
         assert_eq!(spans(&units), vec![(1, 2)]);
+    }
+
+    /// **An item's doc comment is part of it**, with or without an attribute
+    /// between them, and so is a method's inside an `impl`. tree-sitter-rust
+    /// ends a `///` comment's node on the next line, past its newline, so the
+    /// attachment reads where its text ends.
+    #[test]
+    fn a_doc_comment_starts_its_items_unit() {
+        let src = "/// One act.\n#[derive(Debug)]\npub struct Act {\n    x: u8,\n}\n\n\
+                   impl Act {\n    /// How it reads.\n    ///\n    /// More.\n    pub fn summary(&self) {}\n}\n";
+        let units = carve(src, Language::Rust);
+        assert_partition(src, &units);
+        assert_eq!(
+            names(&units),
+            vec!["struct Act", "", "impl Act > fn summary", ""]
+        );
+        assert_eq!(spans(&units), vec![(1, 5), (7, 7), (8, 11), (12, 12)]);
+    }
+
+    /// YAML is carved into paragraphs, as plain text is.
+    #[test]
+    fn yaml_is_carved_into_paragraphs() {
+        let src = "name: Bram\n\nmood:\n  calm: 2\n";
+        assert_eq!(spans(&carve(src, Language::Yaml)), vec![(1, 1), (3, 4)]);
     }
 
     #[test]

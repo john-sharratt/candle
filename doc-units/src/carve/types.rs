@@ -20,8 +20,6 @@ pub enum ChunkKind {
     /// A run of lines no item claims, or a paragraph of a file with no carver:
     /// one run of non-blank lines between blank lines.
     Paragraph,
-    /// One line of a line-structured document (YAML).
-    Line,
 }
 
 /// One carved scope. Line numbers are 1-indexed and inclusive on both ends.
@@ -29,7 +27,7 @@ pub enum ChunkKind {
 pub struct Scope {
     /// Nesting names from outermost to innermost, joined by ` > ` when shown:
     /// `["impl KvCache", "fn seal_chunk"]`. Empty for a unit that is named by
-    /// its own first line (a paragraph, a YAML line, an unclaimed run).
+    /// its own first line (a paragraph, an unclaimed run).
     pub path: Vec<String>,
     pub kind: ChunkKind,
     pub start_line: u32,

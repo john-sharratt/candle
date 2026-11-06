@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use doc_units::render::{around, pages, units, PAGE_LINES};
+use doc_units::render::{around, blocks, pages, Source, PAGE_LINES};
 use doc_units::{apply, Doc, Edit, Language};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -398,10 +398,14 @@ impl Benches {
         let current = self.read(body, raw, shelf)?;
         let done = apply(&Doc::new(&key, &current), edit).map_err(|e| format!("In {key}, {e}."))?;
         self.write(body, about, raw, &done.doc.text(), shelf)?;
+        let source = Source {
+            file: &key,
+            tag: fence_tag(done.doc.language()),
+        };
         Ok(format!(
             "{key}: {}\n{}",
             done.summary,
-            around(&done.doc, &done.touched, done.at_line)
+            around(&done.doc, &done.touched, done.at_line, source)
         ))
     }
 
@@ -768,7 +772,7 @@ fn editable_area(p: &MindPath) -> bool {
     }
 }
 
-/// Header, fence and anchored parts — the shape a read returns.
+/// Header and anchored parts — the shape a read returns.
 ///
 /// **A tool result lands in the conversation verbatim**, so a read is one
 /// page: whole parts up to [`PAGE_LINES`] lines. One long `.yaml` would
@@ -777,21 +781,20 @@ fn editable_area(p: &MindPath) -> bool {
 /// than returning nothing, which a model reads as "the document is empty" and
 /// acts on; the header and a closing line carry the continuation signal.
 ///
-/// Each part shows under its anchor, which is what makes the *next* act
-/// precise: an edit names the part by it, so the character never has to copy
-/// the words it is changing to say where they are.
+/// Each part is a fenced block naming its anchor, which is what makes the
+/// *next* act precise: an edit names the part by it, so the character never
+/// has to copy the words it is changing to say where they are.
 fn anchored_excerpt(path: &str, content: &str, page: usize) -> String {
     let doc = Doc::new(path, content);
     if doc.units().is_empty() {
-        return format!("\n{path} (empty):\n\n```\n```\n");
+        return format!("\n{path} (empty).\n");
     }
     let all = pages(&doc, PAGE_LINES);
     let page = page.clamp(1, all.len());
     let range = all[page - 1].clone();
     let n = doc.units().len();
     let parts = match doc.language() {
-        Language::Markdown | Language::PlainText => "paragraphs",
-        Language::Yaml => "lines",
+        Language::Markdown | Language::PlainText | Language::Yaml => "paragraphs",
         _ => "parts",
     };
     let header = match all.len() {
@@ -807,12 +810,20 @@ fn anchored_excerpt(path: &str, content: &str, page: usize) -> String {
         true => format!("There is more: the next read asks for page {}.\n", page + 1),
         false => String::new(),
     };
-    let tag = match doc.language() {
+    let source = Source {
+        file: path,
+        tag: fence_tag(doc.language()),
+    };
+    format!("\n{header}:\n\n{}{more}", blocks(&doc, range, source))
+}
+
+/// The language tag a document's blocks open with; empty reads `text`.
+fn fence_tag(language: Language) -> &'static str {
+    match language {
         Language::Yaml => "yaml",
         Language::Markdown => "markdown",
         _ => "",
-    };
-    format!("\n{header}:\n\n```{tag}\n{}```\n{more}", units(&doc, range))
+    }
 }
 
 #[cfg(test)]

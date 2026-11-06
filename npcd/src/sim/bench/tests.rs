@@ -857,8 +857,8 @@ fn a_read_returns_at_most_one_page() {
         out.starts_with("\nlayers/eras/long.md (page 1 of 6: paragraphs 1–2 of 12):"),
         "{out}"
     );
-    assert!(out.contains("| line 1\n"), "{out}");
-    assert!(out.contains("line 160\n"), "{out}");
+    assert!(out.contains("\n +1 line 1\n"), "{out}");
+    assert!(out.contains("\n+80 line 160\n"), "{out}");
     assert!(!out.contains("line 161"), "the cap did not hold");
     assert!(
         out.ends_with("There is more: the next read asks for page 2.\n"),
@@ -874,7 +874,7 @@ fn a_read_continues_from_the_page_it_is_given() {
     long_document(&root, 900);
     let out = b.excerpt("m1", "layers/eras/long.md", 2, &s).unwrap();
     assert!(out.contains("(page 2 of 6: paragraphs 3–4 of 12)"), "{out}");
-    assert!(out.contains("| line 161\n"), "{out}");
+    assert!(out.contains("\n +1 line 161\n"), "{out}");
     assert!(!out.contains("line 160\n"), "{out}");
 }
 
@@ -907,8 +907,9 @@ fn a_short_document_comes_back_whole_and_anchored() {
     assert_eq!(
         out,
         format!(
-            "\nlayers/eras/third.md (1 paragraph):\n\n```markdown\n{a}| the third era\nburned \
-             in the spring\n```\n"
+            "\nlayers/eras/third.md (1 paragraph):\n\n```markdown file=layers/eras/third.md \
+             part={a} lines=1-2 scope=\"the third era\"\n +1 the third era\n +2 burned in the \
+             spring\n```\n"
         )
     );
 }

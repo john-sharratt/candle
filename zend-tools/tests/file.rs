@@ -10,14 +10,13 @@ fn ctx() -> ToolContext {
     ToolContext::new()
 }
 
-/// The parts a rendered `file_read` page shows, between its fences. The
-/// format itself is pinned in `file_overlay.rs` and `render.rs`.
-fn page_body(resp: &serde_json::Value) -> String {
+/// The parts a rendered `file_read` shows, each a block, without the read's
+/// closing line. The format itself is pinned in `file_overlay.rs` and
+/// `render.rs`.
+fn parts_read(resp: &serde_json::Value) -> String {
     let text = resp.as_str().expect("file_read returns a rendered string");
-    text.split_once("```")
-        .and_then(|(_, rest)| rest.split_once('\n'))
-        .and_then(|(_, rest)| rest.rsplit_once("```"))
-        .map(|(body, _)| body.to_string())
+    text.rsplit_once("```\n")
+        .map(|(blocks, _)| format!("{blocks}```\n"))
         .unwrap_or_default()
 }
 
@@ -68,11 +67,17 @@ fn file_write_unicode() {
     write(&ctx, "uni.txt", content);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "uni.txt", "page": 1}),
+        json!({"repo": REPO, "path": "uni.txt", "list": 1}),
         &ctx,
     ));
     let anchor = anchor_of(&ctx, "uni.txt", "Unicode");
-    assert_eq!(page_body(&resp), format!("{anchor}| {content}\n"));
+    assert_eq!(
+        resp,
+        format!(
+            "```text file={REPO}/uni.txt part={anchor} lines=1 scope=\"{content}\"\n +1 {content}\n```\n\
+             end of {REPO}/uni.txt lines 1 of 1 — the end of the file\n"
+        )
+    );
 }
 
 /// A move keeps the bytes, leaves nothing behind, and overwrites nothing.
@@ -139,7 +144,7 @@ fn file_edit_not_found() {
 fn file_read_of_a_url_points_to_web_fetch() {
     let resp = harness::invoke(
         "file_read",
-        json!({"repo": REPO, "path": "https://docs.rs/serde/latest/serde/", "page": 1}),
+        json!({"repo": REPO, "path": "https://docs.rs/serde/latest/serde/", "list": 1}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
     assert!(
@@ -218,7 +223,10 @@ fn file_edit_round_trip() {
     let now = anchor_of(&ctx, "rt.txt", "hello");
     assert_eq!(
         resp["result"],
-        format!("Replaced {at}.\n{now}| hello Rust\nChanged lines:\n- hello world\n+ hello Rust\n")
+        format!(
+            "Replaced {at}.\n```text file={REPO}/rt.txt part={now} lines=1 scope=\"hello Rust\"\n \
+             +1 hello Rust\n```\nChanged lines:\n- hello world\n+ hello Rust\n"
+        )
     );
     assert_eq!(resp["bytes"], 10);
 }
@@ -229,11 +237,16 @@ fn file_write_read_roundtrip() {
     write(&ctx, "hello.txt", "hello world");
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "hello.txt", "page": 1}),
+        json!({"repo": REPO, "path": "hello.txt", "list": 1}),
         &ctx,
     ));
     let a = anchor_of(&ctx, "hello.txt", "hello");
-    assert_eq!(page_body(&resp), format!("{a}| hello world\n"));
+    assert_eq!(
+        parts_read(&resp),
+        format!(
+            "```text file={REPO}/hello.txt part={a} lines=1 scope=\"hello world\"\n +1 hello world\n```\n"
+        )
+    );
 }
 
 #[test]
@@ -257,7 +270,7 @@ fn file_write_creates_vs_overwrites() {
 fn file_read_not_found() {
     let resp = harness::invoke(
         "file_read",
-        json!({"repo": REPO, "path": "nosuchfile.txt", "page": 1}),
+        json!({"repo": REPO, "path": "nosuchfile.txt", "list": 1}),
     );
     harness::expect_error(&resp, "not_found");
 }
@@ -323,7 +336,10 @@ fn file_edit_inserts_a_method_after_another() {
         "{result}"
     );
     assert!(
-        result.contains(&format!("{size}| class Inventory > size\n  size() {{\n")),
+        result.contains(&format!(
+            "```javascript file={REPO}/inv.js part={size} lines=5-7 scope=\"class Inventory > \
+             size\"\n +1   size() {{\n"
+        )),
         "{result}"
     );
 }
@@ -349,7 +365,7 @@ fn file_edit_deletes_and_moves_parts() {
     assert_eq!(text_of(&ctx, "s.md"), "Three.\n\nOne.\n");
     assert_eq!(
         resp["result"],
-        format!("Deleted {two}.\n{three}| Three.\nChanged lines:\n- Two.\n-\n")
+        format!("Deleted {two}.\npart={three} lines=1 Three.\nChanged lines:\n- Two.\n-\n")
     );
 }
 
@@ -620,11 +636,16 @@ fn leading_slash_and_dot_segments_normalise_to_the_same_entry() {
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "/src/./main.rs", "page": 1}),
+        json!({"repo": REPO, "path": "/src/./main.rs", "list": 1}),
         &ctx,
     ));
     let a = anchor_of(&ctx, "src/main.rs", "main");
-    assert_eq!(page_body(&bare), format!("{a}| fn main\nfn main() {{}}\n"));
+    assert!(
+        parts_read(&bare).ends_with(&format!(
+            "part={a} lines=1 scope=\"fn main\"\n +1 fn main() {{}}\n```\n"
+        )),
+        "{bare}"
+    );
 }
 
 #[test]

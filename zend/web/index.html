@@ -864,22 +864,21 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       const first = Object.values(args).find((v) => typeof v === 'string' && v);
       if (first) subject = first;
     }
-    // The call's own page, shown even before a response has come back —
-    // `file_read`'s `page` is a required argument, so it is always present.
-    // Pages count from 1 on the wire, so it is shown as it stands.
+    // What the read asked for, shown even before a response has come back —
+    // `file_read` names exactly one of `part`, `lines` or `list`.
     let detail = '';
-    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + args.page;
-    // file_read's opening fence, once the response lands:
-    // "```rust file=repo/path page=2 pages=5 lines=1420", or "lines=0" alone
-    // for an empty file — richer than the call alone. The line range a page
-    // covers is derived from the fixed 200-line page stride.
-    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+) pages=(\d+))? lines=(\d+)\n/.exec(resp.raw);
-    if (fence && fence[1] === undefined) detail = 'empty';
-    else if (fence) {
-      const page = Number(fence[1]), total = Number(fence[3]);
-      const first = (page - 1) * 200 + 1, last = Math.min(page * 200, total);
-      detail = 'page ' + page + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
+    if (name === 'file_read') {
+      if (typeof args.part === 'string') detail = 'part ' + args.part;
+      else if (typeof args.lines === 'string') detail = 'lines ' + args.lines;
+      else if (typeof args.list === 'number') detail = 'list ' + args.list;
     }
+    // file_read's closing line, once the response lands:
+    // "end of repo/path lines 1-198 of 1420 — …" — the lines the read held and
+    // the file's length, richer than the call alone.
+    const held = resp && name === 'file_read'
+      && /end of \S+ lines (\d+(?:-\d+)?) of (\d+) —/.exec(resp.raw);
+    if (held) detail = 'lines ' + held[1] + ' of ' + held[2];
+    else if (resp && name === 'file_read' && / holds no text — \d+ line\(s\), all blank/.test(resp.raw)) detail = 'empty';
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
       detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + p.page + '/' + p.pages : '');

@@ -69,9 +69,9 @@ all use.
   fenced code block is one unit however many blank lines it holds, and YAML
   front matter is one unit. Blank lines carry no anchor; the edit act restores
   the separating blank line on insert and delete.
-- **`.yaml` documents: the line.** Character sheets, world files and
-  `missions.yaml` are line-structured, and a paragraph of YAML is not a unit
-  anybody edits.
+- **`.yaml` documents: the paragraph**, as plain text. Every line of a part is
+  shown with its number in the part (§5), so a one-line change needs no
+  one-line unit, and a unit per line would put a block around every line.
 - **Code: the semantic scope**, carved by the per-language tree-sitter carver
   zend used to chunk `code_reading` before that layer moved to real file reads
   (removed in `46e247083`; restored by §9). Its rules carry over:
@@ -80,7 +80,9 @@ all use.
     maps node kinds to a unit: a function or method, a type definition (struct,
     enum, trait, class, interface, type alias), a run of constants, or another
     top-level item (`macro_rules!`, a module-level statement). An item's
-    leading doc comments and attributes are part of it. Containers are not
+    leading doc comments and attributes are part of it — attached by where
+    each one's text ends, since tree-sitter-rust's `///` node ends past its
+    newline, on the item's own first line. Containers are not
     units — an `impl` or `mod` is the path its members are named under
     (`impl KvCache > fn seal_chunk`), so a large impl never becomes one unit.
   - **The innermost item owns its lines.** Parsers emit nested items — a
@@ -149,41 +151,41 @@ How often a seed is bumped, and how likely a stale anchor is to match new text:
 
 ## 5. Reading
 
-`file_read` labels each unit with its anchor. A unit named by its own first
-line — a paragraph, a YAML line — shows that line after its anchor and the rest
-beneath it (npcd's header shown):
-
-```
-layers/life/bram/2834-11 The Body.md (14 paragraphs):
-Qm7x| The bay was warm when you walked in, the tank fluid already cycling,
-and the light was the light of a room nobody had left in years.
-b4_K| Then the order came down on the shared frequency…
-9fTa| You said fourteen.
-```
-
-A code unit shows its anchor and scope path, then its lines exactly as they
-are, indentation and all (zend's fence shown):
+Every unit is a fenced block of its own. The fence names the file, the unit's
+anchor, the lines of the file it holds and its scope — a code unit's path, or
+else its own first line — and each of its lines follows behind its number in
+the unit, from `+1`, exactly as it is, indentation and all
+(`docs/zen_coding_challenge_fixes.md` Cause 4):
 
 ````
-```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs page=1 pages=3 lines=620
-Hk2a| file header
-//! Chunked KV backing.
-Zp0_| use std::sync::Arc;
-use std::collections::BTreeMap;
-r7Lm| impl KvCache > fn seal_chunk
-    pub fn seal_chunk(&mut self, gid: ChunkGid) -> Result<()> {
-        …
-    }
+```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs part=Zp0_ lines=3-4 scope="use std::sync::Arc;"
+ +1 use std::sync::Arc;
+ +2 use std::collections::BTreeMap;
 ```
-end of candle/candle-nn/src/kv_cache/chunked/backing.rs page 1 of 3 — next: page=2
+```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs part=r7Lm lines=6-9 scope="impl KvCache > fn seal_chunk"
+ +1     /// Seal a chunk.
+ +2     pub fn seal_chunk(&mut self, gid: ChunkGid) -> Result<()> {
+ +3         …
+ +4     }
+```
+end of candle/candle-nn/src/kv_cache/chunked/backing.rs lines 1-198 of 620 — next: lines=199-391
 ````
 
-- **Paging packs whole units**: a page holds whole units, up to 200 lines of
-  them (`doc_units::render::PAGE_LINES`), so no unit is ever cut across two
-  pages. `page` counts from 1; a page past the end reads the last. A page's
-  line range depends on the file, so zend's `file_read` also takes `line` — an
-  error's or a stack trace's — and returns the page holding it.
-- `file_grep` names each hit's unit and the page holding it (§7a).
+- **No anchor stands on a line of content.** Shown inline on a unit's first
+  line, an anchor read as that line's alone: a worker replaced a five-line
+  `use` block with the one line it meant to change. The fence bounds the unit,
+  and the number before each line keeps content off the start of the line, so a
+  line of the file holding ```` ``` ```` cannot close the block and a line
+  shaped like an anchor reads as content.
+- **zend's `file_read` reads one of three things**: a `part` by its anchor; the
+  `lines` an error or a range names, as the whole units they touch, up to 200
+  lines (`doc_units::render::PAGE_LINES`), from the unit holding the first —
+  a one-line read says which unit and line of it that is; or a page of the
+  `list` of the file's units, one line each, a short file coming back whole. A
+  read of lines ends naming the next range to read. npcd's bench reads by
+  page, the units of each shown the same way.
+- `file_grep` names each hit's unit by its anchor, its line in the unit and the
+  unit's scope (§7a).
 - The label path is not hashed: the anchor is the unit's text alone, so moving a
   function into another `impl` does not change its anchor, and renaming it does.
 - **Nothing about a read is remembered.** Anchors are computed from the text
@@ -290,15 +292,18 @@ as it was, so zend's resumed turns do not re-issue one (`Replay::Unsafe`).
 
 ### The reply
 
-Every edit answers with what was done, then the units it wrote, whole, under
-their new anchors, between the unit before and the unit after, each in one line:
+Every edit answers with what was done, then the units it wrote, whole, as
+blocks under their new anchors, between the unit before and the unit after,
+each in one line:
 
-```
+````
 Changed 9fTa.
-b4_K| Then the order came down on the shared frequency…
-R2kp| You said fifteen.
-cX0e| The tower lord's reply came back flat…
+part=b4_K lines=3 Then the order came down on the shared frequency…
+```markdown file="layers/life/bram/2834-11 The Body.md" part=R2kp lines=5 scope="You said fifteen."
+ +1 You said fifteen.
 ```
+part=cX0e lines=7 The tower lord's reply came back flat…
+````
 
 A delete shows the units now either side of where it was. The next edit can
 name the new anchors without reading the document again.
@@ -323,13 +328,14 @@ carried on as before; only the first sitting may mend.
 
 ## 7a. Other places that cite lines
 
-- **`file_grep`** labels each hit with the anchor and scope path of the unit it
-  falls in (`part`) and the `file_read` page that holds it (`page`), so a hit
-  can be read whole, or edited, without counting pages.
+- **`file_grep`** labels each hit with the anchor of the unit it falls in
+  (`part`), its line in that unit (`at`, `+30`) and the unit's scope, so a hit
+  can be read whole, or edited, without counting anything.
 - **Tool output that is not a read** — compiler errors, test failures, diffs,
   blame — keeps its own line numbers. It describes the world, not the editing
-  surface; an author goes from it to a read — `file_read`'s `line` opens the
-  page holding the line — and edits from the read.
+  surface; an author goes from it to a read — `file_read`'s `lines` reads the
+  unit holding the line and says which line of it that is — and edits from the
+  read.
 - **zend's MCP endpoint** carries the same `file_read`/`file_edit` as every other
   caller: one form, anchors. Its tool description teaches the convention.
 

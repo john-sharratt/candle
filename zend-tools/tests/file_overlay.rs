@@ -10,8 +10,7 @@ mod harness;
 
 use std::path::Path;
 
-use doc_units::anchor::is_anchor;
-use doc_units::render::{pages, units, PAGE_LINES};
+use doc_units::render::{blocks, entry, Source};
 use doc_units::Doc;
 use serde_json::json;
 use tempfile::TempDir;
@@ -49,22 +48,18 @@ fn ctx_for(dir: &TempDir) -> ToolContext {
     harness::workspace_ctx(dir.path())
 }
 
-/// The text of a rendered `file_read` page of a plain-text file: its parts
-/// with their `XXXX| ` anchors taken off — so a test can assert on content
-/// without restating the format (which `read_returns_an_anchored_fenced_page`
-/// pins separately).
+/// The text of a rendered `file_read` of a plain-text file: its parts' lines,
+/// without their blocks' fences, the `+N` before each, or the closing line — so
+/// a test can assert on content without restating the format (which
+/// `read_returns_each_part_as_a_block` pins separately).
 fn excerpt_source(resp: &serde_json::Value) -> String {
     let text = resp.as_str().expect("file_read returns a rendered string");
-    let body = text
-        .split_once("```")
-        .and_then(|(_, rest)| rest.split_once('\n'))
-        .and_then(|(_, rest)| rest.rsplit_once("```"))
-        .map(|(body, _)| body)
-        .unwrap_or("");
-    body.lines()
-        .map(|l| match l.split_once("| ") {
-            Some((a, rest)) if is_anchor(a) => rest,
-            _ => l,
+    text.lines()
+        .filter(|l| !l.starts_with("```") && !l.starts_with("end of "))
+        .map(|l| {
+            let numbered = l.trim_start().trim_start_matches('+');
+            let line = numbered.trim_start_matches(|c: char| c.is_ascii_digit());
+            line.strip_prefix(' ').unwrap_or(line)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -94,13 +89,13 @@ fn read_falls_through_to_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
+        json!({"repo": REPO, "path": "src/main.rs", "list": 1}),
         &ctx,
     ));
     let a = &anchors("src/main.rs", MAIN_RS)[0];
     assert!(
         resp.as_str().unwrap().contains(&format!(
-            "{a}| fn main\nfn main() {{\n    println!(\"hi\");\n}}\n"
+            "part={a} lines=1-3 scope=\"fn main\"\n +1 fn main() {{\n +2     println!(\"hi\");\n +3 }}\n"
         )),
         "{resp}"
     );
@@ -121,7 +116,7 @@ fn alternate_spellings_of_a_path_resolve_to_the_same_entry() {
     ] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_read",
-            json!({ "repo": REPO, "path": path, "page": 1 }),
+            json!({ "repo": REPO, "path": path, "list": 1 }),
             &ctx,
         ));
         assert!(
@@ -137,7 +132,7 @@ fn read_of_a_missing_workspace_path_is_not_found() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/nope.rs", "page": 1}),
+        json!({"repo": REPO, "path": "src/nope.rs", "list": 1}),
         &ctx,
     );
     harness::expect_error(&resp, "not_found");
@@ -150,7 +145,7 @@ fn parent_traversal_cannot_escape_the_workspace() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "../../../../etc/passwd", "page": 1}),
+        json!({"repo": REPO, "path": "../../../../etc/passwd", "list": 1}),
         &ctx,
     );
     harness::expect_error(&resp, "not_found");
@@ -167,7 +162,7 @@ fn non_utf8_workspace_file_is_unreadable_not_missing() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "blob.bin", "page": 1}),
+        json!({"repo": REPO, "path": "blob.bin", "list": 1}),
         &ctx,
     );
     harness::expect_error(&resp, "unreadable");
@@ -239,7 +234,7 @@ fn list_omits_gitignored_and_hidden_paths() {
     // depend on.
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": ".gitignore", "page": 1}),
+        json!({"repo": REPO, "path": ".gitignore", "list": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "target/\nsecret.txt");
@@ -373,7 +368,7 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
     harness::expect_error(
         &harness::invoke_with_ctx(
             "file_read",
-            json!({"repo": REPO, "path": "docs/guide.md", "page": 1}),
+            json!({"repo": REPO, "path": "docs/guide.md", "list": 1}),
             &ctx,
         ),
         "not_found",
@@ -428,7 +423,7 @@ fn writing_over_a_whiteout_resurrects_the_path_as_a_creation() {
     );
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "README.md", "page": 1}),
+        json!({"repo": REPO, "path": "README.md", "list": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "# back");
@@ -596,19 +591,19 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
     assert!(lib.get("modified").is_none(), "unchanged entries stay lean");
 }
 
-// ── file_read page format ────────────────────────────────────────────────────
+// ── file_read format ─────────────────────────────────────────────────────────
 
-/// A read returns the same shape the `code_reading` ingest prefills: a
-/// language-tagged fence naming the file, the page and the file's length, then
-/// each part under its anchor — a code part with its scope path — then the
+/// A read returns the same shape the `code_reading` ingest prefills: each part
+/// a language-tagged block whose fence names the file, the part's anchor, its
+/// lines and its scope, each line behind its number in the part — then the
 /// closing line. Not JSON — the runner places a string result verbatim.
 #[test]
-fn read_returns_an_anchored_fenced_page() {
+fn read_returns_each_part_as_a_block() {
     let dir = workspace();
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
+        json!({"repo": REPO, "path": "src/main.rs", "list": 1}),
         &ctx,
     );
     let text = resp.as_str().expect("file_read returns a rendered string");
@@ -616,152 +611,158 @@ fn read_returns_an_anchored_fenced_page() {
     assert_eq!(
         text,
         format!(
-            "\n```rust file=proj/src/main.rs page=1 pages=1 lines=3\n{a}| fn main\nfn main() {{\n    \
-             println!(\"hi\");\n}}\n```\nend of proj/src/main.rs page 1 of 1 — the last page\n"
+            "```rust file=proj/src/main.rs part={a} lines=1-3 scope=\"fn main\"\n +1 fn main() {{\n \
+             +2     println!(\"hi\");\n +3 }}\n```\nend of proj/src/main.rs lines 1-3 of 3 — the end \
+             of the file\n"
         ),
     );
 }
 
-/// Without a page a read is rejected — a page is required, and the fence
-/// states the total so the model knows to keep going.
+/// **A read names exactly one of `part`, `lines` and `list`**: none, or two,
+/// is refused.
 #[test]
-fn read_without_a_page_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
-    write_disk(&harness::repo_root(dir.path()), "big.rs", &body);
-    let ctx = harness::workspace_ctx(dir.path());
-
-    let resp = harness::invoke_with_ctx("file_read", json!({"repo": REPO, "path": "big.rs"}), &ctx);
-    harness::expect_error(&resp, "invalid_arguments");
+fn a_read_naming_none_or_two_things_is_refused() {
+    let dir = workspace();
+    let ctx = ctx_for(&dir);
+    for args in [
+        json!({"repo": REPO, "path": "src/main.rs"}),
+        json!({"repo": REPO, "path": "src/main.rs", "list": 1, "lines": "1"}),
+        json!({"repo": REPO, "path": "src/main.rs", "list": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "lines": "0"}),
+        json!({"repo": REPO, "path": "src/main.rs", "lines": "+3"}),
+    ] {
+        let resp = harness::invoke_with_ctx("file_read", args.clone(), &ctx);
+        harness::expect_error(&resp, "invalid_arguments");
+    }
 }
 
-/// Each page holds whole parts up to its line budget, and a page number past
-/// the end clamps to the last page rather than failing.
+/// **A read of lines holds the whole parts they touch, up to its budget**, and
+/// names the range to read next; one past the end reads the last part.
 #[test]
-fn read_returns_the_requested_page_and_clamps_one_past_the_end() {
+fn a_read_of_lines_holds_whole_parts_and_names_the_next() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
     write_disk(&harness::repo_root(dir.path()), "big.txt", &body);
     let ctx = harness::workspace_ctx(dir.path());
     // One 900-line paragraph, cut at the unit cap into eleven parts of 80
-    // lines and one of 20; two 80-line parts fill a page.
+    // lines and one of 20; two 80-line parts fill a read.
     let doc = Doc::new("big.txt", &body);
-    let all = pages(&doc, PAGE_LINES);
     assert_eq!(doc.units().len(), 12);
-    assert_eq!(all.len(), 6);
+    let source = Source {
+        file: "proj/big.txt",
+        tag: "",
+    };
+    let read = |lines: &str| {
+        harness::invoke_with_ctx(
+            "file_read",
+            json!({"repo": REPO, "path": "big.txt", "lines": lines}),
+            &ctx,
+        )
+        .as_str()
+        .unwrap()
+        .to_string()
+    };
 
-    let middle = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "big.txt", "page": 2}),
-        &ctx,
-    );
     assert_eq!(
-        middle.as_str().unwrap(),
+        read("161-320"),
         format!(
-            "\n```text file=proj/big.txt page=2 pages=6 lines=900\n{}```\n\
-             end of proj/big.txt page 2 of 6 — next: page=3\n",
-            units(&doc, 2..4)
+            "{}end of proj/big.txt lines 161-320 of 900 — next: lines=321-480\n",
+            blocks(&doc, 2..4, source)
         ),
     );
-    assert!(units(&doc, 2..4).contains("| line 161\nline 162\n"));
-
-    // Page 6 is both the last real page and where an out-of-range request
-    // (page 99) clamps to.
-    let last = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "big.txt", "page": 6}),
-        &ctx,
+    assert!(read("161-320").contains("lines=161-240 scope=\"line 161\"\n +1 line 161\n +2 line 162\n"));
+    // Asked for more than a read holds, it holds what fits and says where on.
+    assert_eq!(
+        read("1-900"),
+        format!(
+            "{}end of proj/big.txt lines 1-160 of 900 — next: lines=161-320\n",
+            blocks(&doc, 0..2, source)
+        ),
     );
-    let clamped = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "big.txt", "page": 99}),
-        &ctx,
+    // One line is its part, named with its line in it.
+    let a10 = &doc.units()[10].anchor;
+    assert_eq!(
+        read("850"),
+        format!(
+            "line 850 is part={a10} +50\n{}end of proj/big.txt lines 801-880 of 900 — next: \
+             lines=881-900\n",
+            blocks(&doc, 10..11, source)
+        ),
     );
-    let expected = format!(
-        "\n```text file=proj/big.txt page=6 pages=6 lines=900\n{}```\n\
-         end of proj/big.txt page 6 of 6 — the last page\n",
-        units(&doc, 10..12)
-    );
-    assert_eq!(last.as_str().unwrap(), expected);
-    assert_eq!(clamped.as_str().unwrap(), expected, "clamps to page 6");
-
-    // A `line` reads the page holding it, whatever `page` says: line 850 is
-    // in part 10 (lines 801-880), on page 6.
-    let by_line = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "big.txt", "page": 1, "line": 850}),
-        &ctx,
-    );
-    assert_eq!(by_line.as_str().unwrap(), expected);
+    assert!(read("9999").starts_with("proj/big.txt has 900 lines\n```text file=proj/big.txt"));
+    assert!(read("9999").ends_with("end of proj/big.txt lines 881-900 of 900 — the end of the file\n"));
 }
 
-/// A line between parts reads as the part after it, and a line past the end
-/// as the last.
+/// **A one-line read says which part and line it is**, and a blank line
+/// between parts says so.
 #[test]
-fn read_by_line_names_the_page_of_the_part_it_falls_in() {
+fn a_one_line_read_names_its_part_and_line() {
     let dir = tempfile::tempdir().unwrap();
     let body: String = (0..300).map(|i| format!("para {i}\n\n")).collect();
     write_disk(&harness::repo_root(dir.path()), "p.md", &body);
     let ctx = harness::workspace_ctx(dir.path());
     let doc = Doc::new("p.md", &body);
-    let page_with = |unit: usize| {
-        pages(&doc, PAGE_LINES)
-            .iter()
-            .position(|p| p.contains(&unit))
-            .unwrap()
-            + 1
+    let read = |line: usize| {
+        harness::invoke_with_ctx(
+            "file_read",
+            json!({"repo": REPO, "path": "p.md", "lines": line.to_string()}),
+            &ctx,
+        )
+        .as_str()
+        .unwrap()
+        .to_string()
     };
-    for (line, unit) in [(1, 0), (2, 1), (401, 200), (600, 299), (9999, 299)] {
+    let a = |i: usize| doc.units()[i].anchor.clone();
+    assert!(read(1).starts_with(&format!("line 1 is part={} +1\n", a(0))));
+    assert!(read(401).starts_with(&format!("line 401 is part={} +1\n", a(200))));
+    for blank in [2, 600] {
+        assert!(
+            read(blank).starts_with(&format!("line {blank} is a blank line between parts\n")),
+            "line {blank}"
+        );
+    }
+    assert!(read(9999).starts_with("proj/p.md has 600 lines\n"));
+}
+
+/// **A list names every part in one line**, and a page past its end reads the
+/// last page rather than nothing, which a model would read as "the file is
+/// empty".
+#[test]
+fn a_list_names_the_parts_and_clamps_past_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=900).map(|i| format!("line {i}\n")).collect();
+    write_disk(&harness::repo_root(dir.path()), "big.txt", &body);
+    let ctx = harness::workspace_ctx(dir.path());
+    let doc = Doc::new("big.txt", &body);
+    let entries: String = (0..12).map(|i| entry(&doc, i)).collect();
+    let expected = format!(
+        "proj/big.txt: 900 lines in 12 parts. Read one with `part`, or a run of them with \
+         `lines`.\n{entries}end of the parts of proj/big.txt page 1 of 1 — the last page\n"
+    );
+    for page in [1, 99] {
         let resp = harness::invoke_with_ctx(
             "file_read",
-            json!({"repo": REPO, "path": "p.md", "page": 1, "line": line}),
+            json!({"repo": REPO, "path": "big.txt", "list": page}),
             &ctx,
         );
-        let fence = format!("page={} ", page_with(unit));
-        assert!(resp.as_str().unwrap().contains(&fence), "line {line}");
+        assert_eq!(resp.as_str().unwrap(), expected, "list {page}");
     }
+    assert!(entries.starts_with(&format!(
+        "part={} lines=1-80 line 1\npart={} lines=81-160 line 81\n",
+        doc.units()[0].anchor,
+        doc.units()[1].anchor
+    )));
 }
 
-/// **There is no page 0**: a read of one is refused with a reason, never read
-/// as the first page or the last.
-#[test]
-fn read_page_zero_is_refused() {
-    let dir = workspace();
-    let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
-        &ctx,
-    );
-    harness::expect_error(&resp, "invalid_arguments");
-}
-
-/// A page past the end of a single-page file clamps to page 1 rather than
-/// returning nothing, which a model would read as "the file is empty".
-#[test]
-fn read_past_the_end_clamps_into_the_file() {
-    let dir = workspace();
-    let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 9999}),
-        &ctx,
-    );
-    let text = resp.as_str().unwrap();
-    assert!(
-        text.starts_with("\n```rust file=proj/src/main.rs page=1 pages=1 lines=3\n"),
-        "{text:.60}"
-    );
-}
-
-/// **The read fence is the only place a file's length is reported, so it has to
-/// be right for every shape of ending.**
+/// **A read's closing line is the only place a file's length is reported, so
+/// it has to be right for every shape of ending.**
 ///
-/// A listing carries no line count, so the fence's `lines=N` is the single source
-/// of a file's length — the number the model pages against — and an off-by-one over
-/// a trailing newline would misplace the last range of every file.
+/// A listing carries no line count, so the closing line's `of N` is the single
+/// source of a file's length — the number the model reads on against — and an
+/// off-by-one over a trailing newline would misplace the last range of every
+/// file.
 #[test]
-fn the_read_fence_reports_the_files_true_length() {
+fn the_read_reports_the_files_true_length() {
     let dir = tempfile::tempdir().unwrap();
     let root = harness::repo_root(dir.path());
     // Each shape that has ever made a line count ambiguous.
@@ -779,41 +780,47 @@ fn the_read_fence_reports_the_files_true_length() {
     let ctx = harness::workspace_ctx(dir.path());
 
     for (name, _, expected) in cases {
-        // Every case fits on page 1, so this is always the whole file — the
-        // fence's `lines=N` is stated unconditionally either way.
+        // Every case is short, so a list reads it whole and closes stating its
+        // length — or, with nothing but blank lines, says how many.
         let resp = harness::invoke_with_ctx(
             "file_read",
-            json!({"repo": REPO, "path": name, "page": 1}),
+            json!({"repo": REPO, "path": name, "list": 1}),
             &ctx,
         );
         let text = resp.as_str().unwrap();
-        // The fence line ends "page=P pages=M lines=N" — `lines=` names the file's
-        // true length.
         let total: i64 = text
-            .split_once(" lines=")
-            .and_then(|(_, rest)| rest.split_once('\n'))
-            .map(|(n, _)| n.parse().unwrap())
-            .unwrap_or_else(|| panic!("{name}: fence carries no `lines=N`: {text:?}"));
+            .lines()
+            .find(|l| l.starts_with("end of "))
+            .and_then(|l| l.split_once(" — "))
+            .and_then(|(said, _)| said.rsplit_once(" of "))
+            .map(|(_, n)| n.parse().unwrap())
+            .or_else(|| {
+                text.split_once("holds no text — ")
+                    .and_then(|(_, rest)| rest.split_once(' '))
+                    .map(|(n, _)| n.parse().unwrap())
+            })
+            .unwrap_or_else(|| panic!("{name}: the read states no length: {text:?}"));
         assert_eq!(
             total, expected,
-            "{name}: fence total {total} != true length {expected}",
+            "{name}: stated length {total} != true length {expected}",
         );
     }
 }
 
-/// An empty file reads as empty rather than as an impossible page.
+/// An empty file reads as empty rather than as an impossible range.
 #[test]
 fn read_of_an_empty_file_reports_empty() {
     let dir = workspace();
     write_disk(&harness::repo_root(dir.path()), "blank.rs", "");
     let ctx = ctx_for(&dir);
-    let resp = harness::invoke_with_ctx(
-        "file_read",
-        json!({"repo": REPO, "path": "blank.rs", "page": 1}),
-        &ctx,
-    );
-    assert_eq!(
-        resp.as_str().unwrap(),
-        "\n```rust file=proj/blank.rs lines=0\n```\nend of proj/blank.rs\n"
-    );
+    for args in [
+        json!({"repo": REPO, "path": "blank.rs", "list": 1}),
+        json!({"repo": REPO, "path": "blank.rs", "lines": "1"}),
+    ] {
+        let resp = harness::invoke_with_ctx("file_read", args, &ctx);
+        assert_eq!(
+            resp.as_str().unwrap(),
+            "proj/blank.rs holds no text — 0 line(s), all blank.\n"
+        );
+    }
 }

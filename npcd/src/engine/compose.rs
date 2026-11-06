@@ -29,7 +29,7 @@
 //! instead, and writes it whole.
 
 use candle_conversation::stencil::{Param, ThinkMode, ToolSpec};
-use doc_units::render::units;
+use doc_units::render::{blocks, Source};
 use doc_units::{apply, Doc};
 use serde_json::{json, Map, Value};
 
@@ -114,12 +114,16 @@ pub fn question(
     }
     let standing = standing.map(str::trim).filter(|t| !t.is_empty());
     if let Some(text) = standing {
-        // Each paragraph under its anchor, as a read shows it: what a `mend`
-        // names (`docs/npcd_anchored_edits.md` §7).
+        // Each paragraph a block naming its anchor, as a read shows it: what a
+        // `mend` names (`docs/npcd_anchored_edits.md` §7).
         let doc = Doc::new(writes, text);
+        let source = Source {
+            file: writes,
+            tag: "markdown",
+        };
         q.push_str(&format!(
-            "\n# `{writes}` as it stands, each paragraph under its anchor\n\n{}",
-            units(&doc, 0..doc.units().len())
+            "\n# `{writes}` as it stands, each paragraph a block naming its anchor\n\n{}",
+            blocks(&doc, 0..doc.units().len(), source)
         ));
     }
     let length = match min_words {
