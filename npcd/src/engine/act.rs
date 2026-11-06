@@ -324,7 +324,7 @@ fn function_blocks_to_lines(s: &str, tools: &[ToolSpec]) -> Option<String> {
         out.push('\n');
         rest = &block[read.end..];
     }
-    out
+    Some(out)
 }
 /// Every well-formed call in a decode, by whatever name it uses.
 ///
