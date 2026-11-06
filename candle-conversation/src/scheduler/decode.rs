@@ -1741,14 +1741,12 @@ impl Scheduler {
                         // answer: an end straight after the reasoning ends the
                         // turn as it stands. A replayed turn plays what its
                         // recording holds, the tail's text included.
-                        let ends = self.eos_tokens.contains(&token)
-                            && state.recorded_reply.is_none();
+                        let ends =
+                            self.eos_tokens.contains(&token) && state.recorded_reply.is_none();
                         let tail = match ends {
                             true => state.triggers.tail_driver().filter(|_| {
-                                let after = after_reasoning(
-                                    &state.generated_tokens,
-                                    state.think_close_at,
-                                );
+                                let after =
+                                    after_reasoning(&state.generated_tokens, state.think_close_at);
                                 answered(after, |run| {
                                     self.tokenizer.decode(run, false).unwrap_or_default()
                                 })
