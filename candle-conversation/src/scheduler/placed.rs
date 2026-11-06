@@ -11,9 +11,36 @@ use candle_transformers::models::piece_key::PieceKey;
 use super::{ConversationError, Scheduler, SequenceId};
 use crate::conversation::window_sealed_tokens;
 use crate::index_pages;
-use crate::placed_span::PlacedSpan;
+use crate::placed_span::{span_at, PlacedSpan};
 
 impl Scheduler {
+    /// Place every span a prefill has stopped at, and move the prefill past it.
+    ///
+    /// Run as a wave group forms, never as one completes: pushing a span's
+    /// index pages places them in the index tenant, which a forward in flight
+    /// refuses (the arena frontier is the forward's while it runs), and a group
+    /// completes inside the step whose forward is still running.
+    pub(super) fn place_reached_spans(&mut self) {
+        for i in 0..self.active_prefills.len() {
+            let p = &self.active_prefills[i];
+            if p.error.is_some() || p.finished.is_some() {
+                continue;
+            }
+            let Some(span) = span_at(&p.work.placed_spans, p.offset).cloned() else {
+                continue;
+            };
+            let seq = p.work.sequence_id;
+            if let Err(e) = self.place_span(seq, &span) {
+                self.active_prefills[i].error = Some(e);
+                continue;
+            }
+            let placed: Vec<u32> =
+                self.active_prefills[i].work.tokens[span.tokens.clone()].to_vec();
+            Self::record_slot_tokens(&mut self.slot_tokens, seq, &placed);
+            self.active_prefills[i].offset = span.tokens.end;
+        }
+    }
+
     /// Place `span` on `seq`, whose prefill has just reached its start.
     ///
     /// Everything that can refuse is read before the slot is touched: the

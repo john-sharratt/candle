@@ -3847,6 +3847,8 @@ impl Scheduler {
     /// Members are ordered prefills-then-sections and this order is then fixed for
     /// the group's life (the held residual depends on a stable input order).
     fn form_wave_group(&mut self, include_sections: bool) {
+        // A prefill that stopped at a placed span takes it before it rides on.
+        self.place_reached_spans();
         // ── Dialogue prefills creep in bounded chunks ────────────────────────
         //
         // Each takes at most `max_prefill_pass_tokens` rows, packed under that
@@ -4586,28 +4588,10 @@ impl Scheduler {
                         seq_id,
                         &chunk_tokens,
                     );
+                    // A placed span beginning here goes in as the next group
+                    // forms (`place_reached_spans`), when no forward owns the
+                    // partition.
                     self.active_prefills[i].offset = end;
-                    // A placed span begins here: its K/V goes in now, every
-                    // layer having run the chunk before it, and the prefill
-                    // carries on from its end.
-                    let placed =
-                        placed_span::span_at(&self.active_prefills[i].work.placed_spans, end)
-                            .cloned();
-                    if let Some(span) = placed {
-                        if let Err(e) = self.place_span(seq_id, &span) {
-                            self.active_prefills[i].error = Some(e);
-                            continue;
-                        }
-                        let placed_tokens: Vec<u32> =
-                            self.active_prefills[i].work.tokens[span.tokens.clone()].to_vec();
-                        super::Scheduler::record_slot_tokens(
-                            &mut self.slot_tokens,
-                            seq_id,
-                            &placed_tokens,
-                        );
-                        self.active_prefills[i].offset = span.tokens.end;
-                    }
-                    let end = self.active_prefills[i].offset;
                     if end < total {
                         // More to prefill: report progress and ride the next group.
                         let _ = self.active_prefills[i].work.event_tx.send(
