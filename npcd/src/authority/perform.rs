@@ -28,6 +28,8 @@ use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
 use crate::engine::{body, build};
 
+use crate::engine::tools;
+
 /// An act made, for the feed and the character, and whether it moved the
 /// character's mission.
 #[derive(Debug, Clone)]
@@ -115,7 +117,12 @@ impl Runtime {
                 decided,
                 pinned_at,
             } => {
-                let act = act_of(&call).map_err(|why| anyhow::anyhow!("{why}"))?;
+                // The call line was decoded on another member, whose `Within`
+                // never crosses the wire, so the catalog read with is the whole
+                // one — the list the sender's grammar was drawn from, and the
+                // one `specs_within` is the room-narrowed fallback of. What it
+                // decides here is only where a function block's values end.
+                let act = act_of(&call, &tools::specs()).map_err(|why| anyhow::anyhow!("{why}"))?;
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
                 let body = self.body_of(npc);
                 if let (Some((hosted, body)), Some((at, company))) = (&body, decided) {

@@ -100,9 +100,15 @@ whole, as it decoded.
 `</tool_call>` only after a real `</function>`, by the shared rule.
 
 **npcd, in the same change.** `npcd/src/engine/act.rs` moves onto the shared
-reader. Its parse names no catalog, so it closes a value on either tag
-(`Follows::Either`): a character's last value holding another element's tags
-is split there.
+reader, and it reads with the catalog its grammar was compiled from: `parse`
+and `raw_calls` take `&[ToolSpec]`, and every caller passes the list its own
+decode was built from — the acting turn and the probe the list
+`specs_within` built the turn's grammar from (`mind::act_specs`), a question
+its one `answer` spec, a composition sitting `draft` plus `mend` with the
+piece's anchors, the authority's forwarded call the whole catalog (the
+sender's `Within` never crosses the wire). A character's last value holding
+another element's tags therefore reads back whole, as it decoded
+(`a_last_value_holding_another_elements_tags_reads_whole`).
 
 **Tests, byte for byte**
 

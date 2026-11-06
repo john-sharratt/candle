@@ -142,7 +142,10 @@ mod tests {
                 CATALOG.iter().all(|c| c.name != call),
                 "`{call}` must not be in the world catalog: `act::parse` would accept it live"
             );
-            let parsed = act::parse(&format!(r#"{{"tool": "{call}"}}"#));
+            // No catalog: the point of the test is that these are in no world
+            // catalog at all, and the fixture is a bare JSON line, so no
+            // function block is read here either way.
+            let parsed = act::parse(&format!(r#"{{"tool": "{call}"}}"#), &[]);
             assert!(parsed.acts.is_empty(), "`{call}` became an act");
             assert!(
                 matches!(&parsed.rejected[..], [Rejected::UnknownTool { tool }] if tool == call),

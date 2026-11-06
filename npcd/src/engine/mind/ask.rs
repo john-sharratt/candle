@@ -73,9 +73,12 @@ pub fn answer_spec(choices: &[String]) -> anyhow::Result<ToolSpec> {
     })
 }
 
-/// Read an answer out of a decode. `None` when the decode holds no `answer` call.
-pub fn read_answer(raw: &str) -> Option<(String, Option<String>)> {
-    let (_, args) = act::raw_calls(raw)
+/// Read an answer out of a decode. `None` when the decode holds no `answer`
+/// call. `tools` is the catalog the answer's grammar was compiled from — the
+/// one spec, as its caller built it — so a value holding another element's tags
+/// reads back whole rather than split.
+pub fn read_answer(raw: &str, tools: &[ToolSpec]) -> Option<(String, Option<String>)> {
+    let (_, args) = act::raw_calls(raw, tools)
         .into_iter()
         .find(|(name, _)| name == ANSWER_TOOL)?;
     let text = |key: &str| match args.get(key) {
@@ -117,7 +120,8 @@ impl Minds {
         choices: &[String],
     ) -> anyhow::Result<Answer> {
         let started = Instant::now();
-        let tree = self.answer_tree(&[answer_spec(choices)?])?;
+        let spec = answer_spec(choices)?;
+        let tree = self.answer_tree(&[spec.clone()])?;
         let put = Put {
             scope: AskScope::Whole,
             tree,
@@ -126,7 +130,8 @@ impl Minds {
         let text = self
             .ask_under(npc_id, persona, within, question, put)
             .await?;
-        let (answer, reason) = read_answer(&text)
+        // Read it back with the same one spec the grammar was compiled from.
+        let (answer, reason) = read_answer(&text, &[spec])
             .ok_or_else(|| anyhow::anyhow!("no answer call in the reply: {}", text.trim()))?;
         Ok(Answer {
             answer,
@@ -238,7 +243,7 @@ mod tests {
 <tool_call>
 {"name": "answer", "arguments": {"value": "lost", "reason": "I do not know this room."}}
 </tool_call>"#;
-        let (value, reason) = read_answer(raw).expect("an answer");
+        let (value, reason) = read_answer(raw, &[answer_spec(&[]).unwrap()]).expect("an answer");
         assert_eq!(value, "lost");
         assert_eq!(reason.as_deref(), Some("I do not know this room."));
     }
@@ -248,11 +253,17 @@ mod tests {
         let raw = r#"<tool_call>
 {"name": "answer", "arguments": {"value": "yes"}}
 </tool_call>"#;
-        assert_eq!(read_answer(raw), Some(("yes".to_string(), None)));
+        assert_eq!(
+            read_answer(raw, &[answer_spec(&[]).unwrap()]),
+            Some(("yes".to_string(), None))
+        );
     }
 
     #[test]
     fn a_reply_with_no_answer_call_reads_as_none() {
-        assert_eq!(read_answer("I am fine."), None);
+        assert_eq!(
+            read_answer("I am fine.", &[answer_spec(&[]).unwrap()]),
+            None
+        );
     }
 }

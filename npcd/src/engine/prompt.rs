@@ -714,7 +714,7 @@ pub fn build_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tools::{by_name, for_mode, CATALOG};
+    use crate::engine::tools::{by_name, for_mode, specs, CATALOG};
 
     /// The shape the shipped checkpoint is held to. Tests that are not about
     /// the call format use this so they read the prompt a live character reads.
@@ -1160,7 +1160,9 @@ mod tests {
 
             // And what it shows is a call the parser reads back as one act —
             // the round trip the old test only did half of.
-            let p = act::parse(&shown);
+            // The prompt is built from the whole catalog, so the parse reads
+            // with the same list.
+            let p = act::parse(&shown, &specs());
             assert_eq!(
                 p.acts.len(),
                 1,
