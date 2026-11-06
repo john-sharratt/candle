@@ -16,7 +16,6 @@ use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
 use super::wave_logits::WaveLogits;
 use super::*;
-use crate::placed_span;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
 use crate::recurrent_span::{snap_advance, span_at, ArmKind};
@@ -3847,8 +3846,6 @@ impl Scheduler {
     /// Members are ordered prefills-then-sections and this order is then fixed for
     /// the group's life (the held residual depends on a stable input order).
     fn form_wave_group(&mut self, include_sections: bool) {
-        // A prefill that stopped at a placed span takes it before it rides on.
-        self.place_reached_spans();
         // ── Dialogue prefills creep in bounded chunks ────────────────────────
         //
         // Each takes at most `max_prefill_pass_tokens` rows, packed under that
@@ -4163,7 +4160,6 @@ impl Scheduler {
                 continue;
             };
             let p = &self.active_prefills[i];
-            *advance = placed_span::snap_advance(&p.work.placed_spans, p.offset, *advance);
             *advance = snap_advance(&p.work.recurrent_spans, p.offset, *advance);
             let Some(span) = span_at(&p.work.recurrent_spans, p.offset).cloned() else {
                 continue;
@@ -4560,23 +4556,6 @@ impl Scheduler {
                     let seq_id = self.active_prefills[i].work.sequence_id;
                     let off = self.active_prefills[i].offset;
                     let end = (off + advance).min(total);
-                    // A chunk that ran over a placed span forwarded what was to
-                    // be placed: every group is cut at a span's start, so this is
-                    // a group formed without the cut, refused rather than taken
-                    // as a prefill of the span.
-                    if let Some(span) = self.active_prefills[i]
-                        .work
-                        .placed_spans
-                        .iter()
-                        .find(|s| off < s.tokens.start && end > s.tokens.start)
-                    {
-                        let why = format!(
-                            "the prefill chunk {off}..{end} ran over the placed span at {:?}",
-                            span.tokens
-                        );
-                        self.active_prefills[i].error = Some(ConversationError::Other(why));
-                        continue;
-                    }
                     if let Err(e) = self.session.advance_sequence(seq_id.0, end - off) {
                         self.active_prefills[i].error = Some(ConversationError::Model(e));
                         continue;
@@ -4588,9 +4567,6 @@ impl Scheduler {
                         seq_id,
                         &chunk_tokens,
                     );
-                    // A placed span beginning here goes in as the next group
-                    // forms (`place_reached_spans`), when no forward owns the
-                    // partition.
                     self.active_prefills[i].offset = end;
                     if end < total {
                         // More to prefill: report progress and ride the next group.
@@ -7175,7 +7151,6 @@ mod wave_chunk_tests {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
-                placed_spans: Vec::new(),
             },
             offset: 0,
             next_projection: 0,

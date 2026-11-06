@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::chat::{apply_tools_dial, dial_selection};
-use crate::session::diag::{DiagRun, DiagSpec, NamedBlock, PlacedBlock, Splice};
+use crate::session::diag::{DiagRun, DiagSpec, NamedBlock, Splice};
 use crate::session::{ReplaySampling, ZendSession};
 use crate::types::ToolMode;
 
@@ -53,10 +53,6 @@ pub struct RunBody {
     /// `{name, block}`: that block takes an earlier run's capture.
     #[serde(default)]
     pub merge: Vec<NamedBlock>,
-    /// `{block, source, edge}`: that block's body is placed from timeline
-    /// `source`, `edge` grid steps of each end prefilled.
-    #[serde(default)]
-    pub placed: Vec<PlacedBlock>,
 }
 
 #[derive(Deserialize)]
@@ -118,7 +114,6 @@ pub async fn start(
                 splices: r.splices.clone(),
                 capture: r.capture.clone(),
                 merge: r.merge.clone(),
-                placed: r.placed.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()

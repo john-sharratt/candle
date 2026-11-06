@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::config::SamplingConfig;
-use crate::placed_span::PlacedText;
 use crate::projection::SelectionState;
 use crate::recurrent_span::TextSpan;
 use crate::stencil::{StencilTree, TriggerRegistry};
@@ -132,11 +131,6 @@ pub struct TurnOptions {
     /// before `Done` — or replayed from a record
     /// (`docs/recurrent_reply_calibration.md`).
     pub recurrent_spans: Vec<TextSpan>,
-
-    /// Runs of the user half whose K/V is placed from another conversation's
-    /// turn holding the same text, their edges prefilled
-    /// (`docs/inline_read_injection.md`).
-    pub placed: Vec<PlacedText>,
 }
 
 impl TurnOptions {

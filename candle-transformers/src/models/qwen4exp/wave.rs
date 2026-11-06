@@ -27,7 +27,6 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -56,7 +55,6 @@ use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
 };
-use super::page_slice::slice_page;
 use super::paged_index;
 use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
@@ -2854,10 +2852,6 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     fn push_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<bool> {
         Qwen4ExpBatched::push_positional_state(self, seq, blob, key)?;
         Ok(true)
-    }
-
-    fn slice_positional_page(&self, page: &[u8], tokens: Range<usize>) -> Result<Option<Vec<u8>>> {
-        slice_page(page, &self.attention_ratios(), tokens).map(Some)
     }
 
     fn positional_lift_bytes(&self, page: &[u8], key: &PieceKey) -> Result<usize> {

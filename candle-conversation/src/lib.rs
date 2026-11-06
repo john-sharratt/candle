@@ -99,7 +99,6 @@ pub mod profile {
     };
 }
 pub mod engine_slot;
-pub mod placed_span;
 pub mod prompts;
 pub mod provenance;
 mod recorded_reply;
