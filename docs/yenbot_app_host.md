@@ -316,7 +316,7 @@ the app gets 403, and an account not yet approved gets nothing but `/me`
 | `POST /push/subscribe`, `DELETE /push/subscribe` | Register or remove this device for notifications (§11). |
 | `GET /inbox`, `POST /inbox/<id>/read` | The account's notifications (§11). |
 | `GET/PUT /settings/<app>` | A small per-app, per-account settings object. |
-| `GET /library?kind=…&tag=…` | The art library's catalogue (§15). |
+| `GET /library?kind=…&tag=…&colour=…` | The art library's pictures, each with its sizes' addresses; no account needed (§15). |
 | `GET /export/<app>`, `POST /import/<app>` | An app's data as JSON or CSV, out and back in (§20.1). |
 | `POST /opens/<app>` | The framework records that this account opened the app (§20.3). |
 | `GET/POST /google/<app>/connect`, `GET /google/<app>/status` | Connect this account's Google services for the app, and whether they are (§19.3). |
@@ -1043,11 +1043,14 @@ it is made and every app looks like part of one site:
 
 | Kind | What it is | Sizes |
 |---|---|---|
-| `tiles` | App icons for the landing page: one subject on a soft shape, in the palette's accents | 512, 256, 128 |
-| `illustrations` | Scenes for headers and onboarding: cooking, school, garden, travel, money, health, family, celebration… | 1600×900 and 800×450 |
-| `empty` | Empty-state art: "nothing here yet" for lists, photos, messages, search, inbox | 600×450 |
-| `backgrounds` | Soft textures and gradients behind a page or a card | 1600×1600, tiling where marked |
-| `stickers` | Small cut-out objects and badges: stars, hearts, ticks, trophies, food, animals | 256 with transparency |
+| `tiles` | App icons for the landing page: one subject, full bleed on a flat palette colour; the page rounds the corners | 512, 256, 128 |
+| `illustrations` | Scenes for headers and onboarding: cooking, school, garden, travel, money, health, family, celebration… | 1024×576 and 512×288 |
+| `empty` | Empty-state art: "nothing here yet" for lists, photos, messages, search, inbox | 600×450 and 300×225 |
+| `backgrounds` | Soft textures and gradients behind a page or a card | 1024×1024 and 512, tiling where marked |
+| `stickers` | Small cut-out objects and badges: stars, hearts, ticks, trophies, food, animals | 256 and 128 with transparency |
+
+The image model draws at most 1024 a side, so no size is larger than what
+it draws: a picture is never scaled up.
 
 The interface's own icons are not pictures: they stay the vector set in the
 design system (§8.5).
@@ -1057,26 +1060,39 @@ design system (§8.5).
 With Zen's image engine, through the MCP's `image_generate` and `image_edit`
 — drawn by Claude while building, the same way Yen's apps are built. Every
 picture is drawn to the **house style**, written once in
-`docs/library.md`: the palette (the design tokens' colours by name), the
-light, the rendering (a soft, rounded, gently lit illustration style, the
-same for every kind), what never appears (text, logos, photographs of real
-people), and a fixed preamble every prompt begins with. Pictures are drawn in
-families — one prompt, varied seeds — and the best of each is kept.
+`docs/library.md`: a soft flat vector style — simple rounded shapes, no
+outlines, two-tone shading, a soft long shadow, light from the upper left —
+in the palette (the design tokens' colours by name), the same for every kind;
+what never appears (text, logos, photographs, real people's likenesses); and
+a fixed prompt around the subject — an opening sentence per kind, which sets
+the frame, and one closing paragraph for every picture. The image model
+varies little with the seed, so a family is drawn by varying the subject's
+description, and the best of each is kept. A sticker is drawn on plain grey
+and its background removed (`image_edit`).
 
-A kept picture is committed once, at full size, as `library/<kind>/<id>.png`,
-with a line in `library/catalogue.yaml`: its kind, tags, prompt and seed, so
-any picture can be drawn again in kind. Pictures are binary, so a Zen task
-commits them (§17.7) — the worker takes the link `image_generate` answered
-with. The platform does the rest on load: it sizes each picture to its kind's
-sizes as WebP (PNG where transparency needs it), reads its dominant colour,
-and caches the results; a catalogue line naming a picture that is not there,
-or a picture with no line, is refused by the gate.
+A kept picture is committed once, as it was drawn, as
+`library/<kind>/<id>.png`, with a line in `library/catalogue.yaml`: its kind,
+tags, prompt and seed, so any picture can be drawn again in kind. Pictures
+are binary, so a Zen task commits them (§17.7) — the worker takes the link
+`image_generate` answered with. The platform does the rest on load: it cuts
+each picture to its kind's shape and sizes it to its kind's sizes as lossless
+WebP — flat art compresses well without loss, and WebP keeps a sticker's
+transparency, so one format serves every kind — reads its dominant colour
+(the most common among its saturated pixels, so the subject rather than its
+cream ground) and the palette colour nearest it, and caches the results by
+the picture's content. On a change to `library/`, the gate refuses a
+catalogue that does not parse, a line naming a picture that is not there, a
+picture with no line, and anything else in the folder; and it checks every
+app with the change, since an app may name a picture it took out.
 
 ### 15.3 How apps use it
 
 `/_library` shows the whole library, searchable by kind, tag and colour, for
-Claude and for Yen. An app names pictures by id —
-`<yen-empty art="no-recipes">`, `tile: library/tiles/bell-coral`,
+Claude and for Yen; `GET /api/v1/library` is the same search, and each
+picture is served at `/_library/<kind>/<id>-<width>.webp`. Neither needs an
+account: the library is the site's own, like its framework. An app names
+pictures by id — `<yen-empty art="no-recipes">`,
+`tile: library/tiles/bell-coral`, an address,
 `app.library.find({ kind: "illustrations", tag: "cooking" })` — and the check
 refuses a name not in the catalogue. A picture an app needs that is not in the
 library is drawn to the house style and added to the library, not to the app,
@@ -1084,10 +1100,14 @@ so the next app has it too.
 
 ### 15.4 The first library
 
-Drawn before the first app: sixty tiles across the palette's accents, thirty
-illustrations across the subjects above, twenty empty states, twelve
-backgrounds and fifty stickers — about 170 pictures, enough that the
-templates (§16) and a first app need nothing drawn.
+Drawn before the first app: sixteen tiles, two in each of the palette's
+eight colours, for the apps a family makes first (recipes, shopping, lists,
+a planner, reminders, a journal, photos, money, a garden, health, school,
+travel, a tracker, an assistant, a picture maker, a daily digest); ten
+illustrations across the subjects above; eight empty states; four
+backgrounds; and twelve stickers — fifty pictures, enough that the templates
+(§16) and a first app need nothing drawn. The library grows from there one
+picture at a time, as apps need them.
 
 ## 16. Templates
 
@@ -1527,6 +1547,14 @@ Taken 2026-11-06:
 - **No approvals** anywhere in the iteration.
 - **The connector's guide is short** and points into the repository's
   `docs/`, which derive from this design.
+
+Taken 2026-11-07:
+
+- **The house style is soft flat vector** (§15.2).
+- **The library's sizes are what the image model draws** — 1024 at most a
+  side — and nothing is scaled up (§15.1).
+- **The first library is fifty pictures**, grown one picture at a time as
+  apps need more (§15.4).
 
 ## 24. Order of work
 
