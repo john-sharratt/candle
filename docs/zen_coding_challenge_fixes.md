@@ -622,10 +622,13 @@ origin's."*
 
 **Decision.** A nudge or a reply arrives with its sender's name: the
 caller's display name, or "the agent that started this task". The worker's
-prompt gives it in that form.
+prompt gives it in that form. So does the answer check's send-back
+(`workers::SENT_BACK`, "From zend, which checked your answer — not the
+user"): in the second challenge round a researcher sent back for its `Steps:`
+section journaled it as "the Steps: accounting the user asked for".
 
 **Where.** `workers::nudge` and the reply path in `zend/src/mcp/workers.rs`,
-where the queued text is delivered.
+where the queued text is delivered, and the send-back in `workers::run`.
 
 ## Cause 8 — refusals without a way on
 

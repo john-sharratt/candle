@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::driver::StencilDriver;
 use super::held_arms::HeldBranches;
+use super::held_values::HeldValues;
 use super::session::StencilSession;
 use super::tree::StencilTree;
 use super::vocab::TokenId;
@@ -30,6 +31,9 @@ struct Binding {
     held: Option<Arc<HeldBranches>>,
     min_reasoning: u32,
     unreasoned: Option<Arc<HeldBranches>>,
+    /// The values the walk's keyed fields are held to (see
+    /// [`TriggerRegistry::holding_values`]).
+    values: Option<Arc<HeldValues>>,
 }
 
 impl Binding {
@@ -40,6 +44,7 @@ impl Binding {
             held: None,
             min_reasoning: 0,
             unreasoned: None,
+            values: None,
         }
     }
 }
@@ -138,6 +143,19 @@ impl TriggerRegistry {
         TriggerRegistry { by_token }
     }
 
+    /// A copy of this registry in which every walk `token` starts holds its
+    /// keyed fields to `values` ([`StencilDriver::hold_values`],
+    /// `docs/stencil_tree.md` §9.2). An unbound `token` leaves the registry as
+    /// it is.
+    #[must_use]
+    pub fn holding_values(&self, token: TokenId, values: Arc<HeldValues>) -> Self {
+        let mut by_token = self.by_token.clone();
+        if let Some(binding) = by_token.get_mut(&token) {
+            binding.values = Some(values);
+        }
+        TriggerRegistry { by_token }
+    }
+
     /// The tree `token` starts, when it is a trigger.
     pub fn tree_for(&self, token: TokenId) -> Option<&Arc<StencilTree>> {
         self.by_token.get(&token).map(|b| &b.tree)
@@ -190,6 +208,9 @@ impl TriggerRegistry {
             };
             if let Some(held) = held {
                 driver.hold_branches(Arc::clone(held));
+            }
+            if let Some(values) = &b.values {
+                driver.hold_values(Arc::clone(values));
             }
             driver
         })

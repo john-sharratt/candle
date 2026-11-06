@@ -30,6 +30,7 @@
 //! [`observe`]: StencilSession::observe
 
 mod builder;
+mod call_so_far;
 mod compile;
 mod driver;
 pub mod element_close;
@@ -38,6 +39,7 @@ mod error;
 mod field_order;
 mod function_block;
 mod held_arms;
+mod held_values;
 mod json_lexer;
 mod mask;
 mod named_arm;
@@ -59,6 +61,8 @@ mod edge_tests;
 #[cfg(test)]
 mod held_tests;
 #[cfg(test)]
+mod held_values_tests;
+#[cfg(test)]
 mod invoke_body_tests;
 #[cfg(test)]
 mod shaped_params_tests;
@@ -75,6 +79,7 @@ pub use driver::{Healed, PathStats, StencilDriver, StepMask};
 pub use error::{BuildError, WalkError};
 pub use function_block::function_blocks_to_json;
 pub use held_arms::{held_branches, held_branches_first, HeldBranches};
+pub use held_values::{literal_pattern, FieldHold, HeldValues, ValueHolds};
 pub use mask::{ban, boost, AllowedSet};
 pub use named_arm::{arm_name, named_arm};
 pub use session::{Observe, StencilAction, StencilSession};
@@ -95,7 +100,8 @@ pub use value_rule::ValueRule;
 // depend on `candle-transformers` for one enum.
 pub use candle_transformers::models::dialect::CallStyle;
 pub use tree::{
-    FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree, MAX_STRING_VALUE_TOKENS,
+    FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree, TreeMarks,
+    MAX_STRING_VALUE_TOKENS,
 };
 pub use trie::{Spill, SpillId, Step, TokenTrie, TrieNodeId};
 pub use trigger::TriggerRegistry;

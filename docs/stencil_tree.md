@@ -722,6 +722,54 @@ wasted round, ten or so a day in ingest. The refusal stays in
 `zend::layers::run::only_given` as a check on the hold: a call it refuses got
 past the grammar, a stencil defect, and is logged at `ERROR` rather than run.
 
+### 9.2 Holding a call's values to what exists
+
+A pattern holds a value to a *shape*: `part` to four anchor characters, `from`
+to `+N`. A shape admits values that do not exist — an anchor the file does not
+have, `+40` of a 37-line part — and every one is a refused call, read and
+retried. A model that has decided on a wrong value retries it: live, a coder
+whose reasoning said `+37` wrote `"to": "last"` seven rounds running (a stale
+overlay had given `to` an anchor's pattern, which "last" fits), and only the
+repeat guard ended it. **The grammar, not a guard after it, holds a call to what
+can succeed**: each round, the fields whose values are known are held to those
+values, so a value that does not exist cannot be written, and neither can the
+call that was just refused for one.
+
+- **Every value span carries a key.** The tool-call front-end records, beside
+  each argument's span, `tool.field` (`file_edit.part`; an array's items
+  `tool.field[]`) in the spec's `keys` table, and `compile` carries it to the
+  tree's (`StencilTree::key_of(node)`). Nothing else about the span changes.
+- **A turn's held values** (`HeldValues`, `stencil/held_values.rs`) map a key to
+  the values its span may take, and a value may depend on fields already written
+  in the same call: `file_edit.part` on `repo` and `path`, `from` and `to` on
+  `repo`, `path` and `part`. Each is a `ValueRule` over the literal values,
+  built for the turn with `ValueRule::new` — never `ValueRule::shared`, whose
+  cache keeps every pattern for the process's life and would grow by one per
+  round.
+- **The session holds a keyed span to its held rule** in place of the span's
+  own: entering a span, it looks up the key and the call's written fields
+  (`StencilSession::written`), and walks the held rule when there is one. A key
+  with no held values, or whose fields name nothing held (a file the
+  conversation never read), keeps the span's own rule. Each keyed span's value
+  is recorded as the call writes it, so a later field can depend on it.
+- **What a turn holds is the conversation's own** (`zend/src/held_values.rs`):
+  for each file the conversation has read, grepped or edited, the anchors it
+  carves into now — in the conversation's store, its own edits included — and
+  each part's line count. `file_read.part`, `file_edit.part`, `file_edit.through`
+  and `file_edit.dest` are held to the anchors of the file named;
+  `file_edit.from` and `file_edit.to` to `+1` through the length of the part
+  named.
+- **A refused value is not offered again**, because it is not offered at all:
+  the held values are read again each round from the file as it stands, so an
+  anchor or a line that does not exist — the repeat the guard used to end — is
+  never among them. The files a conversation has read or edited are noted
+  after each round (`FilesSeen::note`), its 32 most recent held.
+
+**Cost.** A held rule is a few literal values: a file of a hundred parts is a
+rule of about four hundred states, under `ValueRule`'s cap of 512 (a file past
+it keeps the pattern). It is built once per round from files already in
+memory, and dropped with the turn.
+
 ---
 
 ## 10. Scheduler integration

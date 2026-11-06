@@ -34,6 +34,7 @@ mod engine_asks;
 pub mod file_commit;
 pub mod hand_records;
 pub mod handover;
+pub mod held_values;
 pub mod ingest;
 pub mod ingest_backlog;
 pub mod ingest_cancel;

@@ -95,6 +95,12 @@ pub fn holding() -> MutexGuard<'static, ()> {
     BEGIN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What a task sent back by its answer's check is told first: who sent it
+/// back. Unheaded, a worker took the check's words for the user's, and its
+/// journal credited the user with asking for them
+/// (`docs/zen_coding_challenge_fixes.md` Cause 7).
+pub const SENT_BACK: &str = "From zend, which checked your answer — not the user:\n\n";
+
 /// What every task's prompt ends with: how to ask Claude instead of guessing.
 /// Asking ends the turn — the worker's last words are the question — so
 /// nothing waits mid-turn, a restart finds a finished turn, and the answer is
@@ -1346,7 +1352,7 @@ async fn run(
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            next = First::Message(format!("{}{ASKING}", told.join("\n\n")));
+            next = First::Message(format!("{SENT_BACK}{}{ASKING}", told.join("\n\n")));
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
             worker.checked = true;

@@ -269,6 +269,14 @@ impl ValueRule {
         Ok(rule)
     }
 
+    /// The rule for `pattern` over `vocab`'s one sorted copy, kept by no cache:
+    /// a rule its caller owns and drops — a turn's held values
+    /// (`docs/stencil_tree.md` §9.2), new each round, which [`Self::shared`]
+    /// would keep for the process's life.
+    pub fn owned(pattern: &str, vocab: &dyn Vocab) -> Result<ValueRule, RuleError> {
+        ValueRule::over(pattern, &shared_sorted(vocab))
+    }
+
     /// The pattern this rule holds to.
     pub fn pattern(&self) -> &str {
         &self.pattern

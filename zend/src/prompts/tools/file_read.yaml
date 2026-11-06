@@ -43,11 +43,9 @@ parameters:
       type: string
     part:
       description: One part, by its four-character anchor — the `part=` of its block, a `file_grep` hit's `part`, a list entry's (e.g. `KehT`). One of `part`, `lines`, `list`.
-      pattern: '[A-Za-z0-9_-]{4}'
       type: string
     lines:
       description: Lines of the file, from 1 — one, `84`, or a range, `120-180` — read as the whole parts they touch, up to 200 lines. One of `part`, `lines`, `list`.
-      pattern: '[1-9][0-9]{0,6}(-[1-9][0-9]{0,6})?'
       type: string
     list:
       description: A page of the list of the file's parts, from 1 — `1` to start; a short file comes back whole. One of `part`, `lines`, `list`.

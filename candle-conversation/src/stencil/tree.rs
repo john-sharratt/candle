@@ -4,6 +4,7 @@
 //! Built once by [`compile`](super::compile::compile) and shared (`Arc`) across
 //! decode sessions.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::terminator::Terminator;
@@ -166,6 +167,21 @@ pub struct StencilTree {
     /// out-of-grammar token is ever decoded (a failsafe — see the session's
     /// bail path).  Empty ⇒ just exit with no closing tokens.
     bail: Vec<TokenId>,
+    /// What the tree knows of a call: which spans write which field, and which
+    /// branches choose its tool.
+    marks: TreeMarks,
+}
+
+/// Which spans write which argument field, and which branches choose a call's
+/// tool (`docs/stencil_tree.md` §9.2).
+#[derive(Debug, Clone, Default)]
+pub struct TreeMarks {
+    pub keys: HashMap<NodeId, Arc<str>>,
+    /// Each name branch's arms: the tokens an arm takes in the branch, and the
+    /// tool it names. By the arm's tokens, not its text: a start every arm
+    /// shares is written before the branch, so its tokens alone may not spell
+    /// the name.
+    pub name_branches: HashMap<NodeId, Arc<HashMap<Vec<TokenId>, Arc<str>>>>,
 }
 
 impl StencilTree {
@@ -176,6 +192,7 @@ impl StencilTree {
         fingerprint: u64,
         label: String,
         bail: Vec<TokenId>,
+        marks: TreeMarks,
     ) -> Self {
         StencilTree {
             nodes,
@@ -184,7 +201,23 @@ impl StencilTree {
             fingerprint,
             label,
             bail,
+            marks,
         }
+    }
+
+    /// The field the span at `node` writes, when it is an argument's value.
+    pub fn key_of(&self, node: NodeId) -> Option<&Arc<str>> {
+        self.marks.keys.get(&node)
+    }
+
+    /// Whether the branch at `node` chooses a call's tool.
+    pub fn is_name_branch(&self, node: NodeId) -> bool {
+        self.marks.name_branches.contains_key(&node)
+    }
+
+    /// The tool the name branch at `node` names when its arm took `tokens`.
+    pub fn tool_named(&self, node: NodeId, tokens: &[TokenId]) -> Option<&Arc<str>> {
+        self.marks.name_branches.get(&node)?.get(tokens)
     }
 
     pub fn root(&self) -> NodeId {

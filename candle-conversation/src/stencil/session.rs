@@ -7,12 +7,14 @@
 
 use std::sync::Arc;
 
+use super::call_so_far::CallSoFar;
 use super::error::WalkError;
+use super::held_values::HeldValues;
 use super::mask::AllowedSet;
 use super::terminator::{Feed, Terminator, TerminatorState};
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::{Spill, Step, TokenTrie, TrieNodeId};
-use super::value_rule::ValueState;
+use super::value_rule::{ValueRule, ValueState};
 use super::vocab::TokenId;
 
 /// What the scheduler should do next for a sequence in a session.
@@ -118,6 +120,14 @@ pub struct StencilSession {
     /// `"]` the end of the array. The next branch offers only what continues
     /// it, because a model asked again from a bare quote answers differently.
     carried: Vec<u8>,
+    /// The values the walk's keyed fields are held to (`docs/stencil_tree.md`
+    /// §9.2).
+    held: Option<Arc<HeldValues>>,
+    /// The rule the current span walks: the turn's held rule for its field
+    /// when it has one, else the span's own.
+    active: Option<Arc<ValueRule>>,
+    /// What the walk has written of the call it is in.
+    call: CallSoFar,
 }
 
 impl StencilSession {
@@ -131,6 +141,39 @@ impl StencilSession {
             rewrite: None,
             value: None,
             carried: Vec::new(),
+            held: None,
+            active: None,
+            call: CallSoFar::default(),
+        }
+    }
+
+    /// Hold every keyed field the walk writes to `held`: entering a span that
+    /// writes a field, the walk takes the turn's held rule for that field —
+    /// given the call's tool and what it has written so far — in place of the
+    /// span's own (`docs/stencil_tree.md` §9.2).
+    pub fn hold_values(&mut self, held: Arc<HeldValues>) {
+        self.held = Some(held);
+    }
+
+    /// The rule the span at `node` walks: the turn's held rule for its field,
+    /// else its own.
+    fn rule_at(&self, node: NodeId, span: &FreeTextSpan) -> Option<Arc<ValueRule>> {
+        let key = self.tree.key_of(node);
+        let held = self
+            .held
+            .as_ref()
+            .zip(key)
+            .and_then(|(held, key)| held.rule_for(self.call.tool(), key, self.call.written()));
+        held.or_else(|| span.rule.clone())
+    }
+
+    /// Enter the span at `node`: take its rule, and begin recording its value
+    /// when it writes a field.
+    fn enter_span(&mut self, node: NodeId, span: &FreeTextSpan) {
+        self.active = self.rule_at(node, span);
+        self.value = Self::value_start(span, self.active.as_ref());
+        if let Some(key) = self.tree.key_of(node) {
+            self.call.open(Arc::clone(key));
         }
     }
 
@@ -235,13 +278,17 @@ impl StencilSession {
                         None => trie.frontier(pos),
                     });
                     self.carried.clear();
+                    if self.tree.is_name_branch(node) {
+                        self.call.begin_naming();
+                    }
                     self.cursor = Cursor::InBranch { node, pos };
                     StencilAction::MaskedDecode(set)
                 }
                 StencilNode::FreeText(span) => {
+                    let span = span.clone();
                     self.carried.clear();
-                    self.value = Self::value_start(span);
-                    let action = Self::span_action(span, 0, self.value);
+                    self.enter_span(node, &span);
+                    let action = Self::span_action(&span, 0, self.value, self.active.as_ref());
                     self.cursor = Cursor::InFreeText {
                         node,
                         term: span.term.start(),
@@ -260,7 +307,7 @@ impl StencilSession {
             }
             Cursor::InFreeText { node, emitted, .. } => {
                 let span = self.free_span(node);
-                Self::span_action(span, emitted, self.value)
+                Self::span_action(span, emitted, self.value, self.active.as_ref())
             }
             Cursor::Bailing => {
                 self.cursor = Cursor::Done;
@@ -275,19 +322,24 @@ impl StencilSession {
         }
     }
 
-    /// Where a value under `span`'s rule starts: past the opening quote when
-    /// the grammar wrote it.
-    fn value_start(span: &FreeTextSpan) -> Option<ValueState> {
-        span.rule.as_ref().map(|_| match span.term {
+    /// Where a value of `span` under `rule` starts: past the opening quote
+    /// when the grammar wrote it.
+    fn value_start(span: &FreeTextSpan, rule: Option<&Arc<ValueRule>>) -> Option<ValueState> {
+        rule.map(|_| match span.term {
             Terminator::JsonString => ValueState::Inside(0),
             _ => ValueState::Open,
         })
     }
 
-    /// What the next token of `span` decodes under: the rule's mask while the
+    /// What the next token of `span` decodes under: `rule`'s mask while the
     /// value stands on it, else free.
-    fn span_action(span: &FreeTextSpan, emitted: u32, value: Option<ValueState>) -> StencilAction {
-        match (&span.rule, value) {
+    fn span_action(
+        span: &FreeTextSpan,
+        emitted: u32,
+        value: Option<ValueState>,
+        rule: Option<&Arc<ValueRule>>,
+    ) -> StencilAction {
+        match (rule, value) {
             (Some(rule), Some(state)) => StencilAction::MaskedDecode(rule.mask(state).clone()),
             _ => Self::free_decode_action(span, emitted),
         }
@@ -435,12 +487,20 @@ impl StencilSession {
         match std::mem::replace(&mut self.cursor, Cursor::Done) {
             Cursor::InBranch { node, pos } => {
                 let step = self.branch_trie(node).step(pos, token);
+                let naming = self.tree.is_name_branch(node);
+                if naming {
+                    self.call.name(token);
+                }
                 match step {
                     Some(Step::Descend(p)) => {
                         self.cursor = Cursor::InBranch { node, pos: p };
                         Ok(Observe::Continue)
                     }
                     Some(Step::Accept(next)) => {
+                        if naming {
+                            let tool = self.tree.tool_named(node, self.call.naming()).cloned();
+                            self.call.named(tool);
+                        }
                         self.cursor = Cursor::At(next);
                         Ok(Observe::ArmComplete)
                     }
@@ -461,69 +521,10 @@ impl StencilSession {
                 term,
                 emitted,
             } => {
-                let span = self.free_span(node).clone();
-                let emitted = emitted + 1;
-                // **EOS never ends a turn the stencil is still steering.**
-                //
-                // It is intercepted here and the cursor moves on, whatever kind
-                // of span this is. What the stencil has not finished emitting,
-                // it emits — the structural statics after this span are injected
-                // in the EOS's place, so the call is closed rather than
-                // abandoned half-written.
-                //
-                // This used to be reachable only through `eos_ends` or a
-                // `close_token`, which coupled "may EOS end this span" to
-                // "does this span have a closing token" — two unrelated
-                // questions. A byte-terminated span had neither, so EOS fell
-                // through to `term.feed`, matched nothing, and left the cursor
-                // parked in the value while the decode loop sealed the turn on
-                // the EOS it had just sampled. Measured on the persisted
-                // substrate: **244 of 259 turns** wrote a complete, correct
-                // function block and never closed it, every one discarded.
-                //
-                // A stencil is a guarantee about what can be emitted; a token
-                // that ends the turn from inside one is a hole in it, and the
-                // free-decode span was the only place that hole existed.
-                // Every end token, not only the canonical one: the decode loop
-                // seals on any of them, and one this missed ended a reply from
-                // inside an open think block mid-sentence.
-                if self.tree.is_end(token) {
-                    self.cursor = Cursor::At(span.next);
-                    return Ok(match span.eos_ends {
-                        // The span is allowed to end this way — the think-steer
-                        // tree's final span, whose whole job is to run to EOS.
-                        true => Observe::SpanEos,
-                        // It is not. The span's terminator never fired, so
-                        // whatever finishes the value was never written: the
-                        // EOS is replaced by that text — the element is closed
-                        // properly rather than running into whatever follows —
-                        // or, with nothing to write, swallowed so it never
-                        // reaches the sequence (and never seals it).
-                        false => {
-                            let completion = term.completion();
-                            if !completion.is_empty() {
-                                self.rewrite = Some(completion);
-                            }
-                            Observe::TokenClosedDrop
-                        }
-                    });
-                }
-                // A close *token* ends the span before any byte terminator runs.
-                // `suppress_close` drops the closing token (the successor
-                // prefills the continuation in its place); otherwise it is kept
-                // (committed).
-                if let Some(ct) = span.close_token {
-                    if token == ct {
-                        self.cursor = Cursor::At(span.next);
-                        return Ok(if span.suppress_close {
-                            Observe::TokenClosedDrop
-                        } else {
-                            Observe::TokenClosedKeep
-                        });
-                    }
-                }
-                self.value = Self::value_after(&span, self.value, bytes);
-                Ok(self.feed_span(node, &span, term, emitted, token, bytes))
+                self.call.feed(bytes);
+                let observed = self.observe_span(node, term, emitted, token, bytes);
+                self.close_left_span();
+                Ok(observed)
             }
             other => {
                 self.cursor = other;
@@ -532,14 +533,90 @@ impl StencilSession {
         }
     }
 
-    /// Where `value` stands after `bytes` of `span`.
+    /// The value being recorded is the call's once the walk has left its span.
+    fn close_left_span(&mut self) {
+        if !matches!(self.cursor, Cursor::InFreeText { .. }) {
+            self.call.close();
+        }
+    }
+
+    /// Consume `token`, decoded inside the free-text span `node`, whose
+    /// terminator stands at `term` after `emitted` tokens.
+    fn observe_span(
+        &mut self,
+        node: NodeId,
+        term: TerminatorState,
+        emitted: u32,
+        token: TokenId,
+        bytes: &[u8],
+    ) -> Observe {
+        let span = self.free_span(node).clone();
+        let emitted = emitted + 1;
+        // **EOS never ends a turn the stencil is still steering.**
+        //
+        // It is intercepted here and the cursor moves on, whatever kind of span
+        // this is. What the stencil has not finished emitting, it emits — the
+        // structural statics after this span are injected in the EOS's place,
+        // so the call is closed rather than abandoned half-written.
+        //
+        // This used to be reachable only through `eos_ends` or a `close_token`,
+        // which coupled "may EOS end this span" to "does this span have a
+        // closing token" — two unrelated questions. A byte-terminated span had
+        // neither, so EOS fell through to `term.feed`, matched nothing, and left
+        // the cursor parked in the value while the decode loop sealed the turn
+        // on the EOS it had just sampled. Measured on the persisted substrate:
+        // **244 of 259 turns** wrote a complete, correct function block and
+        // never closed it, every one discarded.
+        //
+        // A stencil is a guarantee about what can be emitted; a token that ends
+        // the turn from inside one is a hole in it, and the free-decode span was
+        // the only place that hole existed. Every end token, not only the
+        // canonical one: the decode loop seals on any of them, and one this
+        // missed ended a reply from inside an open think block mid-sentence.
+        if self.tree.is_end(token) {
+            self.cursor = Cursor::At(span.next);
+            return match span.eos_ends {
+                // The span is allowed to end this way — the think-steer tree's
+                // final span, whose whole job is to run to EOS.
+                true => Observe::SpanEos,
+                // It is not. The span's terminator never fired, so whatever
+                // finishes the value was never written: the EOS is replaced by
+                // that text — the element is closed properly rather than running
+                // into whatever follows — or, with nothing to write, swallowed
+                // so it never reaches the sequence (and never seals it).
+                false => {
+                    let completion = term.completion();
+                    if !completion.is_empty() {
+                        self.rewrite = Some(completion);
+                    }
+                    Observe::TokenClosedDrop
+                }
+            };
+        }
+        // A close *token* ends the span before any byte terminator runs.
+        // `suppress_close` drops the closing token (the successor prefills the
+        // continuation in its place); otherwise it is kept (committed).
+        if let Some(ct) = span.close_token {
+            if token == ct {
+                self.cursor = Cursor::At(span.next);
+                return if span.suppress_close {
+                    Observe::TokenClosedDrop
+                } else {
+                    Observe::TokenClosedKeep
+                };
+            }
+        }
+        self.value = Self::value_after(self.active.as_ref(), self.value, bytes);
+        self.feed_span(node, &span, term, emitted, token, bytes)
+    }
+
+    /// Where `value` stands after `bytes` under `rule`.
     fn value_after(
-        span: &FreeTextSpan,
+        rule: Option<&Arc<ValueRule>>,
         value: Option<ValueState>,
         bytes: &[u8],
     ) -> Option<ValueState> {
-        let rule = span.rule.as_ref()?;
-        rule.advance(value?, bytes)
+        rule?.advance(value?, bytes)
     }
 
     /// Feed `bytes` — `token`'s, or the part of it inside the span — to the
@@ -601,8 +678,11 @@ impl StencilSession {
     fn spill_into(&mut self, spill: Spill, token: TokenId, bytes: &[u8]) -> Observe {
         let span = self.free_span(spill.next).clone();
         let term = span.term.start();
-        self.value = Self::value_after(&span, Self::value_start(&span), &spill.rest);
+        self.enter_span(spill.next, &span);
+        self.call.feed(&spill.rest);
+        self.value = Self::value_after(self.active.as_ref(), self.value, &spill.rest);
         let observe = self.feed_span(spill.next, &span, term, 1, token, &spill.rest);
+        self.close_left_span();
         if let Some(rest) = self.rewrite.take() {
             let arm = bytes.len().saturating_sub(spill.rest.len());
             let mut whole = bytes[..arm].to_vec();

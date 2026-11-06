@@ -6,7 +6,8 @@
 //! invariants.  Keeping the front-ends in string space guarantees they produce
 //! identical trees for identical logical input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::error::BuildError;
 use super::terminator::Terminator;
@@ -77,6 +78,12 @@ pub struct TreeSpec {
     /// Text emitted to gracefully terminate the invocation if an out-of-grammar
     /// token is decoded (the failsafe bail set).  Empty ⇒ just exit.
     pub bail: String,
+    /// The field each argument's value span writes, by span: what a turn's
+    /// held values are looked up by (`docs/stencil_tree.md` §9.2).
+    pub keys: HashMap<SpecId, Arc<str>>,
+    /// The branches whose arms are a call's tool names: what the walk reads a
+    /// call's tool from.
+    pub name_branches: HashSet<SpecId>,
 }
 
 impl TreeSpec {
@@ -86,6 +93,8 @@ impl TreeSpec {
             root: SpecId(0),
             label: label.into(),
             bail: String::new(),
+            keys: HashMap::new(),
+            name_branches: HashSet::new(),
         }
     }
 
