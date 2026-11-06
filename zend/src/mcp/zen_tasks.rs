@@ -6,7 +6,9 @@
 //! They run through the operations runner as the conversation's person, with
 //! `/mcp`'s own implementation (`workers::start`, `answer`, `nudge`), and
 //! answer at once with the task's handle: the conversation waits on it with
-//! `job_status`, which reads a task as it reads any job.
+//! `job_status`, which reads a task as it reads any job. A task started here
+//! begins on its starter's branches and uncommitted changes
+//! (`crate::conv_inherit`).
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -30,6 +32,10 @@ pub const NUDGE: &str = "repo_task_nudge";
 
 /// Every tool here: what a task's tool list never holds.
 pub const TASK_TOOLS: [&str; 3] = [START, REPLY, NUDGE];
+
+/// What a started task is told it begins on (`conv_inherit`).
+pub const BEGINS_ON: &str = " It begins on your branches with your uncommitted changes as your \
+     last finished tool round saved them; what it changes stays its own until it commits.";
 
 /// Where a conversation stands in the nesting of tasks, which is one level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +164,13 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
         prompt,
         (Priority::Normal, effort, kind),
         by_task,
+        Some(&call.lineage),
     ) {
-        Ok(w) => following(&w.thread, &w.name, "Started"),
+        Ok(w) => {
+            let mut started = following(&w.thread, &w.name, "Started");
+            started.text.push_str(BEGINS_ON);
+            started
+        }
         Err(e) => Answer::error(e),
     }
 }

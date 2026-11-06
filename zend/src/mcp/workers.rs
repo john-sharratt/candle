@@ -202,7 +202,10 @@ pub fn summary_line(entry: &str, max: usize) -> String {
 
 /// Start `prompt` on a new worker named after `wanted` under `thread`,
 /// decoding at `priority`, thinking at `effort` and doing `kind`'s work; the
-/// worker's record, `running`.
+/// worker's record, `running`. A worker a conversation of Zen's starts —
+/// `from` names it — begins on that conversation's branches and uncommitted
+/// changes (`conv_inherit`).
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     session: &Arc<ZendSession>,
     caller: &Caller,
@@ -211,6 +214,7 @@ pub fn start(
     prompt: &str,
     (priority, effort, kind): (Priority, Effort, WorkerKind),
     by_task: bool,
+    from: Option<&str>,
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -241,6 +245,9 @@ pub fn start(
         now,
     );
     worker.by_task = by_task;
+    if let Some(Err(e)) = from.and_then(|starter| session.begin_on(&worker.conv_id, starter)) {
+        return Err(format!("the task could not be given its starter's work: {e}"));
+    }
     let started = if by_task {
         "A task started:"
     } else {

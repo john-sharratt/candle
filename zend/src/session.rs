@@ -99,6 +99,7 @@ use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
+use crate::conv_inherit;
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
 use crate::conv_sweep::{CONV_IDLE_TTL, CONV_SWEEP_EVERY};
@@ -4228,6 +4229,13 @@ fn run_inference_stream(
             // — reads each repository through its own branch, and gets back
             // the changes its tool rounds made there.
             conv_overlay::restore(&state.engine, timeline, &files, &mirror);
+            // A task a conversation started begins on its starter's branches
+            // and changes, once.
+            if let Some(from) = conv_inherit::starter(&state.engine, timeline) {
+                let theirs = state.saved_files(&from);
+                let took = conv_inherit::take(&state.engine, timeline, &files, &mirror, &theirs);
+                tracing::info!(conv_id = %conv_id, %from, took, "a task begins on its starter's work");
+            }
             // Its working set is in-memory and did not survive. The seeds
             // resolve again on its own branch and enter provenance at the
             // seeding momentum, and the rest of the momentum rebuilds from
@@ -6820,6 +6828,18 @@ impl ZendSession {
     /// the model is not loaded.
     pub fn saved_files(&self, conv_id: &str) -> Option<Arc<RepoFiles>> {
         Some(self.loaded()?.saved_files(conv_id))
+    }
+
+    /// Name `starter` as the conversation `conv_id`, a task not yet begun,
+    /// begins on: its branches and its changes ([`conv_inherit`]). `None`
+    /// while the model is not loaded.
+    pub fn begin_on(&self, conv_id: &str, starter: &str) -> Option<EngineResult<()>> {
+        let state = self.loaded()?;
+        Some(conv_inherit::mark(
+            &state.engine,
+            conversation_timeline(conv_id),
+            starter,
+        ))
     }
 
     /// Upload `id`'s bytes, from `conv_id`'s uploads store. The outer `None`
