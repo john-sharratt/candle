@@ -414,10 +414,15 @@ instead.
   `Scope` enum's values — the scheduler, the persistence pass, the log's owner,
   a remote batch, its adoptions, the summariser, a section's seal, the
   repositories' follower, the journals, a tenant's load, the log's maintenance,
-  the census itself, the cluster's sockets, and the async runtime. A thread sets
-  its own as it starts (`set_thread`); a call narrows it while a guard lives
-  (`enter`). The guard is not `Send`, so it cannot be held across an `.await`
-  and name the next task's blocks.
+  the census itself, the cluster's sockets, and the async runtime. The
+  scheduler's loop is split by stage (`scheduler/census_stage.rs`): its decode
+  quantum (`decode`), its prefill quantum (`prefill`), sealing turns and
+  ingesting sections (`turn_seal`), the gallery and its rates (`gallery`), and
+  answering a request (`requests`); `scheduler` keeps what is left — admission,
+  relief, settling, housekeeping. There is room for 32. A thread sets its own
+  as it starts (`set_thread`); a call narrows it while a guard lives (`enter`).
+  The guard is not `Send`, so it cannot be held across an `.await` and name the
+  next task's blocks.
 - **A block of 4 KiB or more carries its scope** in a header in front of it:
   the alignment's size, at least 16 bytes, its last byte the scope. Whether a
   block has one is decided by its layout alone — at least 4 KiB, aligned to at
