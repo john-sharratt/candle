@@ -133,6 +133,7 @@ impl Tool for HttpSessionOpen {
         let entry = HttpEntry {
             meta: SessionMeta {
                 session_id: session_id.clone(),
+                conversation: ctx.lineage().to_string(),
                 opened_at: Utc::now().to_rfc3339(),
                 last_activity: Utc::now().to_rfc3339(),
                 alive: true,

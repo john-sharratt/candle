@@ -985,6 +985,17 @@ impl ToolHost {
     ) -> Arc<ToolContext> {
         Arc::new(self.bound(mode, files, lineage).with_journals(journals))
     }
+
+    /// Close every tool session the conversation `lineage` opened — sockets,
+    /// HTTP sessions and the credentials they carry, SSH, SQL, code — for a
+    /// conversation that is archived or deleted and so never runs another
+    /// round. Answers how many it closed. Every mode's context shares one
+    /// registry.
+    pub fn close_sessions(&self, lineage: &str) -> usize {
+        self.contexts[ToolMode::Restricted.level() as usize]
+            .sessions
+            .close_conversation(lineage)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -993,7 +1004,43 @@ impl ToolHost {
 mod tests {
     use super::*;
 
+    use zend_tools::state::sessions::{CodeEntry, SessionMeta};
     use zend_vfs::RepoSpec;
+
+    /// A code session opened by the round `ctx` runs.
+    fn open_code_session(ctx: &ToolContext, id: &str) {
+        ctx.sessions.insert_code(CodeEntry {
+            meta: SessionMeta {
+                session_id: id.to_string(),
+                conversation: ctx.lineage().to_string(),
+                opened_at: String::new(),
+                last_activity: String::new(),
+                alive: true,
+            },
+            language: "javascript".to_string(),
+            history: Vec::new(),
+        });
+    }
+
+    /// **A conversation's sessions close with it, whatever mode opened them**,
+    /// and another conversation's stay open.
+    #[test]
+    fn closing_a_conversations_sessions_spares_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
+        let files = host.conversation_files();
+        let a_full = host.context_for(ToolMode::Comprehensive, &files, "a");
+        let a_restricted = host.context_for(ToolMode::Restricted, &files, "a");
+        let b = host.context_for(ToolMode::Comprehensive, &files, "b");
+        open_code_session(&a_full, "s1");
+        open_code_session(&a_restricted, "s2");
+        open_code_session(&b, "s3");
+
+        assert_eq!(host.close_sessions("a"), 2);
+        assert!(b.sessions.get_code("s3").is_some());
+        assert!(a_full.sessions.get_code("s1").is_none());
+        assert_eq!(host.close_sessions("a"), 0);
+    }
 
     /// `dir` as a workspace holding one repository, `r`.
     fn workspace_in(dir: &tempfile::TempDir) -> Workspace {

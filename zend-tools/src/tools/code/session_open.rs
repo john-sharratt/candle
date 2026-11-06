@@ -45,6 +45,7 @@ impl Tool for CodeSessionOpen {
         ctx.sessions.insert_code(CodeEntry {
             meta: SessionMeta {
                 session_id: sid.clone(),
+                conversation: ctx.lineage().to_string(),
                 opened_at: now(),
                 last_activity: now(),
                 alive: true,

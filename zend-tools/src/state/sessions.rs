@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::net::{TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use native_tls::TlsStream;
 
@@ -49,6 +49,10 @@ extern crate rusqlite;
 #[derive(Clone)]
 pub struct SessionMeta {
     pub session_id: String,
+    /// The conversation that opened it (its context's lineage); empty for
+    /// none. Archiving the conversation closes it
+    /// ([`SessionRegistry::close_conversation`]).
+    pub conversation: String,
     pub opened_at: String,
     pub last_activity: String,
     pub alive: bool,
@@ -204,6 +208,10 @@ pub struct SessionRegistry {
     pub sql: RwLock<HashMap<String, Arc<Mutex<SqlEntry>>>>,
     pub remote_fs: RwLock<HashMap<String, Arc<Mutex<RemoteFsEntry>>>>,
     pub code: RwLock<HashMap<String, Arc<Mutex<CodeEntry>>>>,
+    /// Session and SSH-process id → the conversation that opened it, kept
+    /// beside the maps so closing a conversation's sessions reads no entry's
+    /// lock: a tool call may be holding one.
+    owners: Mutex<HashMap<String, String>>,
 }
 
 /// Which kinds of session have at least one open.
@@ -245,8 +253,70 @@ impl SessionRegistry {
         Self::default()
     }
 
+    fn owners(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.owners.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn own(&self, meta: &SessionMeta) {
+        if !meta.conversation.is_empty() {
+            self.owners()
+                .insert(meta.session_id.clone(), meta.conversation.clone());
+        }
+    }
+
+    fn disown(&self, id: &str) {
+        self.owners().remove(id);
+    }
+
+    /// Close every session `conversation` opened, of every kind, and the SSH
+    /// processes running on them, answering how many sessions it closed. A
+    /// session is dropped from its map here and its connection closes when
+    /// the last holder lets go — at once, unless a tool call is using it,
+    /// and then when that call ends. An empty `conversation` names none.
+    pub fn close_conversation(&self, conversation: &str) -> usize {
+        if conversation.is_empty() {
+            return 0;
+        }
+        let ids: Vec<String> = {
+            let mut owners = self.owners();
+            let ids: Vec<String> = owners
+                .iter()
+                .filter(|(_, c)| c.as_str() == conversation)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                owners.remove(id);
+            }
+            ids
+        };
+        fn take<V>(map: &RwLock<HashMap<String, V>>, id: &str) -> bool {
+            map.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id)
+                .is_some()
+        }
+        let mut closed = 0;
+        for id in &ids {
+            // A process is owned like a session but is not one: it is counted
+            // with the SSH session it runs on.
+            take(&self.ssh_processes, id);
+            let session = take(&self.ssh, id)
+                | take(&self.telnet, id)
+                | take(&self.http, id)
+                | take(&self.tcp, id)
+                | take(&self.udp, id)
+                | take(&self.tls, id)
+                | take(&self.sql, id)
+                | take(&self.remote_fs, id)
+                | take(&self.code, id);
+            closed += usize::from(session);
+        }
+        closed
+    }
+
     // SSH
     pub fn insert_ssh(&self, entry: SshEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.ssh
             .write()
@@ -257,6 +327,7 @@ impl SessionRegistry {
         self.ssh.read().unwrap().get(id).cloned()
     }
     pub fn remove_ssh(&self, id: &str) -> bool {
+        self.disown(id);
         self.ssh.write().unwrap().remove(id).is_some()
     }
     pub fn list_ssh(&self) -> Vec<Arc<Mutex<SshEntry>>> {
@@ -266,6 +337,12 @@ impl SessionRegistry {
     // SSH processes
     pub fn insert_ssh_process(&self, proc: SshProcess) {
         let id = proc.process_id.clone();
+        {
+            let mut owners = self.owners();
+            if let Some(conversation) = owners.get(&proc.session_id).cloned() {
+                owners.insert(id.clone(), conversation);
+            }
+        }
         self.ssh_processes
             .write()
             .unwrap()
@@ -275,11 +352,13 @@ impl SessionRegistry {
         self.ssh_processes.read().unwrap().get(id).cloned()
     }
     pub fn remove_ssh_process(&self, id: &str) -> bool {
+        self.disown(id);
         self.ssh_processes.write().unwrap().remove(id).is_some()
     }
 
     // Telnet
     pub fn insert_telnet(&self, entry: TelnetEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.telnet
             .write()
@@ -290,6 +369,7 @@ impl SessionRegistry {
         self.telnet.read().unwrap().get(id).cloned()
     }
     pub fn remove_telnet(&self, id: &str) -> bool {
+        self.disown(id);
         self.telnet.write().unwrap().remove(id).is_some()
     }
     pub fn list_telnet(&self) -> Vec<Arc<Mutex<TelnetEntry>>> {
@@ -298,6 +378,7 @@ impl SessionRegistry {
 
     // HTTP
     pub fn insert_http(&self, entry: HttpEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.http
             .write()
@@ -308,6 +389,7 @@ impl SessionRegistry {
         self.http.read().unwrap().get(id).cloned()
     }
     pub fn remove_http(&self, id: &str) -> bool {
+        self.disown(id);
         self.http.write().unwrap().remove(id).is_some()
     }
     pub fn list_http(&self) -> Vec<Arc<Mutex<HttpEntry>>> {
@@ -316,6 +398,7 @@ impl SessionRegistry {
 
     // TCP
     pub fn insert_tcp(&self, entry: TcpEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.tcp
             .write()
@@ -326,6 +409,7 @@ impl SessionRegistry {
         self.tcp.read().unwrap().get(id).cloned()
     }
     pub fn remove_tcp(&self, id: &str) -> bool {
+        self.disown(id);
         self.tcp.write().unwrap().remove(id).is_some()
     }
     pub fn list_tcp(&self) -> Vec<Arc<Mutex<TcpEntry>>> {
@@ -334,6 +418,7 @@ impl SessionRegistry {
 
     // UDP
     pub fn insert_udp(&self, entry: UdpEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.udp
             .write()
@@ -344,6 +429,7 @@ impl SessionRegistry {
         self.udp.read().unwrap().get(id).cloned()
     }
     pub fn remove_udp(&self, id: &str) -> bool {
+        self.disown(id);
         self.udp.write().unwrap().remove(id).is_some()
     }
     pub fn list_udp(&self) -> Vec<Arc<Mutex<UdpEntry>>> {
@@ -352,6 +438,7 @@ impl SessionRegistry {
 
     // TLS
     pub fn insert_tls(&self, entry: TlsEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.tls
             .write()
@@ -362,6 +449,7 @@ impl SessionRegistry {
         self.tls.read().unwrap().get(id).cloned()
     }
     pub fn remove_tls(&self, id: &str) -> bool {
+        self.disown(id);
         self.tls.write().unwrap().remove(id).is_some()
     }
     pub fn list_tls(&self) -> Vec<Arc<Mutex<TlsEntry>>> {
@@ -370,6 +458,7 @@ impl SessionRegistry {
 
     // SQL
     pub fn insert_sql(&self, entry: SqlEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.sql
             .write()
@@ -380,6 +469,7 @@ impl SessionRegistry {
         self.sql.read().unwrap().get(id).cloned()
     }
     pub fn remove_sql(&self, id: &str) -> bool {
+        self.disown(id);
         self.sql.write().unwrap().remove(id).is_some()
     }
     pub fn list_sql(&self) -> Vec<Arc<Mutex<SqlEntry>>> {
@@ -388,6 +478,7 @@ impl SessionRegistry {
 
     // Remote FS
     pub fn insert_remote_fs(&self, entry: RemoteFsEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.remote_fs
             .write()
@@ -410,6 +501,7 @@ impl SessionRegistry {
                     .unwrap_or(true);
                 if !within_window {
                     drop(entry);
+                    self.disown(id);
                     self.remote_fs.write().unwrap().remove(id);
                     return None;
                 }
@@ -419,6 +511,7 @@ impl SessionRegistry {
         Some(arc)
     }
     pub fn remove_remote_fs(&self, id: &str) -> bool {
+        self.disown(id);
         self.remote_fs.write().unwrap().remove(id).is_some()
     }
     pub fn list_remote_fs(&self) -> Vec<Arc<Mutex<RemoteFsEntry>>> {
@@ -427,6 +520,7 @@ impl SessionRegistry {
 
     // Code
     pub fn insert_code(&self, entry: CodeEntry) {
+        self.own(&entry.meta);
         let id = entry.meta.session_id.clone();
         self.code
             .write()
@@ -437,9 +531,115 @@ impl SessionRegistry {
         self.code.read().unwrap().get(id).cloned()
     }
     pub fn remove_code(&self, id: &str) -> bool {
+        self.disown(id);
         self.code.write().unwrap().remove(id).is_some()
     }
     pub fn list_code(&self) -> Vec<Arc<Mutex<CodeEntry>>> {
         self.code.read().unwrap().values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    fn meta(id: &str, conversation: &str) -> SessionMeta {
+        SessionMeta {
+            session_id: id.to_string(),
+            conversation: conversation.to_string(),
+            opened_at: String::new(),
+            last_activity: String::new(),
+            alive: true,
+        }
+    }
+
+    fn tcp(id: &str, conversation: &str, listener: &TcpListener) -> TcpEntry {
+        TcpEntry {
+            meta: meta(id, conversation),
+            peer_addr: String::new(),
+            local_addr: String::new(),
+            stream: TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+        }
+    }
+
+    fn http(id: &str, conversation: &str) -> HttpEntry {
+        HttpEntry {
+            meta: meta(id, conversation),
+            base_url: None,
+            credential_name: Some("yenbot".to_string()),
+            client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    fn code(id: &str, conversation: &str) -> CodeEntry {
+        CodeEntry {
+            meta: meta(id, conversation),
+            language: "javascript".to_string(),
+            history: Vec::new(),
+        }
+    }
+
+    /// **Archiving a conversation closes what it opened, and only that.**
+    #[test]
+    fn closing_a_conversation_closes_its_sessions_and_no_others() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reg = SessionRegistry::new();
+        reg.insert_tcp(tcp("t-a", "a", &listener));
+        reg.insert_http(http("h-a", "a"));
+        reg.insert_code(code("c-a", "a"));
+        reg.insert_tcp(tcp("t-b", "b", &listener));
+        reg.insert_http(http("h-b", "b"));
+
+        assert_eq!(reg.close_conversation("a"), 3);
+        assert!(reg.get_tcp("t-a").is_none());
+        assert!(reg.get_http("h-a").is_none());
+        assert!(reg.get_code("c-a").is_none());
+        assert!(reg.get_tcp("t-b").is_some());
+        assert!(reg.get_http("h-b").is_some());
+
+        assert_eq!(reg.close_conversation("a"), 0, "nothing is closed twice");
+        assert_eq!(reg.close_conversation("b"), 2);
+    }
+
+    /// **A session that belongs to no conversation is never swept.**
+    #[test]
+    fn an_unowned_session_is_closed_by_no_conversation() {
+        let reg = SessionRegistry::new();
+        reg.insert_http(http("h", ""));
+        assert_eq!(reg.close_conversation(""), 0);
+        assert!(reg.get_http("h").is_some());
+    }
+
+    /// **A session closed by hand leaves no owner behind**, so its id is not
+    /// counted when the conversation is archived later.
+    #[test]
+    fn a_session_closed_by_hand_is_not_counted_again() {
+        let reg = SessionRegistry::new();
+        reg.insert_http(http("h1", "a"));
+        reg.insert_http(http("h2", "a"));
+        assert!(reg.remove_http("h1"));
+        assert_eq!(reg.close_conversation("a"), 1);
+    }
+
+    /// **A process on an SSH session is the session's conversation's**, and
+    /// goes when it does without being counted as a session.
+    #[test]
+    fn an_ssh_process_goes_with_its_conversation() {
+        let reg = SessionRegistry::new();
+        reg.owners().insert("s".to_string(), "a".to_string());
+        reg.insert_ssh_process(SshProcess {
+            process_id: "p".to_string(),
+            session_id: "s".to_string(),
+            command: String::new(),
+            started_at: String::new(),
+            stdout_buf: Arc::default(),
+            stderr_buf: Arc::default(),
+            exit_code: Arc::default(),
+            running: Arc::default(),
+        });
+        assert_eq!(reg.close_conversation("a"), 0);
+        assert!(reg.get_ssh_process("p").is_none());
     }
 }

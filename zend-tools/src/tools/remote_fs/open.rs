@@ -117,6 +117,7 @@ impl Tool for RemoteFsSessionOpen {
         ctx.sessions.insert_remote_fs(RemoteFsEntry {
             meta: SessionMeta {
                 session_id: sid.clone(),
+                conversation: ctx.lineage().to_string(),
                 opened_at: now(),
                 last_activity: now(),
                 alive: true,

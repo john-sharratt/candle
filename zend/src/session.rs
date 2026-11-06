@@ -7428,6 +7428,9 @@ impl ZendSession {
                 .set_conversation_archived(timeline, true)
                 .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
         };
+        if distilled.is_ok() {
+            close_tool_sessions(&state, conv_id, "archived");
+        }
         Some((state, timeline, distilled))
     }
 
@@ -7448,6 +7451,7 @@ impl ZendSession {
                 .and_then(|()| cease_journal_text(engine, timeline))
         };
         if result.is_ok() {
+            close_tool_sessions(&state, conv_id, "deleted");
             state.conversations.remove(conv_id);
             state.journals.forget(conv_id);
             // After the tombstone, so a turn woken by it finds its timeline
@@ -8921,6 +8925,15 @@ impl ZendSession {
 /// its timeline ([`passthrough::timeline_of`]); any other is [`timeline_for`].
 fn conversation_timeline(conv_id: &str) -> projection::TimelineId {
     passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id))
+}
+
+/// Close the tool sessions `conv_id` opened, now that it will run no more
+/// rounds (`docs/mcp_file_tools.md` §4.2), and say so when it held any.
+fn close_tool_sessions(state: &InferenceState, conv_id: &str, why: &str) {
+    let closed = state.tool_host.close_sessions(conv_id);
+    if closed > 0 {
+        tracing::info!(conv_id, closed, "tool sessions closed: conversation {why}");
+    }
 }
 
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
