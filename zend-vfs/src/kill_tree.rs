@@ -17,6 +17,10 @@
 //! the job there; on Unix with a nice of ten taken before the program runs,
 //! which what it starts inherits and none of it can lower again without
 //! privilege.
+//!
+//! [`Priority::Normal`] sets neither: the child keeps the priority it inherits,
+//! so an agent that runs its jobs below normal keeps them there, and a
+//! `Normal` command asks for nothing beyond the process that asked.
 
 use std::io;
 use std::process::{Child, Command};
