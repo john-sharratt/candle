@@ -44,6 +44,8 @@ pub mod cluster_audit;
 pub mod cluster_command;
 pub mod cluster_logs;
 pub mod cluster_status;
+mod file_edit_and_commit;
+mod files;
 mod fit;
 pub mod gateway_command;
 pub mod group_add;
@@ -161,6 +163,10 @@ pub fn definitions() -> Value {
         task::definition(),
         reply::definition(),
         nudge::definition(),
+        files::definition("file_read"),
+        files::definition("file_list"),
+        files::definition("file_search"),
+        file_edit_and_commit::definition(),
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
@@ -224,6 +230,13 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         task::NAME => task::call(ctx, args).await,
         reply::NAME => reply::call(ctx, args).await,
         nudge::NAME => blocking(ctx, args, nudge::call).await,
+        name if files::NAMES.contains(&name) => {
+            let (ctx, args, name) = (ctx.clone(), args.clone(), name.to_string());
+            tokio::task::spawn_blocking(move || files::call(&ctx, &name, &args))
+                .await
+                .unwrap_or_else(|e| Answer::error(format!("the tool failed: {e}")))
+        }
+        file_edit_and_commit::NAME => blocking(ctx, args, file_edit_and_commit::call).await,
         journal_read::NAME => blocking(ctx, args, journal_read::call).await,
         journal_note::NAME => blocking(ctx, args, journal_note::call).await,
         journal_grep::NAME => blocking(ctx, args, journal_grep::call).await,
@@ -340,6 +353,10 @@ mod tests {
                 "repo_task_start",
                 "repo_task_reply",
                 "repo_task_nudge",
+                "file_read",
+                "file_list",
+                "file_search",
+                "file_edit_and_commit",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
@@ -400,6 +417,9 @@ mod tests {
             read_only,
             [
                 "get_user_context",
+                "file_read",
+                "file_list",
+                "file_search",
                 "journal_read",
                 "journal_grep",
                 "thread_list",

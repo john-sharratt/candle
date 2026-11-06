@@ -275,6 +275,10 @@ hops included. A typical call already does — the floor through both hops is ~1
 over budget is one *waiting* on something, never one working. Each rule below names a wait that
 was found on the path and removed; adding one back puts the tail back.
 
+`file_edit_and_commit` is the one exception, by design: it pushes to origin, and to a gated
+repository only after the gate answers (up to 10 s, `docs/mcp_file_tools.md` §3.5, §5.4). It
+holds no lock another call takes while it waits.
+
 1. **No network I/O under a lock a request takes.** The journal sync pushes and fetches with the
    store free and takes it only between the steps (`journals::store::sync`); `zend_vfs::Repo`
    runs transfers under their own lock, never the write lock a commit needs. A write waited out a

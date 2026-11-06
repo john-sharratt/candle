@@ -124,7 +124,7 @@ pub use vfs::git_source::GitSource;
 pub use vfs::{has_markers, Base, FileState, SavedBase, SavedChain, Snapshot, VfsError, VfsStore};
 pub use work::{merge_into, Committing, Landed, Merged, NotCommitted};
 pub use workspace::{
-    Attached, RepoPlace, RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE,
+    Attached, Author, RepoPlace, RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE,
 };
 pub use worktrees::{Worktree, WorktreeCheckout};
 pub use write::apply::ApplyOutcome;

@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The id of a gated push's candidate branch (`repo_events`).
+uuid       = { version = "1", features = ["v4"] }
 
 axum         = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tokio        = { version = "1",   features = ["full"] }

@@ -30,8 +30,12 @@ use zend_tools::sandboxes::{page, LogPage, Ran, SandboxesError};
 use zend_vfs::sandbox::refuse_git;
 use zend_vfs::{
     ChangedFile, DiskWriteGrant, JobId, JobInfo, JobNotFound, JobRequest, JobStatus, Push,
-    RunOutcome, Unrecorded, VfsStore,
+    RunOutcome, Unrecorded, VfsStore, Workspace,
 };
+
+use crate::repo_events::announced::Announced;
+use crate::repo_events::member_bus::MemberBus;
+use crate::repo_events::Bus;
 
 pub struct AgentExecutor {
     agents: Agents,
@@ -40,16 +44,37 @@ pub struct AgentExecutor {
     jobs_dir: PathBuf,
     /// Every job run, by id, as `run_output` reads it.
     ran: Mutex<HashMap<JobId, JobInfo>>,
+    /// The gateways' bus, reached over the member's sockets; `None` for a
+    /// daemon with no cluster, whose pushes nothing subscribes to.
+    bus: Option<Arc<dyn Bus>>,
+    /// The repositories whose pushes a gate checks first, and their gate.
+    gates: HashMap<String, String>,
 }
 
 impl AgentExecutor {
     pub fn new(agents: Agents, runtime: Handle, jobs_dir: PathBuf) -> AgentExecutor {
+        let bus = agents
+            .member()
+            .map(|m| Arc::new(MemberBus::new(m.clone(), runtime.clone())) as Arc<dyn Bus>);
         AgentExecutor {
             agents,
             runtime,
             jobs_dir,
             ran: Mutex::new(HashMap::new()),
+            bus,
+            gates: HashMap::new(),
         }
+    }
+
+    /// This executor gating each of `workspace`'s repositories that names a
+    /// `gate:`.
+    pub fn gating(mut self, workspace: &Workspace) -> AgentExecutor {
+        self.gates = workspace
+            .repos()
+            .iter()
+            .filter_map(|r| r.gate.clone().map(|g| (r.name.clone(), g)))
+            .collect();
+        self
     }
 
     /// Drive `job` on the daemon's runtime, where the cluster's sockets live,
@@ -177,8 +202,14 @@ impl Executor for AgentExecutor {
         Ok((info, read))
     }
 
+    /// An agent's pushes of `repo` — gated and announced on the bus when this
+    /// daemon is a member ([`Announced`]), as every push Zen makes must be.
     fn pusher(&self, repo: &str) -> Arc<dyn Push> {
-        AgentPush::shared(self.agents.clone(), self.runtime.clone(), repo)
+        let inner = AgentPush::shared(self.agents.clone(), self.runtime.clone(), repo);
+        match &self.bus {
+            Some(bus) => Announced::shared(inner, repo, self.gates.get(repo).cloned(), bus.clone()),
+            None => inner,
+        }
     }
 }
 

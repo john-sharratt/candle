@@ -73,18 +73,37 @@ pub enum WorkspaceError {
     AlreadyAttached(String),
 }
 
+/// Who the commits Zen makes to a repository through the connector are by
+/// (`docs/mcp_file_tools.md` §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Author {
+    pub name: String,
+    pub email: String,
+}
+
 /// One repository as the manifest names it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoSpec {
     /// What tools call it, and its folder's name under the workspace.
     pub name: String,
+    /// Its commits' author; the manifest's `author:` when it names none.
+    #[serde(default)]
+    pub author: Option<Author>,
+    /// The service that checks a change before the repository's branch moves
+    /// (`docs/mcp_file_tools.md` §5.4): every push Zen makes to it is asked of
+    /// `gate/<repo>` first. `None`, its pushes are not gated.
+    #[serde(default)]
+    pub gate: Option<String>,
 }
 
 impl RepoSpec {
     pub fn named(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            author: None,
+            gate: None,
         }
     }
 }
@@ -92,6 +111,9 @@ impl RepoSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    /// Every repository's author, unless it names its own.
+    #[serde(default)]
+    author: Option<Author>,
     repos: Vec<RepoSpec>,
 }
 
@@ -103,6 +125,10 @@ pub struct Repo {
     pub name: String,
     /// Where it is.
     pub place: RepoPlace,
+    /// Its commits' author, when the manifest names one.
+    pub author: Option<Author>,
+    /// The service gating its pushes, when it has one.
+    pub gate: Option<String>,
 }
 
 /// Where a workspace repository is.
@@ -231,12 +257,25 @@ impl Workspace {
                 });
             }
         };
-        let manifest: Manifest =
-            serde_yaml::from_str(&text).map_err(|e| WorkspaceError::Unreadable {
-                path: root.to_path_buf(),
-                why: e.to_string(),
-            })?;
-        Ok(manifest.repos)
+        Self::parse_manifest(&text).map_err(|why| WorkspaceError::Unreadable {
+            path: root.to_path_buf(),
+            why,
+        })
+    }
+
+    /// The repositories a manifest's `text` lists, each with its author — its
+    /// own, else the manifest's.
+    fn parse_manifest(text: &str) -> Result<Vec<RepoSpec>, String> {
+        let manifest: Manifest = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+        let default = manifest.author;
+        Ok(manifest
+            .repos
+            .into_iter()
+            .map(|mut spec| {
+                spec.author = spec.author.or_else(|| default.clone());
+                spec
+            })
+            .collect())
     }
 
     /// This workspace with repository `name` read from the substrate instead
@@ -288,6 +327,8 @@ impl Workspace {
             repos.push(Repo {
                 place: RepoPlace::Folder(root.join(&spec.name)),
                 name: spec.name,
+                author: spec.author,
+                gate: spec.gate,
             });
         }
         Ok(Self { root, repos })
@@ -307,6 +348,8 @@ impl Workspace {
         self.repos.push(Repo {
             name: name.to_string(),
             place: RepoPlace::Folder(self.root.join(name)),
+            author: None,
+            gate: None,
         });
         Ok(self)
     }
@@ -455,6 +498,43 @@ mod tests {
                 .in_substrate("b"),
             Err(WorkspaceError::Unknown("b".into()))
         );
+    }
+
+    /// **A repository's author is its own, else the manifest's**, and a gate
+    /// is named per repository.
+    #[test]
+    fn authors_default_from_the_manifest_and_gates_are_per_repository() {
+        let specs = Workspace::parse_manifest(
+            "author: {name: John, email: j@example.com}\n\
+             repos:\n\
+             \x20 - name: candle\n\
+             \x20 - name: yenbot\n\
+             \x20   author: {name: Yen, email: y@example.com}\n\
+             \x20   gate: yenbot\n",
+        )
+        .unwrap();
+        let ws = Workspace::new("/w", specs).unwrap();
+        let john = Author {
+            name: "John".into(),
+            email: "j@example.com".into(),
+        };
+        let yen = Author {
+            name: "Yen".into(),
+            email: "y@example.com".into(),
+        };
+        let candle = ws.repo("candle").unwrap();
+        assert_eq!(
+            (candle.author.as_ref(), candle.gate.as_deref()),
+            (Some(&john), None)
+        );
+        let yenbot = ws.repo("yenbot").unwrap();
+        assert_eq!(
+            (yenbot.author.as_ref(), yenbot.gate.as_deref()),
+            (Some(&yen), Some("yenbot"))
+        );
+        let bare = Workspace::parse_manifest("repos:\n  - name: candle\n").unwrap();
+        assert_eq!(bare[0].author, None);
+        assert!(Workspace::parse_manifest("repos:\n  - {name: a, gat: x}\n").is_err());
     }
 
     #[test]

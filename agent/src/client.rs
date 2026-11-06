@@ -117,6 +117,12 @@ impl Agents {
         }
     }
 
+    /// The member the agents are reached through; `None` for a daemon with no
+    /// cluster.
+    pub fn member(&self) -> Option<&Arc<AppMember>> {
+        self.member.as_ref()
+    }
+
     /// The agent in this process alone: a daemon with no cluster, whose
     /// repositories are read and written through it as a member's are through
     /// the cluster's (`docs/substrate_git.md` §9).

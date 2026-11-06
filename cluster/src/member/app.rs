@@ -817,6 +817,16 @@ impl AppMember {
         self.open_to(&self.id.app)
     }
 
+    /// A stream up to every admitted gateway, for what each must see: a
+    /// publish on its bus, which is its own (`docs/mcp_file_tools.md` §5.2).
+    pub fn open_up_all(&self) -> Vec<VirtualConn> {
+        let sockets: Vec<SessionHandle> = lock(&self.sockets).iter().flatten().cloned().collect();
+        sockets
+            .iter()
+            .filter_map(|s| s.open(&self.id.app).ok())
+            .collect()
+    }
+
     /// Whether any socket is admitted: a stream up can be opened.
     pub fn admitted(&self) -> bool {
         lock(&self.sockets).iter().any(Option::is_some)

@@ -250,13 +250,19 @@ a subscriber that must see it also polls the branch, slowly.
 ### 5.4 `gate/<repo>`: a check before the branch moves
 
 The bus also carries a request and its answer. Before a push to a gated
-repository (§3.3), zend publishes:
+repository (§3.3) moves a branch, zend pushes the commit to a candidate
+branch, `zen/candidate/<id>`, and asks on `gate/<repo>`
+(`zend/src/repo_events/announced.rs`):
 
 ```json
-{"op": "publish", "topic": "gate/yenbot",
- "payload": {"id": "01JD…", "ref": "refs/zen/candidate/01JD…", "commit": "4f1c…",
-             "base": "a3f9…", "paths": ["apps/recipes/pages/home.js"]}}
+{"id": "3f2a…", "ref": "refs/heads/zen/candidate/3f2a…", "commit": "4f1c…",
+ "base": "a3f9…", "branch": "main", "paths": ["apps/recipes/pages/home.js"]}
 ```
+
+`base` is what the branch held (the push's lease), `null` for a new branch.
+The candidate branch is deleted whatever the answer. Every push Zen makes goes
+through one pusher per repository (`ToolContext::pusher`), so this is where
+each is gated and, once it lands, announced (§5.3).
 
 The gate fetches the candidate, checks it, and answers on
 `gate/<repo>/result/<id>`:
@@ -267,7 +273,11 @@ The gate fetches the candidate, checks it, and answers on
 
 zend waits for that answer — ten seconds at most — and moves the branch only
 on `ok`. A gate that is not connected, or does not answer in time, refuses
-the change rather than letting it through unchecked.
+the change rather than letting it through unchecked. A refusal comes back to
+whoever pushed as every spec of the push rejected by the remote with the
+reason (`Rejection::Remote`), as a server hook's would, so `git_push`,
+`file_edit_and_commit` and an agent job each report it the way they report
+any refusal.
 
 ## 6. Logs and sites in the connector
 

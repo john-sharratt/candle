@@ -886,7 +886,8 @@ impl ToolHost {
             return Ok(Self::new(workspace, secrets)?);
         };
         let executor =
-            AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR));
+            AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR))
+                .gating(workspace);
         Ok(Self::on(workspace, secrets, Arc::new(executor))?)
     }
 

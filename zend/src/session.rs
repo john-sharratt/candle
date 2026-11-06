@@ -80,7 +80,7 @@ use web::auth::Roles;
 use zend_tools::run_watch::{self, RunWatch};
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::{JournalBook, JournalShelf};
-use zend_tools::OpsRunner;
+use zend_tools::{OpsRunner, ToolContext};
 use zend_vfs::{RepoFiles, Workspace};
 
 use crate::api::chat::{
@@ -7459,6 +7459,21 @@ impl ZendSession {
             state.deletions.deleted();
         }
         Some(result)
+    }
+
+    /// What the connector's repository tools work with
+    /// (`docs/mcp_file_tools.md` §2–§3): a context over the workspace as it is
+    /// committed — no conversation's changes — whose pushes are made, gated
+    /// and announced as every push of Zen's is, and each repository's base
+    /// branch. It belongs to no conversation, so it pushes to any branch.
+    /// `None` while the model is not loaded.
+    pub fn repository_tools(&self) -> Option<(Arc<ToolContext>, BaseBranches)> {
+        let state = self.loaded()?;
+        let files = state.tool_host.conversation_files();
+        let ctx = state
+            .tool_host
+            .context_for(ToolMode::Comprehensive, &files, "");
+        Some((ctx, state.base_branches.clone()))
     }
 
     /// `GET /v1/conversations/{id}/journal`: the journal's entries as the
