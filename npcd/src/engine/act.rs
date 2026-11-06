@@ -504,8 +504,8 @@ mod tests {
     #[test]
     fn an_unterminated_block_keeps_its_narration_exactly_once() {
         let s = "She set the cup down. <function=ask>\n<parameter=to>\nYaelis\n";
-        let out =
-            function_blocks_to_lines(s, &tools::specs()).expect("the text contains a function block");
+        let out = function_blocks_to_lines(s, &tools::specs())
+            .expect("the text contains a function block");
         assert_eq!(
             out.matches("She set the cup down.").count(),
             1,
@@ -520,8 +520,8 @@ mod tests {
     #[test]
     fn a_crossed_name_and_body_span_keeps_its_narration_exactly_once() {
         let s = "Prose first. <function=ask</function>trailing>";
-        let out =
-            function_blocks_to_lines(s, &tools::specs()).expect("the text contains a function block");
+        let out = function_blocks_to_lines(s, &tools::specs())
+            .expect("the text contains a function block");
         assert_eq!(
             out.matches("Prose first.").count(),
             1,

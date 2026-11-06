@@ -120,8 +120,7 @@ impl Runtime {
                 // one — the list the sender's grammar was drawn from, and the
                 // one `specs_within` is the room-narrowed fallback of. What it
                 // decides here is only where a function block's values end.
-                let act =
-                    act_of(&call, &tools::specs()).map_err(|why| anyhow::anyhow!("{why}"))?;
+                let act = act_of(&call, &tools::specs()).map_err(|why| anyhow::anyhow!("{why}"))?;
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
                 let body = self.body_of(npc);
                 if let (Some((hosted, body)), Some((at, company))) = (&body, decided) {
