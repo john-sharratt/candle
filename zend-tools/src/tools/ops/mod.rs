@@ -55,6 +55,7 @@ pub enum Service {
     Motherd,
     Web,
     Mcp,
+    Yenbot,
 }
 
 /// Hand `req` to the daemon's runner as tool `tool`.

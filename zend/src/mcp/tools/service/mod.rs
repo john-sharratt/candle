@@ -31,7 +31,16 @@ pub mod guard;
 pub mod status;
 
 /// The services keep runs, each built from the package of its name.
-pub const SERVICES: [&str; 3] = ["motherd", "web", "mcp"];
+pub const SERVICES: [&str; 4] = ["motherd", "web", "mcp", "yenbot"];
+
+/// The workspace repository each service is built from: the cluster's from
+/// candle, Yen Bots from its own (`docs/yenbot_app_host.md` §5.5).
+pub fn repo_of(service: &str) -> &'static str {
+    match service {
+        "yenbot" => "yenbot",
+        _ => "candle",
+    }
+}
 
 /// keep's routes.
 pub const KEEP_STATE: &str = "/v1/keep/state";
@@ -57,8 +66,8 @@ pub fn service_of(text: &str) -> Result<&'static str, String> {
         .find(|s| s.eq_ignore_ascii_case(text.trim()))
         .ok_or_else(|| {
             format!(
-                "`{text}` is not a service keep runs: `motherd` (the daemon), `web` (the gateway) or \
-                 `mcp` (the connector)"
+                "`{text}` is not a service keep runs: `motherd` (the daemon), `web` (the gateway), \
+                 `mcp` (the connector) or `yenbot` (Yen Bots)"
             )
         })
 }
@@ -257,6 +266,12 @@ mod tests {
         assert_eq!(built_service(&words("cargo build -p web")), None);
         assert_eq!(built_service(&words("cargo build --release -p zend")), None);
         assert_eq!(service_of(" WEB "), Ok("web"));
+        assert_eq!(
+            built_service(&words("cargo build --release -p yenbot")),
+            Some("yenbot")
+        );
+        assert_eq!(repo_of("yenbot"), "yenbot");
+        assert_eq!(repo_of("web"), "candle");
         assert!(service_of("zend")
             .unwrap_err()
             .contains("not a service keep runs"));

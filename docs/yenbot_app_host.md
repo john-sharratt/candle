@@ -202,8 +202,9 @@ A watcher on `apps/`, `library/` and `web/` reloads a changed manifest, its
 schedules and its workflows, and drops its cached files, within a second. A
 page open in
 a browser reloads itself when its app changes: the framework keeps an
-`EventSource` on `/api/v1/events/_reload` while the tab is visible. Yen sees a
-change Claude made without touching her phone.
+`EventSource` on `/api/v1/events/_reload` while the page is open — a page
+hidden when a change landed would otherwise show the old one when it comes
+back. Yen sees a change Claude made without touching her phone.
 
 ### 5.4 Publishing
 
@@ -257,10 +258,11 @@ release motherd, web and mcp (`zend/src/mcp/tools/service/deploy.rs`):
 `service_control` restarts, stops and starts it through keep, as it does the
 others, for a site that is wedged rather than broken.
 
-`service_deploy` names its repository and services in constants today
-(`REPO = "candle"`, `SERVICES = [motherd, web, mcp]`, shared with
-`service_control` and `service_status`); they become a table of service →
-(repository, package), with yenbot's row (§22). The yenbot binary
+The services keep runs are one list, `SERVICES = [motherd, web, mcp, yenbot]`
+(`zend/src/mcp/tools/service/mod.rs`), shared by `service_deploy`,
+`service_control` and the workers' tools (`zend-tools`'s `Service`); each is
+built from the package of its name, in the repository `repo_of` names —
+`yenbot` for yenbot, `candle` for the rest (§22). The yenbot binary
 answers `--build-info` from the cluster crate's version module and prints
 `INFO serving` once listening, as mcp does.
 
@@ -412,9 +414,13 @@ was asked or drawn, by which app and account, how long, how many tokens) and
 
 ### 7.4 Backups
 
-Every night at 03:00, a platform job (§9) writes `VACUUM INTO
-data\backups\yenbot-YYYY-MM-DD.db` and copies the files directory beside it;
-fourteen are kept, on BlackWorld. Restoring is an API call, like everything
+Once a day — when the site starts, and at its first look after the UTC day
+turns (every fifteen minutes) — it writes `VACUUM INTO
+data\backups\yenbot-YYYY-MM-DD.db`, through a part file renamed into place so
+a backup cut short is written again; fourteen are kept, on BlackWorld
+(`yenbot/src/store/backups.rs`). Once the scheduler runs platform jobs (§9)
+the backup is one, at 03:00 in Yen's time zone, and once apps keep files
+(§7.2) it copies the files directory beside the store. Restoring is an API call, like everything
 else (§6.2):
 
 - **One app**, the usual case — "I deleted the wrong recipes" —

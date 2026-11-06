@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::http::Method;
 use serde_json::{json, Value};
 
+use super::service::{service_of, SERVICES};
 use super::{string, Answer, Ctx};
 use crate::mcp::ops::{self, json_of};
 use crate::mcp::ops_tools::OpsCall;
@@ -18,7 +19,8 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Restart, stop or start a service — motherd (the daemon that runs the models), web \
-            (the gateway) or mcp (this connector's own server) — on one machine, through keep, the \
+            (the gateway), mcp (this connector's own server) or yenbot (Yen Bots) — on one machine, \
+            through keep, the \
             supervisor that runs them. A restart runs the \
             installed binary again, with no trial; a start lifts a stop. A stop holds the service down until \
             it is started again — a decision: ask the user, and pass `confirm: \"approved by the user\"` only \
@@ -27,7 +29,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "The machine, as `cluster_status` names it."},
-                "service": {"type": "string", "enum": ["motherd", "web", "mcp"]},
+                "service": {"type": "string", "enum": SERVICES},
                 "action": {"type": "string", "enum": ["restart", "stop", "start"]},
                 "confirm": {"type": "string", "description": "`approved by the user`, for a stop."}
             },
@@ -58,7 +60,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let (host, service, action) = match (
         string(args, "host"),
-        string(args, "service"),
+        string(args, "service").and_then(service_of),
         string(args, "action"),
     ) {
         (Ok(h), Ok(s), Ok(a)) => (h, s, a),
@@ -99,5 +101,15 @@ mod tests {
             .starts_with("stopping a service is a decision"));
         assert!(gate("stop", Some(ops::APPROVED)).is_ok());
         assert!(gate("kill", None).is_err());
+    }
+
+    /// **It controls every service keep runs**, the ones `service_deploy`
+    /// deploys.
+    #[test]
+    fn the_schema_offers_the_services_keep_runs() {
+        assert_eq!(
+            definition()["inputSchema"]["properties"]["service"]["enum"],
+            json!(["motherd", "web", "mcp", "yenbot"])
+        );
     }
 }

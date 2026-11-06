@@ -14,7 +14,7 @@ use axum::http::Method;
 use serde_json::{json, Value};
 use zend_vfs::JobStatus;
 
-use super::{guard, keep, service_of, trial_body, KEEP_TRIAL, SERVICES};
+use super::{guard, keep, repo_of, service_of, trial_body, KEEP_TRIAL, SERVICES};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::job::JobHandle;
@@ -23,8 +23,7 @@ use crate::mcp::tools::{string, Answer, Ctx};
 
 pub const NAME: &str = "service_deploy";
 
-/// The repository every service is built from, and the one branch keep tries.
-const REPO: &str = "candle";
+/// The one branch keep tries; each service's repository is [`repo_of`].
 const BRANCH: &str = "main";
 
 /// How long a build may run: a first one on a machine compiles the workspace.
@@ -53,7 +52,7 @@ pub fn definition() -> Value {
             runs. Only \
             origin/main is built: merge and push first. `motherd` is the daemon — models, Zen, npcd; \
             trying it stops every app on that machine for the trial. `web` is the gateway; `mcp` is the \
-            connector. One machine per call: a new motherd joins the cluster as a candidate and the others \
+            connector; `yenbot` is Yen Bots, built from its own repository. One machine per call: a new motherd joins the cluster as a candidate and the others \
             take it once it is certified, which is the user's decision (`cluster_command`); `web` and \
             `mcp` are deployed machine by machine. Say on each step where it runs — the machine and the \
             handle — so whoever watches knows. Admins only.",
@@ -61,7 +60,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `service_status` name it: `BlackWorld`, `WhiteWorld`."},
-                "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway) or `mcp` (the connector)."}
+                "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway), `mcp` (the connector) or `yenbot` (Yen Bots)."}
             },
             "required": ["host", "service"],
             "additionalProperties": false
@@ -80,7 +79,7 @@ pub fn build_job(service: &str) -> RunJob {
         args.extend(["-p", CONNECTOR].map(str::to_string));
     }
     RunJob {
-        repo: REPO.to_string(),
+        repo: repo_of(service).to_string(),
         branch: BRANCH.to_string(),
         overlay: Overlay::default(),
         program: "cargo".to_string(),
@@ -247,6 +246,15 @@ mod tests {
         assert_eq!(built_service(&command), Some("web"));
     }
 
+    /// **Yen Bots is built from its own repository**, on main.
+    #[test]
+    fn yenbot_is_built_from_its_own_repository() {
+        let job = build_job("yenbot");
+        assert_eq!((job.repo.as_str(), job.branch.as_str()), ("yenbot", "main"));
+        assert_eq!(job.args, ["build", "--release", "-p", "yenbot"]);
+        assert_eq!(job.stage.as_deref(), Some("target/release/yenbot.exe"));
+    }
+
     /// **The daemon is built with its connector**, and the job ahead of it
     /// stages the connector from that same build without reading as a deploy.
     #[test]
@@ -303,7 +311,7 @@ mod tests {
         let d = definition();
         assert_eq!(
             d["inputSchema"]["properties"]["service"]["enum"],
-            json!(["motherd", "web", "mcp"])
+            json!(["motherd", "web", "mcp", "yenbot"])
         );
         assert_eq!(d["inputSchema"]["required"], json!(["host", "service"]));
     }

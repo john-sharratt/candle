@@ -27,3 +27,8 @@ checkouts:
     dir: D:/agent/journals
     push: true
     journal: true
+  # Yen Bots (docs/yenbot_app_host.md §4, §5.5): built and released here by
+  # `service_deploy {service: yenbot}`; its live checkout is the service's own.
+  - name: yenbot
+    dir: D:/agent/yenbot
+    push: true

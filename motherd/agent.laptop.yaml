@@ -25,3 +25,6 @@ checkouts:
   - name: journals
     dir: C:/Users/johna/prog/agent/journals
     push: true
+  - name: yenbot
+    dir: C:/Users/johna/prog/agent/yenbot
+    push: true
