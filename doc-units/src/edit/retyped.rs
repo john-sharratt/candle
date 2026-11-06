@@ -20,9 +20,15 @@ pub(super) fn retyped(unit: &str, old: &str, new: &str) -> Option<String> {
     let at = unit.find(old)?;
     let start = unit[..at].rfind('\n').map_or(0, |i| i + 1);
     let old_end = at + old.trim_end_matches(['\r', '\n']).len();
-    let end = unit[old_end..].find('\n').map_or(unit.len(), |i| old_end + i);
+    let end = unit[old_end..]
+        .find('\n')
+        .map_or(unit.len(), |i| old_end + i);
     let above: Vec<&str> = unit[..start].lines().collect();
-    let below: Vec<&str> = unit[end..].strip_prefix('\n').unwrap_or("").lines().collect();
+    let below: Vec<&str> = unit[end..]
+        .strip_prefix('\n')
+        .unwrap_or("")
+        .lines()
+        .collect();
     let lines: Vec<&str> = new.lines().collect();
     let same = |a: &[&str], b: &[&str]| {
         a.iter().zip(b).all(|(x, y)| x.trim() == y.trim()) && a.iter().any(|l| !l.trim().is_empty())
@@ -102,7 +108,11 @@ mod tests {
     /// **Retyping the lines below is refused too**, and counts them.
     #[test]
     fn the_lines_below_retyped_are_refused() {
-        let got = retyped(PART, "#[cfg(test)]", "#[cfg(all(test, unix))]\nmod tests {\n    fn a() {}");
+        let got = retyped(
+            PART,
+            "#[cfg(test)]",
+            "#[cfg(all(test, unix))]\nmod tests {\n    fn a() {}",
+        );
         assert_eq!(
             got.as_deref(),
             Some(
@@ -120,7 +130,12 @@ mod tests {
     fn the_start_of_its_line_retyped_is_refused() {
         let unit = "fn f() {\n    while self.len > max {\n        stop();\n    }\n}\n";
         assert_eq!(
-            retyped(unit, "self.len > max", "while self.len >= max {\n        warn();").as_deref(),
+            retyped(
+                unit,
+                "self.len > max",
+                "while self.len >= max {\n        warn();"
+            )
+            .as_deref(),
             Some(
                 "with `old`, `text` replaces only those words, but it begins with `while`, which \
                  their line already holds around them and keeps, so the line would hold it \
@@ -130,7 +145,12 @@ mod tests {
         );
         let unit = "    let total = count(items, limit);\n";
         assert_eq!(
-            retyped(unit, "items", "items\n        .iter()\n        .count(), limit);").as_deref(),
+            retyped(
+                unit,
+                "items",
+                "items\n        .iter()\n        .count(), limit);"
+            )
+            .as_deref(),
             Some(
                 "with `old`, `text` replaces only those words, but it ends with `, limit);`, \
                  which their line already holds around them and keeps, so the line would hold \

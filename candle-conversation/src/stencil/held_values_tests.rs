@@ -269,7 +269,10 @@ fn a_name_spilled_into_its_value_still_names_the_call() {
         &mut HeldRules::default(),
     )));
     for (token, bytes) in [(b'c' as TokenId, &b"c"[..]), (b'd' as TokenId, b"d")] {
-        assert!(matches!(session.next_action(), StencilAction::MaskedDecode(_)));
+        assert!(matches!(
+            session.next_action(),
+            StencilAction::MaskedDecode(_)
+        ));
         session.observe(token, bytes).unwrap();
     }
     let StencilAction::MaskedDecode(after_name) = session.next_action() else {

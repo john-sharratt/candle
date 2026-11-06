@@ -29,9 +29,9 @@ use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
-    held_branches_first,
-    HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId,
-    ToolCallEnvelope, ToolSpec, TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
+    held_branches_first, HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode,
+    ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
 #[cfg(feature = "memory-census")]

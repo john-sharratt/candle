@@ -127,7 +127,10 @@ mod tests {
             .with_special("<|im_end|>", IM_END)
             .with_end(IM_END);
         let tree = Arc::new(compile(&compile_steps_tail(&steps(), "<|im_end|>"), &v).unwrap());
-        let mut d = TriggerRegistry::new().with_tail(tree).tail_driver().unwrap();
+        let mut d = TriggerRegistry::new()
+            .with_tail(tree)
+            .tail_driver()
+            .unwrap();
         let mut text = String::new();
         let mut said = ["done", "could not"].into_iter();
         let mut line = ["a1b2c3d\n", "no quiet machine\n"].into_iter();
@@ -174,7 +177,10 @@ mod tests {
     fn an_outcome_is_one_of_the_three() {
         let v = TestVocab::new().with_special("<|im_end|>", IM_END);
         let tree = Arc::new(compile(&compile_steps_tail(&steps(), "<|im_end|>"), &v).unwrap());
-        let mut d = TriggerRegistry::new().with_tail(tree).tail_driver().unwrap();
+        let mut d = TriggerRegistry::new()
+            .with_tail(tree)
+            .tail_driver()
+            .unwrap();
         loop {
             match d.step() {
                 StepMask::Prefill(_) => continue,

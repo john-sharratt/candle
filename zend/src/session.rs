@@ -83,6 +83,7 @@ use zend_tools::tools::journal::{JournalBook, JournalShelf};
 use zend_tools::{OpsRunner, ToolContext};
 use zend_vfs::{RepoFiles, Workspace};
 
+use crate::answer_steps;
 use crate::api::chat::{
     apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
     RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
@@ -99,7 +100,6 @@ use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
-use crate::answer_steps;
 use crate::conv_inherit;
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
