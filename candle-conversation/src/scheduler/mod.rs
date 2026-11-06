@@ -31,6 +31,7 @@ mod admit;
 mod admit_ground;
 mod band;
 mod block_guard;
+mod census_stage;
 mod compaction_stall;
 mod creep_slice;
 mod decode;
@@ -94,6 +95,7 @@ mod wave_timing;
 mod whole_conversations;
 
 use band::recorded_band;
+use census_stage::Stage;
 use detached::Detached;
 use expert_counters::ExpertCounters;
 use graph_window::graph_window;
@@ -4409,6 +4411,7 @@ impl Scheduler {
     /// ring put 12% of the scheduler's time in `requests` — one window 3.4 s of
     /// 4 — with no forward running meanwhile, and nothing said which request.
     fn handle_request(&mut self, req: SchedulerRequest) -> bool {
+        let _stage = census_stage::enter(Stage::Requests);
         let name = req.span_name();
         let began = Instant::now();
         self.request_laps.start();

@@ -20,7 +20,7 @@ use super::thread_state::shard_and_scope;
 
 /// How many scopes there are. A power of two: a header byte is masked by it,
 /// so no byte read back indexes past the counters.
-pub const SCOPES: usize = 16;
+pub const SCOPES: usize = 32;
 
 /// The parts of the daemon a block can be made in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,7 +31,8 @@ pub enum Scope {
     /// The async runtime's workers and blocking pool: HTTP, MCP, the apps'
     /// tasks.
     Async = 1,
-    /// The conversation scheduler: waves, seals, projections.
+    /// The conversation scheduler's loop outside the stages named below:
+    /// admission, relief, settling the device, housekeeping.
     Scheduler = 2,
     /// The persistence pass: tier migration, purges, the store gauges.
     Persistence = 3,
@@ -57,6 +58,18 @@ pub enum Scope {
     Census = 13,
     /// The cluster's sockets: replication sends and receives.
     Cluster = 14,
+    /// The scheduler's decode quantum: decode waves, and the prefills it
+    /// promotes to decodes.
+    Decode = 15,
+    /// The scheduler's prefill quantum.
+    Prefill = 16,
+    /// The scheduler sealing what finished: turns, and the sections it
+    /// ingests.
+    TurnSeal = 17,
+    /// The scheduler's gallery keep and sweep, and its published rates.
+    Gallery = 18,
+    /// The scheduler answering a request sent to it.
+    Requests = 19,
 }
 
 impl Scope {
@@ -77,6 +90,11 @@ impl Scope {
         Scope::Maintenance,
         Scope::Census,
         Scope::Cluster,
+        Scope::Decode,
+        Scope::Prefill,
+        Scope::TurnSeal,
+        Scope::Gallery,
+        Scope::Requests,
     ];
 
     /// The scope's name, as the report and the log carry it.
@@ -97,6 +115,11 @@ impl Scope {
             Scope::Maintenance => "maintenance",
             Scope::Census => "census",
             Scope::Cluster => "cluster",
+            Scope::Decode => "decode",
+            Scope::Prefill => "prefill",
+            Scope::TurnSeal => "turn_seal",
+            Scope::Gallery => "gallery",
+            Scope::Requests => "requests",
         }
     }
 }

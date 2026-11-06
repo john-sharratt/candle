@@ -204,9 +204,10 @@ impl Census {
     }
 }
 
+/// Each test's census is a `static` of its own, as the allocator's is: a
+/// census is ~1.6 MB, past what a test thread's stack holds.
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::thread;
 
     use super::*;
@@ -215,7 +216,8 @@ mod tests {
     /// again** — exact bytes, exact count.
     #[test]
     fn an_allocation_and_its_free_are_counted_exactly() {
-        let c = Census::new();
+        static C: Census = Census::new();
+        let c = &C;
         c.on_alloc(0, 30_000);
         let n = c.counts();
         assert_eq!(
@@ -242,7 +244,8 @@ mod tests {
     /// the shards differ, the sum is exact.
     #[test]
     fn a_free_on_another_shard_balances_in_the_sum() {
-        let c = Census::new();
+        static C: Census = Census::new();
+        let c = &C;
         c.on_alloc(3, 5_000);
         c.on_free(41, 5_000);
         assert_eq!(c.counts().live_bytes(), 0);
@@ -254,7 +257,8 @@ mod tests {
     /// free — on another shard — takes it out of both.
     #[test]
     fn a_scoped_block_is_counted_in_its_scope() {
-        let c = Census::new();
+        static C: Census = Census::new();
+        let c = &C;
         c.on_alloc_scoped(2, 100_000, 5);
         let n = c.counts();
         assert_eq!(
@@ -285,16 +289,15 @@ mod tests {
     /// census exact**: nothing live, everything allocated also freed.
     #[test]
     fn many_threads_leave_an_exact_census() {
-        let c = Arc::new(Census::new());
+        static C: Census = Census::new();
         let threads: Vec<_> = (0..16)
             .map(|t| {
-                let c = Arc::clone(&c);
                 thread::spawn(move || {
                     for i in 0..10_000 {
                         let size = 16 + (i * 37 + t * 101) % 40_000;
-                        c.on_alloc(t, size);
+                        C.on_alloc(t, size);
                         // Freed on the next thread's shard half the time.
-                        c.on_free(if i % 2 == 0 { t } else { t + 1 }, size);
+                        C.on_free(if i % 2 == 0 { t } else { t + 1 }, size);
                     }
                 })
             })
@@ -302,7 +305,7 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        let n = c.counts();
+        let n = C.counts();
         assert_eq!((n.live_bytes(), n.live_count()), (0, 0));
         assert_eq!(n.freed_total(), n.allocated_total);
         assert!(n.allocated_total > 0);

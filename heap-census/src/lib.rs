@@ -36,4 +36,4 @@ mod thread_state;
 pub mod verdict;
 
 pub use counting::Counting;
-pub use scope::{enter, set_thread, Scope};
+pub use scope::{enter, set_thread, Scope, Scoped};
