@@ -1598,7 +1598,7 @@ mod tests {
 
         // One real request per placed unit kind: a file, a folder, and a
         // repository root — the root being the one whose request says no "folder".
-        let file = crate::code_read::opening_prompt("candle/src/lib.rs", 120, 1);
+        let file = crate::code_read::opening_prompt("candle/src/lib.rs", 120, &[(1, 120)]);
         let folder = render::render_request(&unit("candle/zend/src/"));
         let root = render::render_request(&unit("candle/"));
 

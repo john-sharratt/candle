@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn opening_prompt_names_the_path_and_the_one_tool() {
-        let p = opening_prompt("candle/src/lib.rs", 120, 1);
+        let p = opening_prompt("candle/src/lib.rs", 120, &[(1, 120)]);
         assert!(
             p.starts_with("Read the entire contents of `src/lib.rs` in the `candle` repository")
         );
