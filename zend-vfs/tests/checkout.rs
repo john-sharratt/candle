@@ -676,7 +676,10 @@ fn a_crlf_checkout_takes_the_conversations_own_text() {
         std::fs::remove_file(f.root.join(p)).unwrap();
     }
     git(&f.root, &["checkout", "-q", "--", "."]);
-    assert_eq!(disk(&f.root, "README.md"), text("# app\r\n\r\nthe app.\r\n"));
+    assert_eq!(
+        disk(&f.root, "README.md"),
+        text("# app\r\n\r\nthe app.\r\n")
+    );
     assert_eq!(at_base(&f, "README.md"), text("# app\n\nthe app.\n"));
 
     let mut changes = FileChanges::new();

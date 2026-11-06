@@ -31,10 +31,16 @@ impl Line {
         matches!(self, Self::Removed(_) | Self::Added(_))
     }
 
+    /// The line as shown: its mark, then its text after a space — a blank
+    /// line is its mark alone, with no space trailing.
     fn text(&self) -> String {
+        let shown = |mark: char, line: &str| match bare(line) {
+            "" => format!("{mark}\n"),
+            text => format!("{mark} {text}\n"),
+        };
         match self {
-            Self::Removed(l) => format!("- {}\n", bare(l)),
-            Self::Added(l) => format!("+ {}\n", bare(l)),
+            Self::Removed(l) => shown('-', l),
+            Self::Added(l) => shown('+', l),
             Self::Gap => GAP.to_string(),
         }
     }
@@ -192,6 +198,12 @@ mod tests {
     fn nothing_changed_shows_nothing() {
         assert_eq!(changed("same\ntext\n", "same\ntext\n"), "");
         assert_eq!(changed("", ""), "");
+    }
+
+    /// A blank line is its mark alone, with no space after it.
+    #[test]
+    fn a_blank_line_is_its_mark_alone() {
+        assert_eq!(changed("a\n\nb\n", "a\nb\n"), "-\n");
     }
 
     /// A file that ends without a newline keeps its last line whole, and a

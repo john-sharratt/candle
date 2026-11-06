@@ -339,7 +339,11 @@ mod tests {
             std::fs::remove_file(t.path.join(name)).unwrap();
         }
         t.git(&["checkout", "--", "."]);
-        assert_eq!(t.read("text.txt"), b"one\r\ntwo\r\n", "the checkout converts");
+        assert_eq!(
+            t.read("text.txt"),
+            b"one\r\ntwo\r\n",
+            "the checkout converts"
+        );
 
         let repo = t.repo();
         let at = Rev::Oid(commit);
@@ -361,7 +365,11 @@ mod tests {
         let all = repo.read_committed_all(&at, &refs).unwrap();
 
         for (i, path) in bulk.iter().enumerate() {
-            assert_eq!(all[path.as_str()], format!("file {i}\n").into_bytes(), "{path}");
+            assert_eq!(
+                all[path.as_str()],
+                format!("file {i}\n").into_bytes(),
+                "{path}"
+            );
         }
         assert_eq!(all.len(), refs.len() - 2, "the missing path and the folder");
         for name in ["text.txt", "kept.lf", "made.crlf"] {

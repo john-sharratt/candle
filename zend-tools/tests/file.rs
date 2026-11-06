@@ -218,7 +218,9 @@ fn file_edit_round_trip() {
     let now = anchor_of(&ctx, "rt.txt", "hello");
     assert_eq!(
         resp["result"],
-        format!("Replaced {at}.\n{now}| hello Rust\n")
+        format!(
+            "Replaced {at}.\n{now}| hello Rust\nChanged lines:\n- hello world\n+ hello Rust\n"
+        )
     );
     assert_eq!(resp["bytes"], 10);
 }
@@ -347,7 +349,10 @@ fn file_edit_deletes_and_moves_parts() {
         json!({"path": "s.md", "at": two, "do": "delete"}),
     ));
     assert_eq!(text_of(&ctx, "s.md"), "Three.\n\nOne.\n");
-    assert_eq!(resp["result"], format!("Deleted {two}.\n{three}| Three.\n"));
+    assert_eq!(
+        resp["result"],
+        format!("Deleted {two}.\n{three}| Three.\nChanged lines:\n- Two.\n-\n")
+    );
 }
 
 /// The tool end to end over a real workspace: the edit lands in the session,
