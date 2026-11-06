@@ -105,15 +105,7 @@ impl UnsealedAsker {
             };
             let message = TurnText::from(question);
             self.submitter
-                .submit_turn_on(
-                    slot,
-                    inputs,
-                    &message,
-                    question.to_string(),
-                    options,
-                    &[],
-                    None,
-                )?
+                .submit_turn_on(slot, inputs, &message, question.to_string(), options, None)?
                 .0
         };
         handle.wait_async().await
