@@ -28,10 +28,8 @@ tempfile = { workspace = true }
 web      = { path = "../web" }
 
 [features]
-# The memory census is on in the deployed build while BlackWorld's untracked
-# growth is being found (`docs/memory_census.md`).
-default = ["memory-census"]
-# The memory census: the counting allocator installed, and the host's census
+default = []
+# The memory census (`docs/memory_census.md`): the counting allocator installed, and the host's census
 # task and the stores' gauge pass running.
 memory-census = ["dep:heap-census", "zend/memory-census", "npcd/memory-census"]
 # Zero-cost scoped timing of the hot path; `/v1/profile` reports it.

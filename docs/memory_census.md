@@ -357,9 +357,8 @@ The census is a Cargo feature, `memory-census`, like `profile` and
 three things that do work — the counting allocator each binary installs, the
 host's once-a-minute census task, and each store's gauge pass — and leaves the
 types and the readers built, so `/v1/memory` and `/v1/telemetry` report the
-census absent without it. `motherd` turns it on by default while BlackWorld's
-growth is being found; `zend` and `npcd` take it when built with
-`--features memory-census`. The feature runs down through `zend`, `npcd`,
+census absent without it. `motherd`, `zend` and `npcd` take it when built with
+`--features memory-census`; the deployed build leaves it out. The feature runs down through `zend`, `npcd`,
 `host`, `candle-conversation` and `substrate-git`, each of which names its
 threads' scopes (§10) only with it.
 
