@@ -786,7 +786,12 @@ the token that would end the turn (`TriggerRegistry::with_tail`). An end token
 sampled in free decode, with a tail bound, is dropped, not committed, and the
 tail's walk writes in its place. The tail's own last static is the turn's
 close, so the turn ends inside the stencil. A tail fires once, and never on a
-replayed turn, whose recording already holds what it wrote.
+replayed turn, whose recording already holds what it wrote. It fires only
+after an answer (`scheduler/answered.rs`): an end token with nothing but
+whitespace since the reasoning ends the turn as it stands. A reviewer
+reasoned until its think block was closed for it, then sampled the end at
+once. The tail wrote its `Steps:` onto the empty answer, which then passed
+the check that sends back an answer that leaves its steps out.
 
 A task's `Steps:` section is the tail (`stencil/answer_steps.rs`). It writes
 the heading and, for each step, `N. <its words> — `. Each line is held to

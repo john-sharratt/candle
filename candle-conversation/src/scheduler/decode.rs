@@ -1,3 +1,4 @@
+use super::answered::{after_reasoning, answered};
 use super::band::rank;
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
@@ -1736,12 +1737,22 @@ impl Scheduler {
                     None => {
                         // An end token with a tail bound does not end the turn:
                         // it is dropped, and the tail writes in its place and
-                        // ends the turn itself — once. A replayed turn plays
-                        // what its recording holds, the tail's text included.
-                        let tail = match self.eos_tokens.contains(&token)
-                            && state.recorded_reply.is_none()
-                        {
-                            true => state.triggers.tail_driver(),
+                        // ends the turn itself — once, and only after an
+                        // answer: an end straight after the reasoning ends the
+                        // turn as it stands. A replayed turn plays what its
+                        // recording holds, the tail's text included.
+                        let ends = self.eos_tokens.contains(&token)
+                            && state.recorded_reply.is_none();
+                        let tail = match ends {
+                            true => state.triggers.tail_driver().filter(|_| {
+                                let after = after_reasoning(
+                                    &state.generated_tokens,
+                                    state.think_close_at,
+                                );
+                                answered(after, |run| {
+                                    self.tokenizer.decode(run, false).unwrap_or_default()
+                                })
+                            }),
                             false => None,
                         };
                         if let Some(driver) = tail {
