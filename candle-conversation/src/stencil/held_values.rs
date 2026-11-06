@@ -145,4 +145,46 @@ mod tests {
         );
         assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
     }
+    /// **Every character a pattern reads as an operator is escaped**, one arm
+    /// per character, and a value of plain letters and digits is left as it is.
+    #[test]
+    fn every_operator_in_a_value_is_escaped() {
+        let cases: &[(&str, &str)] = &[
+            ("\\", r"(?:\\)"),
+            (".", r"(?:\.)"),
+            ("+", r"(?:\+)"),
+            ("*", r"(?:\*)"),
+            ("?", r"(?:\?)"),
+            ("(", r"(?:\()"),
+            (")", r"(?:\))"),
+            ("|", r"(?:\|)"),
+            ("[", r"(?:\[)"),
+            ("]", r"(?:\])"),
+            ("{", r"(?:\{)"),
+            ("}", r"(?:\})"),
+            ("^", r"(?:\^)"),
+            ("$", r"(?:\$)"),
+            ("#", r"(?:\#)"),
+            ("&", r"(?:\&)"),
+            ("-", r"(?:\-)"),
+            ("~", r"(?:\~)"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                literal_pattern(&[value.to_string()]),
+                *expected,
+                "`{value}` was not escaped"
+            );
+        }
+        // Several operators in one value, and two values alternated.
+        assert_eq!(
+            literal_pattern(&["a(b]c".into(), "x|y".into()]),
+            r"(?:a\(b\]c|x\|y)"
+        );
+        // Plain letters and digits pass through untouched.
+        assert_eq!(
+            literal_pattern(&["src42".into(), "KehT".into()]),
+            "(?:src42|KehT)"
+        );
+    }
 }
