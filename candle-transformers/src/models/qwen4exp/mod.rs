@@ -53,7 +53,6 @@ pub mod model;
 /// The NextN / MTP draft head — the block past the trunk, and the input
 /// assembly that feeds it.
 pub mod mtp;
-pub mod page_slice;
 pub mod paged_index;
 #[cfg(feature = "cuda")]
 pub mod place;
