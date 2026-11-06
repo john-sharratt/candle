@@ -1656,6 +1656,7 @@ impl Scheduler {
     /// (the reprojection drain inside it is separately attributed to
     /// [`WavePhase::Reproject`] as a sub-slice).
     fn timed_decode(&mut self) {
+        let _stage = census_stage::enter(Stage::Decode);
         let _g = profile::span("loop:decode");
         let t = Instant::now();
         self.wave_stats.in_decode_quantum = true;
@@ -1683,6 +1684,7 @@ impl Scheduler {
 
     /// Clean up finished turns — their seals — filed with the census.
     fn timed_cleanup(&mut self) {
+        let _stage = census_stage::enter(Stage::Seal);
         let t = Instant::now();
         self.cleanup_finished();
         self.step_census
@@ -1692,6 +1694,7 @@ impl Scheduler {
     /// Update the gallery's keep trade, give up its dead turns, and publish
     /// the learned rates, each filed with the census (`step_census`).
     fn timed_rates_and_gallery(&mut self) {
+        let _stage = census_stage::enter(Stage::Gallery);
         let t = Instant::now();
         self.update_gallery_keep();
         self.sweep_gallery();
@@ -1714,6 +1717,7 @@ impl Scheduler {
             Self::withdraw_abandoned_prefills,
         );
         self.timed_rates_and_gallery();
+        let _stage = census_stage::enter(Stage::Prefill);
         self.run_prefill_until_budget();
         self.wave_stats
             .add_phase(WavePhase::Prefill, t.elapsed().as_millis() as u64);
@@ -1722,6 +1726,7 @@ impl Scheduler {
     /// Run the section-ingest quantum, attributing its wall-clock to
     /// [`WavePhase::Section`].
     fn timed_section(&mut self) {
+        let _stage = census_stage::enter(Stage::Seal);
         let _g = profile::span("loop:section");
         let t = Instant::now();
         self.timed_activity(
