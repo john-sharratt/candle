@@ -76,6 +76,9 @@ impl RoundTiming {
         };
         let (prefill_tokens, prefill_ms) = pair(words.next(), "prefill=")?;
         let (generated, decode_ms) = pair(words.next(), "decode=")?;
+        if words.next().is_some() {
+            return None;
+        }
         Some(RoundTiming {
             queued_ms,
             prefill_tokens,
@@ -156,6 +159,11 @@ mod tests {
         );
         assert_eq!(RoundTiming::parse(&r.value()), Some(r));
         assert_eq!(RoundTiming::parse("queued=x"), None);
+        assert_eq!(
+            RoundTiming::parse(&format!("{} garbage", r.value())),
+            None,
+            "a value with more than its three fields is not one this wrote"
+        );
         assert_eq!(
             r.to_string(),
             "queued 2.5 s, prefill 512 tok in 1.4 s, decode 210 tok in 6.1 s"

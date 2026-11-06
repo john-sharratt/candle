@@ -628,7 +628,7 @@ user"): in the second challenge round a researcher sent back for its `Steps:`
 section journaled it as "the Steps: accounting the user asked for".
 
 **Where.** `workers::nudge` and the reply path in `zend/src/mcp/workers.rs`,
-where the queued text is delivered, and the send-back in `workers::settle`.
+where the queued text is delivered, and the send-back in `workers::run`.
 
 ## Cause 8 — refusals without a way on
 
