@@ -3473,17 +3473,6 @@ pub(crate) struct Scheduler {
     /// Each sealed section's per-position model state, by the section's
     /// content address — see [`section_pages`].
     pub(super) section_positional: SectionPages,
-    /// Each sealed turn's per-position model state, keyed as its K/V is.
-    ///
-    /// The conversation counterpart of [`Self::section_positional`], and the
-    /// one that carries the actual dialogue: a projection rebuilds a slot by
-    /// Arc-injecting the turns it selected, and those turns' index rows cannot
-    /// be borrowed with their chunks.
-    ///
-    /// Process-local, with the same limit stated there — a turn cold-loaded on
-    /// a later run has its K/V and not its page, and the injection says so
-    /// rather than selecting silently against a prefix it never indexed.
-    pub(super) turn_positional: HashMap<TurnKey, Arc<StoredPages>>,
     /// Batched sampler for token generation.
     sampler: BatchedSampler,
     /// When `true`, special tokens are included in streamed text.
@@ -4215,7 +4204,6 @@ impl Scheduler {
             section_queue: VecDeque::new(),
             active_section_ingests: Vec::new(),
             section_positional: SectionPages::default(),
-            turn_positional: HashMap::new(),
             sampler,
             show_special_tokens,
             health_config,
@@ -7418,8 +7406,6 @@ impl Scheduler {
         self.timeline_projections
             .retain(|t, _| !timelines.contains(t));
         self.ingest_timelines.retain(|t| !timelines.contains(t));
-        self.turn_positional
-            .retain(|k, _| !timelines.contains(&k.timeline));
         self.persist_triggers.detach(id);
         self.attached_substrates
             .retain(|c| !c.same_substrate(conversation));
@@ -8012,7 +7998,6 @@ impl Scheduler {
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
                 section_positional: &self.section_positional,
-                turn_positional: &self.turn_positional,
             },
             segments,
             defer,
@@ -8058,7 +8043,6 @@ impl Scheduler {
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
             section_positional: &self.section_positional,
-            turn_positional: &self.turn_positional,
         };
         projection_assembler::apply_segments_build(state, &mut ctx, segments)
     }
@@ -8095,7 +8079,6 @@ impl Scheduler {
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
             section_positional: &self.section_positional,
-            turn_positional: &self.turn_positional,
         };
         // The wave path fires the batched gap-fill BEFORE this finish, so the
         // fresh islands' K/V is in the gaps and capturable.
@@ -9995,18 +9978,14 @@ impl Scheduler {
                         // seals no pages at all, which `turn_sealed_without_thinking`
                         // handles by injecting it whole. The warning above already
                         // names both numbers.
+                        //
+                        // The substrate holds the bytes until the write lands and
+                        // the log after it; a slot that places the turn holds them
+                        // again for as long as it does (`HeldIndexPages`).
                         if covered == turn_token_count {
-                            let payload = index_pages::encode(&pages);
                             conversation.enqueue_index_page(
                                 turn_stream_id(target.timeline.raw(), idx.0),
-                                payload.clone(),
-                            );
-                            self.turn_positional.insert(
-                                TurnKey {
-                                    timeline: target.timeline,
-                                    index: idx,
-                                },
-                                Arc::new(StoredPages::new(payload)),
+                                index_pages::encode(&pages),
                             );
                         }
                     }
@@ -10787,19 +10766,14 @@ impl Scheduler {
                                 );
                             }
                             // The rows for the K/V just injected. Borrowing the
-                            // turn's keys does not bring its index across —
-                            // resident copy first, then the turn's stored page,
-                            // the same order a projection uses.
-                            let key = TurnKey::new(target.timeline, idx);
-                            let page = match self.turn_positional.get(&key).cloned() {
-                                Some(pages) => Some(pages),
-                                None => conversation
-                                    .turn_index_page(target.timeline, idx)
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!("memory catch-up: {e}");
-                                        None
-                                    }),
-                            };
+                            // turn's keys does not bring its index across — the
+                            // turn's page, read as a projection reads it.
+                            let page = conversation
+                                .turn_index_page(target.timeline, idx)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("memory catch-up: {e}");
+                                    None
+                                });
                             // The stored page is a framed LIST of pages, and the
                             // model reads one page at a time — see
                             // `index_pages::push_in_order`. However the pages fare,

@@ -1127,8 +1127,8 @@ mod tests {
 
     /// A turn's QSA index page has to outlive the process that sealed it.
     ///
-    /// Held only in the scheduler's `turn_positional` map it dies with the
-    /// daemon, and every turn cold-loaded afterwards hands a projection its K/V
+    /// Held only in RAM it dies with the daemon, and every turn cold-loaded
+    /// afterwards hands a projection its K/V
     /// with no index of it — the slot's caches then sit permanently short by
     /// that turn's width and the select refuses once the conversation passes the
     /// identity threshold. This asserts the byte-for-byte round trip through a

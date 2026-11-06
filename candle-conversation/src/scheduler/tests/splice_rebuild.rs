@@ -12,9 +12,9 @@
 use super::positional_ledger::toy_page;
 use super::*;
 use crate::index_pages;
+use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::{
     GroupId, LayerId, ProjectionSegment, ResolvedTurn, SealedKind, TimelineId, TurnId, TurnIndex,
-    TurnKey,
 };
 use crate::substrate::TurnPartWrite;
 use crate::token_buffer::TokenBuffer;
@@ -31,7 +31,7 @@ struct Fixture {
 }
 
 /// One sealed turn per width, each with K/V of its own on the session and a
-/// toy page covering it, resident the way a turn this process sealed is.
+/// toy page covering it, written the way a seal writes it.
 fn fixture(widths: &[usize]) -> Fixture {
     let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
     let conversation = Conversation::new();
@@ -90,12 +90,9 @@ fn seal_turn(
             |seqs| Ok(seqs.to_vec()),
         )
         .expect("record the turn");
-    scheduler.turn_positional.insert(
-        TurnKey { timeline, index },
-        Arc::new(StoredPages::new(index_pages::encode(&[(
-            tokens,
-            toy_page(tokens, &[label]),
-        )]))),
+    conversation.enqueue_index_page(
+        turn_stream_id(timeline.raw(), index.0),
+        index_pages::encode(&[(tokens, toy_page(tokens, &[label]))]),
     );
     index
 }

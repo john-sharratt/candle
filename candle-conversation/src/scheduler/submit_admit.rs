@@ -46,6 +46,11 @@ impl Scheduler {
     /// K/V lifted hot ([`incoming_hot_bytes`]) and the index pages placed for
     /// them, each page priced by the model at what placing it would claim —
     /// zero for a piece already resident, since a placed page is shared.
+    ///
+    /// A turn's page is priced from memory only
+    /// ([`Conversation::turn_index_page_in_memory`]): pricing runs on the
+    /// scheduler thread for every submit and rebuild, and never reads the log.
+    /// A page only the log holds is priced at nothing.
     pub(super) fn projection_lift(
         &self,
         conversation: &Conversation,
@@ -67,8 +72,8 @@ impl Scheduler {
         };
         let mut index = 0u64;
         for t in turns {
-            if let Some(stored) = self.turn_positional.get(t) {
-                index += price(stored);
+            if let Some(stored) = conversation.turn_index_page_in_memory(t.timeline, t.index) {
+                index += price(&stored);
             }
         }
         let read = conversation.read();

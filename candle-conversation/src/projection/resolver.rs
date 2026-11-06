@@ -4996,6 +4996,22 @@ impl Conversation {
         Ok(Some(page))
     }
 
+    /// [`Self::turn_index_page`] without the log: the page while the substrate
+    /// still holds its bytes — sealed and not yet written — or while a caller
+    /// holds the bytes a read produced ([`HeldIndexPages`]). `None` for a page
+    /// only the log has, which this never reads.
+    pub fn turn_index_page_in_memory(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<Arc<StoredPages>> {
+        let stream_id = turn_stream_id(timeline.raw(), index.0);
+        match self.read().index_page_record_of(stream_id)? {
+            (IndexPage::Resident(pages), _) => Some(pages),
+            (IndexPage::Stored(_), id) => self.held_index_pages.get(stream_id, id),
+        }
+    }
+
     /// The bytes of the index page `stream_id` keeps in the log, read first at
     /// `loc` and again wherever compaction moved it.
     fn read_stored_index_page(
@@ -6013,6 +6029,63 @@ mod tests {
             "a new page for the stream is read, though the old one is still held"
         );
         assert!(!Arc::ptr_eq(&newer, &fresh));
+    }
+
+    /// **The in-memory lookup never reads the log.** A written page that no
+    /// caller holds is not found; once a read holds it, the lookup hands back
+    /// that very allocation; and when the holder lets go it is not found again.
+    #[test]
+    fn the_in_memory_lookup_finds_only_pages_held() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(29).expect("timeline id");
+        conv.register_timeline(tl, layer, group);
+        let sealed = Arc::new(vec![SealedSequence {
+            chunks: vec![SealedChunk::for_test(1000, 4)],
+            token_count: 4,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]);
+        let idx = conv
+            .record_turn(
+                tl,
+                Role::Assistant,
+                TurnPartWrite {
+                    token_ids: TokenBuffer::from(vec![41, 42, 43, 44]),
+                    token_count: 4,
+                    block_start: 0,
+                    block_end: 1,
+                    sealed_gpu: Some(sealed),
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record the turn");
+        let page = crate::index_pages::encode(&[(2, vec![5u8; 96])]);
+        conv.enqueue_index_page(turn_stream_id(tl.raw(), idx.0), page.clone());
+        conv.flush_writer();
+
+        assert!(
+            conv.turn_index_page_in_memory(tl, idx).is_none(),
+            "written and held by no one, the page is only in the log"
+        );
+        let held = conv
+            .turn_index_page(tl, idx)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        let found = conv
+            .turn_index_page_in_memory(tl, idx)
+            .expect("a held page is in memory");
+        assert!(Arc::ptr_eq(&held, &found), "the held allocation itself");
+        assert_eq!(found.bytes(), page.as_slice());
+
+        drop(found);
+        drop(held);
+        assert!(
+            conv.turn_index_page_in_memory(tl, idx).is_none(),
+            "with no holder left, the page is the log's alone"
+        );
     }
 
     /// **An ephemeral conversation takes its directory with it.**

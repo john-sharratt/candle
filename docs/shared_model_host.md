@@ -56,8 +56,8 @@ one scheduler (`slots_sharing_a_substrate_are_walked_once`, `:15487`).
   `:662`).
 
 **Keys that carry no substrate.** `TurnKey`, `TimelineId`, `SectionId` and `StreamId`
-key scheduler-wide maps (`turn_positional` `:3170`, `ingest_timelines` `:3456`,
-`timeline_projections` `:3530`) and the gallery arena's residency map
+key scheduler-wide maps (`ingest_timelines` `:3456`, `timeline_projections` `:3530`)
+and the gallery arena's residency map
 (`gallery_arena/mod.rs:113`). Each `Conversation` has its own `TimelineAllocator`,
 minting `max(now_µs, last+1)` (`projection/ids.rs:372-421`), so two substrates can
 mint the same id, and two substrates opened on different machines may already hold
@@ -317,8 +317,8 @@ ConversationEngine (one per tenant) = Arc<EngineCore> + one attachment
 process-wide allocator (`projection::ids::process_timeline_allocator`), and attaching
 a substrate whose stored timeline ids overlap an attached one's is refused. So a bare
 `TimelineId` — and the `TurnKey`s and `StreamId`s built on it — names one thing in
-the process, and `turn_positional`, `ingest_timelines`, `timeline_projections`, the
-gallery arena's residency map and the relief keep-sets stay keyed as they were.
+the process, and `ingest_timelines`, `timeline_projections`, the gallery arena's
+residency map and the relief keep-sets stay keyed as they were.
 
 **Section tables key by content, not by `SectionId`.** A `SectionId` is its schema's
 own, so the scheduler's per-section tables never key by it alone: the index pages are

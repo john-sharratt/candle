@@ -733,9 +733,6 @@ pub(super) struct ApplyContext<'a> {
     /// brings its index rows along with its chunks. Empty for a model that
     /// carries none — see `Scheduler::section_positional`.
     pub(super) section_positional: &'a SectionPages,
-    /// Each sealed turn's per-position model state — the dialogue counterpart
-    /// of [`Self::section_positional`], and the one this path uses most.
-    pub(super) turn_positional: &'a HashMap<TurnKey, Arc<StoredPages>>,
 }
 
 /// A built-but-not-yet-fired gap-fill descriptor for one slot. Owned (no
@@ -2173,23 +2170,14 @@ fn inject_sealed_turn(
     // result takes the highest index, and the call turn is then windowed a turn
     // early. See `docs/thinking_span_projection.md` §6.3 before adding a clause.)
     //
-    // The rows come from the resident map first, then the turn's stored record:
-    // the map holds only what THIS process sealed, so after a restart every turn
-    // that predates it misses there and the record is the only copy — which is
-    // the whole reason the pages are written to the log rather than kept in RAM.
-    let key = TurnKey { timeline, index };
+    // The rows come from the turn's stored record: its bytes while the
+    // substrate still holds them, a slot's held copy while one places the turn
+    // (`HeldIndexPages`), and the log otherwise.
     let t_resolve = Instant::now();
     let fetch = profile::span("inject:turn:fetch_page");
-    let resident = ctx.turn_positional.get(&key).cloned();
     // Before the substrate lock: a page left in the log is read through the
     // persistence path, which takes its own.
-    let stored = match resident {
-        Some(pages) => Some(pages),
-        None => {
-            let _g = profile::span("inject:turn:page_not_resident");
-            ctx.conversation.turn_index_page(timeline, index)?
-        }
-    };
+    let stored = ctx.conversation.turn_index_page(timeline, index)?;
     // The page as stored, before any windowing filters it: what the placed
     // piece holds, so the next rebuild finds it again by its record.
     let held_page = stored.clone();
