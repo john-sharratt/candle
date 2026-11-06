@@ -224,6 +224,18 @@ cluster:
   # (docs/static_placement.md §2): the table every daemon compiles in, so the
   # gateway places by the same file the members size themselves by.
   machines_file: "../host/machines.yaml"
+  # Services on this machine that act as themselves (docs/mcp_file_tools.md
+  # §4): Yen Bots, on the routes and bus topics below. The same file is
+  # yenbot's D:/yenbot/secrets/gateway.key. Made once with
+  #
+  #   target\release\web.exe --new-ops-key web/secrets/yenbot.key
+  service_keys:
+    - name: yenbot
+      key_file: "secrets/yenbot.key"
+      routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit]
+      topics:
+        subscribe: ["repo/yenbot", "gate/yenbot"]
+        publish: ["gate/yenbot/result/*", "service/yenbot/*"]
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
@@ -338,6 +350,22 @@ sites:
         exact: true
         upstream: "http://127.0.0.1:8095"
         cluster: mcp
+
+  # ── yenbot.com.au — Yen Bots ────────────────────────────────────────────
+  # Yen's app-hosting site (docs/yenbot_app_host.md): one binary on this
+  # machine's loopback, supervised by keep, serving the platform's pages, its
+  # apps and its API. Sign-in stays the gateway's, on the site's own cookie
+  # domain (auth.yaml `domains`). `logs` makes it a log source the connector's
+  # log tools read (docs/mcp_file_tools.md §6).
+  - name: yenbot
+    hosts: ["yenbot.com.au", "yenbot.localhost"]
+    logs: true
+    api:
+      - {prefix: /, upstream: "http://127.0.0.1:8096"}
+
+  - name: yenbot-alt
+    hosts: ["www.yenbot.com.au"]
+    redirect: "https://yenbot.com.au"
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.
