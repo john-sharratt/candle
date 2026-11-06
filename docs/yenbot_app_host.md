@@ -429,8 +429,13 @@ else (§6.2):
   backup's, in one transaction, after writing a backup of what it replaces;
   the rest of the site is untouched and keeps running.
 - **The whole store**, for a corrupted database: the same route without `app`
-  swaps the file in under the store's write lock and reopens it, again after
-  backing up what it replaces.
+  copies the backup in with SQLite's backup API under the store's lock and
+  brings it up to the build's schema, again after backing up what it
+  replaces; a backup from a newer build is refused before anything is
+  copied.
+
+What a restore replaces is kept beside the backups as `replaced-<ms>.db`
+(`yenbot/src/store/restore.rs`).
 
 `GET /api/v1/admin/backups` lists them with their dates and sizes.
 
