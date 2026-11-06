@@ -2,7 +2,7 @@
 
 **Status: design, not built.** This document is authoritative for the file,
 log and site tools the Zen connector offers, the gateway's publish/subscribe
-bus, and the service keys they rest on. Its first consumer is Yen Bots
+bus and the gates it carries, and the service keys they rest on. Its first consumer is Yen Bots
 (`docs/yenbot_app_host.md`), which goes live a second after a commit lands.
 
 ## 1. What it is for
@@ -68,17 +68,24 @@ whose existing content is not, is refused.
    the repository's object store and a commit on the base, by the git layer
    (`docs/zend_git.md` — it writes commits and moves refs without touching any
    working tree). The author is the repository's (§3.3).
-4. **Push**, compare-and-swap: origin's branch must still be the base
-   (`docs/zend_git.md` §1, every ref move names the value it replaces).
-5. **Race.** If the push is refused because the branch moved, fetch the new
+4. **Gate**, for a repository that names one (§3.3): push the commit to a
+   candidate ref, `refs/zen/candidate/<id>`, publish `gate/<repo>` on the bus
+   (§5.4) and wait for the gate's answer. Refused — or no answer within ten
+   seconds — deletes the candidate and fails the call with the gate's reason;
+   the branch never moved. A repository with no gate skips this step.
+5. **Push**, compare-and-swap: origin's branch moves from the base to the
+   commit (`docs/zend_git.md` §1, every ref move names the value it replaces).
+6. **Race.** If the push is refused because the branch moved, fetch the new
    head and go back to step 2 with the same changes. Edits are matched by
    their text, so re-applying them onto someone else's newer commit is safe;
    if one no longer applies — its `old` text was changed by that commit — the
    call fails as in step 2, naming it. At most three attempts.
-6. **Publish** `repo/<repo>` on the gateway's bus (§5.3).
+7. **Publish** `repo/<repo>` on the gateway's bus (§5.3).
 
-The answer: the commit id, the branch, the paths it changed, and the attempt
-it landed on.
+The call is all or nothing: the change is on the branch, checked by the
+repository's gate, or it is nowhere. The answer: the commit id, the branch,
+the paths it changed, the attempt it landed on — or the step that refused it
+and why.
 
 ### 3.3 Authors
 
@@ -94,10 +101,14 @@ repos:
   - name: journals
   - name: yenbot
     author: {name: Yen, email: yensharratt@gmail.com}
+    gate: yenbot                # the service that checks a change before the branch moves
 ```
 
 The committer is the author. A commit carries no attribution to a model or an
-assistant (`CLAUDE.md`, "No AI attribution anywhere").
+assistant (`CLAUDE.md`, "No AI attribution anywhere"). A repository's `gate`
+names the service that answers its `gate/<repo>` requests (§5.4); every push
+Zen makes to it — this tool's, a worker task's, an agent job's — goes through
+the gate.
 
 ### 3.4 Access
 
@@ -130,8 +141,8 @@ service_keys:
     identity: "service:yenbot"
     routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit]
     topics:
-      subscribe: ["repo/yenbot"]
-      publish: ["service/yenbot/*"]
+      subscribe: ["repo/yenbot", "gate/yenbot"]
+      publish: ["gate/yenbot/result/*", "service/yenbot/*"]
 ```
 
 A request bearing a service key as `Authorization: Bearer`, from a trusted
@@ -184,6 +195,28 @@ push — so a subscriber learns of each change by one path, whoever made it:
 A push made outside Zen (a developer pushing from a laptop) publishes nothing;
 a subscriber that must see it also polls the branch, slowly.
 
+### 5.4 `gate/<repo>`: a check before the branch moves
+
+The bus also carries a request and its answer. Before a push to a gated
+repository (§3.3), zend publishes:
+
+```json
+{"op": "publish", "topic": "gate/yenbot",
+ "payload": {"id": "01JD…", "ref": "refs/zen/candidate/01JD…", "commit": "4f1c…",
+             "base": "a3f9…", "paths": ["apps/recipes/pages/home.js"]}}
+```
+
+The gate fetches the candidate, checks it, and answers on
+`gate/<repo>/result/<id>`:
+
+```json
+{"ok": false, "reason": "apps/recipes/pages/home.js:14 uses a literal colour; use a token"}
+```
+
+zend waits for that answer — ten seconds at most — and moves the branch only
+on `ok`. A gate that is not connected, or does not answer in time, refuses
+the change rather than letting it through unchecked.
+
 ## 6. Logs and sites in the connector
 
 ### 6.1 Log sources
@@ -215,23 +248,23 @@ The sources are:
 `log_grep` with `source: "cluster"` is what `cluster_logs` answers today, so
 `cluster_logs` is removed and the guides that name it name `log_grep`.
 
-### 6.3 Sites: screenshots and data
+### 6.3 Sites: stored data
 
-A site that wants Claude to see it serves two read-only routes, and the
-gateway lists it with `shot: true` and `data: true`:
+A site that lets Claude read what its apps stored serves one read-only route,
+and the gateway lists it with `data: true`:
 
 | Tool | Route | What it answers |
 |---|---|---|
-| `site_shot {site, app, page?, width?, theme?, live?}` | `GET /v1/site/shot` | The page rendered now, as a picture the session sees. |
 | `site_data {site, app, coll, where?, limit?}` | `GET /v1/site/data` | What the app stored, as rows. |
+
+How a page looks is not a tool: the person pastes a screenshot into the chat.
 
 ### 6.4 Who they act as
 
 Each tool calls through the gateway as the person whose connector it is, with
 their identity headers; the source or site decides what that person may read
 — yenbot answers its admins only. The tools run no model and answer within the
-request-path budget, except `site_shot`, which renders a page and is the
-budget's second documented exception.
+request-path budget.
 
 ## 7. Tests
 
@@ -247,6 +280,10 @@ budget's second documented exception.
 - **The bus**: subscribe, publish, a topic outside a key's scope refused, a
   wildcard, a slow subscriber dropped, a member's publish over the cluster
   socket delivered to a service.
+- **The gate**: an ok moves the branch; a refusal leaves it where it was and
+  deletes the candidate; a gate that is not connected, or answers after ten
+  seconds, refuses; a worker task's push to a gated repository is gated
+  too.
 - **`repo/<name>`**: a push through each of the three paths publishes once,
   with the commit and the paths.
 - **Log sources**: `log_list` over the cluster and a site with sub-sources;
@@ -262,9 +299,10 @@ budget's second documented exception.
 | zend's push paths | Publish `repo/<name>` after each push. |
 | `web/src/` and `web/web.yaml` | `service_keys:`; the bus and `/gateway/events`. |
 | `cluster/` | A publish (and subscribe) message on the member's socket. |
-| `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`; `site_shot`, `site_data`. |
-| `web/web.yaml`, `web/src/` | `logs`, `shot` and `data` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
-| `CLAUDE.md` | `file_edit_and_commit` and `site_shot` as the request-path budget's exceptions. |
+| `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`; `site_data`. |
+| `web/web.yaml`, `web/src/` | `logs` and `data` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
+| `zend-vfs/src/workspace.rs`, zend's push paths | `gate:` in the manifest; every push to a gated repository through `gate/<repo>` first. |
+| `CLAUDE.md` | `file_edit_and_commit` as the request-path budget's exception. |
 | `mcp/src/guides/` | The connector's guides name the file and log tools, `log_grep` where they named `cluster_logs`, and when a task is the better tool. |
 
 ## 9. Order of work
@@ -274,5 +312,6 @@ budget's second documented exception.
 2. The read tools on the connector.
 3. Service keys at the gateway.
 4. The bus, its WebSocket and the members' publish.
-5. zend publishing `repo/<name>` on every push.
-6. Log sources and the log tools, replacing `cluster_logs`; the site tools.
+5. zend publishing `repo/<name>` on every push, and gating the pushes of a
+   gated repository.
+6. Log sources and the log tools, replacing `cluster_logs`; `site_data`.

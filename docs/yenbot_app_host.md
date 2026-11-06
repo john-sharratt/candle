@@ -46,10 +46,12 @@ by rule — before it goes live.
 | Yen is not a coder | The framework, templates, the art library, guides, an extensive `CLAUDE.md` and the checks are all there from the first day (§8, §15–§17). |
 | The app-building guide is read for every new app | `yenbot new` starts every app and stamps the guide's edition; the check refuses an app built against an older one (§17.3). |
 | The styling must be amazing, to her attention to detail | One design system with fixed tokens, a living catalogue, and a check that renders every screen to pictures Claude looks at before publishing (§8.5, §17.4). |
-| Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; screenshots and data through two more read-only tools (§18). |
+| Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; stored data through `site_data`; and Yen pastes a screenshot when she wants Claude to see a page (§18). |
+| An edit is all or nothing | `file_edit_and_commit` returns live or refused: the site checks the change before `main` moves (§5.4). |
+| Claude remembers between chats | The `yenbot` journal holds each app's purpose, Yen's decisions and her preferences (§17.6). |
+| No approvals while iterating | Nothing in editing, publishing or a Zen task on the yenbot repository waits on an approval (§17.7). |
 | Data stays sound as apps change | Collections declare their fields; writes are validated; an app's version can carry a migration (§7.5). |
 | Real apps' queries | Counts, sums and groups, full-text search, batches, pages (§7.6). |
-| Drafts touch no real data | A draft app runs on its own data, seeded with samples (§5.4). |
 | English, Vietnamese-safe | English interfaces; type, input, search and sorting that handle Vietnamese correctly (§8.7). |
 | Families share | Groups, and roles per collection and per record; children with their own Google accounts (§12.5). |
 | Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped (§12.6). |
@@ -122,7 +124,7 @@ yenbot/
     catalogue.yaml
     tiles/  illustrations/  empty/  backgrounds/  stickers/
   templates/                  starting points for a new app (§16)
-  guides/                     the manual (§17)
+  docs/                       the manual (§17)
   yenbot.yaml                 the service's config
   tests/
 ```
@@ -141,7 +143,7 @@ name: Reminders
 description: Things to remember, with a ping when they are due.
 tile: library/tiles/bell-coral # its icon on the landing page, from the library (§15)
 colour: coral                  # the tile's accent, a palette token
-status: live                   # live | draft (draft: the admin only)
+status: live                   # live | draft (draft: not on the landing page yet)
 guide: 3                       # the app-building guide's edition it was built to (§17.3)
 collections:                   # what it stores, and each one's fields (§7.2, §7.5)
   reminders:
@@ -184,32 +186,36 @@ change Claude made without touching her phone.
 
 ### 5.4 Publishing
 
-Publishing is a commit on `main`. The fast path is the Zen connector's
-`file_edit_and_commit` (`docs/mcp_file_tools.md` §3): Claude reads a file with
-`file_read`, sends its edits, and the call commits them to `main` as Yen and
-pushes them — one call, one commit. A larger change made by a Zen task lands
-the same way, as the task's commits.
+Publishing is a commit on `main`, and iterating happens on the live site. The
+fast path is the Zen connector's `file_edit_and_commit`
+(`docs/mcp_file_tools.md` §3): Claude reads a file with `file_read`, sends its
+edits, and the call answers **live** or **refused** — one call, one commit,
+all or nothing:
 
-Every push Zen makes is announced on the gateway's bus as `repo/yenbot`
-(`docs/mcp_file_tools.md` §5). yenbot holds a WebSocket subscription to it;
-on a message it fetches `origin/main`, fast-forwards `D:\yenbot\live`, checks
-the apps whose paths changed (§17.4, the rules only), and swaps in each that
-passes — about a second after the push, and the open tab reloads itself
-(§5.3). An app that fails keeps its last good version, and the reason goes on
-the admin page. On every (re)connection, and every 60 s as a backstop for a
-push made outside Zen, yenbot fetches regardless. The fetch runs off every
-request path, and a history rewrite is refused (fast-forward only) and
-logged.
+1. The call commits the edits as Yen and pushes them to a candidate ref, not
+   to `main`.
+2. It publishes a check request on the gateway's bus, `gate/yenbot`
+   (`docs/mcp_file_tools.md` §5.4). yenbot is the repository's gate: it
+   fetches the candidate, runs the rule check (§17.4) on the apps the change
+   touches, and answers ok or refused with the rule, file and line.
+3. On ok, the call moves `main` to the candidate (compare-and-swap) and
+   publishes `repo/yenbot`; yenbot fast-forwards `D:\yenbot\live`, swaps the
+   apps in, and the open tab reloads itself (§5.3). The call answers live, with
+   the commit. On refused, the candidate is deleted, `main` never moved, and
+   the call answers the reason.
 
-**Drafts**: an app with `status: draft` is live for the admins only, its
-schedules held, so a new app is tried on the real site before anyone else
-sees it. **A draft runs on its own data**: its collections, files and jobs live
-under the namespace `draft:<id>`, apart from the live app's, and are seeded
-from the app's `samples/*.json` when the namespace is empty — so trying a draft
-never touches anyone's real records, and the screenshots (§17.4) have data to
-show. Taking an app out of draft starts it on its live namespace; the draft's
-data is discarded unless the manifest says to carry it over. **Rolling back**
-is a revert commit; every version of every app is in git.
+The whole loop is about two seconds. A larger change made by a Zen task lands
+the same way, each of its commits through the same gate. yenbot also fetches
+on every (re)connection to the bus and every 60 s, for a push made outside
+Zen; such a push is checked on arrival and an app that fails keeps its last
+good version, with the reason on the admin page. A history rewrite is
+refused (fast-forward only) and logged.
+
+**Drafts**: a new app with `status: draft` is not on the landing page yet; the
+admins open it by its URL while it is being made, and Claude asks Yen before
+setting it `live`. It runs on the live store like any app. **Undoing** is
+failing forward: a new edit that puts back what was there, from the journal
+(§17.6) or the chat.
 
 **Platform releases** go the ordinary way: an agent build on BlackWorld,
 staged to keep, tried, and kept when it prints `INFO serving` (`CLAUDE.md`,
@@ -253,7 +259,7 @@ approved gets nothing but `/me` (§12.2).
 
 Outside `/api/v1`, three groups of routes serve something other than an app's
 own pages: `/hooks/<app>/<name>` (inbound hooks, §19.2), `/v1/logs` (§18.2)
-and `/v1/site/…` (screenshots and data for the connector, §18.3).
+and `/v1/site/data` (stored data for the connector, §18.3).
 
 ## 7. The store
 
@@ -273,7 +279,7 @@ needs a migration:
 
 ```sql
 CREATE TABLE docs (
-  app        TEXT NOT NULL,          -- the namespace: the app's id, or draft:<id> (§5.4)
+  app        TEXT NOT NULL,          -- the app's id
   coll       TEXT NOT NULL,
   id         TEXT NOT NULL,          -- ULID
   owner      TEXT NOT NULL,          -- the account that created it
@@ -545,7 +551,7 @@ as a workflow (§10) on a bounded pool, a few at a time. A run that finishes
 marks its job `done`, or advances a repeating job to its next time. A run that
 fails is retried with backoff (1 min, 5 min, 30 min, then `failed`) and its
 error kept in `job_runs`; a failed job shows on the admin page and in
-`GET /jobs/<app>`. A draft app's jobs are `held`.
+`GET /jobs/<app>`.
 
 ### 9.4 When the machine was down
 
@@ -770,7 +776,7 @@ with Google". Pending: a page saying the account is waiting for Yen.
 - **Groups**: create, rename, add and remove accounts (§12.5).
 - **Apps**: each with its tile, status, public or private, who it is shared
   with, the order on the landing page, its last publish, its check result
-  with the screenshots (§17.4), its storage, and export, import and delete
+  (§17.4), its storage, and export, import and delete
   (§20.1).
 - **Jobs**: what runs next, what failed and why.
 - **Secrets**: each app's integration keys, set and replaced, never shown
@@ -847,7 +853,7 @@ design system (§8.5).
 With Zen's image engine, through the MCP's `image_generate` and `image_edit`
 — drawn by Claude while building, the same way Yen's apps are built. Every
 picture is drawn to the **house style**, written once in
-`guides/library.md`: the palette (the design tokens' colours by name), the
+`docs/library.md`: the palette (the design tokens' colours by name), the
 light, the rendering (a soft, rounded, gently lit illustration style, the
 same for every kind), what never appears (text, logos, photographs of real
 people), and a fixed preamble every prompt begins with. Pictures are drawn in
@@ -887,31 +893,36 @@ the app sets); a picture maker (describe it, draw it, keep it); reminders
 workflow that gathers and notifies); a form that saves answers and a page
 that sums them up. A new app is `yenbot new <id> --from <template>`.
 
-## 17. Guides, CLAUDE.md and the checks
+## 17. Docs, CLAUDE.md, the checks and the connector's guide
 
 ### 17.1 The manual
 
-The guides are the product as much as the code is, and they are complete from
-the first release. In the repository, `guides/`, versioned with the code they
-describe:
+The docs are the product as much as the code is, and they are complete from
+the first release. They live in the repository's `docs/`, versioned with the
+code they describe, and they derive from this design: each part of it becomes
+the doc a builder reads, written for a model building for someone who cannot
+read the code.
 
-- **`building-an-app.md`** — the app-building guide: read in full before every
-  new app, and before any change that adds a page, a collection, a workflow or
-  a schedule (§17.3). How to turn what Yen asks for into an app: which
-  template, which pieces, which library art; the layout and its conventions
-  and why; drafts, showing Yen, going public; the check and the screenshots.
-  It starts with its edition number.
-- One guide per part: the manifest; the framework (components, signals,
-  pages, stores, forms, offline writes); the SDK; data, fields and migrations;
+- **`docs/building-an-app.md`** — the app-building guide: read in full before
+  every new app, and before any change that adds a page, a collection, a
+  workflow or a schedule (§17.3). How to turn what Yen asks for into an app:
+  which template, which pieces, which library art; the layout and its
+  conventions and why; drafts and going live; what the gate checks. It starts
+  with its edition number.
+- **`docs/index.md`** — one line per doc saying when to read it, so a session
+  reads only what the task needs.
+- One doc per part: the manifest; the framework (components, signals, pages,
+  stores, forms, offline writes); the SDK; data, fields and migrations;
   queries, sums and search; files; AI, pictures and asking about an app's
   data; jobs and schedules; workflows and `ctx`; integrations, secrets and
   hooks; notifications and the home-screen install; the design system and
   every component; language and type; the art library and its house style;
   templates; accounts, groups, sharing and private apps; what the platform
-  keeps safe and what an app must never do; publishing, drafts and their
-  sample data, and rolling back; seeing what happened — logs, errors,
-  screenshots, data; exporting, importing and deleting; backups and restoring;
-  what to do when it breaks.
+  keeps safe and what an app must never do; editing and publishing through the
+  gate; bigger changes through Zen tasks and watching them (§17.7); seeing what
+  happened — logs, errors, data, and Yen's screenshots; the journal (§17.6);
+  exporting, importing and deleting; backups and restoring; what to do when it
+  breaks.
 
 Every rule comes with its reason, every API and every `ctx` call with a
 complete working example, every component with its states, and every common
@@ -926,28 +937,31 @@ extensive:
 
 - **What Yen Bots is and who it is for** — Yen, how she works (claude.ai
   through Zen, often from her phone, never at a terminal), and that she is not
-  a coder: explain in plain words, show her the result rather than describe
-  the code, ask before anything she would not expect.
+  a coder: explain in plain words, never show her code, ask before anything
+  she would not expect. She shows Claude a page by pasting a screenshot and
+  saying what it is.
 - **The map** — the repository's layout (§4), where every kind of thing
   goes, and what is served from disk versus embedded.
-- **The order of work** — read `guides/building-an-app.md` before every new
-  app (§17.3); start from a template with `yenbot new`; build in the
-  conventions; draw missing art into the library; run the check and look at
-  every screenshot; publish as a draft; show Yen; go public only when she says.
-  Small edits go through `file_read` and `file_edit_and_commit`, a commit
-  each; larger work through a Zen task.
+- **The order of work** — read the app's journal entries (§17.6); read
+  `docs/building-an-app.md` before every new app (§17.3); start from a template
+  with `yenbot new`; build in the conventions; draw missing art into the
+  library; edit through `file_read` and `file_edit_and_commit`, which answers
+  live or refused; ask Yen to look; note what was decided in the journal. A
+  bigger change — the platform, anything that is not an app's own files — goes
+  to a Zen task, watched to its end (§17.7).
 - **The rules, each with its reason** — tokens only, never literal colours or
   sizes; nothing from outside the site; a component never reaches into a
   store; one component per file; library art by id; never edit the live
-  directory; never commit a secret; never take an app out of draft or make one
-  public without Yen; platform changes are releases, app changes are pushes.
-- **The commands** — `yenbot new`, `yenbot check`, `yenbot shot`, `yenbot
-  library add`, building and testing the platform, and publishing.
+  directory; never commit a secret; never set an app live or make one public
+  without Yen; undo by failing forward; platform changes are releases, app
+  changes are edits.
+- **The commands** — `yenbot new`, `yenbot check`, `yenbot library add`,
+  building and testing the platform, and releasing it.
 - **Seeing what happened** — `log_list`, `log_read` and `log_grep` for the
-  site's and each app's lines, browser errors included; `site_shot` to see a
-  page; `site_data` to see what an app stored (§18). Look before guessing.
-- **When something breaks** — reading the app's log first, how to roll an app
-  back, how to restore a backup, and when to stop and ask.
+  site's and each app's lines, browser errors included; `site_data` to see
+  what an app stored (§18). Look before guessing.
+- **When something breaks** — reading the app's log first, failing forward,
+  restoring a backup, and when to stop and ask.
 
 ### 17.3 Read for every new app
 
@@ -963,10 +977,11 @@ A rule a model might skip is enforced where it can be:
   building guide ends with a short checklist the session confirms to Yen
   before it publishes.
 
-### 17.4 The checks, by rule and by eye
+### 17.4 The check, which is the gate
 
-`yenbot check <app>` — a subcommand of the binary, and the same check the
-admin page shows — refuses an app that: has a manifest error; names a
+`yenbot check <app>` — a subcommand of the binary, the check the gate runs on
+every candidate (§5.4), and the result the admin page shows — refuses an app
+that: has a manifest error; names a
 workflow, collection, tile or library picture that is not there; is built to
 an older guide edition; uses a literal colour, font or pixel size where a
 token exists; breaks the layout conventions (§8.3) — a page or component
@@ -976,28 +991,56 @@ uses `unsafeHTML`; writes a field its collection does not declare; raises a
 collection's version without its migration; loads anything from outside the
 site; or has a workflow that does not parse or exports no function.
 
-**Then it looks.** `yenbot shot <app>` renders every page of the app in a
-headless browser — Microsoft Edge, which every Windows install carries — at
-phone and desktop width, light and dark, on the draft's sample data (§5.4),
-and keeps the screenshots. Claude sees them through the connector's
-`site_shot` (§18.3), and the building guide has it look at each one against
-the design system's catalogue — alignment, spacing, contrast, truncated text,
-an empty state that reads well — before publishing, and show Yen the phone
-shots when it does. The admin page keeps the last shots of every app.
+It runs in well under a second, so it can stand in front of every edit. How a
+page looks is Yen's to judge: she pastes a screenshot into the chat and says
+what it shows.
 
-A publish whose app fails the check stays on its last good version and says
-why on the admin page.
+### 17.5 The connector's guide
 
-### 17.5 In Zen's MCP
+`yen-apps` (`mcp/src/guides/yen-apps.md`), derived from this design and kept
+short, because it is read at the start of every chat and her context is not
+spent on it. It says what Yen Bots is, the tools the work uses
+(`file_read`, `file_edit_and_commit`, the log tools, `site_data`, the journal
+tools, `repo_task_start` and its watching), the order of work, and that
+everything else is in the yenbot repository: `CLAUDE.md` first, then
+`docs/index.md`, reading only the docs the task needs. Every Claude session
+Yen opens, on any device, reads it first, as `guide_list` already asks.
 
-One guide, `yen-apps` (`mcp/src/guides/yen-apps.md`): what Yen Bots is, that
-the repository's `CLAUDE.md` and `guides/building-an-app.md` are read before
-anything else, and the order of work. Every Claude session Yen opens, on any
-device, reads it first, as `guide_list` already asks.
+### 17.6 The journal
 
-### 17.6 Yen's claude.ai Project
+Claude does not remember between chats; the `yenbot` journal does. It is a
+journal of Zen's memory (`docs/memory_backbone.md`), readable and writable from
+claude.ai and from Zen's workers alike:
 
-The guides above are what Claude reads once it is in the repository; this is
+- **Per app**: what it is for, what Yen decided and why, what she asked for
+  that is not done yet.
+- **Yen's taste**: what she likes and does not — "no gradients", "bigger
+  type on the kids' apps" — which every app follows.
+
+A session reads the journal's entries for the app before it changes anything,
+and notes each decision as it is made (`journal_read`, `journal_grep`,
+`journal_note`). The journal is also what failing forward reads when Yen asks
+for something back as it was.
+
+### 17.7 Bigger changes, and no approvals
+
+Anything that is not an app's own files — the platform's Rust, its embedded
+framework, the design system's components — goes to a Zen task
+(`repo_task_start`) and, for the binary, a release (`service_deploy`). A task
+runs for minutes; a claude.ai chat does not wake on its own. So the docs say
+how to watch one: start it, tell Yen roughly how long it will take, check it
+with `repo_task_wait` while she waits or when she comes back, read its result
+and its commits, and confirm on the site that it landed.
+
+**Nothing in this iteration waits on an approval**: `file_edit_and_commit`,
+the read and log tools, the journal, a Zen task on the yenbot repository and
+a release of the yenbot service all run on the connector's grant alone. A step
+that would ask Yen to approve something in another window breaks the loop she
+works in, so none does.
+
+### 17.8 Yen's claude.ai Project
+
+The docs above are what Claude reads once it is in the repository; this is
 how it gets there. Yen works in one claude.ai Project, "Yen Bots", set up once
 by John, with the Zen connector enabled and these instructions:
 
@@ -1009,7 +1052,7 @@ and in what order. Yen is not a coder: speak plainly, show her the result,
 and ask before anything she would not expect.
 ```
 
-The text lives in `guides/claude-ai-project.md`, so a change to it is
+The text lives in `docs/claude-ai-project.md`, so a change to it is
 reviewed like any other; John copies it into the Project when it changes.
 
 ## 18. Seeing what happened
@@ -1040,23 +1083,19 @@ yenbot serves `GET /v1/logs` with the cluster members' query
 plus `source`, and `GET /v1/logs/sources`, which lists `yenbot` and every app
 with how many lines each holds. Lines are kept in the store, thirty days.
 
-### 18.3 Screenshots and data
+### 18.3 Stored data
 
-- `GET /v1/site/shot?app=…&page=…&width=phone|desktop&theme=light|dark` —
-  renders the page now (§17.4), on the draft's sample data unless `live` is
-  asked, and answers the picture.
-- `GET /v1/site/data?app=…&coll=…&where=…&limit=…` — what an app stored,
-  read-only, live or draft.
-
-Both answer the admins only.
+`GET /v1/site/data?app=…&coll=…&where=…&limit=…` — what an app stored,
+read-only, for the admins only.
 
 ### 18.4 In the connector
 
 The connector reads it all with general tools (`docs/mcp_file_tools.md` §6):
 `log_list` names every log source — the cluster's members and yenbot's apps
-alike — `log_read` reads one's newest lines, `log_grep` searches one or all.
-`site_shot` and `site_data` call §18.3 and answer a picture and rows. They act
-as the person whose connector it is, so yenbot sees an admin.
+alike — `log_read` reads one's newest lines, `log_grep` searches one or all,
+and `site_data` calls §18.3. They act as the person whose connector it is, so
+yenbot sees an admin. What a page looks like comes from Yen: a screenshot
+pasted into the chat.
 
 ## 19. Integrations
 
@@ -1120,10 +1159,12 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
 | `service_deploy` | Learns `yenbot`: its repository and its package. |
-| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs`, and `site_shot`, `site_data` (`docs/mcp_file_tools.md` §6). |
+| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs`, and `site_data` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
+| Zen's memory | The `yenbot` journal (§17.6). |
+| Zen grants | No approval on any step of the iteration (§17.7). |
 | `web/web.yaml` | yenbot as a log source and a site whose health the gateway reports (§20.2). |
 | `mcp/src/guides/` | `yen-apps.md` (§17.5). |
-| Yen's claude.ai | The "Yen Bots" Project and its instructions (§17.6). John sets it up. |
+| Yen's claude.ai | The "Yen Bots" Project and its instructions (§17.8). John sets it up. |
 | `web/src/site/tokera/page.rs`, `estate.js` | The estate entry (§21). |
 | `docs/deployment.md` | The service, its port, its paths and its launch line. |
 
@@ -1138,21 +1179,29 @@ Taken 2026-11-06:
   registration would let any Google account use the model and the image
   engine through a public app.
 - **No AI budget, no email, backups local.**
-- **Edits are commits**, through `file_edit_and_commit`, announced on the
-  gateway's bus; the site subscribes rather than being called
-  (`docs/mcp_file_tools.md`).
+- **Edits are commits, all or nothing**: `file_edit_and_commit` answers live
+  or refused, the site gating each one over the gateway's bus before `main`
+  moves (`docs/mcp_file_tools.md`).
+- **Iterating happens on the live site**; drafts only keep a new app off the
+  landing page.
+- **Undo is failing forward**; there are no history tools.
 - **Children sign in with their own Google accounts**, approved and grouped
   like anyone else.
 - **English interfaces, Vietnamese-safe** throughout.
 - **No vision** in the first version.
-- **Claude sees the site through general, read-only connector tools**: logs
-  by source (`log_list`, `log_read`, `log_grep`), screenshots and data.
+- **Claude sees the site through general, read-only connector tools** — logs
+  by source (`log_list`, `log_read`, `log_grep`) and stored data — and sees a
+  page when Yen pastes a screenshot and says what it shows.
+- **Memory between chats is the `yenbot` journal.**
+- **No approvals** anywhere in the iteration.
+- **The connector's guide is short** and points into the repository's
+  `docs/`, which derive from this design.
 
 ## 24. Order of work
 
 1. The gateway and zend: sign-in per domain, the yenbot site and route, and
-   `docs/mcp_file_tools.md` — service keys, the bus, `repo/<name>`, the
-   connector's file and log tools.
+   `docs/mcp_file_tools.md` — service keys, the bus, `repo/<name>`, gates,
+   the connector's file and log tools.
 2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
    watcher and the publisher, its logs and `/v1/logs`, health, keep and
@@ -1163,7 +1212,7 @@ Taken 2026-11-06:
    forms, offline writes, error reporting.
 5. The design system, its type and its Vietnamese test page, its catalogue
    page and the components.
-6. Drafts on their own data, samples, and the screenshots with `site_shot`.
+6. The gate: `yenbot check` answering candidates on the bus.
 7. The art library: the house style, `yenbot library`, the first library.
 8. Jobs and workflows: the scheduler, the record-driven schedules, QuickJS and
    `ctx`, migrations.
@@ -1171,7 +1220,10 @@ Taken 2026-11-06:
 10. AI and pictures through Zen, and asking about an app's data.
 11. Integrations: secrets, outbound calls, inbound hooks.
 12. The admin page, export, import, deleting and archiving.
-13. Templates, the checks, the guides, the MCP guide, the claude.ai Project.
-14. Zen access for Yen, `service_deploy`, the estate entry, `deployment.md`.
-15. Yen's first app, built by her in claude.ai from the guides alone — the
-    test of everything above.
+13. Templates, the repository's `docs/` derived from this design, `CLAUDE.md`,
+    the connector's `yen-apps` guide, the `yenbot` journal, the claude.ai
+    Project.
+14. `service_deploy` for yenbot, no approvals on the iteration, the estate
+    entry, `deployment.md`.
+15. Yen's first app, built by her in claude.ai from the docs alone — the test
+    of everything above.
