@@ -185,4 +185,37 @@ mod tests {
         assert!(!chains.holds(&a), "the older chain went");
         assert!(chains.holds(&b));
     }
+    /// **A chain named again outlives one not named**: `resolve` touches every
+    /// chain the overlay names, so once the bytes held pass the cap it is the
+    /// chain held earlier and not named since that goes — the one named again
+    /// stays, though it came first.
+    #[test]
+    fn a_chain_named_again_outlives_one_not_named() {
+        let store = VfsStore::new();
+        store.write("a.txt", "one\n".into()).unwrap();
+        store.write("b.txt", "two\n".into()).unwrap();
+        store.write("c.txt", "three\n".into()).unwrap();
+        let full = Overlay::of(&store.snapshot());
+        let (a, b, c) = (
+            full.chains["a.txt"].clone(),
+            full.chains["b.txt"].clone(),
+            full.chains["c.txt"].clone(),
+        );
+        let size = |name: &str| serde_json::to_vec(&full.carried[name]).unwrap().len();
+        // Room for A and C together, and for nothing more once C arrives.
+        let mut chains = Chains::new(size(&a) + size(&c));
+        chains.hold(a.clone(), full.carried[&a].clone());
+        chains.hold(b.clone(), full.carried[&b].clone());
+        // A named again, by name alone: the touch moves it behind B.
+        let named_a = Overlay {
+            chains: BTreeMap::from([("x".to_string(), a.clone())]),
+            ..Default::default()
+        };
+        chains.resolve(&named_a).unwrap();
+        chains.hold(c.clone(), full.carried[&c].clone());
+        assert!(chains.holds(&a), "the chain named again was evicted");
+        assert!(chains.holds(&c));
+        assert!(!chains.holds(&b), "the chain not named since went");
+        assert!(chains.bytes() <= size(&a) + size(&c));
+    }
 }
