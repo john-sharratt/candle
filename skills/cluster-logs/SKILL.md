@@ -1,6 +1,6 @@
 ---
 name: cluster-logs
-description: Find what the cluster members' logs say about a symptom — a crash, a stall, an error, a slow request — with the lines cited, using the zend MCP's cluster_logs tool to search every member at once. Use when diagnosing any cluster problem before changing anything.
+description: Find what the logs say about a symptom — a crash, a stall, an error, a slow request, a broken Yen Bots app — with the lines cited, using the zend MCP's log_grep tool to search every member and site at once. Use when diagnosing any cluster or site problem before changing anything.
 ---
 
 # Cluster logs
@@ -11,8 +11,10 @@ description: Find what the cluster members' logs say about a symptom — a crash
    the least `level` (WARN for problems, ERROR for failures), the `tenant`
    (zend, npcd) when known, and `since` — an RFC 3339 prefix — a little
    before it started.
-2. `cluster_logs {grep, level, tenant, since, limit}`. Every member's matching
-   lines come back under that member, oldest first, the latest `limit` kept.
+2. `log_grep {grep, level, tenant, since, limit}`. Every member's and site's
+   matching lines come back under it, oldest first, the latest `limit` kept;
+   `source` narrows to one (`cluster`, `yenbot`, `yenbot/<app>` — `log_list`
+   names them).
 3. Narrow: a different pattern, a later `since`, one member's `node` (an
    Admin's). Read on through time with a later `since`.
 4. Answer with:

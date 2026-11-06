@@ -1,7 +1,7 @@
 ---
 name: watch
 description: How to keep an eye on a rollout, a member or the logs for a while — delegated to a worker that reports only exceptions and the end state.
-tools: [repo_task_start, job_status, cluster_status, cluster_logs, cluster_audit]
+tools: [repo_task_start, job_status, cluster_status, log_grep, cluster_audit]
 ---
 # Watching
 
@@ -12,7 +12,7 @@ Two cautions:
 
 - A worker runs on a zend member. A rollout or restart of zend loses it, so
   watch a zend rollout yourself, with `cluster_status` and `cluster_audit`.
-- Read the logs once before you start: lines that are always there (a
+- Read the logs once before you start (`log_grep`): lines that are always there (a
   chronic WARN or ERROR) go into the prompt as ones to ignore, or the watch
   fires at once.
 

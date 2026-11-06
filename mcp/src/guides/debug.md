@@ -1,7 +1,7 @@
 ---
 name: debug
 description: How to find a bug's root cause with a worker — reproduce, narrow by evidence, fix the cause with a test that failed before it.
-tools: [repo_task_start, job_status, repo_task_reply, cluster_logs, repo_job_start, job_read]
+tools: [repo_task_start, job_status, repo_task_reply, log_grep, repo_job_start, job_read]
 ---
 # Debugging to the root cause
 
@@ -64,5 +64,5 @@ and its context intact.
 ## Read the result
 
 Check the CAUSE against its EVIDENCE: a cause that does not explain every
-symptom is not the cause. For a production symptom, read `cluster_logs`
+symptom is not the cause. For a production symptom, read `log_grep`
 yourself first and put the lines in CONTEXT.

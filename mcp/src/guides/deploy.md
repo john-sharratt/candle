@@ -1,7 +1,7 @@
 ---
 name: deploy
 description: How to put origin/main onto one machine — one service_deploy call builds it on that machine's agent and has keep try it — then watch it to proven or rolled back, read why when it fails, stop it, and confirm it serves.
-tools: [service_deploy, service_status, job_status, job_read, job_grep, job_list, job_cancel, cluster_status, cluster_logs]
+tools: [service_deploy, service_status, job_status, job_read, job_grep, job_list, job_cancel, cluster_status, log_grep]
 ---
 # Deploying to one machine
 

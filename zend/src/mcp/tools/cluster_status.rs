@@ -271,7 +271,7 @@ pub fn upgrade_line(m: &Value, floor: Option<u64>) -> Option<String> {
     if said.is_empty() && below {
         return Some(
             "below the floor, with no upgrade under way: it is left behind — read its \
-             `cluster_logs` for why"
+             log for why (`log_grep`, or a worker's `cluster_logs`)"
                 .into(),
         );
     }
@@ -439,7 +439,7 @@ pub fn absent_line(host: &str, state: &Value, now: u64) -> String {
     match m.get("running").and_then(Value::as_u64) {
         Some(pid) => format!(
             "- {host}: not answering — keep runs motherd {build} as pid {pid}, so it is \
-             loading or stuck: read its lines with `cluster_logs`"
+             loading or stuck: read its lines with `log_grep` (a worker's `cluster_logs`)"
         ),
         None => format!("- {host}: not answering — keep has motherd {build} stopped"),
     }
@@ -756,7 +756,7 @@ mod tests {
         assert_eq!(
             absent_line("WhiteWorld", &state(json!(464), Value::Null), NOW),
             "- WhiteWorld: not answering — keep runs motherd 4419-6ecd6158 as pid 464, so it is \
-             loading or stuck: read its lines with `cluster_logs`"
+             loading or stuck: read its lines with `log_grep` (a worker's `cluster_logs`)"
         );
         assert_eq!(
             absent_line("WhiteWorld", &state(Value::Null, Value::Null), NOW),

@@ -1,7 +1,7 @@
 ---
 name: release
 description: How to take a commit on origin/main through a full release — tests, a trial on one machine, certification, then a rollout member by member — stopping at each decision for the user's approval.
-tools: [repo_job_start, job_status, job_read, job_grep, service_deploy, service_status, cluster_command, gateway_command, cluster_status, cluster_logs, journal_note]
+tools: [repo_job_start, job_status, job_read, job_grep, service_deploy, service_status, cluster_command, gateway_command, cluster_status, log_grep, journal_note]
 ---
 # Releasing a build
 
@@ -33,7 +33,7 @@ mirroring traffic.
 - `cluster_status` every few minutes: the upgrade line shows the candidate and
   its state.
 - If certification fails or passes with gaps, report what `cluster_status`
-  and `cluster_logs` say. Accepting it anyway is `cluster_command {name:
+  and `log_grep` say. Accepting it anyway is `cluster_command {name:
   "certify-anyway", args: {app, build}}` — a decision: ask, and pass
   `confirm: "approved by the user"` only with approval.
 

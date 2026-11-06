@@ -3,8 +3,8 @@
 //! (`docs/claude_zend_gateway.md` §3.2) delegate to zend and read what came
 //! back; the operations tools (§8) see and run the cluster — its members,
 //! their commands, the build agents, each machine's service supervisor, the
-//! substrate — and every one but `cluster_status` and `cluster_logs` is for
-//! Admins only, with each decision gated on the user's approval
+//! substrate — and every one but `cluster_status` and the log tools ([`logs`])
+//! is for Admins only, with each decision gated on the user's approval
 //! ([`super::ops`]). Whatever runs longer than a call — a task, a build, a
 //! deploy, a maintenance job — is a job, watched, read and stopped with the
 //! five `job_*` tools ([`job`], `docs/jobs.md`).
@@ -65,6 +65,7 @@ pub mod journal_note;
 mod journal_read;
 pub mod layer_read;
 pub mod layer_toggle;
+pub mod logs;
 pub mod mem;
 pub mod member_status;
 mod nudge;
@@ -192,7 +193,9 @@ pub fn definitions() -> Value {
         job::grep::definition(),
         job::cancel::definition(),
         cluster_status::definition(),
-        cluster_logs::definition(),
+        logs::list::definition(),
+        logs::read::definition(),
+        logs::grep::definition(),
         cluster_audit::definition(),
         member_status::definition(),
         cluster_command::definition(),
@@ -263,7 +266,9 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         job::grep::NAME => job::grep::call(ctx, args).await,
         job::cancel::NAME => job::cancel::call(ctx, args).await,
         cluster_status::NAME => cluster_status::call(ctx, args).await,
-        cluster_logs::NAME => cluster_logs::call(ctx, args).await,
+        logs::list::NAME => logs::list::call(ctx, args).await,
+        logs::read::NAME => logs::read::call(ctx, args).await,
+        logs::grep::NAME => logs::grep::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
         member_status::NAME => member_status::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
@@ -384,7 +389,9 @@ mod tests {
                 "job_grep",
                 "job_cancel",
                 "cluster_status",
-                "cluster_logs",
+                "log_list",
+                "log_read",
+                "log_grep",
                 "cluster_audit",
                 "member_status",
                 "cluster_command",
@@ -431,7 +438,9 @@ mod tests {
                 "job_read",
                 "job_grep",
                 "cluster_status",
-                "cluster_logs",
+                "log_list",
+                "log_read",
+                "log_grep",
                 "cluster_audit",
                 "member_status",
                 "service_status",

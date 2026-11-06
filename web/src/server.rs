@@ -43,7 +43,9 @@ use crate::auth::{Auth, Gateways};
 use crate::bus;
 use crate::cluster::peers::dial_all;
 use crate::cluster::route::{self, Routed};
-use crate::cluster::{endpoint, page, stamp_served_by, ClusterPeer, Gateway, MemberOrigin};
+use crate::cluster::{
+    endpoint, page, site_logs, stamp_served_by, ClusterPeer, Gateway, MemberOrigin,
+};
 use crate::compress;
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
@@ -261,7 +263,8 @@ impl Builder {
                 .merge(bus::http::router(
                     gw.clone(),
                     self.cfg.server.trusted_backends.clone(),
-                )),
+                ))
+                .merge(site_logs::router(&self.cfg)),
             None => Router::new(),
         };
         let cluster = self.cluster.clone();

@@ -76,13 +76,16 @@ pub fn path_of(args: &Value) -> String {
             q.append_pair(key, v);
         }
     }
-    let limit = args
-        .get("limit")
+    q.append_pair("limit", &limit_of(args).to_string());
+    format!("/v1/logs?{}", q.finish())
+}
+
+/// The lines a search asks for: `limit`, or the default, at most the most.
+pub fn limit_of(args: &Value) -> u64 {
+    args.get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, MAX_LIMIT);
-    q.append_pair("limit", &limit.to_string());
-    format!("/v1/logs?{}", q.finish())
+        .clamp(1, MAX_LIMIT)
 }
 
 /// One member as the gateway's status lists it.

@@ -355,7 +355,7 @@ default is to delegate, through the skills in `skills/` (`zend-thread` first):
   answering a codebase question, writing tests, building, testing, a trial
   deploy, watching, reviewing, researching — as a `repo_task_start` on this work's
   thread.
-- **Call directly** the short operations — `cluster_status`, `cluster_logs`, a
+- **Call directly** the short operations — `cluster_status`, `log_grep`, a
   job's result.
 - **Keep** deciding what to do, design and its documents, checking zend's
   results against the turns they cite before acting on them, and every step

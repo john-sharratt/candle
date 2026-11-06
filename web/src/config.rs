@@ -496,6 +496,11 @@ pub struct Site {
     /// against the working documents, which is the point of not copying them.
     #[serde(default)]
     pub papers: Option<PathBuf>,
+    /// The site is a log source (`docs/mcp_file_tools.md` §6.1): its upstream
+    /// answers `/v1/logs` and `/v1/logs/sources`, which the connector's log
+    /// tools read through `/gateway/logs/<site>/…`.
+    #[serde(default)]
+    pub logs: bool,
     #[serde(skip)]
     pub roots_abs: Vec<PathBuf>,
     #[serde(skip)]

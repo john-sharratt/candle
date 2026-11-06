@@ -17,6 +17,7 @@
 //! | [`bearer_key`] | the keys that stand in for a session: status, ops |
 //! | [`ops_key`] | the admin an operator on the box acts as, for emergencies |
 //! | [`service_key`] | a service on the box acting as itself, on its own routes |
+//! | [`site_logs`] | the sites' logs, read for a member's connector call |
 //! | [`peers`] | the peer gateways: node id, identity, dial loops (§13.4) |
 //! | [`upgrade`] | the socket's WebSocket upgrade, over a transport that stamps its reads |
 //! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
@@ -37,6 +38,7 @@ pub mod page;
 pub mod peers;
 pub mod route;
 pub mod service_key;
+pub mod site_logs;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;

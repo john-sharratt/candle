@@ -1,7 +1,7 @@
 ---
 name: health
 description: How to read how the cluster stands — every member's build and state, each app's floor, upgrades in progress, anything in fault — and summarise it with problems first.
-tools: [cluster_status, service_status, cluster_logs, cluster_audit]
+tools: [cluster_status, service_status, log_grep, cluster_audit]
 ---
 # Cluster health
 

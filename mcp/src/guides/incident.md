@@ -1,7 +1,7 @@
 ---
 name: incident
 description: How to handle something broken now — contain, establish what changed, diagnose from evidence, act only with approval, then write it up.
-tools: [cluster_status, cluster_logs, cluster_audit, service_status, service_control, cluster_command, job_status, journal_note]
+tools: [cluster_status, log_grep, cluster_audit, service_status, service_control, cluster_command, job_status, journal_note]
 ---
 # Incidents
 
@@ -18,7 +18,7 @@ did each. Most incidents start just after something changed.
 
 ## 3. Evidence
 
-`cluster_logs` from a little before it started (`logs`). Quote the lines.
+`log_grep` from a little before it started (`logs`). Quote the lines.
 
 ## 4. Act — only with approval for anything that changes the cluster
 

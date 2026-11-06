@@ -309,6 +309,13 @@ The sources are:
   Yen Bots is `yenbot` and one `yenbot/<app>` per app
   (`docs/yenbot_app_host.md` §18).
 
+The gateway reaches a site's for a member (`web/src/cluster/site_logs.rs`):
+`GET /gateway/logs` lists the sites, and `GET /gateway/logs/<site>/v1/logs?…`
+and `…/v1/logs/sources` go on to the site's upstream with the caller's
+identity headers. `/v1/logs/sources` answers
+`{"sources": [{"name", "lines", "newest"}]}`; `/v1/logs` answers as a member
+does, `{"lines", "matched", "complete"}`.
+
 ### 6.2 The tools
 
 | Tool | What it does |
@@ -317,8 +324,12 @@ The sources are:
 | `log_read {source, since?, level?, limit?}` | A source's newest lines, oldest first. |
 | `log_grep {grep, source?, level?, since?, limit?, node?}` | A regular expression over one source, or every source when none is named; each line under its source. `node` names one member, as `cluster_logs` did, for Admins. |
 
-`log_grep` with `source: "cluster"` is what `cluster_logs` answers today, so
-`cluster_logs` is removed and the guides that name it name `log_grep`.
+`log_grep` with `source: "cluster"` is what `cluster_logs` answers, so the
+connector offers `cluster_logs` no more and the connector's guides name
+`log_grep` (`zend/src/mcp/tools/logs/`). A worker keeps its own
+`cluster_logs` (`zend-tools/src/tools/ops/cluster.rs`): its catalog,
+calibration and grants are a worker's, and a guide's prompt for a worker
+names it.
 
 ### 6.3 What is not a tool
 

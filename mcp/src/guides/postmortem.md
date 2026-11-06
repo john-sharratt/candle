@@ -1,7 +1,7 @@
 ---
 name: postmortem
 description: How to write up an incident, a rollback or a bad run — the timeline from the audit and logs, the cause, what would have caught it, and the lasting fix noted.
-tools: [cluster_audit, cluster_logs, journal_read, journal_note, timeline_read, repo_task_start, job_status]
+tools: [cluster_audit, log_grep, journal_read, journal_note, timeline_read, repo_task_start, job_status]
 ---
 # Postmortem
 
@@ -11,7 +11,7 @@ tools: [cluster_audit, cluster_logs, journal_read, journal_note, timeline_read, 
   floors in the window, each with its UTC time — a restart shows as a socket
   closed then an admission. It names who sent a command when the gateway
   recorded one; a certification or a crash has no sender.
-- `cluster_logs`: the lines around each event (`logs`).
+- `log_grep`: the lines around each event (`logs`).
 - `journal_read` the incident's or release's thread: what was decided and
   done.
 - For a bad worker run: the worker's journal and its turns (`verify`) —
