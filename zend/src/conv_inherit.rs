@@ -25,11 +25,7 @@ use crate::conv_overlay::{self, Mirror};
 pub const FROM_KEY: &str = "files_from";
 
 /// Name `starter` as the conversation `timeline` begins on.
-pub fn mark(
-    engine: &ConversationEngine,
-    timeline: TimelineId,
-    starter: &str,
-) -> EngineResult<()> {
+pub fn mark(engine: &ConversationEngine, timeline: TimelineId, starter: &str) -> EngineResult<()> {
     engine.set_conversation_metadata(timeline, FROM_KEY, starter)
 }
 

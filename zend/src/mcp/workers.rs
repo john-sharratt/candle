@@ -246,7 +246,9 @@ pub fn start(
     );
     worker.by_task = by_task;
     if let Some(Err(e)) = from.and_then(|starter| session.begin_on(&worker.conv_id, starter)) {
-        return Err(format!("the task could not be given its starter's work: {e}"));
+        return Err(format!(
+            "the task could not be given its starter's work: {e}"
+        ));
     }
     let started = if by_task {
         "A task started:"
