@@ -253,9 +253,13 @@ release motherd, web and mcp (`zend/src/mcp/tools/service/deploy.rs`):
    part, `keep/src/remote.rs`).
 3. `service_status` and the job tools (`job_status`, `job_read`) watch it.
 
+`service_control` restarts, stops and starts it through keep, as it does the
+others, for a site that is wedged rather than broken.
+
 `service_deploy` names its repository and services in constants today
-(`REPO = "candle"`, `SERVICES = [motherd, web, mcp]`); they become a table of
-service → (repository, package), with yenbot's row (§22). The yenbot binary
+(`REPO = "candle"`, `SERVICES = [motherd, web, mcp]`, shared with
+`service_control` and `service_status`); they become a table of service →
+(repository, package), with yenbot's row (§22). The yenbot binary
 answers `--build-info` from the cluster crate's version module and prints
 `INFO serving` once listening, as mcp does.
 
@@ -318,6 +322,7 @@ Everything the admin page shows and does, under `/api/v1/admin`:
 | `GET /admin/errors?app=…`, `GET /admin/feedback?app=…` | Browser errors and feedback notes. |
 | `PUT/DELETE /admin/secrets/<app>/<name>`, `GET /admin/secrets/<app>` | An app's integration keys: set, remove, list names (§19.1). |
 | `POST /admin/apps/<id>/archive\|restore`, `GET /admin/archive` | Deleted apps' data, kept thirty days (§20.1). |
+| `GET /admin/backups`, `POST /admin/backups/<date>/restore` | The nightly backups; restore one app's data, or the whole store (§7.4). |
 | `GET/POST/DELETE /admin/tokens` | API tokens (§6.3). |
 | `PUT /admin/registration` | Approve or open (§12.2). |
 
@@ -408,8 +413,19 @@ was asked or drawn, by which app and account, how long, how many tokens) and
 
 Every night at 03:00, a platform job (§9) writes `VACUUM INTO
 data\backups\yenbot-YYYY-MM-DD.db` and copies the files directory beside it;
-fourteen are kept, on BlackWorld. Restoring is stopping the service and
-putting a backup in the database's place; the guides say how.
+fourteen are kept, on BlackWorld. Restoring is an API call, like everything
+else (§6.2):
+
+- **One app**, the usual case — "I deleted the wrong recipes" —
+  `POST /api/v1/admin/backups/<date>/restore {app, collections?}` replaces that
+  app's records and files (all of them, or the collections named) with the
+  backup's, in one transaction, after writing a backup of what it replaces;
+  the rest of the site is untouched and keeps running.
+- **The whole store**, for a corrupted database: the same route without `app`
+  swaps the file in under the store's write lock and reopens it, again after
+  backing up what it replaces.
+
+`GET /api/v1/admin/backups` lists them with their dates and sizes.
 
 ### 7.5 Fields, validation and migrations
 
@@ -631,7 +647,7 @@ CREATE TABLE jobs (
   app         TEXT NOT NULL,         -- '_platform' for the platform's own
   workflow    TEXT NOT NULL,
   args        TEXT NOT NULL,         -- JSON
-  source      TEXT NOT NULL,         -- 'schedule:<n>' | 'record:<coll>/<id>' | 'workflow'
+  source      TEXT NOT NULL,         -- 'schedule:<n>' | 'record:<coll>/<id>' | 'write:<coll>/<id>' | 'workflow'
   rule        TEXT,                  -- a repeat rule, for a repeating job
   next_ms     INTEGER,               -- NULL: not due again
   attempts    INTEGER NOT NULL DEFAULT 0,
@@ -644,7 +660,7 @@ CREATE TABLE job_runs (job TEXT, started_ms INTEGER, ended_ms INTEGER,
                        outcome TEXT, error TEXT, log TEXT);
 ```
 
-### 9.2 Three ways jobs are made
+### 9.2 Four ways jobs are made
 
 - **Repeat rules** in the manifest's `schedules:` — `every: "daily 07:30"`,
   `"weekly mon 09:00"`, `"monthly 1st 08:00"`, `"hourly"`, or a cron line for
@@ -658,6 +674,12 @@ CREATE TABLE job_runs (job TEXT, started_ms INTEGER, ended_ms INTEGER,
 - **From workflows** — `ctx.schedule(at, workflow, args)` (§10.2): a
   workflow that has to come back later — tomorrow's follow-up, a retry in an
   hour — leaves a job for itself.
+- **On a write** — `when: {collection: chores, does: update, where: {done:
+  true}}, run: chore_done`: a record created, changed or deleted, matching the
+  filter, makes a job for the workflow with the record before and after, in
+  the same transaction as the write. "Tell me when the kids finish a chore" is
+  this and a notification; the workflow runs moments later, off the request,
+  so a write never waits on it.
 
 ### 9.3 Running
 
@@ -1371,7 +1393,7 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | Zen credentials | `yenbot`, an API token for Yen's account, saved with `credential_save` (§6.3). |
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
-| `service_deploy` | Learns `yenbot`: its repository and its package. |
+| `service_deploy`, `service_control`, `service_status` | Learn `yenbot`: its repository and its package (§5.5). |
 | Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
 | Zen's memory | The `yenbot` journal (§17.6). |
 | Zen grants | No approval on any step of the iteration (§17.7). |
