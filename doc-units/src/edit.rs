@@ -1,7 +1,11 @@
 //! One anchored edit, applied to a document — `docs/npcd_anchored_edits.md` §6.
 //!
 //! An edit names a unit by its anchor (`at`), optionally the last unit of a
-//! span (`to`), and says what to do there. **An anchor that names no unit of
+//! span (`to`), and says what to do there — to the unit whole, or to lines of
+//! it, numbered from 1 in the unit as a read shows them
+//! (`docs/zen_coding_challenge_fixes.md` Cause 4). A line range counts from
+//! the unit's own first line, so an edit elsewhere never moves it, and several
+//! edits from one read stay valid. **An anchor that names no unit of
 //! the document as it stands is refused** ([`EditError::Stale`]): an anchor is
 //! its unit's text, hashed, so a unit somebody else changed no longer has the
 //! anchor it was read under, and an edit is never applied to text its author
@@ -60,6 +64,21 @@ pub enum Op {
         dest: String,
         place: Place,
     },
+    /// Replace lines `from` through `to` of the unit — numbered from 1 in the
+    /// unit, as a read shows them — with `text`.
+    ReplaceLines {
+        from: usize,
+        to: usize,
+        text: String,
+    },
+    /// Add `text` as lines of the unit, before or after its line `line`.
+    InsertLines {
+        place: Place,
+        line: usize,
+        text: String,
+    },
+    /// Remove lines `from` through `to` of the unit.
+    DeleteLines { from: usize, to: usize },
 }
 
 /// An edit: the anchor it is made at and what it does there.
@@ -201,6 +220,49 @@ pub fn apply(doc: &Doc, edit: &Edit) -> Result<Applied, EditError> {
                 ),
             )
         }
+        Op::ReplaceLines { from, to, text } => {
+            let i = find(doc, at)?;
+            let (s, e) = lines_of(doc, i, *from, *to)?;
+            let new = text_lines(text, eol(doc))
+                .ok_or_else(|| empty("replace", "to take lines out, delete them"))?;
+            let grown = new.len() as isize - (e - s) as isize;
+            (
+                splice(doc.lines(), s, e, new),
+                unit_after(doc, i, grown),
+                format!("Replaced {} of {at}.", lines_name(*from, *to)),
+            )
+        }
+        Op::InsertLines { place, line, text } => {
+            let i = find(doc, at)?;
+            let (s, e) = lines_of(doc, i, *line, *line)?;
+            let new = text_lines(text, eol(doc)).ok_or_else(|| empty("insert", ""))?;
+            let n = new.len() as isize;
+            let pos = match place {
+                Place::Before => s,
+                Place::After => e,
+            };
+            (
+                splice(doc.lines(), pos, pos, new),
+                unit_after(doc, i, n),
+                format!("Inserted {} +{line} of {at}.", place.word()),
+            )
+        }
+        Op::DeleteLines { from, to } => {
+            let i = find(doc, at)?;
+            let (s, e) = lines_of(doc, i, *from, *to)?;
+            let u = &doc.units()[i];
+            if (s, e) == (u.start, u.end) {
+                return Err(EditError::Invalid(format!(
+                    "{} is every line of {at}; to take the part out, delete it without `from`",
+                    lines_name(*from, *to)
+                )));
+            }
+            (
+                splice(doc.lines(), s, e, Vec::new()),
+                unit_after(doc, i, -((e - s) as isize)),
+                format!("Deleted {} of {at}.", lines_name(*from, *to)),
+            )
+        }
     };
 
     let after = Doc::of(doc.language(), &lines.concat());
@@ -268,6 +330,44 @@ fn span(doc: &Doc, at: &str, to: Option<&str>) -> Result<(usize, usize), EditErr
         )));
     }
     Ok((a, b))
+}
+
+/// Lines `from` through `to` of unit `i`, numbered from 1 in the unit, as the
+/// range of the document's lines (from 0, end exclusive) they are — or why
+/// they are not lines of it.
+fn lines_of(doc: &Doc, i: usize, from: usize, to: usize) -> Result<(usize, usize), EditError> {
+    let u = &doc.units()[i];
+    let len = u.end - u.start;
+    let past = |n: usize| {
+        EditError::Invalid(format!(
+            "{} has {len} line(s), +1 to +{len}; +{n} is not one of them",
+            u.anchor
+        ))
+    };
+    match (from, to) {
+        (0, _) => Err(past(0)),
+        (_, t) if t > len => Err(past(t)),
+        (f, t) if f > t => Err(EditError::Invalid(format!(
+            "+{f} comes after +{t}: a range runs from `from` forward to `to`"
+        ))),
+        (f, t) => Ok((u.start + f - 1, u.start + t)),
+    }
+}
+
+/// Unit `i`'s lines once an edit inside it has grown it by `grown` lines (a
+/// negative count for one that shrank it): the region whose units the reply
+/// shows, so the part comes back whole with its lines numbered afresh.
+fn unit_after(doc: &Doc, i: usize, grown: isize) -> (usize, usize) {
+    let u = &doc.units()[i];
+    (u.start, (u.end as isize + grown) as usize)
+}
+
+/// `+3`, or `+3 to +5`, as a summary names lines of a part.
+fn lines_name(from: usize, to: usize) -> String {
+    match from == to {
+        true => format!("line +{from}"),
+        false => format!("lines +{from} to +{to}"),
+    }
 }
 
 fn span_name(at: &str, to: Option<&str>) -> String {
@@ -486,6 +586,119 @@ mod tests {
                 to: None,
             },
         }
+    }
+
+    const CODE: &str = "use x;\n\nfn a() {\n    1\n    2\n}\n";
+
+    fn lines(at: &str, op: Op) -> Edit {
+        Edit { at: at.into(), op }
+    }
+
+    /// **Lines of a part are replaced by their numbers in it**, and the reply
+    /// names the part's lines afresh.
+    #[test]
+    fn lines_of_a_part_are_replaced_by_their_numbers() {
+        let d = Doc::new("a.rs", CODE);
+        let at = a(&d, 1);
+        let done = apply(
+            &d,
+            &lines(
+                &at,
+                Op::ReplaceLines {
+                    from: 2,
+                    to: 3,
+                    text: "    10\n    20\n    30".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            done.doc.text(),
+            "use x;\n\nfn a() {\n    10\n    20\n    30\n}\n"
+        );
+        assert_eq!(done.summary, format!("Replaced lines +2 to +3 of {at}."));
+        assert_eq!(done.touched, vec![1]);
+        assert_eq!((done.doc.units()[1].start, done.doc.units()[1].end), (2, 7));
+    }
+
+    #[test]
+    fn lines_are_inserted_before_or_after_a_line_of_a_part() {
+        let d = Doc::new("a.rs", CODE);
+        let at = a(&d, 1);
+        let after = apply(
+            &d,
+            &lines(
+                &at,
+                Op::InsertLines {
+                    place: Place::After,
+                    line: 2,
+                    text: "    1.5".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            after.doc.text(),
+            "use x;\n\nfn a() {\n    1\n    1.5\n    2\n}\n"
+        );
+        assert_eq!(after.summary, format!("Inserted after +2 of {at}."));
+        let before = apply(
+            &d,
+            &lines(
+                &at,
+                Op::InsertLines {
+                    place: Place::Before,
+                    line: 1,
+                    text: "#[inline]".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            before.doc.text(),
+            "use x;\n\n#[inline]\nfn a() {\n    1\n    2\n}\n"
+        );
+    }
+
+    #[test]
+    fn lines_are_deleted_but_never_every_line_of_a_part() {
+        let d = Doc::new("a.rs", CODE);
+        let at = a(&d, 1);
+        let done = apply(&d, &lines(&at, Op::DeleteLines { from: 3, to: 3 })).unwrap();
+        assert_eq!(done.doc.text(), "use x;\n\nfn a() {\n    1\n}\n");
+        assert_eq!(done.summary, format!("Deleted line +3 of {at}."));
+        assert_eq!(
+            apply(&d, &lines(&at, Op::DeleteLines { from: 1, to: 4 })).unwrap_err(),
+            EditError::Invalid(format!(
+                "lines +1 to +4 is every line of {at}; to take the part out, delete it \
+                 without `from`"
+            ))
+        );
+    }
+
+    /// **A line the part does not have, or a range run backwards, is refused**,
+    /// naming the part's length.
+    #[test]
+    fn a_line_past_the_part_or_a_backward_range_is_refused() {
+        let d = Doc::new("a.rs", CODE);
+        let at = a(&d, 1);
+        let delete = |from, to| apply(&d, &lines(&at, Op::DeleteLines { from, to })).unwrap_err();
+        assert_eq!(
+            delete(2, 5),
+            EditError::Invalid(format!(
+                "{at} has 4 line(s), +1 to +4; +5 is not one of them"
+            ))
+        );
+        assert_eq!(
+            delete(0, 1),
+            EditError::Invalid(format!(
+                "{at} has 4 line(s), +1 to +4; +0 is not one of them"
+            ))
+        );
+        assert_eq!(
+            delete(3, 2),
+            EditError::Invalid("+3 comes after +2: a range runs from `from` forward to `to`".into())
+        );
     }
 
     #[test]

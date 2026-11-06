@@ -46,7 +46,7 @@ use super::caller::{Caller, Person};
 use super::chats::naming::is_chat_thread;
 use super::chats::talk;
 use super::names;
-use super::nudges;
+use super::nudges::{self, Sender};
 use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::resuming;
@@ -535,7 +535,8 @@ pub fn resume(
     let told = revive(session, &records, owner, &mut worker, now)?;
     let first = match session.pending_round(&worker.conv_id) {
         Some(call_turn) => {
-            nudges::queue(&records, &worker.conv_id, &told, now).map_err(|e| e.to_string())?;
+            nudges::queue(&records, &worker.conv_id, Sender::Zend, &told, now)
+                .map_err(|e| e.to_string())?;
             First::Interrupted { call_turn }
         }
         None => First::Message(format!("{told}{}", closing_of(worker.kind))),
@@ -579,7 +580,8 @@ pub async fn carry_on(
     };
     let now = now_ms();
     let told = revive(session, &records, owner, &mut worker, now)?;
-    nudges::queue(&records, &worker.conv_id, &told, now).map_err(|e| e.to_string())?;
+    nudges::queue(&records, &worker.conv_id, Sender::Zend, &told, now)
+        .map_err(|e| e.to_string())?;
     begin_held(
         session,
         &records,
@@ -620,7 +622,8 @@ pub fn nudge(
             }
         ));
     }
-    nudges::queue(&records, &worker.conv_id, text, now_ms()).map_err(|e| e.to_string())?;
+    nudges::queue(&records, &worker.conv_id, Sender::Starter, text, now_ms())
+        .map_err(|e| e.to_string())?;
     note(
         &records,
         &owner,
@@ -1248,7 +1251,7 @@ async fn run(
         };
         live.set_doing(Doing::Journaling);
         // A nudge that came after the turn's last tool round was never read.
-        for undelivered in nudges::take(&records, &worker.conv_id) {
+        for (_, undelivered) in nudges::take(&records, &worker.conv_id) {
             let line = format!(
                 "not delivered — the turn ended without another tool round: {}",
                 first_line(&undelivered, PROMPT_QUOTE)

@@ -1,16 +1,8 @@
 //! A layer's `ingest:` block — what one of its units is, what it builds on, and
-//! what it is asked — read from the projection schema it is declared in.
-//!
-//! ```yaml
-//! - name: dependency_analysis
-//!   dials: { thinking_effort: balanced }
-//!   ingest:
-//!     unit: file            # one unit per file the layer below holds
-//!     after: static_analysis
-//!     edges: true           # the answer names the files it depends on
-//!     prompt: |
-//!       What do the structs, traits and functions in `<<path>>` depend on? …
-//! ```
+//! what it is asked — read from the projection schema it is declared in. A
+//! block names its `unit` (one per file the layer below holds, or one per day),
+//! the layer it is built `after`, whether its answer names the files it depends
+//! on (`edges`), and the `prompt` its units are asked.
 //!
 //! The thinking a unit runs with is the layer's own `thinking_effort` dial —
 //! the same dial a dialogue turn on the layer would read — so one level names
@@ -222,7 +214,7 @@ mod tests {
 
     fn spec(unit: UnitKind) -> LayerSpec {
         LayerSpec {
-            layer: "static_analysis".into(),
+            layer: "file_notes".into(),
             unit,
             after: Some("code_reading".into()),
             prompt: "Read `<<path>>` of `<<repo>>` (<<file>>) on <<day>>: <<transcript>>".into(),
@@ -305,12 +297,12 @@ mod tool_tests {
     #[test]
     fn a_layer_naming_a_writing_tool_is_refused() {
         let tools = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        assert!(check_tools("static_analysis", &tools(&["file_read", "file_edit"])).is_err());
+        assert!(check_tools("file_notes", &tools(&["file_read", "file_edit"])).is_err());
         assert!(check_tools("security_review", &tools(&["web_search", "http_request"])).is_err());
         // A fetch would give a unit reading the workspace a channel to any host.
         assert!(check_tools("security_review", &tools(&["file_read", "web_fetch"])).is_err());
-        assert!(check_tools("static_analysis", &tools(&READ_ONLY_TOOLS)).is_ok());
+        assert!(check_tools("file_notes", &tools(&READ_ONLY_TOOLS)).is_ok());
         assert!(check_tools("security_review", &tools(&RESEARCH_TOOLS)).is_ok());
-        assert!(check_tools("static_analysis", &[]).is_ok());
+        assert!(check_tools("file_notes", &[]).is_ok());
     }
 }

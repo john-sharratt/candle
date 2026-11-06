@@ -662,7 +662,7 @@ mod tests {
     fn a_unit_retrieves_what_stands_on_its_branches() {
         let mut ground = Ground::default();
         ground.standing.insert(
-            "static_analysis".into(),
+            "file_notes".into(),
             vec![
                 below(1, &["main"]),
                 below(2, &["topic"]),
@@ -670,7 +670,7 @@ mod tests {
             ],
         );
         let group = candle_conversation::projection::GroupId::for_test(7);
-        let sees = [("static_analysis".to_string(), group)];
+        let sees = [("file_notes".to_string(), group)];
         let got = scopes(&sees, &ground, &["topic".to_string()], "r/elsewhere");
         assert_eq!(got.len(), 1);
         let mut allowed: Vec<u64> = got[0].1.iter().map(|t| t.raw()).collect();
@@ -690,11 +690,11 @@ mod tests {
     fn a_unit_is_not_offered_its_own_files_units() {
         let mut ground = Ground::default();
         ground.standing.insert(
-            "static_analysis".into(),
+            "file_notes".into(),
             vec![below(1, &["main"]), below(2, &["main"])],
         );
         let group = candle_conversation::projection::GroupId::for_test(7);
-        let sees = [("static_analysis".to_string(), group)];
+        let sees = [("file_notes".to_string(), group)];
         let got = scopes(&sees, &ground, &["main".to_string()], "r/s1");
         let allowed: Vec<u64> = got[0].1.iter().map(|t| t.raw()).collect();
         assert_eq!(allowed, [2]);
@@ -712,7 +712,7 @@ mod tests {
             b
         };
         ground.standing.insert(
-            "static_analysis".into(),
+            "file_notes".into(),
             vec![
                 other(1, &["topic"]),
                 other(2, &["trunk"]),
@@ -720,7 +720,7 @@ mod tests {
             ],
         );
         let group = candle_conversation::projection::GroupId::for_test(7);
-        let sees = [("static_analysis".to_string(), group)];
+        let sees = [("file_notes".to_string(), group)];
         let got = scopes(&sees, &ground, &["topic".to_string()], "r/x");
         let mut allowed: Vec<u64> = got[0].1.iter().map(|t| t.raw()).collect();
         allowed.sort();

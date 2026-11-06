@@ -261,7 +261,8 @@ pub fn open(ctx: &ToolContext, name: &str) -> Result<ConvRepo, GitToolError> {
 pub enum RevKind {
     /// The branch this conversation is on. Needs no `name`.
     Head,
-    /// A local branch by short name, e.g. `main`.
+    /// A branch by short name, e.g. `main`, as origin holds it — the record,
+    /// never a local copy that may lag it.
     Branch,
     /// A tag by short name, e.g. `v1.2.0`.
     Tag,
@@ -338,7 +339,7 @@ impl RevArg {
         };
         Ok(match self.kind {
             RevKind::Head => repo.head()?,
-            RevKind::Branch => Rev::Branch(BranchName::parse(named("branch")?)?),
+            RevKind::Branch => on_record(repo, &BranchName::parse(named("branch")?)?)?,
             RevKind::Tag => Rev::Tag(TagName::parse(named("tag")?)?),
             RevKind::Ref => {
                 // A short name here is almost always a remote branch or a
@@ -414,6 +415,31 @@ impl RevArg {
     }
 }
 
+/// `branch` as the record holds it — origin's copy, or with no origin the
+/// local branch (`docs/zend_git.md` §7.8) — never the local cache of
+/// origin's, which a branch this checkout never wrote to does not have and
+/// which can lag origin's. A branch the record does not hold is refused,
+/// naming the ones it does.
+fn on_record(repo: &ConvRepo, branch: &BranchName) -> Result<Rev, GitToolError> {
+    if let Some(tip) = repo.record_tip(branch)? {
+        return Ok(Rev::Oid(tip));
+    }
+    let held: Vec<String> = repo
+        .record_branches()?
+        .into_iter()
+        .map(|b| b.name.as_str().to_string())
+        .collect();
+    let shown = held.iter().take(20).cloned().collect::<Vec<_>>().join(", ");
+    let more = match held.len() > 20 {
+        true => format!(" and {} more", held.len() - 20),
+        false => String::new(),
+    };
+    Err(GitError::invalid(format!(
+        "there is no branch {branch} on the record; it holds {shown}{more}"
+    ))
+    .into())
+}
+
 /// A `parent`'s base, read as whichever form the name fits: a full object id,
 /// a full ref, or a branch — `HEAD` being the conversation's. The model writes
 /// `HEAD`, `main` or a sha here and all three work, because guessing wrong
@@ -428,7 +454,7 @@ fn branchish(name: &str, repo: &ConvRepo) -> Result<Rev, GitToolError> {
     if name.starts_with("refs/") {
         return Ok(Rev::Ref(RefName::parse(name)?));
     }
-    Ok(Rev::Branch(BranchName::parse(name)?))
+    on_record(repo, &BranchName::parse(name)?)
 }
 
 /// A revision argument that defaults to the conversation's branch when the

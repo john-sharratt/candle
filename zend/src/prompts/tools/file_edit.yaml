@@ -31,7 +31,7 @@ questions:
 - rewrite the body of that function
 category: Files
 mandatory: true
-description: 'Change one part of an existing file of the named repo by its anchor, leaving the rest exactly as it is. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `file_read` shows every part of a file — a function, a type, a block of imports, a paragraph — as a fenced block whose fence names its four-character anchor and its scope (`part=r7Lm lines=120-134 scope="impl Cache > fn seal"`); name the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just those words inside it), `insert_before` or `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is to stand, indentation included — never with anchors in it, and never with the `+N` numbers a read shows beside each line, which are not part of the file. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. An anchor that no longer names a part — the file changed since it was read — is refused as stale; read it again and edit by the anchors it shows. Returns what was done and the parts it wrote under their new anchors, between the parts either side of them, so the next edit needs no read. It also lists the lines that changed — `-` for what was removed, `+` for what was written, `…` where unchanged lines lie between runs: a line listed there that you did not mean to change is a slip to fix with the next edit. Triggered by "change X to Y in the file", "update this function", "add this after", "remove that", "move this". For a new file, or rewriting most of one, use write.'
+description: 'Change an existing file of the named repo by one of its parts, leaving the rest exactly as it is. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `file_read` shows every part of a file — a function, a type, a block of imports, a paragraph — as a fenced block whose fence names its four-character anchor and its scope (`part=r7Lm lines=120-134 scope="impl Cache > fn seal"`), with each of its lines numbered `+1`, `+2`, … in the part; name the part as `part` and say what to `do`. **To change lines of a part, name them by those numbers**: `from` (and `to`, for more than one) — `replace` them with `text`, `insert_before` or `insert_after` line `from` the lines `text`, or `delete` them. The numbers count from the part''s own first line, so an edit elsewhere never moves them and several edits from one read stay right. Without `from`, the edit is to the part whole: `replace` it with `text` (or, with `old`, replace just those words inside it), `insert_before` or `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`; `through` extends a whole-part replace, delete or move over a run of consecutive parts. Write `text` as the lines are to stand, indentation included — never with anchors in it, and never with the `+N` numbers a read shows beside each line, which are not part of the file. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. An anchor that no longer names a part — the file changed since it was read — is refused as stale; read it again and edit by the anchors it shows. Returns what was done and the parts it wrote under their new anchors, between the parts either side of them, so the next edit needs no read. It also lists the lines that changed — `-` for what was removed, `+` for what was written, `…` where unchanged lines lie between runs: a line listed there that you did not mean to change is a slip to fix with the next edit. Triggered by "change X to Y in the file", "update this function", "add this after", "remove that", "move this". For a new file, or rewriting most of one, use write.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -44,13 +44,13 @@ parameters:
       description: Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
-    at:
+    part:
       description: The anchor of the part to change — the `part=` of its block in `file_read` (e.g. `r7Lm`). Required.
       maxLength: 4
       minLength: 4
       type: string
     do:
-      description: What to do there — `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
+      description: What to do there — `replace`, `insert_before` or `insert_after`, `delete`, or `move`. Required.
       enum:
       - replace
       - insert_before
@@ -58,18 +58,26 @@ parameters:
       - delete
       - move
       type: string
+    from:
+      description: For replace, the inserts and delete — the first line of the part the edit covers, `+N` as the read numbers it beside the line (e.g. `+3`). Leave it out to edit the part whole.
+      pattern: '\+[1-9][0-9]?'
+      type: string
+    to:
+      description: For replace and delete with `from` — the last line of the part covered, `+N`; left out, `from` alone.
+      pattern: '\+[1-9][0-9]?'
+      type: string
     old:
-      description: For replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
+      description: For a whole-part replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`.
       type:
       - string
       - 'null'
     text:
-      description: For replace, insert_before and insert_after — the new text, the words replacing `old` or the whole part as it is to stand, its indentation included. Not given for delete or move.
+      description: For replace, insert_before and insert_after — the new text, its indentation included — the lines `from` through `to` as they are to stand, the words replacing `old`, or the whole part. Not given for delete or move.
       type:
       - string
       - 'null'
-    to:
-      description: For replace, delete and move — the anchor of the last part of a run of consecutive parts, so the edit covers `at` through `to`.
+    through:
+      description: For a whole-part replace, delete or move — the anchor of the last part of a run of consecutive parts, so the edit covers `part` through `through`.
       type:
       - string
       - 'null'
@@ -87,11 +95,41 @@ parameters:
   required:
   - repo
   - path
-  - at
+  - part
   - do
   title: EditRequest
   type: object
 examples:
+- |-
+  the compiler says line 84 is wrong, fix it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The read of line 84 said `line 84 is part=KehT +30`, and its block shows line +30 as `if len > max {`. One line of the part changes, so `replace` with `from` +30 names exactly that line, and `text` is the line as it is to stand, its indentation included and no number in front of it.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "part": "KehT", "do": "replace", "from": "+30", "text": "        if len >= max {"}}
+  </tool_call><|projection|>
+- |-
+  those two retry lines are wrong, they should back off<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The block for fn connect numbers the two retry lines +12 and +13. Two consecutive lines of one part change, so `replace` with `from` +12 and `to` +13 covers both, and `text` holds the two lines as they are to stand.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/net.rs", "part": "Wq3n", "do": "replace", "from": "+12", "to": "+13", "text": "        let wait = backoff.next();\n        sleep(wait);"}}
+  </tool_call><|projection|>
+- |-
+  drop the leftover debug println in that function<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The println is line +7 of the part the read showed. One line goes and the rest of the function stays, so `delete` with `from` +7 removes that line alone.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/pipeline.rs", "part": "pL0e", "do": "delete", "from": "+7"}}
+  </tool_call><|projection|>
 - |-
   now fix the bug you found<|im_end|>
   <|im_start|>assistant
@@ -100,7 +138,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "at": "b4Qx", "do": "replace", "old": "len > max", "text": "len >= max"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "part":"b4Qx", "do": "replace", "old": "len > max", "text": "len >= max"}}
   </tool_call><|projection|>
 - |-
   add a test for that next to the others<|im_end|>
@@ -110,7 +148,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "at": "Kd2w", "do": "insert_after", "text": "    #[test]\n    fn empty_input_is_accepted() {\n        assert!(parse(\"\").is_ok());\n    }\n"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/parser.rs", "part":"Kd2w", "do": "insert_after", "text": "    #[test]\n    fn empty_input_is_accepted() {\n        assert!(parse(\"\").is_ok());\n    }\n"}}
   </tool_call><|projection|>
 - |-
   that helper is dead now, take it out<|im_end|>
@@ -120,7 +158,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/util.rs", "at": "zP9c", "do": "delete"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/util.rs", "part":"zP9c", "do": "delete"}}
   </tool_call><|projection|>
 - |-
   the path in the test needs changing as well<|im_end|>
@@ -130,7 +168,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "candle", "path": "web/tests/roles.rs", "at": "HYzy", "do": "replace", "old": "old-icon.png", "text": "new-icon.png"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "candle", "path": "web/tests/roles.rs", "part":"HYzy", "do": "replace", "old": "old-icon.png", "text": "new-icon.png"}}
   </tool_call><|projection|>
 - |-
   rewrite the body of that function so it pages<|im_end|>
@@ -140,7 +178,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/list.rs", "at": "m3Ty", "do": "replace", "text": "fn list(page: usize) -> Vec<Item> {\n    items().skip(page * SIZE).take(SIZE).collect()\n}\n"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/list.rs", "part":"m3Ty", "do": "replace", "text": "fn list(page: usize) -> Vec<Item> {\n    items().skip(page * SIZE).take(SIZE).collect()\n}\n"}}
   </tool_call><|projection|>
 - in Cargo.toml change the line `version = "0.1.0"` to `version = "0.2.0"`<|im_end|>
 - in src/config.rs replace the string `localhost` with `0.0.0.0`<|im_end|>
@@ -160,7 +198,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/config.rs", "at": "r7Lm", "do": "replace", "old": "/data/old.json", "text": "/data/new.json"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/config.rs", "part":"r7Lm", "do": "replace", "old": "/data/old.json", "text": "/data/new.json"}}
   </tool_call><|projection|>
 - |-
   add a len method after is_empty, you have just read the file again<|im_end|>
@@ -170,5 +208,5 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/queue.rs", "at": "k2Pz", "do": "insert_after", "text": "    pub fn len(&self) -> usize {\n        self.items.len()\n    }\n"}}
+  <|projection|>{"name": "file_edit", "arguments": {"repo": "app", "path": "src/queue.rs", "part":"k2Pz", "do": "insert_after", "text": "    pub fn len(&self) -> usize {\n        self.items.len()\n    }\n"}}
   </tool_call><|projection|>

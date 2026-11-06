@@ -647,7 +647,7 @@ The closing line names the lines the read held, the file's length, and the range
 
 ### `file_edit`
 
-Change one part of an existing file by its anchor (`docs/npcd_anchored_edits.md` §6). `at` names the part as `file_read` shows it; `do` says what to do there: `replace` it with `text` (or, with `old`, just those words inside it), `insert_before` / `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of parts. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. For a new file, or rewriting most of one, use `write`.
+Change an existing file by one of its parts (`docs/npcd_anchored_edits.md` §6, `docs/zen_coding_challenge_fixes.md` Cause 4). `part` names the part as `file_read` shows it; `do` says what to do there. With `from` (and `to`) — lines of the part as the read numbers them, `+N`, forced to that shape by the grammar — the edit covers those lines: `replace` them with `text`, `insert_before` / `insert_after` line `from` the lines `text`, or `delete` them. Without `from` it covers the part whole: `replace` it with `text` (or, with `old`, just those words inside it), `insert_before` / `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`; `through` extends a whole-part replace, delete or move over a run of parts. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. For a new file, or rewriting most of one, use `write`.
 
 **Parameters**
 
@@ -657,15 +657,17 @@ Change one part of an existing file by its anchor (`docs/npcd_anchored_edits.md`
   "properties": {
     "repo": {"type": "string"},
     "path": {"type": "string"},
-    "at": {"type": "string", "minLength": 4, "maxLength": 4},
+    "part": {"type": "string", "minLength": 4, "maxLength": 4},
     "do": {"type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "move"]},
-    "text": {"type": ["string", "null"]},
+    "from": {"type": "string", "pattern": "\\+[1-9][0-9]?"},
+    "to": {"type": "string", "pattern": "\\+[1-9][0-9]?"},
     "old": {"type": ["string", "null"]},
-    "to": {"type": ["string", "null"]},
+    "text": {"type": ["string", "null"]},
+    "through": {"type": ["string", "null"]},
     "dest": {"type": ["string", "null"]},
     "where": {"type": "string", "enum": ["before", "after"]}
   },
-  "required": ["repo", "path", "at", "do"]
+  "required": ["repo", "path", "part", "do"]
 }
 ```
 

@@ -153,6 +153,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::mcp::nudges::Sender;
     use crate::mcp::records::MemRecords;
     use crate::mcp::threads::{Note, State};
 
@@ -210,7 +211,7 @@ mod tests {
             record::say(r, OWNER, ID, &s).unwrap();
         }
         let conv = threads::conv_id(OWNER, &thread, "zen");
-        nudges::queue(r, &conv, "look again", 3).unwrap();
+        nudges::queue(r, &conv, Sender::Starter, "look again", 3).unwrap();
         reported::mark(r, OWNER, &thread, "zen", 4).unwrap();
         // Untouched: a person's thread, and the same chat id of another owner.
         threads::attach(r, OWNER, "review", 0).unwrap();

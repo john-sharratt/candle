@@ -316,8 +316,8 @@ pub const FILE_EDIT: Tool = Tool {
     plane: Plane::World,
     availability: Availability::AtPart,
     description: "Change one part of a document, leaving the rest exactly as it is. `file_read` \
-                  shows every paragraph under a four-character anchor; name the one you mean as \
-                  `at` and say what to `do`: `replace` it with `text` — or, with `old`, change just \
+                  shows every paragraph as a block whose fence names its four-character anchor \
+                  (`part=b4_K`); name the one you mean as `at` and say what to `do`: `replace` it with `text` — or, with `old`, change just \
                   those words inside it — `insert_before` or `insert_after` it a new paragraph \
                   `text`, `delete` it, or `move` it `before` or `after` the paragraph `dest`. `to` \
                   carries a replace, delete or move on through a run of paragraphs, `at` through \
@@ -335,8 +335,8 @@ pub const FILE_EDIT: Tool = Tool {
             name: "at",
             ty: "string",
             required: true,
-            description: "The anchor of the paragraph to change — the four characters before its \
-                          `|` in your last read of it.",
+            description: "The anchor of the paragraph to change — the `part=` of its block in \
+                          your last read of it.",
         },
         Param {
             name: "do",
@@ -349,7 +349,8 @@ pub const FILE_EDIT: Tool = Tool {
             ty: "string",
             required: false,
             description: "For replace and the inserts: the new paragraph, as it is to stand — or, \
-                          with `old`, what those words become.",
+                          with `old`, what those words become. Never the `+N` numbers a read \
+                          shows beside each line.",
         },
         Param {
             name: "old",

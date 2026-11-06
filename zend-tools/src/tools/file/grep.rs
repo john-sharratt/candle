@@ -34,8 +34,9 @@ pub(crate) const MAX_LINE_CHARS: usize = 400;
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct GrepRequest {
     /// Regular expression to search for (Rust `regex` syntax — `\b`, `[A-Z]`,
-    /// `foo|bar`, `^fn `). A plain string works as itself. Required.
-    #[validate(length(min = 1))]
+    /// `foo|bar`, `^fn `). A plain string works as itself. Required. An empty
+    /// one is refused by [`FileGrep::run`] with the tools that do what it was
+    /// reaching for, not by a length rule whose refusal names only the rule.
     pub pattern: String,
     /// The repository to search, or `*` to search every repository in the
     /// workspace. Required.
@@ -144,6 +145,16 @@ impl Tool for FileGrep {
     }
 
     fn run(ctx: &ToolContext, req: GrepRequest) -> Result<GrepResponse, FileError> {
+        // Measured twice in one evening: a worker wanting every file under a
+        // prefix sent an empty pattern, and was told only "pattern: length".
+        if req.pattern.trim().is_empty() {
+            return Err(FileError::InvalidArguments(
+                "the pattern is empty, and an empty pattern matches no line worth showing; to \
+                 see the files under a path, use file_list, and to find a file by its name, \
+                 file_search"
+                    .to_string(),
+            ));
+        }
         // A bad pattern is the caller's to fix, and the regex crate's message
         // names the offending position — far more useful than "invalid regex".
         let re = RegexBuilder::new(&req.pattern)

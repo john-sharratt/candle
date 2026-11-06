@@ -381,7 +381,7 @@ A run that crashed, or whose restore failed, leaves its journal, and the next `p
 
 `publish_branch(pulled, new)` moves a branch anywhere on purpose — a new branch, a rewind — under the same lease, and `unpublish_branch` deletes on origin under the lease, then locally. Neither retries: origin moving in between is a refusal, never an overwrite. With no `origin` remote the local branch is the record: the pull reads it and a publish moves it.
 
-Reads never touch the network: they read the local refs. The origin watcher keeps the tracking refs within seconds of origin (`docs/zend_branch_ingest.md` §4), and `Repo::record_branches` reads the record through them — every `refs/remotes/origin/*` branch, or with no origin every local branch.
+Reads never touch the network: they read the local refs. The origin watcher keeps the tracking refs within seconds of origin (`docs/zend_branch_ingest.md` §4), and `Repo::record_branches` reads the record through them — every `refs/remotes/origin/*` branch, or with no origin every local branch. **A tool's branch revision reads the record, never the local branch** (`zend-tools/src/tools/git/mod.rs`'s `on_record`, through `Repo::record_tip`): a local branch is only a cache of origin's, which a checkout that never wrote to a branch does not have and which can lag it, so `{"kind": "branch", "name": "main"}` is origin's `main`, and `git_refs`' `branches` lists the record's branches.
 
 ### 7.9 A conversation's work
 

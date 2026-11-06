@@ -9,8 +9,8 @@
 //!
 //! **A unit's key names its layer and the unit it was built on**, so no two
 //! layers ever share one — the content keys, the leases and the retrieval index
-//! are all keyed by it, and a layer above `code_reading` keyed by the file
-//! would read as already done.
+//! are all keyed by it, and a unit keyed by the file it reads alone would read
+//! as already done for every layer built on the same file.
 
 use sha2::{Digest, Sha256};
 
@@ -109,11 +109,11 @@ mod tests {
 
     #[test]
     fn a_units_key_names_its_layer_and_differs_by_what_it_built_on() {
-        let a = unit_key("static_analysis", "v2:candle/a.rs@1");
-        assert!(a.starts_with("u2:static_analysis:"));
-        assert_ne!(a, unit_key("static_analysis", "v2:candle/a.rs@2"));
-        assert_ne!(a, unit_key("critical_analysis", "v2:candle/a.rs@1"));
-        assert_eq!(a, unit_key("static_analysis", "v2:candle/a.rs@1"));
+        let a = unit_key("file_notes", "v2:candle/a.rs@1");
+        assert!(a.starts_with("u2:file_notes:"));
+        assert_ne!(a, unit_key("file_notes", "v2:candle/a.rs@2"));
+        assert_ne!(a, unit_key("day_notes", "v2:candle/a.rs@1"));
+        assert_eq!(a, unit_key("file_notes", "v2:candle/a.rs@1"));
     }
 
     /// A unit of a layer that does not expire is keyed by what it built on

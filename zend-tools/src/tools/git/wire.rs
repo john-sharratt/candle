@@ -14,8 +14,8 @@ use serde::Serialize;
 
 use crate::tools::file::grep::truncate;
 use zend_vfs::{
-    BlameLine, Branch, CommitInfo, DiffEntry, DiffStatus, FileMode, GitTime, GrepHit, ObjectKind,
-    Published, Rejection, Remote, Signature, Tag, TreeEntry, Upstream,
+    BlameLine, CommitInfo, DiffEntry, DiffStatus, FileMode, GitTime, GrepHit, ObjectKind,
+    Published, RecordBranch, Rejection, Remote, Signature, Tag, TreeEntry, Upstream,
 };
 
 #[derive(Serialize)]
@@ -193,11 +193,13 @@ pub struct WireBranch {
 }
 
 impl WireBranch {
-    pub fn new(b: &Branch, head: bool) -> Self {
+    /// A branch as the record holds it: the record is what an upstream would
+    /// be compared against, so it has none of its own.
+    pub fn on_record(b: &RecordBranch, head: bool) -> Self {
         Self {
             name: b.name.as_str().to_string(),
-            id: b.oid.as_str().to_string(),
-            upstream: b.upstream.as_ref().map(Into::into),
+            id: b.tip.as_str().to_string(),
+            upstream: None,
             head,
         }
     }

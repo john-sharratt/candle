@@ -266,9 +266,9 @@ diagnostics (behind the existing `SelectionDiagnostics` sink):
 - the projection event gains nothing — `SelectedTurn.score` / `SelectedSection.score`
   already record the normalized values.
 
-Layers with `conv_count = 0` (static_analysis … bug_analysis) cannot score and are
-out of scope here; they start scoring the moment their ingest phases populate them,
-through exactly this path.
+Layers with `conv_count = 0` cannot score and are out of scope here; a layer
+starts scoring the moment its ingest populates it, through exactly this path.
+(The analysis layers this once named were removed; see B.5.)
 
 ### A.4 Level prior — the quiet-slot guard (measured requirement, F5)
 

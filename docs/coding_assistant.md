@@ -607,7 +607,7 @@ When the daily budget is exhausted, the daemon continues with local model analys
 source_hash: sha256:a1b2c3d4...    # hash of source at analysis time
 
 phases:
-  static_analysis:
+  code_reading:
     analyst: qwen3-30b-a3b          # local analysis (immediate)
     enhanced_analyst: claude-opus-4-6  # or gpt-5, gemini-2.5-pro, etc
     enhanced_at: 2026-04-05T15:30:00Z
@@ -832,13 +832,13 @@ phases:
         k_lower: "base64:..."
         # ...
 
-  static_analysis:
+  code_reading:
     turns:
       - role: user
-        content: "What structs, classes, traits, functions..."
+        content: "Read the entire contents of `src/auth/handler.rs`..."
       - role: assistant
         content: |
-          [decoded artifact enumeration]
+          [decoded summary of the file]
     fingerprints: { k_lower: "base64:...", ... }
 
   dependency_analysis:

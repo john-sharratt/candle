@@ -194,7 +194,25 @@ end of candle/candle-nn/src/kv_cache/chunked/backing.rs lines 1-198 of 620 — n
 
 ## 6. Editing
 
-`file_edit` takes an anchor and an operation:
+npcd's bench `file_edit` act takes an anchor and an operation on the unit
+whole, as below. **zend's `file_edit` names the unit `part`, and lines of it
+too**: `from` and `to`, `+N` as the read numbers them beside each line and
+forced to that shape by the grammar, make `replace`, the inserts and `delete`
+cover those lines of the unit; without `from` the edit is to the unit whole as
+below, with `through` in the place of `to`
+(`docs/zen_coding_challenge_fixes.md` Cause 4):
+
+```json
+{"repo": "app", "path": "src/parser.rs", "part": "KehT", "do": "replace", "from": "+30", "text": "        if len >= max {"}
+{"repo": "app", "path": "src/pipeline.rs", "part": "pL0e", "do": "delete", "from": "+7"}
+```
+
+A unit's lines count from its own first line, so an edit in another unit never
+moves them and several edits from one read stay right; a range a unit does not
+hold is refused naming its length. npcd's act keeps the whole-unit form: its
+turn grammar holds `file_edit` at every bench under a path budget (§6, *The
+grammar*), and the unit-whole operations with `old` are what it was measured
+against.
 
 ```json
 {"path": "layers/life/bram-the-gardener/2834-11 The Body.md", "at": "9fTa", "do": "replace", "text": "You said fourteen, and meant it."}
