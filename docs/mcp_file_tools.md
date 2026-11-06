@@ -1,8 +1,8 @@
-# File tools in the Zen MCP, and the gateway's pub/sub
+# File, log and site tools in the Zen MCP, and the gateway's pub/sub
 
-**Status: design, not built.** This document is authoritative for the file
-tools the Zen connector offers, the gateway's publish/subscribe bus, and the
-service keys both rest on. Its first consumer is Yen Bots
+**Status: design, not built.** This document is authoritative for the file,
+log and site tools the Zen connector offers, the gateway's publish/subscribe
+bus, and the service keys they rest on. Its first consumer is Yen Bots
 (`docs/yenbot_app_host.md`), which goes live a second after a commit lands.
 
 ## 1. What it is for
@@ -184,7 +184,56 @@ push — so a subscriber learns of each change by one path, whoever made it:
 A push made outside Zen (a developer pushing from a laptop) publishes nothing;
 a subscriber that must see it also polls the branch, slowly.
 
-## 6. Tests
+## 6. Logs and sites in the connector
+
+### 6.1 Log sources
+
+The connector reads logs today with `cluster_logs`: the gateway gathers
+`GET /v1/logs` from the cluster's members (`host/src/logs.rs`,
+`zend/src/mcp/tools/cluster_logs.rs`), each line a `LogLine` — time, level,
+target, message, tenant — searched by `grep`, `level`, `tenant`, `since` and
+`limit`. That contract is general, so it becomes the contract of a **log
+source**: anything that answers `GET /v1/logs` with those parameters (plus
+`source`) and `GET /v1/logs/sources`, listing what it holds.
+
+The sources are:
+
+- **The cluster** — every member's tenants, gathered by the gateway as now.
+- **Sites the gateway lists as log sources** — `logs: true` on a site in
+  `web/web.yaml` — each with the sub-sources its `/v1/logs/sources` names:
+  Yen Bots is `yenbot` and one `yenbot/<app>` per app
+  (`docs/yenbot_app_host.md` §18).
+
+### 6.2 The tools
+
+| Tool | What it does |
+|---|---|
+| `log_list` | Every source: its name, what it is (a member's tenant, a site, an app), how many lines it holds and its newest line's time. |
+| `log_read {source, since?, level?, limit?}` | A source's newest lines, oldest first. |
+| `log_grep {grep, source?, level?, since?, limit?, node?}` | A regular expression over one source, or every source when none is named; each line under its source. `node` names one member, as `cluster_logs` did, for Admins. |
+
+`log_grep` with `source: "cluster"` is what `cluster_logs` answers today, so
+`cluster_logs` is removed and the guides that name it name `log_grep`.
+
+### 6.3 Sites: screenshots and data
+
+A site that wants Claude to see it serves two read-only routes, and the
+gateway lists it with `shot: true` and `data: true`:
+
+| Tool | Route | What it answers |
+|---|---|---|
+| `site_shot {site, app, page?, width?, theme?, live?}` | `GET /v1/site/shot` | The page rendered now, as a picture the session sees. |
+| `site_data {site, app, coll, where?, limit?}` | `GET /v1/site/data` | What the app stored, as rows. |
+
+### 6.4 Who they act as
+
+Each tool calls through the gateway as the person whose connector it is, with
+their identity headers; the source or site decides what that person may read
+— yenbot answers its admins only. The tools run no model and answer within the
+request-path budget, except `site_shot`, which renders a page and is the
+budget's second documented exception.
+
+## 7. Tests
 
 - **Edits, against raw expected bytes**: one edit, several in order, an `old`
   found twice or not at all, create, replace, delete, move, a change set where
@@ -200,8 +249,11 @@ a subscriber that must see it also polls the branch, slowly.
   socket delivered to a service.
 - **`repo/<name>`**: a push through each of the three paths publishes once,
   with the commit and the paths.
+- **Log sources**: `log_list` over the cluster and a site with sub-sources;
+  `log_grep` across all of them, and with `source: "cluster"` answering what
+  `cluster_logs` did; a site refusing a person it does not admit.
 
-## 7. What changes
+## 8. What changes
 
 | Where | Change |
 |---|---|
@@ -210,10 +262,12 @@ a subscriber that must see it also polls the branch, slowly.
 | zend's push paths | Publish `repo/<name>` after each push. |
 | `web/src/` and `web/web.yaml` | `service_keys:`; the bus and `/gateway/events`. |
 | `cluster/` | A publish (and subscribe) message on the member's socket. |
-| `CLAUDE.md` | `file_edit_and_commit` as the request-path budget's exception. |
-| `mcp/src/guides/` | The connector's guides name the file tools and when a task is the better tool. |
+| `zend/src/mcp/tools/` | `log_list`, `log_read`, `log_grep` in place of `cluster_logs`; `site_shot`, `site_data`. |
+| `web/web.yaml`, `web/src/` | `logs`, `shot` and `data` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
+| `CLAUDE.md` | `file_edit_and_commit` and `site_shot` as the request-path budget's exceptions. |
+| `mcp/src/guides/` | The connector's guides name the file and log tools, `log_grep` where they named `cluster_logs`, and when a task is the better tool. |
 
-## 8. Order of work
+## 9. Order of work
 
 1. `author:` in the manifest; `file_edit_and_commit` on the git layer, with
    its tests against real repositories.
@@ -221,3 +275,4 @@ a subscriber that must see it also polls the branch, slowly.
 3. Service keys at the gateway.
 4. The bus, its WebSocket and the members' publish.
 5. zend publishing `repo/<name>` on every push.
+6. Log sources and the log tools, replacing `cluster_logs`; the site tools.

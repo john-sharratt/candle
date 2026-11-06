@@ -46,7 +46,14 @@ by rule — before it goes live.
 | Yen is not a coder | The framework, templates, the art library, guides, an extensive `CLAUDE.md` and the checks are all there from the first day (§8, §15–§17). |
 | The app-building guide is read for every new app | `yenbot new` starts every app and stamps the guide's edition; the check refuses an app built against an older one (§17.3). |
 | The styling must be amazing, to her attention to detail | One design system with fixed tokens, a living catalogue, and a check that renders every screen to pictures Claude looks at before publishing (§8.5, §17.4). |
-| tokera.com links to it | An entry in the estate dropdown (§18). |
+| Claude can see what it built | Browser errors, workflow runs, check refusals and the platform's own lines are logs the connector reads with `log_list`, `log_read`, `log_grep`; screenshots and data through two more read-only tools (§18). |
+| Data stays sound as apps change | Collections declare their fields; writes are validated; an app's version can carry a migration (§7.5). |
+| Real apps' queries | Counts, sums and groups, full-text search, batches, pages (§7.6). |
+| Drafts touch no real data | A draft app runs on its own data, seeded with samples (§5.4). |
+| English, Vietnamese-safe | English interfaces; type, input, search and sorting that handle Vietnamese correctly (§8.7). |
+| Families share | Groups, and roles per collection and per record; children with their own Google accounts (§12.5). |
+| Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped (§12.6). |
+| tokera.com links to it | An entry in the estate dropdown (§21). |
 
 ## 3. Where it runs
 
@@ -136,9 +143,11 @@ tile: library/tiles/bell-coral # its icon on the landing page, from the library 
 colour: coral                  # the tile's accent, a palette token
 status: live                   # live | draft (draft: the admin only)
 guide: 3                       # the app-building guide's edition it was built to (§17.3)
-collections:                   # what it stores (§7.2)
-  reminders: { scope: private, index: [due_ms] }
-  lists: shared
+collections:                   # what it stores, and each one's fields (§7.2, §7.5)
+  reminders:
+    scope: private
+    fields: { title: { type: text, required: true }, due_ms: { type: time } }
+    index: [due_ms]
 ai: true                       # it may call the AI and draw pictures (§14)
 notify: true                   # it may send notifications (§11)
 schedules:                     # jobs (§9)
@@ -192,16 +201,21 @@ push made outside Zen, yenbot fetches regardless. The fetch runs off every
 request path, and a history rewrite is refused (fast-forward only) and
 logged.
 
-**Drafts**: an app with `status: draft` is live for the admin only, its
+**Drafts**: an app with `status: draft` is live for the admins only, its
 schedules held, so a new app is tried on the real site before anyone else
-sees it. **Rolling back** is a revert commit; every version of every app is in
-git.
+sees it. **A draft runs on its own data**: its collections, files and jobs live
+under the namespace `draft:<id>`, apart from the live app's, and are seeded
+from the app's `samples/*.json` when the namespace is empty — so trying a draft
+never touches anyone's real records, and the screenshots (§17.4) have data to
+show. Taking an app out of draft starts it on its live namespace; the draft's
+data is discarded unless the manifest says to carry it over. **Rolling back**
+is a revert commit; every version of every app is in git.
 
 **Platform releases** go the ordinary way: an agent build on BlackWorld,
 staged to keep, tried, and kept when it prints `INFO serving` (`CLAUDE.md`,
 "Releasing and Testing Locally"; keep's trial in `keep/src/main.rs`).
 `service_deploy` learns the `yenbot` service and its repository for this
-(§19).
+(§22).
 
 ## 6. The API
 
@@ -214,9 +228,15 @@ approved gets nothing but `/me` (§12.2).
 |---|---|
 | `GET /me` | The account: name, email, picture, status, whether the admin. |
 | `GET /apps` | The apps this account may open, for the landing page. |
-| `GET /data/<app>/<coll>?where=…&order=…&limit=…` | Query a collection (§7.2). |
-| `POST /data/<app>/<coll>` | Create a document; answers it with its id and version. |
+| `GET /data/<app>/<coll>?where=…&order=…&limit=…&after=…` | Query a collection, a page at a time (§7.2, §7.6). |
+| `GET /data/<app>/<coll>/_sum?group=…&count&sum=…` | Counts, sums, averages, minimum and maximum, grouped (§7.6). |
+| `GET /data/<app>/<coll>/_search?q=…` | Full-text search over the collection's searchable fields (§7.6). |
+| `POST /data/<app>/<coll>` | Create a document, validated against the collection's fields (§7.5); answers it with its id and version. |
 | `GET/PATCH/DELETE /data/<app>/<coll>/<id>` | Read, update (merge, with `If-Match` on the version), delete. |
+| `POST /data/<app>/_batch` | Several creates, updates and deletes in one transaction, all or nothing. |
+| `PUT /data/<app>/<coll>/<id>/_share` | Who else may read or edit one record (§12.5). |
+| `POST /errors` | What went wrong in a browser: the framework reports every uncaught error and failed call (§18.1). |
+| `POST /feedback/<app>` | A note to Yen from the app's own menu, into her inbox. |
 | `GET /events/<app>` | Server-sent events: every change to the app's collections, so a list another person changes updates live. |
 | `POST /files/<app>` | Upload a file (image, PDF): stored, sized, thumbnailed; answers its id and URLs. |
 | `GET /files/<app>/<id>[/thumb]` | Fetch it. |
@@ -228,7 +248,12 @@ approved gets nothing but `/me` (§12.2).
 | `GET /inbox`, `POST /inbox/<id>/read` | The account's notifications (§11). |
 | `GET/PUT /settings/<app>` | A small per-app, per-account settings object. |
 | `GET /library?kind=…&tag=…` | The art library's catalogue (§15). |
-| `/admin/…` | The admin's: accounts, app visibility, jobs, check results (§13.2). |
+| `GET /export/<app>`, `POST /import/<app>` | An app's data as JSON or CSV, out and back in (§20.1). |
+| `/admin/…` | The admins': accounts, groups, app visibility, jobs, secrets, check results (§13.2). |
+
+Outside `/api/v1`, three groups of routes serve something other than an app's
+own pages: `/hooks/<app>/<name>` (inbound hooks, §19.2), `/v1/logs` (§18.2)
+and `/v1/site/…` (screenshots and data for the connector, §18.3).
 
 ## 7. The store
 
@@ -248,7 +273,7 @@ needs a migration:
 
 ```sql
 CREATE TABLE docs (
-  app        TEXT NOT NULL,
+  app        TEXT NOT NULL,          -- the namespace: the app's id, or draft:<id> (§5.4)
   coll       TEXT NOT NULL,
   id         TEXT NOT NULL,          -- ULID
   owner      TEXT NOT NULL,          -- the account that created it
@@ -282,6 +307,55 @@ Every night at 03:00, a platform job (§9) writes `VACUUM INTO
 data\backups\yenbot-YYYY-MM-DD.db` and copies the files directory beside it;
 fourteen are kept, on BlackWorld. Restoring is stopping the service and
 putting a backup in the database's place; the guides say how.
+
+### 7.5 Fields, validation and migrations
+
+A collection declares its fields in the manifest, so the server can refuse a
+bad write and a form can be built from the declaration:
+
+```yaml
+collections:
+  recipes:
+    scope: shared
+    version: 2                       # the shape's version
+    fields:
+      title:    { type: text, required: true, max: 120 }
+      serves:   { type: number, min: 1, default: 2 }
+      photo:    { type: file }
+      tags:     { type: list, of: text }
+      cooked:   { type: time }
+      notes:    { type: text, long: true }
+    search: [title, notes, tags]     # what full-text search covers (§7.6)
+    index:  [cooked]
+```
+
+Types: `text`, `number`, `bool`, `time`, `date`, `file`, `list`, `object`,
+`ref` (another record's id, with its collection). A write that does not match
+is refused with the field and the reason, which the framework's forms show
+beside the field. Fields not declared are refused, so a typo cannot quietly
+start a second field.
+
+**Migrations.** When an app raises a collection's `version`, it ships
+`workflows/migrate-<coll>-<n>.js`, a workflow that takes one record at the
+old shape and returns it at the new. On load the platform runs it over every
+record, in batches, in the background, recording progress; until it finishes
+the app is served its last good version. A raised version without its
+migration is refused at load.
+
+### 7.6 Queries, sums, search and batches
+
+- **Pages**: `limit` and `after` (an opaque cursor), so a long list loads as
+  it scrolls.
+- **Sums**: `count`, `sum`, `avg`, `min`, `max`, grouped by one or two
+  fields, for trackers and dashboards — the `_sum` route and
+  `collection.sum({group, …})`.
+- **Search**: each collection's `search:` fields are kept in an SQLite FTS5
+  index, updated in the write's own transaction, with diacritics folded so
+  "pho" finds "phở" (§8.7) — the `_search` route and `collection.search(q)`.
+- **Batches**: several writes in one transaction, all or nothing —
+  `app.batch(b => …)`.
+- **References**: a `ref` field is fetched with the record when the query asks
+  (`expand: [author]`), one level deep.
 
 ## 8. The frontend framework
 
@@ -402,8 +476,25 @@ The shell (title, back to the landing page, the account's avatar), sign-in
 handled, light and dark following the device, phone-first layout, installable
 to the home screen, offline read of what was last loaded, loading and empty
 and error states in every component, the change feed, uploads with
-thumbnails, AI and pictures with streaming progress, notifications, and a
-"something went wrong" panel that says what and offers a retry.
+thumbnails, AI and pictures with streaming progress, notifications, forms
+built from a collection's fields with their errors beside each field, a
+"send Yen feedback" item in the app's menu, every error reported to the site
+(§18.1), and a "something went wrong" panel that says what and offers a
+retry.
+
+**Offline writes**: a change made with no connection is kept in the browser's
+storage, shown as pending, and sent when the connection is back, in order,
+each with the version it was made against; one that conflicts with a newer
+change is shown to the person to keep or drop, never silently overwritten.
+
+### 8.7 Language and type
+
+Interfaces are in English, and everything handles Vietnamese: the text and
+display faces cover the full Vietnamese set, stacked diacritics included
+(chosen and checked against a test page of Vietnamese text); text is
+normalised to NFC on every write so the same word is always the same bytes;
+search folds diacritics (§7.6); sorting is by `Intl.Collator`; dates, times
+and numbers are formatted for `en-AU` in Yen's time zone.
 
 ## 9. Scheduled jobs
 
@@ -501,7 +592,8 @@ in the engine:
 | `schedule(at, workflow, args)` | A job for later. |
 | `run(workflow, args)` | Another of the app's workflows, awaited. |
 | `once(key, fn)` | Run `fn` only once for this key, across retries. |
-| `fetch(url)` | An HTTP GET to a host the manifest's `fetch:` lists — a weather service, a feed. |
+| `fetch(url, {method, headers, body})` | An HTTP call to a host the manifest's `fetch:` lists — a weather service, a calendar (§19.1). |
+| `secret(name)` | One of the app's integration keys (§19.1). |
 | `time(ms)`, `now()`, `log(…)` | Time in Yen's zone; a line in the run's log. |
 
 ### 10.3 Limits
@@ -617,7 +709,47 @@ she sees it, and the accounts she shares it with by name. Visibility and
 shares are rows in `app_access`, changed on the admin page and effective at
 once; a new app arrives public once it leaves draft, and the guides tell
 Claude to ask Yen before taking an app out of draft. Making an app private
-hides it and its data from everyone else at once; nothing is deleted.
+hides it and its data from everyone else at once; nothing is deleted. An app
+can also be shared with a group (§12.5).
+
+### 12.5 Groups and sharing
+
+Families share some things and not others, so access below the app has three
+levels:
+
+- **Groups**, kept by the admins on the admin page: `household`, `kids`,
+  `grandparents`, any name, each a set of accounts. Children sign in with
+  their own Google accounts (Family Link works) and are approved like anyone
+  else, then put in their groups.
+- **Collection roles**, in the manifest: who may read and who may write a
+  shared collection — `roles: { read: [everyone], write: [household] }` — so
+  the kids can see the chores list and only the parents edit it. `private`
+  collections stay their owner's.
+- **Record shares**: one record shared with named accounts or groups, to read
+  or to edit (`PUT …/_share`, `record.share(…)`) — a single shopping list
+  shared with Grandma, a recipe sent to a friend.
+
+The server applies all three on every read, write, search, sum, export and
+change-feed message; the framework hides what an account cannot do rather
+than letting it fail.
+
+### 12.6 Safe by default
+
+Apps show other people's words and pictures, so the platform closes the
+common holes for every app, without the app asking:
+
+- **A strict Content-Security-Policy** on every page: scripts, styles, fonts
+  and images from the site only, no inline script, no `eval` — which is also
+  what keeps every app off outside CDNs.
+- **Request forgery refused**: the API requires the `X-Yen-App` header the
+  framework sends and the session cookie is `SameSite=Lax`, so another site
+  cannot make a signed-in browser call it.
+- **Markup escaped**: Lit escapes every value it renders; the guides forbid
+  `unsafeHTML`, and the check refuses it.
+- **Uploads checked**: by their bytes, not their name, against the types the
+  collection's `file` field allows, with a size ceiling; images are re-encoded
+  when thumbnailed, which drops anything hidden in them.
+- **Secrets never reach a browser** (§19.1).
 
 ## 13. Pages
 
@@ -631,14 +763,20 @@ with Google". Pending: a page saying the account is waiting for Yen.
 
 ### 13.2 The admin page
 
-`/_admin`, for the admin only:
+`/_admin`, for the admins only:
 
 - **Accounts**: pending ones first with approve and refuse; then everyone,
-  with when they joined and were last seen, and block.
+  with when they joined and were last seen, their groups, and block.
+- **Groups**: create, rename, add and remove accounts (§12.5).
 - **Apps**: each with its tile, status, public or private, who it is shared
-  with, the order on the landing page, its last publish, and its check result
-  with the screenshots (§17.4).
+  with, the order on the landing page, its last publish, its check result
+  with the screenshots (§17.4), its storage, and export, import and delete
+  (§20.1).
 - **Jobs**: what runs next, what failed and why.
+- **Secrets**: each app's integration keys, set and replaced, never shown
+  again once saved (§19.1).
+- **Errors and feedback**: what browsers reported, and notes from the apps'
+  feedback items.
 - **Registration**: approve or open.
 
 ## 14. AI and pictures through Zen
@@ -676,6 +814,15 @@ picture sizes, and nothing caps how much it asks for. Every call is recorded
 in `ai_calls`, and the admin page shows what each app and account has used.
 What keeps a stranger from using it freely is registration (§12.2): only an
 active account reaches an app.
+
+**Asking about the app's own data.** "Which of my recipes use chicken?" is
+search first, then the model: `app.ai.ask(question, {from: collection})`
+searches the collection's searchable fields (§7.6), puts the best matches in
+the prompt with their ids, and answers with the ids it drew on, so the app
+links to them. A semantic index (embeddings) is not in the first version.
+
+**No looking at pictures.** Zen's model reads text only; an app cannot ask
+it about a photo. A vision path is designed when an app needs one.
 
 ## 15. The art library
 
@@ -755,11 +902,16 @@ describe:
   and why; drafts, showing Yen, going public; the check and the screenshots.
   It starts with its edition number.
 - One guide per part: the manifest; the framework (components, signals,
-  pages, stores); the SDK; data; files; AI and pictures; jobs and schedules;
-  workflows and `ctx`; notifications and the home-screen install; the design
-  system and every component; the art library and its house style;
-  templates; accounts, access and private apps; publishing, drafts and rolling
-  back; backups and restoring; what to do when it breaks.
+  pages, stores, forms, offline writes); the SDK; data, fields and migrations;
+  queries, sums and search; files; AI, pictures and asking about an app's
+  data; jobs and schedules; workflows and `ctx`; integrations, secrets and
+  hooks; notifications and the home-screen install; the design system and
+  every component; language and type; the art library and its house style;
+  templates; accounts, groups, sharing and private apps; what the platform
+  keeps safe and what an app must never do; publishing, drafts and their
+  sample data, and rolling back; seeing what happened — logs, errors,
+  screenshots, data; exporting, importing and deleting; backups and restoring;
+  what to do when it breaks.
 
 Every rule comes with its reason, every API and every `ctx` call with a
 complete working example, every component with its states, and every common
@@ -791,8 +943,11 @@ extensive:
   public without Yen; platform changes are releases, app changes are pushes.
 - **The commands** — `yenbot new`, `yenbot check`, `yenbot shot`, `yenbot
   library add`, building and testing the platform, and publishing.
-- **When something breaks** — where the logs are, how to roll an app back,
-  how to restore a backup, and when to stop and ask.
+- **Seeing what happened** — `log_list`, `log_read` and `log_grep` for the
+  site's and each app's lines, browser errors included; `site_shot` to see a
+  page; `site_data` to see what an app stored (§18). Look before guessing.
+- **When something breaks** — reading the app's log first, how to roll an app
+  back, how to restore a backup, and when to stop and ask.
 
 ### 17.3 Read for every new app
 
@@ -817,17 +972,18 @@ an older guide edition; uses a literal colour, font or pixel size where a
 token exists; breaks the layout conventions (§8.3) — a page or component
 outside its folder, a component reaching into a store, two components in one
 file; has an image without `alt`; lacks an empty or error state on a list;
-loads anything from outside the site; or has a workflow that does not parse
-or exports no function.
+uses `unsafeHTML`; writes a field its collection does not declare; raises a
+collection's version without its migration; loads anything from outside the
+site; or has a workflow that does not parse or exports no function.
 
 **Then it looks.** `yenbot shot <app>` renders every page of the app in a
 headless browser — Microsoft Edge, which every Windows install carries — at
-phone and desktop width, light and dark, with sample data, and writes the
-screenshots. Through Zen they come back to Claude as pictures, and the
-building guide has Claude look at each one against the design system's
-catalogue — alignment, spacing, contrast, truncated text, an empty state that
-reads well — before publishing, and show Yen the phone shots when it does.
-The admin page keeps the last shots of every app.
+phone and desktop width, light and dark, on the draft's sample data (§5.4),
+and keeps the screenshots. Claude sees them through the connector's
+`site_shot` (§18.3), and the building guide has it look at each one against
+the design system's catalogue — alignment, spacing, contrast, truncated text,
+an empty state that reads well — before publishing, and show Yen the phone
+shots when it does. The admin page keeps the last shots of every app.
 
 A publish whose app fails the check stays on its last good version and says
 why on the admin page.
@@ -839,14 +995,120 @@ the repository's `CLAUDE.md` and `guides/building-an-app.md` are read before
 anything else, and the order of work. Every Claude session Yen opens, on any
 device, reads it first, as `guide_list` already asks.
 
-## 18. tokera.com
+### 17.6 Yen's claude.ai Project
+
+The guides above are what Claude reads once it is in the repository; this is
+how it gets there. Yen works in one claude.ai Project, "Yen Bots", set up once
+by John, with the Zen connector enabled and these instructions:
+
+```text
+You build and change apps on Yen Bots (yenbot.com.au) for Yen, through the Zen
+connector. Before anything else in a chat, read the Zen guide `yen-apps` with
+guide_read, then follow it: it tells you what to read in the yenbot repository
+and in what order. Yen is not a coder: speak plainly, show her the result,
+and ask before anything she would not expect.
+```
+
+The text lives in `guides/claude-ai-project.md`, so a change to it is
+reviewed like any other; John copies it into the Project when it changes.
+
+## 18. Seeing what happened
+
+Claude cannot see the site from claude.ai unless the site shows it. Everything
+that happens on Yen Bots is therefore written down where the connector can
+read it.
+
+### 18.1 What is recorded
+
+- **The platform's own lines** — starts, publishes and swaps, refused
+  versions and why, migrations, failures — in the same line shape as the
+  cluster's members (`host/src/logs.rs` `LogLine`: time, level, target,
+  message).
+- **Per app**, as its own log source `yenbot/<app>`:
+  - **browser errors** — the framework catches every uncaught error, rejected
+    promise and failed API call and posts it to `/api/v1/errors` with the
+    page, the account, the stack and the browser; repeats are counted rather
+    than flooding;
+  - **workflow runs** — each run's start, its `ctx.log` lines, its outcome
+    and its error;
+  - **check results** — a refused version, its rule and the file and line.
+
+### 18.2 `/v1/logs`
+
+yenbot serves `GET /v1/logs` with the cluster members' query
+(`grep`, `level`, `since`, `limit`; `zend/src/mcp/tools/cluster_logs.rs`)
+plus `source`, and `GET /v1/logs/sources`, which lists `yenbot` and every app
+with how many lines each holds. Lines are kept in the store, thirty days.
+
+### 18.3 Screenshots and data
+
+- `GET /v1/site/shot?app=…&page=…&width=phone|desktop&theme=light|dark` —
+  renders the page now (§17.4), on the draft's sample data unless `live` is
+  asked, and answers the picture.
+- `GET /v1/site/data?app=…&coll=…&where=…&limit=…` — what an app stored,
+  read-only, live or draft.
+
+Both answer the admins only.
+
+### 18.4 In the connector
+
+The connector reads it all with general tools (`docs/mcp_file_tools.md` §6):
+`log_list` names every log source — the cluster's members and yenbot's apps
+alike — `log_read` reads one's newest lines, `log_grep` searches one or all.
+`site_shot` and `site_data` call §18.3 and answer a picture and rows. They act
+as the person whose connector it is, so yenbot sees an admin.
+
+## 19. Integrations
+
+### 19.1 Secrets and outbound calls
+
+An app that talks to another service — a weather feed, a calendar, a school
+portal — keeps its keys in the store, per app, set on the admin page and never
+shown again once saved. A workflow reads one with `ctx.secret(name)`; no
+browser ever receives one. `ctx.fetch` may `GET`, `POST`, `PUT` and `DELETE`
+to the hosts the manifest's `fetch:` lists, with headers and a body.
+
+### 19.2 Inbound hooks
+
+`/hooks/<app>/<name>` runs the app's `workflows/hooks/<name>.js` with the
+request, for a service that calls in — a form elsewhere, a shortcut on her
+phone. A hook is reachable without signing in, so each carries a token made
+on the admin page, in its URL or as an HMAC signature with an app secret; an
+unsigned call is refused and logged.
+
+## 20. Lifecycle and health
+
+### 20.1 Apps and accounts over time
+
+- **Deleting an app** is removing its folder. Its data, files and jobs are
+  moved to an archive and kept thirty days, shown on the admin page with
+  restore; then a platform job purges them.
+- **Renaming an app** is `yenbot rename <old> <new>`, which moves its folder,
+  its data and its jobs together.
+- **Export and import**: an app's data as JSON (every collection) or CSV (one
+  collection), from the admin page and `/api/v1/export`; an import is
+  validated against the fields like any write.
+- **An account deleted** by an admin loses its private records and files;
+  records it shared stay, shown as by a former member.
+- **Storage**: the admin page shows each app's records and files; a platform
+  job removes files no record names.
+
+### 20.2 Health
+
+yenbot answers `GET /v1/status` (ready, version, the store, the scheduler,
+the bus subscription). keep restarts it when it exits. The gateway reports
+each site upstream's health in its status, so `cluster_status` shows Yen Bots
+beside the cluster, and a site that stays down is a line there rather than a
+silence.
+
+## 21. tokera.com
 
 The estate dropdown lists the sites in `ESTATE` (`web/src/site/tokera/page.rs`)
 and its copy in `web/content/common/lib/estate.js`, kept equal by
 `the_estate_list_matches_the_shared_module`. Yen Bots is a fifth entry there,
 with its tile under `web/content/common/brand/`, and in the footer.
 
-## 19. What changes outside the new repository
+## 22. What changes outside the new repository
 
 | Where | Change |
 |---|---|
@@ -858,13 +1120,14 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: yensharratt@gmail.com}`. |
 | `service_deploy` | Learns `yenbot`: its repository and its package. |
-| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4). |
-| Zen jobs | A job's screenshots come back to the session as pictures (§17.4). |
+| Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs`, and `site_shot`, `site_data` (`docs/mcp_file_tools.md` §6). |
+| `web/web.yaml` | yenbot as a log source and a site whose health the gateway reports (§20.2). |
 | `mcp/src/guides/` | `yen-apps.md` (§17.5). |
-| `web/src/site/tokera/page.rs`, `estate.js` | The estate entry (§18). |
+| Yen's claude.ai | The "Yen Bots" Project and its instructions (§17.6). John sets it up. |
+| `web/src/site/tokera/page.rs`, `estate.js` | The estate entry (§21). |
 | `docs/deployment.md` | The service, its port, its paths and its launch line. |
 
-## 20. Decisions
+## 23. Decisions
 
 Taken 2026-11-06:
 
@@ -878,25 +1141,37 @@ Taken 2026-11-06:
 - **Edits are commits**, through `file_edit_and_commit`, announced on the
   gateway's bus; the site subscribes rather than being called
   (`docs/mcp_file_tools.md`).
+- **Children sign in with their own Google accounts**, approved and grouped
+  like anyone else.
+- **English interfaces, Vietnamese-safe** throughout.
+- **No vision** in the first version.
+- **Claude sees the site through general, read-only connector tools**: logs
+  by source (`log_list`, `log_read`, `log_grep`), screenshots and data.
 
-## 21. Order of work
+## 24. Order of work
 
 1. The gateway and zend: sign-in per domain, the yenbot site and route, and
    `docs/mcp_file_tools.md` — service keys, the bus, `repo/<name>`, the
-   connector's file tools.
+   connector's file and log tools.
 2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
-   watcher and the publisher, keep and `INFO serving`.
-3. The API, with tests against a real SQLite file.
-4. The frontend framework: `yen.js`, the vendored modules, routing, stores.
-5. The design system, its catalogue page and the components.
-6. The art library: the house style, `yenbot library`, the first library.
-7. Jobs and workflows: the scheduler, the record-driven schedules, QuickJS and
-   `ctx`.
-8. Notifications: the service worker, Web Push, the inbox.
-9. AI and pictures through Zen.
-10. The admin page.
-11. Templates, the checks and screenshots, the guides, the MCP guide.
-12. Zen access for Yen, `service_deploy`, the estate entry, `deployment.md`.
-13. Yen's first app, built by her in claude.ai from the guides alone — the
+   watcher and the publisher, its logs and `/v1/logs`, health, keep and
+   `INFO serving`.
+3. The API — fields and validation, queries, sums, search, batches, groups and
+   shares — with tests against a real SQLite file.
+4. The frontend framework: `yen.js`, the vendored modules, routing, stores,
+   forms, offline writes, error reporting.
+5. The design system, its type and its Vietnamese test page, its catalogue
+   page and the components.
+6. Drafts on their own data, samples, and the screenshots with `site_shot`.
+7. The art library: the house style, `yenbot library`, the first library.
+8. Jobs and workflows: the scheduler, the record-driven schedules, QuickJS and
+   `ctx`, migrations.
+9. Notifications: the service worker, Web Push, the inbox.
+10. AI and pictures through Zen, and asking about an app's data.
+11. Integrations: secrets, outbound calls, inbound hooks.
+12. The admin page, export, import, deleting and archiving.
+13. Templates, the checks, the guides, the MCP guide, the claude.ai Project.
+14. Zen access for Yen, `service_deploy`, the estate entry, `deployment.md`.
+15. Yen's first app, built by her in claude.ai from the guides alone — the
     test of everything above.
