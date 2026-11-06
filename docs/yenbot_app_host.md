@@ -116,7 +116,8 @@ yenbot/
                               and embedded into the binary at build time (§5.2)
     index.html  _admin/       the landing page and the admin page
     _/yen.js  _/framework/    the framework: one import, one module per concern (§8)
-    _/ui/                     design system: tokens.css, yen.css, components/
+    _/yen.css  _/ui/          design system: the page's look; tokens.css, fonts.css, components/
+    _design/                  the catalogue and the Vietnamese test page (§8.5, §8.7)
     _/vendor/                 pinned third-party modules (Lit, signals)
     _/icons/  _/fonts/        the vector UI icon set and the typefaces
     sw.js                     the service worker: push and offline (§11)
@@ -566,10 +567,9 @@ import { YenElement, html } from "/_/yen.js";
 import { recipes } from "../stores/recipes.js";
 export class RecipesHome extends YenElement {
   render() {
-    return html`<yen-page title="Recipes">
-      <yen-list .items=${recipes.value} empty="no-recipes">
-        ${r => html`<recipe-card .recipe=${r}></recipe-card>`}
-      </yen-list>
+    return html`<yen-page heading="Recipes">
+      <yen-list .items=${recipes.value} empty="No recipes yet"
+                .item=${r => html`<recipe-card .recipe=${r}></recipe-card>`}></yen-list>
       <yen-fab icon="plus" href="new">Add a recipe</yen-fab>
     </yen-page>`;
   }
@@ -610,27 +610,40 @@ The look is the platform's, not each app's. `/_/yen.css` carries:
   all honour `prefers-reduced-motion`.
 
 `/_design` lists every token and every component in every state, light and
-dark, at phone and desktop width. It is the reference Claude builds against
-and the page Yen points at when something looks wrong.
+dark side by side, at phone and desktop width; `?part=<section>` shows one
+section. It is the reference Claude builds against and the page Yen points at
+when something looks wrong. The tokens live once, in `tokens.css`: the
+browser loads it, the catalogue reads it to draw its dark frame beside its
+light one, and the platform reads it to check a theme's contrast.
+
+The site puts `/_/yen.css` and the app's theme at the head of every app page,
+so an app's `index.html` names neither. A line of text is never set tighter
+than 1.4 and is only ever cut short sideways — Be Vietnam Pro sets a
+Vietnamese capital's stacked marks above the line box, and a vertical clip
+cuts them off (found on the Vietnamese test page).
 
 **An app may override a few named tokens for itself**, in its manifest:
 
 ```yaml
 theme:
   accent: "#d94f70"          # the app's colour: buttons, links, its tile
-  accent-dark: "#f07a95"     # the same in dark mode
-  surface: warm              # one of the palette's named surfaces
+  accent-dark: "#f07a95"     # the same in dark mode; lightened from accent until it reads, when absent
+  surface: warm              # warm | plain | cool | rose | sage
   radius: round              # soft | round | square
   type: display              # text | display — the face for headings
   density: roomy             # compact | normal | roomy
 ```
 
-The platform writes these as custom properties on the app's root, so every
-component takes them without the app touching CSS. Only these names exist; the
-check refuses any other, and refuses an accent whose contrast against its
-surface falls below WCAG AA in either mode, so an override can change an app's
-character but never break its legibility. `/_design?app=<id>` shows the
-catalogue in the app's theme.
+The platform writes these as custom properties on the app's root — a
+stylesheet, `/_/theme/<id>.css`, linked by its contents' digest so an edit is
+seen on the next load — so every component takes them without the app
+touching CSS. Only these names exist; the manifest is refused at load for any
+other, and for an accent whose contrast against its surface's page or card
+falls below WCAG AA (4.5:1) in either mode, saying by how much and which way
+to go. An override can change an app's character but never break its
+legibility. The ink on the accent is white or the dark page's colour,
+whichever reads better. `/_design?app=<id>` shows the catalogue in the app's
+theme.
 
 ### 8.6 What every app gets without asking
 
@@ -1555,7 +1568,7 @@ or the docs are fixed until it passes as written.
 | 17 | "Make a homework helper chat for the kids" | `ai: true` and the chat panel | §14 | A child's account asks and gets a streamed answer; the call is in `ai_calls`. |
 | 18 | "I deleted the wrong recipes" | A task: `GET /admin/backups`, then `POST /admin/backups/<date>/restore {app}` | §7.4 | The recipes are back; every other app's data is untouched; a backup of what was replaced exists. |
 | 19 | "The site's not loading" | `cluster_status` for the site's health, `log_grep` on `yenbot`, then `service_control` to restart | §20.2, §5.5 | Claude says what the log showed and the site answers again. |
-| 20 | "Make the date picker nicer everywhere" | The platform component under `web/_/ui/`, an edit, served from disk | §5.2 | Every app's date picker changes without a release; `/_design` shows it in every state. |
+| 20 | "Make the date picker nicer everywhere" | The platform component under `web/_/ui/components/`, an edit and a release (the binary embeds `web/`) | §5.2, §5.5 | Every app's date picker changes with the release; `/_design` shows it in every state. |
 | 21 | "Can the platform make QR codes?" | A task on the Rust, then `service_deploy` for yenbot, watched with `job_status` | §5.5, §17.7 | The feature is live; Claude told Yen how long it would take and confirmed on the site that it landed. |
 | 22 | "Put my apps in this order" | Yen's admin page, or a task: `PUT /admin/apps/order` | §6.2 | The landing page shows the order she gave. |
 | 23 | "Put the recipes in a spreadsheet" | `/export/<app>` as CSV | §20.1 | The CSV opens in a spreadsheet with every recipe and Vietnamese text intact. |
