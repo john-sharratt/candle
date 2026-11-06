@@ -115,7 +115,7 @@ yenbot/
   web/                        the platform's web files: served from disk by the gateway,
                               and embedded into the binary at build time (§5.2)
     index.html  _admin/       the landing page and the admin page
-    _/framework/              yen.js: components, signals, router, SDK (§8)
+    _/yen.js  _/framework/    the framework: one import, one module per concern (§8)
     _/ui/                     design system: tokens.css, yen.css, components/
     _/vendor/                 pinned third-party modules (Lit, signals)
     _/icons/  _/fonts/        the vector UI icon set and the typefaces
@@ -192,9 +192,17 @@ everything: the platform's web files, the apps, the API.
   (`apps/`) are read from the live checkout and change on the next load.
 
 `/a/<id>/…` is yenbot's, from the app's folder in the live checkout. Every
-file goes through the same responder as the consoles' (`web::asset::respond`):
+file, the platform's and the apps', goes through one responder
+(`src/serve/asset.rs`, the same rules as the consoles' `web::asset::respond`):
 a strong `ETag` over the content, `304` when it matches, gzip, and a short
 `max-age` for HTML, JS and CSS.
+
+- **Every page of an app is its `index.html`**: a path with no file and no
+  extension (`/a/recipes/r/7`) is answered with it, and the router reads the
+  page from the address.
+- **`index.html` is given `<base href="/a/<id>/">`**, so its relative
+  addresses mean the same from every page.
+- **`app.yaml` and `workflows/` are the server's**, and are not served.
 
 ### 5.3 Hot reload
 
@@ -283,6 +291,7 @@ the app gets 403, and an account not yet approved gets nothing but `/me`
 |---|---|
 | `GET /me` | The account: name, email, picture, status, whether the admin. |
 | `GET /apps` | The apps this account may open, for the landing page. |
+| `GET /apps/<app>` | One app as its pages are built from it: its collections, their fields, and whether the account may add to each. |
 | `GET /data/<app>/<coll>?where=…&order=…&limit=…&after=…` | Query a collection, a page at a time (§7.2, §7.6). |
 | `GET /data/<app>/<coll>/_sum?group=…&count&sum=…` | Counts, sums, averages, minimum and maximum, grouped (§7.6). |
 | `GET /data/<app>/<coll>/_search?q=…` | Full-text search over the collection's searchable fields (§7.6). |
@@ -290,9 +299,9 @@ the app gets 403, and an account not yet approved gets nothing but `/me`
 | `GET/PATCH/DELETE /data/<app>/<coll>/<id>` | Read, update (merge, with `If-Match` on the version), delete. |
 | `POST /data/<app>/_batch` | Several creates, updates and deletes in one transaction, all or nothing. |
 | `PUT /data/<app>/<coll>/<id>/_share` | Who else may read or edit one record (§12.5). |
-| `POST /errors` | What went wrong in a browser: the framework reports every uncaught error and failed call (§18.1). |
+| `POST /errors` | What went wrong in a browser: the framework reports every uncaught error and failed call (§18.1); a repeat is counted, and written at most once a minute. |
 | `POST /feedback/<app>` | A note to Yen from the app's own menu, into her inbox. |
-| `GET /events/<app>` | Server-sent events: every change to the app's collections, so a list another person changes updates live. |
+| `GET /events/<app>` | Server-sent events: every change to the app's records the account may see, so a list another person changes updates live. A change names the record and its version, never its fields, which the page reads through the data routes; a deletion names only the id. `reset` after a restore, or when the page fell behind. |
 | `POST /files/<app>` | Upload a file (image, PDF): stored, sized, thumbnailed; answers its id and URLs. |
 | `GET /files/<app>/<id>[/thumb]` | Fetch it. |
 | `POST /ai/chat` | A chat completion, streamed or whole, optionally constrained to a JSON schema (§14). |
@@ -464,7 +473,10 @@ Types: `text`, `number`, `bool`, `time`, `date`, `file`, `list`, `object`,
 `ref` (another record's id, with its collection). A write that does not match
 is refused with the field and the reason, which the framework's forms show
 beside the field. Fields not declared are refused, so a typo cannot quietly
-start a second field.
+start a second field. A page sees a record as its fields beside the record's
+own names — `id`, `owner`, `version`, `created_ms`, `updated_ms`, `pending` —
+so no field may take one of those names. Every string written is stored in
+NFC (§8.7).
 
 **Migrations.** When an app raises a collection's `version`, it ships
 `workflows/migrate-<coll>-<n>.js`, a workflow that takes one record at the
@@ -636,6 +648,11 @@ retry.
 storage, shown as pending, and sent when the connection is back, in order,
 each with the version it was made against; one that conflicts with a newer
 change is shown to the person to keep or drop, never silently overwritten.
+Every write takes this one path, connected or not, so there is no second way
+for a write to go: a refusal while its page still waits on it — a form's
+mistake — is the page's to show beside the field; one that comes after the
+page moved on is held in the shell, to keep ("Keep mine", sent again over the
+newer version) or drop.
 
 ### 8.7 Language and type
 
