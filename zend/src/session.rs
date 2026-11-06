@@ -7422,15 +7422,14 @@ impl ZendSession {
     ) -> Option<(Arc<InferenceState>, TimelineId, EngineResult<()>)> {
         let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
-        let distilled = {
-            let engine = &state.engine;
-            engine
-                .set_conversation_archived(timeline, true)
-                .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
-        };
-        if distilled.is_ok() {
+        let engine = &state.engine;
+        let archived = engine.set_conversation_archived(timeline, true);
+        // Archived, it runs no more rounds, whether or not it distils.
+        if archived.is_ok() {
             close_tool_sessions(&state, conv_id, "archived");
         }
+        let distilled =
+            archived.and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly));
         Some((state, timeline, distilled))
     }
 

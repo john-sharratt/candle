@@ -146,6 +146,17 @@ impl Bus {
         reply: &str,
         wait: Duration,
     ) -> Result<Value, Unanswered> {
+        // Only a subscriber naming the topic itself is one that answers it: a
+        // wildcard watcher hears requests and answers none, and counting it
+        // would turn a gateway with no answerer into a timeout, keeping the
+        // asker from the gateway that has one.
+        let answerable = self
+            .subscribers()
+            .iter()
+            .any(|s| s.patterns.iter().any(|p| p == topic));
+        if !answerable {
+            return Err(Unanswered::NoSubscriber);
+        }
         let mut sub = self.subscribe(vec![reply.to_string()]);
         let answer = if self.publish(topic, payload) == 0 {
             Err(Unanswered::NoSubscriber)
@@ -256,6 +267,20 @@ mod tests {
             .await,
             Err(Unanswered::NoSubscriber)
         );
+        // A wildcard watcher hears requests but answers none: still nobody
+        // to ask, at once, not after the wait.
+        let mut watcher = bus.subscribe(vec!["gate/*".into()]);
+        assert_eq!(
+            bus.request(
+                "gate/x",
+                json!({}),
+                "gate/x/result/1",
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(Unanswered::NoSubscriber)
+        );
+        assert!(watcher.messages.try_recv().is_err(), "and nothing was sent");
         let _deaf = bus.subscribe(vec!["gate/x".into()]);
         assert_eq!(
             bus.request(

@@ -87,69 +87,81 @@ impl Announced {
         }
     }
 
-    /// Ask the gate about moving `branch` to `commit`: `None` when it may,
-    /// else why not.
+    /// Ask the gate about `spec`, a branch's move or its deletion: `None` when
+    /// it may, else why not. A move is shown to the gate as a candidate
+    /// branch it can fetch; a deletion has nothing to fetch and is asked with
+    /// `delete: true`.
     fn ask_gate(
         &self,
         gate: &str,
         repo: &Repo,
         remote: &RemoteName,
-        commit: &Oid,
         branch: &BranchName,
-        lease: &Lease,
+        spec: &PushSpec,
+        paths: &[String],
     ) -> Result<Option<String>, GitError> {
         let id = Uuid::new_v4().simple().to_string();
-        let candidate = candidate_branch(&id)?;
-        let placed = self.inner.push(
-            repo,
-            remote,
-            &[PushSpec::branch(
-                commit.clone(),
-                candidate.clone(),
-                Lease::Absent,
-            )],
-        )?;
-        if let Some(r) = placed.iter().find(|r| !r.accepted()) {
-            return Ok(Some(format!(
-                "the candidate for the gate could not be pushed: {:?}",
-                r.outcome
-            )));
-        }
-        let base = match lease {
-            Lease::Expect(oid) => Some(oid),
-            Lease::Absent => None,
+        let base = lease_base(&spec.lease);
+        let candidate = match &spec.action {
+            PushAction::Update(commit) => {
+                let candidate = candidate_branch(&id)?;
+                let placed = self.inner.push(
+                    repo,
+                    remote,
+                    &[PushSpec::branch(
+                        commit.clone(),
+                        candidate.clone(),
+                        Lease::Absent,
+                    )],
+                )?;
+                if let Some(r) = placed.iter().find(|r| !r.accepted()) {
+                    return Ok(Some(format!(
+                        "the candidate for the gate could not be pushed: {:?}",
+                        r.outcome
+                    )));
+                }
+                Some((candidate, commit.clone()))
+            }
+            PushAction::Delete => None,
         };
         let ask = json!({
             "id": id,
-            "ref": candidate.to_ref().as_str(),
-            "commit": commit.as_str(),
+            "ref": candidate.as_ref().map(|(c, _)| c.to_ref().as_str().to_string()),
+            "commit": candidate.as_ref().map(|(_, commit)| commit.as_str().to_string()),
             "base": base.map(Oid::as_str),
             "branch": branch.as_str(),
-            "paths": self.paths(repo, base, commit),
+            "delete": candidate.is_none(),
+            "paths": paths,
         });
         let topic = format!("gate/{}", self.repo);
         let answer = self
             .bus
             .ask(&topic, ask, &format!("{topic}/result/{id}"), GATE_WAIT);
-        let removed = self.inner.push(
-            repo,
-            remote,
-            &[PushSpec::delete_branch(candidate.clone(), commit.clone())],
-        );
-        if !removed.is_ok_and(|r| r.iter().all(PushResult::accepted)) {
-            tracing::warn!(repo = %self.repo, candidate = %candidate.as_str(), "a gate's candidate branch could not be deleted");
+        if let Some((candidate, commit)) = candidate {
+            let removed = self.inner.push(
+                repo,
+                remote,
+                &[PushSpec::delete_branch(candidate.clone(), commit)],
+            );
+            if !removed.is_ok_and(|r| r.iter().all(PushResult::accepted)) {
+                tracing::warn!(repo = %self.repo, candidate = %candidate.as_str(), "a gate's candidate branch could not be deleted");
+            }
         }
         Ok(verdict(gate, answer))
     }
 
-    fn announce(&self, repo: &Repo, spec: &PushSpec) {
-        let (PushAction::Update(commit), PushTarget::Branch(branch)) = (&spec.action, &spec.target)
-        else {
+    /// The paths a branch spec changes: those from what the branch held to
+    /// the commit it moves to; none for a deletion or a new branch.
+    fn spec_paths(&self, repo: &Repo, spec: &PushSpec) -> Vec<String> {
+        match &spec.action {
+            PushAction::Update(commit) => self.paths(repo, lease_base(&spec.lease), commit),
+            PushAction::Delete => Vec::new(),
+        }
+    }
+
+    fn announce(&self, branch: &BranchName, spec: &PushSpec, paths: Vec<String>) {
+        let PushAction::Update(commit) = &spec.action else {
             return;
-        };
-        let base = match &spec.lease {
-            Lease::Expect(oid) => Some(oid),
-            Lease::Absent => None,
         };
         self.bus.publish(
             &format!("repo/{}", self.repo),
@@ -157,9 +169,17 @@ impl Announced {
                 "repo": self.repo,
                 "branch": branch.as_str(),
                 "commit": commit.as_str(),
-                "paths": self.paths(repo, base, commit),
+                "paths": paths,
             }),
         );
+    }
+}
+
+/// What a lease says the branch held; `None` for a new branch.
+fn lease_base(lease: &Lease) -> Option<&Oid> {
+    match lease {
+        Lease::Expect(oid) => Some(oid),
+        Lease::Absent => None,
     }
 }
 
@@ -191,16 +211,18 @@ impl Push for Announced {
         remote: &RemoteName,
         specs: &[PushSpec],
     ) -> Result<Vec<PushResult>, GitError> {
+        // Each branch spec's paths, read once for the gate and the
+        // announcement alike.
+        let branches: Vec<(&PushSpec, &BranchName, Vec<String>)> = specs
+            .iter()
+            .filter_map(|spec| match &spec.target {
+                PushTarget::Branch(branch) => Some((spec, branch, self.spec_paths(repo, spec))),
+                PushTarget::Tag(_) => None,
+            })
+            .collect();
         if let Some(gate) = &self.gate {
-            for spec in specs {
-                let (PushAction::Update(commit), PushTarget::Branch(branch)) =
-                    (&spec.action, &spec.target)
-                else {
-                    continue;
-                };
-                if let Some(refusal) =
-                    self.ask_gate(gate, repo, remote, commit, branch, &spec.lease)?
-                {
+            for (spec, branch, paths) in &branches {
+                if let Some(refusal) = self.ask_gate(gate, repo, remote, branch, spec, paths)? {
                     return Ok(specs
                         .iter()
                         .map(|s| PushResult {
@@ -212,12 +234,12 @@ impl Push for Announced {
             }
         }
         let results = self.inner.push(repo, remote, specs)?;
-        for spec in specs {
+        for (spec, branch, paths) in branches {
             let moved = results.iter().any(|r| {
                 r.target == spec.target && r.accepted() && r.outcome != PushOutcome::UpToDate
             });
             if moved {
-                self.announce(repo, spec);
+                self.announce(branch, spec, paths);
             }
         }
         Ok(results)
@@ -429,7 +451,7 @@ mod tests {
             *ask,
             json!({"id": id, "ref": format!("refs/heads/zen/candidate/{id}"),
                    "commit": two.as_str(), "base": one.as_str(), "branch": "main",
-                   "paths": ["apps/x/app.yaml"]})
+                   "delete": false, "paths": ["apps/x/app.yaml"]})
         );
         let candidate = candidate_branch(id).unwrap();
         assert_eq!(
@@ -485,6 +507,47 @@ mod tests {
             assert_eq!(pushed[1].action, PushAction::Delete);
             assert!(bus.published.lock().unwrap().is_empty());
         }
+    }
+
+    /// **A branch's deletion is gated too**, asked with nothing to fetch, and
+    /// refused like a move when the gate does not say ok.
+    #[test]
+    fn a_branch_deletion_is_asked_of_the_gate() {
+        let Setup {
+            _dir,
+            repo,
+            taker,
+            bus,
+            push,
+            two,
+            ..
+        } = setup(
+            Some("yenbot"),
+            Ok(json!({"ok": false, "reason": "main stays"})),
+        );
+        let origin = RemoteName::parse("origin").unwrap();
+        let main = BranchName::parse("main").unwrap();
+        let results = push
+            .push(
+                &repo,
+                &origin,
+                &[PushSpec::delete_branch(main.clone(), two.clone())],
+            )
+            .unwrap();
+        assert_eq!(
+            results[0].outcome,
+            PushOutcome::Rejected(Rejection::Remote(
+                "the gate yenbot refused it: main stays".into()
+            ))
+        );
+        let asked = bus.asked.lock().unwrap();
+        let ask = &asked[0].1;
+        assert_eq!(
+            *ask,
+            json!({"id": ask["id"], "ref": null, "commit": null, "base": two.as_str(),
+                   "branch": "main", "delete": true, "paths": []})
+        );
+        assert!(taker.0.lock().unwrap().is_empty(), "nothing was pushed");
     }
 
     /// **A tag is not a branch move**: it is neither gated nor announced.

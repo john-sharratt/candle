@@ -11,7 +11,7 @@ mod node_file;
 
 pub use app::{
     AppMember, CapacitySource, ClaimUse, ClusterView, Identity, KeyThroughHook, ReleaseHook,
-    UnclaimHook, APPLY_WAIT, CAPACITY_EVERY, GROUP,
+    UnclaimHook, APPLY_WAIT, BUS_GROUP, CAPACITY_EVERY, GROUP,
 };
 pub use claims::{Check, MemberClaims, OwnClaim};
 pub use link::{Link, Links, START_WAIT};

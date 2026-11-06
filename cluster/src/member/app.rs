@@ -65,6 +65,12 @@ const COORD_TICKS: u64 = 2;
 /// The prefix of a stream's target that names another app's group (§5.1).
 pub const GROUP: &str = "group:";
 
+/// The group a member's own use of a gateway's bus goes to
+/// (`docs/mcp_file_tools.md` §5.2). It is apart from the stream towards the
+/// member's app, which also carries what its listener forwards up for
+/// clients, so nothing but the member itself reaches the bus as a member.
+pub const BUS_GROUP: &str = "bus";
+
 /// The longest a request waits for the records ahead of it to be applied.
 pub const APPLY_WAIT: Duration = Duration::from_secs(10);
 
@@ -817,13 +823,15 @@ impl AppMember {
         self.open_to(&self.id.app)
     }
 
-    /// A stream up to every admitted gateway, for what each must see: a
-    /// publish on its bus, which is its own (`docs/mcp_file_tools.md` §5.2).
-    pub fn open_up_all(&self) -> Vec<VirtualConn> {
+    /// A stream to the bus of every admitted gateway ([`BUS_GROUP`]), for
+    /// what each must see: a publish on its bus, which is its own
+    /// (`docs/mcp_file_tools.md` §5.2).
+    pub fn open_bus_all(&self) -> Vec<VirtualConn> {
+        let target = format!("{GROUP}{BUS_GROUP}");
         let sockets: Vec<SessionHandle> = lock(&self.sockets).iter().flatten().cloned().collect();
         sockets
             .iter()
-            .filter_map(|s| s.open(&self.id.app).ok())
+            .filter_map(|s| s.open(&target).ok())
             .collect()
     }
 

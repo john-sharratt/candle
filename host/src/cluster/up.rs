@@ -77,7 +77,7 @@ pub async fn send_to_group(
 
 /// One request on a stream to a gateway, its body read no longer than
 /// `read_for`: for a caller that chose the gateway itself
-/// ([`AppMember::open_up_all`]).
+/// ([`AppMember::open_bus_all`]).
 pub async fn send_over(
     conn: VirtualConn,
     method: Method,

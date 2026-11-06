@@ -36,7 +36,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
@@ -208,10 +208,20 @@ pub struct SessionRegistry {
     pub sql: RwLock<HashMap<String, Arc<Mutex<SqlEntry>>>>,
     pub remote_fs: RwLock<HashMap<String, Arc<Mutex<RemoteFsEntry>>>>,
     pub code: RwLock<HashMap<String, Arc<Mutex<CodeEntry>>>>,
-    /// Session and SSH-process id → the conversation that opened it, kept
-    /// beside the maps so closing a conversation's sessions reads no entry's
-    /// lock: a tool call may be holding one.
-    owners: Mutex<HashMap<String, String>>,
+    /// Who opened each session, kept beside the maps so closing a
+    /// conversation's sessions reads no entry's lock: a tool call may be
+    /// holding one.
+    owners: Mutex<Owners>,
+}
+
+/// Each session's conversation, and the conversations already closed.
+#[derive(Default)]
+struct Owners {
+    /// Session and SSH-process id → the conversation that opened it.
+    by_session: HashMap<String, String>,
+    /// Conversations whose sessions have been closed: a round still in
+    /// flight when its conversation was archived opens nothing more.
+    closed: HashSet<String>,
 }
 
 /// Which kinds of session have at least one open.
@@ -253,19 +263,35 @@ impl SessionRegistry {
         Self::default()
     }
 
-    fn owners(&self) -> MutexGuard<'_, HashMap<String, String>> {
+    fn owners(&self) -> MutexGuard<'_, Owners> {
         self.owners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn own(&self, meta: &SessionMeta) {
+    /// Put `entry`, opened as `meta` says, in `map` — unless its conversation
+    /// has already been closed, when it is dropped and its connection with
+    /// it. The owner and the entry go in under one hold of the owners, so a
+    /// close sees both or neither.
+    fn admit<V>(&self, map: &RwLock<HashMap<String, Arc<Mutex<V>>>>, meta: &SessionMeta, entry: V) {
+        let mut owners = self.owners();
         if !meta.conversation.is_empty() {
-            self.owners()
+            if owners.closed.contains(&meta.conversation) {
+                tracing::info!(
+                    conversation = %meta.conversation,
+                    "a session opened after its conversation closed is dropped"
+                );
+                return;
+            }
+            owners
+                .by_session
                 .insert(meta.session_id.clone(), meta.conversation.clone());
         }
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(meta.session_id.clone(), Arc::new(Mutex::new(entry)));
     }
 
     fn disown(&self, id: &str) {
-        self.owners().remove(id);
+        self.owners().by_session.remove(id);
     }
 
     /// Close every session `conversation` opened, of every kind, and the SSH
@@ -279,13 +305,15 @@ impl SessionRegistry {
         }
         let ids: Vec<String> = {
             let mut owners = self.owners();
+            owners.closed.insert(conversation.to_string());
             let ids: Vec<String> = owners
+                .by_session
                 .iter()
                 .filter(|(_, c)| c.as_str() == conversation)
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &ids {
-                owners.remove(id);
+                owners.by_session.remove(id);
             }
             ids
         };
@@ -316,12 +344,8 @@ impl SessionRegistry {
 
     // SSH
     pub fn insert_ssh(&self, entry: SshEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.ssh
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.ssh, &meta, entry);
     }
     pub fn get_ssh(&self, id: &str) -> Option<Arc<Mutex<SshEntry>>> {
         self.ssh.read().unwrap().get(id).cloned()
@@ -337,11 +361,9 @@ impl SessionRegistry {
     // SSH processes
     pub fn insert_ssh_process(&self, proc: SshProcess) {
         let id = proc.process_id.clone();
-        {
-            let mut owners = self.owners();
-            if let Some(conversation) = owners.get(&proc.session_id).cloned() {
-                owners.insert(id.clone(), conversation);
-            }
+        let mut owners = self.owners();
+        if let Some(conversation) = owners.by_session.get(&proc.session_id).cloned() {
+            owners.by_session.insert(id.clone(), conversation);
         }
         self.ssh_processes
             .write()
@@ -358,12 +380,8 @@ impl SessionRegistry {
 
     // Telnet
     pub fn insert_telnet(&self, entry: TelnetEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.telnet
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.telnet, &meta, entry);
     }
     pub fn get_telnet(&self, id: &str) -> Option<Arc<Mutex<TelnetEntry>>> {
         self.telnet.read().unwrap().get(id).cloned()
@@ -378,12 +396,8 @@ impl SessionRegistry {
 
     // HTTP
     pub fn insert_http(&self, entry: HttpEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.http
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.http, &meta, entry);
     }
     pub fn get_http(&self, id: &str) -> Option<Arc<Mutex<HttpEntry>>> {
         self.http.read().unwrap().get(id).cloned()
@@ -398,12 +412,8 @@ impl SessionRegistry {
 
     // TCP
     pub fn insert_tcp(&self, entry: TcpEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.tcp
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.tcp, &meta, entry);
     }
     pub fn get_tcp(&self, id: &str) -> Option<Arc<Mutex<TcpEntry>>> {
         self.tcp.read().unwrap().get(id).cloned()
@@ -418,12 +428,8 @@ impl SessionRegistry {
 
     // UDP
     pub fn insert_udp(&self, entry: UdpEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.udp
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.udp, &meta, entry);
     }
     pub fn get_udp(&self, id: &str) -> Option<Arc<Mutex<UdpEntry>>> {
         self.udp.read().unwrap().get(id).cloned()
@@ -438,12 +444,8 @@ impl SessionRegistry {
 
     // TLS
     pub fn insert_tls(&self, entry: TlsEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.tls
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.tls, &meta, entry);
     }
     pub fn get_tls(&self, id: &str) -> Option<Arc<Mutex<TlsEntry>>> {
         self.tls.read().unwrap().get(id).cloned()
@@ -458,12 +460,8 @@ impl SessionRegistry {
 
     // SQL
     pub fn insert_sql(&self, entry: SqlEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.sql
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.sql, &meta, entry);
     }
     pub fn get_sql(&self, id: &str) -> Option<Arc<Mutex<SqlEntry>>> {
         self.sql.read().unwrap().get(id).cloned()
@@ -478,12 +476,8 @@ impl SessionRegistry {
 
     // Remote FS
     pub fn insert_remote_fs(&self, entry: RemoteFsEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.remote_fs
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.remote_fs, &meta, entry);
     }
     pub fn get_remote_fs(&self, id: &str) -> Option<Arc<Mutex<RemoteFsEntry>>> {
         let arc = self.remote_fs.read().unwrap().get(id).cloned()?;
@@ -520,12 +514,8 @@ impl SessionRegistry {
 
     // Code
     pub fn insert_code(&self, entry: CodeEntry) {
-        self.own(&entry.meta);
-        let id = entry.meta.session_id.clone();
-        self.code
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(entry)));
+        let meta = entry.meta.clone();
+        self.admit(&self.code, &meta, entry);
     }
     pub fn get_code(&self, id: &str) -> Option<Arc<Mutex<CodeEntry>>> {
         self.code.read().unwrap().get(id).cloned()
@@ -603,6 +593,22 @@ mod tests {
         assert_eq!(reg.close_conversation("b"), 2);
     }
 
+    /// **A round still in flight when its conversation closed opens nothing
+    /// more**: the session it opens is dropped, and another conversation's
+    /// opens as ever.
+    #[test]
+    fn a_session_opened_after_its_conversation_closed_is_dropped() {
+        let reg = SessionRegistry::new();
+        assert_eq!(reg.close_conversation("a"), 0);
+        reg.insert_http(http("late", "a"));
+        reg.insert_code(code("late-code", "a"));
+        reg.insert_http(http("other", "b"));
+        assert!(reg.get_http("late").is_none());
+        assert!(reg.get_code("late-code").is_none());
+        assert!(reg.get_http("other").is_some());
+        assert_eq!(reg.close_conversation("a"), 0);
+    }
+
     /// **A session that belongs to no conversation is never swept.**
     #[test]
     fn an_unowned_session_is_closed_by_no_conversation() {
@@ -628,7 +634,9 @@ mod tests {
     #[test]
     fn an_ssh_process_goes_with_its_conversation() {
         let reg = SessionRegistry::new();
-        reg.owners().insert("s".to_string(), "a".to_string());
+        reg.owners()
+            .by_session
+            .insert("s".to_string(), "a".to_string());
         reg.insert_ssh_process(SshProcess {
             process_id: "p".to_string(),
             session_id: "s".to_string(),

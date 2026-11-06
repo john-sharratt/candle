@@ -201,6 +201,35 @@ async fn a_service_answers_a_gate_request() {
     );
 }
 
+/// **A member on its bus stream needs no key and has every topic**; the same
+/// request on the gateway's own router, which is where a member's listener
+/// forwards its clients, is refused.
+#[tokio::test]
+async fn a_member_publishes_on_its_bus_stream_alone() {
+    let gw = gateway();
+    let members = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let on_stream = members.local_addr().unwrap();
+    let router = bus::http::member_router(gw.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            members,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let forwarded = spawn(gw).await;
+    let client = reqwest::Client::new();
+    let post = |addr: SocketAddr| {
+        client
+            .post(format!("http://{addr}/gateway/events/publish"))
+            .json(&json!({"topic": "gate/yenbot/result/7", "payload": {"ok": true}}))
+            .send()
+    };
+    assert_eq!(post(on_stream).await.unwrap().status(), 200);
+    assert_eq!(post(forwarded).await.unwrap().status(), 401);
+}
+
 /// **Publishing over HTTP takes a key, and only the key's topics.**
 #[tokio::test]
 async fn publishing_over_http_is_the_keys() {

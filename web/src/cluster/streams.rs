@@ -7,8 +7,10 @@
 //! - **Towards `group:agent`**: the member's jobs, each sent to an agent
 //!   ([`jobs`](super::jobs), §11.5).
 //! - **Towards `group:keep`**: an Admin's requests to a machine's keep, each
-//!   sent to the keep of the machine it names ([`keeps`](super::keeps)). Any
-//!   other group is refused.
+//!   sent to the keep of the machine it names ([`keeps`](super::keeps)).
+//! - **Towards `group:bus`**: the member itself on this gateway's bus
+//!   (`docs/mcp_file_tools.md` §5.2), on any topic. Any other group is
+//!   refused.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -16,8 +18,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
+use axum::Router;
 use cluster::gateway::{MemberStream, KEEP};
-use cluster::member::GROUP;
+use cluster::member::{BUS_GROUP, GROUP};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -27,6 +30,7 @@ use tower::Service;
 
 use super::jobs::{self, AGENT_APP};
 use super::{keeps, Gateway, MemberOrigin};
+use crate::bus::http::member_router;
 
 /// Serve `stream`, which the member at `ip` opened.
 pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
@@ -35,6 +39,8 @@ pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
             serve_group(gateway, ip, stream, Group::Agents);
         } else if group == KEEP {
             serve_group(gateway, ip, stream, Group::Keeps);
+        } else if group == BUS_GROUP {
+            serve_router(gateway, ip, stream, member_router(gateway.clone()), None);
         } else {
             tracing::debug!(group, "a member opened a stream to a group that takes none");
             stream.conn.reset();
@@ -45,11 +51,23 @@ pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
         stream.conn.reset();
         return;
     };
-    let open = gateway.hub.traffic.stream();
     let origin = MemberOrigin {
-        app: stream.app,
+        app: stream.app.clone(),
         node: stream.node,
     };
+    serve_router(gateway, ip, stream, router, Some(origin));
+}
+
+/// Each request on `stream` served by `router`, marked `origin` when it is
+/// one the member forwarded up for its app.
+fn serve_router(
+    gateway: &Arc<Gateway>,
+    ip: IpAddr,
+    stream: MemberStream,
+    router: Router,
+    origin: Option<MemberOrigin>,
+) {
+    let open = gateway.hub.traffic.stream();
     tokio::spawn(async move {
         let _open = open;
         let svc = service_fn(move |req: Request<Incoming>| {
@@ -59,7 +77,9 @@ pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
                 let mut req = req.map(Body::new);
                 req.extensions_mut()
                     .insert(ConnectInfo(SocketAddr::new(ip, 0)));
-                req.extensions_mut().insert(origin);
+                if let Some(origin) = origin {
+                    req.extensions_mut().insert(origin);
+                }
                 match router.call(req).await {
                     Ok(res) => Ok::<_, Infallible>(res),
                     Err(never) => match never {},

@@ -4,6 +4,7 @@
 //! | Module | |
 //! |---|---|
 //! | [`member_bus`] | the bus, reached over this member's sockets to its gateways |
+//! | [`offline`] | the bus of a daemon in no cluster: nothing heard, no gate asked |
 //! | [`announced`] | the [`Push`](zend_vfs::Push) every repository's pushes go through: gated, then announced |
 //!
 //! Every push Zen makes to a workspace repository — a worker's `git_push`,
@@ -15,6 +16,7 @@
 
 pub mod announced;
 pub mod member_bus;
+pub mod offline;
 
 use std::time::Duration;
 

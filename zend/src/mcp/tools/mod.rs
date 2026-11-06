@@ -213,7 +213,11 @@ pub fn definitions() -> Value {
 /// substrate and may commit a record or a journal write, which waits on the
 /// disk, and on the pool that wait holds up none of the calls the runtime is
 /// running beside it.
-async fn blocking(ctx: &Ctx, args: &Value, tool: fn(&Ctx, &Value) -> Answer) -> Answer {
+async fn blocking(
+    ctx: &Ctx,
+    args: &Value,
+    tool: impl FnOnce(&Ctx, &Value) -> Answer + Send + 'static,
+) -> Answer {
     let (ctx, args) = (ctx.clone(), args.clone());
     tokio::task::spawn_blocking(move || tool(&ctx, &args))
         .await
@@ -231,10 +235,8 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         reply::NAME => reply::call(ctx, args).await,
         nudge::NAME => blocking(ctx, args, nudge::call).await,
         name if files::NAMES.contains(&name) => {
-            let (ctx, args, name) = (ctx.clone(), args.clone(), name.to_string());
-            tokio::task::spawn_blocking(move || files::call(&ctx, &name, &args))
-                .await
-                .unwrap_or_else(|e| Answer::error(format!("the tool failed: {e}")))
+            let name = name.to_string();
+            blocking(ctx, args, move |ctx, args| files::call(ctx, &name, args)).await
         }
         file_edit_and_commit::NAME => blocking(ctx, args, file_edit_and_commit::call).await,
         journal_read::NAME => blocking(ctx, args, journal_read::call).await,

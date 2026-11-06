@@ -13,7 +13,8 @@
 use std::collections::HashMap;
 
 use zend_vfs::{
-    BranchName, ChangeSet, GitError, Oid, Published, Rejection, Repo, RepoPath, Rev, Signature,
+    BranchName, ChangeSet, FileMode, GitError, Oid, Published, Rejection, Repo, RepoPath, Rev,
+    Signature,
 };
 
 use super::change::Change;
@@ -94,18 +95,38 @@ fn path(p: &str) -> Result<RepoPath, String> {
 struct Files<'r> {
     repo: &'r Repo,
     onto: Rev,
-    pending: HashMap<String, Option<Vec<u8>>>,
+    /// What the changes so far left at each path they touched: its bytes and
+    /// the mode it takes — `None` to keep the mode the path already has —
+    /// or `None` for a path they removed.
+    pending: HashMap<String, Option<Content>>,
 }
+
+/// A file's new bytes, and the mode it takes — `None` to keep its own.
+type Content = (Vec<u8>, Option<FileMode>);
 
 impl Files<'_> {
     fn read(&self, p: &str) -> Result<Option<Vec<u8>>, String> {
         if let Some(held) = self.pending.get(p) {
-            return Ok(held.clone());
+            return Ok(held.as_ref().map(|(bytes, _)| bytes.clone()));
         }
         self.repo
             .blobs()
             .read_at(&self.onto, &path(p)?)
             .map_err(|e| format!("{p}: {e}"))
+    }
+
+    /// The mode of the file at `p` — an executable bit, a symlink — so a
+    /// moved file keeps it.
+    fn mode(&self, p: &str) -> Result<Option<FileMode>, String> {
+        if let Some(Some((_, Some(mode)))) = self.pending.get(p) {
+            return Ok(Some(*mode));
+        }
+        let at = path(p)?;
+        let entries = self
+            .repo
+            .tree_entries(&self.onto, &[&at])
+            .map_err(|e| format!("{p}: {e}"))?;
+        Ok(entries.into_iter().find(|e| e.path == at).map(|e| e.mode))
     }
 
     fn text(&self, p: &str) -> Result<String, String> {
@@ -136,14 +157,17 @@ fn changed(
         let step = match change {
             Change::Edit { path: p, edits } => files.text(p).and_then(|text| {
                 apply(&text, &Change::edits(edits))
-                    .map(|t| vec![(p.clone(), Some(t.into_bytes()))])
+                    .map(|t| vec![(p.clone(), Some((t.into_bytes(), None)))])
                     .map_err(|m| m.describe(p))
             }),
             Change::Write { path: p, content } => {
                 if content.contains('\0') {
                     Err(format!("{p}: the content is not text"))
                 } else {
-                    Ok(vec![(p.clone(), Some(content.clone().into_bytes()))])
+                    Ok(vec![(
+                        p.clone(),
+                        Some((content.clone().into_bytes(), None)),
+                    )])
                 }
             }
             Change::Delete { path: p } => match files.read(p) {
@@ -152,9 +176,9 @@ fn changed(
                 Err(e) => Err(e),
             },
             Change::Move { from, to } => match (files.read(from), files.read(to)) {
-                (Ok(Some(bytes)), Ok(None)) => {
-                    Ok(vec![(from.clone(), None), (to.clone(), Some(bytes))])
-                }
+                (Ok(Some(bytes)), Ok(None)) => files
+                    .mode(from)
+                    .map(|mode| vec![(from.clone(), None), (to.clone(), Some((bytes, mode)))]),
                 (Ok(None), _) => Err(format!("{from} does not exist, so it cannot be moved")),
                 (_, Ok(Some(_))) => Err(format!(
                     "{to} already exists; delete it first or move elsewhere"
@@ -174,7 +198,7 @@ fn changed(
             Err(why) => return Ok(Err(why)),
         };
         match content {
-            Some(bytes) => set.write(at, bytes, None)?,
+            Some((bytes, mode)) => set.write(at, bytes, mode)?,
             None => set.delete(at)?,
         }
     }
@@ -396,6 +420,38 @@ mod tests {
             on_origin(origin.path(), "b.txt"),
             "bee two\n",
             "theirs is kept"
+        );
+    }
+
+    /// **A moved file keeps its mode**: an executable script is still one at
+    /// its new path.
+    #[test]
+    fn a_moved_file_keeps_its_mode() {
+        let (origin, work) = repo(&[("scripts/run.sh", "#!/bin/sh\necho hi\n")]);
+        git(
+            work.path(),
+            &["update-index", "--chmod=+x", "scripts/run.sh"],
+        );
+        git(work.path(), &["commit", "-q", "-m", "executable"]);
+        git(work.path(), &["push", "-q", "origin", "main"]);
+        let r = Repo::open(work.path()).unwrap();
+        let outcome = commit(
+            &r,
+            &main_branch(),
+            &[Change::Move {
+                from: "scripts/run.sh".into(),
+                to: "bin/run.sh".into(),
+            }],
+            "move the script",
+            &yen(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Live { .. }), "{outcome:?}");
+        assert_eq!(
+            git(origin.path(), &["ls-tree", "main", "bin/run.sh"])
+                .split_whitespace()
+                .next(),
+            Some("100755")
         );
     }
 

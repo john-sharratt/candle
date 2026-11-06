@@ -215,7 +215,11 @@ segments; a subscription may end in `*`.
   subscribe and publish only on the topics their key names (§4).
 - **Cluster members** use it over the cluster socket they already hold to the
   gateway (`docs/replicated_substrate.md` §5.8), on any topic, as members are
-  already trusted there.
+  already trusted there — on a stream to the gateway's `group:bus`, never the
+  stream towards their own app. That one also carries every request a
+  member's listener forwards up for a client, so being on it vouches for the
+  client, not the member; the bus routes on the gateway's own router admit
+  service keys alone.
 
 Beside the socket, for a caller that publishes rather than listens
 (`web/src/bus/http.rs`), the same callers under the same rules:
@@ -260,6 +264,11 @@ branch, `zen/candidate/<id>`, and asks on `gate/<repo>`
 ```
 
 `base` is what the branch held (the push's lease), `null` for a new branch.
+A branch's deletion is asked too, with nothing to fetch: `"ref": null,
+"commit": null, "delete": true` (a move carries `"delete": false`). Only a
+subscriber naming `gate/<repo>` itself answers: a gateway whose only listeners
+are wildcard watchers says `no_subscriber` at once, so the asker goes on to
+the gateway that has the gate.
 The candidate branch is deleted whatever the answer. Every push Zen makes goes
 through one pusher per repository (`ToolContext::pusher`), so this is where
 each is gated and, once it lands, announced (§5.3).
@@ -273,7 +282,8 @@ The gate fetches the candidate, checks it, and answers on
 
 zend waits for that answer — ten seconds at most — and moves the branch only
 on `ok`. A gate that is not connected, or does not answer in time, refuses
-the change rather than letting it through unchecked. A refusal comes back to
+the change rather than letting it through unchecked — and so does a daemon in
+no cluster, which has no bus to ask on. A refusal comes back to
 whoever pushed as every spec of the push rejected by the remote with the
 reason (`Rejection::Remote`), as a server hook's would, so `git_push`,
 `file_edit_and_commit` and an agent job each report it the way they report

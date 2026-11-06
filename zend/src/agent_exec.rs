@@ -35,6 +35,7 @@ use zend_vfs::{
 
 use crate::repo_events::announced::Announced;
 use crate::repo_events::member_bus::MemberBus;
+use crate::repo_events::offline::Offline;
 use crate::repo_events::Bus;
 
 pub struct AgentExecutor {
@@ -45,7 +46,8 @@ pub struct AgentExecutor {
     /// Every job run, by id, as `run_output` reads it.
     ran: Mutex<HashMap<JobId, JobInfo>>,
     /// The gateways' bus, reached over the member's sockets; `None` for a
-    /// daemon with no cluster, whose pushes nothing subscribes to.
+    /// daemon with no cluster, whose pushes nothing subscribes to and whose
+    /// gated repositories' pushes are refused ([`Offline`]).
     bus: Option<Arc<dyn Bus>>,
     /// The repositories whose pushes a gate checks first, and their gate.
     gates: HashMap<String, String>,
@@ -206,9 +208,12 @@ impl Executor for AgentExecutor {
     /// daemon is a member ([`Announced`]), as every push Zen makes must be.
     fn pusher(&self, repo: &str) -> Arc<dyn Push> {
         let inner = AgentPush::shared(self.agents.clone(), self.runtime.clone(), repo);
-        match &self.bus {
-            Some(bus) => Announced::shared(inner, repo, self.gates.get(repo).cloned(), bus.clone()),
-            None => inner,
+        match (&self.bus, self.gates.get(repo).cloned()) {
+            (Some(bus), gate) => Announced::shared(inner, repo, gate, bus.clone()),
+            // A gated repository with no bus to ask its gate on: its pushes
+            // are refused, never let through unchecked.
+            (None, Some(gate)) => Announced::shared(inner, repo, Some(gate), Arc::new(Offline)),
+            (None, None) => inner,
         }
     }
 }

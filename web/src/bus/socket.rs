@@ -18,13 +18,11 @@ use axum::extract::ws::{Message as Frame, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::http::{caller, BusState, Caller};
 use super::topic;
-use crate::cluster::MemberOrigin;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -48,17 +46,11 @@ enum Who {
 
 pub async fn upgrade(
     State(s): State<BusState>,
-    origin: Option<Extension<MemberOrigin>>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let who = match caller(
-        &s,
-        &headers,
-        origin.as_ref().map(|o| &o.0),
-        peer.map(|p| p.0),
-    ) {
+    let who = match caller(&s, &headers, peer.map(|p| p.0)) {
         Some(Caller::Member) => Who::Member,
         Some(Caller::Service(key)) => {
             match s.gateway.service_keys.iter().position(|k| ptr::eq(k, key)) {
