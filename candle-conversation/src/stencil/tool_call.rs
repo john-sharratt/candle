@@ -47,6 +47,7 @@
 //! a call.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -1021,6 +1022,7 @@ pub fn compile_tool_call_tree(
         arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
     }
     let name_branch = b.spec.push(NodeSpec::Branch { arms });
+    b.spec.name_branches.insert(name_branch);
     let open = b.spec.push(NodeSpec::Static {
         text: env.open.clone(),
         next: name_branch,
@@ -1133,6 +1135,11 @@ fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
         };
         host.nodes.push(moved);
     }
+    for (id, key) in &sub.keys {
+        host.keys.insert(SpecId(id.0 + base), Arc::clone(key));
+    }
+    host.name_branches
+        .extend(sub.name_branches.iter().map(|id| SpecId(id.0 + base)));
     remap(sub.root)
 }
 
@@ -1269,6 +1276,7 @@ pub fn compile_action_loop_with_body<'a>(
             arms.push((format!("{}{}", tool.name, env.name_close), arm_target));
         }
         let name_branch = b.spec.push(NodeSpec::Branch { arms });
+        b.spec.name_branches.insert(name_branch);
         let open = b.spec.push(NodeSpec::Static {
             text: env.open.clone(),
             next: name_branch,
@@ -1623,6 +1631,13 @@ impl<'a> ToolTreeBuilder<'a> {
         Ok(id)
     }
 
+    /// Record that `span` writes `p`'s value: what a turn's held values are
+    /// looked up by (`docs/stencil_tree.md` §9.2).
+    fn keyed(&mut self, span: SpecId, p: &Param) -> SpecId {
+        self.spec.keys.insert(span, Arc::from(p.name.as_str()));
+        span
+    }
+
     /// A value sub-tree for `p`, transitioning to `next` after the value.
     /// Returns a `lead-in` string that must be appended to the preceding key/arm
     /// static, plus the value's entry node.  Folding the lead-in (a string/enum
@@ -1698,7 +1713,7 @@ impl<'a> ToolTreeBuilder<'a> {
                     limits: self.env.string_limits(p),
                     next,
                 });
-                return Ok((String::new(), span));
+                return Ok((String::new(), self.keyed(span, p)));
             }
             let span = self.spec.push(NodeSpec::FreeText {
                 term: Terminator::JsonStringValue,
@@ -1708,7 +1723,7 @@ impl<'a> ToolTreeBuilder<'a> {
                 suppress_close: false,
                 next,
             });
-            return Ok((String::new(), span));
+            return Ok((String::new(), self.keyed(span, p)));
         }
         // An enum field's arms carry the first step of what follows the field
         // — the next key, or the close — so the value's closing quote and the
@@ -1777,7 +1792,7 @@ impl<'a> ToolTreeBuilder<'a> {
                         next,
                     },
                 });
-                vec![("\"".into(), span)]
+                vec![("\"".into(), self.keyed(span, p))]
             }
             // **An object with a schema is written by the grammar**: its brace,
             // its keys, its separators — the model decodes only the values.

@@ -21,7 +21,7 @@ use super::encode_cache::EncodeCache;
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
-use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
+use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree, TreeMarks};
 use super::trie::TokenTrie;
 use super::value_rule::{ValueRule, ValueState};
 use super::vocab::{TokenId, Vocab};
@@ -33,18 +33,19 @@ pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildE
     let vocab: &dyn Vocab = &encoder;
     let mut arena = Arena::default();
     let root = lower(spec, vocab, spec.root, "", &mut arena)?;
-    let arena = arena.nodes;
-    verify_invariants(&arena)?;
+    let Arena { nodes, marks, .. } = arena;
+    verify_invariants(&nodes)?;
     // The bail set is tokenized standalone — it is emitted from an unknown point
     // (wherever the failsafe fires), so there is no stable left context.
     let bail = vocab.encode(&spec.bail);
     Ok(StencilTree::new(
-        arena,
+        nodes,
         root,
         vocab.end_tokens(),
         vocab.fingerprint(),
         spec.label.clone(),
         bail,
+        marks,
     ))
 }
 
@@ -131,6 +132,8 @@ fn dfs(
 struct Arena {
     nodes: Vec<StencilNode>,
     lowered: HashMap<(SpecId, String), NodeId>,
+    /// The spec's keyed spans and name branches, by the nodes they lowered to.
+    marks: TreeMarks,
 }
 
 impl Arena {
@@ -196,6 +199,9 @@ fn lower_uncached(
         NodeSpec::Branch { arms } => lower_branch(spec, vocab, prefix, &run, node.0, arms, arena),
         _ => {
             let term = lower_terminal(spec, vocab, node, arena)?;
+            if let Some(key) = spec.keys.get(&node) {
+                arena.marks.keys.insert(term, Arc::clone(key));
+            }
             if run.is_empty() {
                 return Ok(term);
             }
@@ -335,6 +341,14 @@ fn lower_branch(
     }
     let trie = trie.with_leads(|token| vocab.decode(&[token]).first().copied());
     let branch = push(arena, StencilNode::Branch { trie });
+    if spec.name_branches.contains(&SpecId(node)) {
+        let named = arms
+            .iter()
+            .zip(&trie_arms)
+            .map(|((text, _), (tokens, _))| (tokens.clone(), Arc::from(tool_name(text))))
+            .collect();
+        arena.marks.name_branches.insert(branch, Arc::new(named));
+    }
     if static_toks.is_empty() {
         Ok(branch)
     } else {
@@ -346,6 +360,15 @@ fn lower_branch(
             },
         ))
     }
+}
+
+/// The tool a name arm's text names: its leading run of name characters,
+/// before the envelope's close.
+fn tool_name(arm: &str) -> &str {
+    let end = arm
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(arm.len());
+    &arm[..end]
 }
 
 /// The number of leading tokens shared by every sequence.

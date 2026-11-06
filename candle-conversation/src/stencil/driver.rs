@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use super::held_arms::HeldBranches;
+use super::held_values::HeldValues;
 use super::mask::AllowedSet;
 use super::session::{Observe, StencilAction, StencilSession};
 use super::tree::{NodeId, StencilTree};
@@ -203,6 +204,12 @@ impl StencilDriver {
     /// frontier as usual.
     pub fn hold_branches(&mut self, held: Arc<HeldBranches>) {
         self.held = Some(held);
+    }
+
+    /// Hold every keyed field the walk writes to `values`
+    /// ([`StencilSession::hold_values`], `docs/stencil_tree.md` §9.2).
+    pub fn hold_values(&mut self, values: Arc<HeldValues>) {
+        self.session.hold_values(values);
     }
 
     /// Hold the tree's first branch ([`StencilTree::first_branch`]) to the
