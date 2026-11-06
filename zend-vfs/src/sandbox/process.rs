@@ -302,10 +302,43 @@ mod tests {
     }
 
     /// **A command run below normal priority is**, and one run at normal
-    /// priority is not lowered.
+    /// priority is not lowered — it runs where the process that asked for it
+    /// runs, which is what an agent sharing its host with a model member asks
+    /// for (`docs/replicated_substrate.md` §11.5).
+    ///
+    /// `Below` is set outright — the creation flag on Windows, `setpriority`
+    /// before exec on Unix — so it reads the same wherever the test runs.
+    /// `Normal` is not set at all: `kill_tree::prepare` leaves the child alone
+    /// and a child inherits its parent's class, so the promise `Normal` makes
+    /// is that the sandbox lowers nothing, and the reference for it is this
+    /// process's own priority — not the word `Normal`, which this process
+    /// cannot report when the agent running it is itself below normal.
     #[tokio::test]
     async fn a_command_runs_at_the_priority_it_asks_for() {
         let dir = tempfile::tempdir().unwrap();
+        // What this process runs at, read from a child the sandbox never
+        // touched: inheritance is the only thing that could carry a class
+        // down, and it carries this one.
+        let own = {
+            let out = if cfg!(windows) {
+                std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-Process -Id $PID).PriorityClass",
+                    ])
+                    .output()
+            } else {
+                std::process::Command::new("sh")
+                    .args(["-c", "nice"])
+                    .output()
+            };
+            String::from_utf8(out.expect("this process can read its own priority").stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+
         let mut sink = Vec::new();
         execute(
             dir.path(),
@@ -325,7 +358,11 @@ mod tests {
             .await
             .unwrap();
         let normal = String::from_utf8(sink).unwrap();
-        assert_eq!(normal.trim(), if cfg!(windows) { "Normal" } else { "0" });
+        assert_eq!(
+            normal.trim(),
+            own,
+            "a Normal command came back lower than the process that asked for it"
+        );
     }
 
     /// A program that does not exist is an error, not an outcome.
