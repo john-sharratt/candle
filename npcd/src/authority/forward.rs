@@ -12,6 +12,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use candle_conversation::stencil::ToolSpec;
+
 use crate::engine::act::{parse, Act};
 use crate::engine::body::Outcome;
 
@@ -35,9 +37,10 @@ pub fn call_line(act: &Act) -> String {
 }
 
 /// The act a call line makes, as the parser reads it; the reason when it is
-/// not one act.
-pub fn act_of(call: &str) -> Result<Act, String> {
-    let mut parsed = parse(call);
+/// not one act. `tools` is the catalog the decode's grammar was compiled from,
+/// which is what says where a function block's values end.
+pub fn act_of(call: &str, tools: &[ToolSpec]) -> Result<Act, String> {
+    let mut parsed = parse(call, tools);
     match (parsed.acts.len(), parsed.rejected.first()) {
         (1, _) => Ok(parsed.acts.remove(0)),
         (_, Some(r)) => Err(r.line()),
@@ -82,13 +85,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::engine::tools;
 
     /// An act sent as its call line is the same act at the other end.
     #[test]
     fn an_act_round_trips_through_its_call_line() {
-        let act = act_of(r#"{"tool": "shout", "intent": "over here"}"#).unwrap();
+        let specs = tools::specs();
+        let act = act_of(r#"{"tool": "shout", "intent": "over here"}"#, &specs).unwrap();
         let line = call_line(&act);
-        assert_eq!(act_of(&line).unwrap(), act);
+        assert_eq!(act_of(&line, &specs).unwrap(), act);
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap(),
             json!({"tool": "shout", "intent": "over here"})
@@ -97,8 +102,9 @@ mod tests {
 
     #[test]
     fn a_line_that_is_not_one_act_says_why() {
-        assert!(act_of("{not json").is_err());
-        assert!(act_of(r#"{"tool": "no_such_tool"}"#).is_err());
+        let specs = tools::specs();
+        assert!(act_of("{not json", &specs).is_err());
+        assert!(act_of(r#"{"tool": "no_such_tool"}"#, &specs).is_err());
     }
 
     /// The verdict keeps its kind and its line, as JSON.

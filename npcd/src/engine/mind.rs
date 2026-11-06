@@ -417,8 +417,16 @@ fn compile_act_loop(
             Some(compile_think_tree(thinking.mode(), &steer))
         }
     };
-    let specs = tools::specs_within(Mode::Physical, within);
+    let specs = act_specs(within);
     compile_calls(e, cfg, &specs, tools::ACTS_PER_TURN, prelude.as_ref())
+}
+
+/// The catalog the act grammar is compiled from, and so the catalog every
+/// reader of a character's decode must hold: the same list, from the same
+/// `Within`, so the grammar and the reader cannot disagree about where a
+/// function block's value ends.
+pub(super) fn act_specs(within: &tools::Within) -> Vec<ToolSpec> {
+    tools::specs_within(Mode::Physical, within)
 }
 
 /// A grammar for a turn made of calls to `specs`, at most `max_calls` of them.
@@ -865,7 +873,7 @@ impl Minds {
         let raw = response.text.clone();
 
         Ok(Probe {
-            parsed: act::parse(&raw),
+            parsed: act::parse(&raw, &act_specs(within)),
             // **Reasoned, not merely "contains `<think>`".**
             //
             // On a family whose suppression *is* a prefilled empty block —
@@ -1886,7 +1894,7 @@ impl Minds {
                 thought.retired = retired;
             }
         }
-        thought.parsed = act::parse(&response.text);
+        thought.parsed = act::parse(&response.text, &act_specs(within));
         Ok(thought)
     }
 

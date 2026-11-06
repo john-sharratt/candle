@@ -3315,7 +3315,7 @@ impl Runtime {
                 }
                 Err(_) => break,
             };
-            if let (Some(doc), Some(edits)) = (&standing_doc, compose::read_mend(&raw)) {
+            if let (Some(doc), Some(edits)) = (&standing_doc, compose::read_mend(&raw, &calls)) {
                 let made = compose::mended(doc, &edits);
                 if made.made == 0 {
                     return refused(compose::nothing_mended(&writes, &made.refused));
@@ -3326,7 +3326,7 @@ impl Runtime {
             }
             // Carrying a piece on is drafting it: only the first sitting may mend.
             calls.truncate(1);
-            let Some(written) = compose::read(&raw) else {
+            let Some(written) = compose::read(&raw, &calls) else {
                 break;
             };
             let written = compose::unlabelled(&written, &writes);

@@ -66,9 +66,11 @@ pub fn spec() -> ToolSpec {
 }
 
 /// The piece, read out of a composition's decode — `None` when it holds no
-/// `draft` call with any text in it.
-pub fn read(raw: &str) -> Option<String> {
-    let (_, args) = act::raw_calls(raw)
+/// `draft` call with any text in it. `tools` is the catalog the sitting's
+/// grammar was compiled from, so a piece whose text holds another element's
+/// tags reads back whole rather than cut at the first `</parameter>`.
+pub fn read(raw: &str, tools: &[ToolSpec]) -> Option<String> {
+    let (_, args) = act::raw_calls(raw, tools)
         .into_iter()
         .find(|(name, _)| name == DRAFT)?;
     match args.get("text") {
@@ -217,9 +219,11 @@ pub fn mend_spec(anchors: &[String]) -> ToolSpec {
 }
 
 /// The edits a mending sitting's decode answered with — `None` when it holds
-/// no `mend` call, so the sitting wrote a `draft` or nothing.
-pub fn read_mend(raw: &str) -> Option<Vec<Map<String, Value>>> {
-    let (_, args) = act::raw_calls(raw)
+/// no `mend` call, so the sitting wrote a `draft` or nothing. `tools` is the
+/// catalog the sitting's grammar was compiled from — `draft` and, when a piece
+/// stands, `mend` with its anchors.
+pub fn read_mend(raw: &str, tools: &[ToolSpec]) -> Option<Vec<Map<String, Value>>> {
+    let (_, args) = act::raw_calls(raw, tools)
         .into_iter()
         .find(|(name, _)| name == MEND)?;
     let edits = args.get("edits")?.as_array()?;
@@ -560,14 +564,23 @@ mod tests {
              {{\"at\": \"{c}\", \"do\": \"replace\", \"text\": \"Again.\"}}, \
              {{\"at\": \"{a}\", \"do\": \"insert_before\", \"text\": \"Dawn.\"}}]}}}}\n</tool_call>"
         );
-        let edits = read_mend(&raw).expect("a mend call");
+        // The sitting's own catalog: `draft`, and `mend` with this piece's
+        // anchors — the list its grammar was compiled from.
+        let tools = [spec(), mend_spec(&[a.clone(), b.clone(), c.clone()])];
+        let edits = read_mend(&raw, &tools).expect("a mend call");
         assert_eq!(edits.len(), 4);
         let m = mended(&doc, &edits);
         assert_eq!(m.text, "Dawn.\n\nThe bay was warm.\n\nYou said fifteen.\n");
         assert_eq!(m.made, 3);
         assert_eq!(m.refused.len(), 1);
         assert!(m.refused[0].contains("read it again"), "{:?}", m.refused);
-        assert_eq!(read_mend("<tool_call>\n{\"name\": \"draft\", \"arguments\": {\"text\": \"x\"}}\n</tool_call>"), None);
+        assert_eq!(
+            read_mend(
+                "<tool_call>\n{\"name\": \"draft\", \"arguments\": {\"text\": \"x\"}}\n</tool_call>",
+                &tools
+            ),
+            None
+        );
     }
 
     /// The mend's grammar binds `at` and `to` to the piece's own anchors.
@@ -594,15 +607,16 @@ mod tests {
         let raw = r#"<tool_call>
 {"name": "draft", "arguments": {"text": "  You count the fleet as it comes in.  "}}
 </tool_call>"#;
+        let tools = [spec()];
         assert_eq!(
-            read(raw).as_deref(),
+            read(raw, &tools).as_deref(),
             Some("You count the fleet as it comes in.")
         );
-        assert_eq!(read("no call at all"), None);
+        assert_eq!(read("no call at all", &tools), None);
         let empty = r#"<tool_call>
 {"name": "draft", "arguments": {"text": "  "}}
 </tool_call>"#;
-        assert_eq!(read(empty), None);
+        assert_eq!(read(empty, &tools), None);
     }
 
     #[test]

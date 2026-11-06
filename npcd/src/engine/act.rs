@@ -36,11 +36,12 @@
 //! requested.
 
 use candle_conversation::stencil::element_close::{read_block, LT_ESCAPE};
+use candle_conversation::stencil::ToolSpec;
 use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::engine::tools;
+use crate::engine::tools::{self, by_name};
 
 /// One act a character took.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -268,9 +269,18 @@ const FN_OPEN: &str = "<function=";
 /// the object is written, so a value survives the round trip intact rather
 /// than being cut at its first quote.
 ///
+/// # The catalog is the grammar's, and the reader holds it
+///
+/// Which tag may follow a value is the grammar's to say (`element_close`), and
+/// `tools` is the list the decode's grammar was compiled from. A last value
+/// holding `</parameter>\n<parameter=` is then content — the grammar had no
+/// `<parameter=` left to offer there — and the block reads back as it decoded.
+/// Without it a reader closes on either tag and splits a value the grammar
+/// wrote whole.
+///
 /// `None` when the text holds no function block at all, so the ordinary path
 /// costs one `find` and allocates nothing.
-fn function_blocks_to_lines(s: &str) -> Option<String> {
+fn function_blocks_to_lines(s: &str, tools: &[ToolSpec]) -> Option<String> {
     if !s.contains(FN_OPEN) {
         return None;
     }
@@ -289,10 +299,7 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         // finished with `</parameter>`, so a block with an unclosed value was
         // not the grammar's and is left as text too.
         let block = &rest[at..];
-        // Read without the catalog, closing a value on either tag: a parse
-        // here names no tool list, so a last value holding another element's
-        // tags is split where the grammar kept it whole.
-        let Some(read) = read_block(block, &[]) else {
+        let Some(read) = read_block(block, tools) else {
             // From the block's start, NOT `rest`: the narration before it was
             // already pushed above, so re-emitting the whole remainder would
             // duplicate it.
@@ -314,17 +321,20 @@ fn function_blocks_to_lines(s: &str) -> Option<String> {
         out.push('\n');
         rest = &block[read.end..];
     }
+    // Anything after the last block is narration too, and is kept.
     out.push_str(rest);
     Some(out)
 }
 
 /// Every well-formed call in a decode, by whatever name it uses.
 ///
-/// [`parse`] without the catalog: a call to a tool this engine does not list
-/// still comes back, which is what the answer to a question needs — that one is
-/// forced through a tool of its own, outside the character's acts.
-pub fn raw_calls(output: &str) -> Vec<(String, Map<String, Value>)> {
-    normalize(output)
+/// `tools` is the catalog the decode's grammar was compiled from, so a value
+/// holding another element's tags reads back whole rather than split. A call to
+/// a tool that catalog does not list still comes back — that is what the answer
+/// to a question needs: it is forced through a tool of its own, outside the
+/// character's acts.
+pub fn raw_calls(output: &str, tools: &[ToolSpec]) -> Vec<(String, Map<String, Value>)> {
+    normalize(output, tools)
         .lines()
         .map(str::trim)
         .filter(|line| looks_like_call(line))
@@ -342,9 +352,11 @@ pub fn raw_calls(output: &str) -> Vec<(String, Map<String, Value>)> {
 }
 
 /// A decode with its call envelope and function blocks reduced to one JSON
-/// object per line, the shape the line walk reads.
-fn normalize(output: &str) -> String {
-    let output = match function_blocks_to_lines(output) {
+/// object per line, the shape the line walk reads. `tools` is the catalog the
+/// decode's grammar was compiled from, which is what says where each block's
+/// values end.
+fn normalize(output: &str, tools: &[ToolSpec]) -> String {
+    let output = match function_blocks_to_lines(output, tools) {
         Some(translated) => translated,
         None => output.to_string(),
     };
@@ -353,8 +365,11 @@ fn normalize(output: &str) -> String {
         .replace(CALL_CLOSE, "\n")
 }
 
-/// Parse a decode into acts.
-pub fn parse(output: &str) -> Parsed {
+/// Parse a decode into acts. `tools` is the catalog the decode's grammar was
+/// compiled from: the function-block reader closes each value where that
+/// grammar offers the next tag, so a value holding another element's tags reads
+/// back whole rather than split.
+pub fn parse(output: &str, tools: &[ToolSpec]) -> Parsed {
     let mut out = Parsed::default();
     let mut narration: Vec<&str> = Vec::new();
 
@@ -373,7 +388,7 @@ pub fn parse(output: &str) -> Parsed {
     // because a `<tool_call>` block spans lines: the markers and the object sit
     // on three lines of their own. Removing just the markers leaves the object
     // on its own line, which is what the walk below already understands.
-    let output = &normalize(output);
+    let output = &normalize(output, tools);
 
     for raw in output.lines() {
         let line = raw.trim();
@@ -404,7 +419,7 @@ pub fn parse(output: &str) -> Parsed {
                     });
                     continue;
                 };
-                let Some(tool) = tools::by_name(&name) else {
+                let Some(tool) = by_name(&name) else {
                     out.rejected.push(Rejected::UnknownTool { tool: name });
                     continue;
                 };
@@ -443,6 +458,15 @@ pub fn parse(output: &str) -> Parsed {
 mod tests {
     use super::*;
 
+    /// The tests parse with the whole catalog — the fixture names nothing
+    /// narrower. A live turn passes the list its own grammar was compiled from
+    /// (`tools::specs_within`); the whole catalog is the same rule with every
+    /// tool offered, so a value's end is decided by a field order rather than
+    /// by `Follows::Either`.
+    fn parse(output: &str) -> Parsed {
+        super::parse(output, &tools::specs())
+    }
+
     // ── the function-block syntax ───────────────────────────────────────────
 
     /// **The function-block shape, read end to end.**
@@ -480,7 +504,8 @@ mod tests {
     #[test]
     fn an_unterminated_block_keeps_its_narration_exactly_once() {
         let s = "She set the cup down. <function=ask>\n<parameter=to>\nYaelis\n";
-        let out = function_blocks_to_lines(s).expect("the text contains a function block");
+        let out =
+            function_blocks_to_lines(s, &tools::specs()).expect("the text contains a function block");
         assert_eq!(
             out.matches("She set the cup down.").count(),
             1,
@@ -495,7 +520,8 @@ mod tests {
     #[test]
     fn a_crossed_name_and_body_span_keeps_its_narration_exactly_once() {
         let s = "Prose first. <function=ask</function>trailing>";
-        let out = function_blocks_to_lines(s).expect("the text contains a function block");
+        let out =
+            function_blocks_to_lines(s, &tools::specs()).expect("the text contains a function block");
         assert_eq!(
             out.matches("Prose first.").count(),
             1,
@@ -607,6 +633,56 @@ mod tests {
         ));
         assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
         assert_eq!(p.acts[0].args["situation"], said);
+    }
+
+    /// **Narration after the last call is kept**, exactly once: a character
+    /// that spoke after its act still said it.
+    #[test]
+    fn narration_after_the_last_block_is_kept() {
+        let s = "<function=reflect>\n<parameter=situation>\nalone\n</parameter>\n\
+                 <parameter=inner_thoughts>\nquiet\n</parameter>\n\
+                 <parameter=feeling>\ncalm</parameter>\n</function>\nShe waited.";
+        let out = function_blocks_to_lines(s, &tools::specs()).expect("a function block");
+        assert!(!out.contains("<function="), "the block was read: {out:?}");
+        assert!(out.ends_with("\nShe waited."), "{out:?}");
+        assert_eq!(out.matches("She waited.").count(), 1, "{out:?}");
+    }
+
+    /// **The last value holds another element's tags, and the catalog is what
+    /// says so.**
+    ///
+    /// `reflect`'s last argument is `feeling`, so the grammar offers nothing but
+    /// `</function>` after it: `</parameter>` followed by `<parameter=` inside
+    /// that value is content, and all three arguments read back exactly as
+    /// written. Read without the catalog — what `read_block` does with `&[]` —
+    /// the same block splits into a `feeling` of `x` and an `other` nobody
+    /// wrote, which is the split threading the catalog through removes.
+    #[test]
+    fn a_last_value_holding_another_elements_tags_reads_whole() {
+        let block = "<function=reflect>\n<parameter=situation>\nalone\n</parameter>\n\
+             <parameter=inner_thoughts>\nthe box has given up a fold\n</parameter>\n\
+             <parameter=feeling>\nx</parameter>\n<parameter=other>\ny</parameter>\n\
+             </function>";
+        let p = parse(&format!("<tool_call>\n{block}</tool_call>"));
+        assert_eq!(p.acts.len(), 1, "{:?} / {:?}", p.rejected, p.narration);
+        assert_eq!(p.acts[0].tool, "reflect");
+        assert_eq!(p.acts[0].args["situation"], "alone");
+        assert_eq!(
+            p.acts[0].args["inner_thoughts"],
+            "the box has given up a fold"
+        );
+        assert_eq!(
+            p.acts[0].args["feeling"],
+            "x</parameter>\n<parameter=other>\ny"
+        );
+        assert_eq!(p.acts[0].args.len(), 3, "{:?}", p.acts[0].args);
+
+        // The same block read with no catalog splits where the grammar kept it
+        // whole — the discriminator, and the reason every caller passes one.
+        let split = read_block(block, &[]).expect("the block reads without a catalog too");
+        assert_eq!(split.args.len(), 4, "{:?}", split.args);
+        assert_eq!(split.args[2], ("feeling", "x"));
+        assert_eq!(split.args[3], ("other", "y"));
     }
 
     /// A truncated block is narration, not a call with invented arguments. A
