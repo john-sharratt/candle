@@ -283,7 +283,7 @@ fn edit_copies_the_workspace_file_up_and_leaves_disk_untouched() {
         json!({
             "repo": REPO,
             "path": "src/main.rs",
-            "at": anchors("src/main.rs", MAIN_RS)[0],
+            "part": anchors("src/main.rs", MAIN_RS)[0],
             "do": "replace",
             "old": "println!(\"hi\");",
             "text": "println!(\"hello\");"
@@ -312,7 +312,7 @@ fn edit_of_a_workspace_file_is_ambiguous_when_the_text_occurs_twice() {
     let ctx = ctx_for(&dir);
     let resp = harness::invoke_with_ctx(
         "file_edit",
-        json!({"repo": REPO, "path": "dup.txt", "at": anchors("dup.txt", "aa\nbb\naa\n")[0],
+        json!({"repo": REPO, "path": "dup.txt", "part": anchors("dup.txt", "aa\nbb\naa\n")[0],
                "do": "replace", "old": "aa", "text": "cc"}),
         &ctx,
     );
@@ -444,7 +444,7 @@ fn edit_after_delete_reports_not_found() {
             json!({
                 "repo": REPO,
                 "path": "src/lib.rs",
-                "at": anchors("src/lib.rs", "pub mod util;\n")[0],
+                "part": anchors("src/lib.rs", "pub mod util;\n")[0],
                 "do": "replace",
                 "text": "pub mod helper;"
             }),

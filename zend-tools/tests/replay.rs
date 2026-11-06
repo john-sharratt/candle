@@ -26,7 +26,7 @@ fn a_file_edit_may_be_re_issued_unless_it_inserts() {
         serde_json::json!({
             "repo": REPO,
             "path": "src/main.rs",
-            "at": "Qm7x",
+            "part": "Qm7x",
             "do": action,
             "text": "new",
         })

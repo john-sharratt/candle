@@ -1048,8 +1048,23 @@ each motherd at low priority (`motherd/motherd.yaml`, `motherd/agent.yaml`).
   reports it lost, and the skill runs it again.
 
 A worker builds and tests its own changes with `run_command`, which lays its
-uncommitted work down; `repo_job_start` runs a branch as origin holds it, and is
-Claude's. A worker reads a deploy's build with the `repo_job_*` readers.
+uncommitted work down, or with `repo_job_start`, which lays the same work —
+as its last tool round saved it — onto the branch on a build agent and says
+how many files it carries. Started by Claude, `repo_job_start` runs a branch
+as origin holds it. A worker reads a deploy's build with the `repo_job_*`
+readers.
+
+**A worker's answer accounts for its steps.** A brief's numbered or bulleted
+lines are its steps (`mcp/steps.rs`). An answer to a brief of two or more
+steps ends with a `Steps:` section, a line per step saying `done` and what
+shows it, `not done` or `could not` and why; one that leaves a step out is
+sent back once to account for it, in the same send-back as a citation check
+(`docs/zen_coding_challenge_fixes.md` Cause 3).
+
+**A nudge says who sent it.** A message queued for a worker's next tool round
+is delivered under a line naming its sender — Claude, the agent that started
+the task, or zend carrying a cut-off task on — and that neither is the user
+(`mcp/nudges.rs`).
 
 ### 8.4 Deploying
 

@@ -1,6 +1,6 @@
 //! file_edit tool — one anchored edit (`docs/npcd_anchored_edits.md` §6).
 
-use doc_units::render::{around, Source};
+use doc_units::render::{around, entry, Source};
 use doc_units::{apply, Doc, Edit, EditError, Op, Place};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,17 +40,25 @@ pub struct EditRequest {
     pub path: String,
     /// The anchor of the part to change: the `part=` of its block in `file_read` (e.g. `r7Lm`). Required.
     #[validate(length(min = 1))]
-    pub at: String,
+    pub part: String,
     /// What to do there: `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
     #[serde(rename = "do")]
     #[schemars(with = "EditAction")]
     pub action: String,
-    /// For replace only: words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is. Comes before `text`: the grammar offers the arguments in this order, and `text` declared first left a call that wrote `old` no way to say what replaces it.
-    pub old: Option<String>,
-    /// For replace, insert_before and insert_after: the new text — the words replacing `old`, or the whole part as it is to stand, its indentation included. Not given for delete or move.
-    pub text: Option<String>,
-    /// For replace, delete and move: the anchor of the last part of a run of consecutive parts, so the edit covers `at` through `to`.
+    /// For replace, insert and delete: the first line of the part the edit covers, `+N` as a read numbers it. Without it, the edit is to the part whole.
+    #[serde(default)]
+    #[schemars(with = "String")]
+    pub from: Option<String>,
+    /// For replace and delete with `from`: the last line covered, `+N`; left out, `from` alone.
+    #[serde(default)]
+    #[schemars(with = "String")]
     pub to: Option<String>,
+    /// For replace only: words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`. Comes before `text`: the grammar offers the arguments in this order, and `text` declared first left a call that wrote `old` no way to say what replaces it.
+    pub old: Option<String>,
+    /// For replace, insert_before and insert_after: the new text — the lines `from` through `to` as they are to stand, the words replacing `old`, or the whole part — its indentation included. Not given for delete or move.
+    pub text: Option<String>,
+    /// For a whole-part replace, delete or move: the anchor of the last part of a run of consecutive parts, so the edit covers `part` through `through`.
+    pub through: Option<String>,
     /// For move: the anchor of the part to move it beside.
     pub dest: Option<String>,
     /// For move: `before` or `after` `dest`.
@@ -75,15 +83,18 @@ pub struct FileEdit;
 impl Tool for FileEdit {
     const NAME: &'static str = "file_edit";
     const DESCRIPTION: &'static str =
-        "Change one part of an existing file by its anchor, leaving the rest exactly as it is. \
+        "Change an existing file by one of its parts, leaving the rest exactly as it is. \
          `file_read` shows every part of a file — a function, a type, a block of imports, a \
-         paragraph — as a block whose fence names its four-character anchor (`part=r7Lm`); name \
-         the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace \
-         just those words inside it), `insert_before` / `insert_after` it a new part `text`, \
-         `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete \
-         and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is \
-         to stand, indentation included — never with the `+N` numbers a read shows beside its \
-         lines. Use for: changing a function \
+         paragraph — as a block whose fence names its four-character anchor (`part=r7Lm`) and \
+         numbers each of its lines `+1`, `+2`, …; name the part as `part` and say what to `do`. \
+         With `from` (and `to`), the edit covers those lines of the part, by those numbers: \
+         `replace` them with `text`, `insert_before` / `insert_after` line `from` the lines \
+         `text`, or `delete` them. Without `from` it covers the part whole: `replace` it with \
+         `text` (or, with `old`, replace just those words inside it), `insert_before` / \
+         `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part \
+         `dest`; `through` extends replace, delete and move over a run of consecutive parts. \
+         Write `text` as the lines are to stand, indentation included — never with the `+N` \
+         numbers a read shows beside them. Use for: changing a function \
          body, adding a method after another, fixing a value in a config, removing dead code, \
          reordering items. An anchor that no longer names a part — the file changed since it was \
          read — is refused; read it again. Returns what was done and the parts it wrote under \
@@ -121,10 +132,12 @@ impl Tool for FileEdit {
             return Err(FileError::InvalidArguments(why));
         }
         let doc = Doc::new(&req.path, &content);
-        let done = apply(&doc, &edit)?;
+        let done = apply(&doc, &edit).map_err(|e| refused(&doc, e))?;
         let text = done.doc.text();
         let bytes = text.len();
-        if let (None, "replace", Some(new)) = (&req.old, req.action.as_str(), &req.text) {
+        if let (None, None, "replace", Some(new)) =
+            (&req.old, &req.from, req.action.as_str(), &req.text)
+        {
             let (written, after) = (new.lines().count(), text.lines().count());
             if let Some(why) = clobbers(content.lines().count(), after, written) {
                 return Err(FileError::InvalidArguments(why));
@@ -210,15 +223,80 @@ fn numbered(text: &str) -> Option<String> {
     })
 }
 
+/// The most parts a stale edit's refusal lists.
+const STALE_PARTS: usize = 60;
+
+/// `e` as the call's error. A stale anchor carries the parts the file has
+/// now, one line each, so the next edit can name one without a read in
+/// between (`docs/zen_coding_challenge_fixes.md` Cause 8).
+fn refused(doc: &Doc, e: EditError) -> FileError {
+    let EditError::Stale(_) = &e else {
+        return e.into();
+    };
+    let n = doc.units().len();
+    let parts: String = (0..n.min(STALE_PARTS)).map(|i| entry(doc, i)).collect();
+    let more = match n > STALE_PARTS {
+        true => format!(
+            "… and {} more — `file_read` with `list` names them all\n",
+            n - STALE_PARTS
+        ),
+        false => String::new(),
+    };
+    FileError::Stale(format!("{e}. Its parts now:\n{parts}{more}"))
+}
+
+/// `+N`, a line of a part as a read numbers it, as `N`.
+fn line_of(name: &str, value: &str) -> Result<usize, FileError> {
+    value
+        .strip_prefix('+')
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| {
+            FileError::InvalidArguments(format!(
+                "`{name}` is a line of the part as a read numbers it, `+1` upwards — {value:?} \
+                 is not; a line of the file is not what it takes"
+            ))
+        })
+}
+
+/// The lines `from` through `to` the request names, if it names any.
+fn line_range(req: &EditRequest) -> Result<Option<(usize, usize)>, FileError> {
+    match (&req.from, &req.to) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(FileError::InvalidArguments(
+            "`to` ends a range that `from` starts; give `from` too".into(),
+        )),
+        (Some(from), to) => {
+            let from = line_of("from", from)?;
+            let to = to.as_deref().map(|t| line_of("to", t)).transpose()?;
+            Ok(Some((from, to.unwrap_or(from))))
+        }
+    }
+}
+
 /// The request as the edit it names, or why it names none.
 fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
     let invalid = |why: &str| FileError::InvalidArguments(why.to_string());
-    if req.at.chars().count() != 4 {
+    if req.part.chars().count() != 4 {
         return Err(invalid(&format!(
-            "`at` is a part's four-character anchor, the `part=` of its block; {:?} is not — \
+            "`part` is a part's four-character anchor, the `part=` of its block; {:?} is not — \
              copy the anchor whole from `file_read`",
-            req.at
+            req.part
         )));
+    }
+    let lines = line_range(req)?;
+    if lines.is_some() && req.action == "move" {
+        return Err(invalid(
+            "`move` moves whole parts; it takes no `from` — to move lines, delete them and \
+             insert them where they go",
+        ));
+    }
+    if lines.is_some() && (req.old.is_some() || req.through.is_some()) {
+        return Err(invalid(
+            "`from` names lines of one part: it takes no `old`, which changes words of the \
+             part, and no `through`, which runs on over whole parts",
+        ));
     }
     let text = || {
         req.text.clone().ok_or_else(|| {
@@ -233,23 +311,43 @@ fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
             })
         })
     };
-    let op = match req.action.as_str() {
-        "replace" => Op::Replace {
+    let insert = |place: Place| -> Result<Op, FileError> {
+        Ok(match lines {
+            Some((line, last)) if line != last => {
+                return Err(invalid(
+                    "an insert goes before or after one line, `from`; it takes no `to`",
+                ))
+            }
+            Some((line, _)) => Op::InsertLines {
+                place,
+                line,
+                text: text()?,
+            },
+            None => Op::Insert {
+                place,
+                text: text()?,
+            },
+        })
+    };
+    let op = match (req.action.as_str(), lines) {
+        ("replace", Some((from, to))) => Op::ReplaceLines {
+            from,
+            to,
+            text: text()?,
+        },
+        ("replace", None) => Op::Replace {
             text: text()?,
             old: req.old.clone(),
-            to: req.to.clone(),
+            to: req.through.clone(),
         },
-        "insert_before" => Op::Insert {
-            place: Place::Before,
-            text: text()?,
+        ("insert_before", _) => insert(Place::Before)?,
+        ("insert_after", _) => insert(Place::After)?,
+        ("delete", Some((from, to))) => Op::DeleteLines { from, to },
+        ("delete", None) => Op::Delete {
+            to: req.through.clone(),
         },
-        "insert_after" => Op::Insert {
-            place: Place::After,
-            text: text()?,
-        },
-        "delete" => Op::Delete { to: req.to.clone() },
-        "move" => Op::Move {
-            to: req.to.clone(),
+        ("move", _) => Op::Move {
+            to: req.through.clone(),
             dest: req
                 .dest
                 .clone()
@@ -260,14 +358,14 @@ fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
                 _ => return Err(invalid("`move` needs `where`: `before` or `after`")),
             },
         },
-        other => {
+        (other, _) => {
             return Err(invalid(&format!(
                 "`do` is {other:?}; it is one of replace, insert_before, insert_after, delete, move"
             )))
         }
     };
     Ok(Edit {
-        at: req.at.clone(),
+        at: req.part.clone(),
         op,
     })
 }
@@ -319,6 +417,70 @@ mod tests {
         assert_eq!(numbered("+x\n"), None);
         assert_eq!(numbered("+10px\n"), None);
         assert_eq!(numbered(""), None);
+    }
+
+    fn request(action: &str, from: Option<&str>, to: Option<&str>) -> EditRequest {
+        EditRequest {
+            repo: "r".into(),
+            path: "a.rs".into(),
+            part: "KehT".into(),
+            action: action.into(),
+            from: from.map(String::from),
+            to: to.map(String::from),
+            old: None,
+            text: Some("x".into()),
+            through: None,
+            dest: None,
+            place: None,
+        }
+    }
+
+    /// **`from` and `to` name lines of the part as `+N`**, and an edit with
+    /// them is the line operation; without them, the part whole.
+    #[test]
+    fn from_and_to_name_lines_of_the_part() {
+        let op = |action, from, to| edit_of(&request(action, from, to)).map(|e| e.op);
+        assert_eq!(
+            op("replace", Some("+2"), Some("+5")).unwrap(),
+            Op::ReplaceLines {
+                from: 2,
+                to: 5,
+                text: "x".into()
+            }
+        );
+        assert_eq!(
+            op("delete", Some("+3"), None).unwrap(),
+            Op::DeleteLines { from: 3, to: 3 }
+        );
+        assert_eq!(
+            op("insert_after", Some("+1"), None).unwrap(),
+            Op::InsertLines {
+                place: Place::After,
+                line: 1,
+                text: "x".into()
+            }
+        );
+        assert_eq!(
+            op("replace", None, None).unwrap(),
+            Op::Replace {
+                text: "x".into(),
+                old: None,
+                to: None
+            }
+        );
+        for (action, from, to) in [
+            ("replace", Some("3"), None),
+            ("replace", Some("+0"), None),
+            ("replace", Some("+3x"), None),
+            ("replace", None, Some("+3")),
+            ("insert_after", Some("+1"), Some("+2")),
+            ("move", Some("+1"), None),
+        ] {
+            assert!(
+                matches!(op(action, from, to), Err(FileError::InvalidArguments(_))),
+                "{action} {from:?} {to:?}"
+            );
+        }
     }
 
     /// **`old` is offered before `text`.** The tool grammar emits optional

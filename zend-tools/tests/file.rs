@@ -113,14 +113,14 @@ fn file_edit_refusals_say_what_to_send() {
     write(&ctx, "e.txt", "one\n");
     let resp = edit(
         &ctx,
-        json!({"path": "e.txt", "at": "abc", "do": "replace", "text": "y"}),
+        json!({"path": "e.txt", "part":"abc", "do": "replace", "text": "y"}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
     assert!(detail.contains("four-character anchor"), "{detail}");
     assert!(detail.contains("\"abc\""), "{detail}");
     let resp = edit(
         &ctx,
-        json!({"path": "e.txt", "at": "abcd", "do": "replace", "old": "one"}),
+        json!({"path": "e.txt", "part":"abcd", "do": "replace", "old": "one"}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
     assert!(detail.contains("the words that replace them"), "{detail}");
@@ -130,7 +130,7 @@ fn file_edit_refusals_say_what_to_send() {
 fn file_edit_not_found() {
     let resp = harness::invoke(
         "file_edit",
-        json!({"repo": REPO, "path": "nonexistent.txt", "at": "abcd", "do": "replace", "text": "y"}),
+        json!({"repo": REPO, "path": "nonexistent.txt", "part":"abcd", "do": "replace", "text": "y"}),
     );
     let detail = harness::expect_error(&resp, "not_found");
     // The refusal names the way to create the file, not only the fault.
@@ -217,7 +217,7 @@ fn file_edit_round_trip() {
     let at = anchor_of(&ctx, "rt.txt", "hello");
     let resp = harness::expect_success(edit(
         &ctx,
-        json!({"path": "rt.txt", "at": at, "do": "replace", "text": "hello Rust"}),
+        json!({"path": "rt.txt", "part":at, "do": "replace", "text": "hello Rust"}),
     ));
     assert_eq!(text_of(&ctx, "rt.txt"), "hello Rust");
     let now = anchor_of(&ctx, "rt.txt", "hello");
@@ -283,7 +283,7 @@ fn file_edit_with_old_changes_only_those_words() {
     let at = anchor_of(&ctx, "edit.txt", "foo");
     let resp = harness::expect_success(edit(
         &ctx,
-        json!({"path": "edit.txt", "at": at, "do": "replace", "old": "bar", "text": "qux"}),
+        json!({"path": "edit.txt", "part":at, "do": "replace", "old": "bar", "text": "qux"}),
     ));
     assert_eq!(resp["bytes"], 11);
     assert!(
@@ -303,7 +303,7 @@ fn file_edit_with_old_twice_in_the_part_is_ambiguous() {
     let at = anchor_of(&ctx, "dup.txt", "aa");
     let resp = edit(
         &ctx,
-        json!({"path": "dup.txt", "at": at, "do": "replace", "old": "aa", "text": "xx"}),
+        json!({"path": "dup.txt", "part":at, "do": "replace", "old": "aa", "text": "xx"}),
     );
     harness::expect_error(&resp, "ambiguous");
     assert_eq!(text_of(&ctx, "dup.txt"), "aa bb aa\n");
@@ -322,7 +322,7 @@ fn file_edit_inserts_a_method_after_another() {
     let at = anchor_of(&ctx, "inv.js", "list");
     let resp = harness::expect_success(edit(
         &ctx,
-        json!({"path": "inv.js", "at": at, "do": "insert_after",
+        json!({"path": "inv.js", "part":at, "do": "insert_after",
                "text": "  size() {\n    return 0;\n  }"}),
     ));
     assert_eq!(
@@ -355,12 +355,12 @@ fn file_edit_deletes_and_moves_parts() {
     let three = anchor_of(&ctx, "s.md", "Three");
     harness::expect_success(edit(
         &ctx,
-        json!({"path": "s.md", "at": one, "do": "move", "dest": three, "where": "after"}),
+        json!({"path": "s.md", "part":one, "do": "move", "dest": three, "where": "after"}),
     ));
     assert_eq!(text_of(&ctx, "s.md"), "Two.\n\nThree.\n\nOne.\n");
     let resp = harness::expect_success(edit(
         &ctx,
-        json!({"path": "s.md", "at": two, "do": "delete"}),
+        json!({"path": "s.md", "part":two, "do": "delete"}),
     ));
     assert_eq!(text_of(&ctx, "s.md"), "Three.\n\nOne.\n");
     assert_eq!(
@@ -382,7 +382,7 @@ fn file_edit_replaces_through_the_overlay_and_leaves_disk_untouched() {
     let ctx = harness::workspace_ctx(dir.path());
 
     let at = anchor_of(&ctx, "src/main.rs", "fn main");
-    let args = json!({"path": "src/main.rs", "at": at, "do": "replace",
+    let args = json!({"path": "src/main.rs", "part":at, "do": "replace",
                       "old": "let retries = 3;", "text": "let retries = 30;"});
     let first = harness::expect_success(edit(&ctx, args.clone()));
     assert_eq!(first["repo"], REPO);
@@ -435,7 +435,7 @@ fn file_edit_records_only_the_changed_lines() {
         let at = doc.units()[doc.unit_at(line - 1).unwrap()].anchor.clone();
         harness::expect_success(edit(
             &overlay,
-            json!({"path": "big.txt", "at": at, "do": "replace", "old": old, "text": new}),
+            json!({"path": "big.txt", "part":at, "do": "replace", "old": old, "text": new}),
         ));
     }
 
@@ -476,7 +476,7 @@ fn a_stale_edit_does_not_copy_the_file_up() {
 
     let resp = edit(
         &ctx,
-        json!({"path": "config.toml", "at": "zzzz", "do": "replace", "text": "[net]\nport = 1\n"}),
+        json!({"path": "config.toml", "part":"zzzz", "do": "replace", "text": "[net]\nport = 1\n"}),
     );
     harness::expect_error(&resp, "stale");
 
@@ -507,7 +507,7 @@ fn file_edit_writes_nothing_when_old_is_not_there() {
     let at = anchor_of(&ctx, "all.txt", "alpha");
     let resp = edit(
         &ctx,
-        json!({"path": "all.txt", "at": at, "do": "replace", "old": "absent", "text": "new"}),
+        json!({"path": "all.txt", "part":at, "do": "replace", "old": "absent", "text": "new"}),
     );
     let detail = harness::expect_error(&resp, "not_found");
     assert_eq!(
@@ -524,11 +524,11 @@ fn file_edit_rejects_an_edit_that_changes_nothing() {
     write(&ctx, "p.txt", "a\n");
     let at = anchor_of(&ctx, "p.txt", "a");
     for args in [
-        json!({"path": "p.txt", "at": at, "do": "replace", "old": "a", "text": "a"}),
-        json!({"path": "p.txt", "at": at, "do": "replace", "text": "  \n"}),
-        json!({"path": "p.txt", "at": at, "do": "replace"}),
-        json!({"path": "p.txt", "at": at, "do": "move", "dest": at, "where": "after"}),
-        json!({"path": "p.txt", "at": at, "do": "rewrite", "text": "b"}),
+        json!({"path": "p.txt", "part":at, "do": "replace", "old": "a", "text": "a"}),
+        json!({"path": "p.txt", "part":at, "do": "replace", "text": "  \n"}),
+        json!({"path": "p.txt", "part":at, "do": "replace"}),
+        json!({"path": "p.txt", "part":at, "do": "move", "dest": at, "where": "after"}),
+        json!({"path": "p.txt", "part":at, "do": "rewrite", "text": "b"}),
     ] {
         harness::expect_error(&edit(&ctx, args), "invalid_arguments");
     }

@@ -4,6 +4,30 @@
 gives its evidence, the decision, and where the change lands. All are
 decided, except whether the stacked-layer machinery stays (Cleanup).
 
+**Built** (2026-11-06): every cause. Cause 4's read format shipped first, in
+build 4471 (`5dddd4896`). Where the build departs from the decision, the
+departure is recorded here:
+
+- **Cause 1** records each round's queue wait, prefill tokens and time, and
+  generated tokens and decode time (`zend/src/round_timing.rs`, metadata
+  `round.<turn>`). `timeline_read`'s `calls` view shows them beside the
+  round's calls and totals them under its header. Reasoning and call tokens
+  are recorded together, as the engine counts them.
+- **Cause 3** is held on the answer, not on a journal field. A brief's
+  numbered or bulleted lines are its steps (`zend/src/mcp/steps.rs`). An
+  answer to two or more steps ends with a `Steps:` section, and one that
+  leaves a step out is sent back once, in the citation check's send-back. The
+  coder and reviewer role documents ask for the section. That a `done` step
+  cites a call is asked, not verified.
+- **Cause 4**'s line ranges are zend's `file_edit` (`part`, `from`, `to`,
+  `through`). npcd's bench act keeps the whole-unit form under its turn
+  grammar's path budget (`docs/npcd_anchored_edits.md` §6).
+- **Cause 5** carries the task's overlay inline in the job, as `run_command`'s
+  `AgentExecutor` already does: the agent holds no substrate, and the job
+  request is the path the overlay already takes. The agent-side cache with
+  its `409 missing` and resubmit is not built; it would save resending
+  unchanged deltas, and is open with the user.
+
 **Source:** six worker tasks run on 2026-11-06 after
 `docs/zen_coding_session_fixes.md` was built:
 
@@ -45,7 +69,7 @@ Three things stand out.
 | 1 | Model time is 89–94% of a task, and we cannot yet say where it goes | Record each round's queue wait, prefill and decode, and decide from that | agreed |
 | 2 | Forced `journal_note` is 20–30% of all calls | No change: the notes are the journal, and the record future training learns from | decided: keep |
 | 3 | A worker ends without the steps it was asked for | The closing entry accounts for each step asked for | agreed, to try |
-| 4 | A whole-part replace drops more than was meant | Each part a fenced block with a `+N` gutter; `file_edit` by part and relative range; `file_read` by `part`, `lines` or `list`; fix the carver's doc attachment | decided |
+| 4 | A whole-part replace drops more than was meant | Each part a fenced block with a `+N` gutter; `file_edit` by part and relative range; `file_read` by `part`, `lines` or `list`; fix the carver's doc attachment | built |
 | 5 | A build ran without the worker's uncommitted edits, and passed | A job names the overlay it expects; the agent answers with what it lacks; the caller resubmits it from the substrate | decided |
 | 6 | `branch: main` reads a local cache of origin | A branch revision reads origin's record, never the local cache | decided: fix |
 | 7 | A nudge reads as the user speaking | A nudge arrives with its sender's name | agreed |

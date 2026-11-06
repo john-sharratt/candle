@@ -23,6 +23,7 @@ use crate::mcp::names::Path;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::threads;
 use crate::mcp::workers::first_line;
+use crate::round_timing;
 
 mod calls;
 mod probe;
@@ -139,9 +140,12 @@ pub fn head(t: &TimelineDetail) -> String {
     if !t.custom.is_empty() {
         // The values too: the dials a worker ran with (`dial_effort`,
         // `dial_think`, …) are what a review of its run asks after.
+        // A round's timing is the `calls` view's to show, one a turn — listed
+        // here, a long task's header would be its rounds.
         let pairs: Vec<String> = t
             .custom
             .iter()
+            .filter(|(k, _)| !k.starts_with(round_timing::PREFIX))
             .map(|(k, v)| format!("{k}={}", first_line(v, META_VALUE)))
             .collect();
         out.push_str(&format!("\nmetadata: {}", pairs.join(", ")));

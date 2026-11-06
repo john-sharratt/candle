@@ -11,8 +11,11 @@
 //! checked against the agent's sandbox allow-list there; a shell line is
 //! refused here, before anything is sent.
 
+use std::sync::Arc;
+
 use agent::wire::RunJob;
 use serde_json::{json, Value};
+use tokio::task::spawn_blocking;
 use zend_vfs::Snapshot;
 
 use super::{host_in, phase, pinned, Handle, NO_AGENTS};
@@ -38,9 +41,10 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Start a program — a build, a test run, clippy — on a build agent: a cluster machine \
-            that checks out a repository and runs programs on it, never one serving traffic. It runs \
-            against `branch` exactly as origin holds it, so push first; nothing of yours that is not pushed \
-            is in it. Answers at once, before the agent fetches origin, with the job's handle \
+            that checks out a repository and runs programs on it, never one serving traffic. Started from a \
+            task, it runs on `branch` with the task's uncommitted changes laid onto it, as `run_command` \
+            does; started from outside one, on `branch` exactly as origin holds it, so push first. The \
+            answer says which, and how many uncommitted files it carries. Answers at once, before the agent fetches origin, with the job's handle \
             (`build:<node>:<id>`), the machine it runs on and its phase; the job then fetches, waits for \
             the checkout if another job holds it, runs, and stages what it built when `stage` asks. \
             Give a program and its arguments, one entry each — `cargo test -p web` is program `cargo`, args \
@@ -140,11 +144,50 @@ pub fn next_steps(job: &JobHandle) -> String {
     )
 }
 
+/// The calling task's uncommitted changes to `repo`, as its last tool round
+/// saved them: what its job lays onto the branch, as `run_command` lays them
+/// onto its sandbox. A job from outside a task carries none, and runs the
+/// branch as origin holds it.
+///
+/// **A job a task starts runs the task's work, not origin's alone.** A worker
+/// started tests on a branch before committing to it, read "1399 passed" off
+/// a run of origin's tree without its edits, and recorded a pass of a change
+/// the run never held (`docs/zen_coding_challenge_fixes.md` Cause 5).
+async fn overlay_of(call: &OpsCall, repo: &str) -> Snapshot {
+    if !call.worker {
+        return Snapshot::default();
+    }
+    let (session, conv, repo) = (
+        Arc::clone(&call.session),
+        call.lineage.clone(),
+        repo.to_string(),
+    );
+    spawn_blocking(move || {
+        session
+            .saved_files(&conv)
+            .and_then(|files| files.repo(&repo).ok().map(|store| store.snapshot()))
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// What a job's answer says of the work it carries.
+fn carried(worker: bool, overlay: &Snapshot) -> String {
+    match (worker, overlay.chains().len()) {
+        (false, _) => " as origin holds it".to_string(),
+        (true, 0) => " as origin holds it — you have no uncommitted changes in it".to_string(),
+        (true, n) => format!(" with your {n} uncommitted file(s) laid onto it"),
+    }
+}
+
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
-    let job = match job_of(args) {
+    let mut job = match job_of(args) {
         Ok(j) => j,
         Err(e) => return Answer::error(e),
     };
+    job.overlay = overlay_of(call, &job.repo).await;
+    let carrying = carried(call.worker, &job.overlay);
     let Some(agents) = call.session.agents() else {
         return Answer::error(NO_AGENTS);
     };
@@ -176,7 +219,7 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     };
     let job = JobHandle::Build(Handle::new(node, &view.id));
     Answer::ok(format!(
-        "Started {job} on {}: `{command}` on {place} — {}.\n{}",
+        "Started {job} on {}: `{command}` on {place}{carrying} — {}.\n{}",
         host_in(&listed, node),
         phase(&view.phase, node),
         next_steps(&job)
@@ -238,6 +281,17 @@ mod tests {
         let args = json!({"repo": "candle", "branch": "main", "program": "cargo",
                           "args": ["test", "|", "tail"]});
         assert!(job_of(&args).unwrap_err().contains("`|` is shell syntax"));
+    }
+
+    /// **A job's answer says whose work it runs**: origin's alone from outside
+    /// a task, and from a task its uncommitted files, or that it has none.
+    #[test]
+    fn the_answer_says_what_work_the_job_carries() {
+        assert_eq!(carried(false, &Snapshot::default()), " as origin holds it");
+        assert_eq!(
+            carried(true, &Snapshot::default()),
+            " as origin holds it — you have no uncommitted changes in it"
+        );
     }
 
     #[test]

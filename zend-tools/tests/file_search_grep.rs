@@ -195,7 +195,7 @@ fn a_hit_names_its_part_and_its_line_in_it() {
     // The hit's anchor edits the part with no read in between.
     harness::expect_success(harness::invoke_with_ctx(
         "file_edit",
-        json!({"repo": REPO, "path": path, "at": a, "do": "replace",
+        json!({"repo": REPO, "path": path, "part": a, "do": "replace",
                "old": "API_KEY = 1", "text": "API_KEY = 2"}),
         &c,
     ));

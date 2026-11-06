@@ -780,7 +780,7 @@ mod tests {
             vec![result(
                 "file_edit",
                 json!({"repo": "candle", "path": "docs/a.md",
-                       "at": "Qm7x", "do": "replace", "old": "W_warm_max", "text": "B_out"}),
+                       "part": "Qm7x", "do": "replace", "old": "W_warm_max", "text": "B_out"}),
                 json!({"error": "ambiguous", "detail": "`old` occurs 9 times in Qm7x"}),
             )]
         };

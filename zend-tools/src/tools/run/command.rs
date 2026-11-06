@@ -12,7 +12,7 @@ use zend_vfs::{FileDelta, JobRequest, Rev};
 use super::RunError;
 use crate::exec;
 use crate::sandboxes::{page, LogPage, SandboxesError};
-use crate::{RegisteredTool, Tool, ToolContext};
+use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RunRequest {
@@ -95,6 +95,18 @@ impl Tool for RunCommand {
     type Response = RunResponse;
     type Error = RunError;
 
+    /// A program that only reads the conversation's files and writes its own
+    /// build output — which the sandbox keeps out of the conversation's
+    /// changes — leaves the files as it found them, so a resumed turn runs it
+    /// again rather than refusing it (`docs/zen_coding_challenge_fixes.md`
+    /// Cause 9). Anything else may change a file, and is refused on resume.
+    fn replay(req: &Self::Request) -> Replay {
+        match reads_only(&req.program, &req.args) {
+            true => Replay::Safe,
+            false => Replay::Unsafe,
+        }
+    }
+
     fn run(ctx: &ToolContext, req: RunRequest) -> Result<RunResponse, RunError> {
         let (program, args) = take_apart(req.program, req.args)?;
         let executor = ctx.executor()?.ok_or(RunError::NoSandboxes)?;
@@ -147,6 +159,27 @@ impl Tool for RunCommand {
             output_end,
             output_cut: outcome.output.truncated,
         })
+    }
+}
+
+/// The cargo commands that read the sources and write only their own build
+/// output.
+const CARGO_READS: [&str; 5] = ["test", "check", "clippy", "build", "doc"];
+
+/// Whether `program` with `args` changes none of the conversation's files:
+/// cargo's checks, tests and builds, and `cargo fmt` when it only checks.
+fn reads_only(program: &str, args: &[String]) -> bool {
+    if program.trim() != "cargo" {
+        return false;
+    }
+    let mut words = args
+        .iter()
+        .map(String::as_str)
+        .skip_while(|a| a.starts_with('+'));
+    match words.next() {
+        Some(sub) if CARGO_READS.contains(&sub) => true,
+        Some("fmt") => args.iter().any(|a| a == "--check"),
+        _ => false,
     }
 }
 
@@ -357,6 +390,32 @@ mod tests {
 
     fn strings(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// **cargo's checks, tests and builds are run again on resume**, and
+    /// `cargo fmt` only when it checks; any other program, or cargo doing
+    /// anything else, may change a file and is not.
+    #[test]
+    fn a_program_that_only_reads_is_replayed() {
+        let safe = |program: &str, args: &[&str]| reads_only(program, &strings(args));
+        assert!(safe("cargo", &["test", "-p", "zend", "--lib"]));
+        assert!(safe("cargo", &["+nightly", "check"]));
+        assert!(safe(
+            "cargo",
+            &["clippy", "--tests", "--", "-D", "warnings"]
+        ));
+        assert!(safe("cargo", &["build", "--release"]));
+        assert!(safe("cargo", &["fmt", "--all", "--", "--check"]));
+        assert!(
+            !safe("cargo test", &["-p", "web"]),
+            "a command line in `program` is refused when it runs"
+        );
+        assert!(!safe("cargo", &["fmt", "--all"]));
+        assert!(!safe("cargo", &["add", "serde"]));
+        assert!(!safe("cargo", &["fix"]));
+        assert!(!safe("cargo", &[]));
+        assert!(!safe("npm", &["test"]));
+        assert!(!safe("python", &["scripts/gen.py"]));
     }
 
     /// **A cargo flag left without its value is refused before anything

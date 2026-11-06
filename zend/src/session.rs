@@ -136,6 +136,7 @@ use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resident::Resident;
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
+use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
 use crate::substrate_git::{self, Repositories};
 use crate::think_budget;
@@ -4603,6 +4604,7 @@ fn run_inference_stream(
             {
                 tracing::warn!(conv_id = %conv_id, "retrieval scope panicked: {e}");
             }
+            let submitted = Instant::now();
             let handle = match cs
                 .conv
                 .submit_turn_with_options(current_message.clone(), options)
@@ -5005,6 +5007,24 @@ fn run_inference_stream(
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
+            }
+            // Where the round's time went, under its turn: what a slow task is
+            // read by before anything is changed to speed it up.
+            if let Some(turn) = resp.seal.as_ref().and_then(|s| s.turn_index) {
+                let timing = RoundTiming::of(
+                    submitted.elapsed().as_millis() as u64,
+                    resp.stats.turn_prefill_tokens as u64,
+                    resp.stats.prefill_ms as u64,
+                    resp.stats.tokens_generated as u64,
+                    resp.stats.decode_ms as u64,
+                );
+                if let Err(err) = state.engine.set_conversation_metadata(
+                    timeline,
+                    &round_timing::key(turn),
+                    &timing.value(),
+                ) {
+                    tracing::warn!(conv_id = %conv_id, "recording the round's timing failed: {err}");
+                }
             }
             // A failed turn is kept — what it wrote is what the user watched
             // arrive — and so is why it stopped, under the turn it belongs to,
@@ -6794,6 +6814,12 @@ impl ZendSession {
         self.conversation_uploads(conv_id)
             .into_iter()
             .find(|u| u.id == id)
+    }
+
+    /// `conv_id`'s file stores as its saved events hold them; `None` while
+    /// the model is not loaded.
+    pub fn saved_files(&self, conv_id: &str) -> Option<Arc<RepoFiles>> {
+        Some(self.loaded()?.saved_files(conv_id))
     }
 
     /// Upload `id`'s bytes, from `conv_id`'s uploads store. The outer `None`

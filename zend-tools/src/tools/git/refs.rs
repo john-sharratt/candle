@@ -18,7 +18,8 @@ const PER_PAGE: usize = 40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RefKind {
-    /// Local branches, with upstream tracking where configured.
+    /// The branches on the record — origin's, or with no origin the local
+    /// ones — with the commit each holds.
     Branches,
     /// Tags, annotated and lightweight.
     Tags,
@@ -76,9 +77,9 @@ pub struct GitRefs;
 impl Tool for GitRefs {
     const NAME: &'static str = "git_refs";
     const DESCRIPTION: &'static str =
-        "List a repository's refs. `kind` picks which: `branches` gives local branches \
-         with the commit each points at, which one you are on, and how far ahead or \
-         behind its upstream it is; `tags` gives tags with the commit each finally points \
+        "List a repository's refs. `kind` picks which: `branches` gives the branches as \
+         origin holds them — the record every branch revision reads — with the commit \
+         each holds and which one you are on; `tags` gives tags with the commit each finally points \
          at and whether it is annotated; `remotes` gives configured remotes and their URLs \
          (credentials redacted); `remote_branches` gives the remote-tracking branches from \
          the last fetch, and those remotes' URLs too. A `count` comes back with every \
@@ -115,8 +116,10 @@ impl Tool for GitRefs {
 
         match req.kind {
             RefKind::Branches => {
+                // The record's branches — origin's, or with no origin the
+                // local ones — the same branches a `branch` revision reads.
                 let current = repo.branch().map(|b| b.as_str().to_string());
-                let all = repo.branches()?;
+                let all = repo.record_branches()?;
                 let paging = Paging::of(all.len(), page, PER_PAGE);
                 out.kind = "branches";
                 out.count = all.len();
@@ -126,7 +129,7 @@ impl Tool for GitRefs {
                         .take(paging.per_page)
                         .map(|b| {
                             let is_head = current.as_deref() == Some(b.name.as_str());
-                            WireBranch::new(b, is_head)
+                            WireBranch::on_record(b, is_head)
                         })
                         .collect(),
                 );
