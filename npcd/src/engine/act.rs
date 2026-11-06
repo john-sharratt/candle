@@ -40,6 +40,10 @@ use candle_conversation::stencil::{
     ToolSpec,
 };
 
+use journal_core::json_repair::escape_control_in_strings;
+use serde::Serialize;
+use serde_json::{Map, Value};
+
 use crate::engine::tools;
 
 /// One act a character took.
