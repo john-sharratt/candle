@@ -108,14 +108,15 @@ pub fn capture(
         };
         changed.push((path, target, now_stamp, now));
     }
-    // What the conversation had: the ledger's content, or the base's — every
-    // base copy read in one pass, none for an untracked path.
+    // What the conversation had: the ledger's content, or the base's as
+    // committed — the form its store reads — every base copy read in one pass,
+    // none for an untracked path.
     let from_base: Vec<&RepoPath> = changed
         .iter()
         .filter(|(path, ..)| ledger.entry(path).is_none() && !untracked.contains(path))
         .map(|(_, target, ..)| &target.repo_path)
         .collect();
-    let mut at_base = repo.read_checked_out_all(&base, &from_base)?;
+    let mut at_base = repo.read_committed_all(&base, &from_base)?;
 
     let mut captured = Vec::new();
     for (path, target, now_stamp, now) in changed {

@@ -9,46 +9,15 @@
 //! branch, and the tracked files and the index at that branch's commit,
 //! whatever they held before. Untracked files are left to the caller, which
 //! knows which of them it wrote. [`Repo::restore_paths`] is the narrow form,
-//! for files a run is known to have changed, and [`Repo::read_checked_out`]
-//! reads a file as either would write it, which is what the checkout's bytes
-//! are compared against.
+//! for files a run is known to have changed, and [`Repo::read_committed_all`]
+//! reads files as they are committed — the form a conversation's file store
+//! reads them in, and so the form its changes are made against.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::GitError;
 use crate::types::{BranchName, Oid, RepoPath, Rev};
 use crate::{RefOp, RefTransaction, Repo};
-
-/// A private index file and folder under a working tree's git folder, for one
-/// [`Repo::read_checked_out_all`], removed when dropped.
-struct Scratch {
-    index: PathBuf,
-    folder: PathBuf,
-}
-
-impl Scratch {
-    fn new(git_dir: &Path) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stem = format!(
-            "zend-read-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        Self {
-            index: git_dir.join(format!("{stem}.index")),
-            folder: git_dir.join(stem),
-        }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.index);
-        let _ = std::fs::remove_dir_all(&self.folder);
-    }
-}
 
 /// `paths` in runs short enough for one command line: well inside Windows'
 /// 32 767 characters, with room for the fixed arguments and the repository's
@@ -189,91 +158,28 @@ impl Repo {
         Ok(out)
     }
 
-    /// Each of `paths` at `rev` as a checkout writes it — what
-    /// [`Self::read_checked_out`] reads for one, for many at once, by the
-    /// checkout's own code: the files `rev` holds among `paths` are found
-    /// ([`Self::files_at`]), `rev` is read into a private index, and
-    /// `checkout-index` writes those files into a private folder under this
-    /// working tree's git folder, from which they are read and the folder
-    /// removed. Line-ending conversions, `.gitattributes` and `smudge` filters
-    /// apply exactly as a checkout applies them, and nothing a checkout does not
-    /// do — unlike `git archive`, which drops `export-ignore` files and expands
-    /// `export-subst` placeholders. Three processes per call, where reading one
-    /// file at a time costs two per file. The real index and working tree are
-    /// not touched. Paths `rev` holds no file at are absent from the result.
-    pub fn read_checked_out_all(
+    /// Each of `paths` at `rev` as committed: the blob's own bytes, with no
+    /// conversion a checkout would apply — `core.autocrlf`, `.gitattributes`
+    /// line endings, `smudge` filters. That is the form a conversation's file
+    /// store reads a branch in ([`crate::GitSource`] reads blobs), so it is the
+    /// text the conversation's changes were made against, and the base a chain
+    /// of them replays onto and a tool's changes are measured from. Paths `rev`
+    /// holds no file at are absent from the result. One reader for the call.
+    pub fn read_committed_all(
         &self,
         rev: &Rev,
         paths: &[&RepoPath],
     ) -> Result<BTreeMap<String, Vec<u8>>, GitError> {
         let files = self.files_at(rev, paths)?;
-        if files.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let scratch = Scratch::new(self.git_dir()?);
-        let index = scratch.index.as_os_str().to_owned();
-        self.git("read-tree")
-            .arg(rev.spec())
-            .env("GIT_INDEX_FILE", index.clone())
-            .about_rev(rev.spec())
-            .run_ok()?;
-        let prefix = format!("{}/", scratch.folder.to_string_lossy().replace('\\', "/"));
-        let list: Vec<u8> = files
-            .iter()
-            .flat_map(|path| path.bytes().chain(std::iter::once(0)))
-            .collect();
-        self.git("checkout-index")
-            .args(["-q", "-f", "-z", "--stdin"])
-            .arg(format!("--prefix={prefix}"))
-            .env("GIT_INDEX_FILE", index)
-            .stdin(list)
-            .about_rev(rev.spec())
-            .run_ok()?;
+        let blobs = self.blobs();
         let mut out = BTreeMap::new();
         for path in files {
-            let at = scratch.folder.join(&path);
-            let meta = std::fs::symlink_metadata(&at)
-                .map_err(|e| GitError::malformed("checkout-index", format!("{path}: {e}")))?;
-            // A link a checkout would make, where links are made: its content
-            // is its target, as a checkout without them writes it.
-            let content = if meta.file_type().is_symlink() {
-                std::fs::read_link(&at).map(|t| t.to_string_lossy().replace('\\', "/").into_bytes())
-            } else {
-                std::fs::read(&at)
+            let repo_path = RepoPath::parse(&path)?;
+            if let Some(content) = blobs.read_at(rev, &repo_path)? {
+                out.insert(path, content);
             }
-            .map_err(|e| GitError::malformed("checkout-index", format!("{path}: {e}")))?;
-            out.insert(path, content);
         }
         Ok(out)
-    }
-
-    /// `path` at `rev` as a checkout writes it to disk: the blob with the
-    /// repository's conversions for that path applied — `core.autocrlf`,
-    /// `.gitattributes` line endings, `smudge` filters. `None` when `rev` holds
-    /// no file there.
-    ///
-    /// One `cat-file --filters` per call rather than a batch reader: in batch
-    /// mode git reports the stored blob's size but sends the converted bytes,
-    /// and a conversion that adds carriage returns makes those longer, so the
-    /// stream cannot be read by its headers. A file at a time is also the
-    /// scale this is for — the files a tool run changed.
-    pub fn read_checked_out(
-        &self,
-        rev: &Rev,
-        path: &RepoPath,
-    ) -> Result<Option<Vec<u8>>, GitError> {
-        let found = self.tree_entries(rev, &[path])?;
-        if !found.iter().any(|e| e.mode.is_blob()) {
-            return Ok(None);
-        }
-        let bytes = self
-            .git("cat-file")
-            .arg("--filters")
-            .arg(format!("{}:{}", rev.spec(), path))
-            .read_only()
-            .about_rev(rev.spec())
-            .run_ok()?;
-        Ok(Some(bytes))
     }
 }
 
@@ -404,63 +310,13 @@ mod tests {
         assert_eq!(t.read("a.txt"), b"second\n");
     }
 
-    /// **A checked-out read is byte for byte what the checkout holds.** With
-    /// `core.autocrlf=true` a text blob stored with LF is written with CRLF, and
-    /// a `.gitattributes` rule applies per path; the plain blob reader returns
-    /// the stored blob, this what `git checkout` wrote to disk. A binary file
-    /// reads unconverted, and a missing path — or a folder — is `None`.
+    /// **A committed read is the blob, whatever the checkout converts** — under
+    /// `core.autocrlf=true` and a per-path `eol` rule, a text file reads with
+    /// the LF it was committed with, a binary file untouched, awkward names
+    /// whole, and a missing path and a folder absent — across more paths than
+    /// one command line holds.
     #[test]
-    fn a_checked_out_read_matches_the_file_a_checkout_writes() {
-        let t = TestRepo::init();
-        t.write(".gitattributes", b"*.lf eol=lf\n");
-        t.write("text.txt", b"one\ntwo\n");
-        t.write("kept.lf", b"one\ntwo\n");
-        t.write("bin.dat", &[0, 1, b'\n', 2]);
-        t.write("dir/inner.txt", b"x\n");
-        let commit = t.commit_all("base");
-        t.git(&["config", "core.autocrlf", "true"]);
-        for name in ["text.txt", "kept.lf", "bin.dat"] {
-            std::fs::remove_file(t.path.join(name)).unwrap();
-        }
-        t.git(&["checkout", "--", "."]);
-
-        let repo = t.repo();
-        let at = Rev::Oid(commit);
-        let path = |p: &str| RepoPath::parse(p).unwrap();
-        for name in ["text.txt", "kept.lf", "bin.dat"] {
-            assert_eq!(
-                repo.read_checked_out(&at, &path(name)).unwrap().unwrap(),
-                t.read(name),
-                "{name}: the checkout's bytes"
-            );
-        }
-        assert_eq!(
-            t.read("text.txt"),
-            b"one\r\ntwo\r\n",
-            "the conversion applied"
-        );
-        assert_eq!(t.read("kept.lf"), b"one\ntwo\n", "the attribute applied");
-        assert_eq!(
-            repo.blobs()
-                .read_at(&at, &path("text.txt"))
-                .unwrap()
-                .unwrap(),
-            b"one\ntwo\n",
-            "the stored blob is unconverted"
-        );
-        assert_eq!(
-            repo.read_checked_out(&at, &path("absent.txt")).unwrap(),
-            None
-        );
-        assert_eq!(repo.read_checked_out(&at, &path("dir")).unwrap(), None);
-    }
-
-    /// **A batched read is byte for byte what reading each file alone gives**
-    /// — line-ending conversions and attributes applied, a binary file
-    /// untouched, awkward names, a missing path and a folder absent — across
-    /// more paths than one command line holds.
-    #[test]
-    fn a_batched_read_matches_reading_one_at_a_time() {
+    fn a_committed_read_is_the_blob_whatever_the_checkout_converts() {
         let t = TestRepo::init();
         t.write(".gitattributes", b"*.lf eol=lf\n*.crlf eol=crlf\n");
         t.write("text.txt", b"one\ntwo\n");
@@ -479,6 +335,11 @@ mod tests {
         }
         let commit = t.commit_all("base");
         t.git(&["config", "core.autocrlf", "true"]);
+        for name in ["text.txt", "made.crlf"] {
+            std::fs::remove_file(t.path.join(name)).unwrap();
+        }
+        t.git(&["checkout", "--", "."]);
+        assert_eq!(t.read("text.txt"), b"one\r\ntwo\r\n", "the checkout converts");
 
         let repo = t.repo();
         let at = Rev::Oid(commit);
@@ -497,64 +358,20 @@ mod tests {
         .collect();
         let bulk: Vec<RepoPath> = many.iter().map(|n| RepoPath::parse(n).unwrap()).collect();
         let refs: Vec<&RepoPath> = special.iter().chain(&bulk).collect();
-        let all = repo.read_checked_out_all(&at, &refs).unwrap();
+        let all = repo.read_committed_all(&at, &refs).unwrap();
 
-        // The awkward ones against reading each alone.
-        for path in &special {
-            assert_eq!(
-                all.get(path.as_str()),
-                repo.read_checked_out(&at, path).unwrap().as_ref(),
-                "{path}"
-            );
-        }
-        // The many against the bytes a CRLF checkout writes.
         for (i, path) in bulk.iter().enumerate() {
-            assert_eq!(
-                all[path.as_str()],
-                format!("file {i}\r\n").into_bytes(),
-                "{path}"
-            );
+            assert_eq!(all[path.as_str()], format!("file {i}\n").into_bytes(), "{path}");
         }
         assert_eq!(all.len(), refs.len() - 2, "the missing path and the folder");
-        assert_eq!(all["text.txt"], b"one\r\ntwo\r\n");
-        assert_eq!(all["kept.lf"], b"one\ntwo\n");
-        assert!(repo.read_checked_out_all(&at, &[]).unwrap().is_empty());
-    }
-
-    /// **A batched read is a checkout, not an archive**: a file marked
-    /// `export-ignore` is read, and an `export-subst` placeholder is left as
-    /// the checkout writes it. Nothing is left behind in the git folder, and
-    /// the real index and working tree are untouched.
-    #[test]
-    fn a_batched_read_ignores_what_only_an_archive_applies() {
-        let t = TestRepo::init();
-        t.write(
-            ".gitattributes",
-            b"tests/** export-ignore\nsubst.txt export-subst\n",
-        );
-        t.write("tests/t.txt", b"kept\n");
-        t.write("subst.txt", b"at $Format:%H$\n");
-        let commit = t.commit_all("base");
-        t.write("subst.txt", b"a local edit\n");
-
-        let repo = t.repo();
-        let paths: Vec<RepoPath> = ["tests/t.txt", "subst.txt"]
-            .iter()
-            .map(|p| RepoPath::parse(p).unwrap())
-            .collect();
-        let refs: Vec<&RepoPath> = paths.iter().collect();
-        let all = repo.read_checked_out_all(&Rev::Oid(commit), &refs).unwrap();
-        assert_eq!(all["tests/t.txt"], b"kept\n");
-        assert_eq!(all["subst.txt"], b"at $Format:%H$\n");
-
-        let leftovers: Vec<String> = std::fs::read_dir(t.path.join(".git"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("zend-read-"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-        assert_eq!(t.read("subst.txt"), b"a local edit\n");
-        assert_eq!(repo.status().unwrap().len(), 1, "only the local edit");
+        for name in ["text.txt", "kept.lf", "made.crlf"] {
+            assert_eq!(all[name], b"one\ntwo\n", "{name}: as committed");
+        }
+        assert_eq!(all["bin.dat"], [0, 1, b'\n', 2, 255]);
+        assert_eq!(all["dir with space/café ü.txt"], b"x\n");
+        assert_eq!(all["empty.txt"], b"");
+        assert!(!all.contains_key("absent.txt") && !all.contains_key("dir with space"));
+        assert!(repo.read_committed_all(&at, &[]).unwrap().is_empty());
     }
 
     /// **Only the named paths go back** — edited and deleted ones restored,

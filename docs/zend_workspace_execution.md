@@ -222,7 +222,7 @@ On one machine the repository's own folder is the build agent: `zend-vfs::sandbo
 
 1. **Lock.**
 2. **Set aside** what the folder holds (`checkout::preserve`, `docs/zend_git.md` §7.7), under a file lock no other process's job can share. The index, and every changed, untracked and flagged file, are snapshotted byte for byte as git objects held by refs of their own. What is ignored is listed, and nothing on the list is ever removed or captured, whatever the branch's ignore rules say. An ignored file or folder at a path the job writes or the branch adds is moved aside. A journal in the git folder records all of it before anything is disturbed.
-3. **Put the checkout** on the conversation's branch at its base, and lay the conversation's changes down.
+3. **Put the checkout** on the conversation's branch at its base, and lay the conversation's changes down — as the conversation holds them. Its store reads the branch as committed, so its changes are made against the committed text: they are replayed onto the blobs (`Repo::read_committed_all`), never onto the checkout's converted copies, and a tool's changes are read back against the same text. Under `core.autocrlf` a file the conversation changed is laid down with the line endings it holds, which git compares through its own conversion.
 4. **Check the command** — git run directly is refused, pointing at the git tools — and run it.
 5. **Read back** what it changed as deltas, and record them in the conversation's store.
 6. **Put the folder back**: `HEAD` where it was, the job's untracked files and links cleared, the set-aside files returned, the snapshot's bytes and index written back with their flags, and only then the snapshot let go.

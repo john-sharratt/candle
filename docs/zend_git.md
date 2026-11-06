@@ -44,7 +44,7 @@ The `zend-vfs` crate, depending on nothing else in the workspace. The git layer 
 ```
 zend-vfs/src/
   lib.rs              Repo: open (top-level check), dir, format, write lock
-  execution.rs        force_checkout_branch, restore_paths, read_checked_out (§7.7)
+  execution.rs        force_checkout_branch, restore_paths, read_committed_all (§7.7)
   version.rs          GitVersion, MINIMUM, installed()
   runner.rs           Invocation: args, -c overrides, env, stdin, timeout
   kill_tree.rs        Process-tree kill (Job Object / process group)
@@ -348,11 +348,9 @@ A tool that runs on the machine needs a conversation's files on disk: its branch
 | `force_branch_tip(branch, from, to)` | `branch` put at `to` as a compare-and-swap against `from` (`None`: absent), whether or not it is checked out — the one ref move that ignores a checkout, for taking back a branch a tool moved; index and working tree untouched | `update-ref --no-deref --stdin -z` |
 | `attach_head(branch)` | `HEAD` pointed at `branch`, index and working tree untouched | `symbolic-ref HEAD refs/heads/<branch>` |
 | `restore_paths(commit, paths)` | the named tracked files back to `commit`'s content, nothing else touched; batched under the command-line limit | `checkout --force <commit> -- <paths>` |
-| `read_checked_out(rev, path)` | a file's bytes as a checkout writes them — `core.autocrlf`, `.gitattributes` and `smudge` applied; `None` for a missing path or a folder | `cat-file --filters`, one per file |
+| `read_committed_all(rev, paths)` | many files' bytes as committed — the blobs, with no `core.autocrlf`, `.gitattributes` or `smudge` conversion; a missing path or a folder absent | `ls-tree` for which exist, then one `cat-file --batch` reader |
 
-`read_checked_out_all(rev, paths)` reads many files as a checkout writes them in three processes per call, by the checkout's own code: `ls-tree` for which exist, `read-tree` of `rev` into a private index, and `checkout-index` of those files into a private folder under the git folder, read back and removed — so conversions, attributes and filters apply exactly as a checkout's, and nothing only an archive applies (`export-ignore`, `export-subst`) does. `files_at(rev, paths)` answers only which exist. `materialize` and `capture` read the base through these, and only where it is needed: a conversation's chain that opens with a write or a delete replaces the base, and a path status reports untracked (and nothing else) has no base copy. `status_with_head` gives status and `HEAD` in one process (`--branch --no-ahead-behind`), which each pass asks for together.
-
-`read_checked_out` is one process per file rather than a batch reader because `cat-file --batch --filters` reports the stored blob's size in its header while sending the converted bytes, and a conversion that adds carriage returns makes those longer.
+`files_at(rev, paths)` answers only which exist. `materialize` and `capture` read the base through `read_committed_all`, and only where it is needed: a conversation's chain that opens with a write or a delete replaces the base, and a path status reports untracked (and nothing else) has no base copy. The committed form is the one a conversation's store reads a branch in, so it is the text its changes were made against; a checkout's converted copy is not, and under `core.autocrlf` an edit made against LF would not fit its CRLF. `status_with_head` gives status and `HEAD` in one process (`--branch --no-ahead-behind`), which each pass asks for together.
 
 On top of these, `materialize` reaches what `reset --hard` plus writing every changed file would leave while touching only files whose bytes are wrong: it resets onto the branch only when `HEAD` is not on it at its commit or the index was changed, otherwise restores the tracked files `status` names and removes the untracked ones, and writes a conversation's file only when its content differs, dated by the write — a build cache compares a source's time with its outputs', and one checkout serves every conversation. A ledger of each written file's content and stamp (size and modification time) lets `capture` trust a file without reading it, unless the stamp is within the racy window of when it was taken.
 

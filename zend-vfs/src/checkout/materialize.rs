@@ -86,7 +86,10 @@ pub fn materialize(
 
     // Everything the conversation's changes name, resolved and computed first
     // — the base's copies read in one pass, and only where a chain opens with
-    // an edit: one that opens with a write or a delete replaces the base.
+    // an edit: one that opens with a write or a delete replaces the base. They
+    // are read as committed, the form the conversation's store read them in
+    // and made its edits against — never as a checkout converts them, whose
+    // line endings an edit made against the committed text would not fit.
     let targets = changes
         .iter()
         .map(|(path, _)| Ok((path.to_string(), target::resolve(&root, path)?)))
@@ -101,7 +104,7 @@ pub fn materialize(
         })
         .map(|(_, t)| &t.repo_path)
         .collect();
-    let mut at_base = repo.read_checked_out_all(&base_rev, &edited)?;
+    let mut at_base = repo.read_committed_all(&base_rev, &edited)?;
     let mut wanted: BTreeMap<String, (Target, Option<Vec<u8>>)> = BTreeMap::new();
     for (path, target) in targets {
         let base_copy = at_base.remove(target.repo_path.as_str());

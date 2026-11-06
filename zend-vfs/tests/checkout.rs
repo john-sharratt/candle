@@ -89,11 +89,11 @@ fn text(s: &str) -> Option<Vec<u8>> {
     Some(s.as_bytes().to_vec())
 }
 
-/// What `path` holds at the base commit, as a checkout writes it.
+/// What `path` holds at the base commit, as committed — the form a
+/// conversation's store reads, and so the text its changes are made against.
 ///
 /// Read once per path and kept: the base never changes under a test, and
-/// the assertions ask for the same paths every round. A test that changes how
-/// the base is checked out (its line endings) does so before its first read.
+/// the assertions ask for the same paths every round.
 fn at_base(f: &Fixture, path: &str) -> Option<Vec<u8>> {
     if let Some(known) = f.base_copies.borrow().get(path) {
         return known.clone();
@@ -104,7 +104,7 @@ fn at_base(f: &Fixture, path: &str) -> Option<Vec<u8>> {
     let refs: Vec<&RepoPath> = paths.iter().collect();
     let read = f
         .repo
-        .read_checked_out_all(&Rev::Oid(f.base.clone()), &refs)
+        .read_committed_all(&Rev::Oid(f.base.clone()), &refs)
         .unwrap();
     let mut copies = f.base_copies.borrow_mut();
     for p in &paths {
@@ -655,12 +655,16 @@ fn a_restored_mtime_is_caught_inside_the_racy_window() {
     assert_eq!(view(&f, &changes, "README.md"), text("bbbb\n"));
 }
 
-/// **Line endings follow the checkout.** With `core.autocrlf=true` the base
-/// is checked out with CRLF; the conversation's changes are made against
-/// that, materialise exactly, and a tool's CRLF edit comes back as an edit of
-/// CRLF lines.
+/// **The conversation's text is the committed text, whatever the checkout's
+/// line endings.** With `core.autocrlf=true` the checkout holds CRLF where
+/// the blobs hold LF. The conversation's store reads the blobs, so its edits
+/// are made against LF: they replay onto the committed text, materialise as
+/// the conversation holds them, and a tool's edit of that file comes back as
+/// an edit of those lines. A file the tool changed that the conversation never
+/// touched comes back against the committed text too, in the checkout's
+/// bytes.
 #[test]
-fn a_crlf_checkout_round_trips() {
+fn a_crlf_checkout_takes_the_conversations_own_text() {
     let f = fixture();
     git(&f.root, &["config", "core.autocrlf", "true"]);
     for p in [
@@ -672,15 +676,15 @@ fn a_crlf_checkout_round_trips() {
         std::fs::remove_file(f.root.join(p)).unwrap();
     }
     git(&f.root, &["checkout", "-q", "--", "."]);
-    assert_eq!(at_base(&f, "README.md"), text("# app\r\n\r\nthe app.\r\n"));
+    assert_eq!(disk(&f.root, "README.md"), text("# app\r\n\r\nthe app.\r\n"));
+    assert_eq!(at_base(&f, "README.md"), text("# app\n\nthe app.\n"));
 
     let mut changes = FileChanges::new();
-    let crlf_lib = LIB.replace('\n', "\r\n");
     change(
         &f,
         &mut changes,
         "src/lib.rs",
-        Some(crlf_lib.replace("    2\r\n", "    22\r\n").as_bytes()),
+        Some(LIB.replace("    2\n", "    22\n").as_bytes()),
     );
     let (mut ledger, _) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
     assert_holds(&f, &changes, "crlf");
@@ -689,14 +693,28 @@ fn a_crlf_checkout_round_trips() {
     put(
         &f.root,
         "src/lib.rs",
-        now.replace("    3\r\n", "    33\r\n").as_bytes(),
+        now.replace("    3\n", "    33\n").as_bytes(),
+    );
+    let readme = String::from_utf8(disk(&f.root, "README.md").unwrap()).unwrap();
+    put(
+        &f.root,
+        "README.md",
+        readme.replace("the app.", "the app!").as_bytes(),
     );
     let captured = capture(&f.repo, &f.branch, &mut ledger).unwrap();
-    let FileDelta::Edit { splices } = &captured[0].1.delta else {
+    let paths: Vec<&str> = captured.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["README.md", "src/lib.rs"]);
+    let FileDelta::Edit { splices } = &captured[1].1.delta else {
         panic!("{captured:?}");
     };
-    assert_eq!(splices[0].inserted, "    33\r\n");
+    assert_eq!(splices[0].inserted, "    33\n");
     changes.extend(captured);
+    assert_eq!(
+        view(&f, &changes, "README.md"),
+        text("# app\r\n\r\nthe app!\r\n")
+    );
+    let (_, again) = materialize(&f.repo, &grant(), &f.branch, &changes).unwrap();
+    assert!(again.written.is_empty(), "{again:?}");
     assert_holds(&f, &changes, "crlf after capture");
 }
 
