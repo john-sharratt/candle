@@ -1472,7 +1472,51 @@ Taken 2026-11-06:
 13. Templates, the repository's `docs/` derived from this design (with
     `docs/calling-the-api.md`), `CLAUDE.md`, the connector's `yen-apps` guide,
     the `yenbot` journal, the `yenbot` Zen credential, the claude.ai Project.
-14. `service_deploy` for yenbot, no approvals on the iteration, the estate
-    entry, `deployment.md`.
-15. Yen's first app, built by her in claude.ai from the docs alone — the test
+14. `service_deploy`, `service_control` and `service_status` for yenbot, no
+    approvals on the iteration, the estate entry, `deployment.md`.
+15. The test cases (§25), run in claude.ai through the "Yen Bots" Project,
+    every one passing.
+16. Yen's first app, built by her in claude.ai from the docs alone — the test
     of everything above.
+
+## 25. Test cases
+
+The platform is done when every case below passes, run as Yen would run it: a
+fresh chat in the "Yen Bots" claude.ai Project (§17.8), the request typed in
+her words, nothing else said. Claude has only the connector, the guides and
+the repository's docs. A case passes when the outcome holds on the live site
+and Claude got there by the path named, reading the guide named. A case that
+passes another way — a guess that happened to work, a tool the guide does not
+name, a question to Yen the docs should have answered — fails, and the guide
+or the docs are fixed until it passes as written.
+
+"Task" is a Zen task calling the API with `http_session_open` and
+`http_request` and the `yenbot` credential (§6.3); "edit" is
+`file_edit_and_commit` (§5.4).
+
+| # | Yen says | Path | Guide | Passes when |
+|---|---|---|---|---|
+| 1 | "Make me a recipe app" | `building-an-app.md` read in full; the closest template copied; edits (or a task for a large template); the gate checks it; it is a draft | §17.3, §16 | The app opens for Yen at `/a/recipes/`, is not on anyone else's landing page, and its manifest's `guide:` is the current edition. |
+| 2 | "Make it pink, with rounder buttons" | `theme:` overrides in the manifest, one edit | §8.5 | The app shows the new accent and radius in light and dark; an accent too pale to read is refused by the gate and Claude picks a readable one. |
+| 3 | "It's blank" (a screenshot) | `log_grep` on `yenbot/<app>` for browser errors; the fix; an edit | §18 | Claude names the error from the log before changing anything, and the page renders after the edit. |
+| 4 | "Remind me every Sunday night to plan meals" | `schedules:` in the manifest; a workflow; Web Push | §9.2, §11 | A push arrives on Yen's phone at the set time. |
+| 5 | "Did the reminder go out?" | `log_read` of the workflow's runs, or a task: `GET /admin/jobs` | §18, §6.2 | Claude answers with the run's time and outcome. |
+| 6 | "Run it now so I can see" | A task: `POST /admin/jobs/<id>/run` | §6.2, `calling-the-api.md` | The push arrives within the task's run, and Claude told Yen roughly how long it would take. |
+| 7 | "Approve my cousin" | Yen's admin page, or a task: `POST /admin/accounts/<id>/approve` | §6.2 | The cousin's account is active and sees the public apps. |
+| 8 | "Only the family should see the chores app" | A task: `PUT /admin/apps/<id>/visibility` and `/shares` with `household` | §12.4–12.5 | An account outside `household` gets neither the tile nor the app's data. |
+| 9 | "The kids can see the chores, only we can change them" | Collection `roles:` in the manifest, one edit | §12.5 | A child's account reads the list and cannot change it; the edit controls are hidden, not failing. |
+| 10 | "Draw a cute icon for it" | The art library through a Zen task, in the house style | §15 | The tile shows the new art, sized, in the library by id. |
+| 11 | "Are my recipes actually saved?" | A task: `GET /admin/data/recipes/recipes` | §6.2 | Claude answers with the records' count and names, from the store. |
+| 12 | "Add a photo to each recipe" | A `file` field, the collection's version raised with its migration | §7.5 | Old recipes still open; new ones take a photo with a thumbnail. |
+| 13 | "How much is each app being used?" | A task: `GET /admin/usage` | §20.3 | Claude answers opens and active accounts per app for the period asked. |
+| 14 | "Show my Google calendar in the planner" | `google:` in the manifest; "Connect Google" through the gateway; `ctx.google.fetch` | §19.3 | After Yen connects once, the planner lists her events; an account that has not connected sees the button, not an error. |
+| 15 | "Undo that, I liked it before" | Failing forward: the journal's note of what she had, and a task reading the earlier version from git and writing it back | §17.6 | The page is as it was, through a new commit; no history was rewritten. |
+| 16 | "Tell me when the kids finish a chore" | A `when:` job on the chores collection, a workflow, a notification | §9.2, §11 | Marking a chore done sends Yen a push within seconds. |
+| 17 | "Make a homework helper chat for the kids" | `ai: true` and the chat panel | §14 | A child's account asks and gets a streamed answer; the call is in `ai_calls`. |
+| 18 | "I deleted the wrong recipes" | A task: `GET /admin/backups`, then `POST /admin/backups/<date>/restore {app}` | §7.4 | The recipes are back; every other app's data is untouched; a backup of what was replaced exists. |
+| 19 | "The site's not loading" | `cluster_status` for the site's health, `log_grep` on `yenbot`, then `service_control` to restart | §20.2, §5.5 | Claude says what the log showed and the site answers again. |
+| 20 | "Make the date picker nicer everywhere" | The platform component under `web/_/ui/`, an edit, served from disk | §5.2 | Every app's date picker changes without a release; `/_design` shows it in every state. |
+| 21 | "Can the platform make QR codes?" | A task on the Rust, then `service_deploy` for yenbot, watched with `job_status` | §5.5, §17.7 | The feature is live; Claude told Yen how long it would take and confirmed on the site that it landed. |
+| 22 | "Put my apps in this order" | Yen's admin page, or a task: `PUT /admin/apps/order` | §6.2 | The landing page shows the order she gave. |
+| 23 | "Put the recipes in a spreadsheet" | `/export/<app>` as CSV | §20.1 | The CSV opens in a spreadsheet with every recipe and Vietnamese text intact. |
+| 24 | "Put it on my phone's home screen" | The install prompt every app gets | §11 | The app opens from the home screen, full-screen, and its pushes still arrive. |
