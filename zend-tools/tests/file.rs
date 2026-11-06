@@ -218,9 +218,7 @@ fn file_edit_round_trip() {
     let now = anchor_of(&ctx, "rt.txt", "hello");
     assert_eq!(
         resp["result"],
-        format!(
-            "Replaced {at}.\n{now}| hello Rust\nChanged lines:\n- hello world\n+ hello Rust\n"
-        )
+        format!("Replaced {at}.\n{now}| hello Rust\nChanged lines:\n- hello world\n+ hello Rust\n")
     );
     assert_eq!(resp["bytes"], 10);
 }

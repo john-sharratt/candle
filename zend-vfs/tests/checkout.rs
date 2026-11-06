@@ -675,7 +675,12 @@ fn a_crlf_checkout_takes_the_conversations_own_text() {
     ] {
         std::fs::remove_file(f.root.join(p)).unwrap();
     }
-    git(&f.root, &["checkout", "-q", "--", "."]);
+    // The helper pins `core.autocrlf=false` on every call; a later `-c` wins,
+    // so this checkout converts as the repository's own config says.
+    git(
+        &f.root,
+        &["-c", "core.autocrlf=true", "checkout", "-q", "--", "."],
+    );
     assert_eq!(
         disk(&f.root, "README.md"),
         text("# app\r\n\r\nthe app.\r\n")
