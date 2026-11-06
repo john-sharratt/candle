@@ -59,6 +59,7 @@ mod phase_split;
 mod piece_identity;
 mod piece_splice;
 mod pinned_report;
+mod placed;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;
@@ -128,6 +129,7 @@ use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::persistence::triggers::{PersistenceTriggers, FIRST_ATTACHMENT};
+use crate::placed_span::PlacedSpan;
 use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::Content;
 use crate::projection::{
@@ -420,6 +422,9 @@ pub(crate) enum SchedulerRequest {
         /// Spans of `prefill_tokens` whose recurrent state is captured or
         /// replayed — see [`crate::TurnOptions::recurrent_spans`].
         recurrent_spans: Vec<TokenSpan>,
+        /// Spans of `prefill_tokens` placed from another turn's K/V — see
+        /// [`crate::TurnOptions::placed`].
+        placed_spans: Vec<PlacedSpan>,
     },
 
     /// Free a sequence slot.
@@ -2234,6 +2239,9 @@ pub(super) struct PrefillWork {
     /// Spans of `tokens` each prefilled as a chunk of its own, armed on the
     /// model for a capture or a replay of their recurrent state.
     pub(super) recurrent_spans: Vec<TokenSpan>,
+    /// Spans of `tokens` placed from another turn's K/V when the prefill
+    /// reaches them, rather than forwarded (`docs/inline_read_injection.md`).
+    pub(super) placed_spans: Vec<PlacedSpan>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -4561,6 +4569,7 @@ impl Scheduler {
                 free_tool_calls_from_penalties,
                 recorded_reply,
                 recurrent_spans,
+                placed_spans,
             } => {
                 // **The whole SubmitTurn handler, because it is the one that runs real
                 // work on the loop thread.** Its siblings are bookkeeping; this one
@@ -4918,6 +4927,11 @@ impl Scheduler {
                 } else {
                     (Vec::new(), Vec::new())
                 };
+                // A placed span's source is lifted and pinned with the selected
+                // history: its K/V is placed partway through this prefill, after
+                // admission, and has to be hot when the prefill reaches it.
+                turn_keys_for_elevate
+                    .extend(placed_spans.iter().map(|s| TurnKey::new(s.source, s.turn)));
 
                 // **What the projection will put on the device is priced here, and
                 // put there only when admission takes the turn** (`submit_admit`).
@@ -4971,6 +4985,7 @@ impl Scheduler {
                         free_tool_calls_from_penalties,
                         recorded_reply,
                         recurrent_spans,
+                        placed_spans,
                     },
                     lift,
                     depth,
@@ -6601,6 +6616,7 @@ impl Scheduler {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
             recurrent_spans: Vec::new(),
+            placed_spans: Vec::new(),
         });
         Ok(())
     }
@@ -16090,6 +16106,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
             recurrent_spans: Vec::new(),
+            placed_spans: Vec::new(),
         }
     }
 
@@ -16874,6 +16891,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
             recurrent_spans: Vec::new(),
+            placed_spans: Vec::new(),
         }
     }
 

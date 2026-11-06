@@ -16,6 +16,7 @@ use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
 use super::wave_logits::WaveLogits;
 use super::*;
+use crate::placed_span;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
 use crate::recurrent_span::{snap_advance, span_at, ArmKind};
@@ -4160,6 +4161,7 @@ impl Scheduler {
                 continue;
             };
             let p = &self.active_prefills[i];
+            *advance = placed_span::snap_advance(&p.work.placed_spans, p.offset, *advance);
             *advance = snap_advance(&p.work.recurrent_spans, p.offset, *advance);
             let Some(span) = span_at(&p.work.recurrent_spans, p.offset).cloned() else {
                 continue;
@@ -4556,6 +4558,23 @@ impl Scheduler {
                     let seq_id = self.active_prefills[i].work.sequence_id;
                     let off = self.active_prefills[i].offset;
                     let end = (off + advance).min(total);
+                    // A chunk that ran over a placed span forwarded what was to
+                    // be placed: every group is cut at a span's start, so this is
+                    // a group formed without the cut, refused rather than taken
+                    // as a prefill of the span.
+                    if let Some(span) = self.active_prefills[i]
+                        .work
+                        .placed_spans
+                        .iter()
+                        .find(|s| off < s.tokens.start && end > s.tokens.start)
+                    {
+                        let why = format!(
+                            "the prefill chunk {off}..{end} ran over the placed span at {:?}",
+                            span.tokens
+                        );
+                        self.active_prefills[i].error = Some(ConversationError::Other(why));
+                        continue;
+                    }
                     if let Err(e) = self.session.advance_sequence(seq_id.0, end - off) {
                         self.active_prefills[i].error = Some(ConversationError::Model(e));
                         continue;
@@ -4568,6 +4587,27 @@ impl Scheduler {
                         &chunk_tokens,
                     );
                     self.active_prefills[i].offset = end;
+                    // A placed span begins here: its K/V goes in now, every
+                    // layer having run the chunk before it, and the prefill
+                    // carries on from its end.
+                    let placed =
+                        placed_span::span_at(&self.active_prefills[i].work.placed_spans, end)
+                            .cloned();
+                    if let Some(span) = placed {
+                        if let Err(e) = self.place_span(seq_id, &span) {
+                            self.active_prefills[i].error = Some(e);
+                            continue;
+                        }
+                        let placed_tokens: Vec<u32> =
+                            self.active_prefills[i].work.tokens[span.tokens.clone()].to_vec();
+                        super::Scheduler::record_slot_tokens(
+                            &mut self.slot_tokens,
+                            seq_id,
+                            &placed_tokens,
+                        );
+                        self.active_prefills[i].offset = span.tokens.end;
+                    }
+                    let end = self.active_prefills[i].offset;
                     if end < total {
                         // More to prefill: report progress and ride the next group.
                         let _ = self.active_prefills[i].work.event_tx.send(
@@ -7151,6 +7191,7 @@ mod wave_chunk_tests {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                placed_spans: Vec::new(),
             },
             offset: 0,
             next_projection: 0,

@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context};
 use candle_conversation::decode_diag::{self, Arm, Capture, Control, StepRecord};
+use candle_conversation::placed_span::PlacedText;
 use candle_conversation::projection::{recorded_dials, ProjectionScript, TimelineId, TurnIndex};
 use candle_conversation::recurrent_span::{ArmKind, ReplyRows, TextSpan};
 use candle_conversation::{SamplingConfig, SelectionState, TurnEvent, TurnOptions};
@@ -83,6 +84,46 @@ pub struct DiagRun {
     /// Blocks of the submitted half that take an earlier run's capture: its
     /// rows run through the block's entering state in place of the block's.
     pub merge: Vec<NamedBlock>,
+    /// Blocks of the submitted half whose bodies are placed from a sealed
+    /// turn holding the same text, their edges prefilled
+    /// (`docs/inline_read_injection.md`).
+    pub placed: Vec<PlacedBlock>,
+}
+
+/// A `<tool_response>` block of the submitted half, by its position in the
+/// round, whose body is placed from timeline `source` with `edge` grid steps of
+/// each end prefilled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PlacedBlock {
+    pub block: usize,
+    pub source: u64,
+    pub edge: usize,
+}
+
+/// The runs `blocks` names in `half`, the user half a run submits.
+fn placed_runs(half: &str, blocks: &[PlacedBlock]) -> anyhow::Result<Vec<PlacedText>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let round = tool_round_blocks(half).context("the submitted user half is not a tool round")?;
+    blocks
+        .iter()
+        .map(|p| {
+            let block = round.get(p.block).with_context(|| {
+                format!(
+                    "the round holds {} blocks, so no block {}",
+                    round.len(),
+                    p.block
+                )
+            })?;
+            Ok(PlacedText {
+                bytes: block.body.clone(),
+                source: TimelineId::from_raw(p.source)
+                    .with_context(|| format!("{} names no timeline", p.source))?,
+                edge: p.edge,
+            })
+        })
+        .collect()
 }
 
 /// A `<tool_response>` block of the submitted user half, by its position in
@@ -108,7 +149,7 @@ pub struct HistoryDiffers {
 }
 
 impl HistoryDiffers {
-    fn of(c: &TurnComparison) -> Self {
+    pub(super) fn of(c: &TurnComparison) -> Self {
         Self {
             turn: c.turn,
             ids_at: c.difference.as_ref().map(|d| d.at),
@@ -413,6 +454,9 @@ impl ZendSession {
         let Some(target_sealed) = recorded.get(spec.turn) else {
             bail!("turn {} has no sealed record", spec.turn);
         };
+        let Some(target_opening) = events[spec.turn].first() else {
+            bail!("turn {} has no recorded projection", spec.turn);
+        };
 
         let diag_id = format!(
             "diag/{}/{}/{}/{run_index}",
@@ -431,7 +475,7 @@ impl ZendSession {
         // The turn's dials are what its recording ran under, whatever the caller
         // set: they steer the think block as well as the projection.
         let mut reply = spec.selection.clone();
-        for (selector, option) in recorded_dials(&events[spec.turn][0]) {
+        for (selector, option) in recorded_dials(target_opening) {
             reply.select(selector, option);
         }
 
@@ -466,6 +510,7 @@ impl ZendSession {
                 let script = script_of(&events[index], conv);
                 conv.set_projection(builder.with_script(script).into());
             },
+            &mut |_, _, _, _| Ok(()),
         )?;
         let replay_secs = replay_start.elapsed().as_secs_f64();
         let replayed = conv.sealed_turns(timeline);
@@ -529,6 +574,7 @@ impl ZendSession {
         };
         let half_text = half.text();
         let (recurrent_spans, spans) = armed_spans(run, &half_text, captures)?;
+        let placed = placed_runs(&half_text, &run.placed)?;
         tracing::info!(run = run_index, spans = ?spans, "diag: the target's armed spans");
         let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
         let think_mode = think_mode_from_selection(&selection);
@@ -551,6 +597,7 @@ impl ZendSession {
             forced_tokens: Some(spec.token),
             forced_suffix: suffix,
             recurrent_spans,
+            placed,
             ..Default::default()
         };
         if run.user.is_some() && from > 0 {
@@ -689,6 +736,7 @@ mod tests {
             splices: Vec::new(),
             capture,
             merge,
+            placed: Vec::new(),
         }
     }
 
@@ -757,6 +805,27 @@ mod tests {
                 .to_string(),
             "the round holds 2 blocks, so no block 5"
         );
+    }
+
+    /// A placed block is its body, between the tags; a block the round does not
+    /// hold is refused.
+    #[test]
+    fn a_placed_block_is_its_body() {
+        let placed = |block| PlacedBlock {
+            block,
+            source: 5,
+            edge: 2,
+        };
+        let runs = placed_runs(ROUND, &[placed(1)]).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(&ROUND[runs[0].bytes.clone()], "bb");
+        assert_eq!(runs[0].source.raw(), 5);
+        assert_eq!(runs[0].edge, 2);
+        assert_eq!(
+            placed_runs(ROUND, &[placed(5)]).unwrap_err().to_string(),
+            "the round holds 2 blocks, so no block 5"
+        );
+        assert!(placed_runs("plain", &[]).unwrap().is_empty());
     }
 
     #[test]

@@ -157,6 +157,7 @@ use crate::workspace::UPLOADS_REPO;
 pub mod diag;
 mod memory_writer;
 mod replay;
+pub mod restore;
 pub use replay::{
     Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
     TurnComparison,

@@ -5340,6 +5340,19 @@ pub trait ManagedBatchedModel {
         Ok(0)
     }
 
+    /// The rows of `page` — one page a seal of this model produced — that cover
+    /// its tokens `tokens`, as a page of their own: what a span placed from part
+    /// of a sealed turn pushes ([`Self::push_positional_state`]) in place of the
+    /// turn's whole page. A range the model cannot cut there is refused.
+    /// `None` for a model that keeps no per-position state.
+    fn slice_positional_page(
+        &self,
+        _page: &[u8],
+        _tokens: Range<usize>,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// Device bytes a creep residual for `rows` holds while its sweep runs —
     /// what [`Self::claim_residual`] claims for them. Admission prices a
     /// prefill's rows at this as well as at their tier, because the residual is

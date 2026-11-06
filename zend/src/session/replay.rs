@@ -39,7 +39,7 @@ use std::time::Instant;
 use anyhow::{bail, Context};
 use candle_conversation::{
     ProjectionEvent, RecoveredMessage, Role as TurnRole, SamplingConfig, SealedTurn,
-    SelectionState, TurnEvent, TurnOptions,
+    SelectionState, TurnEvent, TurnOptions, TurnResponse,
 };
 
 use super::{
@@ -260,8 +260,14 @@ pub fn turn_selection(
     }
 }
 
+/// What [`replay_history`] hands back once a turn has sealed: its index, the
+/// conversation, the projection points its decode streamed and its response.
+pub(super) type OnSealed<'a> =
+    dyn FnMut(usize, &mut Sequence, Vec<ProjectionEvent>, &TurnResponse) -> anyhow::Result<()> + 'a;
+
 /// Decode `turns` again onto `conv`, each under the triggers and sampling config
-/// the chat gave it, its recorded ids forced. `before` runs ahead of each turn.
+/// the chat gave it, its recorded ids forced. `before` runs ahead of each turn;
+/// `sealed` once it has sealed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn replay_history(
     state: &InferenceState,
@@ -272,9 +278,10 @@ pub(super) fn replay_history(
     tools_mode: ToolMode,
     demonstration: Demonstration,
     before: &mut dyn FnMut(usize, &mut Sequence),
+    sealed: &mut OnSealed<'_>,
 ) -> anyhow::Result<()> {
     for (index, turn) in turns.iter().enumerate() {
-        let Some(sealed) = recorded.get(index) else {
+        let Some(record) = recorded.get(index) else {
             bail!("turn {index} has no sealed record to replay");
         };
         before(index, conv);
@@ -289,17 +296,31 @@ pub(super) fn replay_history(
             )),
             triggers: turn_triggers(state, think_mode_from_selection(&selection), tools_mode),
             selection,
-            recorded_turn: Some(sealed.token_ids.clone()),
+            recorded_turn: Some(record.token_ids.clone()),
             ..Default::default()
         };
         let handle = conv
             .submit_turn_with_options(tool_round_text(&turn.user), options)
             .with_context(|| format!("replaying turn {index}"))?;
-        let response = handle
-            .wait()
-            .with_context(|| format!("replaying turn {index}"))?;
+        let mut points = Vec::new();
+        let mut finished = None;
+        for event in handle.stream() {
+            match event {
+                TurnEvent::Projection(p) => points.push(p),
+                TurnEvent::Done(response) => {
+                    finished = Some(response);
+                    break;
+                }
+                TurnEvent::Error(e) => bail!("replaying turn {index}: {e}"),
+                _ => {}
+            }
+        }
+        let response = finished.with_context(|| {
+            format!("the scheduler closed replayed turn {index} without finishing it")
+        })?;
         conv.finish_turn(handle, &response)
             .with_context(|| format!("sealing replayed turn {index}"))?;
+        sealed(index, conv, points, &response)?;
     }
     Ok(())
 }
@@ -379,6 +400,7 @@ impl ZendSession {
                 spec.tools_mode,
                 spec.demonstration,
                 &mut |_, _| {},
+                &mut |_, _, _, _| Ok(()),
             )
             .with_context(|| format!("run {run}"))?;
             let replay_secs = replay_start.elapsed().as_secs_f64();

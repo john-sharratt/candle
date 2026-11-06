@@ -41,6 +41,7 @@ pub mod models;
 pub mod projections;
 pub mod prompt_tokens;
 mod repo_map;
+pub mod restore;
 pub mod scan;
 pub mod substrate;
 pub mod worker_continue;
@@ -312,6 +313,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             get(diag::dump),
         )
         .route(
+            "/v1/conversations/:id/restore",
+            Role::User,
+            conversation(),
+            post(restore::restore),
+        )
+        .route(
             "/v1/conversations/:id/prompt-tokens",
             Role::User,
             conversation(),
@@ -447,6 +454,7 @@ mod tests {
                 ("/v1/conversations/:id/projection-context", "user"),
                 ("/v1/conversations/:id/diag/decode", "user"),
                 ("/v1/conversations/:id/diag/decode/:run", "user"),
+                ("/v1/conversations/:id/restore", "user"),
                 ("/v1/conversations/:id/prompt-tokens", "user"),
                 ("/v1/conversations/:id/journal", "user"),
                 ("/v1/conversations/:id/journal/draft", "user"),
@@ -490,6 +498,7 @@ mod tests {
             ("POST", "/v1/conversations/c-1/projection-context"),
             ("POST", "/v1/conversations/c-1/diag/decode"),
             ("GET", "/v1/conversations/c-1/diag/decode/1"),
+            ("POST", "/v1/conversations/c-1/restore"),
             ("GET", "/v1/conversations/c-1/prompt-tokens"),
             ("GET", "/v1/conversations/c-1/journal"),
             ("POST", "/v1/conversations/c-1/journal/draft"),

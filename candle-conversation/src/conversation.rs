@@ -213,6 +213,7 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
+use crate::placed_span::{place, PlacedSpan, PlacedText};
 use crate::recurrent_span::TokenSpan;
 use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
 use crate::turn_text::{encode_pieces, token_span, TurnText};
@@ -2089,12 +2090,18 @@ impl Sequence {
         // state past the prompt — the swap window closes.
         self.state_is_prompt_only = false;
 
+        let sources: Vec<Vec<SealedTurn>> = options
+            .placed
+            .iter()
+            .map(|p| self.sealed_turns(p.source))
+            .collect();
         let (handle, user_tokens) = self.submit_turn_on(
             self.id,
             self.projection_inputs(),
             &user_message,
             user_text.clone(),
             options,
+            &sources,
             self.build_reprojection_policy(),
         )?;
         // Record the pending user turn (text + raw tokens for the tree).
@@ -2129,7 +2136,10 @@ impl TurnSubmitter {
     /// Touches no conversation state — the caller owns the in-flight guard and the
     /// pending user turn — and returns the encoded user half so the sealing caller
     /// can record it. `reprojection` enables mid-decode re-projection, which only
-    /// a turn that is going to be sealed has any use for.
+    /// a turn that is going to be sealed has any use for. `sources` holds, for
+    /// each of `options.placed`, the turns of the conversation it is placed
+    /// from.
+    #[allow(clippy::too_many_arguments)]
     fn submit_turn_on(
         &self,
         sequence_id: SequenceId,
@@ -2137,8 +2147,16 @@ impl TurnSubmitter {
         user_message: &TurnText,
         user_text: String,
         options: TurnOptions,
+        sources: &[Vec<SealedTurn>],
         reprojection: Option<ReprojectionPolicy>,
     ) -> crate::Result<(TurnHandle, TokenBuffer)> {
+        if sources.len() != options.placed.len() {
+            return Err(ConversationError::Other(format!(
+                "{} placed run(s) and {} source(s) read for them",
+                options.placed.len(),
+                sources.len()
+            )));
+        }
         // Pin the system prompt into the substrate (idempotent).
         // Subsequent SubmitTurn calls re-inject it onto the slot via
         // `apply_projection`; the upload cache amortises after the
@@ -2222,6 +2240,12 @@ impl TurnSubmitter {
                 })
                 .map_err(|e| ConversationError::Tokenizer(e.to_string()))
             })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let placed_spans = options
+            .placed
+            .iter()
+            .zip(sources)
+            .map(|(p, turns)| self.resolve_placed(user_message, &user_tokens, p, turns))
             .collect::<crate::Result<Vec<_>>>()?;
         let markers = format!("{}{}", self.config.dialect.user_end, assistant_start_marker);
         let assistant_head = format!("{user_text}{markers}");
@@ -2361,8 +2385,47 @@ impl TurnSubmitter {
                 .recorded_turn
                 .map(|g| (g, options.forced_tokens, options.forced_suffix)),
             recurrent_spans,
+            placed_spans,
         )?;
         Ok((handle, user_tokens))
+    }
+
+    /// Where `placed`'s run of `user_message` — whose ids are `user_tokens` —
+    /// is placed from among `turns`, the source's, as positions in the half
+    /// (`placed_span::place`).
+    fn resolve_placed(
+        &self,
+        user_message: &TurnText,
+        user_tokens: &[u32],
+        placed: &PlacedText,
+        turns: &[SealedTurn],
+    ) -> crate::Result<PlacedSpan> {
+        let run = token_span(
+            &self.tokenizer,
+            &self.literal_tokenizer,
+            user_message,
+            placed.bytes.clone(),
+        )
+        .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
+        let (tokens, turn, source_tokens) =
+            place(&user_tokens[run.clone()], run.start, turns, placed.edge).map_err(|e| {
+                ConversationError::Other(format!(
+                    "placing bytes {:?} of the user half from timeline {}: {e}",
+                    placed.bytes,
+                    placed.source.raw()
+                ))
+            })?;
+        if tokens.start == 0 {
+            return Err(ConversationError::Other(
+                "a placed span opens a turn's prefill: there is no head to prefill".to_string(),
+            ));
+        }
+        Ok(PlacedSpan {
+            tokens,
+            source: placed.source,
+            turn: TurnIndex(turn),
+            source_tokens,
+        })
     }
 }
 
@@ -2502,6 +2565,7 @@ impl Sequence {
             false,
             // Nothing is decoded, so there is no reply to replay.
             None,
+            Vec::new(),
             Vec::new(),
         )?;
         self.turn_in_flight = true;
@@ -2667,6 +2731,7 @@ impl Sequence {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                placed_spans: Vec::new(),
                 seal_group: Some(turns),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -2720,6 +2785,7 @@ impl TurnSubmitter {
         free_tool_calls_from_penalties: bool,
         recorded_turn: Option<(Vec<u32>, Option<usize>, Vec<u32>)>,
         recurrent_spans: Vec<TokenSpan>,
+        placed_spans: Vec<PlacedSpan>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -2786,6 +2852,13 @@ impl TurnSubmitter {
                 kind: s.kind,
             })
             .collect();
+        let placed_spans: Vec<PlacedSpan> = placed_spans
+            .into_iter()
+            .map(|s| PlacedSpan {
+                tokens: s.tokens.start + head_len as usize..s.tokens.end + head_len as usize,
+                ..s
+            })
+            .collect();
         // The closing marker rides the post-decode tail, so it lands after the
         // decoded body and inside the sealed grid.
         let mut post_decode_tokens = post_decode_tokens;
@@ -2850,6 +2923,7 @@ impl TurnSubmitter {
                 free_tool_calls_from_penalties,
                 recorded_reply: reply,
                 recurrent_spans,
+                placed_spans,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -3094,6 +3168,7 @@ impl Sequence {
             None,
             false,
             None,
+            Vec::new(),
             Vec::new(),
         )?;
 
@@ -5526,6 +5601,7 @@ impl ProbeCtx {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                placed_spans: Vec::new(),
             })
             .is_err()
         {
